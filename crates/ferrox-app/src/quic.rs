@@ -339,10 +339,7 @@ pub(crate) fn quiche_config(roots: &[Vec<u8>], cc: Option<&str>) -> Option<quich
 pub(crate) fn flush_egress(conn: &mut quiche::Connection, sock: &Datagram) {
     let mut out = [0u8; MAX_DATAGRAM];
     while let Ok((written, info)) = conn.send(&mut out) {
-        let r = sock.send_to(&out[..written], info.to);
-        if std::env::var("FERROX_FLUSH_LOG").is_ok() {
-            eprintln!("FLUSH {written}B to {} r={r:?}", info.to);
-        }
+        let _ = sock.send_to(&out[..written], info.to);
     }
 }
 
@@ -440,26 +437,34 @@ pub(crate) fn stream_send_all(
                     flush_egress(conn, sock);
                     return true;
                 }
-                if written == 0 {
-                    if Instant::now() >= deadline {
-                        return false;
-                    }
-                    flush_egress(conn, sock);
-                    std::thread::sleep(Duration::from_millis(5));
+                if written == 0 && !send_credit_wait(conn, sock, deadline) {
+                    return false;
                 }
             }
             Err(quiche::Error::Done) => {
-                if Instant::now() >= deadline {
+                if !send_credit_wait(conn, sock, deadline) {
                     return false;
                 }
-                flush_egress(conn, sock);
-                std::thread::sleep(Duration::from_millis(5));
             }
             Err(_) => return false,
         }
     }
     flush_egress(conn, sock);
     true
+}
+
+/// Flush, then read the socket before retrying a blocked send: sleeping deaf to it leaves the peer's
+/// `MAX_STREAM_DATA` unread, so a send past the initial flow window never resumes.
+fn send_credit_wait(conn: &mut quiche::Connection, sock: &Datagram, deadline: Instant) -> bool {
+    flush_egress(conn, sock);
+    if Instant::now() >= deadline {
+        return false;
+    }
+    let Ok(local) = sock.local_addr() else {
+        return false;
+    };
+    let left = deadline.saturating_duration_since(Instant::now());
+    pump_once(conn, sock, local, left)
 }
 
 pub(crate) fn stream_recv_exact(
@@ -1241,16 +1246,22 @@ impl Write for QuicStream {
         if buf.is_empty() {
             return Ok(0);
         }
+        // The lock covers one send each: a flow-control wait must not hold it, or ACKs stop arriving.
         let deadline = Instant::now() + SEND_WAIT;
-        let sent = match self.conn.lock() {
-            Ok(mut conn) => stream_send_all(&mut conn, &self.sock, self.id, buf, false, deadline),
-            Err(_) => false,
-        };
-        if sent {
-            Ok(buf.len())
-        } else {
-            Err(std::io::Error::other("quic stream send timed out"))
+        let mut rest = buf;
+        while !rest.is_empty() {
+            match self.send_once(rest) {
+                Ok(0) => {
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::other("quic stream send timed out"));
+                    }
+                    std::thread::sleep(STREAM_POLL);
+                }
+                Ok(n) => rest = &rest[n..],
+                Err(error) => return Err(error),
+            }
         }
+        Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -1263,6 +1274,23 @@ impl Write for QuicStream {
 }
 
 impl QuicStream {
+    /// One send flight without holding the lock across the wait behind it.
+    fn send_once(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let Ok(mut conn) = self.conn.lock() else {
+            return Err(std::io::Error::other("quic connection lock poisoned"));
+        };
+        match conn.stream_send(self.id, buf, false) {
+            Ok(n) => {
+                flush_egress(&mut conn, &self.sock);
+                Ok(n)
+            }
+            Err(quiche::Error::Done) => Ok(0),
+            Err(error) => Err(std::io::Error::other(format!(
+                "quic stream send: {error:?}"
+            ))),
+        }
+    }
+
     /// Half-close our direction: the peer reads everything sent, then EOF.
     pub(crate) fn fin(&self) -> bool {
         let Ok(mut conn) = self.conn.lock() else {
@@ -1406,9 +1434,6 @@ fn route(
         return;
     }
     // Server SCIDs are the parse length, so short-header DCIDs read exactly, not into payload.
-    if std::env::var("FERROX_QLOG").is_ok() {
-        eprintln!("QLOG accept from={from}");
-    }
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
     if getrandom::getrandom(&mut scid).is_err() {
         return;
@@ -1469,9 +1494,6 @@ fn reap(serve: &Serve, sock: &Arc<Datagram>, conns: &mut HashMap<Vec<u8>, Arc<Se
             id: stream,
         };
         let serve = Arc::clone(serve);
-        if std::env::var("FERROX_QLOG").is_ok() {
-            eprintln!("QLOG spawn {stream}");
-        }
         std::thread::spawn(move || serve(session));
     }
 }
