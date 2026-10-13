@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::json::Json;
 use ferrox_core::failure::{Failure, Kind, Ladder, Rung, Stage};
-use ferrox_core::tls::{Edges, Stream, TlsProvider as _};
+use ferrox_core::tls::{Edges, RecordAlignment as _, Stream, TlsProvider as _};
 use ferrox_core::transport::EarlyData;
 
 pub(crate) fn print_version() {
@@ -1681,7 +1681,7 @@ fn serve_vless_reality(
     match carrier {
         Carrier::Raw => {
             let Ok(raw) = stream.try_clone() else { return };
-            let edges = Edges::of(&stream);
+            let edges = reality_edges(server, &stream);
             let accepted =
                 ferrox_core::tls::RealityServer::accept(server, unix_millis(), stream, edges);
             answer_reality(accepted, Some(raw), id, freedom, server);
@@ -1737,13 +1737,22 @@ fn serve_vless_reality(
     }
 }
 
+/// The ends the cover origin sees: looked up only for a PROXY header, so a handshake without one costs no lookup.
+fn reality_edges(server: &ferrox_core::tls::RealityServerConfig, stream: &TcpStream) -> Edges {
+    if server.xver > 0 {
+        Edges::of(stream)
+    } else {
+        Edges::default()
+    }
+}
+
 // REALITY runs on the raw stream because the references read the ClientHello off TCP, not an upgraded one.
 fn serve_carrier_reality(
     stream: TcpStream,
     server: &ferrox_core::tls::RealityServerConfig,
     serve: impl FnOnce(ferrox_core::tls::RealityServer<TcpStream>),
 ) {
-    let edges = Edges::of(&stream);
+    let edges = reality_edges(server, &stream);
     match ferrox_core::tls::RealityServer::accept(server, unix_millis(), stream, edges) {
         Ok(ferrox_core::tls::RealityAccept::Session(session)) => serve(session),
         Ok(ferrox_core::tls::RealityAccept::Proxied(proxied)) => relay_fallback(proxied),
@@ -1939,6 +1948,8 @@ fn relay_vless<S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'sta
     if flow == crate::vision::FLOW {
         relay_stream(crate::vision::Link::new(session, raw, id), uplink, &close);
     } else {
+        // No direct switch coming: the limiter stops bounding and tracking reads.
+        session.disarm_record_alignment();
         relay_stream(session, uplink, &close);
     }
 }
@@ -4308,6 +4319,7 @@ fn dial_vless_reality(
             &close,
         );
     } else {
+        session.disarm_record_alignment();
         relay_stream(downstream, session, &close);
     }
 }
@@ -10329,6 +10341,31 @@ mod tests {
         }
         drop(inner);
         server.join().expect("joins");
+    }
+
+    #[test]
+    fn reality_edges_skip_lookups_without_xver() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let (mut site, _) = listener.accept().expect("accepts");
+        let _ = &mut site;
+        let plain = ferrox_core::tls::RealityServerConfig {
+            xver: 0,
+            ..ferrox_core::tls::RealityServerConfig::default()
+        };
+        assert_eq!(
+            reality_edges(&plain, &stream),
+            Edges::default(),
+            "no PROXY header means no lookup"
+        );
+        let proxied = ferrox_core::tls::RealityServerConfig {
+            xver: 1,
+            ..ferrox_core::tls::RealityServerConfig::default()
+        };
+        let edges = reality_edges(&proxied, &stream);
+        assert!(edges.peer.is_some() && edges.local.is_some());
+        assert_ne!(edges.peer, edges.local);
     }
 
     #[test]

@@ -56,7 +56,7 @@ pub struct RealityServerConfig {
 /// The two ends of a socket, for the PROXY-protocol header a cover origin is
 /// sent before anything else: `local` is the source the cover origin sees and
 /// `peer` the destination it was dialled on.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Edges {
     pub peer: Option<SocketAddr>,
     pub local: Option<SocketAddr>,
@@ -166,7 +166,11 @@ impl<S: Stream> TlsProvider for RealityServer<S> {
 }
 
 // Already bounded outside: the accept path reads through a limiter from the first byte.
-impl<S: Stream> super::RecordAlignment for RealityServer<S> {}
+impl<S: Stream> super::RecordAlignment for RealityServer<S> {
+    fn disarm_record_alignment(&mut self) {
+        self.inner.disarm_record_alignment();
+    }
+}
 
 impl<S: Stream> Read for RealityServer<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -356,6 +360,16 @@ impl<S: Write> Write for Replay<S> {
     }
 }
 
+impl<S: super::RecordAlignment> super::RecordAlignment for Replay<S> {
+    fn engage_record_alignment(&mut self) {
+        self.io.engage_record_alignment();
+    }
+
+    fn disarm_record_alignment(&mut self) {
+        self.io.disarm_record_alignment();
+    }
+}
+
 /// Reads from the socket in TLS-record-sized bites once engaged, so the session
 /// never buffers bytes past the record it is decrypting and a Vision direct-mode
 /// unwrap finds every byte after the last framed record still in the kernel.
@@ -365,6 +379,7 @@ pub struct RecordLimiter<S> {
     header_len: usize,
     payload_remaining: usize,
     align: bool,
+    track: bool,
 }
 
 impl<S> std::fmt::Debug for RecordLimiter<S> {
@@ -385,6 +400,7 @@ impl<S> RecordLimiter<S> {
             header_len: 0,
             payload_remaining: 0,
             align: true,
+            track: true,
         }
     }
 
@@ -395,6 +411,7 @@ impl<S> RecordLimiter<S> {
             header_len: 0,
             payload_remaining: 0,
             align: false,
+            track: true,
         }
     }
 
@@ -406,6 +423,12 @@ impl<S> RecordLimiter<S> {
 impl<S> super::RecordAlignment for RecordLimiter<S> {
     fn engage_record_alignment(&mut self) {
         self.align = true;
+        self.track = true;
+    }
+
+    fn disarm_record_alignment(&mut self) {
+        self.align = false;
+        self.track = false;
     }
 }
 
@@ -413,6 +436,9 @@ impl<S: Read> Read for RecordLimiter<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
+        }
+        if !self.track {
+            return self.io.read(buf);
         }
         let limit = if !self.align {
             buf.len()
@@ -993,8 +1019,16 @@ impl<S: Stream> RealityClientSession<S> {
         }
         let auth_key = auth_key(&shared, &random)
             .ok_or_else(|| TlsError::Other("reality: hkdf expand failed".to_owned()))?;
-        // Probe and flight share the verifier, so the seal covers the bytes going out.
+        // One config for both passes, so the probe and the flight cannot drift apart.
         let verifier = std::sync::Arc::new(RealityVerifier::new(auth_key));
+        let mut config = rustls::ClientConfig::builder_with_provider(client_provider())
+            .with_safe_default_protocol_versions()
+            .map_err(|e| TlsError::Other(format!("reality: protocol versions: {e}")))?
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_no_client_auth();
+        config.alpn_protocols = Vec::new();
+        let config = std::sync::Arc::new(config);
         let _guard = MaterialGuard::hold(Material {
             session_id: [0u8; 32],
             grease,
@@ -1002,7 +1036,7 @@ impl<S: Stream> RealityClientSession<S> {
             secret: ephemeral,
             calls: 0,
         });
-        let probe = hello_wire(&cfg.server_name, verifier.clone())?;
+        let probe = hello_wire(&cfg.server_name, &config)?;
         let message = handshake_message(&probe)?;
         let sealed = seal_session_id(
             &auth_key,
@@ -1013,14 +1047,7 @@ impl<S: Stream> RealityClientSession<S> {
             message,
         );
         MaterialGuard::seal(sealed);
-        let mut config = rustls::ClientConfig::builder_with_provider(client_provider())
-            .with_safe_default_protocol_versions()
-            .map_err(|e| TlsError::Other(format!("reality: protocol versions: {e}")))?
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth();
-        config.alpn_protocols = Vec::new();
-        let conn = rustls::ClientConnection::new(std::sync::Arc::new(config), name)
+        let conn = rustls::ClientConnection::new(config, name)
             .map_err(|e| TlsError::Other(format!("reality: client hello: {e:?}")))?;
         let mut session = Self {
             inner: crate::tls::RustlsProvider::from_connection(conn, io),
@@ -1107,18 +1134,11 @@ fn seal_session_id(
 /// Builds one hello off the thread-local material without touching the network.
 fn hello_wire(
     server_name: &str,
-    verifier: std::sync::Arc<RealityVerifier>,
+    config: &std::sync::Arc<rustls::ClientConfig>,
 ) -> Result<Vec<u8>, TlsError> {
-    let mut config = rustls::ClientConfig::builder_with_provider(client_provider())
-        .with_safe_default_protocol_versions()
-        .map_err(|e| TlsError::Other(format!("reality: protocol versions: {e}")))?
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_no_client_auth();
-    config.alpn_protocols = Vec::new();
     let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
         .map_err(|e| TlsError::Other(format!("reality: server name: {e}")))?;
-    let mut conn = rustls::ClientConnection::new(std::sync::Arc::new(config), name)
+    let mut conn = rustls::ClientConnection::new(config.clone(), name)
         .map_err(|e| TlsError::Other(format!("reality: client hello: {e:?}")))?;
     let mut out = Vec::new();
     conn.write_tls(&mut out)
@@ -2509,6 +2529,24 @@ mod tests {
     }
 
     #[test]
+    fn a_disarmed_limiter_stops_bounding_reads() {
+        fn record(kind: u8, payload: &[u8]) -> Vec<u8> {
+            let mut out = vec![kind, 0x03, 0x03];
+            out.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_be_bytes());
+            out.extend_from_slice(payload);
+            out
+        }
+        let mut wire = record(0x16, &[1u8; 100]);
+        wire.extend_from_slice(&record(0x17, &[2u8; 200]));
+        let mut limited = RecordLimiter::new(&wire[..]);
+        limited.disarm_record_alignment();
+        let mut both = [0u8; 4096];
+        let n = limited.read(&mut both).expect("reads");
+        assert_eq!(n, wire.len(), "two records arrive in one read");
+        assert_eq!(&both[..n], &wire[..]);
+    }
+
+    #[test]
     fn an_open_limiter_passes_everything_through_and_tracks_behind() {
         fn record(kind: u8, payload: &[u8]) -> Vec<u8> {
             let mut out = vec![kind, 0x03, 0x03];
@@ -2563,8 +2601,19 @@ mod tests {
                 secret: [0x44; 32],
                 calls: 0,
             });
+            hello_wire(SNI, &test_config()).expect("builds")
+        }
+
+        fn test_config() -> std::sync::Arc<rustls::ClientConfig> {
             let verifier = std::sync::Arc::new(RealityVerifier::new([0x55u8; 32]));
-            hello_wire(SNI, verifier).expect("builds")
+            let mut config = rustls::ClientConfig::builder_with_provider(client_provider())
+                .with_safe_default_protocol_versions()
+                .expect("versions")
+                .dangerous()
+                .with_custom_certificate_verifier(verifier)
+                .with_no_client_auth();
+            config.alpn_protocols = Vec::new();
+            std::sync::Arc::new(config)
         }
         let first = hello([0u8; 32]);
         let second = hello([0x77u8; 32]);

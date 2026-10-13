@@ -239,6 +239,16 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             if self.pending() == 0 {
                 return false;
             }
+            if self.read.want_header == 5 && self.pending() >= 5 {
+                // Five header iterations with no observable in between read as one load.
+                let head = &self.have[self.hat..self.hat + 5];
+                self.read.command = head[0];
+                self.read.want_content = (usize::from(head[1]) << 8) | usize::from(head[2]);
+                self.read.want_padding = (usize::from(head[3]) << 8) | usize::from(head[4]);
+                self.hat += 5;
+                self.read.want_header = 0;
+                continue;
+            }
             if self.read.want_header > 0 {
                 let byte = self.have[self.hat];
                 match self.read.want_header {
@@ -607,6 +617,62 @@ mod tests {
             framed,
             b"paddedend".len()
         );
+    }
+
+    /// A reader that answers in seeded chunks, so a red run replays anywhere.
+    struct Seeded<'a> {
+        left: &'a [u8],
+        state: u32,
+    }
+
+    impl Read for Seeded<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.left.is_empty() {
+                return Ok(0);
+            }
+            let mut x = self.state;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            self.state = x;
+            // Framed like the core sweep: whole UUID prefix first, splits after.
+            let take = (x as usize % 48 + 21).min(buf.len()).min(self.left.len());
+            buf[..take].copy_from_slice(&self.left[..take]);
+            self.left = &self.left[take..];
+            Ok(take)
+        }
+    }
+
+    impl Write for Seeded<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl RecordAlignment for Seeded<'_> {}
+
+    #[test]
+    fn seeded_splits_read_back_as_whole_content() {
+        let content: Vec<u8> = (0..2048u32).map(|i| (i % 251) as u8).collect();
+        let mut input = frame(true, 0, &content, 37);
+        input.extend(frame(false, 1, b"tail", 3));
+        input.extend_from_slice(b"raw tail");
+        let mut link = Link::new(
+            Seeded {
+                left: &input,
+                state: 0x9e37_79b9,
+            },
+            None,
+            &UUID,
+        );
+        let mut got = Vec::new();
+        link.read_to_end(&mut got).expect("reads");
+        let mut want = content;
+        want.extend_from_slice(b"tailraw tail");
+        assert_eq!(got, want);
     }
 
     #[test]

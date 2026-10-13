@@ -56,6 +56,8 @@ graph TD
 | hello-buffers-per-single-record-read | 1 | ferrox-core-reality::tests::reading_a_single_record_hello_allocates_one_buffer |
 | tls13-session-tickets-per-authenticated-handshake | 0 | ferrox-core-reality::tests::an_authenticated_session_sends_no_tickets_after_the_handshake |
 | certificateverify-signature-scheme | ED25519 | ferrox-core-reality::tests::the_reality_certificate_verify_answers_ed25519_the_peer_never_offered |
+| disarmed-limiter-records-per-read | 2 | ferrox-core-reality::tests::a_disarmed_limiter_stops_bounding_reads |
+| addrs-resolved-per-xver0-handshake | 0 | ferrox-app-proxy::tests::reality_edges_skip_lookups_without_xver |
 | client-hello-passes-per-handshake | 2 | ferrox-core-reality::tests::client_hellos_differ_only_in_the_session_id |
 | sealed-session-id-bytes | 32 | ferrox-core-reality::tests::client_seal_matches_the_test_oracle_byte_for_byte |
 | unauthenticated-servers-accepted | 0 | ferrox-core-reality::tests::a_client_with_a_wrong_key_is_refused_before_any_proxy_byte |
@@ -159,6 +161,32 @@ handshake duration is quoted from a machine without a named runner.
   asked for `/interop%20grpc/Tun` and the `grpc_reality` row died in warmup.
   `grpc_path` escapes one segment now, and
   `a_grpc_service_name_is_escaped_the_way_xray_escapes_it` pins it.
+
+- **Five single-byte header iterations read as one five-byte load.** Both
+  framers parse a header byte per loop trip with no observable in between, so
+  a whole header present in the buffer parses at once and a split one falls
+  back to the byte loop; `open_seeded_splits_match_whole_feeds` sweeps 32
+  seeded chunkings against whole feeds, short reads, mid-header splits and
+  empty frames included.
+- **A session that never goes direct stops bounding and tracking reads.**
+  `disarm_record_alignment` is the else-branch of the Vision check on both
+  roles, so non-Vision bulk pays one straight socket read; Vision flows keep
+  the limiter and `engage` re-arms defensively.
+  `a_disarmed_limiter_stops_bounding_reads` delivers two records in one read
+  and every relay test still moves the same bytes.
+- **A handshake without a PROXY header costs no address lookup.** The only
+  reader of the edges is the `xver > 0` branch, so lookups happen only there;
+  `reality_edges_skip_lookups_without_xver` pins default against real.
+- **One client config builds both hello passes**, so the probe and the flight
+  cannot drift apart; the determinism test still shows only the session id
+  moving.
+
+Tried and set aside with reasons: probe elimination (both references build
+twice and one RTT dominates the build), smaller Vision staging reads (read
+granularity moves the syscall count, which this page counts), zero-fill
+removal in padding (zeros are wire bytes), second relay copy removal (partial
+frames need the staging buffer), full edge laziness inside `accept` (a generic
+stream has no addresses; the `xver` gate covers the common path).
 
 What is **not** removed, and stays named: there is no uTLS fingerprint shaping
 in this tree at all, so the `unsafe-*` fingerprint extension parses, requires
