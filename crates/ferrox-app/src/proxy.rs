@@ -9310,6 +9310,7 @@ mod tests {
             .set_read_timeout(Some(RELAY_POLL))
             .expect("arms the server idle grain");
         let raw = session.try_clone().expect("shares the fd");
+        #[cfg(unix)]
         let probe = session.try_clone().expect("probes the fd");
         drop(lane);
 
@@ -9323,6 +9324,8 @@ mod tests {
         let mut answer = [0u8; 2];
         edge.read_exact(&mut answer).expect("answers");
         assert_eq!(answer, [0, 0], "the relay grants the tunnel");
+        // The grant is written after the SESSION_POLL arm and the relay returns early if arming fails, so it already proves the raw arm armed cross-platform; only a duplicated file description can reflect a later setsockopt, so the value witness is unix-only (WSADuplicateSocket gives Windows an independent handle).
+        #[cfg(unix)]
         assert_eq!(
             probe.read_timeout().ok().flatten(),
             Some(SESSION_POLL),
