@@ -1,0 +1,53 @@
+name: ops
+
+on:
+  pull_request:
+    paths:
+      - 'crates/**'
+      - 'scripts/count-ops.sh'
+      - 'scripts/expected-ops.txt'
+      - 'scripts/method-ops.txt'
+      - 'scripts/method-counts.txt'
+      - 'docs/**'
+      - '.github/workflows/ops.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  counts:
+    name: exact operation counts
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          key: ops-line-tables
+      - name: install the counting tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends valgrind strace
+      - name: check exact counts
+        env:
+          RUSTFLAGS: -C debuginfo=line-tables-only
+        run: ./scripts/count-ops.sh check quic::tests::pem_wraps_at_sixty_four_columns scripts/expected-ops.txt
+      - name: report the per-method counts, never red
+        env:
+          RUSTFLAGS: -C debuginfo=line-tables-only
+        run: |
+          {
+            echo '# per-method retired instructions, informational'
+            while read -r doc filter symbol; do
+              case "$doc" in ''|'#'*) continue ;; esac
+              printf '\n## %s -- %s\n' "$doc" "$symbol"
+              ./scripts/count-ops.sh report "$filter" "$symbol" < /dev/null || echo "not found: $symbol"
+            done < scripts/method-ops.txt
+          } | tee target/method-ops.md
+      - uses: actions/upload-artifact@v4
+        with:
+          name: method-ops
+          path: target/method-ops.md
+          if-no-files-found: error

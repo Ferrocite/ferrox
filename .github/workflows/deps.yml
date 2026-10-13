@@ -1,0 +1,34 @@
+name: deps
+
+on:
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "deny.toml"
+      - "crates/*/Cargo.toml"
+      - ".github/workflows/deps.yml"
+  schedule:
+    - cron: "41 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: deps-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  deny:
+    name: licence, source and advisory policy
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: Cargo.toml
+          deny-path: deny.toml
+          command: check advisories bans licenses sources
+          use-lockfile: true

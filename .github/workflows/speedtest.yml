@@ -1,0 +1,135 @@
+name: speedtest
+
+
+on:
+  workflow_dispatch:
+    inputs:
+      configs:
+        description: "One vless:// per line (# comments allowed). Credentials stay masked; only redacted labels reach the report."
+        required: true
+        type: string
+      target_url:
+        description: "Static file every core downloads"
+        required: false
+        default: "https://speed.hetzner.de/1GB.bin"
+        type: string
+      target_sha256:
+        description: "Expected SHA-256 of the file (empty = bytes counted, validation unverified)"
+        required: false
+        default: ""
+        type: string
+      target_md5:
+        description: "Expected MD5 of the file, checked when SHA-256 is absent. Some public mirrors publish only MD5, and an unverified download is a throughput measurement of nothing."
+        required: false
+        default: ""
+        type: string
+      repeats:
+        description: "Attempts per config per core"
+        required: false
+        default: "2"
+        type: string
+      cores:
+        description: "Comma-separated subset to drive"
+        required: false
+        default: "ferrox,xray-core,zeronet,sing-box,xray-rust"
+        type: string
+      curl_max_time:
+        description: "Seconds before one download is declared stalled"
+        required: false
+        default: "1500"
+        type: string
+
+concurrency:
+  group: speedtest-${{ github.ref }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: -D warnings --cfg aes_armv8 --cfg polyval_armv8
+
+jobs:
+  speedtest:
+    name: live speedtest (ubuntu, sequential)
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: scripts/requirements-benchmark.txt
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: speedtest
+      - name: check the upstream pins resolve
+        run: ./scripts/check-upstream-pins.sh
+      - name: fetch the pinned comparator trees
+        run: ./scripts/fetch-upstream.sh --only xray-core,sing-box,zeronet,xray-rust
+      - name: install the chart dependency
+        run: pip install -r scripts/requirements-benchmark.txt
+      - name: hand the run its configs (masked before anything runs)
+        env:
+          CONFIGS: ${{ inputs.configs }}
+        run: |
+          printf '%s\n' "$CONFIGS" > "$RUNNER_TEMP/live-configs.txt"
+          while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+            echo "::add-mask::$line"
+          done < "$RUNNER_TEMP/live-configs.txt"
+          echo "configs: $(grep -c . "$RUNNER_TEMP/live-configs.txt") line(s) handed over (count only)"
+      - name: dial every core through every config, download the file
+        env:
+          CORES: ${{ inputs.cores }}
+        run: >
+          ./scripts/run-live-speedtest.sh
+          --configs-file "$RUNNER_TEMP/live-configs.txt"
+          --target-url "${{ inputs.target_url }}"
+          --target-sha256 "${{ inputs.target_sha256 }}"
+          --target-md5 "${{ inputs.target_md5 }}"
+          --repeats "${{ inputs.repeats }}"
+          --cores "$CORES"
+          --curl-max-time "${{ inputs.curl_max_time }}"
+          --out target/live-speedtest
+      - name: render the report
+        run: >
+          python3 scripts/render-live-speedtest.py
+          --dir target/live-speedtest
+      - name: validate medians and redaction
+        run: >
+          python3 scripts/validate-live-speedtest.py
+          --dir target/live-speedtest
+          --tokens target/live-speedtest/tokens.txt
+      - name: publish the report
+        if: always()
+        run: |
+          {
+            echo
+            echo '```'
+            cat target/live-speedtest/summary.md 2>/dev/null || echo "no report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: upload the evidence (configs, tokens and bytes stay behind)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: live-speedtest-${{ github.run_id }}
+          path: |
+            target/live-speedtest/records.jsonl
+            target/live-speedtest/summary.md
+            target/live-speedtest/summary.json
+            target/live-speedtest/manifest.txt
+            target/live-speedtest/throughput.png
+            target/live-speedtest/attempts/**/*.log
+            target/live-speedtest/attempts/**/*.json
+          retention-days: 30
+          if-no-files-found: error

@@ -1,0 +1,143 @@
+name: parity
+
+on:
+  workflow_dispatch:
+    inputs:
+      splice_pipe_bytes:
+        description: "override the relay's splice pipe capacity, in bytes (blank = the compiled-in default)"
+        required: false
+        type: string
+      repeats:
+        description: "paired repeats per engine"
+        required: false
+        type: string
+      connections:
+        description: "concurrent flows per engine"
+        required: false
+        type: string
+      traffic:
+        description: "upload | download | full-duplex"
+        required: false
+        type: string
+      iterations:
+        description: "payload iterations per flow"
+        required: false
+        type: string
+  schedule:
+    - cron: "23 5 * * *"
+
+concurrency:
+  group: parity-${{ github.ref }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: --cfg aes_armv8 --cfg polyval_armv8
+
+jobs:
+  fetch:
+    name: check the pins and fetch the comparators
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/check-upstream-pins.sh
+      - run: ./scripts/fetch-upstream.sh --only xray-core,sing-box,zeronet,xray-rust
+      - uses: actions/upload-artifact@v4
+        with:
+          name: parity-upstream
+          path: upstream/
+          retention-days: 1
+          include-hidden-files: true
+          if-no-files-found: error
+
+  parity:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    needs: fetch
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux x86_64
+            os: ubuntu-latest
+          - name: linux aarch64
+            os: ubuntu-24.04-arm
+          - name: macos aarch64
+            os: macos-15
+          - name: windows x86_64
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: parity
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          cache-dependency-path: upstream/pins.toml
+      - name: install the QUIC build tool
+        if: runner.os == 'Windows'
+        run: choco install nasm -y --no-progress || echo "nasm already installed"
+      - uses: actions/download-artifact@v4
+        with:
+          name: parity-upstream
+          path: upstream
+      - name: build the engine under test
+        run: cargo build --locked --release -p ferrox-app -p ferrox-bench
+      - name: record the machine
+        shell: bash
+        run: |
+          echo "### machine" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '```'
+            uname -a || ver
+            rustc -vV
+            nproc 2>/dev/null || echo "logical CPUs: unavailable"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: identity, counts, timings, framing, then the process comparison
+        shell: bash
+        env:
+          SPLICE_PIPE: ${{ inputs.splice_pipe_bytes }}
+          REPEATS: ${{ inputs.repeats }}
+          CONNECTIONS: ${{ inputs.connections }}
+          TRAFFIC: ${{ inputs.traffic }}
+          ITERATIONS: ${{ inputs.iterations }}
+        run: ./scripts/run-parity.sh
+      - name: publish the table
+        if: always()
+        shell: bash
+        run: |
+          if [ ! -s target/bench-report.md ]; then
+            echo "::error::no report at target/bench-report.md, so this run measured nothing"
+          fi
+          {
+            echo
+            echo '```'
+            cat target/bench-report.md 2>/dev/null || echo "no report"
+            echo '```'
+            echo
+            echo "Every run's \`request.json\` and \`result.json\` are under \`target/parity/\`, in"
+            echo "the schema the pinned xray-rust harness reads and writes, so the same"
+            echo "files can be handed to it unmodified."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: upload the raw runs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: parity-${{ matrix.name }}-${{ github.run_id }}
+          path: |
+            target/parity/**/*.json
+            target/parity/**/stdout.log
+            target/parity/**/stderr.log
+            target/bench-report.md
+          retention-days: 30
+          if-no-files-found: error

@@ -1,0 +1,136 @@
+name: Foxy lane (live account check)
+
+# Proves the `foxy` lane against the real Mozilla Guardian service with a
+# Firefox account: the FxA login, the Guardian mint, the published catalogue,
+# the country pin, and then the carriers themselves — QUIC first, because no
+# local check can say whether an edge answers UDP at all.
+#
+# Needs repository secrets (Settings -> Secrets and variables -> Actions ->
+# Secrets): FOXY_EMAIL and FOXY_PASS, or USERNAME and PASSWORD under the names a
+# repository already has. An optional repository variable,
+# FOXY_COUNTRY, pins the egress country and defaults to US. Without the secrets
+# the job skips cleanly, so a fork's pull request never sees them and never
+# fails for their absence.
+#
+# Weekly plus on demand: the quota on a personal account is finite and one run
+# spends kilobytes, so the schedule is weekly rather than per-push. The unit
+# gates are not repeated here: `ci.yml` owns them, and a flaky QUIC loopback
+# test in another job must not be able to swallow a live measurement.
+on:
+  schedule:
+    - cron: "23 4 * * 1"
+  workflow_dispatch:
+    inputs:
+      country:
+        description: country code to pin the dial at
+        required: false
+        default: US
+
+permissions:
+  contents: read
+
+env:
+  NO_PROXY: 127.0.0.1,localhost
+
+jobs:
+  foxy-live:
+    name: Foxy lane live (auth, pass, catalogue, carriers)
+    # Not the pinned 24.04 the artifact jobs use: this job builds nothing, and
+    # 24.04's trust store predates the Let's Encrypt intermediate the account
+    # host is issued from, which is a measurement of the runner rather than of
+    # the lane.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # The account lives under either spelling: FOXY_EMAIL/FOXY_PASS name what
+      # it is, USERNAME/PASSWORD are the names a repository already has.
+      - name: Check secrets present
+        id: secrets
+        env:
+          FOXY_EMAIL: ${{ secrets.FOXY_EMAIL || secrets.USERNAME }}
+          FOXY_PASS: ${{ secrets.FOXY_PASS || secrets.PASSWORD }}
+        run: |
+          if [ -z "$FOXY_EMAIL" ] || [ -z "$FOXY_PASS" ]; then
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::the account secrets are missing; skipping the live check."
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: foxy-live
+      # The runner's bundle predates the Let's Encrypt intermediates the
+      # account host is issued from (YR1/YR2 in 2026), so refresh it before
+      # measuring: an UnknownIssuer from a stale runner is a measurement of
+      # the runner, not of the lane.
+      - name: Refresh the runner trust store
+        if: steps.secrets.outputs.present == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ca-certificates
+          sudo update-ca-certificates || true
+          echo "runner bundle now:"
+          for bundle in /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt; do
+            if [ -r "$bundle" ]; then
+              echo "$bundle: $(grep -c 'BEGIN CERTIFICATE' "$bundle") certificates"
+            fi
+          done
+      # Signs in for real, mints for real, reads the catalogue, and reports which
+      # carriers answered. Every output line is metadata; the pass is never
+      # printed. This is the only check that can say whether QUIC works.
+      - name: Live lane, every carrier
+        if: steps.secrets.outputs.present == 'true'
+        env:
+          FOXY_EMAIL: ${{ secrets.FOXY_EMAIL || secrets.USERNAME }}
+          FOXY_PASS: ${{ secrets.FOXY_PASS || secrets.PASSWORD }}
+          FOXY_CODE: ${{ secrets.FOXY_CODE }}
+          FOXY_COUNTRY: ${{ inputs.country || vars.FOXY_COUNTRY || 'US' }}
+        run: |
+          cargo test -p ferrox-app --locked -- --ignored --nocapture --test-threads=1 \
+            foxy_live::the_lane_carries_a_tunnel_on_the_carrier_the_edge_answers \
+            foxy_live::the_quic_lane_reaches_the_edge_over_udp_or_says_why_not
+      # The UDP reachability report is a measurement, not a gate: whether an
+      # edge answers QUIC is a fact about the edge, not about this tree, and a
+      # network that filters udp/443 must not turn the lane red.
+      # What the account host actually presents, and how much of the runner's
+      # bundle the lane read. A refusal with no issuer in it is a refusal nobody
+      # can act on.
+      # What the edge does with a second CONNECT on one HTTP/2 session: the
+      # lane's session pool stands on the answer, so it is asked of the real
+      # edge rather than read out of a reference.
+      - name: Two CONNECT streams on one session
+        if: steps.secrets.outputs.present == 'true'
+        env:
+          FOXY_EMAIL: ${{ secrets.FOXY_EMAIL || secrets.USERNAME }}
+          FOXY_PASS: ${{ secrets.FOXY_PASS || secrets.PASSWORD }}
+          FOXY_CODE: ${{ secrets.FOXY_CODE }}
+          FOXY_COUNTRY: ${{ inputs.country || vars.FOXY_COUNTRY || 'US' }}
+        run: |
+          cargo test -p ferrox-app --locked -- --ignored --nocapture --test-threads=1 \
+            foxy_live::a_second_connect_stream_on_one_session_names_what_the_edge_does
+      - name: What the account host presents
+        if: always() && steps.secrets.outputs.present == 'true'
+        continue-on-error: true
+        run: |
+          for host in api.accounts.firefox.com firefox.settings.services.mozilla.com; do
+            echo "== $host"
+            echo | openssl s_client -connect "$host:443" -servername "$host" 2>/dev/null               | openssl x509 -noout -subject -issuer -dates || echo "no certificate"
+          done
+          echo "== runner bundle"
+          for bundle in /etc/ssl/cert.pem /etc/ssl/certs/ca-certificates.crt; do
+            if [ -r "$bundle" ]; then
+              echo "$bundle: $(grep -c 'BEGIN CERTIFICATE' "$bundle") certificates"
+            fi
+          done
+      - name: Summarise
+        if: always() && steps.secrets.outputs.present == 'true'
+        run: |
+          {
+            echo "### Foxy lane, live"
+            echo
+            echo "The lane signs in, mints a pass, pins a country from the"
+            echo "published catalogue and tries each carrier in turn. The log"
+            echo "above names the edge, the carriers that refused it and the"
+            echo "country the tunnel exited in."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,12 @@
+# The oracle fixtures are compared byte for byte against a recorder's output, so
+# no runner may rewrite their line endings. `core.autocrlf` defaults to true on
+# the `windows x86_64` image and converted `expected.txt` to CRLF on checkout,
+# which failed `kcp::oracle::the_scripted_core_matches_the_pinned_go` on that
+# runner and nowhere else. `-text` is a path-scoped opt-out of EOL conversion: a
+# golden file whose bytes a runner can rewrite is not a golden file.
+scripts/kcp-oracle/expected.txt -text
+scripts/kcp-oracle/script.txt -text
+
+# Same reason, for every other checked-in expectation in this tree.
+**/fixtures/** -text
+**/*.golden -text

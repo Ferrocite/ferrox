@@ -1,0 +1,155 @@
+[sources.xray-core]
+repo          = "https://github.com/XTLS/Xray-core"
+rev           = "c77a4d0e4932a53f3eeafafdfef877b56fd660ad"
+always        = true
+default_branch = "main"
+path          = "common/crypto"
+test_enabled  = false
+suite         = "go test -count=1 -timeout 8m ./proxy/vless/..."
+ferrox_binary = ""
+note          = "Xray-core at this pin. Disabled: in-process Go suite with no seam, so no Ferrox binary can be injected; full list runs in xray-baseline.yml"
+
+[sources.sing-box]
+repo          = "https://github.com/SagerNet/sing-box"
+rev           = "e4b7e692f4545890bfc9d43960328e1449fa803b"
+always        = true
+default_branch = "testing"
+path          = "protocol/shadowsocks"
+test_enabled  = false
+ferrox_binary = ""
+note          = "the chacha20poly1305 usage whose one-shot interface forces a refill per call; the cipher itself is the out-of-tree module sagernet/sing-shadowsocks2 (no chacha20poly1305 string in this tree), so path names the in-tree caller"
+
+[sources.amneziawg-go]
+repo          = "https://github.com/amnezia-vpn/amneziawg-go"
+rev           = "b5928efb6ca19f0153958460c3d141f04abc5c2e"
+topics        = "amnezia, wireguard"
+default_branch = "master"
+path          = "device"
+test_enabled  = false
+ferrox_binary = ""
+note          = "hand-rolled ChaCha20 in the WireGuard data path"
+
+[sources.amnezia-client]
+repo          = "https://github.com/amnezia-vpn/amnezia-client"
+rev           = "f1af8efb4b2675c75dfdbaeafcb0cdc6ebad6a4b"
+topics        = "amnezia, junk packet, header protection"
+default_branch = "dev"
+path          = "common/crypto"
+test_enabled  = false
+ferrox_binary = ""
+note          = "the C++ Amnezia core; the second implementation of the same wire format"
+
+[sources.xray-rust]
+repo          = "https://github.com/aimalygin/xray-rust"
+rev           = "07dd396a61fa5b94a6f7c2b446efe644399dbdd9"
+topics        = "interop, balancer, round robin, proxy chain"
+default_branch = "main"
+path          = "crates"
+test_enabled  = true
+suite         = "git init -q Xray-core && git -C Xray-core fetch --quiet --depth 1 https://github.com/XTLS/Xray-core 5ca6f4b7d4dc20a881d4330e498892697627ec0c && git -C Xray-core checkout --quiet FETCH_HEAD && FERROX_ECHO_TRACE=1 cargo test -p xray-core-rs --test local_xray_interop_tests -- --ignored --exact --test-threads=1 rust_socks_client_reaches_echo_server_through_local_xray_vless_tcp rust_round_robin_balancer_uses_each_local_xray_vless_member rust_two_hop_proxy_chain_reaches_echo_through_local_xray_vless_servers rust_socks_client_reaches_echo_server_through_local_xray_vless_ws rust_socks_client_reaches_echo_server_through_local_xray_vless_httpupgrade rust_socks_client_reaches_echo_server_through_local_xray_vless_ws_early_data rust_socks_client_reaches_echo_server_through_local_xray_vless_httpupgrade_early_data rust_socks_client_reaches_echo_server_through_local_xray_vless_ws_tls rust_socks_client_reaches_echo_server_through_local_xray_vless_tls rust_socks_client_reaches_echo_server_through_local_xray_vless_reality_vision rust_socks_client_reaches_echo_server_through_local_xray_vless_tls_vision inner_tls_session_survives_vision_direct_switch_through_local_xray_reality_vision rust_socks_client_reaches_echo_server_through_local_xray_vless_reality_vision_selected_fingerprints rust_socks_clients_open_parallel_echo_flows_through_local_xray_vless_reality_vision_selected_fingerprints xray_core_socks_clients_open_parallel_echo_flows_through_local_xray_vless_reality_vision_selected_fingerprints rust_socks_client_reaches_echo_server_through_local_xray_vless_grpc_reality rust_socks_client_reaches_echo_server_through_local_xray_vless_grpc rust_socks_client_reaches_echo_server_through_local_xray_vless_grpc_tls rust_socks_client_reads_a_server_greeting_through_local_xray_vless_grpc inner_tls_session_survives_vision_direct_switch_through_local_xray_tls_vision rust_socks_client_reaches_echo_server_through_local_xray_vless_httpupgrade_tls fragment_finalmask_tls_interop fragment_finalmask_tls_vision_direct_interop"
+ferrox_binary = "ferrox-app"
+seam           = "XRAY_VLESS_FULL_BINARY"
+note          = "Rust VLESS core; 23 of local_xray_interop_tests.rs's 29 interop tests run against ferrox-app via XRAY_VLESS_FULL_BINARY, checked by conformance.yml. Of the 6 that stay out, three dial a live origin (the two REALITY fragment rows and the xhttp matrix's REALITY-H2 case), one needs an owner-supplied remote profile, and udp_noise_xhttp_h3 drives QUIC flows this binary has no UDP leg for; the sixth, the multi-mode gRPC bulk row, is a defect: the inbound resets the connection partway through a megabyte downlink. Suite fetches the Xray-core checkout the tests assert on because the harness clones only this repo"
+
+[sources.xray-rust-hysteria]
+repo          = "https://github.com/aimalygin/xray-rust"
+rev           = "07dd396a61fa5b94a6f7c2b446efe644399dbdd9"
+topics        = "hysteria"
+default_branch = "main"
+path          = "crates"
+test_enabled  = true
+suite         = "cargo test -p xray-transport --test hysteria_interop_tests -- --ignored --exact pinned_reference_rejects_wrong_auth_and_closes_failed_tcp_destination"
+ferrox_binary = "ferrox-app"
+seam          = "XRAY_HYSTERIA_BINARY"
+note          = "the same core's Hysteria v2 client against ferrox-app's `protocol: hysteria` inbound: a wrong password is refused and a failed destination closes after the acknowledgement. UDP stays out — ferrox carries no UDP flows, and the two tests that need them name that refusal. The harness's readiness token is the pinned Xray banner; ferrox-app emits it labeled as the harness's string"
+
+[sources.xray-core-rust]
+repo          = "https://github.com/Be90nia/xray-core-rust"
+rev           = "87d72569247073b13099951f8a89cd27ff784181"
+always        = true
+default_branch = "master"
+path          = "crates"
+test_enabled  = false
+ferrox_binary = ""
+note          = "a Rust rewrite of xray-core, read as a third same-language implementation for the best-of-everything comparison (the aimalygin/xray-rust core above is the second); no suite seam, so it informs parsing and framing rewrites rather than a conformance run"
+
+[sources.pattng]
+repo          = "https://github.com/patterniha/PattNG"
+rev           = "10f18e1cf82fad4141889bf5edcf68baecfc9f77"
+topics        = "ciphersuites, unsafe fingerprint, plaintext to public"
+default_branch = "my-releases"
+path          = "V2rayNG"
+test_enabled  = false
+ferrox_binary = ""
+note          = "v2rayNG fork for Iranians: cipherSuites + unsafe fingerprints, aether core, plaintext VLESS/TROJAN to public (the superset rows)"
+
+[sources.zeronet]
+repo          = "https://github.com/zeghostwriter/ZeroNet"
+rev           = "3dd7f1cc1ba6ef7a91f4c01f812685d83c718034"
+always        = true
+default_branch = "main"
+path          = "crates"
+test_enabled  = true
+suite         = "cargo test -p zero-runtime --test xray_oracle -- --ignored --test-threads=1 vless_over_raw_tcp_matches_the_oracle trojan_over_raw_tcp_matches_the_oracle shadowsocks_over_raw_tcp_matches_the_oracle vless_over_websocket_matches_the_oracle vless_over_http_upgrade_matches_the_oracle vless_over_grpc_matches_the_oracle vmess_over_raw_tcp_matches_the_oracle trojan_over_websocket_matches_the_oracle vmess_over_websocket_matches_the_oracle"
+ferrox_binary = "ferrox-app"
+seam           = "ZRAY_XRAY_BINARY"
+note          = "MIT Zray core; 9 oracle tests run against ferrox-app via ZRAY_XRAY_BINARY, checked by conformance.yml"
+
+[sources.mqvpn]
+repo          = "https://github.com/mp0rta/mqvpn"
+rev           = "0a53f5acee0c54458b3fa1809fb94b57681c59c7"
+topics        = "masque, connect-ip, multipath, scheduler, wlb, minrtt, reinjection, backup_fec, hybrid tcp"
+default_branch = "main"
+path          = "src"
+test_enabled  = false
+ferrox_binary = ""
+note          = "MASQUE CONNECT-IP (RFC 9484) over Multipath QUIC; WLB/minrtt/backup_fec schedulers, hybrid TCP lane, reorder + reinjection; Apache-2.0"
+
+[sources.aether]
+repo          = "https://github.com/CluvexStudio/Aether"
+rev           = "6175b67df370ab856bcee07fe85b524031903956"
+topics        = "masque, warp, gool, mim, psiphon, lyrebird, obfs4, snowflake, webtunnel, meek, onionmasq, arti"
+default_branch = "main"
+path          = "aether"
+test_enabled  = false
+ferrox_binary = ""
+note          = "open-source Rust WARP core (AGPL-3.0): MASQUE over HTTP/3 and HTTP/2, WireGuard, nested gool/mim, Tor x3, upstream chaining; the source PattNG vendors as libaether.so"
+
+[sources.zeptun]
+repo          = "https://github.com/Noisemux/zeptun"
+rev           = "3fd354d4a0993b8ea39ae34333a66a45c3f16a37"
+topics        = "tun2socks, tun, fake-ip, offload"
+default_branch = "main"
+path          = "src"
+test_enabled  = false
+ferrox_binary = ""
+note          = "Zig tun2socks engine (MIT): TUN to TCP/UDP/ICMP via SOCKS5/direct/passthrough, fake-IP DNS, offloads, io_uring/epoll/kqueue/IOCP"
+
+[sources.slipstream]
+repo          = "https://github.com/EndPositive/slipstream"
+rev           = "397850b16e70a52513269134b2c7b9aa13a56745"
+topics        = "dns covert, qname, txt, multi-resolver, port-53, dcubic, bbr"
+default_branch = "main"
+path          = "src"
+test_enabled  = false
+ferrox_binary = ""
+note          = "DNS covert channel over QUIC multipath (picoquic); TCP-over-DNS via base32/TXT, multi-resolver parallel + direct port-53 mode; Apache-2.0"
+
+[sources.quiche]
+repo          = "https://github.com/cloudflare/quiche"
+rev           = "b60aff932a78c4bd9c219cc501f3966bff223448"
+topics        = "quic, http/3, h3, masque, hysteria, tuic, multipath, 0-rtt"
+default_branch = "master"
+path          = "quiche"
+test_enabled  = false
+ferrox_binary = ""
+note          = "Cloudflare QUIC + HTTP/3 stack (BSD-2.0); the default QUIC for MASQUE/H3 rungs — never a preference, always the measured choice"
+
+[sources.lxbox]
+repo          = "https://github.com/Leadaxe/LxBox"
+rev           = "22a03912a3ece4174a3f5599d77fc5ebaede4943"
+default_branch = "main"
+path          = "app"
+test_enabled  = false
+ferrox_binary = ""
+note          = "Android VPN client for VLESS, REALITY, XHTTP, Cloudflare WARP, Tailscale and AmneziaWG, powered by a sing-box fork; the client-side superset and config shapes to read against"

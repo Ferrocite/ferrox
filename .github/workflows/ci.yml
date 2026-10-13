@@ -1,0 +1,121 @@
+name: ci
+
+
+on:
+  schedule:
+    - cron: "37 6 * * *"
+  pull_request:
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/**/*.rs"
+      - "crates/**/*.toml"
+      - "scripts/**"
+      - "docs/**"
+      - "README.md"
+      - "AGENTS.md"
+      - ".github/workflows/**"
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "1"
+  RUSTFLAGS: -D warnings --cfg aes_armv8 --cfg polyval_armv8
+
+jobs:
+  lint:
+    name: lint, docs and gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci
+      - run: cargo fmt --all -- --check
+      - name: lint the workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings -W clippy::perf -W clippy::suspicious
+      - run: cargo doc --workspace --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: the gates that do not need a toolchain
+        env:
+          GATES: check-leak-surface check-comments check-fixture-safety check-dependency-policy check-windows-binary-paths check-method-docs
+        run: |
+          for gate in $GATES; do
+            ( "./scripts/$gate.sh" > "/tmp/$gate.log" 2>&1; echo $? > "/tmp/$gate.rc" ) &
+          done
+          wait
+          status=0
+          for gate in $GATES; do
+            cat "/tmp/$gate.log"
+            rc="$(cat "/tmp/$gate.rc")"
+            if [ "$rc" != 0 ]; then
+              echo "::error::$gate.sh exited $rc"
+              status=$rc
+            fi
+          done
+          exit "$status"
+
+  test:
+    name: test (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux x86_64
+            os: ubuntu-latest
+          - name: macos aarch64
+            os: macos-latest
+          - name: windows x86_64
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci
+      - name: install the QUIC build tool
+        if: runner.os == 'Windows'
+        shell: bash
+        run: choco install nasm -y --no-progress || { choco list --local-only 2>/dev/null | grep -iq nasm; }
+      - name: run the full suite
+        id: test
+        shell: bash
+        env:
+          # Stage tracing for the loopback echo family: captured per test and
+          # printed only on failure, so the next scheduler stall names where
+          # it stopped (P47) at zero cost to a green run.
+          FERROX_ECHO_TRACE: 1
+        run: cargo test --workspace --locked
+      - name: publish the verdict
+        if: always()
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.test.outcome }}
+        run: |
+          {
+            echo "### test (${{ matrix.name }})"
+            echo '```'
+            uname -a 2>/dev/null || ver
+            rustc -vV
+            echo '```'
+            echo "cargo test --workspace --locked: $OUTCOME"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$OUTCOME" != "success" ]; then
+            echo "::error::cargo test on ${{ matrix.name }} did not succeed (outcome: $OUTCOME)"
+            exit 1
+          fi
+

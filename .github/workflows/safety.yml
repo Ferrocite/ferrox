@@ -1,0 +1,122 @@
+name: safety
+
+on:
+  schedule:
+    - cron: "11 3 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: safety-${{ github.ref }}
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: -D warnings --cfg aes_armv8 --cfg polyval_armv8
+
+jobs:
+  miri:
+    name: miri (${{ matrix.shard }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - shard: poly1305
+            package: ferrox-core
+            target: --lib
+            filters: "poly1305::"
+          - shard: record-aead
+            package: ferrox-core
+            target: --lib
+            filters: "record:: aead:: aesgcm::"
+          - shard: chacha
+            package: ferrox-core
+            target: --lib
+            filters: "chacha::"
+          - shard: protocols
+            package: ferrox-core
+            target: --lib
+            filters: "mux:: vless:: transport:: addr:: shadowsocks::"
+          - shard: relay
+            package: ferrox-core
+            target: --lib
+            filters: "kcp:: tls:: failure:: core::"
+          - shard: tails
+            package: ferrox-app
+            target: --bin ferrox-app
+            filters: "relay_buffer a_promoted_buffer a_read_into_the_tail a_head_dribbled a_body_never_lands a_frame_split_across_reads a_continue_then_end_sequence"
+          - shard: parsers
+            package: ferrox-core
+            target: --test parsers
+            filters: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: miri
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: miri
+      - name: run this shard of Miri
+        id: shard
+        shell: bash
+        run: |
+          set +e
+          cargo +nightly miri test -p ${{ matrix.package }} ${{ matrix.target }} \
+            --no-fail-fast -- ${{ matrix.filters }} --test-threads 2 2>&1 | tee /tmp/miri.log
+          rc="${PIPESTATUS[0]}"
+          ran="$(grep -c ' \.\.\. ok$' /tmp/miri.log || true)"
+          failed="$(grep -c ' \.\.\. FAILED$' /tmp/miri.log || true)"
+          echo "### miri: ${{ matrix.shard }} — $ran ok, $failed failed" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$ran" -eq 0 ] && [ "$failed" -eq 0 ]; then
+            echo "::error::shard ${{ matrix.shard }} interpreted no tests; its filter matched nothing"
+            rc=1
+          fi
+          echo "exit=$rc" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+
+  report:
+    name: weekly verdict
+    needs: miri
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: collect the shard verdicts
+        id: verdicts
+        run: |
+          verdicts="${{ join(needs.*.results, ' ') }}"
+          failed=0
+          for result in $verdicts; do
+            if [ "$result" != "success" ]; then
+              failed=1
+            fi
+          done
+          echo "shards=$verdicts" >> "$GITHUB_STEP_SUMMARY"
+          echo "failed=$failed" >> "$GITHUB_OUTPUT"
+      - name: write the verdict file
+        env:
+          FAILED: ${{ steps.verdicts.outputs.failed }}
+        run: |
+          if [ "$FAILED" = "0" ]; then verdict="PASS"; else verdict="FAIL"; fi
+          today="$(date -u +%F)"
+          next="$(date -u -d 'next monday' +%F)"
+          echo "Miri weekly $verdict $today, next check $next" > miri-verdict.txt
+          cat miri-verdict.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: upload the verdict
+        uses: actions/upload-artifact@v4
+        with:
+          name: miri-verdict-${{ github.run_id }}
+          path: miri-verdict.txt
+          retention-days: 90
+          if-no-files-found: error
+      - name: fail when any shard failed
+        if: steps.verdicts.outputs.failed != '0'
+        run: exit 1

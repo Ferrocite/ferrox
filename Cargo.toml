@@ -1,0 +1,52 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/ferrox-core",
+  "crates/ferrox-bench",
+  "crates/ferrox-prompt",
+  "crates/ferrox-app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.95"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/TheGorgeousIvorChival/ferrox"
+description = "A from-scratch proxy core, proven bit-identical to the implementations it replaces and not slower at any measured length"
+publish = false
+
+[workspace.dependencies]
+ferrox-core = { version = "0.1.0", path = "crates/ferrox-core" }
+
+rustls = { version = "0.23", default-features = false }
+
+[workspace.lints.rust]
+missing_docs = "allow"
+missing_debug_implementations = "allow"
+unsafe_op_in_unsafe_fn = "deny"
+mismatched_lifetime_syntaxes = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+undocumented_unsafe_blocks = "allow"
+missing_safety_doc = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+cast_possible_truncation = "allow"
+cast_lossless = "allow"
+cast_sign_loss = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.bench]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

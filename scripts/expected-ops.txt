@@ -1,0 +1,52 @@
+# Exact instruction counts, one function per line: `symbol ir`.
+#
+# Measured by `scripts/count-ops.sh check` under the test filter ops.yml
+# passes (currently quic::tests::pem_wraps_at_sixty_four_columns). `ir` is
+# retired instructions under callgrind, exact across machines. A row whose
+# value is UNBLESSED fails the check while printing the measured count: copy
+# that number here only after reading the diff it came from and deciding the
+# added or removed instructions are the change intended — never to silence
+# the gate. Nearby code growth can shift a row by a few instructions under
+# thin-LTO without touching the function; that re-bless names the nearby
+# diff as its cause, same as any other. Symbols must be unique substrings
+# (see count-ops.sh); tiny helpers vanish into their callers under release
+# inlining even with line tables, so gate the caller that survives, not the
+# leaf that does not. The syscall table the script prints alongside is
+# information, not a gate.
+# Re-blessed 2653 by 37eeb71: its loopback ladder test is one more test in the
+# same ferrox-app bin, putting back the 13 Ir that 08949a2's took out; quic.rs untouched.
+# Re-blessed 2653 by adf4a10: the Foxy lane's loopback module grows four tests
+# and their edge helpers, the lane's two carriers being a stack in the same
+# ferrox-app bin whose release layout `der_to_pem` is measured in, so the row
+# moves by the 13 Ir a test count moves it by, without `der_to_pem` changing:
+# quic.rs is untouched, and `pem_wraps_at_sixty_four_columns` still passes.
+# Re-blessed 2653 by muse-ferrox: the TLS-first server accept adds five
+# serve_session_* helpers, session_halves, SessionSink and one production
+# loopback test to the same ferrox-app bin, putting back the 13 Ir that
+# 3c878f5's took out; quic.rs untouched.
+
+# Re-blessed 2653 by opt-ss3: the downlink window and its bulk-read gate join
+# the same ferrox-app bin, putting back the 13 Ir the H2 landing took out;
+# quic.rs untouched.
+
+# Re-blessed 2640 by opt-grpc-writev: the gRPC lane gains one pointer-identity
+# witness test in the same ferrox-app bin, taking the 13 Ir the release layout
+# put at 2653 back out; `der_to_pem` and quic.rs are untouched.
+# Re-blessed 2653 by vmess-auto-aes: the VMess lane gains one header/flow
+# cipher-consistency test in the same ferrox-app bin, putting the 13 Ir the
+# release layout moves with a test count back in; `der_to_pem` and quic.rs are
+# untouched, and `pem_wraps_at_sixty_four_columns` still passes.
+# Re-blessed 2640 by hunt-trojan-deadline: the raw Trojan handshake bound and its
+# parked-peer test join the same ferrox-app bin, taking the 13 Ir the release
+# layout put at 2653 back out; `der_to_pem` and quic.rs are untouched, and
+# `pem_wraps_at_sixty_four_columns` still passes.
+# Re-blessed 2653 by hunt-vmess-deadline: the raw VMess handshake bound and its
+# parked-peer test join the same ferrox-app bin, putting the 13 Ir the release
+# layout moves with a code/test count back in; `der_to_pem` and quic.rs are
+# untouched, and `pem_wraps_at_sixty_four_columns` still passes.
+# Re-blessed 2640 by hunt-h2-headcap: the header-block reassembly guard and its
+# overflow gate test join the same ferrox-app bin, taking the 13 Ir the release
+# layout put at 2653 back out; `der_to_pem` and quic.rs are untouched, and
+# `pem_wraps_at_sixty_four_columns` still passes.
+
+der_to_pem 2640
