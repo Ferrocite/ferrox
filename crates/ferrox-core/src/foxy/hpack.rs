@@ -636,22 +636,27 @@ mod tests {
         }
         let mut code = 0i64;
         let mut previous = 0usize;
-        for bits in SHORTEST..=MAX_BITS {
+        let walked = table
+            .probe
+            .iter()
+            .zip(&histogram)
+            .enumerate()
+            .skip(SHORTEST);
+        for (bits, (&probe, &count)) in walked {
             code <<= bits - previous;
             previous = bits;
             // A length with no codes is left at the table's zero default, exactly
             // as the build skips it; only a length that carries codes is checked.
-            if histogram[bits] == 0 {
+            if count == 0 {
                 continue;
             }
-            let probe = table.probe[bits];
             assert_eq!(
                 probe >> 32,
                 u64::from(code as u32),
                 "first of length {bits}"
             );
-            assert_eq!(probe as u32, histogram[bits], "count of length {bits}");
-            code += i64::from(histogram[bits]);
+            assert_eq!(probe as u32, count, "count of length {bits}");
+            code += i64::from(count);
         }
     }
 
