@@ -1340,9 +1340,9 @@ fn serve_vless_quic_inbound(
     thread::spawn(move || {
         crate::quic::serve_loop(
             crate::quic::Datagram::plain(sock),
-            Arc::new(Mutex::new(config)),
-            serve,
-            Arc::new(AtomicBool::new(false)),
+            &Arc::new(Mutex::new(config)),
+            &serve,
+            &Arc::new(AtomicBool::new(false)),
         );
     });
     true
@@ -1365,6 +1365,11 @@ fn serve_vless_quic(mut stream: crate::quic::QuicStream, id: &[u8; 16], freedom:
         stream.close();
         return;
     };
+    // Both relay halves share one lock each: an untimed blocking read would pin its half forever.
+    if uplink.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        stream.close();
+        return;
+    }
     if stream.write_all(&[0, 0]).is_err() {
         stream.close();
         return;
@@ -14739,9 +14744,8 @@ mod tests {
         )
         .expect("identity loads");
         let config = crate::quic::serve_config(&identity).expect("serves");
-        let sock = crate::quic::Datagram::plain(
-            crate::quic::bind_datagram("127.0.0.1:0").expect("binds"),
-        );
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
         let addr = sock.local_addr().expect("addr");
         let stop = Arc::new(AtomicBool::new(false));
         let task_stop = Arc::clone(&stop);
@@ -14749,12 +14753,8 @@ mod tests {
             serve_vless_quic(stream, &id, true);
         });
         let driver = thread::spawn(move || {
-            crate::quic::serve_loop(
-                sock,
-                Arc::new(Mutex::new(config)),
-                serve,
-                task_stop,
-            );
+            let config = Arc::new(Mutex::new(config));
+            crate::quic::serve_loop(sock, &config, &serve, &task_stop);
         });
         (addr, roots, stop, driver)
     }
@@ -14768,18 +14768,23 @@ mod tests {
     ) -> Vec<u8> {
         let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", addr.port())
             .expect("a socket the server can be addressed from");
-        eprintln!("TMP addrs: client={local} server={peer}");
         let sock = crate::quic::Datagram::plain(sock);
-        let mut conn =
-            crate::quic::handshake_within(&sock, peer, local, "localhost", roots, QUIC_TEST_TIMEOUT)
-                .expect("handshakes");
+        let mut conn = crate::quic::handshake_within(
+            &sock,
+            peer,
+            local,
+            "localhost",
+            roots,
+            QUIC_TEST_TIMEOUT,
+        )
+        .expect("handshakes");
         assert!(crate::quic::send_h3_opening(&mut conn, &sock));
         let deadline = Instant::now() + QUIC_TEST_TIMEOUT;
         assert!(crate::quic::stream_send_all(
             &mut conn, &sock, 0, header, false, deadline
         ));
-        let response =
-            crate::quic::stream_recv_exact(&mut conn, &sock, local, 0, 2, deadline).expect("accepts");
+        let response = crate::quic::stream_recv_exact(&mut conn, &sock, local, 0, 2, deadline)
+            .expect("accepts");
         assert_eq!(response, vec![0, 0]);
         assert!(crate::quic::stream_send_all(
             &mut conn, &sock, 0, payload, false, deadline
@@ -14790,142 +14795,6 @@ mod tests {
         let _ = conn.close(false, 0, b"done");
         crate::quic::flush_egress(&mut conn, &sock);
         back
-    }
-
-
-    #[test]
-    fn quic_tmp_decode_then_echo() {
-        let minted =
-            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
-        let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
-        let identity = ferrox_core::tls::parse_pem_identity(
-            minted.cert.pem().as_bytes(),
-            minted.key_pair.serialize_pem().as_bytes(),
-        )
-        .expect("identity loads");
-        let config = crate::quic::serve_config(&identity).expect("serves");
-        let sock = crate::quic::Datagram::plain(
-            crate::quic::bind_datagram("127.0.0.1:0").expect("binds"),
-        );
-        let addr = sock.local_addr().expect("addr");
-        let stop = Arc::new(AtomicBool::new(false));
-        let task_stop = Arc::clone(&stop);
-        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let serve: crate::quic::Serve = Arc::new(move |mut session: crate::quic::QuicStream| {
-            let decoded = decode_request_bounded(&mut session).expect("decodes");
-            assert_eq!(decoded.0, id);
-            let uplink =
-                TcpStream::connect(("127.0.0.1", decoded.3.port())).expect("dials like production");
-            session.write_all(&[0, 0]).expect("accepts");
-            let fin = session.clone();
-            let stop = uplink.try_clone().expect("clones");
-            let peer = session.clone();
-            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                let _ = stop.shutdown(Shutdown::Both);
-                peer.close();
-            });
-            relay_stream(session, uplink, &close);
-            let _ = fin.fin();
-        });
-        let driver = thread::spawn(move || {
-            crate::quic::serve_loop(
-                sock,
-                Arc::new(Mutex::new(config)),
-                serve,
-                task_stop,
-            );
-        });
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
-        let echo_port = echo.local_addr().expect("addr").port();
-        thread::spawn(move || {
-            let (mut stream, _) = echo.accept().expect("accepts");
-            let mut buf = [0u8; 64];
-            loop {
-                match stream.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
-                    Ok(n) => {
-                        if stream.write_all(&buf[..n]).is_err() {
-                            break;
-                        }
-                    }
-                }
-            }
-        });
-        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
-        let header = vless_header(&id, 1, &target);
-        let (csock, peer, local) = crate::quic::udp_to_server("127.0.0.1", addr.port())
-            .expect("a socket the server can be addressed from");
-        let csock = crate::quic::Datagram::plain(csock);
-        let mut conn = crate::quic::handshake_within(
-            &csock, peer, local, "localhost", &roots, Duration::from_secs(10),
-        )
-        .expect("handshakes");
-        assert!(crate::quic::send_h3_opening(&mut conn, &csock));
-        let deadline = Instant::now() + Duration::from_secs(10);
-        assert!(crate::quic::stream_send_all(&mut conn, &csock, 0, &header, false, deadline));
-        let back =
-            crate::quic::stream_recv_exact(&mut conn, &csock, local, 0, 2, deadline).expect("accepts");
-        assert_eq!(back, vec![0, 0]);
-        assert!(crate::quic::stream_send_all(&mut conn, &csock, 0, b"ping", false, deadline));
-        let echo =
-            crate::quic::stream_recv_exact(&mut conn, &csock, local, 0, 4, deadline).expect("echoes");
-        assert_eq!(echo, b"ping");
-        let _ = conn.close(false, 0, b"done");
-        crate::quic::flush_egress(&mut conn, &csock);
-        stop.store(true, Ordering::Relaxed);
-        driver.join().expect("joins");
-    }
-
-    #[test]
-    fn quic_tmp_direct_send() {
-        let minted =
-            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
-        let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
-        let identity = ferrox_core::tls::parse_pem_identity(
-            minted.cert.pem().as_bytes(),
-            minted.key_pair.serialize_pem().as_bytes(),
-        )
-        .expect("identity loads");
-        let config = crate::quic::serve_config(&identity).expect("serves");
-        let sock = crate::quic::Datagram::plain(
-            crate::quic::bind_datagram("127.0.0.1:0").expect("binds"),
-        );
-        let addr = sock.local_addr().expect("addr");
-        let stop = Arc::new(AtomicBool::new(false));
-        let task_stop = Arc::clone(&stop);
-        let serve: crate::quic::Serve = Arc::new(move |session: crate::quic::QuicStream| {
-            let mut session = session;
-            let mut head = [0u8; 4];
-            crate::proxy::read_exact(&mut session, &mut head).expect("reads");
-            assert_eq!(&head, b"ping");
-            session.write_all(b"pong").expect("writes");
-            session.flush().expect("flushes");
-        });
-        let driver = thread::spawn(move || {
-            crate::quic::serve_loop(
-                sock,
-                Arc::new(Mutex::new(config)),
-                serve,
-                task_stop,
-            );
-        });
-        let (csock, peer, local) = crate::quic::udp_to_server("127.0.0.1", addr.port())
-            .expect("a socket the server can be addressed from");
-        let csock = crate::quic::Datagram::plain(csock);
-        let mut conn = crate::quic::handshake_within(
-            &csock, peer, local, "localhost", &roots, Duration::from_secs(10),
-        )
-        .expect("handshakes");
-        let deadline = Instant::now() + Duration::from_secs(10);
-        assert!(crate::quic::send_h3_opening(&mut conn, &csock));
-        assert!(crate::quic::stream_send_all(&mut conn, &csock, 0, b"ping", false, deadline));
-        let back =
-            crate::quic::stream_recv_exact(&mut conn, &csock, local, 0, 4, deadline).expect("echoes");
-        assert_eq!(back, b"pong");
-        let _ = conn.close(false, 0, b"done");
-        crate::quic::flush_egress(&mut conn, &csock);
-        stop.store(true, Ordering::Relaxed);
-        driver.join().expect("joins");
     }
 
     #[test]
@@ -14947,7 +14816,6 @@ mod tests {
         });
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let (addr, roots, stop, driver) = quic_serve_loopback(id);
-        eprintln!("TMP addrs: server={addr}");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let header = vless_header(&id, 1, &target);
         let payload: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
@@ -14987,17 +14855,24 @@ mod tests {
         let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", addr.port())
             .expect("a socket the server can be addressed from");
         let sock = crate::quic::Datagram::plain(sock);
-        let mut conn =
-            crate::quic::handshake_within(&sock, peer, local, "localhost", &roots, QUIC_TEST_TIMEOUT)
-                .expect("handshakes");
+        let mut conn = crate::quic::handshake_within(
+            &sock,
+            peer,
+            local,
+            "localhost",
+            &roots,
+            QUIC_TEST_TIMEOUT,
+        )
+        .expect("handshakes");
         assert!(crate::quic::send_h3_opening(&mut conn, &sock));
         let deadline = Instant::now() + QUIC_TEST_TIMEOUT;
         for stream in [0u64, 4] {
             assert!(crate::quic::stream_send_all(
                 &mut conn, &sock, stream, &header, false, deadline
             ));
-            let response = crate::quic::stream_recv_exact(&mut conn, &sock, local, stream, 2, deadline)
-                .expect("accepts");
+            let response =
+                crate::quic::stream_recv_exact(&mut conn, &sock, local, stream, 2, deadline)
+                    .expect("accepts");
             assert_eq!(response, vec![0, 0], "stream {stream} opens");
             let payload = format!("stream {stream} bulk").into_bytes();
             assert!(crate::quic::stream_send_all(
@@ -15037,21 +14912,27 @@ mod tests {
         let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", addr.port())
             .expect("a socket the server can be addressed from");
         let sock = crate::quic::Datagram::plain(sock);
-        let mut conn =
-            crate::quic::handshake_within(&sock, peer, local, "localhost", &roots, QUIC_TEST_TIMEOUT)
-                .expect("handshakes");
+        let mut conn = crate::quic::handshake_within(
+            &sock,
+            peer,
+            local,
+            "localhost",
+            &roots,
+            QUIC_TEST_TIMEOUT,
+        )
+        .expect("handshakes");
         assert!(crate::quic::send_h3_opening(&mut conn, &sock));
         let deadline = Instant::now() + QUIC_TEST_TIMEOUT;
-        assert!(crate::quic::stream_send_all(&mut conn, &sock, 0, &bad, false, deadline));
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 0, &bad, false, deadline
+        ));
         let quick = Instant::now() + Duration::from_secs(10);
         assert!(
             crate::quic::stream_recv_exact(&mut conn, &sock, local, 0, 2, quick).is_none(),
             "a stranger gets no accept"
         );
         assert_eq!(
-            echo.accept()
-                .expect_err("nothing dials the target")
-                .kind(),
+            echo.accept().expect_err("nothing dials the target").kind(),
             std::io::ErrorKind::WouldBlock
         );
         let _ = conn.close(false, 0, b"done");
@@ -15061,10 +14942,9 @@ mod tests {
 
     #[test]
     fn quic_inbound_needs_tls() {
-        let bare = crate::json::parse(
-            r#"{"streamSettings": {"network": "quic", "security": "none"}}"#,
-        )
-        .expect("parses");
+        let bare =
+            crate::json::parse(r#"{"streamSettings": {"network": "quic", "security": "none"}}"#)
+                .expect("parses");
         assert!(quic_inbound_identity(&bare).is_none());
         let tls_bare = crate::json::parse(
             r#"{"streamSettings": {"security": "tls", "tlsSettings": {"certificates": []}}}"#,
@@ -15077,7 +14957,8 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("ferrox-quic-in-{}-{stamp}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-quic-in-{}-{stamp}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("dirs");
         let cert_path = dir.join("c.crt");
         let key_path = dir.join("c.key");

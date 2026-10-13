@@ -279,9 +279,7 @@ pub(crate) fn tune(config: &mut quiche::Config, alpn: &[u8]) -> bool {
 }
 
 /// A serving identity: the lane's own tuning plus the certificate chain quiche reads at load time.
-pub(crate) fn serve_config(
-    identity: &ferrox_core::tls::TlsServerConfig,
-) -> Option<quiche::Config> {
+pub(crate) fn serve_config(identity: &ferrox_core::tls::TlsServerConfig) -> Option<quiche::Config> {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?;
     if !tune(&mut config, ALPN) {
         return None;
@@ -1229,7 +1227,7 @@ impl Read for QuicStream {
                 Err(_) => {
                     return Err(std::io::Error::other("quic connection lock poisoned"));
                 }
-            };
+            }
             if Instant::now() >= deadline {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
@@ -1265,7 +1263,6 @@ impl Write for QuicStream {
 }
 
 impl QuicStream {
-
     /// Half-close our direction: the peer reads everything sent, then EOF.
     pub(crate) fn fin(&self) -> bool {
         let Ok(mut conn) = self.conn.lock() else {
@@ -1296,20 +1293,28 @@ struct ServerConn {
 /// The per-stream entry point a VLESS inbound serves: one stream, one session, no shared state.
 pub(crate) type Serve = Arc<dyn Fn(QuicStream) + Send + Sync>;
 
+/// The driver's two datagram scratch buffers, passed as one so routing stays within the argument budget.
+struct Scratch {
+    buf: [u8; MAX_DATAGRAM],
+    out: [u8; MAX_DATAGRAM],
+}
+
 /// The driver: one UDP socket is read by this loop alone, so no packet is fed to the wrong connection.
 pub(crate) fn serve_loop(
     sock: Datagram,
-    config: Arc<Mutex<quiche::Config>>,
-    serve: Serve,
-    stop: Arc<AtomicBool>,
+    config: &Arc<Mutex<quiche::Config>>,
+    serve: &Serve,
+    stop: &Arc<AtomicBool>,
 ) {
     let Ok(local) = sock.local_addr() else {
         return;
     };
     let sock = Arc::new(sock);
     let mut conns: HashMap<Vec<u8>, Arc<ServerConn>> = HashMap::new();
-    let mut buf = [0u8; MAX_DATAGRAM];
-    let mut out = [0u8; MAX_DATAGRAM];
+    let mut scratch = Scratch {
+        buf: [0u8; MAX_DATAGRAM],
+        out: [0u8; MAX_DATAGRAM],
+    };
     let mut applied: Option<Duration> = None;
     while !stop.load(Ordering::Relaxed) {
         let start = Instant::now();
@@ -1329,8 +1334,8 @@ pub(crate) fn serve_loop(
             }
             applied = Some(wait);
         }
-        match sock.recv_from(&mut buf) {
-            Ok((n, from)) => route(&sock, local, &config, &mut conns, &mut buf, &mut out, n, from),
+        match sock.recv_from(&mut scratch.buf) {
+            Ok((n, from)) => route(&sock, local, config, &mut conns, &mut scratch, n, from),
             Err(e)
                 if matches!(
                     e.kind(),
@@ -1350,7 +1355,7 @@ pub(crate) fn serve_loop(
             }
             Err(_) => return,
         }
-        reap(&serve, &sock, &mut conns);
+        reap(serve, &sock, &mut conns);
     }
 }
 
@@ -1373,11 +1378,11 @@ fn route(
     local: SocketAddr,
     config: &Arc<Mutex<quiche::Config>>,
     conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>,
-    buf: &mut [u8; MAX_DATAGRAM],
-    out: &mut [u8; MAX_DATAGRAM],
+    scratch: &mut Scratch,
     n: usize,
     from: SocketAddr,
 ) {
+    let Scratch { buf, out } = scratch;
     let Ok(header) = quiche::Header::from_slice(&mut buf[..n], quiche::MAX_CONN_ID_LEN) else {
         return;
     };
@@ -1430,18 +1435,9 @@ fn route(
 }
 
 /// New peer streams to sessions, finished ones out of the table, dead connections dropped.
-fn reap(
-    serve: &Serve,
-    sock: &Arc<Datagram>,
-    conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>,
-) {
+fn reap(serve: &Serve, sock: &Arc<Datagram>, conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>) {
     // Closed connections drop every key they hold, so no routing entry outlives its connection.
-    conns.retain(|_, state| {
-        state
-            .conn
-            .lock()
-            .is_ok_and(|conn| !conn.is_closed())
-    });
+    conns.retain(|_, state| state.conn.lock().is_ok_and(|conn| !conn.is_closed()));
     // New source IDs first: a packet carrying one must route on the next datagram.
     for state in conns.values().cloned().collect::<Vec<_>>() {
         let Ok(conn) = state.conn.lock() else {
@@ -1451,7 +1447,7 @@ fn reap(
     }
     let mut fresh: Vec<(Arc<Mutex<quiche::Connection>>, u64)> = Vec::new();
     for state in conns.values() {
-            let Ok(conn) = state.conn.lock() else {
+        let Ok(conn) = state.conn.lock() else {
             continue;
         };
         let readable: Vec<u64> = conn.readable().collect();
