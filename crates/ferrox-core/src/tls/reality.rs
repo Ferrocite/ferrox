@@ -170,6 +170,10 @@ impl<S: Stream> super::RecordAlignment for RealityServer<S> {
     fn disarm_record_alignment(&mut self) {
         self.inner.disarm_record_alignment();
     }
+
+    fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        self.inner.write_all_slices(parts)
+    }
 }
 
 impl<S: Stream> Read for RealityServer<S> {
@@ -1078,6 +1082,10 @@ impl<S: Stream> TlsProvider for RealityClientSession<S> {
 impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RealityClientSession<S> {
     fn engage_record_alignment(&mut self) {
         self.inner.engage_record_alignment();
+    }
+
+    fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        self.inner.write_all_slices(parts)
     }
 }
 
