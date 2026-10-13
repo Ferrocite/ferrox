@@ -92,6 +92,7 @@ xtls-vision first-frame-uuid-bytes 16 ferrox-app-vision::tests::writing_frames_t
 xtls-vision tls-buffers-inspected-before-the-switch 8 ferrox-app-vision::tests::both_directions_spend_the_same_filter_budget
 xtls-vision user-space-copies-per-byte-while-framed 2 ferrox-app-vision::tests::the_framing_switch_ends_the_staging
 xtls-vision user-space-copies-per-byte-after-the-switch 0 ferrox-app-vision::tests::the_framing_switch_ends_the_staging
+xtls-vision user-space-copies-per-byte-written-while-framed 0 ferrox-app-vision::tests::the_writer_hands_the_callers_payload_by_pointer
 xtls-vision framed-staging-buffer-bytes 16384 ferrox-app-vision::tests::the_framed_staging_buffers_stay_at_one_record
 xtls-vision seal-open-staging-allocations 0 ferrox-bench-gate-2
 

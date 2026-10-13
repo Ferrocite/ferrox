@@ -19,6 +19,8 @@ const TLS_APPLICATION_DATA: [u8; 3] = [0x17, 0x03, 0x03];
 const TLS13_VERSIONS: [u8; 6] = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
 const TLS_AES_128_CCM_8_SHA256: u16 = 0x1305;
 const SHORTEST_FRAME: usize = 21;
+/// Padding never exceeds `BUFFER - SHORTEST_FRAME`, so one static zero run covers every trailer the framer writes.
+const ZERO: [u8; BUFFER] = [0u8; BUFFER];
 
 pub(crate) struct Link<S: Read + Write + RecordAlignment> {
     session: S,
@@ -28,7 +30,6 @@ pub(crate) struct Link<S: Read + Write + RecordAlignment> {
     hat: usize,
     out: Vec<u8>,
     oat: usize,
-    staging: Vec<u8>,
     #[cfg_attr(not(test), allow(dead_code, reason = "read by the staging gate"))]
     staged: usize,
     read: Reading,
@@ -71,7 +72,6 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             hat: 0,
             out: Vec::with_capacity(WINDOW),
             oat: 0,
-            staging: Vec::with_capacity(BUFFER + SHORTEST_FRAME),
             staged: 0,
             read: Reading {
                 padding: true,
@@ -302,13 +302,14 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         }
     }
 
-    fn frame(
+    fn frame_head(
         uuid: &[u8; 16],
         tls: &Tls,
         sent_uuid: &mut bool,
-        into: &mut Vec<u8>,
+        head: &mut [u8; SHORTEST_FRAME],
         buf: &[u8],
-    ) -> u8 {
+        padding: usize,
+    ) -> (u8, usize) {
         let complete =
             tls.present && buf.len() >= 6 && buf[..3] == TLS_APPLICATION_DATA && is_record_run(buf);
         let ends = complete || (!tls.twelve_or_above && tls.budget <= 1);
@@ -317,17 +318,16 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             (_, true) => 1,
             _ => 0,
         };
+        let mut at = 0;
         if !*sent_uuid {
-            into.extend_from_slice(uuid);
+            head[..16].copy_from_slice(uuid);
+            at = 16;
             *sent_uuid = true;
         }
-        let padding = padding_len(buf.len(), tls.present);
-        into.push(command);
-        into.extend_from_slice(&(buf.len() as u16).to_be_bytes());
-        into.extend_from_slice(&(padding as u16).to_be_bytes());
-        into.extend_from_slice(buf);
-        into.resize(into.len() + padding, 0);
-        command
+        head[at] = command;
+        head[at + 1..at + 3].copy_from_slice(&(buf.len() as u16).to_be_bytes());
+        head[at + 3..at + 5].copy_from_slice(&(padding as u16).to_be_bytes());
+        (command, at + 5)
     }
 }
 
@@ -375,15 +375,19 @@ impl<S: Read + Write + RecordAlignment> Write for Link<S> {
             self.tls.observe(buf);
             self.engage();
         }
-        self.staging.clear();
-        let command = Self::frame(
+        // Head, caller's buffer, zero trailer: one `write_all_slices`, one record, no staging copy.
+        let padding = padding_len(buf.len(), self.tls.present);
+        let mut head = [0u8; SHORTEST_FRAME];
+        let (command, head_len) = Self::frame_head(
             &self.uuid,
             &self.tls,
             &mut self.write.sent_uuid,
-            &mut self.staging,
+            &mut head,
             buf,
+            padding,
         );
-        self.session.write_all(&self.staging)?;
+        self.session
+            .write_all_slices(&[&head[..head_len], buf, &ZERO[..padding]])?;
         if command != 0 {
             self.write.padding = false;
             self.write.raw = self.raw.is_some() && self.tls.enable_xtls && command == CMD_DIRECT;
@@ -777,6 +781,96 @@ mod tests {
         assert_eq!(&out[21..26], b"hello");
         assert_eq!(out.len(), 26 + pad);
         assert!(pad < BUFFER);
+    }
+
+    /// A sink that records the slices it was handed, so the pointer can witness the removed copy.
+    struct Peeker {
+        written: Vec<u8>,
+        /// `(payload_ptr, payload_len)` for each `write_all_slices` call.
+        calls: Vec<(*const u8, usize)>,
+    }
+
+    impl Read for Peeker {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for Peeker {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl RecordAlignment for Peeker {
+        fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+            assert_eq!(parts.len(), 3, "head | caller's payload | zero trailer");
+            self.calls.push((parts[1].as_ptr(), parts[1].len()));
+            for part in parts {
+                self.written.extend_from_slice(part);
+            }
+            Ok(())
+        }
+    }
+
+    /// The payload pointer the caller handed `write` is the same pointer that reaches `write_all_slices`; a staging copy would move it.
+    #[test]
+    fn the_writer_hands_the_callers_payload_by_pointer() {
+        let mut link = Link::new(
+            Peeker {
+                written: Vec::new(),
+                calls: Vec::new(),
+            },
+            None,
+            &UUID,
+        );
+        let mut payload: Vec<u8> = (0..4_000u32).map(|i| (i % 251) as u8).collect();
+        let want_ptr = payload.as_ptr();
+        let want_len = payload.len();
+        link.write_all(&payload).expect("writes");
+        assert_eq!(link.session.calls.len(), 1);
+        let (got_ptr, got_len) = link.session.calls[0];
+        assert_eq!(
+            got_ptr, want_ptr,
+            "the caller's payload reached the session uncopied"
+        );
+        assert_eq!(got_len, want_len);
+        // Grow the caller's buffer so the next write would have shown a stale staging pointer.
+        payload.extend_from_slice(b"-more-");
+        let second_ptr = payload.as_ptr();
+        link.write_all(&payload).expect("writes");
+        assert_eq!(link.session.calls.len(), 2);
+        assert_eq!(
+            link.session.calls[1].0, second_ptr,
+            "still by pointer, after a realloc"
+        );
+    }
+
+    /// Steady write traffic leaves the read-side capacities alone; nothing on the write path allocates a buffer that grows.
+    #[test]
+    fn write_traffic_holds_the_buffer_capacities_steady() {
+        let mut link = link(&[]);
+        let have_before = link.have.capacity();
+        let out_before = link.out.capacity();
+        let body = vec![0x42u8; 1_400];
+        for _ in 0..64 {
+            link.write_all(&body).expect("writes");
+        }
+        assert_eq!(
+            link.have.capacity(),
+            have_before,
+            "no allocation on the write path"
+        );
+        assert_eq!(
+            link.out.capacity(),
+            out_before,
+            "no allocation on the write path"
+        );
     }
 
     #[test]
