@@ -180,11 +180,8 @@ impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RustlsProvid
 
     fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
         self.drive()?;
-        for part in parts {
-            if !part.is_empty() {
-                self.conn.writer().write_all(part)?;
-            }
-        }
+        let mut writer = self.conn.writer();
+        coalesce(&mut writer, parts)?;
         match self.conn.complete_io(&mut self.io) {
             Err(error) if !idle(&error) => return Err(recover(error).into()),
             _ => {}
@@ -311,17 +308,42 @@ impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RustlsServer
 
     fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
         self.drive()?;
-        for part in parts {
-            if !part.is_empty() {
-                self.conn.writer().write_all(part)?;
-            }
-        }
+        let mut writer = self.conn.writer();
+        coalesce(&mut writer, parts)?;
         match self.conn.complete_io(&mut self.io) {
             Err(error) if !idle(&error) => return Err(recover(error).into()),
             _ => {}
         }
         Ok(())
     }
+}
+
+/// Hand `parts` to a rustls writer in one `write_vectored` so the fragmenter sees one payload and emits one record; iterating `write_all` per part would emit one record per part.
+fn coalesce<W: Write + ?Sized>(writer: &mut W, parts: &[&[u8]]) -> std::io::Result<()> {
+    let mut chunks: Vec<&[u8]> = parts.iter().copied().filter(|p| !p.is_empty()).collect();
+    while !chunks.is_empty() {
+        let slices: Vec<std::io::IoSlice<'_>> =
+            chunks.iter().copied().map(std::io::IoSlice::new).collect();
+        let wrote = writer.write_vectored(&slices)?;
+        if wrote == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+        }
+        let mut left = wrote;
+        for chunk in &mut chunks {
+            if left == 0 {
+                break;
+            }
+            if chunk.len() <= left {
+                left -= chunk.len();
+                *chunk = &[];
+            } else {
+                *chunk = &chunk[left..];
+                left = 0;
+            }
+        }
+        chunks.retain(|c| !c.is_empty());
+    }
+    Ok(())
 }
 
 /// The rustls config an identity produces, so tests pin wire behavior here.

@@ -45,6 +45,7 @@ graph TD
 | tls-buffers-inspected-before-the-switch | 8 | ferrox-app-vision::tests::both_directions_spend_the_same_filter_budget |
 | user-space-copies-per-byte-while-framed | 2 | ferrox-app-vision::tests::the_framing_switch_ends_the_staging |
 | user-space-copies-per-byte-after-the-switch | 0 | ferrox-app-vision::tests::the_framing_switch_ends_the_staging |
+| user-space-copies-per-byte-written-while-framed | 0 | ferrox-app-vision::tests::the_writer_hands_the_callers_payload_by_pointer |
 | framed-staging-buffer-bytes | 16384 | ferrox-app-vision::tests::the_framed_staging_buffers_stay_at_one_record |
 | seal-open-staging-allocations | 0 | ferrox-bench-gate-2 |
 <!-- counts:end -->
@@ -158,6 +159,26 @@ throughout the whole session, not only during the handshake.
   `fill`s a larger-than-one-record handshake takes — which is a case the framing
   was already required to survive. `the_framing_staging_buffers_stay_at_one_record`
   holds the capacity at 16 KiB where it used to reach 256 KiB.
+
+- **The write path's staging copy of the caller's payload.** `frame` used to
+  `staging.extend_from_slice(buf)` before handing the frame to the session, one
+  user-space copy per written byte while the framing was live. The frame now
+  goes over as three slices — head, the caller's own buffer, and a static zero
+  run for the padding — through `RecordAlignment::write_all_slices`, which
+  `RustlsProvider` and `RustlsServerProvider` implement over `write_vectored`
+  so rustls sees one payload and emits one record. The wrapper types in the
+  Vision path (`RealityServer`, `RealityClientSession`) forward, so the
+  coalescing impl is what actually runs.
+  `the_writer_hands_the_callers_payload_by_pointer` witnesses it: the pointer
+  that reaches `write_all_slices` is the caller's pointer, and it is still the
+  caller's pointer after the caller reallocs. `write_traffic_holds_the_buffer_capacities_steady`
+  gates the removal on the two remaining `Vec`s in `Link`: `have.capacity()` and
+  `out.capacity()` do not move across 64 writes, so no buffer came back to take
+  `staging`'s place. What got worse: `coalesce` allocates one small `Vec<IoSlice>`
+  per call to hand rustls an arbitrary-length slice list, where the old code
+  allocated none (it reused the pre-sized `staging`). At a 2 KiB payload the
+  allocation is a fraction of the memcpy it replaces; the copy was per-byte,
+  the Vec is per-record.
 
 What was deliberately **not** removed: the seed table and the padding itself.
 Padding bytes are wire bytes; making them random instead of zero would change
