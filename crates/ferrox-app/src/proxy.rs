@@ -1942,28 +1942,45 @@ fn relay_fallback<S: Stream + Send + 'static>(proxied: ferrox_core::tls::Proxied
     let two = Arc::new(Half::new(target));
     let mut up = upload.map(Gauge::start);
     let mut down = download.map(Gauge::start);
+    // A finished leg ends the splice; the sibling notices on its next poll grain.
+    let ended = Arc::new(AtomicBool::new(false));
     let (send, recv) = (Arc::clone(&one), Arc::clone(&two));
-    let downlink = thread::spawn(move || copy_paced(&recv, &send, down.as_mut()));
-    copy_paced(&one, &two, up.as_mut());
+    let (down_send, down_recv, down_ended) =
+        (Arc::clone(&send), Arc::clone(&recv), Arc::clone(&ended));
+    let downlink = thread::spawn(move || {
+        copy_paced(&down_recv, &down_send, down.as_mut(), &down_ended);
+    });
+    copy_paced(&one, &two, up.as_mut(), &ended);
     let _ = downlink.join();
 }
 
-fn copy_paced<R: Read, W: Write>(from: &Half<R>, to: &Half<W>, mut gauge: Option<&mut Gauge>) {
+fn copy_paced<R: Read, W: Write>(
+    from: &Half<R>,
+    to: &Half<W>,
+    mut gauge: Option<&mut Gauge>,
+    ended: &AtomicBool,
+) {
     let mut buffer = RelayBuf::new();
     loop {
         let n = match from.read_once(buffer.as_mut()) {
-            Ok(0) => return,
+            Ok(0) => break,
             Ok(n) => n,
-            Err(error) if is_timeout(&error) => continue,
-            Err(_) => return,
+            Err(error) if is_timeout(&error) => {
+                if ended.load(Ordering::Relaxed) {
+                    break;
+                }
+                continue;
+            }
+            Err(_) => break,
         };
         if let Some(gauge) = gauge.as_mut() {
             gauge.admit(n);
         }
         if to.write_once(buffer.filled(n)).is_err() {
-            return;
+            break;
         }
     }
+    ended.store(true, Ordering::Relaxed);
 }
 
 fn finish_reality<
@@ -9231,6 +9248,48 @@ mod tests {
             &head, b"ping",
             "the peer's hello reaches the origin in order"
         );
+    }
+
+    #[test]
+    fn the_cover_origin_splice_ends_when_the_peer_finishes() {
+        let peer_side = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let origin_side = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let origin_port = origin_side.local_addr().expect("addr").port();
+        let mut peer = TcpStream::connect(peer_side.local_addr().expect("addr")).expect("connects");
+        let client = peer_side.accept().expect("accepts").0;
+        client
+            .set_read_timeout(Some(RELAY_POLL))
+            .expect("polls like the server path");
+        let target = TcpStream::connect(("127.0.0.1", origin_port)).expect("dials");
+        let (gone_tx, gone_rx) = std::sync::mpsc::channel();
+        let cover = thread::spawn(move || {
+            let (mut origin, _) = origin_side.accept().expect("accepts");
+            let mut head = [0u8; 4];
+            origin.read_exact(&mut head).expect("reads");
+            let _ = gone_rx.recv_timeout(Duration::from_secs(5));
+            head
+        });
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let fallback = thread::spawn(move || {
+            relay_fallback(ferrox_core::tls::Proxied {
+                client,
+                target,
+                upload: None,
+                download: None,
+            });
+            let _ = finished_tx.send(());
+        });
+        peer.write_all(b"ping").expect("sends");
+        drop(peer);
+        let ended = finished_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        let _ = gone_tx.send(());
+        let head = cover.join().expect("the cover origin ends");
+        fallback.join().expect("the splice ends");
+        assert!(
+            ended,
+            "a finished peer ends the splice against a silent origin"
+        );
+        assert_eq!(&head, b"ping", "the hello reaches the origin");
     }
 
     #[test]
