@@ -79,7 +79,8 @@ fn huffman_code(symbol: usize) -> Option<(u32, usize)> {
     let slot = table.symbols[base..base + probe as u32 as usize]
         .iter()
         .position(|other| usize::from(*other) == symbol)?;
-    Some(((probe >> 32) as u32) + slot as u32, bits)
+    let code = ((probe >> 32) as u32) + slot as u32;
+    Some((code, bits))
 }
 
 /// Decodes one Huffman-coded string: the 257th entry is the EOS code rather than a symbol, so a block decoding one is malformed, and only the all-ones prefix under eight bits may follow the last symbol.
