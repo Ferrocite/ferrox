@@ -184,6 +184,53 @@ pub(crate) fn tls_cert_paths(settings: &Json) -> Option<(&str, &str)> {
     ))
 }
 
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// The eight hex digits per group of an inbound id or an outbound server uuid, dashes optional.
+pub(crate) fn uuid_bytes(text: &str) -> Option<[u8; 16]> {
+    let mut out = [0u8; 16];
+    let mut index = 0;
+    let mut high: Option<u8> = None;
+    for byte in text.bytes() {
+        if byte == b'-' {
+            continue;
+        }
+        let digit = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => return None,
+        };
+        match high.take() {
+            Some(h) => {
+                if index >= 16 {
+                    return None;
+                }
+                out[index] = (h << 4) | digit;
+                index += 1;
+            }
+            None => high = Some(digit),
+        }
+    }
+    if index == 16 && high.is_none() {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// The 56-byte hex SHA-224 of the password that Trojan speaks on the wire.
+pub(crate) fn trojan_key(password: &str) -> [u8; 56] {
+    use sha2::Digest as _;
+    let digest = sha2::Sha224::digest(password.as_bytes());
+    let mut out = [0u8; 56];
+    for (i, byte) in digest.iter().enumerate() {
+        out[2 * i] = HEX[(byte >> 4) as usize];
+        out[2 * i + 1] = HEX[(byte & 0x0F) as usize];
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

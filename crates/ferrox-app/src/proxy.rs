@@ -9,7 +9,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::{
-    inbound_reality_config, inbound_tls_identity, key32, short_id, tls_cert_paths,
+    inbound_reality_config, inbound_tls_identity, key32, short_id, tls_cert_paths, trojan_key,
+    uuid_bytes,
 };
 use crate::json::Json;
 use ferrox_core::failure::{Failure, Kind, Ladder, Rung, Stage};
@@ -7946,19 +7947,6 @@ fn parse_socks_udp(packet: &[u8]) -> Option<(SocketAddr, &[u8])> {
     Some((addr, &packet[used..]))
 }
 
-const HEX: &[u8; 16] = b"0123456789abcdef";
-
-fn trojan_key(password: &str) -> [u8; 56] {
-    use sha2::Digest as _;
-    let digest = sha2::Sha224::digest(password.as_bytes());
-    let mut out = [0u8; 56];
-    for (i, byte) in digest.iter().enumerate() {
-        out[2 * i] = HEX[(byte >> 4) as usize];
-        out[2 * i + 1] = HEX[(byte & 0x0F) as usize];
-    }
-    out
-}
-
 /// The handshake that keeps the client's name: resolving here hands the edge an address it cannot route.
 fn socks_target(client: &mut TcpStream, grant: bool) -> Option<(u8, SocksTarget)> {
     let mut head = [0u8; 2];
@@ -9189,38 +9177,6 @@ fn stream_security(node: &Json) -> &str {
 
 fn vless_security_supported(sec: &str) -> bool {
     sec.is_empty() || sec == "none"
-}
-
-fn uuid_bytes(text: &str) -> Option<[u8; 16]> {
-    let mut out = [0u8; 16];
-    let mut index = 0;
-    let mut high: Option<u8> = None;
-    for byte in text.bytes() {
-        if byte == b'-' {
-            continue;
-        }
-        let digit = match byte {
-            b'0'..=b'9' => byte - b'0',
-            b'a'..=b'f' => byte - b'a' + 10,
-            b'A'..=b'F' => byte - b'A' + 10,
-            _ => return None,
-        };
-        match high.take() {
-            Some(h) => {
-                if index >= 16 {
-                    return None;
-                }
-                out[index] = (h << 4) | digit;
-                index += 1;
-            }
-            None => high = Some(digit),
-        }
-    }
-    if index == 16 && high.is_none() {
-        Some(out)
-    } else {
-        None
-    }
 }
 
 fn x25519_pair() -> (String, String) {
