@@ -627,8 +627,7 @@ mod tests {
 
     #[test]
     fn the_fused_probe_holds_the_canonical_first_and_count_of_every_length() {
-        // An independent canonical walk straight off the code lengths, the second
-        // source the fused probe is checked against rather than against itself.
+        // An independent canonical walk off the code lengths is the second source the fused probe is checked against, not itself.
         let table = huffman();
         let mut histogram = [0u32; MAX_BITS + 1];
         for &length in &HUFFMAN_BITS {
@@ -645,8 +644,7 @@ mod tests {
         for (bits, (&probe, &count)) in walked {
             code <<= bits - previous;
             previous = bits;
-            // A length with no codes is left at the table's zero default, exactly
-            // as the build skips it; only a length that carries codes is checked.
+            // A length with no codes keeps the table's zero default, as the build skips it; only a populated length is checked.
             if count == 0 {
                 continue;
             }
