@@ -1,11 +1,13 @@
 use std::cell::RefCell;
 
-use crate::proxy::RELAY_BUFFER;
+use crate::proxy::RELAY_SMALL_BUFFER;
 use ferrox_core::tls::RecordAlignment;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
 const BUFFER: usize = 2048;
+/// The framed window is one `rustls` record and the relay's own first read: past the switch neither staging buffer is touched again, so neither reaches for a whole relay's worth.
+const WINDOW: usize = RELAY_SMALL_BUFFER;
 const SEED: [u32; 4] = [900, 500, 900, 256];
 const FILTER_PACKETS: i32 = 8;
 const CMD_DIRECT: u8 = 2;
@@ -65,9 +67,9 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             session,
             raw,
             uuid: *uuid,
-            have: Vec::with_capacity(RELAY_BUFFER),
+            have: Vec::with_capacity(WINDOW),
             hat: 0,
-            out: Vec::with_capacity(RELAY_BUFFER),
+            out: Vec::with_capacity(WINDOW),
             oat: 0,
             staging: Vec::with_capacity(BUFFER + SHORTEST_FRAME),
             staged: 0,
@@ -177,10 +179,10 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         loop {
             self.compact();
             let base = self.have.len();
-            self.have.reserve_exact(RELAY_BUFFER);
-            // The read lands in spare capacity; staging here copied every framed byte twice.
+            self.have.reserve_exact(WINDOW - base);
+            // The read lands in spare capacity held steady at the window; staging here copied every framed byte twice.
             let read = unsafe {
-                self.have.set_len(base + RELAY_BUFFER);
+                self.have.set_len(WINDOW);
                 self.session.read(&mut self.have[base..])
             };
             let n = match read {
@@ -616,6 +618,40 @@ mod tests {
             "only framed bytes are staged: {} in, {} more out",
             framed,
             b"paddedend".len()
+        );
+    }
+
+    /// The framed staging never reaches for a full relay buffer: it is capped at one record and holds steady across a whole handshake's worth of fills.
+    #[test]
+    fn the_framed_staging_buffers_stay_at_one_record() {
+        let mut input = Vec::new();
+        for i in 0..24u32 {
+            let content: Vec<u8> = (0..700u32).map(|k| (k as u8) ^ (i as u8)).collect();
+            input.extend(frame(i == 0, 0, &content, 300));
+        }
+        input.extend(frame(false, 1, b"end", 0));
+        let tail = vec![0xABu8; 40_000];
+        input.extend_from_slice(&tail);
+
+        let mut link = link(&input);
+        let mut got = Vec::new();
+        link.read_to_end(&mut got).expect("reads");
+        let mut want: Vec<u8> = (0..24u32)
+            .flat_map(|i| (0..700u32).map(move |k| (k as u8) ^ (i as u8)))
+            .collect();
+        want.extend_from_slice(b"end");
+        want.extend_from_slice(&tail);
+        assert_eq!(got, want, "framing round-trips at one-record reads");
+
+        assert_eq!(
+            link.have.capacity(),
+            WINDOW,
+            "the read buffer holds exactly the window, never a relay's 256 KiB"
+        );
+        assert!(
+            link.out.capacity() < crate::proxy::RELAY_BUFFER,
+            "the staging buffer stays under a full relay buffer, at {}",
+            link.out.capacity()
         );
     }
 
