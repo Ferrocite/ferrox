@@ -7955,8 +7955,9 @@ fn socks_target(client: &mut TcpStream, grant: bool) -> Option<(u8, SocksTarget)
     if head[0] != 5 {
         return None;
     }
-    let mut methods = vec![0u8; usize::from(head[1])];
-    read_exact(client, &mut methods).ok()?;
+    // The offered-method count is an unauthenticated byte and the list is never inspected, so drain it on the stack (head[1] can never overrun the 255-byte array) to keep the heap off the pre-auth path.
+    let mut methods = [0u8; u8::MAX as usize];
+    read_exact(client, &mut methods[..usize::from(head[1])]).ok()?;
     if client.write_all(&[5, 0]).is_err() {
         return None;
     }
@@ -9138,6 +9139,31 @@ mod tests {
         assert_eq!(&granted[..3], &[5, 0, 0]);
         let ungranted = handshake(false);
         assert!(ungranted.is_empty(), "no grant before the tunnel opens");
+    }
+
+    #[test]
+    fn a_maximal_method_offer_drains_on_the_stack_and_still_grants() {
+        // head[1] = 255 is the largest count a peer can send, and with no method 0x00 offered the reply is still no-auth, so the offer is provably never inspected.
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let accepted = std::thread::spawn(move || listener.accept().expect("accepts").0);
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("times out");
+        let mut greeting = vec![5u8, u8::MAX];
+        greeting.extend_from_slice(&[2u8; u8::MAX as usize]);
+        greeting.extend([5, 1, 0, 3, 11]);
+        greeting.extend_from_slice(b"example.com");
+        greeting.extend([0, 80]);
+        client.write_all(&greeting).expect("greets");
+        let mut server = accepted.join().expect("accepts");
+        let (cmd, target) = socks_target(&mut server, true).expect("handshakes");
+        assert_eq!(cmd, 1);
+        assert_eq!(target.authority(), "example.com:80");
+        let mut reply = [0u8; 2];
+        client.read_exact(&mut reply).expect("selects a method");
+        assert_eq!(reply, [5, 0]);
     }
 
     struct Dribble {
