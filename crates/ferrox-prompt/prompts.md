@@ -187,6 +187,8 @@ Give matrix row {index} of table {section} — the implemented method {method} �
 Audit the hot path of {method} — matrix row {index} of table {section} — for work done and discarded: a value generated then overwritten, a memset before a read that fills every byte, a lock taken twice for one wait, a buffer sized for the worst case on the common small one. For each finding, remove it or prove why it is load-bearing against the leanest shape in {references}. Before writing a test that reconstructs a quantity, look for the counter already lying around as state.
 ```
 
+**Add-on — write-all-slices:** A framer's staging Vec that copies the caller's payload so a head and a trailer can share one record is not fixed by moving the copy to a stack buffer; fix `RecordAlignment::write_all_slices` at the provider layer to go through `write_vectored`, override it at every wrapper in the caller's path (the record-layer wrappers and the session types both need an arm that reaches the coalescing impl), and hand the framer's head, body, and trailer over as three slices. The default that iterates `write_all` per part is right on a raw stream and wrong under TLS, where each write_all becomes its own record.
+
 ## P9 · Prove a vector rung on the ISA it compiles for
 
 **When to use:** A SIMD or width-generic rung is in the tree and a CI runner whose architecture is named has not yet run the differential on it.
