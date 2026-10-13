@@ -1,3 +1,4 @@
+mod config;
 mod foxy;
 mod foxy_account;
 mod foxy_catalog;
