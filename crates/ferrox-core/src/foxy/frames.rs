@@ -34,16 +34,18 @@ impl H2Frame {
     /// Parses a frame header, refusing a stream id with its reserved bit set because every frame this lane exchanges leaves that bit clear.
     #[must_use]
     pub fn parse(header: &[u8; H2_HEADER]) -> Option<Self> {
-        if header[0] & 0x80 != 0 || header[3] & 0x80 != 0 || header[4] & 0x80 != 0 {
+        // Two wide loads bring in length, kind and stream; three reserved bits collapse to one mask plus one byte test.
+        let head = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
+        let flags = header[4];
+        if head & 0x8000_0080 != 0 || flags & 0x80 != 0 {
             return None;
         }
-        let length = u32::from_be_bytes([0, header[0], header[1], header[2]]);
         let stream = u32::from_be_bytes([header[5], header[6], header[7], header[8]]);
         Some(Self {
-            kind: header[3],
-            flags: header[4],
+            kind: head as u8,
+            flags,
             stream,
-            length,
+            length: head >> 8,
         })
     }
 
