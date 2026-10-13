@@ -1,0 +1,22 @@
+[package]
+name = "ferrox-prompt"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "Renders the slice a contributor should work on next, from a Markdown library that is the only place prompt prose lives"
+
+# No dependencies, and the absence is the design rather than an accident of a
+# first draft. What this needs is a Markdown file, a clipboard and a clock, and
+# every crate that could supply one of those would be a thing to keep current
+# for no capability in return. It also means the tool cannot stop working
+# because a registry is unreachable, which is the same reason nothing in
+# `ferrox-core` is allowed to make a claim it cannot re-derive.
+# One policy for the whole workspace, declared once. This crate has no unsafe
+# blocks, so most of it does not apply; `missing_docs` does, and the prompts it
+# documents are the ones a contributor reads to find out what a slice is.
+[lints]
+workspace = true
+
+[dependencies]

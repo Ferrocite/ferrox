@@ -1,0 +1,64 @@
+name: interop-baseline
+
+
+on:
+  pull_request:
+    paths:
+      - "crates/**/*.rs"
+      - "upstream/pins.toml"
+      - "scripts/run-interop-baseline.sh"
+      - ".github/workflows/interop-baseline.yml"
+  schedule:
+    - cron: "41 8 * * 1"
+  workflow_dispatch:
+    inputs:
+      suite:
+        description: "suite to run (all|zeronet|xray-rust)"
+        required: false
+        default: "all"
+
+concurrency:
+  group: interop-baseline-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    name: full suites vs ferrox-app (informational, never red on test failures)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: interop-baseline
+      - name: run every suite test vs ferrox-app, document, stay green
+        shell: bash
+        run: ./scripts/run-interop-baseline.sh "${{ inputs.suite || 'all' }}"
+      - name: publish the per-test verdicts
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo
+            echo '```'
+            cat target/interop-baseline/interop-baseline-summary.md 2>/dev/null || echo "no summary written"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: upload the full logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: interop-baseline-${{ github.run_id }}
+          path: |
+            target/interop-baseline/zeronet.log
+            target/interop-baseline/xray-rust.log
+            target/interop-baseline/interop-baseline-summary.md
+          retention-days: 30
+          if-no-files-found: error

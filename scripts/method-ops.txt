@@ -1,0 +1,46 @@
+# Per-method retired-instruction counts, for ops.yml to report.
+#
+# `scripts/count-ops.sh check` gates the one blessed row in
+# `scripts/expected-ops.txt`. This file is the open list: ops.yml measures every
+# row here on every run and publishes the numbers, which is what turns a row in
+# `scripts/method-counts.txt` from UNBLESSED into a number somebody can read and
+# decide to bless. A symbol that inlined into its caller under release will not
+# appear in a callgrind profile; that row is reported as not found and the next
+# name up is the one to try.
+#
+# A symbol reported as `not found` inlined into its caller under release: the
+# row is then noise, and the name up is the one to try. `ferrox_app::foxy::read_frame`
+# and `masque::datagram_encode` are the two that survive for this method.
+#
+# `doc  test filter  symbol`
+record-layer  record::tests::the_ladder_reports_the_blocks_the_caller_asked_for  ferrox_core::record::fill_exact
+record-layer  record::tests::the_head_is_the_references_own_first_block_and_the_rest_is_unshifted  ferrox_core::record::fill_exact_with_head
+record-layer  record::tests::the_ladder_reports_the_blocks_the_caller_asked_for  ferrox_core::aead::chacha20_poly1305_decrypt_in_place
+record-layer  poly1305::tests::byte_at_a_time_matches_one_shot  ferrox_core::poly1305::Poly1305::update
+shadowsocks  shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag  ferrox_core::shadowsocks::Cipher::seal_into
+shadowsocks  shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag  ferrox_core::shadowsocks::Cipher::open_in_place
+shadowsocks  shadowsocks::tests::an_opened_payload_is_the_datagrams_own_bytes  ferrox_core::shadowsocks::Cipher::open_in_place
+shadowsocks  shadowsocks::tests::rc4_matches_the_published_vectors  ferrox_core::shadowsocks::Rc4::crypt
+shadowsocks-2022  shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag  ferrox_core::shadowsocks2022::Cipher::seal_into
+shadowsocks-2022  shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag  ferrox_core::shadowsocks2022::Cipher::open_in_place
+shadowsocks-2022  shadowsocks2022::tests::an_opened_payload_is_the_datagrams_own_bytes  ferrox_core::shadowsocks2022::Cipher::open_in_place
+shadowsocks-2022  shadowsocks2022::tests::udp_multi_user_packs_one_eih_and_opens_with_the_pinned_psk  ferrox_app::shadowsocks2022::Datagrams::seal_list
+shadowsocks-2022  shadowsocks2022::tests::udp_multi_user_packs_one_eih_and_opens_with_the_pinned_psk  ferrox_app::shadowsocks2022::Datagrams::open_multi
+shadowsocks-2022  shadowsocks2022::tests::udp_server_replies_are_server_typed_and_stay_with_their_session  ferrox_app::shadowsocks2022::Datagrams::seal_server
+shadowsocks-2022  shadowsocks2022::tests::udp_server_replies_are_server_typed_and_stay_with_their_session  ferrox_app::shadowsocks2022::Datagrams::open_server
+vmess  vmess::tests::frames_seal_to_stable_bytes  vmess::stage_frames
+vmess  vmess::tests::frames_seal_to_stable_bytes  vmess::read_frame
+trojan  proxy::tests::the_trojan_header_costs_two_reads_not_seven  proxy::decode_trojan_request
+vless  vless::tests::first_method_header_is_stable  ferrox_core::vless::VlessLink::encode_into
+xtls-vision  vision::tests::the_framing_switch_ends_the_staging  vision::Link::read_direct
+carrier-foxy  foxy::loopback::the_http2_carrier_writes_one_literal_header_block_and_relays  foxy::read_frame
+carrier-foxy  foxy::loopback::the_masque_carrier_opens_connect_udp_and_echoes_a_datagram  masque::datagram_encode
+carrier-websocket  ws::tests::a_read_covers_a_window_not_one_frame_header  ws::WsReader::pull
+carrier-websocket  ws::tests::frames_round_trip_masked_and_plain  ws::write_frame
+carrier-websocket  ws::tests::mask_chunks_match_the_byte_loop  ws::apply_mask
+carrier-websocket  ws::tests::mask_chunks_match_the_byte_loop  ws::tests::mask_chunks_match_the_byte_loop
+mux-cool  mux::tests::a_new_frame_is_the_bytes_the_fields_add_up_to  ferrox_core::mux::Frame::encode
+mux-cool  proxy::tests::a_read_into_the_tail_appends_exactly_what_the_stream_held  ferrox_app::proxy::read_into_tail
+kcp  kcp::oracle::the_scripted_core_matches_the_pinned_go  ferrox_core::kcp::Segment::serialize
+kcp  kcp::connection::tests::every_read_size_delivers_the_same_stream  ferrox_core::kcp::worker::ReceivingWorker::read
+kcp  kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next  ferrox_core::kcp::Connection::input

@@ -1,0 +1,84 @@
+name: bench
+
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 4 * * *"
+
+concurrency:
+  group: bench-${{ github.ref }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: --cfg aes_armv8 --cfg polyval_armv8
+
+jobs:
+  pins:
+    name: upstream pins resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - run: ./scripts/check-upstream-pins.sh
+
+  bench:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    needs: pins
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux x86_64
+            os: ubuntu-latest
+          - name: linux aarch64
+            os: ubuntu-24.04-arm
+          - name: macos aarch64
+            os: macos-15
+          - name: windows x86_64
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: bench
+      - name: install the QUIC build tool
+        if: runner.os == 'Windows'
+        run: choco install nasm -y --no-progress || echo "nasm already installed"
+      - name: record the machine
+        shell: bash
+        run: |
+          {
+            echo '### machine'
+            echo '```'
+            uname -a || ver
+            rustc -vV
+            grep -m1 -o -E 'vaes|vpclmulqdq|avx512f|avx2|aes|pclmulqdq|pmull' /proc/cpuinfo 2>/dev/null | sort -u || sysctl -a 2>/dev/null | grep -E 'machdep.cpu.(features|leaf7_features)' || echo 'no cpuinfo'
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: identity, then deterministic properties, then timings
+        run: cargo run --locked --release -p ferrox-bench
+      - name: publish the table
+        if: always()
+        run: |
+          {
+            echo
+            echo '```'
+            cat target/bench-report.md 2>/dev/null || echo "no report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-report-${{ matrix.name }}-${{ github.run_id }}
+          path: target/bench-report.md
+          retention-days: 30
+          if-no-files-found: warn

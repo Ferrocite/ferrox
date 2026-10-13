@@ -1,0 +1,43 @@
+name: quic probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_INCREMENTAL: "1"
+  CARGO_INCREMENTAL: "1"
+
+jobs:
+  probe:
+    name: quic loopback on ubuntu
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci
+      - name: the two that fail, alone
+        run: |
+          for pass in 1 2 3; do
+            echo "=== pass $pass, one test thread"
+            RUST_BACKTRACE=0 cargo test -p ferrox-app --locked --bin ferrox-app -- \
+              proxy::tests::quic_pool_shares_one_connection_between_two_streams \
+              --exact --nocapture --test-threads=1 2>&1 | tail -40
+          done
+      - name: the same, with the suite's own parallelism
+        run: |
+          for pass in 1 2 3; do
+            echo "=== pass $pass, default threads"
+            RUST_BACKTRACE=0 cargo test -p ferrox-app --locked --bin ferrox-app -- \
+              proxy::tests::quic_pool_shares_one_connection_between_two_streams \
+              --exact --nocapture 2>&1 | tail -60
+          done
+      - name: every quic test in the binary
+        run: |
+          RUST_BACKTRACE=0 cargo test -p ferrox-app --locked --bin ferrox-app -- \
+            proxy::tests::quic --nocapture --test-threads=1 2>&1 | tail -80

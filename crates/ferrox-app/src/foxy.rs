@@ -1,0 +1,4081 @@
+//! Foxy lane: a CONNECT tunnel to an account's CDN edge over H1/H2/H3; a lane hands the caller a carrier-agnostic `Read + Write`.
+
+use ferrox_core::foxy::connectip;
+use ferrox_core::foxy::{self, authority, frames, hpack, masque, Failure, Pass};
+use ferrox_core::tls::TlsProvider;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+/// Attempts at one address before the lane moves on, and the pause between them: an edge that closes a handshake it started answers again in ~0.1s, so retry fast without waiting minutes on a dead address.
+const EDGE_ATTEMPTS: usize = 8;
+const EDGE_BACKOFF_MS: u64 = 250;
+const HEADER_TIMEOUT: Duration = Duration::from_secs(20);
+const MAX_FRAME: usize = frames::MAX_FRAME as usize;
+const MAX_HEAD: usize = 8_192;
+/// Unparsed capsule-stream cap: fail the association rather than buffer a peer that never completes a capsule.
+const DATAGRAM_BUF_MAX: usize = 256 * 1024;
+const SEND_WAIT: Duration = Duration::from_secs(10);
+/// The client's first unidirectional stream, carrying the SETTINGS that make the connection HTTP/3.
+const CONTROL_STREAM: u64 = 2;
+/// Request-stream buffer cap before the lane drops what it already read, and the max DATA frame size.
+const H3_WINDOW: usize = 256 * 1024;
+const H3_FRAME: usize = 16 * 1024;
+
+/// The carriers the lane can carry, in `auto`'s preference order: QUIC (one handshake carries every flow), HTTP/2 (the edge speaks it), HTTP/1.1 (every edge does).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Carrier {
+    H1,
+    H2,
+    H3,
+    /// Try each carrier in turn: an edge that will not answer QUIC is a slower tunnel, not a refused one.
+    Auto,
+}
+
+impl Carrier {
+    #[must_use]
+    pub(crate) const fn alpn(self) -> &'static [u8] {
+        match self {
+            Self::H1 => b"http/1.1",
+            Self::H2 => b"h2",
+            Self::H3 => b"h3",
+            // An unexpanded `auto` offers nothing: a dial reaching here fails the handshake instead of quietly dialling HTTP/2.
+            Self::Auto => b"",
+        }
+    }
+
+    /// The carriers to try, most preferred first, one entry when not `auto`.
+    #[must_use]
+    pub(crate) const fn order(self) -> [Self; 3] {
+        match self {
+            Self::Auto => [Self::H3, Self::H2, Self::H1],
+            Self::H3 => [Self::H3, Self::H3, Self::H3],
+            Self::H2 => [Self::H2, Self::H2, Self::H2],
+            Self::H1 => [Self::H1, Self::H1, Self::H1],
+        }
+    }
+
+    /// The carriers a UDP flow rides: HTTP/1.1 has no extended CONNECT for datagrams, and the configured carrier does not apply.
+    #[must_use]
+    pub(crate) const fn udp_order() -> [Self; 2] {
+        [Self::H3, Self::H2]
+    }
+}
+
+/// Reads a carrier from a config or a link: `auto` is a carrier, and an unknown name is `auto`, never a silent HTTP/2.
+pub(crate) fn carrier(name: &str) -> Carrier {
+    match name {
+        "h1" | "http/1.1" => Carrier::H1,
+        "h2" | "http/2" => Carrier::H2,
+        "h3" | "quic" => Carrier::H3,
+        _ => Carrier::Auto,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct FoxyDial {
+    /// The edge name: the TLS server name, the ALPN subject, and the country the hostname pins.
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    /// The address to connect to, when it is not the name's own resolution.
+    pub(crate) address: Option<SocketAddr>,
+    pub(crate) carrier: Carrier,
+    /// The upstream hop the dial chains through (TCP over CONNECT or SOCKS5; QUIC over a SOCKS5 UDP association).
+    pub(crate) upstream: Option<UpstreamProxy>,
+    pub(crate) roots: Vec<Vec<u8>>,
+    pub(crate) pins: foxy::pin::Pins,
+    pub(crate) pass: Pass,
+}
+
+/// One hop before the edge: plain HTTP CONNECT or a no-auth SOCKS5 handshake; anything else, including credentials, refuses.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct UpstreamProxy {
+    http: bool,
+    host: String,
+    port: u16,
+}
+
+impl UpstreamProxy {
+    /// Whether the hop speaks HTTP CONNECT, a TCP-only hop: a QUIC carrier must be refused instead.
+    pub(crate) fn http(&self) -> bool {
+        self.http
+    }
+}
+
+pub(crate) fn upstream_proxy(text: &str) -> Option<UpstreamProxy> {
+    let text = text.trim();
+    let (http, rest) = text
+        .strip_prefix("http://")
+        .map(|rest| (true, rest))
+        .or_else(|| text.strip_prefix("socks5://").map(|rest| (false, rest)))
+        .or_else(|| text.strip_prefix("socks5h://").map(|rest| (false, rest)))?;
+    let (host, port) = rest.rsplit_once(':')?;
+    if host.is_empty() || host.contains('/') || host.contains('@') {
+        return None;
+    }
+    let port = port.parse::<u16>().ok()?;
+    Some(UpstreamProxy {
+        http,
+        host: host.to_owned(),
+        port,
+    })
+}
+
+/// The TLS session to the edge, dialed address by address — the handshake and ALPN are part of "does this address work"; a configured hop is the dial instead.
+fn tls_to_edge(dial: &FoxyDial) -> Result<ferrox_core::tls::RustlsProvider<TcpStream>, Failure> {
+    if let Some(proxy) = dial.upstream.as_ref() {
+        return edge_over_hop(proxy, dial);
+    }
+    let peers = match dial.address {
+        Some(address) => vec![address],
+        None => format!("{}:{}", dial.host, dial.port)
+            .to_socket_addrs()
+            .map_err(|_| Failure::Io)?
+            .collect(),
+    };
+    let mut tried = 0usize;
+    for peer in peers {
+        tried += 1;
+        // The edge sometimes closes a handshake it started with no reason, seconds away from carrying the tunnel; 8 quick asks make that a leg, not a flow.
+        for attempt in 0..EDGE_ATTEMPTS {
+            let stream = match TcpStream::connect_timeout(&peer, CONNECT_TIMEOUT) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    debug_address(peer, &format!("tcp {error}"));
+                    break;
+                }
+            };
+            let _ = stream.set_nodelay(true);
+            // Half-second handshake budget: a quiet edge would otherwise hold the flow for the OS TCP timeout, which answers EAGAIN on macOS.
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+            match finish_tls(dial, stream) {
+                Ok(tls) => {
+                    // The budget was the handshake's: leave it set and a relay's read times out at half a second whatever quantum it asked for.
+                    let _ = tls.get_ref().set_read_timeout(None);
+                    return Ok(tls);
+                }
+                Err(failure) => {
+                    // An ALPN mismatch is the edge naming a protocol, which no retry changes; only losing the connection is worth a second try.
+                    let worth = matches!(failure, Failure::Io);
+                    if attempt + 1 < EDGE_ATTEMPTS && worth {
+                        std::thread::sleep(after_attempt(attempt));
+                        continue;
+                    }
+                    debug_address(peer, &failure.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    if tried > 1 {
+        eprintln!("foxy: the edge carried the lane on none of its {tried} addresses");
+    }
+    Err(Failure::Io)
+}
+
+/// The edge through the configured hop, retried like a direct dial: a hop head read answers `WouldBlock`, not `TimedOut`, on macOS (`Os { code: 35 }`).
+fn edge_over_hop(
+    proxy: &UpstreamProxy,
+    dial: &FoxyDial,
+) -> Result<ferrox_core::tls::RustlsProvider<TcpStream>, Failure> {
+    let mut tried = 0usize;
+    let mut failure = Failure::Io;
+    for attempt in 0..EDGE_ATTEMPTS {
+        tried += 1;
+        match tcp_via(proxy, dial).and_then(|stream| finish_tls(dial, stream)) {
+            Ok(tls) => return Ok(tls),
+            Err(lost) => {
+                failure = lost;
+                let worth = matches!(failure, Failure::Io | Failure::Stream);
+                if attempt + 1 < EDGE_ATTEMPTS && worth {
+                    std::thread::sleep(after_attempt(attempt));
+                }
+            }
+        }
+    }
+    debug_loss(
+        "the hop refused the edge",
+        &format!("after {tried} attempts"),
+    );
+    Err(failure)
+}
+
+/// The pause before the next attempt at one address: flat, because the edge answers a refusal in ~0.1s, so 8 attempts cost seconds, not a whole budget.
+fn after_attempt(_attempt: usize) -> std::time::Duration {
+    Duration::from_millis(EDGE_BACKOFF_MS)
+}
+
+/// Diagnostics behind `FOXY_DEBUG`: a red leg is only actionable when it names the address, the stage and the platform error — a refusal and a hang share a message otherwise.
+fn debug_loss(stage: &str, error: &dyn std::fmt::Display) {
+    if std::env::var("FOXY_DEBUG").is_ok() {
+        eprintln!("foxy-debug: {stage}: {error}");
+    }
+}
+
+fn debug_address(peer: SocketAddr, why: &str) {
+    if std::env::var("FOXY_DEBUG").is_ok() {
+        eprintln!("foxy-debug: address {peer} lost: {why}");
+    }
+}
+
+/// One address, all the way to a usable session, naming the failed stage — a bare "io" cannot be told apart from any other leg's.
+fn finish_tls(
+    dial: &FoxyDial,
+    stream: TcpStream,
+) -> Result<ferrox_core::tls::RustlsProvider<TcpStream>, Failure> {
+    let mut tls = match ferrox_core::tls::RustlsProvider::connect(&tls_config(dial), stream) {
+        Ok(tls) => tls,
+        Err(error) => {
+            debug_loss("the TLS client failed to start", &error.to_string());
+            return Err(Failure::Io);
+        }
+    };
+    if let Err(error) = tls.handshake() {
+        debug_loss("the TLS handshake with the edge failed", &error.to_string());
+        return Err(Failure::Io);
+    }
+    negotiated(&tls, dial)
+        .inspect_err(|_| debug_stage("the edge named no protocol this lane speaks"))
+        .map(|()| tls)
+}
+
+fn tls_config(dial: &FoxyDial) -> ferrox_core::tls::TlsConfig {
+    ferrox_core::tls::TlsConfig {
+        server_name: dial.host.clone(),
+        alpn: vec![dial.carrier.alpn().to_vec()],
+        roots: dial.roots.clone(),
+        pins: dial.pins.clone(),
+    }
+}
+
+/// TCP to the edge through one upstream hop: the TLS name stays the edge's, so the hop carries bytes it can neither read nor address.
+fn tcp_via(proxy: &UpstreamProxy, dial: &FoxyDial) -> Result<TcpStream, Failure> {
+    let mut stream = tcp_to_proxy(proxy).ok_or(Failure::Io)?;
+    let edge = authority(&dial.host, dial.port);
+    if proxy.http {
+        // Build CONNECT request without allocating String in most cases
+        let mut request = Vec::with_capacity(edge.len() + 32);
+        request.extend_from_slice(b"CONNECT ");
+        request.extend_from_slice(edge.as_bytes());
+        request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+        request.extend_from_slice(edge.as_bytes());
+        request.extend_from_slice(b"\r\n\r\n");
+        stream.write_all(&request).map_err(|_| Failure::Io)?;
+        // The whole head, not just the status line
+        let mut head = Vec::with_capacity(64);
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            read_exact(&mut stream, &mut byte).map_err(|_| Failure::Io)?;
+            head.push(byte[0]);
+            if head.len() > 4096 {
+                return Err(Failure::Io);
+            }
+        }
+        let code = head
+            .split(|b| *b == b'\n')
+            .next()
+            .and_then(|line| line.split(|b| *b == b' ').nth(1))
+            .and_then(|code| std::str::from_utf8(code).ok())
+            .and_then(|code| code.trim().parse::<u16>().ok())
+            .ok_or(Failure::Io)?;
+        opened(code)?;
+    } else {
+        socks_greeting(&mut stream)?;
+        let host_len = u8::try_from(dial.host.len()).map_err(|_| Failure::Io)?;
+        let mut request = vec![5, 1, 0, 3, host_len];
+        request.extend_from_slice(dial.host.as_bytes());
+        request.extend_from_slice(&dial.port.to_be_bytes());
+        stream.write_all(&request).map_err(|_| Failure::Io)?;
+        // The hop's bound address is not the edge's: read past it and drop it, the connection itself is the answer.
+        if socks_reply(&mut stream)?.is_none() {
+            return Err(Failure::Io);
+        }
+    }
+    Ok(stream)
+}
+
+/// One UDP association with a SOCKS5 hop: greeting, a request naming no destination, the relay address; the caller holds the control connection — dropping it ends the association.
+pub(crate) fn associate_udp(proxy: &UpstreamProxy) -> Option<(Arc<TcpStream>, SocketAddr)> {
+    let mut control = tcp_to_proxy(proxy)?;
+    if socks_greeting(&mut control).is_err() {
+        return None;
+    }
+    if control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]).is_err() {
+        return None;
+    }
+    let Ok(Some(relay)) = socks_reply(&mut control) else {
+        return None;
+    };
+    Some((Arc::new(control), relay))
+}
+
+/// The one hop this tree speaks to, dialed: a proxy that does not answer at all is a failed dial, not a lane running direct.
+fn tcp_to_proxy(proxy: &UpstreamProxy) -> Option<TcpStream> {
+    // Same reason the edge dial tries each one: a hop answering on the second listed family is still the hop this lane uses.
+    for addr in format!("{}:{}", proxy.host, proxy.port)
+        .to_socket_addrs()
+        .ok()?
+    {
+        if let Ok(stream) = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            let _ = stream.set_nodelay(true);
+            // The head is read a byte at a time and is small, so a few seconds is the honest bound; without it a missing byte holds the flow for the OS's minutes-long timeout.
+            let _ = stream.set_read_timeout(Some(HEADER_TIMEOUT));
+            return Some(stream);
+        }
+    }
+    None
+}
+
+/// No authentication offered, none accepted: a hop that selects anything else is one this lane cannot use.
+fn socks_greeting(stream: &mut TcpStream) -> Result<(), Failure> {
+    stream.write_all(&[5, 1, 0]).map_err(|_| Failure::Io)?;
+    let mut method = [0u8; 2];
+    read_exact(stream, &mut method).map_err(|_| Failure::Io)?;
+    if method != [5, 0] {
+        return Err(Failure::Io);
+    }
+    Ok(())
+}
+
+/// Whether the hop granted the request, and the address it bound: a refusal answers the same reply with a non-zero status, and a name in the reply is something this tree cannot address back.
+fn socks_reply(stream: &mut TcpStream) -> Result<Option<SocketAddr>, Failure> {
+    let mut head = [0u8; 4];
+    read_exact(stream, &mut head).map_err(|_| Failure::Io)?;
+    if head[1] != 0 {
+        return Ok(None);
+    }
+    let mut read = |into: &mut [u8]| read_exact(stream, into).map_err(|_| Failure::Io);
+    let ip = match head[3] {
+        1 => {
+            let mut octets = [0u8; 4];
+            read(&mut octets)?;
+            std::net::Ipv4Addr::from(octets).into()
+        }
+        4 => {
+            let mut octets = [0u8; 16];
+            read(&mut octets)?;
+            std::net::Ipv6Addr::from(octets).into()
+        }
+        _ => return Err(Failure::Io),
+    };
+    let mut port = [0u8; 2];
+    read(&mut port)?;
+    Ok(Some(SocketAddr::new(ip, u16::from_be_bytes(port))))
+}
+
+/// A handshake that answered a different ALPN is a refusal, not a downgrade: the lane asked for exactly one protocol.
+fn negotiated<S: TlsProvider>(tls: &S, dial: &FoxyDial) -> Result<(), Failure> {
+    match tls.alpn() {
+        Some(got) if got == dial.carrier.alpn() => Ok(()),
+        _ => Err(Failure::Frame),
+    }
+}
+
+fn opened(status: u16) -> Result<(), Failure> {
+    if (200..300).contains(&status) {
+        Ok(())
+    } else {
+        Err(Failure::Rejected(status))
+    }
+}
+
+fn read_exact<S: Read>(io: &mut S, buf: &mut [u8]) -> std::io::Result<()> {
+    let mut at = 0usize;
+    while at < buf.len() {
+        match io.read(&mut buf[at..]) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            // A socket timeout on macOS answers EAGAIN, so a would-block read is the same answer: retried by the caller, which is what a quantum is for.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) && at == 0 =>
+            {
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+            Ok(read) => at += read,
+        }
+    }
+    Ok(())
+}
+
+/// HTTP/1.1 CONNECT: the request, the status line, then the target's own bytes.
+pub(crate) fn open_h1(dial: &FoxyDial, target: &str) -> Result<Tls1, Failure> {
+    let mut tls = tls_to_edge(dial)?;
+    tls.write_all(&foxy::connect_request(target, &dial.pass.token))
+        .map_err(|_| Failure::Io)?;
+    opened(foxy::connect_status(&head(&mut tls)?)?)?;
+    Ok(Tls1(tls))
+}
+
+fn head<S: Read>(io: &mut S) -> Result<Vec<u8>, Failure> {
+    let mut head = Vec::with_capacity(256);
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        if head.len() >= MAX_HEAD {
+            return Err(Failure::Frame);
+        }
+        read_exact(io, &mut byte).map_err(|_| Failure::Stream)?;
+        head.push(byte[0]);
+    }
+    Ok(head)
+}
+
+/// HTTP/2 CONNECT: preface, settings, stream 1 and the status in its first header block. Stream 1 is the lane's only stream, so the codec needs no stream-id bookkeeping.
+pub(crate) fn open_h2(dial: &FoxyDial, target: &str) -> Result<Tls2, Failure> {
+    let mut block = Vec::with_capacity(96 + dial.pass.token.len());
+    hpack::hpack_connect(target, &dial.pass.token, &mut block);
+    open_h2_with(dial, &block)
+}
+
+/// One UDP target as its own H2 connection carrying CONNECT-UDP: a lane stays one stream on one connection, so a second target is a second connection.
+pub(crate) fn open_udp(
+    dial: &FoxyDial,
+    target_host: &str,
+    target_port: u16,
+) -> Result<Tls2, Failure> {
+    let edge = if dial.port == 443 {
+        dial.host.clone()
+    } else {
+        format!("{}:{}", dial.host, dial.port)
+    };
+    let mut block = Vec::with_capacity(160 + dial.pass.token.len() + target_host.len());
+    masque::connect_udp(
+        &edge,
+        target_host,
+        target_port,
+        &dial.pass.token,
+        &mut block,
+    );
+    open_h2_with(dial, &block)
+}
+
+fn open_h2_with(dial: &FoxyDial, block: &[u8]) -> Result<Tls2, Failure> {
+    let mut tls = tls_to_edge(dial)?;
+
+    // The stream window arrives in the settings; the connection window only moves by a frame, so without this the tunnel is paced by a round trip for its first 64 KiB.
+    let mut opening = Vec::with_capacity(48 + block.len());
+    opening.extend_from_slice(frames::PREFACE);
+    h2_frame(
+        frames::SETTINGS,
+        0,
+        0,
+        &frames::client_settings(),
+        &mut opening,
+    );
+    h2_frame(
+        frames::WINDOW_UPDATE,
+        0,
+        0,
+        &(frames::WINDOW - frames::DEFAULT_WINDOW).to_be_bytes(),
+        &mut opening,
+    );
+    h2_frame(frames::HEADERS, 0x4, 1, block, &mut opening);
+    tls.write_all(&opening).map_err(|_| Failure::Io)?;
+
+    let mut lane = Tls2 {
+        tls,
+        window: foxy::flow::Window::new(i64::from(frames::WINDOW), i64::from(frames::WINDOW)),
+        max_frame: MAX_FRAME,
+        carry: Vec::new(),
+        at: 0,
+        out: Vec::new(),
+        capsule_buf: Vec::new(),
+        fin: false,
+    };
+    let status = lane.await_status()?;
+    opened(status)?;
+    Ok(lane)
+}
+
+/// The stage the lane's edge dial lost, behind `FOXY_DEBUG`: a red leg is only actionable when it says where.
+fn debug_stage(stage: &str) {
+    if std::env::var("FOXY_DEBUG").is_ok() {
+        eprintln!("foxy-debug: {stage}");
+    }
+}
+
+fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8], out: &mut Vec<u8>) {
+    let frame = frames::H2Frame {
+        kind,
+        flags,
+        stream,
+        length: payload.len() as u32,
+    };
+    out.extend_from_slice(&frame.header());
+    out.extend_from_slice(payload);
+}
+
+/// The two `WINDOW_UPDATE` frames a credit grants differ only by stream id, so their eighteen header bytes are constant and each call writes the increment into the two slots left zero here.
+const CREDIT_TEMPLATE: [u8; 26] = {
+    let mut out = [0u8; 26];
+    // length 4, WINDOW_UPDATE, no flags, stream 1 at [0..9], stream 0 at [13..22].
+    out[2] = 4;
+    out[3] = frames::WINDOW_UPDATE;
+    out[8] = 1;
+    out[15] = 4;
+    out[16] = frames::WINDOW_UPDATE;
+    out
+};
+
+/// A relay over a TLS stream that speaks HTTP/2: a caller writing bytes sees a DATA frame, a caller reading bytes sees one's payload.
+pub(crate) struct Tls2 {
+    tls: ferrox_core::tls::RustlsProvider<TcpStream>,
+    window: foxy::flow::Window,
+    max_frame: usize,
+    /// Bytes read from a DATA frame the caller has not taken, with a cursor: draining would move what is left on every call.
+    carry: Vec<u8>,
+    at: usize,
+    /// The frame this lane writes, reused so a relay allocates nothing per frame.
+    out: Vec<u8>,
+    /// Capsule-stream bytes not parsed yet: one capsule may span DATA frames, so frames accumulate here.
+    capsule_buf: Vec<u8>,
+    fin: bool,
+}
+
+/// One frame off the wire into the caller's owned buffer; a socket timeout keeps its kind so a relay can tell an idle quantum from a dead peer.
+fn read_frame(
+    tls: &mut ferrox_core::tls::RustlsProvider<TcpStream>,
+    out: &mut Vec<u8>,
+    max_frame: usize,
+) -> std::io::Result<frames::H2Frame> {
+    let mut header = [0u8; frames::H2_HEADER];
+    read_exact(tls, &mut header)?;
+    let frame = frames::H2Frame::parse(&header)
+        .ok_or_else(|| std::io::Error::other("foxy: a header that is not a frame"))?;
+    crate::proxy::resize_scratch(out, (frame.length as usize).min(max_frame));
+    read_exact(tls, out)?;
+    Ok(frame)
+}
+
+impl Tls2 {
+    pub(crate) fn set_read_quantum(&self, quantum: Duration) -> std::io::Result<()> {
+        self.tls.get_ref().set_read_timeout(Some(quantum))
+    }
+
+    /// Reads one frame, hands it to `body` with the payload borrowed, and puts the buffer back.
+    fn with_frame<R>(
+        &mut self,
+        body: impl FnOnce(&mut Self, frames::H2Frame, &[u8]) -> R,
+    ) -> std::io::Result<R> {
+        let mut payload = std::mem::take(&mut self.out);
+        let frame = read_frame(&mut self.tls, &mut payload, self.max_frame);
+        let out = match frame {
+            Ok(frame) => body(self, frame, &payload),
+            Err(error) => {
+                self.out = payload;
+                return Err(error);
+            }
+        };
+        self.out = payload;
+        Ok(out)
+    }
+
+    /// The window this lane grants back as it reads, one update per frame: the connection update is the one that would otherwise stop a relay in its tracks.
+    fn credit(&mut self, len: usize) -> Result<(), Failure> {
+        let increment = (len as u32).to_be_bytes();
+        let mut out = CREDIT_TEMPLATE;
+        out[9..13].copy_from_slice(&increment);
+        out[22..26].copy_from_slice(&increment);
+        self.tls.write_all(&out).map_err(|_| Failure::Io)
+    }
+
+    fn ack(&mut self, kind: u8, payload: &[u8]) -> Result<(), Failure> {
+        self.out.clear();
+        h2_frame(kind, 0x1, 0, payload, &mut self.out);
+        self.tls.write_all(&self.out).map_err(|_| Failure::Io)
+    }
+
+    /// A push promise is refused by name — the only stream the lane answers that is not the one it opened.
+    fn refuse_push(&mut self) -> Result<(), Failure> {
+        self.out.clear();
+        h2_frame(frames::RST_STREAM, 0, 1, &8u32.to_be_bytes(), &mut self.out);
+        self.tls.write_all(&self.out).map_err(|_| Failure::Io)
+    }
+
+    fn await_status(&mut self) -> Result<u16, Failure> {
+        let deadline = Instant::now() + HEADER_TIMEOUT;
+        let mut block = Vec::with_capacity(64);
+        while Instant::now() < deadline {
+            let status = self
+                .with_frame(
+                    |lane, frame, payload| match frames::h2_event(frame, payload, 1) {
+                        frames::H2Event::Headers { block: more, .. } => {
+                            header_status(&mut block, more, frame.flags & frames::END_HEADERS != 0)
+                        }
+                        frames::H2Event::Settings { ack: false, .. } => {
+                            let mut at = 0usize;
+                            while let Some((id, value)) = frames::setting(payload, at) {
+                                match id {
+                                    4 => lane.window.reset_stream(value),
+                                    5 => lane.max_frame = (value as usize).clamp(16_384, MAX_FRAME),
+                                    _ => {}
+                                }
+                                at += 6;
+                            }
+                            lane.ack(frames::SETTINGS, &[]).map(|()| None)
+                        }
+                        frames::H2Event::Ping { ack: false, .. } => {
+                            lane.ack(frames::PING, payload).map(|()| None)
+                        }
+                        frames::H2Event::Push => lane.refuse_push().map(|()| None),
+                        frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
+                            Err(Failure::Stream)
+                        }
+                        // A status larger than one frame arrives in pieces: each fragment is appended and the block read once `END_HEADERS` says it is whole.
+                        frames::H2Event::Other { kind } if kind == frames::CONTINUATION => {
+                            header_status(
+                                &mut block,
+                                payload,
+                                frame.flags & frames::END_HEADERS != 0,
+                            )
+                        }
+                        _ => Ok(None),
+                    },
+                )
+                .map_err(|_| Failure::Stream)??;
+            if let Some(status) = status {
+                return Ok(status);
+            }
+        }
+        Err(Failure::Stream)
+    }
+
+    /// Hands the caller what it asked for out of `carry` and moves the cursor: a copy of bytes, never a move of what is left.
+    fn take(&mut self, buf: &mut [u8]) -> usize {
+        let take = buf.len().min(self.carry.len() - self.at);
+        buf[..take].copy_from_slice(&self.carry[self.at..self.at + take]);
+        self.at += take;
+        if self.at == self.carry.len() {
+            self.carry.clear();
+            self.at = 0;
+        }
+        take
+    }
+
+    /// Stages the tail of a payload the caller had no room for, after handing over the part it took: only that tail is copied twice.
+    fn stage(&mut self, payload: &[u8], taken: usize) {
+        if taken < payload.len() {
+            self.carry.clear();
+            self.carry.extend_from_slice(&payload[taken..]);
+            self.at = 0;
+        }
+    }
+
+    /// One UDP payload as one DATAGRAM capsule, split over DATA frames when needed: the capsule stream is byte-oriented and the reader reassembles.
+    pub(crate) fn write_datagram(&mut self, payload: &[u8]) -> std::io::Result<()> {
+        if self.fin {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
+        self.out.clear();
+        masque::datagram_encode(payload, &mut self.out);
+        let mut at = 0usize;
+        while at < self.out.len() {
+            let frame = foxy::flow::frame_size(self.out.len() - at, self.max_frame)
+                .min(self.window.stream());
+            if frame == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            self.window.take(frame);
+            let frame = frame as usize;
+            let header = frames::H2Frame {
+                kind: frames::DATA,
+                flags: 0,
+                stream: 1,
+                length: frame as u32,
+            }
+            .header();
+            self.tls.write_parts(&header, &self.out[at..at + frame])?;
+            at += frame;
+        }
+        Ok(())
+    }
+
+    /// One UDP payload out of the capsule stream: frames accumulate until a whole DATAGRAM capsule parses; empty datagrams are skipped so `Ok(0)` stays the end of stream.
+    pub(crate) fn read_datagram(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if let Some((used, payload)) = masque::datagram_split(&self.capsule_buf) {
+                let len = payload.len();
+                let take = buf.len().min(len);
+                buf[..take].copy_from_slice(&payload[..take]);
+                self.capsule_buf.drain(..used);
+                if len == 0 {
+                    continue;
+                }
+                return Ok(len);
+            }
+            if self.fin {
+                return Ok(0);
+            }
+            if self.capsule_buf.len() > DATAGRAM_BUF_MAX {
+                self.capsule_buf.clear();
+                return Err(std::io::Error::other(
+                    "foxy: a capsule stream that never parses",
+                ));
+            }
+            let read = self.with_frame(|lane, frame, payload| -> std::io::Result<usize> {
+                match frames::h2_event(frame, payload, 1) {
+                    frames::H2Event::Data { payload, end } => {
+                        let len = payload.len();
+                        lane.fin = end;
+                        lane.window.add_stream(len as u32);
+                        lane.window.add_connection(len as u32);
+                        if len > 0 {
+                            lane.credit(len).map_err(io)?;
+                        }
+                        // A capsule is usually whole inside one DATA frame, so it is handed over where it lies and only the ones behind it staged; nothing is handed over while a split capsule waits, because stream order is datagram order.
+                        if lane.capsule_buf.is_empty() {
+                            if let Some((used, datagram)) = masque::datagram_split(payload) {
+                                let take = buf.len().min(datagram.len());
+                                buf[..take].copy_from_slice(&datagram[..take]);
+                                lane.capsule_buf.extend_from_slice(&payload[used..]);
+                                return Ok(datagram.len());
+                            }
+                        }
+                        lane.capsule_buf.extend_from_slice(payload);
+                        Ok(0)
+                    }
+                    frames::H2Event::Ping { ack: false, .. } => {
+                        lane.ack(frames::PING, payload).map_err(io)?;
+                        Ok(0)
+                    }
+                    frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
+                        lane.fin = true;
+                        Ok(0)
+                    }
+                    _ => Ok(0),
+                }
+            });
+            let read = read??;
+            if read > 0 {
+                return Ok(read);
+            }
+        }
+    }
+}
+
+/// One HTTP/2 session to the edge, opening written and no stream yet, for the live check of what the edge does with a second CONNECT — no loopback edge can stand in for the real one.
+#[cfg(test)]
+pub(crate) fn raw_h2_session(
+    dial: &FoxyDial,
+) -> Result<ferrox_core::tls::RustlsProvider<TcpStream>, Failure> {
+    open_h2_with_raw(dial)
+}
+
+/// The dial half of `open_h2_with`, before any stream.
+#[cfg(test)]
+fn open_h2_with_raw(
+    dial: &FoxyDial,
+) -> Result<ferrox_core::tls::RustlsProvider<TcpStream>, Failure> {
+    let mut tls = tls_to_edge(dial)?;
+    let mut opening = Vec::with_capacity(48);
+    opening.extend_from_slice(frames::PREFACE);
+    h2_frame(
+        frames::SETTINGS,
+        0,
+        0,
+        &frames::client_settings(),
+        &mut opening,
+    );
+    h2_frame(
+        frames::WINDOW_UPDATE,
+        0,
+        0,
+        &(frames::WINDOW - frames::DEFAULT_WINDOW).to_be_bytes(),
+        &mut opening,
+    );
+    tls.write_all(&opening).map_err(|_| Failure::Io)?;
+    tls.flush().map_err(|_| Failure::Io)?;
+    Ok(tls)
+}
+
+impl Write for Tls2 {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.fin {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
+        let frame = foxy::flow::frame_size(buf.len(), self.max_frame).min(self.window.stream());
+        if frame == 0 {
+            return Ok(0);
+        }
+        self.window.take(frame);
+        let frame = frame as usize;
+        // Header and payload in one write: two writes would be two TLS records, and the record boundary is on the wire.
+        let header = frames::H2Frame {
+            kind: frames::DATA,
+            flags: 0,
+            stream: 1,
+            length: frame as u32,
+        }
+        .header();
+        self.tls.write_parts(&header, &buf[..frame])?;
+        Ok(frame as usize)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.tls.flush()
+    }
+}
+
+impl Read for Tls2 {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.at < self.carry.len() {
+                return Ok(self.take(buf));
+            }
+            if self.fin {
+                return Ok(0);
+            }
+            let read = self.with_frame(|lane, frame, payload| -> std::io::Result<usize> {
+                match frames::h2_event(frame, payload, 1) {
+                    frames::H2Event::Data { payload, end } => {
+                        let len = payload.len();
+                        // The payload is copied once, into the caller's buffer: staging into `carry` first would be a second pass over every byte.
+                        let taken = buf.len().min(len);
+                        buf[..taken].copy_from_slice(&payload[..taken]);
+                        lane.stage(payload, taken);
+                        lane.window.add_stream(len as u32);
+                        lane.window.add_connection(len as u32);
+                        lane.fin = end;
+                        if len > 0 {
+                            lane.credit(len).map_err(io)?;
+                        }
+                        Ok(taken)
+                    }
+                    frames::H2Event::Ping { ack: false, .. } => {
+                        lane.ack(frames::PING, payload).map_err(io)?;
+                        Ok(0)
+                    }
+                    frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
+                        lane.fin = true;
+                        Ok(0)
+                    }
+                    _ => Ok(0),
+                }
+            });
+            let read = read??;
+            if read > 0 {
+                return Ok(read);
+            }
+        }
+    }
+}
+
+/// The HTTP/1.1 relay: bytes in, bytes out, once the status has been read.
+pub(crate) struct Tls1(pub(crate) ferrox_core::tls::RustlsProvider<TcpStream>);
+
+/// Undecodable-block dump behind `FOXY_DEBUG`: the hex of a header block no codec here reads, so a red live run names the encoding.
+fn debug_block(block: &[u8]) {
+    if std::env::var("FOXY_DEBUG").is_ok() {
+        eprintln!("foxy-debug: undecodable header block {block:02x?}");
+    }
+}
+
+/// Appends one header-block fragment and reads the status only once the peer's `END_HEADERS` says the block is whole; a partial block is never parsed.
+fn header_status(
+    block: &mut Vec<u8>,
+    piece: &[u8],
+    end_headers: bool,
+) -> Result<Option<u16>, Failure> {
+    block.extend_from_slice(piece);
+    if !end_headers {
+        return Ok(None);
+    }
+    hpack::hpack_status(block).map(Some).ok_or_else(|| {
+        debug_block(block);
+        Failure::Frame
+    })
+}
+
+/// Bounds one blocking read so a relay holding one lock for both directions can interleave: the backward read returns `WouldBlock` within the quantum instead of holding the lock.
+impl Tls1 {
+    pub(crate) fn set_read_quantum(&self, quantum: Duration) -> std::io::Result<()> {
+        self.0.get_ref().set_read_timeout(Some(quantum))
+    }
+}
+
+impl Write for Tls1 {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl Read for Tls1 {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+/// HTTP/3 CONNECT over one pooled QUIC connection (control stream, request stream, one HEADERS each way, DATA both ways — the pooling is what makes QUIC worth having); the tuple is the shared connection, its socket, the local address, and this flow's stream id.
+pub(crate) type Quic = (
+    std::sync::Arc<std::sync::Mutex<quiche::Connection>>,
+    std::sync::Arc<crate::quic::Datagram>,
+    SocketAddr,
+    u64,
+);
+
+pub(crate) struct H3 {
+    shared: std::sync::Arc<std::sync::Mutex<quiche::Connection>>,
+    sock: std::sync::Arc<crate::quic::Datagram>,
+    local: SocketAddr,
+    stream: u64,
+    /// The request stream's read window, filled straight from the stream — no scratch buffer, no second copy: `head[..filled]` has arrived, `head[carried..filled]` is unparsed.
+    head: Vec<u8>,
+    filled: usize,
+    carried: usize,
+    /// The remainder of a DATA frame the caller had no room for, with a cursor: draining moves what is left on every call.
+    carry: Vec<u8>,
+    at: usize,
+    /// The frame this lane writes, reused so a relay allocates nothing per frame.
+    out: Vec<u8>,
+    /// Capsule-stream bytes no whole DATAGRAM capsule has consumed yet: one capsule may span DATA frames, so frames accumulate only here.
+    capsule_buf: Vec<u8>,
+    fin: bool,
+    deadline: Instant,
+    /// Bounds one blocking `Read::read` the way the socket timeout bounds TCP carriers: set, it returns `WouldBlock` after the quantum so a one-lock relay can interleave.
+    quantum: Option<Duration>,
+}
+
+impl H3 {
+    pub(crate) fn set_read_quantum(&mut self, quantum: Duration) {
+        self.quantum = Some(quantum);
+    }
+
+    pub(crate) fn open(dial: &FoxyDial, target: &str, quic: Quic) -> Result<Self, Failure> {
+        let (shared, sock, local, stream) = quic;
+        let mut lane = Self {
+            shared,
+            sock,
+            local,
+            stream,
+            head: Self::open_window(),
+            filled: 0,
+            carried: 0,
+            carry: Vec::new(),
+            at: 0,
+            out: Vec::new(),
+            capsule_buf: Vec::new(),
+            fin: false,
+            deadline: Instant::now(),
+            quantum: None,
+        };
+        let status = lane.request(target, &dial.pass.token)?;
+        opened(status)?;
+        Ok(lane)
+    }
+
+    fn with_conn<T>(&mut self, body: impl FnOnce(&mut quiche::Connection) -> T) -> Option<T> {
+        let mut guard = self.shared.lock().ok()?;
+        let out = body(&mut guard);
+        crate::quic::flush_egress(&mut guard, &self.sock);
+        Some(out)
+    }
+
+    /// Read window opened into its uninitialised tail rather than zero-filled: the stream fills what it reads and the walk never reads past what arrived.
+    fn open_window() -> Vec<u8> {
+        let mut window = Vec::with_capacity(H3_WINDOW);
+        crate::proxy::resize_scratch(&mut window, H3_WINDOW);
+        window
+    }
+
+    /// The HTTP/3 opening a fresh connection carries exactly once: a complete SETTINGS plus QPACK encoder/decoder hellos, literal-only with no dynamic table; a truncated SETTINGS waits forever and a second control stream is a connection error, and nothing is ever finished.
+    pub(crate) fn h3_opening() -> [(u64, Vec<u8>); 3] {
+        let mut control = Vec::with_capacity(16);
+        frames::quic_varint(&mut control, 0x00);
+        let settings = [0x01u8, 0x00, 0x07, 0x00, 0x08, 0x00];
+        frames::quic_varint(&mut control, 0x04);
+        frames::quic_varint(&mut control, settings.len() as u64);
+        control.extend_from_slice(&settings);
+        let mut encoder = Vec::with_capacity(2);
+        frames::quic_varint(&mut encoder, 0x02);
+        let mut decoder = Vec::with_capacity(2);
+        frames::quic_varint(&mut decoder, 0x03);
+        [(CONTROL_STREAM, control), (6, encoder), (10, decoder)]
+    }
+
+    /// One UDP target as its own stream on a shared HTTP/3 connection: the extended CONNECT names `capsule-protocol: ?1` and datagrams ride DATAGRAM capsules — RFC 9298, the same capsule stream the HTTP/2 edge carries.
+    pub(crate) fn open_udp(
+        dial: &FoxyDial,
+        target_host: &str,
+        target_port: u16,
+        quic: Quic,
+    ) -> Result<Self, Failure> {
+        let (shared, sock, local, stream) = quic;
+        let mut lane = Self {
+            shared,
+            sock,
+            local,
+            stream,
+            head: Self::open_window(),
+            filled: 0,
+            carried: 0,
+            carry: Vec::new(),
+            at: 0,
+            out: Vec::new(),
+            capsule_buf: Vec::new(),
+            fin: false,
+            deadline: Instant::now(),
+            quantum: None,
+        };
+        let status = lane.udp_request(dial, target_host, target_port)?;
+        opened(status)?;
+        Ok(lane)
+    }
+
+    /// One CONNECT-IP tunnel as its own stream on a shared HTTP/3 connection: the request names `connect-ip` and `capsule-protocol: ?1`, and the address request that follows opens a tunnel carrying every destination.
+    pub(crate) fn open_ip(dial: &FoxyDial, quic: Quic) -> Result<Self, Failure> {
+        let (shared, sock, local, stream) = quic;
+        let mut lane = Self {
+            shared,
+            sock,
+            local,
+            stream,
+            head: Self::open_window(),
+            filled: 0,
+            carried: 0,
+            carry: Vec::new(),
+            at: 0,
+            out: Vec::new(),
+            capsule_buf: Vec::new(),
+            fin: false,
+            deadline: Instant::now(),
+            quantum: None,
+        };
+        let edge = if dial.port == 443 {
+            dial.host.clone()
+        } else {
+            format!("{}:{}", dial.host, dial.port)
+        };
+        let mut block = Vec::with_capacity(160 + dial.pass.token.len());
+        connectip::connect_ip_qpack(&edge, "*", 0, &dial.pass.token, &mut block);
+        let mut frame = Vec::with_capacity(16 + block.len());
+        frames::quic_varint(&mut frame, frames::H3_HEADERS);
+        frames::quic_varint(&mut frame, block.len() as u64);
+        frame.extend_from_slice(&block);
+        lane.send(lane.stream, &frame, false)?;
+        let status = lane.read_head()?;
+        opened(status)?;
+        let mut request = Vec::new();
+        connectip::address_request(1, 4, &[0, 0, 0, 0], &mut request);
+        connectip::address_request(2, 6, &[0; 16], &mut request);
+        // The request rides one DATA frame the way a packet does: capsules here are framed, and raw bytes would read as a frame header.
+        let mut head = [0u8; 9];
+        let len = frames::quic_varint_into(&mut head, request.len() as u64);
+        head.copy_within(0..len, 1);
+        head[0] = frames::H3_DATA as u8;
+        lane.send(lane.stream, &head[..=len], false)?;
+        lane.send(lane.stream, &request, false)?;
+        Ok(lane)
+    }
+
+    fn udp_request(
+        &mut self,
+        dial: &FoxyDial,
+        target_host: &str,
+        target_port: u16,
+    ) -> Result<u16, Failure> {
+        let edge = if dial.port == 443 {
+            dial.host.clone()
+        } else {
+            format!("{}:{}", dial.host, dial.port)
+        };
+        let mut block = Vec::with_capacity(160 + dial.pass.token.len() + target_host.len());
+        masque::connect_udp_qpack(
+            &edge,
+            target_host,
+            target_port,
+            &dial.pass.token,
+            &mut block,
+        );
+        let mut frame = Vec::with_capacity(16 + block.len());
+        frames::quic_varint(&mut frame, frames::H3_HEADERS);
+        frames::quic_varint(&mut frame, block.len() as u64);
+        frame.extend_from_slice(&block);
+        self.send(self.stream, &frame, false)?;
+        self.read_head()
+    }
+
+    /// One pump of the request stream into the capsule buffer: whole DATA frames are staged where they lie, and the cursor is shared with the frame walk because a byte spent here cannot be spent again.
+    fn fill_capsules(&mut self) -> Result<(), Failure> {
+        if H3_WINDOW - self.filled < 16 {
+            self.head.copy_within(self.carried..self.filled, 0);
+            self.filled -= self.carried;
+            self.carried = 0;
+        }
+        self.deadline = Instant::now() + HEADER_TIMEOUT;
+        self.fill()?;
+        let mut at = self.carried;
+        while at < self.filled {
+            let mut head = 0usize;
+            let Some(frame) = frames::h3_frame(&self.head[at..self.filled], &mut head) else {
+                break;
+            };
+            let end = match at
+                .checked_add(head)
+                .and_then(|body| body.checked_add(frame.length as usize))
+            {
+                Some(end) if end <= self.filled => end,
+                _ => break,
+            };
+            let body = at + head;
+            if matches!(
+                frames::h3_event(frame, &self.head[body..end]),
+                frames::H3Event::Data { .. }
+            ) {
+                self.capsule_buf.extend_from_slice(&self.head[body..end]);
+            }
+            at = end;
+        }
+        self.carried = at;
+        Ok(())
+    }
+
+    /// Sends the address request and reads the assignment: without one the lane has no source address to write into a packet, and a proxy that refuses is refused rather than guessed at.
+    pub(crate) fn address_assign(
+        &mut self,
+    ) -> Result<Option<ferrox_core::foxy::connectip::Assigned>, Failure> {
+        let deadline = Instant::now() + HEADER_TIMEOUT;
+        let mut assigned = None;
+        while Instant::now() < deadline {
+            if let Some((used, capsule)) = connectip::capsule_split(&self.capsule_buf) {
+                let (granted, quit) = match capsule {
+                    connectip::Capsule::AddressAssign(body) => {
+                        let mut into = Vec::new();
+                        if connectip::address_assign(body, &mut into).is_none() {
+                            (None, true)
+                        } else {
+                            (into.into_iter().find(|grant| !grant.refused()), false)
+                        }
+                    }
+                    connectip::Capsule::RouteAdvert(body) => {
+                        let mut routes = Vec::new();
+                        let _ = connectip::route_advert(body, &mut routes);
+                        (None, false)
+                    }
+                    _ => (None, false),
+                };
+                self.capsule_buf.drain(..used);
+                if let Some(granted) = granted {
+                    assigned = Some(granted);
+                }
+                if quit {
+                    return Err(Failure::Frame);
+                }
+                if assigned.is_some() {
+                    return Ok(assigned);
+                }
+                continue;
+            }
+            if self.fin {
+                return Err(Failure::Stream);
+            }
+            self.fill_capsules().map_err(io)?;
+        }
+        Ok(assigned)
+    }
+
+    /// One IP packet, as a frame's payload the caller takes whole.
+    pub(crate) fn read_ip(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        let started = Instant::now();
+        loop {
+            if let Some((used, capsule)) = connectip::capsule_split(&self.capsule_buf) {
+                let packet = if let connectip::Capsule::Datagram(packet) = capsule {
+                    packet.to_vec()
+                } else {
+                    Vec::new()
+                };
+                self.capsule_buf.drain(..used);
+                if !packet.is_empty() {
+                    return Ok(Some(packet));
+                }
+                continue;
+            }
+            if self.fin {
+                return Ok(None);
+            }
+            if self
+                .quantum
+                .is_some_and(|quantum| started.elapsed() >= quantum)
+            {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            self.fill_capsules().map_err(io)?;
+        }
+    }
+
+    /// One UDP payload as one DATAGRAM capsule inside one DATA frame: the capsule's length is its own, so the frame's length is issued first and the capsule follows — one buffer, one stream write.
+    pub(crate) fn write_datagram(&mut self, payload: &[u8]) -> std::io::Result<()> {
+        if self.fin {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
+        let mut out = std::mem::take(&mut self.out);
+        out.clear();
+        masque::datagram_encode(payload, &mut out);
+        let mut head = [0u8; 9];
+        let len = frames::quic_varint_into(&mut head, out.len() as u64);
+        head.copy_within(0..len, 1);
+        head[0] = frames::H3_DATA as u8;
+        let sent = self
+            .send(self.stream, &head[..=len], false)
+            .and_then(|()| self.send(self.stream, &out, false));
+        self.out = out;
+        sent.map_err(io)?;
+        Ok(())
+    }
+
+    /// One UDP payload out of the capsule stream: DATA frames are parsed until a whole DATAGRAM capsule appears, capsules that span frames accumulate, and empty datagrams are skipped so `Ok(0)` stays the end of stream.
+    pub(crate) fn read_datagram(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let started = Instant::now();
+        loop {
+            if let Some((used, payload)) = masque::datagram_split(&self.capsule_buf) {
+                let take = buf.len().min(payload.len());
+                buf[..take].copy_from_slice(&payload[..take]);
+                let len = payload.len();
+                self.capsule_buf.drain(..used);
+                if len == 0 {
+                    continue;
+                }
+                return Ok(len);
+            }
+            if self.fin {
+                return Ok(0);
+            }
+            if self
+                .quantum
+                .is_some_and(|quantum| started.elapsed() >= quantum)
+            {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            if self.capsule_buf.len() > DATAGRAM_BUF_MAX {
+                self.capsule_buf.clear();
+                return Err(std::io::Error::other(
+                    "foxy: a capsule stream that never parses",
+                ));
+            }
+            self.deadline = Instant::now() + HEADER_TIMEOUT;
+            self.fill().map_err(io)?;
+            // A capsule is usually whole inside one DATA frame, so a frame's payload is parsed where it lies and only a split capsule staged: the same one copy the tunnel read makes.
+            let mut at = self.carried;
+            while at < self.filled {
+                let mut head = 0usize;
+                let Some(frame) = frames::h3_frame(&self.head[at..self.filled], &mut head) else {
+                    break;
+                };
+                let end = match at
+                    .checked_add(head)
+                    .and_then(|body| body.checked_add(frame.length as usize))
+                {
+                    Some(end) if end <= self.filled => end,
+                    _ => break,
+                };
+                let body = at + head;
+                match frames::h3_event(frame, &self.head[body..end]) {
+                    frames::H3Event::Data {
+                        payload,
+                        end: stream_end,
+                    } => {
+                        self.fin = stream_end;
+                        // A capsule is usually whole inside one DATA frame, so it is handed over where it lies and only the ones behind it staged; nothing is handed over while a split capsule waits, because stream order is datagram order.
+                        if self.capsule_buf.is_empty() {
+                            if let Some((used, datagram)) = masque::datagram_split(payload) {
+                                let take = buf.len().min(datagram.len());
+                                buf[..take].copy_from_slice(&datagram[..take]);
+                                let len = datagram.len();
+                                self.capsule_buf.extend_from_slice(&payload[used..]);
+                                self.carried = end;
+                                if len == 0 {
+                                    at = end;
+                                    break;
+                                }
+                                return Ok(len);
+                            }
+                        }
+                        self.capsule_buf.extend_from_slice(payload);
+                    }
+                    frames::H3Event::Reset { .. } | frames::H3Event::GoAway { .. } => {
+                        self.fin = true;
+                        self.carried = self.filled;
+                        return Ok(0);
+                    }
+                    _ => {}
+                }
+                at = end;
+            }
+            self.carried = at;
+        }
+    }
+
+    fn request(&mut self, target: &str, bearer: &str) -> Result<u16, Failure> {
+        let mut block = Vec::with_capacity(96 + bearer.len());
+        hpack::qpack_connect(target, bearer, &mut block);
+        let mut frame = Vec::with_capacity(16 + block.len());
+        frames::quic_varint(&mut frame, frames::H3_HEADERS);
+        frames::quic_varint(&mut frame, block.len() as u64);
+        frame.extend_from_slice(&block);
+        self.send(self.stream, &frame, false)?;
+        self.read_head()
+    }
+
+    fn send(&mut self, stream: u64, buf: &[u8], fin: bool) -> Result<(), Failure> {
+        let deadline = Instant::now() + SEND_WAIT;
+        let mut rest = buf;
+        while !rest.is_empty() {
+            let written = self
+                .with_conn(|conn| conn.stream_send(stream, rest, false))
+                .ok_or(Failure::Io)?
+                .map_err(|_| Failure::Io)?;
+            rest = &rest[written..];
+            if written == 0 {
+                if Instant::now() >= deadline {
+                    return Err(Failure::Io);
+                }
+                self.pump(Duration::from_millis(5));
+            }
+        }
+        if fin {
+            self.fin(stream)?;
+        }
+        Ok(())
+    }
+
+    fn fin(&mut self, stream: u64) -> Result<(), Failure> {
+        let sent = self
+            .with_conn(|conn| conn.stream_send(stream, &[], true))
+            .ok_or(Failure::Io)?;
+        sent.map(|_| ()).map_err(|_| Failure::Io)
+    }
+
+    fn pump(&mut self, wait: Duration) {
+        let local = self.local;
+        if let Ok(mut guard) = self.shared.lock() {
+            crate::quic::pump_once(&mut guard, &self.sock, local, wait);
+        }
+    }
+
+    /// Pulls the request stream until a whole HEADERS frame has arrived, then reads the status; bytes read past that frame stay buffered because the edge's first DATA frame is the tunnel, not a header.
+    fn read_head(&mut self) -> Result<u16, Failure> {
+        self.deadline = Instant::now() + HEADER_TIMEOUT;
+        while Instant::now() < self.deadline {
+            if let Some(status) = Self::header_in(&self.head[self.carried..self.filled])? {
+                return Ok(status);
+            }
+            self.fill()?;
+        }
+        Err(Failure::Stream)
+    }
+
+    /// The status of the first complete HEADERS frame in `bytes`, and how much of it that frame was.
+    fn header_in(bytes: &[u8]) -> Result<Option<u16>, Failure> {
+        let mut at = 0usize;
+        let Some(frame) = frames::h3_frame(bytes, &mut at) else {
+            return Ok(None);
+        };
+        let Some(end) = at.checked_add(frame.length as usize) else {
+            return Err(Failure::Frame);
+        };
+        let Some(body) = bytes.get(at..end) else {
+            return Ok(None);
+        };
+        match frames::h3_event(frame, body) {
+            frames::H3Event::Headers { block, .. } => {
+                hpack::qpack_status(block).map(Some).ok_or(Failure::Frame)
+            }
+            frames::H3Event::Reset { .. } | frames::H3Event::GoAway { .. } => Err(Failure::Stream),
+            _ => Ok(None),
+        }
+    }
+
+    /// One read from the request stream straight into the window's spare room, or a pump when nothing arrived — the same two answers a QUIC stream gives, minus the second copy.
+    fn fill(&mut self) -> Result<(), Failure> {
+        let id = self.stream;
+        let mut window = std::mem::take(&mut self.head);
+        let filled = self.filled;
+        let room = window.len() - filled;
+        let room = if room == 0 {
+            window.resize(filled + H3_WINDOW, 0);
+            H3_WINDOW
+        } else {
+            room
+        };
+        let read = self.with_conn(|conn| conn.stream_recv(id, &mut window[filled..filled + room]));
+        self.head = window;
+        match read {
+            Some(Ok((0, true))) => Err(Failure::Stream),
+            Some(Ok((read, _))) => {
+                self.filled += read;
+                Ok(())
+            }
+            Some(Err(quiche::Error::Done)) => {
+                if Instant::now() >= self.deadline {
+                    return Err(Failure::Stream);
+                }
+                self.pump(Duration::from_millis(5));
+                Ok(())
+            }
+            _ => Err(Failure::Io),
+        }
+    }
+
+    /// Hands the caller what is left of a frame the caller's buffer had no room for, and moves the cursor.
+    fn take(&mut self, buf: &mut [u8]) -> usize {
+        let take = buf.len().min(self.carry.len() - self.at);
+        buf[..take].copy_from_slice(&self.carry[self.at..self.at + take]);
+        self.at += take;
+        if self.at == self.carry.len() {
+            self.carry.clear();
+            self.at = 0;
+        }
+        take
+    }
+}
+
+impl Write for H3 {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.fin {
+            return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
+        }
+        let frame = foxy::flow::frame_size(buf.len(), H3_FRAME);
+        if frame == 0 {
+            return Ok(0);
+        }
+        // The frame's varints are their own send and the payload keeps the caller's buffer: quiche copies every slice it is handed, so staging the two together would be a second copy of every byte.
+        let mut head = [0u8; 9];
+        let len = frames::quic_varint_into(&mut head, u64::from(frame));
+        head.copy_within(0..len, 1);
+        head[0] = frames::H3_DATA as u8;
+        self.send(self.stream, &head[..=len], false).map_err(io)?;
+        self.send(self.stream, &buf[..frame as usize], false)
+            .map_err(io)?;
+        Ok(frame as usize)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.with_conn(|_| ()).ok_or_else(|| io(Failure::Io))
+    }
+}
+
+impl Read for H3 {
+    /// The tunnel, not the stream: the caller gets the payload of DATA frames, because a frame header read as payload carries the tunnel's own framing into every byte after it.
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let started = Instant::now();
+        loop {
+            if self.at < self.carry.len() {
+                return Ok(self.take(buf));
+            }
+            if self.fin {
+                return Ok(0);
+            }
+            if self
+                .quantum
+                .is_some_and(|quantum| started.elapsed() >= quantum)
+            {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            self.deadline = Instant::now() + HEADER_TIMEOUT;
+            if H3_WINDOW - self.filled < 16 {
+                // Only the frames already parsed are worth moving, and they move to the start of the window rather than draining out of it.
+                self.head.copy_within(self.carried..self.filled, 0);
+                self.filled -= self.carried;
+                self.carried = 0;
+            }
+            self.fill().map_err(io)?;
+            if let Some(read) = self.take_frames(buf).map_err(io)? {
+                return Ok(read);
+            }
+        }
+    }
+}
+
+impl H3 {
+    /// Walks the buffered frames, handing a DATA payload straight to the caller and leaving anything that is not tunnel bytes where the next read starts; only what the caller has no room for is staged in `carry`.
+    fn take_frames(&mut self, buf: &mut [u8]) -> Result<Option<usize>, Failure> {
+        loop {
+            let at = self.carried;
+            if at >= self.filled {
+                return Ok(None);
+            }
+            let mut head = 0usize;
+            let Some(frame) = frames::h3_frame(&self.head[at..self.filled], &mut head) else {
+                return Ok(None);
+            };
+            let end = match at
+                .checked_add(head)
+                .and_then(|body| body.checked_add(frame.length as usize))
+            {
+                Some(end) if end <= self.filled => end,
+                _ => return Ok(None),
+            };
+            let body = at + head;
+            match frames::h3_event(frame, &self.head[body..end]) {
+                frames::H3Event::Data { payload, .. } => {
+                    let taken = buf.len().min(payload.len());
+                    buf[..taken].copy_from_slice(&payload[..taken]);
+                    if taken < payload.len() {
+                        self.carry.clear();
+                        self.carry.extend_from_slice(&payload[taken..]);
+                        self.at = 0;
+                    }
+                    self.carried = end;
+                    return Ok(Some(taken));
+                }
+                frames::H3Event::Reset { .. } | frames::H3Event::GoAway { .. } => {
+                    self.fin = true;
+                    self.carried = self.filled;
+                    return Ok(None);
+                }
+                _ => self.carried = end,
+            }
+        }
+    }
+}
+
+/// Reads the two-letter country out of whatever the probe answered: a `loc=XX` line, a `"countryCode":"XX"` field, or nothing — a probe that cannot be read is not evidence.
+#[must_use]
+pub(crate) fn exit_country(head: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(head);
+    if let Some(after) = text.split_once("loc=") {
+        let code: String = after
+            .1
+            .chars()
+            .take_while(char::is_ascii_alphanumeric)
+            .collect();
+        if code.len() == 2 && code.chars().all(|c| c.is_ascii_uppercase()) {
+            return Some(code);
+        }
+    }
+    let key = "\"countryCode\":\"";
+    let at = text.find(key)? + key.len();
+    text.get(at..at + 2)
+        .filter(|code| code.chars().all(|c| c.is_ascii_uppercase()))
+        .map(str::to_owned)
+}
+
+fn io(failure: Failure) -> std::io::Error {
+    std::io::Error::other(failure.to_string())
+}
+
+/// A pooled HTTP/3 UDP flow: the pool holds the client stream until it is released, so the lane ending gives it back — a UDP lane lives in a map and is dropped by it, and the release travels with the lane, not a caller that has to remember it.
+pub(crate) struct PooledDatagram {
+    lane: H3,
+    dial: crate::quic::QuicDial,
+    id: u64,
+}
+
+impl PooledDatagram {
+    /// The pooled flow's lane, kept next to what ending it has to give back.
+    pub(crate) fn pool(lane: H3, dial: crate::quic::QuicDial, id: u64) -> Self {
+        Self { lane, dial, id }
+    }
+}
+
+impl Drop for PooledDatagram {
+    fn drop(&mut self) {
+        crate::quic::release_stream(&self.dial, self.id);
+    }
+}
+
+/// One CONNECT-UDP lane on whichever carrier the edge answers: a UDP flow is a capsule stream either way, and which carrier carries it is the dial's question.
+pub(crate) enum Datagram {
+    H2(Box<Tls2>),
+    H3(Box<PooledDatagram>),
+}
+
+/// One CONNECT-IP lane, on whichever carrier the edge answers: there is one tunnel for *every* destination at once, so the lane carries an IP address the proxy assigned it and demultiplexes by the destination in the packet; the tunnel opens by an address request and the assignment, both arriving as capsules on the stream the packets ride.
+pub(crate) enum Ip {
+    /// HTTP/2, whose frames carry the capsule stream as their payload.
+    H2(Box<Tls2>),
+    /// HTTP/3, whose frames carry it the same way.
+    H3(Box<H3>),
+}
+
+impl Ip {
+    /// Opens the tunnel on the carrier the dial names, with the address the proxy assigned.
+    pub(crate) fn open(
+        dial: &FoxyDial,
+        quic: Option<Quic>,
+    ) -> Result<(Self, Option<ferrox_core::foxy::connectip::Assigned>), Failure> {
+        match (quic, dial.carrier) {
+            (Some(quic), _) => {
+                let mut lane = H3::open_ip(dial, quic)?;
+                let assigned = lane.address_assign()?;
+                Ok((Self::H3(Box::new(lane)), assigned))
+            }
+            (None, Carrier::H1) => Err(Failure::Frame),
+            (None, _) => {
+                let lane = open_ip_h2(dial)?;
+                Ok((Self::H2(Box::new(lane.0)), lane.1))
+            }
+        }
+    }
+
+    /// Flushes what a write staged so the edge reads it: a lane over a TLS session writes into the session, and the record leaves on the flush.
+    pub(crate) fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::H2(lane) => lane.tls.flush(),
+            Self::H3(lane) => lane.flush(),
+        }
+    }
+
+    /// One UDP payload out, as one IP packet: the build is the codec's, the frame that carries it is the carrier's.
+    pub(crate) fn write(
+        &mut self,
+        source: &[u8],
+        destination: &[u8],
+        source_port: u16,
+        destination_port: u16,
+        payload: &[u8],
+    ) -> std::io::Result<bool> {
+        let mut packet = Vec::new();
+        let built = ferrox_core::foxy::connectip::udp_datagram(
+            &ferrox_core::foxy::connectip::UdpDatagram {
+                source,
+                destination,
+                source_port,
+                destination_port,
+                payload,
+            },
+            &mut packet,
+        );
+        if !built {
+            return Ok(false);
+        }
+        // The packet leaves on the flush rather than waiting for the next write: these are datagrams, and one that waits is one the peer never sees.
+        match self {
+            Self::H2(lane) => lane.write_datagram(&packet).map(|()| true),
+            Self::H3(lane) => lane.write_datagram(&packet).map(|()| true),
+        }
+    }
+
+    /// One UDP payload in, as one IP packet: the destination is what a reply is addressed to, and `None` is a frame that is not a datagram yet.
+    pub(crate) fn read(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        match self {
+            Self::H2(lane) => lane.read_ip(),
+            Self::H3(lane) => lane.read_ip(),
+        }
+    }
+}
+
+/// One CONNECT-IP lane as its own H2 connection: the tunnel carries UDP datagrams for every destination, so a lane is one connection rather than a stream per target.
+pub(crate) fn open_ip_h2(
+    dial: &FoxyDial,
+) -> Result<(Tls2, Option<ferrox_core::foxy::connectip::Assigned>), Failure> {
+    let edge = if dial.port == 443 {
+        dial.host.clone()
+    } else {
+        format!("{}:{}", dial.host, dial.port)
+    };
+    let mut block = Vec::with_capacity(160 + dial.pass.token.len());
+    connectip::connect_ip(&edge, "*", 0, &dial.pass.token, &mut block);
+    let mut lane = open_h2_with(dial, &block)?;
+    let assigned = lane.address_assign()?;
+    Ok((lane, assigned))
+}
+
+impl Tls2 {
+    /// Sends the address request and reads the assignment: without one the lane has no source address to write into a packet, and a proxy that refuses is refused rather than guessed at.
+    fn address_assign(
+        &mut self,
+    ) -> Result<Option<ferrox_core::foxy::connectip::Assigned>, Failure> {
+        let mut request = Vec::new();
+        connectip::address_request(1, 4, &[0, 0, 0, 0], &mut request);
+        connectip::address_request(2, 6, &[0; 16], &mut request);
+        self.out.clear();
+        self.out.extend_from_slice(&request);
+        // The request rides the capsule stream inside DATA frames, the way a packet does: raw TLS bytes would desynchronise the edge's frame walk.
+        let mut at = 0usize;
+        while at < self.out.len() {
+            let frame = foxy::flow::frame_size(self.out.len() - at, self.max_frame)
+                .min(self.window.stream());
+            if frame == 0 {
+                std::thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+            self.window.take(frame);
+            let frame = frame as usize;
+            let header = frames::H2Frame {
+                kind: frames::DATA,
+                flags: 0,
+                stream: 1,
+                length: frame as u32,
+            }
+            .header();
+            self.tls
+                .write_parts(&header, &self.out[at..at + frame])
+                .map_err(|_| Failure::Io)?;
+            at += frame;
+        }
+
+        let deadline = Instant::now() + HEADER_TIMEOUT;
+        let mut assigned = None;
+        while Instant::now() < deadline {
+            if let Some((used, capsule)) = connectip::capsule_split(&self.capsule_buf) {
+                // The capsule is read before the buffer is drained, so a refused or granted answer costs no copy of it.
+                let (granted, quit) = match capsule {
+                    connectip::Capsule::AddressAssign(body) => {
+                        let mut into = Vec::new();
+                        if connectip::address_assign(body, &mut into).is_none() {
+                            (None, true)
+                        } else {
+                            (into.into_iter().find(|grant| !grant.refused()), false)
+                        }
+                    }
+                    connectip::Capsule::RouteAdvert(body) => {
+                        let mut routes = Vec::new();
+                        let _ = connectip::route_advert(body, &mut routes);
+                        (None, false)
+                    }
+                    _ => (None, false),
+                };
+                self.capsule_buf.drain(..used);
+                if let Some(granted) = granted {
+                    assigned = Some(granted);
+                }
+                if quit {
+                    return Err(Failure::Frame);
+                }
+                if assigned.is_some() {
+                    return Ok(assigned);
+                }
+                continue;
+            }
+            if self.fin {
+                return Err(Failure::Stream);
+            }
+            let read = self.with_frame(|lane, frame, payload| -> std::io::Result<()> {
+                match frames::h2_event(frame, payload, 1) {
+                    frames::H2Event::Data { payload, end } => {
+                        lane.capsule_buf.extend_from_slice(payload);
+                        lane.fin = end;
+                        lane.window.add_stream(payload.len() as u32);
+                        lane.window.add_connection(payload.len() as u32);
+                        if !payload.is_empty() {
+                            lane.credit(payload.len()).map_err(io)?;
+                        }
+                        Ok(())
+                    }
+                    frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
+                        lane.fin = true;
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                }
+            });
+            read??;
+        }
+        Ok(assigned)
+    }
+
+    /// One IP packet, as a datagram this lane can read both ends of.
+    pub(crate) fn read_ip(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+        loop {
+            if let Some((used, capsule)) = connectip::capsule_split(&self.capsule_buf) {
+                // A datagram is handed whole — the caller takes the buffer and the lane keeps it — so this reads a packet out rather than a slice of one.
+                let packet = if let connectip::Capsule::Datagram(packet) = capsule {
+                    packet.to_vec()
+                } else {
+                    Vec::new()
+                };
+                self.capsule_buf.drain(..used);
+                if !packet.is_empty() {
+                    return Ok(Some(packet));
+                }
+                continue;
+            }
+            if self.fin {
+                return Ok(None);
+            }
+            let read = self.with_frame(|lane, frame, payload| -> std::io::Result<()> {
+                match frames::h2_event(frame, payload, 1) {
+                    frames::H2Event::Data { payload, end } => {
+                        lane.capsule_buf.extend_from_slice(payload);
+                        lane.fin = end;
+                        lane.window.add_stream(payload.len() as u32);
+                        lane.window.add_connection(payload.len() as u32);
+                        if !payload.is_empty() {
+                            lane.credit(payload.len()).map_err(io)?;
+                        }
+                        Ok(())
+                    }
+                    frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
+                        lane.fin = true;
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                }
+            });
+            read??;
+        }
+    }
+}
+
+/// Opens the tunnel on whichever carrier the dial names and hands the caller something it can read and write; the `H3` arm needs the connection the pool already established.
+pub(crate) enum Tunnel {
+    H1(Tls1),
+    H2(Tls2),
+    H3(Box<H3>),
+}
+
+impl Tunnel {
+    pub(crate) fn open(dial: &FoxyDial, target: &str, quic: Option<Quic>) -> Result<Self, Failure> {
+        match (dial.carrier, quic) {
+            (Carrier::H1, _) => open_h1(dial, target).map(Self::H1),
+            (Carrier::H2, _) => open_h2(dial, target).map(Self::H2),
+            (Carrier::H3, Some(quic)) => {
+                H3::open(dial, target, quic).map(|lane| Self::H3(Box::new(lane)))
+            }
+            (Carrier::H3, None) => Err(Failure::Stream),
+            // `auto` is expanded by the caller into the carriers it prefers; an unexpanded one here is a bug, and the answer is not a downgrade.
+            (Carrier::Auto, _) => Err(Failure::Frame),
+        }
+    }
+
+    /// Bounds one blocking read on every carrier so a relay sharing one lane between its two directions stops holding its lock while idle: reads past the quantum answer `WouldBlock` and the relay retries instead of wedging.
+    pub(crate) fn set_read_quantum(&mut self, quantum: Duration) -> std::io::Result<()> {
+        match self {
+            Self::H1(lane) => lane.set_read_quantum(quantum),
+            Self::H2(lane) => lane.set_read_quantum(quantum),
+            Self::H3(lane) => {
+                lane.set_read_quantum(quantum);
+                Ok(())
+            }
+        }
+    }
+}
+
+impl std::io::Write for Datagram {
+    fn write(&mut self, payload: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::H2(lane) => lane.write_datagram(payload),
+            Self::H3(lane) => lane.lane.write_datagram(payload),
+        }
+        .map(|()| payload.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl std::io::Read for Datagram {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::H2(lane) => lane.read_datagram(buf),
+            Self::H3(lane) => lane.lane.read_datagram(buf),
+        }
+    }
+}
+
+impl Write for Tunnel {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::H1(lane) => lane.write(buf),
+            Self::H2(lane) => lane.write(buf),
+            Self::H3(lane) => lane.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::H1(lane) => lane.flush(),
+            Self::H2(lane) => lane.flush(),
+            Self::H3(lane) => lane.flush(),
+        }
+    }
+}
+
+impl Read for Tunnel {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::H1(lane) => lane.read(buf),
+            Self::H2(lane) => lane.read(buf),
+            Self::H3(lane) => lane.read(buf),
+        }
+    }
+}
+
+/// The SOCKS reply a refusal becomes: an edge that declined the target says so locally instead of paying a round trip to hear the same status again.
+pub(crate) fn refusal_reply(failure: Failure) -> u8 {
+    match failure {
+        Failure::Rejected(status) if foxy::target_is_unreachable(status) => 0x04,
+        Failure::Stream => 0x06,
+        Failure::Rejected(_) | Failure::Frame | Failure::Io => 0x01,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The constant credit buffer is the two frames the per-call loop built: a window update for stream 1 and one for the connection, each with the increment slot left for the caller to fill.
+    #[test]
+    fn the_credit_template_is_the_two_window_update_frames() {
+        for (slot, stream) in [(0usize, 1u32), (13, 0)] {
+            let frame = frames::H2Frame {
+                kind: frames::WINDOW_UPDATE,
+                flags: 0,
+                stream,
+                length: 4,
+            };
+            assert_eq!(
+                &CREDIT_TEMPLATE[slot..slot + 9],
+                &frame.header()[..],
+                "header at {slot}"
+            );
+        }
+        assert_eq!(
+            &CREDIT_TEMPLATE[9..13],
+            &[0u8; 4],
+            "increment is patched per call"
+        );
+        assert_eq!(
+            &CREDIT_TEMPLATE[22..26],
+            &[0u8; 4],
+            "increment is patched per call"
+        );
+    }
+
+    fn dial(host: &str, carrier: Carrier) -> FoxyDial {
+        FoxyDial {
+            host: host.to_owned(),
+            port: 443,
+            address: Some(SocketAddr::from(([127, 0, 0, 1], 1))),
+            carrier,
+            upstream: None,
+            roots: Vec::new(),
+            pins: foxy::pin::Pins::default(),
+            pass: Pass {
+                token: "the-pass".to_owned(),
+                expires_at: None,
+                quota_remaining: None,
+                quota_reset: None,
+            },
+        }
+    }
+
+    #[test]
+    fn every_carrier_asks_for_exactly_its_own_alpn() {
+        for (carrier, want) in [
+            (Carrier::H1, &b"http/1.1"[..]),
+            (Carrier::H2, &b"h2"[..]),
+            (Carrier::H3, &b"h3"[..]),
+        ] {
+            assert_eq!(
+                tls_config(&dial("edge.example", carrier)).alpn,
+                vec![want.to_vec()]
+            );
+        }
+    }
+
+    #[test]
+    fn the_tls_config_names_the_edge_and_carries_its_pins() {
+        let mut d = dial("edge.example", Carrier::H2);
+        d.roots = vec![vec![1, 2, 3]];
+        d.pins = foxy::pin::Pins::parse([
+            "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned()
+        ]);
+        let config = tls_config(&d);
+        assert_eq!(config.server_name, "edge.example");
+        assert_eq!(config.roots, vec![vec![1, 2, 3]]);
+        assert_eq!(config.pins.len(), 1);
+    }
+
+    /// The order the lane trusts to find a tunnel, and the order a datagram trusts: `auto` walks all three, UDP walks the two that can carry a capsule at all.
+    #[test]
+    fn the_carriers_are_ordered_by_what_the_edge_can_answer() {
+        assert_eq!(
+            Carrier::Auto.order(),
+            [Carrier::H3, Carrier::H2, Carrier::H1]
+        );
+        assert_eq!(Carrier::H2.order(), [Carrier::H2, Carrier::H2, Carrier::H2]);
+        assert_eq!(Carrier::udp_order(), [Carrier::H3, Carrier::H2]);
+        assert!(
+            !Carrier::udp_order().contains(&Carrier::H1),
+            "HTTP/1.1 has no extended CONNECT to carry a capsule"
+        );
+    }
+
+    /// The pause between attempts bounds the budget the whole dial spends: a peer that would have answered is not waited on for long.
+    #[test]
+    fn an_edge_attempt_is_retried_under_a_growing_pause() {
+        // The pause is flat because a refusal comes back fast: eight asks at one address is a couple of seconds of pause, not a leg's budget.
+        assert_eq!(super::after_attempt(0), Duration::from_millis(250));
+        assert_eq!(super::after_attempt(7), Duration::from_millis(250));
+        let budget: u64 = (0..EDGE_ATTEMPTS - 1)
+            .map(|attempt| super::after_attempt(attempt).as_millis() as u64)
+            .sum();
+        assert!(
+            budget <= 5_000,
+            "eight asks at one address cost a couple of seconds, not {budget}ms"
+        );
+    }
+
+    #[test]
+    fn only_a_two_hundred_opens_the_tunnel() {
+        for status in [200u16, 204, 299] {
+            assert!(opened(status).is_ok(), "{status}");
+        }
+        for status in [199u16, 300, 401, 403, 502] {
+            assert_eq!(opened(status), Err(Failure::Rejected(status)));
+        }
+    }
+
+    #[test]
+    fn a_refusal_becomes_the_socks_reply_that_says_so() {
+        assert_eq!(refusal_reply(Failure::Rejected(502)), 0x04);
+        assert_eq!(refusal_reply(Failure::Rejected(403)), 0x01);
+        assert_eq!(refusal_reply(Failure::Stream), 0x06);
+        assert_eq!(refusal_reply(Failure::Io), 0x01);
+        assert_eq!(refusal_reply(Failure::Frame), 0x01);
+    }
+
+    #[test]
+    fn the_dial_order_is_the_pinned_country_only() {
+        let edges = vec![
+            foxy::Candidate {
+                host: "de1".into(),
+                port: 443,
+                country: "DE".into(),
+                city: "berlin".into(),
+            },
+            foxy::Candidate {
+                host: "us1".into(),
+                port: 443,
+                country: "US".into(),
+                city: "nyc".into(),
+            },
+            foxy::Candidate {
+                host: "de2".into(),
+                port: 443,
+                country: "DE".into(),
+                city: "frankfurt".into(),
+            },
+        ];
+        let order = foxy::dial_order(&edges, "DE", None, 3);
+        assert_eq!(order.len(), 2);
+        assert!(order.iter().all(|edge| edge.country == "DE"));
+    }
+
+    #[test]
+    fn a_quic_lane_without_a_connection_is_a_refusal_not_a_panic() {
+        assert_eq!(
+            Tunnel::open(&dial("edge.example", Carrier::H3), "e:443", None).err(),
+            Some(Failure::Stream)
+        );
+    }
+
+    #[test]
+    fn an_upstream_proxy_names_its_scheme_host_and_port() {
+        let http = upstream_proxy("http://proxy.local:8080").expect("parses");
+        assert!(http.http);
+        assert_eq!((http.host, http.port), ("proxy.local".to_owned(), 8080));
+        let socks = upstream_proxy("socks5://proxy.local:1080").expect("parses");
+        assert!(!socks.http);
+        assert_eq!((socks.host, socks.port), ("proxy.local".to_owned(), 1080));
+        let h = upstream_proxy("socks5h://proxy.local:1080").expect("parses");
+        assert!(!h.http);
+        for bad in [
+            "",
+            "proxy.local:8080",
+            "gopher://proxy.local:70",
+            "http://proxy.local",
+            "http://proxy.local:99999",
+            "http://proxy.local:80/extra",
+            "http://user:pass@proxy.local:8080",
+        ] {
+            assert!(upstream_proxy(bad).is_none(), "{bad:?} refuses");
+        }
+    }
+
+    #[test]
+    fn an_exit_probe_is_read_in_either_shape_it_can_answer_in() {
+        assert_eq!(exit_country(b"fl=1\nloc=DE\n"), Some("DE".to_owned()));
+        assert_eq!(
+            exit_country(b"{\"status\":\"success\",\"countryCode\":\"US\"}"),
+            Some("US".to_owned())
+        );
+        assert_eq!(
+            exit_country(b"loc=de"),
+            None,
+            "a lowercase answer is not a country code"
+        );
+        assert_eq!(exit_country(b"nothing here"), None);
+        assert_eq!(exit_country(b"loc=DEU"), None);
+    }
+}
+
+#[cfg(test)]
+mod loopback {
+    use super::*;
+    use std::net::TcpListener;
+
+    const PAYLOAD: &[u8] = b"the tunnel carries the bytes unchanged";
+
+    fn minted(alpn: &[u8]) -> (Vec<Vec<u8>>, ferrox_core::tls::TlsServerConfig) {
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
+        let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
+        let server = ferrox_core::tls::TlsServerConfig {
+            cert_chain: vec![minted.cert.der().to_vec()],
+            key_der: minted.key_pair.serialize_der(),
+            key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
+            alpn: vec![alpn.to_vec()],
+            send_tickets: true,
+        };
+        (roots, server)
+    }
+
+    fn dial_for(
+        roots: Vec<Vec<u8>>,
+        port: u16,
+        carrier: Carrier,
+        pins: foxy::pin::Pins,
+    ) -> FoxyDial {
+        FoxyDial {
+            host: "localhost".to_owned(),
+            port,
+            address: Some(SocketAddr::from(([127, 0, 0, 1], port))),
+            carrier,
+            upstream: None,
+            roots,
+            pins,
+            pass: Pass {
+                token: "the-pass".to_owned(),
+                expires_at: None,
+                quota_remaining: None,
+                quota_reset: None,
+            },
+        }
+    }
+
+    /// An address that accepts TCP is not an address that carries the lane: `localhost` answers v6 first on both runners that matter, so a silent v6 listener must not cost the lane the v4 edge behind it.
+    #[test]
+    fn an_address_whose_tls_does_not_answer_costs_the_lane_the_next_one() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (roots, server) = minted(b"h2");
+        let mute = TcpListener::bind("[::1]:0").expect("binds v6");
+        let mute_port = mute.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            // Accepts the connection and then says nothing, which is the whole of an address that cannot carry TLS.
+            let (stream, _) = mute.accept().expect("accepts");
+            drop(stream);
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds v4");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            while tls.read(&mut [0u8; 1]).map_or(true, |n| n > 0) {}
+        });
+
+        let dial = FoxyDial {
+            // The port the name resolves to for both families, so the two listeners are the two addresses of one name.
+            host: "localhost".to_owned(),
+            port: mute_port.min(port) + mute_port.max(port).saturating_sub(mute_port),
+            address: None,
+            carrier: Carrier::H2,
+            upstream: None,
+            roots,
+            pins: foxy::pin::Pins::default(),
+            pass: Pass {
+                token: "the-pass".to_owned(),
+                expires_at: None,
+                quota_remaining: None,
+                quota_reset: None,
+            },
+        };
+        // The v4 edge's port, which is the one that speaks.
+        let dial = FoxyDial { port, ..dial };
+        let tls = tls_to_edge(&dial).expect("dials the address whose TLS answers");
+        assert_eq!(tls.alpn(), Some(&b"h2"[..]), "the session is the live one");
+    }
+
+    /// An address the config names is the dial it named: a name that answers does not get it, because the named address is the poison-proof dial and the TLS name is verified against it.
+    #[test]
+    fn an_address_the_config_names_is_the_dial_it_named() {
+        let (roots, _server) = minted(b"h2");
+        let dial = FoxyDial {
+            host: "localhost".to_owned(),
+            port: 443,
+            address: Some(SocketAddr::from(([127, 0, 0, 1], 1))),
+            carrier: Carrier::H2,
+            upstream: None,
+            roots,
+            pins: foxy::pin::Pins::default(),
+            pass: Pass {
+                token: "the-pass".to_owned(),
+                expires_at: None,
+                quota_remaining: None,
+                quota_reset: None,
+            },
+        };
+        assert!(
+            tls_to_edge(&dial).is_err(),
+            "the named address is the only one"
+        );
+    }
+
+    fn round_trip(tunnel: &mut Tunnel) {
+        tunnel.write_all(PAYLOAD).expect("writes");
+        tunnel.flush().expect("flushes");
+        let mut back = vec![0u8; PAYLOAD.len()];
+        tunnel.read_exact(&mut back).expect("reads");
+        assert_eq!(back, PAYLOAD);
+    }
+
+    /// A dial whose hop is the only way to the edge: the name the CONNECT carries is not the name anything resolves, so a dial that reaches the edge has gone through the hop.
+    fn hop_stream(proxy: &UpstreamProxy) -> std::net::TcpStream {
+        tcp_via(proxy, &upstream_dial(proxy.clone(), None)).expect("chains through the hop")
+    }
+
+    fn upstream_dial(proxy: UpstreamProxy, edge: Option<SocketAddr>) -> FoxyDial {
+        FoxyDial {
+            host: "edge.test".to_owned(),
+            port: 2499,
+            address: edge,
+            carrier: Carrier::H1,
+            upstream: Some(proxy),
+            roots: Vec::new(),
+            pins: foxy::pin::Pins::default(),
+            pass: Pass {
+                token: "the-pass".to_owned(),
+                expires_at: None,
+                quota_remaining: None,
+                quota_reset: None,
+            },
+        }
+    }
+
+    fn read_head(stream: &mut dyn std::io::Read) -> String {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).expect("reads a head");
+            head.push(byte[0]);
+        }
+        String::from_utf8(head).expect("ascii")
+    }
+
+    #[test]
+    fn tcp_through_an_http_upstream_sends_connect_and_carries_bytes() {
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = proxy.local_addr().expect("addr").port();
+        let seen = std::thread::spawn(move || {
+            let (mut stream, _) = proxy.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let head = read_head(&mut stream);
+            stream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .expect("answers");
+            let mut buf = [0u8; 64];
+            let read = stream.read(&mut buf).expect("reads");
+            stream.write_all(&buf[..read]).expect("echoes");
+            head
+        });
+        let proxy = upstream_proxy(&format!("http://127.0.0.1:{port}")).expect("parses");
+        let mut stream = hop_stream(&proxy);
+        stream.write_all(PAYLOAD).expect("writes");
+        let mut back = vec![0u8; PAYLOAD.len()];
+        stream.read_exact(&mut back).expect("echoes");
+        assert_eq!(back, PAYLOAD);
+        assert_eq!(
+            seen.join().expect("joins"),
+            "CONNECT edge.test:2499 HTTP/1.1\r\nHost: edge.test:2499\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn tcp_through_a_socks5_upstream_shakes_hands_and_carries_bytes() {
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = proxy.local_addr().expect("addr").port();
+        let seen = std::thread::spawn(move || {
+            let (mut stream, _) = proxy.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut greet = [0u8; 3];
+            read_exact(&mut stream, &mut greet).expect("greets");
+            stream.write_all(&[5, 0]).expect("selects");
+            let mut request = vec![0u8; 16];
+            read_exact(&mut stream, &mut request).expect("connects");
+            let mut want = vec![5, 1, 0, 3, 9];
+            want.extend_from_slice(b"edge.test");
+            want.extend_from_slice(&2499u16.to_be_bytes());
+            assert_eq!(request, want);
+            stream
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .expect("grants");
+            let mut buf = [0u8; 64];
+            let read = stream.read(&mut buf).expect("reads");
+            stream.write_all(&buf[..read]).expect("echoes");
+            greet.to_vec()
+        });
+        let proxy = upstream_proxy(&format!("socks5://127.0.0.1:{port}")).expect("parses");
+        let mut stream = hop_stream(&proxy);
+        stream.write_all(PAYLOAD).expect("writes");
+        let mut back = vec![0u8; PAYLOAD.len()];
+        stream.read_exact(&mut back).expect("echoes");
+        assert_eq!(back, PAYLOAD);
+        assert_eq!(seen.join().expect("joins"), vec![5, 1, 0]);
+    }
+
+    /// A hop that refuses is a failed dial and not a fallback: the edge is never dialed around a proxy the config named, because a lane that bypasses its configured hop is a leak.
+    #[test]
+    fn a_refused_upstream_is_a_failed_dial_and_not_a_direct_one() {
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = proxy.local_addr().expect("addr").port();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let edge_port = listener.local_addr().expect("addr").port();
+        let (dialed_tx, dialed_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+                let _ = dialed_tx.send(());
+            }
+        });
+        std::thread::spawn(move || {
+            let (mut stream, _) = proxy.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut greet = [0u8; 3];
+            read_exact(&mut stream, &mut greet).expect("greets");
+            stream.write_all(&[5, 0]).expect("selects");
+            let mut request = vec![0u8; 15];
+            read_exact(&mut stream, &mut request).expect("connects");
+            // A general failure, which is how a hop says it will not connect.
+            stream
+                .write_all(&[5, 1, 0, 1, 0, 0, 0, 0, 0, 0])
+                .expect("refuses");
+        });
+        let proxy = upstream_proxy(&format!("socks5://127.0.0.1:{port}")).expect("parses");
+        let edge = Some(SocketAddr::from(([127, 0, 0, 1], edge_port)));
+        assert!(
+            tls_to_edge(&upstream_dial(proxy.clone(), edge)).is_err(),
+            "a refused hop is a failed dial"
+        );
+        assert!(
+            dialed_rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "the edge on port {edge_port} was dialed around the hop"
+        );
+    }
+
+    #[test]
+    fn h1_through_an_http_upstream_reaches_its_edge() {
+        let (roots, server) = minted(b"http/1.1");
+        let edge = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let edge_port = edge.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let (stream, _) = edge.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let request = read_head(&mut tls);
+            assert_eq!(
+                request,
+                "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Bearer the-pass\r\n\r\n"
+            );
+            tls.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .expect("answers");
+            let mut buf = [0u8; 64];
+            let read = tls.read(&mut buf).expect("reads");
+            assert_eq!(&buf[..read], PAYLOAD);
+            tls.write_all(&buf[..read]).expect("echoes");
+        });
+        let proxy = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let proxy_port = proxy.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let (mut downstream, _) = proxy.accept().expect("accepts");
+            downstream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let head = read_head(&mut downstream);
+            assert_eq!(
+                head,
+                format!(
+                    "CONNECT localhost:{edge_port} HTTP/1.1\r\nHost: localhost:{edge_port}\r\n\r\n"
+                )
+            );
+            downstream
+                .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .expect("answers");
+            let edge = TcpStream::connect(("127.0.0.1", edge_port)).expect("dials");
+            let (mut up_read, mut up_write) = (edge.try_clone().expect("clones"), edge);
+            let mut down = downstream.try_clone().expect("clones");
+            let pipe = std::thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                while let Ok(read) = down.read(&mut buf) {
+                    if read == 0 || up_write.write_all(&buf[..read]).is_err() {
+                        break;
+                    }
+                }
+            });
+            let mut buf = [0u8; 8192];
+            while let Ok(read) = up_read.read(&mut buf) {
+                if read == 0 || downstream.write_all(&buf[..read]).is_err() {
+                    break;
+                }
+            }
+            pipe.join().expect("joins");
+        });
+        let mut dial = dial_for(roots, edge_port, Carrier::H1, foxy::pin::Pins::default());
+        dial.upstream = upstream_proxy(&format!("http://127.0.0.1:{proxy_port}"));
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        round_trip(&mut tunnel);
+    }
+
+    /// A SOCKS5 hop for the QUIC carrier: a TCP side answering `UDP ASSOCIATE` with the address of its relay socket, and a relay carrying datagrams with the association's own header — both halves write that header themselves, so the framing is witnessed by something other than the code it checks.
+    fn socks_relay(edge_port: u16) -> UpstreamProxy {
+        let control = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let proxy_port = control.local_addr().expect("addr").port();
+        let relay = crate::quic::bind_datagram("127.0.0.1:0").expect("binds");
+        let relay_addr = relay.local_addr().expect("addr");
+        std::thread::spawn(move || {
+            let (mut stream, _) = control.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("times out");
+            let mut greet = [0u8; 3];
+            read_exact(&mut stream, &mut greet).expect("greets");
+            assert_eq!(greet, [5, 1, 0], "no authentication offered");
+            stream.write_all(&[5, 0]).expect("selects");
+            let mut ask = [0u8; 10];
+            read_exact(&mut stream, &mut ask).expect("associates");
+            assert_eq!(&ask[..4], [5, 3, 0, 1], "a UDP association, naming nothing");
+            let octets = match relay_addr.ip() {
+                std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+                std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+            };
+            let mut grant = vec![5, 0, 0, 1];
+            grant.extend_from_slice(&octets);
+            grant.extend_from_slice(&relay_addr.port().to_be_bytes());
+            stream.write_all(&grant).expect("grants");
+            // The association lives as long as the control connection does, so this thread holds it until the lane is done with the hop.
+            let mut sink = [0u8; 64];
+            let _ = stream.read(&mut sink);
+        });
+        std::thread::spawn(move || {
+            relay
+                .set_read_timeout(Some(Duration::from_secs(60)))
+                .expect("times out");
+            let mut lane: Option<SocketAddr> = None;
+            let mut buf = [0u8; 2048];
+            while let Ok((n, from)) = relay.recv_from(&mut buf) {
+                match lane {
+                    // The lane's first datagram is the one that says so: the association names no destination, so nothing arrives from the edge until the lane has spoken.
+                    None => lane = Some(from),
+                    Some(lane) if lane == from => {
+                        if n < 10 || buf[2] != 0 || buf[3] != 1 {
+                            continue;
+                        }
+                        let ip = [buf[4], buf[5], buf[6], buf[7]];
+                        let port = u16::from_be_bytes([buf[8], buf[9]]);
+                        let _ = relay.send_to(&buf[10..n], SocketAddr::from((ip, port)));
+                    }
+                    Some(lane) => {
+                        // The edge's answer, framed for the lane the way the lane's own header framed the request.
+                        let mut framed = vec![0, 0, 0, 1, 127, 0, 0, 1];
+                        framed.extend_from_slice(&edge_port.to_be_bytes());
+                        framed.extend_from_slice(&buf[..n]);
+                        let _ = relay.send_to(&framed, lane);
+                    }
+                }
+            }
+        });
+        upstream_proxy(&format!("socks5://127.0.0.1:{proxy_port}")).expect("parses")
+    }
+
+    #[test]
+    fn the_quic_carrier_rides_a_socks5_upstream_and_carries_the_bytes() {
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let edge_port = sock.local_addr().expect("addr").port();
+        let cert = crate::quic::der_to_pem(&server.cert_chain[0], "CERTIFICATE");
+        let key = crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY");
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (uni_tx, uni_rx) = std::sync::mpsc::channel();
+        let edge = h3_edge(sock, cert, key, seen_tx, uni_tx);
+        let proxy = socks_relay(edge_port);
+        let (client, peer, local) = crate::quic::udp_to_server("127.0.0.1", edge_port)
+            .expect("a socket the edge can be addressed from");
+        let (relay_control, relay) = associate_udp(&proxy).expect("associates");
+        let quic = crate::quic::direct_stream_on(
+            crate::quic::Datagram::relayed(client, relay, relay_control),
+            peer,
+            local,
+            "localhost",
+            &roots,
+        )
+        .expect("a connection through the hop");
+        let mut dial = dial_for(roots, edge_port, Carrier::H3, foxy::pin::Pins::default());
+        dial.upstream = Some(proxy);
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", Some(quic)).expect("opens");
+        let block = seen_rx
+            // The edge's own budget is a minute, so a lane that needs longer than that is a hang and not a slow machine.
+            .recv_timeout(Duration::from_secs(60))
+            .expect("block");
+        let mut want = Vec::new();
+        hpack::qpack_connect("example.com:443", "the-pass", &mut want);
+        assert_eq!(block, want, "the edge read the block the lane wrote");
+        // The opening arrived as well as the request: a relay that dropped the control stream would still carry the request stream, because both travel the same datagrams.
+        let uni = uni_rx.recv_timeout(Duration::from_secs(60)).expect("uni");
+        let stream = |id| {
+            uni.iter()
+                .find(|(known, _, _)| *known == id)
+                .unwrap_or_else(|| panic!("stream {id} opened"))
+        };
+        let (_, control, control_fin) = stream(2);
+        let mut at = 0usize;
+        assert_eq!(control.first(), Some(&0x00), "a control stream type");
+        at += 1;
+        assert_eq!(control.get(at), Some(&0x04), "one SETTINGS frame");
+        at += 1;
+        let len = frames::quic_read(control, &mut at).expect("a length") as usize;
+        assert_eq!(
+            control.len(),
+            at + len,
+            "a complete SETTINGS, no truncation"
+        );
+        assert!(!control_fin, "control stays open");
+        for (id, first) in [(6u64, 0x02u8), (10, 0x03)] {
+            let (_, bytes, fin) = stream(id);
+            assert_eq!(bytes.as_slice(), &[first], "qpack stream {id}");
+            assert!(!fin, "qpack stream {id} stays open");
+        }
+        round_trip(&mut tunnel);
+        edge.join().expect("joins");
+    }
+
+    #[test]
+    fn the_http11_carrier_sends_three_fields_and_carries_the_bytes() {
+        let (roots, server) = minted(b"http/1.1");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                read_exact(&mut tls, &mut byte).expect("reads the request");
+                head.push(byte[0]);
+            }
+            let request = String::from_utf8(head).expect("ascii");
+            assert_eq!(
+                request,
+                "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Bearer the-pass\r\n\r\n"
+            );
+            tls.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .expect("answers");
+            let mut buf = [0u8; 64];
+            let read = tls.read(&mut buf).expect("reads");
+            assert_eq!(&buf[..read], PAYLOAD);
+            tls.write_all(&buf[..read]).expect("echoes");
+        });
+        let dial = dial_for(roots, port, Carrier::H1, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        round_trip(&mut tunnel);
+        edge.join().expect("joins");
+    }
+
+    #[test]
+    fn a_rejected_http11_request_is_a_status_not_a_tunnel() {
+        let (roots, server) = minted(b"http/1.1");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut buf = [0u8; 1024];
+            let _ = tls.read(&mut buf);
+            tls.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n")
+                .expect("answers");
+            std::thread::sleep(Duration::from_millis(50));
+        });
+        let dial = dial_for(roots, port, Carrier::H1, foxy::pin::Pins::default());
+        assert_eq!(
+            Tunnel::open(&dial, "example.com:443", None).err(),
+            Some(Failure::Rejected(407))
+        );
+        assert_eq!(refusal_reply(Failure::Rejected(407)), 0x01);
+        edge.join().expect("joins");
+    }
+
+    /// Reads exactly `buf` the way a real edge server must: a socket timeout answers `WouldBlock` on macOS under scheduler load and means "nothing yet", not a closed lane, so it is retried until the budget or a genuine close — aborting on the timeout would tear the lane down mid-echo while nothing is wrong.
+    fn read_exact_poll<S: Read>(io: &mut S, buf: &mut [u8]) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut at = 0usize;
+        while at < buf.len() {
+            match io.read(&mut buf[at..]) {
+                Ok(0) => return false,
+                Ok(read) => at += read,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    if std::time::Instant::now() >= deadline {
+                        return false;
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+        true
+    }
+
+    /// The edge side of the HTTP/2 carrier: preface, settings, one stream, one status, then DATA both ways.
+    fn h2_edge(
+        listener: TcpListener,
+        server: ferrox_core::tls::TlsServerConfig,
+        seen: std::sync::mpsc::Sender<Vec<u8>>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut head = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut head) {
+                return;
+            }
+            assert_eq!(head, frames::PREFACE);
+            let mut ack = Vec::new();
+            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut ack);
+            tls.write_all(&ack).ok();
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                match frames::h2_event(frame, &payload, 1) {
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                        tls.write_all(&out).ok();
+                    }
+                    frames::H2Event::Headers { block, .. } => {
+                        let _ = seen.send(block.to_vec());
+                        let mut out = Vec::new();
+                        h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut out);
+                        tls.write_all(&out).ok();
+                    }
+                    frames::H2Event::Data { payload, .. } => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::DATA, 0, 1, payload, &mut out);
+                        tls.write_all(&out).ok();
+                    }
+                    _ => {}
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn the_http2_carrier_writes_one_literal_header_block_and_relays() {
+        let (roots, server) = minted(b"h2");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let _edge = h2_edge(listener, server, seen_tx);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let block = seen_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("block");
+        let mut want = Vec::new();
+        hpack::hpack_connect("example.com:443", "the-pass", &mut want);
+        assert_eq!(block, want, "the edge reads the same block the lane wrote");
+        round_trip(&mut tunnel);
+    }
+
+    #[test]
+    fn the_shared_lane_carries_both_directions_at_once() {
+        const BIG: usize = 16 * 1024;
+        const STEP: usize = 1024;
+        let (roots, server) = minted(b"h2");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, _seen_rx) = std::sync::mpsc::channel();
+        let _edge = h2_edge(listener, server, seen_tx);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        tunnel
+            .set_read_quantum(Duration::from_millis(5))
+            .expect("bounds one read");
+        let lane = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
+        let sent: Vec<u8> = (0..BIG).map(|i| (i % 251) as u8).collect();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let forward = std::sync::Arc::clone(&lane);
+        let chunk = sent.clone();
+        std::thread::spawn(move || {
+            let mut at = 0usize;
+            while at < chunk.len() {
+                let end = (at + STEP).min(chunk.len());
+                match forward.lock().expect("locks").write(&chunk[at..end]) {
+                    Ok(0) => std::thread::sleep(Duration::from_millis(5)),
+                    Ok(wrote) => at += wrote,
+                    Err(error) => panic!("the write failed: {error}"),
+                }
+            }
+            done_tx.send(()).expect("reports");
+        });
+        let mut back = vec![0u8; BIG];
+        let mut at = 0usize;
+        while at < BIG {
+            match lane.lock().expect("locks").read(&mut back[at..]) {
+                Ok(0) => panic!("the echo ended early"),
+                Ok(read) => at += read,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    // The lane is shared with the writer, so an idle poll sleeps instead of re-locking: a tight poll loop starves the writer behind the same mutex under load.
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("the echo failed: {error}"),
+            }
+        }
+        done_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("both directions flow at once");
+        assert_eq!(back, sent);
+    }
+
+    /// A byte-level test cannot see a copy, so capacity is the witness: `out` is the write buffer and `carry` the read one, and a lane that stages a payload before handing it over has grown the buffer it staged in.
+    #[test]
+    fn a_relayed_byte_is_copied_once_on_its_way_through_the_lane() {
+        const BIG: usize = 40 * 1024;
+        let (roots, server) = minted(b"h2");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, _seen_rx) = std::sync::mpsc::channel();
+        let _edge = h2_edge(listener, server, seen_tx);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        let sent: Vec<u8> = (0..BIG).map(|i| (i % 251) as u8).collect();
+        let staged = lane.out.capacity();
+        let mut wrote = 0usize;
+        while wrote < sent.len() {
+            match lane.write(&sent[wrote..]) {
+                Ok(0) => panic!("a lane that stops writing"),
+                Ok(advanced) => wrote += advanced,
+                Err(error) => panic!("the write failed: {error}"),
+            }
+        }
+        lane.flush().expect("flushes");
+        assert_eq!(
+            lane.out.capacity(),
+            staged,
+            "the payload went into the record, not into a staging buffer"
+        );
+        // A read hands the frame payload straight to the caller's buffer: what is staged is only what the caller's buffer had no room for.
+        let mut back = vec![0u8; BIG];
+        let mut read = 0usize;
+        while read < BIG {
+            read += lane.read(&mut back[read..]).expect("reads");
+        }
+        assert_eq!(back, sent, "the bytes are the bytes either way");
+        assert_eq!(lane.carry.capacity(), 0, "nothing was staged");
+        assert_eq!(lane.at, 0, "the read cursor is where it started");
+    }
+
+    /// The remainder the caller has no room for is the only thing that travels through the read buffer, and the lane reads it back out one piece at a time until the frame is done.
+    #[test]
+    fn a_read_leaves_only_what_the_callers_buffer_had_no_room_for() {
+        const FRAME: usize = 16 * 1024;
+        const STEP: usize = 100;
+        let (roots, server) = minted(b"h2");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, _seen_rx) = std::sync::mpsc::channel();
+        let _edge = h2_edge(listener, server, seen_tx);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        let sent: Vec<u8> = (0..FRAME).map(|i| (i % 251) as u8).collect();
+        lane.write_all(&sent).expect("writes");
+        lane.flush().expect("flushes");
+        let mut back = vec![0u8; FRAME];
+        let mut at = 0usize;
+        while at < FRAME {
+            let room = (FRAME - at).min(STEP);
+            let read = lane.read(&mut back[at..at + room]).expect("reads");
+            assert!(read > 0, "a frame that stops mid-way");
+            at += read;
+        }
+        assert_eq!(back, sent, "the bytes are the bytes either way");
+        assert!(lane.carry.is_empty(), "the remainder was drained");
+        assert_eq!(lane.at, 0, "the read cursor is where it started");
+    }
+
+    #[test]
+    fn the_http2_carrier_assembles_a_status_split_over_continuation() {
+        let (roots, server) = minted(b"h2");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut head = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut head) {
+                return;
+            }
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                match frames::h2_event(frame, &payload, 1) {
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                        tls.write_all(&out).expect("acks the settings");
+                    }
+                    frames::H2Event::Headers { .. } => {
+                        // The status in two fragments: an indexed field the lane skips, then the indexed 200 on a CONTINUATION.
+                        let mut first = Vec::new();
+                        h2_frame(frames::HEADERS, 0x0, 1, &[0x80 | 0x21], &mut first);
+                        tls.write_all(&first).expect("sends the fragment");
+                        let mut rest = Vec::new();
+                        h2_frame(frames::CONTINUATION, 0x4, 1, &[0x88], &mut rest);
+                        tls.write_all(&rest).expect("sends the tail");
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+        });
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        assert!(Tunnel::open(&dial, "example.com:443", None).is_ok());
+        edge.join().expect("joins");
+    }
+
+    /// The CONNECT-IP tunnel over HTTP/2: the request is `connect-ip`, the assignment that follows carries the tunnel's own address, and a datagram to one destination rides the tunnel the address bought rather than a stream of its own.
+    #[test]
+    fn the_connect_ip_carrier_opens_one_tunnel_and_carries_a_datagram() {
+        let (roots, server) = minted(b"\x68\x32");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (udp_tx, udp_rx) = std::sync::mpsc::channel();
+        let edge = ip_h2_edge(listener, server, seen_tx, udp_tx, 1);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let (mut lane, assigned) = Ip::open(&dial, None).expect("opens");
+        let assigned = assigned.expect("an address");
+        assert!(!assigned.refused(), "the tunnel owns an address");
+        assert_eq!(assigned.bytes(), &[198, 51, 100, 9]);
+        assert_eq!(assigned.width(), 4, "an IPv4 tunnel");
+        let block = seen_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("block");
+        let text = String::from_utf8_lossy(&block);
+        for field in [
+            "CONNECT",
+            "connect-ip",
+            "/.well-known/masque/ip/*/0/",
+            "Bearer the-pass",
+            "capsule-protocol",
+            "?1",
+        ] {
+            assert!(text.contains(field), "missing {field}");
+        }
+        let written = lane
+            .write(
+                &[198, 51, 100, 9],
+                &[203, 0, 113, 9],
+                40_000,
+                443,
+                b"hello ip",
+            )
+            .expect("writes");
+        assert!(written, "the packet was built");
+        lane.flush().expect("flushes");
+        let (destination, port, payload) = udp_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the edge read it");
+        assert_eq!(destination, vec![203, 0, 113, 9]);
+        assert_eq!(port, 443);
+        assert_eq!(payload, b"hello ip");
+        // The reply comes back from the destination, and the lane reads it as a packet whose source is where the datagram went.
+        let packet = lane.read().expect("reads").expect("a reply");
+        let read = connectip::udp_from_packet(&packet).expect("parses");
+        assert!(read.verified);
+        assert_eq!(
+            read.source,
+            &[203, 0, 113, 9],
+            "the reply is from the target"
+        );
+        assert_eq!(read.destination, &[198, 51, 100, 9]);
+        assert_eq!(read.payload, b"hello ip");
+        edge.join().expect("joins");
+    }
+
+    /// The tunnel carries more than one destination, which is what the shared address buys: a second destination rides the tunnel the first one opened.
+    #[test]
+    fn one_tunnel_carries_every_destination_at_once() {
+        let (roots, server) = minted(b"\x68\x32");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (udp_tx, udp_rx) = std::sync::mpsc::channel();
+        let edge = ip_h2_edge(listener, server, seen_tx, udp_tx, 2);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let (mut lane, _) = Ip::open(&dial, None).expect("opens");
+        let _ = seen_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("block");
+        for (host, payload) in [
+            ([203, 0, 113, 1], &b"first"[..]),
+            ([203, 0, 113, 2], &b"second"[..]),
+        ] {
+            assert!(lane
+                .write(&[198, 51, 100, 9], &host, 40_000, 443, payload)
+                .expect("writes"));
+            lane.flush().expect("flushes");
+        }
+        for (host, payload) in [
+            ([203, 0, 113, 1], &b"first"[..]),
+            ([203, 0, 113, 2], &b"second"[..]),
+        ] {
+            let (destination, _, seen) = udp_rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the edge read it");
+            assert_eq!(destination, host.to_vec());
+            assert_eq!(seen, payload);
+        }
+        edge.join().expect("joins");
+    }
+
+    /// A loopback HTTP/2 edge that speaks CONNECT-IP: it answers the request, sends an `ADDRESS_ASSIGN` for the tunnel's own address, then relays whichever destination the packet names — one stream carrying more than one destination, where a CONNECT-UDP edge answers only a single target.
+    fn ip_h2_edge(
+        listener: TcpListener,
+        server: ferrox_core::tls::TlsServerConfig,
+        seen: std::sync::mpsc::Sender<Vec<u8>>,
+        udp: std::sync::mpsc::Sender<(Vec<u8>, u16, Vec<u8>)>,
+        want: usize,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut head = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut head) {
+                return;
+            }
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                match frames::h2_event(frame, &payload, 1) {
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                        tls.write_all(&out).expect("acks the settings");
+                    }
+                    frames::H2Event::Headers { block, .. } => {
+                        seen.send(block.to_vec()).expect("reports the block");
+                        let mut out = Vec::new();
+                        h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut out);
+                        tls.write_all(&out).expect("answers");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            // The address the proxy assigns: an RFC 1918 one, since the tunnel is a private network and not the internet.
+            ip_h2_assign(&mut tls);
+            // The client's address request arrives as DATA before the first packet, so the capsule loop below drains it where it lies.
+            ip_h2_relay(&mut tls, &udp, want);
+        })
+    }
+
+    /// The assignment a CONNECT-IP edge answers with: one address the tunnel owns, flushed so the lane's first read finds it.
+    fn ip_h2_assign(tls: &mut ferrox_core::tls::RustlsServerProvider<TcpStream>) {
+        // One ADDRESS_ASSIGN, whose body is the request id, the version, the address and the prefix.
+        let mut body = Vec::new();
+        body.push(1);
+        body.push(4);
+        body.extend_from_slice(&[198, 51, 100, 9]);
+        body.push(32);
+        let mut capsule = Vec::new();
+        capsule.push(1);
+        frames::quic_varint(&mut capsule, body.len() as u64);
+        capsule.extend_from_slice(&body);
+        let mut frame = Vec::new();
+        h2_frame(frames::DATA, 0, 1, &capsule, &mut frame);
+        tls.write_all(&frame).expect("assigns an address");
+        tls.flush().expect("flushes the assignment");
+    }
+
+    /// The packets one CONNECT-IP edge carries: each names its destination, so one stream serves `want` of them and then the edge rests.
+    fn ip_h2_relay(
+        tls: &mut ferrox_core::tls::RustlsServerProvider<TcpStream>,
+        udp: &std::sync::mpsc::Sender<(Vec<u8>, u16, Vec<u8>)>,
+        want: usize,
+    ) {
+        let mut stream = Vec::new();
+        let mut carried = 0usize;
+        loop {
+            let mut header = [0u8; frames::H2_HEADER];
+            if read_exact(tls, &mut header).is_err() {
+                continue;
+            }
+            let Some(frame) = frames::H2Frame::parse(&header) else {
+                continue;
+            };
+            let mut payload = vec![0u8; frame.length as usize];
+            if read_exact(tls, &mut payload).is_err() {
+                continue;
+            }
+            if frame.kind != frames::DATA {
+                continue;
+            }
+            stream.extend_from_slice(&payload);
+            while let Some((used, capsule)) = connectip::capsule_split(&stream) {
+                let packet = if let connectip::Capsule::Datagram(packet) = capsule {
+                    packet.to_vec()
+                } else {
+                    stream.drain(..used);
+                    continue;
+                };
+                stream.drain(..used);
+                let Some(read) = connectip::udp_from_packet(&packet) else {
+                    continue;
+                };
+                if read.source != [198, 51, 100, 9] {
+                    continue;
+                }
+                udp.send((
+                    read.destination.to_vec(),
+                    read.destination_port,
+                    read.payload.to_vec(),
+                ))
+                .expect("reports the datagram");
+                // A reply from the destination, which is what a caller reads.
+                let mut reply = Vec::new();
+                assert!(connectip::udp_datagram(
+                    &connectip::UdpDatagram {
+                        source: read.destination,
+                        destination: &[198, 51, 100, 9],
+                        source_port: read.destination_port,
+                        destination_port: read.source_port,
+                        payload: read.payload,
+                    },
+                    &mut reply
+                ));
+                let mut coded = Vec::new();
+                connectip::packet_encode(&reply, &mut coded);
+                let mut frame = Vec::new();
+                h2_frame(frames::DATA, 0, 1, &coded, &mut frame);
+                tls.write_all(&frame).expect("replies");
+                tls.flush().expect("flushes the reply");
+                carried += 1;
+                if carried >= want {
+                    // The reply is not the end of the edge: a lane that has to read a second frame to find the rest of its capsule must find the edge still there.
+                    std::thread::sleep(Duration::from_millis(250));
+                    return;
+                }
+            }
+        }
+    }
+    #[test]
+    fn the_masque_carrier_opens_connect_udp_and_echoes_a_datagram() {
+        let (roots, server) = minted(b"h2");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let edge = masque_h2_edge(listener, server, seen_tx, 1);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut lane = open_udp(&dial, "example.com", 443).expect("opens");
+        let block = seen_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("block");
+        let text = String::from_utf8_lossy(&block);
+        for field in [
+            "connect-udp",
+            "/.well-known/masque/udp/example.com/443/",
+            "Bearer the-pass",
+        ] {
+            assert!(text.contains(field), "missing {field}");
+        }
+        lane.write_datagram(b"hello udp").expect("writes");
+        lane.flush().expect("flushes");
+        read_datagram(&mut lane, b"hello udp");
+        assert!(
+            lane.capsule_buf.is_empty(),
+            "a capsule whole inside one frame is not staged"
+        );
+        edge.join().expect("joins");
+    }
+
+    /// A capsule the edge split over several DATA frames arrives as one datagram, and the only bytes staged are the ones the split made it stage: the reassembly is the copy that cannot be avoided.
+    #[test]
+    fn a_capsule_split_over_frames_reassembles_as_one_datagram() {
+        let (roots, server) = minted(b"h2");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let edge = masque_h2_edge(listener, server, seen_tx, 2);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut lane = open_udp(&dial, "example.com", 443).expect("opens");
+        let _block = seen_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("block");
+        lane.write_datagram(b"hello udp").expect("writes");
+        lane.flush().expect("flushes");
+        read_datagram(&mut lane, b"hello udp");
+        assert!(lane.capsule_buf.is_empty(), "the remainder was drained");
+        edge.join().expect("joins");
+    }
+
+    /// A frame boundary is not a capsule boundary: two DATAGRAM capsules inside one DATA frame are two datagrams, in order — the edge echoes a received frame as one frame, so the pair comes back together or not at all.
+    #[test]
+    fn a_frame_of_two_datagrams_arrives_as_two_datagrams() {
+        let (roots, server) = minted(b"h2");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, _seen_rx) = std::sync::mpsc::channel();
+        let _edge = h2_edge(listener, server, seen_tx);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut lane = open_udp(&dial, "example.com", 443).expect("opens");
+        let mut both = Vec::new();
+        masque::datagram_encode(b"first", &mut both);
+        masque::datagram_encode(b"second", &mut both);
+        lane.write_all(&both).expect("writes");
+        lane.flush().expect("flushes");
+        lane.set_read_quantum(Duration::from_secs(5))
+            .expect("bounds a read");
+        read_datagram(&mut lane, b"first");
+        read_datagram(&mut lane, b"second");
+    }
+
+    /// One datagram through the lane, asserted whole; a buffer that has grown is the only thing a staged capsule leaves behind.
+    fn read_datagram(lane: &mut Tls2, want: &[u8]) {
+        let mut back = [0u8; 64];
+        let mut at = 0usize;
+        while at < want.len() {
+            match lane.read_datagram(&mut back[at..]) {
+                Ok(0) => panic!("the echo ended early"),
+                Ok(read) => at += read,
+                Err(error) => panic!("the echo failed: {error}"),
+            }
+        }
+        assert_eq!(&back[..at], want);
+    }
+
+    /// A loopback HTTP/2 edge that answers a CONNECT-UDP request and echoes the datagram back, `parts` bytes of capsule to a DATA frame.
+    fn masque_h2_edge(
+        listener: TcpListener,
+        server: ferrox_core::tls::TlsServerConfig,
+        seen: std::sync::mpsc::Sender<Vec<u8>>,
+        parts: usize,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut head = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut head) {
+                return;
+            }
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                match frames::h2_event(frame, &payload, 1) {
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        let mut out = Vec::new();
+                        h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                        tls.write_all(&out).expect("acks the settings");
+                    }
+                    frames::H2Event::Headers { block, .. } => {
+                        seen.send(block.to_vec()).expect("reports the block");
+                        let mut out = Vec::new();
+                        h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut out);
+                        tls.write_all(&out).expect("answers");
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            let mut stream = Vec::new();
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                if frame.kind != frames::DATA {
+                    continue;
+                }
+                stream.extend_from_slice(&payload);
+                if let Some((_, datagram)) = masque::datagram_split(&stream) {
+                    let mut echo = Vec::new();
+                    masque::datagram_encode(datagram, &mut echo);
+                    // The capsule in one piece, or split over `parts` frames: a frame boundary inside a capsule is legal, and the lane has to answer the datagram either way.
+                    let halves: Vec<usize> =
+                        (1..parts).map(|part| echo.len() * part / parts).collect();
+                    let mut at = 0usize;
+                    for cut in halves.into_iter().chain([echo.len()]) {
+                        let mut out = Vec::new();
+                        h2_frame(frames::DATA, 0, 1, &echo[at..cut], &mut out);
+                        tls.write_all(&out).expect("echoes");
+                        at = cut;
+                    }
+                    // The echo is not the end of the edge: a lane that has to read a second frame to find the rest of its capsule must find the edge still there, and a TLS peer that drops on a reader's next syscall is one the runner decides.
+                    std::thread::sleep(Duration::from_millis(250));
+                    return;
+                }
+            }
+        })
+    }
+
+    /// A loopback QUIC edge that speaks the HTTP/3 opening and nothing else that matters: one request stream answered with a 200, and one capsule echoed back.
+    fn quic_udp_edge(
+        sock: crate::quic::Datagram,
+        server: ferrox_core::tls::TlsServerConfig,
+        seen: std::sync::mpsc::Sender<Vec<u8>>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let tag = format!("ferrox-foxy-udp-{}-{stamp}", std::process::id());
+            let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
+            let key_path = std::env::temp_dir().join(format!("{tag}.key"));
+            let cert_pem = crate::quic::der_to_pem(&server.cert_chain[0], "CERTIFICATE");
+            let key_pem = crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY");
+            std::fs::write(&cert_path, &cert_pem).expect("stages cert");
+            std::fs::write(&key_path, &key_pem).expect("stages key");
+            let mut config = crate::quic::server_config(crate::quic::ALPN);
+            config
+                .load_cert_chain_from_pem_file(cert_path.to_str().expect("ascii"))
+                .expect("loads chain");
+            config
+                .load_priv_key_from_pem_file(key_path.to_str().expect("ascii"))
+                .expect("loads key");
+            let _ = std::fs::remove_file(&cert_path);
+            let _ = std::fs::remove_file(&key_path);
+            let local = sock.local_addr().expect("addr");
+            let mut conn = crate::quic::server_accept(&sock, local, &mut config);
+            let mut buf = [0u8; 1350];
+            let mut out = [0u8; 1350];
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let mut stream = None;
+            let mut raw = Vec::new();
+            while stream.is_none() {
+                assert!(std::time::Instant::now() < deadline, "the request arrives");
+                let Some((n, from)) = crate::quic::server_poll(&sock, &mut buf) else {
+                    crate::quic::server_idle(&mut conn, &sock, &mut out);
+                    continue;
+                };
+                let info = quiche::RecvInfo { from, to: local };
+                let ids: Vec<u64> = conn.readable().collect();
+                conn.recv(&mut buf[..n], info).expect("drives");
+                for id in ids {
+                    if id % 4 != 0 {
+                        continue;
+                    }
+                    let piece = drain(&mut conn, id);
+                    if !piece.is_empty() {
+                        raw.extend_from_slice(&piece);
+                        stream = Some(id);
+                    }
+                }
+                while let Ok((written, info)) = conn.send(&mut out) {
+                    let _ = sock.send_to(&out[..written], info.to);
+                }
+            }
+            let stream = stream.expect("a request stream");
+            let mut at = 0usize;
+            let frame = frames::h3_frame(&raw, &mut at).expect("a frame");
+            seen.send(raw[at..at + frame.length as usize].to_vec())
+                .expect("reports");
+            answer_udp(
+                &sock, local, &mut conn, stream, &mut buf, &mut out, deadline,
+            );
+        })
+    }
+
+    /// The 200 the request is answered with, then the capsule echoed: the frame the edge sends back is the frame it read, header and capsule together, because the frame's payload *is* the capsule stream.
+    fn answer_udp(
+        sock: &crate::quic::Datagram,
+        local: SocketAddr,
+        conn: &mut quiche::Connection,
+        stream: u64,
+        buf: &mut [u8; 1350],
+        out: &mut [u8; 1350],
+        deadline: Instant,
+    ) {
+        let mut reply = Vec::new();
+        frames::quic_varint(&mut reply, frames::H3_HEADERS);
+        frames::quic_varint(&mut reply, 3);
+        // `0xd9` is QPACK static index 25, which is `:status 200`: the indexed field line, after the block's two required zero bytes.
+        reply.extend_from_slice(&[0x00, 0x00, 0xd9]);
+        conn.stream_send(stream, &reply, false).expect("answers");
+        // A frame's header and its payload can arrive in different packets, so a capsule is walked whole or not at all: only what whole frames cover is spent out of the window.
+        let mut pending: Vec<u8> = Vec::new();
+        while std::time::Instant::now() < deadline {
+            let Some((n, from)) = crate::quic::server_poll(sock, buf) else {
+                crate::quic::server_idle(conn, sock, out);
+                continue;
+            };
+            let info = quiche::RecvInfo { from, to: local };
+            conn.recv(&mut buf[..n], info).expect("drives");
+            pending.extend_from_slice(&drain(conn, stream));
+            let mut echo = Vec::new();
+            let mut at = 0usize;
+            let mut whole = 0usize;
+            while at < pending.len() {
+                let start = at;
+                let Some(frame) = frames::h3_frame(&pending, &mut at) else {
+                    break;
+                };
+                let end = at + frame.length as usize;
+                if end > pending.len() {
+                    break;
+                }
+                if matches!(
+                    frames::h3_event(frame, &pending[at..end]),
+                    frames::H3Event::Data { .. }
+                ) {
+                    echo.extend_from_slice(&pending[start..end]);
+                }
+                at = end;
+                whole = end;
+            }
+            pending.drain(..whole);
+            if !echo.is_empty() {
+                // One datagram is one DATA frame, so a flow that split its own capsule over several of them would be a change the peer sees.
+                assert_eq!(
+                    frames::h3_frame(&echo, &mut 0).map(|frame| frame.kind),
+                    Some(frames::H3_DATA),
+                    "the echo carries a DATA frame"
+                );
+                conn.stream_send(stream, &echo, false).expect("echoes");
+                while let Ok((written, info)) = conn.send(out) {
+                    let _ = sock.send_to(&out[..written], info.to);
+                }
+                return;
+            }
+            while let Ok((written, info)) = conn.send(out) {
+                let _ = sock.send_to(&out[..written], info.to);
+            }
+        }
+    }
+
+    /// A loopback QUIC edge that speaks CONNECT-IP: one request stream answered with a 200, an address assignment for the tunnel's own address, and a relay that answers whichever destination the packet names.
+    fn quic_ip_edge(
+        sock: crate::quic::Datagram,
+        server: ferrox_core::tls::TlsServerConfig,
+        seen: std::sync::mpsc::Sender<Vec<u8>>,
+        udp: std::sync::mpsc::Sender<(Vec<u8>, u16, Vec<u8>)>,
+        want: usize,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let tag = format!("ferrox-foxy-ip-{}-{stamp}", std::process::id());
+            let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
+            let key_path = std::env::temp_dir().join(format!("{tag}.key"));
+            let cert_pem = crate::quic::der_to_pem(&server.cert_chain[0], "CERTIFICATE");
+            let key_pem = crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY");
+            std::fs::write(&cert_path, &cert_pem).expect("stages cert");
+            std::fs::write(&key_path, &key_pem).expect("stages key");
+            let mut config = crate::quic::server_config(crate::quic::ALPN);
+            config
+                .load_cert_chain_from_pem_file(cert_path.to_str().expect("ascii"))
+                .expect("loads chain");
+            config
+                .load_priv_key_from_pem_file(key_path.to_str().expect("ascii"))
+                .expect("loads key");
+            let _ = std::fs::remove_file(&cert_path);
+            let _ = std::fs::remove_file(&key_path);
+            let local = sock.local_addr().expect("addr");
+            let mut conn = crate::quic::server_accept(&sock, local, &mut config);
+            let mut buf = [0u8; 1350];
+            let mut out = [0u8; 1350];
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let mut stream = None;
+            let mut raw = Vec::new();
+            while stream.is_none() {
+                assert!(std::time::Instant::now() < deadline, "the request arrives");
+                let Some((n, from)) = crate::quic::server_poll(&sock, &mut buf) else {
+                    crate::quic::server_idle(&mut conn, &sock, &mut out);
+                    continue;
+                };
+                let info = quiche::RecvInfo { from, to: local };
+                let ids: Vec<u64> = conn.readable().collect();
+                conn.recv(&mut buf[..n], info).expect("drives");
+                for id in ids {
+                    if id % 4 != 0 {
+                        continue;
+                    }
+                    let piece = drain(&mut conn, id);
+                    if !piece.is_empty() {
+                        raw.extend_from_slice(&piece);
+                        stream = Some(id);
+                    }
+                }
+                while let Ok((written, info)) = conn.send(&mut out) {
+                    let _ = sock.send_to(&out[..written], info.to);
+                }
+            }
+            let stream = stream.expect("a request stream");
+            let mut at = 0usize;
+            let frame = frames::h3_frame(&raw, &mut at).expect("a frame");
+            seen.send(raw[at..at + frame.length as usize].to_vec())
+                .expect("reports");
+            answer_ip(&sock, local, &mut conn, stream, &udp, want);
+        })
+    }
+
+    /// The 200 the CONNECT-IP request is answered with, the assignment the tunnel owns, and one relayed packet per destination: the reply is a new packet with the ends swapped, because the tunnel carries addresses and not an echo.
+    fn answer_ip(
+        sock: &crate::quic::Datagram,
+        local: SocketAddr,
+        conn: &mut quiche::Connection,
+        stream: u64,
+        udp: &std::sync::mpsc::Sender<(Vec<u8>, u16, Vec<u8>)>,
+        want: usize,
+    ) {
+        let mut buf = [0u8; 1350];
+        let mut out = [0u8; 1350];
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut reply = Vec::new();
+        frames::quic_varint(&mut reply, frames::H3_HEADERS);
+        frames::quic_varint(&mut reply, 3);
+        reply.extend_from_slice(&[0x00, 0x00, 0xd9]);
+        conn.stream_send(stream, &reply, false).expect("answers");
+        // One ADDRESS_ASSIGN, whose body is the request id, the version, the address and the prefix: an RFC 1918 one, since the tunnel is a private network and not the internet.
+        let mut body = Vec::new();
+        body.push(1);
+        body.push(4);
+        body.extend_from_slice(&[198, 51, 100, 9]);
+        body.push(32);
+        let mut capsule = Vec::new();
+        capsule.push(1);
+        frames::quic_varint(&mut capsule, body.len() as u64);
+        capsule.extend_from_slice(&body);
+        send_h3_data(conn, stream, &capsule);
+        while let Ok((written, info)) = conn.send(&mut out) {
+            let _ = sock.send_to(&out[..written], info.to);
+        }
+        // The client's address request arrives as DATA before the first packet, so the capsule loop below drains it where it lies.
+        let mut pending: Vec<u8> = Vec::new();
+        let mut stream_buf: Vec<u8> = Vec::new();
+        let mut carried = 0usize;
+        while std::time::Instant::now() < deadline {
+            let Some((n, from)) = crate::quic::server_poll(sock, &mut buf) else {
+                crate::quic::server_idle(conn, sock, &mut out);
+                continue;
+            };
+            let info = quiche::RecvInfo { from, to: local };
+            conn.recv(&mut buf[..n], info).expect("drives");
+            pending.extend_from_slice(&drain(conn, stream));
+            let mut at = 0usize;
+            let mut whole = 0usize;
+            while at < pending.len() {
+                let Some(frame) = frames::h3_frame(&pending, &mut at) else {
+                    break;
+                };
+                let end = at + frame.length as usize;
+                if end > pending.len() {
+                    break;
+                }
+                if matches!(
+                    frames::h3_event(frame, &pending[at..end]),
+                    frames::H3Event::Data { .. }
+                ) {
+                    stream_buf.extend_from_slice(&pending[at..end]);
+                }
+                at = end;
+                whole = end;
+            }
+            pending.drain(..whole);
+            while let Some((used, capsule)) = connectip::capsule_split(&stream_buf) {
+                let packet = if let connectip::Capsule::Datagram(packet) = capsule {
+                    packet.to_vec()
+                } else {
+                    stream_buf.drain(..used);
+                    continue;
+                };
+                stream_buf.drain(..used);
+                let Some(read) = connectip::udp_from_packet(&packet) else {
+                    continue;
+                };
+                if read.source != [198, 51, 100, 9] {
+                    continue;
+                }
+                udp.send((
+                    read.destination.to_vec(),
+                    read.destination_port,
+                    read.payload.to_vec(),
+                ))
+                .expect("reports the datagram");
+                // A reply from the destination, which is what a caller reads.
+                let mut reply = Vec::new();
+                assert!(connectip::udp_datagram(
+                    &connectip::UdpDatagram {
+                        source: read.destination,
+                        destination: &[198, 51, 100, 9],
+                        source_port: read.destination_port,
+                        destination_port: read.source_port,
+                        payload: read.payload,
+                    },
+                    &mut reply
+                ));
+                let mut coded = Vec::new();
+                connectip::packet_encode(&reply, &mut coded);
+                send_h3_data(conn, stream, &coded);
+                while let Ok((written, info)) = conn.send(&mut out) {
+                    let _ = sock.send_to(&out[..written], info.to);
+                }
+                carried += 1;
+                if carried >= want {
+                    // The reply is not the end of the edge: a lane that has to read a second frame to find the rest of its capsule must find the edge still there.
+                    std::thread::sleep(Duration::from_millis(250));
+                    return;
+                }
+            }
+            while let Ok((written, info)) = conn.send(&mut out) {
+                let _ = sock.send_to(&out[..written], info.to);
+            }
+        }
+    }
+
+    /// One H3 DATA frame carrying `payload` on `stream`: capsules on this stream are framed, and the header is its own send because quiche copies every slice it is handed.
+    fn send_h3_data(conn: &mut quiche::Connection, stream: u64, payload: &[u8]) {
+        let mut head = [0u8; 9];
+        let len = frames::quic_varint_into(&mut head, payload.len() as u64);
+        head.copy_within(0..len, 1);
+        head[0] = frames::H3_DATA as u8;
+        conn.stream_send(stream, &head[..=len], false)
+            .expect("frames");
+        conn.stream_send(stream, payload, false).expect("carries");
+    }
+
+    /// CONNECT-IP over QUIC: the request names `connect-ip`, the assignment carries the tunnel's own address, and a datagram rides the tunnel it bought — the block the edge reads is asserted against the block the codec writes, so this is the carrier's proof, not the codec's.
+    #[test]
+    fn the_connect_ip_carrier_opens_one_tunnel_over_quic_and_carries_a_datagram() {
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let port = sock.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (udp_tx, udp_rx) = std::sync::mpsc::channel();
+        let edge = quic_ip_edge(sock, server, seen_tx, udp_tx, 1);
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let (mut lane, assigned) = Ip::open(&dial, Some(quic)).expect("opens");
+        let assigned = assigned.expect("an address");
+        assert!(!assigned.refused(), "the tunnel owns an address");
+        assert_eq!(assigned.bytes(), &[198, 51, 100, 9]);
+        assert_eq!(assigned.width(), 4, "an IPv4 tunnel");
+        let block = seen_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("block");
+        let mut want = Vec::new();
+        connectip::connect_ip_qpack(&format!("localhost:{port}"), "*", 0, "the-pass", &mut want);
+        assert_eq!(block, want, "the edge reads the block the lane wrote");
+        let written = lane
+            .write(
+                &[198, 51, 100, 9],
+                &[203, 0, 113, 9],
+                40_000,
+                443,
+                b"hello ip",
+            )
+            .expect("writes");
+        assert!(written, "the packet was built");
+        lane.flush().expect("flushes");
+        let (destination, port, payload) = udp_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the edge read it");
+        assert_eq!(destination, vec![203, 0, 113, 9]);
+        assert_eq!(port, 443);
+        assert_eq!(payload, b"hello ip");
+        // The reply comes back from the destination, and the lane reads it as a packet whose source is where the datagram went.
+        let packet = lane.read().expect("reads").expect("a reply");
+        let read = connectip::udp_from_packet(&packet).expect("parses");
+        assert!(read.verified);
+        assert_eq!(
+            read.source,
+            &[203, 0, 113, 9],
+            "the reply is from the target"
+        );
+        assert_eq!(read.destination, &[198, 51, 100, 9]);
+        assert_eq!(read.payload, b"hello ip");
+        edge.join().expect("joins");
+    }
+
+    /// MASQUE over the pooled QUIC connection: a QPACK block naming `connect-udp` and the capsule protocol, and a datagram riding one DATAGRAM capsule inside one DATA frame — the block the edge reads is asserted against the block the codec writes, so this is the carrier's proof, not the codec's.
+    #[test]
+    fn the_masque_carrier_opens_connect_udp_over_quic_and_echoes_a_datagram() {
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let port = sock.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let edge = quic_udp_edge(sock, server, seen_tx);
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let mut lane = H3::open_udp(&dial, "example.com", 443, quic).expect("opens");
+        let block = seen_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("block");
+        let mut want = Vec::new();
+        masque::connect_udp_qpack(
+            &format!("localhost:{port}"),
+            "example.com",
+            443,
+            "the-pass",
+            &mut want,
+        );
+        assert_eq!(block, want, "the edge reads the block the lane wrote");
+        lane.write_datagram(b"hello udp").expect("writes");
+        let mut back = [0u8; 64];
+        let mut at = 0usize;
+        while at < b"hello udp".len() {
+            match lane.read_datagram(&mut back[at..]) {
+                Ok(0) => panic!("the echo ended early"),
+                Ok(read) => at += read,
+                Err(error) => panic!("the echo failed: {error}"),
+            }
+        }
+        assert_eq!(&back[..at], b"hello udp");
+        edge.join().expect("joins");
+    }
+
+    /// The QUIC twin of a frame that carries two datagrams: the edge answers a DATA frame with the frame it read, header and capsules together, so one frame leaving the lane must come back as two datagrams in order.
+    #[test]
+    fn a_quic_frame_of_two_datagrams_arrives_as_two_datagrams() {
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let port = sock.local_addr().expect("addr").port();
+        let (seen_tx, _seen_rx) = std::sync::mpsc::channel();
+        let edge = quic_udp_edge(sock, server, seen_tx);
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let mut lane = H3::open_udp(&dial, "example.com", 443, quic).expect("opens");
+        lane.set_read_quantum(Duration::from_secs(5));
+        let mut both = Vec::new();
+        masque::datagram_encode(b"first", &mut both);
+        masque::datagram_encode(b"second", &mut both);
+        lane.write_all(&both).expect("writes one frame");
+        for want in [b"first".as_slice(), b"second".as_slice()] {
+            let mut back = [0u8; 64];
+            let mut at = 0usize;
+            while at < want.len() {
+                match lane.read_datagram(&mut back[at..]) {
+                    Ok(0) => panic!("the echo ended early"),
+                    Ok(read) => at += read,
+                    Err(error) => panic!("the echo failed: {error}"),
+                }
+            }
+            assert_eq!(&back[..at], want);
+        }
+        edge.join().expect("joins");
+    }
+
+    #[test]
+    fn the_http2_carrier_reads_a_huffman_coded_status() {
+        let (roots, server) = minted(b"h2");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut sink = vec![0u8; 4096];
+            let _ = tls.read(&mut sink);
+            // an indexed `:status` of 200, which is one byte
+            let mut out = Vec::new();
+            h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut out);
+            tls.write_all(&out).expect("answers");
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        assert!(Tunnel::open(&dial, "example.com:443", None).is_ok());
+        edge.join().expect("joins");
+    }
+
+    #[test]
+    fn a_pinned_edge_that_is_not_the_pin_is_refused() {
+        let (roots, server) = minted(b"http/1.1");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            let _ = tls.handshake();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let wrong = foxy::pin::Pins::parse([
+            "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned()
+        ]);
+        let dial = dial_for(roots, port, Carrier::H1, wrong);
+        assert!(Tunnel::open(&dial, "example.com:443", None).is_err());
+        edge.join().expect("joins");
+    }
+
+    #[test]
+    fn a_pinned_edge_that_is_the_pin_opens_the_tunnel() {
+        let (roots, server) = minted(b"http/1.1");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let right =
+            foxy::pin::Pins::parse([foxy::pin::spki_pin(&server.cert_chain[0]).expect("pins")]);
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut sink = vec![0u8; 1024];
+            let _ = tls.read(&mut sink);
+            tls.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .expect("answers");
+            std::thread::sleep(Duration::from_millis(100));
+        });
+        let dial = dial_for(roots, port, Carrier::H1, right);
+        assert!(Tunnel::open(&dial, "example.com:443", None).is_ok());
+        edge.join().expect("joins");
+    }
+
+    /// The edge half of the QUIC carrier: a control stream, one HEADERS frame with a QPACK status, and DATA frames echoed both ways — the proof the QUIC lane lacked: the wire request compared byte for byte with the lane's block, the status read through the QPACK decoder, and the bytes after the head travelling through the tunnel; a codec test answers none of those three.
+    fn h3_edge(
+        sock: crate::quic::Datagram,
+        cert_pem: Vec<u8>,
+        key_pem: Vec<u8>,
+        seen: std::sync::mpsc::Sender<Vec<u8>>,
+        uni: std::sync::mpsc::Sender<Vec<(u64, Vec<u8>, bool)>>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let tag = format!("ferrox-foxy-h3-{}-{stamp}", std::process::id());
+            let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
+            let key_path = std::env::temp_dir().join(format!("{tag}.key"));
+            std::fs::write(&cert_path, &cert_pem).expect("stages cert");
+            std::fs::write(&key_path, &key_pem).expect("stages key");
+            let mut config = crate::quic::server_config(crate::quic::ALPN);
+            config
+                .load_cert_chain_from_pem_file(cert_path.to_str().expect("ascii"))
+                .expect("loads chain");
+            config
+                .load_priv_key_from_pem_file(key_path.to_str().expect("ascii"))
+                .expect("loads key");
+            let _ = std::fs::remove_file(&cert_path);
+            let _ = std::fs::remove_file(&key_path);
+            let local = sock.local_addr().expect("addr");
+            let mut conn = crate::quic::server_accept(&sock, local, &mut config);
+            let mut buf = [0u8; 1350];
+            let mut out = [0u8; 1350];
+            // A server's own control stream is its first unidirectional stream, id 3, and the client's SETTINGS are answered on it.
+            let mut control = Vec::new();
+            frames::quic_varint(&mut control, frames::H3_DATA);
+            frames::quic_varint(&mut control, 0);
+            conn.stream_send(3, &control, true).expect("opens control");
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let mut request = None;
+            // The client's unidirectional streams, id plus bytes plus whether the lane closed one: control must arrive whole and stay open.
+            let mut uni_streams: Vec<(u64, Vec<u8>, bool)> = Vec::new();
+            let uni_ready = |streams: &[(u64, Vec<u8>, bool)]| {
+                [2u64, 6, 10].iter().all(|want| {
+                    streams
+                        .iter()
+                        .any(|(id, bytes, _)| id == want && !bytes.is_empty())
+                })
+            };
+            while request.is_none() || !uni_ready(&uni_streams) {
+                assert!(std::time::Instant::now() < deadline, "the request arrives");
+                let Some((n, from)) = crate::quic::server_poll(&sock, &mut buf) else {
+                    crate::quic::server_idle(&mut conn, &sock, &mut out);
+                    continue;
+                };
+                let info = quiche::RecvInfo { from, to: local };
+                let ids: Vec<u64> = conn.readable().collect();
+                conn.recv(&mut buf[..n], info).expect("drives");
+                for id in ids {
+                    if id % 4 == 2 {
+                        drain_uni(&mut conn, id, &mut uni_streams);
+                        continue;
+                    }
+                    // The control stream is unidirectional and the request is not, so the stream id itself tells them apart.
+                    if id % 4 != 0 {
+                        continue;
+                    }
+                    let piece = drain(&mut conn, id);
+                    if !piece.is_empty() {
+                        request = Some((id, piece));
+                    }
+                }
+                while let Ok((written, info)) = conn.send(&mut out) {
+                    let _ = sock.send_to(&out[..written], info.to);
+                }
+            }
+            let _ = uni.send(uni_streams);
+            let (stream, raw) = request.expect("read");
+            let mut at = 0usize;
+            let frame = frames::h3_frame(&raw, &mut at).expect("a frame");
+            let block = raw[at..at + frame.length as usize].to_vec();
+            let _ = seen.send(block);
+
+            let mut reply = Vec::new();
+            frames::quic_varint(&mut reply, frames::H3_HEADERS);
+            frames::quic_varint(&mut reply, 3);
+            // `0xd9` is QPACK static index 25, which is `:status 200`: the indexed field line with a six-bit prefix, then the block's two required zero bytes.
+            reply.extend_from_slice(&[0x00, 0x00, 0xd9]);
+            conn.stream_send(stream, &reply, false).expect("answers");
+            while let Ok((written, info)) = conn.send(&mut out) {
+                let _ = sock.send_to(&out[..written], info.to);
+            }
+            echo_stream(&sock, local, &mut conn, &mut buf, &mut out, stream);
+        })
+    }
+
+    /// Echoes one request stream's DATA payloads until the lane's whole payload has come back: the tunnel half of the loopback proof.
+    fn echo_stream(
+        sock: &crate::quic::Datagram,
+        local: SocketAddr,
+        conn: &mut quiche::Connection,
+        buf: &mut [u8; 1350],
+        out: &mut [u8; 1350],
+        stream: u64,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let mut received: Vec<u8> = Vec::new();
+        let mut sent = 0usize;
+        let mut pending: Vec<u8> = Vec::new();
+        while sent < PAYLOAD.len() {
+            assert!(std::time::Instant::now() < deadline, "the tunnel echoes");
+            if let Some((n, from)) = crate::quic::server_poll(sock, &mut buf[..]) {
+                let info = quiche::RecvInfo { from, to: local };
+                conn.recv(&mut buf[..n], info).expect("drives");
+                pending.extend_from_slice(&drain(&mut *conn, stream));
+                let mut at = 0usize;
+                let mut whole = 0usize;
+                while let Some(frame) = frames::h3_frame(&pending, &mut at) {
+                    let end = at + frame.length as usize;
+                    if end > pending.len() {
+                        break;
+                    }
+                    if let frames::H3Event::Data { payload, .. } =
+                        frames::h3_event(frame, &pending[at..end])
+                    {
+                        received.extend_from_slice(payload);
+                    }
+                    at = end;
+                    whole = end;
+                }
+                // Only what whole frames cover is spent: a header that arrived without its payload has to wait for the rest of it.
+                pending.drain(..whole);
+            }
+            if received.len() > sent {
+                let n = (received.len() - sent).min(16_384);
+                let mut frame = Vec::new();
+                frames::quic_varint(&mut frame, frames::H3_DATA);
+                frames::quic_varint(&mut frame, n as u64);
+                frame.extend_from_slice(&received[sent..sent + n]);
+                conn.stream_send(stream, &frame, false).expect("echoes");
+                sent += n;
+            }
+            while let Ok((written, info)) = conn.send(&mut out[..]) {
+                let _ = sock.send_to(&out[..written], info.to);
+            }
+        }
+    }
+
+    /// One unidirectional stream's bytes plus whether it has closed, merged into the snapshot the test asserts the lane's opening against.
+    fn drain_uni(conn: &mut quiche::Connection, id: u64, streams: &mut Vec<(u64, Vec<u8>, bool)>) {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match conn.stream_recv(id, &mut chunk) {
+                Ok((0, _)) | Err(_) => break,
+                Ok((n, fin)) => match streams.iter_mut().find(|(known, _, _)| *known == id) {
+                    Some((_, bytes, closed)) => {
+                        bytes.extend_from_slice(&chunk[..n]);
+                        *closed = *closed || fin;
+                    }
+                    None => streams.push((id, chunk[..n].to_vec(), fin)),
+                },
+            }
+        }
+    }
+
+    /// Every byte a stream holds, read into a buffer that exists: a `Vec` handed to `stream_recv` is a zero-length slice and never receives anything.
+    fn drain(conn: &mut quiche::Connection, id: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut chunk = [0u8; 8192];
+        while let Ok((n, _)) = conn.stream_recv(id, &mut chunk) {
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&chunk[..n]);
+        }
+        out
+    }
+
+    #[test]
+    fn the_quic_carrier_sends_the_block_reads_the_status_and_carries_the_bytes() {
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let port = sock.local_addr().expect("addr").port();
+        let key_pem = crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY");
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (uni_tx, uni_rx) = std::sync::mpsc::channel();
+        let edge = h3_edge(
+            sock,
+            crate::quic::der_to_pem(&server.cert_chain[0], "CERTIFICATE"),
+            key_pem,
+            seen_tx,
+            uni_tx,
+        );
+
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", Some(quic)).expect("opens");
+        let block = seen_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("block");
+        let mut want = Vec::new();
+        hpack::qpack_connect("example.com:443", "the-pass", &mut want);
+        assert_eq!(block, want, "the edge reads the same block the lane wrote");
+        let uni = uni_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("uni streams");
+        let stream = |id| {
+            uni.iter()
+                .find(|(known, _, _)| *known == id)
+                .unwrap_or_else(|| panic!("stream {id} opened"))
+        };
+        let (_, control, control_fin) = stream(2);
+        let mut at = 0usize;
+        assert_eq!(control.first(), Some(&0x00), "a control stream type");
+        at += 1;
+        assert_eq!(control.get(at), Some(&0x04), "one SETTINGS frame");
+        at += 1;
+        let len = frames::quic_read(control, &mut at).expect("a length") as usize;
+        assert_eq!(
+            control.len(),
+            at + len,
+            "a complete SETTINGS, no truncation"
+        );
+        assert!(!control_fin, "control stays open");
+        for (id, first) in [(6u64, 0x02u8), (10, 0x03)] {
+            let (_, bytes, fin) = stream(id);
+            assert_eq!(bytes.as_slice(), &[first], "qpack stream {id}");
+            assert!(!fin, "qpack stream {id} stays open");
+        }
+        round_trip(&mut tunnel);
+        // The frame's varints are sent beside the payload rather than staged with it, so the lane's write buffer never grows: capacity is the witness, because the bytes are the same either way.
+        let Tunnel::H3(lane) = &tunnel else {
+            panic!("an h3 lane");
+        };
+        assert_eq!(lane.out.capacity(), 0, "no buffer was staged to write one");
+        edge.join().expect("joins");
+    }
+}

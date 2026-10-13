@@ -1,0 +1,87 @@
+name: compare
+
+
+on:
+  workflow_dispatch:
+    inputs:
+      vless_link:
+        description: "Working vless:// link (uuid/pbk stay masked; only type/security/flow reach the report)"
+        required: true
+        type: string
+      live:
+        description: "TCP reachability check too (sends nothing)?"
+        required: false
+        default: "false"
+
+concurrency:
+  group: compare-${{ github.ref }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  compare:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux x86_64
+            os: ubuntu-latest
+          - name: macos aarch64
+            os: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: check the upstream pins resolve
+        run: ./scripts/check-upstream-pins.sh
+      - name: record the machine
+        run: |
+          echo "### machine" >> "$GITHUB_STEP_SUMMARY"
+          {
+            echo '```'
+            uname -a || ver
+            rustc -vV
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: offline comparison (no network, link stays masked)
+        env:
+          VLESS_LINK: ${{ inputs.vless_link }}
+        run: |
+          echo "::add-mask::$VLESS_LINK"
+          if [ -n "$VLESS_LINK" ]; then
+            cargo run --locked --release -p ferrox-bench -- --config "$VLESS_LINK"
+          else
+            echo "no vless_link input (push run): exercising parser against the brief link shape only"
+            cargo test --locked --release -p ferrox-core vless
+          fi
+      - name: app check (offline, no network)
+        env:
+          VLESS_LINK: ${{ inputs.vless_link }}
+        run: |
+          echo "::add-mask::$VLESS_LINK"
+          if [ -n "$VLESS_LINK" ]; then
+            cargo run --locked --release -p ferrox-app -- check "$VLESS_LINK"
+          fi
+      - name: live reachability (TCP connect only, sends nothing)
+        if: inputs.live == 'true'
+        env:
+          VLESS_LINK: ${{ inputs.vless_link }}
+        run: |
+          echo "::add-mask::$VLESS_LINK"
+          cargo run --locked --release -p ferrox-app -- run "$VLESS_LINK"
+      - name: publish the table
+        if: always()
+        run: |
+          {
+            echo
+            echo '```'
+            cat target/bench-report.md 2>/dev/null || echo "no report"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

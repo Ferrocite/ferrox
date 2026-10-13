@@ -1,0 +1,4 @@
+# The matrix runner itself is stdlib-only. This is the one dependency, and it
+# is only needed for the charts; a run without it produces every number and
+# no images (mirrors upstream/zeronet/docs/benchmarks/harness/requirements.txt).
+matplotlib>=3.7

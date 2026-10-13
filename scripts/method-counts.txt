@@ -1,0 +1,192 @@
+# One row per claim a method page makes: `doc key value checker`.
+#
+# `scripts/check-method-docs.sh` requires each `docs/function/<doc>.md` counts
+# block to hold exactly these rows for `<doc>`, with the same value and the
+# same checker. A number edited in a page without editing here fails; a row
+# here with no page fails.
+#
+# `UNBLESSED` is the value this repository already uses for an instruction
+# count nobody has measured yet. `scripts/count-ops.sh` prints the real number
+# on the next Linux run; the claim stays open until it has been read, and it is
+# blessed into `scripts/expected-ops.txt` only after the diff that moved it has
+# been read. It is not a number and must never be quoted as one.
+#
+# doc key value checker
+
+# --- the rung every AEAD method sits on -------------------------------------
+record-layer ops-retired-instructions UNBLESSED scripts/count-ops.sh
+record-layer discarded-keystream-blocks 0 ferrox-bench-gate-2
+record-layer allocations-per-fill 0 ferrox-bench-gate-2
+record-layer zero-filled-bytes-per-fill 0 ferrox-bench-gate-2
+record-layer blocks-per-byte 1/64 ferrox-bench-gate-2
+record-layer blocks-per-iteration 8 ferrox-core-chacha::backend
+record-layer blocks-per-iteration-on-avx512 16 ferrox-core-chacha::backend
+record-layer fused-head-blocks 1 ferrox-core-record::tests::the_head_is_the_references_own_first_block_and_the_rest_is_unshifted
+record-layer backends-a-differential-test-cannot-lie-to 6 ferrox-bench-gate-1
+
+# --- Shadowsocks AEAD -------------------------------------------------------
+shadowsocks ops-retired-instructions UNBLESSED scripts/count-ops.sh
+shadowsocks aead-calls-per-chunk 2 ferrox-core-shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
+shadowsocks maximum-payload-per-chunk 16383 ferrox-core-shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
+shadowsocks write-syscalls-per-relay-read 1 ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole
+shadowsocks payload-chunks-per-relay-read 1 ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole
+shadowsocks user-space-copies-per-byte-written 0 ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole
+shadowsocks user-space-copies-per-byte-read 0 ferrox-app-shadowsocks::tests::chunks_open_that_seal_sealed_and_reject_damage
+shadowsocks zero-filled-bytes-per-chunk 0 ferrox-app-shadowsocks::tests::chunks_open_that_seal_sealed_and_reject_damage
+shadowsocks chunk-buffer-allocations-per-connection 1 ferrox-app-shadowsocks::tests::chunks_open_that_seal_sealed_and_reject_damage
+shadowsocks udp-payload-buffers-per-datagram 1 ferrox-app-shadowsocks::tests::an_opened_payload_is_the_datagrams_own_bytes
+shadowsocks udp-datagram-reallocations-after-the-first 0 ferrox-app-shadowsocks::tests::an_opened_payload_is_the_datagrams_own_bytes
+shadowsocks subkey-heap-buffers-per-connection 1 ferrox-core-shadowsocks::tests::a_cipher_is_one_heap_buffer
+shadowsocks stream-iv-bytes-per-handshake 16 ferrox-app-shadowsocks::tests::stream_relays_an_echo
+shadowsocks stream-write-syscalls-per-relay-read 1 ferrox-app-shadowsocks::tests::stream_relay_read_becomes_one_write
+shadowsocks stream-crypt-allocations-per-call 0 ferrox-core-shadowsocks::tests::rc4_crypt_is_in_place_and_allocates_nothing
+shadowsocks stream-crypt-copies-per-byte 0 ferrox-core-shadowsocks::tests::rc4_crypt_is_in_place_and_allocates_nothing
+shadowsocks stream-udp-payload-buffers-per-datagram 1 ferrox-app-shadowsocks::tests::stream_opened_payload_is_the_datagrams_own_bytes
+shadowsocks stream-udp-datagram-reallocations-after-the-first 0 ferrox-app-shadowsocks::tests::stream_opened_payload_is_the_datagrams_own_bytes
+
+# --- Shadowsocks 2022 -------------------------------------------------------
+shadowsocks-2022 ops-retired-instructions UNBLESSED scripts/count-ops.sh
+shadowsocks-2022 aead-calls-per-chunk 2 ferrox-core-shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
+shadowsocks-2022 maximum-payload-per-chunk 65535 ferrox-core-shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
+shadowsocks-2022 write-syscalls-per-16KiB-relay-read 1 ferrox-app-shadowsocks2022::tests::one_relay_read_becomes_one_write_and_reads_back_whole
+shadowsocks-2022 payload-chunks-per-16KiB-relay-read 1 ferrox-app-shadowsocks2022::tests::one_relay_read_becomes_one_write_and_reads_back_whole
+shadowsocks-2022 user-space-copies-per-byte-written 0 ferrox-app-shadowsocks2022::tests::one_relay_read_becomes_one_write_and_reads_back_whole
+shadowsocks-2022 user-space-copies-per-byte-read 0 ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage
+shadowsocks-2022 zero-filled-bytes-per-chunk 0 ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage
+shadowsocks-2022 chunk-buffer-allocations-per-connection 1 ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage
+shadowsocks-2022 udp-payload-buffers-per-datagram 1 ferrox-app-shadowsocks2022::tests::an_opened_payload_is_the_datagrams_own_bytes
+shadowsocks-2022 udp-datagram-reallocations-after-the-first 0 ferrox-app-shadowsocks2022::tests::an_opened_payload_is_the_datagrams_own_bytes
+shadowsocks-2022 subkey-heap-buffers-per-connection 1 ferrox-core-shadowsocks2022::tests::a_cipher_holds_one_heap_buffer_for_aes_and_none_for_chacha
+shadowsocks-2022 udp-multi-user-eih-bytes-per-packet 16 ferrox-app-shadowsocks2022::tests::udp_multi_user_packs_one_eih_and_opens_with_the_pinned_psk
+shadowsocks-2022 udp-relay-header-bytes-stripped-per-packet 16 ferrox-app-shadowsocks2022::tests::udp_relay_strips_one_header_and_still_opens
+shadowsocks-2022 udp-server-reply-client-session-bytes 8 ferrox-app-shadowsocks2022::tests::udp_server_replies_are_server_typed_and_stay_with_their_session
+
+# --- VMess AEAD -------------------------------------------------------------
+vmess ops-retired-instructions UNBLESSED scripts/count-ops.sh
+vmess maximum-payload-per-frame 8192 ferrox-app-vmess::tests::frames_seal_to_stable_bytes
+vmess frames-per-write-syscall 4 ferrox-app-vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time
+vmess write-syscalls-per-32KiB-relay-read 1 ferrox-app-vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time
+vmess user-space-copies-per-byte-written 1 ferrox-app-vmess::tests::frames_reuse_the_callers_buffers
+vmess frame-buffer-allocations-per-relay-write 0 ferrox-app-vmess::tests::frames_reuse_the_callers_buffers
+vmess counters-per-frame 1 ferrox-app-vmess::tests::counters_advance_one_per_frame_at_any_offset
+
+# --- VLESS ------------------------------------------------------------------
+vless ops-retired-instructions UNBLESSED scripts/count-ops.sh
+vless request-header-allocations 0 ferrox-bench-gate-2
+vless request-header-bytes-zero-filled 0 ferrox-bench-gate-2
+vless address-families-encoded 4 ferrox-core-vless::tests::header_address_families_encode_stably
+vless vision-addons-bytes 2 ferrox-core-vless::tests::non_vision_header_carries_empty_addons
+vless reality-outbound-rows-dialled 0 ferrox-app-proxy::tests::vless_outbound_with_reality_security_is_skipped
+
+# --- Trojan -----------------------------------------------------------------
+trojan ops-retired-instructions UNBLESSED scripts/count-ops.sh
+trojan password-bytes-on-the-wire 56 ferrox-app-proxy::tests::trojan_key_is_sha224_hex
+trojan framing-bytes-added-after-the-header 0 ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers
+trojan udp-framing-bytes-per-datagram 2 ferrox-app-proxy::tests::trojan_udp_frames_carry
+
+# --- XTLS Vision ------------------------------------------------------------
+xtls-vision ops-retired-instructions UNBLESSED scripts/count-ops.sh
+xtls-vision padding-command-bytes 5 ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid
+xtls-vision first-frame-uuid-bytes 16 ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid
+xtls-vision tls-buffers-inspected-before-the-switch 8 ferrox-app-vision::tests::both_directions_spend_the_same_filter_budget
+xtls-vision user-space-copies-per-byte-while-framed 2 ferrox-app-vision::tests::the_framing_switch_ends_the_staging
+xtls-vision user-space-copies-per-byte-after-the-switch 0 ferrox-app-vision::tests::the_framing_switch_ends_the_staging
+xtls-vision seal-open-staging-allocations 0 ferrox-bench-gate-2
+
+# --- Mux.Cool ---------------------------------------------------------------
+mux-cool ops-retired-instructions UNBLESSED scripts/count-ops.sh
+mux-cool maximum-frame-payload-bytes 8192 ferrox-core-mux::tests::the_decoder_refuses_only_what_it_cannot_frame
+mux-cool relay-copies-per-byte-written 0 ferrox-app-proxy::tests::a_two_part_write_hands_the_payload_over_by_pointer
+mux-cool codec-copies-per-byte-written 1 ferrox-core-mux::tests::a_header_plus_a_patched_length_is_the_whole_frame
+mux-cool mux-frame-allocations 0 ferrox-bench-gate-6
+mux-cool live-session-cap 8 ferrox-core-mux::tests::the_concurrency_cap_counts_live_sessions_and_not_the_ids_used
+mux-cool xudp-frame-layout-matches-upstream 1 ferrox-app-proxy::tests::xudp_frames_match_the_upstream_layout
+
+# --- carriers ---------------------------------------------------------------
+carrier-websocket ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-websocket read-syscalls-per-64-frames 1 ferrox-app-ws::tests::a_read_covers_a_window_not_one_frame_header
+carrier-websocket read-ahead-window-bytes 32768 ferrox-app-ws::tests::a_read_covers_a_window_not_one_frame_header
+carrier-websocket write-syscalls-per-frame 1 ferrox-app-ws::tests::frames_round_trip_masked_and_plain
+carrier-websocket user-space-copies-per-byte-unmasked-write 0 ferrox-app-ws::tests::frames_round_trip_masked_and_plain
+carrier-websocket user-space-copies-per-byte-masked-write 1 ferrox-app-ws::tests::frames_round_trip_masked_and_plain
+carrier-websocket user-space-copies-per-byte-read 1 ferrox-app-ws::tests::a_read_covers_a_window_not_one_frame_header
+
+carrier-httpupgrade ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-httpupgrade framing-bytes-after-the-101 0 ferrox-app-httpupgrade::tests::upgrade_carries_an_echo_over_loopback
+carrier-httpupgrade user-space-copies-per-byte-relayed 1 ferrox-app-httpupgrade::tests::upgrade_carries_an_echo_over_loopback
+
+carrier-httpheader ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-httpheader framing-bytes-added 0 ferrox-app-httpheader::tests::header_carries_an_echo_over_loopback
+carrier-httpheader user-space-copies-per-byte-relayed 1 ferrox-app-proxy::tests::carried_streams_round_trip_behind_the_http_camouflage
+
+carrier-grpc ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-grpc hunk-payload-bytes 16384 ferrox-app-grpc::tests::hunks_carry_the_xray_schema_bytes
+carrier-grpc user-space-copies-per-byte-written 0 ferrox-app-grpc::tests::the_uplink_hands_the_payload_to_the_writer_by_pointer
+carrier-grpc payload-staging-copies-per-byte-read 0 ferrox-app-grpc::tests::a_body_never_lands_in_a_second_buffer
+carrier-grpc message-bytes-moved-per-padded-frame 11 ferrox-app-grpc::tests::a_padded_frame_is_the_one_move_the_lane_still_makes
+carrier-grpc message-buffer-reallocations-per-same-sized-frame 0 ferrox-app-grpc::tests::the_message_buffer_is_reused_not_reallocated
+
+carrier-xhttp ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-xhttp framing-size-lines-without-an-allocation 0 ferrox-app-xhttp::tests::size_lines_match_format_without_allocating
+carrier-xhttp framing-read-syscalls-per-16KiB-chunk 1 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
+carrier-xhttp framing-read-syscalls-per-16KiB-chunk 1 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
+carrier-xhttp read-syscalls-per-16KiB-chunk 2 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
+carrier-xhttp framing-read-syscalls-per-16KiB-chunk 1 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
+carrier-xhttp user-space-copies-per-byte-written 1 ferrox-app-xhttp::tests::exchange_carries_an_echo_over_loopback
+
+carrier-foxy ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-foxy payload-staging-copies-per-byte-written 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane
+carrier-foxy payload-staging-copies-per-byte-read 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane
+carrier-foxy read-buffer-bytes-per-staged-remainder 1 ferrox-app-foxy::loopback::a_read_leaves_only_what_the_callers_buffer_had_no_room_for
+carrier-foxy carriers-dialled 3 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer
+carrier-foxy udp-carriers-dialled 2 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer
+carrier-foxy datagram-frames-per-capsule 1 ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_over_quic_and_echoes_a_datagram
+carrier-foxy capsules-reassembled-across-frames 1 ferrox-app-foxy::loopback::a_capsule_split_over_frames_reassembles_as_one_datagram
+carrier-foxy datagrams-out-of-one-frame 2 ferrox-app-foxy::loopback::a_frame_of_two_datagrams_arrives_as_two_datagrams
+carrier-foxy quic-datagrams-out-of-one-frame 2 ferrox-app-foxy::loopback::a_quic_frame_of_two_datagrams_arrives_as_two_datagrams
+carrier-foxy stream-write-staging-copies-per-byte 0 ferrox-app-foxy::loopback::the_quic_carrier_sends_the_block_reads_the_status_and_carries_the_bytes
+carrier-foxy server-roles 0 ferrox-app-proxy::tests::quic_serve_closes_without_handshake
+carrier-foxy dialled-without-ca-cert-file 0 ferrox-app-proxy::tests::quic_outbound_reads_ca_cert_file
+
+carrier-quic ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-quic handshakes-per-server 1 ferrox-app-proxy::tests::quic_pool_shares_one_connection_between_two_streams
+carrier-quic server-roles 0 ferrox-app-proxy::tests::quic_serve_closes_without_handshake
+carrier-quic dialled-without-ca-cert-file 0 ferrox-app-proxy::tests::quic_outbound_reads_ca_cert_file
+
+reality-tls ops-retired-instructions UNBLESSED scripts/count-ops.sh
+reality-tls tls-providers 1 ferrox-core::active_backends
+reality-tls client-outbound-rows-dialled 0 ferrox-app-proxy::tests::vless_outbound_with_reality_security_is_skipped
+reality-tls x25519-shares-recognised 3 ferrox-core-reality::tests::the_x25519_share_is_found_in_every_group_that_carries_one
+reality-tls short-id-bytes 8 ferrox-core-reality::tests::a_short_id_is_zero_padded_to_eight_bytes
+reality-tls cover-origin-dials-per-authenticated-hello 0 ferrox-core-reality::tests::an_authenticated_hello_costs_the_cover_origin_nothing
+reality-tls cover-origin-bytes-per-spliced-hello 1 ferrox-core-reality::tests::an_unauthenticated_hello_is_spliced_into_the_cover_origin_byte_for_byte
+reality-tls proxy-protocol-header-bytes 28 ferrox-core-reality::tests::the_binary_proxy_header_is_a_fixed_rectangular_twenty_eight_bytes
+reality-tls hello-buffers-per-single-record-read 1 ferrox-core-reality::tests::reading_a_single_record_hello_allocates_one_buffer
+reality-tls tls13-session-tickets-per-authenticated-handshake 0 ferrox-core-reality::tests::an_authenticated_session_sends_no_tickets_after_the_handshake
+reality-tls certificateverify-signature-scheme ED25519 ferrox-core-reality::tests::the_reality_certificate_verify_answers_ed25519_the_peer_never_offered
+
+kcp ops-retired-instructions UNBLESSED scripts/count-ops.sh
+kcp maximum-transmission-unit-bytes 1350 ferrox-core-kcp::tests::the_upstream_defaults_are_these
+kcp command-only-segment-bytes 16 ferrox-core-kcp::tests::the_command_only_layout_is_sixteen_bytes
+kcp oracle-runs-against-the-pinned-go 1 ferrox-core-kcp::oracle::the_scripted_core_matches_the_pinned_go
+kcp rto-cap-seconds 10 ferrox-core-kcp::tests::rto_is_capped_at_ten_seconds_and_widened
+kcp app-rows-serving-over-kcp 4 ferrox-app-proxy::tests::kcp_carries_vless_echo_over_loopback
+kcp send-payload-buffers-per-window 1 ferrox-core-kcp::window::tests::the_arena_serves_every_segment_without_growing
+kcp send-payload-reallocations-per-window 0 ferrox-core-kcp::window::tests::the_arena_serves_every_segment_without_growing
+kcp send-payload-staging-copies-per-segment 0 ferrox-core-kcp::window::tests::the_writer_gets_the_arena_range_and_not_a_copy_of_it
+kcp receive-payload-reallocations-per-window 0 ferrox-core-kcp::connection::tests::the_receive_pool_serves_every_segment_without_growing
+kcp receive-parse-allocations-per-segment 0 ferrox-core-kcp::segment::tests::a_data_segment_is_parsed_into_the_lent_buffer
+kcp ack-number-list-reallocations-per-flush 0 ferrox-core-kcp::window::tests::the_ack_list_reuses_its_scratch_across_flushes
+kcp segment-header-staging-copies-per-segment 0 ferrox-core-kcp::segment::tests::a_borrowed_payload_serialises_identically_to_an_owned_one
+kcp segment-list-vectors-per-datagram 1 ferrox-core-kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next
+kcp reader-wakeups-per-datagram 1 ferrox-core-kcp::connection::tests::a_datagram_wakes_the_reader_once_however_many_segments_it_carries
+trojan header-reads-numeric-address 2 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven
+trojan header-reads-domain-address 3 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven
+trojan header-bytes-copied-out-of-the-buffer 0 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven
+trojan key-bytes-compared-early-exit 0 ferrox-app-proxy::tests::the_key_compare_reads_every_byte
+carrier-hysteria ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-hysteria tcp-flows-per-handshake 1 ferrox-app-proxy::tests::hysteria_carries_vless_echo_over_loopback
+carrier-hysteria wrong-password-bytes-relayed 0 ferrox-app-proxy::tests::hysteria_refuses_a_wrong_password_without_relaying
+carrier-hysteria non-v2-configs-carried 0 ferrox-app-proxy::tests::hysteria_settings_parse_with_guarded_fallbacks
+carrier-hysteria udp-bytes-relayed 0 ferrox-app-proxy::tests::hysteria_dial_udp_uplink_is_none
+carrier-hysteria pinned-hysteria-client-verdicts 1 scripts/run-upstream-suite.sh

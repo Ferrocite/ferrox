@@ -1,0 +1,57 @@
+name: prompts
+
+# `crates/ferrox-prompt/prompts.md` is the only Markdown file with a build
+# attached to it, and it was costing four jobs on three operating systems per
+# edit because it sat under `crates/**`. It gets its own one-runner workflow, so
+# an edit to the roadmap or to a prompt body builds one binary and checks one
+# file.
+
+on:
+  # No `push: main` leg. `crates/ferrox-prompt/src/**` is under `crates/**`, so
+  # every source edit is already proven by `ci.yml`'s pull request run before it
+  # merges, and a merge cannot change a prompt. What the push leg did buy was the
+  # `prompts.md`-only path, which `ci.yml` deliberately does not start on — so
+  # this keeps its own pull request trigger and drops the push one.
+  pull_request:
+    paths:
+      - "crates/ferrox-prompt/prompts.md"
+      - "crates/ferrox-prompt/src/**"
+      - ".github/workflows/prompts.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: prompts-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "1"
+  RUSTFLAGS: -D warnings --cfg aes_armv8 --cfg polyval_armv8
+
+jobs:
+  check:
+    name: the prompt library is well formed
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          # Same `RUSTFLAGS` and same `CARGO_INCREMENTAL` as `ci.yml`, and this
+          # workspace's `env:` block says so, so the two can share a cache
+          # legitimately. It means a `prompts.md` edit — which starts no job in
+          # `ci.yml` — still finds the crate compiled.
+          shared-key: ci
+      # A duplicate id, a slice with no gate, a dependency on a prompt that does
+      # not exist, a cycle, or a `**Touches:**` path that has been renamed.
+      - run: cargo run --locked --quiet -p ferrox-prompt -- check
+      # `cargo test --workspace` in `ci.yml` already covers these. They are named
+      # separately here because `prompts.md` is a Markdown file, and `ci.yml`'s
+      # `paths` filter does not start on it — so for a prompt-body edit this is
+      # the only run, and for a source edit it is a subset of one already in
+      # flight. Dropping it would leave the Markdown path untested.
+      - run: cargo test -p ferrox-prompt --locked

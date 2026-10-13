@@ -1,0 +1,30 @@
+Ferrox is distributed under a dual licence: you may use it under the terms of
+either the MIT Licence or the Apache Licence, Version 2.0, at your option.
+
+    SPDX-License-Identifier: MIT OR Apache-2.0
+
+This file is the notice; the full texts are in the two files beside it and both
+apply to this work.
+
+  MIT Licence          see LICENSE-MIT
+  Apache Licence 2.0   see LICENSE-APACHE
+
+Why dual rather than MIT alone: Apache-2.0 contributes an express patent grant
+and a patent-retaliation clause, which a cryptographic and networking core
+should carry. It is also the licence every dependency in this workspace already
+offers (rustls is Apache-2.0 OR ISC OR MIT, chacha20 and cipher are MIT OR
+Apache-2.0), so the dual grant introduces no friction for
+a downstream packager.
+
+Why not MPL-2.0, which this project previously carried: MPL-2.0 is file-level
+copyleft, and its only advantage here was matching Xray-core's licence to keep
+a future code-sharing door open. That door is better kept open by running
+upstream's test suites against this implementation in CI than by holding a
+copyleft licence in reserve.
+
+Upstream implementations are not vendored into this repository. Xray-core
+(MPL-2.0), sing-box (GPL-3.0) and AmneziaWG (MIT) are compared against by
+executing their suites, not by copying their code or their tests, so none of
+their terms attach to this work.
+
+Copyright 2026 Ferrox contributors.

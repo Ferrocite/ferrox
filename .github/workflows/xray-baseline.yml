@@ -1,0 +1,59 @@
+name: xray-baseline
+
+
+on:
+  pull_request:
+    paths:
+      - "crates/**/*.rs"
+      - "upstream/pins.toml"
+      - "scripts/run-xray-baseline.sh"
+      - ".github/workflows/xray-baseline.yml"
+  schedule:
+    - cron: "41 7 * * 1"
+  workflow_dispatch:
+    inputs:
+      pattern:
+        description: "go test pattern (default ./... = all of xray-core)"
+        required: false
+        default: "./..."
+
+concurrency:
+  group: xray-baseline-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  baseline:
+    name: xray-core baseline (informational, never red on test failures)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: run all pinned xray-core tests, report, stay green
+        shell: bash
+        run: ./scripts/run-xray-baseline.sh "${{ inputs.pattern || './...' }}"
+      - name: publish the totals
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo
+            echo '```'
+            cat target/xray-baseline/xray-baseline-summary.md 2>/dev/null || echo "no summary written"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: upload the full log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xray-baseline-${{ github.run_id }}
+          path: |
+            target/xray-baseline/xray-baseline.log
+            target/xray-baseline/xray-baseline-summary.md
+          retention-days: 30
+          if-no-files-found: error

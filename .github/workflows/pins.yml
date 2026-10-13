@@ -1,0 +1,31 @@
+name: pins
+
+on:
+  pull_request:
+    paths:
+      - "upstream/pins.toml"
+      - "scripts/check-upstream-pins.sh"
+      - "scripts/fetch-upstream.sh"
+      - "scripts/run-upstream-suite.sh"
+      - ".github/workflows/pins.yml"
+  schedule:
+    - cron: "23 5 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: pins-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pins:
+    name: every upstream pin resolves
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: check the upstream pins resolve
+        shell: bash
+        run: ./scripts/check-upstream-pins.sh
