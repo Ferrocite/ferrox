@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{Read as _, Write as _};
+use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs as _, UdpSocket};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -263,6 +263,48 @@ fn stage_at(path: &std::path::Path, bundle: &[u8]) -> Option<(std::path::PathBuf
     Some((path.to_path_buf(), text))
 }
 
+/// One ALPN and one flow-control shape for the lane: a weaker peer negotiates down, never up.
+pub(crate) fn tune(config: &mut quiche::Config, alpn: &[u8]) -> bool {
+    if config.set_application_protos(&[alpn]).is_err() {
+        return false;
+    }
+    config.set_max_idle_timeout(IDLE_TIMEOUT_MS);
+    config.set_initial_max_data(MAX_DATA);
+    config.set_initial_max_stream_data_bidi_local(MAX_STREAM_DATA);
+    config.set_initial_max_stream_data_bidi_remote(MAX_STREAM_DATA);
+    config.set_initial_max_stream_data_uni(MAX_STREAM_DATA);
+    config.set_initial_max_streams_bidi(MAX_STREAMS);
+    config.set_initial_max_streams_uni(MAX_STREAMS);
+    true
+}
+
+/// A serving identity: the lane's own tuning plus the certificate chain quiche reads at load time.
+pub(crate) fn serve_config(identity: &ferrox_core::tls::TlsServerConfig) -> Option<quiche::Config> {
+    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?;
+    if !tune(&mut config, ALPN) {
+        return None;
+    }
+    let label = match identity.key_kind {
+        ferrox_core::tls::ServerKeyKind::Pkcs8 => "PRIVATE KEY",
+        ferrox_core::tls::ServerKeyKind::Sec1 => "EC PRIVATE KEY",
+        ferrox_core::tls::ServerKeyKind::Pkcs1 => "RSA PRIVATE KEY",
+    };
+    let mut chain = Vec::new();
+    for der in &identity.cert_chain {
+        chain.extend_from_slice(&der_to_pem(der, "CERTIFICATE"));
+    }
+    let key = der_to_pem(&identity.key_der, label);
+    let (cert_path, cert_text) = stage_trust_file(&chain)?;
+    let (key_path, key_text) = stage_trust_file(&key)?;
+    let loaded = config
+        .load_cert_chain_from_pem_file(&cert_text)
+        .and(config.load_priv_key_from_pem_file(&key_text))
+        .is_ok();
+    let _ = std::fs::remove_file(&cert_path);
+    let _ = std::fs::remove_file(&key_path);
+    loaded.then_some(config)
+}
+
 pub(crate) fn quiche_config(roots: &[Vec<u8>], cc: Option<&str>) -> Option<quiche::Config> {
     if roots.is_empty() {
         return None;
@@ -395,26 +437,34 @@ pub(crate) fn stream_send_all(
                     flush_egress(conn, sock);
                     return true;
                 }
-                if written == 0 {
-                    if Instant::now() >= deadline {
-                        return false;
-                    }
-                    flush_egress(conn, sock);
-                    std::thread::sleep(Duration::from_millis(5));
+                if written == 0 && !send_credit_wait(conn, sock, deadline) {
+                    return false;
                 }
             }
             Err(quiche::Error::Done) => {
-                if Instant::now() >= deadline {
+                if !send_credit_wait(conn, sock, deadline) {
                     return false;
                 }
-                flush_egress(conn, sock);
-                std::thread::sleep(Duration::from_millis(5));
             }
             Err(_) => return false,
         }
     }
     flush_egress(conn, sock);
     true
+}
+
+/// Flush, then read the socket before retrying a blocked send: sleeping deaf to it leaves the peer's
+/// `MAX_STREAM_DATA` unread, so a send past the initial flow window never resumes.
+fn send_credit_wait(conn: &mut quiche::Connection, sock: &Datagram, deadline: Instant) -> bool {
+    flush_egress(conn, sock);
+    if Instant::now() >= deadline {
+        return false;
+    }
+    let Ok(local) = sock.local_addr() else {
+        return false;
+    };
+    let left = deadline.saturating_duration_since(Instant::now());
+    pump_once(conn, sock, local, left)
 }
 
 pub(crate) fn stream_recv_exact(
@@ -1137,6 +1187,317 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
     None
 }
 
+/// One VLESS session on a serving connection: stream bytes through the shared connection lock.
+#[derive(Clone)]
+pub(crate) struct QuicStream {
+    conn: Arc<Mutex<quiche::Connection>>,
+    sock: Arc<Datagram>,
+    id: u64,
+}
+
+/// How long one stream read polls quiche before idling: FIN and close land inside the next quantum.
+const STREAM_QUANTUM: Duration = Duration::from_millis(100);
+
+/// Between polls of quiche state, so a waiting read never holds the connection lock.
+const STREAM_POLL: Duration = Duration::from_millis(5);
+
+impl Read for QuicStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let deadline = Instant::now() + STREAM_QUANTUM;
+        loop {
+            match self.conn.lock() {
+                Ok(mut conn) => {
+                    if conn.is_closed() {
+                        return Ok(0);
+                    }
+                    let (n, fin) = match conn.stream_recv(self.id, buf) {
+                        Ok(got) => got,
+                        Err(quiche::Error::Done) => (0, false),
+                        Err(error) => {
+                            return Err(std::io::Error::other(format!(
+                                "quic stream read: {error:?}"
+                            )));
+                        }
+                    };
+                    if n > 0 {
+                        return Ok(n);
+                    }
+                    if fin {
+                        return Ok(0);
+                    }
+                }
+                Err(_) => {
+                    return Err(std::io::Error::other("quic connection lock poisoned"));
+                }
+            }
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            std::thread::sleep(STREAM_POLL);
+        }
+    }
+}
+
+impl Write for QuicStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        // The lock covers one send each: a flow-control wait must not hold it, or ACKs stop arriving.
+        let deadline = Instant::now() + SEND_WAIT;
+        let mut rest = buf;
+        while !rest.is_empty() {
+            match self.send_once(rest) {
+                Ok(0) => {
+                    if Instant::now() >= deadline {
+                        return Err(std::io::Error::other("quic stream send timed out"));
+                    }
+                    std::thread::sleep(STREAM_POLL);
+                }
+                Ok(n) => rest = &rest[n..],
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let Ok(mut conn) = self.conn.lock() else {
+            return Err(std::io::Error::other("quic connection lock poisoned"));
+        };
+        flush_egress(&mut conn, &self.sock);
+        Ok(())
+    }
+}
+
+impl QuicStream {
+    /// One send flight without holding the lock across the wait behind it.
+    fn send_once(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let Ok(mut conn) = self.conn.lock() else {
+            return Err(std::io::Error::other("quic connection lock poisoned"));
+        };
+        match conn.stream_send(self.id, buf, false) {
+            Ok(n) => {
+                flush_egress(&mut conn, &self.sock);
+                Ok(n)
+            }
+            Err(quiche::Error::Done) => Ok(0),
+            Err(error) => Err(std::io::Error::other(format!(
+                "quic stream send: {error:?}"
+            ))),
+        }
+    }
+
+    /// Half-close our direction: the peer reads everything sent, then EOF.
+    pub(crate) fn fin(&self) -> bool {
+        let Ok(mut conn) = self.conn.lock() else {
+            return false;
+        };
+        let deadline = Instant::now() + SEND_WAIT;
+        let done = stream_send_all(&mut conn, &self.sock, self.id, &[], true, deadline);
+        flush_egress(&mut conn, &self.sock);
+        done
+    }
+
+    /// Stop the stream in both directions; the connection itself is untouched.
+    pub(crate) fn close(&self) {
+        if let Ok(mut conn) = self.conn.lock() {
+            let _ = conn.stream_shutdown(self.id, quiche::Shutdown::Write, 0);
+            let _ = conn.stream_shutdown(self.id, quiche::Shutdown::Read, 0);
+            flush_egress(&mut conn, &self.sock);
+        }
+    }
+}
+
+/// One serving session: the QUIC connection behind one lock, the stream ids already handed out.
+struct ServerConn {
+    conn: Arc<Mutex<quiche::Connection>>,
+    seen: Mutex<HashSet<u64>>,
+}
+
+/// The per-stream entry point a VLESS inbound serves: one stream, one session, no shared state.
+pub(crate) type Serve = Arc<dyn Fn(QuicStream) + Send + Sync>;
+
+/// The driver's two datagram scratch buffers, passed as one so routing stays within the argument budget.
+struct Scratch {
+    buf: [u8; MAX_DATAGRAM],
+    out: [u8; MAX_DATAGRAM],
+}
+
+/// The driver: one UDP socket is read by this loop alone, so no packet is fed to the wrong connection.
+pub(crate) fn serve_loop(
+    sock: Datagram,
+    config: &Arc<Mutex<quiche::Config>>,
+    serve: &Serve,
+    stop: &Arc<AtomicBool>,
+) {
+    let Ok(local) = sock.local_addr() else {
+        return;
+    };
+    let sock = Arc::new(sock);
+    let mut conns: HashMap<Vec<u8>, Arc<ServerConn>> = HashMap::new();
+    let mut scratch = Scratch {
+        buf: [0u8; MAX_DATAGRAM],
+        out: [0u8; MAX_DATAGRAM],
+    };
+    let mut applied: Option<Duration> = None;
+    while !stop.load(Ordering::Relaxed) {
+        let start = Instant::now();
+        let mut wait = Duration::from_millis(100);
+        for state in conns.values() {
+            let Ok(conn) = state.conn.lock() else {
+                continue;
+            };
+            if let Some(left) = conn.timeout() {
+                wait = wait.min(left);
+            }
+        }
+        wait = wait.max(Duration::from_millis(1));
+        if applied != Some(wait) {
+            if sock.set_read_timeout(Some(wait)).is_err() {
+                return;
+            }
+            applied = Some(wait);
+        }
+        match sock.recv_from(&mut scratch.buf) {
+            Ok((n, from)) => route(&sock, local, config, &mut conns, &mut scratch, n, from),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                let elapsed = start.elapsed();
+                for state in conns.values() {
+                    let Ok(mut conn) = state.conn.lock() else {
+                        continue;
+                    };
+                    if conn.timeout().is_none_or(|left| left <= elapsed) {
+                        conn.on_timeout();
+                        flush_egress(&mut conn, &sock);
+                    }
+                }
+            }
+            Err(_) => return,
+        }
+        reap(serve, &sock, &mut conns);
+    }
+}
+
+/// Source IDs quiche issues mid-connection: any packet may carry one, so every new one routes.
+fn learn_ids(
+    conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>,
+    state: &Arc<ServerConn>,
+    conn: &quiche::Connection,
+) {
+    for id in conn.source_ids() {
+        if !conns.contains_key(id.as_ref()) {
+            conns.insert(id.as_ref().to_vec(), Arc::clone(state));
+        }
+    }
+}
+
+/// One packet to its connection, or to a new connection when it knocks with an Initial.
+fn route(
+    sock: &Datagram,
+    local: SocketAddr,
+    config: &Arc<Mutex<quiche::Config>>,
+    conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>,
+    scratch: &mut Scratch,
+    n: usize,
+    from: SocketAddr,
+) {
+    let Scratch { buf, out } = scratch;
+    let Ok(header) = quiche::Header::from_slice(&mut buf[..n], quiche::MAX_CONN_ID_LEN) else {
+        return;
+    };
+    if let Some(state) = conns.get(header.dcid.as_ref()).cloned() {
+        let Ok(mut conn) = state.conn.lock() else {
+            return;
+        };
+        let info = quiche::RecvInfo { from, to: local };
+        let _ = conn.recv(&mut buf[..n], info);
+        flush_egress(&mut conn, sock);
+        learn_ids(conns, &state, &conn);
+        return;
+    }
+    if header.ty != quiche::Type::Initial {
+        return;
+    }
+    if !quiche::version_is_supported(header.version) {
+        if let Ok(len) = quiche::negotiate_version(&header.scid, &header.dcid, out) {
+            let _ = sock.send_to(&out[..len], from);
+        }
+        return;
+    }
+    // Server SCIDs are the parse length, so short-header DCIDs read exactly, not into payload.
+    let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
+    if getrandom::getrandom(&mut scid).is_err() {
+        return;
+    }
+    let cid = quiche::ConnectionId::from_ref(&scid);
+    let Ok(mut guard) = config.lock() else {
+        return;
+    };
+    let Ok(mut conn) = quiche::accept(&cid, None, local, from, &mut guard) else {
+        return;
+    };
+    drop(guard);
+    let info = quiche::RecvInfo { from, to: local };
+    if conn.recv(&mut buf[..n], info).is_err() {
+        return;
+    }
+    flush_egress(&mut conn, sock);
+    let state = Arc::new(ServerConn {
+        conn: Arc::new(Mutex::new(conn)),
+        seen: Mutex::new(HashSet::new()),
+    });
+    conns.insert(scid.to_vec(), Arc::clone(&state));
+    conns.insert(header.dcid.as_ref().to_vec(), state);
+}
+
+/// New peer streams to sessions, finished ones out of the table, dead connections dropped.
+fn reap(serve: &Serve, sock: &Arc<Datagram>, conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>) {
+    // Closed connections drop every key they hold, so no routing entry outlives its connection.
+    conns.retain(|_, state| state.conn.lock().is_ok_and(|conn| !conn.is_closed()));
+    // New source IDs first: a packet carrying one must route on the next datagram.
+    for state in conns.values().cloned().collect::<Vec<_>>() {
+        let Ok(conn) = state.conn.lock() else {
+            continue;
+        };
+        learn_ids(conns, &state, &conn);
+    }
+    let mut fresh: Vec<(Arc<Mutex<quiche::Connection>>, u64)> = Vec::new();
+    for state in conns.values() {
+        let Ok(conn) = state.conn.lock() else {
+            continue;
+        };
+        let readable: Vec<u64> = conn.readable().collect();
+        if let Ok(mut seen) = state.seen.lock() {
+            for stream in readable {
+                // Client bidirectional streams only: the H3 opening rides unidirectional ones.
+                if stream % 4 != 0 || !seen.insert(stream) {
+                    continue;
+                }
+                fresh.push((Arc::clone(&state.conn), stream));
+            }
+            seen.retain(|stream| !conn.stream_finished(*stream));
+        }
+    }
+    for (conn, stream) in fresh {
+        let session = QuicStream {
+            conn,
+            sock: Arc::clone(sock),
+            id: stream,
+        };
+        let serve = Arc::clone(serve);
+        std::thread::spawn(move || serve(session));
+    }
+}
+
 /// One connection, one stream, no pool thread: which reader owns a shared connection must not decide the proof.
 #[cfg(test)]
 pub(crate) fn direct_stream(
@@ -1245,14 +1606,7 @@ pub(crate) fn server_accept(
 #[cfg(test)]
 pub(crate) fn server_config(alpn: &[u8]) -> quiche::Config {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
-    config.set_application_protos(&[alpn]).expect("negotiates");
-    config.set_max_idle_timeout(IDLE_TIMEOUT_MS);
-    config.set_initial_max_data(MAX_DATA);
-    config.set_initial_max_stream_data_bidi_local(MAX_STREAM_DATA);
-    config.set_initial_max_stream_data_bidi_remote(MAX_STREAM_DATA);
-    config.set_initial_max_stream_data_uni(MAX_STREAM_DATA);
-    config.set_initial_max_streams_bidi(MAX_STREAMS);
-    config.set_initial_max_streams_uni(MAX_STREAMS);
+    assert!(tune(&mut config, alpn), "the lane tuning holds");
     config
 }
 
@@ -1398,6 +1752,40 @@ mod tests {
     fn config_refuses_without_trust() {
         assert!(quiche_config(&[], None).is_none());
         assert!(quiche_config(&[vec![0u8; 16]], None).is_none());
+    }
+
+    fn minted_identity() -> ferrox_core::tls::TlsServerConfig {
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["quic.test".to_owned()]).expect("mints");
+        let roots = parse_ca_pem(minted.cert.pem().as_bytes());
+        assert_ne!(roots, Vec::<Vec<u8>>::new());
+        ferrox_core::tls::TlsServerConfig {
+            cert_chain: roots,
+            key_der: minted.key_pair.serialize_der(),
+            key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
+            alpn: Vec::new(),
+            send_tickets: true,
+        }
+    }
+
+    #[test]
+    fn serve_config_loads_a_minted_identity() {
+        assert!(serve_config(&minted_identity()).is_some());
+    }
+
+    #[test]
+    fn serve_config_refuses_without_a_chain_or_key() {
+        let empty = ferrox_core::tls::TlsServerConfig {
+            cert_chain: Vec::new(),
+            key_der: Vec::new(),
+            key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
+            alpn: Vec::new(),
+            send_tickets: true,
+        };
+        assert!(serve_config(&empty).is_none());
+        let mut no_key = minted_identity();
+        no_key.key_der = vec![0u8; 16];
+        assert!(serve_config(&no_key).is_none());
     }
 
     #[test]
