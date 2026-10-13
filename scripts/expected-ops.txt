@@ -53,5 +53,10 @@
 # ferrox-app bin links, so the release layout shifts by the 13 Ir a code move
 # costs it; `der_to_pem` and quic.rs are untouched, and
 # `pem_wraps_at_sixty_four_columns` still passes.
+# Re-blessed 2680 by wip-mux-quic: the QUIC server role joins the ferrox-app
+# bin with serve_vless_quic, serve_vless_quic_inbound and send_credit_wait plus
+# their pooled-connection loopback tests, shifting the thin-LTO release layout
+# by ~two code/test-count moves; the `der_to_pem` body is byte-for-byte
+# unchanged from main, and `pem_wraps_at_sixty_four_columns` still passes.
 
-der_to_pem 2653
+der_to_pem 2680
