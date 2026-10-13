@@ -48,5 +48,10 @@
 # overflow gate test join the same ferrox-app bin, taking the 13 Ir the release
 # layout put at 2653 back out; `der_to_pem` and quic.rs are untouched, and
 # `pem_wraps_at_sixty_four_columns` still passes.
+# Re-blessed 2653 by hpack-fused-probe: the HPACK Huffman decoder fuses its
+# per-length first/count tables into one probe in ferrox-core, which the
+# ferrox-app bin links, so the release layout shifts by the 13 Ir a code move
+# costs it; `der_to_pem` and quic.rs are untouched, and
+# `pem_wraps_at_sixty_four_columns` still passes.
 
-der_to_pem 2640
+der_to_pem 2653
