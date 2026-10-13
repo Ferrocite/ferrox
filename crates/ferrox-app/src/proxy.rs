@@ -2041,6 +2041,13 @@ fn relay_vless<S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'sta
         eprintln!("tls: uplink timeout failed");
         return;
     }
+    // Two pumps share the session's half-lock: read the raw arm's fd at one tick, or a silent read stalls the peer's write for a grain.
+    if let Some(raw) = raw.as_ref() {
+        if raw.set_read_timeout(Some(SESSION_POLL)).is_err() {
+            eprintln!("tls: session timeout failed");
+            return;
+        }
+    }
     if session.write_all(&[0, 0]).is_err() {
         return;
     }
@@ -9288,6 +9295,47 @@ mod tests {
             "a finished peer ends the splice against a silent origin"
         );
         assert_eq!(&head, b"ping", "the hello reaches the origin");
+    }
+
+    /// Two pumps share one session lock: a read that holds it for a whole idle grain stalls the opposite pump's write for that grain.
+    #[test]
+    fn a_server_relay_bounds_the_shared_session_to_one_tick() {
+        let site = TcpListener::bind("127.0.0.1:0").expect("binds the site");
+        let site_addr: SocketAddr = site.local_addr().expect("addr");
+        let dialed = thread::spawn(move || {
+            let (peer, _) = site.accept().expect("accepts");
+            peer
+        });
+
+        let lane = TcpListener::bind("127.0.0.1:0").expect("binds the lane");
+        let lane_addr: SocketAddr = lane.local_addr().expect("addr");
+        let mut edge = TcpStream::connect(lane_addr).expect("connects");
+        let (session, _) = lane.accept().expect("accepts");
+        session
+            .set_read_timeout(Some(RELAY_POLL))
+            .expect("arms the server idle grain");
+        let raw = session.try_clone().expect("shares the fd");
+        let probe = session.try_clone().expect("probes the fd");
+        drop(lane);
+
+        let id = [0x5Au8; 16];
+        edge.write_all(&vless_header(&id, 1, &site_addr))
+            .expect("greets");
+        let relay = thread::spawn(move || relay_vless(session, Some(raw), &id, true));
+
+        edge.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("arms the reply read");
+        let mut answer = [0u8; 2];
+        edge.read_exact(&mut answer).expect("answers");
+        assert_eq!(answer, [0, 0], "the relay grants the tunnel");
+        assert_eq!(
+            probe.read_timeout().ok().flatten(),
+            Some(SESSION_POLL),
+            "the shared fd must poll at one tick, or a silent session read stalls the peer pump's write"
+        );
+        drop(edge);
+        relay.join().expect("the relay ends");
+        drop(dialed.join().expect("the site holds its connection"));
     }
 
     #[test]

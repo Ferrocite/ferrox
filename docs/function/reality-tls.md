@@ -62,6 +62,7 @@ graph TD
 | client-hello-passes-per-handshake | 2 | ferrox-core-reality::tests::client_hellos_differ_only_in_the_session_id |
 | sealed-session-id-bytes | 32 | ferrox-core-reality::tests::client_seal_matches_the_test_oracle_byte_for_byte |
 | unauthenticated-servers-accepted | 0 | ferrox-core-reality::tests::a_client_with_a_wrong_key_is_refused_before_any_proxy_byte |
+| server-shared-session-poll-millis | 1 | ferrox-app-proxy::tests::a_server_relay_bounds_the_shared_session_to_one_tick |
 <!-- counts:end -->
 
 ## Ops
@@ -130,6 +131,7 @@ handshake duration is quoted from a machine without a named runner.
   sockets at all, and the `reality_vision` conformance row is the witness.
 - **A splice that outlived its own exchange.** Once both directions were live, a cover origin that stays open and silent pinned the far pump forever: `copy_paced` stopped only on bytes or an error, and its poll timeout only continued. A finished leg now raises a flag the sibling notices on its next twenty-millisecond grain, the same end-the-other-side discipline `copy_stream` already keeps; `the_cover_origin_splice_ends_when_the_peer_finishes` holds a keep-alive-silent origin against a finished peer and is red without the flag.
 - **A splice that pumped the upload twice.** `relay_fallback` crossed its copy directions, so both `copy_paced` pumps read the client and wrote the cover origin: the origin's reply never reached the peer, and two racing readers of one client half could deliver the hello to the origin out of order. The directions are crossed now, and the spliced target carries the same twenty-millisecond poll every other relay point sets, because an untimed read on a silent origin holds the mutex its upload writes on. `the_cover_origin_splice_carries_the_reply_back_to_the_peer` drives both legs over loopback and fails red on either direction.
+- **A server relay that read its shared session at the idle grain.** Two pumps hold one session through one half-lock: one reads it to forward the request, the other writes the answer into it. A read that parks for a whole twenty-millisecond grain holds that lock for the grain, so the answer waits out every silence. Every other session-shared rung already bounds this: the client sets a one-millisecond poll at dial time, and carried sessions hand the pumps halves that sleep unlocked between polls — only the server raw arm never lowered its grain. `relay_vless` now bounds the shared fd to one tick before it parks the pumps, and `a_server_relay_bounds_the_shared_session_to_one_tick` reads the fd's timeout back after the tunnel grant is on the wire: red at twenty, green at one, no byte on the wire moved.
 - **A split hello reassembled twice.** The reader grows one buffer and stops at
   the declared handshake length, then hands rustls the same bytes through a
   replay prefix, so the record framing is read once rather than re-parsed by a
