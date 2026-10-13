@@ -45,6 +45,7 @@ graph TD
 | tls-buffers-inspected-before-the-switch | 8 | ferrox-app-vision::tests::both_directions_spend_the_same_filter_budget |
 | user-space-copies-per-byte-while-framed | 2 | ferrox-app-vision::tests::the_framing_switch_ends_the_staging |
 | user-space-copies-per-byte-after-the-switch | 0 | ferrox-app-vision::tests::the_framing_switch_ends_the_staging |
+| framed-staging-buffer-bytes | 16384 | ferrox-app-vision::tests::the_framed_staging_buffers_stay_at_one_record |
 | seal-open-staging-allocations | 0 | ferrox-bench-gate-2 |
 <!-- counts:end -->
 
@@ -64,7 +65,9 @@ graph TD
 (`gate_vision_allocs`) over content lengths 0, 1, 64, 1400 and 8171 and refuses
 any allocation, any allocated byte and any zero-fill; the wall clock for this
 framing is not separately timed and no duration is quoted here. Allocation
-counts are deterministic and are gated; durations are not.
+counts are deterministic and are gated; durations are not. `Link`'s own working
+set is gated by capacity, not by an allocator window, and the next paragraphs
+say what that gate sees.
 
 One row on this page names a gate that does not cover it, and it is renamed
 rather than deleted so the claim stays true: `seal-open-staging-allocations 0`
@@ -75,11 +78,31 @@ second, independent implementation of this framing. It shares nothing with
 `tls.budget` filter, no `read_direct` — and the data path above is `Link`
 throughout.
 
-**`vision::Link` is under no allocation gate at all, and it allocates.** `Link::fill`
-does `self.have.reserve_exact(RELAY_BUFFER)` for 256 KiB and `out` starts at
-`Vec::new()` and grows to hold the decoded content, so a gate that drove `Link`
-would report at least one allocation on the first fill. No number is claimed for
-it here. The two rows beside the renamed one are properly gated: both
+**`vision::Link` was the one buffer in this tree sized for a whole relay and
+paid for whether the relay used it or not.** `Link::new` opened `have` and `out`
+at `Vec::with_capacity(RELAY_BUFFER)`, 256 KiB each, and `fill` read a full
+`RELAY_BUFFER` per framed pass — 512 KiB resident per endpoint for the life of
+the connection, on a window that exists only until the switch. Past the switch
+neither buffer is touched again: reads go through `read_direct` into the
+caller's buffer and writes go direct, so the reservation bought nothing after
+the handshake and was never freed. The window is now `RELAY_SMALL_BUFFER`,
+16 KiB, one `rustls` record and the relay's own first read.
+
+What the smaller window changes is the **read granularity of the framed pass**,
+not the bytes: a handshake larger than one record drains over more `fill`s. That
+is exactly the case the framing already had to survive — `unpad` carries a frame
+across reads (`a_frame_split_across_reads_is_reassembled`, and
+`seeded_splits_read_back_as_whole_content` replays one seeded chunking against
+whole content) — so the count moved and the output did not. The bulk, which is
+every byte after the switch, never read through `have` and reads no more or
+fewer syscalls than before.
+
+The gate is the capacity, held steady: `the_framed_staging_buffers_stay_at_one_record`
+drains 24 padded frames plus a 40 KiB tail, asserts the bytes round-trip, and
+asserts `have.capacity()` equals the 16 KiB window rather than the 256 KiB it
+used to reach — red at 262144 on the old size, green at 16384 on the new one.
+
+The two rows beside the renamed one are properly gated: both
 `user-space-copies-per-byte-while-framed` and `-after-the-switch` name
 `the_framing_switch_ends_the_staging`, which really does drive `Link`.
 
@@ -125,6 +148,16 @@ throughout the whole session, not only during the handshake.
   parses at once and a split one keeps the byte loop;
   `seeded_splits_read_back_as_whole_content` replays one seeded chunking
   against whole content, tail included.
+
+- **A 512 KiB working set for a window that closes at the handshake.**
+  `Link::new` reserved `have` and `out` at `RELAY_BUFFER` and `fill` read that
+  much per framed pass, so every Vision endpoint held 512 KiB of relay-sized
+  staging for the whole connection even though both buffers go unused the moment
+  the switch lands. The window is now one `rustls` record,
+  `RELAY_SMALL_BUFFER`; the bytes are unchanged, and what moved is how many
+  `fill`s a larger-than-one-record handshake takes — which is a case the framing
+  was already required to survive. `the_framing_staging_buffers_stay_at_one_record`
+  holds the capacity at 16 KiB where it used to reach 256 KiB.
 
 What was deliberately **not** removed: the seed table and the padding itself.
 Padding bytes are wire bytes; making them random instead of zero would change
