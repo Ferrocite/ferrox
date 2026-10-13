@@ -451,14 +451,27 @@ pub fn udp_head(body: &[u8]) -> Option<(UdpHead, &[u8])> {
     ))
 }
 
-/// The one's-complement sum of bytes read as 16-bit big-endian words, the last zero-padded on an odd run, and eight bytes are one add rather than four: `0xffff = 2^16 - 1` makes `2^16` and `2^32` congruent to 1 mod `0xffff`, so a lane folded as `(hi32 + lo32)` lands in the same residue class as the four words it holds — witnessed by `the_word_fold_is_the_byte_at_a_time_sum` and `word_sum_is_the_word_at_a_time_sum_at_every_tail`.
+/// The one's-complement sum of bytes read as 16-bit big-endian words, the last zero-padded on an odd run, and eight bytes are one add rather than four: `0xffff = 2^16 - 1` makes `2^16` and `2^32` congruent to 1 mod `0xffff`, so a lane folded as `(hi32 + lo32)` lands in the same residue class as the four words it holds — witnessed by `the_word_fold_is_the_byte_at_a_time_sum`, `word_sum_is_the_word_at_a_time_sum_at_every_tail` and `the_parallel_accumulators_hold_the_single_accumulator_word_sum`.
 fn word_sum(bytes: &[u8]) -> u32 {
     let (lanes, rem) = bytes.as_chunks::<8>();
-    let mut acc = 0u64;
-    for lane in lanes {
-        let word = u64::from_be_bytes(*lane);
-        acc += (word >> 32) + (word & 0xffff_ffff);
+    // Four independent accumulators break the loop-carried add a single one imposes; their total is the same u64 because addition modulo 2^64 associates and commutes, so word_sum returns the very magnitude pseudo_sum's single fold reads at every lane count and remainder.
+    let (quads, singles) = lanes.as_chunks::<4>();
+    let (mut a0, mut a1, mut a2, mut a3) = (0u64, 0u64, 0u64, 0u64);
+    for quad in quads {
+        let w0 = u64::from_be_bytes(quad[0]);
+        let w1 = u64::from_be_bytes(quad[1]);
+        let w2 = u64::from_be_bytes(quad[2]);
+        let w3 = u64::from_be_bytes(quad[3]);
+        a0 += (w0 >> 32) + (w0 & 0xffff_ffff);
+        a1 += (w1 >> 32) + (w1 & 0xffff_ffff);
+        a2 += (w2 >> 32) + (w2 & 0xffff_ffff);
+        a3 += (w3 >> 32) + (w3 & 0xffff_ffff);
     }
+    for lane in singles {
+        let word = u64::from_be_bytes(*lane);
+        a0 += (word >> 32) + (word & 0xffff_ffff);
+    }
+    let mut acc = (a0 + a1) + (a2 + a3);
     // The run left is shorter than a lane: every group taken here is even so pairs still begin on an even byte, and a lone trailing byte is the high half of a zero-padded word.
     let mut at = 0usize;
     if rem.len() - at >= 4 {
@@ -934,6 +947,67 @@ mod tests {
             assert_eq!(
                 residue(word_sum(&bytes)),
                 residue(by_words(&bytes)),
+                "all-ones len {len}"
+            );
+        }
+    }
+
+    /// The parallel lane accumulators hold the exact u32 a single accumulator returns — every length through several quads, every lane remainder, all-ones carries — because `pseudo_sum` folds only once and reads that magnitude, a contract the residue-only sweeps above cannot see.
+    #[test]
+    fn the_parallel_accumulators_hold_the_single_accumulator_word_sum() {
+        // The pre-rewrite walk, one accumulator, as the second source the parallel one is checked against.
+        fn by_one_accumulator(bytes: &[u8]) -> u32 {
+            let (lanes, rem) = bytes.as_chunks::<8>();
+            let mut acc = 0u64;
+            for lane in lanes {
+                let word = u64::from_be_bytes(*lane);
+                acc += (word >> 32) + (word & 0xffff_ffff);
+            }
+            let mut at = 0usize;
+            if rem.len() - at >= 4 {
+                acc += u64::from(u32::from_be_bytes(
+                    rem[at..at + 4].try_into().expect("four bytes"),
+                ));
+                at += 4;
+            }
+            if rem.len() - at >= 2 {
+                acc += u64::from(u16::from_be_bytes(
+                    rem[at..at + 2].try_into().expect("two bytes"),
+                ));
+                at += 2;
+            }
+            if rem.len() - at == 1 {
+                acc += u64::from(rem[at]) << 8;
+            }
+            let mut sum = (acc >> 32) + (acc & 0xffff_ffff);
+            sum = (sum >> 16) + (sum & 0xffff);
+            sum = (sum >> 16) + (sum & 0xffff);
+            sum as u32
+        }
+        let pattern = |len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|i| (i as u32).wrapping_mul(2_654_435_761) as u8)
+                .collect()
+        };
+        // Every lane count through sixteen quads, and the remainder mod four each one leaves.
+        for len in 0..=130usize {
+            let bytes = pattern(len);
+            assert_eq!(word_sum(&bytes), by_one_accumulator(&bytes), "len {len}");
+        }
+        // Deep runs and all-ones lanes, where a dropped or mis-folded quad moves the exact magnitude, not just its residue.
+        for len in [1_000usize, 4_096, 16_384, 65_535] {
+            let bytes = pattern(len);
+            assert_eq!(
+                word_sum(&bytes),
+                by_one_accumulator(&bytes),
+                "deep len {len}"
+            );
+        }
+        for len in [8usize, 16, 32, 40, 1_000, 65_536] {
+            let bytes = vec![0xffu8; len];
+            assert_eq!(
+                word_sum(&bytes),
+                by_one_accumulator(&bytes),
                 "all-ones len {len}"
             );
         }
