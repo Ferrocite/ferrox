@@ -9,8 +9,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::{
-    inbound_reality_config, inbound_tls_identity, key32, short_id, tls_cert_paths, trojan_key,
-    uuid_bytes,
+    grpc_path, inbound_reality_config, inbound_tls_identity, kcp_config, outbound_flow,
+    outbound_reality, outbound_tls, stream_security, sub_path, tcp_http_path, tls_ca_roots,
+    tls_cert_paths, trojan_key, uuid_bytes, vless_security_supported,
 };
 use crate::json::Json;
 use ferrox_core::failure::{Failure, Kind, Ladder, Rung, Stage};
@@ -8829,126 +8830,6 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
     None
 }
 
-fn tls_ca_roots(outbound: &Json) -> Option<Vec<Vec<u8>>> {
-    outbound
-        .get("streamSettings")
-        .and_then(|s| s.get("tlsSettings"))
-        .and_then(|s| s.get("caCertFile"))
-        .and_then(Json::as_str)
-        .and_then(|path| std::fs::read(path).ok())
-        .map(|pem| crate::quic::parse_ca_pem(&pem))
-        .filter(|roots| !roots.is_empty())
-}
-
-fn tls_alpn(settings: Option<&Json>) -> Vec<Vec<u8>> {
-    let Some(alpn) = settings.and_then(|s| s.get("alpn")) else {
-        return Vec::new();
-    };
-    if let Some(single) = alpn.as_str() {
-        if single.is_empty() {
-            return Vec::new();
-        }
-        return vec![single.as_bytes().to_vec()];
-    }
-    let Some(items) = alpn.as_arr() else {
-        return Vec::new();
-    };
-    items
-        .iter()
-        .filter_map(Json::as_str)
-        .filter(|s| !s.is_empty())
-        .map(|s| s.as_bytes().to_vec())
-        .collect()
-}
-
-fn outbound_tls(outbound: &Json, address: &str) -> Option<Arc<ferrox_core::tls::TlsConfig>> {
-    let settings = outbound.get("streamSettings")?;
-    if settings.get("security").and_then(Json::as_str) != Some("tls") {
-        return None;
-    }
-    let tls = settings.get("tlsSettings");
-    if matches!(
-        tls.and_then(|s| s.get("allowInsecure")),
-        Some(Json::Bool(true))
-    ) {
-        return None;
-    }
-    let server_name = tls
-        .and_then(|s| s.get("serverName"))
-        .and_then(Json::as_str)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(address)
-        .to_owned();
-    if server_name.is_empty() {
-        return None;
-    }
-    let alpn = tls_alpn(tls);
-    let system_only = !matches!(
-        tls.and_then(|s| s.get("disableSystemRoot")),
-        Some(Json::Bool(true))
-    );
-    let roots = tls_ca_roots(outbound).or_else(|| {
-        system_only
-            .then(crate::quic::system_roots)
-            .filter(|r| !r.is_empty())
-    })?;
-    if roots.is_empty() {
-        return None;
-    }
-    Some(Arc::new(ferrox_core::tls::TlsConfig {
-        server_name,
-        alpn,
-        roots,
-        pins: ferrox_core::foxy::pin::Pins::default(),
-    }))
-}
-
-/// The outbound REALITY identity: the decoy name, the server static key, the short id.
-fn outbound_reality(
-    outbound: &Json,
-    address: &str,
-) -> Option<Arc<ferrox_core::tls::RealityClientConfig>> {
-    let settings = outbound.get("streamSettings")?;
-    if settings.get("security").and_then(Json::as_str) != Some("reality") {
-        return None;
-    }
-    let reality = settings.get("realitySettings")?;
-    let server_name = reality
-        .get("serverName")
-        .and_then(Json::as_str)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(address)
-        .to_owned();
-    if server_name.is_empty() {
-        return None;
-    }
-    Some(Arc::new(ferrox_core::tls::RealityClientConfig {
-        server_name,
-        public_key: reality.get("publicKey")?.as_str().and_then(key32)?,
-        short_id: reality
-            .get("shortId")
-            .and_then(Json::as_str)
-            .and_then(short_id)?,
-        fingerprint: reality
-            .get("fingerprint")
-            .and_then(Json::as_str)
-            .unwrap_or("chrome")
-            .to_owned(),
-    }))
-}
-
-/// The user flow: empty or Vision dials, anything else is refused rather than sent plain.
-fn outbound_flow(server: &Json) -> String {
-    server
-        .get("users")
-        .and_then(Json::as_arr)
-        .and_then(|users| users.first())
-        .and_then(|user| user.get("flow"))
-        .and_then(Json::as_str)
-        .unwrap_or("")
-        .to_owned()
-}
-
 // TLS runs outside the carrier, the order both references use, so every diallable carrier is accepted here.
 fn tls_parts(
     outbound: &Json,
@@ -8974,38 +8855,6 @@ fn tls_parts(
         | Carrier::Unknown => return None,
     }
     outbound_tls(outbound, address).map(|tls| (carrier, host, tls))
-}
-
-fn kcp_config(settings: Option<&Json>) -> ferrox_core::kcp::Config {
-    let base = ferrox_core::kcp::Config::default();
-    let Some(kcp) = settings.and_then(|s| s.get("kcpSettings")) else {
-        return base;
-    };
-    let num = |camel: &str, snake: &str| {
-        kcp.get(camel)
-            .or_else(|| kcp.get(snake))
-            .and_then(Json::as_u32)
-    };
-    let mtu = num("mtu", "mtu").unwrap_or(base.mtu);
-    let tti = num("tti", "tti").unwrap_or(base.tti);
-    ferrox_core::kcp::Config {
-        mtu: if mtu > ferrox_core::kcp::DATA_SEGMENT_OVERHEAD {
-            mtu
-        } else {
-            base.mtu
-        },
-        tti: if (1..=1000).contains(&tti) {
-            tti
-        } else {
-            base.tti
-        },
-        uplink_capacity: num("uplinkCapacity", "uplink_capacity").unwrap_or(base.uplink_capacity),
-        downlink_capacity: num("downlinkCapacity", "downlink_capacity")
-            .unwrap_or(base.downlink_capacity),
-        cwnd_multiplier: num("cwndMultiplier", "cwnd_multiplier").unwrap_or(base.cwnd_multiplier),
-        max_sending_window: num("maxSendingWindow", "max_sending_window")
-            .unwrap_or(base.max_sending_window),
-    }
 }
 
 fn stream_carrier(settings: Option<&Json>) -> Carrier {
@@ -9074,71 +8923,6 @@ fn hysteria_carrier(settings: Option<&Json>) -> Carrier {
     })
 }
 
-fn sub_path(settings: Option<&Json>, key: &str) -> String {
-    settings
-        .and_then(|s| s.get(key))
-        .and_then(|s| s.get("path"))
-        .and_then(Json::as_str)
-        .unwrap_or("/")
-        .to_owned()
-}
-fn grpc_path(settings: Option<&Json>) -> String {
-    let service = settings
-        .and_then(|s| s.get("grpcSettings"))
-        .and_then(|s| s.get("serviceName"))
-        .and_then(Json::as_str)
-        .unwrap_or("")
-        .trim();
-    if service.is_empty() {
-        return "/Tun".to_owned();
-    }
-    if service.starts_with('/') {
-        return service.to_owned();
-    }
-    format!("/{}/Tun", grpc_escape(service.trim_matches('/')))
-}
-
-/// Go's `url.PathEscape` for one segment, the way Xray escapes a service name.
-fn grpc_escape(service: &str) -> String {
-    const HEX: &[u8; 16] = b"0123456789ABCDEF";
-    let mut out = String::with_capacity(service.len());
-    for byte in service.bytes() {
-        let keep = byte.is_ascii_alphanumeric()
-            || matches!(
-                byte,
-                b'-' | b'_' | b'.' | b'~' | b'$' | b'&' | b'+' | b':' | b'=' | b'@'
-            );
-        if keep {
-            out.push(byte as char);
-        } else {
-            out.push('%');
-            out.push(HEX[usize::from(byte >> 4)] as char);
-            out.push(HEX[usize::from(byte & 0x0f)] as char);
-        }
-    }
-    out
-}
-
-fn tcp_http_path(settings: Option<&Json>) -> Option<String> {
-    let header = settings
-        .and_then(|s| s.get("tcpSettings"))
-        .and_then(|s| s.get("header"))?;
-    if header.get("type").and_then(Json::as_str) != Some("http") {
-        return None;
-    }
-    let request = header.get("request")?;
-    if let Some(paths) = request.get("path").and_then(Json::as_arr) {
-        let first = paths.iter().find_map(Json::as_str);
-        if let Some(path) = first {
-            return Some(path.to_owned());
-        }
-    }
-    if let Some(path) = request.get("path").and_then(Json::as_str) {
-        return Some(path.to_owned());
-    }
-    Some("/".to_owned())
-}
-
 fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, String) {
     let settings = outbound.get("streamSettings");
     let carrier = stream_carrier(settings);
@@ -9166,17 +8950,6 @@ fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, String) {
 
 fn inbound_carrier(inbound: &Json) -> Carrier {
     stream_carrier(inbound.get("streamSettings"))
-}
-
-fn stream_security(node: &Json) -> &str {
-    node.get("streamSettings")
-        .and_then(|s| s.get("security"))
-        .and_then(Json::as_str)
-        .unwrap_or("")
-}
-
-fn vless_security_supported(sec: &str) -> bool {
-    sec.is_empty() || sec == "none"
 }
 
 fn x25519_pair() -> (String, String) {

@@ -90,7 +90,7 @@ fn as_uint(node: &Json) -> Option<u64> {
 }
 
 /// Xray fills the eight bytes from the front and zero-pads the tail, so `a8` is `a8 00 ...`, never `00 ... a8`.
-pub(crate) fn short_id(hex: &str) -> Option<[u8; 8]> {
+fn short_id(hex: &str) -> Option<[u8; 8]> {
     let mut out = [0u8; 8];
     if hex.is_empty() || hex.len() > 16 || !hex.len().is_multiple_of(2) {
         return None;
@@ -101,7 +101,7 @@ pub(crate) fn short_id(hex: &str) -> Option<[u8; 8]> {
     Some(out)
 }
 
-pub(crate) fn key32(text: &str) -> Option<[u8; 32]> {
+fn key32(text: &str) -> Option<[u8; 32]> {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut word = 0u32;
     let mut bits = 0;
@@ -229,6 +229,237 @@ pub(crate) fn trojan_key(password: &str) -> [u8; 56] {
         out[2 * i + 1] = HEX[(byte & 0x0F) as usize];
     }
     out
+}
+
+pub(crate) fn tls_ca_roots(outbound: &Json) -> Option<Vec<Vec<u8>>> {
+    outbound
+        .get("streamSettings")
+        .and_then(|s| s.get("tlsSettings"))
+        .and_then(|s| s.get("caCertFile"))
+        .and_then(Json::as_str)
+        .and_then(|path| std::fs::read(path).ok())
+        .map(|pem| crate::quic::parse_ca_pem(&pem))
+        .filter(|roots| !roots.is_empty())
+}
+
+fn tls_alpn(settings: Option<&Json>) -> Vec<Vec<u8>> {
+    let Some(alpn) = settings.and_then(|s| s.get("alpn")) else {
+        return Vec::new();
+    };
+    if let Some(single) = alpn.as_str() {
+        if single.is_empty() {
+            return Vec::new();
+        }
+        return vec![single.as_bytes().to_vec()];
+    }
+    let Some(items) = alpn.as_arr() else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .filter_map(Json::as_str)
+        .filter(|s| !s.is_empty())
+        .map(|s| s.as_bytes().to_vec())
+        .collect()
+}
+
+pub(crate) fn outbound_tls(
+    outbound: &Json,
+    address: &str,
+) -> Option<Arc<ferrox_core::tls::TlsConfig>> {
+    let settings = outbound.get("streamSettings")?;
+    if settings.get("security").and_then(Json::as_str) != Some("tls") {
+        return None;
+    }
+    let tls = settings.get("tlsSettings");
+    if matches!(
+        tls.and_then(|s| s.get("allowInsecure")),
+        Some(Json::Bool(true))
+    ) {
+        return None;
+    }
+    let server_name = tls
+        .and_then(|s| s.get("serverName"))
+        .and_then(Json::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(address)
+        .to_owned();
+    if server_name.is_empty() {
+        return None;
+    }
+    let alpn = tls_alpn(tls);
+    let system_only = !matches!(
+        tls.and_then(|s| s.get("disableSystemRoot")),
+        Some(Json::Bool(true))
+    );
+    let roots = tls_ca_roots(outbound).or_else(|| {
+        system_only
+            .then(crate::quic::system_roots)
+            .filter(|r| !r.is_empty())
+    })?;
+    if roots.is_empty() {
+        return None;
+    }
+    Some(Arc::new(ferrox_core::tls::TlsConfig {
+        server_name,
+        alpn,
+        roots,
+        pins: ferrox_core::foxy::pin::Pins::default(),
+    }))
+}
+
+/// The outbound REALITY identity: the decoy name, the server static key, the short id.
+pub(crate) fn outbound_reality(
+    outbound: &Json,
+    address: &str,
+) -> Option<Arc<ferrox_core::tls::RealityClientConfig>> {
+    let settings = outbound.get("streamSettings")?;
+    if settings.get("security").and_then(Json::as_str) != Some("reality") {
+        return None;
+    }
+    let reality = settings.get("realitySettings")?;
+    let server_name = reality
+        .get("serverName")
+        .and_then(Json::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(address)
+        .to_owned();
+    if server_name.is_empty() {
+        return None;
+    }
+    Some(Arc::new(ferrox_core::tls::RealityClientConfig {
+        server_name,
+        public_key: reality.get("publicKey")?.as_str().and_then(key32)?,
+        short_id: reality
+            .get("shortId")
+            .and_then(Json::as_str)
+            .and_then(short_id)?,
+        fingerprint: reality
+            .get("fingerprint")
+            .and_then(Json::as_str)
+            .unwrap_or("chrome")
+            .to_owned(),
+    }))
+}
+
+/// The user flow: empty or Vision dials, anything else is refused rather than sent plain.
+pub(crate) fn outbound_flow(server: &Json) -> String {
+    server
+        .get("users")
+        .and_then(Json::as_arr)
+        .and_then(|users| users.first())
+        .and_then(|user| user.get("flow"))
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_owned()
+}
+
+pub(crate) fn kcp_config(settings: Option<&Json>) -> ferrox_core::kcp::Config {
+    let base = ferrox_core::kcp::Config::default();
+    let Some(kcp) = settings.and_then(|s| s.get("kcpSettings")) else {
+        return base;
+    };
+    let num = |camel: &str, snake: &str| {
+        kcp.get(camel)
+            .or_else(|| kcp.get(snake))
+            .and_then(Json::as_u32)
+    };
+    let mtu = num("mtu", "mtu").unwrap_or(base.mtu);
+    let tti = num("tti", "tti").unwrap_or(base.tti);
+    ferrox_core::kcp::Config {
+        mtu: if mtu > ferrox_core::kcp::DATA_SEGMENT_OVERHEAD {
+            mtu
+        } else {
+            base.mtu
+        },
+        tti: if (1..=1000).contains(&tti) {
+            tti
+        } else {
+            base.tti
+        },
+        uplink_capacity: num("uplinkCapacity", "uplink_capacity").unwrap_or(base.uplink_capacity),
+        downlink_capacity: num("downlinkCapacity", "downlink_capacity")
+            .unwrap_or(base.downlink_capacity),
+        cwnd_multiplier: num("cwndMultiplier", "cwnd_multiplier").unwrap_or(base.cwnd_multiplier),
+        max_sending_window: num("maxSendingWindow", "max_sending_window")
+            .unwrap_or(base.max_sending_window),
+    }
+}
+
+pub(crate) fn sub_path(settings: Option<&Json>, key: &str) -> String {
+    settings
+        .and_then(|s| s.get(key))
+        .and_then(|s| s.get("path"))
+        .and_then(Json::as_str)
+        .unwrap_or("/")
+        .to_owned()
+}
+pub(crate) fn grpc_path(settings: Option<&Json>) -> String {
+    let service = settings
+        .and_then(|s| s.get("grpcSettings"))
+        .and_then(|s| s.get("serviceName"))
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .trim();
+    if service.is_empty() {
+        return "/Tun".to_owned();
+    }
+    if service.starts_with('/') {
+        return service.to_owned();
+    }
+    format!("/{}/Tun", grpc_escape(service.trim_matches('/')))
+}
+
+/// Go's `url.PathEscape` for one segment, the way Xray escapes a service name.
+fn grpc_escape(service: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut out = String::with_capacity(service.len());
+    for byte in service.bytes() {
+        let keep = byte.is_ascii_alphanumeric()
+            || matches!(
+                byte,
+                b'-' | b'_' | b'.' | b'~' | b'$' | b'&' | b'+' | b':' | b'=' | b'@'
+            );
+        if keep {
+            out.push(byte as char);
+        } else {
+            out.push('%');
+            out.push(HEX[usize::from(byte >> 4)] as char);
+            out.push(HEX[usize::from(byte & 0x0f)] as char);
+        }
+    }
+    out
+}
+
+pub(crate) fn tcp_http_path(settings: Option<&Json>) -> Option<String> {
+    let header = settings
+        .and_then(|s| s.get("tcpSettings"))
+        .and_then(|s| s.get("header"))?;
+    if header.get("type").and_then(Json::as_str) != Some("http") {
+        return None;
+    }
+    let request = header.get("request")?;
+    if let Some(paths) = request.get("path").and_then(Json::as_arr) {
+        let first = paths.iter().find_map(Json::as_str);
+        if let Some(path) = first {
+            return Some(path.to_owned());
+        }
+    }
+    if let Some(path) = request.get("path").and_then(Json::as_str) {
+        return Some(path.to_owned());
+    }
+    Some("/".to_owned())
+}
+
+pub(crate) fn stream_security(node: &Json) -> &str {
+    node.get("streamSettings")
+        .and_then(|s| s.get("security"))
+        .and_then(Json::as_str)
+        .unwrap_or("")
+}
+
+pub(crate) fn vless_security_supported(sec: &str) -> bool {
+    sec.is_empty() || sec == "none"
 }
 
 #[cfg(test)]
