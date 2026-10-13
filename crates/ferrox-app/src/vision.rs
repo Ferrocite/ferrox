@@ -30,7 +30,7 @@ pub(crate) struct Link<S: Read + Write + RecordAlignment> {
     hat: usize,
     out: Vec<u8>,
     oat: usize,
-    #[cfg_attr(not(test), allow(dead_code, reason = "read by the staging gate"))]
+    #[cfg(test)]
     staged: usize,
     read: Reading,
     write: Writing,
@@ -72,6 +72,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             hat: 0,
             out: Vec::with_capacity(WINDOW),
             oat: 0,
+            #[cfg(test)]
             staged: 0,
             read: Reading {
                 padding: true,
@@ -167,6 +168,15 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         self.staged
     }
 
+    #[cfg(test)]
+    fn stage(&mut self, n: usize) {
+        self.staged += n;
+    }
+
+    #[cfg(not(test))]
+    #[allow(clippy::unused_self)]
+    fn stage(&mut self, _n: usize) {}
+
     fn compact(&mut self) {
         if self.hat > 0 {
             self.have.drain(..self.hat);
@@ -199,7 +209,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 self.flush_truncated();
                 return Ok(self.oat < self.out.len());
             }
-            self.staged += n;
+            self.stage(n);
             let was = self.out.len();
             let framed = self.unpad();
             if self.tls.budget > 0 && self.out.len() > was {
@@ -228,7 +238,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 let tail = self.have.len();
                 let taken = tail - self.hat;
                 self.out.extend_from_slice(&self.have[self.hat..tail]);
-                self.staged += taken;
+                self.stage(taken);
                 self.hat = tail;
                 return true;
             }
@@ -268,7 +278,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 let take = self.read.want_content.min(self.pending());
                 self.out
                     .extend_from_slice(&self.have[self.hat..self.hat + take]);
-                self.staged += take;
+                self.stage(take);
                 self.hat += take;
                 self.read.want_content -= take;
                 continue;
@@ -287,7 +297,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         let tail = self.have.len();
         let taken = tail - self.hat;
         self.out.extend_from_slice(&self.have[self.hat..tail]);
-        self.staged += taken;
+        self.stage(taken);
         self.hat = tail;
         true
     }
@@ -297,19 +307,12 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             let tail = self.have.len();
             let taken = tail - self.hat;
             self.out.extend_from_slice(&self.have[self.hat..tail]);
-            self.staged += taken;
+            self.stage(taken);
             self.hat = tail;
         }
     }
 
-    fn frame_head(
-        uuid: &[u8; 16],
-        tls: &Tls,
-        sent_uuid: &mut bool,
-        head: &mut [u8; SHORTEST_FRAME],
-        buf: &[u8],
-        padding: usize,
-    ) -> (u8, usize) {
+    fn frame_head(tls: &Tls, buf: &[u8], padding: usize) -> (u8, [u8; 5]) {
         let complete =
             tls.present && buf.len() >= 6 && buf[..3] == TLS_APPLICATION_DATA && is_record_run(buf);
         let ends = complete || (!tls.twelve_or_above && tls.budget <= 1);
@@ -318,16 +321,13 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             (_, true) => 1,
             _ => 0,
         };
-        let mut at = 0;
-        if !*sent_uuid {
-            head[..16].copy_from_slice(uuid);
-            at = 16;
-            *sent_uuid = true;
-        }
-        head[at] = command;
-        head[at + 1..at + 3].copy_from_slice(&(buf.len() as u16).to_be_bytes());
-        head[at + 3..at + 5].copy_from_slice(&(padding as u16).to_be_bytes());
-        (command, at + 5)
+        let lengths = [
+            (buf.len() as u16).to_be_bytes(),
+            (padding as u16).to_be_bytes(),
+        ];
+        let [clen_hi, clen_lo] = lengths[0];
+        let [plen_hi, plen_lo] = lengths[1];
+        (command, [command, clen_hi, clen_lo, plen_hi, plen_lo])
     }
 }
 
@@ -375,19 +375,17 @@ impl<S: Read + Write + RecordAlignment> Write for Link<S> {
             self.tls.observe(buf);
             self.engage();
         }
-        // Head, caller's buffer, zero trailer: one `write_all_slices`, one record, no staging copy.
+        // Uuid on the first frame, then head, caller's buffer, zero trailer: one `write_all_slices`, one record, no copies.
         let padding = padding_len(buf.len(), self.tls.present);
-        let mut head = [0u8; SHORTEST_FRAME];
-        let (command, head_len) = Self::frame_head(
-            &self.uuid,
-            &self.tls,
-            &mut self.write.sent_uuid,
-            &mut head,
-            buf,
-            padding,
-        );
-        self.session
-            .write_all_slices(&[&head[..head_len], buf, &ZERO[..padding]])?;
+        let (command, head) = Self::frame_head(&self.tls, buf, padding);
+        let first = !self.write.sent_uuid;
+        self.write.sent_uuid = true;
+        let parts: &[&[u8]] = if first {
+            &[&self.uuid[..], &head, buf, &ZERO[..padding]]
+        } else {
+            &[&head, buf, &ZERO[..padding]]
+        };
+        self.session.write_all_slices(parts)?;
         if command != 0 {
             self.write.padding = false;
             self.write.raw = self.raw.is_some() && self.tls.enable_xtls && command == CMD_DIRECT;
@@ -788,6 +786,8 @@ mod tests {
         written: Vec<u8>,
         /// `(payload_ptr, payload_len)` for each `write_all_slices` call.
         calls: Vec<(*const u8, usize)>,
+        /// uuid pointer for the calls where the framer prepended it (the first frame).
+        uuids: Vec<*const u8>,
     }
 
     impl Read for Peeker {
@@ -809,8 +809,17 @@ mod tests {
 
     impl RecordAlignment for Peeker {
         fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
-            assert_eq!(parts.len(), 3, "head | caller's payload | zero trailer");
-            self.calls.push((parts[1].as_ptr(), parts[1].len()));
+            // First frame: uuid | head | caller's payload | zero trailer. Later: head | caller's payload | zero trailer.
+            let (uuid_at, payload_at) = match parts.len() {
+                3 => (None, 1),
+                4 => (Some(0), 2),
+                n => panic!("unexpected {n} parts"),
+            };
+            self.calls
+                .push((parts[payload_at].as_ptr(), parts[payload_at].len()));
+            if let Some(i) = uuid_at {
+                self.uuids.push(parts[i].as_ptr());
+            }
             for part in parts {
                 self.written.extend_from_slice(part);
             }
@@ -825,6 +834,7 @@ mod tests {
             Peeker {
                 written: Vec::new(),
                 calls: Vec::new(),
+                uuids: Vec::new(),
             },
             None,
             &UUID,
@@ -848,6 +858,33 @@ mod tests {
         assert_eq!(
             link.session.calls[1].0, second_ptr,
             "still by pointer, after a realloc"
+        );
+    }
+
+    /// The uuid reaches the session as a slice of the link's own field; a stack-header build would have copied it there.
+    #[test]
+    fn the_writer_hands_the_uuid_by_pointer_on_the_first_frame() {
+        let mut link = Link::new(
+            Peeker {
+                written: Vec::new(),
+                calls: Vec::new(),
+                uuids: Vec::new(),
+            },
+            None,
+            &UUID,
+        );
+        let want_uuid = std::ptr::from_ref(&link.uuid).cast::<u8>();
+        link.write_all(b"hello").expect("writes");
+        assert_eq!(link.session.uuids.len(), 1, "the uuid goes out once");
+        assert_eq!(
+            link.session.uuids[0], want_uuid,
+            "the uuid reached the session by pointer, not copied into a stack head"
+        );
+        link.write_all(b"again").expect("writes");
+        assert_eq!(
+            link.session.uuids.len(),
+            1,
+            "no second prepended uuid after the first frame"
         );
     }
 
