@@ -9311,7 +9311,7 @@ mod tests {
             .expect("arms the server idle grain");
         let raw = session.try_clone().expect("shares the fd");
         #[cfg(unix)]
-        let probe = session.try_clone().expect("probes the shared file description");
+        let probe = session.try_clone().expect("probes the fd");
         drop(lane);
 
         let id = [0x5Au8; 16];
