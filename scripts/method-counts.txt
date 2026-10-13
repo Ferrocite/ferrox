@@ -172,6 +172,7 @@ reality-tls client-hello-passes-per-handshake 2 ferrox-core-reality::tests::clie
 reality-tls sealed-session-id-bytes 32 ferrox-core-reality::tests::client_seal_matches_the_test_oracle_byte_for_byte
 reality-tls unauthenticated-servers-accepted 0 ferrox-core-reality::tests::a_client_with_a_wrong_key_is_refused_before_any_proxy_byte
 reality-tls server-shared-session-poll-millis 1 ferrox-app-proxy::tests::a_server_relay_bounds_the_shared_session_to_one_tick
+reality-tls late-hello-grains-survived 12 ferrox-app-proxy::tests::a_plain_tls_lane_retries_a_hello_that_arrives_past_the_grain
 
 kcp ops-retired-instructions UNBLESSED scripts/count-ops.sh
 kcp maximum-transmission-unit-bytes 1350 ferrox-core-kcp::tests::the_upstream_defaults_are_these

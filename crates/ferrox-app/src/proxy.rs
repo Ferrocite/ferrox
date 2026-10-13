@@ -1657,16 +1657,11 @@ fn accept_tls_session(
         return None;
     };
     // Silence is scheduling, not death: an idle handshake retries to the deadline; anything else refuses.
-    let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
-    loop {
-        match session.handshake() {
-            Ok(()) => return Some(session),
-            Err(ferrox_core::tls::TlsError::Timeout) if Instant::now() < deadline => {}
-            Err(_) => {
-                echo_trace("tls-server handshake refused");
-                return None;
-            }
-        }
+    if shake_tls(&mut session) {
+        Some(session)
+    } else {
+        echo_trace("tls-server handshake refused");
+        None
     }
 }
 
@@ -1686,7 +1681,7 @@ fn serve_vless_tls(
             let Ok(mut tls) = ferrox_core::tls::accept(server, stream) else {
                 return;
             };
-            if tls.handshake().is_err() {
+            if !shake_tls(&mut tls) {
                 return;
             }
             relay_vless(tls, Some(raw), id, freedom);
@@ -1747,8 +1742,8 @@ fn serve_carried_tls<S: Read + Write + Send + 'static>(
     relay_vless(tls, None, id, freedom);
 }
 
-/// An idle REALITY handshake is retried until the deadline, anything else refuses at once.
-fn shake_reality<S: ferrox_core::tls::TlsProvider>(session: &mut S) -> bool {
+/// An idle handshake is retried until the deadline; anything but silence refuses at once.
+fn shake_tls<S: ferrox_core::tls::TlsProvider>(session: &mut S) -> bool {
     let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
     loop {
         match session.handshake() {
@@ -1779,7 +1774,7 @@ fn serve_vless_reality(
         }
         Carrier::Ws { path, .. } => {
             serve_carrier_reality(stream, server, |mut session| {
-                if !shake_reality(&mut session) {
+                if !shake_tls(&mut session) {
                     return;
                 }
                 let (reader, writer) = session_halves(session);
@@ -1788,7 +1783,7 @@ fn serve_vless_reality(
         }
         Carrier::Xhttp { settings, .. } => {
             serve_carrier_reality(stream, server, |mut session| {
-                if !shake_reality(&mut session) {
+                if !shake_tls(&mut session) {
                     return;
                 }
                 let (reader, writer) = session_halves(session);
@@ -1798,7 +1793,7 @@ fn serve_vless_reality(
         Carrier::HttpUpgrade { path } => {
             let Ok(raw) = stream.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
-                if !shake_reality(&mut session) {
+                if !shake_tls(&mut session) {
                     return;
                 }
                 let (reader, writer) = session_halves(session);
@@ -1808,7 +1803,7 @@ fn serve_vless_reality(
         Carrier::HttpHeader { path } => {
             let Ok(raw) = stream.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
-                if !shake_reality(&mut session) {
+                if !shake_tls(&mut session) {
                     return;
                 }
                 let (reader, writer) = session_halves(session);
@@ -1817,7 +1812,7 @@ fn serve_vless_reality(
         }
         Carrier::Grpc { path } => {
             serve_carrier_reality(stream, server, |mut session| {
-                if !shake_reality(&mut session) {
+                if !shake_tls(&mut session) {
                     return;
                 }
                 let (reader, writer) = session_halves(session);
@@ -1989,7 +1984,7 @@ fn finish_reality<
     id: &[u8; 16],
     freedom: bool,
 ) {
-    if !shake_reality(&mut session) {
+    if !shake_tls(&mut session) {
         return;
     }
     relay_vless(session, raw, id, freedom);
@@ -9336,6 +9331,29 @@ mod tests {
         drop(edge);
         relay.join().expect("the relay ends");
         drop(dialed.join().expect("the site holds its connection"));
+    }
+
+    /// Every other TLS rung re-shakes a slow hello to its deadline; the raw arm shook once and refused at the grain.
+    #[test]
+    fn a_plain_tls_lane_retries_a_hello_that_arrives_past_the_grain() {
+        use ferrox_core::tls::TlsProvider;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let server: SocketAddr = listener.local_addr().expect("addr");
+        let lane = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_tls(stream, &[0x9Du8; 16], true, &Carrier::Raw, &server_config);
+        });
+
+        // The hello arrives twelve grains later than the lane's first read; only its deadline may refuse it.
+        let edge = TcpStream::connect(server).expect("connects");
+        thread::sleep(Duration::from_millis(240));
+        let mut client = ferrox_core::tls::connect(&client_config, edge).expect("opens");
+        let shook = client.handshake();
+        drop(client);
+        lane.join().expect("the lane ends");
+        shook.expect("a hello past the grain completes the handshake, not a refusal");
     }
 
     #[test]

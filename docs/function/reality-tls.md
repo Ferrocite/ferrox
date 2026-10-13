@@ -63,6 +63,7 @@ graph TD
 | sealed-session-id-bytes | 32 | ferrox-core-reality::tests::client_seal_matches_the_test_oracle_byte_for_byte |
 | unauthenticated-servers-accepted | 0 | ferrox-core-reality::tests::a_client_with_a_wrong_key_is_refused_before_any_proxy_byte |
 | server-shared-session-poll-millis | 1 | ferrox-app-proxy::tests::a_server_relay_bounds_the_shared_session_to_one_tick |
+| late-hello-grains-survived | 12 | ferrox-app-proxy::tests::a_plain_tls_lane_retries_a_hello_that_arrives_past_the_grain |
 <!-- counts:end -->
 
 ## Ops
@@ -161,6 +162,7 @@ handshake duration is quoted from a machine without a named runner.
   flow died as `socks connect rejected`, five to eleven of thirty-two depending
   on the runner's mood. The handshake is now retried to the same thirty-second
   deadline the plain-`TLS` path already used, and the burst row is the witness.
+- **A plain-`TLS` raw arm that still shook once.** The retry-to-deadline discipline reached the carrier arms through `accept_tls_session` and the `REALITY` arms through the burst fix, but the `Carrier::Raw` arm of `serve_vless_tls` — matrix row 2 — kept a single `handshake()` on the twenty-millisecond-grained socket: a `ClientHello` that arrived one grain late was refused, not retried, and the lane died before its own deadline. The retry loop was that discipline twice over — `shake_reality` was it with a `REALITY`-only name, and `accept_tls_session` carried an inline copy — so both folds now call one `shake_tls`, and the raw arm calls it too. `a_plain_tls_lane_retries_a_hello_that_arrives_past_the_grain` holds the hello twelve grains and refuses the lane at one: restoring the one-shot shake turns it red on the spot.
 - **A service name compared unescaped.** The server built `/interop grpc/Tun`
   while every reference escapes the configured name Go's way, so the client
   asked for `/interop%20grpc/Tun` and the `grpc_reality` row died in warmup.
@@ -204,7 +206,9 @@ second signature (verified when present, never sent), and the cover origin's
 own chain, which an authenticated session never presents here or upstream. A
 plain-`TLS` server that switches to direct has the same over-read shape and no
 limiter in front of it yet; no row carries inner `TLS` over plain `TLS`, so it
-is a named gap and not a carried cost.
+is a named gap and not a carried cost. The inner-`TLS` lane carried over `KCP`
+(`serve_carried_tls`) still shakes once: its transport is paced by the `KCP`
+pump, not by a socket grain, and no row handshakes a late hello through it.
 
 ## Pins
 
