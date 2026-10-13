@@ -1657,16 +1657,11 @@ fn accept_tls_session(
         return None;
     };
     // Silence is scheduling, not death: an idle handshake retries to the deadline; anything else refuses.
-    let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
-    loop {
-        match session.handshake() {
-            Ok(()) => return Some(session),
-            Err(ferrox_core::tls::TlsError::Timeout) if Instant::now() < deadline => {}
-            Err(_) => {
-                echo_trace("tls-server handshake refused");
-                return None;
-            }
-        }
+    if shake_tls(&mut session) {
+        Some(session)
+    } else {
+        echo_trace("tls-server handshake refused");
+        None
     }
 }
 
@@ -1686,7 +1681,7 @@ fn serve_vless_tls(
             let Ok(mut tls) = ferrox_core::tls::accept(server, stream) else {
                 return;
             };
-            if tls.handshake().is_err() {
+            if !shake_tls(&mut tls) {
                 return;
             }
             relay_vless(tls, Some(raw), id, freedom);
@@ -1747,8 +1742,8 @@ fn serve_carried_tls<S: Read + Write + Send + 'static>(
     relay_vless(tls, None, id, freedom);
 }
 
-/// An idle REALITY handshake is retried until the deadline, anything else refuses at once.
-fn shake_reality<S: ferrox_core::tls::TlsProvider>(session: &mut S) -> bool {
+/// An idle handshake is retried until the deadline; anything but silence refuses at once.
+fn shake_tls<S: ferrox_core::tls::TlsProvider>(session: &mut S) -> bool {
     let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
     loop {
         match session.handshake() {
@@ -1779,7 +1774,7 @@ fn serve_vless_reality(
         }
         Carrier::Ws { path, .. } => {
             serve_carrier_reality(stream, server, |mut session| {
-                if !shake_reality(&mut session) {
+                if !shake_tls(&mut session) {
                     return;
                 }
                 let (reader, writer) = session_halves(session);
@@ -1788,7 +1783,7 @@ fn serve_vless_reality(
         }
         Carrier::Xhttp { settings, .. } => {
             serve_carrier_reality(stream, server, |mut session| {
-                if !shake_reality(&mut session) {
+                if !shake_tls(&mut session) {
                     return;
                 }
                 let (reader, writer) = session_halves(session);
@@ -1798,7 +1793,7 @@ fn serve_vless_reality(
         Carrier::HttpUpgrade { path } => {
             let Ok(raw) = stream.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
-                if !shake_reality(&mut session) {
+                if !shake_tls(&mut session) {
                     return;
                 }
                 let (reader, writer) = session_halves(session);
@@ -1808,7 +1803,7 @@ fn serve_vless_reality(
         Carrier::HttpHeader { path } => {
             let Ok(raw) = stream.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
-                if !shake_reality(&mut session) {
+                if !shake_tls(&mut session) {
                     return;
                 }
                 let (reader, writer) = session_halves(session);
@@ -1817,7 +1812,7 @@ fn serve_vless_reality(
         }
         Carrier::Grpc { path } => {
             serve_carrier_reality(stream, server, |mut session| {
-                if !shake_reality(&mut session) {
+                if !shake_tls(&mut session) {
                     return;
                 }
                 let (reader, writer) = session_halves(session);
@@ -1934,32 +1929,51 @@ fn relay_fallback<S: Stream + Send + 'static>(proxied: ferrox_core::tls::Proxied
         upload,
         download,
     } = proxied;
+    // A silent cover origin must not hold the read across the mutex its upload writes on.
+    if target.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
     let one = Arc::new(Half::new(client));
     let two = Arc::new(Half::new(target));
     let mut up = upload.map(Gauge::start);
     let mut down = download.map(Gauge::start);
-    let (send, recv) = (Arc::clone(&one), Arc::clone(&two));
-    let uplink = thread::spawn(move || copy_paced(&send, &two, up.as_mut()));
-    copy_paced(&one, &recv, down.as_mut());
-    let _ = uplink.join();
+    // A finished leg ends the splice; the sibling notices on its next poll grain.
+    let ended = Arc::new(AtomicBool::new(false));
+    let (down_recv, down_send, down_ended) =
+        (Arc::clone(&two), Arc::clone(&one), Arc::clone(&ended));
+    let downlink =
+        thread::spawn(move || copy_paced(&down_recv, &down_send, down.as_mut(), &down_ended));
+    copy_paced(&one, &two, up.as_mut(), &ended);
+    let _ = downlink.join();
 }
 
-fn copy_paced<R: Read, W: Write>(from: &Half<R>, to: &Half<W>, mut gauge: Option<&mut Gauge>) {
+fn copy_paced<R: Read, W: Write>(
+    from: &Half<R>,
+    to: &Half<W>,
+    mut gauge: Option<&mut Gauge>,
+    ended: &AtomicBool,
+) {
     let mut buffer = RelayBuf::new();
     loop {
         let n = match from.read_once(buffer.as_mut()) {
-            Ok(0) => return,
+            Ok(0) => break,
             Ok(n) => n,
-            Err(error) if is_timeout(&error) => continue,
-            Err(_) => return,
+            Err(error) if is_timeout(&error) => {
+                if ended.load(Ordering::Relaxed) {
+                    break;
+                }
+                continue;
+            }
+            Err(_) => break,
         };
         if let Some(gauge) = gauge.as_mut() {
             gauge.admit(n);
         }
         if to.write_once(buffer.filled(n)).is_err() {
-            return;
+            break;
         }
     }
+    ended.store(true, Ordering::Relaxed);
 }
 
 fn finish_reality<
@@ -1970,7 +1984,7 @@ fn finish_reality<
     id: &[u8; 16],
     freedom: bool,
 ) {
-    if !shake_reality(&mut session) {
+    if !shake_tls(&mut session) {
         return;
     }
     relay_vless(session, raw, id, freedom);
@@ -2021,6 +2035,13 @@ fn relay_vless<S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'sta
     if uplink.set_read_timeout(Some(RELAY_POLL)).is_err() {
         eprintln!("tls: uplink timeout failed");
         return;
+    }
+    // Two pumps share the session's half-lock: read the raw arm's fd at one tick, or a silent read stalls the peer's write for a grain.
+    if let Some(raw) = raw.as_ref() {
+        if raw.set_read_timeout(Some(SESSION_POLL)).is_err() {
+            eprintln!("tls: session timeout failed");
+            return;
+        }
     }
     if session.write_all(&[0, 0]).is_err() {
         return;
@@ -9175,6 +9196,164 @@ mod tests {
         assert!(fired.load(Ordering::SeqCst), "EOF fires the close");
         let gated = to.inner.lock().expect("reads back");
         assert_eq!(gated.sent, b"ping");
+    }
+
+    #[test]
+    fn the_cover_origin_splice_carries_the_reply_back_to_the_peer() {
+        let peer_side = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let origin_side = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let origin_port = origin_side.local_addr().expect("addr").port();
+        let mut peer = TcpStream::connect(peer_side.local_addr().expect("addr")).expect("connects");
+        let client = peer_side.accept().expect("accepts").0;
+        client
+            .set_read_timeout(Some(RELAY_POLL))
+            .expect("polls like the server path");
+        let target = TcpStream::connect(("127.0.0.1", origin_port)).expect("dials");
+        let cover = thread::spawn(move || {
+            let (mut origin, _) = origin_side.accept().expect("accepts");
+            let mut head = [0u8; 4];
+            origin.read_exact(&mut head).expect("reads");
+            origin.write_all(b"pong").expect("replies");
+            origin.shutdown(Shutdown::Write).expect("half-closes");
+            let mut rest = Vec::new();
+            let _ = origin.read_to_end(&mut rest);
+            head
+        });
+        let fallback = thread::spawn(move || {
+            relay_fallback(ferrox_core::tls::Proxied {
+                client,
+                target,
+                upload: None,
+                download: None,
+            });
+        });
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("times out");
+        peer.write_all(b"ping").expect("sends");
+        let mut reply = [0u8; 4];
+        let arrived = match peer.read_exact(&mut reply) {
+            Ok(()) => Some(reply),
+            Err(why) if is_timeout(&why) => None,
+            Err(why) => panic!("reads: {why}"),
+        };
+        drop(peer);
+        let head = cover.join().expect("the cover origin ends");
+        fallback.join().expect("the splice ends");
+        assert_eq!(
+            arrived,
+            Some(*b"pong"),
+            "the origin's reply reaches the peer"
+        );
+        assert_eq!(
+            &head, b"ping",
+            "the peer's hello reaches the origin in order"
+        );
+    }
+
+    #[test]
+    fn the_cover_origin_splice_ends_when_the_peer_finishes() {
+        let peer_side = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let origin_side = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let origin_port = origin_side.local_addr().expect("addr").port();
+        let mut peer = TcpStream::connect(peer_side.local_addr().expect("addr")).expect("connects");
+        let client = peer_side.accept().expect("accepts").0;
+        client
+            .set_read_timeout(Some(RELAY_POLL))
+            .expect("polls like the server path");
+        let target = TcpStream::connect(("127.0.0.1", origin_port)).expect("dials");
+        let (gone_tx, gone_rx) = std::sync::mpsc::channel();
+        let cover = thread::spawn(move || {
+            let (mut origin, _) = origin_side.accept().expect("accepts");
+            let mut head = [0u8; 4];
+            origin.read_exact(&mut head).expect("reads");
+            let _ = gone_rx.recv_timeout(Duration::from_secs(5));
+            head
+        });
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let fallback = thread::spawn(move || {
+            relay_fallback(ferrox_core::tls::Proxied {
+                client,
+                target,
+                upload: None,
+                download: None,
+            });
+            let _ = finished_tx.send(());
+        });
+        peer.write_all(b"ping").expect("sends");
+        drop(peer);
+        let ended = finished_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+        let _ = gone_tx.send(());
+        let head = cover.join().expect("the cover origin ends");
+        fallback.join().expect("the splice ends");
+        assert!(
+            ended,
+            "a finished peer ends the splice against a silent origin"
+        );
+        assert_eq!(&head, b"ping", "the hello reaches the origin");
+    }
+
+    /// Two pumps share one session lock: a read that holds it for a whole idle grain stalls the opposite pump's write for that grain.
+    #[test]
+    fn a_server_relay_bounds_the_shared_session_to_one_tick() {
+        let site = TcpListener::bind("127.0.0.1:0").expect("binds the site");
+        let site_addr: SocketAddr = site.local_addr().expect("addr");
+        let dialed = thread::spawn(move || {
+            let (peer, _) = site.accept().expect("accepts");
+            peer
+        });
+
+        let lane = TcpListener::bind("127.0.0.1:0").expect("binds the lane");
+        let lane_addr: SocketAddr = lane.local_addr().expect("addr");
+        let mut edge = TcpStream::connect(lane_addr).expect("connects");
+        let (session, _) = lane.accept().expect("accepts");
+        session
+            .set_read_timeout(Some(RELAY_POLL))
+            .expect("arms the server idle grain");
+        let raw = session.try_clone().expect("shares the fd");
+        let probe = session.try_clone().expect("probes the fd");
+        drop(lane);
+
+        let id = [0x5Au8; 16];
+        edge.write_all(&vless_header(&id, 1, &site_addr))
+            .expect("greets");
+        let relay = thread::spawn(move || relay_vless(session, Some(raw), &id, true));
+
+        edge.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("arms the reply read");
+        let mut answer = [0u8; 2];
+        edge.read_exact(&mut answer).expect("answers");
+        assert_eq!(answer, [0, 0], "the relay grants the tunnel");
+        assert_eq!(
+            probe.read_timeout().ok().flatten(),
+            Some(SESSION_POLL),
+            "the shared fd must poll at one tick, or a silent session read stalls the peer pump's write"
+        );
+        drop(edge);
+        relay.join().expect("the relay ends");
+        drop(dialed.join().expect("the site holds its connection"));
+    }
+
+    /// Every other TLS rung re-shakes a slow hello to its deadline; the raw arm shook once and refused at the grain.
+    #[test]
+    fn a_plain_tls_lane_retries_a_hello_that_arrives_past_the_grain() {
+        use ferrox_core::tls::TlsProvider;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let server: SocketAddr = listener.local_addr().expect("addr");
+        let lane = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_tls(stream, &[0x9Du8; 16], true, &Carrier::Raw, &server_config);
+        });
+
+        // The hello arrives twelve grains later than the lane's first read; only its deadline may refuse it.
+        let edge = TcpStream::connect(server).expect("connects");
+        thread::sleep(Duration::from_millis(240));
+        let mut client = ferrox_core::tls::connect(&client_config, edge).expect("opens");
+        let shook = client.handshake();
+        drop(client);
+        lane.join().expect("the lane ends");
+        shook.expect("a hello past the grain completes the handshake, not a refusal");
     }
 
     #[test]

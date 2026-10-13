@@ -52,6 +52,7 @@ graph TD
 | short-id-bytes | 8 | ferrox-core-reality::tests::a_short_id_is_zero_padded_to_eight_bytes |
 | cover-origin-dials-per-authenticated-hello | 0 | ferrox-core-reality::tests::an_authenticated_hello_costs_the_cover_origin_nothing |
 | cover-origin-bytes-per-spliced-hello | 1 | ferrox-core-reality::tests::an_unauthenticated_hello_is_spliced_into_the_cover_origin_byte_for_byte |
+| peer-reply-bytes-per-spliced-request | 1 | ferrox-app-proxy::tests::the_cover_origin_splice_carries_the_reply_back_to_the_peer |
 | proxy-protocol-header-bytes | 28 | ferrox-core-reality::tests::the_binary_proxy_header_is_a_fixed_rectangular_twenty_eight_bytes |
 | hello-buffers-per-single-record-read | 1 | ferrox-core-reality::tests::reading_a_single_record_hello_allocates_one_buffer |
 | tls13-session-tickets-per-authenticated-handshake | 0 | ferrox-core-reality::tests::an_authenticated_session_sends_no_tickets_after_the_handshake |
@@ -61,6 +62,8 @@ graph TD
 | client-hello-passes-per-handshake | 2 | ferrox-core-reality::tests::client_hellos_differ_only_in_the_session_id |
 | sealed-session-id-bytes | 32 | ferrox-core-reality::tests::client_seal_matches_the_test_oracle_byte_for_byte |
 | unauthenticated-servers-accepted | 0 | ferrox-core-reality::tests::a_client_with_a_wrong_key_is_refused_before_any_proxy_byte |
+| server-shared-session-poll-millis | 1 | ferrox-app-proxy::tests::a_server_relay_bounds_the_shared_session_to_one_tick |
+| late-hello-grains-survived | 12 | ferrox-app-proxy::tests::a_plain_tls_lane_retries_a_hello_that_arrives_past_the_grain |
 <!-- counts:end -->
 
 ## Ops
@@ -127,6 +130,9 @@ handshake duration is quoted from a machine without a named runner.
   `a_relay_write_is_sent_without_waiting_for_close` and
   `a_finished_relay_closes_the_other_side` drive a flush-gated writer with no
   sockets at all, and the `reality_vision` conformance row is the witness.
+- **A splice that outlived its own exchange.** Once both directions were live, a cover origin that stays open and silent pinned the far pump forever: `copy_paced` stopped only on bytes or an error, and its poll timeout only continued. A finished leg now raises a flag the sibling notices on its next twenty-millisecond grain, the same end-the-other-side discipline `copy_stream` already keeps; `the_cover_origin_splice_ends_when_the_peer_finishes` holds a keep-alive-silent origin against a finished peer and is red without the flag.
+- **A splice that pumped the upload twice.** `relay_fallback` crossed its copy directions, so both `copy_paced` pumps read the client and wrote the cover origin: the origin's reply never reached the peer, and two racing readers of one client half could deliver the hello to the origin out of order. The directions are crossed now, and the spliced target carries the same twenty-millisecond poll every other relay point sets, because an untimed read on a silent origin holds the mutex its upload writes on. `the_cover_origin_splice_carries_the_reply_back_to_the_peer` drives both legs over loopback and fails red on either direction.
+- **A server relay that read its shared session at the idle grain.** Two pumps hold one session through one half-lock: one reads it to forward the request, the other writes the answer into it. A read that parks for a whole twenty-millisecond grain holds that lock for the grain, so the answer waits out every silence. Every other session-shared rung already bounds this: the client sets a one-millisecond poll at dial time, and carried sessions hand the pumps halves that sleep unlocked between polls — only the server raw arm never lowered its grain. `relay_vless` now bounds the shared fd to one tick before it parks the pumps, and `a_server_relay_bounds_the_shared_session_to_one_tick` reads the fd's timeout back after the tunnel grant is on the wire: red at twenty, green at one, no byte on the wire moved.
 - **A split hello reassembled twice.** The reader grows one buffer and stops at
   the declared handshake length, then hands rustls the same bytes through a
   replay prefix, so the record framing is read once rather than re-parsed by a
@@ -156,6 +162,7 @@ handshake duration is quoted from a machine without a named runner.
   flow died as `socks connect rejected`, five to eleven of thirty-two depending
   on the runner's mood. The handshake is now retried to the same thirty-second
   deadline the plain-`TLS` path already used, and the burst row is the witness.
+- **A plain-`TLS` raw arm that still shook once.** The retry-to-deadline discipline reached the carrier arms through `accept_tls_session` and the `REALITY` arms through the burst fix, but the `Carrier::Raw` arm of `serve_vless_tls` — matrix row 2 — kept a single `handshake()` on the twenty-millisecond-grained socket: a `ClientHello` that arrived one grain late was refused, not retried, and the lane died before its own deadline. The retry loop was that discipline twice over — `shake_reality` was it with a `REALITY`-only name, and `accept_tls_session` carried an inline copy — so both folds now call one `shake_tls`, and the raw arm calls it too. `a_plain_tls_lane_retries_a_hello_that_arrives_past_the_grain` holds the hello twelve grains and refuses the lane at one: restoring the one-shot shake turns it red on the spot.
 - **A service name compared unescaped.** The server built `/interop grpc/Tun`
   while every reference escapes the configured name Go's way, so the client
   asked for `/interop%20grpc/Tun` and the `grpc_reality` row died in warmup.
@@ -199,7 +206,9 @@ second signature (verified when present, never sent), and the cover origin's
 own chain, which an authenticated session never presents here or upstream. A
 plain-`TLS` server that switches to direct has the same over-read shape and no
 limiter in front of it yet; no row carries inner `TLS` over plain `TLS`, so it
-is a named gap and not a carried cost.
+is a named gap and not a carried cost. The inner-`TLS` lane carried over `KCP`
+(`serve_carried_tls`) still shakes once: its transport is paced by the `KCP`
+pump, not by a socket grain, and no row handshakes a late hello through it.
 
 ## Pins
 
