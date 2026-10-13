@@ -4112,6 +4112,10 @@ fn dial_vless_reality(
     {
         return note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
     }
+    // The direct switch moves reads onto the raw clone, a handle duplicated before that timeout was armed; arm it to the same tick now that the handshake is done, or an unbounded read holds the shared relay lock forever.
+    if raw.set_read_timeout(Some(SESSION_POLL)).is_err() {
+        return note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
+    }
     let header = if vless.flow == crate::vision::FLOW {
         vless_vision_header(&vless.id, 1, target)
     } else {
