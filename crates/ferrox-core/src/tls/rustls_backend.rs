@@ -121,6 +121,12 @@ impl<S: Stream> RustlsProvider<S> {
         Ok(Self { conn, io })
     }
 
+    /// A connection whose hello was fixed before the handshake: REALITY seals
+    /// its tag into the session id, so the stock random hello cannot go out.
+    pub fn from_connection(conn: rustls::ClientConnection, io: S) -> Self {
+        Self { conn, io }
+    }
+
     fn drive(&mut self) -> Result<(), TlsError> {
         while self.conn.is_handshaking() {
             if let Err(e) = self.conn.complete_io(&mut self.io) {

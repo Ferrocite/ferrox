@@ -182,7 +182,10 @@ mod rustls_backend;
 pub use rustls_backend::{RustlsProvider, RustlsServerProvider};
 
 pub mod reality;
-pub use reality::{Edges, Proxied, RateLimit, RealityAccept, RealityServer, RealityServerConfig};
+pub use reality::{
+    Edges, Proxied, RateLimit, RealityAccept, RealityClientConfig, RealityClientSession,
+    RealityServer, RealityServerConfig,
+};
 
 pub fn connect<S: Stream + RecordAlignment>(
     cfg: &TlsConfig,

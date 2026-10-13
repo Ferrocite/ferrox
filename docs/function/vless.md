@@ -40,7 +40,8 @@ graph TD
 | request-header-bytes-zero-filled | 0 | ferrox-bench-gate-2 |
 | address-families-encoded | 4 | ferrox-core-vless::tests::header_address_families_encode_stably |
 | vision-addons-bytes | 2 | ferrox-core-vless::tests::non_vision_header_carries_empty_addons |
-| reality-outbound-rows-dialled | 0 | ferrox-app-proxy::tests::vless_outbound_with_reality_security_is_skipped |
+| reality-outbound-rows-dialled | 1 | ferrox-app-proxy::tests::vless_outbound_with_reality_security_dials_raw_only |
+| vision-header-targets-matching-core | 2 | ferrox-app-proxy::tests::vision_header_matches_the_core_encoder |
 <!-- counts:end -->
 
 The relay buffer's zero-fills are prose, not a row. A row needs a checker that
@@ -117,12 +118,14 @@ CI-only. No artefact from this branch has been read.
   `a_promoted_buffer_returns_the_bytes_that_were_read`) fill the buffer before
   reading through it.
 
-## Rows that are not dialled
+## Rows that are dialled
 
-`security=reality` outbounds are **skipped, not attempted**
-(`vless_outbound_with_reality_security_is_skipped`): the client role is not
-wired, so a REALITY row in the matrix is a server row. That is a capability
-statement, not a performance one, and it is why the last row above is `0`.
+`security=reality` outbounds dial raw TCP
+(`vless_outbound_with_reality_security_dials_raw_only`): the dial seals the
+session id into a stock hello, verifies the bound leaf, and relays with or
+without Vision. A REALITY row over any carrier is still skipped rather than
+dialled, so those shapes stay server rows. The dial writes the same header
+bytes the core encoder writes (`vision_header_matches_the_core_encoder`).
 
 ## Pins
 

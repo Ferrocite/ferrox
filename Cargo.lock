@@ -457,6 +457,7 @@ dependencies = [
  "chacha20",
  "chacha20poly1305",
  "ctr",
+ "getrandom 0.2.17",
  "hkdf",
  "md5",
  "ml-kem",

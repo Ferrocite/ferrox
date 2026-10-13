@@ -5,11 +5,12 @@ provider *is* `Read + Write`, so nothing above this rung can depend on the stack
 underneath — no feature to select, no build without TLS, and no second provider
 to keep in step. `active_backends()` names it, and it names one.
 
-REALITY is the server side only in this tree. The `security` gate in the proxy
-accepts an outbound when `security` is empty or `none` and **skips** a REALITY
-outbound rather than attempting it, so a REALITY row in the matrix is a server
-row. That is the first thing to know about this method; the rest is the
-handshake's cost.
+REALITY dials raw TCP and serves every carried carrier. The client seals the
+session id into a stock rustls hello in two passes over one scripted provider
+— the probe for the AAD, the flight with the seal — and refuses any leaf whose
+HMAC does not verify, so a cover origin never carries a proxy byte. A REALITY
+outbound over any carrier is still skipped rather than dialled. That is the
+first thing to know about this method; the rest is the handshake's cost.
 
 What the handshake does: read the ClientHello, find the X25519 key share, do one
 group operation, derive the shared secret, HKDF it into an authentication key,
@@ -22,7 +23,8 @@ sessions never present the same bytes.
 
 ```mermaid
 graph TD
-    C["client: ClientHello with a key share"] --> S["server: read the whole hello<br/>across however many records"]
+    D["dial: stock hello with a zeroed tag<br/>for the AAD, then with the seal"] --> C["client: ClientHello with a key share"]
+    C --> S["server: read the whole hello<br/>across however many records"]
     S --> X["find the X25519 share<br/>prefer a plain one over a hybrid"]
     X --> G["one X25519 group operation"]
     G --> K["HKDF the shared secret<br/>into the authentication key"]
@@ -34,6 +36,8 @@ graph TD
     H --> R["splice: bytes in, bytes out<br/>paced by the rate limit its side was given"]
     P --> V["with Vision: the padding<br/>frames stop and the socket is raw"]
     V --> L["relay: bytes in, bytes out"]
+    D --> Q["client: refuse any leaf<br/>whose HMAC does not verify"]
+    Q --> V
 ```
 
 ## Measured
@@ -43,7 +47,7 @@ graph TD
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | tls-providers | 1 | ferrox-core::active_backends |
-| client-outbound-rows-dialled | 0 | ferrox-app-proxy::tests::vless_outbound_with_reality_security_is_skipped |
+| client-outbound-rows-dialled | 1 | ferrox-app-proxy::tests::vless_outbound_with_reality_security_dials_raw_only |
 | x25519-shares-recognised | 3 | ferrox-core-reality::tests::the_x25519_share_is_found_in_every_group_that_carries_one |
 | short-id-bytes | 8 | ferrox-core-reality::tests::a_short_id_is_zero_padded_to_eight_bytes |
 | cover-origin-dials-per-authenticated-hello | 0 | ferrox-core-reality::tests::an_authenticated_hello_costs_the_cover_origin_nothing |
@@ -52,6 +56,9 @@ graph TD
 | hello-buffers-per-single-record-read | 1 | ferrox-core-reality::tests::reading_a_single_record_hello_allocates_one_buffer |
 | tls13-session-tickets-per-authenticated-handshake | 0 | ferrox-core-reality::tests::an_authenticated_session_sends_no_tickets_after_the_handshake |
 | certificateverify-signature-scheme | ED25519 | ferrox-core-reality::tests::the_reality_certificate_verify_answers_ed25519_the_peer_never_offered |
+| client-hello-passes-per-handshake | 2 | ferrox-core-reality::tests::client_hellos_differ_only_in_the_session_id |
+| sealed-session-id-bytes | 32 | ferrox-core-reality::tests::client_seal_matches_the_test_oracle_byte_for_byte |
+| unauthenticated-servers-accepted | 0 | ferrox-core-reality::tests::a_client_with_a_wrong_key_is_refused_before_any_proxy_byte |
 <!-- counts:end -->
 
 ## Ops
@@ -155,8 +162,9 @@ handshake duration is quoted from a machine without a named runner.
 
 What is **not** removed, and stays named: there is no uTLS fingerprint shaping
 in this tree at all, so the `unsafe-*` fingerprint extension parses, requires
-opt-in, and would spoof nothing even with consent. The REALITY client role is
-unwired, so a REALITY outbound is still skipped rather than dialled. The
+opt-in, and would spoof nothing even with consent, and a REALITY hello carries
+the stock rustls shape under every fingerprint. A REALITY outbound over any
+carrier is still skipped rather than dialled. The
 `dest`-mimicry the references do (their `ServerHello` template and
 post-handshake record shaping, which no functional row needs), the `ML-DSA-65`
 second signature (verified when present, never sent), and the cover origin's

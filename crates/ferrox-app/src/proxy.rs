@@ -494,6 +494,8 @@ struct VlessOut {
     quic_roots: Option<Vec<Vec<u8>>>,
     hysteria_roots: Option<Vec<Vec<u8>>>,
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
+    flow: String,
+    reality: Option<Arc<ferrox_core::tls::RealityClientConfig>>,
 }
 
 #[derive(Debug, Clone)]
@@ -2308,6 +2310,20 @@ pub(crate) fn vless_header(id: &[u8; 16], cmd: u8, target: &SocketAddr) -> Vec<u
     header
 }
 
+/// The VLESS header with the Vision flow in its addons, the bytes the core encoder writes.
+pub(crate) fn vless_vision_header(id: &[u8; 16], cmd: u8, target: &SocketAddr) -> Vec<u8> {
+    const ADDONS: &[u8] = b"\x0A\x10xtls-rprx-vision";
+    let mut header = Vec::with_capacity(30 + ADDONS.len());
+    header.push(0);
+    header.extend_from_slice(id);
+    header.push(ADDONS.len() as u8);
+    header.extend_from_slice(ADDONS);
+    header.push(cmd);
+    header.extend_from_slice(&target.port().to_be_bytes());
+    push_addr(&mut header, target, 3);
+    header
+}
+
 pub(crate) fn vless_mux_header(id: &[u8; 16]) -> Vec<u8> {
     let mut header = Vec::with_capacity(19);
     header.push(0);
@@ -2354,6 +2370,10 @@ fn dial_vless(
     let header = vless_header(&vless.id, 1, target);
     if vless.tls.is_some() {
         dial_vless_tls(client, server, vless, target);
+        return;
+    }
+    if vless.reality.is_some() {
+        dial_vless_reality(client, server, vless, target);
         return;
     }
     let params = stream_params(&vless.carrier);
@@ -3123,6 +3143,9 @@ fn dial_udp_uplink(
     source: Arc<Mutex<Option<SocketAddr>>>,
 ) -> Option<UdpUplink> {
     if !matches!(vless.carrier, Carrier::Raw) {
+        return None;
+    }
+    if vless.reality.is_some() {
         return None;
     }
     let endpoint = format!("{}:{}", vless.address, vless.port);
@@ -4205,6 +4228,87 @@ fn dial_vless_tls(client: &TcpStream, server: &SocketAddr, vless: &VlessOut, tar
         | Carrier::Xdrive
         | Carrier::Http
         | Carrier::Unknown => {}
+    }
+}
+
+/// One REALITY dial: TCP, the sealed handshake, the VLESS header, then the relay.
+fn dial_vless_reality(
+    client: &TcpStream,
+    server: &SocketAddr,
+    vless: &VlessOut,
+    target: &SocketAddr,
+) {
+    let Some(cfg) = vless.reality.as_deref() else {
+        return;
+    };
+    let uplink = match dial(server) {
+        Ok(uplink) => uplink,
+        Err(failure) => return note_dial_failure(server, failure),
+    };
+    let Ok(raw) = uplink.try_clone() else {
+        return;
+    };
+    let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
+    let mut session = match ferrox_core::tls::RealityClientSession::connect(
+        cfg,
+        now,
+        ferrox_core::tls::reality::RecordLimiter::new(uplink),
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            return note_dial_failure(
+                server,
+                Failure::new(
+                    Stage::SocketConnected,
+                    Kind::of(&std::io::Error::from(error)),
+                ),
+            );
+        }
+    };
+    // Relay writes complete through reads: bound them to one tick or the first write waits out its answer.
+    if session
+        .get_ref()
+        .get_ref()
+        .set_read_timeout(Some(SESSION_POLL))
+        .is_err()
+    {
+        return note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
+    }
+    let header = if vless.flow == crate::vision::FLOW {
+        vless_vision_header(&vless.id, 1, target)
+    } else {
+        vless_header(&vless.id, 1, target)
+    };
+    if session.write_all(&header).is_err() {
+        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+    }
+    if read_vless_response(&mut session).is_none() {
+        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+    }
+    let Ok(downstream) = client.try_clone() else {
+        return;
+    };
+    if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
+    let close_downstream = downstream.try_clone().ok();
+    let close_raw = raw.try_clone().ok();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if let Some(downstream) = close_downstream.as_ref() {
+            let _ = downstream.shutdown(Shutdown::Both);
+        }
+        if let Some(raw) = close_raw.as_ref() {
+            let _ = raw.shutdown(Shutdown::Both);
+        }
+    });
+    if vless.flow == crate::vision::FLOW {
+        relay_stream(
+            downstream,
+            crate::vision::Link::new(session, Some(raw), &vless.id),
+            &close,
+        );
+    } else {
+        relay_stream(downstream, session, &close);
     }
 }
 
@@ -8793,6 +8897,35 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
                 quic_roots: None,
                 hysteria_roots: None,
                 tls: Some(tls),
+                flow: outbound_flow(server),
+                reality: None,
+            });
+        }
+        // REALITY dials raw TCP only in this slice; carried REALITY stays server-side.
+        if security == "reality" && !mux {
+            let (carrier, host) = outbound_carrier(outbound, &address);
+            if !matches!(carrier, Carrier::Raw) {
+                continue;
+            }
+            let Some(reality) = outbound_reality(outbound, &address) else {
+                continue;
+            };
+            let flow = outbound_flow(server);
+            if !matches!(flow.as_str(), "" | "none" | crate::vision::FLOW) {
+                continue;
+            }
+            return Some(VlessOut {
+                address,
+                port,
+                id,
+                carrier,
+                host,
+                mux,
+                quic_roots: None,
+                hysteria_roots: None,
+                tls: None,
+                flow,
+                reality: Some(reality),
             });
         }
         if !vless_security_supported(security) && !quic_tls {
@@ -8817,6 +8950,8 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
             quic_roots,
             hysteria_roots,
             tls: None,
+            flow: outbound_flow(server),
+            reality: None,
         });
     }
     None
@@ -8937,6 +9072,52 @@ fn outbound_tls(outbound: &Json, address: &str) -> Option<Arc<ferrox_core::tls::
         roots,
         pins: ferrox_core::foxy::pin::Pins::default(),
     }))
+}
+
+/// The outbound REALITY identity: the decoy name, the server static key, the short id.
+fn outbound_reality(
+    outbound: &Json,
+    address: &str,
+) -> Option<Arc<ferrox_core::tls::RealityClientConfig>> {
+    let settings = outbound.get("streamSettings")?;
+    if settings.get("security").and_then(Json::as_str) != Some("reality") {
+        return None;
+    }
+    let reality = settings.get("realitySettings")?;
+    let server_name = reality
+        .get("serverName")
+        .and_then(Json::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(address)
+        .to_owned();
+    if server_name.is_empty() {
+        return None;
+    }
+    Some(Arc::new(ferrox_core::tls::RealityClientConfig {
+        server_name,
+        public_key: reality.get("publicKey")?.as_str().and_then(key32)?,
+        short_id: reality
+            .get("shortId")
+            .and_then(Json::as_str)
+            .and_then(short_id)?,
+        fingerprint: reality
+            .get("fingerprint")
+            .and_then(Json::as_str)
+            .unwrap_or("chrome")
+            .to_owned(),
+    }))
+}
+
+/// The user flow: empty or Vision dials, anything else is refused rather than sent plain.
+fn outbound_flow(server: &Json) -> String {
+    server
+        .get("users")
+        .and_then(Json::as_arr)
+        .and_then(|users| users.first())
+        .and_then(|user| user.get("flow"))
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_owned()
 }
 
 // TLS runs outside the carrier, the order both references use, so every diallable carrier is accepted here.
@@ -10170,21 +10351,277 @@ mod tests {
     }
 
     #[test]
-    fn vless_outbound_with_reality_security_is_skipped() {
-        let root = crate::json::parse(
+    fn vless_outbound_with_reality_security_dials_raw_only() {
+        let bare = crate::json::parse(
             r#"{"outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1",
             "port": 443, "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]},
             "streamSettings": {"network": "tcp", "security": "reality"}}]}"#,
         )
         .expect("parses");
-        assert!(find_vless_outbound(&root).is_none());
-        let root = crate::json::parse(
+        assert!(
+            find_vless_outbound(&bare).is_none(),
+            "no identity means no dial, never a plain one"
+        );
+        let carried = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1",
+            "port": 443, "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]},
+            "streamSettings": {"network": "ws", "security": "reality",
+            "realitySettings": {"serverName": "www.google.com",
+            "publicKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+            "shortId": "a8", "fingerprint": "chrome"}}}]}"#,
+        )
+        .expect("parses");
+        assert!(
+            find_vless_outbound(&carried).is_none(),
+            "a carried REALITY dial stays server-side in this slice"
+        );
+        let plain = crate::json::parse(
             r#"{"outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1",
             "port": 443, "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]},
             "streamSettings": {"network": "tcp"}}]}"#,
         )
         .expect("parses");
-        assert!(find_vless_outbound(&root).is_some());
+        assert!(find_vless_outbound(&plain).is_some());
+    }
+
+    const REALITY_TEST_PRIVATE: [u8; 32] = [
+        0x69, 0x20, 0xca, 0xab, 0x2b, 0x4d, 0xe3, 0x7d, 0xfc, 0xfe, 0xbf, 0x60, 0x8b, 0x2a, 0x43,
+        0x1c, 0x0e, 0xbb, 0xae, 0x26, 0x93, 0x9a, 0x9c, 0x01, 0x9e, 0x06, 0x1e, 0x8a, 0x0b, 0x4e,
+        0x6b, 0x91,
+    ];
+    const REALITY_TEST_SHORT: &str = "0123456789abcdef";
+    const REALITY_TEST_SNI: &str = "www.google.com";
+    const REALITY_TEST_ID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    fn reality_server_config() -> ferrox_core::tls::RealityServerConfig {
+        ferrox_core::tls::RealityServerConfig {
+            private_key: REALITY_TEST_PRIVATE,
+            short_ids: vec![[1, 35, 69, 103, 137, 171, 205, 239]],
+            server_names: vec![REALITY_TEST_SNI.to_owned()],
+            ..ferrox_core::tls::RealityServerConfig::default()
+        }
+    }
+
+    fn reality_client_json(server_port: u16, public_b64: &str, flow: &str) -> String {
+        format!(
+            r#"{{"outbounds": [{{"protocol": "vless", "settings": {{"vnext": [{{"address": "127.0.0.1",
+            "port": {server_port}, "users": [{{"id": "{REALITY_TEST_ID}", "flow": "{flow}"}}]}}]}},
+            "streamSettings": {{"network": "tcp", "security": "reality",
+            "realitySettings": {{"serverName": "{REALITY_TEST_SNI}",
+            "publicKey": "{public_b64}", "shortId": "{REALITY_TEST_SHORT}",
+            "fingerprint": "chrome"}}}}}}]}}"#,
+        )
+    }
+
+    #[test]
+    fn reality_outbound_parses_its_identity() {
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let root = crate::json::parse(&reality_client_json(
+            443,
+            &b64url(&public),
+            "xtls-rprx-vision",
+        ))
+        .expect("parses");
+        let out = find_vless_outbound(&root).expect("dials raw REALITY");
+        assert_eq!(out.flow, "xtls-rprx-vision");
+        let reality = out.reality.expect("carries its identity");
+        assert_eq!(reality.server_name, REALITY_TEST_SNI);
+        assert_eq!(reality.public_key, public);
+        assert_eq!(reality.short_id, [1, 35, 69, 103, 137, 171, 205, 239]);
+        let bare_flow =
+            crate::json::parse(&reality_client_json(443, &b64url(&public), "")).expect("parses");
+        let bare = find_vless_outbound(&bare_flow).expect("dials without a flow too");
+        assert_eq!(bare.flow, "");
+        let bad_flow = crate::json::parse(&reality_client_json(
+            443,
+            &b64url(&public),
+            "xtls-rprx-vision-udp443",
+        ))
+        .expect("parses");
+        assert!(
+            find_vless_outbound(&bad_flow).is_none(),
+            "an unknown flow is refused, never sent plain"
+        );
+    }
+
+    #[test]
+    fn vision_header_matches_the_core_encoder() {
+        let link = ferrox_core::vless::VlessLink::parse(
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?security=reality&encryption=none&type=tcp&flow=xtls-rprx-vision#x",
+        )
+        .expect("parses");
+        let id = uuid_bytes(REALITY_TEST_ID).expect("id");
+        for target in [
+            SocketAddr::from(([192, 0, 2, 53], 80)),
+            SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1], 443)),
+        ] {
+            let host = match target.ip() {
+                std::net::IpAddr::V4(ip) => ip.to_string(),
+                std::net::IpAddr::V6(ip) => ip.to_string(),
+            };
+            let core = link.encode_request_header(&host, target.port());
+            let proxy = vless_vision_header(&id, 1, &target);
+            assert_eq!(proxy, core, "the dial writes the core bytes for {target}");
+            let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+            let port = listener.local_addr().expect("addr").port();
+            let writer = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accepts");
+                decode_request(&mut stream).expect("decodes")
+            });
+            let mut reader = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            reader.write_all(&proxy).expect("writes");
+            let (got, flow, cmd, decoded) = writer.join().expect("joins");
+            assert_eq!(got, id);
+            assert_eq!(flow, "xtls-rprx-vision");
+            assert_eq!(cmd, 1);
+            assert_eq!(decoded, target);
+        }
+    }
+
+    /// One REALITY+Vision pair on loopback: an echo target, a Vision inbound, the dial.
+    struct RealityVisionPair {
+        outbound: Outbound,
+        server: SocketAddr,
+        target: SocketAddr,
+        echo: thread::JoinHandle<()>,
+        front: thread::JoinHandle<()>,
+    }
+
+    fn reality_vision_pair() -> RealityVisionPair {
+        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo_addr = echo.local_addr().expect("addr");
+        let echo = thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 8192];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if stream.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let id = uuid_bytes(REALITY_TEST_ID).expect("id");
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let server_addr = front.local_addr().expect("addr");
+        let server_config = reality_server_config();
+        let front_handle = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_vless_reality(stream, &id, true, &Carrier::Raw, &server_config);
+        });
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let root = crate::json::parse(&reality_client_json(
+            server_addr.port(),
+            &b64url(&public),
+            "xtls-rprx-vision",
+        ))
+        .expect("parses");
+        let outbound = find_outbound(&root).expect("a REALITY outbound");
+        RealityVisionPair {
+            outbound,
+            server: server_addr,
+            target: echo_addr,
+            echo,
+            front: front_handle,
+        }
+    }
+
+    fn dial_pair(pair: &RealityVisionPair) -> (TcpStream, thread::JoinHandle<()>) {
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let outbound = match &pair.outbound {
+            Outbound::Vless(vless) => vless.clone(),
+            _ => panic!("the pair dials VLESS"),
+        };
+        let server = pair.server;
+        let target = pair.target;
+        let dialled = thread::spawn(move || {
+            let (client, _) = front.accept().expect("accepts");
+            tx.send(()).expect("signals");
+            dial_socks_outbound(&client, &Outbound::Vless(outbound), &server, &target);
+        });
+        let user = TcpStream::connect(addr).expect("connects");
+        user.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        rx.recv_timeout(Duration::from_secs(30)).expect("dials");
+        (user, dialled)
+    }
+
+    #[test]
+    fn reality_vision_dial_reaches_echo_through_the_relay() {
+        let pair = reality_vision_pair();
+        let (mut user, dialled) = dial_pair(&pair);
+        let payload: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
+        user.write_all(&payload).expect("writes");
+        let mut back = vec![0u8; payload.len()];
+        user.read_exact(&mut back).expect("echoes");
+        assert_eq!(back, payload);
+        drop(user);
+        dialled.join().expect("joins");
+        pair.echo.join().expect("joins");
+        pair.front.join().expect("joins");
+    }
+
+    #[test]
+    fn reality_vision_direct_switch_carries_inner_tls() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let pair = reality_vision_pair();
+        let (server_config, client_config) = carried_tls_configs();
+        let inner = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let inner_addr = inner.local_addr().expect("addr");
+        let echo = thread::spawn(move || {
+            let (stream, _) = inner.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut buf = [0u8; 4096];
+            loop {
+                match tls.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        tls.write_all(&buf[..n]).expect("echoes");
+                        tls.flush().expect("flushes");
+                    }
+                }
+            }
+        });
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let outbound = match &pair.outbound {
+            Outbound::Vless(vless) => vless.clone(),
+            _ => panic!("the pair dials VLESS"),
+        };
+        let server = pair.server;
+        let dialled = thread::spawn(move || {
+            let (client, _) = front.accept().expect("accepts");
+            tx.send(()).expect("signals");
+            dial_socks_outbound(&client, &Outbound::Vless(outbound), &server, &inner_addr);
+        });
+        let user = TcpStream::connect(addr).expect("connects");
+        user.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        rx.recv_timeout(Duration::from_secs(30)).expect("dials");
+        let mut inner = ferrox_core::tls::connect(&client_config, user).expect("inner configures");
+        inner.handshake().expect("inner handshakes");
+        for round in 0..4 {
+            let payload = format!("inner tls round {round}");
+            inner.write_all(payload.as_bytes()).expect("writes");
+            inner.flush().expect("flushes");
+            let mut echoed = vec![0; payload.len()];
+            inner.read_exact(&mut echoed).expect("echoes");
+            assert_eq!(echoed, payload.as_bytes());
+        }
+        drop(inner);
+        dialled.join().expect("joins");
+        echo.join().expect("joins");
+        pair.front.join().expect("joins");
     }
 
     #[test]
@@ -11390,6 +11827,8 @@ mod tests {
             quic_roots: None,
             hysteria_roots: None,
             tls: None,
+            flow: String::new(),
+            reality: None,
         };
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let relaying = thread::spawn(move || {
@@ -11450,6 +11889,8 @@ mod tests {
             quic_roots: None,
             hysteria_roots: None,
             tls: None,
+            flow: String::new(),
+            reality: None,
         };
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let relaying = thread::spawn(move || {
@@ -11694,6 +12135,8 @@ mod tests {
                 quic_roots: None,
                 hysteria_roots: None,
                 tls: Some(Arc::new(client_config)),
+                flow: String::new(),
+                reality: None,
             };
             echo_trace(&format!("cli {port} dialing"));
             dial_vless(&client, &server, &vless, &target, Ladder::global());
@@ -11983,6 +12426,8 @@ mod tests {
             quic_roots: None,
             hysteria_roots: None,
             tls: Some(Arc::new(tls)),
+            flow: String::new(),
+            reality: None,
         })
     }
 
@@ -12852,6 +13297,8 @@ mod tests {
             quic_roots: None,
             hysteria_roots: None,
             tls: None,
+            flow: String::new(),
+            reality: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -13650,6 +14097,8 @@ mod tests {
             quic_roots: None,
             hysteria_roots: None,
             tls: None,
+            flow: String::new(),
+            reality: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -13945,6 +14394,8 @@ mod tests {
             quic_roots: None,
             hysteria_roots: None,
             tls: None,
+            flow: String::new(),
+            reality: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -14593,6 +15044,8 @@ mod tests {
             quic_roots: None,
             hysteria_roots: None,
             tls: None,
+            flow: String::new(),
+            reality: None,
         };
         let dest: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let source = Arc::new(Mutex::new(None));
@@ -14615,6 +15068,8 @@ mod tests {
             quic_roots: None,
             hysteria_roots: None,
             tls: None,
+            flow: String::new(),
+            reality: None,
         };
         let dest: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let source = Arc::new(Mutex::new(None));
@@ -14737,6 +15192,8 @@ mod tests {
             quic_roots: None,
             hysteria_roots: None,
             tls: None,
+            flow: String::new(),
+            reality: None,
         };
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
@@ -15482,6 +15939,8 @@ mod tests {
             quic_roots: Some(roots),
             hysteria_roots: None,
             tls: None,
+            flow: String::new(),
+            reality: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -15526,6 +15985,8 @@ mod tests {
             quic_roots: None,
             hysteria_roots: None,
             tls: None,
+            flow: String::new(),
+            reality: None,
         });
         let front = TcpListener::bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -16465,6 +16926,8 @@ mod tests {
             quic_roots: None,
             hysteria_roots: None,
             tls: None,
+            flow: String::new(),
+            reality: None,
         }));
         let mut client = TcpStream::connect(("127.0.0.1", front)).expect("connects");
         client
@@ -16496,6 +16959,8 @@ mod tests {
             quic_roots: None,
             hysteria_roots: None,
             tls: None,
+            flow: String::new(),
+            reality: None,
         }));
         let mut client = http_connect(front, &format!("127.0.0.1:{echo}"));
         assert!(http_status(&mut client).starts_with("HTTP/1.1 200"));
@@ -16818,6 +17283,8 @@ mod tests {
             quic_roots: None,
             hysteria_roots: None,
             tls: None,
+            flow: String::new(),
+            reality: None,
         }));
         let mut client = socks_tcp_client(front_port, echo_port);
         client.write_all(b"ping").expect("writes");
