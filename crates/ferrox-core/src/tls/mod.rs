@@ -38,6 +38,9 @@ pub trait TlsProvider: std::io::Read + std::io::Write {
 pub trait RecordAlignment {
     fn engage_record_alignment(&mut self) {}
 
+    /// Stops bounding and tracking reads: a session that never goes direct pays no per-read bookkeeping.
+    fn disarm_record_alignment(&mut self) {}
+
     /// Write several slices in one completion, so the bytes go out together and the alignment read happens once.
     fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()>
     where

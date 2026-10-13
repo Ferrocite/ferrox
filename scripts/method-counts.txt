@@ -165,6 +165,8 @@ reality-tls proxy-protocol-header-bytes 28 ferrox-core-reality::tests::the_binar
 reality-tls hello-buffers-per-single-record-read 1 ferrox-core-reality::tests::reading_a_single_record_hello_allocates_one_buffer
 reality-tls tls13-session-tickets-per-authenticated-handshake 0 ferrox-core-reality::tests::an_authenticated_session_sends_no_tickets_after_the_handshake
 reality-tls certificateverify-signature-scheme ED25519 ferrox-core-reality::tests::the_reality_certificate_verify_answers_ed25519_the_peer_never_offered
+reality-tls disarmed-limiter-records-per-read 2 ferrox-core-reality::tests::a_disarmed_limiter_stops_bounding_reads
+reality-tls addrs-resolved-per-xver0-handshake 0 ferrox-app-proxy::tests::reality_edges_skip_lookups_without_xver
 reality-tls client-hello-passes-per-handshake 2 ferrox-core-reality::tests::client_hellos_differ_only_in_the_session_id
 reality-tls sealed-session-id-bytes 32 ferrox-core-reality::tests::client_seal_matches_the_test_oracle_byte_for_byte
 reality-tls unauthenticated-servers-accepted 0 ferrox-core-reality::tests::a_client_with_a_wrong_key_is_refused_before_any_proxy_byte

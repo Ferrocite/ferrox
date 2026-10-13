@@ -174,6 +174,10 @@ impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RustlsProvid
         self.io.engage_record_alignment();
     }
 
+    fn disarm_record_alignment(&mut self) {
+        self.io.disarm_record_alignment();
+    }
+
     fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
         self.drive()?;
         for part in parts {
@@ -299,6 +303,10 @@ impl<S: Stream> RustlsServerProvider<S> {
 impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RustlsServerProvider<S> {
     fn engage_record_alignment(&mut self) {
         self.io.engage_record_alignment();
+    }
+
+    fn disarm_record_alignment(&mut self) {
+        self.io.disarm_record_alignment();
     }
 
     fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {

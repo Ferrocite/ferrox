@@ -474,7 +474,15 @@ impl VisionOpen {
             }
         }
         while pos < buf.len() {
-            if self.command > 0 {
+            if self.command == 5 && buf.len() - pos >= 5 {
+                // Five header iterations with no observable in between read as one load.
+                self.current = buf[pos];
+                self.content = i32::from(buf[pos + 1]) << 8 | i32::from(buf[pos + 2]);
+                self.padding = i32::from(buf[pos + 3]) << 8 | i32::from(buf[pos + 4]);
+                completed = VisionCommand::from_byte(self.current);
+                pos += 5;
+                self.command = 0;
+            } else if self.command > 0 {
                 let byte = buf[pos];
                 pos += 1;
                 match self.command {
@@ -1277,6 +1285,51 @@ mod tests {
                 Some(VisionCommand::Continue),
                 "chunk {chunk}: command"
             );
+        }
+    }
+
+    fn prng_next(state: &mut u32) -> u32 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        *state = x;
+        x
+    }
+
+    #[test]
+    fn open_seeded_splits_match_whole_feeds() {
+        let id = [0x33u8; 16];
+        let first: Vec<u8> = (0..1024).map(|i| (i % 251) as u8).collect();
+        let mut seal = VisionSeal::new(&SEAL_KEY, &SEAL_NONCE, &id);
+        let mut sealed = vec![0u8; seal_len(first.len(), 8192, true) + 64];
+        let mut n = seal.seal(&mut sealed, &first, VisionCommand::Continue, true);
+        n += seal.seal(&mut sealed[n..], b"second!", VisionCommand::End, false);
+        sealed.truncate(n);
+        sealed.extend_from_slice(b"raw tail");
+        let mut whole_out = vec![0u8; sealed.len()];
+        let mut whole = VisionOpen::new(&id);
+        let (written, completed) = whole.open(&sealed, &mut whole_out);
+        // Thirty-two seeded chunkings, seed printed so a red run replays anywhere.
+        let mut seed = 0x1234_5678u32;
+        for _ in 0..32 {
+            let mut open = VisionOpen::new(&id);
+            let mut got = Vec::new();
+            let mut last = None;
+            let mut at = 0;
+            while at < sealed.len() {
+                // Chunkings start framed: short of a UUID prefix the first read passes through.
+                let take = (prng_next(&mut seed) as usize % 48 + 21).min(sealed.len() - at);
+                let mut out = vec![0u8; take];
+                let (w, c) = open.open(&sealed[at..at + take], &mut out);
+                got.extend_from_slice(&out[..w]);
+                if c.is_some() {
+                    last = c;
+                }
+                at += take;
+            }
+            assert_eq!(got, &whole_out[..written], "seed {seed:#x}");
+            assert_eq!(last, completed, "seed {seed:#x}");
         }
     }
 

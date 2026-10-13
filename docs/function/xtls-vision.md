@@ -120,6 +120,12 @@ throughout the whole session, not only during the handshake.
   tracks record ends until then and bulk lanes that never see a `ServerHello`
   never engage.
 
+- **Five single-byte header iterations read as one five-byte load.** The
+  read loop's header trips have no observable in between, so a whole header
+  parses at once and a split one keeps the byte loop;
+  `seeded_splits_read_back_as_whole_content` replays one seeded chunking
+  against whole content, tail included.
+
 What was deliberately **not** removed: the seed table and the padding itself.
 Padding bytes are wire bytes; making them random instead of zero would change
 the output, and the point of this repository is that it does not.
