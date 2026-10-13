@@ -27,10 +27,9 @@ const SHORTEST: usize = 5;
 const MAX_BITS: usize = 30;
 
 struct Huffman {
-    /// The first code of each length, and how many codes share that length.
-    first: [u32; MAX_BITS + 1],
-    count: [u16; MAX_BITS + 1],
-    /// Where each length's symbols begin in `symbols`, ordered by length then symbol, so a code is `first[length] + offset`.
+    /// One load per probed length: the first code of that length in the high half and how many codes share it in the low half. A length with no codes reads `(0, 0)`, so the range test below already rejects it and no separate empty-length check is needed.
+    probe: [u64; MAX_BITS + 1],
+    /// Where each length's symbols begin in `symbols`, ordered by length then symbol, so a code is `first[length] + offset`; read only on the rare match.
     base: [u16; MAX_BITS + 1],
     symbols: [u16; 257],
 }
@@ -39,8 +38,7 @@ fn huffman() -> &'static Huffman {
     static TABLE: OnceLock<Huffman> = OnceLock::new();
     TABLE.get_or_init(|| {
         let mut table = Huffman {
-            first: [0; MAX_BITS + 1],
-            count: [0; MAX_BITS + 1],
+            probe: [0; MAX_BITS + 1],
             base: [0; MAX_BITS + 1],
             symbols: [0; 257],
         };
@@ -53,17 +51,19 @@ fn huffman() -> &'static Huffman {
             }
             next <<= bits - previous;
             previous = bits;
-            table.first[bits] = next;
+            let first = next;
             table.base[bits] = placed as u16;
+            let mut count = 0u32;
             for (symbol, length) in HUFFMAN_BITS.iter().enumerate() {
                 if usize::from(*length) != bits {
                     continue;
                 }
                 table.symbols[placed] = symbol as u16;
-                table.count[bits] += 1;
+                count += 1;
                 placed += 1;
                 next += 1;
             }
+            table.probe[bits] = (u64::from(first) << 32) | u64::from(count);
         }
         table
     })
@@ -74,11 +74,13 @@ fn huffman() -> &'static Huffman {
 fn huffman_code(symbol: usize) -> Option<(u32, usize)> {
     let bits = usize::from(HUFFMAN_BITS[symbol]);
     let table = huffman();
+    let probe = table.probe[bits];
     let base = table.base[bits] as usize;
-    let slot = table.symbols[base..base + table.count[bits] as usize]
+    let slot = table.symbols[base..base + probe as u32 as usize]
         .iter()
         .position(|other| usize::from(*other) == symbol)?;
-    Some((table.first[bits] + slot as u32, bits))
+    let code = ((probe >> 32) as u32) + slot as u32;
+    Some((code, bits))
 }
 
 /// Decodes one Huffman-coded string: the 257th entry is the EOS code rather than a symbol, so a block decoding one is malformed, and only the all-ones prefix under eight bits may follow the last symbol.
@@ -93,8 +95,9 @@ pub fn huffman_decode(code: &[u8], out: &mut Vec<u8>) -> Option<()> {
             if bits > MAX_BITS {
                 return None;
             }
-            let offset = acc.wrapping_sub(table.first[bits]);
-            if table.count[bits] == 0 || offset >= u32::from(table.count[bits]) {
+            let probe = table.probe[bits];
+            let offset = acc.wrapping_sub((probe >> 32) as u32);
+            if offset >= probe as u32 {
                 continue;
             }
             let symbol = table.symbols[table.base[bits] as usize + offset as usize];
@@ -619,6 +622,39 @@ mod tests {
             let mut out = Vec::new();
             huffman_decode(&coded, &mut out).expect("decodes");
             assert_eq!(out, vec![byte], "symbol {symbol}");
+        }
+    }
+
+    #[test]
+    fn the_fused_probe_holds_the_canonical_first_and_count_of_every_length() {
+        // An independent canonical walk off the code lengths is the second source the fused probe is checked against, not itself.
+        let table = huffman();
+        let mut histogram = [0u32; MAX_BITS + 1];
+        for &length in &HUFFMAN_BITS {
+            histogram[usize::from(length)] += 1;
+        }
+        let mut code = 0i64;
+        let mut previous = 0usize;
+        let walked = table
+            .probe
+            .iter()
+            .zip(&histogram)
+            .enumerate()
+            .skip(SHORTEST);
+        for (bits, (&probe, &count)) in walked {
+            code <<= bits - previous;
+            previous = bits;
+            // A length with no codes keeps the table's zero default, as the build skips it; only a populated length is checked.
+            if count == 0 {
+                continue;
+            }
+            assert_eq!(
+                probe >> 32,
+                u64::from(code as u32),
+                "first of length {bits}"
+            );
+            assert_eq!(probe as u32, count, "count of length {bits}");
+            code += i64::from(count);
         }
     }
 
