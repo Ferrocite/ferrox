@@ -1944,12 +1944,10 @@ fn relay_fallback<S: Stream + Send + 'static>(proxied: ferrox_core::tls::Proxied
     let mut down = download.map(Gauge::start);
     // A finished leg ends the splice; the sibling notices on its next poll grain.
     let ended = Arc::new(AtomicBool::new(false));
-    let (send, recv) = (Arc::clone(&one), Arc::clone(&two));
-    let (down_send, down_recv, down_ended) =
-        (Arc::clone(&send), Arc::clone(&recv), Arc::clone(&ended));
-    let downlink = thread::spawn(move || {
-        copy_paced(&down_recv, &down_send, down.as_mut(), &down_ended);
-    });
+    let (down_recv, down_send, down_ended) =
+        (Arc::clone(&two), Arc::clone(&one), Arc::clone(&ended));
+    let downlink =
+        thread::spawn(move || copy_paced(&down_recv, &down_send, down.as_mut(), &down_ended));
     copy_paced(&one, &two, up.as_mut(), &ended);
     let _ = downlink.join();
 }
