@@ -1934,14 +1934,18 @@ fn relay_fallback<S: Stream + Send + 'static>(proxied: ferrox_core::tls::Proxied
         upload,
         download,
     } = proxied;
+    // A silent cover origin must not hold the read across the mutex its upload writes on.
+    if target.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
     let one = Arc::new(Half::new(client));
     let two = Arc::new(Half::new(target));
     let mut up = upload.map(Gauge::start);
     let mut down = download.map(Gauge::start);
     let (send, recv) = (Arc::clone(&one), Arc::clone(&two));
-    let uplink = thread::spawn(move || copy_paced(&send, &two, up.as_mut()));
-    copy_paced(&one, &recv, down.as_mut());
-    let _ = uplink.join();
+    let downlink = thread::spawn(move || copy_paced(&recv, &send, down.as_mut()));
+    copy_paced(&one, &two, up.as_mut());
+    let _ = downlink.join();
 }
 
 fn copy_paced<R: Read, W: Write>(from: &Half<R>, to: &Half<W>, mut gauge: Option<&mut Gauge>) {
@@ -9175,6 +9179,58 @@ mod tests {
         assert!(fired.load(Ordering::SeqCst), "EOF fires the close");
         let gated = to.inner.lock().expect("reads back");
         assert_eq!(gated.sent, b"ping");
+    }
+
+    #[test]
+    fn the_cover_origin_splice_carries_the_reply_back_to_the_peer() {
+        let peer_side = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let origin_side = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let origin_port = origin_side.local_addr().expect("addr").port();
+        let mut peer = TcpStream::connect(peer_side.local_addr().expect("addr")).expect("connects");
+        let client = peer_side.accept().expect("accepts").0;
+        client
+            .set_read_timeout(Some(RELAY_POLL))
+            .expect("polls like the server path");
+        let target = TcpStream::connect(("127.0.0.1", origin_port)).expect("dials");
+        let cover = thread::spawn(move || {
+            let (mut origin, _) = origin_side.accept().expect("accepts");
+            let mut head = [0u8; 4];
+            origin.read_exact(&mut head).expect("reads");
+            origin.write_all(b"pong").expect("replies");
+            origin.shutdown(Shutdown::Write).expect("half-closes");
+            let mut rest = Vec::new();
+            let _ = origin.read_to_end(&mut rest);
+            head
+        });
+        let fallback = thread::spawn(move || {
+            relay_fallback(ferrox_core::tls::Proxied {
+                client,
+                target,
+                upload: None,
+                download: None,
+            });
+        });
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("times out");
+        peer.write_all(b"ping").expect("sends");
+        let mut reply = [0u8; 4];
+        let arrived = match peer.read_exact(&mut reply) {
+            Ok(()) => Some(reply),
+            Err(why) if is_timeout(&why) => None,
+            Err(why) => panic!("reads: {why}"),
+        };
+        drop(peer);
+        let head = cover.join().expect("the cover origin ends");
+        fallback.join().expect("the splice ends");
+        assert_eq!(
+            arrived,
+            Some(*b"pong"),
+            "the origin's reply reaches the peer"
+        );
+        assert_eq!(
+            &head, b"ping",
+            "the peer's hello reaches the origin in order"
+        );
     }
 
     #[test]

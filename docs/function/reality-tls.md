@@ -52,6 +52,7 @@ graph TD
 | short-id-bytes | 8 | ferrox-core-reality::tests::a_short_id_is_zero_padded_to_eight_bytes |
 | cover-origin-dials-per-authenticated-hello | 0 | ferrox-core-reality::tests::an_authenticated_hello_costs_the_cover_origin_nothing |
 | cover-origin-bytes-per-spliced-hello | 1 | ferrox-core-reality::tests::an_unauthenticated_hello_is_spliced_into_the_cover_origin_byte_for_byte |
+| peer-reply-bytes-per-spliced-request | 1 | ferrox-app-proxy::tests::the_cover_origin_splice_carries_the_reply_back_to_the_peer |
 | proxy-protocol-header-bytes | 28 | ferrox-core-reality::tests::the_binary_proxy_header_is_a_fixed_rectangular_twenty_eight_bytes |
 | hello-buffers-per-single-record-read | 1 | ferrox-core-reality::tests::reading_a_single_record_hello_allocates_one_buffer |
 | tls13-session-tickets-per-authenticated-handshake | 0 | ferrox-core-reality::tests::an_authenticated_session_sends_no_tickets_after_the_handshake |
@@ -127,6 +128,7 @@ handshake duration is quoted from a machine without a named runner.
   `a_relay_write_is_sent_without_waiting_for_close` and
   `a_finished_relay_closes_the_other_side` drive a flush-gated writer with no
   sockets at all, and the `reality_vision` conformance row is the witness.
+- **A splice that pumped the upload twice.** `relay_fallback` crossed its copy directions, so both `copy_paced` pumps read the client and wrote the cover origin: the origin's reply never reached the peer, and two racing readers of one client half could deliver the hello to the origin out of order. The directions are crossed now, and the spliced target carries the same twenty-millisecond poll every other relay point sets, because an untimed read on a silent origin holds the mutex its upload writes on. `the_cover_origin_splice_carries_the_reply_back_to_the_peer` drives both legs over loopback and fails red on either direction.
 - **A split hello reassembled twice.** The reader grows one buffer and stops at
   the declared handshake length, then hands rustls the same bytes through a
   replay prefix, so the record framing is read once rather than re-parsed by a
