@@ -9,14 +9,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::{
-    grpc_path, inbound_reality_config, inbound_tls_identity, kcp_config, outbound_flow,
-    outbound_reality, outbound_tls, stream_security, sub_path, tcp_http_path, tls_ca_roots,
-    tls_cert_paths, trojan_key, uuid_bytes, vless_security_supported,
+    inbound_carrier, inbound_reality_config, inbound_tls_identity, outbound_carrier, outbound_flow,
+    outbound_reality, outbound_tls, stream_security, tls_ca_roots, tls_cert_paths, trojan_key,
+    uuid_bytes, vless_security_supported, Carrier,
 };
 use crate::json::Json;
 use ferrox_core::failure::{Failure, Kind, Ladder, Rung, Stage};
 use ferrox_core::tls::{Edges, RecordAlignment as _, Stream, TlsProvider as _};
-use ferrox_core::transport::EarlyData;
 
 pub(crate) fn print_version() {
     println!("ferrox-app {}", env!("CARGO_PKG_VERSION"));
@@ -527,34 +526,6 @@ macro_rules! refused_carriers {
             | Carrier::Http
             | Carrier::Unknown
     };
-}
-
-#[derive(Debug, Clone)]
-enum Carrier {
-    Raw,
-    Ws {
-        path: String,
-        ed: u32,
-    },
-    HttpUpgrade {
-        path: String,
-    },
-    Grpc {
-        path: String,
-    },
-    Xhttp {
-        settings: Box<crate::xhttp::XhttpSettings>,
-    },
-    HttpHeader {
-        path: String,
-    },
-    Quic,
-    Kcp(ferrox_core::kcp::Config),
-    Hysteria(ferrox_core::hysteria::Config),
-    Masque,
-    Xdrive,
-    Http,
-    Unknown,
 }
 
 #[derive(Debug, Clone)]
@@ -8969,101 +8940,6 @@ fn tls_parts(
     outbound_tls(outbound, address).map(|tls| (carrier, host, tls))
 }
 
-fn stream_carrier(settings: Option<&Json>) -> Carrier {
-    match settings
-        .and_then(|s| s.get("network"))
-        .and_then(Json::as_str)
-    {
-        Some("ws" | "websocket") => {
-            let early = EarlyData::split(&sub_path(settings, "wsSettings"));
-            Carrier::Ws {
-                path: early.path,
-                ed: early.budget,
-            }
-        }
-        Some("httpupgrade") => Carrier::HttpUpgrade {
-            path: EarlyData::split(&sub_path(settings, "httpupgradeSettings")).path,
-        },
-        Some("grpc") => Carrier::Grpc {
-            path: grpc_path(settings),
-        },
-        Some("xhttp" | "splithttp") => match crate::xhttp::XhttpSettings::from_json(settings) {
-            Some(settings) => Carrier::Xhttp {
-                settings: Box::new(settings),
-            },
-            None => Carrier::Unknown,
-        },
-        Some("quic") => Carrier::Quic,
-        Some("kcp" | "mkcp") => Carrier::Kcp(kcp_config(settings)),
-        Some("hysteria") => hysteria_carrier(settings),
-        Some("masque") => Carrier::Masque,
-        Some("xdrive") => Carrier::Xdrive,
-        Some("http" | "h2" | "h3") => Carrier::Http,
-        None | Some("" | "raw" | "tcp") => match tcp_http_path(settings) {
-            Some(path) => Carrier::HttpHeader { path },
-            None => Carrier::Raw,
-        },
-        Some(_) => Carrier::Unknown,
-    }
-}
-
-fn hysteria_carrier(settings: Option<&Json>) -> Carrier {
-    use ferrox_core::hysteria::{Config, Congestion};
-    let hy = settings.and_then(|s| s.get("hysteriaSettings"));
-    let version = hy
-        .and_then(|h| h.get("version"))
-        .and_then(Json::as_u32)
-        .or_else(|| {
-            hy.and_then(|h| h.get("version"))
-                .and_then(Json::as_str)
-                .and_then(|text| text.parse::<u32>().ok())
-        });
-    if version.is_some_and(|v| v != 2) {
-        return Carrier::Unknown;
-    }
-    Carrier::Hysteria(Config {
-        auth: hy
-            .and_then(|h| h.get("auth"))
-            .and_then(Json::as_str)
-            .unwrap_or("")
-            .to_owned(),
-        cc: Congestion::parse(
-            hy.and_then(|h| h.get("congestion"))
-                .and_then(Json::as_str)
-                .unwrap_or(""),
-        ),
-    })
-}
-
-fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, String) {
-    let settings = outbound.get("streamSettings");
-    let carrier = stream_carrier(settings);
-    let key = match &carrier {
-        Carrier::Ws { .. } => "wsSettings",
-        Carrier::HttpUpgrade { .. } => "httpupgradeSettings",
-        Carrier::Grpc { .. } => "grpcSettings",
-        Carrier::Xhttp { .. } => "xhttpSettings",
-        Carrier::HttpHeader { .. } => "tcpSettings",
-        Carrier::Quic => "quicSettings",
-        Carrier::Kcp(_) => "kcpSettings",
-        Carrier::Hysteria(_) => "hysteriaSettings",
-        Carrier::Masque => "masqueSettings",
-        Carrier::Xdrive => "xdriveSettings",
-        Carrier::Unknown | Carrier::Raw | Carrier::Http => "",
-    };
-    let host = settings
-        .and_then(|s| s.get(key))
-        .and_then(|s| s.get("host"))
-        .and_then(Json::as_str)
-        .unwrap_or(address)
-        .to_owned();
-    (carrier, host)
-}
-
-fn inbound_carrier(inbound: &Json) -> Carrier {
-    stream_carrier(inbound.get("streamSettings"))
-}
-
 fn x25519_pair() -> (String, String) {
     let mut private = [0u8; 32];
     getrandom::getrandom(&mut private)
@@ -9084,6 +8960,7 @@ fn b64url(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{grpc_path, stream_carrier};
 
     #[test]
     fn the_seam_split_find_across_agrees_with_the_per_byte_branch_scan() {
