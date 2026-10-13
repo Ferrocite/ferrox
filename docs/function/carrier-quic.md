@@ -1,8 +1,12 @@
 # The QUIC carrier
 
-QUIC is a **client-only** row in the matrix. The server role is refused by name
-(`refused_carriers!`), and this page says so rather than letting a "0"
-syscall count read like a capability.
+QUIC carried VLESS only as a client row; the **server role now exists** and
+serves a `vless` inbound on `security: tls` with a certificate
+(`serve_vless_quic`, `proxy.rs:1352`). Each bidirectional stream is one
+VLESS TCP session: the UUID check, the empty-flow requirement and the TCP
+target dial happen inside `serve_vless_quic`, and a stranger or a UDP/mux
+offer closes the stream before anything is relayed. The ALPN is the default
+lane one (`h3`).
 
 quiche is the default QUIC stack for this rung, and that is a rule rather than a
 preference: whenever a rung needs QUIC and quiche is feasible, quiche. The pin
