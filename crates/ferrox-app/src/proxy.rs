@@ -7287,34 +7287,38 @@ pub(crate) fn find_across(head: &[u8], probe: &[u8], pattern: &[u8]) -> Option<u
         if joined < 4 {
             return None;
         }
-        let mut pos = if head.len() >= 3 { head.len() - 3 } else { 0 };
         let target = u32::from_le_bytes(*b"\r\n\r\n");
-        while pos + 3 < joined {
-            let b0 = if pos < head.len() {
-                head[pos]
-            } else {
-                probe[pos - head.len()]
-            };
-            let b1 = if pos + 1 < head.len() {
-                head[pos + 1]
-            } else {
-                probe[pos + 1 - head.len()]
-            };
-            let b2 = if pos + 2 < head.len() {
-                head[pos + 2]
-            } else {
-                probe[pos + 2 - head.len()]
-            };
-            let b3 = if pos + 3 < head.len() {
-                head[pos + 3]
-            } else {
-                probe[pos + 3 - head.len()]
-            };
-            let v = u32::from_le_bytes([b0, b1, b2, b3]);
-            if v == target {
+        let start = head.len().saturating_sub(3);
+        // Only up to three windows can touch the head/probe seam, so assemble those byte by byte.
+        let straddle_end = head.len().min(joined.saturating_sub(3));
+        let mut pos = start;
+        while pos < straddle_end {
+            let bytes = [
+                head[pos],
+                if pos + 1 < head.len() {
+                    head[pos + 1]
+                } else {
+                    probe[pos + 1 - head.len()]
+                },
+                if pos + 2 < head.len() {
+                    head[pos + 2]
+                } else {
+                    probe[pos + 2 - head.len()]
+                },
+                if pos + 3 < head.len() {
+                    head[pos + 3]
+                } else {
+                    probe[pos + 3 - head.len()]
+                },
+            ];
+            if u32::from_le_bytes(bytes) == target {
                 return Some(pos);
             }
             pos += 1;
+        }
+        // Every window past the seam lies wholly inside probe, so read it as one contiguous scan with no per-byte branch.
+        if let Some(at) = probe.windows(4).position(|w| w == b"\r\n\r\n") {
+            return Some(head.len() + at);
         }
         return None;
     }
@@ -9414,6 +9418,74 @@ fn b64url(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_seam_split_find_across_agrees_with_the_per_byte_branch_scan() {
+        // The contiguous probe scan must yield the identical first position on every seam, interior and absent placement.
+        fn before(head: &[u8], probe: &[u8]) -> Option<usize> {
+            let joined = head.len() + probe.len();
+            if joined < 4 {
+                return None;
+            }
+            let mut pos = if head.len() >= 3 { head.len() - 3 } else { 0 };
+            let target = u32::from_le_bytes(*b"\r\n\r\n");
+            while pos + 3 < joined {
+                let b0 = if pos < head.len() {
+                    head[pos]
+                } else {
+                    probe[pos - head.len()]
+                };
+                let b1 = if pos + 1 < head.len() {
+                    head[pos + 1]
+                } else {
+                    probe[pos + 1 - head.len()]
+                };
+                let b2 = if pos + 2 < head.len() {
+                    head[pos + 2]
+                } else {
+                    probe[pos + 2 - head.len()]
+                };
+                let b3 = if pos + 3 < head.len() {
+                    head[pos + 3]
+                } else {
+                    probe[pos + 3 - head.len()]
+                };
+                if u32::from_le_bytes([b0, b1, b2, b3]) == target {
+                    return Some(pos);
+                }
+                pos += 1;
+            }
+            None
+        }
+        const ALPHABET: [u8; 3] = *b"\r\nZ";
+        let mut buf = [0u8; 6];
+        for head_len in 0..=6usize {
+            for probe_len in 0..=6usize {
+                let total = head_len + probe_len;
+                if total > 6 {
+                    continue;
+                }
+                for code in 0..ALPHABET.len().pow(total as u32) {
+                    let mut rest = code;
+                    for slot in &mut buf[..total] {
+                        *slot = ALPHABET[rest % ALPHABET.len()];
+                        rest /= ALPHABET.len();
+                    }
+                    let (head, probe) = buf.split_at(head_len);
+                    assert_eq!(
+                        find_across(head, probe, b"\r\n\r\n"),
+                        before(head, probe),
+                        "head {head:?} probe {probe:?}"
+                    );
+                }
+            }
+        }
+        // At scale the scan returns the earliest of several matches, including one filling the whole tail.
+        let mut tail = vec![b'x'; 255];
+        tail.extend_from_slice(b"\r\n\r\n\r\n\r\n");
+        assert_eq!(find_across(&[], &tail, b"\r\n\r\n"), Some(255));
+        assert_eq!(find_across(b"\r\n", b"\r\nZZ", b"\r\n\r\n"), Some(0));
+    }
 
     struct Gated {
         sent: Vec<u8>,
