@@ -117,7 +117,9 @@ pub struct RealityServer<S: Stream> {
 impl<S: Stream> RealityServer<S> {
     /// Reads the `ClientHello`, authenticates it, and answers with the session or
     /// with the splice. A hello that does not authenticate and has no cover
-    /// origin configured is an error, which is the whole of a refusal.
+    /// origin configured is an error, which is the whole of a refusal. A peer
+    /// that broke the parse rules is spliced too, carrying the bytes it already
+    /// spent; only one that sent nothing at all is closed.
     pub fn accept(
         cfg: &RealityServerConfig,
         now_ms: u64,
@@ -125,7 +127,15 @@ impl<S: Stream> RealityServer<S> {
         edges: Edges,
     ) -> Result<RealityAccept<S>, TlsError> {
         let mut replay = Replay::new(RecordLimiter::new(io));
-        let (mut raw, body, hello) = read_client_hello(&mut replay)?;
+        let (mut raw, body, hello) = match read_client_hello(&mut replay) {
+            Ok(heard) => heard,
+            Err((why, read)) => {
+                if read.is_empty() {
+                    return Err(why);
+                }
+                return splice(cfg, replay.into_inner().into_inner(), &read, edges);
+            }
+        };
         let auth_key = match body {
             Body::Inline { len } => authenticate(cfg, &mut raw[5..5 + len], &hello, now_ms),
             Body::Split(mut split) => authenticate(cfg, &mut split, &hello, now_ms),
@@ -511,24 +521,28 @@ enum Body {
     Split(Vec<u8>),
 }
 
-fn read_client_hello<S: Read>(io: &mut S) -> Result<(Vec<u8>, Body, ClientHello), TlsError> {
+fn read_client_hello<S: Read>(io: &mut S) -> Result<(Vec<u8>, Body, ClientHello), Refused> {
     let mut raw: Vec<u8> = Vec::new();
     let mut split: Vec<u8> = Vec::new();
     let mut header = [0u8; 5];
     let mut first = true;
     loop {
-        if !read_fully(io, &mut header) {
-            return Err(TlsError::Closed);
+        if read_to_fill(io, &mut header) != header.len() {
+            return Err((TlsError::Closed, raw));
         }
         if header[0] != 0x16 {
-            return Err(TlsError::Other(
-                "reality: expected a handshake record".to_owned(),
+            raw.extend_from_slice(&header);
+            return Err((
+                TlsError::Other("reality: expected a handshake record".to_owned()),
+                raw,
             ));
         }
         let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
         if len > MAX_RECORD {
-            return Err(TlsError::Other(
-                "reality: oversized handshake record".to_owned(),
+            raw.extend_from_slice(&header);
+            return Err((
+                TlsError::Other("reality: oversized handshake record".to_owned()),
+                raw,
             ));
         }
         let at = raw.len();
@@ -537,15 +551,19 @@ fn read_client_hello<S: Read>(io: &mut S) -> Result<(Vec<u8>, Body, ClientHello)
         raw.extend_from_slice(&header);
         let grown: &mut [u8] =
             unsafe { core::slice::from_raw_parts_mut(raw.as_mut_ptr().add(at + 5), len) };
-        if !read_fully(io, grown) {
-            return Err(TlsError::Closed);
+        let filled = read_to_fill(io, grown);
+        unsafe { raw.set_len(at + 5 + filled) };
+        if filled < len {
+            return Err((TlsError::Closed, raw));
         }
-        unsafe { raw.set_len(at + 5 + len) };
         if first {
             first = false;
             if let Some(whole) = hello_is_whole(&raw[5..]) {
                 // the last record may carry past the declared handshake length, and that tail is not part of the hello
-                let hello = parse_client_hello(&raw[5..5 + whole])?;
+                let hello = match parse_client_hello(&raw[5..5 + whole]) {
+                    Ok(hello) => hello,
+                    Err(why) => return Err((why, raw)),
+                };
                 return Ok((raw, Body::Inline { len: whole }, hello));
             }
             split.extend_from_slice(&raw[5..]);
@@ -553,27 +571,38 @@ fn read_client_hello<S: Read>(io: &mut S) -> Result<(Vec<u8>, Body, ClientHello)
             split.extend_from_slice(&raw[at + 5..]);
             if let Some(whole) = hello_is_whole(&split) {
                 split.truncate(whole);
-                let hello = parse_client_hello(&split)?;
+                let hello = match parse_client_hello(&split) {
+                    Ok(hello) => hello,
+                    Err(why) => return Err((why, raw)),
+                };
                 return Ok((raw, Body::Split(split), hello));
             }
             if split.len() > MAX_HELLO {
-                return Err(TlsError::Other("reality: oversized ClientHello".to_owned()));
+                return Err((
+                    TlsError::Other("reality: oversized ClientHello".to_owned()),
+                    raw,
+                ));
             }
         }
     }
 }
 
-pub(crate) fn read_fully<R: Read>(io: &mut R, buf: &mut [u8]) -> bool {
+/// Why the hello was refused, beside every byte the reader took from the peer before the break:
+/// a refusal that consumed anything splices those bytes on, which is what the reference does with
+/// a hello it cannot authenticate.
+type Refused = (TlsError, Vec<u8>);
+
+pub(crate) fn read_to_fill<R: Read>(io: &mut R, buf: &mut [u8]) -> usize {
     let mut at = 0;
     while at < buf.len() {
         match io.read(&mut buf[at..]) {
-            Ok(0) => return false,
+            Ok(0) => break,
             Ok(n) => at += n,
             Err(error) if waiting(&error) => {}
-            Err(_) => return false,
+            Err(_) => break,
         }
     }
-    true
+    at
 }
 
 fn waiting(error: &std::io::Error) -> bool {
@@ -1743,6 +1772,51 @@ mod tests {
             verdict.cover, bytes,
             "the cover origin must see the hello the server read"
         );
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_peer_that_sends_nothing_costs_the_cover_origin_nothing() {
+        let verdict = offer(&settings(), 0, &[]);
+        assert!(!verdict.authenticated);
+        assert_eq!(
+            verdict.dialled, 0,
+            "an empty connection is a scanner, not a TLS client"
+        );
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_hello_that_cannot_be_parsed_still_reaches_the_cover_origin() {
+        // The reference splices whatever it cannot authenticate, so a peer whose hello trips a parse rule sees its own site answer rather than a closed socket: the close is both the detectable break and the hang, and only the bytes the server read go ahead with it.
+        let mut truncated = good_hello();
+        truncated.truncate(truncated.len() - 8);
+        for (bytes, seen) in [
+            (b"not a tls record at all".to_vec(), 5usize),
+            (vec![0x16, 0x03, 0x01, 0xFF, 0xF8, 0x00], 5),
+            (truncated.clone(), truncated.len()),
+        ] {
+            let verdict = offer(&settings(), 0, &bytes);
+            assert!(
+                !verdict.authenticated,
+                "{} bytes authenticated",
+                bytes.len()
+            );
+            assert_eq!(verdict.dialled, 1, "{} bytes dialled nothing", bytes.len());
+            assert_eq!(
+                verdict.cover,
+                bytes[..seen],
+                "{} bytes sent {} to the cover origin",
+                bytes.len(),
+                verdict.cover.len()
+            );
+        }
     }
 
     #[cfg_attr(
