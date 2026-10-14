@@ -399,6 +399,26 @@ body
     }
 
     #[test]
+    fn two_bodies_that_echo_each_other_are_a_warning() {
+        let shared = "fold the record layer framing into one helper everywhere";
+        let one = GOOD.replace(
+            "```text\nbody",
+            &format!("```text\nbody, and {shared} once"),
+        );
+        let text = format!(
+            "{one}\n## P2 · Two\n\n**When to use:** now\n**Status:** todo\n**Leverage:** 1\n\
+             **Effort:** small\n**Gates:** `cargo test`\n\n```text\n{shared} twice\n```\n"
+        );
+        let findings = run(&load(&text), &crate::manifest_root(), true);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.message.contains("echoes P1")),
+            "{findings:#?}"
+        );
+    }
+
+    #[test]
     fn the_live_library_passes_its_own_gate() {
         let library = crate::load_library(None, Path::new(env!("CARGO_MANIFEST_DIR")))
             .expect("the library is next to this crate");
