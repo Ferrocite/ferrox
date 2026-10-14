@@ -1,13 +1,22 @@
 # The xHTTP carrier
 
-One mode is implemented: `POST` with `Transfer-Encoding: chunked`. The padding
-and placement rules for the other xHTTP modes are not, and the roadmap slice
-that still says this carrier has no implementation is stale — it has one, in one
-mode.
+The modes the hub serves are `stream-one`, `stream-up` and `packet-up`, on the
+padding and placement rules the reference ships: `x_padding` in the `Referer` by
+default, or in the configured header, cookie or query parameter once
+`xPaddingObfsMode` is on, with the session id and sequence number in a path
+segment, header, cookie or query parameter as configured. `multi` is not, and
+neither is the `xmux` connection pool under it.
 
 The framing is the chunked encoding and nothing else: a hex length, CRLF, the
 payload, CRLF, and a zero-length terminator. There is no envelope, no type byte
 and no session header beyond the request head.
+
+The settings a server honours come from `extra` when the config carries one: the
+reference builds its `Config` from that block and lets it replace every knob
+except host, path and mode, because that is how a share link carries obfuscation.
+A parser that reads only the outer block answers its own padding check with a
+`400`; "What we removed" names the tests that pin the precedence and the status
+code that falls out of it.
 
 The size lines are the part worth naming. A `Size` line for a given length is a
 pure function of the length, so `size_lines_match_format_without_allocating`
@@ -112,11 +121,36 @@ read.
   slice for folding both into `proxy.rs`, and it is open. Until that lands, this
   carrier duplicates them, which is a code-size debt rather than a data-path
   cost, and it is named here rather than quietly counted as a win.
+- **A settings parse that read one block only.** Every knob was taken from the
+  outer `xhttpSettings`, so a config whose obfuscation lives in `extra` — which
+  is how a share link carries it, and what the oracle's `extra=true` cases send —
+  silently fell back to the defaults: `xPaddingObfsMode` false, padding range
+  100-1000, `Referer` placement. The hub then applied the *default* padding check
+  to a request built to the configured one, and every such request was refused
+  with `HTTP/1.1 400 Bad Request` before any byte of the tunnel moved; that is
+  the `xhttp_requests_match_the_oracle` line in the interop baseline. `extra` now
+  replaces the block the rest of the parse reads, keeping host, path and mode on
+  the outer object as the reference does, and accepting either the object form or
+  the JSON-string form a link query holds. The object form costs one key lookup
+  and no allocation; a shape that is neither object, `null` nor a string of an
+  object is refused rather than ignored.
+  `the_extra_block_replaces_every_knob_but_path_and_mode` pins the precedence and
+  the replace-not-merge rule (`scMaxEachPostBytes` set outside and omitted inside
+  ends up at the default, not at the outer value);
+  `xhttp_refusals_carry_their_statuses` pins what the hub does with the result —
+  the configured header padding is accepted, the default `Referer` padding is now
+  refused, so the knobs demonstrably reach the accept path and not just the
+  parser.
 
 ## Open rows
 
-- One mode only. `stream-one`, `packet-up`, `stream-up` and `multi` are not
-  implemented, and the padding and placement rules per mode are absent.
+- The dialer is one mode: `connect` and `connect_split` write a single
+  `stream-one` POST head, so an outbound on `stream-up` or `packet-up` does not
+  exist yet, and neither does the `xmux` pool under `multi`.
+- Six knobs in the reference's `Config` are not parsed at all:
+  `uplinkChunkSize`, `sessionIDTable`, `sessionIDLength`, `serverMaxHeaderBytes`,
+  `scStreamUpServerSecs` and `xmux`. The first two shape a client's requests, so
+  they belong with the modes above rather than with the hub.
 - The pinned conformance row
   `rust_socks_client_reaches_target_through_remote_xhttp_profile` panics unless
   `XRAY_REMOTE_XHTTP_CONFIG` names an owner-only file. The mode assertion in the
@@ -129,3 +163,11 @@ read.
 | --- | --- |
 | the carrier Xray-core and sing-box do not ship | — |
 | the carrier ZeroNet does ship | `upstream/zeronet/crates/zero-transport/src/xhttp.rs` |
+| `extra` replacing every knob but host, path and mode, in object and string form | `upstream/zeronet/crates/zero-config/src/xhttp.rs:446` |
+| the padding value, its placements and the tokenish length bound | `upstream/zeronet/crates/zero-transport/src/xhttp_request.rs:619` |
+
+The `extra` precedence is cited from ZeroNet's port, not from the Xray pin: the
+`Config` message at `upstream/xray-core/transport/internet/splithttp/config.proto`
+carries all of these knobs as top-level fields and has no `extra` at all, so the
+block is newer than the commit `upstream/pins.toml` names. The rule is the same
+one the reference's own `SplitHTTPConfig.Build` applies.
