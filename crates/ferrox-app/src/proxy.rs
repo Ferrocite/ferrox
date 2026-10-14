@@ -8,6 +8,11 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::budgets::{
+    ACCOUNT_ATTEMPTS, ACCOUNT_BACKOFF_SECS, CARRIER_DEAD_SECS, CARRIER_PROBE, DIAL_TIMEOUT,
+    HANDSHAKE_REQUEST_TIMEOUT, HEAD_DEADLINE, PAYLOAD_GRACE, RELAY_HANDOFF_SPINS, RELAY_IDLE,
+    RELAY_LOCK_TRIES, RELAY_POLL, RELAY_QUANTUM, SESSION_POLL, UDP_IDLE,
+};
 use crate::config::{
     inbound_carrier, inbound_reality_config, inbound_tls_identity, outbound_carrier, outbound_flow,
     outbound_reality, outbound_tls, stream_security, tls_ca_roots, tls_cert_paths, trojan_key,
@@ -214,11 +219,6 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
         }
     }
 }
-
-const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
-
-// Bound the raw opening request read: a peer that connects and stays silent must not pin its per-connection thread forever.
-pub(crate) const HANDSHAKE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn dial(target: &SocketAddr) -> Result<TcpStream, Failure> {
     let stream = TcpStream::connect_timeout(target, DIAL_TIMEOUT)
@@ -2045,18 +2045,11 @@ fn unix_millis() -> u64 {
         })
 }
 
-pub(crate) const RELAY_POLL: Duration = Duration::from_millis(20);
-
-/// How long a shared read holds the lock: under one grain on purpose, so a writer never waits out the wait.
-const SESSION_POLL: Duration = Duration::from_millis(1);
-
 #[derive(Debug)]
 struct Half<T> {
     inner: Mutex<T>,
     wanted: AtomicBool,
 }
-
-const RELAY_HANDOFF_SPINS: u32 = 64;
 
 impl<T> Half<T> {
     fn new(value: T) -> Self {
@@ -2115,8 +2108,6 @@ impl<T: Write> Half<T> {
         }
     }
 }
-
-const RELAY_LOCK_TRIES: u32 = 64;
 
 fn relay_stream<A: Read + Write + Send + 'static, B: Read + Write + Send + 'static>(
     a: A,
@@ -5385,9 +5376,6 @@ fn serve_foxy_front(
 
 const HTTP_HEAD_LIMIT: usize = 8192;
 
-/// A head's arrival budget: without one a quiet peer keeps a task waking once per poll, burning a core.
-pub(crate) const HEAD_DEADLINE: Duration = Duration::from_secs(20);
-
 /// An HTTP proxy request: a tunnel to open, or a head to forward to a raw uplink.
 enum ProxyRequest {
     Connect(SocksTarget),
@@ -6445,16 +6433,6 @@ fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
     }
 }
 
-/// The bound on one backward read's lock hold: without it the first idle read wedges every upload.
-const RELAY_QUANTUM: Duration = Duration::from_millis(100);
-/// How long an `auto` carrier the user did not ask for is proven for; a configured one gets the full budget.
-pub(crate) const CARRIER_PROBE: Duration = Duration::from_millis(2_500);
-/// A silent edge's quarantine: long enough to skip a per-flow probe, short enough to find it answering again.
-pub(crate) const CARRIER_DEAD_SECS: u64 = 60;
-/// Sign-in attempts and the first pause: only wrong credentials and quota are not worth asking again.
-const ACCOUNT_ATTEMPTS: usize = 4;
-const ACCOUNT_BACKOFF_SECS: u64 = 5;
-
 /// Whether a refusal is worth asking again: not credentials, not quota — no retry changes those.
 fn transient(denied: &crate::foxy_account::Denied) -> bool {
     !matches!(
@@ -6462,8 +6440,6 @@ fn transient(denied: &crate::foxy_account::Denied) -> bool {
         crate::foxy_account::Denied::Token | crate::foxy_account::Denied::Quota
     )
 }
-/// A quiet poll's sleep: long enough not to spin, short enough that traffic never feels it.
-const RELAY_IDLE: Duration = Duration::from_millis(10);
 /// The pooled dial uses the edge's name, not its resolved address, so a country's flows share one connection.
 fn foxy_quic_dial(foxy: &FoxyOut, edge: &ferrox_core::foxy::Candidate) -> crate::quic::QuicDial {
     crate::quic::QuicDial {
@@ -6748,8 +6724,6 @@ fn dial_http_outbound(
         do_connect(client, s, http, target);
     }
 }
-
-pub(crate) const UDP_IDLE: Duration = Duration::from_secs(120);
 
 pub(crate) const UDP_BUF: usize = 65535;
 
@@ -7726,9 +7700,6 @@ fn writev_loop(fd: std::os::fd::RawFd, iov: &mut [libc::iovec], mut left: usize)
     }
     true
 }
-
-/// How long a carrier may stay open and silent before the app's payload goes out ahead of the answer: a carrier that refuses inside the window leaves the bytes for the ladder's next rung.
-const PAYLOAD_GRACE: Duration = Duration::from_millis(100);
 
 /// The app's payload pumped while the carrier still owes its answer, because a server may hold that answer until it sees payload — xray flushes its buffered response on the first downstream write and zeronet's `HeaderFirst::hold` waits for the first payload outright — so a client that stops sending to wait hangs both ways.
 pub(crate) struct Pump {

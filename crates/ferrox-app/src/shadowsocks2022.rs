@@ -7,7 +7,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ferrox_core::shadowsocks2022::{self, Cipher, Method, BLOCK_LEN, MAX_CHUNK, TAG_LEN};
 
-use crate::proxy::{push_addr, read_exact, RELAY_POLL, UDP_BUF};
+use crate::budgets::RELAY_POLL;
+use crate::proxy::{push_addr, read_exact, UDP_BUF};
 
 const READ_CHUNK: usize = 0x4000;
 const SKEW: u64 = 30;
@@ -130,11 +131,11 @@ fn serve_single(stream: &mut TcpStream, method: Method, psk: &[u8], freedom: boo
     }
     let key_len = method.key_len();
     // Bound the salt/fixed/variable request reads to a wall-clock budget, then restore the relay's blocking reads.
-    let _ = stream.set_read_timeout(Some(crate::proxy::HANDSHAKE_REQUEST_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT));
     let opened = {
         let mut bounded = crate::proxy::HandshakeDeadline {
             inner: stream,
-            until: std::time::Instant::now() + crate::proxy::HANDSHAKE_REQUEST_TIMEOUT,
+            until: std::time::Instant::now() + crate::budgets::HANDSHAKE_REQUEST_TIMEOUT,
         };
         'req: {
             let mut salt = vec![0u8; key_len];
@@ -192,11 +193,11 @@ fn serve_multi(stream: &mut TcpStream, method: Method, list: &[Vec<u8>], freedom
     let key_len = method.key_len();
     let master = &list[0];
     // Bound the salt/eih/fixed/variable request reads to a wall-clock budget, then restore the relay's blocking reads.
-    let _ = stream.set_read_timeout(Some(crate::proxy::HANDSHAKE_REQUEST_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT));
     let opened = {
         let mut bounded = crate::proxy::HandshakeDeadline {
             inner: stream,
-            until: std::time::Instant::now() + crate::proxy::HANDSHAKE_REQUEST_TIMEOUT,
+            until: std::time::Instant::now() + crate::budgets::HANDSHAKE_REQUEST_TIMEOUT,
         };
         'req: {
             let mut salt = vec![0u8; key_len];
@@ -1633,7 +1634,7 @@ mod tests {
         });
         let _peer = TcpStream::connect(addr).expect("connects");
         done_rx
-            .recv_timeout(crate::proxy::HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
+            .recv_timeout(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
             .expect("the bounded request read returns instead of pinning the thread");
         serving.join().expect("joins");
     }
@@ -1651,7 +1652,7 @@ mod tests {
         });
         let _peer = TcpStream::connect(addr).expect("connects");
         done_rx
-            .recv_timeout(crate::proxy::HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
+            .recv_timeout(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
             .expect("the bounded request read returns instead of pinning the thread");
         serving.join().expect("joins");
     }

@@ -103,7 +103,7 @@ fn fresh_mask() -> Option<[u8; 4]> {
 }
 
 fn read_head(stream: &mut TcpStream) -> Option<Vec<u8>> {
-    crate::proxy::read_http_head(stream, HEAD_LIMIT, crate::proxy::HEAD_DEADLINE)
+    crate::proxy::read_http_head(stream, HEAD_LIMIT, crate::budgets::HEAD_DEADLINE)
 }
 
 struct Shared {
@@ -467,7 +467,7 @@ pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
 ) -> Option<(WsReader<R>, WsWriter)> {
     use std::fmt::Write as _;
     let (head, prefix) =
-        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::proxy::HEAD_DEADLINE)?;
+        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::HEAD_DEADLINE)?;
     let (key, mut early) = check_request(&head, path)?;
     let mut response = format!(
         "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n",
@@ -531,7 +531,7 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     let (handshake, early) = request(host, path, &key, budget, first);
     write.write_all(handshake.as_bytes()).ok()?;
     let (head, behind) =
-        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::proxy::HEAD_DEADLINE)?;
+        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::HEAD_DEADLINE)?;
     check_response(&head, &key)?;
     let (reader, writer) = split_halves(read, write, behind, true);
     if !early && !first.is_empty() && !writer.send(first) {

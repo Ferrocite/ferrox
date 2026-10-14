@@ -37,7 +37,7 @@ impl<R: Read> Read for HeadReader<R> {
 }
 
 fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
-    crate::proxy::read_http_head(stream, HEAD_LIMIT, crate::proxy::HEAD_DEADLINE)
+    crate::proxy::read_http_head(stream, HEAD_LIMIT, crate::budgets::HEAD_DEADLINE)
         .map(|head| (head, Vec::new()))
 }
 
@@ -76,7 +76,7 @@ pub(crate) fn accept_split<R: Read, W: Write>(
     path: &str,
 ) -> Option<(HeadReader<R>, W)> {
     let (head, prefix) =
-        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::proxy::HEAD_DEADLINE)?;
+        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::HEAD_DEADLINE)?;
     check_request(&head, path)?;
     write
         .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")
@@ -133,7 +133,7 @@ pub(crate) fn connect_split<R: Read, W: Write>(
     let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n");
     write.write_all(request.as_bytes()).ok()?;
     let (head, prefix) =
-        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::proxy::HEAD_DEADLINE)?;
+        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::HEAD_DEADLINE)?;
     check_response(&head)?;
     Some((
         HeadReader {

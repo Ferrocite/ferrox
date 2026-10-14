@@ -32,7 +32,7 @@ impl<R: Read> Read for UpReader<R> {
 }
 
 fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
-    crate::proxy::read_http_head(stream, HEAD_LIMIT, crate::proxy::HEAD_DEADLINE)
+    crate::proxy::read_http_head(stream, HEAD_LIMIT, crate::budgets::HEAD_DEADLINE)
         .map(|head| (head, Vec::new()))
 }
 
@@ -69,7 +69,7 @@ pub(crate) fn accept_split<R: Read, W: Write>(
     path: &str,
 ) -> Option<(UpReader<R>, W)> {
     let (head, prefix) =
-        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::proxy::HEAD_DEADLINE)?;
+        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::HEAD_DEADLINE)?;
     check_request(&head, path)?;
     write
         .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
@@ -120,7 +120,7 @@ pub(crate) fn connect_split<R: Read, W: Write>(
         .write_all(upgrade_request(host, path).as_bytes())
         .ok()?;
     let (head, prefix) =
-        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::proxy::HEAD_DEADLINE)?;
+        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::HEAD_DEADLINE)?;
     check_response(&head)?;
     Some((UpReader { read, prefix }, write))
 }

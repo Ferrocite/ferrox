@@ -8,7 +8,8 @@ use ferrox_core::shadowsocks::{
     rc4_md5_key, Cipher, MasterKey, Method, Rc4, LENGTH_LEN, MAX_CHUNK, TAG_LEN,
 };
 
-use crate::proxy::{push_addr, read_exact, RELAY_POLL, UDP_BUF};
+use crate::budgets::RELAY_POLL;
+use crate::proxy::{push_addr, read_exact, UDP_BUF};
 
 const SALT_LEN: usize = 32;
 // One relay read is exactly one AEAD chunk: a 16384 B read would seal as 16383 + 1, a second length seal and tag for a single tail byte.
@@ -39,11 +40,11 @@ pub(crate) fn serve(mut stream: TcpStream, password: &str, method: &str, freedom
     let salt_len = method.key_len();
     let mut head = wire_buffer();
     // Bound the salt and first-chunk reads to a wall-clock budget, then restore the relay's blocking reads.
-    let _ = stream.set_read_timeout(Some(crate::proxy::HANDSHAKE_REQUEST_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT));
     let opened = {
         let mut bounded = crate::proxy::HandshakeDeadline {
             inner: &mut stream,
-            until: std::time::Instant::now() + crate::proxy::HANDSHAKE_REQUEST_TIMEOUT,
+            until: std::time::Instant::now() + crate::budgets::HANDSHAKE_REQUEST_TIMEOUT,
         };
         let mut salt = [0u8; SALT_LEN];
         read_exact(&mut bounded, &mut salt[..salt_len])
@@ -86,11 +87,11 @@ fn serve_stream(mut stream: TcpStream, password: &str) {
     let master = MasterKey::new(password, Method::Rc4Md5.key_len());
     let mut head = [0u8; 512];
     // Bound the IV and address-header reads to a wall-clock budget, then restore the relay's blocking reads.
-    let _ = stream.set_read_timeout(Some(crate::proxy::HANDSHAKE_REQUEST_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT));
     let opened = {
         let mut bounded = crate::proxy::HandshakeDeadline {
             inner: &mut stream,
-            until: std::time::Instant::now() + crate::proxy::HANDSHAKE_REQUEST_TIMEOUT,
+            until: std::time::Instant::now() + crate::budgets::HANDSHAKE_REQUEST_TIMEOUT,
         };
         let mut iv = [0u8; IV_LEN];
         read_exact(&mut bounded, &mut iv)
@@ -833,7 +834,7 @@ mod tests {
         });
         let _peer = TcpStream::connect(addr).expect("connects");
         done_rx
-            .recv_timeout(crate::proxy::HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
+            .recv_timeout(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
             .expect("the bounded request read returns instead of pinning the thread");
         serving.join().expect("joins");
     }
@@ -851,7 +852,7 @@ mod tests {
         });
         let _peer = TcpStream::connect(addr).expect("connects");
         done_rx
-            .recv_timeout(crate::proxy::HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
+            .recv_timeout(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
             .expect("the bounded request read returns instead of pinning the thread");
         serving.join().expect("joins");
     }
