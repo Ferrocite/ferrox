@@ -655,6 +655,24 @@ mod tests {
         );
     }
 
+    /// The probe behind the `shadowsocks` ops row: `crypt` has no frame of its own once the release profile inlines it, so this frame is the 64 KiB stream and one fold over it, with no socket, no allocation and nothing else in the way.
+    #[test]
+    fn the_stream_cipher_costs_the_prga_loop_and_nothing_else() {
+        let mut stream = Rc4::new(b"ferrox-probe-key").expect("a sixteen-byte key schedules");
+        let mut buf = [0u8; 1024];
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            stream.crypt(&mut buf);
+            for &byte in &buf {
+                fold = fold.wrapping_mul(31).wrapping_add(u32::from(byte));
+            }
+        }
+        assert_eq!(
+            fold, 0x5ae1_42e5,
+            "64 in-place calls over one buffer, folded after each"
+        );
+    }
+
     #[test]
     fn rc4_md5_round_trips_every_length_and_turns_on_its_key() {
         let master = MasterKey::new("secret", 16);
