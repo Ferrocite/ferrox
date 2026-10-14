@@ -34,7 +34,7 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 80397 | scripts/count-ops.sh |
+| ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | password-bytes-on-the-wire | 56 | ferrox-app-proxy::tests::trojan_key_is_sha224_hex |
 | framing-bytes-added-after-the-header | 0 | ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers |
 | udp-framing-bytes-per-datagram | 2 | ferrox-app-proxy::tests::trojan_udp_frames_carry |
@@ -51,12 +51,15 @@ graph TD
   proxy::tests::the_trojan_header_costs_two_reads_not_seven 'proxy::decode_trojan_request'
 ```
 
-Blessed `80397` retired instructions for `proxy::decode_trojan_request`,
-measured by `ops.yml` over `the_trojan_header_costs_two_reads_not_seven` (which
-drives all three address forms, so the domain branch's resolver is in the frame).
-It fell from `81735` on `main` — 1338 fewer, the resolver `String` and its
-`host:port` re-scan removed from the domain branch; the `der_to_pem` gate held at
-`2680`, so the change cost the whole-binary layout nothing.
+`UNBLESSED`, and it cannot be blessed: the frame `ops.yml` measures runs through
+`the_trojan_header_costs_two_reads_not_seven`, whose domain branch calls the
+system resolver (`getaddrinfo`) for `localhost`, so the retired-instruction count
+is not reproducible. Two `ops.yml` runs of a byte-identical binary reported
+`80397` then `80812` while `der_to_pem` held at `2680` both times — the spread is
+the resolver, not the release layout. The removed `String` and `host:port`
+re-scan are real and deterministic in our code (no combined `String` is built any
+more), but a number a run contradicts the next is not a gate; it stays `UNBLESSED`
+and the drop below `main`'s `81735` is read as prose, never quoted as a figure.
 
 ## Time
 
@@ -89,11 +92,14 @@ has been read, so no duration is quoted.
   one owned `String` and the `str` form then re-scanned it for the last `:` to
   split host and port back apart. The `(&str, u16)` tuple hands the resolver both
   as separate arguments — no serialisation, no `String`, no port re-scan — and a
-  bracketless IPv6 host is no longer mangled by that split. The bytes the resolver
-  sees are identical either way, so a byte test cannot witness the removed
-  allocation; `decode_trojan_request`'s retired-instruction count is the checker,
-  and `the_trojan_header_costs_two_reads_not_seven` holds the domain path
-  byte-identical.
+  bracketless IPv6 host is no longer mangled by that split. The bytes on the wire
+  are identical either way, so `the_trojan_header_costs_two_reads_not_seven` holds
+  the domain path byte-identical but cannot see the removed allocation, and no
+  count sees it either — the `decode_trojan_request` frame is dominated by the
+  resolver's own nondeterministic work (see **Ops**). The removal is therefore
+  witnessed structurally: the tuple form contains no `format!` and builds no
+  combined `String`, so that allocation is gone by construction, not by
+  measurement.
 
 What is **not** removed: the 2-byte length prefix on UDP. It is wire format, not
 an optimisation, and `trojan_udp_frames_carry` / `trojan_udp_frames_reject_damage`
