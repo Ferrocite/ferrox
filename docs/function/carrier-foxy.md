@@ -65,6 +65,8 @@ graph TD
 | stream-write-staging-copies-per-byte | 0 | ferrox-app-foxy::loopback::the_quic_carrier_sends_the_block_reads_the_status_and_carries_the_bytes |
 | server-roles | 0 | ferrox-app-proxy::tests::quic_serve_closes_without_handshake |
 | dialled-without-ca-cert-file | 0 | ferrox-app-proxy::tests::quic_outbound_reads_ca_cert_file |
+| address-assign-capsule-bytes-per-grant | 9 | ferrox-core-foxy::connectip::tests::the_assign_a_proxy_writes_is_the_assign_the_lane_reads |
+| route-advert-capsule-bytes-per-route | 12 | ferrox-core-foxy::connectip::tests::the_route_advert_a_proxy_writes_is_the_route_advert_the_lane_reads |
 <!-- counts:end -->
 
 `payload-staging-copies-per-byte-written 0` and
@@ -156,6 +158,17 @@ the comparison can be re-read:
   caller's buffer; a loopback edge that walks whole frames or not at all says
   the bytes are still the frame they were.
 
+- **Two hand-rolled `ADDRESS_ASSIGN` capsules.** The HTTP/2 and HTTP/3
+  CONNECT-IP edges each spelled the grant byte-for-byte by hand; both now call
+  `connectip::address_assign_encode`, and the two loopback lanes read back the
+  identical assignment (`the_connect_ip_carrier_opens_one_tunnel_and_carries_a_datagram`,
+  `..._over_quic_and_carries_a_datagram`). The writer is the exact inverse of the
+  reader it feeds — the same request id, version, address and prefix the client
+  lane parses — so `address-assign-capsule-bytes-per-grant 9` and
+  `route-advert-capsule-bytes-per-route 12` name the framing it emits;
+  `route_advert_encode` gives the server→client direction its writer too, so the
+  codec now spells every capsule it reads.
+
 - **Two buffers per UDP flow.** A CONNECT-UDP request used to build the URI
   template's path in one `Vec` and the `Bearer` value in another. Both are
   written where they are read now, because their lengths are known before they
@@ -167,8 +180,14 @@ migration, key updates and batched datagram I/O are quiche's, and this tree has
 not made them run. The HTTP/3 DATAGRAM frame form (RFC 9297 over QUIC
 unidirectional streams) is not carried — the capsule form is, because it is the
 one an edge answers on the same stream it opened CONNECT on. The server role is
-refused by name. And the published MASQUE edge answers TCP on port 2499 rather
-than QUIC, which is why `h3` is tried first and `h2` is not a downgrade.
+refused by name: the CONNECT-IP *client* dials over the Foxy `h3` lane
+(`serve_socks_udp_foxy_ip`, one tunnel carrying every destination), and the codec
+now writes every capsule in both directions, but no proxy *terminates* one — the
+address pool and the IP/ICMP forwarding to a device are not wired, and neither is
+a standalone `Carrier::Masque` VLESS outbound (its planned reason names the live
+foxy lane and the missing dial). And the published MASQUE edge answers TCP on
+port 2499 rather than QUIC, which is why `h3` is tried first and `h2` is not a
+downgrade.
 
 ## Pins
 

@@ -77,6 +77,7 @@ Implement {method} — matrix row {index} of table {section}, currently "{state}
 
 **Add-on — both-roles:** If the state cell concedes one role only, the missing role is the whole slice.
 **Add-on — refused-by-name:** A config naming an unimplemented surface must still refuse with a reason until this slice makes it dial.
+**Add-on — connect-ip-terminate:** When the row is MASQUE CONNECT-IP (matrix row 20), the CONNECT-IP *client* is already shipped — the Foxy `h3` lane dials over HTTP/2 and quiche HTTP/3 and the codec in `crates/ferrox-core/src/foxy/connectip.rs` now writes and reads every capsule in both directions (`address_assign_encode`, `route_advert_encode`, proven inverse to their readers byte-for-byte). The two remaining roles are each their own slice, not one: (a) a proxy that *terminates* a tunnel — read `upstream/xray-core/transport/internet/masque/connectip/` and `upstream/mqvpn` — where the open work is the address pool and the IP/ICMP forwarding to a device, which is platform-privileged (a `tun`) and needs `Role::`/inbound plumbing that no share-link row reaches; (b) a standalone `Carrier::Masque` VLESS outbound off the account (its `planned_reason` names the live foxy lane and the missing dial). Land the codec-complete client row, then route each of those as a separate `next`; do not fold a privileged device write into a codec slice.
 
 ## P2 · Make a shipped method faster and leaner
 
