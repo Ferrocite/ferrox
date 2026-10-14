@@ -6,13 +6,21 @@
 # `scripts/method-counts.txt` from UNBLESSED into a number somebody can read and
 # decide to bless.
 #
-# A row whose symbol reports `Ir=inlined-not-a-frame` was never measured: the
-# profile has no frame for it because the function dissolved into its caller.
-# `lto = "thin"` and `codegen-units = 1` in the release profile erase a small
-# cross-crate helper, so every `ferrox_core::` leaf here is a casualty of the
-# optimisation the shipped binary runs on. A blank is not a count, so the script
-# says which rows are noise instead of printing an empty figure a page could
-# read as one.
+# A row is measured in the test binary that holds its filter, and `count-ops.sh`
+# confirms that before valgrind runs: profiling a binary where the filter matches
+# no test runs zero tests, and then every symbol reads frame-less. The label says
+# which of two different things happened.
+#
+#   Ir=inlined-not-a-frame  the test ran and the profile holds no frame for the
+#                           symbol, so the method dissolved into its caller.
+#   Ir=no-such-test         neither test binary has a test by the filter's name:
+#                           the row drifted and needs re-pointing, not blessing.
+#
+# Until that check existed the harness profiled only the ferrox-app test binary,
+# while 14 of these 31 rows name a test that lives in ferrox-core. Those blanks
+# were never a verdict about inlining, so the `lto = "thin"` sentence published
+# here for them was wrong and is gone; it stays a candidate explanation only for
+# a row the fixed harness reports as `inlined-not-a-frame`.
 #
 # Renaming such a row to its test body is NOT the fix. A test frame charges the
 # harness, the fixture bytes and any socket it opens, which is not a claim about
@@ -20,10 +28,12 @@
 # question. A dead row needs a probe whose cost is the method and nothing else —
 # a repeated call over a fixed buffer — before it earns a number.
 #
-# Surviving rows keep the method's own name: `proxy::decode_trojan_request`,
-# `foxy::read_frame`, `masque::datagram_encode`, `ws::write_frame`, and
-# `ws::tests::mask_chunks_match_the_byte_loop`, whose body is the masking loop
-# with no I/O, so the frame and the method are the same thing.
+# The rows that kept a frame when the app binary was the only one profiled are
+# `proxy::decode_trojan_request`, `foxy::read_frame`, `masque::datagram_encode`,
+# `ws::write_frame`, and `ws::tests::mask_chunks_match_the_byte_loop`, whose body
+# is the masking loop with no I/O, so the frame and the method are the same thing.
+# What the ferrox-core rows cost is read from the `method-ops` artefact after it
+# runs, not written here in advance.
 #
 # `doc  test filter  symbol`
 record-layer  record::tests::the_ladder_reports_the_blocks_the_caller_asked_for  ferrox_core::record::fill_exact

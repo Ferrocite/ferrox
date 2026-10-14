@@ -7,17 +7,46 @@ command -v valgrind >/dev/null || { echo "count-ops: valgrind not installed (apt
 outdir="$(mktemp -d)"
 trap 'rm -rf "$outdir"' EXIT
 
-bin="$(cargo test --release --bin ferrox-app --no-run --locked --message-format=json \
-    | python3 -c 'import json,sys
+test_bin() {
+    cargo test --release "$@" --no-run --locked --message-format=json \
+        | python3 -c 'import json,sys
 for line in sys.stdin:
     try: m = json.loads(line)
     except ValueError: continue
     if m.get("reason") == "compiler-artifact" and m.get("executable"):
-        print(m["executable"]); break')"
-[ -n "$bin" ] || { echo "count-ops: no test binary built" >&2; exit 2; }
+        print(m["executable"]); break'
+}
 
+app_bin="$(test_bin --bin ferrox-app)"
+core_bin="$(test_bin -p ferrox-core --lib)"
+[ -n "$app_bin" ] || { echo "count-ops: no ferrox-app test binary" >&2; exit 2; }
+[ -n "$core_bin" ] || { echo "count-ops: no ferrox-core test binary" >&2; exit 2; }
+
+# The filter decides which binary can be profiled, and a `ferrox_core::` method is driven from either crate's tests, so the symbol's own crate is tried first and the other binary is the fallback.
+find_bin() {
+    local filter="$1" symbol="$2" candidate
+    local -a order=("$app_bin" "$core_bin")
+    case "$symbol" in
+        ferrox_core*) order=("$core_bin" "$app_bin") ;;
+    esac
+    for candidate in "${order[@]}"; do
+        if "$candidate" --exact "$filter" --list 2>/dev/null | grep -q "^$filter: test$"; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Returns the count, or 2 when the measurement broke, 3 when the test ran and the profile holds no frame, 4 when neither test binary has a test by the filter's name.
 ir_of() {
     local filter="$1" symbol="$2" data="$outdir/callgrind.out"
+    local bin
+    # Profiling a binary where the filter matches no test runs zero tests, and then every symbol reads frame-less; the test is confirmed before valgrind is pointed at it.
+    bin="$(find_bin "$filter" "$symbol")" || {
+        echo "count-ops: no test named $filter in either test binary" >&2
+        return 4
+    }
     rm -f "$data" "$data".*
     local status=0
     valgrind --tool=callgrind --callgrind-out-file="$data" \
@@ -51,7 +80,7 @@ with open(sys.argv[1], errors="ignore") as f:
 print(total)
 EOF
 )"
-    # 3 = the profile ran but holds no frame for this symbol, which is a different claim from 2 = the measurement broke.
+    # A zero total means no frame was ever active for the symbol, not that the call happened and cost nothing.
     [ "${total:-0}" != "0" ] || {
         echo "count-ops: no frame for symbol: $symbol" >&2
         echo "count-ops: positions/events header and quic fn records:" >&2
@@ -63,7 +92,7 @@ EOF
 }
 
 syscalls_of() {
-    local filter="$1"
+    local filter="$1" bin="$2"
     if ! command -v strace >/dev/null; then
         echo "count-ops: strace not installed, skipping syscall table" >&2
         return 0
@@ -75,24 +104,32 @@ syscalls_of() {
 if [ "$mode" = "report" ]; then
     filter="$2"
     shift 2
+    first="$1"
+    bin=""
+    bin="$(find_bin "$filter" "$first")" || bin=""
     for symbol in "$@"; do
         got=""
         status=0
         got="$(ir_of "$filter" "$symbol")" || status=$?
         case "$status" in
-            # A symbol with no frame dissolved into its caller under the release profile; a blank here reads as a count that was never taken.
             0) echo "$symbol Ir=$got" ;;
+            # 3 = the test ran and the profile holds no frame for the symbol; 4 = neither test binary has a test by that name. A blank here would read as a count that was never taken.
             3) echo "$symbol Ir=inlined-not-a-frame" ;;
+            4) echo "$symbol Ir=no-such-test" ;;
             *) exit "$status" ;;
         esac
     done
-    syscalls_of "$filter"
+    # The syscall table needs one resolved binary; an unresolvable filter has no run to count syscalls in.
+    [ -n "$bin" ] && syscalls_of "$filter" "$bin"
     exit 0
 fi
 
 if [ "$mode" = "check" ]; then
     filter="$2"
     expect="$3"
+    first_symbol="$(awk '$1 !~ /^#/ && NF { print $1; exit }' "$expect")"
+    bin=""
+    bin="$(find_bin "$filter" "$first_symbol")" || bin=""
     failed=0
     while read -r symbol want _; do
         case "$symbol" in ''|'#'*) continue ;; esac
@@ -104,7 +141,7 @@ if [ "$mode" = "check" ]; then
             echo "count-ops: $symbol Ir=$got ok"
         fi
     done < "$expect"
-    syscalls_of "$filter"
+    [ -n "$bin" ] && syscalls_of "$filter" "$bin"
     exit "$failed"
 fi
 
