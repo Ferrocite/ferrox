@@ -51,12 +51,13 @@ with open(sys.argv[1], errors="ignore") as f:
 print(total)
 EOF
 )"
+    # 3 = the profile ran but holds no frame for this symbol, which is a different claim from 2 = the measurement broke.
     [ "${total:-0}" != "0" ] || {
-        echo "count-ops: symbol not found: $symbol" >&2
+        echo "count-ops: no frame for symbol: $symbol" >&2
         echo "count-ops: positions/events header and quic fn records:" >&2
         grep -E "^(positions|events):" "$produced" >&2 || true
         grep "^fn=.*quic" "$produced" | head -n 10 >&2 || true
-        return 2
+        return 3
     }
     echo "$total"
 }
@@ -76,9 +77,14 @@ if [ "$mode" = "report" ]; then
     shift 2
     for symbol in "$@"; do
         got=""
-        got="$(ir_of "$filter" "$symbol")"
-        # An empty count means the symbol is not a frame at all: it inlined into its caller, and a page that read the blank as a number would be quoting a measurement that never happened.
-        echo "$symbol Ir=${got:-inlined-not-a-frame}"
+        status=0
+        got="$(ir_of "$filter" "$symbol")" || status=$?
+        case "$status" in
+            # A symbol with no frame dissolved into its caller under the release profile; a blank here reads as a count that was never taken.
+            0) echo "$symbol Ir=$got" ;;
+            3) echo "$symbol Ir=inlined-not-a-frame" ;;
+            *) exit "$status" ;;
+        esac
     done
     syscalls_of "$filter"
     exit 0
