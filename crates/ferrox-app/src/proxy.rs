@@ -18108,55 +18108,102 @@ mod relay_tests {
         assert_eq!(got, REPLY, "a finished upload must not drop the reply");
     }
 
+    /// One user, one reader and one relay thread per flow, all sixteen running at once, each flow
+    /// moving thirty-two splice pipes' worth: the multi-connection regime the references sustain at
+    /// gigabits, and the one a stalled flow poisons for its neighbours. Every count a stall needs to
+    /// name itself is published, so the failure says which flow, how far in, how far out and how
+    /// many relays ended. Loopback only, dials nothing.
     #[test]
     fn sixteen_flows_at_once_all_arrive_whole() {
         const FLOWS: usize = 16;
-        const LEN: usize = 20_000;
-        let front = listener();
+        const CHUNK: usize = 65_536;
+        const ROUNDS: usize = 128;
+        const LEN: usize = CHUNK * ROUNDS;
+        let front = Arc::new(listener());
         let front_port = port_of(&front);
-        let back = listener();
+        let back = Arc::new(listener());
         let back_port = port_of(&back);
 
-        let payloads: Vec<Vec<u8>> = (0..FLOWS)
-            .map(|flow| (0..LEN).map(|i| ((i + flow) % 251) as u8).collect())
+        let sent: Arc<[std::sync::atomic::AtomicUsize]> = (0..FLOWS)
+            .map(|_| std::sync::atomic::AtomicUsize::new(0))
             .collect();
-        let wanted = vec![LEN; FLOWS];
 
-        let outbound = payloads.clone();
-        let front_far = thread::spawn(move || {
-            let mut held = Vec::with_capacity(FLOWS);
-            for payload in &outbound {
+        let mut users = Vec::with_capacity(FLOWS);
+        for user in 0..FLOWS {
+            let sent = Arc::clone(&sent);
+            let front = Arc::clone(&front);
+            users.push(thread::spawn(move || {
                 let (mut stream, _) = front.accept().expect("accepts");
-                stream.write_all(payload).expect("writes");
+                stream.set_write_timeout(Some(PATIENCE)).expect("timeout");
+                let chunk: Vec<u8> = (0..CHUNK).map(|i| ((i + user) % 251) as u8).collect();
+                let mut wrote = 0usize;
+                for _ in 0..ROUNDS {
+                    if stream.write_all(&chunk).is_err() {
+                        break;
+                    }
+                    wrote += CHUNK;
+                    sent[user].store(wrote, Ordering::Relaxed);
+                }
                 let _ = stream.shutdown(Shutdown::Write);
-                held.push(stream);
-            }
-            held
-        });
-        let back_far = thread::spawn(move || {
-            let mut lengths = Vec::with_capacity(FLOWS);
-            for _ in 0..FLOWS {
+                // handed back so the kernel's unsent bytes live until the counts are read
+                stream
+            }));
+        }
+        let mut readers = Vec::with_capacity(FLOWS);
+        for _ in 0..FLOWS {
+            let back = Arc::clone(&back);
+            readers.push(thread::spawn(move || {
                 let (mut stream, _) = back.accept().expect("accepts");
                 stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
-                lengths.push(read_all(&mut stream).len());
-            }
-            lengths
-        });
+                let mut arrived = 0usize;
+                let mut chunk = vec![0u8; CHUNK];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return arrived,
+                        Ok(took) => arrived += took,
+                    }
+                }
+            }));
+        }
 
+        let (ended, watched) = mpsc::channel();
         let mut relays = Vec::with_capacity(FLOWS);
         for _ in 0..FLOWS {
             let client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
             let target = TcpStream::connect(("127.0.0.1", back_port)).expect("connects");
-            relays.push(thread::spawn(move || relay(&client, &target)));
+            let ended = ended.clone();
+            relays.push(thread::spawn(move || {
+                relay(&client, &target);
+                let _ = ended.send(());
+            }));
+        }
+        drop(ended);
+
+        let arrived: Vec<usize> = readers
+            .into_iter()
+            .map(|reader| reader.join().expect("reads"))
+            .collect();
+        let mut finished = 0usize;
+        for _ in 0..FLOWS {
+            if watched.recv_timeout(PATIENCE).is_err() {
+                break;
+            }
+            finished += 1;
+        }
+        let written: Vec<usize> = (0..FLOWS)
+            .map(|user| sent[user].load(Ordering::Relaxed))
+            .collect();
+        assert!(
+            arrived.iter().all(|count| *count == LEN) && finished == FLOWS,
+            "{FLOWS} concurrent flows of {LEN} bytes each arrived {arrived:?}, were written \
+             {written:?}, and {finished} of {FLOWS} relays ended"
+        );
+
+        for user in users {
+            user.join().expect("feeds");
         }
         for relay_side in relays {
             relay_side.join().expect("joins");
         }
-        assert_eq!(
-            back_far.join().expect("joins"),
-            wanted,
-            "a flow among sixteen arrived short, which means two flows shared a pipe"
-        );
-        front_far.join().expect("joins");
     }
 }
