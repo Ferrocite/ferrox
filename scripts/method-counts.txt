@@ -81,7 +81,7 @@ vless vision-header-targets-matching-core 2 ferrox-app-proxy::tests::vision_head
 vless dial-header-reallocations 0 ferrox-app-proxy::tests::dial_headers_are_sized_to_the_bytes_they_hold
 
 # --- Trojan -----------------------------------------------------------------
-trojan ops-retired-instructions UNBLESSED scripts/count-ops.sh
+trojan ops-retired-instructions 80397 scripts/count-ops.sh
 trojan password-bytes-on-the-wire 56 ferrox-app-proxy::tests::trojan_key_is_sha224_hex
 trojan framing-bytes-added-after-the-header 0 ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers
 trojan udp-framing-bytes-per-datagram 2 ferrox-app-proxy::tests::trojan_udp_frames_carry

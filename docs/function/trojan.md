@@ -34,7 +34,7 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| ops-retired-instructions | 80397 | scripts/count-ops.sh |
 | password-bytes-on-the-wire | 56 | ferrox-app-proxy::tests::trojan_key_is_sha224_hex |
 | framing-bytes-added-after-the-header | 0 | ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers |
 | udp-framing-bytes-per-datagram | 2 | ferrox-app-proxy::tests::trojan_udp_frames_carry |
@@ -51,7 +51,12 @@ graph TD
   proxy::tests::the_trojan_header_costs_two_reads_not_seven 'proxy::decode_trojan_request'
 ```
 
-`UNBLESSED`, as above.
+Blessed `80397` retired instructions for `proxy::decode_trojan_request`,
+measured by `ops.yml` over `the_trojan_header_costs_two_reads_not_seven` (which
+drives all three address forms, so the domain branch's resolver is in the frame).
+It fell from `81735` on `main` — 1338 fewer, the resolver `String` and its
+`host:port` re-scan removed from the domain branch; the `der_to_pem` gate held at
+`2680`, so the change cost the whole-binary layout nothing.
 
 ## Time
 
