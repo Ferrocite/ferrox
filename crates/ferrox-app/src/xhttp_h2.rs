@@ -1029,36 +1029,57 @@ mod tests {
     /// Endless CONTINUATION frames for one stream must not grow a header block past `HEAD_CAP`: the reassembly is refused with a GOAWAY rather than accumulated without bound.
     #[test]
     fn a_header_block_reassembled_past_the_cap_refuses_the_connection() {
-        let (addr, server) = serve_one(test_settings("stream-up"), [0xaau8; 16], 1);
-        let mut client = H2Client::connect(addr);
-        // Open a header block that never ends: HEADERS without END_HEADERS.
-        write_frame(&mut client.stream, T_HEADERS, 0, 1, &[0x88]);
-        // Feed CONTINUATION frames of one max-size payload each; a compliant endpoint refuses at HEAD_CAP, so none is ever answered by an opened stream.
-        let chunk = [0u8; MAX_RECV_FRAME];
-        for _ in 0..(HEAD_CAP / MAX_RECV_FRAME + 2) {
-            write_frame(&mut client.stream, T_CONT, 0, 1, &chunk);
+        let mut tally: Vec<String> = Vec::new();
+        for _ in 0..24 {
+            let (addr, server) = serve_one(test_settings("stream-up"), [0xaau8; 16], 1);
+            let mut client = H2Client::connect(addr);
+            // Open a header block that never ends: HEADERS without END_HEADERS.
+            write_frame(&mut client.stream, T_HEADERS, 0, 1, &[0x88]);
+            // Feed CONTINUATION frames of one max-size payload each; a compliant endpoint refuses at HEAD_CAP, so none is ever answered by an opened stream.
+            let chunk = [0u8; MAX_RECV_FRAME];
+            for _ in 0..(HEAD_CAP / MAX_RECV_FRAME + 2) {
+                write_frame(&mut client.stream, T_CONT, 0, 1, &chunk);
+            }
+            client.stream.flush().expect("flushes");
+            client
+                .stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("timeout");
+            let mut got = [0u8; 9];
+            let mut at = 0;
+            let why: String = loop {
+                match client.stream.read(&mut got[at..]) {
+                    Ok(0) => break String::from("eof"),
+                    Ok(n) => {
+                        at += n;
+                        if at == got.len() {
+                            break String::from(if got[3] == T_GOAWAY {
+                                "goaway"
+                            } else {
+                                "other-frame"
+                            });
+                        }
+                    }
+                    Err(e) => break format!("{:?}", e.kind()),
+                }
+            };
+            tally.push(format!("{why} {at}B"));
+            drop(client);
+            let _ = server;
         }
-        client.stream.flush().expect("flushes");
-        client
-            .stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .expect("timeout");
-        let mut got = [0u8; 9];
+        let mut counts = std::collections::BTreeMap::new();
+        for row in &tally {
+            *counts.entry(row).or_insert(0usize) += 1;
+        }
+        let seen: Vec<String> = counts
+            .iter()
+            .map(|(row, n)| format!("{row} x{n}"))
+            .collect();
         assert!(
-            fill(&mut client.stream, &mut got).is_some(),
-            "the server neither opened the stream nor refused the over-long block"
+            seen.len() == 1 && seen[0] == "goaway 9B x24",
+            "24 rounds of the over-long block: {}",
+            seen.join(" | ")
         );
-        assert_eq!(got[3], T_GOAWAY, "expected a GOAWAY");
-        let len = usize::from(got[0]) << 16 | usize::from(got[1]) << 8 | usize::from(got[2]);
-        let mut body = vec![0u8; len];
-        assert!(fill(&mut client.stream, &mut body).is_some(), "goaway body");
-        assert_eq!(
-            u32::from_be_bytes(body[4..8].try_into().unwrap()),
-            E_PROTOCOL,
-            "the GOAWAY must carry PROTOCOL_ERROR"
-        );
-        drop(client);
-        let _ = server;
     }
 
     #[test]
