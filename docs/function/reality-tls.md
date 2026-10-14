@@ -193,7 +193,13 @@ twice and one RTT dominates the build), smaller Vision staging reads (read
 granularity moves the syscall count, which this page counts), zero-fill
 removal in padding (zeros are wire bytes), second relay copy removal (partial
 frames need the staging buffer), full edge laziness inside `accept` (a generic
-stream has no addresses; the `xver` gate covers the common path).
+stream has no addresses; the `xver` gate covers the common path), and a relay
+write that drained records with `write_tls` instead of `complete_io` —
+`complete_io` returns after its write phase whenever it has output, so the
+steady-state write already spends no `recv`, and where it does read (pending
+incoming) that one packet is charged to the connection whichever pump reads it,
+so a drain-only flush moves the syscall rather than retiring it; an in-memory
+read-count witness reads zero on both forms, so no count gates the change.
 
 What is **not** removed, and stays named: there is no uTLS fingerprint shaping
 in this tree at all, so the `unsafe-*` fingerprint extension parses, requires
