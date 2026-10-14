@@ -29,6 +29,18 @@ graph TD
     C --> D["hand to the target"]
 ```
 
+## Refusal teardown
+
+An H2 connection we refuse — oversized frame, header block past `HEAD_CAP` — writes its
+GOAWAY and then closes. Closing with the peer's bytes still sitting unread in our receive
+queue makes the stack abort instead of shut down, and the RST can swallow the GOAWAY a few
+microseconds before it: `winsock` delivers `ConnectionReset` with nothing read. So a refused
+connection now stays open for `budgets::GOAWAY_GRACE` (100 ms, the window a peer already
+blocked in `recv` takes the refusal in) before it is killed. The grace is a window, not a
+guarantee: a peer slower than 100 ms one-way still loses the refusal to our close, and this
+slice does not fix that — making the close orderly needs a read deadline the plaintext
+carrier does not arm.
+
 ## Measured
 
 <!-- counts:begin -->

@@ -56,6 +56,7 @@ struct H2Conn {
     peer_initial: Mutex<u64>,
     dead: AtomicBool,
     goaway: AtomicBool,
+    refused: AtomicBool,
 }
 
 impl std::fmt::Debug for H2Conn {
@@ -225,6 +226,14 @@ impl H2Conn {
             return false;
         }
         true
+    }
+
+    /// Refuse the connection: the GOAWAY goes out now, and `refused` remembers that the peer still has to be given the window to read it.
+    fn refuse(&self, code: u32) {
+        self.refused.store(true, Ordering::SeqCst);
+        let mut goaway = [0u8; 8];
+        goaway[4..].copy_from_slice(&code.to_be_bytes());
+        self.frame(T_GOAWAY, 0, 0, &goaway);
     }
 
     fn send_data(&self, stream: u32, mut payload: &[u8]) -> bool {
@@ -511,6 +520,7 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
         peer_initial: Mutex::new(65_535),
         dead: AtomicBool::new(false),
         goaway: AtomicBool::new(false),
+        refused: AtomicBool::new(false),
     });
     let mut initial = Vec::with_capacity(12);
     initial.extend_from_slice(&S_WINDOW.to_be_bytes());
@@ -521,11 +531,9 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
     conn.frame(T_WINDOW, 0, 0, &CONN_WINDOW_TOP_UP.to_be_bytes());
     let mut frag: Option<(u32, Vec<u8>)> = None;
     while let Some((len, kind, flags, sid)) = read_head(&mut read) {
-        // A frame past the default SETTINGS_MAX_FRAME_SIZE is a connection error (RFC 7540 6.9.1): refuse it before reserving its length or blocking on a body that may never arrive.
         if len > MAX_RECV_FRAME {
-            let mut goaway = [0u8; 8];
-            goaway[4..].copy_from_slice(&E_FRAME_SIZE.to_be_bytes());
-            conn.frame(T_GOAWAY, 0, 0, &goaway);
+            // A frame past the default SETTINGS_MAX_FRAME_SIZE is a connection error (RFC 7540 6.9.1): refuse it before reserving its length or blocking on a body that may never arrive.
+            conn.refuse(E_FRAME_SIZE);
             break;
         }
         let mut body = vec![0u8; len];
@@ -537,6 +545,10 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
         ) {
             break;
         }
+    }
+    if conn.refused.load(Ordering::SeqCst) {
+        // Closing while the peer's bytes sit unread aborts the connection, and the RST can swallow the GOAWAY written microseconds earlier; the grace is the window the peer takes it in.
+        std::thread::sleep(crate::budgets::GOAWAY_GRACE);
     }
     conn.kill();
     conn.wake.notify_all();
@@ -653,9 +665,7 @@ fn pump_frame(
                 }
                 // A header block reassembled past the implementation limit is a connection error (RFC 7540 4.3): refuse before growing it, so endless CONTINUATION frames cannot accumulate without bound.
                 if gathered.len() + body.len() > HEAD_CAP {
-                    let mut goaway = [0u8; 8];
-                    goaway[4..].copy_from_slice(&E_PROTOCOL.to_be_bytes());
-                    conn.frame(T_GOAWAY, 0, 0, &goaway);
+                    conn.refuse(E_PROTOCOL);
                     return false;
                 }
                 gathered.extend_from_slice(body);
@@ -1026,39 +1036,44 @@ mod tests {
         let _ = server;
     }
 
-    /// Endless CONTINUATION frames for one stream must not grow a header block past `HEAD_CAP`: the reassembly is refused with a GOAWAY rather than accumulated without bound.
+    /// Endless CONTINUATION frames for one stream must not grow a header block past `HEAD_CAP`: the reassembly is refused with a GOAWAY rather than accumulated without bound. Repeated because one round only sees the race on a busy machine — the refusal used to lose its GOAWAY to our own abortive close.
     #[test]
     fn a_header_block_reassembled_past_the_cap_refuses_the_connection() {
-        let (addr, server) = serve_one(test_settings("stream-up"), [0xaau8; 16], 1);
-        let mut client = H2Client::connect(addr);
-        // Open a header block that never ends: HEADERS without END_HEADERS.
-        write_frame(&mut client.stream, T_HEADERS, 0, 1, &[0x88]);
-        // Feed CONTINUATION frames of one max-size payload each; a compliant endpoint refuses at HEAD_CAP, so none is ever answered by an opened stream.
-        let chunk = [0u8; MAX_RECV_FRAME];
-        for _ in 0..(HEAD_CAP / MAX_RECV_FRAME + 2) {
-            write_frame(&mut client.stream, T_CONT, 0, 1, &chunk);
+        for round in 0..24 {
+            let (addr, server) = serve_one(test_settings("stream-up"), [0xaau8; 16], 1);
+            let mut client = H2Client::connect(addr);
+            // Open a header block that never ends: HEADERS without END_HEADERS.
+            write_frame(&mut client.stream, T_HEADERS, 0, 1, &[0x88]);
+            // Feed CONTINUATION frames of one max-size payload each; a compliant endpoint refuses at HEAD_CAP, so none is ever answered by an opened stream.
+            let chunk = [0u8; MAX_RECV_FRAME];
+            for _ in 0..(HEAD_CAP / MAX_RECV_FRAME + 2) {
+                write_frame(&mut client.stream, T_CONT, 0, 1, &chunk);
+            }
+            client.stream.flush().expect("flushes");
+            client
+                .stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .expect("timeout");
+            let mut got = [0u8; 9];
+            assert!(
+                fill(&mut client.stream, &mut got).is_some(),
+                "round {round}: the server neither opened the stream nor refused the over-long block"
+            );
+            assert_eq!(got[3], T_GOAWAY, "round {round}: expected a GOAWAY");
+            let len = usize::from(got[0]) << 16 | usize::from(got[1]) << 8 | usize::from(got[2]);
+            let mut body = vec![0u8; len];
+            assert!(
+                fill(&mut client.stream, &mut body).is_some(),
+                "round {round}: goaway body"
+            );
+            assert_eq!(
+                u32::from_be_bytes(body[4..8].try_into().unwrap()),
+                E_PROTOCOL,
+                "round {round}: the GOAWAY must carry PROTOCOL_ERROR"
+            );
+            drop(client);
+            let _ = server;
         }
-        client.stream.flush().expect("flushes");
-        client
-            .stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .expect("timeout");
-        let mut got = [0u8; 9];
-        assert!(
-            fill(&mut client.stream, &mut got).is_some(),
-            "the server neither opened the stream nor refused the over-long block"
-        );
-        assert_eq!(got[3], T_GOAWAY, "expected a GOAWAY");
-        let len = usize::from(got[0]) << 16 | usize::from(got[1]) << 8 | usize::from(got[2]);
-        let mut body = vec![0u8; len];
-        assert!(fill(&mut client.stream, &mut body).is_some(), "goaway body");
-        assert_eq!(
-            u32::from_be_bytes(body[4..8].try_into().unwrap()),
-            E_PROTOCOL,
-            "the GOAWAY must carry PROTOCOL_ERROR"
-        );
-        drop(client);
-        let _ = server;
     }
 
     #[test]
