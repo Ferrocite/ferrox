@@ -357,6 +357,28 @@ pub(crate) fn send(
     Ok(reply)
 }
 
+/// A padding character an autofilled or pasted credential can carry: every Unicode whitespace/separator (space, NBSP, ideographic, line/paragraph breaks) plus the zero-width marks (ZWSP/ZWNJ/ZWJ) and the BOM, none of which a real address or a real code contains.
+#[must_use]
+fn is_padding(c: char) -> bool {
+    c.is_whitespace() || matches!(c, '\u{200B}'..='\u{200D}' | '\u{FEFF}')
+}
+
+/// The identity as `FxA` accepts it: padding removed wherever it sits, then lower-cased to the form the stretch salt and the login body must agree on.
+#[must_use]
+fn normalize_identity(email: &str) -> String {
+    email
+        .chars()
+        .filter(|c| !is_padding(*c))
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// The two-factor code with its padding removed but its case untouched: only the digits reach the edge.
+#[must_use]
+fn sanitize_code(code: &str) -> String {
+    code.chars().filter(|c| !is_padding(*c)).collect()
+}
+
 /// The `FxA` login, tried without the two-factor method first: the first attempt's error is the reason to drop it.
 pub(crate) fn login(
     endpoint: &Endpoint,
@@ -364,11 +386,11 @@ pub(crate) fn login(
     email: &str,
     password: &str,
 ) -> Result<(String, bool), Denied> {
-    // An autofilled or pasted identity carries padding that FxA rejects; the address has no significant edge whitespace, so trim before the stretch and the body.
-    let email = email.trim();
-    let stretched = account::auth_pw(email, password);
+    // An autofilled or pasted identity carries padding FxA rejects and a casing the stretch must not depend on; drop every separator, zero-width mark and BOM wherever it sits and lower-case to the one form the salt and the body must agree on.
+    let email = normalize_identity(email);
+    let stretched = account::auth_pw(&email, password);
     for method in [Some("email-2fa"), None] {
-        let body = account::login_body(email, &stretched, method);
+        let body = account::login_body(&email, &stretched, method);
         let reply = foxy_challenge::send_with_challenge(
             endpoint,
             jar,
@@ -719,7 +741,9 @@ impl Account {
             .map_err(|_| Denied::Token)?
             .clone()
             .ok_or(Denied::Token)?;
-        let body = account::code_body(code);
+        // The code arrives from the same autofill that pads the identity; strip its padding, keep its case, before it is sent.
+        let code = sanitize_code(code);
+        let body = account::code_body(&code);
         foxy_challenge::send_with_challenge(
             &self.fxa,
             &self.jar,
@@ -1228,9 +1252,9 @@ mod two_factor {
 
 #[cfg(test)]
 mod padded_identity {
-    /// `FoxyVPN` v1.0.5 fixed a sign-in rejected by autofill padding; the lane must trim the identity before the stretch and the body, never send it raw.
+    /// `FoxyVPN` v1.0.5 rejects a sign-in whose identity or code carries autofill padding; the lane must strip every separator, zero-width mark and BOM wherever it sits, lower-case the identity, and never send a padded credential raw.
     #[test]
-    fn an_autofilled_identity_signs_in_trimmed() {
+    fn an_autofilled_identity_signs_in_normalized() {
         let _turn = super::loopback::EDGE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1238,9 +1262,32 @@ mod padded_identity {
         super::loopback::TWO_FACTOR.store(false, std::sync::atomic::Ordering::Relaxed);
         let (address, roots) = super::loopback::edge();
         let account = super::loopback::account(address, roots);
+        // An interior space, a non-breaking space, a zero-width space, upper case and a trailing BOM: the login handler asserts the body carries exactly "person@example.com", so an edge-trim-only fix fails it.
         account
-            .sign_in("  person@example.com\t", "hunter2")
-            .expect("a padded identity signs in with the trimmed email");
+            .sign_in(" Pe\u{00A0}rson@Ex\u{200B}ample.com \u{FEFF}", "hunter2")
+            .expect("a padded, cased identity signs in normalized");
+        assert!(account.current().token.starts_with("eyJ"), "and mints");
+    }
+
+    /// The two-factor code is stripped the same way, but its case is left alone because it carries digits, not an address.
+    #[test]
+    fn an_autofilled_code_is_verified_sanitized() {
+        let _turn = super::loopback::EDGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::loopback::ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        super::loopback::TWO_FACTOR.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (address, roots) = super::loopback::edge();
+        let account = super::loopback::account(address, roots);
+        account
+            .sign_in("person@example.com", "hunter2")
+            .expect("signs in and stops at two-factor");
+        assert!(account.needs_code(), "the sign-in waits for a code");
+        // The verify handler asserts the body is exactly {"code":"424242"}; a raw padded code leaves the spaces and the zero-width mark in and fails it.
+        account
+            .verify_code(" 4\u{200B} 2 4 2 4\u{00A0}2 ")
+            .expect("a padded code is sanitized to 424242 and verifies");
+        assert!(!account.needs_code(), "the code clears the wait");
         assert!(account.current().token.starts_with("eyJ"), "and mints");
     }
 }
