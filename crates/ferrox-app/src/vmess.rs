@@ -1281,11 +1281,11 @@ pub(crate) fn serve_kcp<R, W>(
 
 pub(crate) fn serve(mut stream: TcpStream, id: &[u8; 16], freedom: bool) {
     // Bound the opening request read like the raw VLESS handshake, then restore the relay's blocking reads.
-    let _ = stream.set_read_timeout(Some(crate::proxy::HANDSHAKE_REQUEST_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT));
     let request = {
         let mut bounded = crate::proxy::HandshakeDeadline {
             inner: &mut stream,
-            until: std::time::Instant::now() + crate::proxy::HANDSHAKE_REQUEST_TIMEOUT,
+            until: std::time::Instant::now() + crate::budgets::HANDSHAKE_REQUEST_TIMEOUT,
         };
         accept_request(&mut bounded, id)
     };
@@ -1529,7 +1529,7 @@ mod tests {
         });
         let _peer = TcpStream::connect(addr).expect("connects");
         done_rx
-            .recv_timeout(crate::proxy::HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
+            .recv_timeout(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
             .expect("the bounded request read returns instead of pinning the thread");
         serving.join().expect("joins");
     }

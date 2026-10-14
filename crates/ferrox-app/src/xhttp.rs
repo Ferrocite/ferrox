@@ -28,7 +28,7 @@ fn bare_path(target: &str) -> &str {
 }
 
 fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
-    crate::proxy::read_http_head(stream, HEAD_LIMIT, crate::proxy::HEAD_DEADLINE)
+    crate::proxy::read_http_head(stream, HEAD_LIMIT, crate::budgets::HEAD_DEADLINE)
         .map(|head| (head, Vec::new()))
 }
 
@@ -1232,7 +1232,7 @@ pub(crate) fn accept_split_with_settings<
     settings: &XhttpSettings,
 ) -> Option<(Box<dyn Read + Send>, XhttpWriter)> {
     let (head, prefix) =
-        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::proxy::HEAD_DEADLINE)?;
+        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::HEAD_DEADLINE)?;
     accept_core(&head, prefix, read, write, settings, None)
 }
 
@@ -1551,7 +1551,7 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
 ) -> Option<(Reader<R>, XhttpWriter)> {
     write.write_all(dial_head(host, path).as_bytes()).ok()?;
     let (head, prefix) =
-        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::proxy::HEAD_DEADLINE)?;
+        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::HEAD_DEADLINE)?;
     check_response(&head)?;
     Some(split_halves(read, write, prefix))
 }
