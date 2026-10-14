@@ -1,16 +1,29 @@
 # Per-method retired-instruction counts, for ops.yml to report.
 #
-# `scripts/count-ops.sh check` gates the one blessed row in
+# `scripts/count-ops.sh check` gates the blessed rows in
 # `scripts/expected-ops.txt`. This file is the open list: ops.yml measures every
 # row here on every run and publishes the numbers, which is what turns a row in
 # `scripts/method-counts.txt` from UNBLESSED into a number somebody can read and
-# decide to bless. A symbol that inlined into its caller under release will not
-# appear in a callgrind profile; that row is reported as not found and the next
-# name up is the one to try.
+# decide to bless.
 #
-# A symbol reported as `not found` inlined into its caller under release: the
-# row is then noise, and the name up is the one to try. `ferrox_app::foxy::read_frame`
-# and `masque::datagram_encode` are the two that survive for this method.
+# A row whose symbol reports `Ir=inlined-not-a-frame` was never measured: the
+# profile has no frame for it because the function dissolved into its caller.
+# `lto = "thin"` and `codegen-units = 1` in the release profile erase a small
+# cross-crate helper, so every `ferrox_core::` leaf here is a casualty of the
+# optimisation the shipped binary runs on. A blank is not a count, so the script
+# says which rows are noise instead of printing an empty figure a page could
+# read as one.
+#
+# Renaming such a row to its test body is NOT the fix. A test frame charges the
+# harness, the fixture bytes and any socket it opens, which is not a claim about
+# the method; it converts an honest blank into a number that answers a different
+# question. A dead row needs a probe whose cost is the method and nothing else —
+# a repeated call over a fixed buffer — before it earns a number.
+#
+# Surviving rows keep the method's own name: `proxy::decode_trojan_request`,
+# `foxy::read_frame`, `masque::datagram_encode`, `ws::write_frame`, and
+# `ws::tests::mask_chunks_match_the_byte_loop`, whose body is the masking loop
+# with no I/O, so the frame and the method are the same thing.
 #
 # `doc  test filter  symbol`
 record-layer  record::tests::the_ladder_reports_the_blocks_the_caller_asked_for  ferrox_core::record::fill_exact
