@@ -18108,51 +18108,63 @@ mod relay_tests {
         assert_eq!(got, REPLY, "a finished upload must not drop the reply");
     }
 
-    /// Sixteen flows on the shared Linux worker set, all pushing at once, each one moving
-    /// thirty-two splice pipes' worth from a socket whose write deadline is armed: a source that
-    /// stops being re-armed shows up as a short count or an unfinished relay, never as a hang.
-    /// Loopback only, dials nothing.
+    /// One user, one reader and one relay thread per flow, all sixteen running at once, each flow
+    /// moving thirty-two splice pipes' worth: the multi-connection regime the references sustain at
+    /// gigabits, and the one a stalled flow poisons for its neighbours. Every count a stall needs to
+    /// name itself is published, so the failure says which flow, how far in, how far out and how
+    /// many relays ended. Loopback only, dials nothing.
     #[test]
     fn sixteen_flows_at_once_all_arrive_whole() {
         const FLOWS: usize = 16;
         const CHUNK: usize = 65_536;
         const ROUNDS: usize = 128;
         const LEN: usize = CHUNK * ROUNDS;
-        let front = listener();
+        let front = Arc::new(listener());
         let front_port = port_of(&front);
-        let back = listener();
+        let back = Arc::new(listener());
         let back_port = port_of(&back);
 
-        let wanted = vec![LEN; FLOWS];
+        let sent: Arc<[std::sync::atomic::AtomicUsize]> = (0..FLOWS)
+            .map(|_| std::sync::atomic::AtomicUsize::new(0))
+            .collect();
 
-        let front_far = thread::spawn(move || {
-            let mut feeders = Vec::with_capacity(FLOWS);
-            for flow in 0..FLOWS {
+        let mut users = Vec::with_capacity(FLOWS);
+        for user in 0..FLOWS {
+            let sent = Arc::clone(&sent);
+            let front = Arc::clone(&front);
+            users.push(thread::spawn(move || {
                 let (mut stream, _) = front.accept().expect("accepts");
                 stream.set_write_timeout(Some(PATIENCE)).expect("timeout");
-                feeders.push(thread::spawn(move || {
-                    let chunk: Vec<u8> = (0..CHUNK).map(|i| ((i + flow) % 251) as u8).collect();
-                    for _ in 0..ROUNDS {
-                        stream
-                            .write_all(&chunk)
-                            .expect("a stalled flow hits its write deadline");
+                let chunk: Vec<u8> = (0..CHUNK).map(|i| ((i + user) % 251) as u8).collect();
+                let mut wrote = 0usize;
+                for _ in 0..ROUNDS {
+                    if stream.write_all(&chunk).is_err() {
+                        break;
                     }
-                    let _ = stream.shutdown(Shutdown::Write);
-                    // handed back so the kernel's unsent bytes live until the lengths are read
-                    stream
-                }));
-            }
-            feeders
-        });
-        let back_far = thread::spawn(move || {
-            let mut lengths = Vec::with_capacity(FLOWS);
-            for _ in 0..FLOWS {
+                    wrote += CHUNK;
+                    sent[user].store(wrote, Ordering::Relaxed);
+                }
+                let _ = stream.shutdown(Shutdown::Write);
+                // handed back so the kernel's unsent bytes live until the counts are read
+                stream
+            }));
+        }
+        let mut readers = Vec::with_capacity(FLOWS);
+        for _ in 0..FLOWS {
+            let back = Arc::clone(&back);
+            readers.push(thread::spawn(move || {
                 let (mut stream, _) = back.accept().expect("accepts");
                 stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
-                lengths.push(read_all(&mut stream).len());
-            }
-            lengths
-        });
+                let mut arrived = 0usize;
+                let mut chunk = vec![0u8; CHUNK];
+                loop {
+                    match stream.read(&mut chunk) {
+                        Ok(0) | Err(_) => return arrived,
+                        Ok(took) => arrived += took,
+                    }
+                }
+            }));
+        }
 
         let (ended, watched) = mpsc::channel();
         let mut relays = Vec::with_capacity(FLOWS);
@@ -18166,19 +18178,29 @@ mod relay_tests {
             }));
         }
         drop(ended);
-        let all_ended = (0..FLOWS).all(|_| watched.recv_timeout(PATIENCE).is_ok());
+
+        let arrived: Vec<usize> = readers
+            .into_iter()
+            .map(|reader| reader.join().expect("reads"))
+            .collect();
+        let mut finished = 0usize;
+        for _ in 0..FLOWS {
+            if watched.recv_timeout(PATIENCE).is_err() {
+                break;
+            }
+            finished += 1;
+        }
+        let written: Vec<usize> = (0..FLOWS)
+            .map(|user| sent[user].load(Ordering::Relaxed))
+            .collect();
         assert!(
-            all_ended,
-            "a relay among sixteen never ended, so one of its directions stopped being polled"
+            arrived.iter().all(|count| *count == LEN) && finished == FLOWS,
+            "{FLOWS} concurrent flows of {LEN} bytes each arrived {arrived:?}, were written \
+             {written:?}, and {finished} of {FLOWS} relays ended"
         );
 
-        assert_eq!(
-            back_far.join().expect("joins"),
-            wanted,
-            "a flow among sixteen arrived short, which means two flows shared a pipe"
-        );
-        for feeder in front_far.join().expect("joins") {
-            feeder.join().expect("feeds");
+        for user in users {
+            user.join().expect("feeds");
         }
         for relay_side in relays {
             relay_side.join().expect("joins");
