@@ -218,7 +218,19 @@ fn digit(byte: u8) -> Option<u8> {
 
 pub fn early_encode_into(out: &mut String, data: &[u8]) {
     out.reserve(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
+    let mut rest = data;
+    // The window's fourth byte is the next group's first byte and every mask drops it, so one load feeds a group; the last under-four bytes take the byte path.
+    while let Some(word) = rest
+        .first_chunk::<4>()
+        .map(|window| u32::from_be_bytes(*window))
+    {
+        out.push(URL_ALPHABET[(word >> 26) as usize] as char);
+        out.push(URL_ALPHABET[((word >> 20) & 63) as usize] as char);
+        out.push(URL_ALPHABET[((word >> 14) & 63) as usize] as char);
+        out.push(URL_ALPHABET[((word >> 8) & 63) as usize] as char);
+        rest = &rest[3..];
+    }
+    for chunk in rest.chunks(3) {
         let mut word = 0u32;
         for &byte in chunk {
             word = (word << 8) | u32::from(byte);
@@ -449,6 +461,38 @@ mod tests {
             early_encode_into(&mut out, bytes);
             assert_eq!(out, format!("prefix:{want}"), "{bytes:?}");
             assert_eq!(early_decode(want).as_deref(), Some(bytes), "{want}");
+        }
+    }
+
+    /// The shape the encode had before the windowed load, kept so the sweep can name what the route did not change.
+    fn byte_path(data: &[u8]) -> String {
+        let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+        for chunk in data.chunks(3) {
+            let mut word = 0u32;
+            for &byte in chunk {
+                word = (word << 8) | u32::from(byte);
+            }
+            word <<= 8 * (3 - chunk.len());
+            out.push(URL_ALPHABET[(word >> 18 & 0x3F) as usize] as char);
+            out.push(URL_ALPHABET[(word >> 12 & 0x3F) as usize] as char);
+            if chunk.len() > 1 {
+                out.push(URL_ALPHABET[(word >> 6 & 0x3F) as usize] as char);
+            }
+            if chunk.len() > 2 {
+                out.push(URL_ALPHABET[(word & 0x3F) as usize] as char);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_windowed_load_encodes_the_bytes_the_byte_path_encoded() {
+        const HEAD: &str = "Sec-WebSocket-Protocol: ";
+        for len in 0..=520usize {
+            let bytes: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(97)).collect();
+            let mut out = String::from(HEAD);
+            early_encode_into(&mut out, &bytes);
+            assert_eq!(&out[HEAD.len()..], byte_path(&bytes), "{len}: route");
         }
     }
 
