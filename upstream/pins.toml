@@ -93,6 +93,7 @@ test_enabled  = true
 suite         = "cargo test -p zero-runtime --test xray_oracle -- --ignored --test-threads=1 vless_over_raw_tcp_matches_the_oracle trojan_over_raw_tcp_matches_the_oracle shadowsocks_over_raw_tcp_matches_the_oracle vless_over_websocket_matches_the_oracle vless_over_http_upgrade_matches_the_oracle vless_over_grpc_matches_the_oracle vmess_over_raw_tcp_matches_the_oracle trojan_over_websocket_matches_the_oracle vmess_over_websocket_matches_the_oracle"
 ferrox_binary = "ferrox-app"
 seam           = "ZRAY_XRAY_BINARY"
+baseline_env  = "ZRAY_ORACLE_LOG=1 ZRAY_TEST_LOG=debug"
 note          = "MIT Zray core; 9 oracle tests run against ferrox-app via ZRAY_XRAY_BINARY, checked by conformance.yml"
 
 [sources.mqvpn]
