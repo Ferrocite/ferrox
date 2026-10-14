@@ -262,13 +262,20 @@ impl Rc4 {
     }
 
     pub fn crypt(&mut self, buf: &mut [u8]) {
+        let s = &mut self.s;
+        let mut i = self.i;
+        let mut j = self.j;
         for cell in buf.iter_mut() {
-            self.i = self.i.wrapping_add(1);
-            self.j = self.j.wrapping_add(self.s[usize::from(self.i)]);
-            self.s.swap(usize::from(self.i), usize::from(self.j));
-            let at = self.s[usize::from(self.i)].wrapping_add(self.s[usize::from(self.j)]);
-            *cell ^= self.s[usize::from(at)];
+            i = i.wrapping_add(1);
+            let si = s[usize::from(i)];
+            j = j.wrapping_add(si);
+            let sj = s[usize::from(j)];
+            s[usize::from(i)] = sj;
+            s[usize::from(j)] = si;
+            *cell ^= s[usize::from(si.wrapping_add(sj))];
         }
+        self.i = i;
+        self.j = j;
     }
 }
 
