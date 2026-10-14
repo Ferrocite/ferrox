@@ -32,7 +32,7 @@ This tree: `crates/ferrox-core`, `crates/ferrox-app`, `docs/function/`.
 | Loopback | refused (row 27) |
 | WireGuard proxy (`proxy/wireguard`, gVisor netstack) | absent |
 | Hysteria v1 proxy (`proxy/hysteria`) | absent (only v2 as carrier) |
-| MASQUE proxy (`proxy/masque`) | not carried; a matrix row `next` draws |
+| MASQUE proxy (`proxy/masque`) | server not carried; the CONNECT-IP client dials on the Foxy `h3` lane (row 20) |
 | TUN inbound (`proxy/tun`) | refused (row 29) |
 | uTLS fingerprints per connection | refused (row 38) |
 | ECH | refused (row 39) |
@@ -51,7 +51,7 @@ This tree: `crates/ferrox-core`, `crates/ferrox-app`, `docs/function/`.
 | xHTTP / SplitHTTP modes (packet-up, stream-up, stream-one, padding/placement) | one mode only (POST + chunked) |
 | KCP/mKCP + FinalMask (aes128gcm, header, original) | core done; finalmask refused (row 31) |
 | Hysteria QUIC transport | done |
-| MASQUE transport | refused; a matrix row `next` draws |
+| MASQUE transport | CONNECT-IP client dialled (h2/h3) on the Foxy lane; server transport refused (row 20) |
 | XDrive | refused (row 32) |
 | Browser dialer | absent |
 | Tagged connections / observatory webhooks | absent |
