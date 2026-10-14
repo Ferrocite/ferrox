@@ -19,6 +19,8 @@ const TLS_APPLICATION_DATA: [u8; 3] = [0x17, 0x03, 0x03];
 const TLS13_VERSIONS: [u8; 6] = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
 const TLS_AES_128_CCM_8_SHA256: u16 = 0x1305;
 const SHORTEST_FRAME: usize = 21;
+/// A framed block is one Xray buffer: `buf.Size` (8192) less the uuid and header, which is where the reference reshapes a longer piece and where its reader refuses the frame.
+const MAX_FRAME_CONTENT: usize = 8192 - SHORTEST_FRAME;
 /// Padding never exceeds `BUFFER - SHORTEST_FRAME`, so one static zero run covers every trailer the framer writes.
 const ZERO: [u8; BUFFER] = [0u8; BUFFER];
 
@@ -306,16 +308,8 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         }
     }
 
-    fn frame_head(tls: &Tls, buf: &[u8], padding: usize) -> [u8; 5] {
-        let complete =
-            tls.present && buf.len() >= 6 && buf[..3] == TLS_APPLICATION_DATA && is_record_run(buf);
-        let ends = complete || (!tls.twelve_or_above && tls.budget <= 1);
-        let command = match (complete && tls.enable_xtls, ends) {
-            (true, _) => CMD_DIRECT,
-            (_, true) => 1,
-            _ => 0,
-        };
-        let clen = (buf.len() as u16).to_be_bytes();
+    fn frame_head(command: u8, content: usize, padding: usize) -> [u8; 5] {
+        let clen = (content as u16).to_be_bytes();
         let plen = (padding as u16).to_be_bytes();
         [command, clen[0], clen[1], plen[0], plen[1]]
     }
@@ -365,20 +359,42 @@ impl<S: Read + Write + RecordAlignment> Write for Link<S> {
             self.tls.observe(buf);
             self.engage();
         }
-        // Uuid on the first frame, then head, caller's buffer, zero trailer: one `write_all_slices`, one record, no copies.
-        let padding = padding_len(buf.len(), self.tls.present);
-        let head = Self::frame_head(&self.tls, buf, padding);
-        let first = !self.write.sent_uuid;
-        self.write.sent_uuid = true;
-        let parts: &[&[u8]] = if first {
-            &[&self.uuid[..], &head, buf, &ZERO[..padding]]
-        } else {
-            &[&head, buf, &ZERO[..padding]]
-        };
-        self.session.write_all_slices(parts)?;
-        if head[0] != 0 {
-            self.write.padding = false;
-            self.write.raw = self.raw.is_some() && self.tls.enable_xtls && head[0] == CMD_DIRECT;
+        // The relay hands one buffer of up to 256 KiB: it frames as blocks of one Xray buffer, and the filter budget and the switch are counted per caller buffer as the reference counts them per `MultiBuffer`.
+        let complete = self.tls.present
+            && buf.len() >= 6
+            && buf[..3] == TLS_APPLICATION_DATA
+            && is_record_run(buf);
+        let ends_early = !self.tls.twelve_or_above && self.tls.budget <= 1;
+        let mut at = 0;
+        while at < buf.len() {
+            let content = (buf.len() - at).min(MAX_FRAME_CONTENT);
+            let last = at + content == buf.len();
+            let padding = padding_len(content, self.tls.present);
+            let switches = last && complete;
+            let command = match (switches && self.tls.enable_xtls, ends_early || switches) {
+                (true, _) => CMD_DIRECT,
+                (_, true) => 1,
+                _ => 0,
+            };
+            let head = Self::frame_head(command, content, padding);
+            let payload = &buf[at..at + content];
+            // Uuid on the first frame, then head, caller's buffer, zero trailer: one `write_all_slices`, one record, no copies.
+            let first = !self.write.sent_uuid;
+            self.write.sent_uuid = true;
+            let parts: &[&[u8]] = if first {
+                &[&self.uuid[..], &head, payload, &ZERO[..padding]]
+            } else {
+                &[&head, payload, &ZERO[..padding]]
+            };
+            self.session.write_all_slices(parts)?;
+            at += content;
+            if command != 0 {
+                self.write.padding = false;
+                self.write.raw =
+                    self.raw.is_some() && self.tls.enable_xtls && command == CMD_DIRECT;
+                self.write_out(&buf[at..])?;
+                return Ok(buf.len());
+            }
         }
         Ok(buf.len())
     }
@@ -849,6 +865,70 @@ mod tests {
             link.session.calls[1].0, second_ptr,
             "still by pointer, after a realloc"
         );
+    }
+
+    /// The relay hands one buffer of up to 256 KiB; past one `buf.Size` block the u16 length wraps and the reference's reader refuses the frame, so the buffer frames as whole blocks and every byte still arrives.
+    #[test]
+    fn a_bulk_write_frames_every_block_inside_the_bound() {
+        let body: Vec<u8> = (0..crate::proxy::RELAY_BUFFER as u32)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let base = body.as_ptr();
+        let mut link = Link::new(
+            Peeker {
+                written: Vec::new(),
+                calls: Vec::new(),
+                uuids: Vec::new(),
+            },
+            None,
+            &UUID,
+        );
+        link.write_all(&body).expect("writes");
+
+        let out = &link.session.written;
+        assert_eq!(&out[..16], &UUID, "one uuid for the whole buffer");
+        assert_eq!(link.session.uuids.len(), 1);
+        assert_eq!(
+            usize::from(u16::from_be_bytes([out[17], out[18]])),
+            MAX_FRAME_CONTENT,
+            "the block is the largest the bound allows, so the fewest of them"
+        );
+        let mut at = 16;
+        let mut framed = 0usize;
+        let mut blocks = 0usize;
+        while at + 5 <= out.len() {
+            assert_eq!(out[at], 0, "the filter window is still open past {blocks}");
+            let content = usize::from(u16::from_be_bytes([out[at + 1], out[at + 2]]));
+            let padding = usize::from(u16::from_be_bytes([out[at + 3], out[at + 4]]));
+            assert!(
+                content + padding <= MAX_FRAME_CONTENT,
+                "block {blocks} frames {content}+{padding} past the bound"
+            );
+            assert_eq!(
+                link.session.calls[blocks].0,
+                base.wrapping_add(framed),
+                "block {blocks} reaches the session from the caller's buffer"
+            );
+            assert_eq!(link.session.calls[blocks].1, content);
+            assert_eq!(
+                &out[at + 5..at + 5 + content],
+                &body[framed..framed + content]
+            );
+            assert_eq!(
+                &ZERO[..padding],
+                &out[at + 5 + content..at + 5 + content + padding]
+            );
+            if content == MAX_FRAME_CONTENT {
+                assert_eq!(padding, 0, "a full block carries no trailer to skip");
+            }
+            framed += content;
+            at += 5 + content + padding;
+            blocks += 1;
+        }
+        assert_eq!(at, out.len(), "every framed byte was walked");
+        assert_eq!(framed, body.len(), "the payload arrived whole");
+        assert_eq!(blocks, body.len().div_ceil(MAX_FRAME_CONTENT));
+        assert_eq!(link.session.calls.len(), blocks);
     }
 
     /// The uuid reaches the session as a slice of the link's own field; a stack-header build would have copied it there.
