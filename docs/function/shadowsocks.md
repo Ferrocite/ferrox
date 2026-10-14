@@ -105,6 +105,17 @@ symbol out of a callgrind run, so this page does not state one. `scripts/expecte
 still blesses exactly one symbol, `der_to_pem`. Blessing a count means reading
 the diff that moved it, never copying a measurement to silence a gate.
 
+`Rc4::crypt` cannot be charged at all: the release profile inlines it into its
+caller, so its own frame does not exist and `Ir=inlined-not-a-frame` is the
+honest report. What is measurable is the probe `scripts/method-ops.txt` now
+points this method's row at —
+`shadowsocks::tests::the_stream_cipher_costs_the_prga_loop_and_nothing_else`,
+which is 64 KiB of `crypt` over one stack buffer and one fold as its witness.
+Read that row as the difference between two runs of it, not as the cost of
+`crypt` by itself: the fold and the frame entry are constant, so a kernel change
+shows up whole. The row stays `UNBLESSED` until a number is read out of the
+`method-ops` artefact and recorded in `scripts/method-counts.txt`.
+
 ## Time
 
 **Not measured on this branch.** Wall clock for this method comes from

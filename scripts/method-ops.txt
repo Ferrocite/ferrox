@@ -37,6 +37,18 @@
 # question. A dead row needs a probe whose cost is the method and nothing else —
 # a repeated call over a fixed buffer — before it earns a number.
 #
+# One row has that now. `shadowsocks` points at
+# `shadowsocks::tests::the_stream_cipher_costs_the_prga_loop_and_nothing_else`:
+# 64 KiB of `Rc4::crypt` over one stack buffer, with one fold as the witness and
+# no socket, allocation or fixture in the frame. Its number is the frame, so the
+# fold and the frame entry ride inside it — which is why a probe row is read as
+# the difference between two runs of the same row and never as the cost of the
+# method alone. The in-memory half of this list is exact for the same reason:
+# `masque::datagram_encode`, `ws::write_frame` and the masking probe held
+# byte-identical across three runs, including one built with different debug
+# info, while the two rows driven over a loopback socket moved between runs at
+# the same flags.
+#
 # Five rows carry a number: `proxy::decode_trojan_request`, `foxy::read_frame`,
 # `masque::datagram_encode`, `ws::write_frame`, and
 # `ws::tests::mask_chunks_match_the_byte_loop`, whose body is the masking loop
@@ -50,7 +62,7 @@ record-layer  poly1305::tests::byte_at_a_time_matches_one_shot  ferrox_core::pol
 shadowsocks  shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag  ferrox_core::shadowsocks::Cipher::seal_into
 shadowsocks  shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag  ferrox_core::shadowsocks::Cipher::open_in_place
 shadowsocks  shadowsocks::tests::an_opened_payload_is_the_datagrams_own_bytes  ferrox_core::shadowsocks::Cipher::open_in_place
-shadowsocks  shadowsocks::tests::rc4_matches_the_published_vectors  ferrox_core::shadowsocks::Rc4::crypt
+shadowsocks  shadowsocks::tests::the_stream_cipher_costs_the_prga_loop_and_nothing_else  ferrox_core::shadowsocks::tests::the_stream_cipher_costs_the_prga_loop_and_nothing_else
 shadowsocks-2022  shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag  ferrox_core::shadowsocks2022::Cipher::seal_into
 shadowsocks-2022  shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag  ferrox_core::shadowsocks2022::Cipher::open_in_place
 shadowsocks-2022  shadowsocks2022::tests::an_opened_payload_is_the_datagrams_own_bytes  ferrox_core::shadowsocks2022::Cipher::open_in_place
