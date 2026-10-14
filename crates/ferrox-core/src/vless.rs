@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::addr::Addr;
+use crate::policy::UnsafeOptIn;
 use crate::transport::{Security, Support, TransportKind};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,15 +143,25 @@ impl VlessLink {
             && self.flow() == "none"
     }
 
+    /// The verdict under no unsafe consent: what a bare link is worth to a default-configured operator.
     #[must_use]
     pub fn support(&self) -> Support {
+        self.support_opted(UnsafeOptIn::none())
+    }
+
+    /// The verdict given an operator's out-of-band consent: an `unsafe-*` fingerprint the bare link
+    /// would veto becomes diallable, because this tree dials the stock stdlib hello under any
+    /// fingerprint (`PattNG`: unsafe means Go `crypto/tls`, not uTLS, so there is nothing to spoof).
+    /// Plaintext-to-public is row 4's separate consent and stays refused here.
+    #[must_use]
+    pub fn support_opted(&self, opt_in: UnsafeOptIn) -> Support {
         if self.has_encryption() {
             return Support::Planned {
                 reason: "vless-encryption: mlkem768x25519plus variants not yet implemented",
             };
         }
         if self.is_first_method() {
-            if self.wants_unsafe_fingerprint() {
+            if self.wants_unsafe_fingerprint() && !opt_in.unsafe_fingerprint() {
                 return Support::UnsafeRequiresOptIn {
                     reason: "unsafe fingerprint requested: re-run with explicit opt-in",
                 };
@@ -166,7 +177,7 @@ impl VlessLink {
             };
         }
         if self.is_none_private_method() {
-            if self.wants_unsafe_fingerprint() {
+            if self.wants_unsafe_fingerprint() && !opt_in.unsafe_fingerprint() {
                 return Support::UnsafeRequiresOptIn {
                     reason: "unsafe fingerprint requested: re-run with explicit opt-in",
                 };
@@ -1021,6 +1032,40 @@ mod tests {
         )
         .expect("parses");
         assert!(matches!(l.support(), Support::UnsafeRequiresOptIn { .. }));
+        // The operator's out-of-band consent clears the veto: the stock-hello dial is PattNG's unsafe.
+        assert_eq!(
+            l.support_opted(UnsafeOptIn::none().allow_unsafe_fingerprint()),
+            Support::Implemented {
+                method: "vless-tcp-reality-vision"
+            },
+        );
+    }
+
+    #[test]
+    fn an_unsafe_fingerprint_adds_no_header_byte() {
+        let header = |fp: &str| {
+            let tail = if fp.is_empty() {
+                String::new()
+            } else {
+                format!("&fp={fp}")
+            };
+            VlessLink::parse(&format!(
+                "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?security=reality&encryption=none&pbk=k&type=tcp&flow=xtls-rprx-vision&sni=example.com&sid=a8{tail}#x"
+            ))
+            .expect("parses")
+            .encode_request_header("example.com", 443)
+        };
+        // The fingerprint shapes the TLS hello, never a VLESS byte: an unsafe one adds nothing.
+        assert_eq!(
+            header(""),
+            header("chrome"),
+            "a preset fingerprint is not a header byte"
+        );
+        assert_eq!(
+            header(""),
+            header("unsafe-chrome"),
+            "an unsafe fingerprint adds no VLESS header byte"
+        );
     }
 
     #[test]
@@ -1060,6 +1105,12 @@ mod tests {
             unsafe_private.support(),
             Support::UnsafeRequiresOptIn { .. }
         ));
+        assert_eq!(
+            unsafe_private.support_opted(UnsafeOptIn::none().allow_unsafe_fingerprint()),
+            Support::Implemented {
+                method: "vless-tcp-none"
+            },
+        );
     }
 
     #[test]

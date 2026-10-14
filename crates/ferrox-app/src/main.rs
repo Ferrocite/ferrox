@@ -22,14 +22,15 @@ mod ws;
 mod xhttp;
 mod xhttp_h2;
 
+use ferrox_core::policy::UnsafeOptIn;
 use ferrox_core::transport::Support;
 use std::io::Write as _;
 use std::time::Duration;
 
 fn usage() -> ! {
     eprintln!("usage:");
-    eprintln!("  ferrox-app check <vless://...>   parse + support + header len (no network)");
-    eprintln!("  ferrox-app run <vless://...>     check + TCP reachability (sends nothing)");
+    eprintln!("  ferrox-app check <vless://...> [--allow-unsafe-fp]   parse + support + header len (no network)");
+    eprintln!("  ferrox-app run <vless://...> [--allow-unsafe-fp]     check + TCP reachability (sends nothing)");
     eprintln!("  ferrox-app version                print the serving binary's version");
     eprintln!("  ferrox-app x25519                 print a fresh X25519 keypair");
     eprintln!("  ferrox-app run -c <config.json>   serve inbounds until killed");
@@ -38,7 +39,24 @@ fn usage() -> ! {
     std::process::exit(2);
 }
 
-fn describe(link: &ferrox_core::vless::VlessLink) -> String {
+/// One share link plus any out-of-band consent flags, in either order.
+fn link_and_opt_in<I: Iterator<Item = String>>(args: &mut I) -> (String, UnsafeOptIn) {
+    let mut link: Option<String> = None;
+    let mut opt = UnsafeOptIn::none();
+    for arg in args {
+        match arg.as_str() {
+            "--allow-unsafe-fp" => opt = opt.allow_unsafe_fingerprint(),
+            _ if link.is_none() => link = Some(arg),
+            _ => usage(),
+        }
+    }
+    match link {
+        Some(link) => (link, opt),
+        None => usage(),
+    }
+}
+
+fn describe(link: &ferrox_core::vless::VlessLink, opt_in: UnsafeOptIn) -> String {
     format!(
         "host={} port={} type={} security={} flow={} support=[{}]",
         link.host,
@@ -46,40 +64,40 @@ fn describe(link: &ferrox_core::vless::VlessLink) -> String {
         link.param("type"),
         link.param("security"),
         link.flow(),
-        link.support(),
+        link.support_opted(opt_in),
     )
 }
 
-fn cmd_check(link_str: &str) {
+fn cmd_check(link_str: &str, opt_in: UnsafeOptIn) {
     let link = ferrox_core::vless::VlessLink::parse(link_str).unwrap_or_else(|e| {
         eprintln!("bad link: {e}");
         std::process::exit(1);
     });
-    println!("{}", describe(&link));
+    println!("{}", describe(&link, opt_in));
     let hdr = link.encode_request_header("example.com", 443);
     println!(
         "header_len={} header_prefix={:02x?}",
         hdr.len(),
         &hdr[..8.min(hdr.len())]
     );
-    match link.support() {
+    match link.support_opted(opt_in) {
         Support::Implemented { method } => {
             println!("diallable: {method} (run checks tcp reachability; sends nothing)");
         }
         Support::Planned { reason } => println!("not yet diallable: {reason}"),
         Support::UnsafeRequiresOptIn { reason } => {
-            println!("needs explicit opt-in (policy::UnsafeOptIn): {reason}");
+            println!("needs explicit opt-in (policy::UnsafeOptIn, or --allow-unsafe-fp): {reason}");
         }
     }
 }
 
-fn cmd_run(link_str: &str) {
+fn cmd_run(link_str: &str, opt_in: UnsafeOptIn) {
     let link = ferrox_core::vless::VlessLink::parse(link_str).unwrap_or_else(|e| {
         eprintln!("bad link: {e}");
         std::process::exit(1);
     });
-    println!("{}", describe(&link));
-    match link.support() {
+    println!("{}", describe(&link, opt_in));
+    match link.support_opted(opt_in) {
         Support::Implemented { .. } => {}
         other => {
             eprintln!("refusing to dial: {other}");
@@ -122,25 +140,21 @@ fn main() {
     let cmd = args.next().unwrap_or_else(|| usage());
     match cmd.as_str() {
         "check" => {
-            let link = args.next().unwrap_or_else(|| usage());
-            if args.next().is_some() {
-                usage();
-            }
-            cmd_check(&link);
+            let (link, opt_in) = link_and_opt_in(&mut args);
+            cmd_check(&link, opt_in);
         }
         "run" => {
-            let next = args.next().unwrap_or_else(|| usage());
-            if next == "-c" || next == "-config" {
+            let first = args.next().unwrap_or_else(|| usage());
+            if first == "-c" || first == "-config" {
                 let file = args.next().unwrap_or_else(|| usage());
                 if args.next().is_some() {
                     usage();
                 }
                 proxy::serve_file(&file);
             }
-            if args.next().is_some() {
-                usage();
-            }
-            cmd_run(&next);
+            let mut iter = std::iter::once(first).chain(args);
+            let (link, opt_in) = link_and_opt_in(&mut iter);
+            cmd_run(&link, opt_in);
         }
         "version" => {
             if args.next().is_some() {
