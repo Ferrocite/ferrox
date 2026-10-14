@@ -67,6 +67,7 @@ graph TD
 | unauthenticated-servers-accepted | 0 | ferrox-core-reality::tests::a_client_with_a_wrong_key_is_refused_before_any_proxy_byte |
 | server-shared-session-poll-millis | 1 | ferrox-app-proxy::tests::a_server_relay_bounds_the_shared_session_to_one_tick |
 | late-hello-grains-survived | 12 | ferrox-app-proxy::tests::a_plain_tls_lane_retries_a_hello_that_arrives_past_the_grain |
+| unsafe-fingerprint-header-bytes-added | 0 | ferrox-core-vless::tests::an_unsafe_fingerprint_adds_no_header_byte |
 <!-- counts:end -->
 
 ## Ops
@@ -215,10 +216,17 @@ incoming) that one packet is charged to the connection whichever pump reads it,
 so a drain-only flush moves the syscall rather than retiring it; an in-memory
 read-count witness reads zero on both forms, so no count gates the change.
 
-What is **not** removed, and stays named: there is no uTLS fingerprint shaping
-in this tree at all, so the `unsafe-*` fingerprint extension parses, requires
-opt-in, and would spoof nothing even with consent, and a REALITY hello carries
-the stock rustls shape under every fingerprint. A REALITY outbound over any
+What is **not** removed, and stays named: this tree does no uTLS browser
+shaping (row 38), so a REALITY hello carries the stock rustls shape under every
+fingerprint. That is not a gap for the PattNG `unsafe-*` fingerprint: `unsafe`
+means build the hello with the stdlib `crypto/tls` rather than uTLS — exactly
+the stock rustls hello this tree already dials — so row 18 is finished by
+`VlessLink::support_opted` honouring the out-of-band
+`UnsafeOptIn::allow_unsafe_fingerprint` (`--allow-unsafe-fp`), which clears the
+parse veto so a consented `fp=unsafe-*` reports `Implemented` and dials, while a
+bare link still refuses; `an_unsafe_fingerprint_adds_no_header_byte` proves the
+fingerprint adds no VLESS byte. The sibling consents `allow_plaintext_to_public`
+(row 4) and `cipherSuites` parsing (row 17) are still not constructed here. A REALITY outbound over any
 carrier is still skipped rather than dialled. The
 `dest`-mimicry the references do (their `ServerHello` template and
 post-handshake record shaping, which no functional row needs), the `ML-DSA-65`

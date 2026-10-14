@@ -61,7 +61,7 @@ pub fn table() -> String {
     );
     let _ = writeln!(
         s,
-        "| 10 | `cipherSuites` + `unsafe-*` fingerprints (`PattNG` ext.) | {} | `policy::UnsafeOptIn::allow_unsafe_fingerprint` + `ClientHello` differential |",
+        "| 10 | `cipherSuites` + `unsafe-*` fingerprints (`PattNG` ext.) | {} | `vless::tests::an_unsafe_fingerprint_adds_no_header_byte` (the fingerprint adds no VLESS byte, so the hello is the stock dial) and `pattng_unsafe_fingerprint_needs_opt_in` (consent clears the veto to `Implemented`); `cipherSuites` is still not parsed — this cell reads the default posture, an un-consented `fp=unsafe-*` refuses |",
         live_support(
             "security=reality&encryption=none&type=tcp&flow=xtls-rprx-vision&fp=unsafe-chrome&sni=example.com&sid=a8&pbk=k",
             "192.0.2.1",
