@@ -102,3 +102,13 @@ flow (the vless-quic pool is not shared here, so `tcp-flows-per-handshake`
 is 1, not 0); 0-RTT, migration and key updates are quiche's; the server keeps
 one UDP socket per inbound with a per-connection route map and a linear scan
 over routes per Initial.
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: crates/ferrox-core/src/hysteria.rs, crates/ferrox-app/src/hysteria.rs
+- oracle: xray-rust-hysteria=rejects_wrong_auth
+- go: ./transport/internet/hysteria/...
+<!-- scope:end -->

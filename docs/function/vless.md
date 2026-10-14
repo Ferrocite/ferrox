@@ -147,3 +147,14 @@ bytes the core encoder writes (`vision_header_matches_the_core_encoder`).
 | header layout, addons, address parsing | `upstream/xray-core/proxy/vless/encoding/` |
 | header layout, field-at-a-time socket reads | `upstream/sing-box` → `sagernet/sing-vmess/vless/protocol.go` |
 | slice parser, zero allocations | `upstream/zeronet/crates/zero-protocol/src/vless.rs` |
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: crates/ferrox-core/src/vless.rs
+- scenarios: vless-raw
+- oracle: vless
+- go: ./proxy/vless/...
+<!-- scope:end -->

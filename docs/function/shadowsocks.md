@@ -272,3 +272,14 @@ answer to, which is stated here rather than counted.
 | XChaCha spellings | `upstream/sing-box/option/shadowsocks.go` |
 | `rc4-md5` outbound spelling, stream cipher table | `upstream/sing-box/option/shadowsocks.go` |
 | method spellings, MD5 chain, HKDF info string | `ferrox-core-shadowsocks` |
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: crates/ferrox-core/src/shadowsocks.rs, crates/ferrox-app/src/shadowsocks.rs
+- scenarios: shadowsocks-raw
+- oracle: shadowsocks
+- go: ./proxy/shadowsocks/...
+<!-- scope:end -->

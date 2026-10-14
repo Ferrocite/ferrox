@@ -265,3 +265,12 @@ the output, and the point of this repository is that it does not.
 | framing, seeds, filter budget | `upstream/xray-core/proxy/proxy.go` |
 | the same wire bytes | `upstream/zeronet/crates/zero-protocol/src/vision.rs` |
 | the flow name and the `security` gate | `ferrox-core-transport::Support` |
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: crates/ferrox-app/src/vision.rs
+- oracle: vision
+<!-- scope:end -->

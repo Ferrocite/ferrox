@@ -130,3 +130,14 @@ it was not copied.
 | 4 KiB read buffer, 2-copies-per-byte read path | `upstream/xray-core/transport/internet/websocket`, gorilla v1.5.3 |
 | 32 KiB buffer, `split_to` frame views, `u128` mask step | `upstream/zeronet/crates/zero-transport/src/ws/` |
 | early data (`Sec-WebSocket-Protocol`) | `ferrox-core-transport::early_decode` |
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: crates/ferrox-app/src/ws.rs
+- scenarios: vless-ws
+- oracle: websocket, ws
+- go: ./transport/internet/websocket/...
+<!-- scope:end -->

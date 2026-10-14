@@ -196,3 +196,12 @@ downgrade.
 | the QUIC + HTTP/3 stack behind `h3` | `upstream/quiche` @ `3fc9bc1c` |
 | the Android client this lane ports | `/tmp/foxyvpn` (`com.vauth.foxyvpn`) |
 | the Go reference client this lane ports | `/tmp/firefox-vpn-client` |
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: crates/ferrox-app/src/foxy.rs, crates/ferrox-app/src/foxy_account.rs, crates/ferrox-app/src/foxy_catalog.rs, crates/ferrox-app/src/foxy_challenge.rs, crates/ferrox-app/src/foxy_live.rs, crates/ferrox-core/src/foxy/*
+- go: ./transport/internet/masque/...
+<!-- scope:end -->

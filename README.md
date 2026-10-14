@@ -39,6 +39,7 @@ A from-scratch proxy core, built to be **bit-identical to the implementations it
 | dependency licence and provenance | `deny.toml` + `scripts/check-dependency-policy.sh`; GPL/AGPL comparators are refused as dependencies |
 | roadmap coherence | `ferrox-prompt check`: no duplicate id, no gate-less slice, no cycle, no renamed `**Touches:**` path |
 | every method page's counts match one manifest | `scripts/check-method-docs.sh` against `scripts/method-counts.txt` — a number edited in a page without editing the manifest fails, and a manifest row with no page fails |
+| a change measured against what it actually touches | [`scripts/check-ci-scope.sh`](scripts/check-ci-scope.sh) against the scope block in each [`docs/function/`](docs/function) page — see [`docs/ci-scope.md`](docs/ci-scope.md); a name that matches no file, matrix id, oracle test or reference package fails, and a file no page owns plans a wide run |
 
 Not claimed: that this is the fastest implementation. A benchmark measures a configuration at a point in time and decays. What is built instead is the machinery that notices.
 
@@ -324,7 +325,8 @@ crates/ferrox-core       record layer, ChaCha20 core, AES-GCM, TLS interface + r
 crates/ferrox-bench      counting allocator, gates, benchmark report, comparator
 crates/ferrox-app        ZeroNet-compatible app on ferrox-core (MIT)
 crates/ferrox-prompt     roadmap advisor; reads prompts.md, the only place a slice is written down
-docs/function            one page per connection method: ops, syscalls, copies, time, data-path graph
+docs/function            one page per connection method: ops, syscalls, copies, time, data-path
+                         graph, and the scope block that says what a change there owes CI
 upstream/                pins plus derived reading copies, re-fetched by scripts/fetch-upstream.sh
 scripts/                 pin checking, upstream fetching, gate and policy checks, count manifests
 ```

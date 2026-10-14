@@ -89,3 +89,11 @@ tree made quiche faster.
 | the QUIC and HTTP/3 stack for this rung | `upstream/quiche` @ `3fc9bc1c` |
 | connection pooling, 0-RTT, migration | `upstream/sing-box/common/` |
 | multiplexed QUIC schedulers, reorder and reinjection | `upstream/mqvpn` |
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: crates/ferrox-app/src/quic.rs
+<!-- scope:end -->
