@@ -162,12 +162,6 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         self.have.len() - self.hat
     }
 
-    /// Bytes that were staged; after the switch out of Vision framing everything is delivered uncopied.
-    #[cfg(test)]
-    pub(crate) fn staged(&self) -> usize {
-        self.staged
-    }
-
     #[cfg(test)]
     fn stage(&mut self, n: usize) {
         self.staged += n;
@@ -184,7 +178,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         }
     }
 
-    /// Reached only while the framing is live, so every byte here was staged; `staged()` counts them.
+    /// Reached only while the framing is live, so every byte here was staged; `staged` counts them.
     fn fill(&mut self) -> std::io::Result<bool> {
         loop {
             self.compact();
@@ -312,7 +306,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         }
     }
 
-    fn frame_head(tls: &Tls, buf: &[u8], padding: usize) -> (u8, [u8; 5]) {
+    fn frame_head(tls: &Tls, buf: &[u8], padding: usize) -> [u8; 5] {
         let complete =
             tls.present && buf.len() >= 6 && buf[..3] == TLS_APPLICATION_DATA && is_record_run(buf);
         let ends = complete || (!tls.twelve_or_above && tls.budget <= 1);
@@ -321,13 +315,9 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             (_, true) => 1,
             _ => 0,
         };
-        let lengths = [
-            (buf.len() as u16).to_be_bytes(),
-            (padding as u16).to_be_bytes(),
-        ];
-        let [clen_hi, clen_lo] = lengths[0];
-        let [plen_hi, plen_lo] = lengths[1];
-        (command, [command, clen_hi, clen_lo, plen_hi, plen_lo])
+        let clen = (buf.len() as u16).to_be_bytes();
+        let plen = (padding as u16).to_be_bytes();
+        [command, clen[0], clen[1], plen[0], plen[1]]
     }
 }
 
@@ -377,7 +367,7 @@ impl<S: Read + Write + RecordAlignment> Write for Link<S> {
         }
         // Uuid on the first frame, then head, caller's buffer, zero trailer: one `write_all_slices`, one record, no copies.
         let padding = padding_len(buf.len(), self.tls.present);
-        let (command, head) = Self::frame_head(&self.tls, buf, padding);
+        let head = Self::frame_head(&self.tls, buf, padding);
         let first = !self.write.sent_uuid;
         self.write.sent_uuid = true;
         let parts: &[&[u8]] = if first {
@@ -386,9 +376,9 @@ impl<S: Read + Write + RecordAlignment> Write for Link<S> {
             &[&head, buf, &ZERO[..padding]]
         };
         self.session.write_all_slices(parts)?;
-        if command != 0 {
+        if head[0] != 0 {
             self.write.padding = false;
-            self.write.raw = self.raw.is_some() && self.tls.enable_xtls && command == CMD_DIRECT;
+            self.write.raw = self.raw.is_some() && self.tls.enable_xtls && head[0] == CMD_DIRECT;
         }
         Ok(buf.len())
     }
@@ -615,7 +605,7 @@ mod tests {
         }
         assert_eq!(got, [b"paddedend".as_slice(), tail.as_slice()].concat());
         assert_eq!(
-            link.staged(),
+            link.staged,
             framed + b"paddedend".len(),
             "only framed bytes are staged: {} in, {} more out",
             framed,
