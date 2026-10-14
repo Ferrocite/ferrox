@@ -26,6 +26,7 @@ graph TD
     D["dial: stock hello with a zeroed tag<br/>for the AAD, then with the seal"] --> C["client: ClientHello with a key share"]
     C --> S["server: read the whole hello<br/>across however many records"]
     S --> X["find the X25519 share<br/>prefer a plain one over a hybrid"]
+    S -->|"a hello that breaks a parse rule"| D
     X --> G["one X25519 group operation"]
     G --> K["HKDF the shared secret<br/>into the authentication key"]
     K --> A["open the sealed session id<br/>over the zeroed hello as AAD"]
@@ -52,6 +53,8 @@ graph TD
 | short-id-bytes | 8 | ferrox-core-reality::tests::a_short_id_is_zero_padded_to_eight_bytes |
 | cover-origin-dials-per-authenticated-hello | 0 | ferrox-core-reality::tests::an_authenticated_hello_costs_the_cover_origin_nothing |
 | cover-origin-bytes-per-spliced-hello | 1 | ferrox-core-reality::tests::an_unauthenticated_hello_is_spliced_into_the_cover_origin_byte_for_byte |
+| cover-origin-dials-per-unparseable-hello | 1 | ferrox-core-reality::tests::a_hello_that_cannot_be_parsed_still_reaches_the_cover_origin |
+| cover-origin-dials-per-silent-peer | 0 | ferrox-core-reality::tests::a_peer_that_sends_nothing_costs_the_cover_origin_nothing |
 | peer-reply-bytes-per-spliced-request | 1 | ferrox-app-proxy::tests::the_cover_origin_splice_carries_the_reply_back_to_the_peer |
 | proxy-protocol-header-bytes | 28 | ferrox-core-reality::tests::the_binary_proxy_header_is_a_fixed_rectangular_twenty_eight_bytes |
 | hello-buffers-per-single-record-read | 1 | ferrox-core-reality::tests::reading_a_single_record_hello_allocates_one_buffer |
@@ -107,7 +110,18 @@ handshake duration is quoted from a machine without a named runner.
   site *before* reading a byte, so a port scanner costs one outbound connection
   each. The dial here is lazy: an authenticated hello costs the cover origin
   nothing, and a refused one costs exactly the hello the server read, which is
-  `an_authenticated_hello_costs_the_cover_origin_nothing`.
+  `an_authenticated_hello_costs_the_cover_origin_nothing` and
+  `a_peer_that_sends_nothing_costs_the_cover_origin_nothing`.
+- **A refusal that closed the socket instead of answering it.** A hello that
+  broke a record or parse rule — not a handshake record, an oversized length,
+  an EOF partway through the body, a `ClientHello` that will not parse — was
+  dropped, while all three references splice whatever they could not
+  authenticate. The close is the detectable break and the hang: a real browser
+  that happened to send an unusual hello got a reset where its own site would
+  have answered. The bytes spent before the break now travel with the splice,
+  and only a peer that sent nothing at all is still closed;
+  `a_hello_that_cannot_be_parsed_still_reaches_the_cover_origin` is red both
+  ways — dialled nothing, or sent bytes the server never read.
 - **Two session tickets after every handshake.** rustls sends two by default and
   both references send none, so the REALITY identity pins the count at zero
   while plain TLS keeps two; `an_authenticated_session_sends_no_tickets_after_the_handshake`

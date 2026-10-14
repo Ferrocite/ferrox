@@ -166,6 +166,8 @@ reality-tls x25519-shares-recognised 3 ferrox-core-reality::tests::the_x25519_sh
 reality-tls short-id-bytes 8 ferrox-core-reality::tests::a_short_id_is_zero_padded_to_eight_bytes
 reality-tls cover-origin-dials-per-authenticated-hello 0 ferrox-core-reality::tests::an_authenticated_hello_costs_the_cover_origin_nothing
 reality-tls cover-origin-bytes-per-spliced-hello 1 ferrox-core-reality::tests::an_unauthenticated_hello_is_spliced_into_the_cover_origin_byte_for_byte
+reality-tls cover-origin-dials-per-unparseable-hello 1 ferrox-core-reality::tests::a_hello_that_cannot_be_parsed_still_reaches_the_cover_origin
+reality-tls cover-origin-dials-per-silent-peer 0 ferrox-core-reality::tests::a_peer_that_sends_nothing_costs_the_cover_origin_nothing
 reality-tls peer-reply-bytes-per-spliced-request 1 ferrox-app-proxy::tests::the_cover_origin_splice_carries_the_reply_back_to_the_peer
 reality-tls proxy-protocol-header-bytes 28 ferrox-core-reality::tests::the_binary_proxy_header_is_a_fixed_rectangular_twenty_eight_bytes
 reality-tls hello-buffers-per-single-record-read 1 ferrox-core-reality::tests::reading_a_single_record_hello_allocates_one_buffer
