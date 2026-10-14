@@ -167,6 +167,10 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
     if matches!(carrier, Carrier::Quic) {
         return serve_vless_quic_inbound(address, inbound, &id, freedom, path);
     }
+    if let Carrier::Unknown { network } = &carrier {
+        eprintln!("unsupported network `{network}` in {path}: refused, not served");
+        return false;
+    }
     match sec {
         "tls" => serve_vless_tls_inbound(address, inbound, &id, &carrier, freedom, path),
         "reality" => serve_vless_reality_inbound(address, inbound, &id, &carrier, freedom, path),
@@ -524,7 +528,7 @@ macro_rules! refused_carriers {
             | Carrier::Masque
             | Carrier::Xdrive
             | Carrier::Http
-            | Carrier::Unknown
+            | Carrier::Unknown { .. }
     };
 }
 
@@ -4134,7 +4138,7 @@ fn dial_vless_tls(client: &TcpStream, server: &SocketAddr, vless: &VlessOut, tar
         | Carrier::Masque
         | Carrier::Xdrive
         | Carrier::Http
-        | Carrier::Unknown => {}
+        | Carrier::Unknown { .. } => {}
     }
 }
 
@@ -4302,7 +4306,7 @@ fn dial_trojan_tls(client: &TcpStream, server: &SocketAddr, trojan: &TrojanOut, 
         | Carrier::Masque
         | Carrier::Xdrive
         | Carrier::Http
-        | Carrier::Unknown => {}
+        | Carrier::Unknown { .. } => {}
     }
 }
 
@@ -4442,7 +4446,7 @@ fn vmess_tls_carried(
         | Carrier::Masque
         | Carrier::Xdrive
         | Carrier::Http
-        | Carrier::Unknown => {}
+        | Carrier::Unknown { .. } => {}
     }
 }
 
@@ -8906,7 +8910,7 @@ fn tls_parts(
         | Carrier::Masque
         | Carrier::Xdrive
         | Carrier::Http
-        | Carrier::Unknown => return None,
+        | Carrier::Unknown { .. } => return None,
     }
     outbound_tls(outbound, address).map(|tls| (carrier, host, tls))
 }
@@ -14753,9 +14757,15 @@ mod tests {
                 Carrier::Masque => "Masque",
                 Carrier::Xdrive => "Xdrive",
                 Carrier::Http => "Http",
-                Carrier::Unknown => "Unknown",
+                Carrier::Unknown { .. } => "Unknown",
             };
             assert_eq!(tag, want, "{network} should map to {want}");
+            if want == "Unknown" {
+                let Carrier::Unknown { network: kept } = got else {
+                    panic!("a refused network is Unknown");
+                };
+                assert_eq!(kept, network, "the refusal lost the rejected name");
+            }
         }
     }
 
@@ -16438,7 +16448,10 @@ mod tests {
         assert_eq!(cfg.cc, ferrox_core::hysteria::Congestion::Brutal);
         let old = crate::json::parse(r#"{"network":"hysteria","hysteriaSettings":{"version":1}}"#)
             .expect("parses");
-        assert!(matches!(stream_carrier(Some(&old)), Carrier::Unknown));
+        assert!(matches!(
+            stream_carrier(Some(&old)),
+            Carrier::Unknown { .. }
+        ));
     }
 
     fn hysteria_loop_with(auth: &str, id: [u8; 16]) -> (u16, Vec<Vec<u8>>) {
