@@ -262,13 +262,21 @@ impl Rc4 {
     }
 
     pub fn crypt(&mut self, buf: &mut [u8]) {
+        // The swap leaves `table[i] == sj` and `table[j] == si`, so the key byte is `table[si + sj]` and the post-swap pair never has to be read back.
+        let table = &mut self.s;
+        let mut i = self.i;
+        let mut j = self.j;
         for cell in buf.iter_mut() {
-            self.i = self.i.wrapping_add(1);
-            self.j = self.j.wrapping_add(self.s[usize::from(self.i)]);
-            self.s.swap(usize::from(self.i), usize::from(self.j));
-            let at = self.s[usize::from(self.i)].wrapping_add(self.s[usize::from(self.j)]);
-            *cell ^= self.s[usize::from(at)];
+            i = i.wrapping_add(1);
+            let si = table[usize::from(i)];
+            j = j.wrapping_add(si);
+            let sj = table[usize::from(j)];
+            table[usize::from(i)] = sj;
+            table[usize::from(j)] = si;
+            *cell ^= table[usize::from(si.wrapping_add(sj))];
         }
+        self.i = i;
+        self.j = j;
     }
 }
 
