@@ -46,6 +46,7 @@ graph TD
 | user-space-copies-per-byte-while-framed | 2 | ferrox-app-vision::tests::the_framing_switch_ends_the_staging |
 | user-space-copies-per-byte-after-the-switch | 0 | ferrox-app-vision::tests::the_framing_switch_ends_the_staging |
 | user-space-copies-per-byte-written-while-framed | 0 | ferrox-app-vision::tests::the_writer_hands_the_callers_payload_by_pointer |
+| uuid-bytes-copied-per-link | 0 | ferrox-app-vision::tests::the_writer_hands_the_uuid_by_pointer_on_the_first_frame |
 | framed-staging-buffer-bytes | 16384 | ferrox-app-vision::tests::the_framed_staging_buffers_stay_at_one_record |
 | seal-open-staging-allocations | 0 | ferrox-bench-gate-2 |
 <!-- counts:end -->
@@ -163,12 +164,13 @@ throughout the whole session, not only during the handshake.
 - **The write path's staging copy of the caller's payload.** `frame` used to
   `staging.extend_from_slice(buf)` before handing the frame to the session, one
   user-space copy per written byte while the framing was live. The frame now
-  goes over as three slices — head, the caller's own buffer, and a static zero
-  run for the padding — through `RecordAlignment::write_all_slices`, which
-  `RustlsProvider` and `RustlsServerProvider` implement over `write_vectored`
-  so rustls sees one payload and emits one record. The wrapper types in the
-  Vision path (`RealityServer`, `RealityClientSession`) forward, so the
-  coalescing impl is what actually runs.
+  goes over as slices — uuid on the first frame, then head, the caller's own
+  buffer, and a static zero run for the padding — through
+  `RecordAlignment::write_all_slices`, which `RustlsProvider` and
+  `RustlsServerProvider` implement over `write_vectored` so rustls sees one
+  payload and emits one record. The wrapper types in the Vision path
+  (`RealityServer`, `RealityClientSession`) forward, so the coalescing impl is
+  what actually runs.
   `the_writer_hands_the_callers_payload_by_pointer` witnesses it: the pointer
   that reaches `write_all_slices` is the caller's pointer, and it is still the
   caller's pointer after the caller reallocs. `write_traffic_holds_the_buffer_capacities_steady`
@@ -179,6 +181,34 @@ throughout the whole session, not only during the handshake.
   allocated none (it reused the pre-sized `staging`). At a 2 KiB payload the
   allocation is a fraction of the memcpy it replaces; the copy was per-byte,
   the Vec is per-record.
+
+- **The stack head's zero-fill and the uuid copy into it.** The 21-byte
+  `let mut head = [0u8; SHORTEST_FRAME]` wrote 21 zeros every call and then
+  overwrote 5 of them with `cmd|clen|plen`; on the first frame, `frame_head`
+  also `copy_from_slice(uuid)`'d the 16 link bytes into `head[..16]` — a second
+  copy of a payload that already lived in `self.uuid`, and on later frames the
+  remaining 16 zeroed bytes were never read because only `head[..5]` was
+  handed to `write_all_slices`. `frame_head` now returns the 5-byte head by
+  value (`[command, clen_hi, clen_lo, plen_hi, plen_lo]`), so there is no
+  pre-init at all: the array's only writes are the five bytes that go on the
+  wire. The uuid reaches the session as `&self.uuid[..]` prepended as its own
+  slice on the first frame; `write_all_slices` then sees four parts on that
+  first frame (`uuid | head | buf | zeros`) and three after (`head | buf |
+  zeros`). `the_writer_hands_the_uuid_by_pointer_on_the_first_frame` witnesses
+  the removed uuid copy by pointer identity: the slice that reaches the session
+  is a view of `Link::uuid`, and it is handed once. Nothing got worse — the
+  record shape and rustls' `payload_owner` length go up by one only on the
+  first frame, and the per-write stack zero-fill drops from 21 bytes to none.
+
+- **Dead production arithmetic on the read path.** `staged` counted framed bytes
+  for `the_framing_switch_ends_the_staging`, but the field and its five `+=`
+  sites in `fill`, `unpad` and `flush_truncated` were reachable in the shipped
+  binary even though nothing outside `#[cfg(test)]` ever read them. The field,
+  the initialiser and the increments are now behind `#[cfg(test)]` through an
+  inlined `stage(n)` helper whose non-test arm folds to nothing; production pays
+  zero per-byte bookkeeping. The claim is structural — `cargo build`'s field
+  list on the release `Link` has one fewer `usize` — not a runtime count, so
+  nothing runs to gate it and it is stated here in prose rather than a table.
 
 What was deliberately **not** removed: the seed table and the padding itself.
 Padding bytes are wire bytes; making them random instead of zero would change

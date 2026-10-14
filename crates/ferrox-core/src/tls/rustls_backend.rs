@@ -320,28 +320,19 @@ impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RustlsServer
 
 /// Hand `parts` to a rustls writer in one `write_vectored` so the fragmenter sees one payload and emits one record; iterating `write_all` per part would emit one record per part.
 fn coalesce<W: Write + ?Sized>(writer: &mut W, parts: &[&[u8]]) -> std::io::Result<()> {
-    let mut chunks: Vec<&[u8]> = parts.iter().copied().filter(|p| !p.is_empty()).collect();
-    while !chunks.is_empty() {
-        let slices: Vec<std::io::IoSlice<'_>> =
-            chunks.iter().copied().map(std::io::IoSlice::new).collect();
-        let wrote = writer.write_vectored(&slices)?;
+    let mut slices: Vec<std::io::IoSlice<'_>> = parts
+        .iter()
+        .copied()
+        .filter(|p| !p.is_empty())
+        .map(std::io::IoSlice::new)
+        .collect();
+    let mut rest = slices.as_mut_slice();
+    while !rest.is_empty() {
+        let wrote = writer.write_vectored(rest)?;
         if wrote == 0 {
             return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
         }
-        let mut left = wrote;
-        for chunk in &mut chunks {
-            if left == 0 {
-                break;
-            }
-            if chunk.len() <= left {
-                left -= chunk.len();
-                *chunk = &[];
-            } else {
-                *chunk = &chunk[left..];
-                left = 0;
-            }
-        }
-        chunks.retain(|c| !c.is_empty());
+        std::io::IoSlice::advance_slices(&mut rest, wrote);
     }
     Ok(())
 }
