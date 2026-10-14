@@ -79,12 +79,23 @@ has been read, so no duration is quoted.
   hex, so there is nothing to derive: 56 bytes on the wire, 56 bytes compared.
   Contrast Shadowsocks, where the MD5 chain and HKDF are real work and are named
   in [that page](shadowsocks.md).
+- **The `host:port` `String` a domain header serialised for the resolver.**
+  `resolve_endpoint` did `format!("{host}:{port}").to_socket_addrs()`: it built
+  one owned `String` and the `str` form then re-scanned it for the last `:` to
+  split host and port back apart. The `(&str, u16)` tuple hands the resolver both
+  as separate arguments — no serialisation, no `String`, no port re-scan — and a
+  bracketless IPv6 host is no longer mangled by that split. The bytes the resolver
+  sees are identical either way, so a byte test cannot witness the removed
+  allocation; `decode_trojan_request`'s retired-instruction count is the checker,
+  and `the_trojan_header_costs_two_reads_not_seven` holds the domain path
+  byte-identical.
 
 What is **not** removed: the 2-byte length prefix on UDP. It is wire format, not
 an optimisation, and `trojan_udp_frames_carry` / `trojan_udp_frames_reject_damage`
-are the gates on it. A domain header still allocates one `String` for the
-`host:port` pair that `to_socket_addrs` takes, and that is a resolver interface,
-not a copy this page can remove.
+are the gates on it. What is left on a domain header is the resolver's own work —
+a real DNS name still reaches `getaddrinfo`, and that lookup belongs to the system
+resolver, not to a copy this page controls; a numeric host in the name field now
+parses straight to an address with no allocation at all.
 
 ## Pins
 
