@@ -20,14 +20,25 @@ pub enum Addr<'a> {
 impl<'a> Addr<'a> {
     #[must_use]
     pub fn of(host: &'a str) -> Self {
-        if host.contains(':') {
+        let bytes = host.as_bytes();
+        // One pass: a ':' selects the IPv6 branch and stops as `contains` did; only an all-`[0-9.]` host can ever parse as IPv4, so a domain skips that doomed call.
+        let (mut colon, mut non_v4) = (false, false);
+        for &c in bytes {
+            if c == b':' {
+                colon = true;
+                break;
+            }
+            non_v4 |= !(c.is_ascii_digit() || c == b'.');
+        }
+        if colon {
             if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
                 return Self::V6(ip.octets());
             }
-        } else if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
-            return Self::V4(ip.octets());
+        } else if !non_v4 {
+            if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+                return Self::V4(ip.octets());
+            }
         }
-        let bytes = host.as_bytes();
         Self::Name(&bytes[..bytes.len().min(MAX_DOMAIN)])
     }
 
@@ -142,6 +153,56 @@ mod tests {
         let n = addr.encode_into(&mut buf);
         assert_eq!(buf[1], u8::try_from(MAX_DOMAIN).expect("255 fits a byte"));
         assert_eq!(Addr::take(&buf[..n]), Ok((addr, n)));
+    }
+
+    #[test]
+    fn the_fused_classifier_is_the_original_two_call_logic_on_every_host() {
+        // The oracle is the pre-change body: the win may only ever drop a family parse the oracle proves fails.
+        fn oracle(host: &str) -> Addr<'_> {
+            if host.contains(':') {
+                if let Ok(ip) = host.parse::<std::net::Ipv6Addr>() {
+                    return Addr::V6(ip.octets());
+                }
+            } else if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+                return Addr::V4(ip.octets());
+            }
+            let bytes = host.as_bytes();
+            Addr::Name(&bytes[..bytes.len().min(MAX_DOMAIN)])
+        }
+        for host in [
+            "",
+            "a",
+            "example.com",
+            "localhost",
+            "galois.example",
+            "xn--80ak6aa92e.com",
+            "192.0.2.53",
+            "10.0.0.1",
+            "0.0.0.0",
+            "255.255.255.255",
+            "192.0.2.4.5",
+            "192.0.2.4.",
+            ".192.0.2.4",
+            "0192.0.2.4",
+            "192.0.2.04",
+            "192.0.2.256",
+            "192.0.2.4 ",
+            " 192.0.2.4",
+            "-192.0.2.4",
+            "192.0.2.4x",
+            "::1",
+            "::",
+            "2001:db8::1",
+            "1:2:3:4:5:6:7:8",
+            "fe80::1%eth0",
+            "1:2:3:4:5:6:7:8:9",
+            "127.0.0.1:80",
+            "example:com",
+            ":",
+            ":::1",
+        ] {
+            assert_eq!(Addr::of(host), oracle(host), "{host:?}");
+        }
     }
 
     #[test]
