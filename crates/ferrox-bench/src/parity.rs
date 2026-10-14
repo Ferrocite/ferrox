@@ -728,7 +728,7 @@ pub fn measure(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> Re
     let ip = local_non_loopback_ipv4()?;
     let sink = allocate_port_range(request.connections)?;
     let sink_ports = ports_of(&sink)?;
-    let sink_port = sink_ports[0];
+    let targets = sink_targets(ip, &sink_ports);
     let probe = allocate_port_excluding(ip, &sink_ports)?;
     let engine_port = bound_port(&probe)?;
 
@@ -768,8 +768,7 @@ pub fn measure(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> Re
         warmup(socks, &bulk_pattern_template(request.payload_size))?;
     }
 
-    let target = SocketAddr::from((ip, sink_port));
-    let (flows, sampler_thread, stop, rx) = start_traffic(pid, request, socks, target);
+    let (flows, sampler_thread, stop, rx) = start_traffic(pid, request, socks, &targets);
     let wall = Instant::now();
     // The cap is enforced inside the fan-in: a stalled flow blocks `read`, so a post-hoc check here could never fire.
     let moved = collect_flows(flows, &stop, wall + RUN_TIMEOUT)?;
@@ -888,13 +887,13 @@ fn start_traffic(
     pid: u32,
     request: &Request,
     engine: SocketAddr,
-    target: SocketAddr,
+    targets: &[SocketAddr],
 ) -> TrafficPhase {
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<(Phase, ps::Sample)>();
     let sampler_thread = spawn_sampler(pid, Arc::clone(&stop), tx);
     (
-        spawn_flows(request, engine, target),
+        spawn_flows(request, engine, targets),
         sampler_thread,
         stop,
         rx,
@@ -1081,7 +1080,7 @@ impl SinkThread {
 fn spawn_flows(
     request: &Request,
     engine: SocketAddr,
-    target: SocketAddr,
+    targets: &[SocketAddr],
 ) -> Vec<JoinHandle<FlowResult>> {
     let template = bulk_pattern_template(request.payload_size);
     (0..request.connections)
@@ -1091,7 +1090,7 @@ fn spawn_flows(
                 pattern: rotate(&template, index, request.connections),
                 traffic: request.traffic,
                 engine,
-                target: SocketAddr::new(target.ip(), sink_port_of(target.port(), index)),
+                target: targets[index],
                 index,
             };
             std::thread::spawn(move || run_flow(&plan))
@@ -1342,6 +1341,7 @@ fn spawn_sink(listeners: Vec<TcpListener>, request: &Request) -> Result<SinkThre
                 if stream.set_nonblocking(false).is_err() {
                     return;
                 }
+                apply_flow_timeouts(&stream);
                 if let Some(reason) = serve_flow(stream, &flow, index, upload_bytes, download_bytes)
                 {
                     if let Ok(mut slot) = sink_reasons.lock() {
@@ -1714,21 +1714,47 @@ fn compress_block(state: &[u32; 8], block: &[u8; 64]) -> [u32; 8] {
     ]
 }
 
-fn sink_port_of(first: u16, index: usize) -> u16 {
-    first.saturating_add(u16::try_from(index).unwrap_or(u16::MAX))
+/// A sink range is not a run of numbers: Linux randomises where each ephemeral bind starts, so the only ports a flow can dial are the ones its own listener read back.
+fn sink_targets(ip: Ipv4Addr, ports: &[u16]) -> Vec<SocketAddr> {
+    ports
+        .iter()
+        .map(|&port| SocketAddr::from((ip, port)))
+        .collect()
+}
+
+/// The deadline is what turns a stall into a report: a blocking accept here spent the job's whole ceiling before any engine was measured.
+fn accept_until(listener: &TcpListener, deadline: Instant) -> Option<TcpStream> {
+    listener.set_nonblocking(true).ok()?;
+    loop {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false).ok()?;
+                apply_flow_timeouts(&stream);
+                return Some(stream);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 pub fn harness_ceiling(connections: usize, payload_size: usize, bytes: u64) -> Result<f64, Error> {
     let ip = local_non_loopback_ipv4()?;
     let listeners = allocate_port_range(connections)?;
-    let port = bound_port(&listeners[0])?;
+    let targets = sink_targets(ip, &ports_of(&listeners)?);
     let pattern = Arc::new(bulk_pattern_template(payload_size));
 
     let sink = std::thread::spawn({
         let pattern = Arc::clone(&pattern);
         move || {
+            let deadline = Instant::now() + RUN_TIMEOUT;
             for (index, listener) in listeners.into_iter().enumerate() {
-                let Ok((stream, _)) = listener.accept() else {
+                let Some(stream) = accept_until(&listener, deadline) else {
                     return;
                 };
                 let flow = Arc::new(rotate(&pattern, index, connections));
@@ -1738,8 +1764,7 @@ pub fn harness_ceiling(connections: usize, payload_size: usize, bytes: u64) -> R
     });
 
     let mut flows = Vec::with_capacity(connections);
-    for index in 0..connections {
-        let addr = SocketAddr::from((ip, sink_port_of(port, index)));
+    for (index, addr) in targets.into_iter().enumerate() {
         let template = Arc::clone(&pattern);
         flows.push(std::thread::spawn(move || {
             ceiling_flow(addr, &template, index, connections, bytes)
@@ -1773,6 +1798,7 @@ fn ceiling_flow(
         return 0.0;
     };
     let _ = stream.set_nodelay(true);
+    apply_flow_timeouts(&stream);
     let pattern = rotate(template, index, flows);
     let started = Instant::now();
     let read_total = read_validated(&mut stream, &pattern, bytes).unwrap_or(0);
@@ -2208,14 +2234,30 @@ mod tests {
     }
 
     #[test]
-    fn a_flows_identity_is_its_port_and_not_its_place_in_the_accept_queue() {
-        assert_eq!(sink_port_of(40_000, 0), 40_000);
-        assert_eq!(sink_port_of(40_000, 15), 40_015);
-        let ports: std::collections::BTreeSet<u16> =
-            (0..16).map(|i| sink_port_of(40_000, i)).collect();
-        assert_eq!(ports.len(), 16, "two flows must never share a sink port");
-        assert_eq!(sink_port_of(u16::MAX, 1), u16::MAX);
-        assert_eq!(sink_port_of(u16::MAX, u16::MAX as usize + 5), u16::MAX);
+    fn a_gapped_range_still_dials_each_listeners_own_port() {
+        let ports: Vec<u16> = sink_targets(Ipv4Addr::LOCALHOST, &[40_000, 40_007, 40_003])
+            .iter()
+            .map(SocketAddr::port)
+            .collect();
+        assert_eq!(
+            ports,
+            vec![40_000, 40_007, 40_003],
+            "a flow dials the port its listener read back, not the first port plus its place"
+        );
+    }
+
+    #[test]
+    fn an_accept_past_its_deadline_is_a_miss_and_not_a_wait() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let started = Instant::now();
+        assert!(
+            accept_until(&listener, started + Duration::from_millis(50)).is_none(),
+            "nobody dialled, so the accept had to report the miss"
+        );
+        assert!(
+            started.elapsed() < FLOW_IO_TIMEOUT,
+            "the accept gave up at its deadline instead of blocking the run"
+        );
     }
 
     #[test]
