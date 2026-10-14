@@ -170,13 +170,12 @@ fn worktree_block(worktree: &Worktree) -> String {
         Place::Absent => {
             let _ = write!(
                 line,
-                "There is no worktree for this slice yet. Create it with \
-                 `./scripts/new-worktree.sh {name}` and work only there — that script \
-                 and never a hand-made `git worktree add`, because it is what points the \
-                 build at the shared `target-dir`, writes `.cargo/config.toml` with the \
-                 hardware-crypto cfgs CI builds with, and links the `upstream/` checkouts \
-                 the references are read from. It makes `{path}` on branch `{name}`; open \
-                 the pull request from that branch.",
+                "No worktree for this slice yet: create it with \
+                 `./scripts/new-worktree.sh {name}` and work only there — never a hand-made \
+                 `git worktree add`, since the script is what points the build at the shared \
+                 `target-dir`, writes the hardware-crypto cfgs CI builds with into \
+                 `.cargo/config.toml`, and links the `upstream/` reading copies. \
+                 It makes `{path}` on branch `{name}`; open the pull request from it.",
                 name = worktree.name,
                 path = worktree.path.display(),
             );
@@ -184,11 +183,11 @@ fn worktree_block(worktree: &Worktree) -> String {
         Place::Linked => {
             let _ = write!(
                 line,
-                "Worktree `{name}` already exists at `{path}` — do this slice there, not in \
-                 the checkout this prompt came from. Update it to match `main` before the \
-                 first edit (`git fetch origin main && git rebase origin/main`): `main` moves \
-                 under a worktree, and a slice built on a stale base measures the wrong code. \
-                 If it holds unmerged work, read it and carry on rather than starting over.",
+                "Worktree `{name}` is at `{path}` — do this slice there, not in the \
+                 checkout this prompt came from. Put it on `main` before the first edit \
+                 (`git fetch origin main && git rebase origin/main`): `main` moves under a \
+                 worktree, and a stale base measures the wrong code. If it holds unmerged \
+                 work, read it and carry on.",
                 name = worktree.name,
                 path = worktree.path.display(),
             );
@@ -196,9 +195,9 @@ fn worktree_block(worktree: &Worktree) -> String {
         Place::Current => {
             let _ = write!(
                 line,
-                "This slice's worktree `{name}` is the very checkout this prompt was read \
-                 from (`{path}`): update it to match `main` first (`git fetch origin main && \
-                 git rebase origin/main`), then do the work here.",
+                "This slice's worktree `{name}` is the checkout this prompt came from \
+                 (`{path}`): put it on `main` first (`git fetch origin main && \
+                 git rebase origin/main`), then work here.",
                 name = worktree.name,
                 path = worktree.path.display(),
             );
@@ -207,8 +206,8 @@ fn worktree_block(worktree: &Worktree) -> String {
             let _ = write!(
                 line,
                 "`{path}` exists but is not a worktree, so `./scripts/new-worktree.sh {name}` \
-                 refuses it. Move that directory aside and create `{name}` with the script — \
-                 the same one, for the same reasons — then work there.",
+                 refuses it. Move that directory aside, then create `{name}` with the script \
+                 and work there.",
                 name = worktree.name,
                 path = worktree.path.display(),
             );
@@ -221,8 +220,8 @@ fn worktree_block(worktree: &Worktree) -> String {
 fn acceptance_block(prompt: &Prompt) -> String {
     let mut block = String::from(
         "## Acceptance\n\n\
-         These checks come from the library, and this slice is not done until every one of \
-         them is green. Run them; do not report the result of a command you did not run.",
+         Not done until every gate below is green. Run them; never report the result of \
+         a command you did not run.",
     );
     for gate in &prompt.gates {
         let _ = write!(block, "\n- {gate}");
