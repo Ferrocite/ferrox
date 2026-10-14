@@ -110,6 +110,7 @@ For {method} — matrix row {index} of table {section} — remove work that is g
 ```
 
 **Add-on — pool-owner:** When one buffer is filled by one thread and drained by another, the pool lives in the object both touch; the parse order respects that single owner.
+**Add-on — tls-config-once:** A rustls `ClientConfig` is rebuilt on every TLS dial (`RustlsProvider::connect` → `config()`), where xray's `GetTLSConfig()` and sing-box's transport both build theirs once per outbound and hand the same value to every connection; memoise the built `Arc` by the config's security-relevant bytes (roots, alpn, pins — never `server_name`, which is per-connection) so a repeat dial pays a key clone and an `Arc` bump instead of re-parsing every DER and rebuilding the verifier and cipher Arcs, gate it on the allocation count in `ferrox-core`'s counting test binary, and because it sits in the shared session layer every `*-tls` carrier funnels through, it is its own slice rather than one method row's hunt.
 
 ## P4 · Prove a shipped row bit-identical to the references
 

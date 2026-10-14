@@ -274,10 +274,8 @@ fn rung_of(carrier: &Carrier) -> Option<Rung> {
 // The (path, early-data budget) a non-raw rung reuses from the configured carrier.
 fn stream_params(carrier: &Carrier) -> Option<(&str, u32)> {
     match carrier {
-        Carrier::Ws { path, ed } => Some((path, *ed)),
-        Carrier::HttpUpgrade { path } | Carrier::Grpc { path } | Carrier::HttpHeader { path } => {
-            Some((path, 0))
-        }
+        Carrier::Ws { path, ed } | Carrier::HttpUpgrade { path, ed } => Some((path, *ed)),
+        Carrier::Grpc { path } | Carrier::HttpHeader { path } => Some((path, 0)),
         Carrier::Xhttp { settings, .. } => Some((settings.path.as_str(), 0)),
         _ => None,
     }
@@ -597,7 +595,7 @@ fn accept_loop(address: &str, role: &Role) {
                 Carrier::Ws { path, .. } => {
                     serve_trojan_ws(stream, &key, path.as_str(), freedom);
                 }
-                Carrier::HttpUpgrade { path } => {
+                Carrier::HttpUpgrade { path, .. } => {
                     serve_trojan_httpupgrade(stream, &key, path.as_str(), freedom);
                 }
                 Carrier::Grpc { path } => {
@@ -626,7 +624,7 @@ fn accept_loop(address: &str, role: &Role) {
                 Carrier::HttpHeader { path } => {
                     crate::vmess::serve_httpheader(stream, path.as_str(), &id, freedom);
                 }
-                Carrier::HttpUpgrade { path } => {
+                Carrier::HttpUpgrade { path, .. } => {
                     crate::vmess::serve_httpupgrade(stream, path.as_str(), &id, freedom);
                 }
                 Carrier::Grpc { path } => {
@@ -660,7 +658,7 @@ fn serve_shadowsocks(
             Carrier::Ws { path, .. } => {
                 crate::shadowsocks2022::serve_ws(stream, password, method, path.as_str(), freedom);
             }
-            Carrier::HttpUpgrade { path } => {
+            Carrier::HttpUpgrade { path, .. } => {
                 crate::shadowsocks2022::serve_httpupgrade(
                     stream,
                     password,
@@ -705,7 +703,7 @@ fn serve_shadowsocks(
         Carrier::Ws { path, .. } => {
             crate::shadowsocks::serve_ws(stream, password, method, path.as_str(), freedom);
         }
-        Carrier::HttpUpgrade { path } => {
+        Carrier::HttpUpgrade { path, .. } => {
             crate::shadowsocks::serve_httpupgrade(stream, password, method, path.as_str(), freedom);
         }
         Carrier::Grpc { path } => {
@@ -754,7 +752,7 @@ fn serve_vless(stream: TcpStream, id: &[u8; 16], carrier: &Carrier, freedom: boo
             }
             crate::proxy::relay_sink(reader, &writer, &uplink, |_| {});
         }
-        Carrier::HttpUpgrade { path } => {
+        Carrier::HttpUpgrade { path, .. } => {
             let Some((mut reader, mut write)) = crate::httpupgrade::accept(stream, path) else {
                 return;
             };
@@ -1675,7 +1673,7 @@ fn serve_vless_tls(
             let (reader, writer) = session_halves(session);
             serve_xhttp_stream(reader, writer, settings, id, freedom);
         }
-        Carrier::HttpUpgrade { path } => {
+        Carrier::HttpUpgrade { path, .. } => {
             let Ok(raw) = stream.try_clone() else { return };
             let Some(session) = accept_tls_session(stream, server) else {
                 return;
@@ -1765,7 +1763,7 @@ fn serve_vless_reality(
                 serve_xhttp_stream(reader, writer, settings, id, freedom);
             });
         }
-        Carrier::HttpUpgrade { path } => {
+        Carrier::HttpUpgrade { path, .. } => {
             let Ok(raw) = stream.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
                 if !shake_tls(&mut session) {
@@ -2211,7 +2209,8 @@ pub(crate) fn is_timeout(error: &std::io::Error) -> bool {
 }
 
 pub(crate) fn vless_header(id: &[u8; 16], cmd: u8, target: &SocketAddr) -> Vec<u8> {
-    let mut header = Vec::with_capacity(30);
+    // version + uuid + addonsLen + command + port = 21, then the family byte and 4 or 16 octets.
+    let mut header = Vec::with_capacity(21 + if target.is_ipv6() { 17 } else { 5 });
     header.push(0);
     header.extend_from_slice(id);
     header.push(0);
@@ -2224,7 +2223,8 @@ pub(crate) fn vless_header(id: &[u8; 16], cmd: u8, target: &SocketAddr) -> Vec<u
 /// The VLESS header with the Vision flow in its addons, the bytes the core encoder writes.
 pub(crate) fn vless_vision_header(id: &[u8; 16], cmd: u8, target: &SocketAddr) -> Vec<u8> {
     const ADDONS: &[u8] = b"\x0A\x10xtls-rprx-vision";
-    let mut header = Vec::with_capacity(30 + ADDONS.len());
+    // The bare header plus the fixed Flow addon, then the family byte and 4 or 16 octets.
+    let mut header = Vec::with_capacity(21 + ADDONS.len() + if target.is_ipv6() { 17 } else { 5 });
     header.push(0);
     header.extend_from_slice(id);
     header.push(ADDONS.len() as u8);
@@ -2384,14 +2384,11 @@ fn dial_vless_rung(
             true
         }
         Rung::HttpUpgrade => {
-            let Some((mut reader, mut write)) =
-                crate::httpupgrade::connect(uplink, &vless.host, attempt.path)
+            let Some((mut reader, write)) =
+                crate::httpupgrade::connect(uplink, &vless.host, attempt.path, attempt.ed, header)
             else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
-            if write.write_all(header).is_err() {
-                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
-            }
             let pump = Pump::to_stream(client, &write);
             let answered = read_vless_response(&mut reader).is_some();
             pump.end();
@@ -3381,18 +3378,17 @@ fn dial_vmess_httpupgrade(
 ) -> bool {
     let rung = attempt.rung;
     let path = attempt.path;
-    let Some((mut reader, mut write)) = crate::httpupgrade::connect(uplink, &vmess.host, path)
-    else {
-        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
-    };
+    let ed = attempt.ed;
     let Some((request, send, recv, response_key, response_iv, auth)) =
         crate::vmess::client_request(&vmess.id, vmess.cipher, target, 1)
     else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
     };
-    if write.write_all(&request).is_err() {
-        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
-    }
+    let Some((mut reader, write)) =
+        crate::httpupgrade::connect(uplink, &vmess.host, path, ed, &request)
+    else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+    };
     if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
         return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
     }
@@ -3744,14 +3740,11 @@ fn dial_trojan_rung(
             true
         }
         Rung::HttpUpgrade => {
-            let Some((reader, mut write)) =
-                crate::httpupgrade::connect(uplink, &trojan.host, attempt.path)
+            let Some((reader, write)) =
+                crate::httpupgrade::connect(uplink, &trojan.host, attempt.path, attempt.ed, header)
             else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
-            if write.write_all(header).is_err() {
-                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
-            }
             note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
             crate::proxy::relay_carried(reader, &write, client);
             true
@@ -3874,9 +3867,11 @@ fn tls_httpupgrade(
     session: ferrox_core::tls::RustlsProvider<TcpStream>,
     host: &str,
     path: &str,
+    ed: u32,
+    first: &[u8],
 ) -> Option<(crate::httpupgrade::UpReader<ClientHalf>, TlsSink)> {
     let (reader, writer, raw) = tls_halves(session)?;
-    let (reader, writer) = crate::httpupgrade::connect_split(reader, writer, host, path)
+    let (reader, writer) = crate::httpupgrade::connect_split(reader, writer, host, path, ed, first)
         .or_else(|| tls_unreachable(server))?;
     Some((reader, TlsSink { half: writer, raw }))
 }
@@ -4080,14 +4075,12 @@ fn dial_vless_tls(client: &TcpStream, server: &SocketAddr, vless: &VlessOut, tar
             }
             relay_sink(reader, &writer, client, |_| {});
         }
-        Carrier::HttpUpgrade { path } => {
-            let Some((mut reader, mut sink)) = tls_httpupgrade(server, session, &vless.host, path)
+        Carrier::HttpUpgrade { path, ed } => {
+            let Some((mut reader, sink)) =
+                tls_httpupgrade(server, session, &vless.host, path, *ed, &header)
             else {
                 return;
             };
-            if sink.write_all(&header).is_err() {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
             if read_vless_response(&mut reader).is_none() {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
@@ -4261,14 +4254,12 @@ fn dial_trojan_tls(client: &TcpStream, server: &SocketAddr, trojan: &TrojanOut, 
             };
             relay_sink(reader, &writer, client, |_| {});
         }
-        Carrier::HttpUpgrade { path } => {
-            let Some((reader, mut sink)) = tls_httpupgrade(server, session, &trojan.host, path)
+        Carrier::HttpUpgrade { path, ed } => {
+            let Some((reader, sink)) =
+                tls_httpupgrade(server, session, &trojan.host, path, *ed, header)
             else {
                 return;
             };
-            if sink.write_all(header).is_err() {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
             relay_sink(reader, &sink, client, |_| {});
         }
         Carrier::Grpc { path } => {
@@ -4378,14 +4369,12 @@ fn vmess_tls_carried(
                 None,
             );
         }
-        Carrier::HttpUpgrade { path } => {
-            let Some((reader, sink)) = tls_httpupgrade(server, session, &vmess.host, path) else {
+        Carrier::HttpUpgrade { path, ed } => {
+            let Some((mut reader, sink)) =
+                tls_httpupgrade(server, session, &vmess.host, path, *ed, &request)
+            else {
                 return;
             };
-            let (mut reader, mut sink) = (reader, sink);
-            if sink.write_all(&request).is_err() {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
             if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
@@ -4655,7 +4644,8 @@ fn dial_ss_httpupgrade(
     ladder: &Ladder,
 ) -> bool {
     let rung = attempt.rung;
-    let Some((reader, mut writer)) = crate::httpupgrade::connect(uplink, &ss.host, attempt.path)
+    let Some((reader, mut writer)) =
+        crate::httpupgrade::connect(uplink, &ss.host, attempt.path, 0, &[])
     else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
@@ -10292,6 +10282,22 @@ mod tests {
         }
     }
 
+    /// The dial headers are reserved to the exact bytes they hold, so an IPv6 destination —
+    /// 38 and 56 bytes against the old `with_capacity(30)`/`(48)` — no longer reallocates.
+    #[test]
+    fn dial_headers_are_sized_to_the_bytes_they_hold() {
+        let id = [0x5au8; 16];
+        for target in [
+            SocketAddr::from(([192, 0, 2, 53], 80)),
+            SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1], 443)),
+        ] {
+            let plain = vless_header(&id, 1, &target);
+            assert_eq!(plain.capacity(), plain.len(), "no realloc for {target}");
+            let vision = vless_vision_header(&id, 1, &target);
+            assert_eq!(vision.capacity(), vision.len(), "no realloc for {target}");
+        }
+    }
+
     /// One REALITY+Vision pair on loopback: an echo target, a Vision inbound, the dial.
     struct RealityVisionPair {
         outbound: Outbound,
@@ -11172,7 +11178,8 @@ mod tests {
                 ))
             },
             |stream| {
-                let (reader, write) = crate::httpupgrade::connect(stream, "127.0.0.1", "/tunnel")?;
+                let (reader, write) =
+                    crate::httpupgrade::connect(stream, "127.0.0.1", "/tunnel", 0, &[])?;
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(write) as Box<dyn Write + Send>,
@@ -11445,7 +11452,10 @@ mod tests {
     #[test]
     fn a_silent_peer_cannot_pin_an_httpupgrade_handshake() {
         let id = [0x23u8; 16];
-        let carrier = Carrier::HttpUpgrade { path: "/p".into() };
+        let carrier = Carrier::HttpUpgrade {
+            path: "/p".into(),
+            ed: 0,
+        };
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -12326,6 +12336,7 @@ mod tests {
                     id,
                     Carrier::HttpUpgrade {
                         path: "/u".to_owned(),
+                        ed: 0,
                     },
                     client_config,
                 )
@@ -12447,6 +12458,7 @@ mod tests {
                     id,
                     Carrier::HttpUpgrade {
                         path: "/u".to_owned(),
+                        ed: 0,
                     },
                     client_config,
                 )
@@ -12548,6 +12560,7 @@ mod tests {
                     key,
                     Carrier::HttpUpgrade {
                         path: "/u".to_owned(),
+                        ed: 0,
                     },
                     client_config,
                 )
@@ -12848,6 +12861,7 @@ mod tests {
         socks_dials_ss_via(
             Carrier::HttpUpgrade {
                 path: "/ss-upgrade".to_owned(),
+                ed: 0,
             },
             crate::shadowsocks::serve_httpupgrade,
             "/ss-upgrade",
@@ -14299,6 +14313,7 @@ mod tests {
             cipher: crate::vmess::Cipher::Chacha,
             carrier: Carrier::HttpUpgrade {
                 path: "/tunnel".to_owned(),
+                ed: 0,
             },
             host: "127.0.0.1".to_owned(),
             tls: None,
@@ -14491,6 +14506,7 @@ mod tests {
             key: trojan_key("secret"),
             carrier: Carrier::HttpUpgrade {
                 path: "/tunnel".to_owned(),
+                ed: 0,
             },
             host: "127.0.0.1".to_owned(),
             tls: None,
@@ -15119,6 +15135,7 @@ mod tests {
             (
                 Carrier::HttpUpgrade {
                     path: "/t".to_owned(),
+                    ed: 0,
                 },
                 Rung::HttpUpgrade,
             ),
