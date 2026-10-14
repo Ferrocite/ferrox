@@ -66,11 +66,22 @@ nothing needed removing, and which two claims about this carrier are false:
   when `Ed == 0`, and `http.ReadRequest` allocating the request, the header map
   and every value string. That is a per-connection cost, once, and it is not
   where a connection spends its time.
-- `?ed=N` early data is **parsed and not carried** on this carrier. `Ed` is
-  stripped from the path and the budget is a path-level test only
-  (`an_early_data_budget_leaves_the_request_unchanged`). An earlier README here
-  claimed "both roles" for early data; that was true for WebSocket and false
-  here, and the WebSocket page is where early data is claimed.
+- `?ed=N` early data is **carried on both roles**. The budget is stripped from
+  the path for the request line and, separately, held in `Carrier::HttpUpgrade
+  { ed }` so a dial can use it. When the first payload bytes fit the budget the
+  client writes them straight after the `GET`, ahead of reading the `101`, which
+  is the whole saving — one round trip off connection setup; when they do not,
+  or the budget is zero, the payload is held back and sent after the `101` as
+  before. The server needs no budget: it peeks the head, reads exactly through
+  `\r\n\r\n`, and leaves the pipelined bytes on the socket (or hands them back
+  as the prefix when the halves cannot peek), so the early data is the first
+  thing the reader returns. Checked by
+  `early_data_rides_ahead_of_the_switch` and
+  `a_payload_over_the_budget_follows_the_switch`; the request line itself is
+  unchanged by the budget (`an_early_data_budget_leaves_the_request_unchanged`).
+  This matches xray, whose `Ed == 0` forces a blocking `connRF.Read([]byte{})`
+  before the payload while `Ed > 0` pipelines it; sing-box carries no httpupgrade
+  early data at all.
 
 ## Pins
 

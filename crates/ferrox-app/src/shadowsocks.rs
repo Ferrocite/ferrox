@@ -1286,7 +1286,8 @@ mod tests {
         });
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, mut writer) =
-            crate::httpupgrade::connect(stream, "127.0.0.1", "/ss-upgrade").expect("carries");
+            crate::httpupgrade::connect(stream, "127.0.0.1", "/ss-upgrade", 0, &[])
+                .expect("carries");
         round_trip(&mut reader, &mut writer, &target);
         let server = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = server.local_addr().expect("addr").port();

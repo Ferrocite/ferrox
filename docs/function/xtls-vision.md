@@ -49,6 +49,7 @@ graph TD
 | uuid-bytes-copied-per-link | 0 | ferrox-app-vision::tests::the_writer_hands_the_uuid_by_pointer_on_the_first_frame |
 | framed-staging-buffer-bytes | 16384 | ferrox-app-vision::tests::the_framed_staging_buffers_stay_at_one_record |
 | seal-open-staging-allocations | 0 | ferrox-bench-gate-2 |
+| coalesce-segment-allocations | 0 | ferrox-core-tls::rustls_backend::tests::the_framer_path_coalesces_without_a_heap_buffer |
 <!-- counts:end -->
 
 ## Ops
@@ -176,11 +177,14 @@ throughout the whole session, not only during the handshake.
   caller's pointer after the caller reallocs. `write_traffic_holds_the_buffer_capacities_steady`
   gates the removal on the two remaining `Vec`s in `Link`: `have.capacity()` and
   `out.capacity()` do not move across 64 writes, so no buffer came back to take
-  `staging`'s place. What got worse: `coalesce` allocates one small `Vec<IoSlice>`
-  per call to hand rustls an arbitrary-length slice list, where the old code
-  allocated none (it reused the pre-sized `staging`). At a 2 KiB payload the
-  allocation is a fraction of the memcpy it replaces; the copy was per-byte,
-  the Vec is per-record.
+  `staging`'s place. The per-record segment list is gone too: `coalesce` laid the
+  `IoSlice`s out in a `Vec` it collected per call, where the old `staging` path
+  allocated none; the four segments the framer hands (`uuid | head | payload |
+  padding`, at most) now ride a stack array, so the write path emits one record and
+  allocates nothing of its own. `the_framer_path_coalesces_without_a_heap_buffer`
+  counts allocations across `coalesce` at the framer's segment shape and holds them
+  at zero; a wider list still goes out in one `write_vectored` by a heap path that
+  test also drives, so the fallback is gated rather than dead.
 
 - **The stack head's zero-fill and the uuid copy into it.** The 21-byte
   `let mut head = [0u8; SHORTEST_FRAME]` wrote 21 zeros every call and then

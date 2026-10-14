@@ -258,7 +258,9 @@ impl VlessLink {
         let addr = carries_address(command).then(|| Addr::of(target_host));
         let vision = self.is_vision();
         let tail = addr.map_or(0, |a| 2 + a.wire_len());
-        let need = 1 + 16 + self.addons_len() + 1 + tail;
+        // The flow is already decided above; `addons_len` would re-look it up in the params map.
+        let addons = if vision { VISION_ADDONS.len() + 1 } else { 1 };
+        let need = 1 + 16 + addons + 1 + tail;
         assert!(out.len() >= need, "vless header buffer too short");
 
         out[0] = 0;

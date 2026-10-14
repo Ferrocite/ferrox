@@ -319,14 +319,41 @@ impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RustlsServer
 }
 
 /// Hand `parts` to a rustls writer in one `write_vectored` so the fragmenter sees one payload and emits one record; iterating `write_all` per part would emit one record per part.
+///
+/// The framer hands at most `uuid | head | payload | padding` — four segments — so they
+/// are laid out on the stack like [`RustlsProvider::write_parts`] does its two, rather
+/// than spending one heap `Vec<IoSlice>` on every framed write.
 fn coalesce<W: Write + ?Sized>(writer: &mut W, parts: &[&[u8]]) -> std::io::Result<()> {
-    let mut slices: Vec<std::io::IoSlice<'_>> = parts
+    let mut stack = [
+        std::io::IoSlice::new(&[]),
+        std::io::IoSlice::new(&[]),
+        std::io::IoSlice::new(&[]),
+        std::io::IoSlice::new(&[]),
+    ];
+    if parts.len() <= stack.len() {
+        let mut kept = 0;
+        for part in parts.iter().copied().filter(|part| !part.is_empty()) {
+            stack[kept] = std::io::IoSlice::new(part);
+            kept += 1;
+        }
+        return write_segments(writer, &mut stack[..kept]);
+    }
+    // A provider handed more segments than the framer produces still goes out in one call.
+    let mut heap: Vec<std::io::IoSlice<'_>> = parts
         .iter()
         .copied()
-        .filter(|p| !p.is_empty())
+        .filter(|part| !part.is_empty())
         .map(std::io::IoSlice::new)
         .collect();
-    let mut rest = slices.as_mut_slice();
+    write_segments(writer, heap.as_mut_slice())
+}
+
+/// Push the segments out in as few `write_vectored` calls as the writer will take,
+/// advancing past each one the writer consumes whole.
+fn write_segments<W: Write + ?Sized>(
+    writer: &mut W,
+    mut rest: &mut [std::io::IoSlice<'_>],
+) -> std::io::Result<()> {
     while !rest.is_empty() {
         let wrote = writer.write_vectored(rest)?;
         if wrote == 0 {
@@ -800,5 +827,63 @@ mod tests {
         assert!(crate::tls::parse_pem_identity(b"nothing here", b"nothing here").is_err());
         let cert_pem = anchor_pem("CERTIFICATE", ANCHOR);
         assert!(crate::tls::parse_pem_identity(&cert_pem, b"nothing here").is_err());
+    }
+
+    /// Counts the segments a coalesced write reached the writer with, allocating nothing itself
+    /// so it can sit inside the measurement window.
+    struct SegmentRecorder {
+        calls: usize,
+        bytes: usize,
+    }
+
+    impl Write for SegmentRecorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.bytes += buf.len();
+            Ok(buf.len())
+        }
+        fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+            self.calls += 1;
+            let n = bufs.iter().map(|slice| slice.len()).sum();
+            self.bytes += n;
+            Ok(n)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The four segments the Vision framer hands go out in one record off the stack: no heap
+    /// buffer per framed write, which is the allocation the old `collect::<Vec<_>>` paid for.
+    #[test]
+    fn the_framer_path_coalesces_without_a_heap_buffer() {
+        let uuid = [0xabu8; 16];
+        let head = [0u8; 5];
+        let payload: Vec<u8> = (0..1400).map(|i| i as u8).collect();
+        let padding = [0u8; 200];
+        let parts: [&[u8]; 4] = [&uuid[..], &head[..], payload.as_slice(), &padding[..]];
+        let mut recorder = SegmentRecorder { calls: 0, bytes: 0 };
+        // The parts are assembled outside the window; only `coalesce` runs inside it.
+        let (result, counts) = crate::alloc_count::measure(|| coalesce(&mut recorder, &parts));
+        result.expect("coalesces");
+        assert_eq!(
+            counts.allocs, 0,
+            "four segments ride the stack, counted {counts:?}"
+        );
+        assert_eq!(recorder.calls, 1, "one `write_vectored`, so one record");
+        assert_eq!(recorder.bytes, 16 + 5 + 1400 + 200);
+    }
+
+    /// Past the stack bound the same segments still go out in one call, and empty runs never
+    /// reach the writer where a zero-length slice would stall `advance_slices`.
+    #[test]
+    fn a_wide_segment_list_and_empty_runs_still_coalesce_in_one_call() {
+        let a = [1u8; 3];
+        let b = [2u8; 4];
+        let empty: [u8; 0] = [];
+        let parts: [&[u8]; 6] = [&a[..], &empty[..], &b[..], &empty[..], &a[..], &b[..]];
+        let mut recorder = SegmentRecorder { calls: 0, bytes: 0 };
+        coalesce(&mut recorder, &parts).expect("coalesces");
+        assert_eq!(recorder.bytes, 3 + 4 + 3 + 4, "empty runs are dropped");
+        assert_eq!(recorder.calls, 1, "one record even past the stack bound");
     }
 }

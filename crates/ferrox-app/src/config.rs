@@ -472,6 +472,7 @@ pub(crate) enum Carrier {
     },
     HttpUpgrade {
         path: String,
+        ed: u32,
     },
     Grpc {
         path: String,
@@ -534,8 +535,10 @@ fn resolve_ws(settings: Option<&Json>, _: &str) -> Carrier {
 }
 
 fn resolve_httpupgrade(settings: Option<&Json>, _: &str) -> Carrier {
+    let early = EarlyData::split(&sub_path(settings, "httpupgradeSettings"));
     Carrier::HttpUpgrade {
-        path: EarlyData::split(&sub_path(settings, "httpupgradeSettings")).path,
+        path: early.path,
+        ed: early.budget,
     }
 }
 

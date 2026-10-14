@@ -78,6 +78,7 @@ vless address-families-encoded 4 ferrox-core-vless::tests::header_address_famili
 vless vision-addons-bytes 2 ferrox-core-vless::tests::non_vision_header_carries_empty_addons
 vless reality-outbound-rows-dialled 1 ferrox-app-proxy::tests::vless_outbound_with_reality_security_dials_raw_only
 vless vision-header-targets-matching-core 2 ferrox-app-proxy::tests::vision_header_matches_the_core_encoder
+vless dial-header-reallocations 0 ferrox-app-proxy::tests::dial_headers_are_sized_to_the_bytes_they_hold
 
 # --- Trojan -----------------------------------------------------------------
 trojan ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -96,6 +97,7 @@ xtls-vision user-space-copies-per-byte-written-while-framed 0 ferrox-app-vision:
 xtls-vision uuid-bytes-copied-per-link 0 ferrox-app-vision::tests::the_writer_hands_the_uuid_by_pointer_on_the_first_frame
 xtls-vision framed-staging-buffer-bytes 16384 ferrox-app-vision::tests::the_framed_staging_buffers_stay_at_one_record
 xtls-vision seal-open-staging-allocations 0 ferrox-bench-gate-2
+xtls-vision coalesce-segment-allocations 0 ferrox-core-tls::rustls_backend::tests::the_framer_path_coalesces_without_a_heap_buffer
 
 # --- Mux.Cool ---------------------------------------------------------------
 mux-cool ops-retired-instructions UNBLESSED scripts/count-ops.sh

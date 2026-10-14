@@ -83,15 +83,30 @@ fn upgrade_request(host: &str, path: &str) -> String {
     )
 }
 
-pub(crate) fn connect(stream: TcpStream, host: &str, path: &str) -> Option<(UpReader, TcpStream)> {
+pub(crate) fn connect(
+    stream: TcpStream,
+    host: &str,
+    path: &str,
+    budget: u32,
+    first: &[u8],
+) -> Option<(UpReader, TcpStream)> {
     let mut read = stream;
+    let early = !first.is_empty() && first.len() as u64 <= u64::from(budget);
     read.write_all(upgrade_request(host, path).as_bytes())
         .ok()?;
+    if early {
+        // The payload rides ahead of the `101`: this is what `?ed` buys — one round trip saved.
+        read.write_all(first).ok()?;
+    }
     let (head, prefix) = read_head(&mut read)?;
     check_response(&head)?;
     let Ok(write) = read.try_clone() else {
         return None;
     };
+    let mut write = write;
+    if !early && !first.is_empty() {
+        write.write_all(first).ok()?;
+    }
     Some((UpReader { read, prefix }, write))
 }
 
@@ -115,13 +130,22 @@ pub(crate) fn connect_split<R: Read, W: Write>(
     mut write: W,
     host: &str,
     path: &str,
+    budget: u32,
+    first: &[u8],
 ) -> Option<(UpReader<R>, W)> {
+    let early = !first.is_empty() && first.len() as u64 <= u64::from(budget);
     write
         .write_all(upgrade_request(host, path).as_bytes())
         .ok()?;
+    if early {
+        write.write_all(first).ok()?;
+    }
     let (head, prefix) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::HEAD_DEADLINE)?;
     check_response(&head)?;
+    if !early && !first.is_empty() {
+        write.write_all(first).ok()?;
+    }
     Some((UpReader { read, prefix }, write))
 }
 
@@ -146,8 +170,53 @@ mod tests {
         });
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, mut write) =
-            connect(stream, "oracle.example", "/tunnel").expect("upgrades");
+            connect(stream, "oracle.example", "/tunnel", 0, &[]).expect("upgrades");
         write.write_all(b"ping").expect("writes");
+        let mut buf = [0u8; 4];
+        reader.read_exact(&mut buf).expect("reads");
+        assert_eq!(&buf, b"pong");
+        server.join().expect("joins");
+    }
+
+    /// A payload that fits the budget rides with the GET, so the server has it before the reader is even built and the caller sends nothing after.
+    #[test]
+    fn early_data_rides_ahead_of_the_switch() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let (mut reader, mut write) = accept(stream, "/tunnel").expect("upgrades");
+            let mut buf = [0u8; 4];
+            reader.read_exact(&mut buf).expect("reads early data");
+            assert_eq!(&buf, b"ping");
+            write.write_all(b"pong").expect("writes");
+        });
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let (mut reader, _write) =
+            connect(stream, "oracle.example", "/tunnel", 4, b"ping").expect("upgrades");
+        let mut buf = [0u8; 4];
+        reader.read_exact(&mut buf).expect("reads");
+        assert_eq!(&buf, b"pong");
+        server.join().expect("joins");
+    }
+
+    /// A payload over the budget is held back and sent only after the `101`, yet still reaches the server whole.
+    #[test]
+    fn a_payload_over_the_budget_follows_the_switch() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let (mut reader, mut write) = accept(stream, "/tunnel").expect("upgrades");
+            let mut buf = [0u8; 4];
+            reader.read_exact(&mut buf).expect("reads after the switch");
+            assert_eq!(&buf, b"ping");
+            write.write_all(b"pong").expect("writes");
+        });
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        // `budget` is one short of the payload, so it cannot ride: the reader still sees it whole.
+        let (mut reader, _write) =
+            connect(stream, "oracle.example", "/tunnel", 3, b"ping").expect("upgrades");
         let mut buf = [0u8; 4];
         reader.read_exact(&mut buf).expect("reads");
         assert_eq!(&buf, b"pong");
@@ -181,8 +250,14 @@ mod tests {
         });
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
         let configured = ferrox_core::transport::EarlyData::split("/interop-upgrade?ed=2048");
-        let (_reader, _write) =
-            connect(stream, "oracle.example", &configured.path).expect("upgrades");
+        let (_reader, _write) = connect(
+            stream,
+            "oracle.example",
+            &configured.path,
+            configured.budget,
+            b"first",
+        )
+        .expect("upgrades");
         server.join().expect("joins");
     }
 
