@@ -1,9 +1,10 @@
-//! Assembly order is fixed: shared protocol, prompt protocol, body, add-ons, gates verbatim; an unfilled required input goes at the top loudly or is not rendered.
+//! Assembly order is fixed: shared protocol, prompt protocol, body, add-ons, worktree, gates verbatim; an unfilled required input goes at the top loudly or is not rendered.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 use crate::markdown::{is_placeholder_name, Addon, Library, Prompt};
+use crate::worktree::{Place, Worktree};
 
 /// What to include beyond the prompt itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +38,8 @@ pub struct Rendered {
     pub supplied: BTreeMap<String, String>,
     /// The add-ons that were resolved, in the order given.
     pub addons: Vec<Addon>,
+    /// The worktree the slice runs in, when the caller named one: where to make it, or where it already is.
+    pub worktree: Option<Worktree>,
 }
 
 /// Render `prompt`; a malformed library is `check`'s find, not something to re-detect here.
@@ -45,6 +48,7 @@ pub fn render(
     prompt: &Prompt,
     values: &BTreeMap<String, String>,
     addons: &[Addon],
+    worktree: Option<&Worktree>,
     options: Options,
 ) -> Rendered {
     let missing: Vec<String> = prompt
@@ -78,6 +82,10 @@ pub fn render(
         ));
     }
 
+    if let Some(worktree) = worktree {
+        parts.push(worktree_block(worktree));
+    }
+
     if options.gates {
         parts.push(acceptance_block(prompt));
     }
@@ -104,6 +112,7 @@ pub fn render(
         missing,
         supplied,
         addons: resolved,
+        worktree: worktree.cloned(),
     }
 }
 
@@ -152,6 +161,60 @@ fn unfilled_block(prompt: &Prompt, missing: &[String]) -> String {
         suggested_command(prompt, missing, &[])
     );
     block
+}
+
+/// Where the slice runs: the script makes the worktree when there is none, and an existing one is updated to `main` before the first edit.
+fn worktree_block(worktree: &Worktree) -> String {
+    let mut line = String::new();
+    match worktree.place {
+        Place::Absent => {
+            let _ = write!(
+                line,
+                "There is no worktree for this slice yet. Create it with \
+                 `./scripts/new-worktree.sh {name}` and work only there — that script \
+                 and never a hand-made `git worktree add`, because it is what points the \
+                 build at the shared `target-dir`, writes `.cargo/config.toml` with the \
+                 hardware-crypto cfgs CI builds with, and links the `upstream/` checkouts \
+                 the references are read from. It makes `{path}` on branch `{name}`; open \
+                 the pull request from that branch.",
+                name = worktree.name,
+                path = worktree.path.display(),
+            );
+        }
+        Place::Linked => {
+            let _ = write!(
+                line,
+                "Worktree `{name}` already exists at `{path}` — do this slice there, not in \
+                 the checkout this prompt came from. Update it to match `main` before the \
+                 first edit (`git fetch origin main && git rebase origin/main`): `main` moves \
+                 under a worktree, and a slice built on a stale base measures the wrong code. \
+                 If it holds unmerged work, read it and carry on rather than starting over.",
+                name = worktree.name,
+                path = worktree.path.display(),
+            );
+        }
+        Place::Current => {
+            let _ = write!(
+                line,
+                "This slice's worktree `{name}` is the very checkout this prompt was read \
+                 from (`{path}`): update it to match `main` first (`git fetch origin main && \
+                 git rebase origin/main`), then do the work here.",
+                name = worktree.name,
+                path = worktree.path.display(),
+            );
+        }
+        Place::Occupied => {
+            let _ = write!(
+                line,
+                "`{path}` exists but is not a worktree, so `./scripts/new-worktree.sh {name}` \
+                 refuses it. Move that directory aside and create `{name}` with the script — \
+                 the same one, for the same reasons — then work there.",
+                name = worktree.name,
+                path = worktree.path.display(),
+            );
+        }
+    }
+    format!("## Worktree\n\n- {line}")
 }
 
 /// The gates, verbatim, under a heading that says what they are for.
@@ -330,10 +393,18 @@ pub fn suggested_command(prompt: &Prompt, missing: &[String], addons: &[String])
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use super::*;
     use crate::markdown::{Effort, Status};
+
+    fn worktree(place: Place) -> Worktree {
+        Worktree {
+            name: "p1-one".to_owned(),
+            path: PathBuf::from("/tmp/ferrox-p1-one"),
+            place,
+        }
+    }
 
     fn values(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
         pairs
@@ -396,6 +467,7 @@ with {target=core}
             prompt,
             &values(&[]),
             &addons,
+            Some(&worktree(Place::Absent)),
             Options {
                 provenance: true,
                 ..Options::default()
@@ -404,19 +476,125 @@ with {target=core}
         let protocol = rendered.text.find("prove it or do not say it").unwrap();
         let body = rendered.text.find("run with 40").unwrap();
         let addon = rendered.text.find("**Add-on — Local first:**").unwrap();
+        let worktree = rendered.text.find("## Worktree").unwrap();
         let gates = rendered.text.find("## Acceptance").unwrap();
         let footer = rendered.text.find("<!-- ferrox-prompt").unwrap();
         assert!(protocol < body, "protocol before body");
         assert!(body < addon, "body before add-ons");
-        assert!(addon < gates, "add-ons before acceptance");
+        assert!(addon < worktree, "add-ons before the worktree");
+        assert!(worktree < gates, "worktree before acceptance");
         assert!(gates < footer, "acceptance before the footer");
+    }
+
+    #[test]
+    fn an_absent_worktree_is_created_with_the_script_it_names() {
+        let library = library();
+        let prompt = library.prompt(1).unwrap();
+        let rendered = render(
+            &library,
+            prompt,
+            &values(&[]),
+            &[],
+            Some(&worktree(Place::Absent)),
+            Options::default(),
+        );
+        assert!(
+            rendered.text.contains("./scripts/new-worktree.sh p1-one"),
+            "{}",
+            rendered.text
+        );
+        assert!(
+            rendered.text.contains("/tmp/ferrox-p1-one"),
+            "{}",
+            rendered.text
+        );
+        assert!(
+            rendered
+                .text
+                .contains("never a hand-made `git worktree add`"),
+            "the script is named as the only way one is made"
+        );
+    }
+
+    #[test]
+    fn an_existing_worktree_is_used_and_put_onto_main() {
+        let library = library();
+        let prompt = library.prompt(1).unwrap();
+        for place in [Place::Linked, Place::Current] {
+            let rendered = render(
+                &library,
+                prompt,
+                &values(&[]),
+                &[],
+                Some(&worktree(place)),
+                Options::default(),
+            );
+            assert!(
+                rendered.text.contains("git rebase origin/main"),
+                "{place:?} renders without the update"
+            );
+            assert!(
+                rendered.text.contains("p1-one"),
+                "{place:?} renders without naming the worktree"
+            );
+            assert!(
+                !rendered.text.contains("./scripts/new-worktree.sh p1-one"),
+                "{place:?} tells the reader to make one that exists"
+            );
+        }
+    }
+
+    #[test]
+    fn a_directory_in_the_way_is_named_rather_than_worked_around() {
+        let library = library();
+        let prompt = library.prompt(1).unwrap();
+        let rendered = render(
+            &library,
+            prompt,
+            &values(&[]),
+            &[],
+            Some(&worktree(Place::Occupied)),
+            Options::default(),
+        );
+        assert!(
+            rendered.text.contains("is not a worktree"),
+            "{}",
+            rendered.text
+        );
+        assert!(
+            rendered.text.contains("/tmp/ferrox-p1-one"),
+            "{}",
+            rendered.text
+        );
+    }
+
+    #[test]
+    fn a_render_without_a_worktree_says_nothing_about_one() {
+        let library = library();
+        let prompt = library.prompt(1).unwrap();
+        let rendered = render(
+            &library,
+            prompt,
+            &values(&[]),
+            &[],
+            None,
+            Options::default(),
+        );
+        assert!(!rendered.text.contains("## Worktree"), "{}", rendered.text);
     }
 
     #[test]
     fn the_default_output_is_the_request_and_nothing_that_frames_it() {
         let library = library();
         let prompt = library.prompt(1).unwrap();
-        let rendered = render(&library, prompt, &values(&[]), &[], Options::default());
+        let rendered = render(
+            &library,
+            prompt,
+            &values(&[]),
+            &[],
+            None,
+            Options::default(),
+        );
         assert!(!rendered.text.contains("# P1 · One"), "{}", rendered.text);
         assert!(!rendered.text.contains("library tag "));
     }
@@ -430,6 +608,7 @@ with {target=core}
             prompt,
             &values(&[("len", "200")]),
             &[],
+            None,
             Options::default(),
         );
         assert!(rendered.text.contains("run with 200"));
@@ -441,7 +620,14 @@ with {target=core}
     fn a_missing_input_is_reported_not_guessed() {
         let library = library();
         let prompt = library.prompt(1).unwrap();
-        let rendered = render(&library, prompt, &values(&[]), &[], Options::default());
+        let rendered = render(
+            &library,
+            prompt,
+            &values(&[]),
+            &[],
+            None,
+            Options::default(),
+        );
         assert_eq!(rendered.missing, vec!["scope"]);
         assert!(
             rendered.text.contains("{scope}"),
@@ -461,7 +647,7 @@ with {target=core}
             allow_unfilled: true,
             ..Options::default()
         };
-        let rendered = render(&library, prompt, &values(&[]), &[], options);
+        let rendered = render(&library, prompt, &values(&[]), &[], None, options);
         let gap = rendered.text.find("## Inputs required").unwrap();
         let protocol = rendered.text.find("prove it or do not say it").unwrap();
         assert!(gap < protocol, "the gap is the first thing read");
@@ -541,6 +727,7 @@ body
             prompt,
             &values(&[]),
             &[],
+            None,
             Options {
                 provenance: true,
                 ..Options::default()
@@ -562,6 +749,7 @@ body
             prompt,
             &values(&[]),
             &[],
+            None,
             Options {
                 provenance: true,
                 ..Options::default()
@@ -569,7 +757,14 @@ body
         );
         assert!(rendered.text.contains("library tag "));
         assert!(rendered.text.contains("not a checksum"));
-        let quiet = render(&library, prompt, &values(&[]), &[], Options::default());
+        let quiet = render(
+            &library,
+            prompt,
+            &values(&[]),
+            &[],
+            None,
+            Options::default(),
+        );
         assert!(!quiet.text.contains("ferrox-prompt ·"));
     }
 
@@ -582,6 +777,7 @@ body
             prompt,
             &values(&[]),
             &[],
+            None,
             Options {
                 gates: false,
                 ..Options::default()
