@@ -96,25 +96,46 @@ that file disagree.
 
 ```bash
 ./scripts/count-ops.sh report \
-  shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole \
-  'shadowsocks::seal_all'
+  shadowsocks::tests::the_stream_cipher_costs_the_prga_loop_and_nothing_else \
+  'ferrox_core::shadowsocks::tests::the_stream_cipher_costs_the_prga_loop_and_nothing_else'
 ```
 
-The row above is `UNBLESSED`: nobody has read a measured number for this
-symbol out of a callgrind run, so this page does not state one. `scripts/expected-ops.txt`
-still blesses exactly one symbol, `der_to_pem`. Blessing a count means reading
-the diff that moved it, never copying a measurement to silence a gate.
+The row above stays `UNBLESSED` on purpose: `scripts/expected-ops.txt` blesses
+exactly one symbol, `der_to_pem`, and blessing means reading the diff that moved
+a count, never copying a measurement to silence a gate.
 
 `Rc4::crypt` cannot be charged at all: the release profile inlines it into its
 caller, so its own frame does not exist and `Ir=inlined-not-a-frame` is the
-honest report. What is measurable is the probe `scripts/method-ops.txt` now
-points this method's row at —
+honest report. What is measurable is the probe `scripts/method-ops.txt` points
+this method's row at —
 `shadowsocks::tests::the_stream_cipher_costs_the_prga_loop_and_nothing_else`,
-which is 64 KiB of `crypt` over one stack buffer and one fold as its witness.
-Read that row as the difference between two runs of it, not as the cost of
-`crypt` by itself: the fold and the frame entry are constant, so a kernel change
-shows up whole. The row stays `UNBLESSED` until a number is read out of the
-`method-ops` artefact and recorded in `scripts/method-counts.txt`.
+64 in-place `crypt` calls over one 1 KiB stack buffer with one fold as the
+witness. Three CI runs of that row read `1297641`, `1297641` and `1297577`; the
+first two are the same code on two different bases, which is what makes this row
+a usable delta instead of a duration.
+
+The third is the delta, and it says there is nothing to win. A hoist of `i` and
+`j` out of `&mut self` into registers, replacing the swap and the post-swap reload
+pair with the identity the swap leaves behind (`table[i] == sj`, `table[j] == si`,
+so the key byte is `table[si + sj]`), takes the state traffic from six table reads
+and two writes to three reads and two writes and deletes the four accesses the
+counters made per byte — seven of the twelve memory ops the loop performs on the
+table and the state. Over 65,536 keystream bytes that predicted hundreds of
+thousands of counts; the artefact moved **64**, 0.005% of the frame. The store
+of `self.i` and the reload of `self.s[i]` were already gone: the loop's own
+memory-to-register promotion removes the counter traffic, and store-to-load
+forwarding answers `self.s[i]`/`self.s[j]` right after the swap wrote them. The
+hand-written version spells out work the codegen was already doing, at eight
+lines and a reborrow, so the shorter body ships and the hoist is closed with both
+numbers.
+
+The absolute stays in prose rather than in the row, because the checker charges
+the fold and 64 frame entries with the kernel and cannot separate them; per the
+rule that a row's value must be what its named checker actually observes, `1297641`
+is a baseline to difference against, not this method's cost. What was **not**
+removed: the six per-byte table reads and two writes. RC4's keystream is one
+serial state machine, so a gather-free vector form has nothing to widen — the
+floor of this loop is the table traffic, and this is it.
 
 ## Time
 
