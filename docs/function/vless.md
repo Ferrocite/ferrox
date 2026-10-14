@@ -42,6 +42,7 @@ graph TD
 | vision-addons-bytes | 2 | ferrox-core-vless::tests::non_vision_header_carries_empty_addons |
 | reality-outbound-rows-dialled | 1 | ferrox-app-proxy::tests::vless_outbound_with_reality_security_dials_raw_only |
 | vision-header-targets-matching-core | 2 | ferrox-app-proxy::tests::vision_header_matches_the_core_encoder |
+| dial-header-reallocations | 0 | ferrox-app-proxy::tests::dial_headers_are_sized_to_the_bytes_they_hold |
 <!-- counts:end -->
 
 The relay buffer's zero-fills are prose, not a row. A row needs a checker that
@@ -117,6 +118,18 @@ CI-only. No artefact from this branch has been read.
   the two size gates (`a_relay_buffer_promotes_only_on_a_read_that_filled_it`,
   `a_promoted_buffer_returns_the_bytes_that_were_read`) fill the buffer before
   reading through it.
+
+- **A reallocating dial header.** The app-side `vless_header` and
+  `vless_vision_header` reserved a fixed 30 and 30+18 bytes, but an IPv6
+  destination writes 38 and 56 — the family byte plus 16 octets instead of 4 —
+  so every v6 dial, including this row's TLS path, overran the reservation and
+  paid a heap reallocation, a copy, and a free on a 38-byte header. They now
+  reserve the exact length (the fixed prefix plus `1 + 4` or `1 + 16` chosen
+  from the destination family), so `capacity == len` and the buffer never
+  grows. `dial_headers_are_sized_to_the_bytes_they_hold` holds the capacity at
+  the length for both families and both header shapes; nothing got worse — the
+  IPv4 shape also loses its 4 bytes of slack, and the bytes on the wire are the
+  same the core encoder writes.
 
 ## Rows that are dialled
 
