@@ -476,7 +476,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         print(f"check-ci-scope: {len(fails)} problem(s)", file=sys.stderr)
         return 1
     print(f"check-ci-scope: {len(pages(root))} scope block(s) agree with the tree, "
-          f"{len(query_plan(root)['rows'])} row(s) in the wide plan")
+          f"{len(ops_rows(root, None))} row(s) in the wide plan")
     return 0
 
 
