@@ -75,7 +75,10 @@ if [ "$mode" = "report" ]; then
     filter="$2"
     shift 2
     for symbol in "$@"; do
-        echo "$symbol Ir=$(ir_of "$filter" "$symbol")"
+        got=""
+        got="$(ir_of "$filter" "$symbol")"
+        # An empty count means the symbol is not a frame at all: it inlined into its caller, and a page that read the blank as a number would be quoting a measurement that never happened.
+        echo "$symbol Ir=${got:-inlined-not-a-frame}"
     done
     syscalls_of "$filter"
     exit 0
