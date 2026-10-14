@@ -350,7 +350,7 @@ cargo run -p ferrox-prompt -- list        # roadmap progress and what is ready n
 cargo run -p ferrox-prompt -- check       # is the library still coherent?
 ```
 
-`next` is repeatable — it records each (template, matrix row) pair in `.ferrox/slices.log` and points the same template at the next outstanding row, so calling it again walks the matrix rather than re-offering one slice. A template's `{references}` lists only the pins relevant to the matrix row it fills. Pinned checkouts under `upstream/` are for reading only; a number produced off a named runner is not evidence about any runner.
+`next` is repeatable — it records each (template, matrix row) pair in `.ferrox/slices.log` and points the same template at the next outstanding row, so calling it again walks the matrix rather than re-offering one slice. A template's `{references}` lists only the pins relevant to the matrix row it fills. Each handout also names the worktree the slice runs in: `../ferrox-<slice>` is where `scripts/new-worktree.sh` puts it, and the prompt either says to create it with that script or to work in the one that already exists after bringing it onto `main` — `--json` carries the same as `worktree`. Pinned checkouts under `upstream/` are for reading only; a number produced off a named runner is not evidence about any runner.
 
 ## Contributing
 

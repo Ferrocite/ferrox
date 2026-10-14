@@ -10,6 +10,7 @@ pub mod json;
 pub mod markdown;
 pub mod render;
 pub mod state;
+pub mod worktree;
 
 use std::path::{Path, PathBuf};
 

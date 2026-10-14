@@ -68,3 +68,5 @@ cargo run -p ferrox-prompt -- check       # is the library still coherent?
 ```
 
 Status is the only field to edit, and a slice is `done` when its gates are green, not when its diff looks finished.
+
+A handout names the worktree its slice runs in and what to do about it: create it with `scripts/new-worktree.sh <slice>` when there is none, and when that script has already made one for this task, work there after bringing it onto `main`.
