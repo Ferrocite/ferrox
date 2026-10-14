@@ -1,3 +1,4 @@
+mod budgets;
 mod config;
 mod foxy;
 mod foxy_account;
