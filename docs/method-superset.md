@@ -78,7 +78,7 @@ superset of connection ways, a subset of code". Concretely:
 | wireguard | protocol | planned | upstream/xray-core/proxy/wireguard, upstream/sing-box/protocol/wireguard, upstream/sing-box/transport/wireguard, upstream/xray-rust/crates/xray-wireguard, upstream/zeronet/crates/zero-protocol/src/wg_stack.rs | userspace netstack, no kernel TUN, reserved bytes |
 | amneziawg | protocol | planned | upstream/zeronet/crates/zero-protocol/src/amnezia.rs | junk + S1–S4 + H1–H4 parameter set |
 | tailscale | protocol | planned | upstream/sing-box/protocol/tailscale | tsnet endpoint, DERP, MagicDNS, exit node |
-| tor | protocol | planned | upstream/sing-box/protocol/tor | spawned `tor` binary or an arti lane; TCP only, so no UDP carrier above it |
+| tor | protocol | planned | upstream/sing-box/protocol/tor, upstream/zeronet/crates/zero-tor | spawned `tor` binary or an arti lane; TCP only, so no UDP carrier above it |
 | openvpn | protocol | planned | upstream/sing-box/protocol/openvpn, upstream/sing-box/transport/openvpn | client + server, `tls_auth`/`tls_crypt`/`tls_crypt_v2` |
 | openconnect | protocol | planned | upstream/sing-box/protocol/openconnect, upstream/sing-box/transport/openconnect | anyconnect/gp/fortinet/f5/pulse/nc flavours |
 | cloudflared | protocol | planned | upstream/sing-box/protocol/cloudflare | Argo tunnel inbound |
@@ -86,6 +86,7 @@ superset of connection ways, a subset of code". Concretely:
 | freedom | protocol | implemented | upstream/xray-core/proxy/freedom, upstream/sing-box/protocol/direct | the sink outbound; `fragment`/`noises`/`finalRules` not carried |
 | blackhole | protocol | planned | upstream/xray-core/proxy/blackhole, upstream/sing-box/protocol/block | `none`/`http`/`custom` response |
 | dns-outbound | protocol | planned | upstream/xray-core/proxy/dns, upstream/sing-box/protocol/dns | rules `direct`/`drop`/`return`/`hijack`, `rewrite_server` |
+| masterdns | protocol | planned | upstream/zeronet/crates/zero-masterdns, upstream/zeronet/crates/zero-protocol/src/masterdns | a VPN over DNS queries: the base/codec wire half and the live half that carries it — UDP resolver, optional compression, ARQ reliability, session handshake, SOCKS stream management |
 | loopback-outbound | protocol | planned | upstream/xray-core/proxy/loopback | re-inject into a named inbound tag, with sniffing |
 | http-protocol | protocol | implemented | upstream/xray-core/proxy/http, upstream/sing-box/protocol/http | front implemented in both directions of the front; the upstream HTTP-proxy outbound is planned |
 | socks | protocol | implemented | upstream/xray-core/proxy/socks, upstream/sing-box/protocol/socks, upstream/zeronet/crates/zero-protocol/src/socks.rs | front implemented; the SOCKS *outbound* is planned (P49's chaining surface) |
@@ -151,6 +152,7 @@ superset of connection ways, a subset of code". Concretely:
 | surface-ffi | surface | planned | upstream/xray-rust/crates/xray-ffi, upstream/zeronet/crates/zray-mobile | C ABI and JNI with panic containment |
 | surface-bench | surface | implemented | upstream/xray-rust/crates/xray-bench, upstream/zeronet/bench/hotpath, crates/ferrox-bench | counting gates and comparators |
 | surface-tui | surface | not-scheduled | upstream/zeronet/crates/zeronet-tui | a desktop UI is not a core |
+| surface-provision | surface | not-scheduled | upstream/zeronet/crates/zero-provision | facts, guide, keys, layout, links, probe, record, release, scripts and SSH install: a server installer is an operating tool, not a core |
 | surface-fuzz | surface | planned | upstream/xray-rust/fuzz, upstream/zeronet/fuzz | seeded untrusted-input targets |<!-- matrix:end -->
 
 Rows without a `docs/function` page are targets or refusals; they make no
