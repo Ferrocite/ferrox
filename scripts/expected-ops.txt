@@ -73,5 +73,10 @@
 # thin-LTO release layout moves with a code/test count back out; `der_to_pem`
 # and quic.rs are byte-for-byte untouched, and
 # `pem_wraps_at_sixty_four_columns` still passes.
+# Re-blessed 2680 by hunt-reality-client-auth: the REALITY client pump and its
+# one withheld-answer witness test join the same ferrox-app bin, putting the
+# 13 Ir the thin-LTO release layout moves with a code/test count back in;
+# `der_to_pem` and quic.rs are byte-for-byte untouched, and
+# `pem_wraps_at_sixty_four_columns` still passes.
 
-der_to_pem 2667
+der_to_pem 2680
