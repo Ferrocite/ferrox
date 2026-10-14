@@ -331,6 +331,36 @@ pub fn route_advert(body: &[u8], into: &mut Vec<Route>) -> Option<()> {
     }
     Some(())
 }
+
+/// The `ADDRESS_ASSIGN` capsule a proxy answers requests with (RFC 9484 §4.2): one whole capsule — type, the body's length, then each grant as request id, version, address and prefix — the exact inverse of [`address_assign`], framed like [`address_request`] so both directions share one wire shape. A refusal is its own entry: the all-zeros address at full length.
+pub fn address_assign_encode(assignments: &[Assigned], out: &mut Vec<u8>) {
+    let body_len = assignments.iter().fold(0usize, |acc, a| {
+        acc + quic_varint_len(a.request_id) + 1 + a.width() + 1
+    });
+    quic_varint(out, ADDRESS_ASSIGN);
+    quic_varint(out, body_len as u64);
+    for a in assignments {
+        quic_varint(out, a.request_id);
+        out.push(a.version);
+        out.extend_from_slice(&a.address[..a.width()]);
+        out.push(a.prefix);
+    }
+}
+
+/// The `ROUTE_ADVERTISEMENT` capsule a proxy names its carried ranges with (RFC 9484 §4.3): the exact inverse of [`route_advert`], one whole capsule of first, last and protocol per route.
+pub fn route_advert_encode(routes: &[Route], out: &mut Vec<u8>) {
+    let body_len = routes.iter().fold(0usize, |acc, r| acc + 2 + 2 * r.width());
+    quic_varint(out, ROUTE_ADVERTISEMENT);
+    quic_varint(out, body_len as u64);
+    for r in routes {
+        let width = r.width();
+        out.push(r.version);
+        out.extend_from_slice(&r.first[..width]);
+        out.extend_from_slice(&r.last[..width]);
+        out.push(r.protocol);
+    }
+}
+
 /// One IPv4 header read in place: this lane walks only the fields it needs, so a header it cannot walk is refused rather than repaired.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Ipv4Head {
@@ -781,6 +811,142 @@ mod tests {
             None,
             "a version with no address width is refused"
         );
+    }
+
+    /// One grant as a proxy would build it, its address padded to sixteen bytes with only the version's width significant.
+    fn assigned(request_id: u64, version: u8, address: &[u8], prefix: u8) -> Assigned {
+        let mut bytes = [0u8; 16];
+        bytes[..address.len()].copy_from_slice(address);
+        Assigned {
+            request_id,
+            version,
+            address: bytes,
+            prefix,
+        }
+    }
+
+    /// One route as a proxy would build it.
+    fn route(version: u8, first: &[u8], last: &[u8], protocol: u8) -> Route {
+        let mut f = [0u8; 16];
+        let mut l = [0u8; 16];
+        f[..first.len()].copy_from_slice(first);
+        l[..last.len()].copy_from_slice(last);
+        Route {
+            first: f,
+            last: l,
+            version,
+            protocol,
+        }
+    }
+
+    /// The assign a proxy writes is the assign the lane reads: encode one whole capsule, split it, read the body — the same fields come back at every boundary the proxy answers with, and the bytes match the shape the reader already accepts, so the writer is proven inverse to it and not merely round-trippable against itself.
+    #[test]
+    fn the_assign_a_proxy_writes_is_the_assign_the_lane_reads() {
+        let read_back = |entries: &[Assigned]| -> Vec<Assigned> {
+            let mut capsule = Vec::new();
+            address_assign_encode(entries, &mut capsule);
+            let (used, kind) = capsule_split(&capsule).expect("a whole capsule");
+            assert_eq!(used, capsule.len(), "the capsule is exactly whole");
+            let Capsule::AddressAssign(body) = kind else {
+                panic!("an assignment capsule")
+            };
+            let mut into = Vec::new();
+            address_assign(body, &mut into).expect("reads back");
+            into
+        };
+        let one = [assigned(1, 4, &[198, 51, 100, 9], 32)];
+        assert_eq!(read_back(&one), one.to_vec());
+        let mut wire = Vec::new();
+        address_assign_encode(&one, &mut wire);
+        assert_eq!(
+            wire,
+            [0x01, 0x07, 0x01, 0x04, 198, 51, 100, 9, 32],
+            "byte-for-byte the assignment the CONNECT-IP edge hand-rolled"
+        );
+        let wide64 = [assigned(
+            2,
+            6,
+            &[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            64,
+        )];
+        assert_eq!(read_back(&wide64), wide64.to_vec(), "host bits above a /64");
+        let refused = [assigned(3, 4, &[0, 0, 0, 0], 32)];
+        assert!(
+            read_back(&refused)[0].refused(),
+            "the all-zeros grant still reads as a refusal"
+        );
+        let big_id = [assigned(
+            1_000_000,
+            6,
+            &[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+            128,
+        )];
+        assert_eq!(read_back(&big_id), big_id.to_vec(), "a two-byte request id");
+        let both = [
+            assigned(1, 4, &[10, 0, 0, 1], 24),
+            assigned(
+                2,
+                6,
+                &[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 3],
+                64,
+            ),
+        ];
+        assert_eq!(read_back(&both), both.to_vec(), "two grants in one capsule");
+        let mut empty = Vec::new();
+        address_assign_encode(&[], &mut empty);
+        assert_eq!(empty, [0x01, 0x00], "an empty capsule names a zero body");
+        assert_eq!(read_back(&[]), [] as [Assigned; 0]);
+    }
+
+    /// The route advert a proxy writes is the route advert the lane reads, at both versions, on UDP and every-protocol limits, and with the bytes the reader already parses.
+    #[test]
+    fn the_route_advert_a_proxy_writes_is_the_route_advert_the_lane_reads() {
+        let read_back = |routes: &[Route]| -> Vec<Route> {
+            let mut capsule = Vec::new();
+            route_advert_encode(routes, &mut capsule);
+            let (used, kind) = capsule_split(&capsule).expect("a whole capsule");
+            assert_eq!(used, capsule.len(), "the capsule is exactly whole");
+            let Capsule::RouteAdvert(body) = kind else {
+                panic!("a route capsule")
+            };
+            let mut into = Vec::new();
+            route_advert(body, &mut into).expect("reads back");
+            into
+        };
+        let v4 = [route(4, &[192, 0, 2, 0], &[192, 0, 2, 255], 0)];
+        assert_eq!(read_back(&v4), v4.to_vec());
+        let mut wire = Vec::new();
+        route_advert_encode(&v4, &mut wire);
+        assert_eq!(
+            wire,
+            [0x03, 0x0a, 4, 192, 0, 2, 0, 192, 0, 2, 255, 0],
+            "byte-for-byte the route the reader already walks"
+        );
+        let v6 = [route(
+            6,
+            &[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            &[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255],
+            17,
+        )];
+        assert_eq!(read_back(&v6), v6.to_vec(), "a UDP-only v6 range");
+        let both = [
+            route(4, &[10, 0, 0, 0], &[10, 0, 0, 255], 0),
+            route(
+                6,
+                &[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                &[0x20, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+                17,
+            ),
+        ];
+        assert_eq!(
+            read_back(&both),
+            both.to_vec(),
+            "a v4 and a v6 in one capsule"
+        );
+        let mut empty = Vec::new();
+        route_advert_encode(&[], &mut empty);
+        assert_eq!(empty, [0x03, 0x00], "an empty advert names a zero body");
+        assert_eq!(read_back(&[]), [] as [Route; 0]);
     }
 
     /// A capsule this lane does not read is answered whole and stepping over it is the caller's, so a proxy advertising an extension must not cost the tunnel its packets.

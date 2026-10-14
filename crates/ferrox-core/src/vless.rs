@@ -585,7 +585,9 @@ fn planned_reason(link: &VlessLink) -> &'static str {
         TransportKind::Hysteria => {
             "vless-hysteria: carrier dials TCP; UDP datagrams and masquerade stay refused"
         }
-        TransportKind::Masque => "vless-masque: parses, dial needs a QUIC stack",
+        TransportKind::Masque => {
+            "vless-masque: CONNECT-IP dials on the Foxy HTTP/3 lane; VLESS over a MASQUE outbound not wired"
+        }
         TransportKind::Xdrive => "vless-xdrive: parses, transport not scheduled",
         TransportKind::Other => "unknown type: parses, transport not scheduled",
     }

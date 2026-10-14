@@ -3058,20 +3058,24 @@ mod loopback {
 
     /// The assignment a CONNECT-IP edge answers with: one address the tunnel owns, flushed so the lane's first read finds it.
     fn ip_h2_assign(tls: &mut ferrox_core::tls::RustlsServerProvider<TcpStream>) {
-        // One ADDRESS_ASSIGN, whose body is the request id, the version, the address and the prefix.
-        let mut body = Vec::new();
-        body.push(1);
-        body.push(4);
-        body.extend_from_slice(&[198, 51, 100, 9]);
-        body.push(32);
         let mut capsule = Vec::new();
-        capsule.push(1);
-        frames::quic_varint(&mut capsule, body.len() as u64);
-        capsule.extend_from_slice(&body);
+        connectip::address_assign_encode(&[ip_tunnel_grant()], &mut capsule);
         let mut frame = Vec::new();
         h2_frame(frames::DATA, 0, 1, &capsule, &mut frame);
         tls.write_all(&frame).expect("assigns an address");
         tls.flush().expect("flushes the assignment");
+    }
+
+    /// The one grant both CONNECT-IP edges answer with: the tunnel's own RFC 1918-ish address, request id one, `198.51.100.9/32`.
+    fn ip_tunnel_grant() -> connectip::Assigned {
+        let mut address = [0u8; 16];
+        address[..4].copy_from_slice(&[198, 51, 100, 9]);
+        connectip::Assigned {
+            request_id: 1,
+            version: 4,
+            address,
+            prefix: 32,
+        }
     }
 
     /// The packets one CONNECT-IP edge carries: each names its destination, so one stream serves `want` of them and then the edge rests.
@@ -3531,16 +3535,9 @@ mod loopback {
         frames::quic_varint(&mut reply, 3);
         reply.extend_from_slice(&[0x00, 0x00, 0xd9]);
         conn.stream_send(stream, &reply, false).expect("answers");
-        // One ADDRESS_ASSIGN, whose body is the request id, the version, the address and the prefix: an RFC 1918 one, since the tunnel is a private network and not the internet.
-        let mut body = Vec::new();
-        body.push(1);
-        body.push(4);
-        body.extend_from_slice(&[198, 51, 100, 9]);
-        body.push(32);
+        // The tunnel's own grant, encoded by the same codec the client reads it back with.
         let mut capsule = Vec::new();
-        capsule.push(1);
-        frames::quic_varint(&mut capsule, body.len() as u64);
-        capsule.extend_from_slice(&body);
+        connectip::address_assign_encode(&[ip_tunnel_grant()], &mut capsule);
         send_h3_data(conn, stream, &capsule);
         while let Ok((written, info)) = conn.send(&mut out) {
             let _ = sock.send_to(&out[..written], info.to);

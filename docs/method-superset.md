@@ -107,7 +107,7 @@ superset of connection ways, a subset of code". Concretely:
 | carrier-quic | carrier | partial | upstream/xray-core/infra/conf/transport_internet.go, upstream/sing-box/transport/v2rayquic, docs/function/carrier-quic.md | client only, quiche, ALPN `h3`; the reference refuses the transport by name, so this row carries its own P35 decision; method string `vless-quic` |
 | carrier-v2ray-quic | carrier | not-scheduled | upstream/sing-box/transport/v2rayquic | the same transport in the second reference, named so the row above is not read as universal |
 | carrier-hysteria | carrier | implemented | upstream/xray-core/transport/internet/hysteria, upstream/zeronet/crates/zero-transport/src/hysteria2.rs, docs/function/carrier-hysteria.md | quiche, ALPN `h3`, one handshake per flow; no UDP, no pooling; method string `vless-hysteria` |
-| carrier-masque | carrier | planned | upstream/xray-core/transport/internet/masque, upstream/sing-box/transport/masque, upstream/zeronet/crates/zero-transport/src/masque.rs | CONNECT-IP over h2/h3, capsules, address pool |
+| carrier-masque | carrier | planned | upstream/xray-core/transport/internet/masque, upstream/sing-box/transport/masque, upstream/zeronet/crates/zero-transport/src/masque.rs | CONNECT-IP client dialled over h2/h3 with both-direction capsules (Foxy lane, row 20); address pool and terminating server refused by name |
 | carrier-xdrive | carrier | planned | upstream/xray-core/transport/internet/xdrive | polls a cloud-drive remote as a transport |
 | carrier-device | carrier | planned | upstream/sing-box/transport/device | the generic TUN/IP device abstraction the reference's VPN endpoints share |
 | carrier-simple-obfs | carrier | planned | upstream/sing-box/transport/simple-obfs | http and tls obfs backends |
