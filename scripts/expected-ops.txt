@@ -58,5 +58,10 @@
 # their pooled-connection loopback tests, shifting the thin-LTO release layout
 # by ~two code/test-count moves; the `der_to_pem` body is byte-for-byte
 # unchanged from main, and `pem_wraps_at_sixty_four_columns` still passes.
+# Re-blessed 2667 by foxy-signin-trim: the Foxy sign-in trim in login() and its
+# one loopback witness test join the same ferrox-app bin, taking the 13 Ir the
+# thin-LTO release layout moves with a code/test count back out; `der_to_pem`
+# and quic.rs are byte-for-byte untouched, and
+# `pem_wraps_at_sixty_four_columns` still passes.
 
-der_to_pem 2680
+der_to_pem 2667
