@@ -364,6 +364,8 @@ pub(crate) fn login(
     email: &str,
     password: &str,
 ) -> Result<(String, bool), Denied> {
+    // An autofilled or pasted identity carries padding that FxA rejects; the address has no significant edge whitespace, so trim before the stretch and the body.
+    let email = email.trim();
     let stretched = account::auth_pw(email, password);
     for method in [Some("email-2fa"), None] {
         let body = account::login_body(email, &stretched, method);
@@ -1024,6 +1026,11 @@ mod loopback {
                 {
                     return reply(406, &[], "");
                 }
+                let body = String::from_utf8_lossy(&seen.body);
+                assert!(
+                    body.contains(r#""email":"person@example.com""#),
+                    "the login must carry the trimmed identity: {body}"
+                );
                 reply(200, &[], &session_answer())
             }
             ("POST", "/v1/oauth/token") => {
@@ -1216,5 +1223,24 @@ mod two_factor {
         assert!(!account.needs_code(), "the code clears the wait");
         assert!(account.current().token.starts_with("eyJ"), "and mints");
         assert_eq!(SESSION.len(), 64, "a session token is 32 bytes of hex");
+    }
+}
+
+#[cfg(test)]
+mod padded_identity {
+    /// `FoxyVPN` v1.0.5 fixed a sign-in rejected by autofill padding; the lane must trim the identity before the stretch and the body, never send it raw.
+    #[test]
+    fn an_autofilled_identity_signs_in_trimmed() {
+        let _turn = super::loopback::EDGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        super::loopback::ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        super::loopback::TWO_FACTOR.store(false, std::sync::atomic::Ordering::Relaxed);
+        let (address, roots) = super::loopback::edge();
+        let account = super::loopback::account(address, roots);
+        account
+            .sign_in("  person@example.com\t", "hunter2")
+            .expect("a padded identity signs in with the trimmed email");
+        assert!(account.current().token.starts_with("eyJ"), "and mints");
     }
 }
