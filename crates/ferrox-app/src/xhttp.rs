@@ -543,6 +543,21 @@ impl XhttpSettings {
         } else {
             XhttpMode::parse_mode(raw)?
         };
+        // Xray's `SplitHTTPConfig.Build` replaces every knob below but host, path and mode with the `extra` block a link carries, which arrives either as an object or as the JSON string the link query holds.
+        let extra = xhttp.get("extra");
+        let owned: Option<crate::json::Json> = match extra {
+            Some(crate::json::Json::Str(text)) => crate::json::parse(text.as_str()).ok(),
+            _ => None,
+        };
+        let xhttp: &crate::json::Json = match extra {
+            None | Some(crate::json::Json::Null) => xhttp,
+            Some(node @ crate::json::Json::Obj(_)) => node,
+            Some(crate::json::Json::Str(_)) => match owned.as_ref() {
+                Some(node @ crate::json::Json::Obj(_)) => node,
+                _ => return None,
+            },
+            Some(_) => return None,
+        };
         out.session_placement = placement_or(
             xhttp.get("sessionIDPlacement"),
             Placement::Path,
@@ -1912,6 +1927,60 @@ mod tests {
                 .mode,
             XhttpMode::StreamUp
         );
+    }
+
+    /// The reference reads its obfuscation knobs from `extra`, which replaces the whole settings block except host, path and mode.
+    #[test]
+    fn the_extra_block_replaces_every_knob_but_path_and_mode() {
+        let node = crate::json::parse(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {
+            "path": "/tunnel", "mode": "stream-one", "scMaxEachPostBytes": 4096,
+            "extra": {"xPaddingBytes": "1-1", "xPaddingObfsMode": true, "xPaddingKey": "ctx",
+                "xPaddingHeader": "x-grpc-context", "xPaddingMethod": "tokenish",
+                "sessionIDPlacement": "header", "sessionIDKey": "Idempotency-Key",
+                "seqPlacement": "header", "seqKey": "Upload-Offset"}}}}"#,
+        )
+        .expect("parses");
+        let got = XhttpSettings::from_json(node.get("streamSettings")).expect("extra parses");
+        assert_eq!(got.path, "/tunnel", "path stays on the outer block");
+        assert_eq!(got.mode, XhttpMode::StreamOne, "and so does mode");
+        assert!(got.x_padding_obfs);
+        assert_eq!(got.x_padding_bytes, (1, 1));
+        assert_eq!(got.x_padding_key, "ctx");
+        assert_eq!(got.x_padding_header, "x-grpc-context");
+        assert_eq!(got.x_padding_method, PadMethod::Tokenish);
+        assert_eq!(
+            got.x_padding_placement,
+            Placement::QueryInHeader,
+            "unset inside extra, so the reference default applies"
+        );
+        assert_eq!(got.session_placement, Placement::Header);
+        assert_eq!(got.session_key, "Idempotency-Key");
+        assert_eq!(got.seq_placement, Placement::Header);
+        assert_eq!(got.seq_key, "Upload-Offset");
+        assert_eq!(
+            got.sc_max_each_post, 1_000_000,
+            "a knob the outer block sets and extra omits is replaced by the default, not merged"
+        );
+
+        let linked = crate::json::parse(
+            r#"{"xhttpSettings": {"path": "/tunnel",
+                "extra": "{\"xPaddingObfsMode\":true,\"xPaddingKey\":\"ctx\"}"}}"#,
+        )
+        .expect("parses");
+        let got = XhttpSettings::from_json(Some(&linked)).expect("string extra parses");
+        assert!(got.x_padding_obfs);
+        assert_eq!(got.x_padding_key, "ctx");
+
+        let null = crate::json::parse(r#"{"xhttpSettings": {"path": "/p", "extra": null}}"#)
+            .expect("parses");
+        assert!(
+            !XhttpSettings::from_json(Some(&null))
+                .expect("null extra")
+                .x_padding_obfs
+        );
+        let bad = crate::json::parse(r#"{"xhttpSettings": {"extra": 7}}"#).expect("parses");
+        assert!(XhttpSettings::from_json(Some(&bad)).is_none());
     }
 
     #[test]

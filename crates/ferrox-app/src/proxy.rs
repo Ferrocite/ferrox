@@ -11047,6 +11047,27 @@ mod tests {
             ),
             413
         );
+
+        let obfs = crate::json::parse(
+            r#"{"xhttpSettings": {"path": "/up", "mode": "stream-one", "extra": {
+                "xPaddingBytes": "1-1", "xPaddingObfsMode": true, "xPaddingKey": "ctx",
+                "xPaddingHeader": "x-grpc-context", "xPaddingMethod": "tokenish"}}}"#,
+        )
+        .expect("parses");
+        let obfs = crate::xhttp::XhttpSettings::from_json(Some(&obfs)).expect("extra parses");
+        assert_eq!(
+            status_of(
+                &obfs,
+                b"POST /up HTTP/1.1\r\nHost: h\r\nx-grpc-context: http://h/up?ctx=kq\r\nTransfer-Encoding: chunked\r\n\r\n"
+            ),
+            200,
+            "the padding the reference puts in the configured header"
+        );
+        assert_eq!(
+            status_of(&obfs, req("POST", "/up", "").as_bytes()),
+            400,
+            "the default Referer padding is refused once obfs mode is on"
+        );
     }
 
     #[test]
