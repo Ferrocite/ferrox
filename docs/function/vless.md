@@ -131,6 +131,21 @@ CI-only. No artefact from this branch has been read.
   IPv4 shape also loses its 4 bytes of slack, and the bytes on the wire are the
   same the core encoder writes.
 
+- **A doomed IPv4 parse on every domain encode.** `Addr::of` scanned for `:`,
+  found none for a domain, and handed the whole host to `std`'s IPv4 parser
+  regardless of shape — so `example.com`, the destination `compare.yml` loops
+  `encode_into` over, paid a parse that can only fail, since an IPv4 literal is
+  `.` and decimal digits and nothing else. The classifier now folds the decision
+  into that single pass: a `:` still breaks to the IPv6 branch as `contains` did,
+  and the IPv4 parse is reached only when every byte is in `[0-9.]` — exactly the
+  set `std` can accept, so the skipped call was always a miss. IPv4 and IPv6
+  hosts are untouched; only the doomed call is gone.
+  `addr::tests::the_fused_classifier_is_the_original_two_call_logic_on_every_host`
+  sweeps well-formed and malformed literals, scope ids and domains against the
+  old two-call logic and holds them byte-identical;
+  `header_address_families_encode_stably` still fixes the encoded bytes for all
+  three families.
+
 ## Rows that are dialled
 
 `security=reality` outbounds dial raw TCP
