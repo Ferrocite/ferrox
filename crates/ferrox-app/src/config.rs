@@ -488,48 +488,106 @@ pub(crate) enum Carrier {
     Masque,
     Xdrive,
     Http,
-    Unknown,
+    Unknown {
+        network: String,
+    },
 }
 
+type Resolver = fn(Option<&Json>, &str) -> Carrier;
+
+// One row per network this tree recognises; a new method adds a row, not a match arm.
+const CARRIERS: &[(&[&str], Resolver)] = &[
+    (&["ws", "websocket"], resolve_ws),
+    (&["httpupgrade"], resolve_httpupgrade),
+    (&["grpc"], resolve_grpc),
+    (&["xhttp", "splithttp"], resolve_xhttp),
+    (&["quic"], resolve_quic),
+    (&["kcp", "mkcp"], resolve_kcp),
+    (&["hysteria"], resolve_hysteria),
+    (&["masque"], resolve_masque),
+    (&["xdrive"], resolve_xdrive),
+    (&["http", "h2", "h3"], resolve_http),
+    (&["", "raw", "tcp"], resolve_tcp_or_header),
+];
+
 pub(crate) fn stream_carrier(settings: Option<&Json>) -> Carrier {
-    match settings
+    let network = settings
         .and_then(|s| s.get("network"))
         .and_then(Json::as_str)
-    {
-        Some("ws" | "websocket") => {
-            let early = EarlyData::split(&sub_path(settings, "wsSettings"));
-            Carrier::Ws {
-                path: early.path,
-                ed: early.budget,
-            }
+        .unwrap_or("");
+    for (aliases, resolve) in CARRIERS {
+        if aliases.contains(&network) {
+            return resolve(settings, network);
         }
-        Some("httpupgrade") => Carrier::HttpUpgrade {
-            path: EarlyData::split(&sub_path(settings, "httpupgradeSettings")).path,
-        },
-        Some("grpc") => Carrier::Grpc {
-            path: grpc_path(settings),
-        },
-        Some("xhttp" | "splithttp") => match crate::xhttp::XhttpSettings::from_json(settings) {
-            Some(settings) => Carrier::Xhttp {
-                settings: Box::new(settings),
-            },
-            None => Carrier::Unknown,
-        },
-        Some("quic") => Carrier::Quic,
-        Some("kcp" | "mkcp") => Carrier::Kcp(kcp_config(settings)),
-        Some("hysteria") => hysteria_carrier(settings),
-        Some("masque") => Carrier::Masque,
-        Some("xdrive") => Carrier::Xdrive,
-        Some("http" | "h2" | "h3") => Carrier::Http,
-        None | Some("" | "raw" | "tcp") => match tcp_http_path(settings) {
-            Some(path) => Carrier::HttpHeader { path },
-            None => Carrier::Raw,
-        },
-        Some(_) => Carrier::Unknown,
+    }
+    Carrier::Unknown {
+        network: network.to_owned(),
     }
 }
 
-fn hysteria_carrier(settings: Option<&Json>) -> Carrier {
+fn resolve_ws(settings: Option<&Json>, _: &str) -> Carrier {
+    let early = EarlyData::split(&sub_path(settings, "wsSettings"));
+    Carrier::Ws {
+        path: early.path,
+        ed: early.budget,
+    }
+}
+
+fn resolve_httpupgrade(settings: Option<&Json>, _: &str) -> Carrier {
+    Carrier::HttpUpgrade {
+        path: EarlyData::split(&sub_path(settings, "httpupgradeSettings")).path,
+    }
+}
+
+fn resolve_grpc(settings: Option<&Json>, _: &str) -> Carrier {
+    Carrier::Grpc {
+        path: grpc_path(settings),
+    }
+}
+
+fn resolve_xhttp(settings: Option<&Json>, network: &str) -> Carrier {
+    match crate::xhttp::XhttpSettings::from_json(settings) {
+        Some(settings) => Carrier::Xhttp {
+            settings: Box::new(settings),
+        },
+        None => Carrier::Unknown {
+            network: network.to_owned(),
+        },
+    }
+}
+
+fn resolve_quic(_: Option<&Json>, _: &str) -> Carrier {
+    Carrier::Quic
+}
+
+fn resolve_kcp(settings: Option<&Json>, _: &str) -> Carrier {
+    Carrier::Kcp(kcp_config(settings))
+}
+
+fn resolve_hysteria(settings: Option<&Json>, network: &str) -> Carrier {
+    hysteria_carrier(settings, network)
+}
+
+fn resolve_masque(_: Option<&Json>, _: &str) -> Carrier {
+    Carrier::Masque
+}
+
+fn resolve_xdrive(_: Option<&Json>, _: &str) -> Carrier {
+    Carrier::Xdrive
+}
+
+fn resolve_http(_: Option<&Json>, _: &str) -> Carrier {
+    Carrier::Http
+}
+
+fn resolve_tcp_or_header(settings: Option<&Json>, _: &str) -> Carrier {
+    match tcp_http_path(settings) {
+        Some(path) => Carrier::HttpHeader { path },
+        None => Carrier::Raw,
+    }
+}
+
+fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
     use ferrox_core::hysteria::{Config, Congestion};
     let hy = settings.and_then(|s| s.get("hysteriaSettings"));
     let version = hy
@@ -541,7 +599,9 @@ fn hysteria_carrier(settings: Option<&Json>) -> Carrier {
                 .and_then(|text| text.parse::<u32>().ok())
         });
     if version.is_some_and(|v| v != 2) {
-        return Carrier::Unknown;
+        return Carrier::Unknown {
+            network: network.to_owned(),
+        };
     }
     Carrier::Hysteria(Config {
         auth: hy
@@ -571,7 +631,7 @@ pub(crate) fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, Stri
         Carrier::Hysteria(_) => "hysteriaSettings",
         Carrier::Masque => "masqueSettings",
         Carrier::Xdrive => "xdriveSettings",
-        Carrier::Unknown | Carrier::Raw | Carrier::Http => "",
+        Carrier::Unknown { .. } | Carrier::Raw | Carrier::Http => "",
     };
     let host = settings
         .and_then(|s| s.get(key))
