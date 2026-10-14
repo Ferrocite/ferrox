@@ -10298,8 +10298,8 @@ mod tests {
         }
     }
 
-    /// One REALITY+Vision pair on loopback: an echo target, a Vision inbound, the dial.
-    struct RealityVisionPair {
+    /// One REALITY pair on loopback: an echo target, an inbound, the dial. The flow is the caller's.
+    struct RealityPair {
         outbound: Outbound,
         server: SocketAddr,
         target: SocketAddr,
@@ -10307,7 +10307,7 @@ mod tests {
         front: thread::JoinHandle<()>,
     }
 
-    fn reality_vision_pair() -> RealityVisionPair {
+    fn reality_pair(flow: &str) -> RealityPair {
         let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
         let echo_addr = echo.local_addr().expect("addr");
         let echo = thread::spawn(move || {
@@ -10337,11 +10337,11 @@ mod tests {
         let root = crate::json::parse(&reality_client_json(
             server_addr.port(),
             &b64url(&public),
-            "xtls-rprx-vision",
+            flow,
         ))
         .expect("parses");
         let outbound = find_outbound(&root).expect("a REALITY outbound");
-        RealityVisionPair {
+        RealityPair {
             outbound,
             server: server_addr,
             target: echo_addr,
@@ -10350,7 +10350,7 @@ mod tests {
         }
     }
 
-    fn dial_pair(pair: &RealityVisionPair) -> (TcpStream, thread::JoinHandle<()>) {
+    fn dial_pair(pair: &RealityPair) -> (TcpStream, thread::JoinHandle<()>) {
         let front = TcpListener::bind("127.0.0.1:0").expect("binds");
         let addr = front.local_addr().expect("addr");
         let (tx, rx) = std::sync::mpsc::channel();
@@ -10374,7 +10374,7 @@ mod tests {
 
     #[test]
     fn reality_vision_dial_reaches_echo_through_the_relay() {
-        let pair = reality_vision_pair();
+        let pair = reality_pair(crate::vision::FLOW);
         let (mut user, dialled) = dial_pair(&pair);
         let payload: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
         user.write_all(&payload).expect("writes");
@@ -10388,10 +10388,31 @@ mod tests {
     }
 
     #[test]
+    fn reality_raw_dial_reaches_echo_through_the_relay() {
+        let pair = reality_pair("");
+        let (mut user, dialled) = dial_pair(&pair);
+        for seed in [11u8, 12] {
+            let length = if seed == 11 { 64 } else { 96 * 1024 };
+            let payload: Vec<u8> = (0..length)
+                .map(|index| (index as u8).wrapping_mul(29).wrapping_add(seed))
+                .collect();
+            user.write_all(&payload).expect("writes");
+            let mut back = vec![0u8; payload.len()];
+            user.read_exact(&mut back)
+                .unwrap_or_else(|why| panic!("{seed}: {length} bytes did not come back: {why}"));
+            assert_eq!(back, payload, "{seed}: payload came back altered");
+        }
+        drop(user);
+        dialled.join().expect("joins");
+        pair.echo.join().expect("joins");
+        pair.front.join().expect("joins");
+    }
+
+    #[test]
     fn reality_vision_direct_switch_carries_inner_tls() {
         use ferrox_core::tls::TlsProvider as _;
 
-        let pair = reality_vision_pair();
+        let pair = reality_pair(crate::vision::FLOW);
         let (server_config, client_config) = carried_tls_configs();
         let inner = TcpListener::bind("127.0.0.1:0").expect("binds");
         let inner_addr = inner.local_addr().expect("addr");
