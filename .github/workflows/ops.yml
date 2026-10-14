@@ -25,7 +25,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
-          key: ops-line-tables
+          key: ops-two-debuginfo
       - name: install the counting tools
         run: |
           sudo apt-get update -qq
@@ -36,7 +36,8 @@ jobs:
         run: ./scripts/count-ops.sh check quic::tests::pem_wraps_at_sixty_four_columns scripts/expected-ops.txt
       - name: report the per-method counts, never red
         env:
-          RUSTFLAGS: -C debuginfo=line-tables-only
+          # Line tables alone give callgrind no inline records, so a leaf the release profile inlines has no frame and its row reads `inlined-not-a-frame`. Full debug info costs nothing at -O3 and describes the inline sites, so the same shipped codegen can be charged per method.
+          RUSTFLAGS: -C debuginfo=2
         run: |
           {
             echo '# per-method retired instructions, informational'
