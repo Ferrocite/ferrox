@@ -34,6 +34,9 @@ step "windows binary paths"
 step "method docs"
 ./scripts/check-method-docs.sh
 
+step "ci scope"
+./scripts/check-ci-scope.sh
+
 step "method matrix"
 ./scripts/check-method-superset.sh
 

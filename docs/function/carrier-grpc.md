@@ -144,3 +144,14 @@ only reason the zero on the first row means anything.
 | `Hunk` encoding, per-write allocation, 32 KiB bufWriter | `upstream/xray-core/transport/internet/grpc/encoding/` |
 | `copy(b, hunk.Data)`, per-write protobuf marshal | `upstream/sing-box` → `transport/v2raygrpc/conn.go` |
 | one in-place assembly, `advance` instead of `drain` | `upstream/zeronet/crates/zero-transport/src/grpc.rs` |
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: crates/ferrox-app/src/grpc.rs, crates/ferrox-app/src/h2.rs
+- scenarios: vless-grpc
+- oracle: grpc
+- go: ./transport/internet/grpc/...
+<!-- scope:end -->

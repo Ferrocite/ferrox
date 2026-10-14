@@ -314,3 +314,12 @@ What is **not** removed, and is named rather than claimed:
 | the reference this rung is proved against | `upstream/xray-core/transport/internet/kcp/` |
 | the Go recorder that produced `expected.txt` | `scripts/kcp-oracle/main.go` |
 | the pin and the suite seam | `upstream/pins.toml`, `[sources.xray-core]` |
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: crates/ferrox-core/src/kcp/*
+- go: ./transport/internet/kcp/...
+<!-- scope:end -->

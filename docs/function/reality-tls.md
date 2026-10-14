@@ -246,3 +246,13 @@ pump, not by a socket grain, and no row handshakes a late hello through it.
 | the fork of `crypto/tls`, the reflection into it | `upstream/xray-core` → `github.com/xtls/reality`, `proxy/proxy.go` |
 | the double ClientHello, `utls`, reflection | `upstream/sing-box/common/tls/reality_client.go` |
 | the certificate and shortId oracle | `github.com/xtls/reality` `tls.go:200-300`, `handshake_server_tls13.go:100-180` |
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: crates/ferrox-core/src/tls/*
+- oracle: reality
+- go: ./transport/internet/tls/...
+<!-- scope:end -->

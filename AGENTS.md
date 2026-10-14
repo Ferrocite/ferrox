@@ -9,7 +9,7 @@ The split is not negotiable.
 | check | where |
 | --- | --- |
 | fmt, clippy, rustdoc | local, every push — `./scripts/check.sh` |
-| policy checks: leak surface, dependency policy, comment trace, fixture safety, windows paths, method docs | local, every push |
+| policy checks: leak surface, dependency policy, comment trace, fixture safety, windows paths, method docs, ci scope | local, every push |
 | **exact operation counts** — `scripts/count-ops.sh` against `scripts/expected-ops.txt` | local, every push |
 | prompt library — `cargo run -p ferrox-prompt -- check` | local, every push |
 | `cargo test --workspace` | local, every push |

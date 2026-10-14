@@ -171,3 +171,13 @@ The `extra` precedence is cited from ZeroNet's port, not from the Xray pin: the
 carries all of these knobs as top-level fields and has no `extra` at all, so the
 block is newer than the commit `upstream/pins.toml` names. The rule is the same
 one the reference's own `SplitHTTPConfig.Build` applies.
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: crates/ferrox-app/src/xhttp.rs, crates/ferrox-app/src/xhttp_h2.rs
+- scenarios: vless-xhttp
+- go: ./transport/internet/splithttp/..., ./transport/internet/xdrive/...
+<!-- scope:end -->

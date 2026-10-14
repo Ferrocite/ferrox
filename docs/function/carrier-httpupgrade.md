@@ -90,3 +90,13 @@ nothing needed removing, and which two claims about this carrier are false:
 | 19-line pass-through, `bufio` handshake | `upstream/xray-core/transport/internet/httpupgrade/` |
 | `buf.NewSize(Buffered())` to preserve coalesced bytes | `upstream/sing-box` → `transport/v2rayhttpupgrade/server.go` |
 | `scanned` cursor, `PrefixedStream` | `upstream/zeronet/crates/zero-transport/src/httpupgrade.rs` |
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: crates/ferrox-app/src/httpupgrade.rs
+- oracle: http_upgrade, httpupgrade
+- go: ./transport/internet/httpupgrade/...
+<!-- scope:end -->

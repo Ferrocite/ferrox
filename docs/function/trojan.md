@@ -121,3 +121,14 @@ Xray's two ends disagree with each other, which is the honest summary: the
 server (`server.go`) reads the first request into one `buf.Buffer` and compares
 `first.Byte(56)` in place, while the client (`protocol.go`, `ParseHeader`) does
 five `io.ReadFull` calls plus `ReadAddressPort` against the bare socket.
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: -
+- scenarios: trojan-raw
+- oracle: trojan
+- go: ./proxy/trojan/...
+<!-- scope:end -->

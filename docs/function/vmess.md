@@ -159,3 +159,14 @@ connection, and neither is where a connection spends its time.
 | chunk stream + chunk masking options, frame sizes | `upstream/xray-core/proxy/vmess/encoding/`, `common/crypto/auth.go` |
 | chunk stream + chunk masking options, `WriteChunkSize` | `upstream/sing-box` → `sagernet/sing-vmess/protocol.go` |
 | the same framing, in place, batched | `upstream/zeronet/crates/zero-protocol/src/vmess.rs` |
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: crates/ferrox-app/src/vmess.rs
+- scenarios: vmess-raw
+- oracle: vmess
+- go: ./proxy/vmess/..., ./common/crypto/...
+<!-- scope:end -->
