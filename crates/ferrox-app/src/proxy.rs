@@ -4191,9 +4191,26 @@ fn dial_vless_reality(
     if session.write_all(&header).is_err() {
         return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
     }
-    if read_vless_response(&mut session).is_none() {
+    // A server may hold its answer until it has payload to send, so the upload runs through the pump while this leg waits, as on every other carrier; a TLS session cannot split, so both legs share it behind one lock until the pump's owner joins and hands it back.
+    let shared = Arc::new(Mutex::new(session));
+    let mut reader = TlsHalf {
+        session: Arc::clone(&shared),
+    };
+    let pump = Pump::over(client, {
+        let mut writer = TlsHalf {
+            session: Arc::clone(&shared),
+        };
+        move |bytes| writer.write_all(bytes).is_ok()
+    });
+    let answered = read_vless_response(&mut reader).is_some();
+    pump.end();
+    if !answered {
         return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
     }
+    drop(reader);
+    let Some(Ok(mut session)) = Arc::into_inner(shared).map(Mutex::into_inner) else {
+        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Local));
+    };
     let Ok(downstream) = client.try_clone() else {
         return;
     };
@@ -11694,6 +11711,70 @@ mod tests {
             flow: String::new(),
             reality: None,
         };
+        let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let relaying = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_vless(&stream, &server_addr, &vless, &target, Ladder::global());
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client
+            .read_exact(&mut back)
+            .expect("echoes through a withheld answer");
+        assert_eq!(&back, b"ping");
+        drop(client);
+        server.join().expect("joins");
+        relaying.join().expect("joins");
+    }
+
+    /// The pump belongs to the carrier, and REALITY is a carrier: a REALITY server that holds its `[0, 0]` until the first payload record arrives must not deadlock the client either.
+    #[test]
+    fn vless_reality_client_pumps_the_upload_before_reading_the_response() {
+        let id = uuid_bytes(REALITY_TEST_ID).expect("id");
+        let server_config = reality_server_config();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let server_addr = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let edges = reality_edges(&server_config, &stream);
+            let Ok(ferrox_core::tls::RealityAccept::Session(mut session)) =
+                ferrox_core::tls::RealityServer::accept(
+                    &server_config,
+                    unix_millis(),
+                    stream,
+                    edges,
+                )
+            else {
+                panic!("the peer handshakes, it is not proxied to the cover origin");
+            };
+            assert!(shake_tls(&mut session), "handshakes");
+            let Some((got, _flow, cmd, _target)) = decode_request(&mut session) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(cmd, 1);
+            let mut payload = [0u8; 4];
+            read_exact(&mut session, &mut payload).expect("reads payload before answering");
+            session.write_all(&[0, 0]).expect("answers");
+            session.write_all(&payload).expect("echoes");
+        });
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let root = crate::json::parse(&reality_client_json(
+            server_addr.port(),
+            &b64url(&public),
+            "",
+        ))
+        .expect("parses");
+        let Outbound::Vless(vless) = find_outbound(&root).expect("a REALITY outbound") else {
+            panic!("the outbound dials VLESS");
+        };
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let relaying = thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
