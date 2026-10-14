@@ -898,7 +898,8 @@ fn mux_target_addr(target: &ferrox_core::mux::Target<'_>) -> Option<SocketAddr> 
 }
 
 fn resolve_endpoint(host: &str, port: u16) -> Option<SocketAddr> {
-    format!("{host}:{port}").to_socket_addrs().ok()?.next()
+    // The tuple asks the resolver for host and port directly: no `host:port` re-serialisation, no String, no port re-scan.
+    (host, port).to_socket_addrs().ok()?.next()
 }
 
 fn mux_target_of(addr: SocketAddr) -> ferrox_core::mux::Target<'static> {
