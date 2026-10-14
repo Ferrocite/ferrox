@@ -18108,30 +18108,41 @@ mod relay_tests {
         assert_eq!(got, REPLY, "a finished upload must not drop the reply");
     }
 
+    /// Sixteen flows on the shared Linux worker set, all pushing at once, each one moving
+    /// thirty-two splice pipes' worth from a socket whose write deadline is armed: a source that
+    /// stops being re-armed shows up as a short count or an unfinished relay, never as a hang.
+    /// Loopback only, dials nothing.
     #[test]
     fn sixteen_flows_at_once_all_arrive_whole() {
         const FLOWS: usize = 16;
-        const LEN: usize = 20_000;
+        const CHUNK: usize = 65_536;
+        const ROUNDS: usize = 128;
+        const LEN: usize = CHUNK * ROUNDS;
         let front = listener();
         let front_port = port_of(&front);
         let back = listener();
         let back_port = port_of(&back);
 
-        let payloads: Vec<Vec<u8>> = (0..FLOWS)
-            .map(|flow| (0..LEN).map(|i| ((i + flow) % 251) as u8).collect())
-            .collect();
         let wanted = vec![LEN; FLOWS];
 
-        let outbound = payloads.clone();
         let front_far = thread::spawn(move || {
-            let mut held = Vec::with_capacity(FLOWS);
-            for payload in &outbound {
+            let mut feeders = Vec::with_capacity(FLOWS);
+            for flow in 0..FLOWS {
                 let (mut stream, _) = front.accept().expect("accepts");
-                stream.write_all(payload).expect("writes");
-                let _ = stream.shutdown(Shutdown::Write);
-                held.push(stream);
+                stream.set_write_timeout(Some(PATIENCE)).expect("timeout");
+                feeders.push(thread::spawn(move || {
+                    let chunk: Vec<u8> = (0..CHUNK).map(|i| ((i + flow) % 251) as u8).collect();
+                    for _ in 0..ROUNDS {
+                        stream
+                            .write_all(&chunk)
+                            .expect("a stalled flow hits its write deadline");
+                    }
+                    let _ = stream.shutdown(Shutdown::Write);
+                    // handed back so the kernel's unsent bytes live until the lengths are read
+                    stream
+                }));
             }
-            held
+            feeders
         });
         let back_far = thread::spawn(move || {
             let mut lengths = Vec::with_capacity(FLOWS);
@@ -18143,20 +18154,34 @@ mod relay_tests {
             lengths
         });
 
+        let (ended, watched) = mpsc::channel();
         let mut relays = Vec::with_capacity(FLOWS);
         for _ in 0..FLOWS {
             let client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
             let target = TcpStream::connect(("127.0.0.1", back_port)).expect("connects");
-            relays.push(thread::spawn(move || relay(&client, &target)));
+            let ended = ended.clone();
+            relays.push(thread::spawn(move || {
+                relay(&client, &target);
+                let _ = ended.send(());
+            }));
         }
-        for relay_side in relays {
-            relay_side.join().expect("joins");
-        }
+        drop(ended);
+        let all_ended = (0..FLOWS).all(|_| watched.recv_timeout(PATIENCE).is_ok());
+        assert!(
+            all_ended,
+            "a relay among sixteen never ended, so one of its directions stopped being polled"
+        );
+
         assert_eq!(
             back_far.join().expect("joins"),
             wanted,
             "a flow among sixteen arrived short, which means two flows shared a pipe"
         );
-        front_far.join().expect("joins");
+        for feeder in front_far.join().expect("joins") {
+            feeder.join().expect("feeds");
+        }
+        for relay_side in relays {
+            relay_side.join().expect("joins");
+        }
     }
 }
