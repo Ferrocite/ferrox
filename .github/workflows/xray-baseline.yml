@@ -25,18 +25,61 @@ permissions:
   contents: read
 
 jobs:
+  plan:
+    name: plan what this change owes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      wide: ${{ steps.scope.outputs.wide }}
+      go: ${{ steps.scope.outputs.go }}
+      methods: ${{ steps.scope.outputs.methods }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: plan the scope
+        id: scope
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT" == pull_request ]]; then
+            python3 scripts/ci-scope.py scope --base "$BASE"
+          else
+            python3 scripts/ci-scope.py scope --wide
+          fi
+
   baseline:
-    name: xray-core baseline (informational, never red on test failures)
+    name: xray-core packages in scope (informational, never red on test failures)
+    needs: plan
+    if: needs.plan.outputs.go == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-go@v5
         with:
           go-version: stable
-      - name: run all pinned xray-core tests, report, stay green
+      - name: plan the scope, so the package list is read from the same plan
         shell: bash
-        run: ./scripts/run-xray-baseline.sh "${{ inputs.pattern || './...' }}"
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT" == pull_request ]]; then
+            python3 scripts/ci-scope.py scope --base "$BASE" > /dev/null
+          else
+            python3 scripts/ci-scope.py scope --wide > /dev/null
+          fi
+      - name: run the pinned xray-core tests in scope, report, stay green
+        shell: bash
+        env:
+          WANT_PATTERN: ${{ inputs.pattern }}
+        run: ./scripts/run-xray-baseline.sh "${WANT_PATTERN:-./...}"
       - name: publish the totals
         if: always()
         shell: bash

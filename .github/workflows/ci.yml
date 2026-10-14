@@ -30,6 +30,30 @@ env:
   RUSTFLAGS: -D warnings --cfg aes_armv8 --cfg polyval_armv8
 
 jobs:
+  plan:
+    name: what this change owes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      rust: ${{ steps.scope.outputs.rust }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: plan the scope
+        id: scope
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT" == pull_request ]]; then
+            python3 scripts/ci-scope.py scope --base "$BASE"
+          else
+            python3 scripts/ci-scope.py scope --wide
+          fi
+
   lint:
     name: lint, docs and gates
     runs-on: ubuntu-latest
@@ -69,6 +93,10 @@ jobs:
 
   test:
     name: test (${{ matrix.name }})
+    needs: plan
+    # Three compilers build the same unchanged workspace because a page's prose
+    # moved. A wide plan — shared code, a schedule — answers true here.
+    if: needs.plan.outputs.rust == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:

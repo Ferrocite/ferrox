@@ -25,12 +25,42 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  plan:
+    name: plan what this change owes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      wide: ${{ steps.scope.outputs.wide }}
+      suites: ${{ steps.scope.outputs.suites }}
+      methods: ${{ steps.scope.outputs.methods }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: plan the scope
+        id: scope
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT" == pull_request ]]; then
+            python3 scripts/ci-scope.py scope --base "$BASE"
+          else
+            python3 scripts/ci-scope.py scope --wide
+          fi
+
   suites:
-    name: upstream suites (enabled only)
+    name: upstream suites (those in scope)
+    needs: plan
+    if: needs.plan.outputs.suites == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/setup-go@v5
         with:
@@ -38,5 +68,16 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: conformance
+      - name: plan the scope, so each suite is read from the same plan
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT" == pull_request ]]; then
+            python3 scripts/ci-scope.py scope --base "$BASE" > /dev/null
+          else
+            python3 scripts/ci-scope.py scope --wide > /dev/null
+          fi
       - name: upstream suites by test_enabled bit
         run: ./scripts/run-upstream-suite.sh

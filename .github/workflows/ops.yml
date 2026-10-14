@@ -8,6 +8,7 @@ on:
       - 'scripts/expected-ops.txt'
       - 'scripts/method-ops.txt'
       - 'scripts/method-counts.txt'
+      - 'scripts/ci-scope.py'
       - 'docs/**'
       - '.github/workflows/ops.yml'
   workflow_dispatch:
@@ -16,12 +17,44 @@ permissions:
   contents: read
 
 jobs:
+  plan:
+    name: plan what this change owes
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      wide: ${{ steps.scope.outputs.wide }}
+      rust: ${{ steps.scope.outputs.rust }}
+      ops: ${{ steps.scope.outputs.ops }}
+      methods: ${{ steps.scope.outputs.methods }}
+      rows: ${{ steps.scope.outputs.ops_rows }}
+      reason: ${{ steps.scope.outputs.reason }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: plan the scope
+        id: scope
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT" == pull_request ]]; then
+            python3 scripts/ci-scope.py scope --base "$BASE"
+          else
+            python3 scripts/ci-scope.py scope --wide
+          fi
+
   counts:
-    name: exact operation counts
+    name: exact operation counts (${{ needs.plan.outputs.rows }} row(s))
+    needs: plan
+    if: needs.plan.outputs.ops == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
@@ -30,22 +63,39 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends valgrind strace
+      - name: plan the scope, so the rows are read from the same plan
+        shell: bash
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT" == pull_request ]]; then
+            python3 scripts/ci-scope.py scope --base "$BASE" > /dev/null
+          else
+            python3 scripts/ci-scope.py scope --wide > /dev/null
+          fi
       - name: check exact counts
+        if: needs.plan.outputs.rust == 'true'
         env:
           RUSTFLAGS: -C debuginfo=line-tables-only
         run: ./scripts/count-ops.sh check quic::tests::pem_wraps_at_sixty_four_columns scripts/expected-ops.txt
-      - name: report the per-method counts, never red
+      - name: report the per-method counts in scope, never red
         env:
           RUSTFLAGS: -C debuginfo=line-tables-only
         run: |
+          mkdir -p target
           {
             echo '# per-method retired instructions, informational'
-            while read -r doc filter symbol; do
-              case "$doc" in ''|'#'*) continue ;; esac
-              printf '\n## %s -- %s\n' "$doc" "$symbol"
-              ./scripts/count-ops.sh report "$filter" "$symbol" < /dev/null || echo "not found: $symbol"
-            done < scripts/method-ops.txt
-          } | tee target/method-ops.md
+            echo
+            echo "Scope: ${{ needs.plan.outputs.methods || 'the whole tree' }} -- ${{ needs.plan.outputs.reason }}"
+          } > target/method-ops.md
+          python3 scripts/ci-scope.py rows > .ferrox/scope-rows.txt
+          # One call, so one build of the two test binaries serves every row: the
+          # loop this replaces resolved both of them once per row, 31 times.
+          ./scripts/count-ops.sh report-file .ferrox/scope-rows.txt \
+            >> target/method-ops.md 2>&1 || echo 'measurement broke; see the log above' \
+            >> target/method-ops.md
+          cat target/method-ops.md
       - uses: actions/upload-artifact@v4
         with:
           name: method-ops

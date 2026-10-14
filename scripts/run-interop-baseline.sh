@@ -41,7 +41,7 @@ pin_field() {
 {
   echo "# interop baseline (upstream suites against ferrox-app)"
   echo
-  echo "Every test each suite has, pass or fail, against this workspace's ferrox-app. Informational: failures never fail this job; infra failures (bad pin, no toolchain, unbuilt binary) do."
+  echo "Every test each suite has that is in this change's scope, pass or fail, against this workspace's ferrox-app. A wide plan — shared code, a scheduled or manual run — is every test. Informational: failures never fail this job; infra failures (bad pin, no toolchain, unbuilt binary) do."
   echo
 } >"$report"
 
@@ -65,6 +65,14 @@ for name in zeronet xray-rust; do
     echo "::error::$name pin is missing repo/rev/suite/binary/seam"
     exit 1
   fi
+  # The plan narrows this suite to the tests the change reaches; a wide plan or no
+  # plan file answers with the pin's own command, which is the full baseline.
+  scoped="$(python3 scripts/ci-scope.py suite "$name")"
+  if [[ -z "$scoped" ]]; then
+    echo "OUT OF SCOPE: $name — no test of its suite measures this change"
+    continue
+  fi
+  suite="$scoped"
   full="${suite%% --test-threads=1*} --test-threads=1"
   if [[ "$full" == "$suite" ]]; then
     echo "::error::$name suite carries no --test-threads=1 filter names to strip; refusing to rerun the conformance subset as a baseline"
@@ -87,7 +95,7 @@ for name in zeronet xray-rust; do
     exit 1
   fi
   log="$PWD/$out_dir/$name.log"
-  echo "baseline: $name @ ${rev:0:7}, full suite against $workspace/target/debug/$binary via $seam"
+  echo "baseline: $name @ ${rev:0:7}, suite as scoped against $workspace/target/debug/$binary via $seam"
   # A pin's `baseline_env` names hooks its harness reads to say what it was waiting on; without them a hang is only a timeout.
   run_env=("$seam=$workspace/target/debug/$binary")
   if [[ "$diag" != "-" ]]; then
