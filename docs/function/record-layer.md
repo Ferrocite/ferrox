@@ -547,3 +547,14 @@ What is **not** removed, and is named rather than claimed:
 | the one-shot AEAD that forces a refill per call | `upstream/sing-box` → `golang.org/x/crypto/chacha20poly1305`, `chacha20poly1305.go:35` |
 | the explicit block range and the 8→4→2→1 ladder | `upstream/zeronet/crates/zero-protocol/src/chacha20/mod.rs` |
 | the stream cipher this rung replaces | `upstream/xray-core/common/crypto/internal/chacha.go` |
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: crates/ferrox-core/src/record.rs, crates/ferrox-core/src/aead.rs, crates/ferrox-core/src/poly1305.rs, crates/ferrox-core/src/chacha/*, crates/ferrox-core/src/aesgcm/*
+- scenarios: vless-raw, vmess-raw, trojan-raw, shadowsocks-raw
+- oracle: over_raw_tcp
+- go: ./common/crypto/...
+<!-- scope:end -->

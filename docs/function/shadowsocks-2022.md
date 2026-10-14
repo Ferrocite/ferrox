@@ -144,3 +144,13 @@ because they are broken, deprecated or outside the ladder rather than missing;
 here; ChaCha multi-user stays refused (`NewMultiService` in sing-box and
 `inbound_multi.go` in Xray both reject it), so a colon list with a ChaCha
 method is refused on TCP and UDP alike.
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: crates/ferrox-core/src/shadowsocks2022.rs, crates/ferrox-app/src/shadowsocks2022.rs
+- oracle: shadowsocks
+- go: ./proxy/shadowsocks_2022/...
+<!-- scope:end -->

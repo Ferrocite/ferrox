@@ -80,3 +80,12 @@ wrong rather than because they were fixed:
 | head read, `BufferedReader`, `http.ReadRequest` | `upstream/xray-core/transport/internet/headers/` |
 | head read, pooled buffer | `upstream/sing-box` → `transport/v2rayhttp/` |
 | `scanned` head scan, no over-read | `upstream/zeronet/crates/zero-transport/src/httpupgrade.rs` |
+
+## CI scope
+
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+<!-- scope:begin -->
+- paths: crates/ferrox-app/src/httpheader.rs
+- go: ./transport/internet/headers/...
+<!-- scope:end -->
