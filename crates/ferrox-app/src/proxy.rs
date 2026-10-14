@@ -17476,6 +17476,53 @@ mod poll_relay {
         )
     }
 
+    /// A blocking socket parks the worker inside a splice when a wake arrives for a
+    /// queue that has gone — `SPLICE_F_NONBLOCK` guards the pipe half only. `held` stops
+    /// the descriptor being recycled under a restore that writes back the flags it found.
+    struct SpliceGuard {
+        held: TcpStream,
+        saved: libc::c_int,
+    }
+
+    impl SpliceGuard {
+        fn arm(socket: &TcpStream) -> Option<Self> {
+            let held = socket.try_clone().ok()?;
+            let fd = held.as_raw_fd();
+            let saved = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if saved < 0 || saved & libc::O_NONBLOCK != 0 {
+                return None;
+            }
+            if unsafe { libc::fcntl(fd, libc::F_SETFL, saved | libc::O_NONBLOCK) } < 0 {
+                return None;
+            }
+            Some(Self { held, saved })
+        }
+    }
+
+    impl Drop for SpliceGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::fcntl(self.held.as_raw_fd(), libc::F_SETFL, self.saved);
+            }
+        }
+    }
+
+    /// Every socket the flow splices, not only the half a wake reported: one wake drives
+    /// both legs. Armed while both directions hold a pipe, because a direction without one
+    /// hands its sockets to `copy_all_memcpy`, which ends on the first error and would read
+    /// `EAGAIN` as EOF. Descriptors shared by two directions arm once.
+    fn arm_flow(first: &Direction, second: &Direction) -> [Option<SpliceGuard>; 4] {
+        if first.pipe.is_none() || second.pipe.is_none() {
+            return [None, None, None, None];
+        }
+        [
+            SpliceGuard::arm(&first.src),
+            SpliceGuard::arm(&first.dst),
+            SpliceGuard::arm(&second.src),
+            SpliceGuard::arm(&second.dst),
+        ]
+    }
+
     struct Direction {
         src: TcpStream,
         dst: TcpStream,
@@ -17740,11 +17787,11 @@ mod poll_relay {
         let worker = next();
         let (first_tx, first_rx) = mpsc::channel();
         let (second_tx, second_rx) = mpsc::channel();
+        let first = Direction::new(client_read, target_write, first_tx);
+        let second = Direction::new(target_read, client_write, second_tx);
+        let _guards = arm_flow(&first, &second);
         worker.push(Flow {
-            directions: vec![
-                Direction::new(client_read, target_write, first_tx),
-                Direction::new(target_read, client_write, second_tx),
-            ],
+            directions: vec![first, second],
         });
         let _ = first_rx.recv();
         let _ = second_rx.recv();
@@ -17756,6 +17803,7 @@ mod relay_tests {
     use super::*;
     use std::io::{Read, Write};
     use std::net::TcpListener;
+    use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
@@ -17862,6 +17910,166 @@ mod relay_tests {
             REQUEST,
             "the bytes were altered on the way through"
         );
+    }
+
+    const CHUNK: usize = 65_536;
+
+    /// The client of the stalled flow: `rounds` chunks as fast as the socket takes
+    /// them, then a half-close, reporting how much got out.
+    fn push_until_refused(listener: &TcpListener, rounds: usize) -> usize {
+        let (mut stream, _) = listener.accept().expect("accepts");
+        stream.set_write_timeout(Some(PATIENCE)).expect("timeout");
+        let body: Vec<u8> = (0..CHUNK).map(|i| (i % 251) as u8).collect();
+        let mut written = 0usize;
+        for _ in 0..rounds {
+            if stream.write_all(&body).is_err() {
+                break;
+            }
+            written += body.len();
+        }
+        let _ = stream.shutdown(Shutdown::Write);
+        written
+    }
+
+    /// The destination of the stalled flow: it reads none of the flow until the
+    /// neighbours have been collected, then reports how much of it reached it.
+    fn hold_then_read(listener: &TcpListener, release: &mpsc::Receiver<()>) -> usize {
+        let (mut stream, _) = listener.accept().expect("accepts");
+        stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
+        let _ = release.recv();
+        read_all(&mut stream).len()
+    }
+
+    /// One neighbour peer: one chunk, a half-close, and the same bytes back.
+    fn write_then_read_back(stream: &mut TcpStream) -> usize {
+        stream.set_write_timeout(Some(PATIENCE)).expect("timeout");
+        stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
+        let body: Vec<u8> = (0..CHUNK).map(|i| (i % 191) as u8).collect();
+        if stream.write_all(&body).is_err() {
+            return 0;
+        }
+        let _ = stream.shutdown(Shutdown::Write);
+        read_all(stream).len()
+    }
+
+    /// One neighbour origin: it reads the whole body and echoes it back.
+    fn read_then_echo_back(stream: &mut TcpStream) {
+        stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
+        stream.set_write_timeout(Some(PATIENCE)).expect("timeout");
+        let body = read_all(stream);
+        if stream.write_all(&body).is_ok() {
+            let _ = stream.shutdown(Shutdown::Write);
+        }
+    }
+
+    /// One flow whose destination stops reading, driven beside sixteen flows that
+    /// answer promptly. A destination that is merely slow must make that flow
+    /// wait; it must not take the flows behind it down with it, and it does: one
+    /// `advance` runs both legs on any wake, and `SPLICE_F_NONBLOCK` only keeps the
+    /// *pipe* side from blocking, so the leg `poll` never reported ready is spliced
+    /// on a descriptor nobody said was able to take it — which parks the worker
+    /// inside the kernel instead of answering `EAGAIN`. Every other flow queued on
+    /// that worker freezes with it, which is how one stalled connection becomes
+    /// five unrelated red tests. Sixteen neighbours over at most eight workers
+    /// guarantees at least two of them share the parked one, so the freeze names
+    /// itself. The fallback copy path gives every direction its own thread and
+    /// cannot be poisoned, so the witness is the Linux job. Loopback only, dials
+    /// nothing.
+    #[test]
+    fn a_stalled_destination_does_not_freeze_the_flows_behind_it() {
+        const ROUNDS: usize = 512;
+        const NEIGHBOURS: usize = 16;
+
+        let stalled_front = listener();
+        let stalled_front_port = port_of(&stalled_front);
+        let stalled_back = listener();
+        let stalled_back_port = port_of(&stalled_back);
+        let (release, drain_now) = mpsc::channel::<()>();
+        let feeding = thread::spawn(move || push_until_refused(&stalled_front, ROUNDS));
+        let draining = thread::spawn(move || hold_then_read(&stalled_back, &drain_now));
+        let stalled_client = TcpStream::connect(("127.0.0.1", stalled_front_port)).expect("dials");
+        let stalled_target = TcpStream::connect(("127.0.0.1", stalled_back_port)).expect("dials");
+        let (ended, returned) = mpsc::channel::<()>();
+        let stalled_side = ended.clone();
+        let stalled_relay = thread::spawn(move || {
+            relay(&stalled_client, &stalled_target);
+            let _ = stalled_side.send(());
+        });
+
+        let front = listener();
+        let front_port = port_of(&front);
+        let back = listener();
+        let back_port = port_of(&back);
+        let (seen, counted) = mpsc::channel();
+        let peers = thread::spawn(move || {
+            let mut feeders = Vec::with_capacity(NEIGHBOURS);
+            for _ in 0..NEIGHBOURS {
+                let (mut stream, _) = front.accept().expect("accepts");
+                let seen = seen.clone();
+                feeders.push(thread::spawn(move || {
+                    let _ = seen.send(write_then_read_back(&mut stream));
+                }));
+            }
+            feeders
+        });
+        let echo = thread::spawn(move || {
+            for _ in 0..NEIGHBOURS {
+                let (mut stream, _) = back.accept().expect("accepts");
+                thread::spawn(move || read_then_echo_back(&mut stream));
+            }
+        });
+
+        for _ in 0..NEIGHBOURS {
+            let client = TcpStream::connect(("127.0.0.1", front_port)).expect("dials");
+            let target = TcpStream::connect(("127.0.0.1", back_port)).expect("dials");
+            let closed = ended.clone();
+            thread::spawn(move || {
+                relay(&client, &target);
+                let _ = closed.send(());
+            });
+        }
+        drop(ended);
+
+        let mut arrived = Vec::with_capacity(NEIGHBOURS);
+        while arrived.len() < NEIGHBOURS {
+            match counted.recv_timeout(PATIENCE) {
+                Ok(len) => arrived.push(len),
+                Err(_) => break,
+            }
+        }
+        let _ = release.send(());
+        let held = draining.join().expect("joins");
+        let pushed = feeding.join().expect("joins");
+        for feeder in peers.join().expect("joins") {
+            feeder.join().expect("joins");
+        }
+        echo.join().expect("joins");
+
+        let mut closed = 0usize;
+        while closed < NEIGHBOURS + 1 {
+            match returned.recv_timeout(PATIENCE) {
+                Ok(()) => closed += 1,
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            arrived.len() == NEIGHBOURS && arrived.iter().all(|len| *len == CHUNK),
+            "a flow with a stalled destination was driven beside {NEIGHBOURS} that answer \
+             promptly: {arrived:?} of them came back with {CHUNK} bytes, and the stalled one had \
+             {pushed} written and {held} drained"
+        );
+        assert_eq!(
+            closed,
+            NEIGHBOURS + 1,
+            "the flows a parked worker was holding never closed with it"
+        );
+        assert_eq!(
+            held, pushed,
+            "the stalled flow did not carry everything its client managed to write ({pushed} \
+             bytes) once its destination read again ({held} drained)"
+        );
+        stalled_relay.join().expect("joins");
     }
 
     /// The two clones `relay_carried` shares one socket: a finished upload used
