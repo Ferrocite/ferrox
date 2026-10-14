@@ -17476,11 +17476,51 @@ mod poll_relay {
         )
     }
 
-    /// Which half of a direction one `poll` wake actually reported ready.
-    #[derive(Clone, Copy)]
-    enum Leg {
-        Source,
-        Sink,
+    /// A blocking socket parks the worker inside a splice when a wake arrives for a
+    /// queue that has gone — `SPLICE_F_NONBLOCK` guards the pipe half only. `held` stops
+    /// the descriptor being recycled under a restore that writes back the flags it found.
+    struct SpliceGuard {
+        held: TcpStream,
+        saved: libc::c_int,
+    }
+
+    impl SpliceGuard {
+        fn arm(socket: &TcpStream) -> Option<Self> {
+            let held = socket.try_clone().ok()?;
+            let fd = held.as_raw_fd();
+            let saved = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if saved < 0 || saved & libc::O_NONBLOCK != 0 {
+                return None;
+            }
+            if unsafe { libc::fcntl(fd, libc::F_SETFL, saved | libc::O_NONBLOCK) } < 0 {
+                return None;
+            }
+            Some(Self { held, saved })
+        }
+    }
+
+    impl Drop for SpliceGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::fcntl(self.held.as_raw_fd(), libc::F_SETFL, self.saved);
+            }
+        }
+    }
+
+    /// Every socket the flow splices, not only the half a wake reported: one wake drives
+    /// both legs. Armed while both directions hold a pipe, because a direction without one
+    /// hands its sockets to `copy_all_memcpy`, which ends on the first error and would read
+    /// `EAGAIN` as EOF. Descriptors shared by two directions arm once.
+    fn arm_flow(first: &Direction, second: &Direction) -> [Option<SpliceGuard>; 4] {
+        if first.pipe.is_none() || second.pipe.is_none() {
+            return [None, None, None, None];
+        }
+        [
+            SpliceGuard::arm(&first.src),
+            SpliceGuard::arm(&first.dst),
+            SpliceGuard::arm(&second.src),
+            SpliceGuard::arm(&second.dst),
+        ]
     }
 
     struct Direction {
@@ -17506,7 +17546,7 @@ mod poll_relay {
             }
         }
 
-        fn advance(&mut self, leg: Leg) {
+        fn advance(&mut self) {
             if self.ended {
                 return;
             }
@@ -17515,50 +17555,47 @@ mod poll_relay {
                 self.end();
                 return;
             };
-            match leg {
-                Leg::Source => {
-                    let room = pipe.capacity - self.pending;
-                    if !self.src_at_eof && room > 0 {
-                        let moved = unsafe {
-                            libc::splice(
-                                self.src.as_raw_fd(),
-                                std::ptr::null_mut(),
-                                pipe.fds[1],
-                                std::ptr::null_mut(),
-                                room,
-                                SPLICE_F_NONBLOCK,
-                            )
-                        };
-                        if moved > 0 {
-                            self.pending += moved as usize;
-                        } else if moved == 0 {
-                            self.src_at_eof = true;
-                        } else if !retryable() {
-                            self.end();
-                            return;
-                        }
-                    }
+            let room = pipe.capacity - self.pending;
+            if !self.src_at_eof && room > 0 {
+                let moved = unsafe {
+                    libc::splice(
+                        self.src.as_raw_fd(),
+                        std::ptr::null_mut(),
+                        pipe.fds[1],
+                        std::ptr::null_mut(),
+                        room,
+                        SPLICE_F_NONBLOCK,
+                    )
+                };
+                if moved > 0 {
+                    self.pending += moved as usize;
+                } else if moved == 0 {
+                    self.src_at_eof = true;
+                } else if !retryable() {
+                    self.end();
+                    return;
                 }
-                Leg::Sink => {
-                    if self.pending > 0 {
-                        let moved = unsafe {
-                            libc::splice(
-                                pipe.fds[0],
-                                std::ptr::null_mut(),
-                                self.dst.as_raw_fd(),
-                                std::ptr::null_mut(),
-                                self.pending,
-                                SPLICE_F_NONBLOCK,
-                            )
-                        };
-                        if moved > 0 {
-                            self.pending -= moved as usize;
-                        } else if moved < 0 && !retryable() {
-                            self.end();
-                            return;
-                        }
-                    }
+            }
+            while self.pending > 0 {
+                let moved = unsafe {
+                    libc::splice(
+                        pipe.fds[0],
+                        std::ptr::null_mut(),
+                        self.dst.as_raw_fd(),
+                        std::ptr::null_mut(),
+                        self.pending,
+                        SPLICE_F_NONBLOCK,
+                    )
+                };
+                if moved > 0 {
+                    self.pending -= moved as usize;
+                    continue;
                 }
+                if moved < 0 && !retryable() {
+                    self.end();
+                    return;
+                }
+                break;
             }
             if self.src_at_eof && self.pending == 0 {
                 self.end();
@@ -17650,7 +17687,7 @@ mod poll_relay {
     fn run(worker: &Worker) {
         let mut flows: Vec<Flow> = Vec::new();
         let mut pfds: Vec<libc::pollfd> = Vec::with_capacity(64);
-        let mut owners: Vec<Option<(usize, usize, Leg)>> = Vec::with_capacity(64);
+        let mut owners: Vec<(usize, usize)> = Vec::with_capacity(64);
         loop {
             flows.extend(worker.take());
             if flows.iter().any(Flow::finished) {
@@ -17663,7 +17700,7 @@ mod poll_relay {
                 events: libc::POLLIN,
                 revents: 0,
             });
-            owners.push(None);
+            owners.push((usize::MAX, usize::MAX));
             for (flow_index, flow) in flows.iter().enumerate() {
                 for (direction_index, direction) in flow.directions.iter().enumerate() {
                     if direction.ended {
@@ -17679,7 +17716,7 @@ mod poll_relay {
                             events: libc::POLLIN,
                             revents: 0,
                         });
-                        owners.push(Some((flow_index, direction_index, Leg::Source)));
+                        owners.push((flow_index, direction_index));
                     }
                     if direction.pending > 0 {
                         pfds.push(libc::pollfd {
@@ -17687,7 +17724,7 @@ mod poll_relay {
                             events: libc::POLLOUT,
                             revents: 0,
                         });
-                        owners.push(Some((flow_index, direction_index, Leg::Sink)));
+                        owners.push((flow_index, direction_index));
                     }
                 }
             }
@@ -17699,15 +17736,16 @@ mod poll_relay {
                 if entry.revents == 0 {
                     continue;
                 }
-                let Some((flow_index, direction_index, leg)) = owners[index] else {
+                let (flow_index, direction_index) = owners[index];
+                if flow_index == usize::MAX {
                     worker.drain_wake();
                     continue;
-                };
+                }
                 if let Some(direction) = flows
                     .get_mut(flow_index)
                     .and_then(|flow| flow.directions.get_mut(direction_index))
                 {
-                    direction.advance(leg);
+                    direction.advance();
                 }
             }
         }
@@ -17749,11 +17787,11 @@ mod poll_relay {
         let worker = next();
         let (first_tx, first_rx) = mpsc::channel();
         let (second_tx, second_rx) = mpsc::channel();
+        let first = Direction::new(client_read, target_write, first_tx);
+        let second = Direction::new(target_read, client_write, second_tx);
+        let _guards = arm_flow(&first, &second);
         worker.push(Flow {
-            directions: vec![
-                Direction::new(client_read, target_write, first_tx),
-                Direction::new(target_read, client_write, second_tx),
-            ],
+            directions: vec![first, second],
         });
         let _ = first_rx.recv();
         let _ = second_rx.recv();
