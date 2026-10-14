@@ -17,9 +17,9 @@ parse_pins() {
   awk '
     function f(v) { return v == "" ? "-" : v }
     /^\[sources\./ {
-      if (name != "") print name "\t" repo "\t" rev "\t" enabled "\t" f(suite) "\t" f(binary) "\t" f(seam) "\t" f(path)
+      if (name != "") print name "\t" repo "\t" rev "\t" enabled "\t" f(suite) "\t" f(binary) "\t" f(seam) "\t" f(path) "\t" f(diag)
       name = $0; sub(/^\[sources\./, "", name); sub(/\]$/, "", name)
-      repo = ""; rev = ""; enabled = ""; suite = ""; binary = ""; seam = ""; path = ""
+      repo = ""; rev = ""; enabled = ""; suite = ""; binary = ""; seam = ""; path = ""; diag = ""
       next
     }
     /^repo[[:space:]]*=/ { repo = $0; sub(/^[^=]*=[[:space:]]*"/, "", repo); sub(/"[[:space:]]*$/, "", repo); next }
@@ -29,7 +29,8 @@ parse_pins() {
     /^ferrox_binary[[:space:]]*=/ { binary = $0; sub(/^[^=]*=[[:space:]]*"/, "", binary); sub(/"[[:space:]]*$/, "", binary); next }
     /^seam[[:space:]]*=/ { seam = $0; sub(/^[^=]*=[[:space:]]*"/, "", seam); sub(/"[[:space:]]*$/, "", seam); next }
     /^path[[:space:]]*=/ { path = $0; sub(/^[^=]*=[[:space:]]*"/, "", path); sub(/"[[:space:]]*$/, "", path); next }
-    END { if (name != "") print name "\t" repo "\t" rev "\t" enabled "\t" f(suite) "\t" f(binary) "\t" f(seam) "\t" f(path) }
+    /^baseline_env[[:space:]]*=/ { diag = $0; sub(/^[^=]*=[[:space:]]*"/, "", diag); sub(/"[[:space:]]*$/, "", diag); next }
+    END { if (name != "") print name "\t" repo "\t" rev "\t" enabled "\t" f(suite) "\t" f(binary) "\t" f(seam) "\t" f(path) "\t" f(diag) }
   ' "$pins_file"
 }
 
@@ -59,6 +60,7 @@ for name in zeronet xray-rust; do
   suite="$(pin_field "$name" 5)"
   binary="$(pin_field "$name" 6)"
   seam="$(pin_field "$name" 7)"
+  diag="$(pin_field "$name" 9)"
   if [[ -z "$repo" || -z "$rev" || -z "$suite" || -z "$binary" || -z "$seam" ]]; then
     echo "::error::$name pin is missing repo/rev/suite/binary/seam"
     exit 1
@@ -86,8 +88,14 @@ for name in zeronet xray-rust; do
   fi
   log="$PWD/$out_dir/$name.log"
   echo "baseline: $name @ ${rev:0:7}, full suite against $workspace/target/debug/$binary via $seam"
+  # A pin's `baseline_env` names hooks its harness reads to say what it was waiting on; without them a hang is only a timeout.
+  run_env=("$seam=$workspace/target/debug/$binary")
+  if [[ "$diag" != "-" ]]; then
+    read -r -a diag_args <<<"$diag"
+    run_env+=("${diag_args[@]}")
+  fi
   set +e
-  (cd "$dir" && env "$seam=$workspace/target/debug/$binary" bash -c "$full" >"$log" 2>&1)
+  (cd "$dir" && env "${run_env[@]}" bash -c "$full" >"$log" 2>&1)
   test_rc=$?
   set -e
   rm -rf "$dir"
@@ -104,10 +112,27 @@ for name in zeronet xray-rust; do
       grep '^test .* \.\.\. FAILED$' "$log" | sed 's/ \.\.\. FAILED$//' | sort -u || true
       echo '```'
       echo
-      echo "### failure output (first 25 lines per test)"
+      echo "### failure output (each block in full, or its head and tail when a harness floods the middle)"
       echo
       echo '```'
-      awk '/^---- .* stdout ----$/{show=1; n=0; print; next} show && n < 25 {print; n++} show && n >= 25 {show=0}' "$log" || true
+      awk '
+        function emit(  i) {
+          if (!open) return
+          print header
+          if (n <= 44) for (i = 1; i <= n; i++) print body[i]
+          else {
+            for (i = 1; i <= 8; i++) print body[i]
+            print "... " n - 36 " lines elided ..."
+            for (i = n - 27; i <= n; i++) print body[i]
+          }
+          print ""
+          open = 0; n = 0; delete body
+        }
+        /^---- .* stdout ----$/ { emit(); open = 1; header = $0; next }
+        open && /^failures:$/ { emit(); next }
+        open { body[++n] = $0 }
+        END { emit() }
+      ' "$log" || true
       echo '```'
       echo
     fi
