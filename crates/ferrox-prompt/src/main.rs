@@ -13,6 +13,7 @@ use ferrox_prompt::markdown::{
     Addon, Diagnostic, Effort, Library, Prompt, Severity, Status, Targets, Touch,
 };
 use ferrox_prompt::render::{self, Options, Rendered};
+use ferrox_prompt::worktree::Worktree;
 use ferrox_prompt::{clipboard, load_library, workspace_root};
 
 const USAGE: &str = "\
@@ -57,6 +58,9 @@ EXAMPLES
 A prompt with a required input is never rendered with a hole in it: the tool
 prints the command that would fill it instead. Every handout is recorded in
 .ferrox/slices.log so the next few calls do not offer the same slice twice.
+Every handout also names the worktree the slice runs in and what to do about it:
+created with `scripts/new-worktree.sh` when there is none, used and brought onto
+`main` when that script has made one for this task already.
 ";
 
 /// What to do.
@@ -571,6 +575,14 @@ fn merge_values(
     values
 }
 
+/// The worktree this slice runs in: named from the matrix row it draws, or from its title when it draws none, so one task keeps one worktree.
+fn slice_worktree(prompt: &Prompt, values: &Values, root: &Path) -> Worktree {
+    let label = values
+        .get("method")
+        .map_or_else(|| prompt.title.as_str(), String::as_str);
+    Worktree::plan(prompt.id, label, root)
+}
+
 /// The `--json` shape for a `next` handout, so an agent drives the loop without parsing prose.
 fn next_json(
     library: &Library,
@@ -593,9 +605,22 @@ fn next_json(
             target_key.map_or(Value::Null, |key| Value::text(key.to_owned())),
         ),
         ("slice", prompt_json(prompt, ledger)),
+        ("worktree", worktree_json(rendered.worktree.as_ref())),
         ("prompt", Value::text(rendered.text.clone())),
     ])
     .to_pretty()
+}
+
+/// The worktree a handout names, so an agent creates it or reuses it without parsing prose.
+fn worktree_json(worktree: Option<&Worktree>) -> Value {
+    let Some(worktree) = worktree else {
+        return Value::Null;
+    };
+    Value::object([
+        ("name", Value::text(worktree.name.clone())),
+        ("path", Value::text(worktree.path.display().to_string())),
+        ("state", Value::text(worktree.state())),
+    ])
 }
 
 /// `next`: fills a matrix template from its first unserved row, so repeat runs walk the matrix; `--set` still wins.
@@ -652,11 +677,12 @@ fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
     };
     // `--set` wins over the state-filled value, so an explicit row beats the first unserved candidate.
     let values = merge_values(&args.values, target.as_ref(), &state);
+    let worktree = slice_worktree(prompt, &values, root);
     let options = Options {
         allow_unfilled: args.allow_unfilled,
         ..Options::default()
     };
-    let rendered = render::render(library, prompt, &values, &addons, options);
+    let rendered = render::render(library, prompt, &values, &addons, Some(&worktree), options);
 
     let target_key = target.as_ref().map(|(key, _)| key.clone());
     if args.output == Output::Json {
@@ -689,6 +715,9 @@ fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
                 row.method, row.state
             );
         }
+    }
+    if let Some(worktree) = &rendered.worktree {
+        println!("worktree    {}", worktree.brief());
     }
     deliver(&rendered, library, prompt.id, args.output.is_stdout());
     record(
@@ -731,11 +760,12 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
         }
     };
     let values = merge_values(&args.values, target.as_ref(), &state);
+    let worktree = slice_worktree(prompt, &values, root);
     let options = Options {
         allow_unfilled: args.allow_unfilled,
         ..Options::default()
     };
-    let rendered = render::render(library, prompt, &values, &addons, options);
+    let rendered = render::render(library, prompt, &values, &addons, Some(&worktree), options);
     if !rendered.missing.is_empty() && !args.allow_unfilled {
         eprintln!(
             "P{id} needs a value for {}",
@@ -763,6 +793,7 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
                     .map_or(Value::Null, |key| Value::text(key.to_owned())),
             ),
             ("slice", prompt_json(prompt, &ledger)),
+            ("worktree", worktree_json(rendered.worktree.as_ref())),
             ("prompt", Value::text(rendered.text.clone())),
         ])
         .to_pretty();
@@ -806,11 +837,13 @@ fn run_show(args: &Args, library: &Library, root: &Path) -> ExitCode {
         }
     };
     let values = merge_values(&args.values, target.as_ref(), &state);
+    let worktree = slice_worktree(prompt, &values, root);
     let rendered = render::render(
         library,
         prompt,
         &values,
         &addons,
+        Some(&worktree),
         Options {
             allow_unfilled: true,
             ..Options::default()
@@ -876,6 +909,9 @@ fn run_show(args: &Args, library: &Library, root: &Path) -> ExitCode {
                 row.method, row.state
             );
         }
+    }
+    if let Some(worktree) = &rendered.worktree {
+        println!("  worktree      {} — {}", worktree.name, worktree.brief());
     }
     println!();
     println!("--- prompt ---");

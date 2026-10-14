@@ -96,8 +96,8 @@ fn every_prompt_renders_end_to_end_and_renders_the_same_twice() {
             .required_inputs()
             .map(|name| (name.to_owned(), "supplied-by-the-test".to_owned()))
             .collect();
-        let rendered = render::render(&library, prompt, &values, &[], Options::default());
-        let again = render::render(&library, prompt, &values, &[], Options::default());
+        let rendered = render::render(&library, prompt, &values, &[], None, Options::default());
+        let again = render::render(&library, prompt, &values, &[], None, Options::default());
 
         assert!(
             rendered.missing.is_empty(),
@@ -121,6 +121,7 @@ fn every_prompt_renders_end_to_end_and_renders_the_same_twice() {
             prompt,
             &values,
             &[],
+            None,
             Options {
                 provenance: true,
                 ..Options::default()
@@ -180,6 +181,7 @@ fn every_add_on_resolves_and_renders() {
                 prompt,
                 &BTreeMap::new(),
                 &resolved,
+                None,
                 Options::default(),
             );
             assert!(
@@ -310,7 +312,7 @@ fn a_prompt_with_a_required_input_is_only_offered_when_it_is_filled() {
             .iter()
             .map(|name| (name.clone(), "a-value".to_owned()))
             .collect();
-        let rendered = render::render(&library, prompt, &supplied, &[], Options::default());
+        let rendered = render::render(&library, prompt, &supplied, &[], None, Options::default());
         assert!(rendered.missing.is_empty(), "P{}", prompt.id);
     }
 }
