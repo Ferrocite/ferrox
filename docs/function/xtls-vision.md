@@ -9,7 +9,10 @@ The framing is: the first frame is prefixed with the 16-byte user UUID; every
 frame is then `command(1) | length(2) | padLength(2) | content | padding`.
 Commands are `0` continue, `1` end, `2` direct. Padding is zero-filled and its
 length comes from the same seed table Xray uses (`{900, 500, 900, 256}`), so
-the byte counts a DPI sees are the byte counts the reference produces.
+the byte counts a DPI sees are the byte counts the reference produces. One frame
+carries at most 8171 content bytes — Xray's `buf.Size` of 8192 less the uuid and
+the header — so a longer write leaves as several frames, never as one frame the
+reference's reader refuses.
 
 For eight buffers in each direction the writer and the reader run a TLS filter:
 `0x16 0x03` means a handshake record, `0x17 0x03 0x03` means application data,
@@ -42,6 +45,7 @@ graph TD
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | padding-command-bytes | 5 | ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid |
 | first-frame-uuid-bytes | 16 | ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid |
+| largest-framed-block-bytes | 8171 | ferrox-app-vision::tests::a_bulk_write_frames_every_block_inside_the_bound |
 | tls-buffers-inspected-before-the-switch | 8 | ferrox-app-vision::tests::both_directions_spend_the_same_filter_budget |
 | user-space-copies-per-byte-while-framed | 2 | ferrox-app-vision::tests::the_framing_switch_ends_the_staging |
 | user-space-copies-per-byte-after-the-switch | 0 | ferrox-app-vision::tests::the_framing_switch_ends_the_staging |
@@ -213,6 +217,42 @@ throughout the whole session, not only during the handshake.
   zero per-byte bookkeeping. The claim is structural — `cargo build`'s field
   list on the release `Link` has one fewer `usize` — not a runtime count, so
   nothing runs to gate it and it is stated here in prose rather than a table.
+
+- **A bulk write that no reader on the wire accepts.** `copy_stream` hands
+  `Link::write` one buffer of up to `RELAY_BUFFER`, 256 KiB, and the frame's two
+  lengths are `u16`s: past 8171 content bytes the block is larger than the
+  reference's whole `buf.Size` (8192) including the 16-byte uuid and the 5-byte
+  header, and past 65535 `(buf.len() as u16)` wraps the header to a smaller
+  number than the bytes behind it. `zeronet` refuses the first outright —
+  `"Vision frame exceeds the Xray plaintext bound"`
+  (`upstream/zeronet/crates/zero-protocol/src/vision.rs:325`) — and the second
+  desynchronises any peer that trusts the header, which is how a Vision session
+  ends in silence rather than in an error. The reference never makes such a
+  frame: `ReshapeMultiBuffer` (`upstream/xray-core/proxy/proxy.go:463`) splits
+  every piece of `buf.Size - 21` or more *before* `XtlsPadding` frames it, and
+  the padding clamp `buf.Size - 21 - contentLen` (`:517`) keeps
+  uuid+header+content+padding inside 8192. This tree now frames blocks of
+  `8192 - SHORTEST_FRAME = 8171`, the largest block the bound allows, so it
+  makes the fewest of them: one 256 KiB relay buffer leaves 33
+  `write_all_slices` calls, where the reference's halving of each 8192-byte
+  piece needs 64 frames and 32 writer calls for the same bytes. The payload
+  still goes out by pointer — `a_bulk_write_frames_every_block_inside_the_bound`
+  walks all 33 headers, checks every `content + padding` against the bound, and
+  asserts each block's pointer is `caller + framed_so_far` — so the fix cost no
+  copy.
+
+  Two things were kept on the caller buffer rather than the block, because the
+  reference keeps them there: the filter budget counts one packet per caller
+  buffer (`XtlsFilterTls` decrements `NumberOfPacketToFilter` once per
+  `WriteMultiBuffer`, `proxy.go:354`), and the switch command lands on the last
+  piece of that buffer (`i == len(mb) - 1`, `proxy.go:371`). Counting either per
+  block would end the framing after eight *blocks* instead of eight buffers.
+
+  What got worse is the framed pass's record count: while the framing is live,
+  a bulk caller buffer now issues `ceil(len / 8171)` records where it used to
+  issue one. That single record was one the pinned reader refuses, so the old
+  cost was not a working cost; the pass runs only until the switch, and every
+  byte after it still leaves through `write_out` unframed.
 
 What was deliberately **not** removed: the seed table and the padding itself.
 Padding bytes are wire bytes; making them random instead of zero would change
