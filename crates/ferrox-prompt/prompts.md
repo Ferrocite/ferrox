@@ -35,30 +35,28 @@ A row's verdict is read from its state cell alone: `implemented`, `in tree`, or 
 
 Add-ons are one line each: `**Add-on — <slug>:** <extra instruction>`. Paths under `upstream/<name>/` are pinned reading copies fetched by `scripts/fetch-upstream.sh`; they never appear in `**Touches:**` and are never committed. `{references}` is drawn per row from that pin file — every `always` pin, plus every pin the row's own line names or hits one of its `topics` keywords, so a QUIC row asks for quiche and an unrelated row does not, with the whole list as the fallback when nothing matches — which keeps "compare against the best implementation" reading the pins rather than a hand-kept sentence.
 
+Every handout carries the shared protocol, so a template says only what it adds: `check` refuses a `**Prompt protocol:**`, body or add-on that runs five content words with the protocol, and warns when two templates echo each other for six. Code spans, `{blanks}` and function words are not counted as evidence.
+
 ## Shared protocol
 
 ```text
-You are working on Ferrox, a from-scratch proxy core. Two claims define it and both are checked: output is byte-identical to the implementation it replaces, and it is not slower at any measured length.
+You are working on Ferrox, a from-scratch proxy core. Two claims define it and both are checked: output is byte-identical to the implementation it replaces, and it is not slower at any measured length. A change that alters the bytes on the wire to buy a syscall is neither, and it does not land.
 
-The bar is the best implementation, not a working one. References are the pins in `upstream/pins.toml`. Learn how each does the thing, find where it copies, branches, refills, or allocates needlessly, and write the smaller, faster, leaner thing that is bit-identical. Rewrite, do not copy — no upstream line or test enters this tree.
+The bar is the best implementation, not a working one. References are the pins in `upstream/pins.toml`: learn how each does the thing, find where it copies, branches, refills, or allocates needlessly, and write the smaller, faster, leaner thing that is bit-identical. Rewrite, do not copy — no upstream line or test enters this tree.
 
-A claim is either checked by something that runs or it is not made. Never write one without naming its checker; if there is no such thing, say so in the same sentence. A count nobody has measured stays `UNBLESSED`, never quoted as a figure.
+Trust neither this tree nor a reference to have found the floor: hunt the wins, try ideas no template names, keep only what a count proves, and revert a measured regression with its arithmetic on the page. One fewer proven operation is a win worth landing. Faster, safer, leaner, or it does not land; counts prove, durations suggest.
 
-Local before every push: `./scripts/check.sh` runs fmt, clippy, doc, the policy checks, exact operation counts, and the workspace tests. Never local: anything connection-dependent — benchmarks, parity, upstream suites, Miri. Every contributor sits behind a VPN and a proxy, so a local dial measures a tunnel, not the reference. On a platform without valgrind the count gate is CI-only there; name that rather than skipping it silently.
+A claim is either checked by something that runs or it is not made — name its checker, or say in the same sentence that no such check exists. A count nobody has measured stays `UNBLESSED`, never quoted as a figure, and a number enters `scripts/expected-ops.txt` only after reading the diff that moved it. A copy or allocation is proved by pointer identity, not by reading the code: the returned slice's base lies inside the caller's buffer, that buffer's pointer does not move, its capacity does not grow. A byte-level test cannot see a copy — the bytes are identical either way.
 
-Faster, safer, leaner, or it does not land. Counts prove; durations suggest. A copy or allocation claim is proved by pointer identity, not by reading the code: assert the returned slice's base lies inside the caller's buffer, that the buffer's own pointer does not move, and its capacity does not grow. A byte-level test cannot see a copy — the bytes are identical either way.
+Before landing a rewrite, ask what the worst input does: the length that is not a multiple of the vector width, the window already full, the cursor this change moves. The arithmetic finds the regression a green suite hides.
 
-Do not trust an existing implementation, this tree's or a reference's — assume it leaves wins on the table, and hunt them. Try many ideas, including ones no template names, and keep only the ones a count proves faster; revert a measured regression and put its arithmetic on the page. One fewer proven operation is a win worth landing, and believing a breakthrough is findable is what makes you look.
+Local before every push: `./scripts/check.sh` runs fmt, clippy, doc, the policy checks, exact operation counts, and the workspace tests. Never local: anything connection-dependent — benchmarks, parity, upstream suites, Miri — because every contributor sits behind a VPN and a proxy, so a local dial measures a tunnel, not the reference. On a platform without valgrind the count gate is CI-only there; name that rather than skipping it silently.
 
-Simpler with less code wins every tie at equal performance. No abstraction with one implementor, no second way of doing something, no debt left for a later slice. Unsafe only for a measured win; if the safe form ties, the safe form ships.
-
-A change that alters the bytes on the wire to save a syscall is not an optimisation, and it does not land.
-
-Before landing a rewrite, ask what the worst input does: the length that is not a multiple of the vector width, the window already full, the cursor this change moves. A rewrite that passed every test can still be a regression, and the arithmetic finds it without a benchmark.
+Simpler with less code wins every tie at equal performance: no abstraction with one implementor, no second way of doing something, no debt left for a later slice. Unsafe only for a measured win; if the safe form ties, the safe form ships.
 
 Report tersely: what changed, what was measured with numbers, what is still open. A slice that fails is worth more than one reported done that quietly skipped half its gates. Fixes leave no trace — one line of comment per item at most, no TODO, no changelog.
 
-Do not widen the slice. If the slice exposes a larger problem, add a template or an add-on to this file rather than fixing it here.
+Do not widen the slice. If it exposes a larger problem, add a template or an add-on to this file rather than fixing it here.
 ```
 
 ## P1 · Land an open method row
@@ -72,13 +70,13 @@ Do not widen the slice. If the slice exposes a larger problem, add a template or
 **Random weight:** 8
 
 ```text
-Implement {method} — matrix row {index} of table {section}, currently "{state}". Finish the whole row, both roles where the method has two. Read {references} first and take the best idea from each; do not transcribe. Prove byte-identity before speed, and where a reference has a suite with a seam to inject `ferrox-app`, run it unmodified in `conformance.yml`.
+Implement {method} — matrix row {index} of table {section}, currently "{state}". Finish the whole row, both roles where the method has two. Take the best idea from each of {references}. Prove byte-identity before any speed claim, and where a reference ships a suite with a seam to inject `ferrox-app`, run it unmodified in `conformance.yml`.
 ```
 
 **Add-on — both-roles:** If the state cell concedes one role only, the missing role is the whole slice.
 **Add-on — refused-by-name:** A config naming an unimplemented surface must still refuse with a reason until this slice makes it dial.
-**Add-on — connect-ip-terminate:** When the row is MASQUE CONNECT-IP (matrix row 20), the CONNECT-IP *client* is already shipped — the Foxy `h3` lane dials over HTTP/2 and quiche HTTP/3 and the codec in `crates/ferrox-core/src/foxy/connectip.rs` now writes and reads every capsule in both directions (`address_assign_encode`, `route_advert_encode`, proven inverse to their readers byte-for-byte). The two remaining roles are each their own slice, not one: (a) a proxy that *terminates* a tunnel — read `upstream/xray-core/transport/internet/masque/connectip/` and `upstream/mqvpn` — where the open work is the address pool and the IP/ICMP forwarding to a device, which is platform-privileged (a `tun`) and needs `Role::`/inbound plumbing that no share-link row reaches; (b) a standalone `Carrier::Masque` VLESS outbound off the account (its `planned_reason` names the live foxy lane and the missing dial). Land the codec-complete client row, then route each of those as a separate `next`; do not fold a privileged device write into a codec slice.
-**Add-on — pattng-tls-shaping:** When the row is the PattNG `unsafe-*` fingerprint / `cipherSuites` cluster, read `upstream/pattng/V2rayNG/app/src/main/java/com/v2ray/ang/core/TlsSettingsCheck.kt` first: "unsafe" means the stock stdlib ClientHello that honours the user's `cipherSuites` and offers `alpn` as written, not uTLS spoofing — so `ferrox-core`'s existing rustls hello is already the no-spoof half (reality.rs:978) and the real work splits across three matrix rows: parse `cipherSuites` (row 17, never read anywhere), construct the `UnsafeOptIn::allow_unsafe_fingerprint` the app never builds (row 4, "nothing constructs it yet"), then apply a user cipher-suite provider and the alpn-as-written policy to every TLS outbound (`rustls_backend.rs` pins `ALL_CIPHER_SUITES`, `reality.rs` pins empty alpn). That is a cross-cutting TLS-config subsystem, not one row: land the opt-in construction once in the session layer, then the `cipherSuites` parse, then the fingerprint dial, as three `next` calls. And a rustls hello can never be byte-equal to the reference's Go crypto/tls one, so the byte-identity claim has no byte checker here — it is replaced by the `*_selected_fingerprints` rows already listed in the `xray-rust` pin's `conformance.yml` seam running the reference client against `ferrox-app` unmodified; say so rather than writing an unchecked byte claim.
+**Add-on — connect-ip-terminate:** When the row is MASQUE CONNECT-IP (matrix row 20) the client and the two-way codec are already shipped — the Foxy `h3` lane dials over HTTP/2 and quiche HTTP/3, and `crates/ferrox-core/src/foxy/connectip.rs` writes and reads every capsule (`address_assign_encode`, `route_advert_encode`), proven inverse to their readers byte-for-byte. The two open roles are each their own slice: (a) a proxy that *terminates* a tunnel — read `upstream/xray-core/transport/internet/masque/connectip/` and `upstream/mqvpn` — whose open work is the address pool and IP/ICMP forwarding to a privileged `tun`, which no share-link row reaches; (b) a standalone `Carrier::Masque` VLESS outbound off the account. Land the client row, then route each of those as a separate `next`; never fold a privileged device write into a codec slice.
+**Add-on — pattng-tls-shaping:** When the row is the PattNG `unsafe-*` fingerprint / `cipherSuites` cluster, read `upstream/pattng/V2rayNG/app/src/main/java/com/v2ray/ang/core/TlsSettingsCheck.kt` first: "unsafe" means the stock stdlib ClientHello that honours the user's `cipherSuites` and offers `alpn` as written, not uTLS spoofing, so `ferrox-core`'s existing rustls hello is already the no-spoof half (`reality.rs:978`). The work splits across three matrix rows — parse `cipherSuites` (row 17, never read anywhere), construct the `UnsafeOptIn::allow_unsafe_fingerprint` the app never builds (row 4, "nothing constructs it yet"), then apply a user cipher-suite provider and the alpn-as-written policy to every TLS outbound (`rustls_backend.rs` pins `ALL_CIPHER_SUITES`, `reality.rs` pins empty alpn). Land the opt-in once in the session layer, then the parse, then the dial, as three `next` calls. A rustls hello can never be byte-equal to the reference's Go `crypto/tls` one, so this row's byte-identity claim has no byte checker: it is replaced by the `*_selected_fingerprints` rows in the `xray-rust` pin's `conformance.yml` seam, which run the reference client against `ferrox-app` unmodified — name that checker instead of writing a byte claim.
 
 ## P2 · Make a shipped method faster and leaner
 
@@ -91,11 +89,8 @@ Implement {method} — matrix row {index} of table {section}, currently "{state}
 **Random weight:** 9
 
 ```text
-Move {method} — matrix row {index} of table {section}, state "{state}" — towards the best known implementation among {references}. Throughput and leanness at bit-identical output: fewer retired instructions, fewer copies, fewer branches. Think in eliminated work, not added code: factor the math, fuse passes that touch the buffer twice, hoist per-record dispatch, narrow a parse that re-checks what a caller already checked. Re-measure the exact instruction count with `scripts/count-ops.sh` and read the diff before blessing a number in `scripts/expected-ops.txt`.
+Move {method} — matrix row {index} of table {section}, state "{state}" — towards the best known implementation among {references}. Throughput and leanness at bit-identical output: fewer retired instructions, fewer copies, fewer branches. Think in eliminated work, not added code: factor the math, fuse passes that touch the buffer twice, hoist per-record dispatch, narrow a parse that re-checks what a caller already checked. Re-measure the exact count with `scripts/count-ops.sh`.
 ```
-
-**Add-on — worst-case:** Ask what the input that is not a multiple of the vector width, or the window already full, does before landing — the tests may pass and the arithmetic may not.
-**Add-on — revert-what-lost:** A measured regression is reverted, and the arithmetic goes on the page.
 
 ## P3 · Take a shipped method's memory footprint down
 
@@ -108,7 +103,7 @@ Move {method} — matrix row {index} of table {section}, state "{state}" — tow
 **Random weight:** 6
 
 ```text
-For {method} — matrix row {index} of table {section} — remove work that is generated and thrown away: a per-record buffer that could be reused, a second copy of a payload already in the caller's buffer, a zero-fill before a read that overwrites every byte, a `Vec` that reallocates under steady traffic. Prove each removal by pointer identity, gate the allocation claim on `capacity()` held steady over a push/drain cycle, and name the pass that got worse if there is one.
+For {method} — matrix row {index} of table {section} — remove work that is generated and thrown away: a per-record buffer that could be reused, a second copy of a payload already in the caller's buffer, a zero-fill before a read that overwrites every byte, a `Vec` that reallocates under steady traffic. Gate the allocation claim on `capacity()` held steady over a push/drain cycle, and name the pass that got worse if there is one.
 ```
 
 **Add-on — pool-owner:** When one buffer is filled by one thread and drained by another, the pool lives in the object both touch; the parse order respects that single owner.
@@ -141,7 +136,7 @@ For {method} — matrix row {index} of table {section} — replace the argument 
 **Random weight:** 5
 
 ```text
-Read the parsing and framing for {method} — matrix row {index} of table {section} — against {references}, find where they copy, branch per field, or re-scan, and rewrite this tree's version to be bit-identical and cheaper. The output bytes do not move; the operation count goes down. Benchmark the parse and the check the same way — validating code has to be proven faster too.
+Read the parsing and framing for {method} — matrix row {index} of table {section} — against {references}, and rewrite this tree's version cheaper at the same bytes. Prove the validator by the same counts as the parser — checking code is code too, and it runs on every frame.
 ```
 
 **Add-on — seed-fuzz:** Feed untrusted bytes through every entry point on a seeded corpus and assert no panic.
@@ -187,7 +182,7 @@ Give matrix row {index} of table {section} — the implemented method {method} �
 **Random weight:** 5
 
 ```text
-Audit the hot path of {method} — matrix row {index} of table {section} — for work done and discarded: a value generated then overwritten, a memset before a read that fills every byte, a lock taken twice for one wait, a buffer sized for the worst case on the common small one. For each finding, remove it or prove why it is load-bearing against the leanest shape in {references}. Before writing a test that reconstructs a quantity, look for the counter already lying around as state.
+Audit the hot path of {method} — matrix row {index} of table {section} — for work done and discarded: a value computed then overwritten before anything reads it, a lock taken twice for one wait, a buffer sized for the worst case on the common small one. For each finding, remove it or prove it load-bearing against the leanest shape in {references}. Before writing a test that reconstructs a quantity, look for the counter already lying around as state.
 ```
 
 **Add-on — write-all-slices:** A framer's staging Vec that copies the caller's payload so a head and a trailer can share one record is not fixed by moving the copy to a stack buffer; fix `RecordAlignment::write_all_slices` at the provider layer to go through `write_vectored`, override it at every wrapper in the caller's path (the record-layer wrappers and the session types both need an arm that reaches the coalescing impl), and hand the framer's head, body, and trailer over as three slices. The default that iterates `write_all` per part is right on a raw stream and wrong under TLS, where each write_all becomes its own record.
@@ -219,7 +214,7 @@ For {method} — matrix row {index} of table {section} — confirm each width ba
 **Random weight:** 3
 
 ```text
-For {method} — matrix row {index} of table {section} — measure the operation count of its hot symbol with `scripts/count-ops.sh` across every length and boundary the method reaches; read `scripts/method-ops.txt` for the CI number before deciding anything. Blessing a count means reading the diff that moved it and recording why, never pasting a figure to quiet the gate. Where the count is connection-dependent, it belongs to `ops.yml`, not to a laptop run.
+For {method} — matrix row {index} of table {section} — measure the operation count of its hot symbol with `scripts/count-ops.sh` across every length and boundary the method reaches; read `scripts/method-ops.txt` for the CI number before deciding anything. A connection-dependent count belongs to `ops.yml`, not to a laptop run.
 ```
 
 ## P11 · Make a test that loses to the runner fail on a defect
@@ -249,7 +244,7 @@ Take the flaky test on {method} — matrix row {index} of table {section} — an
 **Random weight:** 4
 
 ```text
-Find where the bytes or dispatch of {method} — matrix row {index} of table {section} — are written more than once across the carrier and proxy files, and fold them into one copy with no new abstraction: the shared helper, not a trait for one implementer. The wire format and the operation count do not move; the line count and the divergence risk go down. Where a fork exists only because two paths disagree on one boundary, make them agree and delete the fork.
+Find where the bytes or dispatch of {method} — matrix row {index} of table {section} — are written more than once across the carrier and proxy files, and fold them into one shared helper, not a trait with one implementer. Nothing on the wire or in the count moves; the line count and the divergence risk go down. Where a fork exists only because two paths disagree on one boundary, make them agree and delete the fork.
 ```
 
 **Add-on — retire-dead:** A knob or code path with no consumer gets a caller in a test or is deleted — do not leave it named-but-unreachable.
@@ -268,7 +263,6 @@ Find where the bytes or dispatch of {method} — matrix row {index} of table {se
 Give {method} — matrix row {index} of table {section} — every wait a deadline the socket cannot ignore: bound the handshake, the relay read, and the server drive that spins on an idle peer. Test it by parking the peer and asserting the loop stops within the budget, not by sleeping and hoping. A budget a peer can exhaust must refuse cleanly, not truncate or silently drop what is in flight.
 ```
 
-**Add-on — no-widening:** The deadline is the smallest fix; do not fold an unrelated timeout policy into the same slice.
 **Add-on — deep-retry:** A carrier whose own reader loops on timeouts (gRPC, xHTTP, VMess, Shadowsocks handshakes) needs the budget inside that loop, not around it; record it as a row rather than bolting a wrapper on top.
 
 ## P14 · Put a layer where the references put it
@@ -282,7 +276,7 @@ Give {method} — matrix row {index} of table {section} — every wait a deadlin
 **Random weight:** 3
 
 ```text
-Compare where {references} place the layer for {method} — matrix row {index} of table {section} — against where this tree places it, and move it to match if the references agree and this tree does not: the security layer outside the carrier, the session above the transport, the framer below the record. Same wire bytes, same operation count — a layering change that alters either is a method change and does not land. Prove the move by the byte-differential still passing and the seam a later row needs now existing.
+Compare where {references} place the layer for {method} — matrix row {index} of table {section} — against where this tree places it, and move it to match if the references agree and this tree does not: the security layer outside the carrier, the session above the transport, the framer below the record. Prove the move by the byte-differential still passing and the seam a later row needs now existing; a move that shifts a byte or a count is a method change, not a move.
 ```
 
 ## P15 · Give a non-matrix surface a working seam
@@ -299,8 +293,6 @@ Compare where {references} place the layer for {method} — matrix row {index} o
 Take one engine-adjacent surface {references} carry that this tree names but cannot drive — the account plane, the upstream-proxy chain, or a TUN/VPN mode — and give it a working seam: wire it to a config path or a test entry point, name the reference it matches, and prove one round-trip in CI. If it genuinely cannot be reached from this tree's shape, say why plainly in the place a reader would expect the capability rather than leaving it silently half-described.
 ```
 
-**Add-on — no-diary:** Land the capability and its page; do not record the change in the page as a changelog.
-
 ## P16 · Deep-optimization hunt: beat every reference, or prove the floor
 
 **When to use:** The open-ended, high-effort pass on a shipped method — not the one clean win, but the hunt for an order-of-magnitude one, assuming the current implementation and every reference still leave the breakthrough undiscovered.
@@ -312,14 +304,14 @@ Take one engine-adjacent surface {references} carry that this tree names but can
 **Random weight:** 9
 
 ```text
-Make {method} — matrix row {index} of table {section} — faster, leaner and more functional than {references} put together, at bit-identical output. Assume the current form and every reference leave wins on the table; do not trust any of them. Generate many ideas — including ones this prompt does not name — try each, keep only what a count proves, and revert every measured regression with its arithmetic on the page. One fewer proven operation is a win worth landing, so push each winner to the end instead of stopping at the first.
+Make {method} — matrix row {index} of table {section} — faster, leaner and more functional than {references} put together. This is the open-ended pass: not the one clean win but the order-of-magnitude one, so push each winner to the end instead of stopping at the first.
 
 Think like a math paper, not a patch: change the basis or the order, factor, recast the computation, and prove the new form equivalent before shipping it. Mine every lens — algebraic structure and hot inner loops; bit tricks and SIMD across every width the ladder runs; microarchitecture (cache locality, branch prediction, IPC); I/O (batching, zero-copy, vectored and kernel offloads, ring buffers, lock-free handoffs, segment offloads); outright elimination of ops, copies, allocations, syscalls, locks, atomics, branches, zeroing, checks and dead code nothing reads; and the method-specific tricks — codec tables and DFA walks, one's-complement folding where the modulus allows, varint and padding shapes, multiplexing, and the crypto primitives' hardware paths.
 
-Prove the win or discard it: an exact instruction count from `scripts/count-ops.sh`, allocation and copy counts held by pointer identity, and the benchmark gate in CI. Re-measure the byte-differential before and after — bit-identical means the block, byte, counter and panic-threshold counts are unchanged, not only the output. Where the wire shape is fixed, say so and do not buy a syscall with a datagram boundary. Believe the breakthrough is findable and check every idea, even new ones specific to this task.
+Prove the win or discard it: the exact count from `scripts/count-ops.sh` and the benchmark gate in CI. Re-measure the byte-differential before and after — bit-identical means the block, byte, counter and panic-threshold counts are unchanged, not only the output. Where the wire shape is fixed, say so.
 ```
 
-**Add-on — novel-idea:** An idea no template or lens named here is welcome; prove it the same way — a surprising win is still a win, and a named, measured loss is still evidence.
+**Add-on — novel-idea:** An idea none of the lenses above names is welcome; it is proved the same way or discarded.
 **Add-on — floor-proof:** If the hunt finds nothing above noise, prove the floor: record the ideas tried, each one's count, and what a reader should try next — an argued floor beats a quiet stop.
 **Add-on — many-rounds:** Land one proven win per commit and keep hunting; a single diff that "optimized the method" is the end of one round, not the end of the slice.
 
@@ -334,18 +326,17 @@ Prove the win or discard it: an exact instruction count from `scripts/count-ops.
 **Random weight:** 8
 
 ```text
-Find a concurrency, timing or duplex defect in {method} — matrix row {index} of table {section} — and fix it: a half-closed race, a full-duplex stall, a timeout or deadline the socket can miss, a buffer-ownership or pool race, a wakeup lost behind a cursor, or a test that goes red one run in several. Fix them one at a time, and prove each one rather than guessing at it — a bug found by reading a symptom is a guess until a test reproduces it.
+Find a concurrency, timing or duplex defect in {method} — matrix row {index} of table {section} — and fix one: a half-closed race, a full-duplex stall, a timeout or deadline the socket can miss, a buffer-ownership or pool race, a wakeup lost behind a cursor, or a test that goes red one run in several. One defect per slice.
 
-Reproduce first: land a test that is red on the defect before the fix, then green after, and keep the red case in the suite. Make the reproduction deterministic where the defect is deterministic; where a timing window is genuinely involved, drive it from an in-memory stream or a controllable clock rather than a real socket, because a loopback or scheduler-dependent assertion proves nothing. A flaky test is itself the defect's witness — pin what it actually observes.
+Reproduce before fixing: land a test that is red on the defect and green after it, and keep the red case in the suite — a bug read off a symptom is a guess until that test exists. Where a timing window is genuinely involved, drive it from an in-memory stream or a controllable clock, never a wall-clock sleep or a real socket. A flaky test is itself the defect's witness: pin what it actually observes.
 
-Prove the fix under the tools that see these bugs: Miri in CI for the memory and aliasing races, the differential and byte tests for the wire staying identical, CI conformance and benches for the connections — never a local dial, since every contributor sits behind a VPN and a proxy and a local connection measures neither this code nor the reference. Do not change the bytes on the wire or a datagram boundary to paper over a race; fix the ordering or the ownership, and say which.
+Prove the fix under the tools that see these bugs: Miri for the memory and aliasing races, the byte-differential for the wire, CI conformance and benches for the connections. Never paper over a race by moving a wire byte or a datagram boundary; fix the ordering or the ownership, and say which.
 ```
 
 **Add-on — race-hunt:** Audit where one buffer is touched by two actors, where a cursor or counter can lag what a read consumed, and where a window can fill; name the invariant each guard holds.
 **Add-on — half-close:** The close edge is the usual bug site — check who shuts which direction, what the peer sees, and whether a pending read can outlive its writer.
 **Add-on — shared-close:** Where both directions of one relay tear down through a single shared `close` closure, no per-direction half-close is expressible and whichever thread finishes first aborts the sibling's still-open read; carry two directional closes per site, and where a carrier has no half-close primitive at all, name that limit rather than sweeping `Both` to `Write` blind.
 **Add-on — withheld-answer:** A server may hold its handshake answer until it sees client payload — xray flushes its buffered response on the first downstream write, zeronet's `HeaderFirst::hold` waits for it outright — so a client that stops sending to wait deadlocks both ways; pump the upload leg during the answer wait and hand it back before the session relay. Where the answer read shares one session lock with its writer (TLS halves, mux, the UDP uplink) the leg has to yield that lock first, so record those arms as rows instead of bolting a pump onto a locked half.
-**Add-on — de-flake:** A test failing under load but green alone is scheduler-dependent; move the assertion where it is exact and leave the socket test asserting only bytes.
 
 ## P18 · Give a decision the engine already implies its owner
 
