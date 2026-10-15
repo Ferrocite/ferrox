@@ -106,6 +106,15 @@ watch() {
     wait "$pid" 2>/dev/null
     WRC=$?
   fi
+  # The last poll is up to a second behind the close, and what lands in that gap is how a
+  # suite names itself: libtest writes the failing name, the `failures:` block and the
+  # `test result:` line at the end. Echo the tail before archiving it, or the step log ends
+  # where the polling did and a red run reads as a hang.
+  size=$(wc -c <"$out.part" 2>/dev/null || echo 0)
+  if ((size > sent)); then
+    tail -c +"$((sent + 1))" "$out.part"
+    sent=$size
+  fi
   cat "$out.part" >>"$out" 2>/dev/null || true
   rm -f "$out.part"
 }
@@ -132,13 +141,13 @@ culprit() {
   return 1
 }
 
-# last_binary LOG: the test executable cargo had started when the log stopped.
+# last_binary LOG: the runnable path of the test executable cargo had started when the log stopped.
 last_binary() {
-  sed -n 's/^.*(target\/[^)]*\/\([^/()]*\)).*$/\1/p' "$1" | tail -1
+  sed -n 's/.*(\([^()]*target[\\/][^()]*\)).*/\1/p' "$1" | tail -1 | tr '\\' '/'
 }
 
 selftest_run() {
-  local fake="$PWD/target/ci/selftest-fake" want
+  local fake="$PWD/target/ci/selftest-fake-abcd" want got
   mkdir -p target/ci
   cat >"$fake" <<'EOF'
 #!/usr/bin/env bash
@@ -165,11 +174,32 @@ EOF
   want="$(culprit "$fake")" || { echo "selftest: the stalled test was not named" >&2; return 1; }
   [[ "$want" == "hangs::forever" ]] || { echo "selftest: named '$want', want hangs::forever" >&2; return 1; }
   echo "selftest: ok   a stall stops at the quiet limit and the test that stalls is named"
+  # culprit() runs only on what last_binary() hands back, and that has to be a runnable path:
+  # cargo writes the deps separator as `/` on unix and `\` on Windows.
+  out="target/ci/selftest-last.log"
+  printf '%s\n' 'test x ... ok' '     Running unittests src\main.rs (target\ci\selftest-fake-abcd)' >"$out"
+  got="$(last_binary "$out")"
+  [[ "$got" == "target/ci/selftest-fake-abcd" ]] || {
+    echo "selftest: a windows-shaped Running line yielded '$got'" >&2; return 1; }
+  [[ -x "$got" ]] || {
+    echo "selftest: last_binary yielded '$got', which is not runnable: no test would be run alone" >&2; return 1; }
+  [[ "$(last_binary <(printf '%s\n' '     Running unittests src/main.rs (target/ci/selftest-fake-abcd)'))" \
+    == "target/ci/selftest-fake-abcd" ]] || {
+    echo "selftest: a unix-shaped Running line did not yield the same path" >&2; return 1; }
+  echo "selftest: ok   the stalled run's log yields the runnable binary, on both separators"
   watch "sleep 0.2; echo alive" >/dev/null
   ((STALLED == 0 && WRC == 0)) || { echo "selftest: a working command read as stalled" >&2; return 1; }
   watch "exit 3" >/dev/null
   ((WRC == 3)) || { echo "selftest: a failing command's code did not survive the watch" >&2; return 1; }
   echo "selftest: ok   a command that writes is left alone, and its exit code is returned"
+  # A suite names itself after the last poll: the failing test's name, the `failures:` block
+  # and the `test result:` line all arrive as the process exits, between two polls.
+  out="target/ci/selftest-tail.log"
+  watch "sleep 1.2; echo 'a_name_that_failed'; echo 'test result: FAILED.'" \
+    >"target/ci/selftest-tail-output.log" 2>/dev/null
+  grep -q 'test result: FAILED' "target/ci/selftest-tail-output.log" || {
+    echo "selftest: the bytes after the last poll never reached the watcher's own output" >&2; return 1; }
+  echo "selftest: ok   the run's last lines reach the step log, so a red suite names itself"
   if [[ -d /proc/self/task ]]; then
     [[ -n "$(blocked_under $$ | grep '^  thread ' || true)" ]] || {
       echo "selftest: procfs is here yet no blocked thread was read" >&2; return 1; }
