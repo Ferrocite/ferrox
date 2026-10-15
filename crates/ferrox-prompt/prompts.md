@@ -386,6 +386,8 @@ Report the per-wait cost the census adds where it is reachable, or state that th
 
 **Add-on — starved-leg:** A dump showing one leg of a relay in `read` and its partner in nothing is a join that outlived its bound; check it against `RELAY_JOIN` and the leg-witness tests before naming it a peer problem.
 
+**Add-on — sys-attribution:** `ferrox-bench`'s kernel tally cannot price a Rust relay's sys time: `/proc/<pid>/io` counts the `read`/`write` paths, and std's socket legs — `send`/`recv` — never appear there, which the `ps` witnesses show against a child that writes a file. Attribute the residual per thread instead: sample `/proc/<pid>/task/*/stat` for who holds the `stime`, then name the asks from the census' waits, and report a `0` per-GiB row as the instrument's gap rather than as a crossing that cost nothing.
+
 ## P20 · Scale the parameter surface without growing the app file
 
 **When to use:** A knob a reference ships is either unreachable from this tree's config or is plumbed ad-hoc through the app monolith, so adding the next one costs more of the same accretion rather than a section; the superset rows (README table N 116–124) all land through this shape.
