@@ -200,5 +200,6 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 
 <!-- scope:begin -->
 - paths: crates/ferrox-core/src/mux.rs
+- symbols: mux
 - go: ./common/mux/..., ./common/xudp/...
 <!-- scope:end -->

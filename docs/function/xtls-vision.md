@@ -272,5 +272,6 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/vision.rs
+- symbols: vision
 - oracle: vision
 <!-- scope:end -->
