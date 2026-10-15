@@ -43,12 +43,13 @@ summary="$PWD/$summary"
 
 dir="$(mktemp -d)"
 trap 'rm -rf "$dir"' EXIT
-if ! git clone --quiet --no-checkout "$repo" "$dir" 2>/dev/null; then
-  echo "::error::could not clone $repo"
-  exit 1
-fi
-if ! git -C "$dir" checkout --quiet "$rev" 2>/dev/null; then
-  echo "::error::xray-core rev $rev does not resolve on $repo"
+# One commit, the pinned one: go test reads the tree, never its history, and a
+# full clone of xray-core costs a minute the pin cannot pay back.
+if ! git init --quiet "$dir" >/dev/null 2>&1 \
+  || ! git -C "$dir" remote add origin "$repo" >/dev/null 2>&1 \
+  || ! git -C "$dir" fetch --quiet --no-tags --depth 1 origin "$rev" >/dev/null 2>&1 \
+  || ! git -C "$dir" checkout --quiet FETCH_HEAD 2>/dev/null; then
+  echo "::error::could not fetch $rev from $repo"
   exit 1
 fi
 head="$(git -C "$dir" rev-parse HEAD)"
