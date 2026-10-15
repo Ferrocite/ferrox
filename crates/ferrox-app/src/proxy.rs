@@ -10930,7 +10930,7 @@ mod tests {
         Box::new(crate::xhttp::XhttpSettings {
             path: path.to_owned(),
             // These rows are about what a hub that was *told* a mode refuses; an unstated mode serves every shape its dialer can write.
-            mode_stated: true,
+            mode_source: crate::xhttp::ModeSource::Stated,
             ..crate::xhttp::XhttpSettings::stream_one()
         })
     }
@@ -10942,7 +10942,7 @@ mod tests {
         Box::new(crate::xhttp::XhttpSettings {
             path: path.to_owned(),
             mode,
-            mode_stated: true,
+            mode_source: crate::xhttp::ModeSource::Stated,
             ..crate::xhttp::XhttpSettings::stream_one()
         })
     }
@@ -11392,7 +11392,15 @@ mod tests {
         assert_eq!(
             status_of(&up, req("POST", "/up", "").as_bytes()),
             400,
-            "stream-up without a session id"
+            "an uplink POST with no chunked framing"
+        );
+        assert_eq!(
+            status_of(
+                &up,
+                req("POST", "/up", "Transfer-Encoding: chunked\r\n").as_bytes()
+            ),
+            200,
+            "a stated stream-up hub serves a session-less POST, as the reference does"
         );
         assert_eq!(
             status_of(&up, req("GET", "/up/abc", "").as_bytes()),
