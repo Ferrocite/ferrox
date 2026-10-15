@@ -478,11 +478,11 @@ impl Comparison {
         let _ = writeln!(s, "### Per-repeat measurements\n");
         let _ = writeln!(
             s,
-            "| engine | run | throughput MiB/s | cpu ms/GiB | peak RSS MiB | threads | transfer s | traffic samples |"
+            "| engine | run | throughput MiB/s | cpu ms/GiB | cpu user/sys ms/GiB | peak RSS MiB | threads | transfer s | traffic samples |"
         );
         let _ = writeln!(
             s,
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
         );
         for entry in &self.by_engine {
             for (i, run) in entry.runs.iter().enumerate() {
@@ -491,9 +491,13 @@ impl Comparison {
                 } else {
                     format!("{:.2}", run.cpu_millis_per_gib())
                 };
+                let split = run.cpu_split_per_gib().map_or_else(
+                    || "n/a".to_owned(),
+                    |(user, sys)| format!("{user:.1} / {sys:.1}"),
+                );
                 let _ = writeln!(
                     s,
-                    "| {} | {} | {:.1} | {cpu} | {:.1} | {} | {:.3} | {} |",
+                    "| {} | {} | {:.1} | {cpu} | {split} | {:.1} | {} | {:.3} | {} |",
                     entry.engine,
                     i + 1,
                     run.throughput_mib_s(),
@@ -980,6 +984,9 @@ pub fn revalidate(result_path: &Path) -> Result<Run, Error> {
     let cpu_millis = num("cpu_millis")?;
     check_derived(&root, bytes_sent + bytes_received, seconds, cpu_millis)?;
     check_samples(&root, cpu_millis)?;
+    check_split(&root, cpu_millis)?;
+
+    let optional = |key: &str| root.get(key).and_then(Json::as_num).map(|n| n as u64);
 
     let read_setup = |key: &str| -> u128 {
         root.get("setup")
@@ -1021,6 +1028,8 @@ pub fn revalidate(result_path: &Path) -> Result<Run, Error> {
             setup,
             peak_rss_kib: num("peak_rss_kib")? as u64,
             cpu_millis: cpu_millis as u64,
+            user_millis: optional("cpu_user_millis"),
+            sys_millis: optional("cpu_sys_millis"),
             traffic_samples: samples
                 .iter()
                 .filter(|(phase, _)| *phase == parity::Phase::Traffic)
@@ -1109,6 +1118,31 @@ fn check_samples(root: &Json, cpu_millis: f64) -> Result<(), Error> {
     Ok(())
 }
 
+/// The split is the same cpu counted twice, so it has to add up to it: `/proc` and
+/// `GetProcessTimes` both report the pair, and a `ps` line reports neither.
+fn check_split(root: &Json, cpu_millis: f64) -> Result<(), Error> {
+    let user = root.get("cpu_user_millis").and_then(Json::as_num);
+    let sys = root.get("cpu_sys_millis").and_then(Json::as_num);
+    match (user, sys) {
+        (None, None) => Ok(()),
+        (Some(user), Some(sys)) => {
+            let whole = user + sys;
+            if (whole - cpu_millis).abs() > 1.0 {
+                return Err(Error::Invalid(format!(
+                    "cpu_user_millis {user} + cpu_sys_millis {sys} = {whole}, which is not \
+                     the {cpu_millis} ms of cpu the run reports"
+                )));
+            }
+            Ok(())
+        }
+        _ => Err(Error::Invalid(
+            "result.json reports half a cpu split: one of `cpu_user_millis` or \
+             `cpu_sys_millis` is missing"
+                .into(),
+        )),
+    }
+}
+
 fn read_samples(root: &Json) -> Vec<(parity::Phase, crate::ps::Sample)> {
     root.get("samples")
         .and_then(Json::as_arr)
@@ -1128,6 +1162,14 @@ fn read_samples(root: &Json) -> Vec<(parity::Phase, crate::ps::Sample)> {
                             elapsed_ms: read("elapsed_ms") as u128,
                             rss_kib: read("rss_kib") as u64,
                             cpu_millis: read("cpu_millis") as u64,
+                            user_millis: item
+                                .get("user_millis")
+                                .and_then(Json::as_num)
+                                .map(|n| n as u64),
+                            sys_millis: item
+                                .get("sys_millis")
+                                .and_then(Json::as_num)
+                                .map(|n| n as u64),
                             threads: item.get("threads").and_then(Json::as_num).map(|n| n as u64),
                         },
                     )
@@ -1150,6 +1192,28 @@ mod tests {
             dialect: parity::Dialect::Xray,
             protocols: &[],
         }
+    }
+
+    #[test]
+    fn a_cpu_split_has_to_add_up_to_the_cpu_it_splits() {
+        let mut root = Json::object();
+        root.insert("cpu_user_millis", Json::Num(600.0));
+        root.insert("cpu_sys_millis", Json::Num(400.0));
+        assert!(check_split(&root, 1000.0).is_ok());
+        assert!(
+            check_split(&root, 1200.0).is_err(),
+            "a pair that is not the whole cpu is not a split of it"
+        );
+        let mut half = Json::object();
+        half.insert("cpu_user_millis", Json::Num(600.0));
+        assert!(
+            check_split(&half, 1000.0).is_err(),
+            "half a split is a fault in the writer, not a gap in the source"
+        );
+        assert!(
+            check_split(&Json::object(), 1000.0).is_ok(),
+            "a ps-only run reports no split and is not a fault"
+        );
     }
 
     fn workload() -> Workload {
@@ -1189,6 +1253,8 @@ mod tests {
                 setup: Vec::new(),
                 peak_rss_kib: rss_kib,
                 cpu_millis,
+                user_millis: Some(cpu_millis * 2 / 3),
+                sys_millis: Some(cpu_millis - cpu_millis * 2 / 3),
                 traffic_samples: 10,
                 threads_peak: None,
                 startup_cpu_millis: 0,

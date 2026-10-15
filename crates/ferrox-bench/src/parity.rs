@@ -473,6 +473,9 @@ pub struct Outcome {
     pub setup: Vec<Setup>,
     pub peak_rss_kib: u64,
     pub cpu_millis: u64,
+    /// The same cpu the run reports, split by what the process ran; `None` where the sampler has no split.
+    pub user_millis: Option<u64>,
+    pub sys_millis: Option<u64>,
     pub traffic_samples: usize,
     pub threads_peak: Option<u64>,
     pub startup_cpu_millis: u64,
@@ -507,6 +510,17 @@ impl Run {
 
     pub fn rss_mib(&self) -> f64 {
         self.outcome.peak_rss_kib as f64 / KIB
+    }
+
+    /// The run's cpu split over the bytes it moved; `None` where the sampler has no split.
+    pub fn cpu_split_per_gib(&self) -> Option<(f64, f64)> {
+        let bytes = self.outcome.bytes_sent + self.outcome.bytes_received;
+        if bytes == 0 {
+            return None;
+        }
+        let gib = bytes as f64 / 1_073_741_824.0;
+        let (user, sys) = (self.outcome.user_millis?, self.outcome.sys_millis?);
+        Some((user as f64 / gib, sys as f64 / gib))
     }
 
     fn quartiles(values: &[u128]) -> Option<Quartiles> {
@@ -544,6 +558,12 @@ impl Run {
             item.insert("elapsed_ms", Json::Num(s.elapsed_ms as f64));
             item.insert("rss_kib", Json::Num(s.rss_kib as f64));
             item.insert("cpu_millis", Json::Num(s.cpu_millis as f64));
+            let millis = |value: Option<u64>| match value {
+                Some(v) => Json::Num(v as f64),
+                None => Json::Null,
+            };
+            item.insert("user_millis", millis(s.user_millis));
+            item.insert("sys_millis", millis(s.sys_millis));
             item.insert(
                 "threads",
                 match s.threads {
@@ -573,6 +593,9 @@ impl Run {
         root.insert("throughput_mib_s", Json::Num(self.throughput_mib_s()));
         root.insert("peak_rss_kib", Json::Num(o.peak_rss_kib as f64));
         root.insert("cpu_millis", Json::Num(o.cpu_millis as f64));
+        let split = |value: Option<u64>| value.map_or(Json::Null, |v| Json::Num(v as f64));
+        root.insert("cpu_user_millis", split(o.user_millis));
+        root.insert("cpu_sys_millis", split(o.sys_millis));
         root.insert("cpu_millis_per_gib", Json::Num(self.cpu_millis_per_gib()));
         root.insert(
             "cpu_resolution_floor_millis",
@@ -813,6 +836,8 @@ pub fn measure(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> Re
             setup: moved.setup,
             peak_rss_kib: summary.peak_rss_kib,
             cpu_millis: summary.cpu_millis,
+            user_millis: summary.user_millis,
+            sys_millis: summary.sys_millis,
             traffic_samples: summary.traffic_samples,
             threads_peak: summary.threads_peak,
             startup_cpu_millis,
@@ -825,23 +850,34 @@ pub fn measure(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> Re
 struct Summary {
     peak_rss_kib: u64,
     cpu_millis: u64,
+    user_millis: Option<u64>,
+    sys_millis: Option<u64>,
     traffic_samples: usize,
     threads_peak: Option<u64>,
     transfer: Duration,
 }
 
 fn summarise(samples: &[(Phase, ps::Sample)], moved: &Moved, startup_cpu_millis: u64) -> Summary {
+    let first = samples.first().copied().map(|(_, s)| s);
+    let last = samples.last().copied().map(|(_, s)| s);
+    // `startup_cpu_millis` is this first sample's cpu; the split is measured against the same one.
+    let split =
+        |read: fn(ps::Sample) -> Option<u64>| match (first.and_then(read), last.and_then(read)) {
+            (Some(start), Some(end)) => end.checked_sub(start),
+            _ => None,
+        };
     Summary {
         peak_rss_kib: samples
             .iter()
             .map(|(_, s)| s.rss_kib)
             .max()
             .unwrap_or_default(),
-        cpu_millis: samples
-            .last()
-            .map(|(_, s)| s.cpu_millis)
+        cpu_millis: last
+            .map(|s| s.cpu_millis)
             .unwrap_or_default()
             .saturating_sub(startup_cpu_millis),
+        user_millis: split(|s| s.user_millis),
+        sys_millis: split(|s| s.sys_millis),
         traffic_samples: samples
             .iter()
             .filter(|(phase, _)| *phase == Phase::Traffic)
