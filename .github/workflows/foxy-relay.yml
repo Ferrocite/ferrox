@@ -48,8 +48,39 @@ env:
   NO_PROXY: 127.0.0.1,localhost
 
 jobs:
+  plan:
+    name: does this change reach the lane
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      wide: ${{ steps.scope.outputs.wide }}
+      methods: ${{ steps.scope.outputs.methods }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: plan the scope
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT" == pull_request ]]; then
+            python3 scripts/ci-scope.py scope --base "$BASE"
+          else
+            python3 scripts/ci-scope.py scope --wide
+          fi
+
   foxy-relay:
     name: Foxy relay live (${{ matrix.os }})
+    needs: plan
+    # The lane speaks the foxy carriers and HTTP/3, so a change in either is live
+    # material here; a method the lane never dials is not, and this job otherwise
+    # costs three runners and real quota for it.
+    if: >-
+      needs.plan.outputs.wide == 'true'
+      || contains(needs.plan.outputs.methods, 'foxy')
+      || contains(needs.plan.outputs.methods, 'quic')
     runs-on: ${{ matrix.os }}
     timeout-minutes: 40
     strategy:

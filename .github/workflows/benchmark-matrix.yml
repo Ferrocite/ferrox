@@ -60,19 +60,37 @@ jobs:
       cells: ${{ steps.plan.outputs.cells }}
       oses: ${{ steps.plan.outputs.oses }}
       flags: ${{ steps.plan.outputs.flags }}
+      trees: ${{ steps.plan.outputs.trees }}
+      matrix: ${{ steps.plan.outputs.matrix }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - id: plan
         shell: bash
         env:
           EVENT: ${{ github.event_name }}
+          BASE: ${{ github.event.pull_request.base.sha }}
           WANT_TIER: ${{ inputs.tier }}
           WANT_ONLY: ${{ inputs.only }}
           WANT_REPEATS: ${{ inputs.repeats }}
           WANT_ENGINES: ${{ inputs.engines }}
         run: |
+          matrix=true
+          planned=""
           if [[ "$EVENT" == "pull_request" ]]; then
-            tier="smoke"
+            # A change that reaches one method is measured there, against every
+            # engine at the full tier's repeats; the methods it does not reach are
+            # not measured on this run at all. Shared code reaches everything, so a
+            # wide plan keeps the smoke cell and the nightly run carries the depth.
+            if [[ "$(python3 scripts/ci-scope.py scope --base "$BASE" |
+              sed -n 's/^wide=//p')" == "false" ]]; then
+              tier="full"
+              planned="$(python3 scripts/ci-scope.py scenarios)"
+              [[ -n "$planned" ]] || matrix=false
+            else
+              tier="smoke"
+            fi
             oses='["ubuntu-latest"]'
           elif [[ "$EVENT" == "workflow_dispatch" ]]; then
             tier="${WANT_TIER:-standard}"
@@ -83,7 +101,11 @@ jobs:
           fi
           case "$tier" in smoke | standard | full) ;; *) echo "::error::unknown tier $tier" >&2; exit 2 ;; esac
           source scripts/lib-matrix.sh
-          ids="$(scenarios "$tier" | awk '{print $1}')"
+          if [[ -n "$planned" ]]; then
+            ids="$planned"
+          else
+            ids="$(scenarios "$tier" | awk '{print $1}')"
+          fi
           if [[ -n "$WANT_ONLY" ]]; then
             kept=""
             for id in $ids; do
@@ -96,25 +118,38 @@ jobs:
           fi
           cells="$(for id in $ids; do printf '"%s",' "$id"; done)"
           cells="[${cells%,}]"
-          [[ "$cells" != "[]" ]] || { echo "::error::no scenario survived the filter" >&2; exit 1; }
+          # No cell is an error, unless the plan says so: a method the matrix does
+          # not measure yet has nothing to run here and the nightly wide run has it.
+          if [[ "$cells" == "[]" && "$matrix" != "false" ]]; then
+            echo "::error::no scenario survived the filter" >&2
+            exit 1
+          fi
           flags=""
           [[ -n "$WANT_REPEATS" ]] && flags="$flags --repeats $WANT_REPEATS"
           [[ -n "$WANT_ENGINES" ]] && flags="$flags --engines $WANT_ENGINES"
+          trees="xray-core,sing-box,zeronet,xray-rust"
+          [[ "$tier" == "smoke" && -z "$WANT_ENGINES" ]] && trees="xray-core"
           echo "tier=$tier" >> "$GITHUB_OUTPUT"
           echo "cells=$cells" >> "$GITHUB_OUTPUT"
           echo "oses=$oses" >> "$GITHUB_OUTPUT"
           echo "flags=$flags" >> "$GITHUB_OUTPUT"
+          echo "trees=$trees" >> "$GITHUB_OUTPUT"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "tier $tier cells: $cells"
 
   fetch:
-    name: fetch the four comparator trees
+    name: fetch the comparator trees this plan compares against
     runs-on: ubuntu-latest
+    needs: setup
+    if: needs.setup.outputs.matrix == 'true'
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
       - name: fetch at the pins
         shell: bash
-        run: ./scripts/fetch-upstream.sh --only xray-core,sing-box,zeronet,xray-rust
+        env:
+          TREES: ${{ needs.setup.outputs.trees }}
+        run: ./scripts/fetch-upstream.sh --only "$TREES"
       - uses: actions/upload-artifact@v4
         with:
           name: upstream-trees
@@ -221,7 +256,9 @@ jobs:
     name: render the bundle (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     needs: [setup, cells]
-    if: ${{ !cancelled() }}
+    # `!cancelled()` alone would run this after a skipped matrix: the plan decided
+    # no cell of it is in scope, and a render over an empty bundle is a red job.
+    if: ${{ !cancelled() && needs.setup.outputs.matrix == 'true' }}
     timeout-minutes: 20
     strategy:
       fail-fast: false
