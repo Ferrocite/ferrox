@@ -1651,7 +1651,7 @@ fn serve_session_grpc<R: Read, W: FrameWrite + 'static>(
 fn accept_tls_session(
     stream: TcpStream,
     server: &ferrox_core::tls::TlsServerConfig,
-) -> Option<impl ferrox_core::tls::TlsProvider + Send> {
+) -> Option<impl ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send> {
     let Ok(mut session) = ferrox_core::tls::accept(server, stream) else {
         echo_trace("tls-server accept refused");
         return None;
@@ -3868,7 +3868,9 @@ fn session_halves<S>(session: S) -> (TlsHalf<S>, TlsHalf<S>) {
 }
 
 // A dialled TLS session a carrier can drive: split into a reader and a writer over one lock, plus the raw socket the sink shuts down on teardown.
-trait Dialed: ferrox_core::tls::TlsProvider + Send + 'static {
+trait Dialed:
+    ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send + 'static
+{
     fn into_halves(self) -> Option<(TlsHalf<Self>, TlsHalf<Self>, Arc<TcpStream>)>
     where
         Self: Sized;
@@ -7563,9 +7565,15 @@ impl FrameWrite for TcpStream {
     }
 }
 
-impl<S: ferrox_core::tls::TlsProvider + Send> FrameWrite for TlsHalf<S> {
+impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send> FrameWrite
+    for TlsHalf<S>
+{
+    // One lock, one call: every part of the frame reaches the session as segments of one payload, so it seals one record where a write per part sealed one each.
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
-        parts.iter().all(|part| self.write_all(part).is_ok())
+        let Ok(mut session) = self.session.lock() else {
+            return false;
+        };
+        session.write_all_slices(parts).is_ok()
     }
 }
 
@@ -14728,6 +14736,125 @@ mod tests {
             "the payload must be the writev part itself, not a copy of it"
         );
         assert_eq!(parts[1].iov_len, 1400);
+    }
+
+    /// What a framed write reached the session with: the call shape, which a byte test cannot see.
+    #[derive(Default)]
+    struct Seam {
+        writes: usize,
+        calls: Vec<(usize, Vec<usize>)>,
+        out: Vec<u8>,
+    }
+
+    /// A TLS session that records the seam instead of sealing records: it answers with what it was
+    /// handed, so one call per frame and the caller's own buffer bases are both observable.
+    #[derive(Clone, Default)]
+    struct CountedSession {
+        seam: Arc<Mutex<Seam>>,
+    }
+
+    impl Read for CountedSession {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "no peer",
+            ))
+        }
+    }
+
+    impl Write for CountedSession {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut seam = self.seam.lock().expect("records");
+            seam.writes += 1;
+            seam.out.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ferrox_core::tls::TlsProvider for CountedSession {
+        fn name() -> &'static str
+        where
+            Self: Sized,
+        {
+            "counted"
+        }
+
+        fn suites(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn handshake(&mut self) -> Result<(), ferrox_core::tls::TlsError> {
+            Ok(())
+        }
+
+        fn alpn(&self) -> Option<&[u8]> {
+            None
+        }
+    }
+
+    impl ferrox_core::tls::RecordAlignment for CountedSession {
+        fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+            let mut seam = self.seam.lock().expect("records");
+            let bases = parts.iter().map(|part| part.as_ptr() as usize).collect();
+            seam.calls.push((parts.len(), bases));
+            for part in parts {
+                seam.out.extend_from_slice(part);
+            }
+            Ok(())
+        }
+    }
+
+    /// One frame reaches a TLS session in one call whose segments are the caller's buffers: a write
+    /// per part sealed one record each, and staging the frame would deliver the same bytes by copy.
+    #[test]
+    fn a_frame_reaches_the_tls_session_in_one_call() {
+        let seam = Arc::new(Mutex::new(Seam::default()));
+        let (_reader, mut writer) = session_halves(CountedSession {
+            seam: Arc::clone(&seam),
+        });
+        let body: Vec<u8> = (0..1400).map(|i| (i as u8) ^ 0x5A).collect();
+        let tail: Vec<u8> = (0..64).map(|i| !i).collect();
+
+        assert!(
+            crate::h2::write_frame(&mut writer, crate::h2::T_DATA, 0, 7, &body),
+            "a DATA frame of head and body is written"
+        );
+        assert!(crate::h2::write_frame_parts(
+            &mut writer,
+            crate::h2::T_DATA,
+            0,
+            8,
+            &body,
+            &tail
+        ));
+
+        let seam = seam.lock().expect("records");
+        assert_eq!(
+            seam.writes, 0,
+            "no part left the seam as a write of its own"
+        );
+        assert_eq!(seam.calls.len(), 2, "one call for each frame");
+        assert_eq!(seam.calls[0].0, 2, "head and body");
+        assert_eq!(seam.calls[1].0, 3, "head, first and second");
+        assert_eq!(
+            seam.calls[0].1[1],
+            body.as_ptr() as usize,
+            "the payload segment is the caller's buffer, not a copy of it"
+        );
+        assert_eq!(seam.calls[1].1[1], body.as_ptr() as usize);
+        assert_eq!(seam.calls[1].1[2], tail.as_ptr() as usize);
+
+        let mut want = Vec::new();
+        want.extend_from_slice(&[0u8, 5, 0x78, crate::h2::T_DATA, 0, 0, 0, 0, 7]);
+        want.extend_from_slice(&body);
+        want.extend_from_slice(&[0u8, 5, 0xb8, crate::h2::T_DATA, 0, 0, 0, 0, 8]);
+        want.extend_from_slice(&body);
+        want.extend_from_slice(&tail);
+        assert_eq!(seam.out, want, "the same bytes, in the same order");
     }
 
     /// A two-byte length must never truncate, so an oversize payload is a panic, not a wrap.
