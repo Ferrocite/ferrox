@@ -207,10 +207,13 @@ intervals do not touch:
 So the batch buys about 20% more throughput and about 16% less CPU per byte
 relative to the same reference, and the two intervals being disjoint is what
 makes that a resolved difference rather than a duration that suggests. The price
-is the one the page names: peak RSS went 8.01 → 9.38 MiB over 8 connections,
-+1.37 MiB against the 1.25 MiB the arithmetic predicts
-(8 connections × 2 legs × 82 121 B), and the thread count did not move at all
-(36 before, 36 after). RSS is still 6.6× under the reference.
+is the one the page names: peak RSS went 8.01 → 9.38 MiB over 8 connections, and
+the two buffers this change sizes account for +82 121 B per connection, which
+predicts +0.63 MiB over the eight. The remaining 0.74 MiB is allocator rounding
+and buffers this diff does not size; no run here attributes it, so the measured
+number is what this page carries rather than the predicted one. The thread count
+did not move at all (36 before, 36 after), and RSS is still 6.6× under the
+reference.
 
 The relay harness (`parity.yml` gate 5: 1 flow × 131 072 × 65 536 B, 4 engines ×
 5 paired repeats, `linux x86_64`) agrees, and says so more quietly. Before, on
@@ -395,11 +398,20 @@ Of what is *not* batched either, in the same breath as its cost: the
 `rc4-md5` rung keeps its one-chunk relay read (`READ_CHUNK = MAX_CHUNK`),
 because a stream has no chunk boundaries to preserve and every carrier frame
 the relay writes would change size with the read — a 64 KiB WebSocket frame
-where a peer saw 16 KiB frames is a wire change, not a win. And the batch is not
-free: 80 KiB of buffer per connection more than before, one allocation per leg
-either way. That is the trade the `compare` gate's peak-RSS ratio row reads,
-and nothing on this page claims it is free — no memory row here has a checker
-that observes bytes, so the number is prose, not a count.
+where a peer saw 16 KiB frames is a wire change, not a win. Nor does the UDP leg
+batch: `recvmmsg`/`sendmmsg` over a datagram socket is the same class of win on
+the other transport, and the matrix has no shadowsocks-udp cell to price it in —
+`scripts/lib-matrix.sh` builds this method's engine with `"network": "tcp"` and
+its one scenario is `shadowsocks-raw-down-8`, so a datagram batch would ship with
+no gate that observes it. That is the reason it is not here, and it is the row
+`udp-datagram-reallocations-after-the-first 0` does not claim. And the batch is
+not free: 80 KiB of buffer per connection more than before, one allocation per
+leg either way. The matched pair of runs read that price rather than leaving it
+prose alone — peak RSS 8.01 → 9.38 MiB over 8 connections, where the 82 121 B per
+connection accounts for 0.63 MiB of the 1.37 measured and the rest is allocator
+rounding no run here attributes — and nothing on this page claims it is free; no
+memory row here has a checker that observes bytes, so the row stays out of the
+table even though the number has been read.
 
 ## Pins
 
