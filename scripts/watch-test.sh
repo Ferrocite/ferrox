@@ -141,13 +141,13 @@ culprit() {
   return 1
 }
 
-# last_binary LOG: the test executable cargo had started when the log stopped.
+# last_binary LOG: the runnable path of the test executable cargo had started when the log stopped.
 last_binary() {
-  sed -n 's/^.*(target\/[^)]*\/\([^/()]*\)).*$/\1/p' "$1" | tail -1
+  sed -n 's/.*(\([^()]*target[\\/][^()]*\)).*/\1/p' "$1" | tail -1 | tr '\\' '/'
 }
 
 selftest_run() {
-  local fake="$PWD/target/ci/selftest-fake" want
+  local fake="$PWD/target/ci/selftest-fake-abcd" want got
   mkdir -p target/ci
   cat >"$fake" <<'EOF'
 #!/usr/bin/env bash
@@ -174,6 +174,19 @@ EOF
   want="$(culprit "$fake")" || { echo "selftest: the stalled test was not named" >&2; return 1; }
   [[ "$want" == "hangs::forever" ]] || { echo "selftest: named '$want', want hangs::forever" >&2; return 1; }
   echo "selftest: ok   a stall stops at the quiet limit and the test that stalls is named"
+  # culprit() runs only on what last_binary() hands back, and that has to be a runnable path:
+  # cargo writes the deps separator as `/` on unix and `\` on Windows.
+  out="target/ci/selftest-last.log"
+  printf '%s\n' 'test x ... ok' '     Running unittests src\main.rs (target\ci\selftest-fake-abcd)' >"$out"
+  got="$(last_binary "$out")"
+  [[ "$got" == "target/ci/selftest-fake-abcd" ]] || {
+    echo "selftest: a windows-shaped Running line yielded '$got'" >&2; return 1; }
+  [[ -x "$got" ]] || {
+    echo "selftest: last_binary yielded '$got', which is not runnable: no test would be run alone" >&2; return 1; }
+  [[ "$(last_binary <(printf '%s\n' '     Running unittests src/main.rs (target/ci/selftest-fake-abcd)'))" \
+    == "target/ci/selftest-fake-abcd" ]] || {
+    echo "selftest: a unix-shaped Running line did not yield the same path" >&2; return 1; }
+  echo "selftest: ok   the stalled run's log yields the runnable binary, on both separators"
   watch "sleep 0.2; echo alive" >/dev/null
   ((STALLED == 0 && WRC == 0)) || { echo "selftest: a working command read as stalled" >&2; return 1; }
   watch "exit 3" >/dev/null
