@@ -17,7 +17,7 @@ each page carries a scope block between `<!-- scope:begin -->` and
 | --- | --- | --- |
 | `paths` | the source files that trigger this method | `scripts/ci-scope.py` classifies a diff with them |
 | `scenarios` | substring patterns over the matrix ids in `scripts/lib-matrix.sh` | `benchmark-matrix.yml` |
-| `oracle` | test-name patterns over each enabled pin's suite | `conformance.yml`, `interop-baseline.yml` |
+| `oracle` | test-name patterns over each enabled pin's suite | `conformance.yml` narrows the suite to those names; `interop-baseline.yml` only decides whether the suite is reached, and runs a suite that stays whole |
 | `go` | packages of the pinned reference that test this method | `xray-baseline.yml` |
 
 `oracle` patterns may be bound to one suite with `pin=pattern`, which is how
@@ -63,7 +63,7 @@ skipped and why without opening a log.
 | `ci.yml`'s `test` (three runners) | `rust` | no `.rs`, `Cargo.*` or tool change ⇒ the prose did not move the compiler |
 | `ops.yml`'s `counts` | `ops`, then `rust` for the exact-count step | the row list is the touched methods'; the blessed-count check only rebuilds when Rust moved |
 | `benchmark-matrix.yml`'s `fetch…collect` | `matrix` | a method the matrix does not measure has no cell to run |
-| `conformance.yml`'s `suites`, `interop-baseline.yml`'s `baseline` | `suites` | a pin whose suite holds no test in scope is skipped, and says so |
+| `conformance.yml`'s `suites`, `interop-baseline.yml`'s `baseline` | `suites` | a pin whose suite holds no test in scope is skipped, and says so; conformance then narrows the suite it keeps to those names, while the baseline runs a suite that stays whole |
 | `xray-baseline.yml`'s `baseline` | `go` | only the reference packages that test the touched methods |
 | `foxy-relay.yml`'s live lane | `wide`, or `methods` naming foxy or quic | the lane dials those carriers; a method it never dials does not owe three runners and real quota |
 
@@ -101,10 +101,16 @@ files no page owns are the shared ones (`proxy.rs`, `config.rs`, `transport.rs`,
 the wireguard tree, …), so they plan wide by design: `check-ci-scope.sh` prints
 that list and fails when it changes shape.
 
-A method page moves its method's measurements and not the compiler: the page is
-where the counts live, so `ops`, the matrix cell, the oracle names and the
-reference packages for that method all run, while the three-runner workspace
-build in `ci.yml` does not. `README.md` is not a page, so it moves nothing.
+Two gates stack in front of any measurement. A workflow's own
+`on.pull_request.paths` decides whether it starts at all, and the plan then
+decides which of its jobs run. Of the jobs above only `ci.yml` and `ops.yml`
+start on `docs/**`, so a method page re-measures its method's ops rows and not
+the compiler: the matrix, the oracle suites and the reference stay with the
+source changes their filters name, and with the weekly wide run. The `cells`,
+`oracle` and `go` columns are therefore what the planner answers *for the
+method*, which is what a change to that method's source file pays — editing
+`docs/function/vmess.md` and editing `crates/ferrox-app/src/vmess.rs` plan the
+same scope, and only the second one starts the workflows that measure it.
 
 The `rows` column is the one that costs wall-clock: a valgrind run per row, so a
 VMess change pays 1 measurement instead of 24. A narrow plan also *deepens* what
@@ -129,11 +135,10 @@ pull requests, is what the gate is actually buying:
 So a VMess change used to pay for a whole reference tree's test suite, three
 whole oracle suites, 24 valgrind runs, a live three-runner dial of a lane it does
 not touch, and a VLESS benchmark. It now pays for one run, two reference
-packages, two oracle tests, and the VMess cell against all five engines. A method
-page pays that same measurement with no compiler at all — `ci.yml`'s three
-runners are what it drops, since the counts on the page are what moved, not the
-code they describe. Prose no page is about, `README.md` included, drops the
-measurements too and leaves only the gates that read the declarations.
+packages, two oracle tests, and the VMess cell against all five engines, and it
+skips the live lane. A method page keeps only its own ops rows and drops the
+compiler, and `README.md` drops those too: what is left on a prose run is the
+gate that reads the declarations.
 
 Not claimed: that this is a fixed factor. It is a function of how much of the
 tree a change touches, and the honest summary is that a single-method change now
