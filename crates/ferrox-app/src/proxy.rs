@@ -6169,10 +6169,14 @@ fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
     ) else {
         return;
     };
-    let mut buf = vec![0u8; UDP_BUF];
-    let mut datagrams = crate::shadowsocks::Datagrams::new();
-    while let Ok((n, src)) = relay.recv_from(&mut buf) {
-        let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+    let mut buf = Vec::new();
+    resize_scratch(&mut buf, crate::shadowsocks::DATAGRAM_MAX);
+    while let Ok((n, src)) = relay
+        .recv_from(&mut buf[crate::shadowsocks::SEAL_ROOM..crate::shadowsocks::SEAL_ROOM + UDP_BUF])
+    {
+        let Some((dest, payload)) =
+            parse_socks_udp(&buf[crate::shadowsocks::SEAL_ROOM..crate::shadowsocks::SEAL_ROOM + n])
+        else {
             continue;
         };
         if payload.is_empty() {
@@ -6181,7 +6185,13 @@ fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
         if let Ok(mut slot) = source.lock() {
             *slot = Some(src);
         }
-        if let Some(packet) = datagrams.seal(&master, method, &dest, payload) {
+        let (at, len) = (
+            payload.as_ptr() as usize - buf.as_ptr() as usize,
+            payload.len(),
+        );
+        if let Some(packet) =
+            crate::shadowsocks::seal_datagram(&master, method, &dest, &mut buf, at, len)
+        {
             let _ = uplink.send(packet);
         }
     }
@@ -6317,15 +6327,22 @@ fn spawn_ss_udp_reader(
     let send = relay.try_clone().ok()?;
     let master = master.clone();
     Some(RelayPool::global().run(move || {
-        let mut buf = vec![0u8; UDP_BUF];
-        let mut reply = Vec::with_capacity(UDP_BUF);
-        let mut datagrams = crate::shadowsocks::Datagrams::new();
+        let mut buf = Vec::new();
+        resize_scratch(&mut buf, crate::shadowsocks::DATAGRAM_MAX);
+        let room = crate::shadowsocks::SEAL_ROOM;
+        let base = buf.as_ptr() as usize;
         loop {
-            match read.recv(&mut buf) {
+            match read.recv(&mut buf[room..room + UDP_BUF]) {
                 Ok(n) => {
-                    let Some((target, payload)) = datagrams.open(&master, method, &buf[..n]) else {
+                    let opened = crate::shadowsocks::open_datagram(
+                        &master,
+                        method,
+                        &mut buf[room..room + n],
+                    );
+                    let Some((target, payload)) = opened else {
                         continue;
                     };
+                    let (at, len) = (payload.as_ptr() as usize - base, payload.len());
                     let dest = match source.lock() {
                         Ok(guard) => *guard,
                         Err(_) => None,
@@ -6333,11 +6350,14 @@ fn spawn_ss_udp_reader(
                     let Some(dest) = dest else {
                         continue;
                     };
-                    reply.clear();
-                    reply.extend_from_slice(&[0, 0, 0]);
-                    push_socks_addr(&mut reply, &target);
-                    reply.extend_from_slice(payload);
-                    let _ = send.send_to(&reply, dest);
+                    let head = 3 + match target {
+                        SocketAddr::V4(_) => 7,
+                        SocketAddr::V6(_) => 19,
+                    };
+                    let start = at - head;
+                    buf[start..start + 3].fill(0);
+                    crate::shadowsocks::write_addr(&mut buf[start + 3..at], &target);
+                    let _ = send.send_to(&buf[start..at + len], dest);
                 }
                 Err(error) if is_timeout(&error) => {
                     if done.load(Ordering::Relaxed) {
@@ -14111,9 +14131,10 @@ mod tests {
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let master = ferrox_core::shadowsocks::MasterKey::new(password, 32);
         let method = ferrox_core::shadowsocks::Method::Aes256Gcm;
-        let mut datagrams = crate::shadowsocks::Datagrams::new();
-        let packet = datagrams
-            .seal(&master, method, &target, b"ping")
+        let mut wire = vec![0u8; crate::shadowsocks::DATAGRAM_MAX];
+        let at = crate::shadowsocks::SEAL_ROOM;
+        wire[at..at + 4].copy_from_slice(b"ping");
+        let packet = crate::shadowsocks::seal_datagram(&master, method, &target, &mut wire, at, 4)
             .expect("seals")
             .to_vec();
         let mut attempts = 0usize;
@@ -14140,7 +14161,8 @@ mod tests {
             let Some(n) = echoed else {
                 continue;
             };
-            let (source, payload) = datagrams.open(&master, method, &back[..n]).expect("opens");
+            let (source, payload) =
+                crate::shadowsocks::open_datagram(&master, method, &mut back[..n]).expect("opens");
             assert_eq!(source.port(), target.port());
             assert_eq!(payload, b"ping");
             return;

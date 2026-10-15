@@ -370,7 +370,7 @@ pub(crate) fn client_send_handshake(
     push_addr(&mut addr, target, 4);
     addr.extend_from_slice(&target.port().to_be_bytes());
     let n = addr.len();
-    let mut buf = vec![0u8; SEAL_HEAD + n + TAG_LEN];
+    let mut buf = unfilled(SEAL_HEAD + n + TAG_LEN);
     buf[SEAL_HEAD..SEAL_HEAD + n].copy_from_slice(&addr);
     seal_all(&mut send, &mut buf, n, uplink).ok()?;
     Some((send, Recv::Waiting(method, master)))
@@ -425,7 +425,7 @@ pub(crate) fn pump_relay_carried<R, W>(
     let mut send = send;
     let thread_close = std::sync::Arc::clone(close);
     let done = thread::spawn(move || {
-        let mut buf = vec![0u8; SEAL_HEAD + READ_CHUNK + TAG_LEN];
+        let mut buf = unfilled(SEAL_HEAD + READ_CHUNK + TAG_LEN);
         while let Ok(read) = plain_read.read(&mut buf[SEAL_HEAD..SEAL_HEAD + READ_CHUNK]) {
             if read == 0 {
                 break;
@@ -475,7 +475,7 @@ pub(crate) fn pump_relay_carried<R, W>(
             }
         }
     } else if let Some(mut rc4) = stream {
-        let mut buf = vec![0u8; READ_CHUNK];
+        let mut buf = unfilled(READ_CHUNK);
         while let Some(payload) = open_stream(&mut reader, &mut rc4, &mut buf) {
             if plain_write.write_all(payload).is_err() {
                 break;
@@ -512,13 +512,14 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
         }
     }
     let mut table: HashMap<SocketAddr, SocketAddr> = HashMap::new();
-    let mut buf = vec![0u8; UDP_BUF];
-    let mut reply = vec![0u8; UDP_BUF];
-    let mut datagrams = Datagrams::new();
+    let mut buf = unfilled(DATAGRAM_MAX);
+    let mut reply = unfilled(DATAGRAM_MAX);
     loop {
-        match clients.recv_from(&mut buf) {
+        match clients.recv_from(&mut buf[SEAL_ROOM..SEAL_ROOM + UDP_BUF]) {
             Ok((n, src)) => {
-                if let Some((dest, payload)) = datagrams.open(&master, method, &buf[..n]) {
+                if let Some((dest, payload)) =
+                    open_datagram(&master, method, &mut buf[SEAL_ROOM..SEAL_ROOM + n])
+                {
                     if table.len() >= 4096 {
                         table.clear();
                     }
@@ -536,9 +537,11 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
             Err(_) => break,
         }
         for sock in [&upstream].into_iter().chain(upstream6.as_ref()) {
-            while let Ok((n, src)) = sock.recv_from(&mut reply) {
+            while let Ok((n, src)) = sock.recv_from(&mut reply[SEAL_ROOM..SEAL_ROOM + UDP_BUF]) {
                 if let Some(client) = table.get(&src) {
-                    if let Some(packet) = datagrams.seal(&master, method, &src, &reply[..n]) {
+                    if let Some(packet) =
+                        seal_datagram(&master, method, &src, &mut reply, SEAL_ROOM, n)
+                    {
                         let _ = clients.send_to(packet, client);
                     }
                 }
@@ -555,7 +558,19 @@ pub(crate) const SEAL_HEAD: usize = LENGTH_LEN + TAG_LEN;
 
 /// A chunk buffer sized once: `open_chunk` writes into a prefix of it, so no read ever grows or re-zeroes it.
 pub(crate) fn wire_buffer() -> Vec<u8> {
-    vec![0u8; WIRE_MAX]
+    unfilled(WIRE_MAX)
+}
+
+/// Room for a read to write into without a zero pass first: every byte is written before any code observes it, so the fill was work generated and thrown away.
+#[allow(
+    clippy::uninit_vec,
+    reason = "the buffer is a read target: the read that owns every byte writes before any code reads one"
+)]
+fn unfilled(len: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(len);
+    // SAFETY: every path hands the buffer to a read that initialises the bytes it reports, and no path reads a byte that was not written.
+    unsafe { buf.set_len(len) };
+    buf
 }
 
 /// Seal `n` payload bytes at `buf[SEAL_HEAD..]` and hand seals and payload to `out` in one write: a payload byte is never copied in user space, and one call seals one chunk because the first chunk's tag would clobber a second's plaintext — oversize input is refused loudly rather than corrupted quietly.
@@ -637,7 +652,7 @@ impl<R: Read> ChunkReader<R> {
     fn new(read: R) -> Self {
         Self {
             read,
-            buf: vec![0u8; 2 * WIRE_MAX],
+            buf: unfilled(2 * WIRE_MAX),
             at: 0,
             end: 0,
         }
@@ -697,92 +712,78 @@ fn open_stream<'a>(stream: &mut dyn Read, rc4: &mut Rc4, buf: &'a mut [u8]) -> O
     }
 }
 
-/// The two buffers one UDP socket thread reuses for every datagram it sends and opens: one scratch per direction, owned by the thread that owns the socket, so a datagram costs no allocation and no pass over the payload beyond the copy the address header forces.
-pub(crate) struct Datagrams {
-    sealed: Vec<u8>,
-    opened: Vec<u8>,
+/// Room a sealed datagram's salt and address header take before its payload: the widest header is an IPv6 one at 19 bytes.
+pub(crate) const SEAL_ROOM: usize = SALT_LEN + 19;
+
+/// One UDP datagram's whole wire room: the headroom a seal needs, the payload, and one AEAD tag.
+pub(crate) const DATAGRAM_MAX: usize = SEAL_ROOM + UDP_BUF + TAG_LEN;
+
+/// One SOCKS-style address header — kind, octets, port — written where a datagram's buffer has room for it, so a per-datagram `Vec` is not needed to build the head.
+pub(crate) fn write_addr(out: &mut [u8], dest: &SocketAddr) -> usize {
+    match dest {
+        SocketAddr::V4(v4) => {
+            out[0] = 1;
+            out[1..5].copy_from_slice(&v4.ip().octets());
+            out[5..7].copy_from_slice(&v4.port().to_be_bytes());
+            7
+        }
+        SocketAddr::V6(v6) => {
+            out[0] = 4;
+            out[1..17].copy_from_slice(&v6.ip().octets());
+            out[17..19].copy_from_slice(&v6.port().to_be_bytes());
+            19
+        }
+    }
 }
 
-impl Datagrams {
-    pub(crate) fn new() -> Self {
-        Self {
-            sealed: Vec::new(),
-            opened: Vec::new(),
+/// Seal `n` payload bytes already at `buf[at..at + n]`, writing the salt or stream IV and the address header into the headroom before it and the tag after it: a datagram is sealed where the socket put it, with no per-datagram buffer and no second pass over the payload.
+pub(crate) fn seal_datagram<'a>(
+    master: &MasterKey,
+    method: Method,
+    dest: &SocketAddr,
+    buf: &'a mut [u8],
+    at: usize,
+    n: usize,
+) -> Option<&'a [u8]> {
+    let addr_bytes = if dest.is_ipv6() { 19 } else { 7 };
+    if method.is_stream() {
+        let head = IV_LEN + addr_bytes;
+        if at < head || at + n > buf.len() {
+            return None;
         }
-    }
-
-    pub(crate) fn seal(
-        &mut self,
-        master: &MasterKey,
-        method: Method,
-        dest: &SocketAddr,
-        payload: &[u8],
-    ) -> Option<&[u8]> {
-        if method.is_stream() {
-            return self.seal_stream(master, dest, payload);
-        }
-        let salt_len = method.key_len();
-        let mut salt = [0u8; SALT_LEN];
-        getrandom::getrandom(&mut salt[..salt_len]).ok()?;
-        let mut cipher = Cipher::from_master_key(method, master, &salt[..salt_len])?;
-        let out = &mut self.sealed;
-        out.clear();
-        out.reserve(salt_len + 20 + payload.len() + TAG_LEN);
-        out.extend_from_slice(&salt[..salt_len]);
-        push_addr(out, dest, 4);
-        out.extend_from_slice(&dest.port().to_be_bytes());
-        out.extend_from_slice(payload);
-        cipher.seal_tail_in_place(out, salt_len)?;
-        Some(out)
-    }
-
-    /// The IV and the address header precede the payload and the stream opens in place, so the payload stays where the datagram put it: one copy in, no tag, and no `memmove` at all.
-    fn seal_stream(
-        &mut self,
-        master: &MasterKey,
-        dest: &SocketAddr,
-        payload: &[u8],
-    ) -> Option<&[u8]> {
         let mut iv = [0u8; IV_LEN];
         getrandom::getrandom(&mut iv).ok()?;
         let key = rc4_md5_key(master.as_bytes(), &iv)?;
         let mut rc4 = Rc4::new(&key)?;
-        let out = &mut self.sealed;
-        out.clear();
-        out.reserve(IV_LEN + 20 + payload.len());
-        out.extend_from_slice(&iv);
-        let at = out.len();
-        push_addr(out, dest, 4);
-        out.extend_from_slice(&dest.port().to_be_bytes());
-        out.extend_from_slice(payload);
-        rc4.crypt(&mut out[at..]);
-        Some(out)
+        let clear_at = at - head;
+        buf[clear_at..clear_at + IV_LEN].copy_from_slice(&iv);
+        write_addr(&mut buf[clear_at + IV_LEN..at], dest);
+        rc4.crypt(&mut buf[at - addr_bytes..at + n]);
+        return Some(&buf[clear_at..at + n]);
     }
-
-    /// The salt and the address header precede the payload and the AEAD opens in place, so the payload stays where the datagram put it: one copy in, and the returned slice points into it rather than at a second buffer.
-    pub(crate) fn open(
-        &mut self,
-        master: &MasterKey,
-        method: Method,
-        packet: &[u8],
-    ) -> Option<(SocketAddr, &[u8])> {
-        if method.is_stream() {
-            return self.open_stream(master, packet);
-        }
-        let salt_len = method.key_len();
-        if packet.len() < salt_len + TAG_LEN + 1 {
-            return None;
-        }
-        let mut cipher = Cipher::from_master_key(method, master, &packet[..salt_len])?;
-        let sealed = &mut self.opened;
-        sealed.clear();
-        sealed.extend_from_slice(&packet[salt_len..]);
-        let len = cipher.open_in_place(sealed)?;
-        let (target, used) = parse_addr_header(&sealed[..len])?;
-        Some((target, &sealed[used..len]))
+    let salt_len = method.key_len();
+    let head = salt_len + addr_bytes;
+    if at < head || at + n + TAG_LEN > buf.len() {
+        return None;
     }
+    let mut salt = [0u8; SALT_LEN];
+    getrandom::getrandom(&mut salt[..salt_len]).ok()?;
+    let mut cipher = Cipher::from_master_key(method, master, &salt[..salt_len])?;
+    let clear_at = at - head;
+    buf[clear_at..clear_at + salt_len].copy_from_slice(&salt[..salt_len]);
+    write_addr(&mut buf[clear_at + salt_len..at], dest);
+    let tag = cipher.seal_piece_in_place(&mut buf[at - addr_bytes..at + n])?;
+    buf[at + n..at + n + TAG_LEN].copy_from_slice(&tag);
+    Some(&buf[clear_at..at + n + TAG_LEN])
+}
 
-    fn open_stream(&mut self, master: &MasterKey, packet: &[u8]) -> Option<(SocketAddr, &[u8])> {
+/// Open one wire datagram in place in the caller's buffer: the salt and the address header precede the payload and the payload comes back where the datagram put it, so a datagram costs no allocation, no second buffer and no `memmove`.
+pub(crate) fn open_datagram<'a>(
+    master: &MasterKey,
+    method: Method,
+    packet: &'a mut [u8],
+) -> Option<(SocketAddr, &'a [u8])> {
+    if method.is_stream() {
         if packet.len() < IV_LEN + 1 {
             return None;
         }
@@ -790,13 +791,19 @@ impl Datagrams {
         iv.copy_from_slice(&packet[..IV_LEN]);
         let key = rc4_md5_key(master.as_bytes(), &iv)?;
         let mut rc4 = Rc4::new(&key)?;
-        let sealed = &mut self.opened;
-        sealed.clear();
-        sealed.extend_from_slice(&packet[IV_LEN..]);
-        rc4.crypt(sealed);
-        let (target, used) = parse_addr_header(sealed)?;
-        Some((target, &sealed[used..]))
+        rc4.crypt(&mut packet[IV_LEN..]);
+        let (target, used) = parse_addr_header(&packet[IV_LEN..])?;
+        return Some((target, &packet[IV_LEN + used..]));
     }
+    let salt_len = method.key_len();
+    if packet.len() < salt_len + TAG_LEN + 1 {
+        return None;
+    }
+    let mut cipher = Cipher::from_master_key(method, master, &packet[..salt_len])?;
+    let body = &mut packet[salt_len..];
+    let len = cipher.open_in_place(body)?;
+    let (target, used) = parse_addr_header(&body[..len])?;
+    Some((target, &body[used..len]))
 }
 
 fn parse_addr_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {
@@ -1133,6 +1140,31 @@ mod tests {
         assert_eq!(back, want, "every byte came back");
     }
 
+    /// Seal one datagram into a buffer of its own, the way a socket thread hands its payload to the sealer.
+    fn seal_to_wire(
+        master: &MasterKey,
+        method: Method,
+        dest: &SocketAddr,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut buf = vec![0u8; DATAGRAM_MAX];
+        buf[SEAL_ROOM..SEAL_ROOM + payload.len()].copy_from_slice(payload);
+        seal_datagram(master, method, dest, &mut buf, SEAL_ROOM, payload.len())
+            .expect("seals")
+            .to_vec()
+    }
+
+    /// Open one wire datagram and copy out what it carried, for the tests that compare bytes rather than pointers.
+    fn open_from_wire(
+        master: &MasterKey,
+        method: Method,
+        packet: &[u8],
+    ) -> Option<(SocketAddr, Vec<u8>)> {
+        let mut wire = packet.to_vec();
+        let (target, payload) = open_datagram(master, method, &mut wire)?;
+        Some((target, payload.to_vec()))
+    }
+
     #[test]
     fn stream_udp_round_trips_and_rejects_damage() {
         let method = Method::Rc4Md5;
@@ -1141,82 +1173,31 @@ mod tests {
             "127.0.0.1:53".parse().expect("v4"),
             "[2001:db8::1]:443".parse().expect("v6"),
         ] {
-            let mut datagrams = Datagrams::new();
-            let packet = datagrams
-                .seal(&master, method, &target, b"ping")
-                .expect("seals")
-                .to_vec();
+            let packet = seal_to_wire(&master, method, &target, b"ping");
             let header = if target.is_ipv6() { 19 } else { 7 };
             assert_eq!(
                 packet.len(),
                 IV_LEN + header + b"ping".len(),
                 "a datagram is the IV, the header and the payload, with no tag"
             );
-            let (got, payload) = datagrams.open(&master, method, &packet).expect("opens");
+            let (got, payload) = open_from_wire(&master, method, &packet).expect("opens");
             assert_eq!(got, target);
             assert_eq!(payload, b"ping");
         }
         let target: SocketAddr = "127.0.0.1:53".parse().expect("addr");
-        let mut datagrams = Datagrams::new();
-        let packet = datagrams
-            .seal(&master, method, &target, b"ping")
-            .expect("seals")
-            .to_vec();
+        let packet = seal_to_wire(&master, method, &target, b"ping");
         let mut cut = packet.clone();
         cut.pop();
-        let (_, short) = datagrams.open(&master, method, &cut).expect("opens");
+        let (_, short) = open_from_wire(&master, method, &cut).expect("opens");
         assert_eq!(
             short, b"pin",
             "a stream has no tag: truncation truncates, it does not refuse"
         );
-        assert!(datagrams.open(&master, method, &packet[..10]).is_none());
-        assert!(datagrams.open(&master, method, &[]).is_none());
+        assert!(open_from_wire(&master, method, &packet[..10]).is_none());
+        assert!(open_from_wire(&master, method, &[]).is_none());
         let wrong = MasterKey::new("a-different-password", 16);
-        if let Some((_, payload)) = datagrams.open(&wrong, method, &packet) {
+        if let Some((_, payload)) = open_from_wire(&wrong, method, &packet) {
             assert_ne!(payload, b"ping", "a wrong password opens only noise");
-        }
-    }
-
-    /// The opened payload must be a subslice of the buffer the datagram was opened in: that is what makes the copy count zero instead of two, and the buffer must not move or grow or a datagram reallocates.
-    #[test]
-    fn stream_opened_payload_is_the_datagrams_own_bytes() {
-        let method = Method::Rc4Md5;
-        let master = MasterKey::new("an-example-shared-password", 16);
-        let target: SocketAddr = "127.0.0.1:53".parse().expect("addr");
-        let mut datagrams = Datagrams::new();
-        let packet = datagrams
-            .seal(&master, method, &target, b"a payload worth keeping")
-            .expect("seals")
-            .to_vec();
-        datagrams
-            .open(&master, method, &packet)
-            .expect("warms the buffer");
-        let opened_at = datagrams.opened.as_ptr() as usize;
-        let opened_room = datagrams.opened.capacity();
-        for round in 0..8 {
-            let packet = datagrams
-                .seal(&master, method, &target, b"a payload worth keeping")
-                .expect("seals")
-                .to_vec();
-            let (got, payload) = datagrams.open(&master, method, &packet).expect("opens");
-            assert_eq!(got, target, "round {round}");
-            assert_eq!(payload, b"a payload worth keeping", "round {round}");
-            let at = payload.as_ptr();
-            assert!(
-                datagrams.opened.as_ptr_range().contains(&at),
-                "round {round}: the payload is a separate buffer, so the datagram paid a \
-                 second pass to reach it"
-            );
-            assert_eq!(
-                datagrams.opened.as_ptr() as usize,
-                opened_at,
-                "round {round}: the open buffer moved, so a datagram reallocates"
-            );
-            assert_eq!(
-                datagrams.opened.capacity(),
-                opened_room,
-                "round {round}: the open buffer grew, so a datagram reallocates"
-            );
         }
     }
 
@@ -1422,10 +1403,37 @@ mod tests {
             read: std::io::Cursor::new(wire),
             reads: 0,
         });
-        let first = window.open_chunk(&mut recv).expect("opens").to_vec();
+        let base = window.buf.as_ptr() as usize;
+        let room = window.buf.capacity();
+        let (first_at, first) = {
+            let chunk = window.open_chunk(&mut recv).expect("opens");
+            assert!(
+                (base..base + room).contains(&(chunk.as_ptr() as usize)),
+                "the payload is a separate buffer, so the window copies it out"
+            );
+            (chunk.as_ptr() as usize, chunk.to_vec())
+        };
+        let (second_at, second) = {
+            let chunk = window.open_chunk(&mut recv).expect("opens");
+            assert!(
+                (base..base + room).contains(&(chunk.as_ptr() as usize)),
+                "the payload is a separate buffer, so the window copies it out"
+            );
+            (chunk.as_ptr() as usize, chunk.to_vec())
+        };
+        assert!(first_at < second_at, "the chunks open where they lie");
         assert_eq!(first, &plain[..MAX_CHUNK]);
-        let second = window.open_chunk(&mut recv).expect("opens").to_vec();
         assert_eq!(second, &plain[MAX_CHUNK..]);
+        assert_eq!(
+            window.buf.as_ptr() as usize,
+            base,
+            "the window moved, so a chunk read reallocates"
+        );
+        assert_eq!(
+            window.buf.capacity(),
+            room,
+            "the window grew, so a chunk read reallocates"
+        );
         assert_eq!(window.read.reads, 1, "one bulk read serves both chunks");
         assert!(window.open_chunk(&mut recv).is_none());
         let mut oversize = vec![0u8; SEAL_HEAD + MAX_CHUNK + 1 + TAG_LEN];
@@ -1449,8 +1457,19 @@ mod tests {
         let mut recv = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
         let mut cursor = std::io::Cursor::new(&wire);
         let mut buf = wire_buffer();
-        let back = open_chunk(&mut cursor, &mut recv, &mut buf).expect("opens");
-        assert_eq!(back, &b"length-is-framing"[..]);
+        let base = buf.as_ptr() as usize;
+        let room = buf.capacity();
+        let back_at = {
+            let back = open_chunk(&mut cursor, &mut recv, &mut buf).expect("opens");
+            assert_eq!(back, &b"length-is-framing"[..]);
+            back.as_ptr() as usize
+        };
+        assert!(
+            (base..base + room).contains(&back_at),
+            "the opened payload is a separate buffer, so a chunk read copies it out"
+        );
+        assert_eq!(buf.as_ptr() as usize, base, "the read buffer never moves");
+        assert_eq!(buf.capacity(), room, "the read buffer never grows");
 
         let mut tampered = wire.clone();
         let last = tampered.len() - 1;
@@ -1471,13 +1490,9 @@ mod tests {
             assert_eq!(method.key_len(), salt_len, "{name}");
             let master = MasterKey::new("an-example-shared-password", salt_len);
             let target: SocketAddr = "127.0.0.1:53".parse().expect("addr");
-            let mut datagrams = Datagrams::new();
-            let packet = datagrams
-                .seal(&master, method, &target, b"ping")
-                .expect("seals")
-                .to_vec();
+            let packet = seal_to_wire(&master, method, &target, b"ping");
             assert_eq!(packet.len(), salt_len + 7 + 4 + TAG_LEN, "{name}");
-            let (got, payload) = datagrams.open(&master, method, &packet).expect("opens");
+            let (got, payload) = open_from_wire(&master, method, &packet).expect("opens");
             assert_eq!(got, target, "{name}");
             assert_eq!(payload, b"ping", "{name}");
         }
@@ -1487,7 +1502,6 @@ mod tests {
     fn every_payload_length_and_address_survives_the_round_trip() {
         let method = Method::Aes256Gcm;
         let master = MasterKey::new("an-example-shared-password", 32);
-        let mut datagrams = Datagrams::new();
         let mut checked = 0usize;
         for addr in [
             "127.0.0.1:53".parse().expect("v4"),
@@ -1498,11 +1512,8 @@ mod tests {
                 let payload: Vec<u8> = (0..len)
                     .map(|i| (i as u8).wrapping_mul(31).wrapping_add(9))
                     .collect();
-                let packet = datagrams
-                    .seal(&master, method, &addr, &payload)
-                    .expect("seals")
-                    .to_vec();
-                let (got, back) = datagrams.open(&master, method, &packet).expect("opens");
+                let packet = seal_to_wire(&master, method, &addr, &payload);
+                let (got, back) = open_from_wire(&master, method, &packet).expect("opens");
                 assert_eq!(got, addr, "{addr} len {len}");
                 assert_eq!(back, payload, "{addr} len {len}");
                 checked += 1;
@@ -1511,42 +1522,69 @@ mod tests {
         assert!(checked > 900, "the sweep should be dense, not a sample");
     }
 
-    /// The opened payload must be a subslice of the buffer the datagram was opened in: that is what makes the copy count one instead of three, and the buffer must not move or grow or a datagram reallocates.
+    /// The sealed packet and the opened payload must both be slices of the caller's own datagram buffer: one buffer per datagram, no second pass, and the buffer must not move or grow while datagrams flow through it.
     #[test]
-    fn an_opened_payload_is_the_datagrams_own_bytes() {
-        let method = Method::Aes256Gcm;
-        let master = MasterKey::new("an-example-shared-password", 32);
-        let target: SocketAddr = "127.0.0.1:53".parse().expect("addr");
-        let mut datagrams = Datagrams::new();
-        let packet = datagrams
-            .seal(&master, method, &target, b"a payload worth keeping")
-            .expect("seals")
-            .to_vec();
-        datagrams
-            .open(&master, method, &packet)
-            .expect("warms the buffer");
-        let opened_at = datagrams.opened.as_ptr() as usize;
-        let opened_room = datagrams.opened.capacity();
-        for round in 0..8 {
-            let (got, payload) = datagrams.open(&master, method, &packet).expect("opens");
-            assert_eq!(got, target, "round {round}");
-            assert_eq!(payload, b"a payload worth keeping", "round {round}");
-            let at = payload.as_ptr();
-            assert!(
-                datagrams.opened.as_ptr_range().contains(&at),
-                "round {round}: the payload is a separate buffer, so the datagram paid a \
-                 second pass to reach it"
-            );
-            assert_eq!(
-                datagrams.opened.as_ptr() as usize,
-                opened_at,
-                "round {round}: the open buffer moved, so a datagram reallocates"
-            );
-            assert_eq!(
-                datagrams.opened.capacity(),
-                opened_room,
-                "round {round}: the open buffer grew, so a datagram reallocates"
-            );
+    fn an_opened_payload_is_the_callers_own_bytes() {
+        for (method, key_len) in [(Method::Aes256Gcm, 32), (Method::Rc4Md5, 16)] {
+            let master = MasterKey::new("an-example-shared-password", key_len);
+            let target: SocketAddr = "127.0.0.1:53".parse().expect("addr");
+            let payload = b"a payload worth keeping";
+            let mut wire = vec![0u8; DATAGRAM_MAX];
+            let base = wire.as_ptr() as usize;
+            let room = wire.capacity();
+            for round in 0..8 {
+                wire[SEAL_ROOM..SEAL_ROOM + payload.len()].copy_from_slice(payload);
+                let (sealed_at, sealed) = {
+                    let packet = seal_datagram(
+                        &master,
+                        method,
+                        &target,
+                        &mut wire,
+                        SEAL_ROOM,
+                        payload.len(),
+                    )
+                    .expect("seals");
+                    let at = packet.as_ptr() as usize;
+                    assert!(
+                        (base..base + room).contains(&at),
+                        "round {round}: the sealed datagram is outside the caller's buffer"
+                    );
+                    (at - base, packet.len())
+                };
+                assert_eq!(
+                    wire.as_ptr() as usize,
+                    base,
+                    "round {round}: the seal buffer moved, so a datagram reallocates"
+                );
+                assert_eq!(
+                    wire.capacity(),
+                    room,
+                    "round {round}: the seal buffer grew, so a datagram reallocates"
+                );
+                let opened_at = {
+                    let (got, opened) =
+                        open_datagram(&master, method, &mut wire[sealed_at..sealed_at + sealed])
+                            .expect("opens");
+                    assert_eq!(got, target, "round {round}");
+                    assert_eq!(opened, payload, "round {round}");
+                    opened.as_ptr() as usize
+                };
+                assert!(
+                    (base..base + room).contains(&opened_at),
+                    "round {round}: the payload is a separate buffer, so the datagram paid a \
+                     second pass to reach it"
+                );
+                assert_eq!(
+                    wire.as_ptr() as usize,
+                    base,
+                    "round {round}: the open buffer moved, so a datagram reallocates"
+                );
+                assert_eq!(
+                    wire.capacity(),
+                    room,
+                    "round {round}: the open buffer grew, so a datagram reallocates"
+                );
+            }
         }
     }
 
@@ -1555,21 +1593,22 @@ mod tests {
         let method = Method::Aes256Gcm;
         let master = MasterKey::new("an-example-shared-password", 32);
         let target: SocketAddr = "127.0.0.1:53".parse().expect("addr");
-        let mut datagrams = Datagrams::new();
-        let packet = datagrams
-            .seal(&master, method, &target, b"ping")
-            .expect("seals")
-            .to_vec();
+        let packet = seal_to_wire(&master, method, &target, b"ping");
         let wrong = MasterKey::new("a-different-password", 32);
-        assert!(datagrams.open(&wrong, method, &packet).is_none());
+        assert!(open_from_wire(&wrong, method, &packet).is_none());
         let mut cut = packet.clone();
         cut.pop();
-        assert!(datagrams.open(&master, method, &cut).is_none());
+        assert!(open_from_wire(&master, method, &cut).is_none());
         let mut flipped = packet.clone();
         let last = flipped.len() - 1;
         flipped[last] ^= 1;
-        assert!(datagrams.open(&master, method, &flipped).is_none());
-        assert!(datagrams.open(&master, method, &packet[..10]).is_none());
-        assert!(datagrams.open(&master, method, &[]).is_none());
+        let as_sent = flipped.clone();
+        assert!(open_datagram(&master, method, &mut flipped).is_none());
+        assert_eq!(
+            flipped, as_sent,
+            "a refused datagram is left exactly as it arrived"
+        );
+        assert!(open_from_wire(&master, method, &packet[..10]).is_none());
+        assert!(open_from_wire(&master, method, &[]).is_none());
     }
 }
