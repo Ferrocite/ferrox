@@ -525,16 +525,13 @@ impl Run {
         Some((user as f64 / gib, sys as f64 / gib))
     }
 
-    /// The run's crossing cost per GiB: how often the kernel was asked, and how much each ask carried.
-    /// A splice crosses without either, so a zero here says the path did not go through userspace.
+    /// The run's crossing cost per GiB, or nothing for a tally the crossing never reached; see
+    /// [`io_crossing_per_gib`].
     pub fn io_per_gib(&self) -> Option<(f64, f64)> {
-        let bytes = self.outcome.bytes_sent + self.outcome.bytes_received;
-        if bytes == 0 {
-            return None;
-        }
-        let gib = bytes as f64 / 1_073_741_824.0;
-        let io = self.outcome.io?;
-        Some((io.calls() as f64 / gib, io.bytes() as f64 / gib))
+        io_crossing_per_gib(
+            self.outcome.io?,
+            self.outcome.bytes_sent + self.outcome.bytes_received,
+        )
     }
 
     fn quartiles(values: &[u128]) -> Option<Quartiles> {
@@ -644,6 +641,19 @@ impl Run {
         root.insert("samples", Json::Arr(samples));
         root
     }
+}
+
+/// The run's crossing cost per GiB: how often the kernel was asked, and how much each ask carried.
+/// A `splice` or a `send`/`recv` socket crossing moves bytes `/proc/<pid>/io` never names, and a
+/// relay writes what it moves, so a tally under an eighth of the run's bytes was not looking at the
+/// crossing at all: it gets no number rather than a zero a reader would take for a win. The pair of
+/// witnesses in `ps` is where these two bands come from.
+pub fn io_crossing_per_gib(io: ps::Io, moved: u64) -> Option<(f64, f64)> {
+    if moved == 0 || io.bytes() < moved / 8 {
+        return None;
+    }
+    let gib = moved as f64 / 1_073_741_824.0;
+    Some((io.calls() as f64 / gib, io.bytes() as f64 / gib))
 }
 
 /// The kernel's own counters, under the names `/proc/<pid>/io` prints them, so a number in the

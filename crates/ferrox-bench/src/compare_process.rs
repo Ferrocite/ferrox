@@ -174,15 +174,13 @@ impl Comparison {
             .collect()
     }
 
-    /// The kernel's counts, per GiB, or nothing at all when any run of the engine lacks them: a
-    /// paired ratio over runs that did not all report compares different runs, and a row that
-    /// cannot be trusted reports nothing.
+    /// The kernel's counts, per GiB, or nothing at all when any run of the engine lacks them — a
+    /// tally that is missing, or one blind to the run's crossing: a paired ratio over runs that did
+    /// not all report compares different runs, and a row that cannot be trusted reports nothing.
     fn io_cells(&self, engine: &str, pick: fn((f64, f64)) -> f64) -> Vec<Cell> {
         let runs = self.runs(engine);
-        if runs.is_empty() || runs.iter().any(|run| run.outcome.io.is_none()) {
-            return Vec::new();
-        }
-        runs.iter()
+        let cells = runs
+            .iter()
             .enumerate()
             .filter_map(|(i, run)| {
                 run.io_per_gib().map(|pair| Cell {
@@ -190,7 +188,11 @@ impl Comparison {
                     value: pick(pair),
                 })
             })
-            .collect()
+            .collect::<Vec<_>>();
+        if cells.len() != runs.len() {
+            return Vec::new();
+        }
+        cells
     }
 
     fn runs(&self, engine: &str) -> &[Run] {
@@ -1222,11 +1224,31 @@ fn check_io(root: &Json, moved: f64) -> Result<(), Error> {
     let gib = moved / 1_073_741_824.0;
     let calls = read_calls + write_calls;
     let bytes = read_bytes + write_bytes;
+    let whole = |count: f64| count.max(0.0) as u64;
+    let priced = parity::io_crossing_per_gib(
+        crate::ps::Io {
+            read_calls: whole(read_calls),
+            write_calls: whole(write_calls),
+            read_bytes: whole(read_bytes),
+            write_bytes: whole(write_bytes),
+        },
+        whole(moved),
+    )
+    .is_some();
     let matches = |key: &str, rederived: f64| -> Result<(), Error> {
-        let reported = root
-            .get(key)
-            .and_then(Json::as_num)
-            .ok_or_else(|| Error::Invalid(format!("result.json has no number `{key}`")))?;
+        let Some(reported) = root.get(key).and_then(Json::as_num) else {
+            return if priced {
+                Err(Error::Invalid(format!("result.json has no number `{key}`")))
+            } else {
+                Ok(())
+            };
+        };
+        if !priced {
+            return Err(Error::Invalid(format!(
+                "{key} {reported} prices a tally of {bytes} bytes over a run that moved {moved}, \
+                 which the tally never saw"
+            )));
+        }
         if (rederived - reported).abs() > 1e-6 * reported.abs().max(1.0) {
             return Err(Error::Invalid(format!(
                 "{key} {reported} does not match its own fields: {rederived}"
@@ -1349,30 +1371,12 @@ mod tests {
     #[test]
     fn the_kernel_tally_in_an_artefact_has_to_be_its_own_samples_delta() {
         let one_gib = 1024.0 * 1024.0 * 1024.0;
-        let tally = |(syscr, syscw, rchar, wchar): (f64, f64, f64, f64)| {
-            let mut io = Json::object();
-            io.insert("syscr", Json::Num(syscr));
-            io.insert("syscw", Json::Num(syscw));
-            io.insert("rchar", Json::Num(rchar));
-            io.insert("wchar", Json::Num(wchar));
-            io
-        };
-        let sample = |t| {
-            let mut item = Json::object();
-            item.insert("rss_kib", Json::Num(1.0));
-            item.insert("cpu_millis", Json::Num(1.0));
-            item.insert("io", tally(t));
-            item
-        };
-        let end = (100.0, 50.0, one_gib, one_gib);
+        let end = [100.0, 50.0, one_gib, one_gib];
         let mut root = Json::object();
         root.insert("io", tally(end));
         root.insert("io_calls_per_gib", Json::Num(150.0));
         root.insert("io_bytes_per_gib", Json::Num(2.0 * one_gib));
-        root.insert(
-            "samples",
-            Json::Arr(vec![sample((0.0, 0.0, 0.0, 0.0)), sample(end)]),
-        );
+        root.insert("samples", Json::Arr(vec![sample([0.0; 4]), sample(end)]));
         assert!(check_io(&root, one_gib).is_ok());
         root.insert("io_calls_per_gib", Json::Num(151.0));
         assert!(
@@ -1380,7 +1384,7 @@ mod tests {
             "a per-GiB number has to be the tally over the run's own bytes"
         );
         root.insert("io_calls_per_gib", Json::Num(150.0));
-        root.insert("io", tally((101.0, 50.0, one_gib, one_gib)));
+        root.insert("io", tally([101.0, 50.0, one_gib, one_gib]));
         root.insert("io_calls_per_gib", Json::Num(151.0));
         assert!(
             check_io(&root, one_gib).is_err(),
@@ -1391,7 +1395,7 @@ mod tests {
         root.insert(
             "samples",
             Json::Arr(vec![
-                sample((200.0, 100.0, 2.0 * one_gib, 2.0 * one_gib)),
+                sample([200.0, 100.0, 2.0 * one_gib, 2.0 * one_gib]),
                 sample(end),
             ]),
         );
@@ -1404,6 +1408,45 @@ mod tests {
             "a run sampled where `/proc/<pid>/io` cannot be read reports no tally, which is a gap \
              in the source and not a fault"
         );
+    }
+
+    #[test]
+    fn a_tally_blind_to_the_run_s_crossing_reports_no_per_gib_number() {
+        let one_gib = 1024.0 * 1024.0 * 1024.0;
+        let moved = 8.0 * one_gib;
+        // Rust relays cross sockets on send/recv, which the counter does not name: only startup reads show.
+        let blind = [9.0, 8.0, 11410.0, 3200.0];
+        let mut root = Json::object();
+        root.insert("io", tally(blind));
+        root.insert("io_calls_per_gib", Json::Null);
+        root.insert("io_bytes_per_gib", Json::Null);
+        root.insert("samples", Json::Arr(vec![sample([0.0; 4]), sample(blind)]));
+        assert!(
+            check_io(&root, moved).is_ok(),
+            "a run the tally never saw gets null, which is its own answer rather than a missing number"
+        );
+        root.insert("io_calls_per_gib", Json::Num(2.125));
+        assert!(
+            check_io(&root, moved).is_err(),
+            "a per-GiB number off a blind tally reads as a win over an engine whose counter does \
+             see its syscalls"
+        );
+    }
+
+    fn tally(counts: [f64; 4]) -> Json {
+        let mut io = Json::object();
+        for (name, value) in ["syscr", "syscw", "rchar", "wchar"].into_iter().zip(counts) {
+            io.insert(name, Json::Num(value));
+        }
+        io
+    }
+
+    fn sample(counts: [f64; 4]) -> Json {
+        let mut item = Json::object();
+        item.insert("rss_kib", Json::Num(1.0));
+        item.insert("cpu_millis", Json::Num(1.0));
+        item.insert("io", tally(counts));
+        item
     }
 
     fn workload() -> Workload {

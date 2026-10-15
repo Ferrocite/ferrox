@@ -80,8 +80,9 @@ impl Host {
     }
 }
 
-/// What crossed the process's boundary through `read` and `write`: the calls and the bytes they carried.
-/// A splice goes through neither, so a path that pipes socket to socket moves bytes this does not count.
+/// What crossed the process's boundary through the VFS `read`/`write` paths: `rchar`/`wchar` and the
+/// `syscr`/`syscw` that carried them. A `splice` or a `send`/`recv` socket crossing names neither, so a
+/// small tally here says the instrument did not see the path, not that no bytes moved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Io {
     pub read_calls: u64,
@@ -198,27 +199,35 @@ pub fn sample(host: Host, pid: u32, elapsed_ms: u128) -> Result<Sample, SampleEr
 
 /// What the process's threads crossed the boundary for, as one tally.
 ///
-/// `/proc/<pid>/io` is a *task's* counters on a multithreaded process, so a relay whose worker
-/// threads make the syscalls would report the leader's startup bytes and nothing else. Every task
-/// under `/proc/<pid>/task/` is read and summed instead; a task that dies mid-walk only ever drops
-/// its own line, so the tally stays a floor. No `/proc` at all, or a runner that hides it, is no
-/// tally rather than a failed run.
+/// A relay's syscalls are made by its worker threads, not the one the harness spawned, so every task
+/// under `/proc/<pid>/task/` is read and summed rather than trusting a single file; a task that dies
+/// mid-walk only ever drops its own line, so the tally stays a floor. No `/proc` at all, or a runner
+/// that hides it, is no tally rather than a failed run.
 fn proc_io(pid: u32) -> Option<Io> {
+    walked_io(pid).map(|(io, _tasks)| io)
+}
+
+/// The tally, with how many of the process's tasks were read into it: one task is the leader alone,
+/// which is what a run's zero has to be told apart from.
+fn walked_io(pid: u32) -> Option<(Io, usize)> {
     let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?;
-    let mut total: Option<Io> = None;
+    let mut total: Option<(Io, usize)> = None;
     for task in tasks.flatten() {
         let Ok(text) = std::fs::read_to_string(task.path().join("io")) else {
             continue;
         };
         let Some(io) = parse_io(&text) else { continue };
         total = Some(match total {
-            Some(sum) => Io {
-                read_calls: sum.read_calls.saturating_add(io.read_calls),
-                write_calls: sum.write_calls.saturating_add(io.write_calls),
-                read_bytes: sum.read_bytes.saturating_add(io.read_bytes),
-                write_bytes: sum.write_bytes.saturating_add(io.write_bytes),
-            },
-            None => io,
+            Some((sum, seen)) => (
+                Io {
+                    read_calls: sum.read_calls.saturating_add(io.read_calls),
+                    write_calls: sum.write_calls.saturating_add(io.write_calls),
+                    read_bytes: sum.read_bytes.saturating_add(io.read_bytes),
+                    write_bytes: sum.write_bytes.saturating_add(io.write_bytes),
+                },
+                seen + 1,
+            ),
+            None => (io, 1),
         });
     }
     total
@@ -664,6 +673,165 @@ mod tests {
         release.send(()).expect("the writer thread is parked");
         writer.join().expect("the writer thread ends");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The engine is a *child* process, so the tally has to cross that boundary and land each byte
+    /// once: a walk that reads `/proc/self` fine and a descendant's tasks not at all would bless the
+    /// probe and then report a relay's run as zero, while a per-task file that already held the thread
+    /// group's total would report the same bytes once per task.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_tally_counts_a_child_process_s_worker_thread() {
+        const WRITTEN: u64 = 16 << 20;
+        if let Some(job) = child_job() {
+            return run_child_job(&job, WRITTEN as usize);
+        }
+        let path = std::env::temp_dir().join(format!("ferrox-io-child-{}", std::process::id()));
+        let mut child = spawn_tally_child(
+            "a_tally_counts_a_child_process_s_worker_thread",
+            "file",
+            &path.display().to_string(),
+        );
+        let pid = child.id();
+        let mut seen: Option<(Io, usize)> = None;
+        for _ in 0..400 {
+            let tally = walked_io(pid);
+            if tally
+                .as_ref()
+                .is_some_and(|(io, _)| io.write_bytes >= WRITTEN)
+            {
+                seen = tally;
+                break;
+            }
+            seen = tally.or(seen);
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let (io, tasks) = seen.unwrap_or_else(|| panic!("pid {pid} gives no tally at all"));
+        assert!(
+            io.write_bytes >= WRITTEN,
+            "{WRITTEN} B written by a worker thread of a child, the tally of {tasks} tasks saw {} B",
+            io.write_bytes
+        );
+        assert!(
+            io.write_bytes < WRITTEN * 2,
+            "{WRITTEN} B written once, the tally of {tasks} tasks reports {} B",
+            io.write_bytes
+        );
+        release(&mut child);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// What the tally cannot see at all is a socket: `TcpStream` reaches the kernel through `send` and
+    /// `recv`, and only `read`/`write` are counted, so a child that moves 16 MiB over loopback shows
+    /// its startup bytes while the same child writing to a file shows every one of them. Every
+    /// `io_*_per_gib` in the artefact is to be read against this row — a Rust engine's zero is the
+    /// instrument's blind spot, not its traffic, and it says nothing about a Go engine's non-zero.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_tally_is_blind_to_a_socket_crossing_in_a_child_process() {
+        const MOVED: u64 = 16 << 20;
+        const BLIND: u64 = MOVED / 16;
+        if let Some(job) = child_job() {
+            return run_child_job(&job, MOVED as usize);
+        }
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a loopback sink");
+        let addr = listener.local_addr().expect("its address");
+        let mut child = spawn_tally_child(
+            "the_tally_is_blind_to_a_socket_crossing_in_a_child_process",
+            "socket",
+            &addr.to_string(),
+        );
+        let pid = child.id();
+        let (mut sink, _) = listener.accept().expect("the child connects to the sink");
+        sink.set_read_timeout(Some(std::time::Duration::from_secs(60)))
+            .expect("the sink is drained within the run");
+        let mut drained = vec![0u8; 1 << 16];
+        let mut moved: u64 = 0;
+        while moved < MOVED {
+            use std::io::Read;
+            let take = drained.len().min((MOVED - moved) as usize);
+            let read = sink
+                .read(&mut drained[..take])
+                .expect("the child's bytes arrive");
+            assert_ne!(
+                read, 0,
+                "the socket crossing ends after {moved} B of {MOVED}"
+            );
+            moved += read as u64;
+        }
+        let (io, tasks) = walked_io(pid).expect("the child process has a tally");
+        assert!(
+            io.bytes() < BLIND,
+            "{MOVED} B crossed a socket and the tally of {tasks} tasks saw {} B: the reading is \
+             counting the crossing after all, so the row above is wrong",
+            io.bytes()
+        );
+        release(&mut child);
+    }
+
+    /// The job a spawned child runs instead of the test that spawned it.
+    #[cfg(target_os = "linux")]
+    fn child_job() -> Option<String> {
+        std::env::var("FERROX_IO_CHILD").ok()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn spawn_tally_child(test: &str, job: &str, argument: &str) -> std::process::Child {
+        std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .arg(test)
+            .args(["--exact"])
+            .env("FERROX_IO_CHILD", job)
+            .env("FERROX_IO_CHILD_ARG", argument)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("the tally reads a spawned process")
+    }
+
+    /// Closing the child's stdin is what ends its park; the parent takes the pipe before it waits.
+    #[cfg(target_os = "linux")]
+    fn release(child: &mut std::process::Child) {
+        drop(child.stdin.take());
+        let _ = child.wait();
+    }
+
+    /// The child's half of both witnesses: the bytes are made by a thread that is not the leader, then
+    /// a park on stdin, so the parent reads a tally whose subject still has every thread alive.
+    #[cfg(target_os = "linux")]
+    fn run_child_job(job: &str, written: usize) {
+        use std::io::{Read, Write};
+        let argument =
+            std::env::var("FERROX_IO_CHILD_ARG").expect("the child is told its argument");
+        let (done, wait_done) = std::sync::mpsc::channel::<()>();
+        let to_file = job == "file";
+        std::thread::spawn(move || {
+            let mut file = std::fs::File::create(&argument).ok();
+            let mut stream = if to_file {
+                None
+            } else {
+                std::net::TcpStream::connect(&argument).ok()
+            };
+            let sink: Option<&mut dyn Write> = if to_file {
+                file.as_mut().map(|file| file as &mut dyn Write)
+            } else {
+                stream.as_mut().map(|stream| stream as &mut dyn Write)
+            };
+            let Some(sink) = sink else { return };
+            let zeroes = vec![0u8; 1 << 16];
+            let mut left = written;
+            while left > 0 {
+                let take = left.min(zeroes.len());
+                if sink.write_all(&zeroes[..take]).is_err() {
+                    break;
+                }
+                left -= take;
+            }
+            let _ = done.send(());
+        });
+        let _ = wait_done.recv();
+        let mut one = [0u8; 1];
+        let _ = std::io::stdin().read(&mut one);
     }
 
     #[test]
