@@ -1,11 +1,22 @@
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::proxy::read_exact;
+use crate::budgets::UDP_IDLE;
+use crate::config::{inbound_carrier, outbound_carrier, stream_security, uuid_bytes, Carrier};
+use crate::json::Json;
+use crate::proxy::{
+    climb_or_hold, dial, dial_or_report, dial_tls_session, inbound_id, join, kcp_parts,
+    ladder_start, note_dial_failure, note_success, parse_socks_udp, push_socks_addr, rung_of,
+    serve_kcp_loop, spawn_role, stream_params, tls_grpc, tls_halves, tls_httpheader,
+    tls_httpupgrade, tls_parts, tls_sink, tls_ws, tls_xhttp, vnext_servers, CarrierSink, KcpIo,
+    KcpServe, RelayPool, Role, RungAttempt, UDP_BUF, is_timeout, read_exact,
+};
+use ferrox_core::failure::{Failure, Kind, Ladder, Rung, Stage};
 
 const AUTH_LEN: usize = 16;
 const TAG_LEN: usize = 16;
@@ -1497,7 +1508,7 @@ pub(crate) fn serve_vmess_udp(
     if stream.write_all(prefix).is_err() {
         return;
     }
-    crate::proxy::pump_vmess_udp(&stream, &udp, send, recv);
+    pump_vmess_udp(&stream, &udp, send, recv);
 }
 
 pub(crate) type PendingResponse = ([u8; 16], [u8; 16], u8);
@@ -1577,6 +1588,690 @@ pub(crate) fn pump_relay(
     let _ = sealed.shutdown(Shutdown::Both);
     let _ = plain_write.shutdown(Shutdown::Both);
     let _ = done.join();
+}
+
+// The rungs a VMess session runs on, in from the dispatch that used to hold them:
+// inbound, the carrier ladder, TLS, the UDP uplink and the outbound the config names.
+#[derive(Debug, Clone)]
+pub(crate) struct VmessOut {
+    pub(crate) address: String,
+    pub(crate) port: u16,
+    pub(crate) id: [u8; 16],
+    pub(crate) cipher: Cipher,
+    pub(crate) carrier: Carrier,
+    pub(crate) host: String,
+    pub(crate) tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
+}
+
+pub(crate) fn dial_vmess_kcp(
+    client: &TcpStream,
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    vmess: &VmessOut,
+    target: &SocketAddr,
+) {
+    let Some((request, send, recv, response_key, response_iv, auth)) =
+        client_request(&vmess.id, vmess.cipher, target, 1)
+    else {
+        return;
+    };
+    if conn.write(&request).is_err() {
+        return;
+    }
+    let mut reader = KcpIo {
+        conn: Arc::clone(conn),
+    };
+    if !read_response(&mut reader, &response_key, &response_iv, auth) {
+        return;
+    }
+    let (_, writer, close) = kcp_parts(conn);
+    pump_relay_carried(client, reader, writer, &close, send, recv, None);
+}
+
+pub(crate) fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
+    let id = inbound_id(inbound);
+    match inbound_carrier(inbound) {
+        Carrier::Kcp(config) => {
+            let serve: KcpServe = Arc::new(move |conn| {
+                let (reader, writer, close) = kcp_parts(conn);
+                serve_kcp(reader, writer, &id, freedom, &close);
+            });
+            let owned = address.to_owned();
+            thread::spawn(move || serve_kcp_loop(&owned, config, &serve));
+        }
+        other => spawn_role(
+            address,
+            Role::Vmess {
+                id,
+                carrier: other,
+                freedom,
+            },
+        ),
+    }
+}
+
+struct VmessUdpUplink {
+    write: TcpStream,
+    send: Flow,
+    pad: PadSource,
+    target: SocketAddr,
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+fn dial_vmess_udp_uplink(
+    vmess: &VmessOut,
+    dest: &SocketAddr,
+    relay: &UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+) -> Option<VmessUdpUplink> {
+    if !matches!(vmess.carrier, Carrier::Raw) {
+        return None;
+    }
+    let endpoint = format!("{}:{}", vmess.address, vmess.port);
+    let server = endpoint.to_socket_addrs().ok()?.next()?;
+    let uplink = dial_or_report(&server)?;
+    let (request, send, recv, response_key, response_iv, auth) =
+        client_request(&vmess.id, vmess.cipher, dest, 2)?;
+    let mut uplink = uplink;
+    uplink.write_all(&request).ok()?;
+    let mut reader = uplink.try_clone().ok()?;
+    if !read_response(&mut reader, &response_key, &response_iv, auth) {
+        return None;
+    }
+    let udp_send = relay.try_clone().ok()?;
+    let done = spawn_vmess_udp_reader(reader, udp_send, source, *dest, recv);
+    let pad = PadSource::fresh()?;
+    Some(VmessUdpUplink {
+        write: uplink,
+        send,
+        pad,
+        target: *dest,
+        done,
+    })
+}
+
+fn spawn_vmess_udp_reader(
+    read: TcpStream,
+    udp: UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+    target: SocketAddr,
+    recv: Flow,
+) -> std::sync::mpsc::Receiver<()> {
+    RelayPool::global().run(move || {
+        let mut read = read;
+        let mut recv = recv;
+        let mut scratch = Vec::with_capacity(UDP_BUF);
+        let mut reply = Vec::with_capacity(UDP_BUF);
+        while let Some(chunk) = read_frame(&mut read, &mut recv, &mut scratch) {
+            if chunk.is_empty() {
+                break;
+            }
+            let dest = match source.lock() {
+                Ok(guard) => *guard,
+                Err(_) => None,
+            };
+            let Some(dest) = dest else {
+                continue;
+            };
+            reply.clear();
+            reply.extend_from_slice(&[0, 0, 0]);
+            push_socks_addr(&mut reply, &target);
+            reply.extend_from_slice(chunk);
+            let _ = udp.send_to(&reply, dest);
+        }
+    })
+}
+
+fn dial_vmess_httpupgrade(
+    client: &TcpStream,
+    uplink: TcpStream,
+    vmess: &VmessOut,
+    target: &SocketAddr,
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    let rung = attempt.rung;
+    let path = attempt.path;
+    let ed = attempt.ed;
+    let Some((request, send, recv, response_key, response_iv, auth)) =
+        client_request(&vmess.id, vmess.cipher, target, 1)
+    else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
+    };
+    let Some((mut reader, write)) =
+        crate::httpupgrade::connect(uplink, &vmess.host, path, ed, &request)
+    else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+    };
+    if !read_response(&mut reader, &response_key, &response_iv, auth) {
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+    }
+    note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
+    let Ok(closer) = write.try_clone() else {
+        return true;
+    };
+    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        let _ = closer.shutdown(Shutdown::Both);
+    });
+    pump_relay_carried(client, reader, write, &close, send, recv, None);
+    true
+}
+
+fn dial_vmess_grpc(
+    client: &TcpStream,
+    uplink: TcpStream,
+    vmess: &VmessOut,
+    target: &SocketAddr,
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    let rung = attempt.rung;
+    let path = attempt.path;
+    let Some((mut reader, writer)) = crate::grpc::connect(uplink, &vmess.host, path) else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+    };
+    let Some((request, send, recv, response_key, response_iv, auth)) =
+        client_request(&vmess.id, vmess.cipher, target, 1)
+    else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
+    };
+    if !writer.send(&request) {
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+    }
+    if !read_response(&mut reader, &response_key, &response_iv, auth) {
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+    }
+    note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
+    let closer = writer.clone();
+    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
+    pump_relay_carried(client, reader, writer, &close, send, recv, None);
+    true
+}
+
+fn dial_vmess_ws(
+    client: &TcpStream,
+    uplink: TcpStream,
+    vmess: &VmessOut,
+    target: &SocketAddr,
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    let rung = attempt.rung;
+    let path = attempt.path;
+    let ed = attempt.ed;
+    let Some((request, send, recv, response_key, response_iv, auth)) =
+        client_request(&vmess.id, vmess.cipher, target, 1)
+    else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
+    };
+    let Some((reader, writer)) = crate::ws::connect(uplink, &vmess.host, path, ed, &request) else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+    };
+    note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
+    let closer = writer.clone();
+    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
+    pump_relay_carried(
+        client,
+        reader,
+        WsSink::carried(writer),
+        &close,
+        send,
+        recv,
+        Some((response_key, response_iv, auth)),
+    );
+    true
+}
+
+pub(crate) fn dial_vmess(
+    client: &TcpStream,
+    server: &SocketAddr,
+    vmess: &VmessOut,
+    target: &SocketAddr,
+    ladder: &Ladder,
+) {
+    if vmess.tls.is_some() {
+        dial_vmess_tls(client, server, vmess, target);
+        return;
+    }
+    let params = stream_params(&vmess.carrier);
+    let explicit = rung_of(&vmess.carrier);
+    if explicit.is_none() {
+        let Some(uplink) = dial_or_report(server) else {
+            return;
+        };
+        if dial_vmess_headed(client, uplink, vmess, target) {
+            return;
+        }
+    }
+    let start = ladder_start(&vmess.carrier);
+    let (rungs, count) = Rung::climb_from(start);
+    for rung in &rungs[..count] {
+        let attempt = if *rung == Rung::Raw {
+            RungAttempt {
+                rung: *rung,
+                path: "",
+                ed: 0,
+                explicit: Some(*rung) == explicit,
+            }
+        } else if let Some((path, ed)) = params {
+            RungAttempt {
+                rung: *rung,
+                path,
+                ed,
+                explicit: Some(*rung) == explicit,
+            }
+        } else {
+            break;
+        };
+        let uplink = match dial(server) {
+            Ok(uplink) => uplink,
+            Err(failure) => {
+                let _stop = ladder.record_failure(*rung, &failure);
+                note_dial_failure(server, failure);
+                return;
+            }
+        };
+        if dial_vmess_rung(client, uplink, vmess, target, &attempt, ladder) {
+            return;
+        }
+    }
+}
+
+fn dial_vmess_headed(
+    client: &TcpStream,
+    uplink: TcpStream,
+    vmess: &VmessOut,
+    target: &SocketAddr,
+) -> bool {
+    let Carrier::HttpHeader { path } = &vmess.carrier else {
+        return true;
+    };
+    let Some((mut reader, mut write)) = crate::httpheader::connect(uplink, &vmess.host, path)
+    else {
+        return !Failure::new(Stage::SocketConnected, Kind::Unreachable).worth_retrying();
+    };
+    let Some((request, send, recv, response_key, response_iv, auth)) =
+        client_request(&vmess.id, vmess.cipher, target, 1)
+    else {
+        return !Failure::new(Stage::SocketConnected, Kind::Local).worth_retrying();
+    };
+    if write.write_all(&request).is_err() {
+        return !Failure::new(Stage::RequestSent, Kind::Dropped).worth_retrying();
+    }
+    if !read_response(&mut reader, &response_key, &response_iv, auth) {
+        return !Failure::new(Stage::RequestSent, Kind::Dropped).worth_retrying();
+    }
+    let Ok(closer) = write.try_clone() else {
+        return true;
+    };
+    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        let _ = closer.shutdown(Shutdown::Both);
+    });
+    pump_relay_carried(client, reader, write, &close, send, recv, None);
+    true
+}
+
+fn dial_vmess_rung(
+    client: &TcpStream,
+    uplink: TcpStream,
+    vmess: &VmessOut,
+    target: &SocketAddr,
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    match attempt.rung {
+        Rung::Ws => dial_vmess_ws(client, uplink, vmess, target, attempt, ladder),
+        Rung::HttpUpgrade => dial_vmess_httpupgrade(client, uplink, vmess, target, attempt, ladder),
+        Rung::Grpc => dial_vmess_grpc(client, uplink, vmess, target, attempt, ladder),
+        Rung::Xhttp => {
+            let rung = attempt.rung;
+            let Some((mut reader, writer)) =
+                crate::xhttp::connect(uplink, &vmess.host, attempt.path)
+            else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let Some((request, send, recv, response_key, response_iv, auth)) =
+                client_request(&vmess.id, vmess.cipher, target, 1)
+            else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
+            };
+            if !writer.send(&request) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            if !read_response(&mut reader, &response_key, &response_iv, auth) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
+            let closer = writer.clone();
+            let close: std::sync::Arc<dyn Fn() + Send + Sync> =
+                std::sync::Arc::new(move || closer.finish());
+            pump_relay_carried(client, reader, writer, &close, send, recv, None);
+            true
+        }
+        Rung::Raw => {
+            let rung = attempt.rung;
+            if !attempt.explicit {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            let mut uplink = uplink;
+            let Some((send, recv, response_key, response_iv, auth)) =
+                client_handshake(&mut uplink, &vmess.id, vmess.cipher, target)
+            else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Dropped);
+            };
+            note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
+            pump_relay(
+                client,
+                &uplink,
+                send,
+                recv,
+                Some((response_key, response_iv, auth)),
+            );
+            true
+        }
+    }
+}
+
+fn vmess_tls_raw(
+    client: &TcpStream,
+    server: &SocketAddr,
+    mut session: ferrox_core::tls::RustlsProvider<TcpStream>,
+    vmess: &VmessOut,
+    target: &SocketAddr,
+) {
+    let Some((request, send, recv, response_key, response_iv, auth)) =
+        client_request(&vmess.id, vmess.cipher, target, 1)
+    else {
+        return note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
+    };
+    if session.write_all(&request).is_err() {
+        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+    }
+    if !read_response(&mut session, &response_key, &response_iv, auth) {
+        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+    }
+    let Some((reader, writer, raw)) = tls_halves(session) else {
+        return;
+    };
+    let writer = tls_sink(writer, raw);
+    let closer = writer.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+    pump_relay_carried(client, reader, writer, &close, send, recv, None);
+}
+
+fn vmess_tls_carried(
+    client: &TcpStream,
+    server: &SocketAddr,
+    session: ferrox_core::tls::RustlsProvider<TcpStream>,
+    vmess: &VmessOut,
+    target: &SocketAddr,
+) {
+    let Some((request, send, recv, response_key, response_iv, auth)) =
+        client_request(&vmess.id, vmess.cipher, target, 1)
+    else {
+        return note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
+    };
+    match &vmess.carrier {
+        Carrier::Ws { path, ed } => {
+            let Some((reader, writer)) = tls_ws(server, session, &vmess.host, path, *ed, &request)
+            else {
+                return;
+            };
+            let mut reader = reader;
+            if !read_response(&mut reader, &response_key, &response_iv, auth) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            pump_relay_carried(
+                client,
+                reader,
+                WsSink::carried(writer),
+                &close,
+                send,
+                recv,
+                None,
+            );
+        }
+        Carrier::HttpUpgrade { path, ed } => {
+            let Some((mut reader, sink)) =
+                tls_httpupgrade(server, session, &vmess.host, path, *ed, &request)
+            else {
+                return;
+            };
+            if !read_response(&mut reader, &response_key, &response_iv, auth) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            let closer = sink.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            pump_relay_carried(client, reader, sink, &close, send, recv, None);
+        }
+        Carrier::Grpc { path } => {
+            let Some((reader, writer)) = tls_grpc(server, session, &vmess.host, path) else {
+                return;
+            };
+            let mut reader = reader;
+            if !writer.send(&request) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            if !read_response(&mut reader, &response_key, &response_iv, auth) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            pump_relay_carried(client, reader, writer, &close, send, recv, None);
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let Some((reader, writer)) = tls_xhttp(server, session, &vmess.host, &settings.path)
+            else {
+                return;
+            };
+            if !writer.send(&request) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            let mut reader = reader;
+            if !read_response(&mut reader, &response_key, &response_iv, auth) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
+            pump_relay_carried(client, reader, writer, &close, send, recv, None);
+        }
+        Carrier::HttpHeader { path } => {
+            let Some((reader, sink)) = tls_httpheader(server, session, &vmess.host, path) else {
+                return;
+            };
+            let (mut reader, mut sink) = (reader, sink);
+            if sink.write_all(&request).is_err() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            if !read_response(&mut reader, &response_key, &response_iv, auth) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            let closer = sink.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            pump_relay_carried(client, reader, sink, &close, send, recv, None);
+        }
+        Carrier::Raw
+        | Carrier::Quic
+        | Carrier::Kcp(_)
+        | Carrier::Hysteria(_)
+        | Carrier::Masque
+        | Carrier::Xdrive
+        | Carrier::Http
+        | Carrier::Unknown { .. } => {}
+    }
+}
+
+fn dial_vmess_tls(client: &TcpStream, server: &SocketAddr, vmess: &VmessOut, target: &SocketAddr) {
+    let Some(cfg) = vmess.tls.as_deref() else {
+        return;
+    };
+    let Some(session) = dial_tls_session(server, cfg) else {
+        return;
+    };
+    match &vmess.carrier {
+        Carrier::Raw => vmess_tls_raw(client, server, session, vmess, target),
+        _ => vmess_tls_carried(client, server, session, vmess, target),
+    }
+}
+
+pub(crate) fn serve_socks_udp_vmess(relay: &UdpSocket, vmess: &VmessOut) {
+    let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let mut uplink: Option<VmessUdpUplink> = None;
+    let mut staging = Vec::with_capacity(UDP_BUF);
+    let mut buf = vec![0u8; UDP_BUF];
+    while let Ok((n, src)) = relay.recv_from(&mut buf) {
+        let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+            continue;
+        };
+        if payload.is_empty() {
+            continue;
+        }
+        if let Ok(mut slot) = source.lock() {
+            *slot = Some(src);
+        }
+        let redial = match &uplink {
+            Some(up) => up.target != dest,
+            None => true,
+        };
+        if redial {
+            if let Some(old) = uplink.take() {
+                let _ = old.write.shutdown(Shutdown::Both);
+            }
+            uplink = dial_vmess_udp_uplink(vmess, &dest, relay, Arc::clone(&source));
+        }
+        if let Some(up) = &mut uplink {
+            if !write_frame(
+                &mut up.write,
+                &mut up.send,
+                payload,
+                &mut staging,
+                &mut up.pad,
+            ) {
+                if let Some(old) = uplink.take() {
+                    let _ = old.write.shutdown(Shutdown::Both);
+                }
+            }
+        }
+    }
+    if let Some(old) = uplink.take() {
+        let _ = old.write.shutdown(Shutdown::Both);
+        join(&old.done);
+    }
+}
+
+fn pump_vmess_udp(
+    stream: &TcpStream,
+    udp: &UdpSocket,
+    send: Flow,
+    recv: Flow,
+) {
+    let Ok(tcp_read) = stream.try_clone() else {
+        return;
+    };
+    let Ok(tcp_write) = stream.try_clone() else {
+        return;
+    };
+    let Ok(udp_send) = udp.try_clone() else {
+        return;
+    };
+    if udp.set_read_timeout(Some(UDP_IDLE)).is_err() {
+        return;
+    }
+    let done = Arc::new(AtomicBool::new(false));
+    let done_in = Arc::clone(&done);
+    let forward = move || {
+        let mut tcp_read = tcp_read;
+        let mut recv = recv;
+        let mut scratch = Vec::with_capacity(UDP_BUF);
+        while let Some(chunk) = read_frame(&mut tcp_read, &mut recv, &mut scratch) {
+            if chunk.is_empty() {
+                break;
+            }
+            if udp_send.send(chunk).is_err() {
+                break;
+            }
+        }
+        done_in.store(true, Ordering::Relaxed);
+    };
+    let replied = RelayPool::global().run(forward);
+    let mut send = send;
+    let mut staging = Vec::with_capacity(UDP_BUF);
+    let Some(mut pad) = PadSource::fresh() else {
+        return;
+    };
+    let mut buf = vec![0u8; UDP_BUF];
+    let mut tcp_write = tcp_write;
+    loop {
+        match udp.recv(&mut buf) {
+            Ok(n) => {
+                if n == 0 {
+                    continue;
+                }
+                if !write_frame(
+                    &mut tcp_write,
+                    &mut send,
+                    &buf[..n],
+                    &mut staging,
+                    &mut pad,
+                ) {
+                    break;
+                }
+            }
+            Err(error) if is_timeout(&error) => {
+                if done.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    done.store(true, Ordering::Relaxed);
+    let _ = tcp_write.shutdown(Shutdown::Both);
+    join(&replied);
+}
+
+pub(crate) fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
+    if let Some((outbound, server)) = vnext_servers(root, "vmess").next() {
+        let address = server.get("address").and_then(Json::as_str)?.to_owned();
+        let port = server.get("port").and_then(Json::as_port)?;
+        let user = server
+            .get("users")
+            .and_then(Json::as_arr)
+            .and_then(|users| users.first())?;
+        let id = user.get("id").and_then(Json::as_str).and_then(uuid_bytes)?;
+        let cipher = Cipher::parse(
+            user.get("security")
+                .and_then(Json::as_str)
+                .unwrap_or("auto"),
+        );
+        if let Some((carrier, host, tls)) = tls_parts(outbound, &address) {
+            return Some(VmessOut {
+                address,
+                port,
+                id,
+                cipher,
+                carrier,
+                host,
+                tls: Some(tls),
+            });
+        }
+        // A security the tree cannot dial is refused, never silently sent plain.
+        if !matches!(stream_security(outbound), "" | "none") {
+            return None;
+        }
+        let (carrier, host) = outbound_carrier(outbound, &address);
+        return Some(VmessOut {
+            address,
+            port,
+            id,
+            cipher,
+            carrier,
+            host,
+            tls: None,
+        });
+    }
+    None
 }
 
 #[cfg(test)]
