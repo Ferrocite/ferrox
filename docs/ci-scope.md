@@ -17,7 +17,7 @@ each page carries a scope block between `<!-- scope:begin -->` and
 | --- | --- | --- |
 | `paths` | the source files that trigger this method | `scripts/ci-scope.py` classifies a diff with them |
 | `scenarios` | substring patterns over the matrix ids in `scripts/lib-matrix.sh` | `benchmark-matrix.yml` |
-| `oracle` | test-name patterns over each enabled pin's suite | `conformance.yml`, `interop-baseline.yml` |
+| `oracle` | test-name patterns over each enabled pin's suite | `conformance.yml` narrows the suite to those names; `interop-baseline.yml` only decides whether the suite is reached, and runs a suite that stays whole |
 | `go` | packages of the pinned reference that test this method | `xray-baseline.yml` |
 
 `oracle` patterns may be bound to one suite with `pin=pattern`, which is how
@@ -63,7 +63,7 @@ skipped and why without opening a log.
 | `ci.yml`'s `test` (three runners) | `rust` | no `.rs`, `Cargo.*` or tool change ⇒ the prose did not move the compiler |
 | `ops.yml`'s `counts` | `ops`, then `rust` for the exact-count step | the row list is the touched methods'; the blessed-count check only rebuilds when Rust moved |
 | `benchmark-matrix.yml`'s `fetch…collect` | `matrix` | a method the matrix does not measure has no cell to run |
-| `conformance.yml`'s `suites`, `interop-baseline.yml`'s `baseline` | `suites` | a pin whose suite holds no test in scope is skipped, and says so |
+| `conformance.yml`'s `suites`, `interop-baseline.yml`'s `baseline` | `suites` | a pin whose suite holds no test in scope is skipped, and says so; conformance then narrows the suite it keeps to those names, while the baseline runs a suite that stays whole |
 | `xray-baseline.yml`'s `baseline` | `go` | only the reference packages that test the touched methods |
 | `foxy-relay.yml`'s live lane | `wide`, or `methods` naming foxy or quic | the lane dials those carriers; a method it never dials does not owe three runners and real quota |
 
@@ -101,10 +101,16 @@ files no page owns are the shared ones (`proxy.rs`, `config.rs`, `transport.rs`,
 the wireguard tree, …), so they plan wide by design: `check-ci-scope.sh` prints
 that list and fails when it changes shape.
 
-A method page moves its method's measurements and not the compiler: the page is
-where the counts live, so `ops`, the matrix cell, the oracle names and the
-reference packages for that method all run, while the three-runner workspace
-build in `ci.yml` does not. `README.md` is not a page, so it moves nothing.
+Two gates stack in front of any measurement. A workflow's own
+`on.pull_request.paths` decides whether it starts at all, and the plan then
+decides which of its jobs run. Of the jobs above only `ci.yml` and `ops.yml`
+start on `docs/**`, so a method page re-measures its method's ops rows and not
+the compiler: the matrix, the oracle suites and the reference stay with the
+source changes their filters name, and with the weekly wide run. The `cells`,
+`oracle` and `go` columns are therefore what the planner answers *for the
+method*, which is what a change to that method's source file pays — editing
+`docs/function/vmess.md` and editing `crates/ferrox-app/src/vmess.rs` plan the
+same scope, and only the second one starts the workflows that measure it.
 
 The `rows` column is the one that costs wall-clock: a valgrind run per row, so a
 VMess change pays 1 measurement instead of 24. A narrow plan also *deepens* what
@@ -114,31 +120,52 @@ measured against every reference, and the ones that did not are not measured at
 all.
 
 The same day's CI, measured from the step timings of the runs of five recent
-pull requests, is what the gate is actually buying:
+pull requests, is the left column below. The right column is the same change —
+`crates/ferrox-app/src/vmess.rs`, one method's own file — measured on this
+wiring's own runs, with the run id named so a reader can open it:
 
-| job, on a change that touches one method | time it takes now | what it is doing |
+| job, on a change that touches one method | what it paid | what it pays now |
 | --- | --- | --- |
-| `ops.yml` | 4 m 17 s build + count, 22 s for all 31 rows | one `cargo` build under `-C debuginfo=line-tables-only`, then one valgrind run per test |
-| `conformance.yml` | 4 m 6 s | every test of every enabled suite, against `ferrox-app` |
-| `interop-baseline.yml` | 5 m 0 s | the same suites, whole |
-| `xray-baseline.yml` | 6 m 21 s | `go test ./...` over the pinned xray-core |
-| `benchmark-matrix.yml` | 1 m 31 s per cell | the smoke cell, which is a **VLESS** cell on a VMess change |
-| `foxy-relay.yml` | 2 m 48 s … 14 m, three runners | signs into a live account and moves 1 MB per carrier |
-| `ci.yml`'s `test` | three runners, one workspace build each | the suite, on Linux, macOS and Windows |
+| `ops.yml` | 4 m 17 s build + 22 s of valgrind over 31 rows in 24 runs | 4 m 8 s total: the same one build, 2 of 31 rows in **1** run, report step 1 s — run 38658878715 |
+| `conformance.yml` | 4 m 6 s, every test of every enabled suite against `ferrox-app` | 2 m 41 s: zeronet at `running 2 tests … 17 filtered out`, both xray-rust pins out of scope — run 38658878645 |
+| `interop-baseline.yml` | 5 m 0 s, every suite whole | 2 m 19 s: one suite whole (19 tests), the two pins it does not reach skipped — run 38658878627 |
+| `xray-baseline.yml` | 6 m 21 s, `go test ./...` over the pinned xray-core | 47 s: `go test ./common/crypto/... ./proxy/vmess/...`, 4 packages, all green — run 38658878637 |
+| `benchmark-matrix.yml` | 1 m 31 s per cell, and the smoke pair's cells are **VLESS** cells on a VMess change | one `vmess-raw-down-8` cell at the full tier: five engines, five repeats — run 38658878689, and it is **red**, which is the discovery this row exists to make |
+| `foxy-relay.yml` | 2 m 48 s … 14 m on three runners, plus real quota | 6 s: the plan answers, the live lane job is skipped — run 38658878623 |
+| `ci.yml`'s `test` | three runners, one workspace build each | still three runners: `.rs` moved. On a page or `README.md` edit the job is skipped outright — run 38658518128 |
 
-So a VMess change used to pay for a whole reference tree's test suite, three
+The two layers of that table are worth keeping straight. A `docs/**` edit does
+not even start the comparing jobs, because their `paths:` filters name source; a
+source edit starts them all and the plan then decides what each one measures. So
+a VMess change used to pay for a whole reference tree's test suite, three
 whole oracle suites, 24 valgrind runs, a live three-runner dial of a lane it does
 not touch, and a VLESS benchmark. It now pays for one run, two reference
-packages, two oracle tests, and the VMess cell against all five engines. A method
-page pays that same measurement with no compiler at all — `ci.yml`'s three
-runners are what it drops, since the counts on the page are what moved, not the
-code they describe. Prose no page is about, `README.md` included, drops the
-measurements too and leaves only the gates that read the declarations.
+packages, the tests of the one suite that has a VMess oracle, its own cell at
+every engine, and no live lane at all.
+
+What that VMess cell came back with is the reason to run it: 2 663 ms of CPU per
+GiB against xray-core's 2 422 ms over the same 8 GiB on 8 flows, a ~10% gap the
+harness resolves as its own regression gate (interval `[0.907x, 0.917x]` over
+five pairs), at 7.5x lower peak RSS and equal throughput — run 38658878689,
+artefact `matrix-cell-ubuntu-latest-vmess-raw-down-8`. Two of the five engines
+return nothing there at all: `sing-box` because the matrix's per-cell config is
+an Xray-dialect document and sing-box reads SingBox, and `xray-rust` because it
+does not serve vmess at its pin. None of this was reachable from a pull request
+before, because a VMess change ran a VLESS smoke cell.
 
 Not claimed: that this is a fixed factor. It is a function of how much of the
 tree a change touches, and the honest summary is that a single-method change now
-plans a fraction of the measurements while any change to shared code still plans
-all of them.
+pays a fraction of the measurements while any change to shared code still pays
+all of them — which is what run 38657406765 and its siblings, the wide plan of
+this wiring's own pull request, are the evidence for: every job ran, and every
+one passed.
+
+One row of that table is not a saving, and naming it is the point: `ops.yml`'s
+build is the floor on any change that moves code, and its two VMess rows read
+`Ir=inlined-not-a-frame` in the artefact of run 38658878715 — the test ran, the
+profile held no frame for either symbol, so those two blessed counts are not
+being observed at all. That is a gap in the gate, not in the scope planner, and
+it is the next thing to fix.
 
 ## Adding a method
 
