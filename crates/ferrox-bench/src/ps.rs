@@ -196,12 +196,32 @@ pub fn sample(host: Host, pid: u32, elapsed_ms: u128) -> Result<Sample, SampleEr
     Ok(sample)
 }
 
-/// The four lines `/proc/<pid>/io` counts for the whole thread group. A missing line is a sample
-/// with no kernel tally rather than a failed run, because a runner that hides `io` from the
-/// harness must not turn a benchmark into a fault.
+/// What the process's threads crossed the boundary for, as one tally.
+///
+/// `/proc/<pid>/io` is a *task's* counters on a multithreaded process, so a relay whose worker
+/// threads make the syscalls would report the leader's startup bytes and nothing else. Every task
+/// under `/proc/<pid>/task/` is read and summed instead; a task that dies mid-walk only ever drops
+/// its own line, so the tally stays a floor. No `/proc` at all, or a runner that hides it, is no
+/// tally rather than a failed run.
 fn proc_io(pid: u32) -> Option<Io> {
-    let text = std::fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
-    parse_io(&text)
+    let tasks = std::fs::read_dir(format!("/proc/{pid}/task")).ok()?;
+    let mut total: Option<Io> = None;
+    for task in tasks.flatten() {
+        let Ok(text) = std::fs::read_to_string(task.path().join("io")) else {
+            continue;
+        };
+        let Some(io) = parse_io(&text) else { continue };
+        total = Some(match total {
+            Some(sum) => Io {
+                read_calls: sum.read_calls.saturating_add(io.read_calls),
+                write_calls: sum.write_calls.saturating_add(io.write_calls),
+                read_bytes: sum.read_bytes.saturating_add(io.read_bytes),
+                write_bytes: sum.write_bytes.saturating_add(io.write_bytes),
+            },
+            None => io,
+        });
+    }
+    total
 }
 
 pub fn parse_io(text: &str) -> Option<Io> {
@@ -594,6 +614,56 @@ mod tests {
         ] {
             assert_eq!(parse_io(short), None, "{short:?} cannot be a whole tally");
         }
+    }
+
+    /// A writer thread that is not the leader has to land in the tally, and land in it once: the
+    /// upper bound is what a walk over `/proc/<pid>/task/` cannot reach and a shared-per-thread
+    /// reading of it would blow straight through.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_tally_counts_the_thread_that_made_the_writes() {
+        const WRITTEN: u64 = 16 << 20;
+        let pid = std::process::id();
+        let before = proc_io(pid).expect("a linux process has per-thread io counters");
+        let path = std::env::temp_dir().join(format!("ferrox-io-tally-{pid}"));
+        let file_path = path.clone();
+        let (done, wait_done) = std::sync::mpsc::channel::<()>();
+        let (release, wait_release) = std::sync::mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&file_path).expect("a temp file to write into");
+            let zeroes = vec![0u8; 1 << 16];
+            let mut left = WRITTEN as usize;
+            while left > 0 {
+                let take = left.min(zeroes.len());
+                file.write_all(&zeroes[..take])
+                    .expect("a write reaches the kernel");
+                left -= take;
+            }
+            drop(file);
+            done.send(()).expect("the tally is taken while parked");
+            wait_release
+                .recv()
+                .expect("the parked writer thread is released");
+        });
+        wait_done
+            .recv()
+            .expect("the writer thread finishes its bytes");
+        let after = proc_io(pid).expect("the tally is still readable");
+        let delta = after.since(&before).expect("a counter only rises");
+        assert!(
+            delta.write_bytes >= WRITTEN,
+            "{WRITTEN} B written by a worker thread, the tally saw {} B",
+            delta.write_bytes
+        );
+        assert!(
+            delta.write_bytes < WRITTEN * 2,
+            "{WRITTEN} B written once, the tally reports {} B",
+            delta.write_bytes
+        );
+        release.send(()).expect("the writer thread is parked");
+        writer.join().expect("the writer thread ends");
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
