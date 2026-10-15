@@ -10,10 +10,13 @@ that costs one AEAD call per frame instead of two. That is not a simplification:
 a peer negotiates framing options in the clear, so a different set is visible on
 the wire. Xray's client default is the same three bits, so this matches.
 
-Read and write are asymmetric on purpose. Writing batches: four 8 KiB frames are
-staged into one buffer and written with one syscall. Reading is in place: the
-frame is read into a buffer the connection already owns, the payload is opened
-inside it, and a subslice of that same buffer is what the caller gets.
+Read and write are symmetric about one thing: both batch. Writing stages four
+8 KiB frames into one buffer and writes them once. Reading keeps the sealed bytes
+and the plaintext gathered from them in one buffer, so the pump can tell without
+asking the carrier that four frames are already here, and it leaves the plain leg
+in one write instead of four. A `BufReader` cannot offer that — it hides how much
+it holds — which is why the relay reads through `vmess::Wire` and the handshake
+still reads through `read_frame`.
 
 The payload cipher follows the reference's `auto` negotiation rather than a fixed
 choice: AES-128-GCM where the machine has hardware for it, ChaCha20-Poly1305
@@ -33,11 +36,11 @@ graph TD
     W2 --> W3["one staging buffer<br/>1 copy per byte, 0 allocations"]
     W3 --> W4["write_all, 1 syscall"]
     W4 --> W(("wire"))
-    R(("wire")) --> R1["read the 2-byte length, unmask it"]
-    R1 --> R2["read payload+tag into<br/>the connection's own buffer"]
-    R2 --> R3["open in place<br/>0 copies"]
-    R3 --> R4["counter +1, return a subslice"]
-    R4 --> R5["write_all to the target, 1 syscall"]
+    R(("wire")) --> R1["fill the pump's own buffer<br/>1 read per refill"]
+    R1 --> R2["unmask the 2-byte length,<br/>open each frame in place"]
+    R2 --> R3["gather the plaintext to the front<br/>of that same buffer, 0 allocations"]
+    R3 --> R4["counter +1 per frame"]
+    R4 --> R5["write the whole batch to the target,<br/>1 syscall"]
 ```
 
 ## Measured
@@ -51,6 +54,9 @@ graph TD
 | write-syscalls-per-32KiB-relay-read | 1 | ferrox-app-vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time |
 | user-space-copies-per-byte-written | 1 | ferrox-app-vmess::tests::frames_reuse_the_callers_buffers |
 | frame-buffer-allocations-per-relay-write | 0 | ferrox-app-vmess::tests::frames_reuse_the_callers_buffers |
+| frames-per-plain-write | 4 | ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write |
+| plain-write-syscalls-per-4-frame-batch | 1 | ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write |
+| pump-buffer-allocations-per-batch | 0 | ferrox-app-vmess::tests::the_pump_gathers_into_its_own_buffer_and_never_moves_it |
 | counters-per-frame | 1 | ferrox-app-vmess::tests::counters_advance_one_per_frame_at_any_offset |
 <!-- counts:end -->
 
@@ -65,11 +71,36 @@ graph TD
 
 ## Time
 
-**Not measured on this branch.** `ferrox-bench` gate 4 (`framing.rs`) compares
+**Measured on this branch.** `ferrox-bench` gate 4 (`framing.rs`) compares
 VMess-style framing rows byte for byte against the pinned reference, and gate 7b
 compares the AEAD seals; neither is a clock. The clock is gate 3's ratio at
 every measured length plus `.github/workflows/parity.yml`'s `vmess-raw`
-scenario. No artefact from this branch has been read.
+scenario, and the batch's own number is `benchmark-matrix.yml`'s
+`vmess-raw-down-8` cell: **full tier, ubuntu-latest (4 logical CPUs), 5 medians
+per engine, run 38667435571 on this branch's head.**
+
+| ratio vs xray-core (higher throughput / lower CPU is better) | interval | verdict |
+| --- | --- | --- |
+| throughput | 1.235 [1.216, 1.269] | better, gating |
+| cpu per GiB | 1.178 [1.169, 1.187] | better, gating |
+| peak rss | 7.122 [7.079, 7.165] | better, gating |
+
+The split those two totals are made of, in ms/GiB medians:
+
+| engine | user | sys | total | MiB/s | peak RSS MiB | threads |
+| --- | --- | --- | --- | --- | --- | --- |
+| ferrox | 790 | 1 291 | 2 065 | 1 557.5 | 8.6 | 35 |
+| xray-core | 1 264 | 1 170 | 2 435 | 1 274.8 | 61.2 | 14 |
+| zeronet | 7 578 | 1 614 | 9 201 | 399.2 | 12.5 | 5 |
+
+Against the same branch's own baseline (run 38663342157, standard tier, 3
+repeats: 788 user / 1 850 sys, cpu per GiB 0.921 of xray-core) **the batch moved
+the kernel half and only the kernel half**: −30 % sys per GiB, user CPU inside
+the noise, and the reference on this run reads 1 170 sys against its baseline's
+1 153, so the runner did not move under the number. zeronet's `vmess` rows are
+informational and non-gating; sing-box and xray-rust are **unproven** here for
+the reasons the cell records — Xray-dialect configs and a pin that does not
+serve vmess.
 
 The tag and the payload are both authenticated over the ciphertext, so this
 method's open path is the [`record-layer`](record-layer.md) open path: the tag is
@@ -116,6 +147,24 @@ frame — apply to every 8 KiB VMess frame on the AVX2 and NEON-4 paths.
   scratch each call. This tree stages four frames and writes once;
   `a_batch_on_the_wire_is_the_frames_written_one_at_a_time` is the gate that
   the batch is byte-identical to writing the frames one at a time.
+- **Four write syscalls — and four segments — per relayed batch.** The plain leg of a
+  relay wrote one decoded frame per `write_all`: a syscall and a loopback segment for
+  every 8 KiB. On `vmess-raw-down-8` (run 38663342157, ubuntu-latest, 3 repeats each)
+  ferrox reads **1 850 ms/GiB of system CPU against xray-core's 1 153**, while the same
+  runs read **788 ms/GiB of user CPU against their 1 275**: the user-space half of this
+  method already costs 1.6x less than the reference, and the row that is red is entirely
+  the kernel. The reference batches for the same reason —
+  `AuthenticationReader.ReadMultiBuffer` (`common/crypto/auth.go:207`) pulls one frame
+  and then up to fifteen more **only from what its `BufferedReader` already holds**, so a
+  batch never waits and an interactive byte is never held up to fill one. `Wire::batch`
+  is that shape over one buffer instead of two, which also drops the `BufReader` hop into
+  a scratch `Vec` and the `resize` that zeroed a frame right before `read_exact`
+  overwrote it. `a_batch_of_frames_leaves_the_pump_in_one_write` gates the batch, and
+  `a_dribbled_carrier_still_offers_one_frame_and_loses_nothing` that a carrier arriving
+  three bytes at a time still loses nothing. The moved row, measured on this
+  branch (run 38667435571): **1 850 → 1 291 ms/GiB of system CPU**, user CPU left
+  where it was (788 → 790), which is what makes this a kernel-side removal rather
+  than a relocation into user space.
 - **A second copy on read.** Xray's large-chunk read path
   (`common/crypto/auth.go:188-203`) allocates a pooled buffer, reads into it,
   opens in place, and then calls `buf.MergeBytes`, which is a second copy plus a
@@ -151,6 +200,17 @@ per-connection cache keyed by auth id, which is the same shape as Xray's
 calls (16 + 18 + 8 bytes) rather than one, because the auth id has to be read
 before the length can be decrypted. Both are handshake-only, once per
 connection, and neither is where a connection spends its time.
+
+The batch also **trades one user-space copy for three kernel calls**: gathering
+a frame's plaintext to the front of the pump's buffer is one `copy_within` per
+frame, which the one-frame-per-`write` pump did not pay. It is a relocation, not
+a removal, and it is on the side of the ledger the split above says is already
+cheap — `vmess user-space-copies-per-byte-written 1` counts the write leg only,
+so this read-leg copy is prose rather than a row. `the_pump_gathers_into_its_own_buffer_and_never_moves_it`
+holds the buffer's pointer and capacity steady across a batch so the gather
+cannot quietly become a reallocating batch. What the split also names and this
+slice leaves alone: **35 threads at peak against xray-core's 14** on the same
+cell, which is the relay model, not the framing.
 
 ## Pins
 
