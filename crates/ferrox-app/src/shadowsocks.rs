@@ -427,7 +427,7 @@ pub(crate) fn pump_relay_carried<R, W>(
     let mut send = send;
     let thread_close = std::sync::Arc::clone(close);
     let done = thread::spawn(move || {
-        let mut buf = unfilled(BATCH);
+        let mut buf = unfilled(uplink_buffer_len(&send));
         loop {
             let read = match &send {
                 Uplink::Aead(_) => read_slots(&mut plain_read, &mut buf),
@@ -564,6 +564,15 @@ const SLOT: usize = SEAL_HEAD + MAX_CHUNK + TAG_LEN;
 
 /// The relay's read buffer: one slot per chunk of a batch.
 const BATCH: usize = CHUNKS_PER_BATCH * SLOT;
+
+/// The uplink's read buffer, sized by what the rung can fill: an AEAD leg reads four chunks at a
+/// time, a stream crypt reads one — four slots would be buffers for a batch that leg never makes.
+fn uplink_buffer_len(send: &Uplink) -> usize {
+    match send {
+        Uplink::Aead(_) => BATCH,
+        Uplink::Stream(_) => SLOT,
+    }
+}
 
 /// A chunk buffer sized once: `open_chunk` writes into a prefix of it, so no read ever grows or re-zeroes it.
 pub(crate) fn wire_buffer() -> Vec<u8> {
@@ -1252,6 +1261,27 @@ mod tests {
         let mut back = seen.clone();
         Rc4::new(&key).expect("schedules").crypt(&mut back);
         assert_eq!(back, want, "every byte came back");
+    }
+
+    /// What each rung is given for its read buffer, asserted rather than left to the loop above it.
+    #[test]
+    fn a_stream_uplink_buffers_one_slot_and_an_aead_uplink_a_batch() {
+        let salt = [7u8; SALT_LEN];
+        let master = MasterKey::new("an-example-shared-password", 16);
+        let key = rc4_md5_key(master.as_bytes(), &[9u8; IV_LEN]).expect("derives");
+        assert_eq!(
+            uplink_buffer_len(&Uplink::Stream(Rc4::new(&key).expect("schedules"))),
+            SLOT,
+            "a stream read fills one chunk, so three more slots are memory that leg never touches"
+        );
+        assert_eq!(
+            uplink_buffer_len(&Uplink::Aead(
+                Cipher::new(Method::Aes256Gcm, "an-example-shared-password", &salt)
+                    .expect("derives")
+            )),
+            BATCH,
+            "an AEAD read fills the batch"
+        );
     }
 
     /// Seal one datagram into a buffer of its own, the way a socket thread hands its payload to the sealer.
