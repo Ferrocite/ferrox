@@ -2,7 +2,7 @@
 
 QUIC carried VLESS only as a client row; the **server role now exists** and
 serves a `vless` inbound on `security: tls` with a certificate
-(`serve_vless_quic`, `proxy.rs:1352`). Each bidirectional stream is one
+(`serve_vless_quic`, `proxy.rs:1341`). Each bidirectional stream is one
 VLESS TCP session: the UUID check, the empty-flow requirement and the TCP
 target dial happen inside `serve_vless_quic`, and a stranger or a UDP/mux
 offer closes the stream before anything is relayed. The ALPN is the default

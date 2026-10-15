@@ -408,7 +408,7 @@ pub(crate) enum Role {
 }
 
 #[derive(Debug, Clone)]
-enum Outbound {
+pub(crate) enum Outbound {
     Vless(VlessOut),
     Trojan(TrojanOut),
     Vmess(crate::vmess::VmessOut),
@@ -420,7 +420,7 @@ enum Outbound {
 
 /// The Foxy lane: an account's pass over an edge in one pinned country, plus the split-tunnel list.
 #[derive(Debug, Clone)]
-struct FoxyOut {
+pub(crate) struct FoxyOut {
     account: Option<std::sync::Arc<crate::foxy_account::Account>>,
     country: String,
     city: String,
@@ -494,7 +494,7 @@ fn carrier_key(edge: &ferrox_core::foxy::Candidate, carrier: crate::foxy::Carrie
 }
 
 #[derive(Debug, Clone)]
-struct VlessOut {
+pub(crate) struct VlessOut {
     address: String,
     port: u16,
     id: [u8; 16],
@@ -509,7 +509,7 @@ struct VlessOut {
 }
 
 #[derive(Debug, Clone)]
-struct HttpOut {
+pub(crate) struct HttpOut {
     address: String,
     port: u16,
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
@@ -531,7 +531,7 @@ macro_rules! refused_carriers {
 }
 
 #[derive(Debug, Clone)]
-struct TrojanOut {
+pub(crate) struct TrojanOut {
     address: String,
     port: u16,
     key: [u8; 56],
@@ -541,7 +541,7 @@ struct TrojanOut {
 }
 
 #[derive(Debug, Clone)]
-struct ShadowsocksOut {
+pub(crate) struct ShadowsocksOut {
     address: String,
     port: u16,
     method: String,
@@ -3536,7 +3536,7 @@ pub(crate) fn tls_xhttp(
 
 // One session, two owners: the pump takes a reader and a writer, and a TLS session cannot split.
 #[derive(Debug)]
-struct TlsHalf<S> {
+pub(crate) struct TlsHalf<S> {
     session: Arc<Mutex<S>>,
 }
 
@@ -3548,7 +3548,7 @@ impl<S> Clone for TlsHalf<S> {
     }
 }
 
-type ClientHalf = TlsHalf<ferrox_core::tls::RustlsProvider<TcpStream>>;
+pub(crate) type ClientHalf = TlsHalf<ferrox_core::tls::RustlsProvider<TcpStream>>;
 
 impl<S: ferrox_core::tls::TlsProvider> Read for TlsHalf<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -3594,7 +3594,7 @@ impl<S: ferrox_core::tls::TlsProvider> Write for TlsHalf<S> {
 
 // The write end relays understand: bytes through the shared session, teardown through the raw socket.
 #[derive(Debug)]
-struct TlsSink {
+pub(crate) struct TlsSink {
     half: ClientHalf,
     raw: Arc<TcpStream>,
 }
@@ -6293,7 +6293,10 @@ impl RelayPool {
         })
     }
 
-    pub(crate) fn run(&self, direction: impl FnOnce() + Send + 'static) -> std::sync::mpsc::Receiver<()> {
+    pub(crate) fn run(
+        &self,
+        direction: impl FnOnce() + Send + 'static,
+    ) -> std::sync::mpsc::Receiver<()> {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let task: RelayTask = Box::new(move || {
             let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(direction));
@@ -8251,7 +8254,7 @@ fn b64url(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::config::{grpc_path, stream_carrier};
-    use crate::vmess::{VmessOut, dial_vmess, find_vmess_outbound};
+    use crate::vmess::{dial_vmess, find_vmess_outbound, VmessOut};
 
     #[test]
     fn the_seam_split_find_across_agrees_with_the_per_byte_branch_scan() {

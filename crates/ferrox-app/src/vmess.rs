@@ -10,11 +10,11 @@ use crate::budgets::UDP_IDLE;
 use crate::config::{inbound_carrier, outbound_carrier, stream_security, uuid_bytes, Carrier};
 use crate::json::Json;
 use crate::proxy::{
-    climb_or_hold, dial, dial_or_report, dial_tls_session, inbound_id, join, kcp_parts,
-    ladder_start, note_dial_failure, note_success, parse_socks_udp, push_socks_addr, rung_of,
-    serve_kcp_loop, spawn_role, stream_params, tls_grpc, tls_halves, tls_httpheader,
-    tls_httpupgrade, tls_parts, tls_sink, tls_ws, tls_xhttp, vnext_servers, CarrierSink, KcpIo,
-    KcpServe, RelayPool, Role, RungAttempt, UDP_BUF, is_timeout, read_exact,
+    climb_or_hold, dial, dial_or_report, dial_tls_session, inbound_id, is_timeout, join, kcp_parts,
+    ladder_start, note_dial_failure, note_success, parse_socks_udp, push_socks_addr, read_exact,
+    rung_of, serve_kcp_loop, spawn_role, stream_params, tls_grpc, tls_halves, tls_httpheader,
+    tls_httpupgrade, tls_parts, tls_sink, tls_ws, tls_xhttp, vnext_servers, CarrierSink, KcpServe,
+    RelayPool, Role, RungAttempt, UDP_BUF,
 };
 use ferrox_core::failure::{Failure, Kind, Ladder, Rung, Stage};
 
@@ -1590,8 +1590,7 @@ pub(crate) fn pump_relay(
     let _ = done.join();
 }
 
-// The rungs a VMess session runs on, in from the dispatch that used to hold them:
-// inbound, the carrier ladder, TLS, the UDP uplink and the outbound the config names.
+// The rungs a VMess session runs on, in from the dispatch that used to hold them.
 #[derive(Debug, Clone)]
 pub(crate) struct VmessOut {
     pub(crate) address: String,
@@ -1617,13 +1616,10 @@ pub(crate) fn dial_vmess_kcp(
     if conn.write(&request).is_err() {
         return;
     }
-    let mut reader = KcpIo {
-        conn: Arc::clone(conn),
-    };
+    let (mut reader, writer, close) = kcp_parts(conn);
     if !read_response(&mut reader, &response_key, &response_iv, auth) {
         return;
     }
-    let (_, writer, close) = kcp_parts(conn);
     pump_relay_carried(client, reader, writer, &close, send, recv, None);
 }
 
@@ -2160,12 +2156,7 @@ pub(crate) fn serve_socks_udp_vmess(relay: &UdpSocket, vmess: &VmessOut) {
     }
 }
 
-fn pump_vmess_udp(
-    stream: &TcpStream,
-    udp: &UdpSocket,
-    send: Flow,
-    recv: Flow,
-) {
+fn pump_vmess_udp(stream: &TcpStream, udp: &UdpSocket, send: Flow, recv: Flow) {
     let Ok(tcp_read) = stream.try_clone() else {
         return;
     };
@@ -2208,13 +2199,7 @@ fn pump_vmess_udp(
                 if n == 0 {
                     continue;
                 }
-                if !write_frame(
-                    &mut tcp_write,
-                    &mut send,
-                    &buf[..n],
-                    &mut staging,
-                    &mut pad,
-                ) {
+                if !write_frame(&mut tcp_write, &mut send, &buf[..n], &mut staging, &mut pad) {
                     break;
                 }
             }
