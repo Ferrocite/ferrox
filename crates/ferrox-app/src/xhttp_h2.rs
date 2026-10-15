@@ -578,7 +578,7 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
     }
     if conn.refused.load(Ordering::SeqCst) {
         // Closing while the peer's bytes sit unread aborts the connection, and the RST can swallow the GOAWAY written microseconds earlier; the grace is the window the peer takes it in.
-        std::thread::sleep(crate::budgets::GOAWAY_GRACE);
+        std::thread::sleep(crate::budgets::goaway_grace());
     }
     conn.kill();
     conn.wake.notify_all();

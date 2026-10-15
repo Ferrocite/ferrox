@@ -131,11 +131,12 @@ fn serve_single(stream: &mut TcpStream, method: Method, psk: &[u8], freedom: boo
     }
     let key_len = method.key_len();
     // Bound the salt/fixed/variable request reads to a wall-clock budget, then restore the relay's blocking reads.
-    let _ = stream.set_read_timeout(Some(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT));
+    let budget = crate::budgets::handshake();
+    let _ = stream.set_read_timeout(Some(budget));
     let opened = {
         let mut bounded = crate::proxy::HandshakeDeadline {
             inner: stream,
-            until: std::time::Instant::now() + crate::budgets::HANDSHAKE_REQUEST_TIMEOUT,
+            until: std::time::Instant::now() + budget,
         };
         'req: {
             let mut salt = vec![0u8; key_len];
@@ -193,11 +194,12 @@ fn serve_multi(stream: &mut TcpStream, method: Method, list: &[Vec<u8>], freedom
     let key_len = method.key_len();
     let master = &list[0];
     // Bound the salt/eih/fixed/variable request reads to a wall-clock budget, then restore the relay's blocking reads.
-    let _ = stream.set_read_timeout(Some(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT));
+    let budget = crate::budgets::handshake();
+    let _ = stream.set_read_timeout(Some(budget));
     let opened = {
         let mut bounded = crate::proxy::HandshakeDeadline {
             inner: stream,
-            until: std::time::Instant::now() + crate::budgets::HANDSHAKE_REQUEST_TIMEOUT,
+            until: std::time::Instant::now() + budget,
         };
         'req: {
             let mut salt = vec![0u8; key_len];

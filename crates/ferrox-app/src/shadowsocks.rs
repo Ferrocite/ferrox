@@ -40,11 +40,12 @@ pub(crate) fn serve(mut stream: TcpStream, password: &str, method: &str, freedom
     let salt_len = method.key_len();
     let mut head = wire_buffer();
     // Bound the salt and first-chunk reads to a wall-clock budget, then restore the relay's blocking reads.
-    let _ = stream.set_read_timeout(Some(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT));
+    let budget = crate::budgets::handshake();
+    let _ = stream.set_read_timeout(Some(budget));
     let opened = {
         let mut bounded = crate::proxy::HandshakeDeadline {
             inner: &mut stream,
-            until: std::time::Instant::now() + crate::budgets::HANDSHAKE_REQUEST_TIMEOUT,
+            until: std::time::Instant::now() + budget,
         };
         let mut salt = [0u8; SALT_LEN];
         read_exact(&mut bounded, &mut salt[..salt_len])
@@ -87,11 +88,12 @@ fn serve_stream(mut stream: TcpStream, password: &str) {
     let master = MasterKey::new(password, Method::Rc4Md5.key_len());
     let mut head = [0u8; 512];
     // Bound the IV and address-header reads to a wall-clock budget, then restore the relay's blocking reads.
-    let _ = stream.set_read_timeout(Some(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT));
+    let budget = crate::budgets::handshake();
+    let _ = stream.set_read_timeout(Some(budget));
     let opened = {
         let mut bounded = crate::proxy::HandshakeDeadline {
             inner: &mut stream,
-            until: std::time::Instant::now() + crate::budgets::HANDSHAKE_REQUEST_TIMEOUT,
+            until: std::time::Instant::now() + budget,
         };
         let mut iv = [0u8; IV_LEN];
         read_exact(&mut bounded, &mut iv)
