@@ -70,7 +70,7 @@ moves; a second padded test cuts a pad byte into a message the frame before had
 started and shows the counter at `5`, the move that shape still pays. The two
 window rows come from one test: the two `WINDOW_UPDATE` frames a credit grants
 are the peer's bytes exactly as before, and they now leave in a single write.
-Neither of those numbers is a duration, and `## Time` says why.
+None of those numbers is a duration, and `## Time` says why.
 
 ## Ops
 
@@ -142,7 +142,8 @@ until it is closed.
   its own. Their eighteen header bytes are constant and only the stream id and
   the increment differ, so both come out of one 26-byte template in a single
   write — the same two frames, in the same order, one write syscall fewer per
-  DATA frame. The Foxy lane grants its credit the same way.
+  DATA frame. What this leaves alone: `xhttp_h2`'s `replenish` credits the same
+  pair as two frames over two writes, and its page owns that row.
 
 What is **not** removed: HTTP/2's own framing. `T_DATA`, `T_HEADERS` and
 `T_SETTINGS`, HPACK and the flow-control window are the cost of the carrier,
