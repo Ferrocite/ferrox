@@ -265,6 +265,8 @@ Give {method} — matrix row {index} of table {section} — every wait a deadlin
 
 **Add-on — deep-retry:** A carrier whose own reader loops on timeouts (gRPC, xHTTP, VMess, Shadowsocks handshakes) needs the budget inside that loop, not around it; record it as a row rather than bolting a wrapper on top.
 
+**Add-on — flow-wait-with-no-bound:** In `poll_relay`, `drive` waits on both directions with no bound and `Worker::push` drops the flow when the queue lock is poisoned, so a worker parked inside `copy_all_memcpy` starves every flow queued behind it and their waits print nothing; bound the flow the way `RELAY_JOIN` bounds a leg, and prove it by parking one worker and asserting the flows behind it still end.
+
 ## P14 · Put a layer where the references put it
 
 **When to use:** A method's bytes are right but the security layer, framing, or session lives at a different depth than every pinned reference puts it, so the next row that reuses it cannot.
