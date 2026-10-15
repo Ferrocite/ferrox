@@ -71,11 +71,36 @@ graph TD
 
 ## Time
 
-**Not measured on this branch.** `ferrox-bench` gate 4 (`framing.rs`) compares
+**Measured on this branch.** `ferrox-bench` gate 4 (`framing.rs`) compares
 VMess-style framing rows byte for byte against the pinned reference, and gate 7b
 compares the AEAD seals; neither is a clock. The clock is gate 3's ratio at
 every measured length plus `.github/workflows/parity.yml`'s `vmess-raw`
-scenario. No artefact from this branch has been read.
+scenario, and the batch's own number is `benchmark-matrix.yml`'s
+`vmess-raw-down-8` cell: **full tier, ubuntu-latest (4 logical CPUs), 5 medians
+per engine, run 38667435571 on this branch's head.**
+
+| ratio vs xray-core (higher throughput / lower CPU is better) | interval | verdict |
+| --- | --- | --- |
+| throughput | 1.235 [1.216, 1.269] | better, gating |
+| cpu per GiB | 1.178 [1.169, 1.187] | better, gating |
+| peak rss | 7.122 [7.079, 7.165] | better, gating |
+
+The split those two totals are made of, in ms/GiB medians:
+
+| engine | user | sys | total | MiB/s | peak RSS MiB | threads |
+| --- | --- | --- | --- | --- | --- | --- |
+| ferrox | 790 | 1 291 | 2 065 | 1 557.5 | 8.6 | 35 |
+| xray-core | 1 264 | 1 170 | 2 435 | 1 274.8 | 61.2 | 14 |
+| zeronet | 7 578 | 1 614 | 9 201 | 399.2 | 12.5 | 5 |
+
+Against the same branch's own baseline (run 38663342157, standard tier, 3
+repeats: 788 user / 1 850 sys, cpu per GiB 0.921 of xray-core) **the batch moved
+the kernel half and only the kernel half**: −30 % sys per GiB, user CPU inside
+the noise, and the reference on this run reads 1 170 sys against its baseline's
+1 153, so the runner did not move under the number. zeronet's `vmess` rows are
+informational and non-gating; sing-box and xray-rust are **unproven** here for
+the reasons the cell records — Xray-dialect configs and a pin that does not
+serve vmess.
 
 The tag and the payload are both authenticated over the ciphertext, so this
 method's open path is the [`record-layer`](record-layer.md) open path: the tag is
@@ -136,7 +161,10 @@ frame — apply to every 8 KiB VMess frame on the AVX2 and NEON-4 paths.
   a scratch `Vec` and the `resize` that zeroed a frame right before `read_exact`
   overwrote it. `a_batch_of_frames_leaves_the_pump_in_one_write` gates the batch, and
   `a_dribbled_carrier_still_offers_one_frame_and_loses_nothing` that a carrier arriving
-  three bytes at a time still loses nothing.
+  three bytes at a time still loses nothing. The moved row, measured on this
+  branch (run 38667435571): **1 850 → 1 291 ms/GiB of system CPU**, user CPU left
+  where it was (788 → 790), which is what makes this a kernel-side removal rather
+  than a relocation into user space.
 - **A second copy on read.** Xray's large-chunk read path
   (`common/crypto/auth.go:188-203`) allocates a pooled buffer, reads into it,
   opens in place, and then calls `buf.MergeBytes`, which is a second copy plus a
