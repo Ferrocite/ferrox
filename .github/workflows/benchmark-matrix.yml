@@ -32,6 +32,17 @@ on:
         required: false
         default: ""
         type: string
+      runner:
+        description: "Which platform measures it"
+        required: false
+        default: "all"
+        type: choice
+        options:
+          - all
+          - ubuntu
+          - ubuntu-arm
+          - macos
+          - windows
       only:
         description: "Comma-separated scenario substring filter (blank = every scenario in the tier)"
         required: false
@@ -75,6 +86,7 @@ jobs:
           WANT_ONLY: ${{ inputs.only }}
           WANT_REPEATS: ${{ inputs.repeats }}
           WANT_ENGINES: ${{ inputs.engines }}
+          WANT_RUNNER: ${{ inputs.runner }}
         run: |
           matrix=true
           planned=""
@@ -94,7 +106,13 @@ jobs:
             oses='["ubuntu-latest"]'
           elif [[ "$EVENT" == "workflow_dispatch" ]]; then
             tier="${WANT_TIER:-standard}"
-            oses='["ubuntu-latest", "ubuntu-24.04-arm", "macos-15", "windows-latest"]'
+            case "${WANT_RUNNER:-all}" in
+              ubuntu) oses='["ubuntu-latest"]' ;;
+              ubuntu-arm) oses='["ubuntu-24.04-arm"]' ;;
+              macos) oses='["macos-15"]' ;;
+              windows) oses='["windows-latest"]' ;;
+              *) oses='["ubuntu-latest", "ubuntu-24.04-arm", "macos-15", "windows-latest"]' ;;
+            esac
           else
             tier="standard"
             oses='["ubuntu-latest", "ubuntu-24.04-arm", "macos-15", "windows-latest"]'
