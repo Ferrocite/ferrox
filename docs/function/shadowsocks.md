@@ -41,9 +41,12 @@ graph TD
     J --> K["open in place, zero copies"]
     K --> L["write_all to the target"]
     M["wire datagram"] --> N["salt to the subkey, one copy in"]
-    N --> O["open in place in the socket thread's<br/>own buffer, no allocation"]
-    O --> P["payload is a subslice of that buffer:<br/>memmove 0, no third copy"]
+    N --> O["open in place where the socket put it:<br/>no per-datagram buffer"]
+    O --> P["payload is a subslice of the caller's buffer:<br/>memmove 0"]
     P --> Q(("target"))
+    R["reply datagram"] --> S["open in place, payload still the caller's bytes"]
+    S --> T["SOCKS header into the headroom<br/>right before the payload"]
+    T --> U["one send_to to the client"]
 ```
 
 A stream datagram is `IV` then the header and payload under that datagram's
@@ -56,10 +59,12 @@ graph TD
     C --> D(("wire"))
     E["wire, one read of what arrived"] --> F["crypt in place in<br/>the connection's own buffer"]
     F --> G["write_all to the target"]
-    H["wire datagram"] --> I["IV to the session key, one copy in"]
-    I --> J["crypt in place in the socket thread's<br/>own buffer, no allocation"]
+    H["wire datagram"] --> I["crypt in place where the socket put it:<br/>IV to the session key"]
+    I --> J["no per-datagram buffer, no allocation"]
     J --> K["payload is a subslice of that buffer:<br/>no tag, no memmove"]
     K --> L(("target"))
+    M["reply datagram"] --> N["IV and header into the headroom,<br/>crypt in place"]
+    N --> O["one send_to back"]
 ```
 
 ## Measured
@@ -78,17 +83,16 @@ that file disagree.
 | payload-chunks-per-relay-read | 1 | ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole |
 | user-space-copies-per-byte-written | 0 | ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole |
 | user-space-copies-per-byte-read | 0 | ferrox-app-shadowsocks::tests::chunks_open_that_seal_sealed_and_reject_damage |
-| zero-filled-bytes-per-chunk | 0 | ferrox-app-shadowsocks::tests::chunks_open_that_seal_sealed_and_reject_damage |
-| chunk-buffer-allocations-per-connection | 1 | ferrox-app-shadowsocks::tests::chunks_open_that_seal_sealed_and_reject_damage |
-| udp-payload-buffers-per-datagram | 1 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_datagrams_own_bytes |
-| udp-datagram-reallocations-after-the-first | 0 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_datagrams_own_bytes |
+| chunk-buffer-allocations-per-connection | 1 | ferrox-app-shadowsocks::tests::a_bulk_read_serves_every_buffered_chunk |
+| udp-payload-buffers-per-datagram | 1 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes |
+| udp-datagram-reallocations-after-the-first | 0 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes |
 | subkey-heap-buffers-per-connection | 1 | ferrox-core-shadowsocks::tests::a_cipher_is_one_heap_buffer |
 | stream-iv-bytes-per-handshake | 16 | ferrox-app-shadowsocks::tests::stream_relays_an_echo |
 | stream-write-syscalls-per-relay-read | 1 | ferrox-app-shadowsocks::tests::stream_relay_read_becomes_one_write |
 | stream-crypt-allocations-per-call | 0 | ferrox-core-shadowsocks::tests::rc4_crypt_is_in_place_and_allocates_nothing |
 | stream-crypt-copies-per-byte | 0 | ferrox-core-shadowsocks::tests::rc4_crypt_is_in_place_and_allocates_nothing |
-| stream-udp-payload-buffers-per-datagram | 1 | ferrox-app-shadowsocks::tests::stream_opened_payload_is_the_datagrams_own_bytes |
-| stream-udp-datagram-reallocations-after-the-first | 0 | ferrox-app-shadowsocks::tests::stream_opened_payload_is_the_datagrams_own_bytes |
+| stream-udp-payload-buffers-per-datagram | 1 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes |
+| stream-udp-datagram-reallocations-after-the-first | 0 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes |
 
 <!-- counts:end -->
 
@@ -170,11 +174,16 @@ Read against the three pinned implementations, all of which are in
   payload where it lies — the length seals into 18 B of headroom, the tag
   lands in 16 B of tailroom — and issues one `write_all` over all three. The
   wire bytes are the same stream in the same order.
-- **A zero-fill of up to 16 KiB per chunk read.** The reader used to do
+- **A zero-fill before every read.** The chunk reader used to do
   `chunk.resize(size + TAG_LEN, 0)` and then overwrite every byte of that range
-  from the socket. The buffer is now sized once per connection (`wire_buffer`)
-  and each read writes into a prefix of it, so nothing is re-zeroed after the
-  first connection.
+  from the socket, and the same shape sat under the other six read targets in
+  this file. They are now all built by `unfilled`, which reserves and hands out
+  unwritten bytes: `wire_buffer`, the two-chunk window in `ChunkReader::new`,
+  the handshake's seal buffer, the relay's uplink buffer and stream-downlink
+  buffer, and the two datagram buffers in `serve_udp_on`. Every read writes the
+  range it reports before any code reads it. `zero-filled-bytes-per-chunk` was
+  a row on this page; no checker in `ferrox-app`'s test binary can observe a
+  fill that does not happen, so it is named here and counted nowhere.
 - **The read-side copy.** `Cipher::open_in_place` decrypts inside the caller's
   buffer and returns a subslice of it, so the read path moves a payload byte
   zero times in user space. Zray also decrypts in place, inside one reusable
@@ -192,24 +201,34 @@ Read against the three pinned implementations, all of which are in
   no second transpose and no second store exist. The subkey and the inner nonce
   live on the stack, and the method dispatch is one `match` on `Aead`, hoisted
   out of the per-byte loop rather than a string compare per chunk.
-- **Two of the three copies every UDP payload made.** `open_udp_datagram` took
-  the datagram's sealed tail with `to_vec` (a `malloc` plus a full `memcpy`),
-  opened the AEAD in place, then `copy_within(used..len, 0)` moved the whole
-  payload down to offset zero so the caller could hand it on — and the caller
-  copied it a third time into its reply buffer. The salt and the address header
-  both precede the payload, so one copy in is unavoidable; the `memmove` and the
-  allocation were not. `Datagrams` now holds one `opened` and one `sealed`
-  buffer per socket thread and returns `&opened[used..len]`, so the payload is
-  a subslice of the buffer the datagram was opened in. The same holds for
-  sealing: `seal_udp_datagram` allocated a fresh `Vec` per datagram, and the
-  buffer is now the thread's own.
-  `an_opened_payload_is_the_datagrams_own_bytes` is the gate: it asserts the
-  returned pointer lies inside `opened` — which is `udp-payload-buffers-per-datagram 1`
-  — and that `opened` neither moves nor grows over eight rounds, which is
-  `udp-datagram-reallocations-after-the-first 0`. Same pointer-identity idiom as
-  `frames_reuse_the_callers_buffers`. The 16-byte tag copy and the `memmove` are
-  named rather than counted: no test observes a copy that does not happen, so
-  they are not in the table.
+- **Two of the three copies every UDP payload made.** The old open path took
+  the sealed datagram with `to_vec` — a `malloc` plus a full `memcpy` — opened
+  the AEAD in place, then `copy_within(used..len, 0)` moved the whole payload
+  down to offset zero so the caller could hand it on, and the old seal path
+  built each datagram in a fresh `Vec` too. The salt and the address header both
+  precede the payload, so one copy in is unavoidable; the `memmove` and the
+  per-datagram allocations were not. `open_datagram` opens the packet where the
+  socket put it and returns a subslice; `seal_datagram` writes the salt or IV
+  and the header into the headroom of the caller's buffer and the tag right
+  after the payload, and returns a subslice too. Nothing in between needed
+  state, so the `Datagrams` struct is gone and the two free functions are the
+  API. `an_opened_payload_is_the_callers_own_bytes` is the gate, over
+  `Aes256Gcm` and `Rc4Md5` both: eight rounds assert that the sealed packet and
+  the opened payload each lie inside the caller's buffer
+  (`udp-payload-buffers-per-datagram 1`,
+  `stream-udp-payload-buffers-per-datagram 1`) and that the buffer neither
+  moves nor grows (`udp-datagram-reallocations-after-the-first 0`,
+  `stream-udp-datagram-reallocations-after-the-first 0`). Same pointer-identity
+  idiom as `frames_reuse_the_callers_buffers`. The 16-byte tag copy and the
+  `memmove` are named rather than counted: no test observes a copy that does
+  not happen, so they are not in the table.
+- **The reply's third buffer.** `spawn_ss_udp_reader` used to hand the opened
+  payload to a fresh `Vec` holding the three SOCKS reply bytes, the address and
+  the payload. It now opens in place, writes `[0, 0, 0]` and the address header
+  into the headroom that lies immediately before the opened payload, and sends
+  `&buf[start..at + len]` in one `send_to`: the reply is the caller's read
+  buffer, with the reply header composed in front and the trailing tag left
+  out. Named, not counted, for the same reason as the bullet above.
 - **A 16-byte tag copy per chunk.** `Cipher::open_in_place` split the tag off
   with `split_at_mut` and then built a `[u8; TAG_LEN]` on the stack to pass by
   reference. It now borrows the sixteen bytes that are already there, which is
@@ -236,11 +255,10 @@ Read against the three pinned implementations, all of which are in
   the per-byte loop itself is three wrapping adds, two swaps and one xor with
   no branches at all.
 - **The UDP tag and the third copy on the stream path.** A stream datagram is
-  `IV` plus header plus payload with no tag, so sealing writes the header and
-  payload straight into the thread's `sealed` buffer and crypts the tail where
-  it lies: the same one-copy-in shape as the AEAD path minus the tag bytes.
-  Opening crypts the thread's `opened` buffer in place and returns a subslice,
-  with no `memmove` and no per-datagram allocation either.
+  `IV` plus header plus payload with no tag: sealing writes the IV and header
+  into the caller's headroom and crypts header and payload where they lie, and
+  opening crypts the packet in place and returns a subslice — the same
+  one-copy-in shape as the AEAD path minus the tag bytes.
 - **A read syscall per 18 B length.** The relay loop used to read each sealed
   length with its own `read_exact` before reading the payload it named. It now
   keeps a two-chunk window over the downlink: lengths open out of buffered
@@ -259,7 +277,13 @@ deprecated or outside the ladder rather than missing; the 2022 family lives in
 core itself is checked against its published vectors
 (`rc4_matches_the_published_vectors`); the `MD5(key ++ IV)` composition follows
 the public stream-cipher spec text and has no pinned oracle in this tree to
-answer to, which is stated here rather than counted.
+answer to, which is stated here rather than counted. The UDP path also builds
+one AES key schedule per datagram: the salt is fresh every datagram, so the
+subkey is new and there is nothing to hoist, but a per-thread cipher rebuilt in
+place would save the `Box` the `Aes` engine pays per datagram. Reaching it means
+a rekey surface on `ferrox-core/src/aesgcm`, whose scope covers the record
+layer, so it is a P3 add-on recorded in `crates/ferrox-prompt/prompts.md`
+rather than part of this slice.
 
 ## Pins
 

@@ -32,17 +32,16 @@ shadowsocks write-syscalls-per-relay-read 1 ferrox-app-shadowsocks::tests::one_r
 shadowsocks payload-chunks-per-relay-read 1 ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole
 shadowsocks user-space-copies-per-byte-written 0 ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole
 shadowsocks user-space-copies-per-byte-read 0 ferrox-app-shadowsocks::tests::chunks_open_that_seal_sealed_and_reject_damage
-shadowsocks zero-filled-bytes-per-chunk 0 ferrox-app-shadowsocks::tests::chunks_open_that_seal_sealed_and_reject_damage
-shadowsocks chunk-buffer-allocations-per-connection 1 ferrox-app-shadowsocks::tests::chunks_open_that_seal_sealed_and_reject_damage
-shadowsocks udp-payload-buffers-per-datagram 1 ferrox-app-shadowsocks::tests::an_opened_payload_is_the_datagrams_own_bytes
-shadowsocks udp-datagram-reallocations-after-the-first 0 ferrox-app-shadowsocks::tests::an_opened_payload_is_the_datagrams_own_bytes
+shadowsocks chunk-buffer-allocations-per-connection 1 ferrox-app-shadowsocks::tests::a_bulk_read_serves_every_buffered_chunk
+shadowsocks udp-payload-buffers-per-datagram 1 ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes
+shadowsocks udp-datagram-reallocations-after-the-first 0 ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes
 shadowsocks subkey-heap-buffers-per-connection 1 ferrox-core-shadowsocks::tests::a_cipher_is_one_heap_buffer
 shadowsocks stream-iv-bytes-per-handshake 16 ferrox-app-shadowsocks::tests::stream_relays_an_echo
 shadowsocks stream-write-syscalls-per-relay-read 1 ferrox-app-shadowsocks::tests::stream_relay_read_becomes_one_write
 shadowsocks stream-crypt-allocations-per-call 0 ferrox-core-shadowsocks::tests::rc4_crypt_is_in_place_and_allocates_nothing
 shadowsocks stream-crypt-copies-per-byte 0 ferrox-core-shadowsocks::tests::rc4_crypt_is_in_place_and_allocates_nothing
-shadowsocks stream-udp-payload-buffers-per-datagram 1 ferrox-app-shadowsocks::tests::stream_opened_payload_is_the_datagrams_own_bytes
-shadowsocks stream-udp-datagram-reallocations-after-the-first 0 ferrox-app-shadowsocks::tests::stream_opened_payload_is_the_datagrams_own_bytes
+shadowsocks stream-udp-payload-buffers-per-datagram 1 ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes
+shadowsocks stream-udp-datagram-reallocations-after-the-first 0 ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes
 
 # --- Shadowsocks 2022 -------------------------------------------------------
 shadowsocks-2022 ops-retired-instructions UNBLESSED scripts/count-ops.sh

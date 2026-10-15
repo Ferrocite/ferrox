@@ -61,7 +61,7 @@ record-layer  record::tests::the_ladder_reports_the_blocks_the_caller_asked_for 
 record-layer  poly1305::tests::byte_at_a_time_matches_one_shot  ferrox_core::poly1305::Poly1305::update
 shadowsocks  shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag  ferrox_core::shadowsocks::Cipher::seal_into
 shadowsocks  shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag  ferrox_core::shadowsocks::Cipher::open_in_place
-shadowsocks  shadowsocks::tests::an_opened_payload_is_the_datagrams_own_bytes  ferrox_core::shadowsocks::Cipher::open_in_place
+shadowsocks  shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes  ferrox_core::shadowsocks::Cipher::open_in_place
 shadowsocks  shadowsocks::tests::the_stream_cipher_costs_the_prga_loop_and_nothing_else  ferrox_core::shadowsocks::tests::the_stream_cipher_costs_the_prga_loop_and_nothing_else
 shadowsocks-2022  shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag  ferrox_core::shadowsocks2022::Cipher::seal_into
 shadowsocks-2022  shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag  ferrox_core::shadowsocks2022::Cipher::open_in_place
