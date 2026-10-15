@@ -20,13 +20,18 @@ order so only the last slot can be short, and a batch read of four whole
 chunks can never leave a one-byte tail chunk. A carrier that has no `writev`
 gets std's default, one `write` per slice, which is exactly the per-chunk write
 it saw before — no WebSocket frame, gRPC message or xHTTP chunk changes size.
-The price is buffers: the relay's read buffer and the downlink window are both
-sized for a batch, so a connection carries 80 KiB more than it did
-(`+82 121 B`, 16 417 → 65 668 uplink, 32 798 → 65 668 downlink), still one
-allocation per leg, and it buys 3.5× fewer syscalls per GiB (see Measured).
-`CHUNKS_PER_BATCH` is not tuned past that: the buffer cost is linear in it and
-4 is the batch the pinned reference itself drains, so a wider batch is a larger
-trade rather than a cheaper one, and no CI run has yet priced one.
+The price is buffers, and it is an AEAD connection's price: its relay read
+buffer and downlink window are both sized for a batch, so it carries 80 KiB
+more than it did (`+82 121 B`, 16 417 → 65 668 uplink, 32 798 → 65 668
+downlink), still one allocation per leg, and it buys 3.5× fewer syscalls per
+GiB (see Measured). `rc4-md5` pays none of it — its uplink keeps the one slot
+it had (`uplink_buffer_len`, gated by
+`a_stream_uplink_buffers_one_slot_and_an_aead_uplink_a_batch`), because a rung
+whose read fills one chunk has no batch to hold and four slots would be memory
+it never touches. `CHUNKS_PER_BATCH` is not tuned past that: the buffer cost is
+linear in it and 4 is the batch the pinned reference itself drains, so a wider
+batch is a larger trade rather than a cheaper one, and no CI run has yet priced
+one.
 
 `rc4-md5` is the same rung as a stream: a 16-byte IV in the clear, then the
 address header and every payload byte under RC4 with `MD5(master ++ IV)` as
@@ -208,8 +213,9 @@ So the batch buys about 20% more throughput and about 16% less CPU per byte
 relative to the same reference, and the two intervals being disjoint is what
 makes that a resolved difference rather than a duration that suggests. The price
 is the one the page names: peak RSS went 8.01 → 9.38 MiB over 8 connections, and
-the two buffers this change sizes account for +82 121 B per connection, which
-predicts +0.63 MiB over the eight. The remaining 0.74 MiB is allocator rounding
+the two buffers this change sizes account for +82 121 B per AEAD connection
+(an rc4-md5 connection pays none of it, since its uplink stays at one slot),
+which predicts +0.63 MiB over the eight. The remaining 0.74 MiB is allocator rounding
 and buffers this diff does not size; no run here attributes it, so the measured
 number is what this page carries rather than the predicted one. The thread count
 did not move at all (36 before, 36 after), and RSS is still 6.6× under the
@@ -405,13 +411,14 @@ the other transport, and the matrix has no shadowsocks-udp cell to price it in �
 its one scenario is `shadowsocks-raw-down-8`, so a datagram batch would ship with
 no gate that observes it. That is the reason it is not here, and it is the row
 `udp-datagram-reallocations-after-the-first 0` does not claim. And the batch is
-not free: 80 KiB of buffer per connection more than before, one allocation per
-leg either way. The matched pair of runs read that price rather than leaving it
-prose alone — peak RSS 8.01 → 9.38 MiB over 8 connections, where the 82 121 B per
-connection accounts for 0.63 MiB of the 1.37 measured and the rest is allocator
-rounding no run here attributes — and nothing on this page claims it is free; no
-memory row here has a checker that observes bytes, so the row stays out of the
-table even though the number has been read.
+not free: 80 KiB of buffer per AEAD connection more than before, one allocation
+per leg either way, and none of that price on the stream rung, whose uplink
+stays at one slot. The matched pair of runs read that price rather than leaving
+it prose alone — peak RSS 8.01 → 9.38 MiB over 8 connections, where the 82 121 B
+per connection accounts for 0.63 MiB of the 1.37 measured and the rest is
+allocator rounding no run here attributes — and nothing on this page claims it
+is free; no memory row here has a checker that observes bytes, so the row stays
+out of the table even though the number has been read.
 
 ## Pins
 
