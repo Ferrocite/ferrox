@@ -43,6 +43,7 @@ graph TD
 | reality-outbound-rows-dialled | 1 | ferrox-app-proxy::tests::vless_outbound_with_reality_security_dials_raw_only |
 | vision-header-targets-matching-core | 2 | ferrox-app-proxy::tests::vision_header_matches_the_core_encoder |
 | dial-header-reallocations | 0 | ferrox-app-proxy::tests::dial_headers_are_sized_to_the_bytes_they_hold |
+| request-header-reads | 4 | ferrox-app-proxy::tests::the_vless_request_header_costs_four_reads_not_six |
 <!-- counts:end -->
 
 The relay buffer's zero-fills are prose, not a row. A row needs a checker that
@@ -90,8 +91,23 @@ CI-only. No artefact from this branch has been read.
   thing against the **bare `net.Conn`**, so it is 6–8 real syscalls for a 19–34
   byte header, plus a `make([]byte, strLen)` and a `string(strBytes)` second
   allocation for a domain. Zray parses a slice in place with zero allocations.
-  This tree parses in place too, and `parses_the_brief_link` and
-  `header_address_families_encode_stably` are the gates.
+  The core encoder and the in-memory parser here (`parses_the_brief_link`,
+  `header_address_families_encode_stably`) were always the in-place half — but the
+  **server** read, `decode_request` handed a raw `TcpStream` in `serve_vless_raw`,
+  was the field-at-a-time shape this bullet condemns: `read_exact` for the 18-byte
+  head, then the add-ons, then the command, then the port, then the family byte,
+  then the body — five syscalls for an IP target, six for a domain. The reads are
+  now folded on the grain of the wire: the add-ons ride in with the command byte
+  (both always header, and a mux request's frame data starts after the command, so
+  this read is safe for every command), and the port, family, and the body's first
+  byte are the same four bytes for every family — an IPv4 or IPv6 octet, or a
+  domain's length. So the server request costs four reads for every address family
+  and two for mux. `the_vless_request_header_costs_four_reads_not_six` drives it
+  from an in-memory stream that answers the whole buffer, where the count is exact
+  (a loopback socket's read count moves with the scheduler and cannot gate it); the
+  byte-identity is held by the loopback decode tests that dial every reader. No
+  byte was added to the wire and none is over-read: every read is bounded to header
+  bytes, so the first payload byte still reaches the relay untouched.
 - **A header written through a temporary.** sing-box's `WriteBuffer` path is
   already good — it extends the header into the pooled buffer's headroom and
   writes header and payload in one call — and this tree matches that shape
