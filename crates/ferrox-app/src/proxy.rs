@@ -7111,12 +7111,12 @@ impl RelayPool {
 
 fn join_within(direction: &std::sync::mpsc::Receiver<()>, budget: Duration) -> bool {
     match direction.recv_timeout(budget) {
-        Ok(()) => true,
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             eprintln!("ferrox-app: a relay leg did not hand back inside its join budget");
             false
         }
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
+        // A partner whose sender is gone can never hand back, which is what the unbounded wait already read as finished.
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
     }
 }
 
