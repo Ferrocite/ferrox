@@ -7814,27 +7814,43 @@ pub(crate) fn decode_request(stream: &mut dyn Read) -> Option<([u8; 16], String,
     let mut id = [0u8; 16];
     id.copy_from_slice(&head[1..17]);
     let addons = usize::from(head[17]);
-    let mut flow = String::new();
-    if addons > 0 {
-        // The addons length is a single byte, so the buffer lives on the stack instead of being allocated per handshake.
-        let mut buffer: [std::mem::MaybeUninit<u8>; 255] = [std::mem::MaybeUninit::uninit(); 255];
-        // SAFETY: `read_exact` writes the first `addons` bytes before anything reads them, and only those are ever read.
-        read_exact(stream, unsafe {
-            std::slice::from_raw_parts_mut(buffer.as_mut_ptr().cast(), addons)
-        })
-        .ok()?;
-        let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr().cast(), addons) };
-        flow = addons_flow(bytes);
+    // The add-ons and the command byte are contiguous, and every request — a mux one included — puts its next field after the command, so this one read is always header. The addons length is a single byte, so the buffer lives on the stack.
+    let mut rest = [0u8; 256];
+    read_exact(stream, &mut rest[..=addons]).ok()?;
+    let cmd = rest[addons];
+    let flow = if addons == 0 {
+        String::new()
+    } else {
+        addons_flow(&rest[..addons])
+    };
+    if cmd == 3 {
+        return Some((id, flow, cmd, MUX_TARGET));
     }
-    let mut cmd = [0u8; 1];
-    read_exact(stream, &mut cmd).ok()?;
-    if cmd[0] == 3 {
-        return Some((id, flow, cmd[0], MUX_TARGET));
-    }
-    let mut port = [0u8; 2];
-    read_exact(stream, &mut port).ok()?;
-    let target = read_addr(stream, u16::from_be_bytes(port))?;
-    Some((id, flow, cmd[0], target))
+    // Port, family, and the body's first byte are the same four bytes for every family — an IPv4 or IPv6 octet, or a domain's length — so the whole address header is served by this read and one more.
+    let mut tail = [0u8; 4];
+    read_exact(stream, &mut tail).ok()?;
+    let port = u16::from_be_bytes([tail[0], tail[1]]);
+    let first = tail[3];
+    let target = match tail[2] {
+        1 => {
+            let mut octets = [first; 4];
+            read_exact(stream, &mut octets[1..]).ok()?;
+            SocketAddr::new(std::net::IpAddr::V4(octets.into()), port)
+        }
+        2 => {
+            let mut name = vec![0u8; usize::from(first)];
+            read_exact(stream, &mut name).ok()?;
+            let host = String::from_utf8(name).ok()?;
+            resolve_endpoint(&host, port)?
+        }
+        3 => {
+            let mut octets = [first; 16];
+            read_exact(stream, &mut octets[1..]).ok()?;
+            SocketAddr::new(std::net::IpAddr::V6(octets.into()), port)
+        }
+        _ => return None,
+    };
+    Some((id, flow, cmd, target))
 }
 
 fn addons_flow(body: &[u8]) -> String {
@@ -7959,30 +7975,6 @@ fn decode_trojan_request(stream: &mut dyn Read, key: &[u8; 56]) -> Option<(u8, S
         return None;
     }
     Some((cmd, target))
-}
-
-fn read_addr(stream: &mut dyn Read, port: u16) -> Option<SocketAddr> {
-    let mut atyp = [0u8; 1];
-    read_exact(stream, &mut atyp).ok()?;
-    if atyp[0] == 1 {
-        let mut ip = [0u8; 4];
-        read_exact(stream, &mut ip).ok()?;
-        return Some(SocketAddr::new(std::net::IpAddr::V4(ip.into()), port));
-    }
-    if atyp[0] == 3 {
-        let mut ip = [0u8; 16];
-        read_exact(stream, &mut ip).ok()?;
-        return Some(SocketAddr::new(std::net::IpAddr::V6(ip.into()), port));
-    }
-    if atyp[0] != 2 {
-        return None;
-    }
-    let mut len = [0u8; 1];
-    read_exact(stream, &mut len).ok()?;
-    let mut name = vec![0u8; usize::from(len[0])];
-    read_exact(stream, &mut name).ok()?;
-    let host = String::from_utf8(name).ok()?;
-    resolve_endpoint(&host, port)
 }
 
 pub(crate) fn push_addr(header: &mut Vec<u8>, target: &SocketAddr, v6: u8) {
@@ -9989,6 +9981,91 @@ mod tests {
             assert_eq!(cmd, 1, "{addr:?}");
             assert_eq!(reader.reads, reads, "{addr:?}");
         }
+    }
+
+    /// The server read is four for every address family and two for mux, down from five for an IP and six for a domain: the add-ons ride in with the command byte, and the port, family and the body's first byte share one read.
+    #[test]
+    fn the_vless_request_header_costs_four_reads_not_six() {
+        struct Counting<'a> {
+            at: usize,
+            wire: &'a [u8],
+            reads: usize,
+        }
+        impl Read for Counting<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                let n = (self.wire.len() - self.at).min(buf.len());
+                buf[..n].copy_from_slice(&self.wire[self.at..self.at + n]);
+                self.at += n;
+                Ok(n)
+            }
+        }
+        let id = [0x11u8; 16];
+        let header = |addons: &[u8], cmd: u8, tail: &[u8]| -> Vec<u8> {
+            let mut w = vec![0u8];
+            w.extend_from_slice(&id);
+            w.push(addons.len() as u8);
+            w.extend_from_slice(addons);
+            w.push(cmd);
+            w.extend_from_slice(tail);
+            w
+        };
+        let port = 80u16.to_be_bytes();
+        let cases = [
+            (
+                "ipv4",
+                header(&[], 1, &[port.as_slice(), &[1, 192, 0, 2, 53]].concat()),
+                4usize,
+            ),
+            (
+                "ipv6",
+                header(
+                    &[],
+                    1,
+                    &[
+                        port.as_slice(),
+                        &[3, 0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01],
+                    ]
+                    .concat(),
+                ),
+                4,
+            ),
+            (
+                "domain",
+                header(&[], 1, &[port.as_slice(), b"\x02\x09localhost"].concat()),
+                4,
+            ),
+            (
+                "addons",
+                header(
+                    b"\x0a\x00",
+                    1,
+                    &[port.as_slice(), &[1, 192, 0, 2, 53]].concat(),
+                ),
+                4,
+            ),
+        ];
+        for (label, wire, want) in cases {
+            let mut reader = Counting {
+                at: 0,
+                wire: &wire,
+                reads: 0,
+            };
+            let (got, _flow, cmd, _target) =
+                decode_request(&mut reader).unwrap_or_else(|| panic!("decodes {label}"));
+            assert_eq!((got, cmd), (id, 1), "{label}");
+            assert_eq!(reader.reads, want, "{label}");
+        }
+
+        let mux = header(&[], 3, &[]);
+        let mut reader = Counting {
+            at: 0,
+            wire: &mux,
+            reads: 0,
+        };
+        let (_, _, cmd, _) = decode_request(&mut reader).expect("decodes mux");
+        assert_eq!(cmd, 3, "a mux request stops at the command byte");
+        assert_eq!(reader.reads, 2, "mux");
     }
 
     #[test]
