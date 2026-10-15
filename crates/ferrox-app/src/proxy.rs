@@ -3592,7 +3592,6 @@ fn dial_vmess_rung(
             let closer = writer.clone();
             let close: std::sync::Arc<dyn Fn() + Send + Sync> =
                 std::sync::Arc::new(move || closer.finish());
-            let reader = std::io::BufReader::with_capacity(32 * 1024, reader);
             crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv, None);
             true
         }
@@ -4423,7 +4422,7 @@ fn vmess_tls_carried(
             if !writer.send(&request) {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            let mut reader = std::io::BufReader::with_capacity(32 * 1024, reader);
+            let mut reader = reader;
             if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
