@@ -1,4 +1,6 @@
 mod budgets;
+#[cfg(feature = "census")]
+mod census;
 mod config;
 mod foxy;
 mod foxy_account;

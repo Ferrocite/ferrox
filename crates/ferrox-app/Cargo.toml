@@ -10,6 +10,13 @@ description = "ZeroNet-compatible application built on the released ferrox-core 
 [lints]
 workspace = true
 
+# `census` builds the runtime wait table in `census.rs`. Off by default: the
+# shipped relay does not compile the census at all, so no mutex or slot joins
+# the hot path. `cargo test --workspace --all-features` and safety.yml's
+# census shard are the shapes that read the table.
+[features]
+census = []
+
 [dependencies]
 aes = "0.8"
 aes-gcm = "0.10"
