@@ -10,11 +10,11 @@ that costs one AEAD call per frame instead of two. That is not a simplification:
 a peer negotiates framing options in the clear, so a different set is visible on
 the wire. Xray's client default is the same three bits, so this matches.
 
-Read and write are symmetric about one thing: both batch. Writing stages four
+Read and write are symmetric about one thing: both batch. Writing stages sixteen
 8 KiB frames into one buffer and writes them once. Reading keeps the sealed bytes
 and the plaintext gathered from them in one buffer, so the pump can tell without
-asking the carrier that four frames are already here, and it leaves the plain leg
-in one write instead of four. A `BufReader` cannot offer that — it hides how much
+asking the carrier that a whole batch is already here, and it leaves the plain leg
+in one write instead of sixteen. A `BufReader` cannot offer that — it hides how much
 it holds — which is why the relay reads through `vmess::Wire` and the handshake
 still reads through `read_frame`.
 
@@ -31,7 +31,7 @@ resolved through one function so they cannot diverge —
 
 ```mermaid
 graph TD
-    W["plaintext read, 32 KiB"] --> W1["4 frames of 8192 B"]
+    W["plaintext read, 128 KiB"] --> W1["16 frames of 8192 B"]
     W1 --> W2["each: mask a 2-byte length with SHAKE,<br/>seal the payload in place, append the tag"]
     W2 --> W3["one staging buffer<br/>1 copy per byte, 0 allocations"]
     W3 --> W4["write_all, 1 syscall"]
@@ -50,12 +50,12 @@ graph TD
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | maximum-payload-per-frame | 8192 | ferrox-app-vmess::tests::frames_seal_to_stable_bytes |
-| frames-per-write-syscall | 4 | ferrox-app-vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time |
-| write-syscalls-per-32KiB-relay-read | 1 | ferrox-app-vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time |
+| frames-per-write-syscall | 16 | ferrox-app-vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time |
+| write-syscalls-per-128KiB-relay-read | 1 | ferrox-app-vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time |
 | user-space-copies-per-byte-written | 1 | ferrox-app-vmess::tests::frames_reuse_the_callers_buffers |
 | frame-buffer-allocations-per-relay-write | 0 | ferrox-app-vmess::tests::frames_reuse_the_callers_buffers |
-| frames-per-plain-write | 4 | ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write |
-| plain-write-syscalls-per-4-frame-batch | 1 | ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write |
+| frames-per-plain-write | 16 | ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write |
+| plain-write-syscalls-per-16-frame-batch | 1 | ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write |
 | pump-buffer-allocations-per-batch | 0 | ferrox-app-vmess::tests::the_pump_gathers_into_its_own_buffer_and_never_moves_it |
 | counters-per-frame | 1 | ferrox-app-vmess::tests::counters_advance_one_per_frame_at_any_offset |
 <!-- counts:end -->
@@ -112,21 +112,24 @@ either end of a record, no head recursion into the dispatch on a 64-byte-aligned
 frame — apply to every 8 KiB VMess frame on the AVX2 and NEON-4 paths.
 
 - **Two rows this page claims were not being checked at all.** The gate for
-  `frames-per-write-syscall 4` and `write-syscalls-per-32KiB-relay-read 1` swept
-  payload lengths that topped out at `3 * MAX_PLAIN` — which is **three** frames.
-  The fourth iteration of `stage_frames`' loop was never entered by any test, so
-  the number 4 was unobserved; and the sink was a `Vec`, which cannot tell one
-  `write` from four, so the syscall row had no counter behind it either. The
-  sweep now runs to `4 * MAX_PLAIN - 1`, `4 * MAX_PLAIN` and `READ_PLAIN`, and
-  writes into a `CountingWriter`, so both rows are observed rather than assumed.
-  Nothing about the frames changed; only what the test can see.
+  `frames-per-write-syscall` and `write-syscalls-per-128KiB-relay-read` swept
+  payload lengths that topped out at `3 * MAX_PLAIN` when the batch was four
+  frames — **three** frames, so the fourth iteration of `stage_frames`' loop was
+  never entered by any test and the number 4 was unobserved; and the sink was a
+  `Vec`, which cannot tell one `write` from four, so the syscall row had no
+  counter behind it either. The sweep now runs to the batch bound *written in the
+  constant* — `(FRAMES_PER_WRITE - 1) * MAX_PLAIN`, `FRAMES_PER_WRITE * MAX_PLAIN - 1`,
+  `FRAMES_PER_WRITE * MAX_PLAIN`, one over it, and `READ_PLAIN` — and writes
+  into a `CountingWriter`, so both rows are observed at whatever width the batch
+  is, not at the width they were written for. Nothing about the frames changed;
+  only what the test can see.
 - **A silent truncation that the same gap was hiding.** `stage_frames` staged at
   most `FRAMES_PER_WRITE` frames and, if the read was wider, exited its loop with
   bytes left and returned `true` — a truncated frame sequence on the wire, with
   no assertion anywhere. `pump_relay` clamps to `READ_PLAIN`, which equals the
   batch bound, so nothing reaches it today; but the two expressions that have to
   agree were checked by nobody, and raising `FRAMES_PER_WRITE` without raising
-  `READ_PLAIN` would have dropped the tail of every relay read over 32 KiB.
+  `READ_PLAIN` would have dropped the tail of every relay read over one batch.
   `stage_frames` now refuses instead, and
   `a_read_wider_than_one_batch_is_refused_not_truncated` gates that: it drives
   `READ_PLAIN + 1` and `READ_PLAIN + MAX_PLAIN`, requires `false`, and requires
@@ -140,11 +143,11 @@ frame — apply to every 8 KiB VMess frame on the AVX2 and NEON-4 paths.
   `mb2Write := make(buf.MultiBuffer, 0, len(mb)+10)` and takes a pooled
   `temp := buf.New()` scratch on every `WriteMultiBuffer` call, so the batch is
   the pipe's read granularity rather than a number chosen for syscalls.
-- **Four write syscalls per relay read.** sing-box's VMess writes one
+- **Sixteen write syscalls per relay read.** sing-box's VMess writes one
   `ChunkWriter` frame per write with `WriteChunkSize = 15000`
   (`sing-vmess/protocol.go:24-32`) and only coalesces when the upper layer is
   vectorised. Xray's stream path coalesces with `writev` but starts from a fresh
-  scratch each call. This tree stages four frames and writes once;
+  scratch each call. This tree stages sixteen frames and writes once;
   `a_batch_on_the_wire_is_the_frames_written_one_at_a_time` is the gate that
   the batch is byte-identical to writing the frames one at a time.
 - **Four write syscalls — and four segments — per relayed batch.** The plain leg of a
@@ -165,6 +168,22 @@ frame — apply to every 8 KiB VMess frame on the AVX2 and NEON-4 paths.
   branch (run 38667435571): **1 850 → 1 291 ms/GiB of system CPU**, user CPU left
   where it was (788 → 790), which is what makes this a kernel-side removal rather
   than a relocation into user space.
+- **Three more writes, and three more reads, per relayed batch.** The same lever,
+  taken to the width the reference already caps itself at: `FRAMES_PER_WRITE` 4 → 16,
+  xray's `one frame, then up to fifteen more from what the buffer holds`. The batch
+  still never waits — only the first frame blocks — so the width buys syscalls and
+  costs buffer, nothing else. Measured on `vmess-raw-down-8` (run 38804662396,
+  ubuntu-latest, 5 medians) against the 4-frame shape's own cell (run 38802326890,
+  same runner and reader): **system CPU 1 301 → 1 098 ms/GiB**, which is under
+  xray-core's 1 171 for the first time on this cell, and **user CPU 781 → 635**, so
+  total CPU **2 083 → 1 737** and the gating rows move with it — `cpu per GiB`
+  1.172x → **1.403x**, throughput 1.208x → **1.459x**. What that buys in RAM is
+  named rather than hidden: `WIRE_LEN` 41 365 → 140 641 B per pump and `READ_PLAIN`
+  32 → 128 KiB per relay read, so peak RSS goes **8.67 → 11.4 MiB (+32 %)** and the
+  RSS row's lead over the reference narrows from 7.31x to 5.43x; thread count is
+  unmoved at 35. What is *not* removed is the gather: the batch still leaves as one
+  buffer's front bytes, one copy per byte, because the four-`iovec` shape that
+  avoided it lost more on the kernel than it gained in user space.
 - **A second copy on read.** Xray's large-chunk read path
   (`common/crypto/auth.go:188-203`) allocates a pooled buffer, reads into it,
   opens in place, and then calls `buf.MergeBytes`, which is a second copy plus a
