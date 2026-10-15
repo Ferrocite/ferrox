@@ -115,6 +115,15 @@ fn run_cell_json(run: &Run) -> Json {
     let mut cell = Json::object();
     cell.insert("throughput_mib_s", Json::Num(run.throughput_mib_s()));
     cell.insert("cpu_millis_per_gib", Json::Num(run.cpu_millis_per_gib()));
+    let io = run.io_per_gib();
+    cell.insert(
+        "kernel_calls_per_gib",
+        io.map_or(Json::Null, |(calls, _)| Json::Num(calls)),
+    );
+    cell.insert(
+        "kernel_bytes_per_gib",
+        io.map_or(Json::Null, |(_, bytes)| Json::Num(bytes)),
+    );
     cell.insert("rss_mib", Json::Num(run.rss_mib()));
     cell.insert(
         "threads_peak",
@@ -161,6 +170,25 @@ impl Comparison {
             .map(|(i, run)| Cell {
                 run_index: i + 1,
                 value: run.rss_mib(),
+            })
+            .collect()
+    }
+
+    /// The kernel's counts, per GiB, or nothing at all when any run of the engine lacks them: a
+    /// paired ratio over runs that did not all report compares different runs, and a row that
+    /// cannot be trusted reports nothing.
+    fn io_cells(&self, engine: &str, pick: fn((f64, f64)) -> f64) -> Vec<Cell> {
+        let runs = self.runs(engine);
+        if runs.is_empty() || runs.iter().any(|run| run.outcome.io.is_none()) {
+            return Vec::new();
+        }
+        runs.iter()
+            .enumerate()
+            .filter_map(|(i, run)| {
+                run.io_per_gib().map(|pair| Cell {
+                    run_index: i + 1,
+                    value: pick(pair),
+                })
             })
             .collect()
     }
@@ -231,6 +259,7 @@ impl Comparison {
                             &self.throughput_cells(reference),
                             Direction::Higher,
                         )),
+                        true,
                     ),
                     (
                         format!("cpu per GiB ({candidate} vs {reference})"),
@@ -240,6 +269,7 @@ impl Comparison {
                             &self.cpu_cells(reference),
                             Direction::Lower,
                         )),
+                        true,
                     ),
                     (
                         format!(
@@ -252,11 +282,33 @@ impl Comparison {
                             &self.rss_cells(reference),
                             Direction::Lower,
                         )),
+                        true,
+                    ),
+                    // The kernel's asks and bytes per GiB attribute the cpu row; they never gate it.
+                    (
+                        format!("kernel calls per GiB ({candidate} vs {reference})"),
+                        Direction::Lower,
+                        stats::bootstrap_ci(&stats::paired_ratios(
+                            &self.io_cells(candidate, |(calls, _)| calls),
+                            &self.io_cells(reference, |(calls, _)| calls),
+                            Direction::Lower,
+                        )),
+                        false,
+                    ),
+                    (
+                        format!("kernel bytes per GiB ({candidate} vs {reference})"),
+                        Direction::Lower,
+                        stats::bootstrap_ci(&stats::paired_ratios(
+                            &self.io_cells(candidate, |(_, bytes)| bytes),
+                            &self.io_cells(reference, |(_, bytes)| bytes),
+                            Direction::Lower,
+                        )),
+                        false,
                     ),
                 ]
                 .into_iter()
-                .map(move |(label, direction, interval)| {
-                    let row = if gates {
+                .map(move |(label, direction, interval, gates_row)| {
+                    let row = if gates && gates_row {
                         stats::Row::gating(label.clone(), direction, interval)
                     } else {
                         stats::Row::reported(label.clone(), direction, interval)
@@ -478,11 +530,11 @@ impl Comparison {
         let _ = writeln!(s, "### Per-repeat measurements\n");
         let _ = writeln!(
             s,
-            "| engine | run | throughput MiB/s | cpu ms/GiB | cpu user/sys ms/GiB | peak RSS MiB | threads | transfer s | traffic samples |"
+            "| engine | run | throughput MiB/s | cpu ms/GiB | cpu user/sys ms/GiB | kernel asks / MiB crossed per GiB | peak RSS MiB | threads | transfer s | traffic samples |"
         );
         let _ = writeln!(
             s,
-            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
+            "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |"
         );
         for entry in &self.by_engine {
             for (i, run) in entry.runs.iter().enumerate() {
@@ -495,9 +547,13 @@ impl Comparison {
                     || "n/a".to_owned(),
                     |(user, sys)| format!("{user:.1} / {sys:.1}"),
                 );
+                let kernel = run.io_per_gib().map_or_else(
+                    || "n/a".to_owned(),
+                    |(calls, bytes)| format!("{calls:.0} / {:.0} MiB", bytes / 1_048_576.0),
+                );
                 let _ = writeln!(
                     s,
-                    "| {} | {} | {:.1} | {cpu} | {split} | {:.1} | {} | {:.3} | {} |",
+                    "| {} | {} | {:.1} | {cpu} | {split} | {kernel} | {:.1} | {} | {:.3} | {} |",
                     entry.engine,
                     i + 1,
                     run.throughput_mib_s(),
@@ -985,6 +1041,7 @@ pub fn revalidate(result_path: &Path) -> Result<Run, Error> {
     check_derived(&root, bytes_sent + bytes_received, seconds, cpu_millis)?;
     check_samples(&root, cpu_millis)?;
     check_split(&root, cpu_millis)?;
+    check_io(&root, bytes_sent + bytes_received)?;
 
     let optional = |key: &str| root.get(key).and_then(Json::as_num).map(|n| n as u64);
 
@@ -1038,6 +1095,7 @@ pub fn revalidate(result_path: &Path) -> Result<Run, Error> {
                 .get("threads_peak")
                 .and_then(Json::as_num)
                 .map(|n| n as u64),
+            io: read_io(root.get("io")),
             startup_cpu_millis: num("client_startup_cpu_millis")? as u64,
             startup_seconds: num("client_startup_seconds")?,
             samples,
@@ -1143,6 +1201,64 @@ fn check_split(root: &Json, cpu_millis: f64) -> Result<(), Error> {
     }
 }
 
+fn check_io(root: &Json, moved: f64) -> Result<(), Error> {
+    let count = |key: &str| {
+        root.get("io")
+            .and_then(|io| io.get(key))
+            .and_then(Json::as_num)
+    };
+    let (Some(read_calls), Some(write_calls), Some(read_bytes), Some(write_bytes)) = (
+        count("syscr"),
+        count("syscw"),
+        count("rchar"),
+        count("wchar"),
+    ) else {
+        // A sampler with no `/proc/<pid>/io` leaves the tally out: a gap in the source, not the run.
+        return Ok(());
+    };
+    if moved <= 0.0 {
+        return Ok(());
+    }
+    let gib = moved / 1_073_741_824.0;
+    let calls = read_calls + write_calls;
+    let bytes = read_bytes + write_bytes;
+    let matches = |key: &str, rederived: f64| -> Result<(), Error> {
+        let reported = root
+            .get(key)
+            .and_then(Json::as_num)
+            .ok_or_else(|| Error::Invalid(format!("result.json has no number `{key}`")))?;
+        if (rederived - reported).abs() > 1e-6 * reported.abs().max(1.0) {
+            return Err(Error::Invalid(format!(
+                "{key} {reported} does not match its own fields: {rederived}"
+            )));
+        }
+        Ok(())
+    };
+    matches("io_calls_per_gib", calls / gib)?;
+    matches("io_bytes_per_gib", bytes / gib)?;
+    let samples = read_samples(root);
+    let io_at = |sample: &(parity::Phase, crate::ps::Sample)| sample.1.io;
+    if let (Some(first), Some(last)) = (
+        samples.first().and_then(io_at),
+        samples.last().and_then(io_at),
+    ) {
+        let delta = last.since(&first).ok_or_else(|| {
+            Error::Invalid("the kernel tally went backwards between its own samples".into())
+        })?;
+        let (calls_seen, bytes_seen) = (delta.calls() as f64, delta.bytes() as f64);
+        // Whole counters on both sides, so half a call is the tightest band that still means equal.
+        if (calls_seen - calls).abs() > 0.5 || (bytes_seen - bytes).abs() > 0.5 {
+            return Err(Error::Invalid(format!(
+                "io reports {calls} calls over {bytes} bytes, which is not the samples' delta of \
+                 {} over {}",
+                delta.calls(),
+                delta.bytes(),
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn read_samples(root: &Json) -> Vec<(parity::Phase, crate::ps::Sample)> {
     root.get("samples")
         .and_then(Json::as_arr)
@@ -1171,12 +1287,26 @@ fn read_samples(root: &Json) -> Vec<(parity::Phase, crate::ps::Sample)> {
                                 .and_then(Json::as_num)
                                 .map(|n| n as u64),
                             threads: item.get("threads").and_then(Json::as_num).map(|n| n as u64),
+                            io: read_io(item.get("io")),
                         },
                     )
                 })
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The kernel tally under the names `/proc/<pid>/io` prints it. Half a tally is no tally: a sample
+/// that reports three of the four counters would let a run's delta depend on which line was read.
+fn read_io(item: Option<&Json>) -> Option<crate::ps::Io> {
+    let item = item?;
+    let count = |key: &str| item.get(key).and_then(Json::as_num).map(|n| n as u64);
+    Some(crate::ps::Io {
+        read_calls: count("syscr")?,
+        write_calls: count("syscw")?,
+        read_bytes: count("rchar")?,
+        write_bytes: count("wchar")?,
+    })
 }
 
 #[cfg(test)]
@@ -1213,6 +1343,66 @@ mod tests {
         assert!(
             check_split(&Json::object(), 1000.0).is_ok(),
             "a ps-only run reports no split and is not a fault"
+        );
+    }
+
+    #[test]
+    fn the_kernel_tally_in_an_artefact_has_to_be_its_own_samples_delta() {
+        let one_gib = 1024.0 * 1024.0 * 1024.0;
+        let tally = |(syscr, syscw, rchar, wchar): (f64, f64, f64, f64)| {
+            let mut io = Json::object();
+            io.insert("syscr", Json::Num(syscr));
+            io.insert("syscw", Json::Num(syscw));
+            io.insert("rchar", Json::Num(rchar));
+            io.insert("wchar", Json::Num(wchar));
+            io
+        };
+        let sample = |t| {
+            let mut item = Json::object();
+            item.insert("rss_kib", Json::Num(1.0));
+            item.insert("cpu_millis", Json::Num(1.0));
+            item.insert("io", tally(t));
+            item
+        };
+        let end = (100.0, 50.0, one_gib, one_gib);
+        let mut root = Json::object();
+        root.insert("io", tally(end));
+        root.insert("io_calls_per_gib", Json::Num(150.0));
+        root.insert("io_bytes_per_gib", Json::Num(2.0 * one_gib));
+        root.insert(
+            "samples",
+            Json::Arr(vec![sample((0.0, 0.0, 0.0, 0.0)), sample(end)]),
+        );
+        assert!(check_io(&root, one_gib).is_ok());
+        root.insert("io_calls_per_gib", Json::Num(151.0));
+        assert!(
+            check_io(&root, one_gib).is_err(),
+            "a per-GiB number has to be the tally over the run's own bytes"
+        );
+        root.insert("io_calls_per_gib", Json::Num(150.0));
+        root.insert("io", tally((101.0, 50.0, one_gib, one_gib)));
+        root.insert("io_calls_per_gib", Json::Num(151.0));
+        assert!(
+            check_io(&root, one_gib).is_err(),
+            "a tally self-consistent but not its samples' delta is still a fault"
+        );
+        root.insert("io", tally(end));
+        root.insert("io_calls_per_gib", Json::Num(150.0));
+        root.insert(
+            "samples",
+            Json::Arr(vec![
+                sample((200.0, 100.0, 2.0 * one_gib, 2.0 * one_gib)),
+                sample(end),
+            ]),
+        );
+        assert!(
+            check_io(&root, one_gib).is_err(),
+            "the kernel's counters only rise, so a delta that goes backwards is a torn artefact"
+        );
+        assert!(
+            check_io(&Json::object(), one_gib).is_ok(),
+            "a run sampled where `/proc/<pid>/io` cannot be read reports no tally, which is a gap \
+             in the source and not a fault"
         );
     }
 
@@ -1257,10 +1447,28 @@ mod tests {
                 sys_millis: Some(cpu_millis - cpu_millis * 2 / 3),
                 traffic_samples: 10,
                 threads_peak: None,
+                io: Some(crate::ps::Io {
+                    read_calls: mibs * 128,
+                    write_calls: mibs * 128,
+                    read_bytes: mibs * 1_048_576,
+                    write_bytes: mibs * 1_048_576,
+                }),
                 startup_cpu_millis: 0,
                 startup_seconds: 0.0,
                 samples: Vec::new(),
             },
+        }
+    }
+
+    /// Three repeats of one engine, so a cell's fixture stays shorter than what it asserts.
+    fn synth_engine(engine: &'static str, runs: [(u64, u64, u64); 3]) -> EngineRuns {
+        EngineRuns {
+            engine,
+            dialect: parity::Dialect::Xray,
+            runs: runs
+                .map(|(mibs, cpu_millis, rss_kib)| synth_run(mibs, cpu_millis, rss_kib))
+                .into_iter()
+                .collect(),
         }
     }
 
@@ -1415,24 +1623,14 @@ mod tests {
             workload: workload(),
             repeats: 3,
             by_engine: vec![
-                EngineRuns {
-                    engine: "xray-core",
-                    dialect: parity::Dialect::Xray,
-                    runs: vec![
-                        synth_run(100, 300, 20480),
-                        synth_run(110, 310, 20500),
-                        synth_run(120, 320, 20600),
-                    ],
-                },
-                EngineRuns {
-                    engine: "ferrox",
-                    dialect: parity::Dialect::Xray,
-                    runs: vec![
-                        synth_run(200, 150, 10240),
-                        synth_run(220, 155, 10250),
-                        synth_run(240, 160, 10260),
-                    ],
-                },
+                synth_engine(
+                    "xray-core",
+                    [(100, 300, 20480), (110, 310, 20500), (120, 320, 20600)],
+                ),
+                synth_engine(
+                    "ferrox",
+                    [(200, 150, 10240), (220, 155, 10250), (240, 160, 10260)],
+                ),
             ],
             ceilings_mib_s: vec![900.0, 950.0, 1000.0],
             gated: Some("ferrox"),
@@ -1453,7 +1651,7 @@ mod tests {
         assert_eq!(str_of(&root, "scenario"), "vless-raw-down-1");
         assert_eq!(str_of(&root, "reference"), "xray-core");
         let rows = root.get("rows").expect("rows");
-        let pairs: Vec<(String, String, String)> = match rows {
+        let pairs: Vec<(String, String, String, bool)> = match rows {
             Json::Arr(items) => items
                 .iter()
                 .map(|row| {
@@ -1461,6 +1659,7 @@ mod tests {
                         str_of(row, "label"),
                         str_of(row, "direction"),
                         str_of(row, "verdict"),
+                        row.get("gates").and_then(Json::as_bool) == Some(true),
                     )
                 })
                 .collect(),
@@ -1469,13 +1668,34 @@ mod tests {
         assert_eq!(
             pairs
                 .iter()
-                .map(|(_, _, verdict)| verdict.clone())
+                .map(|(_, _, verdict, _)| verdict.clone())
                 .collect::<Vec<_>>(),
-            vec!["better", "better", "better"]
+            vec!["better", "better", "better", "within-noise", "within-noise"]
         );
         assert_eq!(pairs[0].1, "higher");
         assert_eq!(pairs[1].1, "lower");
         assert_eq!(pairs[2].1, "lower");
+        // A call count diagnoses how the cpu was spent, so the kernel rows attribute and never gate.
+        let kernel: Vec<&str> = pairs
+            .iter()
+            .filter(|(_, _, _, gated)| *gated)
+            .map(|(label, ..)| label.as_str())
+            .collect();
+        assert_eq!(
+            kernel,
+            vec![
+                "throughput (ferrox vs xray-core)",
+                "cpu per GiB (ferrox vs xray-core)",
+                "peak rss (ferrox vs xray-core, 5% tolerance)",
+            ],
+            "the two kernel rows report and never gate"
+        );
+        assert!(
+            pairs[3].0.starts_with("kernel calls per GiB")
+                && pairs[4].0.starts_with("kernel bytes per GiB"),
+            "a cell names what it counted: {:?}",
+            pairs[3].0,
+        );
         assert!(root
             .get("gate_passed")
             .and_then(Json::as_bool)

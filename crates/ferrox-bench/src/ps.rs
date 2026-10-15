@@ -80,6 +80,36 @@ impl Host {
     }
 }
 
+/// What crossed the process's boundary through `read` and `write`: the calls and the bytes they carried.
+/// A splice goes through neither, so a path that pipes socket to socket moves bytes this does not count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Io {
+    pub read_calls: u64,
+    pub write_calls: u64,
+    pub read_bytes: u64,
+    pub write_bytes: u64,
+}
+
+impl Io {
+    pub fn calls(&self) -> u64 {
+        self.read_calls + self.write_calls
+    }
+
+    pub fn bytes(&self) -> u64 {
+        self.read_bytes + self.write_bytes
+    }
+
+    /// The run's own crossing: each counter is monotonic, so the pair it reports is a difference.
+    pub fn since(&self, first: &Io) -> Option<Io> {
+        Some(Io {
+            read_calls: self.read_calls.checked_sub(first.read_calls)?,
+            write_calls: self.write_calls.checked_sub(first.write_calls)?,
+            read_bytes: self.read_bytes.checked_sub(first.read_bytes)?,
+            write_bytes: self.write_bytes.checked_sub(first.write_bytes)?,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Sample {
     pub elapsed_ms: u128,
@@ -90,6 +120,8 @@ pub struct Sample {
     /// What the kernel ran on its behalf; the pair sums to `cpu_millis` wherever both exist.
     pub sys_millis: Option<u64>,
     pub threads: Option<u64>,
+    /// The kernel's own tally of what the process asked it to move; `None` where there is no such file.
+    pub io: Option<Io>,
 }
 
 #[derive(Debug)]
@@ -159,8 +191,46 @@ pub fn sample(host: Host, pid: u32, elapsed_ms: u128) -> Result<Sample, SampleEr
         sample.cpu_millis = user + sys;
         sample.user_millis = Some(user);
         sample.sys_millis = Some(sys);
+        sample.io = proc_io(pid);
     }
     Ok(sample)
+}
+
+/// The four lines `/proc/<pid>/io` counts for the whole thread group. A missing line is a sample
+/// with no kernel tally rather than a failed run, because a runner that hides `io` from the
+/// harness must not turn a benchmark into a fault.
+fn proc_io(pid: u32) -> Option<Io> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/io")).ok()?;
+    parse_io(&text)
+}
+
+pub fn parse_io(text: &str) -> Option<Io> {
+    let mut read_calls = None;
+    let mut write_calls = None;
+    let mut read_bytes = None;
+    let mut write_bytes = None;
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(key), Some(value)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let Ok(count) = value.parse::<u64>() else {
+            continue;
+        };
+        match key {
+            "syscr:" => read_calls = Some(count),
+            "syscw:" => write_calls = Some(count),
+            "rchar:" => read_bytes = Some(count),
+            "wchar:" => write_bytes = Some(count),
+            _ => {}
+        }
+    }
+    Some(Io {
+        read_calls: read_calls?,
+        write_calls: write_calls?,
+        read_bytes: read_bytes?,
+        write_bytes: write_bytes?,
+    })
 }
 
 pub fn parse(line: &str, elapsed_ms: u128) -> Option<Sample> {
@@ -178,6 +248,7 @@ pub fn parse(line: &str, elapsed_ms: u128) -> Option<Sample> {
         user_millis: None,
         sys_millis: None,
         threads,
+        io: None,
     })
 }
 
@@ -320,6 +391,7 @@ mod win32 {
             user_millis: Some(super::ticks_to_millis(filetime_ticks(user))),
             sys_millis: Some(super::ticks_to_millis(filetime_ticks(kernel))),
             threads: thread_count(pid).ok(),
+            io: None,
         })
     }
 
@@ -495,6 +567,61 @@ mod tests {
             assert_eq!(args.first().map(String::as_str), Some("-o"));
             assert_eq!(args.last().map(String::as_str), Some("7"));
         }
+    }
+
+    #[test]
+    fn the_kernel_tally_reads_the_four_lines_a_run_is_measured_by() {
+        let io = parse_io(
+            "rchar: 1091073826\nwchar: 1091072274\nsyscr: 35181\nsyscw: 33930\n\
+             read_bytes: 0\nwrite_bytes: 0\ncancelled_write_bytes: 0\n",
+        )
+        .expect("a whole tally");
+        assert_eq!(io.read_calls, 35_181);
+        assert_eq!(io.write_calls, 33_930);
+        assert_eq!(io.read_bytes, 1_091_073_826);
+        assert_eq!(io.write_bytes, 1_091_072_274);
+        assert_eq!(io.calls(), 69_111, "the pair is one count of asks");
+        assert_eq!(io.bytes(), 2_182_146_100, "and one count of bytes");
+    }
+
+    #[test]
+    fn a_tally_missing_a_line_it_needs_is_no_tally() {
+        for short in [
+            "",
+            "rchar: 1\nwchar: 2\nsyscr: 3\n",
+            "rchar: n/a\nwchar: 2\nsyscr: 3\nsyscw: 4\n",
+            "rchar 1\nwchar 2\nsyscr 3\nsyscw 4\n",
+        ] {
+            assert_eq!(parse_io(short), None, "{short:?} cannot be a whole tally");
+        }
+    }
+
+    #[test]
+    fn the_tally_delta_is_the_run_and_stops_when_a_counter_rewinds() {
+        let first = Io {
+            read_calls: 10,
+            write_calls: 20,
+            read_bytes: 300,
+            write_bytes: 400,
+        };
+        let last = Io {
+            read_calls: 12,
+            write_calls: 22,
+            read_bytes: 360,
+            write_bytes: 420,
+        };
+        let run = last.since(&first).expect("a monotonic pair");
+        assert_eq!(run.calls(), 4);
+        assert_eq!(run.bytes(), 80);
+        let rewound = Io {
+            read_calls: 9,
+            ..last
+        };
+        assert_eq!(
+            rewound.since(&first),
+            None,
+            "a counter that went backwards is not a difference to report"
+        );
     }
 
     #[test]
