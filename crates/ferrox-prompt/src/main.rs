@@ -809,6 +809,9 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     deliver(&rendered, library, prompt.id, args.output.is_stdout());
+    if args.output == Output::Copy {
+        report_render_guide(prompt, target.as_ref(), &values, &state, &addons);
+    }
     record(
         ledger,
         prompt.id,
@@ -1231,6 +1234,71 @@ fn summarise(library: &Library, effort: Option<Effort>) {
     if !ready_ids.is_empty() {
         println!("ready       {} in this order", ready_ids.join(" → "));
     }
+}
+
+/// Print the fill-in guide so a clipboard handoff still explains what was chosen and how to change it.
+fn report_render_guide(
+    prompt: &Prompt,
+    target: Option<&(String, BTreeMap<String, String>)>,
+    values: &Values,
+    state: &ProjectState,
+    addons: &[Addon],
+) {
+    println!("P{} · {}", prompt.id, prompt.title);
+    if let Some((key, _)) = &target {
+        if let Some(row) = state.methods.iter().find(|row| row.key() == *key) {
+            println!(
+                "  targeting   row {key} — {} (state: {})",
+                row.method, row.state
+            );
+        }
+    }
+    if !values.is_empty() {
+        println!(
+            "  filled      {}",
+            values
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !prompt.addons.is_empty() {
+        let selected: Vec<&str> = addons.iter().map(|a| a.slug.as_str()).collect();
+        let available: Vec<String> = prompt
+            .addons
+            .iter()
+            .map(|a| {
+                if selected.contains(&a.slug.as_str()) {
+                    format!("[{}]", a.slug)
+                } else {
+                    a.slug.clone()
+                }
+            })
+            .collect();
+        println!(
+            "  add-ons     {} (bracketed = included)",
+            available.join(", ")
+        );
+    }
+    if state.has_matrix() && prompt.targets.is_matrix() {
+        let candidates = state.candidates(prompt.targets);
+        if candidates.len() > 1 {
+            println!(
+                "  alternatives {} rows in class {}; pick one with --set method=<name> --set index=<n> --set section=<letter>",
+                candidates.len(),
+                prompt.targets.as_str(),
+            );
+        }
+    }
+    println!("  override    re-run with --set KEY=VALUE to replace any filled value");
+    if !prompt.addons.is_empty() {
+        println!(
+            "  example     cargo run -p ferrox-prompt -- render {} --addon {} --set method=<name>",
+            prompt.id, prompt.addons[0].slug
+        );
+    }
+    println!();
 }
 
 /// Hand the text over: the clipboard, or the terminal when asked or unable to.
