@@ -64,7 +64,7 @@ printf '%s %s %s %s\n' '<doc>' '<key>' '<value>' '<checker>' >> scripts/method-c
 | method | page | syscalls | copies per byte | ops | time |
 | --- | --- | --- | --- | --- | --- |
 | record layer (ChaCha20) | [record-layer](docs/function/record-layer.md) | 0 | 0 (in place) | `UNBLESSED` | not measured |
-| Shadowsocks AEAD | [shadowsocks](docs/function/shadowsocks.md) | **1 write per 16 KiB read**, 2 reads per chunk | 1 written, **0** read | `UNBLESSED` | not measured |
+| Shadowsocks AEAD | [shadowsocks](docs/function/shadowsocks.md) | **1 read + 1 write per 64 KiB read** (4 chunks), 1 target write per opened batch | **0** written, **0** read | `UNBLESSED` | not measured |
 | Shadowsocks 2022 | [shadowsocks-2022](docs/function/shadowsocks-2022.md) | **1 write per 16 KiB read**, 2 reads per chunk | 1 written, **0** read | `UNBLESSED` | not measured |
 | VMess AEAD | [vmess](docs/function/vmess.md) | **1 write per 32 KiB read** (4 frames) | 1 written, **0** read | `UNBLESSED` | not measured |
 | VLESS TCP | [vless](docs/function/vless.md) | 1 write per header, 0 framing after | 1 (the relay's own) | `UNBLESSED` | not measured |
