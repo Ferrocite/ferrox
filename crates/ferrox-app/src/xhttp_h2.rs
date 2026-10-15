@@ -761,6 +761,7 @@ mod tests {
         stream: TcpStream,
         next: u32,
         decoder: Decoder,
+        held: VecDeque<(u8, u8, u32, Vec<u8>)>,
     }
 
     impl H2Client {
@@ -778,6 +779,7 @@ mod tests {
                 stream,
                 next: 1,
                 decoder: Decoder::default(),
+                held: VecDeque::new(),
             };
             for _ in 0..3 {
                 let (len, kind, flags, _) = read_head(&mut conn.stream).expect("frame");
@@ -837,33 +839,55 @@ mod tests {
             self.stream.flush().expect("flushes");
         }
 
+        /// The next frame this reader has a use for: a wanted frame for `id` comes off what an
+        /// earlier reader set aside before the socket is read at all, and a frame that arrived for
+        /// another stream is set aside instead of dropped. A PING is answered here, once, so no
+        /// reader has to remember to.
+        fn next_frame(&mut self, id: u32, want: impl Fn(u8) -> bool) -> (u8, u8, u32, Vec<u8>) {
+            loop {
+                if let Some(at) = self.held.iter().position(|f| f.2 == id && want(f.0)) {
+                    return self.held.remove(at).expect("the position just found");
+                }
+                let (len, kind, flags, got) = read_head(&mut self.stream).expect("frame");
+                let mut body = vec![0u8; len];
+                crate::proxy::read_exact(&mut self.stream, &mut body).expect("body");
+                if kind == T_PING && flags & F_ACK == 0 && body.len() == 8 {
+                    write_frame(&mut self.stream, T_PING, F_ACK, 0, &body);
+                    continue;
+                }
+                if got == id && want(kind) {
+                    return (kind, flags, got, body);
+                }
+                self.hold(kind, flags, got, body);
+            }
+        }
+
+        /// A frame belonging to a stream this reader is not waiting on. Dropping one is how a
+        /// multiplexed response arrives short: the bytes were read and then thrown away.
+        fn hold(&mut self, kind: u8, flags: u8, id: u32, body: Vec<u8>) {
+            if !body.is_empty() && matches!(kind, T_DATA | T_HEADERS | T_CONT) {
+                self.held.push_back((kind, flags, id, body));
+            }
+        }
+
         fn response_head(&mut self, id: u32) -> u16 {
             let mut block = Vec::new();
             loop {
-                let (len, kind, flags, got) = read_head(&mut self.stream).expect("frame");
-                let mut frame = vec![0u8; len];
-                crate::proxy::read_exact(&mut self.stream, &mut frame).expect("body");
-                match kind {
-                    T_HEADERS if got == id => {
-                        block.extend_from_slice(&frame);
-                        if flags & F_END_HEADERS != 0 {
-                            let mut fields = Vec::new();
-                            self.decoder.decode(&block, &mut fields).expect("decodes");
-                            for (name, value) in &fields {
-                                if name == b":status" {
-                                    return std::str::from_utf8(value)
-                                        .unwrap_or_default()
-                                        .parse()
-                                        .unwrap_or(0);
-                                }
-                            }
-                            return 0;
+                let (_, flags, _, frame) =
+                    self.next_frame(id, |kind| matches!(kind, T_HEADERS | T_CONT));
+                block.extend_from_slice(&frame);
+                if flags & F_END_HEADERS != 0 {
+                    let mut fields = Vec::new();
+                    self.decoder.decode(&block, &mut fields).expect("decodes");
+                    for (name, value) in &fields {
+                        if name == b":status" {
+                            return std::str::from_utf8(value)
+                                .unwrap_or_default()
+                                .parse()
+                                .unwrap_or(0);
                         }
                     }
-                    T_PING if flags & F_ACK == 0 && frame.len() == 8 => {
-                        write_frame(&mut self.stream, T_PING, F_ACK, 0, &frame);
-                    }
-                    _ => {}
+                    return 0;
                 }
             }
         }
@@ -871,21 +895,12 @@ mod tests {
         fn response_data(&mut self, id: u32, n: usize) -> Vec<u8> {
             let mut out = Vec::with_capacity(n);
             while out.len() < n {
-                let (len, kind, flags, got) = read_head(&mut self.stream).expect("frame");
-                let mut frame = vec![0u8; len];
-                crate::proxy::read_exact(&mut self.stream, &mut frame).expect("body");
-                match kind {
-                    T_DATA if got == id => {
-                        let take = (n - out.len()).min(frame.len());
-                        out.extend_from_slice(&frame[..take]);
-                        let _ = flags;
-                    }
-                    T_PING if flags & F_ACK == 0 && frame.len() == 8 => {
-                        write_frame(&mut self.stream, T_PING, F_ACK, 0, &frame);
-                    }
-                    T_RST if got == id => panic!("stream reset"),
-                    _ => {}
-                }
+                let (kind, flags, _, frame) =
+                    self.next_frame(id, |kind| matches!(kind, T_DATA | T_RST));
+                assert!(kind != T_RST, "stream reset");
+                let take = (n - out.len()).min(frame.len());
+                out.extend_from_slice(&frame[..take]);
+                self.hold(kind, flags, id, frame[take..].to_vec());
             }
             out
         }
@@ -1173,6 +1188,54 @@ mod tests {
         drop(client);
         server.join().expect("joins");
         let _ = echo;
+    }
+
+    /// The scripted peer answers two streams at once and puts the other stream's frames in front of
+    /// each reader, so a reader that throws away what it did not ask for returns the wrong bytes
+    /// rather than only losing them when the scheduler lets two responses interleave.
+    #[test]
+    fn an_early_frame_waits_for_the_reader_that_asked_for_it() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds a scripted peer");
+        let addr = listener.local_addr().expect("addr");
+        let scripted = thread::spawn(move || {
+            let (mut peer, _) = listener.accept().expect("the client connects");
+            for _ in 0..3 {
+                write_frame(&mut peer, T_SETTINGS, 0, 0, &[]);
+            }
+            let ok = block_encode(&[(":status", "200")]);
+            let late = block_encode(&[(":status", "500")]);
+            write_frame(&mut peer, T_HEADERS, F_END_HEADERS, 3, &ok);
+            write_frame(&mut peer, T_HEADERS, F_END_HEADERS, 1, &ok);
+            write_frame(&mut peer, T_DATA, 0, 3, b"held-first-");
+            write_frame(&mut peer, T_DATA, 0, 1, b"head-then-tail");
+            write_frame(&mut peer, T_DATA, 0, 1, b"-continued");
+            write_frame(&mut peer, T_DATA, 0, 3, b"late-second!");
+            write_frame(&mut peer, T_HEADERS, F_END_HEADERS, 3, &late);
+            peer.flush().expect("flushes");
+            let mut drain = [0u8; 64];
+            while peer.read(&mut drain).is_ok_and(|n| n > 0) {}
+        });
+        let mut client = H2Client::connect(addr);
+        assert_eq!(client.response_head(1), 200);
+        assert_eq!(client.response_data(1, 4), b"head");
+        assert_eq!(
+            client.response_data(1, 10),
+            b"-then-tail",
+            "a frame longer than the read asked for has to keep its remainder"
+        );
+        assert_eq!(client.response_data(1, 10), b"-continued");
+        assert_eq!(
+            client.response_data(3, 11),
+            b"held-first-",
+            "another stream's reader must not spend the bytes this one is waiting for"
+        );
+        assert_eq!(
+            client.response_head(3),
+            200,
+            "a status read while waiting on another stream is not noise to drop"
+        );
+        drop(client);
+        scripted.join().expect("the peer ends");
     }
 
     #[test]
