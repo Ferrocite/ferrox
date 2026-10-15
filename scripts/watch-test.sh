@@ -4,22 +4,28 @@
 # binary's tests one at a time until the one that never returns is the only answer left.
 set -uo pipefail
 
-quiet="${WATCH_QUIET:-600}"
+quiet="${WATCH_QUIET:-240}"
+bootstrap="${WATCH_BOOTSTRAP:-900}"
 out="${WATCH_OUT:-target/ci/watch-test.log}"
 selftest=0
 
 usage() {
   cat >&2 <<'EOF'
-usage: watch-test.sh [--quiet SECONDS] [--out FILE] [--selftest] -- COMMAND...
+usage: watch-test.sh [--quiet SECONDS] [--bootstrap SECONDS] [--out FILE] [--selftest] -- COMMAND...
 
-  --quiet SECONDS   silence allowed before the command is stopped (600)
-  --out FILE        where the log is written as it happens (target/ci/watch-test.log)
+  --quiet SECONDS     silence allowed once a test is running (240)
+  --bootstrap SECONDS silence allowed while the command is still building (900)
+  --out FILE          where the log is written as it happens (target/ci/watch-test.log)
 
-WATCH_QUIET and WATCH_OUT set the same two from the environment. The command's own
-exit code is returned, except for a stall, which returns 124. libtest writes a test's
-name when it finishes, so a parallel run only shows which names are missing; the
-second pass runs the stalled binary's tests one per process and stops on the first
-that does not return, which is the only test that could have done it.
+WATCH_QUIET, WATCH_BOOTSTRAP and WATCH_OUT set the same three from the environment.
+Two limits because a suite has two shapes: a cold Windows build can leave one crate
+linking for a quarter of an hour with nothing to print, while a test that has started
+and means to finish prints its name the moment it does. The limit drops to the second
+number as soon as the log says a test binary is running. The command's own exit code
+is returned, except for a stall, which returns 124. libtest writes a test's name when
+it finishes, so a parallel run only shows which names are missing; the second pass
+runs the stalled binary's tests one per process and stops on the first that does not
+return, which is the only test that could have done it.
 EOF
   exit 2
 }
@@ -27,13 +33,15 @@ EOF
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --quiet) quiet="${2:?--quiet wants a number}"; shift 2 ;;
+    --bootstrap) bootstrap="${2:?--bootstrap wants a number}"; shift 2 ;;
     --out) out="${2:?--out wants a path}"; shift 2 ;;
     --selftest) selftest=1; shift ;;
     --) shift; break ;;
     *) echo "unknown argument '$1'" >&2; usage ;;
   esac
 done
-[[ "$quiet" =~ ^[0-9]+$ ]] || { echo "--quiet wants seconds, got '$quiet'" >&2; exit 2; }
+[[ "$quiet" =~ ^[0-9]+$ && "$bootstrap" =~ ^[0-9]+$ ]] \
+  || { echo "--quiet and --bootstrap want seconds" >&2; exit 2; }
 
 # blocked_under PID: every thread below PID and what procfs says it is waiting in.
 # A deadlock reads as a futex wait and a socket stall as a read on one fd; macOS and
@@ -55,9 +63,10 @@ blocked_under() {
 STALLED=0
 WRC=0
 watch() {
-  local command="$1" sent=0 size last_change=$SECONDS pid
+  local command="$1" sent=0 size last_change=$SECONDS pid limit running
   STALLED=0
   WRC=0
+  running=0
   mkdir -p "$(dirname "$out")"
   printf '%s\n' "$command" >"$out"
   # -C, not -la: `cat -u` would buffer the very output this reads, and a pipe would
@@ -71,9 +80,13 @@ watch() {
       sent=$size
       last_change=$SECONDS
     fi
-    if ((SECONDS - last_change >= quiet)); then
+    # Once a test binary has started, silence means a test is not finishing.
+    ((running == 1)) || grep -q '^ *[Rr]unning ' "$out.part" 2>/dev/null && running=1
+    limit=$((running == 1 ? quiet : bootstrap))
+    if ((SECONDS - last_change >= limit)); then
       STALLED=1
-      echo "nothing written for $((SECONDS - last_change))s (the limit is $quiet): stopping it" >&2
+      echo "nothing written for $((SECONDS - last_change))s (the $(
+        ((running == 1)) && echo measuring || echo building) limit is $limit): stopping it" >&2
       echo "blocked threads:" >&2
       blocked_under "$pid" >&2
       # The shell reports a background job it had to kill; that line is noise under a
@@ -138,11 +151,14 @@ if [[ "${1:-}" == "--exact" ]]; then
   echo "test ${2:-} ... ok"
   exit 0
 fi
+echo "     Running unittests src/lib.rs (target/debug/deps/selftest-fake-abcd)"
+echo "     Running unittests src/lib.rs (target/debug/deps/selftest-fake-abcd)"
 echo "test quick::done ... ok"
 sleep 600
 EOF
   chmod +x "$fake"
   quiet=2
+  bootstrap=2
   out="target/ci/selftest.log"
   watch "$fake" >/dev/null
   ((STALLED == 1)) || { echo "selftest: a sleeping command did not read as stalled" >&2; return 1; }
@@ -161,7 +177,19 @@ EOF
   else
     echo "note: no procfs on $(uname -s), so the thread witness is only proven on a Linux runner"
   fi
-  rm -f "$fake" "$out" "${out}.stall"
+  quiet=1 bootstrap=8
+  out="target/ci/selftest-measuring.log"
+  started=$SECONDS
+  watch "echo '     Running unittests src/lib.rs (target/debug/deps/x-abcd)'; sleep 60" >/dev/null
+  ((STALLED == 1 && SECONDS - started < 6)) || {
+    echo "selftest: a stall after a test started was not cut by the quiet limit" >&2; return 1; }
+  out="target/ci/selftest-building.log"
+  started=$SECONDS
+  watch "echo '   Compiling slow-crate v1.0.0'; sleep 60" >/dev/null
+  ((STALLED == 1 && SECONDS - started >= 8)) || {
+    echo "selftest: a silent build was cut before its bootstrap limit" >&2; return 1; }
+  echo "selftest: ok   patient while it builds, strict once a test is running"
+  rm -f "$fake" "$out" "${out}.stall" target/ci/selftest-*.log
   return 0
 }
 

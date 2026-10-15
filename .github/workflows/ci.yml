@@ -129,7 +129,7 @@ jobs:
           # it stopped (P47) at zero cost to a green run.
           FERROX_ECHO_TRACE: 1
         run: |
-          ./scripts/watch-test.sh --quiet 600 --out "target/ci/test-${{ matrix.os }}.log" -- \
+          ./scripts/watch-test.sh --out "target/ci/test-${{ matrix.os }}.log" -- \
             cargo test --workspace --locked 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
       - name: publish the log the stall was cut from
         if: always()
