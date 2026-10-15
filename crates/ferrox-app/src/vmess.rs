@@ -9,8 +9,8 @@ use crate::proxy::read_exact;
 
 const AUTH_LEN: usize = 16;
 const TAG_LEN: usize = 16;
-const MAX_PLAIN: usize = 8192;
 const FRAMES_PER_WRITE: usize = 4;
+const MAX_PLAIN: usize = 8192;
 const READ_PLAIN: usize = MAX_PLAIN * FRAMES_PER_WRITE;
 const OPT_STREAM: u8 = 0x01;
 const OPT_MASK: u8 = 0x04;
