@@ -44,6 +44,7 @@ graph TD
 | vision-header-targets-matching-core | 2 | ferrox-app-proxy::tests::vision_header_matches_the_core_encoder |
 | dial-header-reallocations | 0 | ferrox-app-proxy::tests::dial_headers_are_sized_to_the_bytes_they_hold |
 | request-header-reads | 4 | ferrox-app-proxy::tests::the_vless_request_header_costs_four_reads_not_six |
+| handshake-pump-buffer-reallocations | 0 | ferrox-app-proxy::tests::the_pump_forwards_its_buffer_by_pointer_and_holds_capacity_steady |
 <!-- counts:end -->
 
 The relay buffer's zero-fills are prose, not a row. A row needs a checker that
@@ -61,6 +62,13 @@ the fill is the only difference. The promotion's 240 KiB was never visible to an
 counter here anyway — growing with `resize(.., 0)` writes the tail with
 `write_bytes`, which is not `alloc_zeroed` — and the only counter that would see
 it is an instruction count, which is the `UNBLESSED` row above.
+
+The handshake pump now spends that same `RelayBuf`, so a dial stops paying a
+16 KiB `vec![0u8; …]` memset for bytes the first `read` overwrites. That fill is
+prose by the rule just above; the row that is checked is the pump's buffer
+*handoff* — the carrier receives the buffer's own bytes, and 64 sub-buffer
+push/drain cycles neither move the allocation nor grow its `size()`, so steady
+traffic reallocates none of it.
 
 ## Ops
 
