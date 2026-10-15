@@ -50,6 +50,44 @@ guarantee: a peer slower than 100 ms one-way still loses the refusal to our clos
 slice does not fix that — making the close orderly needs a read deadline the plaintext
 carrier does not arm.
 
+## Mode gates
+
+The reference reads `mode` twice, with two different jobs. The dialer resolves an empty or
+`auto` mode into the shape it will *send* (`dialer.go:332`: `packet-up`, or `stream-one` and
+`stream-up` under REALITY). The hub never resolves it: each shape gate is written
+`Mode != "" && Mode != "auto" && Mode != <shape>` (`hub.go:154`, `:199`, `:241`), so a config
+that does not state a mode serves every shape, and only a config that states one narrows the
+hub.
+
+This carrier resolved `auto` once, at parse, and then compared the *resolved* value on the
+hub too. A config written as `{"path": "/share"}` — every share link without an explicit
+mode, and the matrix cell — therefore became a packet-up-only hub that refused the only head
+our own dialer can write: `xhttp::connect` sends a session-less chunked `POST`, and a session
+id is a packet-up/stream-up shape, so the hub answered its own client `HTTP/1.1 400 Bad
+Request`. Nothing on the wire ever moved, at any connection count, and the run looked like a
+stall rather than a refusal because `dial_vless_rung` reports a `connect` that returns `None`
+as `unreachable at socket-connected (inferred)` and the ladder then climbs
+`xhttp -> grpc -> httpupgrade`; the bench cell wrote no `result.json` at all. That is the
+whole of why `vless-xhttp-down-8` is red on every engine but ours.
+
+`XhttpSettings` now carries `mode_stated`, and the session-less gate arms only when the mode
+was written down — which also lets a *stated* `stream-up` hub serve a session-less `POST`, as
+`hub.go:154` does. `an_unstated_mode_serves_the_dialers_own_head` is the 400 that becomes a
+200, and `the_dialer_and_its_own_hub_complete_on_loopback` completes the round trip through
+the real socket pair; both fail on the previous gate.
+`a_stated_mode_still_refuses_the_session_less_post` and
+`an_unstated_mode_still_serves_the_shape_it_resolved_to` pin what did not move: a hub that
+was told still refuses, and the packet shape auto resolves to is still served.
+
+The hub's two *session-shaped* gates still compare against the resolved mode, so an auto hub
+answers 400 to a `stream-up` `POST` where the reference serves it. That is deliberate and
+witnessed by `an_unstated_mode_still_refuses_the_shape_without_a_carrier_owner`: taking that
+shape means parking its handler on `wait_ended` (see Session teardown below) for a session
+whose upload no H1 carrier ever closes, so the widening waits for that owner. No syscall,
+copy or byte on the wire moves here either — a refusal becomes a served request — so this is
+prose rather than a row in the table below, and the gate that proves it is CI's
+`vless-xhttp-down-8`, which never runs locally.
+
 ## Session teardown
 
 A session outlives the request that made it. The downlink `GET` parks its reader on
@@ -173,7 +211,10 @@ read.
 
 - The dialer is one mode: `connect` and `connect_split` write a single
   `stream-one` POST head, so an outbound on `stream-up` or `packet-up` does not
-  exist yet, and neither does the `xmux` pool under `multi`.
+  exist yet, and neither does the `xmux` pool under `multi`. This is the half of
+  the mode gate that makes an auto hub's refusal cost a whole tunnel — the other
+  half, and the shape the hub still refuses under `auto` until an H1 upload has a
+  carrier-side owner, are in Mode gates above.
 - Six knobs in the reference's `Config` are not parsed at all:
   `uplinkChunkSize`, `sessionIDTable`, `sessionIDLength`, `serverMaxHeaderBytes`,
   `scStreamUpServerSecs` and `xmux`. The first two shape a client's requests, so
