@@ -50,6 +50,33 @@ guarantee: a peer slower than 100 ms one-way still loses the refusal to our clos
 slice does not fix that — making the close orderly needs a read deadline the plaintext
 carrier does not arm.
 
+## Session teardown
+
+A session outlives the request that made it. The downlink `GET` parks its reader on
+`Session::cv` waiting for the next sequence, and the `stream-up` `POST` parks its handler
+there waiting for the downlink. Nothing else ever notified that condvar: `close_session`
+ran only from a `SessionReader`'s `Drop`, so a client that opened one half and died left
+the other half's thread parked for the life of the process, holding its session and up to
+`sc_max_buffered` buffered packets in the global map. The H2 connection is the owner of
+what its streams opened, so `kill()` now ends every session bound to it; and a packet
+refused at the buffer cap ends its own session, because the reader pops a strict sequence
+and a lost packet is a session that cannot be resumed.
+`xhttp_h2::tests::a_dead_carrier_ends_the_session_it_parked` and
+`xhttp::tests::a_refused_packet_ends_the_session_it_overflowed` name the two leaks — both
+fail without the binding — and `xhttp::tests::a_carrier_death_lifts_both_parks` pins the
+wake itself. This is a lifecycle repair, not a count change: no syscall, copy or byte on
+the wire moves, which is why it is prose here rather than a row in the table below.
+
+Two shapes are left parked by this slice and are named rather than rounded off. An H1
+`stream-up` `POST` has no carrier-side owner to bind to — its socket is read only by the
+downlink's reader — so a client that posts an uplink and never opens a downlink still
+holds that thread and its fd. And an H2 *session* spans streams, so binding a session to
+one stream would end a live session when a single `POST` completes; a lone stream reset
+therefore leaves its reader parked until the connection itself ends. A client that
+reconnects under the same session id joins the one global session rather than a fresh one,
+which is already two readers popping one sequence — that is the `sessionIDTable` row below,
+and the binding does not change it.
+
 ## Measured
 
 <!-- counts:begin -->

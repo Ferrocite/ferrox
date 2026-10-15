@@ -958,6 +958,28 @@ fn close_session(s: &Arc<Session>) {
     s.cv.notify_all();
 }
 
+// Drop is the only other way a session ends, and a waiter parked before a reader exists has no Drop to run.
+pub(crate) fn end_session(id: &str) {
+    let carried = sessions().lock().expect("sessions lock").remove(id);
+    if let Some(carried) = carried {
+        close_session(&carried);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn session_is_carried(id: &str) -> bool {
+    sessions().lock().expect("sessions lock").contains_key(id)
+}
+
+/// An h2 connection owns the sessions its streams opened, so its death can end them; a bare H1 request has no carrier to bind to.
+fn bound_session(sid: &str, h2: Option<&crate::xhttp_h2::H2StreamOut>) -> Arc<Session> {
+    let session = get_or_create_session(sid);
+    if let Some(h2) = h2 {
+        h2.bind_session(sid);
+    }
+    session
+}
+
 impl Session {
     fn set_upload(&self, reader: Box<dyn Read + Send>) {
         let mut st = self.state.lock().expect("session lock");
@@ -1363,7 +1385,7 @@ pub(crate) fn accept_core<
                     emit_400(&mut write);
                     return None;
                 }
-                let session = get_or_create_session(sid);
+                let session = bound_session(sid, h2.as_ref());
                 sse_ok(&mut write, settings, &padded);
                 let writer = writer_for(write, h2);
                 return Some((
@@ -1381,7 +1403,7 @@ pub(crate) fn accept_core<
                 emit_400(&mut write);
                 return None;
             }
-            let session = get_or_create_session(sid);
+            let session = bound_session(sid, h2.as_ref());
             if h2.is_some() {
                 session.set_upload(Box::new(read));
             } else {
@@ -1407,7 +1429,7 @@ pub(crate) fn accept_core<
                 emit_500(&mut write);
                 return None;
             };
-            let session = get_or_create_session(sid);
+            let session = bound_session(sid, h2.as_ref());
             let payload = match settings.uplink_data_placement {
                 Placement::Header => {
                     let key = if settings.uplink_data_key.is_empty() {
@@ -1524,6 +1546,8 @@ pub(crate) fn accept_core<
                 return None;
             }
             if !session.push_packet(seq_num, payload, settings.sc_max_buffered) {
+                // A refused packet is a lost one — the reader waits on strict sequence — so the session is over; keeping it alive would park its reader on a sequence that can never arrive.
+                end_session(sid);
                 emit_500(&mut write);
                 return None;
             }
@@ -1981,6 +2005,103 @@ mod tests {
         );
         let bad = crate::json::parse(r#"{"xhttpSettings": {"extra": 7}}"#).expect("parses");
         assert!(XhttpSettings::from_json(Some(&bad)).is_none());
+    }
+
+    /// Both parks — the uplink's `wait_ended` and the downlink's `Read::read` — wait on `session.cv`, and until a carrier owned the session the only thing that ever notified it was a `SessionReader`'s Drop. A client that opened one half and died left the other half's thread parked for the life of the process.
+    #[test]
+    fn a_carrier_death_lifts_both_parks() {
+        let (down_done, down_waiting) = std::sync::mpsc::channel();
+        let down = get_or_create_session("parked-downlink");
+        thread::spawn(move || {
+            let mut reader = SessionReader::new(down, "parked-downlink".to_owned());
+            let mut buf = [0u8; 8];
+            // Nothing is ever posted to this session, so this read is the park itself.
+            let _ = down_done.send(reader.read(&mut buf).expect("reads"));
+        });
+        let (up_done, up_waiting) = std::sync::mpsc::channel();
+        let up = get_or_create_session("parked-uplink");
+        thread::spawn(move || {
+            up.wait_ended();
+            let _ = up_done.send(());
+        });
+        thread::sleep(crate::budgets::RELAY_IDLE);
+        end_session("parked-downlink");
+        end_session("parked-uplink");
+        assert_eq!(
+            down_waiting.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(0),
+            "a parked downlink never saw the end"
+        );
+        assert!(
+            up_waiting
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
+            "an uplink with no downlink parked its POST thread forever"
+        );
+    }
+
+    /// A refused packet is a lost one — the downlink pops a strict sequence — so the 500 has to end the session it overflowed: leaving it alive parks the reader on a sequence no peer will resend.
+    #[test]
+    fn a_refused_packet_ends_the_session_it_overflowed() {
+        struct Sink(Arc<Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("sink").extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl crate::proxy::FrameWrite for Sink {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                let mut seen = self.0.lock().expect("sink");
+                for part in parts {
+                    seen.extend_from_slice(part);
+                }
+                true
+            }
+        }
+        let node = crate::json::parse(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {
+                "path": "/up/", "mode": "packet-up"}}}"#,
+        )
+        .expect("parses");
+        let settings = XhttpSettings::from_json(node.get("streamSettings")).expect("settings");
+        let session = get_or_create_session("overflowed");
+        for seq in 0..30u64 {
+            assert!(
+                session.push_packet(seq, vec![seq as u8], 30),
+                "thirty fit before the refusal"
+            );
+        }
+        let head = format!(
+            "POST /up/overflowed/30 HTTP/1.1\r\nHost: h\r\nReferer: {}\r\nContent-Length: 1\r\n\r\n",
+            "http://127.0.0.1/up/?x_padding=".to_owned() + &"X".repeat(128)
+        );
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        assert!(
+            accept_core(
+                head.as_bytes(),
+                Vec::new(),
+                std::io::Cursor::new(vec![30u8]),
+                Sink(Arc::clone(&seen)),
+                &settings,
+                None,
+            )
+            .is_none(),
+            "a refused packet must not hand the caller a session to read"
+        );
+        let answered = String::from_utf8(seen.lock().expect("sink").clone())
+            .unwrap_or_default()
+            .chars()
+            .take(12)
+            .collect::<String>();
+        assert_eq!(answered, "HTTP/1.1 500", "the overflow answered no 500");
+        assert!(
+            !session_is_carried("overflowed"),
+            "the overflowed session stayed alive with its parked reader"
+        );
     }
 
     #[test]
