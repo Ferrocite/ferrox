@@ -9,9 +9,13 @@ use crate::proxy::read_exact;
 
 const AUTH_LEN: usize = 16;
 const TAG_LEN: usize = 16;
+const HEADER_LEN: usize = 2;
 const MAX_PLAIN: usize = 8192;
 const FRAMES_PER_WRITE: usize = 4;
 const READ_PLAIN: usize = MAX_PLAIN * FRAMES_PER_WRITE;
+// The widest frame we seal: a full payload, its tag, and the padding the mask draw allows.
+const MAX_WIRE: usize = MAX_PLAIN + TAG_LEN + 63;
+const WIRE_LEN: usize = (FRAMES_PER_WRITE + 1) * (MAX_WIRE + HEADER_LEN);
 const OPT_STREAM: u8 = 0x01;
 const OPT_MASK: u8 = 0x04;
 const OPT_PAD: u8 = 0x08;
@@ -701,17 +705,40 @@ fn request_bytes(
     Some((request, data_key, data_iv, auth[0]))
 }
 
-fn read_wire_len(stream: &mut dyn Read, shake: Option<&mut Shake>) -> Option<(usize, usize)> {
-    let mut prefix = [0u8; 2];
+fn read_wire_len(stream: &mut dyn Read, recv: &mut Flow) -> Option<(usize, usize)> {
+    let mut prefix = [0u8; HEADER_LEN];
     read_exact(stream, &mut prefix).ok()?;
-    let wire = u16::from_be_bytes(prefix);
-    match shake {
-        None => Some((usize::from(wire), 0)),
+    Some(masked_len(recv, u16::from_be_bytes(prefix)))
+}
+
+/// A frame's total and padding from the length on the wire. The mask draw is once per frame,
+/// so a pump that peeks a length has to be able to keep this answer.
+fn masked_len(recv: &mut Flow, wire: u16) -> (usize, usize) {
+    match recv.shake.as_mut() {
+        None => (usize::from(wire), 0),
         Some(sizes) => {
             let (padding, total) = sizes.pad_and_mask(wire);
-            Some((usize::from(total), padding))
+            (usize::from(total), padding)
         }
     }
+}
+
+/// One frame's sealed bytes in hand: drop the padding, open the rest in place, and say how
+/// many plain bytes are left. Zero is the stream's end marker; `None` refuses the frame.
+fn open_body(recv: &mut Flow, body: &mut [u8], padding: usize) -> Option<usize> {
+    if body.len() <= padding {
+        return Some(0);
+    }
+    let payload = body.len() - padding;
+    if payload
+        < match recv.cipher {
+            Cipher::None => 0,
+            _ => TAG_LEN,
+        }
+    {
+        return None;
+    }
+    recv.open_chunk(&mut body[..payload])
 }
 
 pub(crate) fn write_frame(
@@ -812,7 +839,7 @@ pub(crate) fn read_frame<'a>(
     recv: &mut Flow,
     scratch: &'a mut Vec<u8>,
 ) -> Option<&'a [u8]> {
-    let (total, padding) = read_wire_len(stream, recv.shake.as_mut())?;
+    let (total, padding) = read_wire_len(stream, recv)?;
     if total <= padding {
         let mut discard = [0u8; 64];
         let mut left = total;
@@ -824,21 +851,160 @@ pub(crate) fn read_frame<'a>(
         scratch.clear();
         return Some(&scratch[..0]);
     }
-    if total - padding
-        < match recv.cipher {
-            Cipher::None => 0,
-            _ => TAG_LEN,
-        }
-    {
-        return None;
-    }
     if scratch.len() < total {
         scratch.resize(total, 0);
     }
     read_exact(stream, &mut scratch[..total]).ok()?;
-    let payload = total - padding;
-    let len = recv.open_chunk(&mut scratch[..payload])?;
+    let len = open_body(recv, &mut scratch[..total], padding)?;
     Some(&scratch[..len])
+}
+
+/// What one decode step of a [`Wire`] did.
+enum Frame {
+    /// A frame opened, its plaintext gathered at the front of the buffer.
+    Decoded,
+    /// Nothing more can open without a wait; send the batch already gathered.
+    Idle,
+    /// The stream is over: its marker frame, an EOF, or a frame that will not open.
+    Last,
+}
+
+/// The receive half of a relay. Sealed bytes and the plaintext gathered from them share one
+/// buffer, so the pump can tell without asking the carrier that a batch of frames is already
+/// here and leave the whole batch in one write — which a `BufReader` hides, and one frame per
+/// `write` pays for in syscalls and in the segments the peer then has to deliver.
+pub(crate) struct Wire<R> {
+    carrier: R,
+    held: Vec<u8>,
+    /// The next frame's header.
+    start: usize,
+    /// One past the last sealed byte read.
+    end: usize,
+    /// The plaintext this batch has gathered at the front.
+    plain: usize,
+    /// A frame whose length is drawn but whose bytes have not all arrived.
+    waiting: Option<(usize, usize)>,
+    last: bool,
+}
+
+impl<R: Read> Wire<R> {
+    fn new(carrier: R) -> Self {
+        Self {
+            carrier,
+            held: vec![0u8; WIRE_LEN],
+            start: 0,
+            end: 0,
+            plain: 0,
+            waiting: None,
+            last: false,
+        }
+    }
+
+    /// Open up to `FRAMES_PER_WRITE` frames, waiting only for the first, and hand back their
+    /// plaintext as one slice. `None` ends the pump.
+    fn batch(&mut self, recv: &mut Flow) -> Option<&[u8]> {
+        if self.last {
+            return None;
+        }
+        self.compact();
+        self.plain = 0;
+        let mut decoded = 0;
+        while decoded < FRAMES_PER_WRITE {
+            match self.frame(recv, decoded == 0) {
+                Frame::Decoded => decoded += 1,
+                Frame::Idle => break,
+                Frame::Last => {
+                    self.last = true;
+                    break;
+                }
+            }
+        }
+        Some(&self.held[..self.plain])
+    }
+
+    fn buffered(&self) -> usize {
+        self.end - self.start
+    }
+
+    /// Drop the frames the batch that just went out was made of.
+    fn compact(&mut self) {
+        if self.start > 0 {
+            self.held.copy_within(self.start..self.end, 0);
+            self.end -= self.start;
+            self.start = 0;
+        }
+    }
+
+    /// Read until `want` bytes are buffered. False when the carrier is not to be asked, or
+    /// when it has said it has no more.
+    fn fill(&mut self, want: usize, block: bool) -> bool {
+        if want > self.held.len() - self.start {
+            // A peer that seals a wider chunk than we do gets one bigger buffer, not a refusal.
+            self.held.resize(self.start + want, 0);
+        }
+        while self.buffered() < want {
+            if !block {
+                return false;
+            }
+            match self.carrier.read(&mut self.held[self.end..]) {
+                Ok(0) => {
+                    self.last = true;
+                    return false;
+                }
+                Ok(read) => self.end += read,
+                // A shared-session carrier sleeps the poll grain then returns a timeout; the wait is paid, so ask again.
+                Err(ref error) if crate::proxy::is_timeout(error) => {}
+                Err(_) => {
+                    self.last = true;
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn frame(&mut self, recv: &mut Flow, block: bool) -> Frame {
+        let (total, padding) = if let Some(sizes) = self.waiting {
+            sizes
+        } else {
+            if self.buffered() < HEADER_LEN && !self.fill(HEADER_LEN, block) {
+                return if self.last { Frame::Last } else { Frame::Idle };
+            }
+            let mut prefix = [0u8; HEADER_LEN];
+            prefix.copy_from_slice(&self.held[self.start..self.start + HEADER_LEN]);
+            let sizes = masked_len(recv, u16::from_be_bytes(prefix));
+            self.waiting = Some(sizes);
+            sizes
+        };
+        if self.buffered() < HEADER_LEN + total && !self.fill(HEADER_LEN + total, block) {
+            return if self.last { Frame::Last } else { Frame::Idle };
+        }
+        self.waiting = None;
+        let body = self.start + HEADER_LEN;
+        let Some(len) = open_body(recv, &mut self.held[body..body + total], padding) else {
+            return Frame::Last;
+        };
+        self.start = body + total;
+        if len == 0 {
+            return Frame::Last;
+        }
+        // Every earlier frame left more bytes than it took, so gathering never reaches forward.
+        self.held.copy_within(body..body + len, self.plain);
+        self.plain += len;
+        Frame::Decoded
+    }
+}
+
+impl<R: Read> Read for Wire<R> {
+    fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+        if self.buffered() > 0 {
+            let take = self.buffered().min(dst.len());
+            dst[..take].copy_from_slice(&self.held[self.start..self.start + take]);
+            self.start += take;
+            return Ok(take);
+        }
+        self.carrier.read(dst)
+    }
 }
 
 pub(crate) type ClientSession = (Flow, Flow, [u8; 16], [u8; 16], u8);
@@ -1027,7 +1193,7 @@ impl std::io::Write for WsSink {
 
 pub(crate) fn pump_relay_carried<R, W>(
     plain: &TcpStream,
-    mut reader: R,
+    reader: R,
     mut writer: W,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
     send: Flow,
@@ -1050,8 +1216,7 @@ pub(crate) fn pump_relay_carried<R, W>(
     let thread_close = std::sync::Arc::clone(close);
     let done = thread::spawn(move || {
         let mut buf = vec![0u8; READ_PLAIN];
-        let batched = READ_PLAIN + FRAMES_PER_WRITE * (TAG_LEN + 2 + 64);
-        let mut staging = Vec::with_capacity(batched);
+        let mut staging = Vec::with_capacity(FRAMES_PER_WRITE * (MAX_WIRE + HEADER_LEN));
         let Some(mut pad) = PadSource::fresh() else {
             return;
         };
@@ -1098,6 +1263,7 @@ pub(crate) fn pump_relay_carried<R, W>(
     });
 
     let mut recv = recv;
+    let mut reader = Wire::new(reader);
     // A lazy server sends the prefix with its first data, so the forward thread is already running here.
     if let Some((response_key, response_iv, auth)) = pending {
         if !read_response(&mut reader, &response_key, &response_iv, auth) {
@@ -1107,14 +1273,13 @@ pub(crate) fn pump_relay_carried<R, W>(
             return;
         }
     }
-    let mut scratch = Vec::with_capacity(MAX_PLAIN + TAG_LEN + 64);
     let mut first = true;
-    while let Some(chunk) = read_frame(&mut reader, &mut recv, &mut scratch) {
+    while let Some(chunk) = reader.batch(&mut recv) {
         if crate::proxy::echo_trace_on() && first {
             crate::proxy::echo_trace("relay bwd first read");
             first = false;
         }
-        if chunk.is_empty() || plain_write.write_all(chunk).is_err() {
+        if plain_write.write_all(chunk).is_err() {
             break;
         }
     }
@@ -1192,7 +1357,6 @@ pub(crate) fn serve_xhttp(stream: TcpStream, path: &str, id: &[u8; 16], freedom:
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> =
         std::sync::Arc::new(move || closer.finish());
-    let reader = std::io::BufReader::with_capacity(32 * 1024, reader);
     pump_relay_carried(&uplink, reader, writer, &close, send, recv, None);
 }
 
@@ -1359,12 +1523,11 @@ pub(crate) fn pump_relay(
     };
     let mut plain_read = plain_read;
     let mut sealed_write = sealed_write;
-    let sealed_read = sealed_read;
     let mut plain_write = plain_write;
     let mut send = send;
     let done = thread::spawn(move || {
         let mut buf = vec![0u8; READ_PLAIN];
-        let mut staging = Vec::with_capacity(READ_PLAIN + FRAMES_PER_WRITE * (TAG_LEN + 2 + 64));
+        let mut staging = Vec::with_capacity(FRAMES_PER_WRITE * (MAX_WIRE + HEADER_LEN));
         let Some(mut pad) = PadSource::fresh() else {
             return;
         };
@@ -1397,22 +1560,21 @@ pub(crate) fn pump_relay(
         let _ = sealed_write.shutdown(Shutdown::Both);
     });
     let mut recv = recv;
-    let mut sealed_reader = std::io::BufReader::with_capacity(16 * 1024, sealed_read);
+    let mut sealed_reader = Wire::new(sealed_read);
     if let Some((response_key, response_iv, auth)) = pending {
         if !read_response(&mut sealed_reader, &response_key, &response_iv, auth) {
-            let _ = sealed_reader.get_ref().shutdown(Shutdown::Both);
+            let _ = sealed.shutdown(Shutdown::Both);
             let _ = plain_write.shutdown(Shutdown::Both);
             let _ = done.join();
             return;
         }
     }
-    let mut scratch = Vec::with_capacity(MAX_PLAIN + TAG_LEN + 64);
-    while let Some(chunk) = read_frame(&mut sealed_reader, &mut recv, &mut scratch) {
-        if chunk.is_empty() || plain_write.write_all(chunk).is_err() {
+    while let Some(chunk) = sealed_reader.batch(&mut recv) {
+        if plain_write.write_all(chunk).is_err() {
             break;
         }
     }
-    let _ = sealed_reader.get_ref().shutdown(Shutdown::Both);
+    let _ = sealed.shutdown(Shutdown::Both);
     let _ = plain_write.shutdown(Shutdown::Both);
     let _ = done.join();
 }
@@ -1673,7 +1835,6 @@ mod tests {
             |stream, id| serve_xhttp(stream, "/vmess-xhttp", &id, true),
             |stream| {
                 let (reader, writer) = crate::xhttp::connect(stream, "127.0.0.1", "/vmess-xhttp")?;
-                let reader = std::io::BufReader::with_capacity(32 * 1024, reader);
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(writer) as Box<dyn Write + Send>,
@@ -2607,5 +2768,159 @@ mod tests {
                 assert_eq!(recv.iv, data_iv, "opening does not disturb the iv");
             }
         }
+    }
+
+    /// A carrier that hands over what it holds, `grain` bytes per read, and counts the asks.
+    /// An in-memory one, because over a socket the scheduler decides how many frames arrive
+    /// together and a count there is a measurement of the machine, not of this code.
+    struct Sealed {
+        held: Vec<u8>,
+        at: usize,
+        grain: usize,
+        reads: usize,
+    }
+
+    impl Read for Sealed {
+        fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            let take = self.grain.min(self.held.len() - self.at).min(dst.len());
+            dst[..take].copy_from_slice(&self.held[self.at..self.at + take]);
+            self.at += take;
+            Ok(take)
+        }
+    }
+
+    /// Frames sealed exactly as the write side seals them, with the plaintext they carry.
+    fn frames(lens: &[usize]) -> (Vec<u8>, Vec<u8>, Flow) {
+        let key = [0x55u8; 16];
+        let iv = [0x66u8; 16];
+        let options = OPT_STREAM | OPT_MASK | OPT_PAD;
+        let mut send = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+        let recv = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("recvs");
+        let mut pad = PadSource::fresh().expect("entropy");
+        let mut sealed = Vec::new();
+        let mut plain = Vec::new();
+        for (i, &len) in lens.iter().enumerate() {
+            let body: Vec<u8> = (0..len).map(|k| (k as u8).wrapping_add(i as u8)).collect();
+            assert!(
+                stage_frame(&mut send, &body, &mut sealed, &mut pad),
+                "seals {i}"
+            );
+            plain.extend_from_slice(&body);
+        }
+        (sealed, plain, recv)
+    }
+
+    /// Drain a pump the way a relay does, counting the writes its batches would become.
+    fn drain(wire: &mut Wire<Sealed>, recv: &mut Flow) -> (usize, Vec<u8>) {
+        let mut writes = 0;
+        let mut got = Vec::new();
+        while let Some(batch) = wire.batch(recv) {
+            if batch.is_empty() {
+                continue;
+            }
+            writes += 1;
+            got.extend_from_slice(batch);
+        }
+        (writes, got)
+    }
+
+    #[test]
+    fn a_batch_of_frames_leaves_the_pump_in_one_write() {
+        let (sealed, plain, mut recv) = frames(&[1000; 9]);
+        let carrier = Sealed {
+            held: sealed,
+            at: 0,
+            grain: usize::MAX,
+            reads: 0,
+        };
+        let mut wire = Wire::new(carrier);
+        let (writes, got) = drain(&mut wire, &mut recv);
+        assert_eq!(
+            writes, 3,
+            "nine frames that arrive together leave as 4, 4 and 1"
+        );
+        assert_eq!(got, plain, "and every byte of them, in order");
+        assert_eq!(
+            wire.carrier.reads, 2,
+            "the stream is read once, plus the read that finds its end"
+        );
+    }
+
+    #[test]
+    fn a_dribbled_carrier_still_offers_one_frame_and_loses_nothing() {
+        let (sealed, plain, mut recv) = frames(&[1000; 9]);
+        let carrier = Sealed {
+            held: sealed,
+            at: 0,
+            grain: 3,
+            reads: 0,
+        };
+        let mut wire = Wire::new(carrier);
+        let (writes, got) = drain(&mut wire, &mut recv);
+        assert_eq!(
+            writes, 9,
+            "a carrier that gives three bytes at a time never holds a second frame, so nothing waits"
+        );
+        assert_eq!(got, plain, "and the bytes are the same bytes");
+    }
+
+    #[test]
+    fn the_pump_gathers_into_its_own_buffer_and_never_moves_it() {
+        let (sealed, plain, mut recv) = frames(&[1000; 3]);
+        let carrier = Sealed {
+            held: sealed,
+            at: 0,
+            grain: usize::MAX,
+            reads: 0,
+        };
+        let mut wire = Wire::new(carrier);
+        let cap = wire.held.capacity();
+        let mut batches = 0;
+        let mut got = Vec::new();
+        while let Some(batch) = wire.batch(&mut recv) {
+            if batch.is_empty() {
+                continue;
+            }
+            let (front, len) = (batch.as_ptr() as usize, batch.len());
+            got.extend_from_slice(batch);
+            assert_eq!(
+                front,
+                wire.held.as_ptr() as usize,
+                "a batch is not the pump's own bytes gathered at its front"
+            );
+            assert_eq!(wire.held.capacity(), cap, "the pump grew its buffer");
+            assert_eq!(got.len(), len, "and the whole batch was handed over");
+            batches += 1;
+        }
+        assert_eq!(batches, 1, "three frames together are one write");
+        assert_eq!(got, plain);
+    }
+
+    #[test]
+    fn an_end_marker_mid_batch_sends_what_the_batch_already_holds() {
+        let (mut sealed, plain, mut recv) = frames(&[1000, 1000]);
+        let key = [0x55u8; 16];
+        let iv = [0x66u8; 16];
+        let options = OPT_STREAM | OPT_MASK | OPT_PAD;
+        let mut send = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+        let mut pad = PadSource::fresh().expect("entropy");
+        assert!(
+            stage_frame(&mut send, &[], &mut sealed, &mut pad),
+            "seals the marker"
+        );
+        let carrier = Sealed {
+            held: sealed,
+            at: 0,
+            grain: usize::MAX,
+            reads: 0,
+        };
+        let mut wire = Wire::new(carrier);
+        let (writes, got) = drain(&mut wire, &mut recv);
+        assert_eq!(
+            writes, 1,
+            "the two frames that came first are not lost to the marker"
+        );
+        assert_eq!(got, plain);
     }
 }
