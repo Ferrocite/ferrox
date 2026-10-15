@@ -72,7 +72,17 @@ graph TD
 | server-shared-session-poll-millis | 1 | ferrox-app-proxy::tests::a_server_relay_bounds_the_shared_session_to_one_tick |
 | late-hello-grains-survived | 12 | ferrox-app-proxy::tests::a_plain_tls_lane_retries_a_hello_that_arrives_past_the_grain |
 | unsafe-fingerprint-header-bytes-added | 0 | ferrox-core-vless::tests::an_unsafe_fingerprint_adds_no_header_byte |
+| certificate-refusals-folded-into-other | 0 | ferrox-core-tls::rustls_backend::tests::mismatched_certificate_name_fails |
+| untrusted-dials-counted-as-retryable | 0 | ferrox-app-proxy::tests::a_refused_chain_is_a_refusal_not_a_drop |
 <!-- counts:end -->
+
+`certificate-refusals-folded-into-other 0` is the shape of a refused chain in the
+error type: the reason lives inside `BadCertificate`, so a caller matches the kind
+and still reads which certificate problem it is. `untrusted-dials-counted-as-retryable 0`
+is what that buys on the dial plane — `tls_failure` can only report a refusal when
+the backend still names one, and before this a refused chain reached it as
+`Other`, so it classified as a peer that hung up and counted into the retryable
+dial total.
 
 ## Ops
 
@@ -207,6 +217,15 @@ handshake duration is quoted from a machine without a named runner.
 - **One client config builds both hello passes**, so the probe and the flight
   cannot drift apart; the determinism test still shows only the session id
   moving.
+- **A refused chain that lost its name.** Every certificate problem used to be
+  folded into `Other("bad certificate: …")` to carry the reason, so no caller
+  could match one: `tls_failure`'s `BadCertificate` arm was unreachable, and a
+  server whose chain this device does not trust classified as a peer that hung up
+  — a dial worth retrying, and a message that says io. `BadCertificate(String)`
+  keeps the kind *and* the reason, which is what
+  `mismatched_certificate_name_fails` matches by variant and what the Foxy lane
+  needs to stop asking an edge no second handshake makes trusted
+  ([the Foxy lane](carrier-foxy.md)).
 
 Tried and set aside with reasons: probe elimination (both references build
 twice and one RTT dominates the build), smaller Vision staging reads (read

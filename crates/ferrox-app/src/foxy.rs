@@ -136,6 +136,7 @@ fn tls_to_edge(dial: &FoxyDial) -> Result<ferrox_core::tls::RustlsProvider<TcpSt
             .collect(),
     };
     let mut tried = 0usize;
+    let mut last = Failure::Io;
     for peer in peers {
         tried += 1;
         // The edge sometimes closes a handshake it started with no reason, seconds away from carrying the tunnel; 8 quick asks make that a leg, not a flow.
@@ -157,6 +158,7 @@ fn tls_to_edge(dial: &FoxyDial) -> Result<ferrox_core::tls::RustlsProvider<TcpSt
                     return Ok(tls);
                 }
                 Err(failure) => {
+                    last = failure;
                     // An ALPN mismatch is the edge naming a protocol, which no retry changes; only losing the connection is worth a second try.
                     let worth = matches!(failure, Failure::Io);
                     if attempt + 1 < EDGE_ATTEMPTS && worth {
@@ -172,7 +174,7 @@ fn tls_to_edge(dial: &FoxyDial) -> Result<ferrox_core::tls::RustlsProvider<TcpSt
     if tried > 1 {
         eprintln!("foxy: the edge carried the lane on none of its {tried} addresses");
     }
-    Err(Failure::Io)
+    Err(last)
 }
 
 /// The edge through the configured hop, retried like a direct dial: a hop head read answers `WouldBlock`, not `TimedOut`, on macOS (`Os { code: 35 }`).
@@ -229,12 +231,12 @@ fn finish_tls(
         Ok(tls) => tls,
         Err(error) => {
             debug_loss("the TLS client failed to start", &error.to_string());
-            return Err(Failure::Io);
+            return Err(error.into());
         }
     };
     if let Err(error) = tls.handshake() {
         debug_loss("the TLS handshake with the edge failed", &error.to_string());
-        return Err(Failure::Io);
+        return Err(error.into());
     }
     negotiated(&tls, dial)
         .inspect_err(|_| debug_stage("the edge named no protocol this lane speaks"))
@@ -1907,7 +1909,7 @@ pub(crate) fn refusal_reply(failure: Failure) -> u8 {
     match failure {
         Failure::Rejected(status) if foxy::target_is_unreachable(status) => 0x04,
         Failure::Stream => 0x06,
-        Failure::Rejected(_) | Failure::Frame | Failure::Io => 0x01,
+        Failure::Rejected(_) | Failure::Frame | Failure::Io | Failure::Untrusted => 0x01,
     }
 }
 
@@ -2035,6 +2037,7 @@ mod tests {
         assert_eq!(refusal_reply(Failure::Stream), 0x06);
         assert_eq!(refusal_reply(Failure::Io), 0x01);
         assert_eq!(refusal_reply(Failure::Frame), 0x01);
+        assert_eq!(refusal_reply(Failure::Untrusted), 0x01);
     }
 
     #[test]
@@ -2223,6 +2226,47 @@ mod loopback {
         assert!(
             tls_to_edge(&dial).is_err(),
             "the named address is the only one"
+        );
+    }
+
+    /// An edge whose chain this device does not trust is a fact about the certificate, not about the moment: the lane asks it once and names the refusal, where an io failure reads as a peer that is merely slow.
+    #[test]
+    fn an_untrusted_edge_is_named_and_asked_once() {
+        use ferrox_core::tls::TlsProvider as _;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (_foreign_roots, server) = minted(b"h2");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&asked);
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut tls) =
+                    ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                else {
+                    continue;
+                };
+                let _ = tls.handshake();
+            }
+        });
+
+        // The roots of some other hand: the same shape of certificate, on a chain that does not verify.
+        let (roots, _) = minted(b"h2");
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let at = Instant::now();
+        let failure = tls_to_edge(&dial).expect_err("the chain is refused");
+        assert_eq!(failure, Failure::Untrusted, "{failure}");
+        assert!(
+            at.elapsed() < Duration::from_millis(EDGE_BACKOFF_MS),
+            "one ask costs no backoff, it took {:?}",
+            at.elapsed()
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "an edge that never had the certificate is not asked eight times"
         );
     }
 

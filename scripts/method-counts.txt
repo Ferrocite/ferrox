@@ -162,6 +162,7 @@ carrier-foxy dialled-without-ca-cert-file 0 ferrox-app-proxy::tests::quic_outbou
 carrier-foxy address-assign-capsule-bytes-per-grant 9 ferrox-core-foxy::connectip::tests::the_assign_a_proxy_writes_is_the_assign_the_lane_reads
 carrier-foxy route-advert-capsule-bytes-per-route 12 ferrox-core-foxy::connectip::tests::the_route_advert_a_proxy_writes_is_the_route_advert_the_lane_reads
 carrier-foxy edges-preferred-by-verified-exit 1 ferrox-app-proxy::foxy_exit_tests::the_preferred_edge_is_the_first_one_whose_exit_agrees_not_the_first_one_opened
+carrier-foxy tcp-connections-asked-of-an-untrusted-edge 1 ferrox-app-foxy::loopback::an_untrusted_edge_is_named_and_asked_once
 
 carrier-quic ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-quic handshakes-per-server 1 ferrox-app-proxy::tests::quic_pool_shares_one_connection_between_two_streams
@@ -191,6 +192,8 @@ reality-tls unauthenticated-servers-accepted 0 ferrox-core-reality::tests::a_cli
 reality-tls server-shared-session-poll-millis 1 ferrox-app-proxy::tests::a_server_relay_bounds_the_shared_session_to_one_tick
 reality-tls late-hello-grains-survived 12 ferrox-app-proxy::tests::a_plain_tls_lane_retries_a_hello_that_arrives_past_the_grain
 reality-tls unsafe-fingerprint-header-bytes-added 0 ferrox-core-vless::tests::an_unsafe_fingerprint_adds_no_header_byte
+reality-tls certificate-refusals-folded-into-other 0 ferrox-core-tls::rustls_backend::tests::mismatched_certificate_name_fails
+reality-tls untrusted-dials-counted-as-retryable 0 ferrox-app-proxy::tests::a_refused_chain_is_a_refusal_not_a_drop
 
 kcp ops-retired-instructions UNBLESSED scripts/count-ops.sh
 kcp maximum-transmission-unit-bytes 1350 ferrox-core-kcp::tests::the_upstream_defaults_are_these

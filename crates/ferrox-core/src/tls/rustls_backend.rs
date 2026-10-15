@@ -88,7 +88,7 @@ impl<S: Stream> RustlsProvider<S> {
         for der in &cfg.roots {
             roots
                 .add(rustls::pki_types::CertificateDer::from(der.as_slice()))
-                .map_err(|e| TlsError::BadCertificate.with_detail(format!("trust anchor: {e}")))?;
+                .map_err(|e| TlsError::BadCertificate(format!("trust anchor: {e}")))?;
         }
         let roots = Arc::new(roots);
 
@@ -118,7 +118,7 @@ impl<S: Stream> RustlsProvider<S> {
                 Arc::clone(&provider),
             )
             .build()
-            .map_err(|e| TlsError::BadCertificate.with_detail(format!("chain: {e}")))?;
+            .map_err(|e| TlsError::BadCertificate(format!("chain: {e}")))?;
             config
                 .dangerous()
                 .set_certificate_verifier(Arc::new(Pinned {
@@ -564,14 +564,11 @@ fn recover(e: std::io::Error) -> TlsError {
 fn map_error(e: &rustls::Error) -> TlsError {
     use rustls::Error as E;
     match e {
-        // An untrusted chain, a name that does not match and an expired certificate are three different problems and the caller can act on each; one variant with no detail is none of them.
-        E::InvalidCertificate(why) => TlsError::BadCertificate.with_detail(format!("{why:?}")),
-        E::InvalidCertRevocationList(why) => {
-            TlsError::BadCertificate.with_detail(format!("{why:?}"))
-        }
-        E::NoCertificatesPresented => TlsError::BadCertificate.with_detail("no certificate"),
-        E::UnsupportedNameType => TlsError::BadCertificate.with_detail("unsupported name type"),
-
+        // An untrusted chain, a name that does not match and an expired certificate are three different problems and the caller can act on each; the why rides with the kind, so matching the kind does not cost the why.
+        E::InvalidCertificate(why) => TlsError::BadCertificate(format!("{why:?}")),
+        E::InvalidCertRevocationList(why) => TlsError::BadCertificate(format!("{why:?}")),
+        E::NoCertificatesPresented => TlsError::BadCertificate("no certificate".to_owned()),
+        E::UnsupportedNameType => TlsError::BadCertificate("unsupported name type".to_owned()),
         E::NoApplicationProtocol
         | E::AlertReceived(rustls::AlertDescription::NoApplicationProtocol)
         | E::PeerIncompatible(_)
@@ -765,8 +762,11 @@ mod tests {
             let mut client = crate::tls::connect(&client("wrong.test", &[b"test-only"]), stream)
                 .expect("configures");
             let err = client.handshake().expect_err("wrong name must fail");
-            // The detail names which of the certificate problems this is.
-            assert!(err.to_string().contains("bad certificate"), "{err}");
+            // The kind carries the why: a caller matches a certificate refusal without losing which certificate problem it is.
+            let TlsError::BadCertificate(why) = &err else {
+                panic!("a name mismatch is a certificate refusal, not {err}");
+            };
+            assert!(why.contains("NotValidForName"), "{why}");
         });
     }
 
