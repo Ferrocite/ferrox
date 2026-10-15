@@ -7748,11 +7748,12 @@ impl Pump {
                     return;
                 }
                 let _ = reading.set_read_timeout(Some(RELAY_POLL));
-                let mut chunk = vec![0u8; 16 * 1024];
+                // The same reused, uninitialised buffer the relay uses: no 16 KiB memset for bytes the first read overwrites.
+                let mut buffer = RelayBuf::new();
                 loop {
-                    match reading.read(&mut chunk) {
+                    match reading.read(buffer.as_mut()) {
                         Ok(size) if size > 0 => {
-                            if !to_carrier(&chunk[..size]) {
+                            if !to_carrier(buffer.filled(size)) {
                                 break;
                             }
                         }
@@ -9868,6 +9869,46 @@ mod tests {
         );
         let handed = buffer.filled(n).to_vec();
         assert_eq!(handed, source[..n], "every byte handed back was read");
+    }
+
+    /// The handshake pump hands the carrier the buffer's own bytes, and a sub-buffer read holds that buffer steady — the allocation claim behind routing the pump through `RelayBuf` rather than a fresh zero-filled `Vec` per connection.
+    #[test]
+    fn the_pump_forwards_its_buffer_by_pointer_and_holds_capacity_steady() {
+        struct Quantum;
+        impl std::io::Read for Quantum {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = 1024usize.min(buf.len());
+                buf[..n].fill(0xa5);
+                Ok(n)
+            }
+        }
+        let mut reader = Quantum;
+        let mut buffer = RelayBuf::new();
+        let base = buffer.as_mut().as_ptr();
+        for round in 0..64u32 {
+            let n = reader
+                .read(buffer.as_mut())
+                .expect("the quantum always answers");
+            let (handed, len) = {
+                let slice = buffer.filled(n);
+                (slice.as_ptr(), slice.len())
+            };
+            assert_eq!(
+                handed, base,
+                "round {round}: the pump forwards the buffer's own bytes, not a copy"
+            );
+            assert_eq!(len, n, "round {round}: only the bytes read escape");
+            assert_eq!(
+                buffer.as_mut().as_ptr(),
+                base,
+                "round {round}: a short read did not move the buffer"
+            );
+            assert_eq!(
+                buffer.size(),
+                RELAY_SMALL_BUFFER,
+                "round {round}: and did not grow it"
+            );
+        }
     }
 
     #[test]
