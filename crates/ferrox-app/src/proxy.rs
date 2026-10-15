@@ -443,6 +443,10 @@ struct FoxyOut {
     direct_ports: Vec<u16>,
     direct_suffixes: Vec<String>,
     exit_probe: Option<String>,
+    /// The pinned-country edge whose real exit the pre-flight confirmed, tried before the label order; empty until one agrees.
+    verified: std::sync::Arc<std::sync::Mutex<Option<ferrox_core::foxy::Candidate>>>,
+    /// Set when no edge could carry a probe tunnel here: the pre-flight then stops rather than costing every flow a dead dial.
+    probe_unavailable: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl FoxyOut {
@@ -485,6 +489,15 @@ impl FoxyOut {
         if let Ok(mut cache) = self.carrier_dead.lock() {
             cache.clear(&key);
         }
+    }
+
+    /// The edge every carrier should try first: the pre-flight's verified exit, else the configured stored edge.
+    fn preferred_edge(&self) -> Option<ferrox_core::foxy::Candidate> {
+        self.verified
+            .lock()
+            .ok()
+            .and_then(|kept| kept.clone())
+            .or_else(|| self.stored.clone())
     }
 }
 
@@ -5247,6 +5260,115 @@ fn clear_limited(strikes: &AtomicU32, until: &AtomicU64) {
     until.store(0, Ordering::Relaxed);
 }
 
+/// Whether the exit probe names a real pin a disposable tunnel can answer: no probe, or `REC`, needs none.
+fn exit_needs_probe(foxy: &FoxyOut) -> bool {
+    foxy.exit_probe.is_some()
+        && !foxy
+            .country
+            .eq_ignore_ascii_case(ferrox_core::foxy::catalog::RECOMMENDED)
+}
+
+/// Given each edge's probe answer in dial order — `None` carried no probe, `Some(true)` exits the pinned country, `Some(false)` exits elsewhere — the index to prefer, or `None` to keep the label order.
+#[must_use]
+fn pick_verified_edge(probes: &[Option<bool>]) -> Option<usize> {
+    probes
+        .iter()
+        .position(|answer| matches!(answer, Some(true)))
+}
+
+/// Whether any edge answered a probe at all: none did means this runner cannot dial the probe tunnel, so stop trying.
+#[must_use]
+fn probes_reachable(probes: &[Option<bool>]) -> bool {
+    probes.iter().any(Option::is_some)
+}
+
+/// The exit country one edge really hands back: a disposable H3 tunnel to the probe authority, asked for the trace, then dropped and its stream released. It never rides a flow's own tunnel, so a per-target carrier is left intact; `None` means this runner could not carry or read the trace here.
+fn probe_edge_exit(
+    foxy: &FoxyOut,
+    edge: &ferrox_core::foxy::Candidate,
+    authority: &str,
+) -> Option<String> {
+    let pass = foxy
+        .account
+        .as_ref()
+        .map_or_else(|| foxy.pass.clone(), |account| account.current());
+    let dial = crate::foxy::FoxyDial {
+        host: edge.host.clone(),
+        port: edge.port,
+        address: foxy.edge_address,
+        carrier: crate::foxy::Carrier::H3,
+        upstream: foxy.upstream.clone(),
+        roots: foxy.roots.clone(),
+        pins: foxy.pins.clone(),
+        pass,
+    };
+    let quic_dial = foxy_quic_dial(foxy, edge);
+    let quic = crate::quic::pooled_stream_within(&quic_dial, crate::quic::HANDSHAKE_TIMEOUT)?;
+    let stream = quic.3;
+    let opened = crate::foxy::Tunnel::open(&dial, authority, Some(quic));
+    if let Ok(mut tunnel) = opened {
+        let seen = foxy_exit_country(&mut tunnel, foxy);
+        drop(tunnel);
+        crate::quic::release_stream(&quic_dial, stream);
+        seen
+    } else {
+        crate::quic::release_stream(&quic_dial, stream);
+        None
+    }
+}
+
+/// The pinned-country edge that really exits in the pin, chosen once per lane over disposable probes and cached so every carrier rides it. Falls back to the label order when no edge agrees, records the truth when one cannot, and stops probing when none can be reached here.
+fn verify_exit(foxy: &FoxyOut) {
+    if !exit_needs_probe(foxy) || foxy.probe_unavailable.load(Ordering::Relaxed) {
+        return;
+    }
+    if foxy.verified.lock().is_ok_and(|kept| kept.is_some()) {
+        return;
+    }
+    let Some(probe) = foxy.exit_probe.as_deref() else {
+        return;
+    };
+    let Some(host) = probe.split('/').next() else {
+        return;
+    };
+    let authority = format!("{host}:80");
+    let order = ferrox_core::foxy::catalog::tier(
+        &foxy.candidates,
+        &foxy.country,
+        &foxy.city,
+        MAX_FOXY_ALTERNATES,
+    );
+    let edges = ferrox_core::foxy::dial_order(
+        &order,
+        &foxy.country,
+        foxy.stored.as_ref(),
+        MAX_FOXY_ALTERNATES,
+    );
+    let pin = foxy.country.to_ascii_uppercase();
+    let mut flags: Vec<Option<bool>> = Vec::with_capacity(edges.len());
+    for edge in &edges {
+        let agreed = probe_edge_exit(foxy, edge, &authority).map(|seen| {
+            let agrees = exit_agrees(&foxy.country, &seen);
+            if !agrees {
+                debug_lane(
+                    edge,
+                    crate::foxy::Carrier::H3,
+                    &format!("exit {seen} differs from pin {pin}"),
+                );
+            }
+            agrees
+        });
+        flags.push(agreed);
+    }
+    if let Some(chosen) = pick_verified_edge(&flags).map(|at| edges[at].clone()) {
+        if let Ok(mut kept) = foxy.verified.lock() {
+            *kept = Some(chosen);
+        }
+    } else if !probes_reachable(&flags) {
+        foxy.probe_unavailable.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Shared loop: first answer wins, a refused pass stops every carrier and edge; the grant belongs to the front.
 fn foxy_open(foxy: &FoxyOut, asked: &SocksTarget) -> FoxyOpen {
     if foxy
@@ -5265,6 +5387,8 @@ fn foxy_open(foxy: &FoxyOut, asked: &SocksTarget) -> FoxyOpen {
         return FoxyOpen::Direct(target);
     }
     let target = asked.authority();
+    verify_exit(foxy);
+    let preferred = foxy.preferred_edge();
     let order = ferrox_core::foxy::catalog::tier(
         &foxy.candidates,
         &foxy.country,
@@ -5280,7 +5404,7 @@ fn foxy_open(foxy: &FoxyOut, asked: &SocksTarget) -> FoxyOpen {
     for edge in ferrox_core::foxy::dial_order(
         &order,
         &foxy.country,
-        foxy.stored.as_ref(),
+        preferred.as_ref(),
         MAX_FOXY_ALTERNATES,
     ) {
         let pass = foxy
@@ -5361,9 +5485,6 @@ fn serve_foxy_front(
         FoxyOpen::Tunnel(tunnel, h3) => {
             let mut tunnel = *tunnel;
             if prefix.is_empty() && client.write_all(&front.grant_line()).is_err() {
-                return;
-            }
-            if !foxy_exit_agrees(&mut tunnel, foxy) {
                 return;
             }
             if !prefix.is_empty() && tunnel.write_all(prefix).is_err() {
@@ -5528,17 +5649,20 @@ fn now_secs() -> u64 {
         .map_or(0, |since| since.as_secs())
 }
 
-/// Asks the tunnel where it exits: a wrong country refuses the flow, an unanswered probe does not.
-fn foxy_exit_agrees<T: Read + Write>(tunnel: &mut T, foxy: &FoxyOut) -> bool {
-    let Some(probe) = foxy.exit_probe.as_deref() else {
-        return true;
-    };
-    let Some((host, path)) = probe.split_once('/') else {
-        return true;
-    };
+/// Whether an observed exit honours the pin: the recommended location accepts any, a pinned country accepts only its own code.
+#[must_use]
+fn exit_agrees(pin: &str, seen: &str) -> bool {
+    pin.eq_ignore_ascii_case(ferrox_core::foxy::catalog::RECOMMENDED)
+        || seen == pin.to_ascii_uppercase()
+}
+
+/// Asks a tunnel where it really exits: one plaintext trace GET, then the `loc` off the reply. `None` when no probe is configured or the trace did not answer — the caller reads that as "no verdict," never as agreement.
+fn foxy_exit_country<T: Read + Write>(tunnel: &mut T, foxy: &FoxyOut) -> Option<String> {
+    let probe = foxy.exit_probe.as_deref()?;
+    let (host, path) = probe.split_once('/')?;
     let request = format!("GET /{path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
     if tunnel.write_all(request.as_bytes()).is_err() {
-        return false;
+        return None;
     }
     let mut head = Vec::with_capacity(1024);
     let mut chunk = [0u8; 512];
@@ -5548,12 +5672,7 @@ fn foxy_exit_agrees<T: Read + Write>(tunnel: &mut T, foxy: &FoxyOut) -> bool {
             Ok(read) => head.extend_from_slice(&chunk[..read]),
         }
     }
-    match crate::foxy::exit_country(&head) {
-        Some(seen) => {
-            foxy.country.eq_ignore_ascii_case("REC") || seen == foxy.country.to_ascii_uppercase()
-        }
-        None => true,
-    }
+    crate::foxy::exit_country(&head)
 }
 
 fn socks_udp_relay(client: &mut TcpStream) -> Option<UdpSocket> {
@@ -8555,6 +8674,8 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
                 probe if probe.is_empty() => None,
                 probe => Some(probe),
             },
+            verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            probe_unavailable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
         });
     }
     None
@@ -18505,5 +18626,49 @@ mod relay_tests {
         for relay_side in relays {
             relay_side.join().expect("joins");
         }
+    }
+}
+
+#[cfg(test)]
+mod foxy_exit_tests {
+    use super::{exit_agrees, pick_verified_edge, probes_reachable};
+
+    #[test]
+    fn a_pinned_country_accepts_its_own_exit_and_refuses_a_single_edge_anycast_that_egresses_elsewhere(
+    ) {
+        assert!(exit_agrees("US", "US"));
+        assert!(exit_agrees("us", "US"));
+        assert!(!exit_agrees("US", "CA"));
+        assert!(
+            exit_agrees(ferrox_core::foxy::catalog::RECOMMENDED, "CA"),
+            "the recommended location accepts wherever the nearest edge exits"
+        );
+    }
+
+    #[test]
+    fn the_preferred_edge_is_the_first_one_whose_exit_agrees_not_the_first_one_opened() {
+        // A `us` label that egresses elsewhere must not win over the next edge that truly exits US.
+        assert_eq!(
+            pick_verified_edge(&[Some(false), Some(true), Some(true)]),
+            Some(1)
+        );
+        assert_eq!(
+            pick_verified_edge(&[None, Some(false), Some(true)]),
+            Some(2)
+        );
+        assert_eq!(pick_verified_edge(&[Some(true)]), Some(0));
+    }
+
+    #[test]
+    fn no_agreeing_exit_leaves_the_label_order_untouched_rather_than_pinning_a_wrong_edge() {
+        assert_eq!(pick_verified_edge(&[]), None);
+        assert_eq!(pick_verified_edge(&[Some(false), None, Some(false)]), None);
+    }
+
+    #[test]
+    fn a_runner_that_carries_no_probe_stops_trying_instead_of_failing_every_flow() {
+        assert!(!probes_reachable(&[None, None, None]));
+        assert!(probes_reachable(&[None, Some(false)]));
+        assert!(!probes_reachable(&[]));
     }
 }

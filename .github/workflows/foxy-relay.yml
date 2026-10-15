@@ -213,7 +213,7 @@ jobs:
           FAILED=""
           for carrier in h1 h2 h3 auto; do
             echo "== carrier $carrier =="
-            CARRIER="$carrier" PORT="$PORT" python3 -c 'import json,os; token=json.load(open("foxy-pass.json"))["pass"]; json.dump({"inbounds":[{"protocol":"socks","listen":"127.0.0.1","port":int(os.environ["PORT"])}],"outbounds":[{"protocol":"foxy","settings":{"pass":token,"country":os.environ["FOXY_COUNTRY"],"carrier":os.environ["CARRIER"]}}]}, open("foxy-relay.json","w"))'
+            CARRIER="$carrier" PORT="$PORT" python3 -c 'import json,os; token=json.load(open("foxy-pass.json"))["pass"]; json.dump({"inbounds":[{"protocol":"socks","listen":"127.0.0.1","port":int(os.environ["PORT"])}],"outbounds":[{"protocol":"foxy","settings":{"pass":token,"country":os.environ["FOXY_COUNTRY"],"carrier":os.environ["CARRIER"],"exitProbe":"www.cloudflare.com/cdn-cgi/trace"}}]}, open("foxy-relay.json","w"))'
             chmod 600 foxy-relay.json
             "$BIN" run -c foxy-relay.json >> ferrox-relay.log 2>&1 &
             echo "$!" > ferrox-relay.pid
@@ -411,7 +411,7 @@ jobs:
             FRONT="$1" PORT="$2" CARRIER="$3" COUNTRY="$FOXY_COUNTRY" UPSTREAM="${4:-}" python3 -c '
           import json, os
           token = json.load(open("foxy-pass.json"))["pass"]
-          settings = {"pass": token, "country": os.environ["COUNTRY"], "carrier": os.environ["CARRIER"]}
+          settings = {"pass": token, "country": os.environ["COUNTRY"], "carrier": os.environ["CARRIER"], "exitProbe": "www.cloudflare.com/cdn-cgi/trace"}
           if os.environ["UPSTREAM"]:
               settings["upstreamProxy"] = os.environ["UPSTREAM"]
           json.dump({"inbounds":[{"protocol":os.environ["FRONT"],"listen":"127.0.0.1","port":int(os.environ["PORT"])}],"outbounds":[{"protocol":"foxy","settings":settings}]}, open("foxy-relay.json","w"))'
@@ -537,7 +537,7 @@ jobs:
             FRONT="$1" PORT="$2" CARRIER="$3" COUNTRY="$4" python3 -c '
           import json, os
           token = json.load(open("foxy-pass.json"))["pass"]
-          settings = {"pass": token, "country": os.environ["COUNTRY"], "carrier": os.environ["CARRIER"]}
+          settings = {"pass": token, "country": os.environ["COUNTRY"], "carrier": os.environ["CARRIER"], "exitProbe": "www.cloudflare.com/cdn-cgi/trace"}
           json.dump({"inbounds":[{"protocol":os.environ["FRONT"],"listen":"127.0.0.1","port":int(os.environ["PORT"])}],"outbounds":[{"protocol":"foxy","settings":settings}]}, open("foxy-relay.json","w"))'
             chmod 600 foxy-relay.json
             "$BIN" run -c foxy-relay.json >> ferrox-relay.log 2>&1 &
