@@ -1,6 +1,6 @@
 // xHTTP over HTTP/2: one connection multiplexes many requests the way many TCP connections would — each stream is one GET, POST or packet — and the H1 dispatch is reused byte for byte, headers re-serialized into the H1-style head the same validators read and the response head parsed back into H2 HEADERS.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
@@ -28,6 +28,10 @@ impl H2StreamOut {
         self.conn.send_data(self.stream, payload)
     }
 
+    pub(crate) fn bind_session(&self, sid: &str) {
+        self.conn.bind_session(sid);
+    }
+
     pub(crate) fn end(&self) {
         self.conn.end_stream(self.stream);
     }
@@ -49,6 +53,7 @@ struct StreamState {
 struct H2Conn {
     write: Mutex<Box<dyn crate::proxy::FrameWrite + Send>>,
     streams: Mutex<HashMap<u32, Arc<H2Stream>>>,
+    sessions: Mutex<HashSet<String>>,
     send_conn: Mutex<u64>,
     wake: Condvar,
     decoder: Mutex<Decoder>,
@@ -337,6 +342,30 @@ impl H2Conn {
             st.dead = true;
             state.cv.notify_all();
         }
+        let sessions: Vec<String> = self
+            .sessions
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .drain()
+            .collect();
+        for session in sessions {
+            crate::xhttp::end_session(&session);
+        }
+    }
+
+    /// The session a stream of this connection waits on dies with the connection: past `dead` there is no frame left to post, so a waiter would park on a sequence no peer can ever send.
+    fn bind_session(&self, sid: &str) {
+        {
+            let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
+            // Every packet-up POST repeats its session's id, so the owned key is only made for a first bind.
+            if !sessions.contains(sid) {
+                sessions.insert(sid.to_owned());
+            }
+        }
+        // `kill` sets `dead` before it drains this set, so a bind that raced the drain ends its own session.
+        if self.dead.load(Ordering::SeqCst) {
+            crate::xhttp::end_session(sid);
+        }
     }
 }
 
@@ -513,6 +542,7 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
     let conn = Arc::new(H2Conn {
         write: Mutex::new(Box::new(write)),
         streams: Mutex::new(HashMap::new()),
+        sessions: Mutex::new(HashSet::new()),
         send_conn: Mutex::new(65_535),
         wake: Condvar::new(),
         decoder: Mutex::new(Decoder::default()),
@@ -998,6 +1028,37 @@ mod tests {
         assert_eq!(client.response_data(down, payload.len()), payload);
         drop(client);
         echo.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    /// A peer that opens a downlink and then dies without ever posting leaves the server's stream thread parked on a sequence that can no longer arrive — the connection, not that thread, owns the session, so its death has to end it and free the thread with it.
+    #[test]
+    fn a_dead_carrier_ends_the_session_it_parked() {
+        let (addr, server) = serve_one(test_settings("stream-up"), [0xbbu8; 16], 1);
+        let mut client = H2Client::connect(addr);
+        let pad = padding();
+        let down = client.headers(
+            "GET",
+            "/up/sess-h2-dead",
+            &[("referer", pad.as_str())],
+            true,
+        );
+        assert_eq!(client.response_head(down), 200);
+        assert!(
+            crate::xhttp::session_is_carried("sess-h2-dead"),
+            "the downlink holds its session while its carrier lives"
+        );
+        drop(client);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while crate::xhttp::session_is_carried("sess-h2-dead")
+            && std::time::Instant::now() < deadline
+        {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            !crate::xhttp::session_is_carried("sess-h2-dead"),
+            "the carrier died and left its session parked: nothing will ever wake that thread"
+        );
         server.join().expect("joins");
     }
 
