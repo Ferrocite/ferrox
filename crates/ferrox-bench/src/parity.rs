@@ -478,6 +478,8 @@ pub struct Outcome {
     pub sys_millis: Option<u64>,
     pub traffic_samples: usize,
     pub threads_peak: Option<u64>,
+    /// The kernel's tally of what this run asked it to move, over the same window as the cpu split.
+    pub io: Option<ps::Io>,
     pub startup_cpu_millis: u64,
     pub startup_seconds: f64,
     pub samples: Vec<(Phase, ps::Sample)>,
@@ -523,6 +525,15 @@ impl Run {
         Some((user as f64 / gib, sys as f64 / gib))
     }
 
+    /// The run's crossing cost per GiB, or nothing for a tally the crossing never reached; see
+    /// [`io_crossing_per_gib`].
+    pub fn io_per_gib(&self) -> Option<(f64, f64)> {
+        io_crossing_per_gib(
+            self.outcome.io?,
+            self.outcome.bytes_sent + self.outcome.bytes_received,
+        )
+    }
+
     fn quartiles(values: &[u128]) -> Option<Quartiles> {
         if values.is_empty() {
             return None;
@@ -564,6 +575,7 @@ impl Run {
             };
             item.insert("user_millis", millis(s.user_millis));
             item.insert("sys_millis", millis(s.sys_millis));
+            item.insert("io", io_json(s.io));
             item.insert(
                 "threads",
                 match s.threads {
@@ -597,6 +609,11 @@ impl Run {
         root.insert("cpu_user_millis", split(o.user_millis));
         root.insert("cpu_sys_millis", split(o.sys_millis));
         root.insert("cpu_millis_per_gib", Json::Num(self.cpu_millis_per_gib()));
+        let per_gib = self.io_per_gib();
+        let number = |value: Option<f64>| value.map_or(Json::Null, Json::Num);
+        root.insert("io", io_json(o.io));
+        root.insert("io_calls_per_gib", number(per_gib.map(|(c, _)| c)));
+        root.insert("io_bytes_per_gib", number(per_gib.map(|(_, b)| b)));
         root.insert(
             "cpu_resolution_floor_millis",
             Json::Num(cpu_resolution_floor_millis() as f64),
@@ -624,6 +641,32 @@ impl Run {
         root.insert("samples", Json::Arr(samples));
         root
     }
+}
+
+/// The run's crossing cost per GiB: how often the kernel was asked, and how much each ask carried.
+/// A `splice` or a `send`/`recv` socket crossing moves bytes `/proc/<pid>/io` never names, and a
+/// relay writes what it moves, so a tally under an eighth of the run's bytes was not looking at the
+/// crossing at all: it gets no number rather than a zero a reader would take for a win. The pair of
+/// witnesses in `ps` is where these two bands come from.
+pub fn io_crossing_per_gib(io: ps::Io, moved: u64) -> Option<(f64, f64)> {
+    if moved == 0 || io.bytes() < moved / 8 {
+        return None;
+    }
+    let gib = moved as f64 / 1_073_741_824.0;
+    Some((io.calls() as f64 / gib, io.bytes() as f64 / gib))
+}
+
+/// The kernel's own counters, under the names `/proc/<pid>/io` prints them, so a number in the
+/// artefact can be checked against the file it came from.
+fn io_json(io: Option<ps::Io>) -> Json {
+    io.map_or(Json::Null, |io| {
+        let mut item = Json::object();
+        item.insert("syscr", Json::Num(io.read_calls as f64));
+        item.insert("syscw", Json::Num(io.write_calls as f64));
+        item.insert("rchar", Json::Num(io.read_bytes as f64));
+        item.insert("wchar", Json::Num(io.write_bytes as f64));
+        item
+    })
 }
 
 fn optional_quartiles_json(q: Option<Quartiles>) -> Json {
@@ -840,6 +883,7 @@ pub fn measure(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> Re
             sys_millis: summary.sys_millis,
             traffic_samples: summary.traffic_samples,
             threads_peak: summary.threads_peak,
+            io: summary.io,
             startup_cpu_millis,
             startup_seconds: started.elapsed().as_secs_f64(),
             samples,
@@ -854,6 +898,7 @@ struct Summary {
     sys_millis: Option<u64>,
     traffic_samples: usize,
     threads_peak: Option<u64>,
+    io: Option<ps::Io>,
     transfer: Duration,
 }
 
@@ -878,6 +923,10 @@ fn summarise(samples: &[(Phase, ps::Sample)], moved: &Moved, startup_cpu_millis:
             .saturating_sub(startup_cpu_millis),
         user_millis: split(|s| s.user_millis),
         sys_millis: split(|s| s.sys_millis),
+        io: match (first.and_then(|s| s.io), last.and_then(|s| s.io)) {
+            (Some(start), Some(end)) => end.since(&start),
+            _ => None,
+        },
         traffic_samples: samples
             .iter()
             .filter(|(phase, _)| *phase == Phase::Traffic)
