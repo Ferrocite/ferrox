@@ -90,15 +90,18 @@ jobs:
         run: |
           matrix=true
           planned=""
+          planned_engines=""
           if [[ "$EVENT" == "pull_request" ]]; then
             # A change that reaches one method is measured there, against every
-            # engine at the full tier's repeats; the methods it does not reach are
-            # not measured on this run at all. Shared code reaches everything, so a
-            # wide plan keeps the smoke cell and the nightly run carries the depth.
+            # engine that method's page records as able to serve it, at the full
+            # tier's repeats; the methods it does not reach are not measured on
+            # this run at all. Shared code reaches everything, so a wide plan
+            # keeps the smoke cell and the nightly run carries the depth.
             if [[ "$(python3 scripts/ci-scope.py scope --base "$BASE" |
               sed -n 's/^wide=//p')" == "false" ]]; then
               tier="full"
               planned="$(python3 scripts/ci-scope.py scenarios)"
+              planned_engines="$(python3 scripts/ci-scope.py engines | paste -sd, -)"
               [[ -n "$planned" ]] || matrix=false
             else
               tier="smoke"
@@ -144,9 +147,18 @@ jobs:
           fi
           flags=""
           [[ -n "$WANT_REPEATS" ]] && flags="$flags --repeats $WANT_REPEATS"
-          [[ -n "$WANT_ENGINES" ]] && flags="$flags --engines $WANT_ENGINES"
           trees="xray-core,sing-box,zeronet,xray-rust"
-          [[ "$tier" == "smoke" && -z "$WANT_ENGINES" ]] && trees="xray-core"
+          if [[ -n "$WANT_ENGINES" ]]; then
+            # A typed list is the caller's own, ferrox included or not.
+            flags="$flags --engines $WANT_ENGINES"
+          elif [[ -n "$planned_engines" ]]; then
+            # The page ruled the rest out, so this run neither fetches, builds nor
+            # probes them; the nightly wide run still measures everything.
+            flags="$flags --engines ferrox,$planned_engines"
+            trees="$planned_engines"
+          elif [[ "$tier" == "smoke" ]]; then
+            trees="xray-core"
+          fi
           echo "tier=$tier" >> "$GITHUB_OUTPUT"
           echo "cells=$cells" >> "$GITHUB_OUTPUT"
           echo "oses=$oses" >> "$GITHUB_OUTPUT"

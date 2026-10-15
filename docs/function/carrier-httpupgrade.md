@@ -97,6 +97,7 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/httpupgrade.rs
+- symbols: httpupgrade
 - oracle: http_upgrade, httpupgrade
 - go: ./transport/internet/httpupgrade/...
 <!-- scope:end -->

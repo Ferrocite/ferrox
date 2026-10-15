@@ -2,10 +2,21 @@
 """Plan what CI has to measure from what a change actually touches.
 
 `docs/function/<method>.md` is the registry. Each page declares the source files
-that trigger it (`paths`) and the work its change owes: matrix scenario ids
-(`scenarios`), upstream oracle test names (`oracle`), reference packages (`go`).
-A changed file no page owns is shared code, and shared code owes the whole
-matrix, so the plan is wide and every job runs exactly as it did before.
+that trigger it (`paths`), the items of the shared relay that are its own
+(`symbols`), and the work its change owes: matrix scenario ids (`scenarios`),
+upstream oracle test names (`oracle`), reference packages (`go`).
+
+A file one page claims is that page's change. A file no page claims is shared,
+and shared code owes the whole matrix — **unless** every hunk of the diff in it
+sits inside something one page names. `proxy.rs` hosts every method's dial and
+serve rungs beside the relay helpers, so a VMess rung edit is a VMess change and
+gets the VMess cells, while `read_exact` changing still owes everything: a Rust
+hunk is attributed by the item it sits in, matched against each page's
+`symbols`. A row of `scripts/method-counts.txt` or `scripts/method-ops.txt`
+already carries its page in the first column, so it claims itself. A hunk that
+resolves to no name, or to items of two methods where only one is claimed, keeps
+the plan wide: attribution is only allowed to narrow on evidence, never to skip
+a measurement.
 
 A workflow runs `scope` once to write the plan file, then every expensive job
 asks for its own slice of it. With no plan file — locally, or on a scheduled run
@@ -41,8 +52,177 @@ OWNED_NOWHERE = "-"
 TOOL = ("crates/ferrox-prompt/", "crates/ferrox-bench/")
 
 SCOPE_BLOCK = re.compile(r"<!--\s*scope:begin\s*-->(.*?)<!--\s*scope:end\s*-->", re.S)
-SCOPE_KEYS = ("paths", "scenarios", "oracle", "go")
-LIST_KEYS = ("methods", "scenarios", "go_packages", "suites_skipped")
+SCOPE_KEYS = ("paths", "symbols", "engines", "scenarios", "oracle", "go")
+LIST_KEYS = ("methods", "scenarios", "go_packages", "suites_skipped", "engines")
+
+# The comparators `scripts/run-benchmark-matrix.sh` builds from `upstream/pins.toml`.
+# A page may declare which of these its method's row is gated against; the ones it
+# leaves out are engines it has recorded as unable to serve the method, so a cell
+# need not build, fetch or probe them. `xray-core` is not optional: the harness
+# refuses a comparison without it.
+ENGINES = ("xray-core", "sing-box", "zeronet", "xray-rust")
+REFERENCE = "xray-core"
+
+# The data files whose every row names its own page in the first column: a hunk
+# here moves one page's claim, so it is that page's change, not shared code
+# moving. `method-ops.txt` rows are `method filter symbol`, `method-counts.txt`
+# rows are `doc key value checker`.
+PAGE_KEYED = ("scripts/method-counts.txt", "scripts/method-ops.txt")
+# A row here is `symbol count`, so the page rides on the symbol: the final path
+# segment is the item whose count is blessed, and a page claiming that item name
+# claims the row.
+SYMBOL_KEYED = ("scripts/expected-ops.txt",)
+
+# The header of a Rust item, as far up as a hunk has to read to know what it
+# changed. `impl` is its own case: the name worth claiming is the type.
+ITEM_KIND = r"(?:const|static|fn|struct|enum|trait|type|mod)"
+ITEM_HEAD = re.compile(rf"^(\s*)(?:pub(?:\([a-z]+\))?\s+)?(?:unsafe\s+)?{ITEM_KIND}\s+([A-Za-z0-9_]+)")
+IMPL_HEAD = re.compile(r"^(\s*)(?:pub(?:\([a-z]+\))?\s+)?(?:unsafe\s+)?impl"
+                       r"(?:\s*<[^<>]*>)?\s+([A-Za-z0-9_]+)")
+
+
+def item_at(lines: list[str], number: int) -> str | None:
+    """The enclosing item name of one 1-based line, or None if it has none.
+
+    A hunk between two items belongs to neither, so a change at or above the
+    header's own indentation is refused instead of blamed on the function above
+    it: a diff must not narrow CI by the accident of where a function ends.
+    """
+    if not lines:
+        return None
+    at = min(max(number, 1), len(lines)) - 1
+    depth = len(lines[at]) - len(lines[at].lstrip())
+    for index in range(at, -1, -1):
+        head = ITEM_HEAD.match(lines[index]) or IMPL_HEAD.match(lines[index])
+        if not head:
+            continue
+        if depth <= len(head.group(1)) and index != at:
+            return None
+        return head.group(2)
+    return None
+
+
+def enclosing(blob: str, start: int, count: int) -> list[str]:
+    """The item names one hunk reaches: its first changed line's and its last."""
+    if not blob:
+        return []
+    lines = blob.splitlines()
+    names: list[str] = []
+    for name in (item_at(lines, start), item_at(lines, start + max(count - 1, 0))):
+        if name is None:
+            return []
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def row_pages(lines: list[str], scopes: dict) -> list[tuple[str, list[str]]]:
+    """A data file's changed rows, each naming its own page in the first column.
+
+    A comment or a blank row names nothing; a row whose key is no page resolves
+    to nothing, and the plan stays wide for it.
+    """
+    found: list[tuple[str, list[str]]] = []
+    for line in lines:
+        row = line.lstrip("+-").strip()
+        if not row or row.startswith("#"):
+            continue
+        key = row.split()[0]
+        if key not in scopes:
+            return [(key, [])]
+        if not any(key == name for name, _ in found):
+            found.append((key, [key]))
+    return found
+
+
+def symbol_pages(lines: list[str], scopes: dict) -> list[tuple[str, list[str]]]:
+    """The pages claiming the blessed symbol counts a diff moved.
+
+    A symbol is a path — `ferrox_core::record::fill_exact` — and the item worth
+    claiming is its last segment, which is the name a page's `symbols` holds.
+    """
+    found: list[tuple[str, list[str]]] = []
+    for line in lines:
+        row = line.lstrip("+-").strip()
+        if not row or row.startswith("#"):
+            continue
+        tail = row.split()[0].split("::")[-1]
+        serving = pages_for(tail, scopes)
+        if not serving:
+            return [(tail, [])]
+        if not any(tail == name for name, _ in found):
+            found.append((tail, serving))
+    return found
+
+
+def pages_for(name: str, scopes: dict) -> list[str]:
+    """The pages whose `symbols` claim one item name."""
+    return [page for page, scope in sorted(scopes.items())
+            if matches(page, name, scope.get("symbols", []))]
+
+
+def hunk_pages(root: str, base: str, path: str,
+               hunks: list[tuple[int, int, int, int]], lines: list[str],
+               scopes: dict) -> list[tuple[str, list[str]]]:
+    """What one shared file's change is, name by name, and who claims each.
+
+    A Rust hunk is read from both sides of the diff because a deletion has no new
+    lines to look at, and removing a rung is still a change to that rung.
+    """
+    if path in PAGE_KEYED:
+        return row_pages(lines, scopes)
+    if path in SYMBOL_KEYED:
+        return symbol_pages(lines, scopes)
+    found: list[tuple[str, list[str]]] = []
+    blobs: dict[str, str] = {}
+    for side, rev in (("old", base), ("new", "HEAD")):
+        out = subprocess.run(["git", "show", f"{rev}:{path}"],
+                             capture_output=True, text=True, cwd=root)
+        blobs[side] = out.stdout if out.returncode == 0 else ""
+    for old_start, old_count, new_start, new_count in hunks:
+        for blob, start, count in ((blobs["old"], old_start, old_count),
+                                   (blobs["new"], new_start, new_count)):
+            if count == 0:
+                continue
+            for name in enclosing(blob, start, count):
+                if any(name == seen for seen, _ in found):
+                    continue
+                found.append((name, pages_for(name, scopes)))
+    return found
+
+
+def parse_diff(text: str) -> tuple[dict[str, list], dict[str, list[str]]]:
+    """`path -> hunks` and `path -> changed lines` from a `git diff -U0`.
+
+    A hunk is the old and new start and count; the changed lines are the body's
+    `+` and `-` rows, which is what a data file's row key is read from.
+    """
+    hunks: dict[str, list] = {}
+    bodies: dict[str, list[str]] = {}
+    path = ""
+    for line in text.splitlines():
+        if line.startswith("+++ "):
+            candidate = line[4:].strip()
+            if candidate.startswith("b/") and candidate != "b/dev/null":
+                path = candidate[2:]
+            elif candidate != "/dev/null":
+                path = ""
+            continue
+        if line.startswith("diff --git "):
+            path = ""
+            continue
+        if not path:
+            continue
+        if line.startswith("@@"):
+            match = re.match(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+            if match:
+                hunks.setdefault(path, []).append(
+                    (int(match.group(1)), int(match.group(2) or 1),
+                     int(match.group(3)), int(match.group(4) or 1)))
+            continue
+        if line[:1] in "+-" and not line.startswith(("+++", "---")):
+            bodies.setdefault(path, []).append(line)
+    return hunks, bodies
 
 
 def repo_root() -> str:
@@ -158,10 +338,18 @@ def filter_suite(pin: str, suite: str, patterns: list[str]) -> str:
     return f"{head} -- {' '.join(flags)} " + " ".join(keep)
 
 
-def classify(changed: list[str], scopes: dict[str, dict[str, list[str]]]) -> dict:
-    """Which methods a diff touches, or why it touches everything."""
+def classify(changed: list[str], scopes: dict[str, dict[str, list[str]]],
+             names: dict[str, list[tuple[str, list[str]]]] | None = None) -> dict:
+    """Which methods a diff touches, or why it touches everything.
+
+    `names` maps a changed shared path to the pairs `(thing, pages)` its hunks
+    resolve to — an item name in a Rust file, a row key or symbol in a data file;
+    without it (a path list from `--changed-file`, or no diff at all) a file no
+    page claims stays shared, which is the wide answer.
+    """
     methods: set[str] = set()
     unclaimed: set[str] = set()
+    attributed: list[str] = []
     tool = False
     rust = False
     # A plan with nothing to look at has no evidence to narrow on, so it runs wide.
@@ -178,17 +366,32 @@ def classify(changed: list[str], scopes: dict[str, dict[str, list[str]]]) -> dic
         if page and page.group(1) in scopes:
             methods.add(page.group(1))
             continue
-        if path.startswith("crates/") and path.endswith(".rs"):
+        if is_shared_source(path):
             owners = [name for name, scope in scopes.items()
                       if any(fnmatch.fnmatch(path, g) for g in scope.get("paths", []))]
             if len(owners) == 1:
                 methods.add(owners[0])
                 continue
-            unclaimed.add(path)
             if len(owners) > 1:
+                unclaimed.add(path)
                 shared = f"{path} is claimed by {' and '.join(sorted(owners))}"
-            elif not shared:
-                shared = f"{path} is claimed by no method page"
+                continue
+            found = (names or {}).get(path)
+            if found:
+                # Every hunk of this shared file belongs to a thing a page claims,
+                # so the file is not what this change is; those things are.
+                if all(pages for _, pages in found):
+                    for name, pages in found:
+                        methods.update(pages)
+                        attributed.append(f"{path}::{name}")
+                    continue
+                first = next(name for name, pages in found if not pages)
+                shared = shared or f"{path}::{first} is claimed by no method page"
+            else:
+                shared = shared or (
+                    f"{path} is claimed by no method page" if found is None
+                    else f"{path} changes rows or items no method page claims")
+            unclaimed.add(path)
             continue
         if path.startswith(("scripts/", ".github/", "upstream/", "crates/")) \
                 or path in ("Cargo.toml", "Cargo.lock"):
@@ -197,7 +400,14 @@ def classify(changed: list[str], scopes: dict[str, dict[str, list[str]]]) -> dic
     wide = bool(unclaimed) or bool(shared)
     reason = shared or ("" if methods else "nothing a method page owns")
     return {"wide": wide, "reason": reason, "methods": sorted(methods),
-            "unclaimed": sorted(unclaimed), "rust": rust or tool}
+            "unclaimed": sorted(unclaimed), "attributed": attributed,
+            "rust": rust or tool}
+
+
+def is_shared_source(path: str) -> bool:
+    """A source or data file whose hunks, not its name, decide the scope."""
+    return (path.startswith("crates/") and path.endswith(".rs")) \
+        or path in PAGE_KEYED or path in SYMBOL_KEYED
 
 
 def ops_rows(root: str, selected: list[str] | None) -> list[dict[str, str]]:
@@ -221,11 +431,24 @@ def measure(root: str, scopes: dict, plan: dict) -> None:
     patterns: list[str] = []
     wanted: list[str] = []
     packages: list[str] = []
+    # An engine list is only ever a *reduction*, and a page that declares no list
+    # owes every comparator, so the answer is the pages' union unless one of them
+    # has not ruled any engine out — then the tier's own default stands.
+    engines: list[str] = []
+    every_declared = selected is not None and bool(selected)
     for name in sorted(scopes) if selected is None else selected:
         scope = scopes[name]
         patterns += scope.get("oracle", [])
         wanted += scope.get("scenarios", [])
         packages += scope.get("go", [])
+        declared = scope.get("engines", [])
+        if selected is not None:
+            if not declared:
+                every_declared = False
+            for engine in declared:
+                if engine not in engines:
+                    engines.append(engine)
+    plan["engines"] = sorted(engines, key=ENGINES.index) if every_declared else []
     plan["scenarios"] = [] if selected is None else [
         i for i in scenario_ids(root) if any(w in i for w in wanted)]
     plan["go_packages"] = sorted(set(packages)) if selected is not None else list(WIDE_GO)
@@ -246,19 +469,44 @@ def measure(root: str, scopes: dict, plan: dict) -> None:
     plan["ops_all"] = len(ops_rows(root, None))
 
 
-def build_plan(root: str, changed: list[str]) -> dict:
+def shared_paths(changed: list[str], scopes: dict) -> list[str]:
+    """Changed files no single page claims: the ones worth attributing by hunk."""
+    out: list[str] = []
+    for path in changed:
+        if not is_shared_source(path) or path.startswith(TOOL):
+            continue
+        owners = [name for name, scope in scopes.items()
+                  if any(fnmatch.fnmatch(path, g) for g in scope.get("paths", []))]
+        if len(owners) != 1:
+            out.append(path)
+    return out
+
+
+def build_plan(root: str, changed: list[str], hunks: dict | None = None,
+               bodies: dict | None = None, base: str = "") -> dict:
     scopes = pages(root)
-    plan = classify(changed, scopes)
+    attributed = None
+    if base and hunks is not None:
+        attributed = {path: hunk_pages(root, base, path, hunks.get(path, []),
+                                       (bodies or {}).get(path, []), scopes)
+                      for path in shared_paths(changed, scopes)}
+    plan = classify(changed, scopes, attributed)
     measure(root, scopes, plan)
     return plan
 
 
-def changed_from(root: str, base: str) -> list[str]:
+def changed_from(root: str, base: str) -> tuple[list[str], dict, dict]:
     out = subprocess.run(["git", "diff", "--name-only", f"{base}...HEAD"],
                          capture_output=True, text=True, cwd=root)
     if out.returncode != 0:
         sys.exit(f"ci-scope: git diff against {base} failed: {out.stderr.strip()}")
-    return [line for line in out.stdout.splitlines() if line.strip()]
+    paths = [line for line in out.stdout.splitlines() if line.strip()]
+    detail = subprocess.run(["git", "diff", "-U0", "--no-color", f"{base}...HEAD"],
+                            capture_output=True, text=True, cwd=root)
+    if detail.returncode != 0:
+        sys.exit(f"ci-scope: git diff -U0 against {base} failed: "
+                 f"{detail.stderr.strip()}")
+    return paths, *parse_diff(detail.stdout)
 
 
 def output_flags(plan: dict) -> dict[str, str]:
@@ -270,6 +518,7 @@ def output_flags(plan: dict) -> dict[str, str]:
         "rust": "true" if plan["wide"] or plan["rust"] else "false",
         "methods": ",".join(plan["methods"]),
         "cells": ",".join(plan["scenarios"]),
+        "engines": ",".join(plan["engines"]),
         "matrix": "true" if plan["wide"] or plan["scenarios"] else "false",
         "suites": "true" if plan["wide"] or plan["suites"] else "false",
         "go": "true" if plan["go_packages"] else "false",
@@ -290,7 +539,10 @@ def write_summary(plan: dict, path: str) -> None:
         ("plan", "wide" if plan["wide"] else "narrow"),
         ("why", plan["reason"] or "the touched methods are the scope"),
         ("methods in scope", ", ".join(plan["methods"]) or "none"),
+        ("shared items attributed", ", ".join(plan["attributed"]) or "none"),
         ("matrix", cells),
+        ("comparators", ",".join(plan["engines"])
+         or "the tier's own default set"),
         ("ops rows", f"{len(plan['rows'])} of {plan['ops_all']}"),
         ("oracle suites", suites or "none"),
         ("reference packages", " ".join(plan["go_packages"])),
@@ -317,6 +569,8 @@ def emit_outputs(plan: dict, github_output: str) -> None:
 
 def cmd_scope(args: argparse.Namespace) -> int:
     root = repo_root()
+    hunks: dict = {}
+    bodies: dict = {}
     if args.wide:
         changed: list[str] = []
     elif args.changed_file:
@@ -325,8 +579,8 @@ def cmd_scope(args: argparse.Namespace) -> int:
     else:
         if not args.base:
             sys.exit("ci-scope: scope wants --base, --changed-file or --wide")
-        changed = changed_from(root, args.base)
-    plan = build_plan(root, changed)
+        changed, hunks, bodies = changed_from(root, args.base)
+    plan = build_plan(root, changed, hunks, bodies, args.base or "")
     path = os.path.join(root, PLAN)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as handle:
@@ -374,21 +628,90 @@ def cmd_suite(args: argparse.Namespace) -> int:
     return 0
 
 
+def shared_names(root: str, scopes: dict) -> dict[str, list[str]]:
+    """Item names in the files no single page claims, per file.
+
+    This is what a `symbols:` pattern is checked against: an attribution that
+    names nothing is a claim that narrows CI for a code path that does not exist.
+    A blessed symbol count is a name of the same kind, so it is read too.
+    """
+    found: dict[str, list[str]] = {}
+    for path in sorted(glob.glob(os.path.join(root, "crates", "*", "src", "**", "*.rs"),
+                                 recursive=True)):
+        relative = os.path.relpath(path, root)
+        if relative.startswith(TOOL):
+            continue
+        owners = [name for name, scope in scopes.items()
+                  if any(fnmatch.fnmatch(relative, g) for g in scope.get("paths", []))]
+        if len(owners) == 1:
+            continue
+        with open(path, encoding="utf-8") as handle:
+            names = [head.group(2) for line in handle.read().splitlines()
+                     for head in [ITEM_HEAD.match(line) or IMPL_HEAD.match(line)]
+                     if head]
+        found[relative] = names
+    for relative in SYMBOL_KEYED:
+        full = os.path.join(root, relative)
+        if not os.path.exists(full):
+            continue
+        with open(full, encoding="utf-8") as handle:
+            found[relative] = [row.split()[0].split("::")[-1] for line in handle
+                               for row in [line.strip()]
+                               if row and not row.startswith("#")]
+    return found
+
+
 def validate(root: str) -> tuple[list[str], list[str]]:
     scopes = pages(root)
+    pinned = {pin["name"]: pin for pin in pins(root)}
     fails: list[str] = []
     notes: list[str] = []
     claimed: dict[str, str] = {}
+    items = shared_names(root, scopes)
+    every_item = sorted({name for names in items.values() for name in names})
+    seen: dict[str, str] = {}
     for name, scope in sorted(scopes.items()):
         if not scope:
             fails.append(f"{name}.md: no <!-- scope:begin --> block")
             continue
         if not scope.get("paths"):
             fails.append(f"{name}.md: scope declares no paths: line")
+        for pattern in scope.get("symbols", []):
+            if "=" in pattern:
+                fails.append(f"{name}.md: symbols {pattern} is pin-qualified; an item "
+                             "name belongs to every suite")
+                continue
+            if pattern in seen:
+                fails.append(f"{name}.md: symbols {pattern} is already declared by "
+                             f"{seen[pattern]}, so a hunk cannot pick between them")
+                continue
+            seen[pattern] = name
+            if not any(matches(name, item, [pattern]) for item in every_item):
+                fails.append(f"{name}.md: symbols {pattern} names no item in the shared "
+                             "files, so it attributes nothing")
+        declared = scope.get("engines", [])
+        for engine in declared:
+            if engine not in ENGINES:
+                fails.append(f"{name}.md: engine {engine} is not one the matrix builds "
+                             f"({', '.join(ENGINES)})")
+        if declared and REFERENCE not in declared:
+            fails.append(f"{name}.md: engines drops {REFERENCE}, and a comparison "
+                         "without the reference is not a comparison")
+        for engine in declared:
+            pin = pinned.get(engine)
+            if pin is None or not pin.get("rev"):
+                fails.append(f"{name}.md: engine {engine} has no pinned rev to build")
+            if engine != REFERENCE and not scope.get("scenarios"):
+                fails.append(f"{name}.md: engines {engine} is ruled in or out of a cell "
+                             "this page never measures")
         for value in scope.get("paths", []):
             if value == OWNED_NOWHERE:
-                notes.append(f"{name}.md: no file of its own, so its source changes "
-                             "plan a wide run")
+                if scope.get("symbols"):
+                    notes.append(f"{name}.md: no file of its own; its hunks are "
+                                 "attributed by the items they sit in")
+                else:
+                    notes.append(f"{name}.md: no file of its own, so its source "
+                                 "changes plan a wide run")
                 continue
             hits = glob.glob(os.path.join(root, value))
             if not hits:
@@ -405,14 +728,14 @@ def validate(root: str) -> tuple[list[str], list[str]]:
     check_oracle(root, scopes, fails, notes)
     check_scenarios(scopes, scenario_ids(root), fails)
     check_go(root, scopes, fails, notes)
-    unowned = [os.path.relpath(path, root)
-               for path in glob.glob(os.path.join(root, "crates", "*", "src", "**",
-                                                  "*.rs"), recursive=True)
-               if os.path.relpath(path, root) not in claimed
-               and not os.path.relpath(path, root).startswith(TOOL)]
+    unowned = [path for path in items if path not in claimed]
     if unowned:
-        notes.append(f"{len(unowned)} source file(s) no page owns, so their changes "
-                     f"plan a wide run: {', '.join(sorted(unowned))}")
+        every = [(path, item) for path in unowned for item in items[path]]
+        notes.append(
+            f"{len(unowned)} shared file(s) hold {len(every)} item(s): a hunk there "
+            "narrows only inside an item a page claims by name, so "
+            f"{sum(1 for _, item in every if pages_for(item, scopes))} of them can; "
+            "the rest plan a wide run")
     return fails, notes
 
 
@@ -495,6 +818,62 @@ FIXTURES = [
      False, ["carrier-grpc", "carrier-websocket"]),
 ]
 
+# The same paths with their hunks attributed: what a shared file owes is the item
+# its hunk sits in, not the file.
+ATTRIBUTED = [
+    ("a shared file, hunks in one method's rung",
+     ["crates/ferrox-app/src/proxy.rs"],
+     {"crates/ferrox-app/src/proxy.rs": [("dial_vmess_rung", ["vmess"])]},
+     False, ["vmess"]),
+    ("a shared file, hunks in a relay helper no page claims",
+     ["crates/ferrox-app/src/proxy.rs"],
+     {"crates/ferrox-app/src/proxy.rs": [("read_exact", [])]},
+     True, None),
+    ("a shared file, rungs of two methods",
+     ["crates/ferrox-app/src/proxy.rs"],
+     {"crates/ferrox-app/src/proxy.rs": [("dial_vmess_rung", ["vmess"]),
+                                         ("dial_trojan_rung", ["trojan"])]},
+     False, ["trojan", "vmess"]),
+    ("a shared file, one rung and one helper",
+     ["crates/ferrox-app/src/proxy.rs"],
+     {"crates/ferrox-app/src/proxy.rs": [("dial_vmess_rung", ["vmess"]),
+                                         ("relay", [])]},
+     True, None),
+    ("a method file plus its counts row and its rung",
+     ["crates/ferrox-app/src/vmess.rs", "docs/function/vmess.md",
+      "scripts/method-counts.txt", "crates/ferrox-app/src/proxy.rs"],
+     {"crates/ferrox-app/src/proxy.rs": [("dial_vmess_rung", ["vmess"])],
+      "scripts/method-counts.txt": [("vmess", ["vmess"])]},
+     False, ["vmess"]),
+    ("a counts row whose key is no page",
+     ["scripts/method-counts.txt"],
+     {"scripts/method-counts.txt": [("vmesss", [])]},
+     True, None),
+    ("a page edit and a shared item of another method",
+     ["docs/function/vless.md", "crates/ferrox-app/src/config.rs"],
+     {"crates/ferrox-app/src/config.rs": [("resolve_xhttp", ["carrier-xhttp"])]},
+     False, ["carrier-xhttp", "vless"]),
+    ("a blessed symbol no page claims",
+     ["scripts/expected-ops.txt"],
+     {"scripts/expected-ops.txt": [("der_to_pem", [])]},
+     True, None),
+    ("a blessed symbol a page claims",
+     ["scripts/expected-ops.txt"],
+     {"scripts/expected-ops.txt": [("fill_exact", ["record-layer"])]},
+     False, ["record-layer"]),
+]
+
+RUST_SIDES = """
+pub(crate) fn read_exact(stream: &mut dyn Read, buf: &mut [u8]) {}
+
+mod tests {
+    fn dial_vmess_rung() {
+        let pump = 1;
+        assert_eq!(pump, 1);
+    }
+}
+"""
+
 
 def cmd_selftest(args: argparse.Namespace) -> int:
     root = repo_root()
@@ -507,6 +886,51 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         failed += 0 if ok else 1
         print(f"selftest: {'ok  ' if ok else 'FAIL'} {label} -> "
               f"wide={plan['wide']} methods={plan['methods']}")
+    for label, changed, names, want_wide, want_methods in ATTRIBUTED:
+        plan = classify(changed, scopes, names)
+        ok = plan["wide"] == want_wide and (want_methods is None
+                                            or plan["methods"] == want_methods)
+        failed += 0 if ok else 1
+        print(f"selftest: {'ok  ' if ok else 'FAIL'} {label} -> "
+              f"wide={plan['wide']} methods={plan['methods']} "
+              f"attributed={plan['attributed']}")
+    sides = RUST_SIDES.splitlines()
+    for label, number, want in [
+        ("a hunk on a signature names that item", 2, "read_exact"),
+        ("a hunk in a body names its item", 6, "dial_vmess_rung"),
+        ("a hunk between two items names nothing", 3, None),
+        ("a hunk on a mod line names the mod", 4, "tests"),
+    ]:
+        got = item_at(sides, number)
+        ok = got == want
+        failed += 0 if ok else 1
+        print(f"selftest: {'ok  ' if ok else 'FAIL'} {label} -> {got}")
+    diff = """diff --git a/scripts/method-counts.txt b/scripts/method-counts.txt
+--- a/scripts/method-counts.txt
++++ b/scripts/method-counts.txt
+@@ -65 +65,2 @@
+-vmess ops-retired-instructions UNBLESSED scripts/count-ops.sh
++vmess ops-retired-instructions 790 scripts/count-ops.sh
++vmess frames-per-write-syscall 4 ferrox-app-vmess::tests::a_batch_on_the_wire
+"""
+    hunks, bodies = parse_diff(diff)
+    rows = row_pages(bodies["scripts/method-counts.txt"], scopes)
+    ok = len(hunks["scripts/method-counts.txt"]) == 1 and rows == [("vmess", ["vmess"])]
+    failed += 0 if ok else 1
+    print(f"selftest: {'ok  ' if ok else 'FAIL'} a counts hunk is read as its row key "
+          f"({hunks} {rows})")
+    # The declarations have to name what is really in the tree, or the narrowing is
+    # a claim about a function that does not exist.
+    for label, name, want in [
+        ("a rung of the relay is claimed by its page", "dial_vmess_rung", ["vmess"]),
+        ("a relay helper is claimed by nobody", "read_exact", []),
+        ("the request decoder is claimed by nobody", "decode_request", []),
+    ]:
+        got = pages_for(name, scopes)
+        ok = got == want
+        failed += 0 if ok else 1
+        print(f"selftest: {'ok  ' if ok else 'FAIL'} {label} "
+              f"({name} -> {got or 'no page'})")
     suite = ("cargo test -p p --test t -- --ignored --test-threads=1 "
              "vmess_over_raw_tcp trojan_over_raw_tcp")
     for label, got, want in [
@@ -569,6 +993,21 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     failed += 0 if ok else 1
     print(f"selftest: {'ok  ' if ok else 'FAIL'} a page edit owes the comparisons "
           f"but not the compiler (rust={prose['rust']}, cells={prose['cells']})")
+    # An engine a page rules out is an engine the cell never builds, fetches or
+    # probes; a page that says nothing keeps the tier's whole set.
+    for label, changed, want in [
+        ("a page's own plan carries only its proven comparators",
+         ["crates/ferrox-app/src/vmess.rs"], ["xray-core", "zeronet"]),
+        ("a page that declares nothing keeps every comparator",
+         ["crates/ferrox-app/src/ws.rs"], []),
+        ("a plan of both keeps every comparator",
+         ["crates/ferrox-app/src/ws.rs", "crates/ferrox-app/src/vmess.rs"], []),
+        ("a wide plan keeps every comparator", ["crates/ferrox-app/src/proxy.rs"], []),
+    ]:
+        got = build_plan(root, changed)["engines"]
+        ok = got == want
+        failed += 0 if ok else 1
+        print(f"selftest: {'ok  ' if ok else 'FAIL'} {label} (engines={','.join(got)})")
     return 1 if failed else 0
 
 

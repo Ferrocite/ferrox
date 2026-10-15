@@ -152,7 +152,7 @@ Read the parsing and framing for {method} — matrix row {index} of table {secti
 **Random weight:** 3
 
 ```text
-Write or bring up to standard {page} for {method} — matrix row {index} of table {section}, state "{state}". Every connection-method page carries the same four numbers — ops, syscalls, memory copies, time — each with the name of the thing that produces it, a `graph TD` of the data path, and what was removed against {references}. The numbers live in exactly one place, `scripts/method-counts.txt`; the page cites the manifest row and does not keep a second copy. Name what was not removed as openly as the wins.
+Write or bring up to standard {page} for {method} — matrix row {index} of table {section}, state "{state}". Every connection-method page carries the same four numbers — ops, syscalls, memory copies, time — each with the name of the thing that produces it, a `graph TD` of the data path, and what was removed against {references}. The numbers live in exactly one place, `scripts/method-counts.txt`; the page cites the manifest row and does not keep a second copy. Name what was not removed as openly as the wins. Carry the scope block with the page: `paths` for the files it owns, `symbols` for every item of a shared file that is its own — a rung in `proxy.rs`, a resolver in `config.rs` — because a method whose code lives in the relay is recognised by nothing else, then `scenarios`, `oracle` and `go`, and `engines` only where its own cell already showed a comparator serving it nothing.
 ```
 
 ## P7 · Wire a conformance seam for a shipped row
