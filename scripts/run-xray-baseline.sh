@@ -3,7 +3,22 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-pattern="${1:-${BASELINE_PATTERN:-./...}}"
+default_pattern="${1:-${BASELINE_PATTERN:-./...}}"
+# A plan file narrows the run to the packages of the reference that measure the
+# change; with none, every package is the answer, which is what a scheduled,
+# manual or local run wants.
+patterns=()
+if [[ -f .ferrox/ci-scope.json ]]; then
+  while IFS= read -r line; do [[ -n "$line" ]] && patterns+=("$line"); done \
+    < <(python3 scripts/ci-scope.py go-packages)
+  if [[ "${#patterns[@]}" -eq 0 ]]; then
+    echo "no package of the pinned reference measures this change: nothing to run"
+    exit 0
+  fi
+else
+  read -r -a patterns <<<"$default_pattern"
+fi
+pattern="${patterns[*]}"
 go_timeout="${GO_TEST_TIMEOUT:-20m}"
 pins_file="upstream/pins.toml"
 out_dir="target/xray-baseline"
@@ -53,7 +68,7 @@ echo "  pattern: go test -count=1 -timeout $go_timeout $pattern"
 echo "  $go_version"
 
 set +e
-(cd "$dir" && go test -count=1 -timeout "$go_timeout" "$pattern" >"$log" 2>&1)
+(cd "$dir" && go test -count=1 -timeout "$go_timeout" "${patterns[@]}" >"$log" 2>&1)
 test_rc=$?
 set -e
 

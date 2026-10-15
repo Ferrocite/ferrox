@@ -135,6 +135,14 @@ while IFS=$'\t' read -r name repo rev enabled suite binary seam path; do
     status=1
     continue
   fi
+  # The plan says which of this suite's tests the change reaches. No plan file, or
+  # a wide plan, answers with the pin's own command, so nothing narrows by accident.
+  scoped="$(python3 scripts/ci-scope.py suite "$name")"
+  if [[ -z "$scoped" ]]; then
+    echo "OUT OF SCOPE: $name — no test of its suite measures this change"
+    continue
+  fi
+  suite="$scoped"
   echo "RUNNING: $name @ $rev against Ferrox binary $binary via $seam"
   echo "  suite: $suite"
   if ! cargo build --locked -q -p "$binary" 2>/dev/null; then

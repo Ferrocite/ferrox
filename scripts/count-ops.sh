@@ -103,31 +103,37 @@ syscalls_of() {
 
 if [ "$mode" = "report-file" ]; then
     rows="${2:?usage: count-ops.sh report-file <rows-file>}"
-    # One build, one binary resolution per row. The loop that lived in ops.yml
+    # One build, one binary resolution per test. The loop that lived in ops.yml
     # called `report` once per row, and every call resolved both test binaries
     # again: 31 rows paid cargo 31 times for the same two executables.
-    while read -r doc filter symbol extra; do
+    # A line is `method filter symbol...`: `ci-scope.py rows` groups the symbols
+    # a test measures, and one valgrind run of it holds every one of them.
+    while read -r -a fields; do
+        doc="${fields[0]:-}"
+        filter="${fields[1]:-}"
         case "$doc" in ''|'#'*) continue ;; esac
-        [ -n "$filter" ] && [ -n "$symbol" ] || {
-            echo "count-ops: $rows wants \`doc filter symbol\`, got: $doc $filter $symbol" >&2
+        [ "${#fields[@]}" -ge 3 ] || {
+            echo "count-ops: $rows wants \`method filter symbol...\`, got: ${fields[*]}" >&2
             exit 2
         }
-        printf '\n## %s -- %s\n' "$doc" "$symbol"
+        printf '\n## %s -- %s\n' "$doc" "$filter"
         bin=""
-        bin="$(find_bin "$filter" "$symbol")" || bin=""
-        got=""
-        status=0
-        got="$(ir_of "$filter" "$symbol")" || status=$?
-        case "$status" in
-            0) echo "$symbol Ir=$got" ;;
-            # 3 = the test ran and the profile holds no frame for the symbol; 4 = neither test binary has a test by that name. A blank here would read as a count that was never taken.
-            3) echo "$symbol Ir=inlined-not-a-frame" ;;
-            4) echo "$symbol Ir=no-such-test" ;;
-            # 2 = valgrind or its output broke. The row loop in ops.yml used to
-            # swallow this as "not found" and carry on, so a break names itself
-            # on the row and the rows after it still get measured.
-            *) echo "$symbol Ir=measurement-broke" ;;
-        esac
+        bin="$(find_bin "$filter" "${fields[2]}")" || bin=""
+        for symbol in "${fields[@]:2}"; do
+            got=""
+            status=0
+            got="$(ir_of "$filter" "$symbol")" || status=$?
+            case "$status" in
+                0) echo "$symbol Ir=$got" ;;
+                # 3 = the test ran and the profile holds no frame for the symbol; 4 = neither test binary has a test by that name. A blank here would read as a count that was never taken.
+                3) echo "$symbol Ir=inlined-not-a-frame" ;;
+                4) echo "$symbol Ir=no-such-test" ;;
+                # 2 = valgrind or its output broke. The row loop in ops.yml used to
+                # swallow this as "not found" and carry on, so a break names itself
+                # on the row and the rows after it still get measured.
+                *) echo "$symbol Ir=measurement-broke" ;;
+            esac
+        done
         if [ -n "$bin" ]; then syscalls_of "$filter" "$bin"; fi
     done < "$rows"
     exit 0

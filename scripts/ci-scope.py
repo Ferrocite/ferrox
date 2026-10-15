@@ -128,8 +128,10 @@ def suite_parts(suite: str) -> tuple[str, list[str], list[str]]:
 
 
 def matches(pin: str, name: str, patterns: list[str]) -> bool:
-    """A pattern is `text`, or `pin=text` to bind it to one suite; it must be a
-    substring of the test name, which is how libtest itself filters."""
+    """A pattern is `text`, or `pin=text` to bind it to one suite. `text` has to
+    land on whole `_`-separated segments of the test name: libtest's own substring
+    filter is looser, and a loose pattern here reads as scope that is not — `ws`
+    is inside `shadowsocks_over_raw_tcp` and inside `…_echo_flows_…`."""
     for pattern in patterns:
         qualified, sep, text = pattern.partition("=")
         if sep:
@@ -137,7 +139,7 @@ def matches(pin: str, name: str, patterns: list[str]) -> bool:
                 continue
         else:
             text = pattern
-        if text.lower() in name.lower():
+        if re.search(rf"(^|_){re.escape(text)}(_|$)", name, re.I):
             return True
     return False
 
@@ -259,10 +261,13 @@ def changed_from(root: str, base: str) -> list[str]:
     return [line for line in out.stdout.splitlines() if line.strip()]
 
 
-def emit_outputs(plan: dict, github_output: str) -> None:
-    keys = {
+def output_flags(plan: dict) -> dict[str, str]:
+    """The job-level `if:` answers. A wide plan is true for every one of them,
+    including `rust`: a scheduled or manual run has no diff to narrow on, so it
+    owes the build and the tests like any shared change does."""
+    return {
         "wide": "true" if plan["wide"] else "false",
-        "rust": "true" if plan["rust"] else "false",
+        "rust": "true" if plan["wide"] or plan["rust"] else "false",
         "methods": ",".join(plan["methods"]),
         "cells": ",".join(plan["scenarios"]),
         "matrix": "true" if plan["wide"] or plan["scenarios"] else "false",
@@ -272,6 +277,32 @@ def emit_outputs(plan: dict, github_output: str) -> None:
         "ops_rows": str(len(plan["rows"])),
         "reason": plan["reason"] or "the touched methods are the scope",
     }
+
+
+def write_summary(plan: dict, path: str) -> None:
+    """The plan as one block on the run page, so a reader sees what was skipped
+    and why without opening a log. Every workflow gets it from this one call."""
+    suites = ", ".join(f"{name}: {len(suite_parts(command)[2])} test(s)"
+                       for name, command in sorted(plan["suites"].items()))
+    cells = (f"{len(plan['scenarios'])} cell(s): " + ", ".join(plan["scenarios"])
+             if not plan["wide"] else "every cell of the tier")
+    rows = [(key, value) for key, value in [
+        ("plan", "wide" if plan["wide"] else "narrow"),
+        ("why", plan["reason"] or "the touched methods are the scope"),
+        ("methods in scope", ", ".join(plan["methods"]) or "none"),
+        ("matrix", cells),
+        ("ops rows", f"{len(plan['rows'])} of {plan['ops_all']}"),
+        ("oracle suites", suites or "none"),
+        ("reference packages", " ".join(plan["go_packages"])),
+    ]]
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write("### CI scope\n\n")
+        handle.write("\n".join(f"- **{key}**: {value}" for key, value in rows))
+        handle.write("\n\n")
+
+
+def emit_outputs(plan: dict, github_output: str) -> None:
+    keys = output_flags(plan)
     lines = [f"{key}={value}" for key, value in keys.items()]
     if github_output:
         with open(github_output, "a", encoding="utf-8") as handle:
@@ -302,6 +333,9 @@ def cmd_scope(args: argparse.Namespace) -> int:
         json.dump(plan, handle, indent=1, sort_keys=True)
         handle.write("\n")
     emit_outputs(plan, args.github_output)
+    summary = os.environ.get("GITHUB_STEP_SUMMARY", "")
+    if summary:
+        write_summary(plan, summary)
     return 0
 
 
@@ -395,14 +429,13 @@ def check_oracle(root: str, scopes: dict, fails: list, notes: list) -> None:
         return
     for name, scope in sorted(scopes.items()):
         for pattern in scope.get("oracle", []):
-            qualified, sep, text = pattern.partition("=")
+            qualified, sep, _ = pattern.partition("=")
             if sep and qualified not in listed:
                 fails.append(f"{name}.md: oracle pattern {pattern} names {qualified}, "
                              "which has no enabled test list")
                 continue
             serving = [pin for pin, names in listed.items()
-                       if (not sep or pin == qualified)
-                       and any(text.lower() in n.lower() for n in names)]
+                       if any(matches(pin, name, [pattern]) for name in names)]
             if not serving:
                 fails.append(f"{name}.md: oracle pattern {pattern} matches no test in "
                              "any enabled suite")
@@ -443,7 +476,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         print(f"check-ci-scope: {len(fails)} problem(s)", file=sys.stderr)
         return 1
     print(f"check-ci-scope: {len(pages(root))} scope block(s) agree with the tree, "
-          f"{len(query_plan(root)['rows'])} row(s) in the wide plan")
+          f"{len(ops_rows(root, None))} row(s) in the wide plan")
     return 0
 
 
@@ -512,14 +545,30 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     wide = build_plan(root, ["crates/ferrox-app/src/proxy.rs"])
     untouched = [pin["name"] for pin in pins(root)
                  if pin.get("test_enabled") == "true" and pin.get("suite")]
+    flags = output_flags(wide)
     ok = wide["scenarios"] == [] and wide["go_packages"] == WIDE_GO \
         and len(wide["rows"]) == wide["ops_all"] \
         and sorted(wide["suites"]) == sorted(untouched) \
         and all(wide["suites"][pin["name"]] == pin["suite"]
-                for pin in pins(root) if pin["name"] in wide["suites"])
+                for pin in pins(root) if pin["name"] in wide["suites"]) \
+        and all(v == "true" for k, v in flags.items()
+                if k in ("rust", "matrix", "suites", "go", "ops"))
     failed += 0 if ok else 1
     print(f"selftest: {'ok  ' if ok else 'FAIL'} a wide plan is the whole list "
           f"({len(wide['rows'])} row(s), suites {sorted(wide['suites'])})")
+    # A job gated on `rust` must still run for the scheduled `--wide` plan, which
+    # has an empty change list and so never sees a .rs path at all.
+    scheduled = output_flags(build_plan(root, []))
+    ok = scheduled["wide"] == "true" and scheduled["rust"] == "true"
+    failed += 0 if ok else 1
+    print(f"selftest: {'ok  ' if ok else 'FAIL'} --wide still owes the build "
+          f"and its tests (rust={scheduled['rust']})")
+    prose = output_flags(build_plan(root, ["docs/function/vmess.md"]))
+    ok = prose["rust"] == "false" and prose["matrix"] == "true" \
+        and prose["ops_rows"] == "2" and prose["go"] == "true"
+    failed += 0 if ok else 1
+    print(f"selftest: {'ok  ' if ok else 'FAIL'} a page edit owes the comparisons "
+          f"but not the compiler (rust={prose['rust']}, cells={prose['cells']})")
     return 1 if failed else 0
 
 
