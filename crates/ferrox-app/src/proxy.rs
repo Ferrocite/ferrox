@@ -44,18 +44,27 @@ pub(crate) fn print_foxy_edges(path: &str) {
     }
 }
 
-pub(crate) fn serve_file(path: &str) -> ! {
-    let text = std::fs::read_to_string(path)
-        .unwrap_or_else(|error| exit(&format!("cannot read {path}: {error}")));
-    let root = crate::json::parse(&text)
-        .unwrap_or_else(|error| exit(&format!("bad config {path}: {error}")));
+pub(crate) fn serve_json(label: &str, text: &str) -> ! {
+    let root = crate::json::parse(text)
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    serve_root(label, &root)
+}
+
+/// Xray's own wire form; the pinned scenario suite spawns this binary with `-config=stdin: -format=pb`.
+pub(crate) fn serve_protobuf(label: &str, bytes: &[u8]) -> ! {
+    let root = crate::xray_pb::to_json(bytes)
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    serve_root(label, &root)
+}
+
+fn serve_root(label: &str, root: &Json) -> ! {
     // Armed before the first inbound opens, so every flow from here reads the budget the operator named.
     crate::budgets::apply(
-        &crate::config::budgets(&root)
-            .unwrap_or_else(|error| exit(&format!("bad config {path}: {error}"))),
+        &crate::config::budgets(root)
+            .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}"))),
     );
-    let freedom = has_protocol(&root, "outbounds", "freedom");
-    let outbound = find_outbound(&root);
+    let freedom = has_protocol(root, "outbounds", "freedom");
+    let outbound = find_outbound(root);
     let mut inbounds = 0;
     let mut hysteria_served = false;
     if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
@@ -72,13 +81,13 @@ pub(crate) fn serve_file(path: &str) -> ! {
             if !inbound_served(protocol) {
                 // Named rather than dropped in silence: a device inbound is one this binary cannot open.
                 eprintln!(
-                    "unsupported inbound protocol `{protocol}` in {path}: refused, not served"
+                    "unsupported inbound protocol `{protocol}` in {label}: refused, not served"
                 );
                 continue;
             }
             match protocol {
                 "vless" => {
-                    if serve_vless_inbound(&address, inbound, freedom, path) {
+                    if serve_vless_inbound(&address, inbound, freedom, label) {
                         inbounds += 1;
                     }
                 }
@@ -95,7 +104,7 @@ pub(crate) fn serve_file(path: &str) -> ! {
                     inbounds += 1;
                 }
                 "hysteria" => {
-                    if serve_hysteria_inbound(&address, inbound, freedom, path) {
+                    if serve_hysteria_inbound(&address, inbound, freedom, label) {
                         inbounds += 1;
                         hysteria_served = true;
                     }
@@ -124,12 +133,12 @@ pub(crate) fn serve_file(path: &str) -> ! {
                     thread::spawn(move || accept_loop(&address, &role));
                     inbounds += 1;
                 }
-                _ => eprintln!("unsupported inbound protocol `{protocol}` in {path}"),
+                _ => eprintln!("unsupported inbound protocol `{protocol}` in {label}"),
             }
         }
     }
     if inbounds == 0 {
-        exit(&format!("no servable inbound in {path}"));
+        exit(&format!("no servable inbound in {label}"));
     }
     if hysteria_served {
         // The readiness token the pinned interop harness scans the server log for; not this binary's name.
@@ -5543,7 +5552,7 @@ fn http_proxy_request(head: &[u8]) -> Option<ProxyRequest> {
     let target = parts.next()?;
     let version = parts.next().unwrap_or(b"HTTP/1.1");
     if method.eq_ignore_ascii_case(b"CONNECT") {
-        return authority_target(target).map(ProxyRequest::Connect);
+        return authority_target(connect_authority(target)).map(ProxyRequest::Connect);
     }
     if method.eq_ignore_ascii_case(b"OPTIONS")
         || method.eq_ignore_ascii_case(b"TRACE")
@@ -5571,6 +5580,20 @@ fn http_proxy_request(head: &[u8]) -> Option<ProxyRequest> {
         ));
     }
     None
+}
+
+/// A CONNECT target is the authority form; Go's transport also sends the
+/// absolute form (`Connect http://host:port/`) when the method is CONNECT and
+/// the destination is plain.
+fn connect_authority(target: &[u8]) -> &[u8] {
+    let rest = [b"http://".as_slice(), b"https://".as_slice()]
+        .into_iter()
+        .find_map(|scheme| target.strip_prefix(scheme))
+        .unwrap_or(target);
+    match rest.iter().position(|byte| *byte == b'/') {
+        Some(at) => &rest[..at],
+        None => rest,
+    }
 }
 
 /// Rewrites the request line to origin-form, keeping every header byte as sent.
@@ -17745,6 +17768,11 @@ mod tests {
             panic!("connect parses");
         };
         assert_eq!(asked.authority(), "example.com:443");
+        let golang = b"Connect http://127.0.0.1:8080/ HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n";
+        let Some(ProxyRequest::Connect(asked)) = http_proxy_request(golang) else {
+            panic!("Go's absolute-form connect parses");
+        };
+        assert_eq!(asked.authority(), "127.0.0.1:8080");
         let absolute =
             b"GET http://example.com:8080/p?q=1 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n";
         let Some(ProxyRequest::Forward(asked, origin)) = http_proxy_request(absolute) else {

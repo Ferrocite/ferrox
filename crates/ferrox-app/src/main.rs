@@ -21,9 +21,11 @@ mod vmess;
 mod ws;
 mod xhttp;
 mod xhttp_h2;
+mod xray_pb;
 
 use ferrox_core::policy::UnsafeOptIn;
 use ferrox_core::transport::Support;
+use std::io::Read as _;
 use std::io::Write as _;
 use std::time::Duration;
 
@@ -34,6 +36,7 @@ fn usage() -> ! {
     eprintln!("  ferrox-app version                print the serving binary's version");
     eprintln!("  ferrox-app x25519                 print a fresh X25519 keypair");
     eprintln!("  ferrox-app run -c <config.json>   serve inbounds until killed");
+    eprintln!("  ferrox-app -config=<file|stdin:> [-format=json|pb]   same, xray's own invocation");
     eprintln!("  ferrox-app mint-foxy-pass -c <config.json> -o <pass.json>");
     eprintln!("                                sign in once, store the proxy pass (0600)");
     std::process::exit(2);
@@ -144,15 +147,11 @@ fn main() {
             cmd_check(&link, opt_in);
         }
         "run" => {
-            let first = args.next().unwrap_or_else(|| usage());
-            if first == "-c" || first == "-config" {
-                let file = args.next().unwrap_or_else(|| usage());
-                if args.next().is_some() {
-                    usage();
-                }
-                proxy::serve_file(&file);
+            let rest: Vec<String> = args.collect();
+            if rest.first().is_some_and(|arg| is_serve_flag(arg)) {
+                serve_from_flags(&rest);
             }
-            let mut iter = std::iter::once(first).chain(args);
+            let mut iter = rest.into_iter();
             let (link, opt_in) = link_and_opt_in(&mut iter);
             cmd_run(&link, opt_in);
         }
@@ -195,7 +194,128 @@ fn main() {
             }
             proxy::print_x25519();
         }
+        _ if is_serve_flag(&cmd) => {
+            let rest: Vec<String> = std::iter::once(cmd).chain(args).collect();
+            serve_from_flags(&rest);
+        }
         _ => usage(),
+    }
+}
+
+/// A flag xray itself takes for a config; `run <link> --allow-unsafe-fp` is link mode.
+fn is_serve_flag(arg: &str) -> bool {
+    matches!(
+        arg.split('=').next().unwrap_or(arg),
+        "-c" | "-config" | "-confdir" | "-format" | "-test" | "-dump"
+    )
+}
+
+/// xray's own invocation (`-config=stdin: -format=pb`) and the `run -c <file>`
+/// spelling this tree shipped first; one config per process either way.
+fn serve_from_flags(args: &[String]) -> ! {
+    let mut configs: Vec<String> = Vec::new();
+    let mut format: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) => (flag, Some(value.to_owned())),
+            None => (arg.as_str(), None),
+        };
+        match flag {
+            "-c" | "-config" | "-format" => {
+                let value = if let Some(value) = inline {
+                    value
+                } else {
+                    i += 1;
+                    args.get(i).cloned().unwrap_or_else(|| usage())
+                };
+                if flag == "-format" {
+                    format = Some(value);
+                } else {
+                    configs.push(value);
+                }
+            }
+            "-confdir" => {
+                eprintln!("ferrox-app: -confdir needs README row 123 (multi-file config layering); refused");
+                std::process::exit(1);
+            }
+            "-test" | "-dump" => {
+                eprintln!("ferrox-app: {flag} is not carried; this binary serves");
+                std::process::exit(1);
+            }
+            _ => usage(),
+        }
+        i += 1;
+    }
+    if configs.len() > 1 {
+        eprintln!(
+            "ferrox-app: {} -config files need README row 123 (multi-file config layering); refused",
+            configs.len()
+        );
+        std::process::exit(1);
+    }
+    let Some(source) = configs.pop() else { usage() };
+    let format = source_format(format.as_deref(), &source);
+    if source == "stdin" || source == "stdin:" {
+        let mut bytes = Vec::new();
+        if let Err(error) = std::io::stdin().read_to_end(&mut bytes) {
+            eprintln!("ferrox-app: cannot read stdin: {error}");
+            std::process::exit(1);
+        }
+        serve_source("stdin:", &bytes, format);
+    }
+    let bytes = std::fs::read(&source).unwrap_or_else(|error| {
+        eprintln!("cannot read {source}: {error}");
+        std::process::exit(1);
+    });
+    serve_source(&source, &bytes, format)
+}
+
+#[derive(Clone, Copy)]
+enum SourceFormat {
+    Json,
+    Protobuf,
+}
+
+/// xray infers the format from the extension when `-format` is absent; a stream
+/// has none, and JSON is this tree's own dialect.
+fn source_format(named: Option<&str>, source: &str) -> SourceFormat {
+    match named.map(str::to_ascii_lowercase).as_deref() {
+        Some("pb" | "protobuf") => SourceFormat::Protobuf,
+        Some("json" | "jsonc") => SourceFormat::Json,
+        Some("auto") | None => {
+            let extension = std::path::Path::new(source)
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .unwrap_or_default();
+            if extension.eq_ignore_ascii_case("pb") || extension.eq_ignore_ascii_case("protobuf") {
+                SourceFormat::Protobuf
+            } else {
+                SourceFormat::Json
+            }
+        }
+        Some(other @ ("toml" | "yaml" | "yml")) => {
+            eprintln!("ferrox-app: config format `{other}` is not carried; json and protobuf are");
+            std::process::exit(1);
+        }
+        Some(other) => {
+            eprintln!("ferrox-app: unknown config format `{other}`");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn serve_source(label: &str, bytes: &[u8], format: SourceFormat) -> ! {
+    match format {
+        SourceFormat::Protobuf => proxy::serve_protobuf(label, bytes),
+        SourceFormat::Json => {
+            let text = std::str::from_utf8(bytes).unwrap_or_else(|error| {
+                eprintln!("bad config {label}: {error}");
+                std::process::exit(1);
+            });
+            proxy::serve_json(label, text)
+        }
     }
 }
 
