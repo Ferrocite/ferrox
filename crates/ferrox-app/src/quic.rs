@@ -200,8 +200,23 @@ fn base64_decode(text: &[u8], out: &mut Vec<u8>) -> bool {
     slots == 0
 }
 
+/// The exact byte length `der_to_pem` writes: two header lines of `11 + label + 6` and `9 + label + 6`, plus one base64 line per 48 input bytes (64 chars full, `4 · ⌈rem/3⌉` partial) and its newline.
+fn pem_capacity(der_len: usize, label_len: usize) -> usize {
+    let full = der_len / 48;
+    let rem = der_len % 48;
+    let lines = full + usize::from(rem != 0);
+    (11 + label_len + 6) + (full * 64 + rem.div_ceil(3) * 4) + lines + (9 + label_len + 6)
+}
+
 pub(crate) fn der_to_pem(der: &[u8], label: &str) -> Vec<u8> {
-    let mut pem = Vec::new();
+    let mut pem = Vec::with_capacity(pem_capacity(der.len(), label.len()));
+    append_pem(&mut pem, der, label);
+    pem
+}
+
+/// Append one PEM block into a buffer the caller has reserved for `pem_capacity`, so the fill is memcpy into live capacity — no reallocation moves the bytes already there.
+fn append_pem(pem: &mut Vec<u8>, der: &[u8], label: &str) {
+    pem.reserve(pem_capacity(der.len(), label.len()));
     pem.extend_from_slice(b"-----BEGIN ");
     pem.extend_from_slice(label.as_bytes());
     pem.extend_from_slice(b"-----\n");
@@ -214,7 +229,6 @@ pub(crate) fn der_to_pem(der: &[u8], label: &str) -> Vec<u8> {
     pem.extend_from_slice(b"-----END ");
     pem.extend_from_slice(label.as_bytes());
     pem.extend_from_slice(b"-----\n");
-    pem
 }
 
 pub(crate) fn parse_ca_pem(pem: &[u8]) -> Vec<Vec<u8>> {
@@ -289,9 +303,15 @@ pub(crate) fn serve_config(identity: &ferrox_core::tls::TlsServerConfig) -> Opti
         ferrox_core::tls::ServerKeyKind::Sec1 => "EC PRIVATE KEY",
         ferrox_core::tls::ServerKeyKind::Pkcs1 => "RSA PRIVATE KEY",
     };
-    let mut chain = Vec::new();
+    let mut chain = Vec::with_capacity(
+        identity
+            .cert_chain
+            .iter()
+            .map(|der| pem_capacity(der.len(), "CERTIFICATE".len()))
+            .sum(),
+    );
     for der in &identity.cert_chain {
-        chain.extend_from_slice(&der_to_pem(der, "CERTIFICATE"));
+        append_pem(&mut chain, der, "CERTIFICATE");
     }
     let key = der_to_pem(&identity.key_der, label);
     let (cert_path, cert_text) = stage_trust_file(&chain)?;
@@ -309,9 +329,14 @@ pub(crate) fn quiche_config(roots: &[Vec<u8>], cc: Option<&str>) -> Option<quich
     if roots.is_empty() {
         return None;
     }
-    let mut bundle = Vec::new();
+    let mut bundle = Vec::with_capacity(
+        roots
+            .iter()
+            .map(|der| pem_capacity(der.len(), "CERTIFICATE".len()))
+            .sum(),
+    );
     for root in roots {
-        bundle.extend_from_slice(&der_to_pem(root, "CERTIFICATE"));
+        append_pem(&mut bundle, root, "CERTIFICATE");
     }
     let (path, path_text) = stage_trust_file(&bundle)?;
     let config = quiche::Config::new(quiche::PROTOCOL_VERSION)
@@ -1692,6 +1717,53 @@ mod tests {
             assert_eq!(line.len(), 64);
         }
         assert_eq!(parse_ca_pem(&pem), vec![vec![0xabu8; 48]]);
+    }
+
+    /// The allocation claim, gated: a PEM buffer reserved to `pem_capacity` lands at exactly its length, so filling it never reallocates and copies what was already written.
+    #[test]
+    fn a_pem_buffer_is_reserved_to_its_exact_length() {
+        for len in [0usize, 1, 2, 3, 46, 47, 48, 49, 96, 97, 143, 300] {
+            let pem = der_to_pem(&vec![0x5au8; len], "CERTIFICATE");
+            assert_eq!(
+                pem.len(),
+                pem.capacity(),
+                "len {len}: a slack capacity means a reallocation copied the prefix"
+            );
+        }
+    }
+
+    /// Pointer identity witnesses the removed double buffer: appending a second block into a buffer reserved for both leaves the first block's address unmoved, and the bytes are the concatenation the old `extend_from_slice(&der_to_pem(..))` produced.
+    #[test]
+    fn appending_into_a_reserved_buffer_does_not_move_it() {
+        let first = der_to_pem(&[7u8; 30], "CERTIFICATE");
+        let second = der_to_pem(&[9u8; 50], "CERTIFICATE");
+        let mut chain = Vec::with_capacity(first.len() + second.len());
+        append_pem(&mut chain, &[7u8; 30], "CERTIFICATE");
+        let base = chain.as_ptr();
+        append_pem(&mut chain, &[9u8; 50], "CERTIFICATE");
+        assert_eq!(
+            base,
+            chain.as_ptr(),
+            "the second append reallocated away the first — a copy the reservation was meant to avoid"
+        );
+        let mut want = first;
+        want.extend_from_slice(&second);
+        assert_eq!(
+            chain, want,
+            "the appended bytes match the old double-buffer output"
+        );
+    }
+
+    /// Bit-identity across the wrap and pad boundaries: the reservation changed where bytes land, never which bytes.
+    #[test]
+    fn pem_survives_the_pad_and_wrap_boundaries() {
+        for len in [1usize, 2, 3, 4, 46, 47, 48, 49, 50, 51, 95, 96, 97] {
+            let der: Vec<u8> = (0..len)
+                .map(|i| u8::try_from(i).expect("len < 256"))
+                .collect();
+            let pem = der_to_pem(&der, "CERTIFICATE");
+            assert_eq!(parse_ca_pem(&pem), vec![der], "len {len}");
+        }
     }
 
     #[test]
