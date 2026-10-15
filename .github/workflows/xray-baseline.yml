@@ -64,6 +64,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: stable
+      # A pin's rev is immutable, so its modules and compiled packages are cacheable by the pin file.
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: xray-go-${{ runner.os }}-${{ hashFiles('upstream/pins.toml') }}
       - name: plan the scope, so the package list is read from the same plan
         shell: bash
         env:

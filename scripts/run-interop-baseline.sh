@@ -79,7 +79,12 @@ for name in zeronet xray-rust; do
     exit 1
   fi
   dir="$(mktemp -d)"
-  if ! git clone --quiet --no-checkout "$repo" "$dir" 2>/dev/null || ! git -C "$dir" checkout --quiet "$rev" 2>/dev/null; then
+  # One commit, the pinned one: the suite reads the tree, never its history, and a
+  # full clone of the reference costs a minute the pin cannot pay back.
+  if ! git init --quiet "$dir" >/dev/null 2>&1 \
+    || ! git -C "$dir" remote add origin "$repo" >/dev/null 2>&1 \
+    || ! git -C "$dir" fetch --quiet --no-tags --depth 1 origin "$rev" >/dev/null 2>&1 \
+    || ! git -C "$dir" checkout --quiet FETCH_HEAD 2>/dev/null; then
     echo "::error::$name rev $rev does not resolve on $repo"
     rm -rf "$dir"
     exit 1
@@ -97,7 +102,10 @@ for name in zeronet xray-rust; do
   log="$PWD/$out_dir/$name.log"
   echo "baseline: $name @ ${rev:0:7}, every test its suite has (the plan reached it) against $workspace/target/debug/$binary via $seam"
   # A pin's `baseline_env` names hooks its harness reads to say what it was waiting on; without them a hang is only a timeout.
-  run_env=("$seam=$workspace/target/debug/$binary")
+  # A pin's rev is immutable, so its build is worth keeping: a pin bump is a new directory.
+  build_dir="$HOME/.cache/ferrox-upstream/$name-${rev:0:12}"
+  mkdir -p "$build_dir"
+  run_env=("CARGO_TARGET_DIR=$build_dir" "$seam=$workspace/target/debug/$binary")
   if [[ "$diag" != "-" ]]; then
     read -r -a diag_args <<<"$diag"
     run_env+=("${diag_args[@]}")
