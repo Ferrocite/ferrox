@@ -122,12 +122,23 @@ jobs:
       - name: run the full suite
         id: test
         shell: bash
+        timeout-minutes: 45
         env:
           # Stage tracing for the loopback echo family: captured per test and
           # printed only on failure, so the next scheduler stall names where
           # it stopped (P47) at zero cost to a green run.
           FERROX_ECHO_TRACE: 1
-        run: cargo test --workspace --locked
+        run: |
+          ./scripts/watch-test.sh --out "target/ci/test-${{ matrix.os }}.log" -- \
+            cargo test --workspace --locked 2>&1 | tee -a "$GITHUB_STEP_SUMMARY"
+      - name: publish the log the stall was cut from
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ matrix.os }}
+          path: target/ci/*.log
+          retention-days: 14
+          if-no-files-found: error
       - name: publish the verdict
         if: always()
         shell: bash
