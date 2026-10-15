@@ -250,7 +250,8 @@ while read -r id traffic connections iterations payload; do
     } >>"$out/commands.sh"
     continue
   fi
-  if "$bench_bin" "${engine_args[@]}" \
+  # `panic = "abort"` turns a panic into a bare `exit 134`; the backtrace names the frame the fault left behind.
+  if RUST_BACKTRACE=full "$bench_bin" "${engine_args[@]}" \
     --traffic "$traffic" --connections "$connections" \
     --iterations "$iterations" --payload-size "$payload" \
     --repeats "$repeats" \
@@ -260,8 +261,17 @@ while read -r id traffic connections iterations payload; do
     --json-report "$celldir/cell.json" >>"$celldir/stdout.log" 2>&1; then
     cells_run=$((cells_run + 1))
   else
-    cells_failed+=("$id (exit $?)")
+    code=$?
+    cells_failed+=("$id (exit $code)")
     status=1
+    # A failed cell's bench output and engine stderr are files the job never reads; echo the panic back into the log.
+    {
+      echo "=== $id failed (exit $code): $celldir/stdout.log (last 40 lines) ==="
+      tail -n 40 "$celldir/stdout.log" 2>/dev/null || true
+      echo "=== $id: panic frames in engine stderr ==="
+      grep -rhE "panicked at|panic:|memory allocation|index out of bounds|attempt to .* zero|stack overflow" \
+        "$celldir/runs" 2>/dev/null | sort -u | head -20 || true
+    } >&2
   fi
   {
     echo "# $id: $traffic $connections flows, $iterations x $payload B, $repeats repeats"
