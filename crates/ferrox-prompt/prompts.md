@@ -296,6 +296,8 @@ Compare where {references} place the layer for {method} — matrix row {index} o
 Take one engine-adjacent surface {references} carry that this tree names but cannot drive — the account plane, the upstream-proxy chain, or a TUN/VPN mode — and give it a working seam: wire it to a config path or a test entry point, name the reference it matches, and prove one round-trip in CI. If it genuinely cannot be reached from this tree's shape, say why plainly in the place a reader would expect the capability rather than leaving it silently half-described.
 ```
 
+**Add-on — server-engine-surface:** The 2026-10-14 ZeroNet pin added server surfaces this tree cannot drive — reverse bridge/portal (`zero-runtime/src/reverse.rs`), PROXY-protocol parsing on an accept (`zero-protocol/src/proxy_protocol.rs`), the WireGuard inbound (`wg_server.rs`), transparent `SO_ORIGINAL_DST`/TPROXY dials (`zero-net/src/transparent.rs`). README table L rows 116–123 and `docs/method-superset.md` name each with its reference paths; take them one row per slice, seam first.
+
 ## P16 · Deep-optimization hunt: beat every reference, or prove the floor
 
 **When to use:** The open-ended, high-effort pass on a shipped method — not the one clean win, but the hunt for an order-of-magnitude one, assuming the current implementation and every reference still leave the breakthrough undiscovered.
@@ -360,3 +362,41 @@ Prove the decision, not the intent: a test that drives each failure kind and ass
 
 **Add-on — bounded-cost:** Name the worst case of the probe or retry — rounds, bytes, latency — and cap it, so recovery cannot become a stall.
 **Add-on — one-owner:** One component decides and one acts; a policy consulted in two places diverges, so fold the second into the first.
+
+## P19 · Make a stall name itself from inside the engine
+
+**When to use:** A hang is only visible from outside — `watch-test.sh` reads procfs wchan on Linux runners and nothing elsewhere, and a thread parked in the engine carries no name of its own — so a stall in the field, on macOS, or on Windows reports a pid, not a wait.
+**Status:** todo
+**Leverage:** 5
+**Effort:** medium
+**Targets:** implemented
+**Gates:** `./scripts/check.sh`; `cargo test --workspace --all-features`; CI: `safety.yml`; CI: `ops.yml`
+**Random weight:** 7
+
+```text
+{method} — matrix row {index} of table {section} — parks a thread in waits the engine knows about by name but the running process cannot say: every cadence lives in `crates/ferrox-app/src/budgets.rs`, yet nothing at runtime reports which named wait holds which thread on which fd for how long. Give the engine its own wchan: a census next to `budgets.rs` where a wait registers its name, the fd it blocks on and the deadline it armed, deregisters on return, and dumps as per-thread lines on demand — from a test, a signal, or the CI harness.
+
+Gate the census on a build shape with no production traffic, the way `count-ops.sh` gates its binary: the hot relay path must not pay for a map a stall hunt reads once. Prove the census by parking a wait on an in-memory stream that answers nothing and asserting the dump names that wait, its fd and a waited-for duration — a test that only compiles the dump sees the API, not the thing it claims. The engine's waits are the table; a row of that table with no census entry is the finding, and the census earns its keep the first time a P17 or P13 slice is written from a dump line naming the wait rather than from a post-mortem.
+
+Report the per-wait cost the census adds where it is reachable, or state that the gated shape makes it zero and name the gate that proves it.
+```
+
+**Add-on — stall-to-name:** Extend `watch-test.sh`: before it kills a stalled test binary it sends the stop and re-reads the log once, and the workspace test harness answers that stop by dumping the census. A stall then prints the engine's wait names beside the procfs lines, on every OS — procfs sees the kernel, only the census sees the engine.
+
+**Add-on — starved-leg:** A dump showing one leg of a relay in `read` and its partner in nothing is a join that outlived its bound; check it against `RELAY_JOIN` and the leg-witness tests before naming it a peer problem.
+
+## P20 · Scale the parameter surface without growing the app file
+
+**When to use:** A knob a reference ships is either unreachable from this tree's config or is plumbed ad-hoc through the app monolith, so adding the next one costs more of the same accretion rather than a section; the superset rows (README table L 116–123) all land through this shape.
+**Status:** todo
+**Leverage:** 4
+**Effort:** large
+**Targets:** implemented
+**Gates:** `./scripts/check.sh`; `cargo test --workspace --all-features`; CI: `conformance.yml`
+**Random weight:** 6
+
+```text
+{method} — matrix row {index} of table {section} — gains its user-settable parameters by carving, not by accretion: move the knob group named in its superset row into the section-owned config type that `crates/ferrox-app/src/config.rs` already shapes per plane, give the app one reader of it, and keep the defaults byte-for-byte what the constants in `budgets.rs` say today, so every blessed count holds across the move and `scripts/count-ops.sh` is the witness that the carve moved no work. A runtime-settable cadence is a count change: the page states the new worst case of a wait the peer can tune, and a knob whose default differs from the constant is refused until the matrix and pages say so.
+
+Prove the surface, not the struct: a config-named test per knob that asserts the engine acts on the value it names — a bound that stops a parked wait, a header that appears on the wire, a byte rate the gauge enforces — beside the parse round-trip. A parsed field no component reads is the defect P18 exists to own; check the knob has its actor before calling the row shipped, and record in the superset matrix the row that moved from planned to implemented only when the actor exists.
+```
