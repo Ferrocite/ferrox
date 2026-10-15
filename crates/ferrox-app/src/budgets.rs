@@ -17,6 +17,9 @@ pub(crate) const SESSION_POLL: Duration = Duration::from_millis(1);
 
 pub(crate) const RELAY_HANDOFF_SPINS: u32 = 64;
 
+/// One leg's wait for its partner after the flow has ended: a partner still missing past the relay's own idle bound is starved rather than draining, and a thread that waits forever turns one stalled peer into a pile-up of held sessions.
+pub(crate) const RELAY_JOIN: Duration = Duration::from_secs(120);
+
 pub(crate) const RELAY_LOCK_TRIES: u32 = 64;
 
 /// A head's arrival budget: without one a quiet peer keeps a task waking once per poll, burning a core.
