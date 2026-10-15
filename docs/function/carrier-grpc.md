@@ -151,6 +151,7 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/grpc.rs, crates/ferrox-app/src/h2.rs
+- symbols: grpc, h2
 - scenarios: vless-grpc
 - oracle: grpc
 - go: ./transport/internet/grpc/...
