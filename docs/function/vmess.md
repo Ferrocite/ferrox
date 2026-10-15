@@ -168,6 +168,22 @@ frame — apply to every 8 KiB VMess frame on the AVX2 and NEON-4 paths.
   branch (run 38667435571): **1 850 → 1 291 ms/GiB of system CPU**, user CPU left
   where it was (788 → 790), which is what makes this a kernel-side removal rather
   than a relocation into user space.
+- **Three more writes, and three more reads, per relayed batch.** The same lever,
+  taken to the width the reference already caps itself at: `FRAMES_PER_WRITE` 4 → 16,
+  xray's `one frame, then up to fifteen more from what the buffer holds`. The batch
+  still never waits — only the first frame blocks — so the width buys syscalls and
+  costs buffer, nothing else. Measured on `vmess-raw-down-8` (run 38804662396,
+  ubuntu-latest, 5 medians) against the 4-frame shape's own cell (run 38802326890,
+  same runner and reader): **system CPU 1 301 → 1 098 ms/GiB**, which is under
+  xray-core's 1 171 for the first time on this cell, and **user CPU 781 → 635**, so
+  total CPU **2 083 → 1 737** and the gating rows move with it — `cpu per GiB`
+  1.172x → **1.403x**, throughput 1.208x → **1.459x**. What that buys in RAM is
+  named rather than hidden: `WIRE_LEN` 41 365 → 140 641 B per pump and `READ_PLAIN`
+  32 → 128 KiB per relay read, so peak RSS goes **8.67 → 11.4 MiB (+32 %)** and the
+  RSS row's lead over the reference narrows from 7.31x to 5.43x; thread count is
+  unmoved at 35. What is *not* removed is the gather: the batch still leaves as one
+  buffer's front bytes, one copy per byte, because the four-`iovec` shape that
+  avoided it lost more on the kernel than it gained in user space.
 - **A second copy on read.** Xray's large-chunk read path
   (`common/crypto/auth.go:188-203`) allocates a pooled buffer, reads into it,
   opens in place, and then calls `buf.MergeBytes`, which is a second copy plus a
