@@ -3,7 +3,7 @@
 Pinned reference: `upstream/xray-core` @ `c77a4d0e` (`upstream/pins.toml`).
 This tree: `crates/ferrox-core`, `crates/ferrox-app`, `docs/function/`.
 
-What runs against what: `xray-rust`'s interop tests drive the pinned Xray client into `ferrox-app` (23 tests, seam `XRAY_VLESS_FULL_BINARY`); `zeronet`'s `xray_oracle` replays its differential checks against a binary injected as Xray (9 tests, seam `ZRAY_XRAY_BINARY`); `xray-core`'s own suite runs only against itself (`xray-baseline.yml`) — its unit tests are in-process, and `testing/scenarios` builds `github.com/xtls/xray-core/main` at run time and spawns it with `-config=stdin: -format=pb` (`testing/scenarios/common_regular.go`), so that subtree turns into a Ferrox check once `ferrox-app` reads the protobuf config.
+What runs against what: `xray-rust`'s interop tests drive the pinned Xray client into `ferrox-app` (23 tests, seam `XRAY_VLESS_FULL_BINARY`); `zeronet`'s `xray_oracle` replays its differential checks against a binary injected as Xray (9 tests, seam `ZRAY_XRAY_BINARY`); `xray-core`'s `testing/scenarios` builds `github.com/xtls/xray-core/main` at run time and spawns it with `-config=stdin: -format=pb` (`testing/scenarios/common_regular.go`), and that build is the seam `scripts/xray-scenarios.sh` answers with `go -overlay`: four http tests run unmodified against `ferrox-app`, which reads that wire form in `crates/ferrox-app/src/xray_pb.rs`. Its unit tests are in-process with no seam and stay in `xray-baseline.yml`.
 
 ## What ferrox has that xray-core does not
 
@@ -69,7 +69,7 @@ What runs against what: `xray-rust`'s interop tests drive the pinned Xray client
 | `app/commander` gRPC API (config/inbound/outbound/log/router/stats) | absent |
 | Geodata (.dat) loader/downloader | absent |
 | Sniffer (HTTP/TLS/QUIC/bittorrent) + dispatcher sniffer | absent |
-| Config schema for every protocol (`infra/conf`) | ferrox-app has its own smaller JSON config |
+| Config schema for every protocol (`infra/conf`) | ferrox-app's own JSON dialect; the protobuf `xray.core.Config` only for the shape the http scenarios write (`xray_pb.rs`: http inbound, freedom outbound, receiver port/listen, apps skipped) — every other field is refused by number or by name |
 | OCSP, antireplay, time-window caches | absent |
 | Freedom fragment, VLESS encryption fragment | refused |
 | finalmask: fragment, header/custom, noise, realm (STUN hole-punch, portmap), salamander, sudoku, udphop, xdns, xicmp, xmc | refused (row 31) |

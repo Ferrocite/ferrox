@@ -72,13 +72,20 @@ for shape in zero-full:refuse some-full:accept zero-filtered:accept; do
   fi
 done
 
+# A pin whose suite builds the reference itself names a harness; the harness
+# carries its own fixture, so a broken shim is caught before any clone.
+if ! bash scripts/xray-scenarios.sh --selftest; then
+  echo "::error::self-test: the scenario harness answered its own selftest red"
+  status=1
+fi
+
 parse_pins() {
   awk '
     function f(v) { return v == "" ? "-" : v }
     /^\[sources\./ {
-      if (name != "") print name "\t" repo "\t" rev "\t" enabled "\t" f(suite) "\t" f(binary) "\t" f(seam) "\t" f(path)
+      if (name != "") print name "\t" repo "\t" rev "\t" enabled "\t" f(suite) "\t" f(binary) "\t" f(seam) "\t" f(path) "\t" f(harness)
       name = $0; sub(/^\[sources\./, "", name); sub(/\]$/, "", name)
-      repo = ""; rev = ""; enabled = ""; suite = ""; binary = ""; seam = ""; path = ""
+      repo = ""; rev = ""; enabled = ""; suite = ""; binary = ""; seam = ""; path = ""; harness = ""
       next
     }
     /^repo[[:space:]]*=/ { repo = $0; sub(/^[^=]*=[[:space:]]*"/, "", repo); sub(/"[[:space:]]*$/, "", repo); next }
@@ -88,16 +95,18 @@ parse_pins() {
     /^ferrox_binary[[:space:]]*=/ { binary = $0; sub(/^[^=]*=[[:space:]]*"/, "", binary); sub(/"[[:space:]]*$/, "", binary); next }
     /^seam[[:space:]]*=/ { seam = $0; sub(/^[^=]*=[[:space:]]*"/, "", seam); sub(/"[[:space:]]*$/, "", seam); next }
     /^path[[:space:]]*=/ { path = $0; sub(/^[^=]*=[[:space:]]*"/, "", path); sub(/"[[:space:]]*$/, "", path); next }
-    END { if (name != "") print name "\t" repo "\t" rev "\t" enabled "\t" f(suite) "\t" f(binary) "\t" f(seam) "\t" f(path) }
+    /^harness[[:space:]]*=/ { harness = $0; sub(/^[^=]*=[[:space:]]*"/, "", harness); sub(/"[[:space:]]*$/, "", harness); next }
+    END { if (name != "") print name "\t" repo "\t" rev "\t" enabled "\t" f(suite) "\t" f(binary) "\t" f(seam) "\t" f(path) "\t" f(harness) }
   ' "$pins_file"
 }
 
 workspace="$PWD"
-while IFS=$'\t' read -r name repo rev enabled suite binary seam path; do
+while IFS=$'\t' read -r name repo rev enabled suite binary seam path harness; do
   [[ "$suite" == "-" ]] && suite=""
   [[ "$binary" == "-" ]] && binary=""
   [[ "$seam" == "-" ]] && seam=""
   [[ "$path" == "-" ]] && path=""
+  [[ "$harness" == "-" ]] && harness=""
   [[ -n "$name" ]] || continue
   if [[ -n "$name_filter" && "$name" != "$name_filter" ]]; then
     continue
@@ -143,7 +152,11 @@ while IFS=$'\t' read -r name repo rev enabled suite binary seam path; do
     continue
   fi
   suite="$scoped"
-  echo "RUNNING: $name @ $rev against Ferrox binary $binary via $seam"
+  via="$seam"
+  if [[ -n "$harness" ]]; then
+    via="$harness (seam: $seam)"
+  fi
+  echo "RUNNING: $name @ $rev against Ferrox binary $binary via $via"
   echo "  suite: $suite"
   if ! cargo build --locked -q -p "$binary" 2>/dev/null; then
     echo "::error::$name: Ferrox binary $binary does not build in this workspace"
@@ -179,14 +192,27 @@ while IFS=$'\t' read -r name repo rev enabled suite binary seam path; do
   build_dir="$HOME/.cache/ferrox-upstream/$name-${rev:0:12}"
   mkdir -p "$build_dir"
   passed=0
-  if (cd "$dir" && env "CARGO_TARGET_DIR=$build_dir" "$seam=$workspace/target/debug/$binary" bash -c "$suite") 2>&1 | tee "$log"; then
+  if [[ -n "$harness" ]]; then
+    if [[ ! -f "$workspace/$harness" ]]; then
+      echo "::error::$name declares harness $harness but the workspace has none"
+      rm -rf "$dir" "$log"
+      status=1
+      continue
+    fi
+    # A suite that builds and spawns the reference itself cannot be pointed at
+    # another binary by a variable: the pin names the harness that rewrites its
+    # build so that the process the suite spawns is Ferrox.
+    if (cd "$dir" && env "CARGO_TARGET_DIR=$build_dir" "FERROX_BINARY=$workspace/target/debug/$binary" bash "$workspace/$harness" "$suite") 2>&1 | tee "$log"; then
+      passed=1
+    fi
+  elif (cd "$dir" && env "CARGO_TARGET_DIR=$build_dir" "$seam=$workspace/target/debug/$binary" bash -c "$suite") 2>&1 | tee "$log"; then
     passed=1
   fi
   if ((passed == 0)); then
     echo "::error::$name suite failed at $rev"
     status=1
   elif libtest_ran_named "$suite" "$log"; then
-    echo "PASS: $name suite green against $binary at $rev (injected via $seam)"
+    echo "PASS: $name suite green against $binary at $rev (injected via $via)"
     ran=$((ran + 1))
   else
     echo "::error::$name suite exited 0 without running what its command names"

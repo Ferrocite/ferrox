@@ -4,10 +4,12 @@ rev           = "c77a4d0e4932a53f3eeafafdfef877b56fd660ad"
 always        = true
 default_branch = "main"
 path          = "common/crypto"
-test_enabled  = false
-suite         = "go test -count=1 -timeout 8m ./proxy/vless/..."
-ferrox_binary = ""
-note          = "Xray-core at this pin. Unit tests are in-process with no seam; testing/scenarios builds main at run time and spawns it as a subprocess (-config=stdin: -format=pb, common_regular.go), so that subtree becomes injectable once ferrox-app reads the protobuf config. Full list runs in xray-baseline.yml"
+test_enabled  = true
+suite         = "go test -count=1 -timeout 20m -run '^(TestHttpConformance|TestHttpError|TestHTTPConnectMethod|TestHttpPost)$' ./testing/scenarios"
+ferrox_binary = "ferrox-app"
+seam          = "BuildXray"
+harness       = "scripts/xray-scenarios.sh"
+note          = "Xray-core at this pin. The unit tests are in-process with no seam; testing/scenarios builds main at run time (BuildXray) and spawns it with -config=stdin: -format=pb (common_regular.go), so scripts/xray-scenarios.sh builds that package with go's -overlay, main.go replaced by a launcher that execs ferrox-app, and the suite spawns that: the four http tests above run against Ferrox. TestHttpBasicAuth stays out because the account map is refused by name, and the vless/vmess/trojan families wait on the protobuf surface naming their inbounds (dokodemo, README row 24, is next). The full list runs in xray-baseline.yml"
 
 [sources.sing-box]
 repo          = "https://github.com/SagerNet/sing-box"
