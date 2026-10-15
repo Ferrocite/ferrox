@@ -10889,6 +10889,8 @@ mod tests {
     fn xhttp_settings(path: &str) -> Box<crate::xhttp::XhttpSettings> {
         Box::new(crate::xhttp::XhttpSettings {
             path: path.to_owned(),
+            // These rows are about what a hub that was *told* a mode refuses; an unstated mode serves every shape its dialer can write.
+            mode_stated: true,
             ..crate::xhttp::XhttpSettings::stream_one()
         })
     }
@@ -10900,6 +10902,7 @@ mod tests {
         Box::new(crate::xhttp::XhttpSettings {
             path: path.to_owned(),
             mode,
+            mode_stated: true,
             ..crate::xhttp::XhttpSettings::stream_one()
         })
     }

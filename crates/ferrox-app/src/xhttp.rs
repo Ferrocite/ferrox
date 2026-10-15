@@ -459,9 +459,15 @@ pub(crate) enum PadMethod {
 }
 
 #[derive(Debug, Clone)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "independent parsed knobs, not a state machine: obfs, sse, grpc-header and a stated-vs-auto mode"
+)]
 pub(crate) struct XhttpSettings {
     pub path: String,
     pub mode: XhttpMode,
+    // The hub narrows shapes only when `mode` was written down; a resolved `auto` is the dialer's default, not a promise about what may arrive.
+    pub mode_stated: bool,
     pub session_placement: Placement,
     pub session_key: String,
     pub seq_placement: Placement,
@@ -487,6 +493,7 @@ impl XhttpSettings {
         Self {
             path: "/".to_owned(),
             mode: XhttpMode::StreamOne,
+            mode_stated: false,
             session_placement: Placement::Path,
             session_key: String::new(),
             seq_placement: Placement::Path,
@@ -538,10 +545,11 @@ impl XhttpSettings {
             .get("mode")
             .and_then(crate::json::Json::as_str)
             .unwrap_or("");
-        out.mode = if raw.is_empty() || raw == "auto" {
-            XhttpMode::auto_mode(settings, xhttp)
-        } else {
+        out.mode_stated = !raw.is_empty() && raw != "auto";
+        out.mode = if out.mode_stated {
             XhttpMode::parse_mode(raw)?
+        } else {
+            XhttpMode::auto_mode(settings, xhttp)
         };
         // Xray's `SplitHTTPConfig.Build` replaces every knob below but host, path and mode with the `extra` block a link carries, which arrives either as an object or as the JSON string the link query holds.
         let extra = xhttp.get("extra");
@@ -1341,7 +1349,9 @@ pub(crate) fn accept_core<
 
     match (sid, seq) {
         (None, None) => {
-            if settings.mode != XhttpMode::StreamOne {
+            if settings.mode_stated
+                && !matches!(settings.mode, XhttpMode::StreamOne | XhttpMode::StreamUp)
+            {
                 emit_400(&mut write);
                 return None;
             }
@@ -2007,6 +2017,159 @@ mod tests {
         assert!(XhttpSettings::from_json(Some(&bad)).is_none());
     }
 
+    /// Where a hub's answer goes when the row is about the status, not the socket.
+    #[derive(Clone)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl Write for Sink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("sink").extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl crate::proxy::FrameWrite for Sink {
+        fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+            let mut seen = self.0.lock().expect("sink");
+            for part in parts {
+                seen.extend_from_slice(part);
+            }
+            true
+        }
+    }
+
+    /// The status a hub answers a head with. `accept_core` writes a refusal and returns `None`, and writes 200 and returns the pair when it serves, so the bytes it wrote answer either way.
+    fn status_through_core(head: &str, settings: &XhttpSettings) -> u16 {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let _ = accept_core(
+            head.as_bytes(),
+            Vec::new(),
+            std::io::Cursor::new(vec![0u8; 1]),
+            Sink(Arc::clone(&seen)),
+            settings,
+            None,
+        );
+        let text = String::from_utf8(seen.lock().expect("sink").clone()).unwrap_or_default();
+        text.split_ascii_whitespace()
+            .nth(1)
+            .and_then(|code| code.parse().ok())
+            .unwrap_or(0)
+    }
+
+    fn settings_from(raw: &str) -> XhttpSettings {
+        let node = crate::json::parse(raw).expect("parses");
+        XhttpSettings::from_json(node.get("streamSettings")).expect("settings")
+    }
+
+    /// A missing or `auto` mode is the dialer's default, not a promise about what may arrive: the reference hub gates a shape only when the mode was written down (`hub.go:154`, `:199`, `:241` all read `Mode != "" && Mode != "auto" && Mode != <shape>`). Our own `xhttp::connect` writes the `stream-one` POST, so a hub resolved from `{"path": "/share"}` refusing it is a hub that answers no dial its own client can make — which is what left `vless-xhttp-down-8` with no flow at any connection count.
+    #[test]
+    fn an_unstated_mode_serves_the_dialers_own_head() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share"}}}"#,
+        );
+        assert_eq!(
+            settings.mode,
+            XhttpMode::PacketUp,
+            "auto resolves the way the reference dialer does"
+        );
+        assert!(
+            !settings.mode_stated,
+            "and nothing was written down to gate with"
+        );
+        let head = format!(
+            "POST /share HTTP/1.1\r\nHost: h\r\nReferer: {}\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n",
+            "http://127.0.0.1/share?x_padding=".to_owned() + &"X".repeat(500)
+        );
+        assert_eq!(
+            status_through_core(&head, &settings),
+            200,
+            "an auto hub refused the head its own dialer writes"
+        );
+    }
+
+    /// The two halves of one process over a socket: `connect` writes the head its own random padding asks for, and the hub built from the same config has to answer it. Before this fix the hub answered `HTTP/1.1 400` to that head at every connection count, which is why `vless-xhttp-down-8` completed no flow.
+    #[test]
+    fn the_dialer_and_its_own_hub_complete_on_loopback() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share"}}}"#,
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let Ok(read) = stream.try_clone() else {
+                return;
+            };
+            let (mut reader, writer) = accept_split_with_settings(read, stream, &settings)
+                .expect("the hub served the dial");
+            let mut buf = [0u8; 4];
+            reader.read_exact(&mut buf).expect("reads the uplink");
+            assert!(writer.send(b"pong"));
+            writer.finish();
+        });
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let (mut reader, writer) =
+            connect(stream, "127.0.0.1", "/share").expect("the dial was answered");
+        assert!(writer.send(b"ping"));
+        let mut buf = [0u8; 4];
+        reader.read_exact(&mut buf).expect("reads the downlink");
+        assert_eq!(&buf, b"pong");
+        server.join().expect("joins");
+    }
+
+    /// The relaxation is only for a mode nobody stated: a `packet-up` hub still refuses a session-less POST, so the knobs demonstrably reach the accept path.
+    #[test]
+    fn a_stated_mode_still_refuses_the_session_less_post() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share", "mode": "packet-up"}}}"#,
+        );
+        assert!(settings.mode_stated);
+        let head = format!(
+            "POST /share HTTP/1.1\r\nHost: h\r\nReferer: {}\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "http://127.0.0.1/share?x_padding=".to_owned() + &"X".repeat(500)
+        );
+        assert_eq!(
+            status_through_core(&head, &settings),
+            400,
+            "a hub told packet-up served a stream-one POST"
+        );
+    }
+
+    /// An auto hub keeps serving the shape it resolved to: the packet it was already answering is still answered, so gating on a stated mode narrowed nothing.
+    #[test]
+    fn an_unstated_mode_still_serves_the_shape_it_resolved_to() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share"}}}"#,
+        );
+        let head = format!(
+            "POST /share/autohub/0 HTTP/1.1\r\nHost: h\r\nReferer: {}\r\nContent-Length: 1\r\n\r\n",
+            "http://127.0.0.1/share?x_padding=".to_owned() + &"X".repeat(500)
+        );
+        assert_eq!(
+            status_through_core(&head, &settings),
+            200,
+            "the packet shape an auto hub resolved to stopped being served"
+        );
+    }
+
+    /// Named, not fixed: the reference hub takes the stream-up shape under `auto` too, and we still answer 400. Accepting it would park the POST thread on `wait_ended` for a session whose upload no H1 carrier ever closes — the open row [`docs/function/carrier-xhttp.md`](../../../docs/function/carrier-xhttp.md) calls the missing carrier-side owner.
+    #[test]
+    fn an_unstated_mode_still_refuses_the_shape_without_a_carrier_owner() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share"}}}"#,
+        );
+        let head = format!(
+            "POST /share/autohub HTTP/1.1\r\nHost: h\r\nReferer: {}\r\nTransfer-Encoding: chunked\r\n\r\n",
+            "http://127.0.0.1/share?x_padding=".to_owned() + &"X".repeat(500)
+        );
+        assert_eq!(
+            status_through_core(&head, &settings),
+            400,
+            "the stream-up shape was accepted with no owner to end its park"
+        );
+    }
+
     /// Both parks — the uplink's `wait_ended` and the downlink's `Read::read` — wait on `session.cv`, and until a carrier owned the session the only thing that ever notified it was a `SessionReader`'s Drop. A client that opened one half and died left the other half's thread parked for the life of the process.
     #[test]
     fn a_carrier_death_lifts_both_parks() {
@@ -2043,25 +2206,6 @@ mod tests {
     /// A refused packet is a lost one — the downlink pops a strict sequence — so the 500 has to end the session it overflowed: leaving it alive parks the reader on a sequence no peer will resend.
     #[test]
     fn a_refused_packet_ends_the_session_it_overflowed() {
-        struct Sink(Arc<Mutex<Vec<u8>>>);
-        impl Write for Sink {
-            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().expect("sink").extend_from_slice(data);
-                Ok(data.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl crate::proxy::FrameWrite for Sink {
-            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
-                let mut seen = self.0.lock().expect("sink");
-                for part in parts {
-                    seen.extend_from_slice(part);
-                }
-                true
-            }
-        }
         let node = crate::json::parse(
             r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {
                 "path": "/up/", "mode": "packet-up"}}}"#,
