@@ -20,7 +20,10 @@ Read has one buffer. A DATA frame's body is read onto the end of the message
 buffer, the envelope and the `Hunk` are parsed where they landed, and the payload
 is delivered out of that buffer at the offset the parser found — so a byte is
 copied twice on the way through: once into user space by the socket read, once
-into the caller's buffer. The cursor skips the protobuf fields this lane does not
+into the caller's buffer. Each body is credited back to the peer as it lands: the
+connection and the stream each get their `WINDOW_UPDATE`, and the two frames —
+eighteen constant header bytes differing only by stream id and the increment —
+leave as one write. The cursor skips the protobuf fields this lane does not
 read without moving them, and the dead prefix is reclaimed before the next body
 is appended, which is what keeps one buffer enough. There is no second buffer to
 stage into and no backlog to join one to.
@@ -50,7 +53,9 @@ graph TD
 | hunk-payload-bytes | 16384 | ferrox-app-grpc::tests::hunks_carry_the_xray_schema_bytes |
 | user-space-copies-per-byte-written | 0 | ferrox-app-grpc::tests::the_uplink_hands_the_payload_to_the_writer_by_pointer |
 | payload-staging-copies-per-byte-read | 0 | ferrox-app-grpc::tests::a_body_never_lands_in_a_second_buffer |
-| message-bytes-moved-per-padded-frame | 11 | ferrox-app-grpc::tests::a_padded_frame_is_the_one_move_the_lane_still_makes |
+| message-bytes-moved-per-padded-frame | 0 | ferrox-app-grpc::tests::a_padded_frame_opens_a_message_without_moving |
+| window-update-writes-per-data-frame | 1 | ferrox-app-grpc::tests::a_credit_grants_both_windows_in_one_write |
+| window-update-frames-per-data-frame | 2 | ferrox-app-grpc::tests::a_credit_grants_both_windows_in_one_write |
 | message-buffer-reallocations-per-same-sized-frame | 0 | ferrox-app-grpc::tests::the_message_buffer_is_reused_not_reallocated |
 <!-- counts:end -->
 
@@ -59,18 +64,27 @@ shape `xtls-vision` uses: it counts the bytes this lane moves for itself, which
 are the only copies a byte test cannot see. It is driven from an in-memory server
 that answers whole frames, over the three shapes a body can arrive in — one
 message per frame, two messages in one frame, one message split over frames. The
-`11` on the padded row is that gate's own message: a 4-byte payload, its 5-byte
-envelope and the `Hunk` tag and length. Neither of those two numbers is a
-duration, and `## Time` says why.
+`0` on the padded row is that gate's own message opened behind a pad byte: the
+parser steps over the byte and the frame's length drops the tail, so nothing
+moves; a second padded test cuts a pad byte into a message the frame before had
+started and shows the counter at `5`, the move that shape still pays. The two
+window rows come from one test: the two `WINDOW_UPDATE` frames a credit grants
+are the peer's bytes exactly as before, and they now leave in a single write.
+None of those numbers is a duration, and `## Time` says why.
 
 ## Ops
 
 ```bash
 ./scripts/count-ops.sh report \
-  grpc::tests::hunks_carry_the_xray_schema_bytes 'grpc::frame_prefix'
+  grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else \
+  grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else
 ```
 
-`UNBLESSED`, as above.
+`UNBLESSED`, as above. The row is a probe, not a fixture test: the two
+per-message math steps — a gRPC envelope assembled and a `Hunk` parsed — over
+buffers the compiler cannot fold, so the frame is the loops and the methods and
+the number is read as the difference between two runs of the same row, never as
+the cost of a method alone.
 
 ## Time
 
@@ -123,19 +137,30 @@ until it is closed.
   `the_uplink_hands_the_payload_to_the_writer_by_pointer` records the base of
   every slice that reaches the frame writer and fails unless one of them *is*
   the caller's buffer, at the payload's full length.
+- **The second write per credit.** A credit is two `WINDOW_UPDATE` frames, one
+  for the connection and one for the stream, and each was built and written on
+  its own. Their eighteen header bytes are constant and only the stream id and
+  the increment differ, so both come out of one 26-byte template in a single
+  write — the same two frames, in the same order, one write syscall fewer per
+  DATA frame. What this leaves alone: `xhttp_h2`'s `replenish` credits the same
+  pair as two frames over two writes, and its page owns that row.
 
 What is **not** removed: HTTP/2's own framing. `T_DATA`, `T_HEADERS` and
 `T_SETTINGS`, HPACK and the flow-control window are the cost of the carrier,
 and they are the same cost Xray and sing-box pay. The 32 KiB HTTP/2 write buffer
 and the 4 MiB session window are named here rather than claimed as ours. Nor is
 the copy into the caller's buffer: a `Read` has to fill the caller's `&mut [u8]`,
-and that is the `1` the `## Data path` graph ends on. Two moves survive the
-staging removal, and both are counted rather than hidden: a padded DATA frame
-carries its pad byte and pad tail *inside* the body the parser reads, so the
-message between them moves once (`11` bytes for the gate's 4-byte payload), and
-a caller that leaves a payload in the buffer while the next frame arrives pays
-one reclaim move of what it has not taken — `staged` counts both, which is the
-only reason the zero on the first row means anything.
+and that is the `1` the `## Data path` graph ends on. Two moves still survive the
+staging removal, and both are counted rather than hidden. A caller that leaves a
+payload in the buffer while the next frame arrives pays one reclaim move of what
+it has not taken. A pad byte that cuts into a message the frame before had
+started still moves what follows it down, because those bytes have to become
+contiguous for the parser; a pad byte that opens a message region costs a cursor
+step instead, which is the `0` on the padded row. `staged` counts both, which is
+the only reason the zeros mean anything. One accounting gap is named rather than
+fixed: a credit is the DATA body less its pad byte and pad tail where RFC 7540
+§6.9.1 counts the whole body, so a padded frame leaves that many bytes of window
+unreturned — conservative, and never taken back.
 
 ## Pins
 
