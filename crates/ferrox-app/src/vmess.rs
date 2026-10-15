@@ -861,18 +861,18 @@ pub(crate) fn read_frame<'a>(
 
 /// What one decode step of a [`Wire`] did.
 enum Frame {
-    /// A frame opened, its plaintext recorded in this batch at the offset the open left it.
+    /// A frame opened, its plaintext gathered at the front of the buffer.
     Decoded,
-    /// Nothing more can open without a wait; send the batch already opened.
+    /// Nothing more can open without a wait; send the batch already gathered.
     Idle,
     /// The stream is over: its marker frame, an EOF, or a frame that will not open.
     Last,
 }
 
-/// The receive half of a relay. Each frame's plaintext stays where its open left it, so the pump can
-/// tell without asking the carrier that a batch of frames is already here and leave the whole batch
-/// in one write — which a `BufReader` hides, and one frame per `write` pays for in syscalls and in
-/// the segments the peer then has to deliver.
+/// The receive half of a relay. Sealed bytes and the plaintext gathered from them share one
+/// buffer, so the pump can tell without asking the carrier that a batch of frames is already
+/// here and leave the whole batch in one write — which a `BufReader` hides, and one frame per
+/// `write` pays for in syscalls and in the segments the peer then has to deliver.
 pub(crate) struct Wire<R> {
     carrier: R,
     held: Vec<u8>,
@@ -880,27 +880,11 @@ pub(crate) struct Wire<R> {
     start: usize,
     /// One past the last sealed byte read.
     end: usize,
-    /// One batch's frames, each at the offset its open left it.
-    parts: [(usize, usize); FRAMES_PER_WRITE],
-    /// How many of `parts` this batch has filled.
-    count: usize,
+    /// The plaintext this batch has gathered at the front.
+    plain: usize,
     /// A frame whose length is drawn but whose bytes have not all arrived.
     waiting: Option<(usize, usize)>,
     last: bool,
-}
-
-/// One batch of opened frames, handed out as the runs they were opened in.
-struct Batch<'a> {
-    held: &'a [u8],
-    parts: [(usize, usize); FRAMES_PER_WRITE],
-    count: usize,
-}
-
-impl Batch<'_> {
-    /// Send this batch's frames as the runs of the pump's own buffer they are, in one write.
-    fn write_to(self, out: &mut dyn Write) -> std::io::Result<()> {
-        crate::proxy::write_all_runs::<FRAMES_PER_WRITE>(out, self.held, &self.parts[..self.count])
-    }
 }
 
 impl<R: Read> Wire<R> {
@@ -910,24 +894,24 @@ impl<R: Read> Wire<R> {
             held: vec![0u8; WIRE_LEN],
             start: 0,
             end: 0,
-            parts: [(0, 0); FRAMES_PER_WRITE],
-            count: 0,
+            plain: 0,
             waiting: None,
             last: false,
         }
     }
 
     /// Open up to `FRAMES_PER_WRITE` frames, waiting only for the first, and hand back their
-    /// plaintext as the runs it lies in. `None` ends the pump.
-    fn batch(&mut self, recv: &mut Flow) -> Option<Batch<'_>> {
+    /// plaintext as one slice. `None` ends the pump.
+    fn batch(&mut self, recv: &mut Flow) -> Option<&[u8]> {
         if self.last {
             return None;
         }
         self.compact();
-        self.count = 0;
-        while self.count < FRAMES_PER_WRITE {
-            match self.frame(recv, self.count == 0) {
-                Frame::Decoded => {}
+        self.plain = 0;
+        let mut decoded = 0;
+        while decoded < FRAMES_PER_WRITE {
+            match self.frame(recv, decoded == 0) {
+                Frame::Decoded => decoded += 1,
                 Frame::Idle => break,
                 Frame::Last => {
                     self.last = true;
@@ -935,11 +919,7 @@ impl<R: Read> Wire<R> {
                 }
             }
         }
-        Some(Batch {
-            held: &self.held,
-            parts: self.parts,
-            count: self.count,
-        })
+        Some(&self.held[..self.plain])
     }
 
     fn buffered(&self) -> usize {
@@ -1008,9 +988,9 @@ impl<R: Read> Wire<R> {
         if len == 0 {
             return Frame::Last;
         }
-        // A frame's plaintext is never longer than the bytes it was sealed in, so one batch's runs never reach into each other.
-        self.parts[self.count] = (body, len);
-        self.count += 1;
+        // Every earlier frame left more bytes than it took, so gathering never reaches forward.
+        self.held.copy_within(body..body + len, self.plain);
+        self.plain += len;
         Frame::Decoded
     }
 }
@@ -1294,12 +1274,12 @@ pub(crate) fn pump_relay_carried<R, W>(
         }
     }
     let mut first = true;
-    while let Some(batch) = reader.batch(&mut recv) {
+    while let Some(chunk) = reader.batch(&mut recv) {
         if crate::proxy::echo_trace_on() && first {
             crate::proxy::echo_trace("relay bwd first read");
             first = false;
         }
-        if batch.write_to(&mut plain_write).is_err() {
+        if plain_write.write_all(chunk).is_err() {
             break;
         }
     }
@@ -1590,8 +1570,8 @@ pub(crate) fn pump_relay(
             return;
         }
     }
-    while let Some(batch) = sealed_reader.batch(&mut recv) {
-        if batch.write_to(&mut plain_write).is_err() {
+    while let Some(chunk) = sealed_reader.batch(&mut recv) {
+        if plain_write.write_all(chunk).is_err() {
             break;
         }
     }
@@ -1969,7 +1949,7 @@ mod tests {
         assert_eq!(crc32(b"123456789"), 0xcbf4_3926);
     }
 
-    /// Counts `write` and `write_vectored` calls and keeps the bytes, so a syscall row is observed rather than inferred: a `Vec` sink cannot tell one write from four, and cannot tell one vectored write from four plain ones.
+    /// Counts `write` calls and keeps the bytes, so a syscall row is observed rather than inferred: a `Vec` sink cannot tell one write from four.
     #[derive(Default)]
     struct CountingWriter {
         writes: usize,
@@ -1981,17 +1961,6 @@ mod tests {
             self.writes += 1;
             self.bytes.extend_from_slice(buf);
             Ok(buf.len())
-        }
-
-        /// Answers the whole batch, so a run's count is exact rather than scheduler-dependent.
-        fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
-            self.writes += 1;
-            let mut done = 0usize;
-            for buf in bufs {
-                self.bytes.extend_from_slice(buf);
-                done += buf.len();
-            }
-            Ok(done)
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
@@ -2843,16 +2812,18 @@ mod tests {
         (sealed, plain, recv)
     }
 
-    /// Drain a pump the way a relay does: every batch goes through the same writer the relay hands
-    /// it to, so the writes counted here are the writes the relay would make.
+    /// Drain a pump the way a relay does, counting the writes its batches would become.
     fn drain(wire: &mut Wire<Sealed>, recv: &mut Flow) -> (usize, Vec<u8>) {
-        let mut sink = CountingWriter::default();
+        let mut writes = 0;
+        let mut got = Vec::new();
         while let Some(batch) = wire.batch(recv) {
-            if batch.write_to(&mut sink).is_err() {
-                break;
+            if batch.is_empty() {
+                continue;
             }
+            writes += 1;
+            got.extend_from_slice(batch);
         }
-        (sink.writes, sink.bytes)
+        (writes, got)
     }
 
     #[test]
@@ -2895,10 +2866,9 @@ mod tests {
         assert_eq!(got, plain, "and the bytes are the same bytes");
     }
 
-    /// Pointer identity is the only test that can see the gather: the same bytes leave either way.
     #[test]
-    fn the_pump_hands_its_frames_over_by_pointer() {
-        let (sealed, plain, mut recv) = frames(&[1000, 1000, 1000]);
+    fn the_pump_gathers_into_its_own_buffer_and_never_moves_it() {
+        let (sealed, plain, mut recv) = frames(&[1000; 3]);
         let carrier = Sealed {
             held: sealed,
             at: 0,
@@ -2907,40 +2877,21 @@ mod tests {
         };
         let mut wire = Wire::new(carrier);
         let cap = wire.held.capacity();
-        let front = wire.held.as_ptr() as usize;
-        let mut got = Vec::new();
         let mut batches = 0;
+        let mut got = Vec::new();
         while let Some(batch) = wire.batch(&mut recv) {
-            if batch.count == 0 {
+            if batch.is_empty() {
                 continue;
             }
+            let (front, len) = (batch.as_ptr() as usize, batch.len());
+            got.extend_from_slice(batch);
             assert_eq!(
-                batch.held.as_ptr() as usize,
                 front,
-                "a batch leaves from the pump's own buffer, not a copy of it"
-            );
-            assert_eq!(
-                batch.parts[0].0, HEADER_LEN,
-                "a frame goes out where its open left it, not gathered over the bytes it came past"
-            );
-            assert_ne!(
-                batch.parts[1].0,
-                batch.parts[0].0 + batch.parts[0].1,
-                "the second frame would sit hard against the first if they had been moved together"
-            );
-            for &(at, len) in &batch.parts[..batch.count] {
-                assert!(
-                    at + len <= batch.held.len(),
-                    "a handed frame is a run of the pump's own buffer"
-                );
-                got.extend_from_slice(&batch.held[at..at + len]);
-            }
-            assert_eq!(wire.held.capacity(), cap, "the pump grew its buffer");
-            assert_eq!(
                 wire.held.as_ptr() as usize,
-                front,
-                "the pump moved its buffer"
+                "a batch is not the pump's own bytes gathered at its front"
             );
+            assert_eq!(wire.held.capacity(), cap, "the pump grew its buffer");
+            assert_eq!(got.len(), len, "and the whole batch was handed over");
             batches += 1;
         }
         assert_eq!(batches, 1, "three frames together are one write");
