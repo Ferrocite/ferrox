@@ -1,7 +1,9 @@
 # Ferrox vs Xray-core feature map
 
-Pinned reference: `upstream/xray-core` @ `7da5dae6` (`upstream/pins.toml`).
+Pinned reference: `upstream/xray-core` @ `c77a4d0e` (`upstream/pins.toml`).
 This tree: `crates/ferrox-core`, `crates/ferrox-app`, `docs/function/`.
+
+What runs against what: `xray-rust`'s interop tests drive the pinned Xray client into `ferrox-app` (23 tests, seam `XRAY_VLESS_FULL_BINARY`); `zeronet`'s `xray_oracle` replays its differential checks against a binary injected as Xray (9 tests, seam `ZRAY_XRAY_BINARY`); `xray-core`'s own suite runs only against itself (`xray-baseline.yml`) — its unit tests are in-process, and `testing/scenarios` builds `github.com/xtls/xray-core/main` at run time and spawns it with `-config=stdin: -format=pb` (`testing/scenarios/common_regular.go`), so that subtree turns into a Ferrox check once `ferrox-app` reads the protobuf config.
 
 ## What ferrox has that xray-core does not
 
@@ -12,7 +14,6 @@ This tree: `crates/ferrox-core`, `crates/ferrox-app`, `docs/function/`.
 | Record layer, four widths, one source | `record.rs` + `Lanes` trait: portable/NEON/SSE2/AVX2 execute the same source | per-arch crypto with divergent implementations |
 | Count-gated claims | exact ops/syscall/copy counts per method, `scripts/method-counts.txt` ⇔ pages | no equivalent gate |
 | Single TLS stack | rustls behind `TlsProvider`, no feature flags | utls + stdlib TLS, selectable per config |
-| Hysteria carried as VLESS transport | `protocol: hysteria` row wired in `ferrox-app` | transport `hysteria` exists, but proxy-level Hysteria is its own proxy, not a VLESS carrier row |
 | KCP bit-exact oracle | `kcp::oracle` vs pinned Go KCP | KCP implementation, no cross-implementation oracle in-tree |
 
 ## What xray-core has that ferrox does not
@@ -23,10 +24,8 @@ This tree: `crates/ferrox-core`, `crates/ferrox-app`, `docs/function/`.
 | --- | --- |
 | VMess (AEAD) — full matrix: UDP over ws/grpc/xhttp/tls, all encodings | partial: no UDP except raw carrier; no auth-length framing bits (matches client default only) |
 | Trojan share-link `trojan://` parser | absent |
-| Shadowsocks-2022 (`proxy/shadowsocks_2022/`) | refused by name (row 28) |
-| HTTP proxy inbound/outbound (`proxy/http`) | absent — only SOCKS inbound |
 | Dokodemo transparent inbound | refused (row 24) |
-| Freedom — fragment/dialer freedom fields | present, but fragment option surface thin |
+| Freedom — `domainStrategy`, fragment, dialer fields | direct dial only (`Outbound::Freedom` in `proxy.rs`); no `fragment`, `domainStrategy`, `proxyProtocol` or dialer options (rows 117, 120) |
 | DNS proxy + fakeDNS + hosts + DoH/DoQ/local nameservers (`app/dns`) | refused (row 26) |
 | Blackhole outbound | refused (row 25) |
 | Loopback | refused (row 27) |
@@ -38,7 +37,7 @@ This tree: `crates/ferrox-core`, `crates/ferrox-app`, `docs/function/`.
 | ECH | refused (row 39) |
 | VLESS stream encryption (`encryption` field, XOR/MLKEM) | refused (row 34) |
 | XTLS Vision UDP-over-443 flow | refused (row 35) |
-| REALITY client dial | refused (row 36) |
+| REALITY ML-DSA-65 binding (`mldsa65Seed` / `mldsa65Verify`) | planned (row 118; the ZeroNet oracle row `reality_with_the_mldsa65_binding_matches_the_oracle` is waiting on it) |
 
 ### Transports
 
@@ -47,10 +46,10 @@ This tree: `crates/ferrox-core`, `crates/ferrox-app`, `docs/function/`.
 | TCP | done |
 | WebSocket (`?ed=` both roles) | done |
 | gRPC | done, own HTTP/2 |
-| HTTPUpgrade | done; `?ed=` parsed, not carried |
+| HTTPUpgrade | done, both roles, `?ed=N` carried (row 16) |
 | xHTTP / SplitHTTP modes (packet-up, stream-up, stream-one, padding/placement) | one mode only (POST + chunked) |
 | KCP/mKCP + FinalMask (aes128gcm, header, original) | core done; finalmask refused (row 31) |
-| Hysteria QUIC transport | done |
+| Hysteria v2 transport (network `hysteria`, masquerade surface) | done as `vless-hysteria` / `protocol: hysteria` over quiche, both roles (row 19); datagrams, salamander and the masquerade site are not carried |
 | MASQUE transport | CONNECT-IP client dialled (h2/h3) on the Foxy lane; server transport refused (row 20) |
 | XDrive | refused (row 32) |
 | Browser dialer | absent |

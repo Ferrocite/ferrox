@@ -7,7 +7,7 @@ path          = "common/crypto"
 test_enabled  = false
 suite         = "go test -count=1 -timeout 8m ./proxy/vless/..."
 ferrox_binary = ""
-note          = "Xray-core at this pin. Disabled: in-process Go suite with no seam, so no Ferrox binary can be injected; full list runs in xray-baseline.yml"
+note          = "Xray-core at this pin. Unit tests are in-process with no seam; testing/scenarios builds main at run time and spawns it as a subprocess (-config=stdin: -format=pb, common_regular.go), so that subtree becomes injectable once ferrox-app reads the protobuf config. Full list runs in xray-baseline.yml"
 
 [sources.sing-box]
 repo          = "https://github.com/SagerNet/sing-box"
