@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{Read, Write};
+use std::io::{IoSlice, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
@@ -7850,6 +7850,35 @@ pub(crate) fn write_all_three(
             && stream.write_all(second).is_ok()
             && stream.write_all(third).is_ok()
     }
+}
+
+/// Hand `parts` runs of `buf` to `out` in one vectored write: one syscall where the socket has
+/// `writev`, one where it has `WSASend`, one per run where the sink has neither, and none at all for
+/// an empty batch — so a caller that opened several records into one buffer leaves them where they
+/// lie instead of gathering them. `N` is the caller's batch width, so the iovec list never touches
+/// the heap.
+pub(crate) fn write_all_runs<const N: usize>(
+    out: &mut dyn Write,
+    buf: &[u8],
+    parts: &[(usize, usize)],
+) -> std::io::Result<()> {
+    let mut made: [IoSlice; N] = std::array::from_fn(|_| IoSlice::new(&[]));
+    let mut pieces = 0usize;
+    for (start, len) in parts.iter().copied() {
+        if len > 0 {
+            made[pieces] = IoSlice::new(&buf[start..start + len]);
+            pieces += 1;
+        }
+    }
+    let mut slices = &mut made[..pieces];
+    while !slices.is_empty() {
+        let written = out.write_vectored(slices)?;
+        if written == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+        }
+        IoSlice::advance_slices(&mut slices, written);
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
