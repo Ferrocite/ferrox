@@ -85,6 +85,10 @@ pub struct Sample {
     pub elapsed_ms: u128,
     pub rss_kib: u64,
     pub cpu_millis: u64,
+    /// What the process itself ran; `None` on a source that has no split, i.e. a `ps` line.
+    pub user_millis: Option<u64>,
+    /// What the kernel ran on its behalf; the pair sums to `cpu_millis` wherever both exist.
+    pub sys_millis: Option<u64>,
     pub threads: Option<u64>,
 }
 
@@ -148,10 +152,13 @@ pub fn sample(host: Host, pid: u32, elapsed_ms: u128) -> Result<Sample, SampleEr
         stderr: format!("unparsable ps sample `{line}`"),
     })?;
     if host == Host::Linux {
-        sample.cpu_millis = proc_stat_cpu(pid).ok_or(SampleError::Cpu {
+        let (user, sys) = proc_stat_cpu(pid).ok_or(SampleError::Cpu {
             pid,
             stderr: format!("no utime/stime in /proc/{pid}/stat"),
         })?;
+        sample.cpu_millis = user + sys;
+        sample.user_millis = Some(user);
+        sample.sys_millis = Some(sys);
     }
     Ok(sample)
 }
@@ -168,6 +175,8 @@ pub fn parse(line: &str, elapsed_ms: u128) -> Option<Sample> {
         elapsed_ms,
         rss_kib,
         cpu_millis,
+        user_millis: None,
+        sys_millis: None,
         threads,
     })
 }
@@ -197,21 +206,23 @@ pub fn parse_time_millis(raw: &str) -> Option<u64> {
     Some(total)
 }
 
-fn proc_stat_cpu(pid: u32) -> Option<u64> {
+fn proc_stat_cpu(pid: u32) -> Option<(u64, u64)> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    proc_stat_millis(&stat, clock_ticks_per_second())
+    proc_stat_times(&stat, clock_ticks_per_second())
 }
 
-fn proc_stat_millis(stat: &str, ticks_per_second: u64) -> Option<u64> {
+fn proc_stat_times(stat: &str, ticks_per_second: u64) -> Option<(u64, u64)> {
     let (_, rest) = stat.rsplit_once(')')?;
     let fields: Vec<&str> = rest.split_whitespace().collect();
-    let ticks = fields
-        .get(11)?
-        .parse::<u64>()
-        .ok()?
-        .checked_add(fields.get(12)?.parse::<u64>().ok()?)?;
-    let millis = ticks.checked_mul(1_000)?;
-    millis.checked_div(ticks_per_second)
+    let millis = |index: usize| {
+        fields
+            .get(index)?
+            .parse::<u64>()
+            .ok()?
+            .checked_mul(1_000)?
+            .checked_div(ticks_per_second)
+    };
+    Some((millis(11)?, millis(12)?))
 }
 
 #[cfg(test)]
@@ -305,6 +316,9 @@ mod win32 {
                 filetime_ticks(exit),
                 filetime_ticks(kernel) + filetime_ticks(user),
             ),
+            // A live process has no exit time, so the pair is the whole of `cpu_millis`.
+            user_millis: Some(super::ticks_to_millis(filetime_ticks(user))),
+            sys_millis: Some(super::ticks_to_millis(filetime_ticks(kernel))),
             threads: thread_count(pid).ok(),
         })
     }
@@ -489,9 +503,9 @@ mod tests {
                     9 4 0 0 20 0 3 0 1000 2000 0 0 0 0 0 0 0 0 0 0 0 0 0 \
                     0 20 0 3 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0";
         assert_eq!(
-            proc_stat_millis(line, FIXTURE_HZ),
-            Some(130),
-            "9 + 4 ticks at 100 Hz is 130 ms"
+            proc_stat_times(line, FIXTURE_HZ),
+            Some((90, 40)),
+            "9 ticks of utime and 4 of stime at 100 Hz are 90 ms and 40 ms"
         );
         assert_eq!(
             parse_time_millis("00:00:00"),
@@ -505,11 +519,11 @@ mod tests {
         let line = "1234 (Web Content (tab)) R 1 2 3 0 0 0 0 0 0 0 7 5 0 0 20 0 1 \
                     0 100 200 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 \
                     0 20 0 1 0 0 0 0 0 0 0 0 0 0 0 0 0";
-        assert_eq!(proc_stat_millis(line, FIXTURE_HZ), Some(120));
+        assert_eq!(proc_stat_times(line, FIXTURE_HZ), Some((70, 50)));
         assert_eq!(
-            proc_stat_millis(line, 1_000),
-            Some(12),
-            "the same line at 1 kHz is a twelfth of it, so the divisor is used"
+            proc_stat_times(line, 1_000),
+            Some((7, 5)),
+            "the same line at 1 kHz is a tenth of it, so the divisor is used"
         );
     }
 
@@ -517,16 +531,26 @@ mod tests {
     fn proc_stat_rejects_a_line_it_cannot_read() {
         for bad in ["", "1234 (x", "1234 (x) S 1 2"] {
             assert_eq!(
-                proc_stat_millis(bad, FIXTURE_HZ),
+                proc_stat_times(bad, FIXTURE_HZ),
                 None,
                 "{bad} must not parse"
             );
         }
         assert_eq!(
-            proc_stat_millis("1234 (x) S 1 2 3 0 0 0 0 0 0 0 9 4", 0),
+            proc_stat_times("1234 (x) S 1 2 3 0 0 0 0 0 0 0 9 4", 0),
             None,
             "a zero divisor resolves nothing"
         );
+    }
+
+    #[test]
+    fn only_a_source_with_two_counters_offers_a_split() {
+        let line = "1234 (x) S 1 2 3 0 0 0 0 0 0 0 90 40";
+        let (user, sys) = proc_stat_times(line, FIXTURE_HZ).expect("two fields");
+        assert_eq!((user, sys), (900, 400));
+        let ps_only = parse("4096 0:01.30 3", 0).expect("sample");
+        assert_eq!(ps_only.user_millis, None, "a ps line has no split");
+        assert_eq!(ps_only.sys_millis, None);
     }
 
     #[cfg(unix)]
@@ -540,12 +564,24 @@ mod tests {
         assert!(s.rss_kib > 0, "a running process has a resident set");
         match Host::current() {
             Host::Linux => {
-                let before = proc_stat_cpu(pid).expect("this process has a /proc entry");
+                let before = proc_stat_cpu(pid)
+                    .map(|(u, s)| u + s)
+                    .expect("this process has a /proc entry");
                 let sampled = sample(Host::current(), pid, 0).expect("this process is sampleable");
-                let after = proc_stat_cpu(pid).expect("this process has a /proc entry");
+                let after = proc_stat_cpu(pid)
+                    .map(|(u, s)| u + s)
+                    .expect("this process has a /proc entry");
                 assert!(
                     before <= sampled.cpu_millis && sampled.cpu_millis <= after,
                     "linux cpu comes from /proc only: {sampled:?} against {before}..={after}"
+                );
+                assert_eq!(
+                    sampled
+                        .user_millis
+                        .zip(sampled.sys_millis)
+                        .map(|(u, s)| u + s),
+                    Some(sampled.cpu_millis),
+                    "the two /proc counters are the whole of the one cpu number"
                 );
                 assert!(floor <= 10, "/proc resolves a tick, not a second");
                 assert!(s.threads.is_some(), "linux ps can count threads");
@@ -553,6 +589,7 @@ mod tests {
             Host::Macos => {
                 assert_eq!(floor, 10, "macOS ps prints hundredths");
                 assert!(s.threads.is_none(), "macOS ps cannot count threads");
+                assert_eq!(s.user_millis, None, "a ps line offers no split here");
             }
             #[cfg(target_os = "windows")]
             Host::Windows => {
