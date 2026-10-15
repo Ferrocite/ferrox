@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{IoSlice, IoSliceMut, Read, Write};
+use std::io::{IoSliceMut, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::thread;
 use std::time::Duration;
@@ -9,7 +9,7 @@ use ferrox_core::shadowsocks::{
 };
 
 use crate::budgets::RELAY_POLL;
-use crate::proxy::{push_addr, read_exact, UDP_BUF};
+use crate::proxy::{push_addr, read_exact, write_all_runs, UDP_BUF};
 
 const SALT_LEN: usize = 32;
 // Chunks one relay read takes and one write carries. A batch never waits for the chunk that has not arrived, so this is a syscall count rather than a latency budget: four costs the same one read and the same one write as one.
@@ -630,7 +630,7 @@ fn seal_all(
                 chunks += 1;
                 got += take;
             }
-            write_slices(out, buf, &sealed[..chunks])
+            write_all_runs::<CHUNKS_PER_BATCH>(out, buf, &sealed[..chunks])
         }
         Uplink::Stream(rc4) => {
             let payload = &mut buf[SEAL_HEAD..SEAL_HEAD + n];
@@ -652,27 +652,6 @@ fn read_slots(read: &mut dyn Read, buf: &mut [u8]) -> std::io::Result<usize> {
         *slot = IoSliceMut::new(&mut filled[SEAL_HEAD..SEAL_HEAD + MAX_CHUNK]);
     }
     read.read_vectored(&mut slots)
-}
-
-/// Hand `parts` of one buffer to `out` in one vectored write: one syscall where the socket has `writev`, one write per piece where the carrier has not, and no syscall at all for an empty batch.
-fn write_slices(out: &mut dyn Write, buf: &[u8], parts: &[(usize, usize)]) -> std::io::Result<()> {
-    let mut made: [IoSlice; CHUNKS_PER_BATCH] = std::array::from_fn(|_| IoSlice::new(&[]));
-    let mut pieces = 0usize;
-    for (start, len) in parts.iter().copied() {
-        if len > 0 {
-            made[pieces] = IoSlice::new(&buf[start..start + len]);
-            pieces += 1;
-        }
-    }
-    let mut slices = &mut made[..pieces];
-    while !slices.is_empty() {
-        let written = out.write_vectored(slices)?;
-        if written == 0 {
-            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
-        }
-        IoSlice::advance_slices(&mut slices, written);
-    }
-    Ok(())
 }
 
 /// Read one wire chunk out of `chunk`'s prefix: `chunk` is the caller's, sized [`WIRE_MAX`] once and opened in place — no allocation, no zero-fill — and the handshake opens exactly one chunk because whatever the peer pipelined after it belongs to the relay.
@@ -812,7 +791,7 @@ fn drain_window<R: Read>(
         if opened == 0 {
             return Ok(());
         }
-        write_slices(out, &window.buf, &batch[..opened])?;
+        write_all_runs::<CHUNKS_PER_BATCH>(out, &window.buf, &batch[..opened])?;
     }
 }
 
@@ -952,6 +931,7 @@ fn parse_addr_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::IoSlice;
 
     /// Silence past the budget is death, not scheduling: a peer that opens the connection and never sends must not pin the raw Shadowsocks handshake thread forever.
     #[test]

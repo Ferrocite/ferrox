@@ -12,11 +12,11 @@ the wire. Xray's client default is the same three bits, so this matches.
 
 Read and write are symmetric about one thing: both batch. Writing stages four
 8 KiB frames into one buffer and writes them once. Reading keeps the sealed bytes
-and the plaintext gathered from them in one buffer, so the pump can tell without
-asking the carrier that four frames are already here, and it leaves the plain leg
-in one write instead of four. A `BufReader` cannot offer that — it hides how much
-it holds — which is why the relay reads through `vmess::Wire` and the handshake
-still reads through `read_frame`.
+in one buffer and hands each opened frame out where its open left it, so the pump
+can tell without asking the carrier that four frames are already here, and it
+leaves the plain leg in one `write_vectored` instead of four writes. A `BufReader`
+cannot offer that — it hides how much it holds — which is why the relay reads
+through `vmess::Wire` and the handshake still reads through `read_frame`.
 
 The payload cipher follows the reference's `auto` negotiation rather than a fixed
 choice: AES-128-GCM where the machine has hardware for it, ChaCha20-Poly1305
@@ -38,9 +38,9 @@ graph TD
     W4 --> W(("wire"))
     R(("wire")) --> R1["fill the pump's own buffer<br/>1 read per refill"]
     R1 --> R2["unmask the 2-byte length,<br/>open each frame in place"]
-    R2 --> R3["gather the plaintext to the front<br/>of that same buffer, 0 allocations"]
+    R2 --> R3["record each frame as a run of<br/>that same buffer, 0 copies, 0 allocations"]
     R3 --> R4["counter +1 per frame"]
-    R4 --> R5["write the whole batch to the target,<br/>1 syscall"]
+    R4 --> R5["one write_vectored of the batch<br/>to the target, 1 syscall"]
 ```
 
 ## Measured
@@ -56,7 +56,8 @@ graph TD
 | frame-buffer-allocations-per-relay-write | 0 | ferrox-app-vmess::tests::frames_reuse_the_callers_buffers |
 | frames-per-plain-write | 4 | ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write |
 | plain-write-syscalls-per-4-frame-batch | 1 | ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write |
-| pump-buffer-allocations-per-batch | 0 | ferrox-app-vmess::tests::the_pump_gathers_into_its_own_buffer_and_never_moves_it |
+| user-space-copies-per-byte-read | 0 | ferrox-app-vmess::tests::the_pump_hands_its_frames_over_by_pointer |
+| pump-buffer-allocations-per-batch | 0 | ferrox-app-vmess::tests::the_pump_hands_its_frames_over_by_pointer |
 | counters-per-frame | 1 | ferrox-app-vmess::tests::counters_advance_one_per_frame_at_any_offset |
 <!-- counts:end -->
 
@@ -165,6 +166,15 @@ frame — apply to every 8 KiB VMess frame on the AVX2 and NEON-4 paths.
   branch (run 38667435571): **1 850 → 1 291 ms/GiB of system CPU**, user CPU left
   where it was (788 → 790), which is what makes this a kernel-side removal rather
   than a relocation into user space.
+- **The batch's own gather.** The pump opened each frame where its bytes lay and then
+  `copy_within`ed its plaintext to the front of the buffer, one copy per frame, only so
+  that a single `write_all` could hand the batch on. `proxy::write_all_runs` takes a
+  batch as the runs it was opened in, so four frames leave as four iovecs of one
+  `write_vectored` — a `writev` on unix, a `WSASend` on Windows — with no byte moved and
+  the same one syscall: `vmess user-space-copies-per-byte-read 0`, gated by
+  `the_pump_hands_its_frames_over_by_pointer`. The routine is the one the Shadowsocks
+  upload batch already drove, moved into `proxy` so the two methods share one vectored
+  writer instead of each keeping a loop.
 - **A second copy on read.** Xray's large-chunk read path
   (`common/crypto/auth.go:188-203`) allocates a pooled buffer, reads into it,
   opens in place, and then calls `buf.MergeBytes`, which is a second copy plus a
@@ -201,16 +211,20 @@ calls (16 + 18 + 8 bytes) rather than one, because the auth id has to be read
 before the length can be decrypted. Both are handshake-only, once per
 connection, and neither is where a connection spends its time.
 
-The batch also **trades one user-space copy for three kernel calls**: gathering
-a frame's plaintext to the front of the pump's buffer is one `copy_within` per
-frame, which the one-frame-per-`write` pump did not pay. It is a relocation, not
-a removal, and it is on the side of the ledger the split above says is already
-cheap — `vmess user-space-copies-per-byte-written 1` counts the write leg only,
-so this read-leg copy is prose rather than a row. `the_pump_gathers_into_its_own_buffer_and_never_moves_it`
-holds the buffer's pointer and capacity steady across a batch so the gather
-cannot quietly become a reallocating batch. What the split also names and this
-slice leaves alone: **35 threads at peak against xray-core's 14** on the same
-cell, which is the relay model, not the framing.
+The batch no longer **trades one user-space copy for three kernel calls** — that was
+its shape until this branch: gathering a frame's plaintext to the front of the pump's
+buffer was one `copy_within` per frame, paid in user space so that the plain leg could
+take one syscall, and the one-frame-per-`write` pump this replaced had never paid it.
+Four runs of one buffer now go out in one `writev`, so the syscall row stands at 1 and
+the copy row is 0 — a removal rather than a relocation.
+`the_pump_hands_its_frames_over_by_pointer` holds the buffer's pointer and capacity
+steady across a batch, requires the batch's first frame to start at offset `HEADER_LEN`
+and the second not to sit hard against it, which is the only way anything can see that
+no byte moved. What this slice does **not** remove is the write leg's staging copy:
+`vmess user-space-copies-per-byte-written 1` still holds, because the payload has to be
+laid down for the seal. What the split above still names and this slice leaves alone is
+**35 threads at peak against xray-core's 14** on the same cell, which is the relay
+model, not the framing.
 
 ## Pins
 
