@@ -79,7 +79,7 @@ vless request-header-allocations 0 ferrox-bench-gate-2
 vless request-header-bytes-zero-filled 0 ferrox-bench-gate-2
 vless address-families-encoded 4 ferrox-core-vless::tests::header_address_families_encode_stably
 vless vision-addons-bytes 2 ferrox-core-vless::tests::non_vision_header_carries_empty_addons
-vless reality-outbound-rows-dialled 1 ferrox-app-proxy::tests::vless_outbound_with_reality_security_dials_raw_only
+vless reality-outbound-rows-dialled 6 ferrox-app-proxy::tests::vless_outbound_with_reality_dials_raw_and_every_carrier
 vless vision-header-targets-matching-core 2 ferrox-app-proxy::tests::vision_header_matches_the_core_encoder
 vless dial-header-reallocations 0 ferrox-app-proxy::tests::dial_headers_are_sized_to_the_bytes_they_hold
 vless request-header-reads 4 ferrox-app-proxy::tests::the_vless_request_header_costs_four_reads_not_six
@@ -168,7 +168,8 @@ carrier-quic dialled-without-ca-cert-file 0 ferrox-app-proxy::tests::quic_outbou
 
 reality-tls ops-retired-instructions UNBLESSED scripts/count-ops.sh
 reality-tls tls-providers 1 ferrox-core::active_backends
-reality-tls client-outbound-rows-dialled 1 ferrox-app-proxy::tests::vless_outbound_with_reality_security_dials_raw_only
+reality-tls client-outbound-rows-dialled 6 ferrox-app-proxy::tests::vless_outbound_with_reality_dials_raw_and_every_carrier
+reality-tls client-carriers-roundtrip-verified 1 ferrox-app-proxy::tests::reality_ws_dial_reaches_echo_through_the_relay
 reality-tls x25519-shares-recognised 3 ferrox-core-reality::tests::the_x25519_share_is_found_in_every_group_that_carries_one
 reality-tls short-id-bytes 8 ferrox-core-reality::tests::a_short_id_is_zero_padded_to_eight_bytes
 reality-tls cover-origin-dials-per-authenticated-hello 0 ferrox-core-reality::tests::an_authenticated_hello_costs_the_cover_origin_nothing

@@ -5,12 +5,15 @@ provider *is* `Read + Write`, so nothing above this rung can depend on the stack
 underneath — no feature to select, no build without TLS, and no second provider
 to keep in step. `active_backends()` names it, and it names one.
 
-REALITY dials raw TCP and serves every carried carrier. The client seals the
-session id into a stock rustls hello in two passes over one scripted provider
-— the probe for the AAD, the flight with the seal — and refuses any leaf whose
-HMAC does not verify, so a cover origin never carries a proxy byte. A REALITY
-outbound over any carrier is still skipped rather than dialled. That is the
-first thing to know about this method; the rest is the handshake's cost.
+REALITY dials raw TCP and every carried carrier, and serves the same set. The
+client seals the session id into a stock rustls hello in two passes over one
+scripted provider — the probe for the AAD, the flight with the seal — and
+refuses any leaf whose HMAC does not verify, so a cover origin never carries a
+proxy byte. A carried REALITY outbound rides the `ws`, `httpupgrade`, `grpc`,
+`xhttp` and `http-header` framings over the very seal the raw dial pays, so the
+hello is the one rung that does not care what sits above it; the UDP-carrier set
+(`quic`, `kcp`, `hysteria`) stays refused for want of a client leg. The rest is
+the handshake's cost.
 
 What the handshake does: read the ClientHello, find the X25519 key share, do one
 group operation, derive the shared secret, HKDF it into an authentication key,
@@ -48,7 +51,8 @@ graph TD
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | tls-providers | 1 | ferrox-core::active_backends |
-| client-outbound-rows-dialled | 1 | ferrox-app-proxy::tests::vless_outbound_with_reality_security_dials_raw_only |
+| client-outbound-rows-dialled | 6 | ferrox-app-proxy::tests::vless_outbound_with_reality_dials_raw_and_every_carrier |
+| client-carriers-roundtrip-verified | 1 | ferrox-app-proxy::tests::reality_ws_dial_reaches_echo_through_the_relay |
 | x25519-shares-recognised | 3 | ferrox-core-reality::tests::the_x25519_share_is_found_in_every_group_that_carries_one |
 | short-id-bytes | 8 | ferrox-core-reality::tests::a_short_id_is_zero_padded_to_eight_bytes |
 | cover-origin-dials-per-authenticated-hello | 0 | ferrox-core-reality::tests::an_authenticated_hello_costs_the_cover_origin_nothing |
@@ -227,8 +231,10 @@ the stock rustls hello this tree already dials — so row 18 is finished by
 parse veto so a consented `fp=unsafe-*` reports `Implemented` and dials, while a
 bare link still refuses; `an_unsafe_fingerprint_adds_no_header_byte` proves the
 fingerprint adds no VLESS byte. The sibling consents `allow_plaintext_to_public`
-(row 4) and `cipherSuites` parsing (row 17) are still not constructed here. A REALITY outbound over any
-carrier is still skipped rather than dialled. The
+(row 4) and `cipherSuites` parsing (row 17) are still not constructed here. A
+carried REALITY outbound now dials the raw-carrier set the server already
+serves; only the UDP-carrier set stays refused rather than dialled, for want of
+a client leg. The
 `dest`-mimicry the references do (their `ServerHello` template and
 post-handshake record shaping, which no functional row needs), the `ML-DSA-65`
 second signature (verified when present, never sent), and the cover origin's
