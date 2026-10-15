@@ -65,7 +65,7 @@ note          = "the same core's Hysteria v2 client against ferrox-app's `protoc
 
 [sources.xray-core-rust]
 repo          = "https://github.com/Be90nia/xray-core-rust"
-rev           = "87d72569247073b13099951f8a89cd27ff784181"
+rev           = "80477c8a673f11a1a24d3035eba80402acfa61c8"
 always        = true
 default_branch = "master"
 path          = "crates"
@@ -85,7 +85,7 @@ note          = "v2rayNG fork for Iranians: cipherSuites + unsafe fingerprints, 
 
 [sources.zeronet]
 repo          = "https://github.com/zeghostwriter/ZeroNet"
-rev           = "3dd7f1cc1ba6ef7a91f4c01f812685d83c718034"
+rev           = "29e7a95eaaf7e0158b96cba83d7118f5f3d87bfd"
 always        = true
 default_branch = "main"
 path          = "crates"
