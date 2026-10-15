@@ -9,6 +9,30 @@ from an MD5 chain over the password. That is SIP004, and the two seals per
 chunk are not an implementation choice — a peer must not be able to tell which
 chunk length we claim until after it has opened the length itself.
 
+That chunk shape is not ours to change: `MAX_CHUNK = 0x3FFF` is the largest
+payload the pinned implementations will read, so a wider chunk is an interop
+break and the only thing left to buy is **chunks per syscall**. The relay now
+takes and hands on `CHUNKS_PER_BATCH = 4` of them at a time — one `readv` over
+four payload slots, four seals in place, one `writev` — and the bytes on the
+wire are the same stream at the same boundaries: tiling a plaintext run into
+chunks is a function of the run and `MAX_CHUNK` alone, `readv` fills iovecs in
+order so only the last slot can be short, and a batch read of four whole
+chunks can never leave a one-byte tail chunk. A carrier that has no `writev`
+gets std's default, one `write` per slice, which is exactly the per-chunk write
+it saw before — no WebSocket frame, gRPC message or xHTTP chunk changes size.
+The price is buffers, and it is an AEAD connection's price: its relay read
+buffer and downlink window are both sized for a batch, so it carries 80 KiB
+more than it did (`+82 121 B`, 16 417 → 65 668 uplink, 32 798 → 65 668
+downlink), still one allocation per leg, and it buys 3.5× fewer syscalls per
+GiB (see Measured). `rc4-md5` pays none of it — its uplink keeps the one slot
+it had (`uplink_buffer_len`, gated by
+`a_stream_uplink_buffers_one_slot_and_an_aead_uplink_a_batch`), because a rung
+whose read fills one chunk has no batch to hold and four slots would be memory
+it never touches. `CHUNKS_PER_BATCH` is not tuned past that: the buffer cost is
+linear in it and 4 is the batch the pinned reference itself drains, so a wider
+batch is a larger trade rather than a cheaper one, and no CI run has yet priced
+one.
+
 `rc4-md5` is the same rung as a stream: a 16-byte IV in the clear, then the
 address header and every payload byte under RC4 with `MD5(master ++ IV)` as
 the per-direction key. No chunks, no tags, no counters — the keystream position
@@ -30,16 +54,16 @@ into the caller's buffer and encrypts it where it lies.
 
 ```mermaid
 graph TD
-    A["plaintext read, 16383 B<br/>one read syscall"] --> B["one chunk of 16383 B"]
-    B --> C1["seal length, 2 B"]
-    C1 --> C2["seal payload, 16383 B"]
-    C2 --> E["length and tag sealed beside the payload<br/>copies of payload: 0"]
-    E --> F["write_all, one write syscall"]
+    A["one readv over four payload slots<br/>one read syscall"] --> B["four chunks of 16383 B,<br/>each in its own slot"]
+    B --> C1["seal each length, 2 B"]
+    C1 --> C2["seal each payload, 16383 B"]
+    C2 --> E["length and tag sealed beside their payload<br/>copies of payload: 0"]
+    E --> F["one writev, four pieces<br/>one write syscall"]
     F --> G(("wire"))
-    H["wire, one windowed read<br/>lengths served from the window"] --> I["open the length chunk in place"]
-    I --> J["read the payload chunk into<br/>the connection's own buffer"]
+    H["wire, one windowed read of a batch<br/>lengths served from the window"] --> I["open the length chunk in place"]
+    I --> J["a chunk still arriving is not waited for"]
     J --> K["open in place, zero copies"]
-    K --> L["write_all to the target"]
+    K --> L["one writev of the whole batch<br/>to the target"]
     M["wire datagram"] --> N["salt to the subkey, one copy in"]
     N --> O["open in place where the socket put it:<br/>no per-datagram buffer"]
     O --> P["payload is a subslice of the caller's buffer:<br/>memmove 0"]
@@ -79,8 +103,11 @@ that file disagree.
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | aead-calls-per-chunk | 2 | ferrox-core-shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag |
 | maximum-payload-per-chunk | 16383 | ferrox-core-shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag |
-| write-syscalls-per-relay-read | 1 | ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole |
-| payload-chunks-per-relay-read | 1 | ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole |
+| write-syscalls-per-64KiB-relay-read | 1 | ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole |
+| payload-chunks-per-64KiB-relay-read | 4 | ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole |
+| read-syscalls-per-64KiB-relay-read | 1 | ferrox-app-shadowsocks::tests::one_relay_read_asks_for_every_slot_of_a_batch |
+| target-write-syscalls-per-opened-batch | 1 | ferrox-app-shadowsocks::tests::a_bulk_read_serves_every_buffered_chunk |
+| reads-spent-waiting-for-an-incomplete-chunk | 0 | ferrox-app-shadowsocks::tests::a_batch_never_waits_for_a_chunk_that_has_not_arrived |
 | user-space-copies-per-byte-written | 0 | ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole |
 | user-space-copies-per-byte-read | 0 | ferrox-app-shadowsocks::tests::chunks_open_that_seal_sealed_and_reject_damage |
 | chunk-buffer-allocations-per-connection | 1 | ferrox-app-shadowsocks::tests::a_bulk_read_serves_every_buffered_chunk |
@@ -95,6 +122,20 @@ that file disagree.
 | stream-udp-datagram-reallocations-after-the-first | 0 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes |
 
 <!-- counts:end -->
+
+What those per-batch rows add up to, as arithmetic on the rows and not as a
+measurement: one GiB in each direction is 65 540 chunks of 16 383 B. The uplink
+used to pay a read and a write for every one of them (131 080) and the downlink
+a read per 32 798 B window and a write per chunk (98 345), which is 229 425
+syscalls per GiB both legs together. A batch is four chunks, so the uplink is
+32 770 and the downlink 32 790: **65 560**, 3.5× fewer. No strace has counted
+this on a live relay — `scripts/count-ops.sh` counts retired instructions in a
+unit test, not syscalls on a socket, and every loopback test in this tree is
+told not to gate a syscall count — so the figure is what the gated rows imply,
+named here rather than blessed anywhere. What is measured is what the kernel
+work costs: the Time section's matched pair of `shadowsocks-raw-down-8` cells
+puts throughput against the reference at 1.162× before and 1.394× after, with
+disjoint intervals.
 
 ## Ops
 
@@ -116,7 +157,11 @@ this method's row at —
 64 in-place `crypt` calls over one 1 KiB stack buffer with one fold as the
 witness. Three CI runs of that row read `1297641`, `1297641` and `1297577`; the
 first two are the same code on two different bases, which is what makes this row
-a usable delta instead of a duration.
+a usable delta instead of a duration. A fourth, `ops.yml` at this branch's head
+(run 38752349893), reads `1297641` again: the batch does not reach this probe's
+loop at all, which is the only instruction-level check it has, since
+`Cipher::seal_into` and `Cipher::open_in_place` both still report
+`inlined-not-a-frame`.
 
 The third is the delta, and it says there is nothing to win. A hoist of `i` and
 `j` out of `&mut self` into registers, replacing the swap and the post-swap reload
@@ -143,17 +188,60 @@ floor of this loop is the table traffic, and this is it.
 
 ## Time
 
-**Not measured on this branch.** Wall clock for this method comes from
-`ferrox-bench` gate 9 (`crates/ferrox-bench/src/ciphers.rs`), which seals the
-same chunk lengths with the same AEAD methods and compares bytes and
-allocation counts against the pinned reference. The stream makes no
-wall-clock claim: its rows are counts (one write, zero copies, zero allocs),
-not durations. `.github/workflows/bench.yml`
-runs it on `linux x86_64`, `linux aarch64`, `macos aarch64` and
-`windows x86_64` and publishes `target/bench-report.md` as an artefact. No
-artefact from a run of this branch has been read, so this page quotes no
-duration. Timing needs a named runner; a number from a laptop behind a VPN
-measures the tunnel.
+Read from two CI runs of one cell of `benchmark-matrix.yml`,
+`shadowsocks-raw-down-8` (download, 8 connections, 16 384 × 65 536 B, full tier,
+5 paired repeats, ubuntu-24.04, 4 logical CPUs, `xray-core` `c77a4d0` as the
+reference): this branch at `77c8254` (run 38752349541, `ferrox-app`
+`12d0da94…`) and `main` at `98f2e08` — the tree with neither of this slice's
+commits on it — dispatched as a matched baseline (run 38754603708, `5781e5f3…`).
+Both cells pass their gates.
+
+The two runs are not on the same machine. The harness's own raw-pipe ceiling —
+its measurement of the pipe with no cipher in it — read a median of 1260 MiB/s
+in the baseline run and 2703 MiB/s in this branch's, so absolute MiB/s across
+the two runs says nothing. What does compare is the ratio each repeat measures
+against the reference on the same machine at the same moment, and those
+intervals do not touch:
+
+| row, vs `xray-core` in the same repeat | before (`98f2e08`) | after (this branch) |
+| --- | --- | --- |
+| throughput (higher better) | 1.162× [1.125, 1.219] | **1.394× [1.360, 1.434]** |
+| CPU per GiB (lower better) | 1.125× [1.114, 1.136] | **1.345× [1.333, 1.358]** |
+| peak RSS (lower better) | 7.69× [7.580, 7.858] | 6.61× [6.502, 6.719] |
+
+So the batch buys about 20% more throughput and about 16% less CPU per byte
+relative to the same reference, and the two intervals being disjoint is what
+makes that a resolved difference rather than a duration that suggests. The price
+is the one the page names: peak RSS went 8.01 → 9.38 MiB over 8 connections, and
+the two buffers this change sizes account for +82 121 B per AEAD connection
+(an rc4-md5 connection pays none of it, since its uplink stays at one slot),
+which predicts +0.63 MiB over the eight. The remaining 0.74 MiB is allocator rounding
+and buffers this diff does not size; no run here attributes it, so the measured
+number is what this page carries rather than the predicted one. The thread count
+did not move at all (36 before, 36 after), and RSS is still 6.6× under the
+reference.
+
+The relay harness (`parity.yml` gate 5: 1 flow × 131 072 × 65 536 B, 4 engines ×
+5 paired repeats, `linux x86_64`) agrees, and says so more quietly. Before, on
+`main` at `6550eca` (run 38689059947): throughput vs `xray-core` median 0.923×
+[0.858, 0.978] and CPU per GiB median 0.888× [0.787, 0.989] — under the
+reference on both. After, on this branch's code commit `d656187` (run
+38748697816): 1.026× [0.952, 1.083] and 1.082× [1.003, 1.138] — over it on both.
+Every one of those four intervals includes 1.0, so no single run of this
+harness resolves 5%; `gate 5 passed: 9` both times, and what the pair of runs
+shows is the direction, which is the same direction the matrix cell proves.
+
+The byte-differential was re-measured, not assumed: at `d656187` the same run
+passes `gate 1 passed: bit-identical at 7200 shapes`, `gate 7 passed: 7 seal
+rows, ciphertext and tag identical to their references` and `gate 9 passed: 10
+shadowsocks cipher rows, byte-identical to the reference and zero allocations
+per chunk on all three methods` on `linux x86_64`, `linux aarch64`,
+`macos aarch64` and `windows x86_64`. Gate 9's self-timed seal rows are printed
+and not gated; on the linux runner they read 119.5 / 281.3 / 686.2 / 3346.3 /
+6482.1 ns per chunk at 64 / 512 / 1400 / 8171 / 16 383 B, against 137.9 / 323.7 /
+822.4 / 3849.0 / 7570.3 ns on `main` that morning. The batch moves no byte of
+the cipher, so those rows are a machine difference and are reported as that, not
+as a win.
 
 ## What we removed
 
@@ -169,16 +257,40 @@ Read against the three pinned implementations, all of which are in
   whole cipher to the out-of-tree `sagernet/sing-shadowsocks2`
   (`protocol/shadowsocks/outbound.go:15`), so what it batches is not readable in
   this pin and no threshold is claimed here. Zray sets
-  `MAX_WRITE_BATCH = 4 × 16383` and
-  drains once per batch. This tree seals the whole relay read around the
-  payload where it lies — the length seals into 18 B of headroom, the tag
-  lands in 16 B of tailroom — and issues one `write_all` over all three. The
-  wire bytes are the same stream in the same order.
+  `MAX_WRITE_BATCH = 4 × 16383` and drains once per batch — the same number this
+  tree now uses for the same arithmetic, and one this tree used to pay a syscall
+  per chunk for. Each chunk of a relay read seals inside its own slot: length
+  into that slot's 18 B of headroom, tag into its 16 B of tailroom — and the
+  batch leaves as one `writev` over those slots, which are exactly the four
+  wire buffers a chunk at a time handed over.
+  `one_relay_read_becomes_one_write_and_reads_back_whole` is the gate and it has
+  two halves: the four piece bases all lie inside the caller's buffer, which
+  neither moves nor grows, and the batch's bytes equal the same chunks sealed
+  one at a time by a fresh cipher from the same salt. The wire bytes are the
+  same stream in the same order.
+- **A read syscall per chunk.** The uplink used to ask the socket for one chunk
+  at a time; it now issues one `readv` over four payload slots. The gate is
+  `one_relay_read_asks_for_every_slot_of_a_batch`, which counts the calls on an
+  in-memory reader, asserts every offered iovec is `MAX_CHUNK` of its own slot,
+  and asserts each byte of the fill lands where `seal_all` reads it from. The
+  strided slot is what makes a batch read legal at all: `readv` fills iovecs in
+  order, so a short fill only ever lands in the last slot, and a chunk's tag has
+  tailroom of its own instead of standing on the next chunk's plaintext. One
+  contiguous 64 KiB run could do neither without a `memmove`, which is why a
+  batch is four slots rather than a wider buffer. The downlink gets the same
+  shape from the other side: `open_batch` opens every chunk the window already
+  holds, waiting only for the first — a peer that stops to hear back from its
+  own target must never find its answer held for a batch that has not arrived —
+  and `drain_window` hands the opened plaintexts to the target in one `writev`.
+  `a_batch_never_waits_for_a_chunk_that_has_not_arrived` is the gate for the
+  no-stall rule and for the nonce it protects: a chunk whose length has been
+  drawn is *held*, so the length is never drawn a second time against the next
+  chunk's nonce when the payload arrives in the following batch.
 - **A zero-fill before every read.** The chunk reader used to do
   `chunk.resize(size + TAG_LEN, 0)` and then overwrite every byte of that range
   from the socket, and the same shape sat under the other six read targets in
   this file. They are now all built by `unfilled`, which reserves and hands out
-  unwritten bytes: `wire_buffer`, the two-chunk window in `ChunkReader::new`,
+  unwritten bytes: `wire_buffer`, the batch-sized window in `ChunkReader::new`,
   the handshake's seal buffer, the relay's uplink buffer and stream-downlink
   buffer, and the two datagram buffers in `serve_udp_on`. Every read writes the
   range it reports before any code reads it. `zero-filled-bytes-per-chunk` was
@@ -241,14 +353,14 @@ Read against the three pinned implementations, all of which are in
   paths now drop the head buffer once the address has been forwarded.
 - **The staging buffer on either path.** An AEAD relay read used to copy
   every chunk into staging because two seals shared one write; now both seals
-  land beside the payload in the read buffer, which carries 34 B of
-  headroom and tailroom sized once per connection. A stream crypt needs no
-  staging either, and `seal_all` crypts the read buffer where it lies on both
+  land beside the payload in the read buffer, which carries 34 B of headroom
+  and tailroom per chunk of the batch, sized once per leg. A stream crypt needs
+  no staging either, and `seal_all` crypts the read buffer where it lies on both
   paths. `stream_relay_read_becomes_one_write` is the gate for the stream
   path; the pointer-identity asserts in
   `one_relay_read_becomes_one_write_and_reads_back_whole` are the gate for
-  the AEAD path: the write leaves from the caller's buffer, which never moves
-  or grows.
+  the AEAD path: every piece of the batch leaves from the caller's buffer,
+  which never moves or grows.
 - **A per-chunk dispatch for the stream.** The AEAD seal matches on the cipher
   per chunk because the ladder differs per method. The stream matches once per
   read in `seal_all` — one `match` on `Uplink` outside any per-byte loop — and
@@ -261,11 +373,14 @@ Read against the three pinned implementations, all of which are in
   one-copy-in shape as the AEAD path minus the tag bytes.
 - **A read syscall per 18 B length.** The relay loop used to read each sealed
   length with its own `read_exact` before reading the payload it named. It now
-  keeps a two-chunk window over the downlink: lengths open out of buffered
-  bytes while payloads still land straight in the caller's buffer, so a bulk
-  read serves the length, the payload and usually the next length in one
-  syscall. `a_bulk_read_serves_every_buffered_chunk` is the gate: one
-  underlying read for two chunks from a source that answers the whole window.
+  keeps a batch-sized window over the downlink: lengths open out of buffered
+  bytes while payloads still land straight in the window, so one bulk read
+  serves the length, the payload and usually the next length too.
+  `a_bulk_read_serves_every_buffered_chunk` is the gate, and it drives the
+  downlink's whole path — `drain_window` over a source that answers the window
+  in one read and a target that counts vectored writes: two chunks opened, one
+  bulk read plus the read that finds the end, one write to the target, and each
+  opened plaintext's base inside the window's own buffer.
 
 What is **not** removed, and is named rather than claimed: `aes-192-gcm`,
 `none` and the remaining stream ciphers (`aes-128-ctr`, `aes-192-ctr`,
@@ -284,6 +399,26 @@ place would save the `Box` the `Aes` engine pays per datagram. Reaching it means
 a rekey surface on `ferrox-core/src/aesgcm`, whose scope covers the record
 layer, so it is a P3 add-on recorded in `crates/ferrox-prompt/prompts.md`
 rather than part of this slice.
+
+Of what is *not* batched either, in the same breath as its cost: the
+`rc4-md5` rung keeps its one-chunk relay read (`READ_CHUNK = MAX_CHUNK`),
+because a stream has no chunk boundaries to preserve and every carrier frame
+the relay writes would change size with the read — a 64 KiB WebSocket frame
+where a peer saw 16 KiB frames is a wire change, not a win. Nor does the UDP leg
+batch: `recvmmsg`/`sendmmsg` over a datagram socket is the same class of win on
+the other transport, and the matrix has no shadowsocks-udp cell to price it in —
+`scripts/lib-matrix.sh` builds this method's engine with `"network": "tcp"` and
+its one scenario is `shadowsocks-raw-down-8`, so a datagram batch would ship with
+no gate that observes it. That is the reason it is not here, and it is the row
+`udp-datagram-reallocations-after-the-first 0` does not claim. And the batch is
+not free: 80 KiB of buffer per AEAD connection more than before, one allocation
+per leg either way, and none of that price on the stream rung, whose uplink
+stays at one slot. The matched pair of runs read that price rather than leaving
+it prose alone — peak RSS 8.01 → 9.38 MiB over 8 connections, where the 82 121 B
+per connection accounts for 0.63 MiB of the 1.37 measured and the rest is
+allocator rounding no run here attributes — and nothing on this page claims it
+is free; no memory row here has a checker that observes bytes, so the row stays
+out of the table even though the number has been read.
 
 ## Pins
 
