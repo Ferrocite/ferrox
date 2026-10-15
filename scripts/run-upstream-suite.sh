@@ -151,14 +151,19 @@ while IFS=$'\t' read -r name repo rev enabled suite binary seam path; do
     continue
   fi
   dir="$(mktemp -d)"
-  if ! git clone --quiet --no-checkout "$repo" "$dir" 2>/dev/null; then
-    echo "::error::$name: could not clone $repo"
+  # One commit, the pinned one: the suite reads the tree, never its history, and
+  # a full clone of the reference costs a minute the pin cannot pay back.
+  if ! git init --quiet "$dir" >/dev/null 2>&1 \
+    || ! git -C "$dir" remote add origin "$repo" >/dev/null 2>&1 \
+    || ! git -C "$dir" fetch --quiet --no-tags --depth 1 origin "$rev" >/dev/null 2>&1 \
+    || ! git -C "$dir" checkout --quiet FETCH_HEAD 2>/dev/null; then
+    echo "::error::$name: rev $rev does not resolve"
     rm -rf "$dir"
     status=1
     continue
   fi
-  if ! git -C "$dir" checkout --quiet "$rev" 2>/dev/null; then
-    echo "::error::$name: rev $rev does not resolve"
+  if [[ "$(git -C "$dir" rev-parse HEAD)" != "$rev" ]]; then
+    echo "::error::$name checkout is not at its pin $rev"
     rm -rf "$dir"
     status=1
     continue
@@ -170,8 +175,11 @@ while IFS=$'\t' read -r name repo rev enabled suite binary seam path; do
     continue
   fi
   log="$(mktemp)"
+  # A pin's rev is immutable, so its build is worth keeping: a pin bump is a new directory.
+  build_dir="$HOME/.cache/ferrox-upstream/$name-${rev:0:12}"
+  mkdir -p "$build_dir"
   passed=0
-  if (cd "$dir" && env "$seam=$workspace/target/debug/$binary" bash -c "$suite") 2>&1 | tee "$log"; then
+  if (cd "$dir" && env "CARGO_TARGET_DIR=$build_dir" "$seam=$workspace/target/debug/$binary" bash -c "$suite") 2>&1 | tee "$log"; then
     passed=1
   fi
   if ((passed == 0)); then

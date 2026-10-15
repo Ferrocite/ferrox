@@ -68,6 +68,11 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: interop-baseline
+      # A pin's rev is immutable, so its build is cacheable by the pin file; a pin bump is a new key.
+      - uses: actions/cache@v4
+        with:
+          path: ~/.cache/ferrox-upstream
+          key: upstream-build-${{ runner.os }}-${{ hashFiles('upstream/pins.toml') }}
       - name: plan the scope, so each suite is read from the same plan
         shell: bash
         env:
