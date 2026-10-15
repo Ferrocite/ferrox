@@ -10676,8 +10676,23 @@ mod tests {
         let user = TcpStream::connect(addr).expect("connects");
         user.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
+        user.set_write_timeout(Some(Duration::from_secs(30)))
+            .expect("write timeout");
         rx.recv_timeout(Duration::from_secs(30)).expect("dials");
         (user, dialled)
+    }
+
+    // Writing before reading only completes while the whole payload fits the chain's buffering, so read while writing.
+    fn echo_bulk(user: &mut TcpStream, payload: &[u8]) -> Vec<u8> {
+        let mut reader = user.try_clone().expect("clones");
+        let length = payload.len();
+        let back = thread::spawn(move || {
+            let mut got = vec![0u8; length];
+            reader.read_exact(&mut got).expect("echoes");
+            got
+        });
+        user.write_all(payload).expect("writes");
+        back.join().expect("reads")
     }
 
     #[test]
@@ -10685,10 +10700,7 @@ mod tests {
         let pair = reality_pair(crate::vision::FLOW);
         let (mut user, dialled) = dial_pair(&pair);
         let payload: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
-        user.write_all(&payload).expect("writes");
-        let mut back = vec![0u8; payload.len()];
-        user.read_exact(&mut back).expect("echoes");
-        assert_eq!(back, payload);
+        assert_eq!(echo_bulk(&mut user, &payload), payload);
         drop(user);
         dialled.join().expect("joins");
         pair.echo.join().expect("joins");
@@ -10704,12 +10716,43 @@ mod tests {
             let payload: Vec<u8> = (0..length)
                 .map(|index| (index as u8).wrapping_mul(29).wrapping_add(seed))
                 .collect();
-            user.write_all(&payload).expect("writes");
-            let mut back = vec![0u8; payload.len()];
-            user.read_exact(&mut back)
-                .unwrap_or_else(|why| panic!("{seed}: {length} bytes did not come back: {why}"));
+            let back = echo_bulk(&mut user, &payload);
             assert_eq!(back, payload, "{seed}: payload came back altered");
         }
+        drop(user);
+        dialled.join().expect("joins");
+        pair.echo.join().expect("joins");
+        pair.front.join().expect("joins");
+    }
+
+    /// A bulk round trip must not assume the socket holds the payload: 4 KiB per direction is under what a fresh loopback socket gets anywhere, and 4 MiB is over what the write-before-read shape could carry at it (witnessed here: it parked in `sendto`).
+    #[test]
+    #[cfg(unix)]
+    fn a_small_socket_buffer_does_not_park_a_bulk_round_trip() {
+        use std::os::unix::io::AsRawFd;
+        let pair = reality_pair("");
+        let (mut user, dialled) = dial_pair(&pair);
+        for (name, opt) in [
+            ("SO_SNDBUF", libc::SO_SNDBUF),
+            ("SO_RCVBUF", libc::SO_RCVBUF),
+        ] {
+            let want: libc::c_int = 4096;
+            // SAFETY: `want` outlives the call, and the size is its own.
+            let set = unsafe {
+                libc::setsockopt(
+                    user.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    opt,
+                    std::ptr::addr_of!(want).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            assert_eq!(0, set, "{name} refused");
+        }
+        let payload: Vec<u8> = (0..4 * 1024 * 1024usize)
+            .map(|index| (index as u8).wrapping_mul(29))
+            .collect();
+        assert_eq!(echo_bulk(&mut user, &payload), payload);
         drop(user);
         dialled.join().expect("joins");
         pair.echo.join().expect("joins");
@@ -10730,10 +10773,7 @@ mod tests {
         let payload: Vec<u8> = (0..200_000u32)
             .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
             .collect();
-        user.write_all(&payload).expect("writes");
-        let mut back = vec![0u8; payload.len()];
-        user.read_exact(&mut back)
-            .expect("echoes over the ws carrier");
+        let back = echo_bulk(&mut user, &payload);
         assert_eq!(
             back, payload,
             "payload came back altered through the carried REALITY session"
