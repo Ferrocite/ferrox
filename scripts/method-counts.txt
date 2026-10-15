@@ -163,6 +163,8 @@ carrier-foxy address-assign-capsule-bytes-per-grant 9 ferrox-core-foxy::connecti
 carrier-foxy route-advert-capsule-bytes-per-route 12 ferrox-core-foxy::connectip::tests::the_route_advert_a_proxy_writes_is_the_route_advert_the_lane_reads
 carrier-foxy edges-preferred-by-verified-exit 1 ferrox-app-proxy::foxy_exit_tests::the_preferred_edge_is_the_first_one_whose_exit_agrees_not_the_first_one_opened
 carrier-foxy tcp-connections-asked-of-an-untrusted-edge 1 ferrox-app-foxy::loopback::an_untrusted_edge_is_named_and_asked_once
+carrier-foxy catalogue-edges-kept-across-a-failed-fetch 4 ferrox-app-foxy_catalog::tests::a_fetch_that_failed_keeps_the_edges_already_known
+carrier-foxy catalogue-edges-rewritten-from-the-cache-file 5 ferrox-app-foxy_catalog::tests::the_cache_file_one_process_writes_is_the_one_the_next_reads
 
 carrier-quic ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-quic handshakes-per-server 1 ferrox-app-proxy::tests::quic_pool_shares_one_connection_between_two_streams
