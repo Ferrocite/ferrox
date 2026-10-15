@@ -24,6 +24,9 @@ The price is buffers: the relay's read buffer and the downlink window are both
 sized for a batch, so a connection carries 80 KiB more than it did
 (`+82 121 B`, 16 417 → 65 668 uplink, 32 798 → 65 668 downlink), still one
 allocation per leg, and it buys 3.5× fewer syscalls per GiB (see Measured).
+`CHUNKS_PER_BATCH` is not tuned past that: the buffer cost is linear in it and
+4 is the batch the pinned reference itself drains, so a wider batch is a larger
+trade rather than a cheaper one, and no CI run has yet priced one.
 
 `rc4-md5` is the same rung as a stream: a 16-byte IV in the clear, then the
 address header and every payload byte under RC4 with `MD5(master ++ IV)` as
