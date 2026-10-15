@@ -16,6 +16,8 @@ pub enum Failure {
     Stream,
     Frame,
     Io,
+    /// The edge presented a chain this device does not trust. It is a fact about the certificate, not about the moment: no retry changes it, and every carrier on that edge answers it the same way.
+    Untrusted,
 }
 
 impl std::fmt::Display for Failure {
@@ -25,6 +27,7 @@ impl std::fmt::Display for Failure {
             Self::Stream => f.write_str("the edge closed the stream"),
             Self::Frame => f.write_str("the edge sent a frame the carrier cannot read"),
             Self::Io => f.write_str("the carrier io failed"),
+            Self::Untrusted => f.write_str("this device does not trust the edge's certificate"),
         }
     }
 }
@@ -34,6 +37,15 @@ impl std::error::Error for Failure {}
 impl From<std::io::Error> for Failure {
     fn from(_: std::io::Error) -> Self {
         Self::Io
+    }
+}
+
+impl From<crate::tls::TlsError> for Failure {
+    fn from(error: crate::tls::TlsError) -> Self {
+        match error {
+            crate::tls::TlsError::BadCertificate(_) => Self::Untrusted,
+            _ => Self::Io,
+        }
     }
 }
 
@@ -252,6 +264,30 @@ impl Health {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A refused chain is the one TLS failure a caller can act on, so the mapping keeps its name; every other TLS failure stays a moment about the connection.
+    #[test]
+    fn a_refused_chain_is_untrusted_and_every_other_tls_failure_is_a_moment() {
+        for (error, want) in [
+            (
+                crate::tls::TlsError::BadCertificate("UnknownIssuer".to_owned()),
+                Failure::Untrusted,
+            ),
+            (crate::tls::TlsError::Timeout, Failure::Io),
+            (crate::tls::TlsError::Closed, Failure::Io),
+            (crate::tls::TlsError::NoSharedCipher, Failure::Io),
+            (
+                crate::tls::TlsError::Other("peer misbehaved".to_owned()),
+                Failure::Io,
+            ),
+        ] {
+            assert_eq!(Failure::from(error), want, "{want}");
+        }
+        assert_eq!(
+            Failure::Untrusted.to_string(),
+            "this device does not trust the edge's certificate"
+        );
+    }
 
     #[test]
     fn an_authority_brackets_ipv6_and_leaves_names_alone() {
