@@ -78,5 +78,20 @@
 # 13 Ir the thin-LTO release layout moves with a code/test count back in;
 # `der_to_pem` and quic.rs are byte-for-byte untouched, and
 # `pem_wraps_at_sixty_four_columns` still passes.
+# Row moves from `der_to_pem` to `append_pem` by opt-der-pem-capacity: after the
+# exact-capacity reservation `der_to_pem` is a thin wrapper (`Vec::with_capacity
+# (pem_capacity(..))`, one call, return) that release inlines away, so no
+# callgrind frame carries its name; the PEM body survives as
+# `ferrox_app::quic::append_pem`, which is what `pem_wraps_at_sixty_four_columns`
+# now executes through it.
+# Re-blessed 1205 by opt-der-pem-capacity: the fill loop lost the log(n) growth
+# reallocs and their repeated prefix re-copies, because `Vec::with_capacity
+# (pem_capacity(..))` in the caller opens the buffer to its exact length and the
+# `reserve` inside `append_pem` is then a no-op; `base64_encode_block` and the
+# wire bytes are unchanged, and the three witnesses (capacity==len,
+# pointer-identity append, pad/wrap round-trip) all pass on every OS. The frame
+# is smaller than the old `der_to_pem 2680` also because the `with_capacity`
+# alloc now sits in the caller (inlined into the test), so the blessed count
+# measures only the fill — the two facts together explain the drop.
 
-der_to_pem 2680
+append_pem 1205

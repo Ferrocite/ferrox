@@ -53,10 +53,16 @@ graph TD
   proxy::tests::quic_pool_shares_one_connection_between_two_streams 'quic::dial_pooled'
 ```
 
-`UNBLESSED`, as above. Note that `quic::tests::pem_wraps_at_sixty_four_columns`
-is the *one* symbol blessed in `scripts/expected-ops.txt`, at `der_to_pem 2653`
-instructions — which is a PEM formatting helper, not a carrier. That is why the
-whole ops row in this table is open.
+`UNBLESSED`, as above. The *one* symbol blessed in `scripts/expected-ops.txt`
+is `append_pem`, driven from `quic::tests::pem_wraps_at_sixty_four_columns` — a
+PEM formatting helper, not a carrier, which is why the carrier ops row stays
+open. The row used to sit on `der_to_pem`; after the exact-capacity
+reservation it became a thin wrapper (`Vec::with_capacity(pem_capacity(..))`,
+one call, return) that release inlines away, so the profile's surviving frame
+is the callee that carries the loop, `append_pem`. `pem_capacity` opens the
+output at the exact length and `append_pem` fills it via memcpy into live
+capacity — the growth reallocs and the per-cert `Vec` that was then copied into
+the chain are gone.
 
 ## Time
 
@@ -76,6 +82,17 @@ behind a VPN measures the tunnel. No artefact from this branch has been read.
   than reaching for the platform store. That is a security property, not a speed
   one, and it belongs on this page because it is a refusal that costs a
   connection.
+- **A PEM buffer that grew, and one that was copied.** `der_to_pem` opened on
+  `Vec::new()` and let each `extend_from_slice` double the buffer, re-copying the
+  prefix every time; `serve_config` and `quiche_config` then built each
+  certificate as its own `Vec` and copied it into the chain. Now one
+  `pem_capacity` reservation sizes the whole buffer and `append_pem` writes
+  blocks straight into it. `a_pem_buffer_is_reserved_to_its_exact_length` gates
+  the reservation (`len == capacity`, so no realloc fired), and
+  `appending_into_a_reserved_buffer_does_not_move_it` proves the removed copy by
+  pointer identity — the first block's address is unmoved across the second
+  append. `pem_survives_the_pad_and_wrap_boundaries` witnesses that the bytes did
+  not change: the reservation moved where bytes land, never which bytes.
 
 What is **not** removed, and is named rather than claimed: 0-RTT, connection
 migration, key updates and batched datagram I/O are quiche's, not this tree's.
