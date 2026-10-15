@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use crate::budgets::{
     ACCOUNT_ATTEMPTS, ACCOUNT_BACKOFF_SECS, CARRIER_DEAD_SECS, CARRIER_PROBE, DIAL_TIMEOUT,
     HANDSHAKE_REQUEST_TIMEOUT, HEAD_DEADLINE, PAYLOAD_GRACE, RELAY_HANDOFF_SPINS, RELAY_IDLE,
-    RELAY_LOCK_TRIES, RELAY_POLL, RELAY_QUANTUM, SESSION_POLL, UDP_IDLE,
+    RELAY_JOIN, RELAY_LOCK_TRIES, RELAY_POLL, RELAY_QUANTUM, SESSION_POLL, UDP_IDLE,
 };
 use crate::config::{
     inbound_carrier, inbound_reality_config, inbound_tls_identity, outbound_carrier, outbound_flow,
@@ -7109,8 +7109,19 @@ impl RelayPool {
     }
 }
 
+fn join_within(direction: &std::sync::mpsc::Receiver<()>, budget: Duration) -> bool {
+    match direction.recv_timeout(budget) {
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            eprintln!("ferrox-app: a relay leg did not hand back inside its join budget");
+            false
+        }
+        // A partner whose sender is gone can never hand back, which is what the unbounded wait already read as finished.
+        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
+    }
+}
+
 fn join(direction: &std::sync::mpsc::Receiver<()>) {
-    let _ = direction.recv();
+    join_within(direction, RELAY_JOIN);
 }
 
 pub(crate) const RELAY_BUFFER: usize = 256 * 1024;
@@ -9801,8 +9812,10 @@ mod tests {
             }));
         }
         for wait in &waits {
-            wait.recv()
-                .expect("every direction must report that it ended");
+            wait.recv_timeout(RELAY_JOIN).expect(
+                "every direction must report that it ended, and a direction that never \
+                         started means the pool serialised them instead of running them",
+            );
         }
         assert_eq!(
             arrived.load(std::sync::atomic::Ordering::SeqCst),
@@ -9815,7 +9828,7 @@ mod tests {
     fn a_direction_that_panics_does_not_take_the_worker_with_it() {
         let pool = RelayPool::global();
         pool.run(|| panic!("this direction is broken on purpose"))
-            .recv()
+            .recv_timeout(RELAY_JOIN)
             .expect(
                 "a panicking direction still has to report that it ended, or the relay \
              waits on it forever",
@@ -9824,9 +9837,37 @@ mod tests {
         pool.run(move || {
             let _ = tx.send(());
         })
-        .recv()
-        .expect("the pool still works");
+        .recv_timeout(RELAY_JOIN)
+        .expect("the pool still works, so a hand-back arrived");
         assert!(rx.try_recv().is_ok(), "and the work after it actually ran");
+    }
+
+    /// A leg whose partner never reports has to be given up on inside the budget, not waited out: the parked arm is the one that used to hold a thread forever.
+    #[test]
+    fn a_leg_that_never_hands_back_is_given_up_on_instead_of_waited_out() {
+        let (_never, held) = std::sync::mpsc::channel::<()>();
+        let started = std::time::Instant::now();
+        assert!(
+            !join_within(&held, Duration::from_millis(50)),
+            "a partner that never reports is a give-up, not a park"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "and it gives up promptly"
+        );
+
+        let (ended_tx, ended_rx) = std::sync::mpsc::channel();
+        ended_tx.send(()).expect("the hand-back is sent");
+        assert!(
+            join_within(&ended_rx, RELAY_JOIN),
+            "a hand-back is a hand-back"
+        );
+        let (gone_tx, gone_rx) = std::sync::mpsc::channel::<()>();
+        drop(gone_tx);
+        assert!(
+            join_within(&gone_rx, RELAY_JOIN),
+            "a partner that died counts as finished, exactly as the unbounded wait read it"
+        );
     }
 
     #[derive(Clone, Default)]
