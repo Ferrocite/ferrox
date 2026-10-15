@@ -217,3 +217,9 @@ carrier-hysteria wrong-password-bytes-relayed 0 ferrox-app-proxy::tests::hysteri
 carrier-hysteria non-v2-configs-carried 0 ferrox-app-proxy::tests::hysteria_settings_parse_with_guarded_fallbacks
 carrier-hysteria udp-bytes-relayed 0 ferrox-app-proxy::tests::hysteria_dial_udp_uplink_is_none
 carrier-hysteria pinned-hysteria-client-verdicts 1 scripts/run-upstream-suite.sh
+
+# --- TLS ClientHello `cipher_suites` field (PattNG ext.) --------------------
+tls-cipher-suites ops-retired-instructions UNBLESSED scripts/count-ops.sh
+tls-cipher-suites oracle-cases-replayed-byte-identical 10 ferrox-core-tls::cipher_suites::tests::oracle_replay_matches_go
+tls-cipher-suites cipher-suite-ids-reachable-by-the-backend 3 ferrox-core-tls::rustls_backend::tests::a_crafted_list_reorders_the_dialer_hello_to_the_reference
+tls-cipher-suites dialer-hello-cipher-field-equals-reference 1 ferrox-core-tls::rustls_backend::tests::a_crafted_list_reorders_the_dialer_hello_to_the_reference

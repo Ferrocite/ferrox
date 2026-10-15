@@ -13,6 +13,10 @@ pub struct TlsConfig {
     /// nothing and refuses nothing, which is the default because a lane with no
     /// pins is the ordinary case.
     pub pins: crate::foxy::pin::Pins,
+    /// The `cipher_suites` ids a client advertises, in `crypto/tls` order, from xray's
+    /// `tlsSettings.cipherSuites`. Empty means the config named none, so the backend keeps
+    /// its stock ordering; see `cipher_suites` for how a non-empty list is built.
+    pub cipher_suites: Vec<u16>,
 }
 
 pub trait TlsProvider: std::io::Read + std::io::Write {
@@ -181,6 +185,7 @@ fn pem_blocks(pem: &[u8], label: &str) -> Vec<Vec<u8>> {
     out
 }
 
+pub mod cipher_suites;
 mod rustls_backend;
 pub use rustls_backend::{RustlsProvider, RustlsServerProvider};
 

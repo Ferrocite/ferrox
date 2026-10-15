@@ -92,17 +92,33 @@ impl<S: Stream> RustlsProvider<S> {
         }
         let roots = Arc::new(roots);
 
-        let mut config = rustls::ClientConfig::builder_with_provider(provider())
+        let mut provider = (*provider()).clone();
+        if !cfg.cipher_suites.is_empty() {
+            // The ring backend's set is a subset of `crypto/tls`'s, so the sort only re-orders what is reachable.
+            let order = &cfg.cipher_suites;
+            provider.cipher_suites.sort_by_key(|cs| {
+                let id = u16::from(cs.suite());
+                order
+                    .iter()
+                    .position(|&want| want == id)
+                    .unwrap_or(usize::MAX)
+            });
+        }
+        let provider = Arc::new(provider);
+
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
             .with_safe_default_protocol_versions()
             .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?
             .with_root_certificates(roots.clone())
             .with_no_client_auth();
         config.alpn_protocols.clone_from(&cfg.alpn);
         if !cfg.pins.is_empty() {
-            let verifier =
-                rustls::client::WebPkiServerVerifier::builder_with_provider(roots, provider())
-                    .build()
-                    .map_err(|e| TlsError::BadCertificate.with_detail(format!("chain: {e}")))?;
+            let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
+                roots,
+                Arc::clone(&provider),
+            )
+            .build()
+            .map_err(|e| TlsError::BadCertificate.with_detail(format!("chain: {e}")))?;
             config
                 .dangerous()
                 .set_certificate_verifier(Arc::new(Pinned {
@@ -637,6 +653,7 @@ mod tests {
             alpn: alpn.iter().map(|p| p.to_vec()).collect(),
             roots: vec![ANCHOR.to_vec()],
             pins: crate::foxy::pin::Pins::default(),
+            cipher_suites: Vec::new(),
         }
     }
 
@@ -672,6 +689,50 @@ mod tests {
             let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
             dial(stream);
         });
+    }
+
+    /// The `cipher_suites` field of a captured `ClientHello` record: skip the 5-byte record and
+    /// 4-byte handshake headers, the legacy version and random, then the session id, and read
+    /// the length-prefixed suite list — the same span the Go oracle dumps.
+    fn hello_cipher_suites(record: &[u8]) -> &[u8] {
+        assert_eq!(record[0], 0x16, "handshake record");
+        assert_eq!(record[5], 0x01, "ClientHello");
+        let body = &record[9..];
+        let sid_len = usize::from(body[2 + 32]);
+        let at = 2 + 32 + 1 + sid_len;
+        let cs_len = usize::from(body[at]) << 8 | usize::from(body[at + 1]);
+        &body[at..at + 2 + cs_len]
+    }
+
+    #[cfg_attr(miri, ignore = "assembles a real hello through ring")]
+    #[test]
+    fn a_crafted_list_reorders_the_dialer_hello_to_the_reference() {
+        // The reference TLS 1.3 field is `0x1301,0x1302,0x1303`; ring's stock provider offers `0x1302,0x1301,0x1303`.
+        let preset =
+            "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256:TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256";
+        let crafted = crate::tls::cipher_suites::hello_ids(
+            &crate::tls::cipher_suites::parse(preset),
+            0x0304,
+            0x0304,
+            true,
+        );
+        let mut cfg = client("tls.test", &[]);
+        cfg.cipher_suites = crafted;
+        let config = RustlsProvider::<TcpStream>::config(&cfg).expect("builds");
+        let mut conn = rustls::ClientConnection::new(
+            config,
+            rustls::pki_types::ServerName::try_from("tls.test").expect("name"),
+        )
+        .expect("session");
+        let mut record = Vec::new();
+        conn.write_tls(&mut record).expect("hello goes out");
+        let got = hello_cipher_suites(&record);
+        let want = crate::tls::cipher_suites::field_bytes(&[0x1301, 0x1302, 0x1303]);
+        assert_eq!(
+            got,
+            want.as_slice(),
+            "dialer hello matches the crypto/tls field"
+        );
     }
 
     #[cfg_attr(
