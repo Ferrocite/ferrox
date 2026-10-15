@@ -83,7 +83,7 @@ skipped and why without opening a log.
 
 | job | gate | what the gate means |
 | --- | --- | --- |
-| `ci.yml`'s `test` (three runners) | `rust` | no `.rs`, `Cargo.*` or tool change ⇒ the prose did not move the compiler |
+| `ci.yml`'s `test` (three runners) | `rust` | a `.rs`, `Cargo.*` or tool-crate change: the compiler's own inputs moved. A wide plan that names none of them — a workflow file, a script — still skips it, because nothing a test reads changed; a schedule with no diff to read keeps the tests |
 | `ops.yml`'s `counts` | `ops`, then `rust` for the exact-count step | the row list is the touched methods'; the blessed-count check only rebuilds when Rust moved |
 | `benchmark-matrix.yml`'s `fetch…collect` | `matrix` | a method the matrix does not measure has no cell to run, and on a narrow plan `engines` says which comparators it fetches, builds and probes |
 | `conformance.yml`'s `suites`, `interop-baseline.yml`'s `baseline` | `suites` | a pin whose suite holds no test in scope is skipped, and says so; conformance then narrows the suite it keeps to those names, while the baseline runs a suite that stays whole |

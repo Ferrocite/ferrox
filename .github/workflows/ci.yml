@@ -95,7 +95,8 @@ jobs:
     name: test (${{ matrix.name }})
     needs: plan
     # Three compilers build the same unchanged workspace because a page's prose
-    # moved. A wide plan — shared code, a schedule — answers true here.
+    # moved. `rust` is what the compiler reads, so a wide plan of workflow files
+    # and scripts answers false here; a schedule, with no diff to read, answers true.
     if: needs.plan.outputs.rust == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60

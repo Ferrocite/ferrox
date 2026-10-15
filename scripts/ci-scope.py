@@ -401,7 +401,7 @@ def classify(changed: list[str], scopes: dict[str, dict[str, list[str]]],
     reason = shared or ("" if methods else "nothing a method page owns")
     return {"wide": wide, "reason": reason, "methods": sorted(methods),
             "unclaimed": sorted(unclaimed), "attributed": attributed,
-            "rust": rust or tool}
+            "planned": bool(changed), "rust": rust or tool}
 
 
 def is_shared_source(path: str) -> bool:
@@ -510,12 +510,12 @@ def changed_from(root: str, base: str) -> tuple[list[str], dict, dict]:
 
 
 def output_flags(plan: dict) -> dict[str, str]:
-    """The job-level `if:` answers. A wide plan is true for every one of them,
-    including `rust`: a scheduled or manual run has no diff to narrow on, so it
-    owes the build and the tests like any shared change does."""
+    """The job-level `if:` answers. `rust` is what the compiler reads, not whether
+    the plan is wide: a workflow or a script change cannot move a test's outcome,
+    while a plan with no diff to look at (--wide, a schedule) owes the tests."""
     return {
         "wide": "true" if plan["wide"] else "false",
-        "rust": "true" if plan["wide"] or plan["rust"] else "false",
+        "rust": "true" if plan["rust"] or not plan["planned"] else "false",
         "methods": ",".join(plan["methods"]),
         "cells": ",".join(plan["scenarios"]),
         "engines": ",".join(plan["engines"]),
@@ -987,6 +987,16 @@ def cmd_selftest(args: argparse.Namespace) -> int:
     failed += 0 if ok else 1
     print(f"selftest: {'ok  ' if ok else 'FAIL'} --wide still owes the build "
           f"and its tests (rust={scheduled['rust']})")
+    # The other half of that rule: a plan read off a real diff that moves no Rust
+    # cannot move a test's outcome either, so three compilers are not owed.
+    infra = output_flags(build_plan(root, [".github/workflows/ci.yml",
+                                            "scripts/check-ci-scope.sh"]))
+    ok = infra["wide"] == "true" and infra["rust"] == "false" \
+        and infra["matrix"] == "true" and infra["ops"] == "true"
+    failed += 0 if ok else 1
+    print(f"selftest: {'ok  ' if ok else 'FAIL'} a wide plan that moves no Rust "
+          f"does not owe the test matrix (rust={infra['rust']}, "
+          f"matrix={infra['matrix']})")
     prose = output_flags(build_plan(root, ["docs/function/vmess.md"]))
     ok = prose["rust"] == "false" and prose["matrix"] == "true" \
         and prose["ops_rows"] == "2" and prose["go"] == "true"
