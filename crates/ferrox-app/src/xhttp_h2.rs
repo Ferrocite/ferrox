@@ -16,6 +16,16 @@ const CONN_WINDOW_TOP_UP: u32 = 16 * 1024 * 1024 - 65_535;
 const MAX_STREAMS: u32 = 100;
 /// The default `SETTINGS_MAX_FRAME_SIZE` (RFC 7540 6.5.2): the largest inbound frame we accept because we never advertise a larger one.
 const MAX_RECV_FRAME: usize = 16_384;
+/// The two `WINDOW_UPDATE` frames one credit grants differ only by stream id, so twenty of their twenty-six bytes are constant; the connection frame keeps the first slot because that is the order it was written in.
+const CREDIT_TEMPLATE: [u8; 26] = {
+    let mut out = [0u8; 26];
+    // length 4, WINDOW_UPDATE, no flags, stream 0 at [0..13], stream id at [13..26].
+    out[2] = 4;
+    out[3] = T_WINDOW;
+    out[15] = 4;
+    out[16] = T_WINDOW;
+    out
+};
 
 #[derive(Debug, Clone)]
 pub(crate) struct H2StreamOut {
@@ -294,10 +304,18 @@ impl H2Conn {
         if n == 0 || n > u32::MAX as usize {
             return;
         }
-        let n = n as u32;
+        let increment = (n as u32).to_be_bytes();
+        let mut out = CREDIT_TEMPLATE;
+        out[9..13].copy_from_slice(&increment);
+        out[18..22].copy_from_slice(&stream.to_be_bytes());
+        out[22..26].copy_from_slice(&increment);
         // Consuming inbound bytes grants the peer more credit; our own send windows rise only from the peer's WINDOW_UPDATE, so crediting them here would let a bulk send outrun the window the peer gave and trip its flow control.
-        let _ = self.frame(T_WINDOW, 0, 0, &n.to_be_bytes());
-        let _ = self.frame(T_WINDOW, 0, stream, &n.to_be_bytes());
+        let Ok(mut write) = self.write.lock() else {
+            return;
+        };
+        if !write.write_slices(&[&out]) {
+            self.dead.store(true, Ordering::SeqCst);
+        }
     }
 
     fn end_stream(&self, stream: u32) {
@@ -754,6 +772,7 @@ mod tests {
     use super::*;
     use crate::h2::MAGIC;
     use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::sync::atomic::AtomicUsize;
     use std::thread;
     use std::time::Duration;
 
@@ -1308,5 +1327,92 @@ mod tests {
         assert_eq!(client.response_head(bad_seq), 500);
         drop(client);
         server.join().expect("joins");
+    }
+
+    /// The writer a credit is read by: it answers with the bytes it was handed, so the number of writes it took is exact — over a loopback socket the same shape moves with the scheduler.
+    struct Counted {
+        written: Arc<Mutex<Vec<u8>>>,
+        slices: Arc<AtomicUsize>,
+    }
+
+    impl Write for Counted {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::proxy::FrameWrite for Counted {
+        fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+            self.slices.fetch_add(1, Ordering::SeqCst);
+            parts.iter().all(|part| self.write_all(part).is_ok())
+        }
+    }
+
+    /// A connection with no streams and no peer: only what a call writes can be seen.
+    fn bare_conn() -> (Arc<H2Conn>, Arc<Mutex<Vec<u8>>>, Arc<AtomicUsize>) {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let slices = Arc::new(AtomicUsize::new(0));
+        let conn = Arc::new(H2Conn {
+            write: Mutex::new(Box::new(Counted {
+                written: Arc::clone(&written),
+                slices: Arc::clone(&slices),
+            })),
+            streams: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashSet::new()),
+            send_conn: Mutex::new(65_535),
+            wake: Condvar::new(),
+            decoder: Mutex::new(Decoder::default()),
+            max_frame: Mutex::new(16_384),
+            peer_initial: Mutex::new(65_535),
+            dead: AtomicBool::new(false),
+            goaway: AtomicBool::new(false),
+            refused: AtomicBool::new(false),
+        });
+        (conn, written, slices)
+    }
+
+    /// One credit is both `WINDOW_UPDATE`s: the pair differs only by stream id, so it goes out as one 26-byte write under one lock, where two `frame()` calls were two locks and two records on the wire for the same bytes.
+    #[test]
+    fn a_credit_grants_both_windows_in_one_write() {
+        let (conn, written, slices) = bare_conn();
+        let increment = 0x1234_5678u32;
+        conn.replenish(7, 0);
+        conn.replenish(7, usize::MAX);
+        assert_eq!(
+            slices.load(Ordering::SeqCst),
+            0,
+            "a credit of nothing, or of more than a frame can say, writes nothing"
+        );
+        conn.replenish(7, increment as usize);
+        assert_eq!(
+            slices.load(Ordering::SeqCst),
+            1,
+            "one credit, one write, whatever the pair costs the old shape"
+        );
+        let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(bytes.len(), 26, "the pair is 26 bytes and nothing else");
+        let mut at = 0usize;
+        for id in [0, 7] {
+            let (len, kind, flags, sid) = read_head(&mut &bytes[at..at + 9]).expect("head");
+            assert_eq!(
+                (len, kind, flags, sid),
+                (4, T_WINDOW, 0, id),
+                "the frame at {at} is the credit for stream {id}"
+            );
+            assert_eq!(
+                bytes[at + 9..at + 13],
+                increment.to_be_bytes(),
+                "both windows rise by the bytes consumed"
+            );
+            at += 13;
+        }
     }
 }
