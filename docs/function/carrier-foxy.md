@@ -29,10 +29,13 @@ its `Read + Write`.
 
 ```mermaid
 graph TD
-    S["SOCKS front, no Mux"] --> O["dial_order: stored edge, then the country's"]
+    S["SOCKS front, no Mux"] --> V{"exit pinned and a probe set?"}
+    V -- "once per lane" --> P["verify_exit: disposable H3 probe per edge, cache the first whose exit agrees"]
+    P --> O["dial_order: verified edge, then stored, then the country's"]
+    V -- "no pin / already verified" --> O
     O --> T{"which carrier?"}
-    T -- h3 --> P["pooled QUIC connection, one handshake per server"]
-    P --> H["QPACK CONNECT on a new stream"]
+    T -- h3 --> Pq["pooled QUIC connection, one handshake per server"]
+    Pq --> H["QPACK CONNECT on a new stream"]
     T -- h2 --> G["h2 preface + settings + HEADERS"]
     T -- h1 --> L["HTTP/1.1 CONNECT"]
     H --> R{"status"}
@@ -67,6 +70,7 @@ graph TD
 | dialled-without-ca-cert-file | 0 | ferrox-app-proxy::tests::quic_outbound_reads_ca_cert_file |
 | address-assign-capsule-bytes-per-grant | 9 | ferrox-core-foxy::connectip::tests::the_assign_a_proxy_writes_is_the_assign_the_lane_reads |
 | route-advert-capsule-bytes-per-route | 12 | ferrox-core-foxy::connectip::tests::the_route_advert_a_proxy_writes_is_the_route_advert_the_lane_reads |
+| edges-preferred-by-verified-exit | 1 | ferrox-app-proxy::foxy_exit_tests::the_preferred_edge_is_the_first_one_whose_exit_agrees_not_the_first_one_opened |
 <!-- counts:end -->
 
 `payload-staging-copies-per-byte-written 0` and
@@ -93,6 +97,25 @@ how many datagrams the gate puts in the frame, on `h2` and on `h3` separately �
 the two lanes reassemble independently and a fix to one says nothing about the
 other.
 
+`edges-preferred-by-verified-exit 1` is the lane's exit-country selection: when a
+pinned country offers more than one edge, a once-per-lane pre-flight asks each
+disposable HTTP/3 probe tunnel where it really exits and dials the first whose
+observed `loc` matches the pin, not the first that merely opened. The value is
+the one disagreeing edge the kernel passes over before the agreeing one, which is
+what `the_preferred_edge_is_the_first_one_whose_exit_agrees_not_the_first_one_opened`
+observes. A country the serverlist publishes as a single anycast edge — the
+United States is `us.m1.fastly-masque.net` alone — has nothing to rotate to, so
+the lane records the truth (`exit CA differs from pin US`, under `FOXY_DEBUG`) and
+dials the one edge it was given: which CDN point of presence answers a country's
+anycast from a given runner is not a choice the client can make.
+
+What the pre-flight costs, named rather than hidden: up to `MAX_FOXY_ALTERNATES +
+1` disposable HTTP/3 dials, once per lane, then cached on `FoxyOut` — so it is
+paid on the first flow, not every one. It runs only when a country is pinned and
+an `exitProbe` is set; the recommended location, and every config with no probe,
+pay nothing, and a runner that cannot carry the trace sets one flag and stops
+probing rather than costing each flow a dead dial.
+
 ## Ops
 
 ```bash
@@ -110,7 +133,9 @@ figure.
 `.github/workflows/foxy-relay.yml` measures — it downloads 1 MB per carrier
 (`h1`, `h2`, `h3`, `auto`) against the real edge on all three runners, and the
 ubuntu job adds a second exit country, the `http` front and the UDP datagram
-path. A duration from a machine behind a VPN measures the tunnel, not the lane.
+path. That job now also sets an `exitProbe` on every pinned-country leg, so the
+pre-flight is what reads the real exit country against the real edge. A duration
+from a machine behind a VPN measures the tunnel, not the lane.
 
 ## What we removed
 
