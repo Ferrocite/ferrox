@@ -28,6 +28,7 @@ A from-scratch proxy core, built to be **bit-identical to the implementations it
 | claim | checked by |
 | --- | --- |
 | compiles | `ci.yml`: `cargo test --workspace` on linux x86_64, macos aarch64, windows x86_64; clippy clean |
+| no test stalls the suite unnoticed | `scripts/watch-test.sh` wraps that same run: past the quiet limit with nothing written it stops the suite, names the test that does not return on its own, prints what each thread waits in, and leaves the log as an artefact — a stall that only burns the job timeout names nothing |
 | bit-identical output | differential test against the pinned reference, run *before* any timing |
 | no use-after-free, no leak | Miri nightly for safe-Rust paths; differential tests for SIMD |
 | no allocation, no zero-fill | counting global allocator, gated at exactly 0 |

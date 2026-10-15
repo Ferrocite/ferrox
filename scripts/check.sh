@@ -44,7 +44,7 @@ step "prompt library"
 cargo run --locked --quiet -p ferrox-prompt -- check
 
 step "tests"
-cargo test --workspace --locked
+./scripts/watch-test.sh -- cargo test --workspace --locked
 
 # Same flags ops.yml blesses under: line tables only, nothing else, because a
 # different RUSTFLAGS is a different program and the counts in expected-ops.txt
