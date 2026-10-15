@@ -3841,15 +3841,38 @@ fn session_halves<S>(session: S) -> (TlsHalf<S>, TlsHalf<S>) {
     (reader, TlsHalf { session: shared })
 }
 
-fn tls_ws(
+// A dialled TLS session a carrier can drive: split into a reader and a writer over one lock, plus the raw socket the sink shuts down on teardown.
+trait Dialed: ferrox_core::tls::TlsProvider + Send + 'static {
+    fn into_halves(self) -> Option<(TlsHalf<Self>, TlsHalf<Self>, Arc<TcpStream>)>
+    where
+        Self: Sized;
+}
+
+impl Dialed for ferrox_core::tls::RustlsProvider<TcpStream> {
+    fn into_halves(self) -> Option<(TlsHalf<Self>, TlsHalf<Self>, Arc<TcpStream>)> {
+        tls_halves(self)
+    }
+}
+
+impl Dialed
+    for ferrox_core::tls::RealityClientSession<ferrox_core::tls::reality::RecordLimiter<TcpStream>>
+{
+    fn into_halves(self) -> Option<(TlsHalf<Self>, TlsHalf<Self>, Arc<TcpStream>)> {
+        let raw = Arc::new(self.get_ref().get_ref().try_clone().ok()?);
+        let (reader, writer) = session_halves(self);
+        Some((reader, writer, raw))
+    }
+}
+
+fn tls_ws<S: Dialed>(
     server: &SocketAddr,
-    session: ferrox_core::tls::RustlsProvider<TcpStream>,
+    session: S,
     host: &str,
     path: &str,
     ed: u32,
     first: &[u8],
-) -> Option<(crate::ws::WsReader<ClientHalf>, crate::ws::WsWriter)> {
-    let (reader, writer, _) = tls_halves(session)?;
+) -> Option<(crate::ws::WsReader<TlsHalf<S>>, crate::ws::WsWriter)> {
+    let (reader, writer, _) = session.into_halves()?;
     crate::ws::connect_split(reader, writer, host, path, ed, first)
         .or_else(|| tls_unreachable(server))
 }
@@ -3862,49 +3885,59 @@ fn tls_unreachable<T>(server: &SocketAddr) -> Option<T> {
     None
 }
 
-fn tls_httpupgrade(
+// The two header-only carrier lanes: a reader over the shared session and a sink that shuts the raw socket down on teardown.
+type Upgraded<S> = (
+    crate::httpupgrade::UpReader<TlsHalf<S>>,
+    SessionSink<TlsHalf<S>>,
+);
+type Headed<S> = (
+    crate::httpheader::HeadReader<TlsHalf<S>>,
+    SessionSink<TlsHalf<S>>,
+);
+
+fn tls_httpupgrade<S: Dialed>(
     server: &SocketAddr,
-    session: ferrox_core::tls::RustlsProvider<TcpStream>,
+    session: S,
     host: &str,
     path: &str,
     ed: u32,
     first: &[u8],
-) -> Option<(crate::httpupgrade::UpReader<ClientHalf>, TlsSink)> {
-    let (reader, writer, raw) = tls_halves(session)?;
+) -> Option<Upgraded<S>> {
+    let (reader, writer, raw) = session.into_halves()?;
     let (reader, writer) = crate::httpupgrade::connect_split(reader, writer, host, path, ed, first)
         .or_else(|| tls_unreachable(server))?;
-    Some((reader, TlsSink { half: writer, raw }))
+    Some((reader, SessionSink { half: writer, raw }))
 }
 
-fn tls_httpheader(
+fn tls_httpheader<S: Dialed>(
     server: &SocketAddr,
-    session: ferrox_core::tls::RustlsProvider<TcpStream>,
+    session: S,
     host: &str,
     path: &str,
-) -> Option<(crate::httpheader::HeadReader<ClientHalf>, TlsSink)> {
-    let (reader, writer, raw) = tls_halves(session)?;
+) -> Option<Headed<S>> {
+    let (reader, writer, raw) = session.into_halves()?;
     let (reader, writer) = crate::httpheader::connect_split(reader, writer, host, path)
         .or_else(|| tls_unreachable(server))?;
-    Some((reader, TlsSink { half: writer, raw }))
+    Some((reader, SessionSink { half: writer, raw }))
 }
 
-fn tls_grpc(
+fn tls_grpc<S: Dialed>(
     server: &SocketAddr,
-    session: ferrox_core::tls::RustlsProvider<TcpStream>,
+    session: S,
     host: &str,
     path: &str,
-) -> Option<(crate::grpc::GrpcReader<ClientHalf>, crate::grpc::GrpcWriter)> {
-    let (reader, writer, _) = tls_halves(session)?;
+) -> Option<(crate::grpc::GrpcReader<TlsHalf<S>>, crate::grpc::GrpcWriter)> {
+    let (reader, writer, _) = session.into_halves()?;
     crate::grpc::connect_split(reader, writer, host, path).or_else(|| tls_unreachable(server))
 }
 
-fn tls_xhttp(
+fn tls_xhttp<S: Dialed>(
     server: &SocketAddr,
-    session: ferrox_core::tls::RustlsProvider<TcpStream>,
+    session: S,
     host: &str,
     path: &str,
-) -> Option<(crate::xhttp::Reader<ClientHalf>, crate::xhttp::XhttpWriter)> {
-    let (reader, writer, _) = tls_halves(session)?;
+) -> Option<(crate::xhttp::Reader<TlsHalf<S>>, crate::xhttp::XhttpWriter)> {
+    let (reader, writer, _) = session.into_halves()?;
     crate::xhttp::connect_split(reader, writer, host, path).or_else(|| tls_unreachable(server))
 }
 
@@ -3966,43 +3999,6 @@ impl<S: ferrox_core::tls::TlsProvider> Write for TlsHalf<S> {
     }
 }
 
-// The write end relays understand: bytes through the shared session, teardown through the raw socket.
-#[derive(Debug)]
-struct TlsSink {
-    half: ClientHalf,
-    raw: Arc<TcpStream>,
-}
-
-impl Clone for TlsSink {
-    fn clone(&self) -> Self {
-        Self {
-            half: self.half.clone(),
-            raw: Arc::clone(&self.raw),
-        }
-    }
-}
-
-impl Write for TlsSink {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.half.write(buf)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.half.flush()
-    }
-}
-
-impl CarrierSink for TlsSink {
-    fn send(&self, bytes: &[u8]) -> bool {
-        let mut half = self.half.clone();
-        half.write_all(bytes).is_ok()
-    }
-
-    fn close(&self) {
-        let _ = self.raw.shutdown(Shutdown::Both);
-    }
-}
-
 // The server write end for header-only carriers: bytes through the shared session, teardown through the raw socket.
 #[derive(Debug, Clone)]
 struct SessionSink<H> {
@@ -4031,6 +4027,87 @@ where
 
     fn close(&self) {
         let _ = self.raw.shutdown(Shutdown::Both);
+    }
+}
+
+/// The carrier lanes a dialled session rides, shared by the `TLS` and `REALITY` client dials: split the sealed session into a carrier's reader and writer, read the answer, then run the plain relay. `Raw` is the caller's and is left untouched here.
+fn ride_carrier<S: Dialed>(
+    server: &SocketAddr,
+    session: S,
+    vless: &VlessOut,
+    header: &[u8],
+    client: &TcpStream,
+) {
+    match &vless.carrier {
+        Carrier::Ws { path, ed } => {
+            let Some((mut reader, writer)) =
+                tls_ws(server, session, &vless.host, path, *ed, header)
+            else {
+                return;
+            };
+            if read_vless_response(&mut reader).is_none() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            relay_sink(reader, &writer, client, |_| {});
+        }
+        Carrier::HttpUpgrade { path, ed } => {
+            let Some((mut reader, sink)) =
+                tls_httpupgrade(server, session, &vless.host, path, *ed, header)
+            else {
+                return;
+            };
+            if read_vless_response(&mut reader).is_none() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            relay_sink(reader, &sink, client, |_| {});
+        }
+        Carrier::Grpc { path } => {
+            let Some((mut reader, writer)) = tls_grpc(server, session, &vless.host, path) else {
+                return;
+            };
+            if !writer.send(header) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            if read_vless_response(&mut reader).is_none() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let Some((mut reader, writer)) =
+                tls_xhttp(server, session, &vless.host, &settings.path)
+            else {
+                return;
+            };
+            if !writer.send(header) {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            if read_vless_response(&mut reader).is_none() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            relay_sink_drained(reader, &writer, client);
+        }
+        Carrier::HttpHeader { path } => {
+            let Some((mut reader, mut sink)) = tls_httpheader(server, session, &vless.host, path)
+            else {
+                return;
+            };
+            if sink.write_all(header).is_err() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            if read_vless_response(&mut reader).is_none() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            relay_sink(reader, &sink, client, |_| {});
+        }
+        Carrier::Raw
+        | Carrier::Quic
+        | Carrier::Kcp(_)
+        | Carrier::Hysteria(_)
+        | Carrier::Masque
+        | Carrier::Xdrive
+        | Carrier::Http
+        | Carrier::Unknown { .. } => {}
     }
 }
 
@@ -4064,74 +4141,7 @@ fn dial_vless_tls(client: &TcpStream, server: &SocketAddr, vless: &VlessOut, tar
             });
             relay_stream(downstream, session, &close);
         }
-        Carrier::Ws { path, ed } => {
-            let Some((mut reader, writer)) =
-                tls_ws(server, session, &vless.host, path, *ed, &header)
-            else {
-                return;
-            };
-            if read_vless_response(&mut reader).is_none() {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
-            relay_sink(reader, &writer, client, |_| {});
-        }
-        Carrier::HttpUpgrade { path, ed } => {
-            let Some((mut reader, sink)) =
-                tls_httpupgrade(server, session, &vless.host, path, *ed, &header)
-            else {
-                return;
-            };
-            if read_vless_response(&mut reader).is_none() {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
-            relay_sink(reader, &sink, client, |_| {});
-        }
-        Carrier::Grpc { path } => {
-            let Some((mut reader, writer)) = tls_grpc(server, session, &vless.host, path) else {
-                return;
-            };
-            if !writer.send(&header) {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
-            if read_vless_response(&mut reader).is_none() {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
-            relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
-        }
-        Carrier::Xhttp { settings, .. } => {
-            let Some((mut reader, writer)) =
-                tls_xhttp(server, session, &vless.host, &settings.path)
-            else {
-                return;
-            };
-            if !writer.send(&header) {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
-            if read_vless_response(&mut reader).is_none() {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
-            relay_sink_drained(reader, &writer, client);
-        }
-        Carrier::HttpHeader { path } => {
-            let Some((mut reader, mut sink)) = tls_httpheader(server, session, &vless.host, path)
-            else {
-                return;
-            };
-            if sink.write_all(&header).is_err() {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
-            if read_vless_response(&mut reader).is_none() {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
-            relay_sink(reader, &sink, client, |_| {});
-        }
-        Carrier::Quic
-        | Carrier::Kcp(_)
-        | Carrier::Hysteria(_)
-        | Carrier::Masque
-        | Carrier::Xdrive
-        | Carrier::Http
-        | Carrier::Unknown { .. } => {}
+        _ => ride_carrier(server, session, vless, &header, client),
     }
 }
 
@@ -4187,54 +4197,59 @@ fn dial_vless_reality(
     } else {
         vless_header(&vless.id, 1, target)
     };
-    if session.write_all(&header).is_err() {
-        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-    }
-    // A server may hold its answer until it has payload to send, so the upload runs through the pump while this leg waits, as on every other carrier; a TLS session cannot split, so both legs share it behind one lock until the pump's owner joins and hands it back.
-    let shared = Arc::new(Mutex::new(session));
-    let mut reader = TlsHalf {
-        session: Arc::clone(&shared),
-    };
-    let pump = Pump::over(client, {
-        let mut writer = TlsHalf {
-            session: Arc::clone(&shared),
-        };
-        move |bytes| writer.write_all(bytes).is_ok()
-    });
-    let answered = read_vless_response(&mut reader).is_some();
-    pump.end();
-    if !answered {
-        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-    }
-    drop(reader);
-    let Some(Ok(mut session)) = Arc::into_inner(shared).map(Mutex::into_inner) else {
-        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Local));
-    };
-    let Ok(downstream) = client.try_clone() else {
-        return;
-    };
-    if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
-        return;
-    }
-    let close_downstream = downstream.try_clone().ok();
-    let close_raw = raw.try_clone().ok();
-    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-        if let Some(downstream) = close_downstream.as_ref() {
-            let _ = downstream.shutdown(Shutdown::Both);
+    match &vless.carrier {
+        Carrier::Raw => {
+            if session.write_all(&header).is_err() {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            // A server may hold its answer until it has payload to send, so the upload runs through the pump while this leg waits, as on every other carrier; a TLS session cannot split, so both legs share it behind one lock until the pump's owner joins and hands it back.
+            let shared = Arc::new(Mutex::new(session));
+            let mut reader = TlsHalf {
+                session: Arc::clone(&shared),
+            };
+            let pump = Pump::over(client, {
+                let mut writer = TlsHalf {
+                    session: Arc::clone(&shared),
+                };
+                move |bytes| writer.write_all(bytes).is_ok()
+            });
+            let answered = read_vless_response(&mut reader).is_some();
+            pump.end();
+            if !answered {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            }
+            drop(reader);
+            let Some(Ok(mut session)) = Arc::into_inner(shared).map(Mutex::into_inner) else {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Local));
+            };
+            let Ok(downstream) = client.try_clone() else {
+                return;
+            };
+            if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+                return;
+            }
+            let close_downstream = downstream.try_clone().ok();
+            let close_raw = raw.try_clone().ok();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                if let Some(downstream) = close_downstream.as_ref() {
+                    let _ = downstream.shutdown(Shutdown::Both);
+                }
+                if let Some(raw) = close_raw.as_ref() {
+                    let _ = raw.shutdown(Shutdown::Both);
+                }
+            });
+            if vless.flow == crate::vision::FLOW {
+                relay_stream(
+                    downstream,
+                    crate::vision::Link::new(session, Some(raw), &vless.id),
+                    &close,
+                );
+            } else {
+                session.disarm_record_alignment();
+                relay_stream(downstream, session, &close);
+            }
         }
-        if let Some(raw) = close_raw.as_ref() {
-            let _ = raw.shutdown(Shutdown::Both);
-        }
-    });
-    if vless.flow == crate::vision::FLOW {
-        relay_stream(
-            downstream,
-            crate::vision::Link::new(session, Some(raw), &vless.id),
-            &close,
-        );
-    } else {
-        session.disarm_record_alignment();
-        relay_stream(downstream, session, &close);
+        _ => ride_carrier(server, session, vless, &header, client),
     }
 }
 
@@ -4343,7 +4358,7 @@ fn vmess_tls_raw(
     let reader = TlsHalf {
         session: Arc::clone(&shared),
     };
-    let writer = TlsSink {
+    let writer = SessionSink {
         half: TlsHalf { session: shared },
         raw: Arc::new(raw),
     };
@@ -8788,10 +8803,18 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
                 reality: None,
             });
         }
-        // REALITY dials raw TCP only in this slice; carried REALITY stays server-side.
+        // REALITY dials raw TCP and every carried carrier the client reaches; the rest stay refused.
         if security == "reality" && !mux {
             let (carrier, host) = outbound_carrier(outbound, &address);
-            if !matches!(carrier, Carrier::Raw) {
+            if !matches!(
+                carrier,
+                Carrier::Raw
+                    | Carrier::Ws { .. }
+                    | Carrier::HttpUpgrade { .. }
+                    | Carrier::Grpc { .. }
+                    | Carrier::Xhttp { .. }
+                    | Carrier::HttpHeader { .. }
+            ) {
                 continue;
             }
             let Some(reality) = outbound_reality(outbound, &address) else {
@@ -10248,7 +10271,42 @@ mod tests {
     }
 
     #[test]
-    fn vless_outbound_with_reality_security_dials_raw_only() {
+    fn vless_outbound_with_reality_dials_raw_and_every_carrier() {
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let key = b64url(&public);
+        let dials = |stream: &str| {
+            let json = format!(
+                r#"{{"outbounds": [{{"protocol": "vless", "settings": {{"vnext": [{{"address": "127.0.0.1",
+                "port": 443, "users": [{{"id": "{REALITY_TEST_ID}"}}]}}]}},
+                "streamSettings": {{{stream}, "security": "reality",
+                "realitySettings": {{"serverName": "{REALITY_TEST_SNI}",
+                "publicKey": "{key}", "shortId": "{REALITY_TEST_SHORT}"}}}}}}]}}"#
+            );
+            find_vless_outbound(&crate::json::parse(&json).expect("parses")).is_some()
+        };
+        assert!(dials(r#""network": "tcp""#), "raw REALITY dials");
+        assert!(dials(r#""network": "ws""#), "ws REALITY dials");
+        assert!(
+            dials(r#""network": "httpupgrade""#),
+            "httpupgrade REALITY dials"
+        );
+        assert!(dials(r#""network": "grpc""#), "grpc REALITY dials");
+        assert!(dials(r#""network": "xhttp""#), "xhttp REALITY dials");
+        assert!(
+            dials(
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": "/"}}}"#
+            ),
+            "http-header REALITY dials"
+        );
+        assert!(
+            !dials(r#""network": "quic""#),
+            "quic REALITY stays refused, no UDP leg"
+        );
+        assert!(
+            !dials(r#""network": "kcp""#),
+            "kcp REALITY stays refused, raw-carrier only"
+        );
         let bare = crate::json::parse(
             r#"{"outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1",
             "port": 443, "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]},
@@ -10259,26 +10317,6 @@ mod tests {
             find_vless_outbound(&bare).is_none(),
             "no identity means no dial, never a plain one"
         );
-        let carried = crate::json::parse(
-            r#"{"outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1",
-            "port": 443, "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]},
-            "streamSettings": {"network": "ws", "security": "reality",
-            "realitySettings": {"serverName": "www.google.com",
-            "publicKey": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
-            "shortId": "a8", "fingerprint": "chrome"}}}]}"#,
-        )
-        .expect("parses");
-        assert!(
-            find_vless_outbound(&carried).is_none(),
-            "a carried REALITY dial stays server-side in this slice"
-        );
-        let plain = crate::json::parse(
-            r#"{"outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "127.0.0.1",
-            "port": 443, "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]},
-            "streamSettings": {"network": "tcp"}}]}"#,
-        )
-        .expect("parses");
-        assert!(find_vless_outbound(&plain).is_some());
     }
 
     const REALITY_TEST_PRIVATE: [u8; 32] = [
@@ -10300,10 +10338,19 @@ mod tests {
     }
 
     fn reality_client_json(server_port: u16, public_b64: &str, flow: &str) -> String {
+        reality_network_json(server_port, public_b64, flow, "tcp")
+    }
+
+    fn reality_network_json(
+        server_port: u16,
+        public_b64: &str,
+        flow: &str,
+        network: &str,
+    ) -> String {
         format!(
             r#"{{"outbounds": [{{"protocol": "vless", "settings": {{"vnext": [{{"address": "127.0.0.1",
             "port": {server_port}, "users": [{{"id": "{REALITY_TEST_ID}", "flow": "{flow}"}}]}}]}},
-            "streamSettings": {{"network": "tcp", "security": "reality",
+            "streamSettings": {{"network": "{network}", "security": "reality",
             "realitySettings": {{"serverName": "{REALITY_TEST_SNI}",
             "publicKey": "{public_b64}", "shortId": "{REALITY_TEST_SHORT}",
             "fingerprint": "chrome"}}}}}}]}}"#,
@@ -10402,6 +10449,10 @@ mod tests {
     }
 
     fn reality_pair(flow: &str) -> RealityPair {
+        reality_pair_with(flow, "tcp", Carrier::Raw)
+    }
+
+    fn reality_pair_with(flow: &str, network: &str, carrier: Carrier) -> RealityPair {
         let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
         let echo_addr = echo.local_addr().expect("addr");
         let echo = thread::spawn(move || {
@@ -10424,14 +10475,15 @@ mod tests {
         let server_config = reality_server_config();
         let front_handle = thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_vless_reality(stream, &id, true, &Carrier::Raw, &server_config);
+            serve_vless_reality(stream, &id, true, &carrier, &server_config);
         });
         let public =
             x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
-        let root = crate::json::parse(&reality_client_json(
+        let root = crate::json::parse(&reality_network_json(
             server_addr.port(),
             &b64url(&public),
             flow,
+            network,
         ))
         .expect("parses");
         let outbound = find_outbound(&root).expect("a REALITY outbound");
@@ -10496,6 +10548,34 @@ mod tests {
                 .unwrap_or_else(|why| panic!("{seed}: {length} bytes did not come back: {why}"));
             assert_eq!(back, payload, "{seed}: payload came back altered");
         }
+        drop(user);
+        dialled.join().expect("joins");
+        pair.echo.join().expect("joins");
+        pair.front.join().expect("joins");
+    }
+
+    #[test]
+    fn reality_ws_dial_reaches_echo_through_the_relay() {
+        let pair = reality_pair_with(
+            "",
+            "ws",
+            Carrier::Ws {
+                path: "/".to_owned(),
+                ed: 0,
+            },
+        );
+        let (mut user, dialled) = dial_pair(&pair);
+        let payload: Vec<u8> = (0..200_000u32)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
+            .collect();
+        user.write_all(&payload).expect("writes");
+        let mut back = vec![0u8; payload.len()];
+        user.read_exact(&mut back)
+            .expect("echoes over the ws carrier");
+        assert_eq!(
+            back, payload,
+            "payload came back altered through the carried REALITY session"
+        );
         drop(user);
         dialled.join().expect("joins");
         pair.echo.join().expect("joins");
@@ -11391,7 +11471,7 @@ mod tests {
         // Let the read pump settle into its wait before the write pump comes by.
         thread::sleep(Duration::from_millis(250));
 
-        let mut sink = TlsSink { half: writer, raw };
+        let mut sink = SessionSink { half: writer, raw };
         for _ in 0..3 {
             let began = Instant::now();
             sink.write_all(b"ping")

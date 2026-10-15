@@ -40,7 +40,7 @@ graph TD
 | request-header-bytes-zero-filled | 0 | ferrox-bench-gate-2 |
 | address-families-encoded | 4 | ferrox-core-vless::tests::header_address_families_encode_stably |
 | vision-addons-bytes | 2 | ferrox-core-vless::tests::non_vision_header_carries_empty_addons |
-| reality-outbound-rows-dialled | 1 | ferrox-app-proxy::tests::vless_outbound_with_reality_security_dials_raw_only |
+| reality-outbound-rows-dialled | 6 | ferrox-app-proxy::tests::vless_outbound_with_reality_dials_raw_and_every_carrier |
 | vision-header-targets-matching-core | 2 | ferrox-app-proxy::tests::vision_header_matches_the_core_encoder |
 | dial-header-reallocations | 0 | ferrox-app-proxy::tests::dial_headers_are_sized_to_the_bytes_they_hold |
 | request-header-reads | 4 | ferrox-app-proxy::tests::the_vless_request_header_costs_four_reads_not_six |
@@ -164,11 +164,13 @@ CI-only. No artefact from this branch has been read.
 
 ## Rows that are dialled
 
-`security=reality` outbounds dial raw TCP
-(`vless_outbound_with_reality_security_dials_raw_only`): the dial seals the
+`security=reality` outbounds dial raw TCP and every carried carrier
+(`vless_outbound_with_reality_dials_raw_and_every_carrier`): the dial seals the
 session id into a stock hello, verifies the bound leaf, and relays with or
-without Vision. A REALITY row over any carrier is still skipped rather than
-dialled, so those shapes stay server rows. The dial writes the same header
+without Vision. A carried REALITY row rides the same `ws`, `httpupgrade`,
+`grpc`, `xhttp` and `http-header` framings a plain-`TLS` row does, over the one
+seal the raw dial pays; only the UDP-carrier set stays a server row, so those
+shapes are still skipped rather than dialled. The dial writes the same header
 bytes the core encoder writes (`vision_header_matches_the_core_encoder`).
 
 ## Pins
