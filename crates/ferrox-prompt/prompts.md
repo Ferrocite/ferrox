@@ -1,6 +1,6 @@
 # Ferrox prompt library
 
-Eighteen reusable templates. `ferrox-prompt` fills each one from the live matrix in `README.md` and the pins in `upstream/pins.toml`, so `next` names the concrete row to work on rather than a hand-transcribed idea. If the tool and these files disagree, the files are right — that is why `ferrox-prompt check` is a CI step and `tests/contract.rs` locks the properties below.
+Twenty reusable templates. `ferrox-prompt` fills each one from the live matrix in `README.md` and the pins in `upstream/pins.toml`, so `next` names the concrete row to work on rather than a hand-transcribed idea. If the tool and these files disagree, the files are right — that is why `ferrox-prompt check` is a CI step and `tests/contract.rs` locks the properties below.
 
 ## Grammar
 
@@ -23,7 +23,7 @@ A body is the single fenced `text` block in the section — a second fenced bloc
 | --- | --- |
 | `{method}` | the chosen row's method name |
 | `{index}` | its `#` in the matrix |
-| `{section}` | the table letter (`A`..`M`) |
+| `{section}` | the table letter (`A`..`N`) |
 | `{state}` | its verdict cell, verbatim |
 | `{page}` | its method page, or the page its slug suggests |
 | `{target}` | its key — `{section}{index}` |
@@ -296,7 +296,7 @@ Compare where {references} place the layer for {method} — matrix row {index} o
 Take one engine-adjacent surface {references} carry that this tree names but cannot drive — the account plane, the upstream-proxy chain, or a TUN/VPN mode — and give it a working seam: wire it to a config path or a test entry point, name the reference it matches, and prove one round-trip in CI. If it genuinely cannot be reached from this tree's shape, say why plainly in the place a reader would expect the capability rather than leaving it silently half-described.
 ```
 
-**Add-on — server-engine-surface:** The 2026-10-14 ZeroNet pin added server surfaces this tree cannot drive — reverse bridge/portal (`zero-runtime/src/reverse.rs`), PROXY-protocol parsing on an accept (`zero-protocol/src/proxy_protocol.rs`), the WireGuard inbound (`wg_server.rs`), transparent `SO_ORIGINAL_DST`/TPROXY dials (`zero-net/src/transparent.rs`). README table L rows 116–123 and `docs/method-superset.md` name each with its reference paths; take them one row per slice, seam first.
+**Add-on — server-engine-surface:** The pinned ZeroNet tree carries server surfaces this tree cannot drive — reverse bridge/portal (`zero-runtime/src/reverse.rs`), PROXY-protocol parsing on an accept (`zero-protocol/src/proxy_protocol.rs`), the WireGuard inbound (`wg_server.rs`), transparent `SO_ORIGINAL_DST`/TPROXY dials (`zero-net/src/transparent.rs`). README table N rows 116–124 and `docs/method-superset.md` name each with its reference paths; take them one row per slice, seam first.
 
 ## P16 · Deep-optimization hunt: beat every reference, or prove the floor
 
@@ -387,7 +387,7 @@ Report the per-wait cost the census adds where it is reachable, or state that th
 
 ## P20 · Scale the parameter surface without growing the app file
 
-**When to use:** A knob a reference ships is either unreachable from this tree's config or is plumbed ad-hoc through the app monolith, so adding the next one costs more of the same accretion rather than a section; the superset rows (README table L 116–123) all land through this shape.
+**When to use:** A knob a reference ships is either unreachable from this tree's config or is plumbed ad-hoc through the app monolith, so adding the next one costs more of the same accretion rather than a section; the superset rows (README table N 116–124) all land through this shape.
 **Status:** todo
 **Leverage:** 4
 **Effort:** large
