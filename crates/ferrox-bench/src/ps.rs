@@ -742,7 +742,7 @@ mod tests {
             &addr.to_string(),
         );
         let pid = child.id();
-        let (mut sink, _) = listener.accept().expect("the child connects to the sink");
+        let mut sink = accept_bounded(&listener, pid);
         sink.set_read_timeout(Some(std::time::Duration::from_secs(60)))
             .expect("the sink is drained within the run");
         let mut drained = vec![0u8; 1 << 16];
@@ -779,7 +779,6 @@ mod tests {
     fn spawn_tally_child(test: &str, job: &str, argument: &str) -> std::process::Child {
         std::process::Command::new(std::env::current_exe().expect("the test binary"))
             .arg(test)
-            .args(["--exact"])
             .env("FERROX_IO_CHILD", job)
             .env("FERROX_IO_CHILD_ARG", argument)
             .stdin(std::process::Stdio::piped())
@@ -787,6 +786,31 @@ mod tests {
             .stderr(std::process::Stdio::null())
             .spawn()
             .expect("the tally reads a spawned process")
+    }
+
+    /// A child that never connects has to fail this witness rather than park it, so the accept is
+    /// polled against a deadline instead of blocking on a connection that is not coming.
+    #[cfg(target_os = "linux")]
+    fn accept_bounded(listener: &std::net::TcpListener, pid: u32) -> std::net::TcpStream {
+        use std::io::ErrorKind;
+        listener
+            .set_nonblocking(true)
+            .expect("the sink accepts without blocking");
+        for _ in 0..400 {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream
+                        .set_nonblocking(false)
+                        .expect("the sink drains in blocking mode");
+                    return stream;
+                }
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(error) => panic!("the sink cannot accept: {error}"),
+            }
+        }
+        panic!("pid {pid} never connected to the loopback sink");
     }
 
     /// Closing the child's stdin is what ends its park; the parent takes the pipe before it waits.
