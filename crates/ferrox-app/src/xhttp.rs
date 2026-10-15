@@ -103,28 +103,49 @@ fn read_line_into(reader: &mut Reader<impl Read>, out: &mut [u8; 130]) -> Option
 }
 
 fn chunk_size(line: &[u8]) -> Option<usize> {
-    let mut end = line.len();
-    for (i, &b) in line.iter().enumerate() {
-        if b == b';' || b == b' ' || b == b'\t' || b == b'\r' || b == b'\n' {
-            end = i;
-            break;
-        }
-    }
-    if end == 0 || end > 16 {
-        return None;
-    }
     let mut size = 0usize;
-    for &b in &line[..end] {
-        let digit = match b {
-            b'0'..=b'9' => b - b'0',
-            b'a'..=b'f' => 10 + (b - b'a'),
-            b'A'..=b'F' => 10 + (b - b'A'),
-            _ => return None,
-        } as usize;
-        size = size * 16 + digit;
+    let mut i = 0;
+    while i < line.len() {
+        let v = CHUNK_LINE_LUT[line[i] as usize];
+        if v == 16 {
+            return if i == 0 { None } else { Some(size) };
+        }
+        if v == 255 {
+            return None;
+        }
+        if i == 16 {
+            return None;
+        }
+        size = (size << 4) | v as usize;
+        i += 1;
+    }
+    if i == 0 {
+        return None;
     }
     Some(size)
 }
+
+/// One pass over the size line: 0..=15 is a hex nibble, 16 marks a terminator (any of `;`, space, tab, CR, LF), 255 marks a byte that can be neither.
+const CHUNK_LINE_LUT: [u8; 256] = {
+    let mut t = [255u8; 256];
+    let mut i = 0;
+    while i < 10 {
+        t[b'0' as usize + i] = i as u8;
+        i += 1;
+    }
+    let mut i = 0;
+    while i < 6 {
+        t[b'a' as usize + i] = 10 + i as u8;
+        t[b'A' as usize + i] = 10 + i as u8;
+        i += 1;
+    }
+    t[b';' as usize] = 16;
+    t[b' ' as usize] = 16;
+    t[b'\t' as usize] = 16;
+    t[b'\r' as usize] = 16;
+    t[b'\n' as usize] = 16;
+    t
+};
 
 /// Generic over the underlying `Read` so a test can drive it from an in-memory stream and count the reads, the way `WsReader` counts its own; `reads` is that counter and the read-syscall row is measured from it.
 #[derive(Debug)]
@@ -1697,6 +1718,87 @@ mod tests {
             ("identity", false),
         ] {
             assert_eq!(has_chunked(value), want, "{value}");
+        }
+    }
+
+    /// The two-pass form kept as the oracle for the fused rewrite: same None-when-invalid, same Some for every accepted size line.
+    fn chunk_size_two_pass(line: &[u8]) -> Option<usize> {
+        let mut end = line.len();
+        for (i, &b) in line.iter().enumerate() {
+            if b == b';' || b == b' ' || b == b'\t' || b == b'\r' || b == b'\n' {
+                end = i;
+                break;
+            }
+        }
+        if end == 0 || end > 16 {
+            return None;
+        }
+        let mut size = 0usize;
+        for &b in &line[..end] {
+            let digit = match b {
+                b'0'..=b'9' => b - b'0',
+                b'a'..=b'f' => 10 + (b - b'a'),
+                b'A'..=b'F' => 10 + (b - b'A'),
+                _ => return None,
+            } as usize;
+            size = size * 16 + digit;
+        }
+        Some(size)
+    }
+
+    /// Bit-identity for the fused `chunk_size`: for every length 0..=20 and every probe byte at every position (with the rest filled by `1`, a hex digit), the fused loop and the two-pass reference agree. The full-window cases (length 16 with and without a terminator) and the length that overruns the cap (17) are the ones the fused rewrite could have moved, so they are covered explicitly.
+    #[test]
+    fn chunk_size_fused_matches_two_pass_on_every_probe() {
+        let probes: [u8; 18] = [
+            b'0', b'1', b'9', b'a', b'f', b'A', b'F', b';', b' ', b'\t', b'\r', b'\n', b'g', b'/',
+            b':', b'@', b'`', 0xff,
+        ];
+        for len in 0..=20usize {
+            let base = vec![b'1'; len];
+            assert_eq!(
+                chunk_size(&base),
+                chunk_size_two_pass(&base),
+                "all-hex len={len}"
+            );
+            for i in 0..len {
+                for &probe in &probes {
+                    let mut line = base.clone();
+                    line[i] = probe;
+                    assert_eq!(
+                        chunk_size(&line),
+                        chunk_size_two_pass(&line),
+                        "len={len} pos={i} probe={probe:#04x}"
+                    );
+                }
+            }
+        }
+        for prefix in [
+            "",
+            ";",
+            " ;",
+            "\t;",
+            "\r\n",
+            "f",
+            "ff",
+            "Ff",
+            "1234567890abcdef",
+            "1234567890abcdef;",
+            "1234567890abcdef\r\n",
+            "1234567890abcdefg",
+            "1234567890abcdefg;",
+            "1234567890abcdef0",
+            "1234567890abcdef0;",
+            "ffffffffffffffff",
+            "fffffffffffffffff",
+            "0",
+            "0;",
+            "00000",
+        ] {
+            assert_eq!(
+                chunk_size(prefix.as_bytes()),
+                chunk_size_two_pass(prefix.as_bytes()),
+                "prefix={prefix:?}"
+            );
         }
     }
 

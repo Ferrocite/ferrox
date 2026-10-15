@@ -20,9 +20,10 @@ code that falls out of it.
 
 The size lines are the part worth naming. A `Size` line for a given length is a
 pure function of the length, so `size_lines_match_format_without_allocating`
-builds them into the caller's buffer and allocates nothing. That is the whole
-optimisation available on a framing this thin: do not allocate for a string you
-already know.
+builds them into the caller's buffer and allocates nothing. The reader's half of
+that framing — turning a size line back into the `usize` it encodes — runs in
+one fused pass, and `chunk_size_fused_matches_two_pass_on_every_probe` keeps it
+bit-identical to the two-pass form it replaced.
 
 ## Data path
 
@@ -133,10 +134,11 @@ and the binding does not change it.
 
 ```bash
 ./scripts/count-ops.sh report \
-  xhttp::tests::size_lines_match_format_without_allocating 'xhttp::push_size_line'
+  xhttp::tests::chunk_size_fused_matches_two_pass_on_every_probe 'xhttp::chunk_size'
 ```
 
-`UNBLESSED`, as above.
+`UNBLESSED`, as above. The reported row points at the fused parser so a future
+slice can bless the one-pass count without moving the target again.
 
 ## Time
 
@@ -176,6 +178,15 @@ read.
 
 ## What we removed
 
+- **A pass over the size line.** `chunk_size` used to scan for the first
+  terminator once and then parse the digits it had kept as a second pass; both
+  branches re-read the same two-to-seven bytes. The rewrite walks the line once,
+  and the nibble, terminator and invalid tests collapse into one 256-byte LUT
+  that is hot in the I-cache after the first chunk. `size * 16 + digit` becomes
+  `(size << 4) | nibble` — same arithmetic, same wrap. Bit-identity is gated by
+  `chunk_size_fused_matches_two_pass_on_every_probe`, which sweeps every length
+  0..=20 with a probe byte at every position against the old two-pass form kept
+  as the oracle. Nothing on the wire moves, and a bad line is still `None`.
 - **An allocation per size line.** A hex length plus CRLF is at most five bytes
   and is a function of the length alone, so it is written in place. Neither
   Xray nor sing-box ships an xHTTP carrier in the pinned trees, so there is no
