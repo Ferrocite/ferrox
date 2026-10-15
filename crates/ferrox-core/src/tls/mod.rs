@@ -63,30 +63,18 @@ impl RecordAlignment for std::net::TcpStream {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TlsError {
     Timeout,
-    BadCertificate,
+    /// Why the chain was refused, carried by the kind: folding a variant into `Other` to hold a message erases the kind, and a caller that cannot match a refused chain cannot act on it — it cannot tell the user, and it cannot stop retrying an edge no retry will make trusted.
+    BadCertificate(String),
     Closed,
     NoSharedCipher,
     Other(String),
-}
-
-impl TlsError {
-    #[must_use]
-    pub fn with_detail(self, detail: impl Into<String>) -> Self {
-        match self {
-            Self::Timeout => Self::Other(format!("timeout: {}", detail.into())),
-            Self::BadCertificate => Self::Other(format!("bad certificate: {}", detail.into())),
-            Self::Closed => Self::Other(format!("closed: {}", detail.into())),
-            Self::NoSharedCipher => Self::Other(format!("no shared cipher: {}", detail.into())),
-            Self::Other(why) => Self::Other(format!("{why}: {}", detail.into())),
-        }
-    }
 }
 
 impl fmt::Display for TlsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Timeout => f.write_str("handshake timed out"),
-            Self::BadCertificate => f.write_str("certificate did not verify"),
+            Self::BadCertificate(why) => write!(f, "certificate did not verify: {why}"),
             Self::Closed => f.write_str("connection closed by peer"),
             Self::NoSharedCipher => f.write_str("no shared cipher suite"),
             Self::Other(why) => write!(f, "backend error: {why}"),

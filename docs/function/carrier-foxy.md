@@ -71,7 +71,29 @@ graph TD
 | address-assign-capsule-bytes-per-grant | 9 | ferrox-core-foxy::connectip::tests::the_assign_a_proxy_writes_is_the_assign_the_lane_reads |
 | route-advert-capsule-bytes-per-route | 12 | ferrox-core-foxy::connectip::tests::the_route_advert_a_proxy_writes_is_the_route_advert_the_lane_reads |
 | edges-preferred-by-verified-exit | 1 | ferrox-app-proxy::foxy_exit_tests::the_preferred_edge_is_the_first_one_whose_exit_agrees_not_the_first_one_opened |
+| tcp-connections-asked-of-an-untrusted-edge | 1 | ferrox-app-foxy::loopback::an_untrusted_edge_is_named_and_asked_once |
 <!-- counts:end -->
+
+`tcp-connections-asked-of-an-untrusted-edge 1` is the retry rule seen from the
+edge's side: the lane asks an edge for a TLS session eight times because the edge
+sometimes drops a handshake it started, and a chain this device does not trust
+drops for a reason no second ask changes. The counter in
+`an_untrusted_edge_is_named_and_asked_once` is the server's own accept loop, so it
+sees the connections, not the intent: one, and the failure that comes back names
+the certificate rather than the moment. The same rule is what stops the `auto`
+carrier walk at the first refusal — the edge's certificate is not the carrier's,
+so HTTP/2 and HTTP/1.1 would answer it identically — so a pinned edge with no
+trusted chain costs one handshake per address instead of one per address per
+carrier. What the front answers stays `0x01 general failure`, now asserted for the
+new variant by `a_refusal_becomes_the_socks_reply_that_says_so`; what changed is
+that the message the user can act on ("this device does not trust the edge's
+certificate") survives to the caller instead of becoming "the carrier io failed".
+
+What this leaves alone, deliberately: `FoxyOut::remember_unanswered` still caches
+only `Io | Stream | Frame` as a carrier that died, so an untrusted chain does not
+mark that carrier dead for the next flow. Trust is per edge, not per carrier, and
+a client that installs the missing root — or fixes its clock — should get a real
+dial on the next flow rather than a cached refusal.
 
 `payload-staging-copies-per-byte-written 0` and
 `payload-staging-copies-per-byte-read 0` are the two rows this page exists to
