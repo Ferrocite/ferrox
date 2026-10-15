@@ -72,7 +72,8 @@ vmess user-space-copies-per-byte-written 1 ferrox-app-vmess::tests::frames_reuse
 vmess frame-buffer-allocations-per-relay-write 0 ferrox-app-vmess::tests::frames_reuse_the_callers_buffers
 vmess frames-per-plain-write 4 ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write
 vmess plain-write-syscalls-per-4-frame-batch 1 ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write
-vmess pump-buffer-allocations-per-batch 0 ferrox-app-vmess::tests::the_pump_gathers_into_its_own_buffer_and_never_moves_it
+vmess user-space-copies-per-byte-read 0 ferrox-app-vmess::tests::the_pump_hands_its_frames_over_by_pointer
+vmess pump-buffer-allocations-per-batch 0 ferrox-app-vmess::tests::the_pump_hands_its_frames_over_by_pointer
 vmess counters-per-frame 1 ferrox-app-vmess::tests::counters_advance_one_per_frame_at_any_offset
 
 # --- VLESS ------------------------------------------------------------------
