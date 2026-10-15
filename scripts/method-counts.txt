@@ -198,6 +198,8 @@ reality-tls late-hello-grains-survived 12 ferrox-app-proxy::tests::a_plain_tls_l
 reality-tls unsafe-fingerprint-header-bytes-added 0 ferrox-core-vless::tests::an_unsafe_fingerprint_adds_no_header_byte
 reality-tls certificate-refusals-folded-into-other 0 ferrox-core-tls::rustls_backend::tests::mismatched_certificate_name_fails
 reality-tls untrusted-dials-counted-as-retryable 0 ferrox-app-proxy::tests::a_refused_chain_is_a_refusal_not_a_drop
+reality-tls session-writes-per-frame 1 ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call
+reality-tls user-space-copies-per-framed-write 0 ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call
 
 kcp ops-retired-instructions UNBLESSED scripts/count-ops.sh
 kcp maximum-transmission-unit-bytes 1350 ferrox-core-kcp::tests::the_upstream_defaults_are_these

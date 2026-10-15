@@ -40,6 +40,8 @@ graph TD
     H --> R["splice: bytes in, bytes out<br/>paced by the rate limit its side was given"]
     P --> V["with Vision: the padding<br/>frames stop and the socket is raw"]
     V --> L["relay: bytes in, bytes out"]
+    FR["a carrier frame: head, payload<br/>and tail as separate slices"] --> FC["one lock, one call:<br/>the parts are segments of one payload"]
+    FC --> WR(("wire"))
     D --> Q["client: refuse any leaf<br/>whose HMAC does not verify"]
     Q --> V
 ```
@@ -74,6 +76,8 @@ graph TD
 | unsafe-fingerprint-header-bytes-added | 0 | ferrox-core-vless::tests::an_unsafe_fingerprint_adds_no_header_byte |
 | certificate-refusals-folded-into-other | 0 | ferrox-core-tls::rustls_backend::tests::mismatched_certificate_name_fails |
 | untrusted-dials-counted-as-retryable | 0 | ferrox-app-proxy::tests::a_refused_chain_is_a_refusal_not_a_drop |
+| session-writes-per-frame | 1 | ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call |
+| user-space-copies-per-framed-write | 0 | ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call |
 <!-- counts:end -->
 
 `certificate-refusals-folded-into-other 0` is the shape of a refused chain in the
@@ -83,6 +87,20 @@ is what that buys on the dial plane — `tls_failure` can only report a refusal 
 the backend still names one, and before this a refused chain reached it as
 `Other`, so it classified as a peer that hung up and counted into the retryable
 dial total.
+
+`session-writes-per-frame 1` and `user-space-copies-per-framed-write 0` are the
+frame seam: what `FrameWrite::write_slices` hands the session when a carrier
+frames a write onto a `TLS` stream. Their checker is
+`a_frame_reaches_the_tls_session_in_one_call`, a session that records the calls
+it receives instead of sealing records, driven through the real
+`h2::write_frame` and `h2::write_frame_parts`. It counts one call per frame with
+two segments and then three, and it fails if the payload segment is not the
+caller's own buffer — the pointer-identity shape, because a test that compared
+bytes would pass just as happily on a frame staged into one scratch buffer. The
+same test asserts the recorded bytes are exactly the two frames concatenated, so
+the stream the peer decrypts is named as unchanged rather than claimed.
+`ops-retired-instructions` stays `UNBLESSED`: no instruction count is quoted for
+this rung, and the call count above is the measurement.
 
 ## Ops
 
@@ -100,6 +118,16 @@ dial total.
 count this repository has ever blessed, and it is measured by `ops.yml` on
 `ubuntu-latest` because valgrind does not exist on the other runners. No
 handshake duration is quoted from a machine without a named runner.
+
+The frame seam has no duration either, and it is not a runner problem: no
+scenario in `scripts/lib-matrix.sh` gives its `streamSettings` a `tlsSettings`,
+so every matrix cell — including the `ws`, `grpc` and `xhttp` cells — dials the
+carrier in the clear and never reaches a `TLS` session on the way to the wire.
+A throughput row here would measure something else. The seam is gated by the
+write count above and by the rows that do carry a frame over a session: the
+workspace's `TLS` carrier loops and CI's `conformance` and upstream suites.
+Giving the matrix a `TLS` arm is the open row that would change that, and it is
+not this page's to settle.
 
 ## What we removed
 
@@ -226,6 +254,34 @@ handshake duration is quoted from a machine without a named runner.
   `mismatched_certificate_name_fails` matches by variant and what the Foxy lane
   needs to stop asking an edge no second handshake makes trusted
   ([the Foxy lane](carrier-foxy.md)).
+
+- **A record per part of a frame.** A carrier frame reaches a session as separate
+  slices — a `ws` frame as head and payload (`ws.rs:410`), an `h2` `DATA` frame
+  the same, `h2::write_frame_parts` as head, envelope and payload, an `xhttp`
+  chunk as size line, body and `CRLF` (`xhttp.rs:342`) — and `FrameWrite for
+  TlsHalf` walked that list with one `write_all` per part. Each of those writes
+  took the session lock, ran the handshake drive, handed rustls one buffer and
+  called `complete_io`, so a frame cost two or three locks, two or three sealed
+  records and two or three flushes, with a 9-byte frame head sealing a record of
+  its own before the payload followed. The impl now locks once and hands the
+  whole parts list to `RecordAlignment::write_all_slices`, which is the `coalesce`
+  this tree already pays for Vision: the segments go out in one `write_vectored`
+  (`rustls_backend.rs:342`, gated by
+  `the_framer_path_coalesces_without_a_heap_buffer` at one call and zero
+  allocations), so the fragmenter sees one payload and emits one record, and one
+  lock covering the whole list means no other writer lands between a frame's
+  parts. Two to one on lock, record and flush for a `ws` or `h2` `DATA` frame;
+  three to one for an envelope-carrying frame and for an `xhttp` chunk. What did
+  not move: the bytes the peer decrypts, which the witness compares against the
+  two frames concatenated, and the plaintext path — `FrameWrite for TcpStream`
+  still means one `writev`. What did move below the stream: the `TLS` record
+  boundaries, since a record now begins at the frame head and runs on into the
+  payload, and a body past one record still fragments. That is why the checker is
+  not only a count: `reality_ws_dial_reaches_echo_through_the_relay` and
+  `vless_outbound_with_reality_dials_raw_and_every_carrier` carry real frames over
+  a session here, and CI's `conformance` and upstream suites are the pinned peers
+  whose reassembly a record-shape change could break — both run on this diff,
+  because the hunk sits in shared code and the plan is wide.
 
 Tried and set aside with reasons: probe elimination (both references build
 twice and one RTT dominates the build), smaller Vision staging reads (read
