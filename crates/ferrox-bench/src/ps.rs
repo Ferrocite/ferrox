@@ -783,7 +783,7 @@ mod tests {
             .env("FERROX_IO_CHILD_ARG", argument)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::inherit())
             .spawn()
             .expect("the tally reads a spawned process")
     }
@@ -820,42 +820,47 @@ mod tests {
         let _ = child.wait();
     }
 
-    /// The child's half of both witnesses: the bytes are made by a thread that is not the leader, then
-    /// a park on stdin, so the parent reads a tally whose subject still has every thread alive.
+    /// The child's half of both witnesses: the bytes are made by a thread that is not the leader, and
+    /// that thread then parks, so the parent reads a tally whose subject still has every
+    /// byte-making task alive. A task that exits takes its own `rchar`/`wchar` out of
+    /// `/proc/<pid>/task/` with it, so a walk over a finished writer would report the leader's
+    /// startup bytes and call a 16 MiB crossing invisible even if the kernel had counted it.
     #[cfg(target_os = "linux")]
     fn run_child_job(job: &str, written: usize) {
         use std::io::{Read, Write};
         let argument =
             std::env::var("FERROX_IO_CHILD_ARG").expect("the child is told its argument");
         let (done, wait_done) = std::sync::mpsc::channel::<()>();
+        let (park, writer_parked) = std::sync::mpsc::channel::<()>();
         let to_file = job == "file";
         std::thread::spawn(move || {
-            let mut file = std::fs::File::create(&argument).ok();
-            let mut stream = if to_file {
-                None
+            let mut sink: Box<dyn Write> = if to_file {
+                Box::new(
+                    std::fs::File::create(&argument)
+                        .expect("the child opens its file with a write"),
+                )
             } else {
-                std::net::TcpStream::connect(&argument).ok()
+                Box::new(
+                    std::net::TcpStream::connect(&argument)
+                        .expect("the child reaches the loopback sink"),
+                )
             };
-            let sink: Option<&mut dyn Write> = if to_file {
-                file.as_mut().map(|file| file as &mut dyn Write)
-            } else {
-                stream.as_mut().map(|stream| stream as &mut dyn Write)
-            };
-            let Some(sink) = sink else { return };
             let zeroes = vec![0u8; 1 << 16];
             let mut left = written;
             while left > 0 {
                 let take = left.min(zeroes.len());
-                if sink.write_all(&zeroes[..take]).is_err() {
-                    break;
-                }
+                sink.write_all(&zeroes[..take])
+                    .expect("the child's bytes reach the kernel");
                 left -= take;
             }
+            let _ = sink.flush();
             let _ = done.send(());
+            let _ = writer_parked.recv();
         });
         let _ = wait_done.recv();
         let mut one = [0u8; 1];
         let _ = std::io::stdin().read(&mut one);
+        drop(park);
     }
 
     #[test]
