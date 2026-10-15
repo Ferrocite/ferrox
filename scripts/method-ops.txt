@@ -77,6 +77,7 @@ vless  vless::tests::first_method_header_is_stable  ferrox_core::vless::VlessLin
 xtls-vision  vision::tests::the_framing_switch_ends_the_staging  vision::Link::read_direct
 carrier-foxy  foxy::loopback::the_http2_carrier_writes_one_literal_header_block_and_relays  foxy::read_frame
 carrier-foxy  foxy::loopback::the_masque_carrier_opens_connect_udp_and_echoes_a_datagram  masque::datagram_encode
+carrier-grpc  grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else  grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else
 carrier-websocket  ws::tests::a_read_covers_a_window_not_one_frame_header  ws::WsReader::pull
 carrier-websocket  ws::tests::frames_round_trip_masked_and_plain  ws::write_frame
 carrier-websocket  ws::tests::mask_chunks_match_the_byte_loop  ws::apply_mask
