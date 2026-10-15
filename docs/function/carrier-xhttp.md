@@ -71,8 +71,8 @@ as `unreachable at socket-connected (inferred)` and the ladder then climbs
 `xhttp -> grpc -> httpupgrade`; the bench cell wrote no `result.json` at all. That is the
 whole of why `vless-xhttp-down-8` is red on every engine but ours.
 
-`XhttpSettings` now carries `mode_stated`, and the session-less gate arms only when the mode
-was written down — which also lets a *stated* `stream-up` hub serve a session-less `POST`, as
+`XhttpSettings` now carries `mode_source` — `Stated` or `Auto` — and the session-less gate
+arms only on `Stated` — which also lets a *stated* `stream-up` hub serve a session-less `POST`, as
 `hub.go:154` does. `an_unstated_mode_serves_the_dialers_own_head` is the 400 that becomes a
 200, and `the_dialer_and_its_own_hub_complete_on_loopback` completes the round trip through
 the real socket pair; both fail on the previous gate.
@@ -257,7 +257,7 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/xhttp.rs, crates/ferrox-app/src/xhttp_h2.rs
-- symbols: xhttp
+- symbols: xhttp, status_of
 - scenarios: vless-xhttp
 - go: ./transport/internet/splithttp/..., ./transport/internet/xdrive/...
 <!-- scope:end -->

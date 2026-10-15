@@ -447,6 +447,13 @@ impl XhttpMode {
     }
 }
 
+/// Whether the config wrote a mode down. The reference hub gates a shape only on a stated mode (`hub.go:154`), so `Auto` names a dialer default rather than a limit on what may arrive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ModeSource {
+    Stated,
+    Auto,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Placement {
     Path,
@@ -480,15 +487,10 @@ pub(crate) enum PadMethod {
 }
 
 #[derive(Debug, Clone)]
-#[allow(
-    clippy::struct_excessive_bools,
-    reason = "independent parsed knobs, not a state machine: obfs, sse, grpc-header and a stated-vs-auto mode"
-)]
 pub(crate) struct XhttpSettings {
     pub path: String,
     pub mode: XhttpMode,
-    // The hub narrows shapes only when `mode` was written down; a resolved `auto` is the dialer's default, not a promise about what may arrive.
-    pub mode_stated: bool,
+    pub mode_source: ModeSource,
     pub session_placement: Placement,
     pub session_key: String,
     pub seq_placement: Placement,
@@ -514,7 +516,7 @@ impl XhttpSettings {
         Self {
             path: "/".to_owned(),
             mode: XhttpMode::StreamOne,
-            mode_stated: false,
+            mode_source: ModeSource::Auto,
             session_placement: Placement::Path,
             session_key: String::new(),
             seq_placement: Placement::Path,
@@ -566,8 +568,12 @@ impl XhttpSettings {
             .get("mode")
             .and_then(crate::json::Json::as_str)
             .unwrap_or("");
-        out.mode_stated = !raw.is_empty() && raw != "auto";
-        out.mode = if out.mode_stated {
+        out.mode_source = if raw.is_empty() || raw == "auto" {
+            ModeSource::Auto
+        } else {
+            ModeSource::Stated
+        };
+        out.mode = if out.mode_source == ModeSource::Stated {
             XhttpMode::parse_mode(raw)?
         } else {
             XhttpMode::auto_mode(settings, xhttp)
@@ -1370,7 +1376,7 @@ pub(crate) fn accept_core<
 
     match (sid, seq) {
         (None, None) => {
-            if settings.mode_stated
+            if settings.mode_source == ModeSource::Stated
                 && !matches!(settings.mode, XhttpMode::StreamOne | XhttpMode::StreamUp)
             {
                 emit_400(&mut write);
@@ -2175,10 +2181,7 @@ mod tests {
             XhttpMode::PacketUp,
             "auto resolves the way the reference dialer does"
         );
-        assert!(
-            !settings.mode_stated,
-            "and nothing was written down to gate with"
-        );
+        assert_eq!(settings.mode_source, ModeSource::Auto);
         let head = format!(
             "POST /share HTTP/1.1\r\nHost: h\r\nReferer: {}\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n",
             "http://127.0.0.1/share?x_padding=".to_owned() + &"X".repeat(500)
@@ -2226,7 +2229,7 @@ mod tests {
         let settings = settings_from(
             r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share", "mode": "packet-up"}}}"#,
         );
-        assert!(settings.mode_stated);
+        assert_eq!(settings.mode_source, ModeSource::Stated);
         let head = format!(
             "POST /share HTTP/1.1\r\nHost: h\r\nReferer: {}\r\nTransfer-Encoding: chunked\r\n\r\n",
             "http://127.0.0.1/share?x_padding=".to_owned() + &"X".repeat(500)
