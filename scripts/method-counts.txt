@@ -143,9 +143,7 @@ carrier-grpc message-buffer-reallocations-per-same-sized-frame 0 ferrox-app-grpc
 carrier-xhttp ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-xhttp framing-size-lines-without-an-allocation 0 ferrox-app-xhttp::tests::size_lines_match_format_without_allocating
 carrier-xhttp framing-read-syscalls-per-16KiB-chunk 1 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
-carrier-xhttp framing-read-syscalls-per-16KiB-chunk 1 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
 carrier-xhttp read-syscalls-per-16KiB-chunk 2 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
-carrier-xhttp framing-read-syscalls-per-16KiB-chunk 1 ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three
 carrier-xhttp user-space-copies-per-byte-written 1 ferrox-app-xhttp::tests::exchange_carries_an_echo_over_loopback
 
 carrier-foxy ops-retired-instructions UNBLESSED scripts/count-ops.sh
