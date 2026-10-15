@@ -28,8 +28,11 @@ record-layer backends-a-differential-test-cannot-lie-to 6 ferrox-bench-gate-1
 shadowsocks ops-retired-instructions UNBLESSED scripts/count-ops.sh
 shadowsocks aead-calls-per-chunk 2 ferrox-core-shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
 shadowsocks maximum-payload-per-chunk 16383 ferrox-core-shadowsocks::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
-shadowsocks write-syscalls-per-relay-read 1 ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole
-shadowsocks payload-chunks-per-relay-read 1 ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole
+shadowsocks write-syscalls-per-64KiB-relay-read 1 ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole
+shadowsocks payload-chunks-per-64KiB-relay-read 4 ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole
+shadowsocks read-syscalls-per-64KiB-relay-read 1 ferrox-app-shadowsocks::tests::one_relay_read_asks_for_every_slot_of_a_batch
+shadowsocks target-write-syscalls-per-opened-batch 1 ferrox-app-shadowsocks::tests::a_bulk_read_serves_every_buffered_chunk
+shadowsocks reads-spent-waiting-for-an-incomplete-chunk 0 ferrox-app-shadowsocks::tests::a_batch_never_waits_for_a_chunk_that_has_not_arrived
 shadowsocks user-space-copies-per-byte-written 0 ferrox-app-shadowsocks::tests::one_relay_read_becomes_one_write_and_reads_back_whole
 shadowsocks user-space-copies-per-byte-read 0 ferrox-app-shadowsocks::tests::chunks_open_that_seal_sealed_and_reject_damage
 shadowsocks chunk-buffer-allocations-per-connection 1 ferrox-app-shadowsocks::tests::a_bulk_read_serves_every_buffered_chunk
