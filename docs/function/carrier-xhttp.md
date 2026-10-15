@@ -126,6 +126,8 @@ and the binding does not change it.
 | framing-read-syscalls-per-16KiB-chunk | 1 | ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three |
 | read-syscalls-per-16KiB-chunk | 2 | ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three |
 | user-space-copies-per-byte-written | 1 | ferrox-app-xhttp::tests::exchange_carries_an_echo_over_loopback |
+| writes-per-credit | 1 | ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write |
+| window-update-frames-per-credit | 2 | ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write |
 <!-- counts:end -->
 
 ## Ops
@@ -133,16 +135,36 @@ and the binding does not change it.
 ```bash
 ./scripts/count-ops.sh report \
   xhttp::tests::chunk_size_fused_matches_two_pass_on_every_probe 'xhttp::chunk_size'
+./scripts/count-ops.sh report \
+  xhttp_h2::tests::a_credit_grants_both_windows_in_one_write 'xhttp_h2::replenish'
 ```
 
 `UNBLESSED`, as above. The reported row points at the fused parser so a future
-slice can bless the one-pass count without moving the target again.
+slice can bless the one-pass count without moving the target again. The second
+row points at the credit: `a_credit_grants_both_windows_in_one_write` calls
+`replenish` on a connection with no peer, no socket and no thread, so the frame
+it charges is the method and nothing else — which is what the open list asks of
+a row before it earns a number. CI read it on this branch (run 38816058317) and
+it reported `Ir=inlined-not-a-frame`: in the release profile the harness
+profiles, the credit dissolves into the two callers that reach it, so the row is
+an honest blank, not a figure, and it stays in the open list until a probe keeps
+a frame for it.
 
 ## Time
 
-**Not measured on this branch.** xHTTP scenarios run in
-`benchmark-matrix.yml` and `parity.yml`. No artefact from this branch has been
-read.
+CI `vless-xhttp-down-8` on this branch (full tier, 5 repeats, linux x86_64, run
+38816058449, gate passed): **2.11× xray-core's throughput** (medians 1598 vs
+770 MiB/s), **2.02× leaner CPU** (1871 vs 3775 ms/GiB) and **5.6× leaner peak
+RSS** (7.7 vs 42.8 MiB) on 43 threads against its 18 — and ahead of zeronet on
+all three rows (1.82× / 1.73× / 2.57×).
+
+What that cell does *not* witness is named, because it is not a small thing: its
+config is `network: xhttp` with `path: /share` and no mode, the dialer writes the
+H1 `stream-one` head for that shape, and the hub reaches `xhttp_h2` only behind a
+peer's 24-byte HTTP/2 preface (`proxy.rs:1513`), so the request never spends a
+credit. The cell is this page's no-regression gate and
+the ratio is our standing against the reference; `writes-per-credit 1` is gated
+by the in-memory writer above, which is the only checker that can count writes.
 
 - **A framing read syscall per chunk, and the second one was two bytes.** The
   reader spent three reads per 16 KiB chunk: one to fetch the size line, one for
@@ -190,6 +212,26 @@ read.
   Xray nor sing-box ships an xHTTP carrier in the pinned trees, so there is no
   comparator here to beat — which is exactly why this page says what it removed
   and does not claim a ratio.
+- **A credit that took two locks and two writes.** `xhttp_h2::replenish` grants
+  the peer back the bytes a stream body just consumed, once per inbound `DATA`
+  frame and once per read of a body, so a bulk tunnel paid it per chunk in each
+  direction. It did so by calling `frame()` twice, and each `frame()` takes the
+  connection writer while each frame reaches `write_slices` as a head and a
+  body: **2 lock acquisitions and 2 writes per credit** (one `writev` per frame
+  on unix), or **4 `write_all` calls** over a TLS stream, where each part is
+  sealed as its own record. The two frames differ only by the stream id, so the
+  pair is now one `const` 26-byte template with three slots patched and one
+  `write_slices(&[&out])` under one lock — **1 write, and 1 syscall on unix**.
+  `a_credit_grants_both_windows_in_one_write` is the checker: an in-memory
+  writer counts the `write_slices` calls and keeps the bytes, and the test
+  asserts one call, 26 bytes, and both frames decoding as length 4,
+  `WINDOW_UPDATE`, no flags, id 0 then the stream, with the same increment in
+  both. A loopback socket cannot witness it — it sees the bytes, not how many
+  writes carried them. What did not move: the same 26 bytes go out in the same
+  order, connection frame first as before, and the credit still touches only
+  the *inbound* windows, which is what
+  `h2_bulk_echo_never_outruns_the_granted_connection_window` pins against the
+  merged pair.
 - **A third copy of the config walk.** `xhttp.rs` carried its own
   byte-identical `header_value` copy and a third head reader; the roadmap has a
   slice for folding both into `proxy.rs`, and it is open. Until that lands, this
@@ -218,6 +260,11 @@ read.
 
 ## Open rows
 
+- This page, `carrier-foxy` (`foxy.rs:516`) and `carrier-grpc` now each carry
+  their own 26-byte `WINDOW_UPDATE` pair. The three differ only in which frame
+  goes first, so one home in `h2` and one writer is the smaller shape; it is
+  open because it crosses three method pages and three cells, and a slice that
+  moves a template is not a slice that measures one lane.
 - The dialer is one mode: `connect` and `connect_split` write a single
   `stream-one` POST head, so an outbound on `stream-up` or `packet-up` does not
   exist yet, and neither does the `xmux` pool under `multi`. This is the half of
