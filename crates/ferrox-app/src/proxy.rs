@@ -3806,7 +3806,7 @@ fn dial_trojan_rung(
 fn tls_failure(error: &ferrox_core::tls::TlsError) -> Failure {
     use ferrox_core::tls::TlsError as Tls;
     match error {
-        Tls::BadCertificate => Failure::new(Stage::SocketConnected, Kind::Rejected),
+        Tls::BadCertificate(_) => Failure::new(Stage::SocketConnected, Kind::Rejected),
         Tls::Timeout => Failure::new(Stage::SocketConnected, Kind::Unreachable),
         Tls::Closed | Tls::NoSharedCipher | Tls::Other(_) => {
             Failure::new(Stage::SocketConnected, Kind::Dropped)
@@ -5480,6 +5480,10 @@ fn foxy_open(foxy: &FoxyOut, asked: &SocksTarget) -> FoxyOpen {
                     // A status is the edge speaking, so only a silent carrier is remembered as dead.
                     foxy.remember_unanswered(&edge, carrier, failure);
                     last = Some(failure);
+                    // A refused chain is the edge's own certificate, not the carrier's: HTTP/2 and HTTP/1.1 would answer a trust failure exactly as this one did.
+                    if matches!(failure, ferrox_core::foxy::Failure::Untrusted) {
+                        break;
+                    }
                 }
             }
         }
@@ -10115,6 +10119,19 @@ mod tests {
             "a refused connect is observed, not inferred"
         );
         assert!(!failure.worth_retrying());
+    }
+
+    /// A refused chain is a refusal, not a dropped connection: while the backend folded the kind into `Other` this arm was unreachable, so an untrusted server reported as a peer that hung up and counted as a dial worth retrying.
+    #[test]
+    fn a_refused_chain_is_a_refusal_not_a_drop() {
+        let refused = ferrox_core::tls::TlsError::BadCertificate("UnknownIssuer".to_owned());
+        let failure = tls_failure(&refused);
+        assert_eq!(failure.stage, Stage::SocketConnected);
+        assert_eq!(failure.kind, Kind::Rejected, "{failure}");
+        assert!(
+            !failure.worth_retrying(),
+            "a chain this device does not trust is not a moment worth another dial"
+        );
     }
 
     #[test]
