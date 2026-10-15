@@ -11,7 +11,7 @@ const AUTH_LEN: usize = 16;
 const TAG_LEN: usize = 16;
 const HEADER_LEN: usize = 2;
 const MAX_PLAIN: usize = 8192;
-const FRAMES_PER_WRITE: usize = 4;
+const FRAMES_PER_WRITE: usize = 16;
 const READ_PLAIN: usize = MAX_PLAIN * FRAMES_PER_WRITE;
 // The widest frame we seal: a full payload, its tag, and the padding the mask draw allows.
 const MAX_WIRE: usize = MAX_PLAIN + TAG_LEN + 63;
@@ -1981,10 +1981,10 @@ mod tests {
             4096,
             MAX_PLAIN,
             MAX_PLAIN + 1,
-            3 * MAX_PLAIN,
-            4 * MAX_PLAIN - 1,
-            4 * MAX_PLAIN,
-            4 * MAX_PLAIN + 1,
+            (FRAMES_PER_WRITE - 1) * MAX_PLAIN,
+            FRAMES_PER_WRITE * MAX_PLAIN - 1,
+            FRAMES_PER_WRITE * MAX_PLAIN,
+            FRAMES_PER_WRITE * MAX_PLAIN + 1,
             READ_PLAIN,
         ] {
             let body: Vec<u8> = (0..run_len)
@@ -2828,7 +2828,7 @@ mod tests {
 
     #[test]
     fn a_batch_of_frames_leaves_the_pump_in_one_write() {
-        let (sealed, plain, mut recv) = frames(&[1000; 9]);
+        let (sealed, plain, mut recv) = frames(&vec![1000; FRAMES_PER_WRITE * 2 + 1]);
         let carrier = Sealed {
             held: sealed,
             at: 0,
@@ -2839,7 +2839,7 @@ mod tests {
         let (writes, got) = drain(&mut wire, &mut recv);
         assert_eq!(
             writes, 3,
-            "nine frames that arrive together leave as 4, 4 and 1"
+            "a batch takes at most FRAMES_PER_WRITE frames, so they leave as {FRAMES_PER_WRITE}, {FRAMES_PER_WRITE} and 1"
         );
         assert_eq!(got, plain, "and every byte of them, in order");
         assert_eq!(
