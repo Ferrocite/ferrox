@@ -10676,14 +10676,14 @@ mod tests {
         let user = TcpStream::connect(addr).expect("connects");
         user.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
-        user.set_write_timeout(Some(Duration::from_secs(30)))
-            .expect("write timeout");
         rx.recv_timeout(Duration::from_secs(30)).expect("dials");
         (user, dialled)
     }
 
-    // Writing before reading only completes while the whole payload fits the chain's buffering, so read while writing.
+    // Writing before reading only completes while the whole payload fits the chain's buffering, so read while writing, and give the write a deadline so a blocked one reports instead of parking.
     fn echo_bulk(user: &mut TcpStream, payload: &[u8]) -> Vec<u8> {
+        user.set_write_timeout(Some(Duration::from_secs(30)))
+            .expect("write timeout");
         let mut reader = user.try_clone().expect("clones");
         let length = payload.len();
         let back = thread::spawn(move || {
