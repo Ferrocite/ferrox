@@ -294,6 +294,7 @@ impl Endpoint {
             alpn: Vec::new(),
             roots: self.roots.clone(),
             pins: ferrox_core::foxy::pin::Pins::default(),
+            cipher_suites: Vec::new(),
         }
     }
 

@@ -264,6 +264,35 @@ fn tls_alpn(settings: Option<&Json>) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// The `cipher_suites` field xray's `tlsSettings.cipherSuites` produces on the wire: the names
+/// parse to ids, then `crypto/tls` re-orders them by preference and appends its TLS 1.3 suites
+/// across the configured version range. Empty when the config names no known suite, which
+/// leaves the backend's stock ordering in place.
+fn tls_cipher_suites(settings: Option<&Json>) -> Vec<u16> {
+    let Some(list) = settings
+        .and_then(|s| s.get("cipherSuites"))
+        .and_then(Json::as_str)
+        .filter(|s| !s.is_empty())
+    else {
+        return Vec::new();
+    };
+    let parsed = ferrox_core::tls::cipher_suites::parse(list);
+    let min = tls_version(settings, "minVersion").unwrap_or(0x0301);
+    let max = tls_version(settings, "maxVersion").unwrap_or(0x0304);
+    ferrox_core::tls::cipher_suites::hello_ids(&parsed, min, max, true)
+}
+
+fn tls_version(settings: Option<&Json>, key: &str) -> Option<u16> {
+    let text = settings.and_then(|s| s.get(key)).and_then(Json::as_str)?;
+    match text.trim() {
+        "1.0" => Some(0x0301),
+        "1.1" => Some(0x0302),
+        "1.2" => Some(0x0303),
+        "1.3" => Some(0x0304),
+        _ => None,
+    }
+}
+
 pub(crate) fn outbound_tls(
     outbound: &Json,
     address: &str,
@@ -306,6 +335,7 @@ pub(crate) fn outbound_tls(
         alpn,
         roots,
         pins: ferrox_core::foxy::pin::Pins::default(),
+        cipher_suites: tls_cipher_suites(tls),
     }))
 }
 
@@ -659,6 +689,26 @@ mod tests {
         assert_eq!(short_id("01020304"), Some([1, 2, 3, 4, 0, 0, 0, 0]));
         assert_eq!(short_id(""), None);
         assert_eq!(short_id("abc"), None);
+    }
+
+    #[test]
+    fn tls_cipher_suites_carries_the_crafted_field() {
+        let with = crate::json::parse(
+            r#"{"tlsSettings": {"cipherSuites": "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256","maxVersion":"1.3","minVersion":"1.3"}}"#,
+        )
+        .expect("parses")
+        .get("tlsSettings")
+        .cloned()
+        .expect("tlsSettings");
+        // A TLS 1.3-only hello is the reference trio, reordered into crypto/tls order.
+        assert_eq!(tls_cipher_suites(Some(&with)), vec![0x1301, 0x1302, 0x1303]);
+        // No cipherSuites means stock ordering, so the backend is left untouched.
+        let none = crate::json::parse(r#"{"tlsSettings": {}}"#)
+            .expect("parses")
+            .get("tlsSettings")
+            .cloned()
+            .expect("tlsSettings");
+        assert_eq!(tls_cipher_suites(Some(&none)), [] as [u16; 0]);
     }
 
     #[test]

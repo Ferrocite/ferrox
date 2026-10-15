@@ -11688,6 +11688,7 @@ mod tests {
             alpn: Vec::new(),
             roots: vec![CARRIER_CERT.to_vec()],
             pins: ferrox_core::foxy::pin::Pins::default(),
+            cipher_suites: Vec::new(),
         };
         (server, client)
     }
