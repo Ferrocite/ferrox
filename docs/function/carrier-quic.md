@@ -54,12 +54,15 @@ graph TD
 ```
 
 `UNBLESSED`, as above. The *one* symbol blessed in `scripts/expected-ops.txt`
-is `der_to_pem`, driven from `quic::tests::pem_wraps_at_sixty_four_columns` — a
+is `append_pem`, driven from `quic::tests::pem_wraps_at_sixty_four_columns` — a
 PEM formatting helper, not a carrier, which is why the carrier ops row stays
-open. `der_to_pem` now reserves its output to the exact length
-`pem_capacity` computes rather than growing a `Vec::new()` by doubling, so the
-fill is memcpy into live capacity; the blessed count sits below where the
-growing version measured.
+open. The row used to sit on `der_to_pem`; after the exact-capacity
+reservation it became a thin wrapper (`Vec::with_capacity(pem_capacity(..))`,
+one call, return) that release inlines away, so the profile's surviving frame
+is the callee that carries the loop, `append_pem`. `pem_capacity` opens the
+output at the exact length and `append_pem` fills it via memcpy into live
+capacity — the growth reallocs and the per-cert `Vec` that was then copied into
+the chain are gone.
 
 ## Time
 
