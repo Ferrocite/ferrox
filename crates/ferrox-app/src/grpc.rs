@@ -12,6 +12,16 @@ use crate::h2::{
 const MSG_CAP: usize = 16 * 1024 * 1024;
 const HUNK: usize = 16 * 1024;
 
+/// The two `WINDOW_UPDATE` frames a credit grants differ only by stream id, so their eighteen header bytes are constant and each call fills the two increment slots left zero here: the pair leaves in one write.
+const CREDIT_PAIR: [u8; 26] = {
+    let mut out = [0u8; 26];
+    out[2] = 4;
+    out[3] = T_WINDOW;
+    out[15] = 4;
+    out[16] = T_WINDOW;
+    out
+};
+
 #[derive(Debug, Default)]
 struct SendWindow {
     conn: u64,
@@ -74,7 +84,7 @@ pub(crate) struct GrpcReader<R: Read = TcpStream> {
     msg_end: usize,
     /// One past the payload the caller has not taken yet, from `msg_at`.
     pay_end: usize,
-    /// Bytes the reader moved for itself — the reclaim move and a padded frame's pad removal: these and nothing else are what the staging gate counts.
+    /// Bytes the reader moved for itself — the reclaim move and the part of a message a pad byte cuts into: these and nothing else are what the staging gate counts.
     #[cfg_attr(not(test), allow(dead_code, reason = "read by the staging gate"))]
     staged: usize,
     /// Scratch for the frames that are not a body: headers, settings, ping.
@@ -142,15 +152,25 @@ impl<R: Read> GrpcReader<R> {
         }
     }
 
+    /// The window this lane grants back as it reads, one credit per frame and one write per credit: the connection update and the stream update are the two halves of a constant pair.
     fn replenish(&self, id: u32, len: usize) {
         if len == 0 {
             return;
         }
         let inc = (len.min(1 << 30) as u32).to_be_bytes();
-        self.emit(T_WINDOW, 0, 0, &inc);
-        if id != 0 {
-            self.emit(T_WINDOW, 0, id, &inc);
-        }
+        let mut pair = CREDIT_PAIR;
+        pair[9..13].copy_from_slice(&inc);
+        let out: &[u8] = if id == 0 {
+            &pair[..13]
+        } else {
+            pair[18..22].copy_from_slice(&id.to_be_bytes());
+            pair[22..26].copy_from_slice(&inc);
+            &pair
+        };
+        let Ok(mut stream) = self.shared.stream.lock() else {
+            return;
+        };
+        stream.write_slices(&[out]);
     }
 
     fn refuse(&self, id: u32) {
@@ -251,11 +271,18 @@ impl<R: Read> GrpcReader<R> {
         };
         self.replenish(id, len - first - pad);
         if first != 0 || pad != 0 {
-            // A padded frame hides the pad byte and pad tail inside the body the parser reads, so dropping them moves what lies between.
-            self.staged += len - first - pad;
-            let end = from + len - pad;
-            self.msg.copy_within(from + first..end, from);
-            self.msg.truncate(end - first);
+            // A pad byte and pad tail sit inside the body the parser reads: when they open a message region a cursor step skips the byte and the frame's length drops the tail, and only a message that already crossed into this frame moves.
+            if self.msg_at == from && self.pay_end == from && self.msg_end == from {
+                self.msg.truncate(from + len - pad);
+                self.msg_at = from + first;
+                self.msg_end = from + first;
+                self.pay_end = from + first;
+            } else {
+                self.staged += len - first - pad;
+                let end = from + len - pad;
+                self.msg.copy_within(from + first..end, from);
+                self.msg.truncate(end - first);
+            }
         }
         let out = self.decode();
         if flags & F_END != 0 {
@@ -1050,9 +1077,60 @@ mod tests {
         assert_eq!(reader.msg.capacity(), cap, "a same-sized body reallocated");
     }
 
-    /// A padded frame is the one shape the lane still moves bytes for: the pad byte and tail sit inside the body the parser reads — counting it also proves the counter above can count.
+    /// The witnesses for `carrier-grpc window-update-writes-per-data-frame 1` and `window-update-frames-per-data-frame 2`: a credit is still the peer's two frames, byte for byte, and they leave in one write.
     #[test]
-    fn a_padded_frame_is_the_one_move_the_lane_still_makes() {
+    fn a_credit_grants_both_windows_in_one_write() {
+        #[derive(Default)]
+        struct Calls(Arc<Mutex<Vec<Vec<u8>>>>);
+        impl std::io::Write for Calls {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().push(data.to_vec());
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl crate::proxy::FrameWrite for Calls {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                self.0.lock().unwrap().push(parts.concat());
+                true
+            }
+        }
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let body = message(b"ping");
+        let mut wire = frame(
+            T_HEADERS,
+            F_END_HEADERS,
+            1,
+            &block_encode(&[(":status", "200"), ("content-type", "application/grpc")]),
+        );
+        wire.extend_from_slice(&frame(T_DATA, 0, 1, &body));
+        let (mut reader, writer) = connect_split(
+            std::io::Cursor::new(wire),
+            Calls(Arc::clone(&calls)),
+            "127.0.0.1",
+            "/x",
+        )
+        .expect("dials");
+        drop(writer);
+        calls.lock().unwrap().clear();
+        let mut got = [0u8; 4];
+        reader.read_exact(&mut got).expect("reads");
+        assert_eq!(&got, b"ping");
+        let inc = (body.len() as u32).to_be_bytes();
+        let mut want = frame(T_WINDOW, 0, 0, &inc);
+        want.extend_from_slice(&frame(T_WINDOW, 0, 1, &inc));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![want],
+            "one write carries the connection and the stream update, and the bytes are the two frames the peer has always seen"
+        );
+    }
+
+    /// The witness for `carrier-grpc message-bytes-moved-per-padded-frame 0`: the pad byte opens a message region, so the parser steps over it and the frame's length drops the tail, and the message between them stays where it landed.
+    #[test]
+    fn a_padded_frame_opens_a_message_without_moving() {
         let mut body = vec![3u8];
         body.extend_from_slice(&message(b"ping"));
         body.extend_from_slice(&[0xA5; 3]);
@@ -1060,10 +1138,24 @@ mod tests {
         let mut got = [0u8; 4];
         reader.read_exact(&mut got).expect("reads");
         assert_eq!(&got, b"ping");
+        assert_eq!(reader.staged, 0, "the pad byte and tail cost no move");
+    }
+
+    /// The move a padded frame still pays, and the witness that the staging counter counts: here the pad byte cuts into a message the frame before had started, so only what follows it moves down.
+    #[test]
+    fn a_padded_frame_that_cuts_into_a_message_moves_only_what_follows_the_pad() {
+        let split = message(b"ping");
+        let mut body = vec![1u8];
+        body.extend_from_slice(&split[6..]);
+        body.push(0xA5);
+        let mut reader = dial(&[(0, split[..6].to_vec()), (F_PADDED | F_END, body)]);
+        let mut got = [0u8; 4];
+        reader.read_exact(&mut got).expect("reads");
+        assert_eq!(&got, b"ping");
         assert_eq!(
             reader.staged,
-            message(b"ping").len(),
-            "the pad removal moves the message bytes and nothing else"
+            split.len() - 6,
+            "only the bytes after the pad byte move"
         );
     }
 
@@ -1131,6 +1223,25 @@ mod tests {
                 assert_eq!(body, want, "max {max} len {len}");
             }
         }
+    }
+
+    /// The ops probe the page's `ops-retired-instructions` row names: the two per-message math steps, a gRPC envelope assembled and a `Hunk` parsed, over buffers the compiler cannot fold — no I/O, so the frame is the loops and the methods.
+    #[test]
+    fn the_envelope_and_the_hunk_cost_their_loops_and_nothing_else() {
+        let messages = std::hint::black_box([
+            &[0x0A, 0x04, b'p', b'i', b'n', b'g'][..],
+            &[0x12, 0x02, 0x01, 0x02, 0x0A, 0x02, b'p', b'g'][..],
+        ]);
+        let mut prefix = [0u8; 16];
+        let mut acc = 0usize;
+        for _ in 0..512 {
+            for msg in messages {
+                let (off, data) = hunk_decode(msg).expect("decodes");
+                acc += off + data.len() + frame_prefix(data.len(), &mut prefix);
+            }
+        }
+        assert!(acc > 0);
+        std::hint::black_box(&prefix);
     }
 
     #[test]
