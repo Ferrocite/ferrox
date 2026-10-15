@@ -72,6 +72,8 @@ graph TD
 | route-advert-capsule-bytes-per-route | 12 | ferrox-core-foxy::connectip::tests::the_route_advert_a_proxy_writes_is_the_route_advert_the_lane_reads |
 | edges-preferred-by-verified-exit | 1 | ferrox-app-proxy::foxy_exit_tests::the_preferred_edge_is_the_first_one_whose_exit_agrees_not_the_first_one_opened |
 | tcp-connections-asked-of-an-untrusted-edge | 1 | ferrox-app-foxy::loopback::an_untrusted_edge_is_named_and_asked_once |
+| catalogue-edges-kept-across-a-failed-fetch | 4 | ferrox-app-foxy_catalog::tests::a_fetch_that_failed_keeps_the_edges_already_known |
+| catalogue-edges-rewritten-from-the-cache-file | 5 | ferrox-app-foxy_catalog::tests::the_cache_file_one_process_writes_is_the_one_the_next_reads |
 <!-- counts:end -->
 
 `tcp-connections-asked-of-an-untrusted-edge 1` is the retry rule seen from the
@@ -94,6 +96,25 @@ only `Io | Stream | Frame` as a carrier that died, so an untrusted chain does no
 mark that carrier dead for the next flow. Trust is per edge, not per carrier, and
 a client that installs the missing root — or fixes its clock — should get a real
 dial on the next flow rather than a cached refusal.
+
+`catalogue-edges-kept-across-a-failed-fetch 4` is the catalogue's answer when the
+settings server does not answer: the four edges the test envelope publishes stay
+dialable, at their own age, so the next flow asks again. A failed fetch — or one
+that reads no edges at all — used to `unwrap_or_default()` the list away, so a
+serverlist hiccup turned a known-good edge set into no edges and every pinned
+country into a refusal. `catalogue-edges-rewritten-from-the-cache-file 5` is the
+same list through the file one process leaves for the next: five edges, one
+tab-separated line each, including the blank city code, which is why the separator
+is a tab and the reader wants exactly four fields per line. A torn file keeps the
+whole lines and drops the rest (`a_cache_file_cut_off_mid_write_keeps_the_lines_that_are_whole`),
+and no file is no list rather than a guess.
+
+What the file buys, named without a number: a cold start inside the `FRESH`
+window dials the settings server not at all, and one with no network at all still
+has yesterday's edges. `edges()` keeps its lock off the fetch — the guard is
+dropped before the round trip, because a control-plane call must not serialize
+every dial in the process — and the stale list is not restamped, so a fetch is
+still attempted per flow while the server is down.
 
 `payload-staging-copies-per-byte-written 0` and
 `payload-staging-copies-per-byte-read 0` are the two rows this page exists to
@@ -221,6 +242,15 @@ the comparison can be re-read:
   written where they are read now, because their lengths are known before they
   are written, which is what `a_named_path_length_is_the_length_of_the_bytes_that_follow`
   holds the two halves of.
+
+- **A fetch that threw away what it had already learned.** `edges()` answered a
+  failed serverlist call with `unwrap_or_default()`, so the lane's knowledge of a
+  country's edges lasted exactly as long as the settings server's uptime and
+  survived no restart at all. The decision is now a function of the list already
+  known plus one fetch's answer, which is what the two catalogue rows can see. The
+  list is also written down — a temp file at `0o600`, renamed onto the live path,
+  the shape `quic.rs::stage_at` already uses — so the next process starts from
+  edges rather than from a round trip.
 
 What is **not** removed, named rather than claimed: 0-RTT, connection
 migration, key updates and batched datagram I/O are quiche's, and this tree has
