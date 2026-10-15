@@ -65,7 +65,8 @@ wrong rather than because they were fixed:
   before they are overwritten. `bytes_pipelined_behind_a_head_stay_in_the_kernel`
   is the gate that the second pass leaves the pipelined tail untouched.
 - A timed-out read is retried until the head's own budget runs out
-  (`proxy::HEAD_DEADLINE`, twenty seconds, the header budget the rest of this
+  (`proxy::budgets::head_arrival()`, `HEAD_DEADLINE`'s twenty seconds unless the
+  config's `budgets` object restated it, the header budget the rest of this
   binary already gives a handshake), and the socket is armed with `RELAY_POLL`
   for the rounds if the caller armed nothing — so a peer that connects and stays
   quiet is a refused handshake, not a thread parked in `peek` or a loop that

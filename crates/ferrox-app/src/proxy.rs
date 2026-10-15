@@ -9,9 +9,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::budgets::{
-    ACCOUNT_ATTEMPTS, ACCOUNT_BACKOFF_SECS, CARRIER_DEAD_SECS, CARRIER_PROBE, DIAL_TIMEOUT,
-    HANDSHAKE_REQUEST_TIMEOUT, HEAD_DEADLINE, PAYLOAD_GRACE, RELAY_HANDOFF_SPINS, RELAY_IDLE,
-    RELAY_JOIN, RELAY_LOCK_TRIES, RELAY_POLL, RELAY_QUANTUM, SESSION_POLL, UDP_IDLE,
+    self, ACCOUNT_ATTEMPTS, ACCOUNT_BACKOFF_SECS, CARRIER_DEAD_SECS, RELAY_HANDOFF_SPINS,
+    RELAY_IDLE, RELAY_LOCK_TRIES, RELAY_POLL, SESSION_POLL,
 };
 use crate::config::{
     inbound_carrier, inbound_reality_config, inbound_tls_identity, outbound_carrier, outbound_flow,
@@ -50,6 +49,11 @@ pub(crate) fn serve_file(path: &str) -> ! {
         .unwrap_or_else(|error| exit(&format!("cannot read {path}: {error}")));
     let root = crate::json::parse(&text)
         .unwrap_or_else(|error| exit(&format!("bad config {path}: {error}")));
+    // Armed before the first inbound opens, so every flow from here reads the budget the operator named.
+    crate::budgets::apply(
+        &crate::config::budgets(&root)
+            .unwrap_or_else(|error| exit(&format!("bad config {path}: {error}"))),
+    );
     let freedom = has_protocol(&root, "outbounds", "freedom");
     let outbound = find_outbound(&root);
     let mut inbounds = 0;
@@ -225,7 +229,7 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
 }
 
 fn dial(target: &SocketAddr) -> Result<TcpStream, Failure> {
-    let stream = TcpStream::connect_timeout(target, DIAL_TIMEOUT)
+    let stream = TcpStream::connect_timeout(target, budgets::dial())
         .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?;
     no_delay(&stream);
     Ok(stream)
@@ -747,7 +751,7 @@ fn serve_vless(stream: TcpStream, id: &[u8; 16], carrier: &Carrier, freedom: boo
             };
             // Past the upgrade the frame layer retries timeouts itself, so bound it by wall clock and poll the socket.
             reader.set_poll(Some(RELAY_POLL));
-            reader.set_handshake_budget(Some(Instant::now() + HANDSHAKE_REQUEST_TIMEOUT));
+            reader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
             let decoded = decode_request(&mut reader);
             reader.set_handshake_budget(None);
             reader.set_poll(None);
@@ -854,14 +858,14 @@ impl std::io::Read for HandshakeDeadline<'_> {
 fn decode_request_bounded(stream: &mut dyn Read) -> Option<([u8; 16], String, u8, SocketAddr)> {
     let mut bounded = HandshakeDeadline {
         inner: stream,
-        until: Instant::now() + HANDSHAKE_REQUEST_TIMEOUT,
+        until: Instant::now() + budgets::handshake(),
     };
     decode_request(&mut bounded)
 }
 
 fn serve_vless_raw(mut stream: TcpStream, id: &[u8; 16], freedom: bool) {
     // Bound only the opening request read to a wall-clock budget, then restore the blocking relay reads behind it.
-    let _ = stream.set_read_timeout(Some(HANDSHAKE_REQUEST_TIMEOUT));
+    let _ = stream.set_read_timeout(Some(budgets::handshake()));
     let decoded = decode_request_bounded(&mut stream);
     let _ = stream.set_read_timeout(None);
     let Some((got, flow, cmd, target)) = decoded else {
@@ -1450,7 +1454,7 @@ fn serve_session_ws<R: Read, W: FrameWrite + 'static>(
         echo_trace("session ws accept refused");
         return;
     };
-    creader.set_handshake_budget(Some(Instant::now() + HANDSHAKE_REQUEST_TIMEOUT));
+    creader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
     let decoded = decode_request(&mut creader);
     creader.set_handshake_budget(None);
     let Some((got, _flow, cmd, target)) = decoded else {
@@ -4814,11 +4818,12 @@ fn dial_ss_xhttp(
 
 fn serve_trojan(mut stream: TcpStream, key: &[u8; 56], freedom: bool) {
     // Bound only the opening request read to a wall-clock budget, then restore the blocking relay reads behind it.
-    let _ = stream.set_read_timeout(Some(HANDSHAKE_REQUEST_TIMEOUT));
+    let budget = budgets::handshake();
+    let _ = stream.set_read_timeout(Some(budget));
     let decoded = {
         let mut bounded = HandshakeDeadline {
             inner: &mut stream,
-            until: Instant::now() + HANDSHAKE_REQUEST_TIMEOUT,
+            until: Instant::now() + budget,
         };
         decode_trojan_request(&mut bounded, key)
     };
@@ -5429,7 +5434,7 @@ fn foxy_open(foxy: &FoxyOut, asked: &SocksTarget) -> FoxyOpen {
                     if foxy.carrier == crate::foxy::Carrier::H3 {
                         crate::quic::HANDSHAKE_TIMEOUT
                     } else {
-                        CARRIER_PROBE
+                        budgets::carrier_probe()
                     },
                 ),
                 _ => None,
@@ -5491,7 +5496,7 @@ fn serve_foxy_front(
                 return;
             }
             // One lock serves both directions: a blocking read would hold the writer, hence the bounded quantum.
-            let _ = tunnel.set_read_quantum(RELAY_QUANTUM);
+            let _ = tunnel.set_read_quantum(budgets::relay_quantum());
             let tunnel = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
             relay_tunnel(&client, &tunnel);
             if let Some((dial, id)) = h3 {
@@ -5606,7 +5611,7 @@ fn authority_target(authority: &[u8]) -> Option<SocksTarget> {
 
 /// The `http` front: CONNECT tunnels like SOCKS, plain HTTP forwards its head, unparsable input closes quietly.
 fn serve_http(mut client: TcpStream, out: &Outbound) {
-    let Some(head) = read_http_head(&mut client, HTTP_HEAD_LIMIT, HEAD_DEADLINE) else {
+    let Some(head) = read_http_head(&mut client, HTTP_HEAD_LIMIT, budgets::head_arrival()) else {
         return;
     };
     let Some(request) = http_proxy_request(&head) else {
@@ -5686,7 +5691,7 @@ fn socks_udp_relay(client: &mut TcpStream) -> Option<UdpSocket> {
     let mut reply = vec![5, 0, 0];
     push_socks_addr(&mut reply, &relay_addr);
     client.write_all(&reply).ok()?;
-    relay.set_read_timeout(Some(UDP_IDLE)).ok()?;
+    relay.set_read_timeout(Some(budgets::udp_idle())).ok()?;
     Some(relay)
 }
 
@@ -5755,7 +5760,7 @@ fn serve_socks_udp_freedom(relay: &UdpSocket) {
         let Ok(relay_write) = relay.try_clone() else {
             continue;
         };
-        let _ = up.set_read_timeout(Some(UDP_IDLE));
+        let _ = up.set_read_timeout(Some(budgets::udp_idle()));
         let done = thread::spawn(move || {
             let mut back = vec![0u8; UDP_BUF];
             let writer = up;
@@ -5983,7 +5988,7 @@ fn open_foxy_ip_tunnel(
                     if foxy.carrier == crate::foxy::Carrier::H3 {
                         crate::quic::HANDSHAKE_TIMEOUT
                     } else {
-                        CARRIER_PROBE
+                        budgets::carrier_probe()
                     },
                 ),
                 _ => None,
@@ -6081,7 +6086,7 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
                         if foxy.carrier == crate::foxy::Carrier::H3 {
                             crate::quic::HANDSHAKE_TIMEOUT
                         } else {
-                            CARRIER_PROBE
+                            budgets::carrier_probe()
                         },
                     ) else {
                         continue;
@@ -6089,7 +6094,7 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
                     let quic = (conn, sock, local, id);
                     match crate::foxy::H3::open_udp(&dial, &host, dest.port(), quic) {
                         Ok(mut lane) => {
-                            lane.set_read_quantum(RELAY_QUANTUM);
+                            lane.set_read_quantum(budgets::relay_quantum());
                             debug_lane(&edge, carrier, &format!("udp opened for {dest}"));
                             clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                             foxy.carrier_answered(&edge, carrier);
@@ -6102,7 +6107,7 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
                 }
                 _ => match crate::foxy::open_udp(&dial, &host, dest.port()) {
                     Ok(lane) => {
-                        let _ = lane.set_read_quantum(RELAY_QUANTUM);
+                        let _ = lane.set_read_quantum(budgets::relay_quantum());
                         debug_lane(&edge, carrier, &format!("udp opened for {dest}"));
                         clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                         foxy.carrier_answered(&edge, carrier);
@@ -6147,7 +6152,9 @@ fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
     let Ok(uplink) = bound else {
         return;
     };
-    if uplink.connect(server).is_err() || uplink.set_read_timeout(Some(UDP_IDLE)).is_err() {
+    if uplink.connect(server).is_err()
+        || uplink.set_read_timeout(Some(budgets::udp_idle())).is_err()
+    {
         return;
     }
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
@@ -6208,7 +6215,9 @@ fn serve_socks_udp_shadowsocks2022(
     let Ok(uplink) = bound else {
         return;
     };
-    if uplink.connect(server).is_err() || uplink.set_read_timeout(Some(UDP_IDLE)).is_err() {
+    if uplink.connect(server).is_err()
+        || uplink.set_read_timeout(Some(budgets::udp_idle())).is_err()
+    {
         return;
     }
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
@@ -6821,7 +6830,8 @@ fn dial_http_outbound(
             return;
         }
         // Whole reads, not octets: a byte reader over TLS decrypts one record per byte.
-        let Some((head, pipelined)) = read_exact_head(&mut stream, HTTP_HEAD_LIMIT, HEAD_DEADLINE)
+        let Some((head, pipelined)) =
+            read_exact_head(&mut stream, HTTP_HEAD_LIMIT, budgets::head_arrival())
         else {
             return;
         };
@@ -6933,7 +6943,7 @@ fn serve_vless_udp(mut stream: TcpStream, target: &SocketAddr) {
     let Ok(udp) = UdpSocket::bind(bind) else {
         return;
     };
-    if udp.connect(target).is_err() || udp.set_read_timeout(Some(UDP_IDLE)).is_err() {
+    if udp.connect(target).is_err() || udp.set_read_timeout(Some(budgets::udp_idle())).is_err() {
         return;
     }
     if stream.write_all(&[0, 0]).is_err() {
@@ -6997,7 +7007,7 @@ pub(crate) fn pump_vmess_udp(
     let Ok(udp_send) = udp.try_clone() else {
         return;
     };
-    if udp.set_read_timeout(Some(UDP_IDLE)).is_err() {
+    if udp.set_read_timeout(Some(budgets::udp_idle())).is_err() {
         return;
     }
     let done = Arc::new(AtomicBool::new(false));
@@ -7112,7 +7122,9 @@ impl RelayPool {
 fn join_within(direction: &std::sync::mpsc::Receiver<()>, budget: Duration) -> bool {
     match direction.recv_timeout(budget) {
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-            eprintln!("ferrox-app: a relay leg did not hand back inside its join budget");
+            eprintln!(
+                "ferrox-app: a relay leg did not hand back inside its {budget:?} join budget"
+            );
             false
         }
         // A partner whose sender is gone can never hand back, which is what the unbounded wait already read as finished.
@@ -7120,8 +7132,9 @@ fn join_within(direction: &std::sync::mpsc::Receiver<()>, budget: Duration) -> b
     }
 }
 
-fn join(direction: &std::sync::mpsc::Receiver<()>) {
-    join_within(direction, RELAY_JOIN);
+/// One leg's wait for its partner, bounded by the join budget the config named. The verdict is returned because the give-up is a fact about the flow, and a bound nobody can observe is not a bound.
+fn join(direction: &std::sync::mpsc::Receiver<()>) -> bool {
+    join_within(direction, budgets::relay_join())
 }
 
 pub(crate) const RELAY_BUFFER: usize = 256 * 1024;
@@ -7872,7 +7885,7 @@ impl Pump {
                 use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
                 let mut reading = reading;
                 if !matches!(
-                    stop_rx.recv_timeout(PAYLOAD_GRACE),
+                    stop_rx.recv_timeout(budgets::payload_grace()),
                     Err(RecvTimeoutError::Timeout)
                 ) {
                     return;
@@ -9090,6 +9103,7 @@ fn b64url(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::budgets::{HANDSHAKE_REQUEST_TIMEOUT, HEAD_DEADLINE, RELAY_JOIN};
     use crate::config::{grpc_path, stream_carrier};
 
     #[test]
@@ -9867,6 +9881,62 @@ mod tests {
         assert!(
             join_within(&gone_rx, RELAY_JOIN),
             "a partner that died counts as finished, exactly as the unbounded wait read it"
+        );
+    }
+
+    /// The budget a leg waits on is the one the config named: the hand-back arrives past a named millisecond and inside the two-minute constant, so the verdict says which value the site read.
+    #[test]
+    fn a_named_join_budget_is_the_bound_a_parked_leg_gives_up_on() {
+        let _guard = budgets::lock();
+        let root = crate::json::parse(r#"{"budgets": {"relayJoin": "1ms"}}"#).expect("parses");
+        budgets::apply(&crate::config::budgets(&root).expect("a budget the engine acts on"));
+        let handed_back_later = || {
+            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(40));
+                let _ = tx.send(());
+            });
+            rx
+        };
+        let gave_up = !join(&handed_back_later());
+        // Restored before the assertion, so a leg another test is joining never reads this table.
+        budgets::clear();
+        assert!(
+            gave_up,
+            "the named 1ms gives the leg up instead of waiting the 40ms out"
+        );
+        assert!(
+            join(&handed_back_later()),
+            "with the constant armed again the same hand-back is joined"
+        );
+    }
+
+    /// A head that never arrives is given up on at its own budget, so a quiet peer costs one give-up and not a task waking once per poll forever.
+    #[test]
+    fn a_head_that_never_arrives_is_given_up_on_at_its_named_budget() {
+        struct Quiet;
+
+        impl Read for Quiet {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+        }
+
+        let root = crate::json::parse(r#"{"budgets": {"headArrival": "150ms"}}"#).expect("parses");
+        let named = crate::config::budgets(&root)
+            .expect("a budget the engine acts on")
+            .head_arrival
+            .expect("named");
+        let started = Instant::now();
+        // The site's own shape: the value the config named is the value the read is armed with.
+        assert!(
+            read_exact_head(&mut Quiet, HEAD_LIMIT_TEST, named).is_none(),
+            "a head that never arrives is refused at its budget"
+        );
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(100) && elapsed < Duration::from_secs(5),
+            "the read ran on the named 150ms, not the 20s constant, and took {elapsed:?}"
         );
     }
 

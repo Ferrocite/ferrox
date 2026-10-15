@@ -679,6 +679,73 @@ pub(crate) fn inbound_carrier(inbound: &Json) -> Carrier {
     stream_carrier(inbound.get("streamSettings"))
 }
 
+/// A wait the config restates; `None` keeps the constant beside the name in `budgets.rs`.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct Budgets {
+    pub(crate) dial: Option<Duration>,
+    pub(crate) handshake: Option<Duration>,
+    pub(crate) head_arrival: Option<Duration>,
+    pub(crate) relay_join: Option<Duration>,
+    pub(crate) relay_quantum: Option<Duration>,
+    pub(crate) udp_idle: Option<Duration>,
+    pub(crate) payload_grace: Option<Duration>,
+    pub(crate) goaway_grace: Option<Duration>,
+    pub(crate) carrier_probe: Option<Duration>,
+}
+
+/// The top-level `"budgets"` object, one name per wait. A name this tree does not know is refused rather than ignored, because a typo in a budget reads as the default it did not set.
+pub(crate) fn budgets(root: &Json) -> Result<Budgets, String> {
+    let mut out = Budgets::default();
+    let Some(section) = root.get("budgets") else {
+        return Ok(out);
+    };
+    let Json::Obj(pairs) = section else {
+        return Err("`budgets` is not an object".to_owned());
+    };
+    for (key, value) in pairs {
+        let slot = match key.as_str() {
+            "dial" => &mut out.dial,
+            "handshake" => &mut out.handshake,
+            "headArrival" => &mut out.head_arrival,
+            "relayJoin" => &mut out.relay_join,
+            "relayQuantum" => &mut out.relay_quantum,
+            "udpIdle" => &mut out.udp_idle,
+            "payloadGrace" => &mut out.payload_grace,
+            "goawayGrace" => &mut out.goaway_grace,
+            "carrierProbe" => &mut out.carrier_probe,
+            other => return Err(format!("unknown budget `{other}`")),
+        };
+        *slot = Some(duration(value, key)?);
+    }
+    Ok(out)
+}
+
+/// `"30s"` or `"2500ms"`, and nothing else: a bare number is refused because the unit a wait is measured in is not the reader's guess.
+fn duration(value: &Json, key: &str) -> Result<Duration, String> {
+    let reject = |reason: String| format!("budget `{key}`: {reason}");
+    let text = value
+        .as_str()
+        .ok_or_else(|| reject("expected a string like \"500ms\" or \"30s\"".to_owned()))?;
+    let (digits, scale) = match text.strip_suffix("ms") {
+        Some(digits) => (digits, 1),
+        None => match text.strip_suffix('s') {
+            Some(digits) => (digits, 1_000),
+            None => return Err(reject(format!("{text:?} names no `ms` or `s` unit"))),
+        },
+    };
+    let count: u64 = digits
+        .trim()
+        .parse()
+        .map_err(|_| reject(format!("{text:?} is not a count")))?;
+    if count == 0 {
+        return Err(reject("a wait of none is not a budget".to_owned()));
+    }
+    count
+        .checked_mul(scale)
+        .map(Duration::from_millis)
+        .ok_or_else(|| reject(format!("{text:?} is past a measurable wait")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -765,5 +832,49 @@ mod tests {
             inbound_tls_identity(&string_form).is_some(),
             "an inline certificate/key string loads too"
         );
+    }
+
+    #[test]
+    fn an_absent_budgets_section_moves_no_wait() {
+        let root = crate::json::parse(r#"{"inbounds": []}"#).expect("parses");
+        assert_eq!(
+            budgets(&root).expect("no section is no override"),
+            Budgets::default(),
+            "a config that names no wait leaves every one at its constant"
+        );
+    }
+
+    #[test]
+    fn a_budget_the_engine_cannot_act_on_is_refused_by_name() {
+        for (json, because) in [
+            (
+                r#"{"budgets": {"dialTimeout": "5s"}}"#,
+                "a name no site reads must not read as the default it did not set",
+            ),
+            (
+                r#"{"budgets": {"dial": "500"}}"#,
+                "the unit a wait is measured in is not the reader's guess",
+            ),
+            (
+                r#"{"budgets": {"dial": "0ms"}}"#,
+                "a wait of none is not a budget",
+            ),
+            (
+                r#"{"budgets": {"dial": 500}}"#,
+                "a count with no unit spelled is not a duration",
+            ),
+            (
+                r#"{"budgets": {"dial": "9223372036854775807s"}}"#,
+                "past a measurable wait is a typo, not a deadline",
+            ),
+            (
+                r#"{"budgets": []}"#,
+                "a section that is not an object names nothing",
+            ),
+        ] {
+            let root = crate::json::parse(json).expect("parses as JSON");
+            let error = budgets(&root).expect_err(because);
+            assert!(error.contains("budget"), "{json}: {error}");
+        }
     }
 }
