@@ -210,14 +210,20 @@ so this read-leg copy is prose rather than a row. `the_pump_gathers_into_its_own
 holds the buffer's pointer and capacity steady across a batch so the gather
 cannot quietly become a reallocating batch. The copy was removed once and put
 back: leaving each frame where its open left it and sending the batch as four
-iovecs of one `write_vectored` moved no byte at all, and on `vmess-raw-down-8`
-(ubuntu-latest, each figure the mean of 3 repeats, same runner and reader either
-side — runs 38789957983 and 38796771414) that read **user 794.6 → 757.5 ms/GiB
-against system 1 254.2 → 1 351.7**, so 37 ms/GiB of user copy bought 97 ms/GiB of
-kernel: the gather is the cheaper shape at this batch width and stays.
-What the split also names and this slice leaves alone: **35 threads at peak
-against xray-core's 14** on the same cell, which is the relay model, not the
-framing.
+iovecs of one `write_vectored` moves no byte at all, and on `vmess-raw-down-8`
+that shape read **user 757.5 against system 1 351.7 ms/GiB** (run 38796771414,
+3 repeats) where the gather reads **user 790.3 against system 1 284.2** pooled
+over the run before it (38789957983) and the five after it (38799273839) — 8
+repeats, total CPU spread 2 027 to 2 110 ms/GiB. The vectored batch took
+~33 ms/GiB off user space and put ~68 ms/GiB on the kernel, ending ~35 ms/GiB
+worse on total CPU and tied on throughput (−0.6%): a relocation onto the half of
+the ledger this method is already behind on, so it does not land.
+The same runs clear the other suspect. `vless-raw-down-8` — this relay model with
+no framing — holds **31 threads at peak** and spends **498.75 ms/GiB of system
+CPU against xray-core's 1 225.8** (run 38801134197): 2.6x less kernel than this
+method's 1 284 at four more threads. **35 threads against xray-core's 14** is
+therefore not what makes the sys row red here; the framing is, and which part of
+it the kernel charges for stays open on this page.
 
 ## Pins
 
