@@ -17,8 +17,8 @@ inside it, and a subslice of that same buffer is what the caller gets.
 
 The payload cipher follows the reference's `auto` negotiation rather than a fixed
 choice: AES-128-GCM where the machine has hardware for it, ChaCha20-Poly1305
-where it does not. Xray's `GetSecurityType` (`common/protocol/headers.go:82`)
-selects on `HasAESGCMHardwareSupport` the same way, so on a runner with AES-NI or
+where it does not. Xray's `GetSecurityType` (`common/protocol/headers.go:82`) selects
+on `HasAESGCMHardwareSupport` the same way, so on a runner with AES-NI or
 armv8 crypto this tree pays hardware AES like the reference instead of a software
 stream cipher, and the request's cipher byte and the flows that seal the body are
 resolved through one function so they cannot diverge —
