@@ -137,7 +137,9 @@ carrier-grpc ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-grpc hunk-payload-bytes 16384 ferrox-app-grpc::tests::hunks_carry_the_xray_schema_bytes
 carrier-grpc user-space-copies-per-byte-written 0 ferrox-app-grpc::tests::the_uplink_hands_the_payload_to_the_writer_by_pointer
 carrier-grpc payload-staging-copies-per-byte-read 0 ferrox-app-grpc::tests::a_body_never_lands_in_a_second_buffer
-carrier-grpc message-bytes-moved-per-padded-frame 11 ferrox-app-grpc::tests::a_padded_frame_is_the_one_move_the_lane_still_makes
+carrier-grpc message-bytes-moved-per-padded-frame 0 ferrox-app-grpc::tests::a_padded_frame_opens_a_message_without_moving
+carrier-grpc window-update-writes-per-data-frame 1 ferrox-app-grpc::tests::a_credit_grants_both_windows_in_one_write
+carrier-grpc window-update-frames-per-data-frame 2 ferrox-app-grpc::tests::a_credit_grants_both_windows_in_one_write
 carrier-grpc message-buffer-reallocations-per-same-sized-frame 0 ferrox-app-grpc::tests::the_message_buffer_is_reused_not_reallocated
 
 carrier-xhttp ops-retired-instructions UNBLESSED scripts/count-ops.sh
