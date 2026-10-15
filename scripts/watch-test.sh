@@ -106,6 +106,15 @@ watch() {
     wait "$pid" 2>/dev/null
     WRC=$?
   fi
+  # The last poll is up to a second behind the close, and what lands in that gap is how a
+  # suite names itself: libtest writes the failing name, the `failures:` block and the
+  # `test result:` line at the end. Echo the tail before archiving it, or the step log ends
+  # where the polling did and a red run reads as a hang.
+  size=$(wc -c <"$out.part" 2>/dev/null || echo 0)
+  if ((size > sent)); then
+    tail -c +"$((sent + 1))" "$out.part"
+    sent=$size
+  fi
   cat "$out.part" >>"$out" 2>/dev/null || true
   rm -f "$out.part"
 }
@@ -170,6 +179,14 @@ EOF
   watch "exit 3" >/dev/null
   ((WRC == 3)) || { echo "selftest: a failing command's code did not survive the watch" >&2; return 1; }
   echo "selftest: ok   a command that writes is left alone, and its exit code is returned"
+  # A suite names itself after the last poll: the failing test's name, the `failures:` block
+  # and the `test result:` line all arrive as the process exits, between two polls.
+  out="target/ci/selftest-tail.log"
+  watch "sleep 1.2; echo 'a_name_that_failed'; echo 'test result: FAILED.'" \
+    >"target/ci/selftest-tail-output.log" 2>/dev/null
+  grep -q 'test result: FAILED' "target/ci/selftest-tail-output.log" || {
+    echo "selftest: the bytes after the last poll never reached the watcher's own output" >&2; return 1; }
+  echo "selftest: ok   the run's last lines reach the step log, so a red suite names itself"
   if [[ -d /proc/self/task ]]; then
     [[ -n "$(blocked_under $$ | grep '^  thread ' || true)" ]] || {
       echo "selftest: procfs is here yet no blocked thread was read" >&2; return 1; }
