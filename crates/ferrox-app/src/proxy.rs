@@ -19418,9 +19418,8 @@ mod poll_relay {
         )
     }
 
-    /// Ingest splices that found no slot in a pipe that still held bytes with byte room
-    /// left: the wake that must not be re-armed. Counted only under `cfg(test)`, where it
-    /// is the quantity the witness names; a production build emits nothing.
+    /// Ingest splices that found no slot in a pipe that still held byte room: the wake the
+    /// back-off exists to stop. Counted only under `cfg(test)`, so a production build emits nothing.
     #[cfg(test)]
     static IDLE_INGESTS: AtomicUsize = AtomicUsize::new(0);
 
