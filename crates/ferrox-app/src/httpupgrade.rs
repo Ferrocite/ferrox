@@ -29,6 +29,27 @@ impl<R: Read> Read for UpReader<R> {
     }
 }
 
+/// Hand the peer its answer whole: a socket closed with received bytes unread is answered with an RST, and that RST discards the `101` this side already wrote. The drain is bounded, so a peer that keeps talking cannot postpone the close.
+pub(crate) fn quiet(stream: &TcpStream) {
+    let mut stream = stream;
+    let previous = stream.read_timeout().ok().flatten();
+    if stream
+        .set_read_timeout(Some(crate::budgets::SESSION_POLL))
+        .is_err()
+    {
+        return;
+    }
+    let mut scratch = [0u8; 4096];
+    let mut drained = 0usize;
+    while drained <= HEAD_LIMIT {
+        match stream.read(&mut scratch) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => drained += n,
+        }
+    }
+    let _ = stream.set_read_timeout(previous);
+}
+
 fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
     crate::proxy::read_http_head(stream, HEAD_LIMIT, crate::budgets::head_arrival())
         .map(|head| (head, Vec::new()))
@@ -187,6 +208,7 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn upgrade_carries_an_echo_over_loopback() {
@@ -425,6 +447,35 @@ mod tests {
         )
         .expect("upgrades");
         server.join().expect("joins");
+    }
+
+    /// The close after a `101` has to be a FIN: witnessed on macOS, an undrained teardown leaves the client's early data unread and the stack answers with a reset that discards the answer, so the drained half ends in EOF and the reset half in `ConnectionReset`.
+    #[test]
+    fn a_drained_teardown_ends_the_upgrade_with_a_fin() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let (_reader, write) = accept(stream, "/tunnel").expect("upgrades");
+            quiet(&write);
+            drop(write);
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        client
+            .write_all(
+                b"GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\n\
+                  Connection: Upgrade\r\nUpgrade: websocket\r\n\r\nfirst",
+            )
+            .expect("writes");
+        server.join().expect("joins");
+        let mut answer = Vec::new();
+        client
+            .read_to_end(&mut answer)
+            .expect("the answer ends in a FIN, not a reset");
+        assert!(answer.starts_with(b"HTTP/1.1 101 Switching Protocols"));
     }
 
     #[test]

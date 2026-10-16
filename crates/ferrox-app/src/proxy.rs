@@ -1584,33 +1584,41 @@ fn serve_session_httpupgrade<R: Read, W: Write + Clone + Send + 'static>(
     id: &[u8; 16],
     freedom: bool,
 ) {
+    // Every exit of a served connection drains before it closes, so the peer keeps what it had already been sent.
+    let raw = Arc::new(raw);
     let Some((mut creader, cwriter)) = crate::httpupgrade::accept_split(read, write, path) else {
         echo_trace("session httpupgrade accept refused");
+        crate::httpupgrade::quiet(&raw);
         return;
     };
     let decoded = decode_request_bounded(&mut creader);
     let Some((got, _flow, cmd, target)) = decoded else {
         echo_trace("session httpupgrade vless decode refused");
+        crate::httpupgrade::quiet(&raw);
         return;
     };
     if got != *id || cmd != 1 || !freedom {
         echo_trace("session httpupgrade vless id or cmd refused");
+        crate::httpupgrade::quiet(&raw);
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
         echo_trace("session httpupgrade uplink refused");
+        crate::httpupgrade::quiet(&raw);
         return;
     };
     let mut sink = SessionSink {
         half: cwriter,
-        raw: Arc::new(raw),
+        raw: Arc::clone(&raw),
     };
     if sink.write_all(&[0, 0]).is_err() {
         echo_trace("session httpupgrade vless response refused");
+        crate::httpupgrade::quiet(&raw);
         return;
     }
     echo_trace("session httpupgrade relaying");
     relay_sink(creader, &sink, &uplink, |_| {});
+    crate::httpupgrade::quiet(&raw);
 }
 
 fn serve_session_httpheader<R: Read, W: Write + Clone + Send + 'static>(
