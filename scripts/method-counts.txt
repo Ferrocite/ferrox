@@ -144,6 +144,10 @@ carrier-grpc window-update-frames-per-data-frame 2 ferrox-app-grpc::tests::a_cre
 carrier-grpc message-buffer-reallocations-per-same-sized-frame 0 ferrox-app-grpc::tests::the_message_buffer_is_reused_not_reallocated
 carrier-grpc batched-elements-served-per-message 8 ferrox-app-grpc::tests::a_batched_downlink_arrives_element_by_element
 carrier-grpc grpc-methods-served-per-listener 2 ferrox-app-grpc::tests::one_listener_serves_both_methods
+carrier-grpc header-field-copies-per-head 0 ferrox-app-h2::tests::a_plain_field_borrows_the_block
+carrier-grpc table-entry-copies-per-indexed-field 0 ferrox-app-h2::tests::an_indexed_field_borrows_the_table
+carrier-grpc decoder-buffer-writes-per-borrowed-field 0 ferrox-app-h2::tests::a_borrowed_block_leaves_the_scratch_alone
+carrier-grpc header-field-allocations-per-inserted-field 2 ferrox-app-h2::tests::an_indexed_field_borrows_the_table
 
 carrier-xhttp ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-xhttp framing-size-lines-without-an-allocation 0 ferrox-app-xhttp::tests::size_lines_match_format_without_allocating
@@ -154,6 +158,7 @@ carrier-xhttp requests-served-per-connection 2 ferrox-app-xhttp::tests::one_conn
 carrier-xhttp requests-served-before-a-close 1 ferrox-app-xhttp::tests::a_request_that_says_close_takes_the_connection_with_it
 carrier-xhttp writes-per-credit 1 ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write
 carrier-xhttp window-update-frames-per-credit 2 ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write
+carrier-xhttp head-buffer-reallocations-per-request-head 0 ferrox-app-xhttp_h2::tests::the_synthesized_head_is_sized_for_its_bytes
 
 carrier-foxy ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-foxy payload-staging-copies-per-byte-written 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane
