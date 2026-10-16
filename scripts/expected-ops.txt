@@ -111,5 +111,14 @@
 # order; pem_wraps_at_sixty_four_columns (a single 48-byte chunk) is the driver,
 # and base64_matches_the_rfc_vectors still walks the short tail through the general
 # path, all green on linux, macos and windows.
+# Re-blessed 591 by opt-append-pem-no-rescan: append_pem dropped its own
+# `pem.reserve(pem_capacity(..))`. Every caller opens the buffer first (der_to_pem
+# at the exact pem_capacity, the QUIC chain and CA bundle at the summed capacity
+# of all their blocks), so the per-block reserve only recomputed pem_capacity's
+# integer arithmetic and hit a no-op capacity check inside the measured frame. The
+# fill lands in already-live capacity either way, so no realloc fires and the bytes
+# are the same concatenation; a_pem_buffer_is_reserved_to_its_exact_length
+# (len == capacity over 12 lengths) and appending_into_a_reserved_buffer_does_not_move_it
+# (pointer identity across two appends) witness it, green on linux, macos and windows.
 
-append_pem 615
+append_pem 591
