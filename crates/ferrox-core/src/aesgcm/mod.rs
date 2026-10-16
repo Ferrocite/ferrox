@@ -790,6 +790,20 @@ impl Aes256Gcm {
     }
 }
 
+/// The length set the differential sweeps walk: dense natively, a representative subset under Miri, whose interpretive AES-GCM rounds cannot finish the full sweep inside the shard's budget.
+#[cfg(test)]
+fn sweep_lengths() -> Vec<usize> {
+    if cfg!(miri) {
+        vec![
+            0, 1, 15, 16, 17, 63, 64, 65, 111, 112, 113, 300, 511, 512, 513,
+        ]
+    } else {
+        (0..=300)
+            .chain([511, 512, 513, 1024, 1400, 4096, 8171, 16383])
+            .collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,8 +910,7 @@ mod tests {
             for nonce in [[0u8; 12], [0xa7u8; 12], [0xffu8; 12]] {
                 for aad_len in [0usize, 1, 15, 16, 17, 64] {
                     let aad: Vec<u8> = (0..aad_len).map(|i| i as u8).collect();
-                    for len in (0..=300usize).chain([511, 512, 513, 1024, 1400, 4096, 8171, 16383])
-                    {
+                    for len in sweep_lengths() {
                         let plain: Vec<u8> = (0..len)
                             .map(|i| (i as u8).wrapping_mul(53).wrapping_add(7))
                             .collect();
@@ -938,7 +951,9 @@ mod tests {
                 }
             }
         }
-        assert!(checked > 5_000, "the sweep should be dense, not a sample");
+        if cfg!(not(miri)) {
+            assert!(checked > 5_000, "the native sweep is dense, not a sample");
+        }
     }
 
     #[test]
@@ -1081,8 +1096,7 @@ mod tests_aes256 {
             for nonce in [[0u8; 12], [0xa7u8; 12], [0xffu8; 12]] {
                 for aad_len in [0usize, 1, 15, 16, 17, 64] {
                     let aad: Vec<u8> = (0..aad_len).map(|i| i as u8).collect();
-                    for len in (0..=300usize).chain([511, 512, 513, 1024, 1400, 4096, 8171, 16383])
-                    {
+                    for len in sweep_lengths() {
                         let plain: Vec<u8> = (0..len)
                             .map(|i| (i as u8).wrapping_mul(53).wrapping_add(7))
                             .collect();
@@ -1120,6 +1134,8 @@ mod tests_aes256 {
                 }
             }
         }
-        assert!(checked > 5_000, "the sweep should be dense, not a sample");
+        if cfg!(not(miri)) {
+            assert!(checked > 5_000, "the native sweep is dense, not a sample");
+        }
     }
 }
