@@ -171,6 +171,8 @@ carrier-foxy edges-preferred-by-verified-exit 1 ferrox-app-proxy::foxy_exit_test
 carrier-foxy tcp-connections-asked-of-an-untrusted-edge 1 ferrox-app-foxy::loopback::an_untrusted_edge_is_named_and_asked_once
 carrier-foxy catalogue-edges-kept-across-a-failed-fetch 4 ferrox-app-foxy_catalog::tests::a_fetch_that_failed_keeps_the_edges_already_known
 carrier-foxy catalogue-edges-rewritten-from-the-cache-file 5 ferrox-app-foxy_catalog::tests::the_cache_file_one_process_writes_is_the_one_the_next_reads
+carrier-foxy dials-of-a-silent-tcp-carrier 1 ferrox-app-proxy::tests::a_silent_carrier_is_dialled_once_rather_than_once_per_rung
+carrier-foxy dials-across-three-flows-of-a-rested-carrier 2 ferrox-app-proxy::tests::a_silent_carrier_is_dialled_once_rather_than_once_per_rung
 
 carrier-quic ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-quic handshakes-per-server 1 ferrox-app-proxy::tests::quic_pool_shares_one_connection_between_two_streams
