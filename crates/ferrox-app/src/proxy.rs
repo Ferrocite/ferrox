@@ -449,6 +449,8 @@ struct FoxyOut {
     limited_until: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Silent carriers and until when: otherwise an `auto` walk repays the whole handshake budget per flow.
     carrier_dead: std::sync::Arc<std::sync::Mutex<ferrox_core::foxy::Refusals>>,
+    /// Edges whose TCP tunnels kept ending soon and the ones rested for a while: an edge that answers the probe yet drops the traffic is otherwise dialed by every flow.
+    edge_strikes: std::sync::Arc<std::sync::Mutex<ferrox_core::foxy::EdgeStrikes>>,
     roots: Vec<Vec<u8>>,
     pins: ferrox_core::foxy::pin::Pins,
     pass: ferrox_core::foxy::Pass,
@@ -511,6 +513,37 @@ impl FoxyOut {
             .ok()
             .and_then(|kept| kept.clone())
             .or_else(|| self.stored.clone())
+    }
+
+    /// Whether this edge's TCP tunnels kept ending soon enough to rest it right now.
+    fn edge_resting(&self, edge: &ferrox_core::foxy::Candidate) -> bool {
+        self.edge_strikes
+            .lock()
+            .is_ok_and(|cache| cache.resting(&edge.authority(), now_secs()))
+    }
+
+    /// The dial order with rested edges left out, or the whole order when every edge rests, so a full rest cannot black-hole a flow.
+    fn live_dials(
+        &self,
+        order: &[ferrox_core::foxy::Candidate],
+    ) -> Vec<ferrox_core::foxy::Candidate> {
+        let live: Vec<_> = order
+            .iter()
+            .filter(|edge| !self.edge_resting(edge))
+            .cloned()
+            .collect();
+        if live.is_empty() {
+            order.to_vec()
+        } else {
+            live
+        }
+    }
+
+    /// A TCP tunnel through this edge ended after lasting this long: two quick ends in a row rest the edge, a tunnel that carried traffic frees it.
+    fn note_edge_end(&self, edge: &ferrox_core::foxy::Candidate, lasted: Duration) {
+        if let Ok(mut cache) = self.edge_strikes.lock() {
+            cache.note_end(&edge.authority(), lasted, now_secs());
+        }
     }
 }
 
@@ -5251,6 +5284,7 @@ enum FoxyOpen {
     Tunnel(
         Box<crate::foxy::Tunnel>,
         Option<(crate::quic::QuicDial, u64)>,
+        ferrox_core::foxy::Candidate,
     ),
     Direct(SocketAddr),
     Refused(u8),
@@ -5412,12 +5446,13 @@ fn foxy_open(foxy: &FoxyOut, asked: &SocksTarget) -> FoxyOpen {
         MAX_FOXY_ALTERNATES,
     );
     let mut last = None;
-    for edge in ferrox_core::foxy::dial_order(
+    let order = ferrox_core::foxy::dial_order(
         &order,
         &foxy.country,
         preferred.as_ref(),
         MAX_FOXY_ALTERNATES,
-    ) {
+    );
+    for edge in foxy.live_dials(&order) {
         let pass = foxy
             .account
             .as_ref()
@@ -5458,7 +5493,7 @@ fn foxy_open(foxy: &FoxyOut, asked: &SocksTarget) -> FoxyOpen {
                     clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                     foxy.carrier_answered(&edge, carrier);
                     let h3 = h3.map(|id| (foxy_quic_dial(foxy, &edge), id));
-                    return FoxyOpen::Tunnel(Box::new(tunnel), h3);
+                    return FoxyOpen::Tunnel(Box::new(tunnel), h3, edge.clone());
                 }
                 Err(failure) => {
                     debug_lane(&edge, carrier, &failure.to_string());
@@ -5498,7 +5533,7 @@ fn serve_foxy_front(
     prefix: &[u8],
 ) {
     match foxy_open(foxy, asked) {
-        FoxyOpen::Tunnel(tunnel, h3) => {
+        FoxyOpen::Tunnel(tunnel, h3, edge) => {
             let mut tunnel = *tunnel;
             if prefix.is_empty() && client.write_all(&front.grant_line()).is_err() {
                 return;
@@ -5509,10 +5544,12 @@ fn serve_foxy_front(
             // One lock serves both directions: a blocking read would hold the writer, hence the bounded quantum.
             let _ = tunnel.set_read_quantum(budgets::relay_quantum());
             let tunnel = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
+            let started = Instant::now();
             relay_tunnel(&client, &tunnel);
             if let Some((dial, id)) = h3 {
                 crate::quic::release_stream(&dial, id);
             }
+            foxy.note_edge_end(&edge, started.elapsed());
         }
         FoxyOpen::Direct(target) => {
             let Some(mut upstream) = dial_or_report(&target) else {
@@ -8814,6 +8851,9 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             limited_until: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             carrier_dead: std::sync::Arc::new(std::sync::Mutex::new(
                 ferrox_core::foxy::Refusals::new(32),
+            )),
+            edge_strikes: std::sync::Arc::new(std::sync::Mutex::new(
+                ferrox_core::foxy::EdgeStrikes::new(32),
             )),
             country,
             city,
@@ -18259,6 +18299,9 @@ mod tests {
             limited_until: std::sync::Arc::new(AtomicU64::new(0)),
             carrier_dead: std::sync::Arc::new(std::sync::Mutex::new(
                 ferrox_core::foxy::Refusals::new(32),
+            )),
+            edge_strikes: std::sync::Arc::new(std::sync::Mutex::new(
+                ferrox_core::foxy::EdgeStrikes::new(32),
             )),
             roots: vec![CARRIER_CERT.to_vec()],
             pins: ferrox_core::foxy::pin::Pins::default(),

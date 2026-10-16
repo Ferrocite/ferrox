@@ -310,6 +310,28 @@ foxy lane and the missing dial). And the published MASQUE edge answers TCP on
 port 2499 rather than QUIC, which is why `h3` is tried first and `h2` is not a
 downgrade.
 
+## The rested edge
+
+The pre-flight proves an edge *answers*; it does not prove a tunnel through it
+*holds*. An exit the edge's own rule refuses opens a CONNECT the edge grants and
+then ends on arrival, so the `verified`/`stored` edge the dial order puts first is
+dialed again by every flow. `count_tunnel_end` rests such an edge after
+`EDGE_REST_STRIKES` quick ends in a row and keeps it out of the order for
+`EDGE_REST`; a tunnel that stayed up `TUNNEL_STAYED_UP` clears the streak, so a
+good edge a network change briefly dropped is not punished for ending.
+
+This is a TCP-front behavior: the association that ends is the relayed flow, so
+`EdgeStrikes` is keyed on the edge authority and consulted once when a flow is
+dialed (skip rested edges, dial them anyway when every one rests rather than
+black-hole the flow) and once when its relay returns. The ejection itself is
+checked by `ferrox-core::foxy::tests` — `count_tunnel_end` and the two-ends-rest
+/ long-tunnel-frees round trip are deterministic there. The consequence that
+matters, *the next dial reaching a different live edge*, is only observable
+against the real MASQUE edge, so it belongs to `foxy-relay.yml`, not to a loopback
+test that cannot stand in for an exit rule. What the flow gains for that is two
+`Mutex` acquisitions and one small `HashMap` probe per tunnel, off the byte path
+and unchanged in count when no edge has rested.
+
 ## Pins
 
 | what | where |
