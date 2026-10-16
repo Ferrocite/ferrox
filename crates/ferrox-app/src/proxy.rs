@@ -5358,7 +5358,7 @@ fn probes_reachable(probes: &[Option<bool>]) -> bool {
 }
 
 /// The exit country one edge really hands back: a disposable H3 tunnel to the probe authority, asked for the trace, then dropped, which is what gives its pooled stream back. It never rides a flow's own tunnel, so a per-target carrier is left intact; `None` means this runner could not carry or read the trace here.
-fn probe_foxy_edge_exit(
+fn probe_edge_exit(
     foxy: &FoxyOut,
     edge: &ferrox_core::foxy::Candidate,
     authority: &str,
@@ -5421,7 +5421,7 @@ fn verify_exit(foxy: &FoxyOut) {
     let pin = foxy.country.to_ascii_uppercase();
     let mut flags: Vec<Option<bool>> = Vec::with_capacity(edges.len());
     for edge in &edges {
-        let agreed = probe_foxy_edge_exit(foxy, edge, &authority).map(|seen| {
+        let agreed = probe_edge_exit(foxy, edge, &authority).map(|seen| {
             let agrees = exit_agrees(&foxy.country, &seen);
             if !agrees {
                 debug_lane(
