@@ -7230,20 +7230,32 @@ pub(crate) struct RelayBuf {
 
 impl RelayBuf {
     #[must_use]
+    pub fn new() -> Self {
+        Self::with_len(RELAY_SMALL_BUFFER)
+    }
+
+    /// The same shape at a caller-chosen read window, for a staging buffer whose headroom and tailroom must sit outside the window rather than shrink it.
+    #[must_use]
     #[allow(
         clippy::uninit_vec,
         reason = "the length is handed straight to `read`, and only the prefix it reports is ever read back"
     )]
-    pub fn new() -> Self {
-        let mut bytes = Vec::with_capacity(RELAY_SMALL_BUFFER);
-        // SAFETY: `filled` yields only the prefix a read reported, so the uninitialised tail is unreachable.
-        unsafe { bytes.set_len(RELAY_SMALL_BUFFER) };
+    pub fn with_len(len: usize) -> Self {
+        let mut bytes = Vec::with_capacity(len);
+        // SAFETY: only the prefix a read reports is ever read back, so the uninitialised tail is unreachable.
+        unsafe { bytes.set_len(len) };
         Self { bytes }
     }
 
     #[must_use]
     pub fn as_mut(&mut self) -> &mut [u8] {
         &mut self.bytes
+    }
+
+    /// The buffer leaves the type; the read that owned every byte already happened, so the `Vec` is only safe to hand out when every later read is prefix-bounded like `open_chunk`'s.
+    #[must_use]
+    pub fn into_vec(self) -> Vec<u8> {
+        self.bytes
     }
 
     #[must_use]
@@ -7258,6 +7270,12 @@ impl RelayBuf {
             unsafe { self.bytes.set_len(RELAY_BUFFER) };
         }
         &self.bytes[..n]
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.bytes.capacity()
     }
 
     #[cfg(test)]
