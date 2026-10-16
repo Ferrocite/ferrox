@@ -2735,6 +2735,10 @@ mod tests {
         assert_eq!(&body[39..71], &[0u8; 32], "the AAD hello stays zeroed");
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "reaches ring's C and assembly, which Miri cannot interpret"
+    )]
     #[test]
     fn the_leaf_parser_reads_the_bound_certificate() {
         let der = bound_certificate(&[3u8; 32], SNI);
