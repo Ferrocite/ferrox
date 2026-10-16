@@ -20,7 +20,8 @@ jobs:
   miri:
     name: miri (${{ matrix.shard }})
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    # The differential crypto shards interpret every case through Miri and finish their tests in 100+ minutes; a lower cap cancels a shard that is green, not slow.
+    timeout-minutes: 180
     strategy:
       fail-fast: false
       matrix:
