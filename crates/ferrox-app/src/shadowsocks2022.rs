@@ -290,12 +290,12 @@ fn serve_relay_on(
         return;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
-    let mut rest = vec![0u8; READ_CHUNK];
+    let mut rest = crate::proxy::RelayBuf::new();
     let mut head = Vec::with_capacity(salt.len() + READ_CHUNK);
     head.extend_from_slice(&salt);
-    match stream.read(&mut rest) {
+    match stream.read(rest.as_mut()) {
         Ok(0) | Err(_) => {}
-        Ok(n) => head.extend_from_slice(&rest[..n]),
+        Ok(n) => head.extend_from_slice(&rest.as_mut()[..n]),
     }
     let _ = stream.set_read_timeout(None);
     if next.write_all(&head).is_err() {
@@ -310,25 +310,25 @@ fn relay_raw(a: &mut TcpStream, b: &mut TcpStream) {
         return;
     };
     let t = thread::spawn(move || {
-        let mut buf = vec![0u8; READ_CHUNK];
+        let mut buf = crate::proxy::RelayBuf::new();
         let mut src = a_read;
         loop {
-            match src.read(&mut buf) {
+            match src.read(buf.as_mut()) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if b_write.write_all(&buf[..n]).is_err() {
+                    if b_write.write_all(&buf.as_mut()[..n]).is_err() {
                         break;
                     }
                 }
             }
         }
     });
-    let mut buf = vec![0u8; READ_CHUNK];
+    let mut buf = crate::proxy::RelayBuf::new();
     loop {
-        match b.read(&mut buf) {
+        match b.read(buf.as_mut()) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if a.write_all(&buf[..n]).is_err() {
+                if a.write_all(&buf.as_mut()[..n]).is_err() {
                     break;
                 }
             }
@@ -645,12 +645,12 @@ pub(crate) fn pump_relay_carried<R, W>(
     let mut send = send;
     let thread_close = std::sync::Arc::clone(close);
     let done = thread::spawn(move || {
-        let mut buf = vec![0u8; SEAL_HEAD + READ_CHUNK + TAG_LEN];
-        while let Ok(read) = plain_read.read(&mut buf[SEAL_HEAD..SEAL_HEAD + READ_CHUNK]) {
+        let mut buf = crate::proxy::RelayBuf::with_len(SEAL_HEAD + READ_CHUNK + TAG_LEN);
+        while let Ok(read) = plain_read.read(&mut buf.as_mut()[SEAL_HEAD..SEAL_HEAD + READ_CHUNK]) {
             if read == 0 {
                 break;
             }
-            if seal_all(&mut send, &mut buf, read, &mut writer).is_err() {
+            if seal_all(&mut send, buf.as_mut(), read, &mut writer).is_err() {
                 break;
             }
         }
@@ -719,7 +719,7 @@ pub(crate) fn pump_relay_carried<R, W>(
 pub(crate) const WIRE_MAX: usize = MAX_CHUNK + TAG_LEN;
 
 pub(crate) fn wire_buffer() -> Vec<u8> {
-    vec![0u8; WIRE_MAX]
+    crate::proxy::RelayBuf::with_len(WIRE_MAX).into_vec()
 }
 
 /// Seal `n` payload bytes at `buf[SEAL_HEAD..]` and hand seals and payload to `out` in one write: a payload byte is never copied in user space, and one call seals one chunk because `READ_CHUNK` is a quarter of `MAX_CHUNK` — a relay read is already one chunk, and oversize input is refused loudly rather than corrupted.
@@ -1726,15 +1726,15 @@ mod tests {
         let psk = vec![7u8; 32];
         let salt = vec![7u8; 32];
         let mut send = Cipher::from_psk(method, &psk, &salt).expect("derives");
-        let mut buf = vec![0u8; SEAL_HEAD + READ_CHUNK + TAG_LEN];
-        for (i, b) in buf[SEAL_HEAD..SEAL_HEAD + READ_CHUNK]
+        let mut buf = crate::proxy::RelayBuf::with_len(SEAL_HEAD + READ_CHUNK + TAG_LEN);
+        for (i, b) in buf.as_mut()[SEAL_HEAD..SEAL_HEAD + READ_CHUNK]
             .iter_mut()
             .enumerate()
         {
             *b = (i % 251) as u8;
         }
-        let plain = buf[SEAL_HEAD..SEAL_HEAD + READ_CHUNK].to_vec();
-        let base = buf.as_ptr() as usize;
+        let plain = buf.as_mut()[SEAL_HEAD..SEAL_HEAD + READ_CHUNK].to_vec();
+        let base = buf.as_mut().as_ptr() as usize;
         let capacity = buf.capacity();
         let mut seen = Vec::new();
         let (writes, wrote_base) = {
@@ -1743,7 +1743,7 @@ mod tests {
                 writes: 0,
                 base: 0,
             };
-            seal_all(&mut send, &mut buf, READ_CHUNK, &mut out).expect("seals");
+            seal_all(&mut send, buf.as_mut(), READ_CHUNK, &mut out).expect("seals");
             (out.writes, out.base)
         };
         assert_eq!(writes, 1, "a relay read is sealed and written once");
@@ -1751,7 +1751,11 @@ mod tests {
             wrote_base, base,
             "the write leaves from the caller's buffer, so no payload byte is copied"
         );
-        assert_eq!(buf.as_ptr() as usize, base, "the read buffer never moves");
+        assert_eq!(
+            buf.as_mut().as_ptr() as usize,
+            base,
+            "the read buffer never moves"
+        );
         assert_eq!(buf.capacity(), capacity, "the read buffer never grows");
         let mut cursor = std::io::Cursor::new(&seen);
         let mut wire = wire_buffer();

@@ -135,6 +135,16 @@ Read against the pinned implementations, all of which are in
   payload and every reply into a fresh `Vec` to end a borrow. The borrows now
   end before the maps are touched — the session id travels by value — so both
   directions hand subslices to the sockets.
+- **The relay buffers' zero fill.** The uplink thread's seal staging, the
+  EIHDR relay's three leg buffers and `wire_buffer` — the downlink's 64 KiB
+  chunk — were per-flow `vec![0u8; n]` callocs; they now read through
+  `RelayBuf`, which asks for the bytes without filling them. The uplink window
+  is unchanged because `RelayBuf` gained a caller-chosen length — the 32 bytes
+  of headroom and tailroom sit outside the read window rather than shrinking
+  it. Nothing past a reported read escapes: the staging test seals through the
+  uninitialised buffer, and the open-path tests refuse a short or damaged
+  chunk without reading the unfilled rest. What retires is the memset per
+  flow, witnessed by the CI RSS matrix, not by a count row.
 
 What is **not** removed, and is named rather than claimed: `rc4-md5`,
 `aes-192-gcm`, `none` and the stream ciphers (`aes-*-ctr`, `aes-*-cfb`,
