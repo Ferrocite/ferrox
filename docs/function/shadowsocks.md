@@ -78,10 +78,10 @@ key, and a stream relay read is crypt-then-write of the same buffer:
 
 ```mermaid
 graph TD
-    A["plaintext read, 16383 B<br/>one read syscall"] --> B["crypt in place<br/>copies of payload: 0"]
+    A["plaintext read, 16383 B<br/>one read syscall"] --> B["crypt in place, copies of payload: 0<br/>16 keystream bytes to a stack block,<br/>two words over the payload"]
     B --> C["write_all, one write syscall"]
     C --> D(("wire"))
-    E["wire, one read of what arrived"] --> F["crypt in place in<br/>the connection's own buffer"]
+    E["wire, one read of what arrived"] --> F["crypt in place in the connection's own buffer<br/>same block, same two words"]
     F --> G["write_all to the target"]
     H["wire datagram"] --> I["crypt in place where the socket put it:<br/>IV to the session key"]
     I --> J["no per-datagram buffer, no allocation"]
@@ -185,6 +185,26 @@ is a baseline to difference against, not this method's cost. What was **not**
 removed: the six per-byte table reads and two writes. RC4's keystream is one
 serial state machine, so a gather-free vector form has nothing to widen — the
 floor of this loop is the table traffic, and this is it.
+
+The traffic that is *not* table traffic can still move, though. `crypt` used to
+read, xor and write one payload byte inside the same loop that walks the state,
+so three memory ops per byte sat on the critical path of a stream that needs
+them only at its end. The loop now walks sixteen keystream bytes into a block on
+its own frame and the block goes over the payload as two `u64` words; a call that
+ends mid-block fills the block short and folds it short, so the state advances by
+exactly the bytes crypted and no keystream byte is generated twice or skipped.
+The gate is new because the old ones could not see this: a wrong keystream
+round-trips against itself, so `rc4_md5_round_trips_every_length_and_turns_on_its_key`,
+`rc4_matches_the_published_vectors` and the fold's own 64 KiB checksum all pass a
+tail that over-consumes a block. `the_keystream_is_the_prga_bytes_at_every_block_edge`
+compares `crypt` with a second PRGA written in the test over its own table — at
+every length from 0 to 40, at 63, 64, 65, 127, 128, 129, 255, 256, 257, 4095,
+4096, 8191 and 16 383, and across twelve carried calls of 1, 7, 8, 9, 15, 16, 17,
+63, 64, 65, 3 and 100 bytes — and it is the only one of the four that fails that
+mutation. What the move costs and does not remove, both named: each keystream
+byte is now stored once and reloaded as part of a word, sixteen stores and two
+loads per block, and the table traffic stays exactly the six reads and two writes
+above.
 
 ## Time
 
@@ -364,8 +384,17 @@ Read against the three pinned implementations, all of which are in
 - **A per-chunk dispatch for the stream.** The AEAD seal matches on the cipher
   per chunk because the ladder differs per method. The stream matches once per
   read in `seal_all` — one `match` on `Uplink` outside any per-byte loop — and
-  the per-byte loop itself is three wrapping adds, two swaps and one xor with
+  the per-byte loop itself is three wrapping adds, two swaps and one store with
   no branches at all.
+- **The payload's three byte ops inside the keystream loop.** `crypt` used to
+  read, xor and write one payload byte from the same loop body that walks the
+  state, so the fold's traffic sat on the critical path of a machine that only
+  needs it at the end. Sixteen keystream bytes now fill a block on the frame and
+  the block goes over the payload as two words (`fold_keystream`); a call that
+  ends mid-block fills it short and folds it short, so the state advances by
+  exactly the bytes crypted. `the_keystream_is_the_prga_bytes_at_every_block_edge`
+  is the gate, and it is the only one that fails a tail that over-consumes a
+  block — see Ops.
 - **The UDP tag and the third copy on the stream path.** A stream datagram is
   `IV` plus header plus payload with no tag: sealing writes the IV and header
   into the caller's headroom and crypts header and payload where they lie, and
