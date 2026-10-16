@@ -86,7 +86,10 @@ traffic reallocates none of it.
 **Not measured on this branch.** `.github/workflows/parity.yml` runs the
 `vless-raw` scenario across the pinned engines for upload, download and
 full-duplex; `.github/workflows/benchmark-matrix.yml` runs the same. Both are
-CI-only. No artefact from this branch has been read.
+CI-only. No artefact from this branch has been read; the two cells quoted under
+**What we removed** for the splice pump are main's nightly at `81c48ad` (the build
+before the pump's idle back-off) and the dispatched replays of `vless-raw-up-1` and
+`vless-raw-down-1` on `905962d`, each read from its own run artefact.
 
 ## What we removed
 
@@ -133,12 +136,17 @@ CI-only. No artefact from this branch has been read.
   held fewer bytes than its capacity, which is a question in bytes, and the ring
   refuses by *slots*: a wake that is honest about the socket still has nowhere to
   put what it sees, and re-arming it is a spin on a flow nobody can move. The
-  `vless-raw-up-1` cell priced that spin at 2 501 ms of system time per GiB, where
-  the pump after the fix costs 185 and xray-core 721, and `vless-raw-down-1` stayed
-  inside noise at 536–585. Measured against the pump that re-armed the wake, a
-  destination reading 512 bytes every 2 ms cost 78 183 ingest splices that moved
-  nothing out of 79 013 wakes in a 400 ms window; the same window on this pump
-  measures 2. Item 15 of
+  `vless-raw-up-1` cell priced that spin as a resolved regression: main's nightly
+  cost 2 501 ms of system time per GiB where xray-core cost 1 076 on that same
+  runner (0.431× its cost, interval [0.423×, 0.441×], the cell exiting red), and the
+  fixed build costs 185 where xray-core costs 721 (3.818× better, interval
+  [3.606×, 4.020×]). The two cells ran on different machines, so only each one's
+  ratio to its own comparator is comparable — not 2 501 against 185.
+  `vless-raw-down-1` moved the same way it already did (2.271× xray-core's cost to
+  2.459×), so the back-off gave nothing up there. Measured against the pump that
+  re-armed the wake, a destination reading 512 bytes every 2 ms cost 78 183 ingest
+  splices that moved nothing out of 79 013 wakes in a 400 ms window; the same window
+  on this pump measures 2. Item 15 of
   `docs/method-superset.md` carries the counts, and
   `poll_relay::no_pollin_is_armed_on_a_ring_that_holds_bytes_it_cannot_take` holds
   the arm's truth table while
