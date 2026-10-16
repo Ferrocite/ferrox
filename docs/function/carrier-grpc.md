@@ -20,10 +20,13 @@ Read has one buffer. A DATA frame's body is read onto the end of the message
 buffer, the envelope and the `Hunk` are parsed where they landed, and the payload
 is delivered out of that buffer at the offset the parser found — so a byte is
 copied twice on the way through: once into user space by the socket read, once
-into the caller's buffer. Each body is credited back to the peer as it lands: the
-connection and the stream each get their `WINDOW_UPDATE`, and the two frames —
-eighteen constant header bytes differing only by stream id and the increment —
-leave as one write. The cursor skips the protobuf fields this lane does not
+into the caller's buffer. What a body owes the peer accumulates instead of
+leaving: one credit pays for the bodies that landed since the last one, as the
+two `WINDOW_UPDATE` frames — eighteen constant header bytes differing only by
+stream id and the increment — in one write, and it is owed once half the
+advertised window has arrived. That grant only holds because the preface pays the
+peer the whole connection window at once, since a batched credit cannot be the
+thing that raises it. The cursor skips the protobuf fields this lane does not
 read without moving them, and the dead prefix is reclaimed before the next body
 is appended, which is what keeps one buffer enough. There is no second buffer to
 stage into and no backlog to join one to.
@@ -58,6 +61,7 @@ graph TD
     D --> E(("wire"))
     E --> F["read the DATA body onto the end<br/>of the message buffer"]
     E --> L["HEADERS block: every field<br/>handed over borrowed, 0 allocations"]
+    F --> N["what the bodies owe accumulates;<br/>one credit write per half-window"]
     F --> G{"compressed?"}
     G -- no --> H["parsed where it landed,<br/>0 staging copies"]
     G -- yes --> I["inflate, the rare path"]
@@ -78,8 +82,10 @@ graph TD
 | user-space-copies-per-byte-written | 0 | ferrox-app-grpc::tests::the_uplink_hands_the_payload_to_the_writer_by_pointer |
 | payload-staging-copies-per-byte-read | 0 | ferrox-app-grpc::tests::a_body_never_lands_in_a_second_buffer |
 | message-bytes-moved-per-padded-frame | 0 | ferrox-app-grpc::tests::a_padded_frame_opens_a_message_without_moving |
-| window-update-writes-per-data-frame | 1 | ferrox-app-grpc::tests::a_credit_grants_both_windows_in_one_write |
-| window-update-frames-per-data-frame | 2 | ferrox-app-grpc::tests::a_credit_grants_both_windows_in_one_write |
+| credit-bytes | 2097152 | ferrox-app-grpc::tests::a_credit_grants_the_window_it_owes_in_one_write |
+| window-update-writes-per-credit | 1 | ferrox-app-grpc::tests::a_credit_grants_the_window_it_owes_in_one_write |
+| window-update-frames-per-credit | 2 | ferrox-app-grpc::tests::a_credit_grants_the_window_it_owes_in_one_write |
+| connection-window-credit-at-preface | 4128769 | ferrox-app-grpc::tests::the_preface_grants_the_peer_a_whole_window |
 | message-buffer-reallocations-per-same-sized-frame | 0 | ferrox-app-grpc::tests::the_message_buffer_is_reused_not_reallocated |
 | batched-elements-served-per-message | 8 | ferrox-app-grpc::tests::a_batched_downlink_arrives_element_by_element |
 | grpc-methods-served-per-listener | 2 | ferrox-app-grpc::tests::one_listener_serves_both_methods |
@@ -97,9 +103,16 @@ message per frame, two messages in one frame, one message split over frames. The
 `0` on the padded row is that gate's own message opened behind a pad byte: the
 parser steps over the byte and the frame's length drops the tail, so nothing
 moves; a second padded test cuts a pad byte into a message the frame before had
-started and shows the counter at `5`, the move that shape still pays. The two
-window rows come from one test: the two `WINDOW_UPDATE` frames a credit grants
-are the peer's bytes exactly as before, and they now leave in a single write. The
+started and shows the counter at `5`, the move that shape still pays. The three
+credit rows come from one test over an in-memory peer that keeps each write it
+was given: full `HUNK` bodies are delivered and counted, and the test fails if a
+credit leaves before `credit-bytes` of bodies have landed, if the grant is more
+than one write, or if that write is not the peer's two frames with the increment
+of every body since the last grant — `128` frames of `16393` bytes per credit, on
+a downlink of full hunks, where the lane used to write one pair per frame. The
+preface row is read off the first write both halves of a call make: the setting
+and the `WINDOW_UPDATE` on stream `0` that lifts the connection to the window the
+setting advertises, which is the grant a batched credit rests on. The
 batched row counts the elements one `TunMulti` message hands over before the
 caller sees a gap: eight 8 KiB elements in two messages, each element delivered
 from where it lay, so the row's `0` is the same `staged` counter and the eight
@@ -193,6 +206,21 @@ until it is closed.
   write — the same two frames, in the same order, one write syscall fewer per
   DATA frame. What this leaves alone: `xhttp_h2`'s `replenish` credits the same
   pair as two frames over two writes, and its page owns that row.
+- **The credit per frame.** A downlink of full hunks is `65_536` DATA frames per
+  GiB, and every one of them was credited and locked as it landed: `65_536`
+  writes of `26` bytes and `65_536` takes of the frame-write mutex, beside the
+  `65_536` writes that carry the payload. Bodies now add to a counter and one
+  credit pays the counter when it reaches half the advertised window, so a GiB
+  costs `512` credit writes and `512` locks — `128` frames per credit by the
+  arithmetic on the page's own `hunk-payload-bytes` and `credit-bytes` rows,
+  witnessed frame by frame by `a_credit_grants_the_window_it_owes_in_one_write`.
+  The two windows can only be batched because the preface pays the peer the
+  connection window that setting implies: one `13`-byte `WINDOW_UPDATE` on stream
+  `0` per connection, added where the settings already went, in the same write.
+  What is not flushed: a credit that has not reached `credit-bytes` when the
+  stream ends is never sent, because the peer still holds at least the other half
+  of the window and can fill it without waiting — the bound the same test reads
+  off its own measured increment.
 - **The pair per header field.** `Decoder::decode` used to answer with a
   `Vec<(Vec<u8>, Vec<u8>)>`: a name and a value allocated for every field of
   every block, which the consumer then read from and dropped. gRPC's `headers()`

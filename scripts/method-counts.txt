@@ -139,8 +139,10 @@ carrier-grpc hunk-payload-bytes 16384 ferrox-app-grpc::tests::hunks_carry_the_xr
 carrier-grpc user-space-copies-per-byte-written 0 ferrox-app-grpc::tests::the_uplink_hands_the_payload_to_the_writer_by_pointer
 carrier-grpc payload-staging-copies-per-byte-read 0 ferrox-app-grpc::tests::a_body_never_lands_in_a_second_buffer
 carrier-grpc message-bytes-moved-per-padded-frame 0 ferrox-app-grpc::tests::a_padded_frame_opens_a_message_without_moving
-carrier-grpc window-update-writes-per-data-frame 1 ferrox-app-grpc::tests::a_credit_grants_both_windows_in_one_write
-carrier-grpc window-update-frames-per-data-frame 2 ferrox-app-grpc::tests::a_credit_grants_both_windows_in_one_write
+carrier-grpc credit-bytes 2097152 ferrox-app-grpc::tests::a_credit_grants_the_window_it_owes_in_one_write
+carrier-grpc window-update-writes-per-credit 1 ferrox-app-grpc::tests::a_credit_grants_the_window_it_owes_in_one_write
+carrier-grpc window-update-frames-per-credit 2 ferrox-app-grpc::tests::a_credit_grants_the_window_it_owes_in_one_write
+carrier-grpc connection-window-credit-at-preface 4128769 ferrox-app-grpc::tests::the_preface_grants_the_peer_a_whole_window
 carrier-grpc message-buffer-reallocations-per-same-sized-frame 0 ferrox-app-grpc::tests::the_message_buffer_is_reused_not_reallocated
 carrier-grpc batched-elements-served-per-message 8 ferrox-app-grpc::tests::a_batched_downlink_arrives_element_by_element
 carrier-grpc grpc-methods-served-per-listener 2 ferrox-app-grpc::tests::one_listener_serves_both_methods
