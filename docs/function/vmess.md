@@ -4,6 +4,8 @@ VMess is the one method here that pays for a keyed handshake and then gets out
 of the way. The header is read once per connection and every later frame is an
 8 KiB payload, a SHAKE-masked 2-byte length, and a 16-byte tag.
 
+A dial that was handed a name writes it inside the sealed request header as ATYP 2 with its own length, so the edge resolves it and the client's resolver is never asked.
+
 The framing this tree speaks is `OptionChunkStream | OptionChunkMasking |
 OptionGlobalPadding` with **no** authenticated-length option, which is the shape
 that costs one AEAD call per frame instead of two. That is not a simplification:

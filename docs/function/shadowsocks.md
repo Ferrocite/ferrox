@@ -9,6 +9,8 @@ from an MD5 chain over the password. That is SIP004, and the two seals per
 chunk are not an implementation choice — a peer must not be able to tell which
 chunk length we claim until after it has opened the length itself.
 
+The handshake's address header is SOCKS-shaped, so a dial that was handed a name writes it as ATYP 3 with its own length and the edge resolves it; a stream cipher puts the IV before it and an AEAD method salts around the whole thing, neither of which changes that byte.
+
 That chunk shape is not ours to change: `MAX_CHUNK = 0x3FFF` is the largest
 payload the pinned implementations will read, so a wider chunk is an interop
 break and the only thing left to buy is **chunks per syscall**. The relay now

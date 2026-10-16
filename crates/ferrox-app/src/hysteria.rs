@@ -387,7 +387,12 @@ pub(crate) fn read_request(flow: &mut Flow, deadline: Instant) -> Option<String>
     }
 }
 
-pub(crate) fn dial_vless(client: &TcpStream, dial: &Dial, id: &[u8; 16], target: &SocketAddr) {
+pub(crate) fn dial_vless(
+    client: &TcpStream,
+    dial: &Dial,
+    id: &[u8; 16],
+    target: &crate::proxy::Destination,
+) {
     let Some(session) = connect(dial) else {
         return;
     };
