@@ -135,9 +135,18 @@ CI-only. No artefact from this branch has been read.
   put what it sees, and re-arming it is a spin on a flow nobody can move. The
   `vless-raw-up-1` cell priced that spin at 2 501 ms of system time per GiB, where
   the pump after the fix costs 185 and xray-core 721, and `vless-raw-down-1` stayed
-  inside noise at 536–585. Item 15 of `docs/method-superset.md` carries the counts,
-  and `relay_tests::a_parked_flow_of_a_stuffed_pipe_ring_costs_the_pump_no_wake`
-  gates the wake itself by counting the ingest splices that move nothing.
+  inside noise at 536–585. Measured against the pump that re-armed the wake, a
+  destination reading 512 bytes every 2 ms cost 78 183 ingest splices that moved
+  nothing out of 79 013 wakes in a 400 ms window. Item 15 of
+  `docs/method-superset.md` carries the counts, and
+  `poll_relay::no_pollin_is_armed_on_a_ring_that_holds_bytes_it_cannot_take` holds
+  the arm's truth table while
+  `relay_tests::a_trickling_destination_does_not_spin_the_pump` counts the wake.
+  What was not removed: the first refusal of each stall is still an ingest attempt,
+  so the pump pays one splice that moves nothing per stall cycle, and a byte the ring
+  could take now waits for the drain wake that clears the stall rather than the source
+  wake that found it. That delay is priced, not assumed: the same cell's throughput
+  measured inside noise afterwards (mid 0.988×), with the system time at a thirteenth.
 - **The relay buffer's own `memset`.** Both of its fills were setup cost paid
   before the first byte arrived: `vec![0u8; 16 KiB]` reaches for `alloc_zeroed`,
   and `resize(256 KiB, 0)` on promotion writes another 240 KiB — 32 KiB per
