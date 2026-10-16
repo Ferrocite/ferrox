@@ -199,7 +199,7 @@ impl Write for H2StreamWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if !self.headed {
             self.head.extend_from_slice(buf);
-            if let Some(at) = self.head.windows(4).position(|w| w == b"\r\n\r\n") {
+            if let Some(at) = crate::proxy::find_double_crlf(&self.head) {
                 let head = std::mem::take(&mut self.head);
                 if !self.emit_headers(&head[..at + 4]) {
                     return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
