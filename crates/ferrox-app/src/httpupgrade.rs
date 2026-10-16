@@ -18,16 +18,14 @@ impl UpReader<TcpStream> {
 
 impl<R: Read> Read for UpReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
+        // The peekable carrier never carries a prefix, so its every bulk read is one branch and a delegate.
+        if self.prefix.is_empty() {
+            return self.read.read(buf);
         }
-        if !self.prefix.is_empty() {
-            let n = self.prefix.len().min(buf.len());
-            buf[..n].copy_from_slice(&self.prefix[..n]);
-            self.prefix.drain(..n);
-            return Ok(n);
-        }
-        self.read.read(buf)
+        let n = self.prefix.len().min(buf.len());
+        buf[..n].copy_from_slice(&self.prefix[..n]);
+        self.prefix.drain(..n);
+        Ok(n)
     }
 }
 
@@ -51,15 +49,37 @@ pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(UpReader, TcpStre
 }
 
 fn check_request(head: &[u8], path: &str) -> Option<()> {
-    if crate::proxy::request_path(head)? != path {
+    // One UTF-8 pass and one line scan answers the whole request; the fanout re-validated and rescanned for each field.
+    let text = std::str::from_utf8(head).ok()?;
+    let mut lines = text.split("\r\n");
+    let request_line = lines.next()?;
+    let mut parts = request_line.split_whitespace();
+    if parts.next()? != "GET" {
         return None;
     }
-    let upgrade = crate::proxy::header_value(head, "upgrade").unwrap_or_default();
-    let connection = crate::proxy::header_value(head, "connection").unwrap_or_default();
-    if !upgrade.eq_ignore_ascii_case("websocket") || !connection.eq_ignore_ascii_case("upgrade") {
+    let target = parts.next()?;
+    if target.split_once('?').map_or(target, |(base, _)| base) != path {
         return None;
     }
-    Some(())
+    let mut upgrade = false;
+    let mut connection = false;
+    for line in lines {
+        // A colon-less line (the trailing empty one after `\r\n\r\n`, or a stray octet line) is skipped, as the references do.
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let (key, value) = (key.trim(), value.trim());
+        if key.eq_ignore_ascii_case("upgrade") {
+            upgrade = value.eq_ignore_ascii_case("websocket");
+        } else if key.eq_ignore_ascii_case("connection") {
+            connection = value.eq_ignore_ascii_case("upgrade");
+        }
+    }
+    if upgrade && connection {
+        Some(())
+    } else {
+        None
+    }
 }
 
 // The same accept over halves that cannot peek: pipelined bytes arrive as a prefix.
@@ -111,17 +131,30 @@ pub(crate) fn connect(
 }
 
 fn check_response(head: &[u8]) -> Option<()> {
+    // One UTF-8 pass and one line scan for status plus both upgrade headers; the fanout cost three of each.
     let text = std::str::from_utf8(head).ok()?;
-    if text.split("\r\n").next()? != "HTTP/1.1 101 Switching Protocols" {
+    let mut lines = text.split("\r\n");
+    if lines.next()? != "HTTP/1.1 101 Switching Protocols" {
         return None;
     }
-    if !crate::proxy::header_value(head, "connection")?.eq_ignore_ascii_case("upgrade") {
-        return None;
+    let mut connection = false;
+    let mut upgrade = false;
+    for line in lines {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let (key, value) = (key.trim(), value.trim());
+        if key.eq_ignore_ascii_case("connection") {
+            connection = value.eq_ignore_ascii_case("upgrade");
+        } else if key.eq_ignore_ascii_case("upgrade") {
+            upgrade = value.eq_ignore_ascii_case("websocket");
+        }
     }
-    if !crate::proxy::header_value(head, "upgrade")?.eq_ignore_ascii_case("websocket") {
-        return None;
+    if connection && upgrade {
+        Some(())
+    } else {
+        None
     }
-    Some(())
 }
 
 // The same connect over halves that cannot peek: pipelined bytes arrive as a prefix.
@@ -176,6 +209,135 @@ mod tests {
         reader.read_exact(&mut buf).expect("reads");
         assert_eq!(&buf, b"pong");
         server.join().expect("joins");
+    }
+
+    /// The in-memory witness for `UpReader::read`: a real cursor, not a socket, so every returned byte is exact and no scheduler decides the sequence.
+    /// The prefix drains first and the inner reader answers the rest; an empty request is `Ok(0)` on both states and never touches the prefix.
+    #[test]
+    fn upreader_drains_its_prefix_then_delegates_every_byte() {
+        let drain = |prefix: &[u8], inner: &[u8], want: usize| -> Vec<u8> {
+            let mut reader = UpReader {
+                read: std::io::Cursor::new(inner.to_vec()),
+                prefix: prefix.to_vec(),
+            };
+            let mut out = Vec::new();
+            let mut buf = vec![0u8; want];
+            loop {
+                let n = reader.read(&mut buf).expect("reads");
+                if n == 0 {
+                    break;
+                }
+                out.extend_from_slice(&buf[..n]);
+            }
+            out
+        };
+        // Prefix longer than the request window: it drains over several calls, then the inner answers, and the whole is prefix ++ inner.
+        assert_eq!(drain(b"abcdef", b"xyz", 3), b"abcdefxyz".to_vec());
+        // The peekable carrier: no prefix, so every byte is the inner reader's, one branch and a delegate.
+        assert_eq!(drain(b"", b"payload", 4), b"payload".to_vec());
+        // An empty request leaves the prefix whole and returns zero, whichever state the reader is in.
+        let mut held = UpReader {
+            read: std::io::Cursor::new(b"tail".to_vec()),
+            prefix: b"head".to_vec(),
+        };
+        assert_eq!(held.read(&mut []).expect("empty read"), 0);
+        assert_eq!(
+            held.prefix, b"head",
+            "an empty request consumed prefix bytes"
+        );
+    }
+
+    /// One UTF-8 pass and one line scan answers the whole request; every byte-level decision matches the previous three-helper fanout.
+    #[test]
+    fn check_request_accepts_and_refuses_the_vectors_it_did() {
+        let ok = b"GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\n\
+                  Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        assert!(check_request(ok, "/tunnel").is_some());
+        // Case- and whitespace-insensitive on both the key and the value, as `trim` plus `eq_ignore_ascii_case` gave.
+        let messy = b"GET /tunnel HTTP/1.1\r\nupGRADE:   WebSocket \r\n\
+                      Connection:  upgrade\r\n\r\n";
+        assert!(check_request(messy, "/tunnel").is_some());
+        // A query is stripped from the target before the compare.
+        assert!(check_request(
+            b"GET /tunnel?ed=4096 HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            "/tunnel"
+        )
+        .is_some());
+        // Each rejection the previous parse produced, the fused one still produces.
+        assert!(check_request(ok, "/other").is_none(), "wrong path");
+        assert!(
+            check_request(
+                b"POST /tunnel HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                "/tunnel"
+            )
+            .is_none(),
+            "non-GET"
+        );
+        assert!(
+            check_request(
+                b"GET /tunnel HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: gzip\r\n\r\n",
+                "/tunnel"
+            )
+            .is_none(),
+            "wrong Upgrade"
+        );
+        assert!(
+            check_request(
+                b"GET /tunnel HTTP/1.1\r\nUpgrade: websocket\r\n\r\n",
+                "/tunnel"
+            )
+            .is_none(),
+            "missing Connection"
+        );
+        // A colon-less line trailing the required headers is skipped; the fanout saw it after returning Some, so both accept.
+        assert!(
+            check_request(
+                b"GET /tunnel HTTP/1.1\r\nUpgrade: websocket\r\nbogus\r\nConnection: Upgrade\r\n\r\n",
+                "/tunnel"
+            )
+            .is_some(),
+            "trailing colon-less line"
+        );
+        assert!(
+            check_request(b"\xff\xfe", "/tunnel").is_none(),
+            "invalid UTF-8"
+        );
+    }
+
+    /// Status and both upgrade headers fall out of one scan; the same vectors decide the same way.
+    #[test]
+    fn check_response_accepts_and_refuses_the_vectors_it_did() {
+        let ok = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\
+                  Upgrade: websocket\r\n\r\n";
+        assert!(check_response(ok).is_some());
+        assert!(check_response(
+            b"HTTP/1.1 101 Switching Protocols\r\nUpgrade:  WEBSOCKET \r\nconnection: Upgrade\r\n\r\n"
+        )
+        .is_some(), "case and spacing");
+        assert!(
+            check_response(b"HTTP/1.1 200 OK\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+                .is_none(),
+            "not 101"
+        );
+        assert!(
+            check_response(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n")
+                .is_none(),
+            "missing Connection"
+        );
+        assert!(
+            check_response(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\n")
+                .is_none(),
+            "missing Upgrade"
+        );
+        assert!(check_response(b"HTTP/1.1 101 Switching Protocols\r\nConnection: keep-alive\r\nUpgrade: websocket\r\n\r\n").is_none(), "wrong Connection");
+        assert!(
+            check_response(
+                b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nbogus\r\n\r\n"
+            )
+            .is_none(),
+            "missing Upgrade despite trailing colon-less line"
+        );
+        assert!(check_response(b"\xff").is_none(), "invalid UTF-8");
     }
 
     /// A payload that fits the budget rides with the GET, so the server has it before the reader is even built and the caller sends nothing after.
