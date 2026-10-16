@@ -177,6 +177,7 @@ carrier-foxy dials-of-a-silent-tcp-carrier 1 ferrox-app-proxy::tests::a_silent_c
 carrier-foxy dials-across-three-flows-of-a-rested-carrier 2 ferrox-app-proxy::tests::a_silent_carrier_is_dialled_once_rather_than_once_per_rung
 
 carrier-quic ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-quic zero-filled-bytes-per-relayed-frame 3 ferrox-app-quic::tests::a_relayed_datagram_frames_its_target_ahead_of_its_payload
 carrier-quic handshakes-per-server 1 ferrox-app-proxy::tests::quic_pool_shares_one_connection_between_two_streams
 carrier-quic server-roles 0 ferrox-app-proxy::tests::quic_serve_closes_without_handshake
 carrier-quic dialled-without-ca-cert-file 0 ferrox-app-proxy::tests::quic_outbound_reads_ca_cert_file
