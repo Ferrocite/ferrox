@@ -19812,6 +19812,7 @@ mod poll_relay {
         assert!(!direction.can_drain(), "an empty ring has nothing to drain");
 
         direction.pending = capacity / 2;
+        direction.ingest_stalled = false;
         assert!(
             direction.can_ingest(),
             "half a ring with no stall recorded is an ingest worth arming for"
@@ -20152,18 +20153,19 @@ mod relay_tests {
     /// A pipe ring's slots go before its bytes: 512-byte segments arriving one wake at a time
     /// stuff the ring at its slot ceiling while byte room remains, so an honest `POLLIN` still
     /// has nowhere to put what it sees. The destination has to be *moving* for that to spin —
-    /// measured against a pump that re-arms the wake, a trickle of 512 bytes every 2 ms costs
-    /// 78 183 ingest splices that move nothing in a 400 ms window, with the pump's cpu at the
-    /// whole of it, while a destination that reads nothing at all parks the ring full and
-    /// registers zero. What the witness counts is the wake itself, `idle_ingests()`, not its
-    /// side effects. Loopback only; the Linux job owns the splice pump.
+    /// measured against a pump that re-arms the wake, this shape cost 78 183 of its 79 013
+    /// wakes as ingest splices that moved nothing in a 400 ms window, with the pump's cpu at
+    /// the whole of it, while a destination that reads nothing at all parks the ring full and
+    /// registers none. The same window on the shipped pump measures 2, and the limit is the
+    /// distance between those two with room for the rest of the suite's flows. Loopback only;
+    /// the Linux job owns the splice pump.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_trickling_destination_does_not_spin_the_pump() {
         const SEGMENT: usize = 512;
         const ROUNDS: usize = 8_192;
         const WINDOW: Duration = Duration::from_millis(400);
-        const SPIN_LIMIT: usize = 1;
+        const SPIN_LIMIT: usize = 1_000;
 
         let stalled_front = listener();
         let stalled_front_port = port_of(&stalled_front);
