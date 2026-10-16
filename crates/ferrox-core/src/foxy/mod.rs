@@ -176,6 +176,74 @@ impl Refusals {
     }
 }
 
+/// A tunnel that stayed up this long proves its edge good, so its end clears the streak counted against it; only tunnels that end sooner, one after another, rest the edge.
+pub const TUNNEL_STAYED_UP: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How many quick tunnel ends in a row take an edge out of the dial order.
+pub const EDGE_REST_STRIKES: u32 = 2;
+
+/// How long a rested edge stays out of the order, on the assumption it was the edge and not the moment.
+pub const EDGE_REST: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// The quick-end streak after one more tunnel end that `lasted`: a tunnel that stayed up resets it to none, a shorter one extends it by one.
+#[must_use]
+pub fn count_tunnel_end(in_a_row: u32, lasted: std::time::Duration) -> u32 {
+    if lasted >= TUNNEL_STAYED_UP {
+        0
+    } else {
+        in_a_row.saturating_add(1)
+    }
+}
+
+/// The edges whose tunnels kept ending soon: each one's quick-end streak and, once the streak reached [`EDGE_REST_STRIKES`], until when the edge is out of the dial order. A check that only proves an edge answers keeps dialing one whose tunnel dies on arrival, as on an exit the edge refuses; this rests it so the next flow asks a different one.
+#[derive(Debug)]
+pub struct EdgeStrikes {
+    entries: std::collections::HashMap<String, (u32, u64)>,
+    cap: usize,
+}
+
+impl EdgeStrikes {
+    #[must_use]
+    pub fn new(cap: usize) -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    /// Whether the edge is rested at `now`.
+    #[must_use]
+    pub fn resting(&self, key: &str, now: u64) -> bool {
+        self.entries.get(key).is_some_and(|&(_, until)| until > now)
+    }
+
+    /// Records a tunnel through `key` that ended after lasting `lasted`, at `now`. A tunnel that stayed up clears the streak and frees the entry; a short one that completes the strikes rests the edge, otherwise it only bumps the streak.
+    pub fn note_end(&mut self, key: &str, lasted: std::time::Duration, now: u64) {
+        let next = count_tunnel_end(self.entries.get(key).map_or(0, |&(count, _)| count), lasted);
+        if next == 0 {
+            self.entries.remove(key);
+            return;
+        }
+        let entry = next >= EDGE_REST_STRIKES;
+        if entry && !self.entries.contains_key(key) && self.entries.len() >= self.cap {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, &(_, until))| until)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        let until = if entry {
+            now.saturating_add(EDGE_REST.as_secs())
+        } else {
+            0
+        };
+        self.entries.insert(key.to_owned(), (next, until));
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Candidate {
     pub host: String,
@@ -384,6 +452,51 @@ mod tests {
         assert_eq!(refusals.entries.len(), 2);
         refusals.clear("c:80");
         assert!(!refusals.blocked("c:80", 10));
+    }
+
+    /// One tunnel that stayed up clears the streak a short one built; only ends sooner than the mark, one after another, extend it.
+    #[test]
+    fn a_tunnel_that_stayed_up_clears_the_quick_end_streak() {
+        use std::time::Duration;
+        let short = TUNNEL_STAYED_UP.saturating_sub(Duration::from_secs(1));
+        assert_eq!(count_tunnel_end(0, short), 1);
+        assert_eq!(count_tunnel_end(1, short), 2);
+        assert_eq!(count_tunnel_end(5, Duration::from_secs(300)), 0);
+        assert_eq!(count_tunnel_end(5, Duration::from_secs(3600)), 0);
+    }
+
+    /// Two quick ends rest the edge for the window; a third carrier that carried traffic for its length frees the entry instead of adding a strike.
+    #[test]
+    fn two_quick_ends_rest_an_edge_and_a_long_tunnel_frees_it() {
+        use std::time::Duration;
+        let short = TUNNEL_STAYED_UP.saturating_sub(Duration::from_secs(1));
+        let mut strikes = EdgeStrikes::new(8);
+        strikes.note_end("edge:443", short, 100);
+        assert!(
+            !strikes.resting("edge:443", 100),
+            "one quick end is not yet a reason to rest"
+        );
+        strikes.note_end("edge:443", short, 100);
+        assert!(
+            strikes.resting("edge:443", 100),
+            "the second quick end in a row rests it"
+        );
+        assert!(
+            !strikes.resting("edge:443", 400),
+            "another edge is untouched"
+        );
+        assert!(
+            !strikes.resting("edge:443", 100 + EDGE_REST.as_secs()),
+            "the rest expires and the edge is dialed again"
+        );
+        // A fresh streak that runs long is proof of a good edge, not a third strike.
+        strikes.note_end("edge:443", short, 500);
+        strikes.note_end("edge:443", Duration::from_secs(300), 500);
+        strikes.note_end("edge:443", short, 500);
+        assert!(
+            !strikes.resting("edge:443", 500),
+            "the long tunnel cleared the streak, so one short end is not a rest"
+        );
     }
 
     fn edge(host: &str, country: &str, city: &str) -> Candidate {
