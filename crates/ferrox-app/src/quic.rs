@@ -166,21 +166,36 @@ const B64_TABLE: [u8; 256] = b64_table();
 fn base64_encode_block(out: &mut [u8; 64], bytes: &[u8]) -> usize {
     assert!(bytes.len() <= 48, "base64 lines are 48 input bytes");
     let mut written = 0;
-    for chunk in bytes.chunks(3) {
-        let mut word = 0u32;
-        for byte in chunk {
-            word = (word << 8) | u32::from(*byte);
+    let mut rest = bytes;
+    // A full three-byte group needs no serial shift-and-or to build the word and no per-slot branch: the three bytes load straight into a 24-bit window at fixed shifts, and the four sextets are fixed shifts written as four stores. This is the whole 48-byte line sixteen times over; the padding case lands once, on the line's tail.
+    while let Some(g) = rest.first_chunk::<3>() {
+        let word = (u32::from(g[0]) << 16) | (u32::from(g[1]) << 8) | u32::from(g[2]);
+        out[written] = B64[(word >> 18) as usize];
+        out[written + 1] = B64[((word >> 12) & 63) as usize];
+        out[written + 2] = B64[((word >> 6) & 63) as usize];
+        out[written + 3] = B64[(word & 63) as usize];
+        written += 4;
+        rest = &rest[3..];
+    }
+    // The trailing one or two bytes, the only place a pad appears, reached once per line.
+    match rest {
+        [a] => {
+            let w = u32::from(*a) << 16;
+            out[written] = B64[(w >> 18) as usize];
+            out[written + 1] = B64[((w >> 12) & 63) as usize];
+            out[written + 2] = b'=';
+            out[written + 3] = b'=';
+            written += 4;
         }
-        word <<= 8 * (3 - chunk.len());
-        let pad = 3 - chunk.len();
-        for slot in 0..4 {
-            if slot < 4 - pad {
-                out[written] = B64[((word >> (18 - 6 * slot)) & 63) as usize];
-            } else {
-                out[written] = b'=';
-            }
-            written += 1;
+        [a, b] => {
+            let w = (u32::from(*a) << 16) | (u32::from(*b) << 8);
+            out[written] = B64[(w >> 18) as usize];
+            out[written + 1] = B64[((w >> 12) & 63) as usize];
+            out[written + 2] = B64[((w >> 6) & 63) as usize];
+            out[written + 3] = b'=';
+            written += 4;
         }
+        _ => {}
     }
     written
 }
