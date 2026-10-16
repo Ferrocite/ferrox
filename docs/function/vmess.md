@@ -58,6 +58,7 @@ graph TD
 | plain-write-syscalls-per-16-frame-batch | 1 | ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write |
 | pump-buffer-allocations-per-batch | 0 | ferrox-app-vmess::tests::the_pump_gathers_into_its_own_buffer_and_never_moves_it |
 | counters-per-frame | 1 | ferrox-app-vmess::tests::counters_advance_one_per_frame_at_any_offset |
+| replay-keys-held-at-most | 131072 | ferrox-app-vmess::tests::the_window_holds_two_rotations_at_most |
 <!-- counts:end -->
 
 ## Ops
@@ -211,9 +212,10 @@ frame — apply to every 8 KiB VMess frame on the AVX2 and NEON-4 paths.
   keep the reference's nonces; past the wrap the nonces repeat, which is the
   reference's wire and is named here rather than hidden.
   `counter_wrap_matches_the_reference` is the gate.
+- **The replay set that grew for the life of the process.** `replay_seen` kept every 16-byte auth id it had ever accepted, so each new connection added to it and nothing ever left; a subscriber reconnecting on its own could grow it without bound. It is now the two-rotation window Shadowsocks 2022's salt filter already used, shared as one `Replay` type rather than written twice. The span is 240 s because `valid_auth_id` accepts an id 120 s either side of the clock, so an id is still refused for the whole time it can be replayed; `the_window_refuses_a_replay_for_its_span_and_forgets_after_two` moves the clock over both edges of that. What is **not** removed is the bound's cost: past 64 Ki ids in one span the window rotates early and the oldest ids are forgotten, which is the same trade the salt filter makes, and `the_window_holds_two_rotations_at_most` is the gate that it stays at two rotations.
 
 What was **not** removed, and is named rather than rounded off: the auth-id
-lookup. `replay_seen` is a linear probe over a `HashSet` of 16-byte ids with no
+lookup. `replay_seen` is a probe over the window's two `HashSet`s of 16-byte ids with no
 per-connection cache keyed by auth id, which is the same shape as Xray's
 `AuthIDDecoderHolder.Match`. The read side of the header costs three `read_exact`
 calls (16 + 18 + 8 bytes) rather than one, because the auth id has to be read
@@ -258,7 +260,7 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/vmess.rs
-- symbols: vmess
+- symbols: vmess, Replay
 - engines: xray-core, zeronet
 - scenarios: vmess-raw
 - oracle: vmess
