@@ -12,6 +12,9 @@ use crate::h2::{
 const MSG_CAP: usize = 16 * 1024 * 1024;
 const HUNK: usize = 16 * 1024;
 
+/// The bodies one credit pays for, half the window the preface advertises: a peer that has sent this much is owed a credit, and one that has not still has the other half to send into, so no grant is ever the thing a stalled writer waits for.
+const CREDIT_AT: u32 = WINDOW / 2;
+
 /// The two `WINDOW_UPDATE` frames a credit grants differ only by stream id, so their eighteen header bytes are constant and each call fills the two increment slots left zero here: the pair leaves in one write.
 const CREDIT_PAIR: [u8; 26] = {
     let mut out = [0u8; 26];
@@ -19,6 +22,29 @@ const CREDIT_PAIR: [u8; 26] = {
     out[3] = T_WINDOW;
     out[15] = 4;
     out[16] = T_WINDOW;
+    out
+};
+
+/// What this lane advertises before any body arrives: the stream window is the setting, and the connection window is the RFC's `65_535` plus this top-up, so both equal `WINDOW` and a peer can send a whole window before it needs a credit.
+const PREFACE: [u8; 28] = {
+    let mut out = [0u8; 28];
+    out[2] = 6;
+    out[3] = T_SETTINGS;
+    let setting = S_WINDOW.to_be_bytes();
+    out[9] = setting[0];
+    out[10] = setting[1];
+    let window = WINDOW.to_be_bytes();
+    out[11] = window[0];
+    out[12] = window[1];
+    out[13] = window[2];
+    out[14] = window[3];
+    out[17] = 4;
+    out[18] = T_WINDOW;
+    let top_up = (WINDOW - 65_535).to_be_bytes();
+    out[24] = top_up[0];
+    out[25] = top_up[1];
+    out[26] = top_up[2];
+    out[27] = top_up[3];
     out
 };
 
@@ -132,6 +158,9 @@ pub(crate) struct GrpcReader<R: Read = TcpStream> {
     staged: usize,
     /// Scratch for the frames that are not a body: headers, settings, ping.
     frame: Vec<u8>,
+    /// Bodies read since the last credit, and the stream they belong to: a credit pays for a window's worth of frames, not for one.
+    owed: u32,
+    owed_id: u32,
     eof: bool,
 }
 
@@ -195,18 +224,31 @@ impl<R: Read> GrpcReader<R> {
         }
     }
 
-    /// The window this lane grants back as it reads, one credit per frame and one write per credit: the connection update and the stream update are the two halves of a constant pair.
-    fn replenish(&self, id: u32, len: usize) {
-        if len == 0 {
+    /// The window this lane grants back as it reads: a body adds to what is owed and nothing leaves the socket, until a credit's worth has landed and one write pays for all of it.
+    fn replenish(&mut self, id: u32, len: usize) {
+        if self.owed > 0 && id != self.owed_id {
+            self.grant();
+        }
+        self.owed_id = id;
+        self.owed += len as u32;
+        if self.owed >= CREDIT_AT {
+            self.grant();
+        }
+    }
+
+    /// The connection update and the stream update are the two halves of a constant pair, and the increment is the window they both owe: one credit, one write, one lock.
+    fn grant(&mut self) {
+        let owed = std::mem::take(&mut self.owed);
+        if owed == 0 {
             return;
         }
-        let inc = (len.min(1 << 30) as u32).to_be_bytes();
+        let inc = owed.to_be_bytes();
         let mut pair = CREDIT_PAIR;
         pair[9..13].copy_from_slice(&inc);
-        let out: &[u8] = if id == 0 {
+        let out: &[u8] = if self.owed_id == 0 {
             &pair[..13]
         } else {
-            pair[18..22].copy_from_slice(&id.to_be_bytes());
+            pair[18..22].copy_from_slice(&self.owed_id.to_be_bytes());
             pair[22..26].copy_from_slice(&inc);
             &pair
         };
@@ -820,6 +862,8 @@ fn new_reader<R: Read>(
         pay_end: 0,
         staged: 0,
         frame: Vec::new(),
+        owed: 0,
+        owed_id: 0,
         eof: false,
     }
 }
@@ -837,13 +881,10 @@ pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     }
     let shared = new_shared(Box::new(write));
     {
-        let mut initial = Vec::with_capacity(12);
-        initial.extend_from_slice(&S_WINDOW.to_be_bytes());
-        initial.extend_from_slice(&WINDOW.to_be_bytes());
         let Ok(mut socket) = shared.stream.lock() else {
             return None;
         };
-        if !write_frame(&mut **socket, T_SETTINGS, 0, 0, &initial) {
+        if socket.write_all(&PREFACE).is_err() {
             return None;
         }
     }
@@ -882,11 +923,7 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     host: &str,
     path: &str,
 ) -> Option<(GrpcReader<R>, GrpcWriter)> {
-    write.write_all(MAGIC).ok()?;
-    let mut initial = Vec::with_capacity(12);
-    initial.extend_from_slice(&S_WINDOW.to_be_bytes());
-    initial.extend_from_slice(&WINDOW.to_be_bytes());
-    if !write_frame(&mut write, T_SETTINGS, 0, 0, &initial) {
+    if !write.write_slices(&[MAGIC, &PREFACE]) {
         return None;
     }
     let block = block_encode(&[
@@ -1018,6 +1055,27 @@ mod tests {
     impl crate::proxy::FrameWrite for Sink {
         fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
             parts.iter().all(|part| self.write_all(part).is_ok())
+        }
+    }
+
+    /// A peer socket that keeps every write it was given as its own entry, so a test can count the writes and read their bytes.
+    #[derive(Default)]
+    struct Calls(Arc<Mutex<Vec<Vec<u8>>>>);
+
+    impl std::io::Write for Calls {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().push(data.to_vec());
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::proxy::FrameWrite for Calls {
+        fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+            self.0.lock().unwrap().push(parts.concat());
+            true
         }
     }
 
@@ -1308,35 +1366,23 @@ mod tests {
         assert_eq!(reader.msg.capacity(), cap, "a same-sized body reallocated");
     }
 
-    /// The witnesses for `carrier-grpc window-update-writes-per-data-frame 1` and `window-update-frames-per-data-frame 2`: a credit is still the peer's two frames, byte for byte, and they leave in one write.
+    /// The witnesses for `carrier-grpc credit-bytes 2097152`, `window-update-writes-per-credit 1` and `window-update-frames-per-credit 2`: a credit is still the peer's two frames, byte for byte, in one write — granted once for a whole half-window of bodies, not once per frame, and never so late that the peer has spent its window waiting for it.
     #[test]
-    fn a_credit_grants_both_windows_in_one_write() {
-        #[derive(Default)]
-        struct Calls(Arc<Mutex<Vec<Vec<u8>>>>);
-        impl std::io::Write for Calls {
-            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().push(data.to_vec());
-                Ok(data.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl crate::proxy::FrameWrite for Calls {
-            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
-                self.0.lock().unwrap().push(parts.concat());
-                true
-            }
-        }
+    fn a_credit_grants_the_window_it_owes_in_one_write() {
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let body = message(b"ping");
+        let hunk = [b'x'; HUNK];
+        let body = message(&hunk);
+        // The first frame that reaches a credit's worth, and two credits of frames, so the run sees both sides of the threshold twice.
+        let per_credit = (CREDIT_AT as usize - 1) / body.len() + 1;
         let mut wire = frame(
             T_HEADERS,
             F_END_HEADERS,
             1,
             &block_encode(&[(":status", "200"), ("content-type", "application/grpc")]),
         );
-        wire.extend_from_slice(&frame(T_DATA, 0, 1, &body));
+        for _ in 0..per_credit * 2 {
+            wire.extend_from_slice(&frame(T_DATA, 0, 1, &body));
+        }
         let (mut reader, writer) = connect_split(
             std::io::Cursor::new(wire),
             Calls(Arc::clone(&calls)),
@@ -1346,16 +1392,85 @@ mod tests {
         .expect("dials");
         drop(writer);
         calls.lock().unwrap().clear();
-        let mut got = [0u8; 4];
-        reader.read_exact(&mut got).expect("reads");
-        assert_eq!(&got, b"ping");
-        let inc = (body.len() as u32).to_be_bytes();
-        let mut want = frame(T_WINDOW, 0, 0, &inc);
-        want.extend_from_slice(&frame(T_WINDOW, 0, 1, &inc));
+        let owed = (per_credit * body.len()) as u32;
+        assert!(owed >= CREDIT_AT, "a credit is owed at the threshold");
+        assert!(
+            owed < WINDOW,
+            "the credit lands while the peer still has window to send into"
+        );
+        let mut got = [0u8; HUNK];
+        let mut want = Vec::new();
+        for credit in 0..2 {
+            for _ in 1..per_credit {
+                reader.read_exact(&mut got).expect("reads a hunk");
+                assert_eq!(got, hunk);
+            }
+            assert_eq!(
+                calls.lock().unwrap().len(),
+                credit,
+                "a body short of a credit's worth grants nothing"
+            );
+            reader.read_exact(&mut got).expect("reads the last hunk");
+            assert_eq!(got, hunk);
+            let inc = owed.to_be_bytes();
+            let mut pair = frame(T_WINDOW, 0, 0, &inc);
+            pair.extend_from_slice(&frame(T_WINDOW, 0, 1, &inc));
+            want.push(pair);
+            assert_eq!(
+                *calls.lock().unwrap(),
+                want,
+                "one write per credit carries the connection and the stream update, and their increments are every body that landed since the last one"
+            );
+        }
+    }
+
+    /// The witness for `carrier-grpc connection-window-credit-at-preface 4128769`: the grant a batched credit rests on, because a peer that started at the RFC's connection window would have to wait for the first credit to send a second window's worth.
+    #[test]
+    fn the_preface_grants_the_peer_a_whole_window() {
+        let mut settings = Vec::with_capacity(8);
+        settings.extend_from_slice(&S_WINDOW.to_be_bytes());
+        settings.extend_from_slice(&WINDOW.to_be_bytes());
+        let mut want = frame(T_SETTINGS, 0, 0, &settings);
+        want.extend_from_slice(&frame(T_WINDOW, 0, 0, &(WINDOW - 65_535).to_be_bytes()));
+
+        let dialed = Arc::new(Mutex::new(Vec::new()));
+        let (reader, writer) = connect_split(
+            std::io::Cursor::new(Vec::new()),
+            Calls(Arc::clone(&dialed)),
+            "127.0.0.1",
+            "/x",
+        )
+        .expect("dials");
+        drop((reader, writer));
+
+        let served = Arc::new(Mutex::new(Vec::new()));
+        let mut wire = MAGIC.to_vec();
+        wire.extend_from_slice(&frame(
+            T_HEADERS,
+            F_END_HEADERS,
+            1,
+            &block_encode(&[
+                (":method", "POST"),
+                (":path", "/x"),
+                ("content-type", "application/grpc"),
+            ]),
+        ));
+        let (reader, writer) =
+            accept_split(std::io::Cursor::new(wire), Calls(Arc::clone(&served)), "/x")
+                .expect("serves");
+        drop((reader, writer));
+
+        let mut head = MAGIC.to_vec();
+        head.extend_from_slice(&want);
         assert_eq!(
-            *calls.lock().unwrap(),
-            vec![want],
-            "one write carries the connection and the stream update, and the bytes are the two frames the peer has always seen"
+            dialed.lock().unwrap()[0],
+            head,
+            "the client's preface, settings and top-up leave as one write"
+        );
+        assert_eq!(
+            served.lock().unwrap()[0],
+            want,
+            "the server grants the same window before it reads a body"
         );
     }
 
