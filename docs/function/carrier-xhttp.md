@@ -309,6 +309,41 @@ by the in-memory writer above, which is the only checker that can count writes.
   the *inbound* windows, which is what
   `h2_bulk_echo_never_outruns_the_granted_connection_window` pins against the
   merged pair.
+- **A base64 decoder of its own, and a pass per character.** The packet-up hub's
+  placement arm joins `X-Data-{i}` headers or `x_data_{i}` cookies into one string
+  and decodes it; that decode was `b64_url_decode` — a `match` per character
+  pushed into a `bits` `Vec` with no capacity, then a second pass over `bits`
+  pushing three bytes per group into a second `Vec` with no capacity either. Two
+  buffers each grown by a reallocation per doubling, two passes, and one extra
+  buffer the size of the input, for a length the head already stated. It now calls
+  `ferrox_core::transport::url_decode`, the same one-pass group loop
+  `early_decode` runs: six bits per table lookup fill a 24-bit window whose three
+  low bytes are the three bytes they stand for, and one `Vec::with_capacity`
+  reserves the tail before the first push. The checker is a differential sweep:
+  `the_shared_loop_decodes_every_prefix_the_serial_ladder_decoded` keeps the old
+  body in the test module as the oracle and walks every prefix of every encoded
+  length to 200 bytes, asserting byte-for-byte equality wherever the prefix is a
+  base64 length. The arm itself had no gate before this, so
+  `a_packet_split_across_data_parts_reaches_the_session_whole` now drives the hub
+  with the parts cut at 41 and 97 characters — mid-group, the way the reference
+  client cuts one encoded stream at a random `uplinkChunkSize`
+  (`upstream/xray-core/transport/internet/splithttp/config.go:66-94`), so only the
+  joined tail carries the remainder — over both placements, and reads the packet
+  back off the session. What did not move: the group math, the joined single
+  string, and every read, syscall and copy count on the request path — the decode
+  was one pass over the head's value in the old shape too, it just made two
+  buffers of it. One divergence is a convergence: five characters are not a
+  base64 length, and the ladder dropped the last one and handed a short packet up
+  as if it were whole, where `base64.RawURLEncoding` (`hub.go:249-285`) and
+  `URL_SAFE_NO_PAD` (`upstream/zeronet/crates/zero-transport/src/xhttp_request.rs:917`)
+  both refuse it. `url_decode` refuses, on a URL-only table that also rejects
+  `+`, `/`, `=` and whitespace for the same reason.
+  `a_trailing_digit_in_the_data_parts_is_refused` pins the `400` and, on the same
+  head with four digits instead of five, the `200` that says the refusal came from
+  the decode rather than from the request's shape.
+  `early_decode` keeps its dual-alphabet table and its trim
+  for the `Sec-WebSocket-Protocol` peer that sends either alphabet padded; only
+  the loop is shared.
 - **A third copy of the config walk.** `xhttp.rs` carried its own
   byte-identical `header_value` copy and a third head reader; the roadmap has a
   slice for folding both into `proxy.rs`, and it is open. Until that lands, this
@@ -336,6 +371,22 @@ by the in-memory writer above, which is the only checker that can count writes.
   parser.
 
 ## Open rows
+
+- A payload the placement arm refuses answers `400` (or `413`) and returns
+  *after* `bound_session` has already entered the sid, and nothing in the tree
+  reaps that map: `end_session` and `SessionReader::drop` are its only removers,
+  and a refused POST reaches neither. So one POST of undecodable base64 under a
+  fresh sid is one `Arc<Session>` kept for the life of the process. The smaller
+  shape is the refusal ending the session it opened, as
+  `a_refused_packet_ends_the_session_it_overflowed` already requires of the
+  overflow; it is not done here because it is the teardown row, not the decode.
+
+- The placement arm still builds `joined` before it decodes: a `String` grown by
+  `push_str` with no capacity, one copy per part, then the decoder's own copy of
+  the payload. The smaller shape decodes the parts in order with a window carried
+  across the boundary, which is one allocation and one copy per POST cheaper. The
+  parts arrive at a size the client picks (`uplinkChunkSize`, unparsed below), so
+  a carried boundary is what the arm has to model either way.
 
 - A kept-alive connection with no request on it is held open by a blocking
   `read_exact_head`, so the reuse this page now documents also buys a thread per idle
@@ -373,6 +424,8 @@ by the in-memory writer above, which is the only checker that can count writes.
 | `extra` replacing every knob but host, path and mode, in object and string form | `upstream/zeronet/crates/zero-config/src/xhttp.rs:446` |
 | the padding value, its placements and the tokenish length bound | `upstream/zeronet/crates/zero-transport/src/xhttp_request.rs:619` |
 | the hub whose `http.Server` keeps the HTTP/1.1 connection alive, with 4 s for the next head | `upstream/xray-core/transport/internet/splithttp/hub.go:561` |
+| the client that encodes the packet once and splits that string across the parts | `upstream/xray-core/transport/internet/splithttp/config.go:66-94` |
+| the hub that joins the parts and decodes them as one `RawURLEncoding` stream | `upstream/xray-core/transport/internet/splithttp/hub.go:249-285` |
 
 The `extra` precedence is cited from ZeroNet's port, not from the Xray pin: the
 `Config` message at `upstream/xray-core/transport/internet/splithttp/config.proto`
