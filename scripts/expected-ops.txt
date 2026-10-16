@@ -94,4 +94,14 @@
 # alloc now sits in the caller (inlined into the test), so the blessed count
 # measures only the fill — the two facts together explain the drop.
 
-append_pem 1205
+# Re-blessed 665 by opt-b64-encode-block: base64_encode_block stopped building
+# each group's word through a serial shift-and-or chain and stopped running a
+# four-iteration slot loop that re-multiplied 18-6*slot and branched on the pad
+# count per sextet. A full three-byte group is four fixed-shift stores now, and
+# the wrapped line is sixteen of them, so append_pem loses the loop control, the
+# per-slot multiply, the pad branch and the serial shifts it no longer pays for.
+# der_to_pem and the wire bytes are unchanged; base64_matches_the_rfc_vectors
+# (empty, one-byte, two-byte, full and wrapped-tail groups) plus
+# pem_survives_the_pad_and_wrap_boundaries pass on linux, macos and windows.
+
+append_pem 665
