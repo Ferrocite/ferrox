@@ -409,12 +409,12 @@ pub(crate) fn relay(tcp: &TcpStream, flow: &Flow) {
     let done = std::thread::spawn(move || {
         let mut tcp_read = tcp_read;
         let mut up = up;
-        let mut buf = vec![0u8; 16384];
+        let mut buf = crate::proxy::RelayBuf::new();
         loop {
-            match tcp_read.read(&mut buf) {
+            match tcp_read.read(buf.as_mut()) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if up.write_all(&buf[..n]).is_err() {
+                    if up.write_all(&buf.as_mut()[..n]).is_err() {
                         break;
                     }
                 }
@@ -423,12 +423,12 @@ pub(crate) fn relay(tcp: &TcpStream, flow: &Flow) {
         up.close();
     });
     let mut back = flow.clone();
-    let mut buf = vec![0u8; 16384];
+    let mut buf = crate::proxy::RelayBuf::new();
     loop {
-        match back.read(&mut buf) {
+        match back.read(buf.as_mut()) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if tcp_write.write_all(&buf[..n]).is_err() {
+                if tcp_write.write_all(&buf.as_mut()[..n]).is_err() {
                     break;
                 }
             }
