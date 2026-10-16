@@ -7409,8 +7409,7 @@ fn find_double_crlf(head: &[u8]) -> Option<usize> {
         let mut lf = x.wrapping_sub(SPREAD) & !x & HIGH;
         while lf != 0 {
             let a = word + lf.trailing_zeros() as usize / 8;
-            // The terminator's first `\n` sits one byte past its start, so `a >= 1`,
-            // and its start must still hold four bytes, so `a - 1 <= last`.
+            // The terminator's first `\n` sits one byte past its start (`a >= 1`), which must still hold four bytes (`a - 1 <= last`).
             if a >= 1 && a - 1 <= last {
                 let s = a - 1;
                 if head[s] == CR && head[s + 2] == CR && head[s + 3] == LF {
@@ -7421,8 +7420,7 @@ fn find_double_crlf(head: &[u8]) -> Option<usize> {
         }
         word += 8;
     }
-    // Starts past the last whole block, and the one start whose first `\n` fell on the
-    // block boundary, are too few for SWAR to pay: check them as four-byte windows.
+    // Starts past the last whole block, and the one whose first `\n` fell on the block boundary, are too few for SWAR to pay: check them as four-byte windows.
     let mut s = if word == 0 { 0 } else { word - 1 };
     while s <= last {
         if head[s..s + 4] == [CR, LF, CR, LF] {
@@ -9314,14 +9312,36 @@ mod tests {
     /// the very same offset — or the same `None` — as the byte-by-byte form it replaced.
     #[test]
     fn the_swar_terminator_scan_is_the_windows_four_scan() {
-        let oracle = |buf: &[u8]| buf.windows(4).position(|w| w == b"\r\n\r\n");
-        const CR: u8 = b'\r';
-        const LF: u8 = b'\n';
-        const NEEDLE: [u8; 4] = [CR, LF, CR, LF];
+        // Nested so the sweep takes any start iterator without collecting one first.
+        fn sweep(len: usize, starts: impl Iterator<Item = usize>) {
+            const CR: u8 = b'\r';
+            const LF: u8 = b'\n';
+            const NEEDLE: [u8; 4] = [CR, LF, CR, LF];
+            let oracle = |buf: &[u8]| buf.windows(4).position(|w| w == b"\r\n\r\n");
+            for start in starts {
+                // A `\n`-and-`Z` body with no `\r`, so the only terminator is the one planted at `start`.
+                if start + 4 <= len {
+                    let mut v: Vec<u8> = (0..len)
+                        .map(|i| if i % 5 == 0 { LF } else { b'Z' })
+                        .collect();
+                    v[start..start + 4].copy_from_slice(&NEEDLE);
+                    assert_eq!(find_double_crlf(&v), oracle(&v), "len {len} at {start}");
+                }
+            }
+            let no_lf: Vec<u8> = vec![CR; len];
+            assert_eq!(find_double_crlf(&no_lf), oracle(&no_lf), "len {len} no LF");
+            let all_lf: Vec<u8> = vec![LF; len];
+            assert_eq!(
+                find_double_crlf(&all_lf),
+                oracle(&all_lf),
+                "len {len} all LF"
+            );
+        }
 
         // Exhaustive over {\r, \n, Z} up to eight bytes: every alignment and near-miss.
         const ALPHABET: [u8; 3] = *b"\r\nZ";
         let mut small = [0u8; 8];
+        let oracle = |buf: &[u8]| buf.windows(4).position(|w| w == b"\r\n\r\n");
         for len in 0..=8usize {
             for code in 0..ALPHABET.len().pow(len as u32) {
                 let mut rest = code;
@@ -9334,45 +9354,18 @@ mod tests {
             }
         }
 
-        let sweep = |len: usize, starts: &[usize]| {
-            for &start in starts {
-                // A body that strewn `\n` and `Z`, with no `\r`, so the only terminator
-                // is the one planted at `start`: the oracle must agree it is the first.
-                let mut body: Vec<u8> = (0..len)
-                    .map(|i| if i % 5 == 0 { LF } else { b'Z' })
-                    .collect();
-                if start + 4 <= len {
-                    body[start..start + 4].copy_from_slice(&NEEDLE);
-                    assert_eq!(
-                        find_double_crlf(&body),
-                        oracle(&body),
-                        "len {len} terminator at {start}"
-                    );
-                }
-            }
-            // A `\r`-strewn body with no `\n` at all, and an all-`\n` body, both None.
-            let no_lf: Vec<u8> = (0..len).map(|_| CR).collect();
-            assert_eq!(find_double_crlf(&no_lf), oracle(&no_lf), "len {len} no LF");
-            let all_lf: Vec<u8> = (0..len).map(|_| LF).collect();
-            assert_eq!(
-                find_double_crlf(&all_lf),
-                oracle(&all_lf),
-                "len {len} all LF"
-            );
-        };
-
-        // Full sweep of every start over lengths that cross a word boundary at both ends.
+        // Every start over the lengths that straddle a block boundary at both ends.
         for len in 0..=130usize {
-            let starts: Vec<usize> = (0..len).collect();
-            sweep(len, &starts);
+            sweep(len, 0..len);
         }
-        // At scale, every start in the first two words and around the final partial word.
+        // At scale, the first two words, mid-buffer, and the final partial word.
         for len in [511usize, 512, 513, 4096, 16 * 1024] {
-            let mut starts: Vec<usize> = (0..17).collect();
-            starts.extend([len / 2, len / 2 + 1]);
-            starts.extend((len.saturating_sub(9))..len);
-            starts.dedup();
-            sweep(len, &starts);
+            sweep(
+                len,
+                (0..17)
+                    .chain([len / 2, len / 2 + 1])
+                    .chain(len.saturating_sub(9)..len),
+            );
         }
     }
 
