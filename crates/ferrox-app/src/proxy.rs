@@ -7376,6 +7376,61 @@ impl Drop for SplicePipe {
     }
 }
 
+/// The first offset whose four bytes are `\r\n\r\n`, found a word at a time: a SWAR
+/// pass marks the `\n` lanes of each eight-byte block, and only the byte after a
+/// marked `\n` is checked against the whole terminator. Bit-identical to
+/// `head.windows(4).position(|w| w == b"\r\n\r\n")` — which compares four bytes at
+/// every offset — but this reads eight bytes per load and lets the wide pass skip the
+/// ~255/256 of offsets that hold no `\n`, doing the four-byte verify only at a real
+/// candidate. Portable integer code: no target feature, no unsafe, one owner of the
+/// terminator shape.
+fn find_double_crlf(head: &[u8]) -> Option<usize> {
+    const CR: u8 = b'\r';
+    const LF: u8 = b'\n';
+    const SPREAD: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let n = head.len();
+    // A terminator needs four bytes, so the latest start that can still hold one.
+    if n < 4 {
+        return None;
+    }
+    let last = n - 4;
+    let want_lf = (LF as u64).wrapping_mul(SPREAD);
+    let mut word = 0usize;
+    // Whole eight-byte blocks: every `\n` in one earns a terminator check at its start.
+    while word + 8 <= n {
+        let block = u64::from_le_bytes(
+            head[word..word + 8]
+                .try_into()
+                .expect("one eight-byte block"),
+        );
+        let x = block ^ want_lf;
+        // A zero byte of `x` is a `\n` lane; isolate those lanes and walk them low to high.
+        let mut lf = x.wrapping_sub(SPREAD) & !x & HIGH;
+        while lf != 0 {
+            let a = word + lf.trailing_zeros() as usize / 8;
+            // The terminator's first `\n` sits one byte past its start (`a >= 1`), which must still hold four bytes (`a - 1 <= last`).
+            if a >= 1 && a - 1 <= last {
+                let s = a - 1;
+                if head[s] == CR && head[s + 2] == CR && head[s + 3] == LF {
+                    return Some(s);
+                }
+            }
+            lf &= lf - 1;
+        }
+        word += 8;
+    }
+    // Starts past the last whole block, and the one whose first `\n` fell on the block boundary, are too few for SWAR to pay: check them as four-byte windows.
+    let mut s = if word == 0 { 0 } else { word - 1 };
+    while s <= last {
+        if head[s..s + 4] == [CR, LF, CR, LF] {
+            return Some(s);
+        }
+        s += 1;
+    }
+    None
+}
+
 pub(crate) fn find_across(head: &[u8], probe: &[u8], pattern: &[u8]) -> Option<usize> {
     debug_assert!(!pattern.is_empty(), "a pattern of no bytes is everywhere");
     // Optimized for \r\n\r\n pattern
@@ -7413,8 +7468,8 @@ pub(crate) fn find_across(head: &[u8], probe: &[u8], pattern: &[u8]) -> Option<u
             }
             pos += 1;
         }
-        // Every window past the seam lies wholly inside probe, so read it as one contiguous scan with no per-byte branch.
-        if let Some(at) = probe.windows(4).position(|w| w == b"\r\n\r\n") {
+        // Every window past the seam lies wholly inside probe, so read it as one SWAR scan.
+        if let Some(at) = find_double_crlf(probe) {
             return Some(head.len() + at);
         }
         return None;
@@ -7530,11 +7585,7 @@ pub(crate) fn read_exact_head(
         // A fresh delimiter must overlap the new bytes, so scan from three octets before them.
         let from = head.len().saturating_sub(3);
         head.extend_from_slice(&chunk[..n]);
-        if let Some(pos) = head[from..]
-            .windows(4)
-            .position(|part| part == b"\r\n\r\n")
-            .map(|hit| hit + from)
-        {
+        if let Some(pos) = find_double_crlf(&head[from..]).map(|hit| hit + from) {
             let prefix = head.split_off(pos + 4);
             return Some((head, prefix));
         }
@@ -9252,6 +9303,70 @@ mod tests {
         tail.extend_from_slice(b"\r\n\r\n\r\n\r\n");
         assert_eq!(find_across(&[], &tail, b"\r\n\r\n"), Some(255));
         assert_eq!(find_across(b"\r\n", b"\r\nZZ", b"\r\n\r\n"), Some(0));
+    }
+
+    /// `find_double_crlf` is the SWAR pass the shared head reader now uses in place of
+    /// `windows(4).position`; this sweep is its oracle. A forged `\r\n\r`, a length that
+    /// is not a multiple of eight, a terminator whose first `\n` lands exactly on a
+    /// block boundary, and an all-`\n` body that keeps the verify busy must all return
+    /// the very same offset — or the same `None` — as the byte-by-byte form it replaced.
+    #[test]
+    fn the_swar_terminator_scan_is_the_windows_four_scan() {
+        // Nested so the sweep takes any start iterator without collecting one first.
+        fn sweep(len: usize, starts: impl Iterator<Item = usize>) {
+            const CR: u8 = b'\r';
+            const LF: u8 = b'\n';
+            const NEEDLE: [u8; 4] = [CR, LF, CR, LF];
+            let oracle = |buf: &[u8]| buf.windows(4).position(|w| w == b"\r\n\r\n");
+            for start in starts {
+                // A `\n`-and-`Z` body with no `\r`, so the only terminator is the one planted at `start`.
+                if start + 4 <= len {
+                    let mut v: Vec<u8> = (0..len)
+                        .map(|i| if i % 5 == 0 { LF } else { b'Z' })
+                        .collect();
+                    v[start..start + 4].copy_from_slice(&NEEDLE);
+                    assert_eq!(find_double_crlf(&v), oracle(&v), "len {len} at {start}");
+                }
+            }
+            let no_lf: Vec<u8> = vec![CR; len];
+            assert_eq!(find_double_crlf(&no_lf), oracle(&no_lf), "len {len} no LF");
+            let all_lf: Vec<u8> = vec![LF; len];
+            assert_eq!(
+                find_double_crlf(&all_lf),
+                oracle(&all_lf),
+                "len {len} all LF"
+            );
+        }
+
+        // Exhaustive over {\r, \n, Z} up to eight bytes: every alignment and near-miss.
+        const ALPHABET: [u8; 3] = *b"\r\nZ";
+        let mut small = [0u8; 8];
+        let oracle = |buf: &[u8]| buf.windows(4).position(|w| w == b"\r\n\r\n");
+        for len in 0..=8usize {
+            for code in 0..ALPHABET.len().pow(len as u32) {
+                let mut rest = code;
+                for slot in &mut small[..len] {
+                    *slot = ALPHABET[rest % ALPHABET.len()];
+                    rest /= ALPHABET.len();
+                }
+                let view = &small[..len];
+                assert_eq!(find_double_crlf(view), oracle(view), "exhaustive {view:?}");
+            }
+        }
+
+        // Every start over the lengths that straddle a block boundary at both ends.
+        for len in 0..=130usize {
+            sweep(len, 0..len);
+        }
+        // At scale, the first two words, mid-buffer, and the final partial word.
+        for len in [511usize, 512, 513, 4096, 16 * 1024] {
+            sweep(
+                len,
+                (0..17)
+                    .chain([len / 2, len / 2 + 1])
+                    .chain(len.saturating_sub(9)..len),
+            );
+        }
     }
 
     struct Gated {
