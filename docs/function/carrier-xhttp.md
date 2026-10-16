@@ -89,6 +89,68 @@ copy or byte on the wire moves here either — a refusal becomes a served reques
 prose rather than a row in the table below, and the gate that proves it is CI's
 `vless-xhttp-down-8`, which never runs locally.
 
+## Connection reuse
+
+A packet-up uplink is a sequence of `POST {sid}/{seq}` requests, and the reference hub is an
+`http.Server` that never closes the connection under it: `plain_ok` answers `Content-Length: 0`
+with `Connection: keep-alive`, and Go's transport puts the socket back in its idle pool and
+writes the *next* packet on it (`hub.go:561` only arms a 4 s timeout for the next head). Our
+hub answered the first POST, promised keep-alive in that very response, and then tore the
+connection down, because `accept_core` could only return a session or nothing.
+
+That mismatch is not merely wasteful — it is the shape of a lost uplink. A client that trusts
+`Connection: keep-alive` reuses the socket without rechecking it; the server's close arrives
+after the request bytes are already written, and a `POST` with a body is not an idempotent
+request, so the transport reports the failure instead of retrying it. The bulk flow in
+`rust_socks_client_reaches_echo_server_through_local_xray_vless_xhttp_selected_cases`
+(`h1-none-packet-up`) is exactly that: 64 KiB posted in packets on one session, and the panic
+is the client giving up on a packet whose connection we had already dropped. The gate for this
+slice is that CI cell; it never runs locally.
+
+`accept_core` now returns `Served` — `Session` (a session took the halves), `Again` (the
+connection is still the caller's, plus the bytes that rode in with this request and belong to
+the next), or `Closed`. `accept_split_with_settings` loops on it, so one connection carries the
+whole uplink: the body is read *before* the placement match so the socket stays
+byte-synchronous, `read_body` reports how much of the sniffed tail it consumed, and the rest is
+pushed back through `ChainReader::set_carry` for the next head. A `Connection: close` or an
+HTTP/1.0 request ends the loop, as does any refusal — refusals still answer `Connection: close`,
+so nothing about them moves.
+
+What is *not* reusable, and named rather than rounded off:
+
+- **A chunked uplink body.** It leaves no length behind that the next head can be found after,
+  so an H1 `packet-up` POST sent with `Transfer-Encoding: chunked` still ends the connection
+  (`resumable = false`). xray's packet-up client writes `Content-Length`, so the cell above does
+  not depend on it.
+- **`stream-up`.** Its POST parks the handler in `wait_ended` for the life of the session, so it
+  owns the connection by definition; recovering the halves would mean ending the park first,
+  which is the carrier-side owner the Mode gates section above still waits for.
+- **HTTP/2.** `Served::Again` is gated on `h2.is_none()`: an h2 stream ends by `end_stream`, and
+  its connection is owned by `xhttp_h2`, not by this loop.
+- **The 4 s window.** The reference gives a peer that keeps a connection alive but says nothing
+  a bounded wait before dropping it; ours blocks in `read_exact_head` on the socket's own
+  timeout, so an idle kept-alive connection holds its thread. `budgets::HEAD_DEADLINE` is only
+  consulted on a timeout error, so it does not bound a blocking read — arming it per request is
+  the open row below.
+
+The cost is stated too: every kept-alive request copies its own head again (`Vec<u8>` from
+`read_exact_head`) and the carried tail once (`prefix[pre..].to_vec()`), and re-runs the padding
+and placement parse. That is the price of not reconnecting; against a TLS handshake per packet
+it is nothing, but it is a copy this slice adds rather than removes, so it is here rather than
+in "What we removed".
+
+```mermaid
+graph TD
+    A["read one request head<br/>on this connection"] --> B{"sid and seq<br/>in the head?"}
+    B -->|"both"| P["read the body to its length,<br/>push the packet, answer 200"]
+    B -->|"no sequence"| S["hand both halves to a session<br/>(stream-one, stream-up, downlink GET)"]
+    P --> K{"keeps_alive(head) and<br/>not HTTP/2?"}
+    K -->|"yes"| C["put the bytes that rode in past this body<br/>back on the front, then read the next head"]
+    C --> A
+    K -->|"no"| X(("connection ends"))
+    S --> X
+```
+
 ## Session teardown
 
 A session outlives the request that made it. The downlink `GET` parks its reader on
@@ -126,6 +188,8 @@ and the binding does not change it.
 | framing-read-syscalls-per-16KiB-chunk | 1 | ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three |
 | read-syscalls-per-16KiB-chunk | 2 | ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three |
 | user-space-copies-per-byte-written | 1 | ferrox-app-xhttp::tests::exchange_carries_an_echo_over_loopback |
+| requests-served-per-connection | 2 | ferrox-app-xhttp::tests::one_connection_carries_the_packet_up_uplink |
+| requests-served-before-a-close | 1 | ferrox-app-xhttp::tests::a_request_that_says_close_takes_the_connection_with_it |
 | writes-per-credit | 1 | ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write |
 | window-update-frames-per-credit | 2 | ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write |
 <!-- counts:end -->
@@ -198,6 +262,19 @@ by the in-memory writer above, which is the only checker that can count writes.
 
 ## What we removed
 
+- **A TCP connection per uplink packet.** The hub used to serve one request per
+  connection and drop the socket, so a `packet-up` uplink paid a connect, a TLS
+  handshake and a fresh slow start for every `scMaxEachPostBytes` of payload. The
+  reuse is counted in memory, where the number is exact:
+  `one_connection_carries_the_packet_up_uplink` asks one `accept_split_with_settings` call to
+  serve two pipelined POSTs and gets **2 answers and both packets in the session**, where the
+  single-shot shape served 1;
+  `a_request_that_says_close_takes_the_connection_with_it` holds the other half — **1 answer**,
+  the pipelined tail left unread. What that buys on throughput, CPU and RSS is CI's
+  `h1-none-packet-up` interop cell and `vless-xhttp-down-8`, read after the run rather than
+  predicted here. A loopback socket is not the checker for either number: it sees the bytes, not
+  how many connections carried them.
+
 - **A pass over the size line.** `chunk_size` used to scan for the first
   terminator once and then parse the digits it had kept as a second pass; both
   branches re-read the same two-to-seven bytes. The rewrite walks the line once,
@@ -260,6 +337,12 @@ by the in-memory writer above, which is the only checker that can count writes.
 
 ## Open rows
 
+- A kept-alive connection with no request on it is held open by a blocking
+  `read_exact_head`, so the reuse this page now documents also buys a thread per idle
+  connection. The reference bounds that wait at 4 s (`hub.go:561`); `budgets::HEAD_DEADLINE`
+  is 20 s and is only consulted on a timeout error, so it does not bound a blocking read. The
+  smaller shape is one deadline armed per loop turn rather than per connection.
+
 - This page, `carrier-foxy` (`foxy.rs:516`) and `carrier-grpc` now each carry
   their own 26-byte `WINDOW_UPDATE` pair. The three differ only in which frame
   goes first, so one home in `h2` and one writer is the smaller shape; it is
@@ -289,6 +372,7 @@ by the in-memory writer above, which is the only checker that can count writes.
 | the carrier ZeroNet does ship | `upstream/zeronet/crates/zero-transport/src/xhttp.rs` |
 | `extra` replacing every knob but host, path and mode, in object and string form | `upstream/zeronet/crates/zero-config/src/xhttp.rs:446` |
 | the padding value, its placements and the tokenish length bound | `upstream/zeronet/crates/zero-transport/src/xhttp_request.rs:619` |
+| the hub whose `http.Server` keeps the HTTP/1.1 connection alive, with 4 s for the next head | `upstream/xray-core/transport/internet/splithttp/hub.go:561` |
 
 The `extra` precedence is cited from ZeroNet's port, not from the Xray pin: the
 `Config` message at `upstream/xray-core/transport/internet/splithttp/config.proto`
