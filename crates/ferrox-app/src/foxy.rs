@@ -917,19 +917,12 @@ impl Read for Tls1 {
     }
 }
 
-/// HTTP/3 CONNECT over one pooled QUIC connection (control stream, request stream, one HEADERS each way, DATA both ways — the pooling is what makes QUIC worth having); the tuple is the shared connection, its socket, the local address, and this flow's stream id.
-pub(crate) type Quic = (
-    std::sync::Arc<std::sync::Mutex<quiche::Connection>>,
-    std::sync::Arc<crate::quic::Datagram>,
-    SocketAddr,
-    u64,
-);
+/// HTTP/3 CONNECT over one pooled QUIC connection (control stream, request stream, one HEADERS each way, DATA both ways — the pooling is what makes QUIC worth having); ending the lane is what hands the stream back to the pool, and a lane that never got built hands it back the same way.
+pub(crate) type Quic = crate::quic::PooledStream;
 
 pub(crate) struct H3 {
-    shared: std::sync::Arc<std::sync::Mutex<quiche::Connection>>,
-    sock: std::sync::Arc<crate::quic::Datagram>,
-    local: SocketAddr,
-    stream: u64,
+    /// The stream this lane rides, and the pool entry it owes back when the lane ends.
+    quic: Quic,
     /// The request stream's read window, filled straight from the stream — no scratch buffer, no second copy: `head[..filled]` has arrived, `head[carried..filled]` is unparsed.
     head: Vec<u8>,
     filled: usize,
@@ -953,12 +946,8 @@ impl H3 {
     }
 
     pub(crate) fn open(dial: &FoxyDial, target: &str, quic: Quic) -> Result<Self, Failure> {
-        let (shared, sock, local, stream) = quic;
         let mut lane = Self {
-            shared,
-            sock,
-            local,
-            stream,
+            quic,
             head: Self::open_window(),
             filled: 0,
             carried: 0,
@@ -976,9 +965,9 @@ impl H3 {
     }
 
     fn with_conn<T>(&mut self, body: impl FnOnce(&mut quiche::Connection) -> T) -> Option<T> {
-        let mut guard = self.shared.lock().ok()?;
+        let mut guard = self.quic.conn.lock().ok()?;
         let out = body(&mut guard);
-        crate::quic::flush_egress(&mut guard, &self.sock);
+        crate::quic::flush_egress(&mut guard, &self.quic.sock);
         Some(out)
     }
 
@@ -1011,12 +1000,8 @@ impl H3 {
         target_port: u16,
         quic: Quic,
     ) -> Result<Self, Failure> {
-        let (shared, sock, local, stream) = quic;
         let mut lane = Self {
-            shared,
-            sock,
-            local,
-            stream,
+            quic,
             head: Self::open_window(),
             filled: 0,
             carried: 0,
@@ -1035,12 +1020,8 @@ impl H3 {
 
     /// One CONNECT-IP tunnel as its own stream on a shared HTTP/3 connection: the request names `connect-ip` and `capsule-protocol: ?1`, and the address request that follows opens a tunnel carrying every destination.
     pub(crate) fn open_ip(dial: &FoxyDial, quic: Quic) -> Result<Self, Failure> {
-        let (shared, sock, local, stream) = quic;
         let mut lane = Self {
-            shared,
-            sock,
-            local,
-            stream,
+            quic,
             head: Self::open_window(),
             filled: 0,
             carried: 0,
@@ -1063,7 +1044,7 @@ impl H3 {
         frames::quic_varint(&mut frame, frames::H3_HEADERS);
         frames::quic_varint(&mut frame, block.len() as u64);
         frame.extend_from_slice(&block);
-        lane.send(lane.stream, &frame, false)?;
+        lane.send(lane.quic.id, &frame, false)?;
         let status = lane.read_head()?;
         opened(status)?;
         let mut request = Vec::new();
@@ -1074,8 +1055,8 @@ impl H3 {
         let len = frames::quic_varint_into(&mut head, request.len() as u64);
         head.copy_within(0..len, 1);
         head[0] = frames::H3_DATA as u8;
-        lane.send(lane.stream, &head[..=len], false)?;
-        lane.send(lane.stream, &request, false)?;
+        lane.send(lane.quic.id, &head[..=len], false)?;
+        lane.send(lane.quic.id, &request, false)?;
         Ok(lane)
     }
 
@@ -1102,7 +1083,7 @@ impl H3 {
         frames::quic_varint(&mut frame, frames::H3_HEADERS);
         frames::quic_varint(&mut frame, block.len() as u64);
         frame.extend_from_slice(&block);
-        self.send(self.stream, &frame, false)?;
+        self.send(self.quic.id, &frame, false)?;
         self.read_head()
     }
 
@@ -1227,8 +1208,8 @@ impl H3 {
         head.copy_within(0..len, 1);
         head[0] = frames::H3_DATA as u8;
         let sent = self
-            .send(self.stream, &head[..=len], false)
-            .and_then(|()| self.send(self.stream, &out, false));
+            .send(self.quic.id, &head[..=len], false)
+            .and_then(|()| self.send(self.quic.id, &out, false));
         self.out = out;
         sent.map_err(io)?;
         Ok(())
@@ -1323,7 +1304,7 @@ impl H3 {
         frames::quic_varint(&mut frame, frames::H3_HEADERS);
         frames::quic_varint(&mut frame, block.len() as u64);
         frame.extend_from_slice(&block);
-        self.send(self.stream, &frame, false)?;
+        self.send(self.quic.id, &frame, false)?;
         self.read_head()
     }
 
@@ -1357,9 +1338,9 @@ impl H3 {
     }
 
     fn pump(&mut self, wait: Duration) {
-        let local = self.local;
-        if let Ok(mut guard) = self.shared.lock() {
-            crate::quic::pump_once(&mut guard, &self.sock, local, wait);
+        let local = self.quic.local;
+        if let Ok(mut guard) = self.quic.conn.lock() {
+            crate::quic::pump_once(&mut guard, &self.quic.sock, local, wait);
         }
     }
 
@@ -1398,7 +1379,7 @@ impl H3 {
 
     /// One read from the request stream straight into the window's spare room, or a pump when nothing arrived — the same two answers a QUIC stream gives, minus the second copy.
     fn fill(&mut self) -> Result<(), Failure> {
-        let id = self.stream;
+        let id = self.quic.id;
         let mut window = std::mem::take(&mut self.head);
         let filled = self.filled;
         let room = window.len() - filled;
@@ -1454,8 +1435,8 @@ impl Write for H3 {
         let len = frames::quic_varint_into(&mut head, u64::from(frame));
         head.copy_within(0..len, 1);
         head[0] = frames::H3_DATA as u8;
-        self.send(self.stream, &head[..=len], false).map_err(io)?;
-        self.send(self.stream, &buf[..frame as usize], false)
+        self.send(self.quic.id, &head[..=len], false).map_err(io)?;
+        self.send(self.quic.id, &buf[..frame as usize], false)
             .map_err(io)?;
         Ok(frame as usize)
     }
@@ -1565,30 +1546,10 @@ fn io(failure: Failure) -> std::io::Error {
     std::io::Error::other(failure.to_string())
 }
 
-/// A pooled HTTP/3 UDP flow: the pool holds the client stream until it is released, so the lane ending gives it back — a UDP lane lives in a map and is dropped by it, and the release travels with the lane, not a caller that has to remember it.
-pub(crate) struct PooledDatagram {
-    lane: H3,
-    dial: crate::quic::QuicDial,
-    id: u64,
-}
-
-impl PooledDatagram {
-    /// The pooled flow's lane, kept next to what ending it has to give back.
-    pub(crate) fn pool(lane: H3, dial: crate::quic::QuicDial, id: u64) -> Self {
-        Self { lane, dial, id }
-    }
-}
-
-impl Drop for PooledDatagram {
-    fn drop(&mut self) {
-        crate::quic::release_stream(&self.dial, self.id);
-    }
-}
-
 /// One CONNECT-UDP lane on whichever carrier the edge answers: a UDP flow is a capsule stream either way, and which carrier carries it is the dial's question.
 pub(crate) enum Datagram {
     H2(Box<Tls2>),
-    H3(Box<PooledDatagram>),
+    H3(Box<H3>),
 }
 
 /// One CONNECT-IP lane, on whichever carrier the edge answers: there is one tunnel for *every* destination at once, so the lane carries an IP address the proxy assigned it and demultiplexes by the destination in the packet; the tunnel opens by an address request and the assignment, both arriving as capsules on the stream the packets ride.
@@ -1857,7 +1818,7 @@ impl std::io::Write for Datagram {
     fn write(&mut self, payload: &[u8]) -> std::io::Result<usize> {
         match self {
             Self::H2(lane) => lane.write_datagram(payload),
-            Self::H3(lane) => lane.lane.write_datagram(payload),
+            Self::H3(lane) => lane.write_datagram(payload),
         }
         .map(|()| payload.len())
     }
@@ -1871,7 +1832,7 @@ impl std::io::Read for Datagram {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::H2(lane) => lane.read_datagram(buf),
-            Self::H3(lane) => lane.lane.read_datagram(buf),
+            Self::H3(lane) => lane.read_datagram(buf),
         }
     }
 }
@@ -3401,8 +3362,8 @@ mod loopback {
                     continue;
                 };
                 let info = quiche::RecvInfo { from, to: local };
-                let ids: Vec<u64> = conn.readable().collect();
                 conn.recv(&mut buf[..n], info).expect("drives");
+                let ids: Vec<u64> = conn.readable().collect();
                 for id in ids {
                     if id % 4 != 0 {
                         continue;
@@ -3538,8 +3499,8 @@ mod loopback {
                     continue;
                 };
                 let info = quiche::RecvInfo { from, to: local };
-                let ids: Vec<u64> = conn.readable().collect();
                 conn.recv(&mut buf[..n], info).expect("drives");
+                let ids: Vec<u64> = conn.readable().collect();
                 for id in ids {
                     if id % 4 != 0 {
                         continue;
@@ -3733,6 +3694,61 @@ mod loopback {
         );
         assert_eq!(read.destination, &[198, 51, 100, 9]);
         assert_eq!(read.payload, b"hello ip");
+        edge.join().expect("joins");
+    }
+
+    /// The pool entry a QUIC lease rode belongs to the leases and not to whichever code remembered to hand it back: it survives until the last one ends and goes with it, taking the connection and its bound socket along.
+    #[test]
+    fn the_pool_holds_the_entry_only_while_a_lease_rides_it() {
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let port = sock.local_addr().expect("addr").port();
+        let (seen_tx, _seen_rx) = std::sync::mpsc::channel();
+        let (udp_tx, udp_rx) = std::sync::mpsc::channel();
+        let edge = quic_ip_edge(sock, server, seen_tx, udp_tx, 1);
+        let dial = crate::quic::QuicDial {
+            id: [0u8; 16],
+            host: "localhost".to_owned(),
+            address: "127.0.0.1".to_owned(),
+            port,
+            upstream: None,
+            roots: Some(roots.clone()),
+        };
+        let first = crate::quic::pooled_stream_within(&dial, crate::quic::HANDSHAKE_TIMEOUT)
+            .expect("a pooled stream");
+        assert!(crate::quic::pool_holds(&dial), "a live lease holds it");
+        let second = crate::quic::pooled_stream_within(&dial, crate::quic::HANDSHAKE_TIMEOUT)
+            .expect("a second stream on the same connection");
+        drop(first);
+        assert!(
+            crate::quic::pool_holds(&dial),
+            "one lease ending does not evict a connection the other still rides"
+        );
+        {
+            let foxy = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+            let (mut lane, _) = Ip::open(&foxy, Some(second)).expect("the tunnel opens");
+            assert!(
+                lane.write(
+                    &[198, 51, 100, 9],
+                    &[203, 0, 113, 9],
+                    40_000,
+                    443,
+                    b"hello ip"
+                )
+                .expect("writes"),
+                "the packet was built"
+            );
+            lane.flush().expect("flushes");
+            udp_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the edge read it");
+            lane.read().expect("reads").expect("a reply");
+        }
+        assert!(
+            !crate::quic::pool_holds(&dial),
+            "the last lease gave the entry back"
+        );
         edge.join().expect("joins");
     }
 
@@ -4020,8 +4036,8 @@ mod loopback {
                     continue;
                 };
                 let info = quiche::RecvInfo { from, to: local };
-                let ids: Vec<u64> = conn.readable().collect();
                 conn.recv(&mut buf[..n], info).expect("drives");
+                let ids: Vec<u64> = conn.readable().collect();
                 for id in ids {
                     if id % 4 == 2 {
                         drain_uni(&mut conn, id, &mut uni_streams);
