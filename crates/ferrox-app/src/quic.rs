@@ -32,12 +32,30 @@ struct PooledState {
 }
 
 /// The shared connection a flow rides, its socket, its local address, and the bidirectional stream id it opened.
-pub(crate) type PooledStream = (
-    Arc<Mutex<quiche::Connection>>,
-    Arc<Datagram>,
-    SocketAddr,
-    u64,
-);
+pub(crate) struct PooledStream {
+    pub(crate) conn: Arc<Mutex<quiche::Connection>>,
+    pub(crate) sock: Arc<Datagram>,
+    pub(crate) local: SocketAddr,
+    pub(crate) id: u64,
+    /// The pool entry the stream was taken from, or none when it was built outside the pool: dropping the stream is what hands the id back, so no path that ends a flow has to remember to.
+    entry: Option<PooledConn>,
+}
+
+impl Drop for PooledStream {
+    /// One owner, so a lane that finishes, an open that fails and a caller that returns early all pay the pool back; an id left in `opening` would pin the entry, its connection and its socket for the life of the process.
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            leave_session(
+                &entry.conn,
+                &entry.table,
+                &entry.sock,
+                pool(),
+                &entry.key,
+                self.id,
+            );
+        }
+    }
+}
 
 #[derive(Clone)]
 struct PooledConn {
@@ -1132,6 +1150,8 @@ pub(crate) fn pooled_stream_within(dial: &QuicDial, budget: Duration) -> Option<
         pool.insert(fresh.key.as_ref().clone(), fresh.clone());
         Some(fresh)
     })?;
+    // The address is read before the id is taken: a lease that cannot say where it is has no id to give back yet.
+    let local = pooled.sock.local_addr().ok()?;
     let id = {
         let Ok(mut table) = pooled.table.lock() else {
             return None;
@@ -1144,27 +1164,19 @@ pub(crate) fn pooled_stream_within(dial: &QuicDial, budget: Duration) -> Option<
         table.opening.insert(id);
         id
     };
-    let local = pooled.sock.local_addr().ok()?;
-    Some((
-        Arc::clone(&pooled.conn),
-        Arc::clone(&pooled.sock),
+    Some(PooledStream {
+        conn: Arc::clone(&pooled.conn),
+        sock: Arc::clone(&pooled.sock),
         local,
         id,
-    ))
+        entry: Some(pooled),
+    })
 }
 
-/// Hands a stream back to the pool, and closes the connection when it was the last stream on it.
-pub(crate) fn release_stream(dial: &QuicDial, id: u64) {
-    let key = QuicServer {
-        address: dial.address.clone(),
-        port: dial.port,
-        host: dial.host.clone(),
-        upstream: dial.upstream.clone(),
-        roots: dial.roots.clone(),
-    };
-    let pooled = pool().stream(dial);
-    let Some(pooled) = pooled else { return };
-    leave_session(&pooled.conn, &pooled.table, &pooled.sock, pool(), &key, id);
+/// Whether the pool still holds a connection for this dial: an entry nothing owes no give-back on is pinned, with its connection and its bound socket, for the life of the process.
+#[cfg(test)]
+pub(crate) fn pool_holds(dial: &QuicDial) -> bool {
+    pool().stream(dial).is_some()
 }
 
 fn build_pooled(dial: &QuicDial) -> Option<PooledConn> {
@@ -1569,12 +1581,14 @@ pub(crate) fn direct_stream_on(
     if !send_h3_opening(&mut conn, &sock) {
         return None;
     }
-    Some((
-        std::sync::Arc::new(std::sync::Mutex::new(conn)),
-        std::sync::Arc::new(sock),
+    Some(PooledStream {
+        conn: std::sync::Arc::new(std::sync::Mutex::new(conn)),
+        sock: std::sync::Arc::new(sock),
         local,
-        4,
-    ))
+        id: 4,
+        // Built outside the pool: nothing to hand back when the lane ends.
+        entry: None,
+    })
 }
 
 /// One datagram off a loopback edge's socket, or nothing when none arrived.

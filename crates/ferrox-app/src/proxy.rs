@@ -5315,13 +5315,10 @@ impl Front {
     }
 }
 
-/// An opened Foxy route: tunnel with its H3 stream to release, a direct dial, a refusal code, or nothing to say.
+/// An opened Foxy route: a tunnel that carries its own pooled stream, a direct dial, a refusal code, or nothing to say.
 enum FoxyOpen {
-    Tunnel(
-        Box<crate::foxy::Tunnel>,
-        Option<(crate::quic::QuicDial, u64)>,
-        ferrox_core::foxy::Candidate,
-    ),
+    /// The lane carries the pool entry it owes, so the flow that ends it is the flow that pays the pool back.
+    Tunnel(Box<crate::foxy::Tunnel>, ferrox_core::foxy::Candidate),
     Direct(SocketAddr),
     Refused(u8),
     Silent,
@@ -5368,7 +5365,7 @@ fn probes_reachable(probes: &[Option<bool>]) -> bool {
     probes.iter().any(Option::is_some)
 }
 
-/// The exit country one edge really hands back: a disposable H3 tunnel to the probe authority, asked for the trace, then dropped and its stream released. It never rides a flow's own tunnel, so a per-target carrier is left intact; `None` means this runner could not carry or read the trace here.
+/// The exit country one edge really hands back: a disposable H3 tunnel to the probe authority, asked for the trace, then dropped, which is what gives its pooled stream back. It never rides a flow's own tunnel, so a per-target carrier is left intact; `None` means this runner could not carry or read the trace here.
 fn probe_edge_exit(
     foxy: &FoxyOut,
     edge: &ferrox_core::foxy::Candidate,
@@ -5390,16 +5387,15 @@ fn probe_edge_exit(
     };
     let quic_dial = foxy_quic_dial(foxy, edge);
     let quic = crate::quic::pooled_stream_within(&quic_dial, crate::quic::HANDSHAKE_TIMEOUT)?;
-    let stream = quic.3;
+    // The lease goes into the open and comes back with the lane: whoever ends the flow hands the pool entry over, and a probe that ends early ends with it.
     let opened = crate::foxy::Tunnel::open(&dial, authority, Some(quic));
-    if let Ok(mut tunnel) = opened {
-        let seen = foxy_exit_country(&mut tunnel, foxy);
-        drop(tunnel);
-        crate::quic::release_stream(&quic_dial, stream);
-        seen
-    } else {
-        crate::quic::release_stream(&quic_dial, stream);
-        None
+    match opened {
+        Ok(mut tunnel) => {
+            let seen = foxy_exit_country(&mut tunnel, foxy);
+            drop(tunnel);
+            seen
+        }
+        Err(_) => None,
     }
 }
 
@@ -5520,7 +5516,6 @@ fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
                 ),
                 _ => None,
             };
-            let h3 = quic.as_ref().map(|(_, _, _, id)| *id);
             match crate::foxy::Tunnel::open(&dial, &target, quic) {
                 Ok(tunnel) => {
                     debug_lane(&edge, carrier, &format!("opened for {target}"));
@@ -5528,8 +5523,7 @@ fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                     clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                     foxy.carrier_answered(&edge, carrier);
-                    let h3 = h3.map(|id| (foxy_quic_dial(foxy, &edge), id));
-                    return FoxyOpen::Tunnel(Box::new(tunnel), h3, edge.clone());
+                    return FoxyOpen::Tunnel(Box::new(tunnel), edge.clone());
                 }
                 Err(failure) => {
                     debug_lane(&edge, carrier, &failure.to_string());
@@ -5569,7 +5563,7 @@ fn serve_foxy_front(
     prefix: &[u8],
 ) {
     match foxy_open(foxy, asked) {
-        FoxyOpen::Tunnel(tunnel, h3, edge) => {
+        FoxyOpen::Tunnel(tunnel, edge) => {
             let mut tunnel = *tunnel;
             if prefix.is_empty() && client.write_all(&front.grant_line()).is_err() {
                 return;
@@ -5582,9 +5576,6 @@ fn serve_foxy_front(
             let tunnel = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
             let started = Instant::now();
             relay_tunnel(&client, &tunnel);
-            if let Some((dial, id)) = h3 {
-                crate::quic::release_stream(&dial, id);
-            }
             foxy.note_edge_end(&edge, started.elapsed());
         }
         FoxyOpen::Direct(target) => {
@@ -6179,9 +6170,8 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
             let host = dest.ip().to_string();
             let failure = match carrier {
                 crate::foxy::Carrier::H3 => {
-                    let quic_dial = foxy_quic_dial(foxy, &edge);
-                    let Some((conn, sock, local, id)) = crate::quic::pooled_stream_within(
-                        &quic_dial,
+                    let Some(lease) = crate::quic::pooled_stream_within(
+                        &foxy_quic_dial(foxy, &edge),
                         if foxy.carrier == crate::foxy::Carrier::H3 {
                             crate::quic::HANDSHAKE_TIMEOUT
                         } else {
@@ -6190,16 +6180,13 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
                     ) else {
                         continue;
                     };
-                    let quic = (conn, sock, local, id);
-                    match crate::foxy::H3::open_udp(&dial, &host, dest.port(), quic) {
+                    match crate::foxy::H3::open_udp(&dial, &host, dest.port(), lease) {
                         Ok(mut lane) => {
                             lane.set_read_quantum(budgets::relay_quantum());
                             debug_lane(&edge, carrier, &format!("udp opened for {dest}"));
                             clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                             foxy.carrier_answered(&edge, carrier);
-                            return Some(crate::foxy::Datagram::H3(Box::new(
-                                crate::foxy::PooledDatagram::pool(lane, quic_dial, id),
-                            )));
+                            return Some(crate::foxy::Datagram::H3(Box::new(lane)));
                         }
                         Err(failure) => failure,
                     }

@@ -187,6 +187,7 @@ carrier-quic zero-filled-bytes-per-relayed-frame 3 ferrox-app-quic::tests::a_rel
 carrier-quic handshakes-per-server 1 ferrox-app-proxy::tests::quic_pool_shares_one_connection_between_two_streams
 carrier-quic server-roles 0 ferrox-app-proxy::tests::quic_serve_closes_without_handshake
 carrier-quic dialled-without-ca-cert-file 0 ferrox-app-proxy::tests::quic_outbound_reads_ca_cert_file
+carrier-quic pool-entries-held-after-the-last-lease 0 ferrox-app-foxy::loopback::the_pool_holds_the_entry_only_while_a_lease_rides_it
 
 reality-tls ops-retired-instructions UNBLESSED scripts/count-ops.sh
 reality-tls tls-providers 1 ferrox-core::active_backends
