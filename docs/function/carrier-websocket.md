@@ -64,7 +64,12 @@ graph TD
   'ws::tests::the_masked_frame_costs_the_walk_over_its_payload_and_nothing_else'
 ```
 
-`UNBLESSED`, as above.
+`UNBLESSED`, as above, and deliberately so: a probe frame charges its own loop
+entry, its asserts and its fixture fill, so `294378` is a baseline to difference
+against and not this method's cost. The two rows read above are the in-memory
+ones — the masked-write probe and the mask loop's own differential — and both
+hold their bytes across runs; `ws::write_frame` is driven over a loopback
+socket, so its movement is reported as movement, never as a figure.
 
 ## Time
 
@@ -73,7 +78,11 @@ isolation: `.github/workflows/parity.yml` runs `scripts/run-parity.sh` for
 `upload`, `download` and `full-duplex` across the pinned engines, and
 `.github/workflows/benchmark-matrix.yml` runs the `vless-ws` scenario. Both are
 CI-only because every developer machine is behind a VPN. No artefact from this
-branch has been read, so no duration is quoted.
+branch has been read, so no duration is quoted. The wide mask pass in
+particular has no duration row to ask for: every `vless-ws` cell the matrix
+plans measures a *download*, where the server writes unmasked frames, so the
+masked direction never reaches the timer. Its evidence is the instruction count
+above, which is what `ops.yml` can see.
 
 ## What we removed
 
@@ -121,6 +130,24 @@ branch has been read, so no duration is quoted.
 - **A second buffer.** `backlog`/`bat` and `have`/`at`/`msg_end` were two ways
   of holding the same thing; there is now one, which is both smaller and one
   fewer place for a copy to hide.
+
+- **Half the instructions per masked byte, on every `avx2` host.** The masked
+  pass walked sixteen bytes with a load, an xor and a store, and the sixteen
+  above it with three more of the same, so the arithmetic of the loop was fixed
+  at three instructions per sixteen bytes however long the frame was. One
+  `ymm` does the same work over thirty-two, still three instructions, which is
+  why the rung is a dispatch on `std::is_x86_feature_detected!("avx2")` above a
+  buffer of at least one pass, with everything else — including every byte
+  past the last whole pass — still through the old ladder. The bytes do not
+  change: xor has no width. `ops.yml` read
+  `ws::tests::the_masked_frame_costs_the_walk_over_its_payload_and_nothing_else`
+  at `330417` on the gate commit (`9020d7f`, run 38849151187) and `294378` on
+  the wide pass (`d202c28`, run 38851963288): **−36 039 Ir, −10.9%** for the
+  same 16 rounds of the relay's 16 KiB chunk. The mask loop's own probe,
+  `ws::tests::mask_chunks_match_the_byte_loop`, moved `452984` → `437971`, and
+  `ws::write_frame`, which is driven over a loopback socket and so moves between
+  runs, moved `168227` → `150445`. All three are in the same direction, and the
+  two in-memory rows are the ones to read.
 
 What is unchanged, deliberately: the **aarch64** step stays 16 bytes per
 `xor_block` with a tail loop, mirroring Zray's measured `u128` step ("Measured
