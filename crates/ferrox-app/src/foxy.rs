@@ -3362,8 +3362,8 @@ mod loopback {
                     continue;
                 };
                 let info = quiche::RecvInfo { from, to: local };
-                let ids: Vec<u64> = conn.readable().collect();
                 conn.recv(&mut buf[..n], info).expect("drives");
+                let ids: Vec<u64> = conn.readable().collect();
                 for id in ids {
                     if id % 4 != 0 {
                         continue;
@@ -3499,8 +3499,8 @@ mod loopback {
                     continue;
                 };
                 let info = quiche::RecvInfo { from, to: local };
-                let ids: Vec<u64> = conn.readable().collect();
                 conn.recv(&mut buf[..n], info).expect("drives");
+                let ids: Vec<u64> = conn.readable().collect();
                 for id in ids {
                     if id % 4 != 0 {
                         continue;
@@ -4036,8 +4036,8 @@ mod loopback {
                     continue;
                 };
                 let info = quiche::RecvInfo { from, to: local };
-                let ids: Vec<u64> = conn.readable().collect();
                 conn.recv(&mut buf[..n], info).expect("drives");
+                let ids: Vec<u64> = conn.readable().collect();
                 for id in ids {
                     if id % 4 == 2 {
                         drain_uni(&mut conn, id, &mut uni_streams);
