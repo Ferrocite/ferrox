@@ -46,10 +46,14 @@ jobs:
             package: ferrox-core
             target: --lib
             filters: "mux:: vless:: transport:: addr:: shadowsocks::"
-          - shard: relay
+          - shard: relay-tls
             package: ferrox-core
             target: --lib
-            filters: "kcp:: tls:: failure:: core::"
+            filters: "tls::"
+          - shard: relay-kcp
+            package: ferrox-core
+            target: --lib
+            filters: "kcp:: failure:: core::"
           - shard: tails
             package: ferrox-app
             target: --bin ferrox-app
