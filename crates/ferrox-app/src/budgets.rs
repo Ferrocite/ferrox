@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-// Every wait cadence in the app: the dial, the handshake read, the relay polls, the head arrival, the carrier probe, the payload grace, the idle timeouts. A hang hunt starts here; anything that can wait and how long is named on this page.
+// Every wait cadence in the app: the dial, the handshake read, the relay polls, the head arrival, the carrier probe, the payload grace, the idle timeouts. A hang hunt starts here; anything that can wait and how long is named on this page, and which of them holds a thread right now is the census' dump.
 
 pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
 

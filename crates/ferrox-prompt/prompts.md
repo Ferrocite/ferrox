@@ -368,7 +368,7 @@ Prove the decision, not the intent: a test that drives each failure kind and ass
 ## P19 · Make a stall name itself from inside the engine
 
 **When to use:** A hang is only visible from outside — `watch-test.sh` reads procfs wchan on Linux runners and nothing elsewhere, and a thread parked in the engine carries no name of its own — so a stall in the field, on macOS, or on Windows reports a pid, not a wait.
-**Status:** todo
+**Status:** doing
 **Leverage:** 5
 **Effort:** medium
 **Targets:** implemented
@@ -388,6 +388,8 @@ Report the per-wait cost the census adds where it is reachable, or state that th
 **Add-on — starved-leg:** A dump showing one leg of a relay in `read` and its partner in nothing is a join that outlived its bound; check it against `RELAY_JOIN` and the leg-witness tests before naming it a peer problem.
 
 **Add-on — sys-attribution:** `ferrox-bench`'s kernel tally cannot price a Rust relay's sys time: `/proc/<pid>/io` counts the `read`/`write` paths, and std's socket legs — `send`/`recv` — never appear there, which the `ps` witnesses show against a child that writes a file. Attribute the residual per thread instead: sample `/proc/<pid>/task/*/stat` for who holds the `stime`, then name the asks from the census' waits, and report a `0` per-GiB row as the instrument's gap rather than as a crossing that cost nothing.
+
+**Add-on — rest-of-the-table:** Eight of the nine named budgets still have no census entry — `dial`, `handshake`, `headArrival`, `relayQuantum`, `udpIdle`, `payloadGrace`, `goawayGrace`, `carrierProbe` — nor do the constants that pace a loop. Most arm sites hold the deadline and then do the blocking call in the same scope, so a row there costs one registration around that call rather than one inside the funnel; a leg through the shared relay half first needs its descriptor named, because a `dyn Read` reaches the wait with no fd to report.
 
 ## P20 · Scale the parameter surface without growing the app file
 
