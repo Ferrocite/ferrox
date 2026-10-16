@@ -334,6 +334,23 @@ the comparison can be re-read:
   the shape `quic.rs::stage_at` already uses — so the next process starts from
   edges rather than from a round trip.
 
+- **A bit-at-a-time Huffman decode.** `huffman_decode` probed the canonical
+  table once per bit it read — eight probes per byte of a coded literal — on the
+  `:status` read of every dial and every header string the H2 and QPACK lanes
+  decode. One 12-bit window now answers every code of length ≤ 12, which is the
+  whole ASCII range, in one load of a 4096-entry table `huffman()` builds once
+  beside the probe rows; a miss hands the twelve bits it already read to the
+  same serial probe the pre-table decoder ran, for the 13..30-bit codes.
+  `the_primary_window_resolves_exactly_the_codes_of_twelve_bits_or_fewer` checks
+  each window against the probe rows, and
+  `the_table_decode_matches_the_serial_probe_on_every_case` compares verdict and
+  partial output across every one- and two-byte string, every prefix of the
+  256-symbol sweep, every two-byte padding suffix on a valid encoding, and
+  30 000 LCG garbage and long-code cases. What is **not** removed: the tail rule
+  (≥ 8 leftover bits, or leftover that is not all ones, still refuses) and the
+  probe rows themselves — a long code still probes bit by bit, just from twelve
+  rather than from one.
+
 What is **not** removed, named rather than claimed: 0-RTT, connection
 migration, key updates and batched datagram I/O are quiche's, and this tree has
 not made them run. The HTTP/3 DATAGRAM frame form (RFC 9297 over QUIC

@@ -25,6 +25,7 @@ const HUFFMAN_BITS: [u8; 257] = [
 
 const SHORTEST: usize = 5;
 const MAX_BITS: usize = 30;
+const PEEK: usize = 12;
 
 struct Huffman {
     /// One load per probed length: the first code of that length in the high half and how many codes share it in the low half. A length with no codes reads `(0, 0)`, so the range test below already rejects it and no separate empty-length check is needed.
@@ -32,6 +33,8 @@ struct Huffman {
     /// Where each length's symbols begin in `symbols`, ordered by length then symbol, so a code is `first[length] + offset`; read only on the rare match.
     base: [u16; MAX_BITS + 1],
     symbols: [u16; 257],
+    /// One load resolves every symbol of `PEEK` bits or fewer — which is every ASCII byte — as `(symbol << 5) | length`; zero means no code of that length prefixes the window, and the serial probe takes over from the bits already read. Prefix-freeness makes the entry unique, and Kraft makes the table fill below one write per entry.
+    primary: [u16; 1 << PEEK],
 }
 
 fn huffman() -> &'static Huffman {
@@ -41,6 +44,7 @@ fn huffman() -> &'static Huffman {
             probe: [0; MAX_BITS + 1],
             base: [0; MAX_BITS + 1],
             symbols: [0; 257],
+            primary: [0; 1 << PEEK],
         };
         let mut next = 0u32;
         let mut placed = 0usize;
@@ -64,33 +68,57 @@ fn huffman() -> &'static Huffman {
                 next += 1;
             }
             table.probe[bits] = (u64::from(first) << 32) | u64::from(count);
+            if bits <= PEEK {
+                let spread = 1usize << (PEEK - bits);
+                for slot in 0..count as usize {
+                    let entry =
+                        (table.symbols[table.base[bits] as usize + slot] << 5) | bits as u16;
+                    let window = (first as usize + slot) << (PEEK - bits);
+                    table.primary[window..window + spread].fill(entry);
+                }
+            }
         }
         table
     })
 }
 
-/// The code of one symbol, read back out of the table the decoder uses so the encoder cannot be a second source of truth; only tests call it, as a CONNECT request is literals.
-#[cfg(test)]
-fn huffman_code(symbol: usize) -> Option<(u32, usize)> {
-    let bits = usize::from(HUFFMAN_BITS[symbol]);
-    let table = huffman();
-    let probe = table.probe[bits];
-    let base = table.base[bits] as usize;
-    let slot = table.symbols[base..base + probe as u32 as usize]
-        .iter()
-        .position(|other| usize::from(*other) == symbol)?;
-    let code = ((probe >> 32) as u32) + slot as u32;
-    Some((code, bits))
+/// The `PEEK` bits starting at bit `p`, whole when the three bytes at `p >> 3` are in the string and bit by bit for its final positions.
+fn peek(code: &[u8], p: usize) -> usize {
+    let byte = p >> 3;
+    let off = p & 7;
+    if byte + 3 <= code.len() {
+        let v = (u32::from(code[byte]) << 16)
+            | (u32::from(code[byte + 1]) << 8)
+            | u32::from(code[byte + 2]);
+        (v >> (PEEK - off)) as usize & ((1 << PEEK) - 1)
+    } else {
+        let mut window = 0usize;
+        for k in 0..PEEK {
+            let q = p + k;
+            window = (window << 1) | usize::from(code[q >> 3] >> (7 - (q & 7)) & 1);
+        }
+        window
+    }
 }
 
-/// Decodes one Huffman-coded string: the 257th entry is the EOS code rather than a symbol, so a block decoding one is malformed, and only the all-ones prefix under eight bits may follow the last symbol.
+/// Decodes one Huffman-coded string: the 257th entry is the EOS code rather than a symbol, so a block decoding one is malformed, and only the all-ones prefix under eight bits may follow the last symbol. A twelve-bit window answers every symbol of that length or shorter in one table load, and the window's twelve bits seed the serial probe for the longer codes that hold their high bits — the same probe the pre-table decoder ran from bit one, starting at twelve, so its verdicts are its own.
 pub fn huffman_decode(code: &[u8], out: &mut Vec<u8>) -> Option<()> {
     let table = huffman();
-    let mut acc = 0u32;
-    let mut bits = 0usize;
-    for byte in code {
-        for shift in (0..8).rev() {
-            acc = (acc << 1) | u32::from(byte >> shift & 1);
+    let end = code.len() * 8;
+    let mut p = 0usize;
+    'symbol: while p + PEEK <= end {
+        let window = peek(code, p);
+        let entry = table.primary[window];
+        if entry != 0 {
+            out.push((entry >> 5) as u8);
+            p += usize::from(entry & 31);
+            continue;
+        }
+        let mut bits = PEEK;
+        let mut acc = window as u32;
+        while p + bits < end {
+            let q = p + bits;
+            acc = (acc << 1) | u32::from(code[q >> 3] >> (7 - (q & 7)) & 1);
             bits += 1;
             if bits > MAX_BITS {
                 return None;
@@ -105,14 +133,47 @@ pub fn huffman_decode(code: &[u8], out: &mut Vec<u8>) -> Option<()> {
                 return None;
             }
             out.push(symbol as u8);
+            p += bits;
+            continue 'symbol;
+        }
+        return None;
+    }
+    let mut acc = 0u32;
+    let mut bits = 0usize;
+    while p < end {
+        acc = (acc << 1) | u32::from(code[p >> 3] >> (7 - (p & 7)) & 1);
+        bits += 1;
+        let probe = table.probe[bits];
+        let offset = acc.wrapping_sub((probe >> 32) as u32);
+        if offset < probe as u32 {
+            let symbol = table.symbols[table.base[bits] as usize + offset as usize];
+            if symbol == 256 {
+                return None;
+            }
+            out.push(symbol as u8);
             acc = 0;
             bits = 0;
         }
+        p += 1;
     }
     if bits != 0 && (bits >= 8 || acc != (1 << bits) - 1) {
         return None;
     }
     Some(())
+}
+
+/// The code of one symbol, read back out of the table the decoder uses so the encoder cannot be a second source of truth; only tests call it, as a CONNECT request is literals.
+#[cfg(test)]
+fn huffman_code(symbol: usize) -> Option<(u32, usize)> {
+    let bits = usize::from(HUFFMAN_BITS[symbol]);
+    let table = huffman();
+    let probe = table.probe[bits];
+    let base = table.base[bits] as usize;
+    let slot = table.symbols[base..base + probe as u32 as usize]
+        .iter()
+        .position(|other| usize::from(*other) == symbol)?;
+    let code = ((probe >> 32) as u32) + slot as u32;
+    Some((code, bits))
 }
 
 #[cfg(test)]
@@ -622,6 +683,123 @@ mod tests {
             let mut out = Vec::new();
             huffman_decode(&coded, &mut out).expect("decodes");
             assert_eq!(out, vec![byte], "symbol {symbol}");
+        }
+    }
+
+    /// The bit-serial decode exactly as it stood, kept as the oracle the table decoder must answer with the same verdict and the same partial output on every case.
+    fn huffman_decode_serial(code: &[u8], out: &mut Vec<u8>) -> Option<()> {
+        let table = huffman();
+        let mut acc = 0u32;
+        let mut bits = 0usize;
+        for byte in code {
+            for shift in (0..8).rev() {
+                acc = (acc << 1) | u32::from(byte >> shift & 1);
+                bits += 1;
+                if bits > MAX_BITS {
+                    return None;
+                }
+                let probe = table.probe[bits];
+                let offset = acc.wrapping_sub((probe >> 32) as u32);
+                if offset >= probe as u32 {
+                    continue;
+                }
+                let symbol = table.symbols[table.base[bits] as usize + offset as usize];
+                if symbol == 256 {
+                    return None;
+                }
+                out.push(symbol as u8);
+                acc = 0;
+                bits = 0;
+            }
+        }
+        if bits != 0 && (bits >= 8 || acc != (1 << bits) - 1) {
+            return None;
+        }
+        Some(())
+    }
+
+    #[test]
+    fn the_primary_window_resolves_exactly_the_codes_of_twelve_bits_or_fewer() {
+        let table = huffman();
+        for window in 0..(1 << PEEK) {
+            let mut hit = (0usize, 0usize);
+            for bits in SHORTEST..=PEEK {
+                let probe = table.probe[bits];
+                let acc = (window >> (PEEK - bits)) as u32;
+                let offset = acc.wrapping_sub((probe >> 32) as u32);
+                if offset < probe as u32 {
+                    hit = (
+                        bits,
+                        usize::from(table.symbols[table.base[bits] as usize + offset as usize]),
+                    );
+                    break;
+                }
+            }
+            let entry = table.primary[window];
+            if hit.0 == 0 {
+                assert_eq!(
+                    entry, 0,
+                    "window {window} holds no short code and must miss"
+                );
+            } else {
+                assert_eq!(usize::from(entry >> 5), hit.1, "window {window} symbol");
+                assert_eq!(usize::from(entry & 31), hit.0, "window {window} length");
+            }
+        }
+    }
+
+    #[test]
+    fn the_table_decode_matches_the_serial_probe_on_every_case() {
+        let mut cases: Vec<Vec<u8>> = vec![vec![]];
+        for a in 0..=255u8 {
+            cases.push(vec![a]);
+            for b in 0..=255u8 {
+                cases.push(vec![a, b]);
+            }
+        }
+        let all: Vec<u8> = (0..=255u8).collect();
+        let mut coded = Vec::new();
+        huffman_encode(&all, &mut coded);
+        for cut in 0..=coded.len() {
+            cases.push(coded[..cut].to_vec());
+        }
+        let mut base = Vec::new();
+        huffman_encode(b"200", &mut base);
+        for a in 0..=255u8 {
+            for b in 0..=255u8 {
+                let mut case = base.clone();
+                case.extend_from_slice(&[a, b]);
+                cases.push(case);
+            }
+        }
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 33) as u8
+        };
+        for _ in 0..20_000 {
+            let len = 1 + usize::from(next()) % 20;
+            cases.push((0..len).map(|_| next()).collect());
+        }
+        let high = [0u8, 10, 14, 255, b'a', b'z', b'0', b'.', b'%'];
+        for _ in 0..10_000 {
+            let len = 1 + usize::from(next()) % 12;
+            let text: Vec<u8> = (0..len)
+                .map(|_| high[usize::from(next()) % high.len()])
+                .collect();
+            let mut enc = Vec::new();
+            huffman_encode(&text, &mut enc);
+            cases.push(enc);
+        }
+        for case in &cases {
+            let mut fast = Vec::new();
+            let mut serial = Vec::new();
+            let got = huffman_decode(case, &mut fast);
+            let was = huffman_decode_serial(case, &mut serial);
+            assert_eq!(got.is_some(), was.is_some(), "verdict for {case:?}");
+            assert_eq!(fast, serial, "output for {case:?}");
         }
     }
 
