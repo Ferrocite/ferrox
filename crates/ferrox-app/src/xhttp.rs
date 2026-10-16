@@ -796,23 +796,36 @@ fn huffman_len(s: &[u8]) -> usize {
 }
 
 fn generate_tokenish(target_huffman_bytes: usize) -> String {
-    const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let n = (target_huffman_bytes * 10).div_ceil(8);
     let mut raw = vec![0u8; n.max(1)];
     getrandom::getrandom(&mut raw).unwrap_or_default();
+    tokenish_adjust(&raw, target_huffman_bytes)
+}
+
+/// Maps the random bytes into base62 and walks the padding to its target, but carries the code-length sum instead of re-scanning the whole string on every one of the 150 adjust steps: only the end the loop touches moves the sum.
+fn tokenish_adjust(raw: &[u8], target_huffman_bytes: usize) -> String {
+    const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
     let mut s: String = raw
         .iter()
         .map(|&b| BASE62[(b as usize) % 62] as char)
         .collect();
+    let mut bits: usize = s
+        .bytes()
+        .map(|b| usize::from(HUFFMAN_CODE_LEN[usize::from(b)]))
+        .sum();
     for iter in 0..150 {
-        let cur = huffman_len(s.as_bytes());
+        let cur = bits.div_ceil(8);
         if cur.abs_diff(target_huffman_bytes) <= 2 {
             return s;
         }
         if cur < target_huffman_bytes {
-            s.push(if iter % 2 == 0 { 'X' } else { 'Z' });
+            let added = if iter % 2 == 0 { b'X' } else { b'Z' };
+            bits += usize::from(HUFFMAN_CODE_LEN[usize::from(added)]);
+            s.push(added as char);
         } else if s.len() > 1 {
+            let last = s.as_bytes()[s.len() - 1];
             s.pop();
+            bits -= usize::from(HUFFMAN_CODE_LEN[usize::from(last)]);
         } else {
             return s;
         }
@@ -1694,6 +1707,55 @@ mod tests {
     use super::*;
     use std::net::TcpListener;
     use std::thread;
+
+    /// The tokenish adjust as it was — the whole string re-summed on every one of the 150 steps — kept as the oracle the carried sum is compared against.
+    fn tokenish_recompute(raw: &[u8], target: usize) -> String {
+        const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+        let mut s: String = raw
+            .iter()
+            .map(|&b| BASE62[(b as usize) % 62] as char)
+            .collect();
+        for iter in 0..150 {
+            let cur = huffman_len(s.as_bytes());
+            if cur.abs_diff(target) <= 2 {
+                return s;
+            }
+            if cur < target {
+                s.push(if iter % 2 == 0 { 'X' } else { 'Z' });
+            } else if s.len() > 1 {
+                s.pop();
+            } else {
+                return s;
+            }
+        }
+        s
+    }
+
+    #[test]
+    fn tokenish_carry_matches_the_recompute_on_every_probe() {
+        let mut targets: Vec<usize> = (0..=64).collect();
+        targets.extend([251, 997, 1500]);
+        for target in targets {
+            let n = ((target * 10).div_ceil(8)).max(1);
+            let mut runs: Vec<Vec<u8>> = vec![vec![0u8; n], vec![255u8; n], vec![61u8; n]];
+            let mut state = 0x2545_F491_4F6C_DD1Du64;
+            let mut raw = Vec::with_capacity(n);
+            for _ in 0..n {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                raw.push((state >> 33) as u8);
+            }
+            runs.push(raw);
+            for raw in runs {
+                assert_eq!(
+                    tokenish_adjust(&raw, target),
+                    tokenish_recompute(&raw, target),
+                    "target {target} raw {raw:?}"
+                );
+            }
+        }
+    }
 
     /// The same drain over a real socket asserts the *bytes* and nothing else: a socket may segment, so its read count moves with the scheduler and cannot gate a number — that claim belongs to `a_chunk_costs_two_reads_not_three`, on an in-memory stream that answers the whole buffer.
     #[test]

@@ -289,6 +289,17 @@ by the in-memory writer above, which is the only checker that can count writes.
   Xray nor sing-box ships an xHTTP carrier in the pinned trees, so there is no
   comparator here to beat — which is exactly why this page says what it removed
   and does not claim a ratio.
+- **A rescan per adjust step.** `generate_tokenish` re-summed the whole
+  padding's Huffman code lengths from byte zero on each of its up-to-150
+  adjust steps, so a K-byte pad cost 150·K table reads per served request. The
+  loop now carries the sum: seeded by one pass over the initial string, then
+  moved only by the pushed or popped char's own length, so `cur` is the same
+  integer at every step and every branch is the same branch.
+  `tokenish_carry_matches_the_recompute_on_every_probe` sweeps targets
+  0..=64 plus three larger sizes against the old recompute form kept as the
+  oracle, over four raw-content shapes per target. What is **not** removed:
+  the seed pass — the initial string's length still has to be computed once —
+  and the randomness of the raw, which is the point of the padding.
 - **A credit that took two locks and two writes.** `xhttp_h2::replenish` grants
   the peer back the bytes a stream body just consumed, once per inbound `DATA`
   frame and once per read of a body, so a bulk tunnel paid it per chunk in each
