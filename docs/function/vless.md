@@ -86,7 +86,10 @@ traffic reallocates none of it.
 **Not measured on this branch.** `.github/workflows/parity.yml` runs the
 `vless-raw` scenario across the pinned engines for upload, download and
 full-duplex; `.github/workflows/benchmark-matrix.yml` runs the same. Both are
-CI-only. No artefact from this branch has been read.
+CI-only. No artefact from this branch has been read; the two cells quoted under
+**What we removed** for the splice pump are main's nightly at `81c48ad` (the build
+before the pump's idle back-off) and the dispatched replays of `vless-raw-up-1` and
+`vless-raw-down-1` on `905962d`, each read from its own run artefact.
 
 ## What we removed
 
@@ -129,6 +132,30 @@ CI-only. No artefact from this branch has been read.
   reaches `bytespool`. The relay buffer here starts at 16 KiB and is promoted to
   256 KiB only once a read fills it completely, and on Linux the plain `copy`
   path is `splice(2)` with no user-space copy at all.
+- **A `POLLIN` the pipe ring could not serve.** The pump armed it while the pipe
+  held fewer bytes than its capacity, which is a question in bytes, and the ring
+  refuses by *slots*: a wake that is honest about the socket still has nowhere to
+  put what it sees, and re-arming it is a spin on a flow nobody can move. The
+  `vless-raw-up-1` cell priced that spin as a resolved regression: main's nightly
+  cost 2 501 ms of system time per GiB where xray-core cost 1 076 on that same
+  runner (0.431× its cost, interval [0.423×, 0.441×], the cell exiting red), and the
+  fixed build costs 185 where xray-core costs 721 (3.818× better, interval
+  [3.606×, 4.020×]). The two cells ran on different machines, so only each one's
+  ratio to its own comparator is comparable — not 2 501 against 185.
+  `vless-raw-down-1` moved the same way it already did (2.271× xray-core's cost to
+  2.459×), so the back-off gave nothing up there. Measured against the pump that
+  re-armed the wake, a destination reading 512 bytes every 2 ms cost 78 183 ingest
+  splices that moved nothing out of 79 013 wakes in a 400 ms window; the same window
+  on this pump measures 2. Item 15 of
+  `docs/method-superset.md` carries the counts, and
+  `poll_relay::no_pollin_is_armed_on_a_ring_that_holds_bytes_it_cannot_take` holds
+  the arm's truth table while
+  `relay_tests::a_trickling_destination_does_not_spin_the_pump` counts the wake.
+  What was not removed: the first refusal of each stall is still an ingest attempt,
+  so the pump pays one splice that moves nothing per stall cycle, and a byte the ring
+  could take now waits for the drain wake that clears the stall rather than the source
+  wake that found it. That delay is priced, not assumed: the same cell's throughput
+  measured inside noise afterwards (mid 0.988×), with the system time at a thirteenth.
 - **The relay buffer's own `memset`.** Both of its fills were setup cost paid
   before the first byte arrived: `vec![0u8; 16 KiB]` reaches for `alloc_zeroed`,
   and `resize(256 KiB, 0)` on promotion writes another 240 KiB — 32 KiB per

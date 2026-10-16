@@ -220,6 +220,12 @@ removed.
 | --- | --- | --- | --- | --- | --- |
 | 14 | UDP-over-TCP pays two read syscalls per datagram for VLESS and four to six for Trojan, where one window read into a per-connection remainder would amortise to one | `proxy.rs:5965-5974` (`read_udp_datagram`), `proxy.rs:6000-6012` (`read_trojan_datagram`), via `read_socks_addr` (`proxy.rs:7156-7199`) | yes | the `Counting` reader idiom already blessed for this file by `proxy::tests::the_trojan_header_costs_two_reads_not_seven` (`proxy.rs:8883`) | P54 |
 
+### Wakes
+
+| # | what | where | bit-identical | witness | slice |
+| --- | --- | --- | --- | --- | --- |
+| 15 | closed: the splice pump armed `POLLIN` on a predicate in *bytes* (`pending < capacity`) while the kernel's `EAGAIN` from `splice_to_pipe` is about *slots*, so a ring of partially filled buffers woke it on data it had nowhere to put, and re-arming that wake is a spin on a flow nobody can move | `proxy.rs` `poll_relay::run` (the arm) and `poll_relay::Direction::advance` (the attempt) | yes — the same two splices at the same lengths into the same buffers; only when the attempt is made changed | `poll_relay::no_pollin_is_armed_on_a_ring_that_holds_bytes_it_cannot_take` is the arm's truth table and holds the invariant that the drain stays armed; `relay_tests::a_trickling_destination_does_not_spin_the_pump` counts `poll_relay::idle_ingests()` (a `cfg(test)` counter, so production emits nothing) over a 400 ms window, where the same counter against unpumped code measured 78 183 of 79 013 wakes moving nothing and 390 ms of pump cpu, and measures 2 on this one; priced by the `vless-raw-up-1` cell as 0.431× xray-core's cost before (2 501 ms of system time per GiB against its 1 076 on that runner, gate red) and 3.818× better after (185 against 721), each ratio against its own runner since the cells landed on different machines, with `vless-raw-down-1` moving from 2.271× to 2.459× xray-core's cost rather than regressing | landed (#129) |
+
 ### Zero-fills that are not witnessed by anything
 
 Three of these carry a manifest row whose named checker cannot see the fill,
