@@ -367,7 +367,7 @@ Prove the decision, not the intent: a test that drives each failure kind and ass
 ## P19 · Make a stall name itself from inside the engine
 
 **When to use:** A hang is only visible from outside — `watch-test.sh` reads procfs wchan on Linux runners and nothing elsewhere, and a thread parked in the engine carries no name of its own — so a stall in the field, on macOS, or on Windows reports a pid, not a wait.
-**Status:** todo
+**Status:** doing
 **Leverage:** 5
 **Effort:** medium
 **Targets:** implemented
