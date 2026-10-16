@@ -137,7 +137,8 @@ CI-only. No artefact from this branch has been read.
   the pump after the fix costs 185 and xray-core 721, and `vless-raw-down-1` stayed
   inside noise at 536–585. Measured against the pump that re-armed the wake, a
   destination reading 512 bytes every 2 ms cost 78 183 ingest splices that moved
-  nothing out of 79 013 wakes in a 400 ms window. Item 15 of
+  nothing out of 79 013 wakes in a 400 ms window; the same window on this pump
+  measures 2. Item 15 of
   `docs/method-superset.md` carries the counts, and
   `poll_relay::no_pollin_is_armed_on_a_ring_that_holds_bytes_it_cannot_take` holds
   the arm's truth table while
