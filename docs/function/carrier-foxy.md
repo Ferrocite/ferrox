@@ -74,6 +74,8 @@ graph TD
 | tcp-connections-asked-of-an-untrusted-edge | 1 | ferrox-app-foxy::loopback::an_untrusted_edge_is_named_and_asked_once |
 | catalogue-edges-kept-across-a-failed-fetch | 4 | ferrox-app-foxy_catalog::tests::a_fetch_that_failed_keeps_the_edges_already_known |
 | catalogue-edges-rewritten-from-the-cache-file | 5 | ferrox-app-foxy_catalog::tests::the_cache_file_one_process_writes_is_the_one_the_next_reads |
+| dials-of-a-silent-tcp-carrier | 1 | ferrox-app-proxy::tests::a_silent_carrier_is_dialled_once_rather_than_once_per_rung |
+| dials-across-three-flows-of-a-rested-carrier | 2 | ferrox-app-proxy::tests::a_silent_carrier_is_dialled_once_rather_than_once_per_rung |
 <!-- counts:end -->
 
 `tcp-connections-asked-of-an-untrusted-edge 1` is the retry rule seen from the
@@ -96,6 +98,40 @@ only `Io | Stream | Frame` as a carrier that died, so an untrusted chain does no
 mark that carrier dead for the next flow. Trust is per edge, not per carrier, and
 a client that installs the missing root — or fixes its clock — should get a real
 dial on the next flow rather than a cached refusal.
+
+`dials-of-a-silent-tcp-carrier 1` and `dials-across-three-flows-of-a-rested-carrier 2`
+are the TCP walk reading the cache it already wrote. The walk asks a carrier's
+`Refusals` entry before it dials, exactly as the datagram walk does, because the
+rule that made the cache was written for the ladder and the TCP front never
+consulted it: `Carrier::order()` returns a *named* carrier three times — the same
+rung three times, so the walk needs no dedupe of its own — and an unremembered
+cache means a flow pointed at an edge that names no protocol this lane speaks paid
+three handshakes for one answer, then repaid them on every later flow for the
+whole `CARRIER_DEAD_SECS` window. The counter is again the edge's own accept loop,
+and the three numbers it sees are the three rules: one for the flow that learns the
+silence, none for the flow inside the window, one more once the window is expired
+by hand in the test. What the walk spends instead is one formatted key per carrier
+rung — `carrier_key` builds a `String`, so a three-rung `auto` walk now formats
+three keys per edge where it formatted none; that is the cost of the skip and it
+sits on a path whose alternative is a handshake.
+
+What this does not do is re-ask an edge that answered a *status*: `opened()` still
+refuses a non-2xx as `Rejected`, and a status is the edge speaking, so
+`remember_unanswered` leaves it out of the cache and the next flow dials it again.
+The rest is only ever for silence.
+
+One dialler still does not consult the cache: `open_foxy_ip_tunnel`, the
+CONNECT-IP walk, marks a silent carrier dead but asks it again on every flow like
+the TCP front used to. It has no witness here because nothing in this tree dials
+that walk, so its row would be a claim with no checker rather than a number.
+
+The other thing this slice found and left alone: the front kept a `Refusals` map
+for the *target*, filled it when an edge answered that a target is unreachable and
+looked it up only at the top of the call, before anything had been written to it.
+Per-flow state with no second reader, so the lookup and the write are gone and the
+walk behaves exactly as it did; the rule the code was reaching for — a target an
+edge declined is answered locally for the rest of its window — is the same shape as
+the carrier rule above and needs a shared map and its own witness, not a comment.
 
 `catalogue-edges-kept-across-a-failed-fetch 4` is the catalogue's answer when the
 settings server does not answer: the four edges the test envelope publishes stay
@@ -195,6 +231,14 @@ the comparison can be re-read:
   over the account's own edge is a superset of both, not a port of either, and
   the MASQUE CONNECT-IP row in `docs/xray-parity.md` stays refused — this page
   claims CONNECT-UDP, not IP-over-QUIC.
+
+- **Two dials of a carrier the edge already went silent on.** The TCP front wrote
+  the `carrier_dead` cache and never read it, so a flow whose named carrier's
+  handshake the edge refused paid that handshake once per rung the carrier repeats
+  — three for a named one — and every flow after it repaid them for the whole
+  quarantine window. The front now asks the cache first, which is what the
+  datagram walk has done since it was written: one dial for the flow that learns
+  the silence, none inside the window, one again when it expires.
 
 - **A second TLS record per CONNECT-UDP frame.** Writing the frame header and
   its capsule as two writes made two TLS records, and a record boundary is on
