@@ -181,7 +181,7 @@ fn atoi(text: &str) -> i64 {
 
 const URL_ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
-const fn digit_table() -> [u8; 256] {
+const fn digit_table(url_only: bool) -> [u8; 256] {
     let mut table = [255u8; 256];
     let mut c = b'A';
     while c <= b'Z' {
@@ -198,22 +198,55 @@ const fn digit_table() -> [u8; 256] {
         table[c as usize] = c - b'0' + 52;
         c += 1;
     }
-    table[b'+' as usize] = 62;
     table[b'-' as usize] = 62;
-    table[b'/' as usize] = 63;
     table[b'_' as usize] = 63;
+    if !url_only {
+        table[b'+' as usize] = 62;
+        table[b'/' as usize] = 63;
+    }
     table
 }
 
-const DIGIT_TABLE: [u8; 256] = digit_table();
+const DIGIT_TABLE: [u8; 256] = digit_table(false);
 
-fn digit(byte: u8) -> Option<u8> {
-    let v = DIGIT_TABLE[byte as usize];
-    if v == 255 {
-        None
-    } else {
-        Some(v)
+/// The same table with the standard alphabet's two characters left invalid, for a peer that must be refused where `RawURLEncoding` refuses.
+const URL_DIGIT_TABLE: [u8; 256] = digit_table(true);
+
+/// One pass, four characters at a time: six bits per lookup fill a 24-bit window whose three low bytes are the three bytes they stand for.
+fn decode_groups(bytes: &[u8], table: &[u8; 256]) -> Option<Vec<u8>> {
+    if bytes.is_empty() {
+        return Some(Vec::new());
     }
+    if bytes.len() % 4 == 1 {
+        return None;
+    }
+    let (full, rest) = bytes.split_at(bytes.len() / 4 * 4);
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3 + 3);
+    for group in full.as_chunks::<4>().0 {
+        let mut word = 0u32;
+        for &byte in group {
+            let digit = table[usize::from(byte)];
+            if digit == 255 {
+                return None;
+            }
+            word = (word << 6) | u32::from(digit);
+        }
+        out.extend_from_slice(&word.to_be_bytes()[1..]);
+    }
+    if !rest.is_empty() {
+        let mut word = 0u32;
+        for &byte in rest {
+            let digit = table[usize::from(byte)];
+            if digit == 255 {
+                return None;
+            }
+            word = (word << 6) | u32::from(digit);
+        }
+        word <<= 6 * (4 - rest.len());
+        let tail = word.to_be_bytes();
+        out.extend_from_slice(&tail[1..rest.len()]);
+    }
+    Some(out)
 }
 
 pub fn early_encode_into(out: &mut String, data: &[u8]) {
@@ -248,33 +281,12 @@ pub fn early_encode_into(out: &mut String, data: &[u8]) {
 }
 
 pub fn early_decode(text: &str) -> Option<Vec<u8>> {
-    let text = text.trim().trim_end_matches('=');
-    if text.is_empty() {
-        return Some(Vec::new());
-    }
-    if text.len() % 4 == 1 {
-        return None;
-    }
-    let bytes = text.as_bytes();
-    let (full, rest) = bytes.split_at(bytes.len() / 4 * 4);
-    let mut out = Vec::with_capacity(bytes.len() / 4 * 3 + 3);
-    for group in full.as_chunks::<4>().0 {
-        let mut word = 0u32;
-        for &byte in group {
-            word = (word << 6) | u32::from(digit(byte)?);
-        }
-        out.extend_from_slice(&word.to_be_bytes()[1..]);
-    }
-    if !rest.is_empty() {
-        let mut word = 0u32;
-        for &byte in rest {
-            word = (word << 6) | u32::from(digit(byte)?);
-        }
-        word <<= 6 * (4 - rest.len());
-        let tail = word.to_be_bytes();
-        out.extend_from_slice(&tail[1..rest.len()]);
-    }
-    Some(out)
+    decode_groups(text.trim().trim_end_matches('=').as_bytes(), &DIGIT_TABLE)
+}
+
+/// The URL form with no slack: `-` and `_` only, no padding, no surrounding whitespace, and a lone trailing character refused rather than dropped.
+pub fn url_decode(text: &str) -> Option<Vec<u8>> {
+    decode_groups(text.as_bytes(), &URL_DIGIT_TABLE)
 }
 
 /// The host's ASCII suffix, ignoring case, without a lowercase copy of the host.
@@ -523,5 +535,92 @@ mod tests {
         assert_eq!(early_decode("abcde"), None, "five is not a base64 length");
         assert_eq!(early_decode("ab*d"), None, "a digit base64 does not have");
         assert_eq!(early_decode(""), Some(Vec::new()));
+    }
+
+    /// The per-character ladder the placement decode had before it shared the group loop, kept so the sweep can name what the route did not change.
+    fn serial_url_decode(s: &str) -> Option<Vec<u8>> {
+        let mut bits: Vec<u8> = Vec::new();
+        for &b in s.as_bytes() {
+            let v = match b {
+                b'A'..=b'Z' => b - b'A',
+                b'a'..=b'z' => b - b'a' + 26,
+                b'0'..=b'9' => b - b'0' + 52,
+                b'-' => 62,
+                b'_' => 63,
+                _ => return None,
+            };
+            bits.push(v);
+        }
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 4 <= bits.len() {
+            out.push((bits[i] << 2) | (bits[i + 1] >> 4));
+            out.push(((bits[i + 1] & 0x0f) << 4) | (bits[i + 2] >> 2));
+            out.push(((bits[i + 2] & 0x03) << 6) | bits[i + 3]);
+            i += 4;
+        }
+        match bits.len() - i {
+            2 => out.push((bits[i] << 2) | (bits[i + 1] >> 4)),
+            3 => {
+                out.push((bits[i] << 2) | (bits[i + 1] >> 4));
+                out.push(((bits[i + 1] & 0x0f) << 4) | (bits[i + 2] >> 2));
+            }
+            _ => {}
+        }
+        Some(out)
+    }
+
+    #[test]
+    fn url_decode_refuses_what_the_reference_refuses() {
+        assert_eq!(url_decode("Zm9vYg"), Some(b"foob".to_vec()));
+        assert_eq!(url_decode("--8"), Some(vec![0xfb, 0xef]));
+        assert_eq!(url_decode(""), Some(Vec::new()));
+        assert_eq!(
+            url_decode("Zm9vYg=="),
+            None,
+            "raw encoding carries no padding"
+        );
+        assert_eq!(
+            url_decode("ab+D"),
+            None,
+            "the standard alphabet is not the url one"
+        );
+        assert_eq!(url_decode("ab/D"), None, "nor is its separator");
+        assert_eq!(
+            url_decode(" Zm9vYg"),
+            None,
+            "and no whitespace stands in for a digit"
+        );
+        assert_eq!(url_decode("abcde"), None, "five is not a base64 length");
+    }
+
+    #[test]
+    fn the_shared_loop_decodes_every_prefix_the_serial_ladder_decoded() {
+        for len in 0..=200usize {
+            let bytes: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(97)).collect();
+            let mut text = String::new();
+            early_encode_into(&mut text, &bytes);
+            assert_eq!(url_decode(&text).as_deref(), Some(&bytes[..]), "{len}");
+            for cut in 0..=text.len() {
+                let prefix = &text[..cut];
+                if cut % 4 == 1 {
+                    assert_eq!(
+                        url_decode(prefix),
+                        None,
+                        "{cut}: a lone trailing digit is refused"
+                    );
+                    assert!(
+                        serial_url_decode(prefix).is_some(),
+                        "{cut}: the ladder dropped the digit instead"
+                    );
+                } else {
+                    assert_eq!(
+                        url_decode(prefix),
+                        serial_url_decode(prefix),
+                        "{cut}: route"
+                    );
+                }
+            }
+        }
     }
 }

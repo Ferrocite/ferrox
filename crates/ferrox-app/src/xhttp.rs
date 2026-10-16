@@ -5,6 +5,8 @@ use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 
+use ferrox_core::transport::url_decode;
+
 const HEAD_LIMIT: usize = 64 * 1024;
 const CHUNK: usize = 16 * 1024;
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
@@ -1240,38 +1242,6 @@ fn content_length(head: &[u8]) -> Option<usize> {
     crate::proxy::header_value(head, "content-length").and_then(|v| v.trim().parse().ok())
 }
 
-fn b64_url_decode(s: &str) -> Option<Vec<u8>> {
-    let mut bits: Vec<u8> = Vec::new();
-    for &b in s.as_bytes() {
-        let v = match b {
-            b'A'..=b'Z' => b - b'A',
-            b'a'..=b'z' => b - b'a' + 26,
-            b'0'..=b'9' => b - b'0' + 52,
-            b'-' => 62,
-            b'_' => 63,
-            _ => return None,
-        };
-        bits.push(v);
-    }
-    let mut out = Vec::new();
-    let mut i = 0;
-    while i + 4 <= bits.len() {
-        out.push((bits[i] << 2) | (bits[i + 1] >> 4));
-        out.push(((bits[i + 1] & 0x0f) << 4) | (bits[i + 2] >> 2));
-        out.push(((bits[i + 2] & 0x03) << 6) | bits[i + 3]);
-        i += 4;
-    }
-    match bits.len() - i {
-        2 => out.push((bits[i] << 2) | (bits[i + 1] >> 4)),
-        3 => {
-            out.push((bits[i] << 2) | (bits[i + 1] >> 4));
-            out.push(((bits[i + 1] & 0x0f) << 4) | (bits[i + 2] >> 2));
-        }
-        _ => {}
-    }
-    Some(out)
-}
-
 // --- Server ------------------------------------------------------------------
 
 // The stream-one handshake the tree has always served: POST with chunked framing on one connection; mode handshakes live in `accept_with_settings`, and this stays so every existing rung keeps dialling.
@@ -1628,7 +1598,7 @@ pub(crate) fn accept_core<
                             None => break,
                         }
                     }
-                    b64_url_decode(&joined)
+                    url_decode(&joined)
                 }
                 Placement::Cookie => {
                     let key = if settings.uplink_data_key.is_empty() {
@@ -1643,7 +1613,7 @@ pub(crate) fn accept_core<
                             None => break,
                         }
                     }
-                    b64_url_decode(&joined)
+                    url_decode(&joined)
                 }
                 _ => Some(body),
             };
@@ -2466,6 +2436,88 @@ mod tests {
         assert_eq!(&buf, b"ping", "the first post reached no session");
         reader.read_exact(&mut buf).expect("the second packet");
         assert_eq!(&buf, b"pong", "the second post reached no session");
+    }
+
+    /// The packet can ride `X-Data-{i}` headers or `x_data_{i}` cookies instead of the body: the client base64url-encodes the *whole* packet and splits that one string at random points (`config.go:66-94`), and the hub joins the parts and decodes once (`hub.go:249-285`) — so a part boundary lands mid-group and only the joined tail carries the remainder.
+    #[test]
+    fn a_packet_split_across_data_parts_reaches_the_session_whole() {
+        let packet: Vec<u8> = (0..200usize).map(|i| (i as u8).wrapping_mul(97)).collect();
+        let mut encoded = String::new();
+        ferrox_core::transport::early_encode_into(&mut encoded, &packet);
+        let cuts = [0usize, 41, 97, encoded.len()];
+        for (placement, sid) in [("header", "data_headers"), ("cookie", "data_cookies")] {
+            let settings = settings_from(&format!(
+                r#"{{"streamSettings": {{"network": "xhttp", "xhttpSettings": {{
+                    "path": "/up", "mode": "packet-up", "uplinkDataPlacement": "{placement}"}}}}}}"#
+            ));
+            let referer = "http://127.0.0.1/up?x_padding=".to_owned() + &"X".repeat(500);
+            let (first, second, third) = (
+                &encoded[cuts[0]..cuts[1]],
+                &encoded[cuts[1]..cuts[2]],
+                &encoded[cuts[2]..cuts[3]],
+            );
+            let parts = if placement == "header" {
+                format!("X-Data-0: {first}\r\nX-Data-1: {second}\r\nX-Data-2: {third}\r\n")
+            } else {
+                format!("Cookie: x_data_0={first};x_data_1={second};x_data_2={third}\r\n")
+            };
+            let head = format!(
+                "POST /up/{sid}/0 HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\n{parts}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            assert!(
+                matches!(
+                    accept_core(
+                        head.as_bytes(),
+                        Vec::new(),
+                        std::io::Cursor::new(Vec::new()),
+                        Sink(Arc::clone(&seen)),
+                        &settings,
+                        None,
+                    ),
+                    Served::Closed
+                ),
+                "{placement}: the parts left a session for the caller to carry"
+            );
+            // Asserted before the read: a refusal would otherwise park `read_exact` on a packet that never arrives.
+            let answered =
+                String::from_utf8(seen.lock().expect("sink").clone()).unwrap_or_default();
+            assert!(
+                answered.starts_with("HTTP/1.1 200"),
+                "{placement}: the hub refused the parts: {answered}"
+            );
+            let mut reader = SessionReader::new(get_or_create_session(sid), sid.to_owned());
+            let mut got = vec![0u8; packet.len()];
+            reader
+                .read_exact(&mut got)
+                .unwrap_or_else(|_| panic!("{placement}: the parts reached no reader"));
+            assert_eq!(got, packet, "{placement}: the joined parts decoded wrong");
+        }
+    }
+
+    /// Five digits are not a base64 length and the reference refuses them with a 400; the per-character ladder dropped the last digit and handed a short packet up as if it were whole. The same head with four digits answers 200, so the refusal is the decode's and not the request's shape.
+    #[test]
+    fn a_trailing_digit_in_the_data_parts_is_refused() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {
+                "path": "/up", "mode": "packet-up", "uplinkDataPlacement": "header"}}}"#,
+        );
+        let referer = "http://127.0.0.1/up?x_padding=".to_owned() + &"X".repeat(500);
+        let post = |sid: &str, value: &str| {
+            format!(
+                "POST /up/{sid}/0 HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\nX-Data-0: {value}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+        };
+        assert_eq!(
+            status_through_core(&post("lone_digit", "abcde"), &settings),
+            400,
+            "a lone trailing digit answered as if it carried a packet"
+        );
+        assert_eq!(
+            status_through_core(&post("four_digits", "Zm9v"), &settings),
+            200,
+            "the same head with a base64 length was refused too, so the 400 above is not the shape's"
+        );
     }
 
     /// A `Connection: close` request ends the reuse: the hub answers it and lets the socket go, so a client that asked for one request per connection never waits on a half-open one.
