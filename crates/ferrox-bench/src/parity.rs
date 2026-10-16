@@ -478,7 +478,8 @@ pub struct Outcome {
     pub sys_millis: Option<u64>,
     pub traffic_samples: usize,
     pub threads_peak: Option<u64>,
-    /// The kernel's tally of what this run asked it to move, over the same window as the cpu split.
+    /// The kernel's tally of what this run asked it to move, as the tallest each counter reached: the
+    /// threads carrying a relay's tallies die with its traffic, which is what `ps::Io::window` reads.
     pub io: Option<ps::Io>,
     pub startup_cpu_millis: u64,
     pub startup_seconds: f64,
@@ -924,10 +925,7 @@ fn summarise(samples: &[(Phase, ps::Sample)], moved: &Moved, startup_cpu_millis:
             .saturating_sub(startup_cpu_millis),
         user_millis: split(|s| s.user_millis),
         sys_millis: split(|s| s.sys_millis),
-        io: match (first.and_then(|s| s.io), last.and_then(|s| s.io)) {
-            (Some(start), Some(end)) => end.since(&start),
-            _ => None,
-        },
+        io: ps::Io::window(samples.iter().filter_map(|(_, s)| s.io)),
         traffic_samples: samples
             .iter()
             .filter(|(phase, _)| *phase == Phase::Traffic)
