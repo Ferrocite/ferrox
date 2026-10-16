@@ -2178,10 +2178,12 @@ fn relay_stream<A: Read + Write + Send + 'static, B: Read + Write + Send + 'stat
 ) {
     let a = Arc::new(Half::new(a));
     let b = Arc::new(Half::new(b));
-    let (up_a, up_b) = (Arc::clone(&a), Arc::clone(&b));
+    // A leg polling its way through a finished relay must see that its sibling ended: shutdown delivery alone hangs when it does not arrive, as on Windows.
+    let ended = Arc::new(AtomicBool::new(false));
+    let (up_a, up_b, up_ended) = (Arc::clone(&a), Arc::clone(&b), Arc::clone(&ended));
     let done_close = Arc::clone(close);
-    let done = thread::spawn(move || copy_stream(&up_a, &up_b, &done_close));
-    copy_stream(&b, &a, close);
+    let done = thread::spawn(move || copy_stream(&up_a, &up_b, &done_close, &up_ended));
+    copy_stream(&b, &a, close, &ended);
     let _ = done.join();
 }
 
@@ -2189,26 +2191,27 @@ fn copy_stream<R: Read, W: Write>(
     from: &Half<R>,
     to: &Half<W>,
     close: &Arc<dyn Fn() + Send + Sync>,
+    ended: &AtomicBool,
 ) {
     let mut buffer = RelayBuf::new();
     loop {
         let n = match from.read_once(buffer.as_mut()) {
-            Ok(0) => {
-                close();
-                return;
-            }
+            Ok(0) => break,
             Ok(n) => n,
-            Err(error) if is_timeout(&error) => continue,
-            Err(_) => {
-                close();
-                return;
+            Err(error) if is_timeout(&error) => {
+                if ended.load(Ordering::Relaxed) {
+                    break;
+                }
+                continue;
             }
+            Err(_) => break,
         };
         if to.write_once(buffer.filled(n)).is_err() {
-            close();
-            return;
+            break;
         }
     }
+    close();
+    ended.store(true, Ordering::Relaxed);
 }
 
 pub(crate) fn resize_scratch(buf: &mut Vec<u8>, len: usize) {
@@ -4180,6 +4183,14 @@ fn dial_vless_tls(client: &TcpStream, server: &SocketAddr, vless: &VlessOut, tar
     let Some(mut session) = dial_tls_session(server, cfg) else {
         return;
     };
+    // The session's leg reads the uplink handle it took; un-timed, a parked read outlives the relay that should end it.
+    if session
+        .get_ref()
+        .set_read_timeout(Some(RELAY_POLL))
+        .is_err()
+    {
+        return;
+    }
     match &vless.carrier {
         Carrier::Raw => {
             if session.write_all(&header).is_err() {
@@ -4321,6 +4332,14 @@ fn dial_trojan_tls(client: &TcpStream, server: &SocketAddr, trojan: &TrojanOut, 
     let Some(mut session) = dial_tls_session(server, cfg) else {
         return;
     };
+    // The session's leg reads the uplink handle it took; un-timed, a parked read outlives the relay that should end it.
+    if session
+        .get_ref()
+        .set_read_timeout(Some(RELAY_POLL))
+        .is_err()
+    {
+        return;
+    }
     match &trojan.carrier {
         Carrier::Raw => {
             let Ok(downstream) = client.try_clone() else {
@@ -6950,6 +6969,14 @@ fn dial_http_outbound(
         let Some(session) = dial_tls_session(server, cfg) else {
             return;
         };
+        // The session's leg reads the uplink handle it took; un-timed, a parked read outlives the relay that should end it.
+        if session
+            .get_ref()
+            .set_read_timeout(Some(RELAY_POLL))
+            .is_err()
+        {
+            return;
+        }
         do_connect(client, session, http, target);
     } else {
         let Some(s) = dial_or_report(server) else {
@@ -9449,10 +9476,61 @@ mod tests {
             sent: Vec::new(),
             held: Vec::new(),
         }));
-        copy_stream(&from, &to, &close);
+        copy_stream(&from, &to, &close, &AtomicBool::new(false));
         assert!(fired.load(Ordering::SeqCst), "EOF fires the close");
         let gated = to.inner.lock().expect("reads back");
         assert_eq!(gated.sent, b"ping");
+    }
+
+    /// A leg that only ever times out: a live socket whose peer fell silent, where no byte or error ends the read on its own.
+    struct Poller;
+
+    impl Read for Poller {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(Duration::from_millis(2));
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+        }
+    }
+
+    impl Write for Poller {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A leg whose source reaches its end at once: the sibling that must retire the other.
+    struct EofReader;
+
+    impl Read for EofReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for EofReader {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_polling_leg_ends_when_its_sibling_finishes() {
+        // The stall the Windows CI caught: a busy `continue` at the timeout outlives the relay that ended, and the join on it never returns.
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let joined = thread::spawn(move || {
+            relay_stream(Poller, EofReader, &close);
+        });
+        joined
+            .join()
+            .expect("the polling leg ends on its sibling's finish");
     }
 
     #[test]
