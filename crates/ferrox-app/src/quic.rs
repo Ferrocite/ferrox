@@ -277,9 +277,8 @@ pub(crate) fn der_to_pem(der: &[u8], label: &str) -> Vec<u8> {
     pem
 }
 
-/// Append one PEM block into a buffer the caller has reserved for `pem_capacity`, so the fill is memcpy into live capacity — no reallocation moves the bytes already there.
+/// Append one PEM block into a buffer the caller has already reserved to `pem_capacity`, so the fill is memcpy into live capacity — no reallocation moves the bytes already there. The reservation is the caller's single job: `der_to_pem` opens the exact length and the chain and bundle open the summed length, so re-reserving per block would only recompute `pem_capacity`'s arithmetic and hit a no-op the callers already proved.
 fn append_pem(pem: &mut Vec<u8>, der: &[u8], label: &str) {
-    pem.reserve(pem_capacity(der.len(), label.len()));
     pem.extend_from_slice(b"-----BEGIN ");
     pem.extend_from_slice(label.as_bytes());
     pem.extend_from_slice(b"-----\n");
