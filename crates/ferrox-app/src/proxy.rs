@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{IoSlice, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(target_os = "linux")]
@@ -7931,6 +7931,46 @@ pub(crate) fn parse_addr_body(buf: &[u8], kind: AddrKind) -> Option<(AddrBody<'_
             let host = std::str::from_utf8(buf.get(2..2 + len)?).ok()?;
             Some((AddrBody::Domain(host), 2 + len))
         }
+    }
+}
+
+/// The keys of this span and the previous one: a key is refused as a replay for at least `span` seconds, and the rotation after that is what forgets it.
+pub(crate) struct Replay {
+    current: HashSet<[u8; 32]>,
+    prev: HashSet<[u8; 32]>,
+    rotated_at: u64,
+    span: u64,
+}
+
+/// Keys one half of a window holds before it rotates early, so a flood bounds the window instead of growing it.
+pub(crate) const REPLAY_KEYS: usize = 64 * 1024;
+
+impl Replay {
+    pub(crate) fn new(span: u64) -> Self {
+        Self {
+            current: HashSet::new(),
+            prev: HashSet::new(),
+            rotated_at: 0,
+            span,
+        }
+    }
+
+    /// Whether this key was already seen inside the window; the clock is the caller's, so the bounds are testable without waiting on it.
+    pub(crate) fn seen(&mut self, key: &[u8; 32], now: u64) -> bool {
+        if now.wrapping_sub(self.rotated_at) >= self.span || self.current.len() >= REPLAY_KEYS {
+            self.prev = std::mem::take(&mut self.current);
+            self.rotated_at = now;
+        }
+        if self.current.contains(key) || self.prev.contains(key) {
+            return true;
+        }
+        self.current.insert(*key);
+        false
+    }
+
+    #[cfg(test)]
+    pub(crate) fn held(&self) -> usize {
+        self.current.len() + self.prev.len()
     }
 }
 
