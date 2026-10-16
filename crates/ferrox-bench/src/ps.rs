@@ -109,6 +109,24 @@ impl Io {
             write_bytes: self.write_bytes.checked_sub(first.write_bytes)?,
         })
     }
+
+    /// What the run crossed, read as the tallest sample that reached each counter rather than the last
+    /// one's: the tally is a sum over the tasks still alive, so a thread-per-flow relay's worker
+    /// threads take their counters with them when they exit and its final sample is the idle leader.
+    /// A process whose tallies survive to the end already reports its tallest sample last, so this is
+    /// the same pair `since` gives it; per-counter maxing keeps the task walk's floor, because each
+    /// counter's own peak still bounds only what was counted.
+    pub fn window(samples: impl IntoIterator<Item = Io>) -> Option<Io> {
+        let mut samples = samples.into_iter();
+        let first = samples.next()?;
+        let tallest = samples.fold(first, |tall, io| Io {
+            read_calls: tall.read_calls.max(io.read_calls),
+            write_calls: tall.write_calls.max(io.write_calls),
+            read_bytes: tall.read_bytes.max(io.read_bytes),
+            write_bytes: tall.write_bytes.max(io.write_bytes),
+        });
+        tallest.since(&first)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -889,6 +907,133 @@ mod tests {
             None,
             "a counter that went backwards is not a difference to report"
         );
+    }
+
+    /// A run whose tallies survive to the end already reports its tallest sample last, so the window
+    /// is the same pair and a process that does not fan out cannot move under it.
+    #[test]
+    fn a_window_over_samples_that_only_rise_is_the_last_since_the_first() {
+        let first = Io {
+            read_calls: 10,
+            write_calls: 20,
+            read_bytes: 300,
+            write_bytes: 400,
+        };
+        let middle = Io {
+            read_calls: 40,
+            write_calls: 60,
+            read_bytes: 900,
+            write_bytes: 1_600,
+        };
+        let last = Io {
+            read_calls: 70,
+            write_calls: 90,
+            read_bytes: 2_000,
+            write_bytes: 3_000,
+        };
+        assert_eq!(
+            Io::window([first, middle, last]),
+            last.since(&first),
+            "the tallest of a rising run is its last sample"
+        );
+    }
+
+    /// A counter that fell when its thread exited keeps its peak, and a counter that kept rising is
+    /// still read off the last sample: the window is per counter, not one sample chosen over another.
+    #[test]
+    fn a_window_keeps_the_counter_that_fell_when_its_thread_exited() {
+        let window = Io::window([
+            Io {
+                read_calls: 1,
+                write_calls: 0,
+                read_bytes: 100,
+                write_bytes: 0,
+            },
+            Io {
+                read_calls: 9,
+                write_calls: 700,
+                read_bytes: 4_000,
+                write_bytes: 8 << 20,
+            },
+            Io {
+                read_calls: 12,
+                write_calls: 3,
+                read_bytes: 4_200,
+                write_bytes: 0,
+            },
+        ])
+        .expect("three tallies are a window");
+        assert_eq!(
+            window.write_calls, 700,
+            "the joined thread's calls are priced"
+        );
+        assert_eq!(
+            window.write_bytes,
+            8 << 20,
+            "and so are the bytes it wrote, though no sample holds both"
+        );
+        assert_eq!(
+            window.read_calls, 11,
+            "a counter that only rises is still the last over the first"
+        );
+        assert_eq!(window.read_bytes, 4_100);
+    }
+
+    /// The collapse the window exists for, measured on a thread this test really joined: exiting
+    /// takes the counters out of the tally, so the last sample's delta reports the run as the idle
+    /// leader's own bytes. That a live thread's writes reach the tally at all is
+    /// `a_tally_counts_the_thread_that_made_the_writes`; this is the half it cannot see.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_joined_writer_thread_leaves_its_bytes_for_the_window_to_keep() {
+        const WRITTEN: u64 = 8 << 20;
+        let pid = std::process::id();
+        let start = proc_io(pid).expect("a linux process has per-thread io counters");
+        let path = std::env::temp_dir().join(format!("ferrox-io-window-{pid}"));
+        let file_path = path.clone();
+        let (written, wait_written) = std::sync::mpsc::channel::<()>();
+        let (release, wait_release) = std::sync::mpsc::channel::<()>();
+        let writer = std::thread::spawn(move || {
+            use std::io::Write;
+            let mut file = std::fs::File::create(&file_path).expect("a temp file to write into");
+            let zeroes = vec![0u8; 1 << 16];
+            let mut left = WRITTEN as usize;
+            while left > 0 {
+                let take = left.min(zeroes.len());
+                file.write_all(&zeroes[..take])
+                    .expect("a write reaches the kernel");
+                left -= take;
+            }
+            drop(file);
+            written
+                .send(())
+                .expect("the peak tally is taken while the writer lives");
+            wait_release
+                .recv()
+                .expect("the parked writer thread is released");
+        });
+        wait_written
+            .recv()
+            .expect("the writer thread finishes its bytes");
+        let alive = proc_io(pid).expect("the tally is readable while its writer lives");
+        release.send(()).expect("the writer thread is parked");
+        writer.join().expect("the writer thread ends");
+        let joined = proc_io(pid).expect("the tally is readable after its writer ends");
+        assert!(
+            alive.write_bytes >= joined.write_bytes + WRITTEN / 2,
+            "{} B written by a thread that then exited: the tally fell from {} B to {} B",
+            WRITTEN,
+            alive.write_bytes,
+            joined.write_bytes
+        );
+        let window = Io::window([start, alive, joined]).expect("three tallies are a window");
+        let last_run = joined.since(&start).map_or(0, |io| io.write_bytes);
+        assert!(
+            window.write_bytes >= last_run + WRITTEN / 2,
+            "the last sample prices the run at {last_run} B where its own peak reached {} B",
+            window.write_bytes
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
