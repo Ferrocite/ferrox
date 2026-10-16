@@ -67,6 +67,7 @@ graph TD
 | datagrams-out-of-one-frame | 2 | ferrox-app-foxy::loopback::a_frame_of_two_datagrams_arrives_as_two_datagrams |
 | quic-datagrams-out-of-one-frame | 2 | ferrox-app-foxy::loopback::a_quic_frame_of_two_datagrams_arrives_as_two_datagrams |
 | stream-write-staging-copies-per-byte | 0 | ferrox-app-foxy::loopback::the_quic_carrier_sends_the_block_reads_the_status_and_carries_the_bytes |
+| datagram-write-staging-copies-per-byte | 0 | ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_and_echoes_a_datagram |
 | server-roles | 0 | ferrox-app-proxy::tests::quic_serve_closes_without_handshake |
 | dialled-without-ca-cert-file | 0 | ferrox-app-proxy::tests::quic_outbound_reads_ca_cert_file |
 | address-assign-capsule-bytes-per-grant | 9 | ferrox-core-foxy::connectip::tests::the_assign_a_proxy_writes_is_the_assign_the_lane_reads |
@@ -296,6 +297,25 @@ the comparison can be re-read:
   grows — which is what
   `the_masque_carrier_opens_connect_udp_over_quic_and_echoes_a_datagram` still
   asserts.
+
+- **A staging copy on every HTTP/2 datagram written.** The CONNECT-UDP writer
+  joined the DATAGRAM capsule's header and the caller's payload in its own buffer
+  before framing, so a written datagram crossed userspace twice — once into that
+  buffer, once into the record. The capsule header now rides a fixed stack buffer
+  (`masque::datagram_prefix_into`, byte-identical to the run `datagram_encode`
+  puts before the payload) while the payload keeps the caller's buffer: the lane
+  hands `[frame header, capsule header, payload]` to one `write_all_slices`, the
+  same call the tunnel's `Write::write` already uses, so the record boundary and
+  every byte are what they were. `datagram-write-staging-copies-per-byte 0` is
+  gated by `the_masque_carrier_opens_connect_udp_and_echoes_a_datagram` resetting
+  the lane's write buffer and holding its capacity at zero across a write — the
+  echoed bytes are identical either way, so capacity is the only witness that can
+  see the copy go. The HTTP/3 leg is deliberately left alone: its `out` is the
+  sentinel the `stream-write-staging-copies-per-byte 0` row already reads to prove
+  the *relay* write stages nothing, and taking the datagram copy there too would
+  empty that sentinel rather than strengthen it. What is **not** removed on the
+  leg that changed: the payload still crosses once into the TLS record — that copy
+  is the floor, not this lane's staging.
 
 - **Two copies of every relayed byte.** The lane used to stage a DATA frame's
   payload in its read buffer and then copy it into the caller's, and stage the

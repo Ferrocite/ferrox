@@ -2,6 +2,7 @@
 
 use ferrox_core::foxy::connectip;
 use ferrox_core::foxy::{self, authority, frames, hpack, masque, Failure, Pass};
+use ferrox_core::tls::RecordAlignment;
 use ferrox_core::tls::TlsProvider;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _};
@@ -668,17 +669,18 @@ impl Tls2 {
         }
     }
 
-    /// One UDP payload as one DATAGRAM capsule, split over DATA frames when needed: the capsule stream is byte-oriented and the reader reassembles.
+    /// One UDP payload as one DATAGRAM capsule, split over DATA frames when needed: the capsule stream is byte-oriented and the reader reassembles. The frame header and the capsule header ride a fixed buffer and the payload keeps the caller's bytes, so the whole datagram is never staged before the record takes it.
     pub(crate) fn write_datagram(&mut self, payload: &[u8]) -> std::io::Result<()> {
         if self.fin {
             return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
         }
-        self.out.clear();
-        masque::datagram_encode(payload, &mut self.out);
+        let mut prefix = [0u8; 10];
+        let plen = masque::datagram_prefix_into(&mut prefix, payload.len());
+        let total = plen + payload.len();
         let mut at = 0usize;
-        while at < self.out.len() {
-            let frame = foxy::flow::frame_size(self.out.len() - at, self.max_frame)
-                .min(self.window.stream());
+        while at < total {
+            let frame =
+                foxy::flow::frame_size(total - at, self.max_frame).min(self.window.stream());
             if frame == 0 {
                 std::thread::sleep(Duration::from_millis(5));
                 continue;
@@ -692,8 +694,22 @@ impl Tls2 {
                 length: frame as u32,
             }
             .header();
-            self.tls.write_parts(&header, &self.out[at..at + frame])?;
-            at += frame;
+            let end = at + frame;
+            // A frame boundary may fall inside the capsule header, so the header is a slice of `prefix` and the payload a slice of the caller's buffer, joined only where one frame spans both.
+            if end <= plen {
+                self.tls
+                    .write_all_slices(&[&header[..], &prefix[at..end]])?;
+            } else if at < plen {
+                self.tls.write_all_slices(&[
+                    &header[..],
+                    &prefix[at..plen],
+                    &payload[..end - plen],
+                ])?;
+            } else {
+                self.tls
+                    .write_all_slices(&[&header[..], &payload[at - plen..end - plen]])?;
+            }
+            at = end;
         }
         Ok(())
     }
@@ -3175,8 +3191,15 @@ mod loopback {
         ] {
             assert!(text.contains(field), "missing {field}");
         }
+        // A byte-level echo cannot see a staging copy, so capacity is the witness on the write side: reset the pooled write buffer, write one datagram, and the buffer a stage would have grown must still be empty.
+        lane.out = Vec::new();
         lane.write_datagram(b"hello udp").expect("writes");
         lane.flush().expect("flushes");
+        assert_eq!(
+            lane.out.capacity(),
+            0,
+            "the datagram's payload went into the record, not into a staging buffer"
+        );
         read_datagram(&mut lane, b"hello udp");
         assert!(
             lane.capsule_buf.is_empty(),
