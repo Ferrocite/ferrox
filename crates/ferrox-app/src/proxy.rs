@@ -11241,19 +11241,44 @@ mod tests {
         (user, dialled)
     }
 
-    // Writing before reading only completes while the whole payload fits the chain's buffering, so read while writing, and give the write a deadline so a blocked one reports instead of parking.
-    fn echo_bulk(user: &mut TcpStream, payload: &[u8]) -> Vec<u8> {
-        user.set_write_timeout(Some(Duration::from_secs(30)))
-            .expect("write timeout");
+    // Writing before reading only completes while the whole payload fits the chain's buffering, so read while writing, and give both arms the same deadline so a blocked one reports instead of parking.
+    fn echo_within(user: &mut TcpStream, payload: &[u8], budget: Duration) -> Vec<u8> {
+        user.set_write_timeout(Some(budget)).expect("write timeout");
         let mut reader = user.try_clone().expect("clones");
+        // A duplicated socket need not inherit the parent's poll timeout, so the reading arm carries its own.
+        reader.set_read_timeout(Some(budget)).expect("read timeout");
         let length = payload.len();
         let back = thread::spawn(move || {
             let mut got = vec![0u8; length];
-            reader.read_exact(&mut got).expect("echoes");
-            got
+            reader.read_exact(&mut got).map(|()| got)
         });
         user.write_all(payload).expect("writes");
-        back.join().expect("reads")
+        back.join().expect("joins").expect("echoes")
+    }
+
+    fn echo_bulk(user: &mut TcpStream, payload: &[u8]) -> Vec<u8> {
+        echo_within(user, payload, Duration::from_secs(30))
+    }
+
+    /// A peer that swallows the payload and answers nothing must cost the witness its budget, not the job's whole stall window; a silent read here is a red that names the arm.
+    #[test]
+    #[should_panic(expected = "echoes")]
+    fn a_silent_echo_peer_ends_the_bulk_read_at_its_budget() {
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let sink = thread::spawn(move || {
+            let (mut peer, _) = front.accept().expect("accepts");
+            let mut drained = [0u8; 4096];
+            while let Ok(read) = peer.read(&mut drained) {
+                if read == 0 {
+                    break;
+                }
+            }
+        });
+        let mut user = TcpStream::connect(addr).expect("connects");
+        let payload: Vec<u8> = (0..4096u32).map(|index| index as u8).collect();
+        echo_within(&mut user, &payload, Duration::from_millis(250));
+        sink.join().expect("drains");
     }
 
     #[test]
