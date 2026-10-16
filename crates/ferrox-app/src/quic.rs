@@ -79,6 +79,22 @@ const SCID_LEN: usize = 16;
 
 pub(crate) const MAX_DATAGRAM: usize = 1350;
 
+/// A datagram buffer with no zero pass: the call the slice is handed to writes every byte it reports.
+pub(crate) struct Unfilled<const N: usize>([std::mem::MaybeUninit<u8>; N]);
+
+impl<const N: usize> Unfilled<N> {
+    #[must_use]
+    pub(crate) fn new() -> Self {
+        Self([std::mem::MaybeUninit::<u8>::uninit(); N])
+    }
+
+    #[must_use]
+    pub(crate) fn as_mut(&mut self) -> &mut [u8] {
+        // SAFETY: every byte read out of here was written by the call this slice was handed to.
+        unsafe { std::slice::from_raw_parts_mut(self.0.as_mut_ptr().cast::<u8>(), N) }
+    }
+}
+
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) const IDLE_TIMEOUT_MS: u64 = 300_000;
@@ -362,8 +378,9 @@ pub(crate) fn quiche_config(roots: &[Vec<u8>], cc: Option<&str>) -> Option<quich
 }
 
 pub(crate) fn flush_egress(conn: &mut quiche::Connection, sock: &Datagram) {
-    let mut out = [0u8; MAX_DATAGRAM];
-    while let Ok((written, info)) = conn.send(&mut out) {
+    let mut room = Unfilled::<MAX_DATAGRAM>::new();
+    let out = room.as_mut();
+    while let Ok((written, info)) = conn.send(out) {
         let _ = sock.send_to(&out[..written], info.to);
     }
 }
@@ -396,8 +413,9 @@ pub(crate) fn pump_once(
     {
         return false;
     }
-    let mut buf = [0u8; MAX_DATAGRAM];
-    match sock.recv_from(&mut buf) {
+    let mut room = Unfilled::<MAX_DATAGRAM>::new();
+    let buf = room.as_mut();
+    match sock.recv_from(buf) {
         Ok((n, from)) => {
             let info = quiche::RecvInfo { from, to: local };
             let _ = conn.recv(&mut buf[..n], info);
@@ -646,10 +664,13 @@ impl Datagram {
             return self.sock.send_to(buf, to);
         };
         // The header carries the real target; the socket itself is addressed to the hop.
-        let mut framed = [0u8; RELAY_HEADER + MAX_DATAGRAM];
+        let mut room = Unfilled::<{ RELAY_HEADER + MAX_DATAGRAM }>::new();
+        let framed = room.as_mut();
         let Some(into) = framed.get_mut(..RELAY_HEADER + buf.len()) else {
             return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
         };
+        // The hop reads these three before the target, so they are filled rather than left as stack garbage.
+        into[..3].fill(0);
         let header = match to {
             SocketAddr::V4(addr) => {
                 into[3] = 1;
@@ -1671,6 +1692,39 @@ mod tests {
         assert_eq!(got, 0, "the kernel knows UDP_GRO");
         assert_eq!(on, 0, "one recv_from carries one packet");
         assert!(udp_to_server("127.0.0.1", 443).is_some(), "still dials");
+    }
+
+    #[test]
+    fn a_relayed_datagram_frames_its_target_ahead_of_its_payload() {
+        use std::net::{TcpListener, TcpStream};
+        let association = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let control = TcpStream::connect(association.local_addr().expect("addr")).expect("dials");
+        let _ = association.accept().expect("accepts");
+        let hop = bind_datagram("127.0.0.1:0").expect("binds");
+        let target = bind_datagram("127.0.0.1:0").expect("binds");
+        let lane = Datagram::relayed(
+            bind_datagram("127.0.0.1:0").expect("binds"),
+            hop.local_addr().expect("addr"),
+            std::sync::Arc::new(control),
+        );
+        let SocketAddr::V4(target) = target.local_addr().expect("addr") else {
+            panic!("a v4 target");
+        };
+        lane.send_to(b"ping", target.into())
+            .expect("frames and sends");
+        hop.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("times out");
+        let mut got = [0u8; 32];
+        let (n, _) = hop.recv_from(&mut got).expect("the hop reads it");
+        let mut want = vec![0, 0, 0, 1];
+        want.extend_from_slice(&target.ip().octets());
+        want.extend_from_slice(&target.port().to_be_bytes());
+        want.extend_from_slice(b"ping");
+        assert_eq!(
+            &got[..n],
+            &want[..],
+            "reserved, fragment, family, address, port, payload"
+        );
     }
 
     #[test]
