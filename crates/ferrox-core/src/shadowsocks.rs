@@ -233,9 +233,12 @@ pub fn rc4_md5_key(master: &[u8], iv: &[u8; 16]) -> Option<[u8; 16]> {
     Some(md5::compute(input).0)
 }
 
+/// Keystream bytes per fold, wide enough that a block is two words.
+const BLOCK: usize = 16;
+
 /// RC4 as the stream ciphers use it: the state is the whole schedule, so a
-/// direction costs 258 bytes on the stack and crypting writes into the
-/// caller's buffer with no second buffer anywhere.
+/// direction costs 258 bytes on the stack, and crypting folds one keystream
+/// block at a time over the caller's buffer with no heap buffer anywhere.
 #[derive(Debug, Clone)]
 pub struct Rc4 {
     s: [u8; 256],
@@ -261,14 +264,42 @@ impl Rc4 {
         Some(Self { s, i: 0, j: 0 })
     }
 
+    /// Sixteen PRGA steps at a time, into a block on this frame, then the block
+    /// over the payload as two words: the state machine stays serial and the
+    /// payload reads and writes leave it.
     pub fn crypt(&mut self, buf: &mut [u8]) {
-        for cell in buf.iter_mut() {
+        let (blocks, tail) = buf.as_chunks_mut::<BLOCK>();
+        let mut block = [0u8; BLOCK];
+        for chunk in blocks {
+            self.keystream(&mut block);
+            fold_keystream(chunk, &block);
+        }
+        if !tail.is_empty() {
+            self.keystream(&mut block[..tail.len()]);
+            fold_keystream(tail, &block[..tail.len()]);
+        }
+    }
+
+    fn keystream(&mut self, out: &mut [u8]) {
+        for cell in out.iter_mut() {
             self.i = self.i.wrapping_add(1);
             self.j = self.j.wrapping_add(self.s[usize::from(self.i)]);
             self.s.swap(usize::from(self.i), usize::from(self.j));
             let at = self.s[usize::from(self.i)].wrapping_add(self.s[usize::from(self.j)]);
-            *cell ^= self.s[usize::from(at)];
+            *cell = self.s[usize::from(at)];
         }
+    }
+}
+
+/// The block laid over the payload it belongs to, eight bytes at a time.
+fn fold_keystream(dst: &mut [u8], key: &[u8]) {
+    let (words, rest) = dst.as_chunks_mut::<8>();
+    for (cell, block) in words.iter_mut().zip(key.as_chunks::<8>().0) {
+        *cell = (u64::from_le_bytes(*cell) ^ u64::from_le_bytes(*block)).to_le_bytes();
+    }
+    let used = words.len() * 8;
+    for (cell, &byte) in rest.iter_mut().zip(&key[used..]) {
+        *cell ^= byte;
     }
 }
 
@@ -653,6 +684,82 @@ mod tests {
             Rc4::new(&[0u8; 257]).is_none(),
             "a key past 256 bytes is refused"
         );
+    }
+
+    /// The PRGA written a second time, byte at a time, over its own table.
+    /// `crypt` is only witnessed as bit-identical against a form that shares no
+    /// code with it: a wrong keystream still round-trips itself, so no amount of
+    /// encrypt-then-decrypt sees one.
+    fn prga_bytes(key: &[u8], count: usize) -> Vec<u8> {
+        let mut table = [0u8; 256];
+        for (at, cell) in table.iter_mut().enumerate() {
+            *cell = at as u8;
+        }
+        let mut j = 0u8;
+        for i in 0..256 {
+            j = j.wrapping_add(table[i]).wrapping_add(key[i % key.len()]);
+            table.swap(i, usize::from(j));
+        }
+        let mut i = 0u8;
+        let mut j = 0u8;
+        (0..count)
+            .map(|_| {
+                i = i.wrapping_add(1);
+                j = j.wrapping_add(table[usize::from(i)]);
+                table.swap(usize::from(i), usize::from(j));
+                let at = table[usize::from(i)].wrapping_add(table[usize::from(j)]);
+                table[usize::from(at)]
+            })
+            .collect()
+    }
+
+    /// One keystream byte per payload byte, at the edges a block form can miss.
+    #[test]
+    fn the_keystream_is_the_prga_bytes_at_every_block_edge() {
+        let stream = prga_bytes(b"ferrox-probe-key", 20_000);
+        let plain: Vec<u8> = (0..20_000usize)
+            .map(|i| (i as u8).wrapping_mul(37))
+            .collect();
+
+        let mut quiet = vec![0u8; 200];
+        Rc4::new(b"ferrox-probe-key")
+            .expect("schedules")
+            .crypt(&mut quiet);
+        assert_eq!(&quiet, &stream[..200], "an empty payload is the stream");
+
+        for len in (0..=40usize).chain([
+            63, 64, 65, 127, 128, 129, 255, 256, 257, 1000, 4095, 4096, 8191, 16_383,
+        ]) {
+            let mut want = plain[..len].to_vec();
+            for (cell, &byte) in want.iter_mut().zip(&stream) {
+                *cell ^= byte;
+            }
+            let mut wire = plain[..len].to_vec();
+            Rc4::new(b"ferrox-probe-key")
+                .expect("schedules")
+                .crypt(&mut wire);
+            assert_eq!(wire, want, "one call of {len} bytes");
+            let mut back = wire;
+            Rc4::new(b"ferrox-probe-key")
+                .expect("schedules")
+                .crypt(&mut back);
+            assert_eq!(back, plain[..len], "len {len}: the same stream decodes");
+        }
+
+        // A block filled past the payload would move a carried stream out of step.
+        let mut carried = Rc4::new(b"ferrox-probe-key").expect("schedules");
+        let mut off = 0usize;
+        for len in [1, 7, 8, 9, 15, 16, 17, 63, 64, 65, 3, 100usize] {
+            let mut want = plain[off..off + len].to_vec();
+            for (cell, byte) in want.iter_mut().zip(&stream[off..]) {
+                *cell ^= *byte;
+            }
+            let mut chunk = plain[off..off + len].to_vec();
+            carried.crypt(&mut chunk);
+            assert_eq!(chunk, want, "call at {off} of {len} bytes");
+            off += len;
+        }
+        assert!(off > 300, "the carried sweep should cross blocks");
     }
 
     /// The probe behind the `shadowsocks` ops row: `crypt` has no frame of its own once the release profile inlines it, so this frame is the 64 KiB stream and one fold over it, with no socket, no allocation and nothing else in the way.
