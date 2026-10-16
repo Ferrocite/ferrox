@@ -1,4 +1,4 @@
-//! Leaf-key pinning, additive to whatever chain verification passed: a pin is `sha256/` plus base64 of SHA-256 over the leaf's `SubjectPublicKeyInfo`; an empty set pins and refuses nothing.
+//! Leaf-key pinning, authoritative for the leaf it names: a pin is `sha256/` plus base64 of SHA-256 over the leaf's `SubjectPublicKeyInfo`, so a chain this device cannot build still verifies against that key; an empty set pins and refuses nothing.
 
 use crate::b64;
 use sha2::{Digest, Sha256};
