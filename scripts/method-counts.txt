@@ -143,6 +143,9 @@ carrier-grpc credit-bytes 2097152 ferrox-app-grpc::tests::a_credit_grants_the_wi
 carrier-grpc window-update-writes-per-credit 1 ferrox-app-grpc::tests::a_credit_grants_the_window_it_owes_in_one_write
 carrier-grpc window-update-frames-per-credit 2 ferrox-app-grpc::tests::a_credit_grants_the_window_it_owes_in_one_write
 carrier-grpc connection-window-credit-at-preface 4128769 ferrox-app-grpc::tests::the_preface_grants_the_peer_a_whole_window
+carrier-grpc pinned-threads-per-silent-preface 0 ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_preface
+carrier-grpc pinned-threads-per-silent-request-head 0 ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_request_head
+carrier-grpc pinned-threads-per-silent-vless-request 0 ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_vless_request
 carrier-grpc message-buffer-reallocations-per-same-sized-frame 0 ferrox-app-grpc::tests::the_message_buffer_is_reused_not_reallocated
 carrier-grpc batched-elements-served-per-message 8 ferrox-app-grpc::tests::a_batched_downlink_arrives_element_by_element
 carrier-grpc grpc-methods-served-per-listener 2 ferrox-app-grpc::tests::one_listener_serves_both_methods

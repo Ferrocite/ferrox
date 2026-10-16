@@ -86,6 +86,9 @@ graph TD
 | window-update-writes-per-credit | 1 | ferrox-app-grpc::tests::a_credit_grants_the_window_it_owes_in_one_write |
 | window-update-frames-per-credit | 2 | ferrox-app-grpc::tests::a_credit_grants_the_window_it_owes_in_one_write |
 | connection-window-credit-at-preface | 4128769 | ferrox-app-grpc::tests::the_preface_grants_the_peer_a_whole_window |
+| pinned-threads-per-silent-preface | 0 | ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_preface |
+| pinned-threads-per-silent-request-head | 0 | ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_request_head |
+| pinned-threads-per-silent-vless-request | 0 | ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_vless_request |
 | message-buffer-reallocations-per-same-sized-frame | 0 | ferrox-app-grpc::tests::the_message_buffer_is_reused_not_reallocated |
 | batched-elements-served-per-message | 8 | ferrox-app-grpc::tests::a_batched_downlink_arrives_element_by_element |
 | grpc-methods-served-per-listener | 2 | ferrox-app-grpc::tests::one_listener_serves_both_methods |
@@ -112,7 +115,13 @@ of every body since the last grant — `128` frames of `16393` bytes per credit,
 a downlink of full hunks, where the lane used to write one pair per frame. The
 preface row is read off the first write both halves of a call make: the setting
 and the `WINDOW_UPDATE` on stream `0` that lifts the connection to the window the
-setting advertises, which is the grant a batched credit rests on. The
+setting advertises, which is the grant a batched credit rests on. The three
+`pinned-threads` rows are one serve thread each, watched through a channel: a
+peer that opens and never speaks, one that sends the `24`-octet preface and
+stops, and one that dials a real gRPC client and never sends its first hunk. The
+`0` is a give-up at `budgets::handshake()` rather than a race, and each row was
+audited by taking its own arm away first — the preface read's deadline, the
+pump's, then the reader's — and reading the test fail at its `15s` bound. The
 batched row counts the elements one `TunMulti` message hands over before the
 caller sees a gap: eight 8 KiB elements in two messages, each element delivered
 from where it lay, so the row's `0` is the same `staged` counter and the eight
@@ -150,12 +159,26 @@ the cost of a method alone.
 
 ## Time
 
-**Not measured on this branch.** `tunnel_carries_an_echo_over_loopback` is the
-flakiest loopback test in the tree — the roadmap records it failing 23 times in
-200 runs with nothing else running, where `read_body` sees EOF after a 9-byte
-frame header, which is a torn write or an RST with data queued rather than a
-framing error. That is an open row and no duration is quoted from this carrier
-until it is closed.
+Measured on CI only, where the run is paired against xray-core on the same
+runner: `benchmark-matrix.yml`, `full` tier, `vless-grpc-down-8` — 8 connections
+streaming `16384` hunks of `65536` B, 8 GiB down, 5 repeats.
+
+| run | what it was | ferrox, median of 5 | xray-core in the same cell |
+| --- | --- | --- | --- |
+| 38968303906 | `main`, machine-matched control | 10.09 s (`10.08`–`10.39`) | 9.09 s, throughput ratio `0.903×` WORSE |
+| 38967309360 | one credit per half-window instead of per frame | 3.81 s (`3.71`–`6.03`) | 9.73 s, throughput ratio `2.405×` better |
+
+The 8 GiB downlink took 2.7 times less wall clock for 128 times fewer credit
+writes, and the comparator's own time moved by less than a second between the
+two cells, so the difference is this carrier's write count and not the runner.
+The after cell's harness ceilings are `1528`–`2270 MiB/s` against ferrox's
+`2153`, which is why the ratio is read as a floor.
+
+Still open, and the reason no local duration is quoted:
+`tunnel_carries_an_echo_over_loopback` is the flakiest loopback test in the tree
+— the roadmap records it failing 23 times in 200 runs with nothing else running,
+where `read_body` sees EOF after a 9-byte frame header, which is a torn write or
+an RST with data queued rather than a framing error.
 
 ## What we removed
 
@@ -236,6 +259,22 @@ until it is closed.
   costs, because the dynamic table outlives the block, and one copy into the
   decoder's warm buffer for a Huffman-coded string, which is what the
   `## Measured` capacity gate is written against.
+- **The head no peer could be refused by.** This was the only vless carrier whose
+  opening read carried neither a poll quantum nor a wall clock: a peer that
+  connects and says nothing, or sends the `24` octets of preface and stops, or
+  completes the handshake and never sends its first hunk, held a relay-pool
+  thread forever. Arming a quantum alone would have made it worse —
+  `proxy::read_exact` retries a timeout by design, so a `20ms` grain with no
+  deadline is `50` wakes a second forever — which is why the clock lives inside
+  the reader as it does for `ws`: each of the three phases now reads under
+  `budgets::handshake()` and hands back an un-armed socket, so the relay behind
+  the head waits blocking exactly as it did. What it costs: `4` `setsockopt`
+  calls per accepted vless-over-gRPC flow, arm and clear at the preface and at
+  the request head, and up to `500` wakes for a peer that never speaks. What is
+  not unified: the http carriers' request head still runs on
+  `budgets::head_arrival()`, because that budget names an HTTP request arriving,
+  while this one is the carrier's opening read — the budget `serve_vless_raw`
+  already bounds its own opening read with.
 
 What is **not** removed: HTTP/2's own framing. `T_DATA`, `T_HEADERS` and
 `T_SETTINGS`, HPACK and the flow-control window are the cost of the carrier,
