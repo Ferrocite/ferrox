@@ -7648,7 +7648,6 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
     W: CarrierSink,
     F: FnOnce(&mut R),
 {
-    const CHUNK: usize = 16 * 1024;
     echo_trace("relay start");
     let Ok(peer_read) = peer.try_clone() else {
         echo_trace("relay no peer");
@@ -7661,10 +7660,10 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
     let mut peer_write = peer_write;
     let uplink = writer.clone();
     let done = thread::spawn(move || {
-        let mut buf = vec![0u8; CHUNK];
+        let mut buf = RelayBuf::new();
         let mut first = true;
         loop {
-            match peer_read.read(&mut buf) {
+            match peer_read.read(buf.as_mut()) {
                 Ok(n) if n > 0 => {
                     if first {
                         echo_trace("relay fwd first read");
@@ -7672,7 +7671,7 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
                     if first {
                         echo_trace("relay fwd sending");
                     }
-                    let sent = uplink.send(&buf[..n]);
+                    let sent = uplink.send(&buf.as_mut()[..n]);
                     if first {
                         echo_trace("relay fwd sent");
                     }
@@ -7705,10 +7704,10 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
             let _ = peer_read.shutdown(Shutdown::Both);
         }
     });
-    let mut buf = vec![0u8; CHUNK];
+    let mut buf = RelayBuf::new();
     let mut first = true;
     loop {
-        match reader.read(&mut buf) {
+        match reader.read(buf.as_mut()) {
             Ok(n) if n > 0 => {
                 if first {
                     echo_trace("relay bwd first read");
@@ -7716,7 +7715,7 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
                 if first {
                     echo_trace("relay bwd forwarding");
                 }
-                if peer_write.write_all(&buf[..n]).is_err() {
+                if peer_write.write_all(&buf.as_mut()[..n]).is_err() {
                     echo_trace("relay bwd peer write failed");
                     break;
                 }
@@ -7754,7 +7753,6 @@ pub(crate) fn relay_sink_drained<R: Read, W: CarrierSink>(reader: R, writer: &W,
 }
 
 pub(crate) fn relay_carried<R: Read>(mut reader: R, write: &TcpStream, peer: &TcpStream) {
-    const CHUNK: usize = 16 * 1024;
     let Ok(peer_read) = peer.try_clone() else {
         return;
     };
@@ -7767,11 +7765,11 @@ pub(crate) fn relay_carried<R: Read>(mut reader: R, write: &TcpStream, peer: &Tc
         return;
     };
     let done = thread::spawn(move || {
-        let mut buf = vec![0u8; CHUNK];
+        let mut buf = RelayBuf::new();
         loop {
-            match peer_read.read(&mut buf) {
+            match peer_read.read(buf.as_mut()) {
                 Ok(n) if n > 0 => {
-                    if uplink.write_all(&buf[..n]).is_err() {
+                    if uplink.write_all(&buf.as_mut()[..n]).is_err() {
                         break;
                     }
                 }
@@ -7781,11 +7779,11 @@ pub(crate) fn relay_carried<R: Read>(mut reader: R, write: &TcpStream, peer: &Tc
         }
         let _ = uplink.shutdown(Shutdown::Write);
     });
-    let mut buf = vec![0u8; CHUNK];
+    let mut buf = RelayBuf::new();
     loop {
-        match reader.read(&mut buf) {
+        match reader.read(buf.as_mut()) {
             Ok(n) if n > 0 => {
-                if peer_write.write_all(&buf[..n]).is_err() {
+                if peer_write.write_all(&buf.as_mut()[..n]).is_err() {
                     break;
                 }
             }
