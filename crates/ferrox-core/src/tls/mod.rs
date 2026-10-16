@@ -9,9 +9,10 @@ pub struct TlsConfig {
     pub server_name: String,
     pub alpn: Vec<Vec<u8>>,
     pub roots: Vec<Vec<u8>>,
-    /// Leaf keys to accept, checked after the chain has verified. Empty pins
-    /// nothing and refuses nothing, which is the default because a lane with no
-    /// pins is the ordinary case.
+    /// Leaf keys to accept: a chain that verified must still hold one, and a
+    /// chain this device cannot build is verified against the pinned leaf as its
+    /// own anchor. Empty pins nothing and refuses nothing, which is the default
+    /// because a lane with no pins is the ordinary case.
     pub pins: crate::foxy::pin::Pins,
     /// The `cipher_suites` ids a client advertises, in `crypto/tls` order, from xray's
     /// `tlsSettings.cipherSuites`. Empty means the config named none, so the backend keeps

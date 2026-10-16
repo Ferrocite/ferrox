@@ -3883,6 +3883,89 @@ mod loopback {
         edge.join().expect("joins");
     }
 
+    /// A device whose trust store cannot build the edge's chain is not a device that distrusts the edge: the pinned leaf is its own anchor, so the tunnel opens and carries bytes where the same edge with no pin is refused.
+    #[test]
+    fn a_pinned_leaf_carries_the_tunnel_when_the_store_cannot_build_the_chain() {
+        let (_foreign, server) = minted(b"http/1.1");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let right =
+            foxy::pin::Pins::parse([foxy::pin::spki_pin(&server.cert_chain[0]).expect("pins")]);
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut sink = vec![0u8; 1024];
+            let _ = tls.read(&mut sink);
+            tls.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .expect("answers");
+            let read = tls.read(&mut sink).expect("reads the payload");
+            tls.write_all(&sink[..read]).expect("echoes");
+        });
+        // The roots of some other hand: the same shape of certificate, on a chain that does not verify.
+        let (roots, _) = minted(b"http/1.1");
+        let dial = dial_for(roots, port, Carrier::H1, right);
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None)
+            .expect("the pinned leaf is its own anchor");
+        round_trip(&mut tunnel);
+        edge.join().expect("joins");
+    }
+
+    /// The anchor is the key the operator named, not any key: a pin that is not this edge's leaf leaves the stale store exactly as refusing as it was.
+    #[test]
+    fn a_pin_that_is_not_the_edges_key_is_still_refused_without_a_trust_store() {
+        let (_foreign, server) = minted(b"http/1.1");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            let _ = tls.handshake();
+        });
+        let wrong = foxy::pin::Pins::parse([
+            "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned()
+        ]);
+        let (roots, _) = minted(b"http/1.1");
+        let dial = dial_for(roots, port, Carrier::H1, wrong);
+        let failure = Tunnel::open(&dial, "example.com:443", None)
+            .err()
+            .expect("a stranger's pin");
+        assert_eq!(failure, Failure::Untrusted, "{failure}");
+        edge.join().expect("joins");
+    }
+
+    /// Pinning replaces who signed the leaf, not what the leaf says: a pinned key answering for a name the certificate does not cover is still refused, which is the check a pinned leaf alone would have skipped.
+    #[test]
+    fn a_pinned_leaf_still_has_to_answer_the_name_it_was_dialled_for() {
+        let (_foreign, server) = minted(b"http/1.1");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let right =
+            foxy::pin::Pins::parse([foxy::pin::spki_pin(&server.cert_chain[0]).expect("pins")]);
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            let _ = tls.handshake();
+        });
+        let (roots, _) = minted(b"http/1.1");
+        // The minted leaf covers `localhost`; this dial names another host to the same address.
+        let dial = FoxyDial {
+            host: "edge.test".to_owned(),
+            ..dial_for(roots, port, Carrier::H1, right)
+        };
+        let failure = Tunnel::open(&dial, "example.com:443", None)
+            .err()
+            .expect("the wrong name");
+        assert_eq!(failure, Failure::Untrusted, "{failure}");
+        edge.join().expect("joins");
+    }
+
     /// The edge half of the QUIC carrier: a control stream, one HEADERS frame with a QPACK status, and DATA frames echoed both ways — the proof the QUIC lane lacked: the wire request compared byte for byte with the lane's block, the status read through the QPACK decoder, and the bytes after the head travelling through the tunnel; a codec test answers none of those three.
     fn h3_edge(
         sock: crate::quic::Datagram,
