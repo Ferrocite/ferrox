@@ -1,6 +1,6 @@
 //! MASQUE CONNECT-UDP over the HTTP/2 edge, one UDP target per stream: RFC 9298 §3.4 extended CONNECT with the default URI template, RFC 9297 §3.5 DATAGRAM capsules carrying RFC 9298 §5 payloads (context 0 plus the UDP bytes) — arithmetic only, nothing here opens a socket.
 
-use super::frames::{quic_read, quic_varint, quic_varint_len};
+use super::frames::{quic_read, quic_varint, quic_varint_into, quic_varint_len};
 use super::hpack::{integer, integer_into};
 
 /// The default URI template, RFC 9298 §2, up to the target host.
@@ -151,6 +151,17 @@ pub fn datagram_encode(payload: &[u8], out: &mut Vec<u8>) {
     quic_varint(out, 1 + payload.len() as u64);
     out.push(0x00);
     out.extend_from_slice(payload);
+}
+
+/// The DATAGRAM capsule's own header for a payload of this length — type zero, the length varint, the context byte zero — written into a fixed buffer so a writer can frame a datagram from the caller's bytes without staging them: exactly the run `datagram_encode` puts before the payload, and `datagram_len(payload) - payload` bytes long.
+#[must_use]
+pub fn datagram_prefix_into(out: &mut [u8; 10], payload: usize) -> usize {
+    out[0] = 0x00;
+    let mut code = [0u8; 9];
+    let n = quic_varint_into(&mut code, 1 + payload as u64);
+    out[1..=n].copy_from_slice(&code[..n]);
+    out[1 + n] = 0x00;
+    2 + n
 }
 
 /// The first complete DATAGRAM capsule in a stream buffer: bytes consumed and the payload, or `None` while it is not whole; unknown types and nonzero contexts are skipped rather than refused, since neither carries bytes this lane reads.
@@ -325,6 +336,21 @@ mod tests {
                 datagram_encode(&vec![0u8; payload], &mut coded);
                 coded.len()
             });
+        }
+    }
+
+    /// The fixed-buffer capsule header is exactly the run the concatenating encoder puts before the payload, at every varint width — the writer that keeps the caller's bytes can only be bit-identical if this holds.
+    #[test]
+    fn the_datagram_prefix_is_the_bytes_encode_puts_before_the_payload() {
+        for payload in [0usize, 1, 62, 63, 64, 16_382, 16_383, 16_384, 70_000] {
+            let body: Vec<u8> = (0..payload).map(|i| (i % 251) as u8).collect();
+            let mut coded = Vec::new();
+            datagram_encode(&body, &mut coded);
+            let mut prefix = [0u8; 10];
+            let plen = datagram_prefix_into(&mut prefix, payload);
+            assert_eq!(plen, datagram_len(payload) - payload, "{payload}");
+            assert_eq!(&coded[..plen], &prefix[..plen], "{payload} header");
+            assert_eq!(&coded[plen..], body.as_slice(), "{payload} payload");
         }
     }
 
