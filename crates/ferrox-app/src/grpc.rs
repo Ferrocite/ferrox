@@ -170,6 +170,13 @@ pub(crate) struct GrpcWriter {
     stream: u32,
 }
 
+impl GrpcReader<TcpStream> {
+    /// Arm or clear the poll quantum on the socket this reader reads through, so a peer that opens then stalls mid-header cannot pin the serve thread past the header read; as the `ws`, `httpupgrade` and `httpheader` readers do, and a duplicated socket inherits no read timeout on Windows.
+    pub(crate) fn set_poll(&mut self, every: Option<std::time::Duration>) {
+        let _ = self.read.set_read_timeout(every);
+    }
+}
+
 impl<R: Read> GrpcReader<R> {
     fn emit(&self, kind: u8, flags: u8, id: u32, body: &[u8]) -> bool {
         let Ok(mut stream) = self.shared.stream.lock() else {

@@ -849,7 +849,10 @@ fn serve_vless(stream: TcpStream, id: &[u8; 16], carrier: &Carrier, freedom: boo
             let Some((mut reader, writer)) = crate::grpc::accept(stream, path) else {
                 return;
             };
-            let Some((got, _flow, cmd, target)) = decode_request(&mut reader) else {
+            reader.set_poll(Some(RELAY_POLL));
+            let decoded = decode_request_bounded(&mut reader);
+            reader.set_poll(None);
+            let Some((got, _flow, cmd, target)) = decoded else {
                 return;
             };
             if got != *id || cmd != 1 || !freedom {
