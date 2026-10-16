@@ -19856,12 +19856,12 @@ mod relay_tests {
 
     const CHUNK: usize = 65_536;
 
-    /// The client of the stalled flow: `rounds` chunks as fast as the socket takes
-    /// them, then a half-close, reporting how much got out.
-    fn push_until_refused(listener: &TcpListener, rounds: usize) -> usize {
+    /// The client of the stalled flow: `rounds` chunks of `chunk_len` as fast as the socket
+    /// takes them, then a half-close, reporting how much got out.
+    fn push_until_refused(listener: &TcpListener, rounds: usize, chunk_len: usize) -> usize {
         let (mut stream, _) = listener.accept().expect("accepts");
         stream.set_write_timeout(Some(PATIENCE)).expect("timeout");
-        let body: Vec<u8> = (0..CHUNK).map(|i| (i % 251) as u8).collect();
+        let body: Vec<u8> = (0..chunk_len).map(|i| (i % 251) as u8).collect();
         let mut written = 0usize;
         for _ in 0..rounds {
             if stream.write_all(&body).is_err() {
@@ -19871,6 +19871,38 @@ mod relay_tests {
         }
         let _ = stream.shutdown(Shutdown::Write);
         written
+    }
+
+    /// utime plus stime, in milliseconds, of every `ferrox-relay` pump thread. The kernel
+    /// reports these fields in 100 Hz ticks, and `comm` is parenthesised, so the fields
+    /// after the last `") "` start at `state` (field 3) and `utime` is field 14.
+    #[cfg(target_os = "linux")]
+    fn pump_cpu_millis() -> u64 {
+        let mut total = 0u64;
+        let mut seen = 0usize;
+        let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
+            panic!("/proc/self/task is not there to read");
+        };
+        for task in tasks.flatten() {
+            let Ok(stat) = std::fs::read_to_string(task.path().join("stat")) else {
+                continue;
+            };
+            let Some(close) = stat.rfind(") ") else {
+                continue;
+            };
+            if !stat[..close].ends_with("ferrox-relay") {
+                continue;
+            }
+            let fields: Vec<&str> = stat[close + 2..].split_whitespace().collect();
+            let (Some(utime), Some(stime)) = (fields.get(11), fields.get(12)) else {
+                continue;
+            };
+            let ticks = utime.parse::<u64>().unwrap_or(0) + stime.parse::<u64>().unwrap_or(0);
+            seen += 1;
+            total += ticks * 10;
+        }
+        assert!(seen > 0, "no ferrox-relay pump thread is there to measure");
+        total
     }
 
     /// The destination of the stalled flow: it reads none of the flow until the
@@ -19927,7 +19959,7 @@ mod relay_tests {
         let stalled_back = listener();
         let stalled_back_port = port_of(&stalled_back);
         let (release, drain_now) = mpsc::channel::<()>();
-        let feeding = thread::spawn(move || push_until_refused(&stalled_front, ROUNDS));
+        let feeding = thread::spawn(move || push_until_refused(&stalled_front, ROUNDS, CHUNK));
         let draining = thread::spawn(move || hold_then_read(&stalled_back, &drain_now));
         let stalled_client = TcpStream::connect(("127.0.0.1", stalled_front_port)).expect("dials");
         let stalled_target = TcpStream::connect(("127.0.0.1", stalled_back_port)).expect("dials");
@@ -20012,6 +20044,54 @@ mod relay_tests {
              bytes) once its destination read again ({held} drained)"
         );
         stalled_relay.join().expect("joins");
+    }
+
+    /// A pipe ring's slots go before its bytes: sixty-four 512-byte segments fill a 256 KiB
+    /// pipe at 32 KiB, so a `POLLIN` wake is honest and still has nowhere to put what it
+    /// sees. Re-arming that wake is a spin on a flow nobody can move, and the cell that
+    /// first priced it read 2.15 s of system time per GiB of it. This is the shape that
+    /// measures the spin instead of the bytes: loopback only, and the Linux job owns the
+    /// splice pump, so that is where the wake count exists to be seen.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_parked_flow_of_small_chunks_costs_the_pump_nothing() {
+        const SEGMENT: usize = 512;
+        const ROUNDS: usize = 4096;
+        const WINDOW: Duration = Duration::from_millis(200);
+
+        let stalled_front = listener();
+        let stalled_front_port = port_of(&stalled_front);
+        let stalled_back = listener();
+        let stalled_back_port = port_of(&stalled_back);
+        let (release, drain_now) = mpsc::channel::<()>();
+        let feeding = thread::spawn(move || push_until_refused(&stalled_front, ROUNDS, SEGMENT));
+        let draining = thread::spawn(move || hold_then_read(&stalled_back, &drain_now));
+        let stalled_client = TcpStream::connect(("127.0.0.1", stalled_front_port)).expect("dials");
+        let stalled_target = TcpStream::connect(("127.0.0.1", stalled_back_port)).expect("dials");
+        let stalled_relay = thread::spawn(move || relay(&stalled_client, &stalled_target));
+
+        thread::sleep(Duration::from_millis(150));
+        let before = pump_cpu_millis();
+        thread::sleep(WINDOW);
+        let burned = pump_cpu_millis().saturating_sub(before);
+
+        let _ = release.send(());
+        let held = draining.join().expect("joins");
+        let pushed = feeding.join().expect("joins");
+        stalled_relay.join().expect("joins");
+
+        assert!(
+            burned < 100,
+            "the pump burned {burned} ms of cpu across a {} ms window in which no byte could \
+             move: a wake that moves nothing must not be re-armed",
+            WINDOW.as_millis(),
+        );
+        assert_eq!(
+            held, pushed,
+            "the parked flow carried {} bytes of the {} its client wrote once its destination \
+             read again",
+            held, pushed
+        );
     }
 
     /// The two clones `relay_carried` shares one socket: a finished upload used
