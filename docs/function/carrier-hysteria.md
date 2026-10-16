@@ -96,6 +96,12 @@ tunnel. No artefact from this branch has been read.
 - **A per-chunk relay clone.** The relay direction held its `Flow` behind one
   clone for the whole direction rather than cloning the backlog `Vec` per
   16 KiB chunk.
+- **The relay legs' zero fill.** Both `relay` buffers were per-flow
+  `vec![0u8; 16384]` callocs; they now read into the same uninitialised
+  `RelayBuf` the proxy's raw loops use. Each leg still reads the whole 16 KiB
+  and forwards `&buf.as_mut()[..n]`, so read granularity, per-chunk copies and
+  syscalls are unchanged — what retires is the two memsets per flow, witnessed
+  by the CI RSS matrix, not by a count row.
 
 What is **not** removed, and is named rather than claimed: one handshake per
 flow (the vless-quic pool is not shared here, so `tcp-flows-per-handshake`
