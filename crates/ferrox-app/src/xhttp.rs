@@ -175,6 +175,11 @@ impl<R: Read> ChainReader<R> {
             read,
         }
     }
+    /// Put the bytes that rode in with the last request but belong to the next one back on the front.
+    fn set_carry(&mut self, carry: Vec<u8>) {
+        self.prefix = carry;
+        self.at = 0;
+    }
 }
 
 impl<R: Read> Read for ChainReader<R> {
@@ -1294,18 +1299,30 @@ fn check_request(head: &[u8], path: &str) -> Option<()> {
     Some(())
 }
 
-// The same accept over halves that cannot peek: pipelined bytes arrive as a prefix.
+// The same accept over halves that cannot peek: pipelined bytes arrive as a prefix. One connection serves requests until a session takes it or a request ends it, so a packet-up uplink does not pay a new connection per POST.
 pub(crate) fn accept_split_with_settings<
     R: Read + Send + 'static,
     W: crate::proxy::FrameWrite + Send + 'static,
 >(
-    mut read: R,
+    read: R,
     write: W,
     settings: &XhttpSettings,
 ) -> Option<(Box<dyn Read + Send>, XhttpWriter)> {
-    let (head, prefix) =
-        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
-    accept_core(&head, prefix, read, write, settings, None)
+    let mut read = ChainReader::new(Vec::new(), read);
+    let mut write = write;
+    loop {
+        let (head, prefix) =
+            crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
+        match accept_core(&head, prefix, read, write, settings, None) {
+            Served::Session(reader, writer) => return Some((reader, writer)),
+            Served::Again(next, next_write, carry) => {
+                read = next;
+                write = next_write;
+                read.set_carry(carry);
+            }
+            Served::Closed => return None,
+        }
+    }
 }
 
 fn writer_for<W: crate::proxy::FrameWrite + Send + 'static>(
@@ -1317,6 +1334,78 @@ fn writer_for<W: crate::proxy::FrameWrite + Send + 'static>(
         writer.set_h2(h);
     }
     writer
+}
+
+/// What one request leaves the connection to. `Session` hands both halves to a session that owns them for as long as the stream lives; `Again` gives them back, with the bytes that came with this request but belong to the next; `Closed` is the end of the connection.
+pub(crate) enum Served<R, W> {
+    Session(Box<dyn Read + Send>, XhttpWriter),
+    Again(R, W, Vec<u8>),
+    Closed,
+}
+
+/// Whether the client means to keep this connection: HTTP/1.1 keeps alive unless the request says otherwise, HTTP/1.0 only when it does.
+fn keeps_alive(head: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(head) else {
+        return false;
+    };
+    let mut lines = text.lines();
+    let mut keep = !lines
+        .next()
+        .unwrap_or_default()
+        .trim_end()
+        .ends_with("HTTP/1.0");
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if !name.trim().eq_ignore_ascii_case("connection") {
+            continue;
+        }
+        let value = value.to_ascii_lowercase();
+        keep = value.split(',').any(|part| part.trim() == "keep-alive")
+            && !value.split(',').any(|part| part.trim() == "close");
+    }
+    keep
+}
+
+/// The body of `n` bytes, and how much of the bytes already read as the head it used; the rest of those belong to the next request on this connection.
+fn read_body<R: Read>(read: &mut R, prefix: &[u8], n: usize) -> Option<(Vec<u8>, usize)> {
+    let mut buf = vec![0u8; n];
+    let pre = prefix.len().min(n);
+    buf[..pre].copy_from_slice(&prefix[..pre]);
+    let mut at = pre;
+    while at < n {
+        match read.read(&mut buf[at..]) {
+            Ok(0) | Err(_) => return None,
+            Ok(r) => at += r,
+        }
+    }
+    Some((buf, pre))
+}
+
+/// How reading a body that ends only when its stream ends turned out.
+enum Drained {
+    Done(Vec<u8>),
+    Over,
+    Broken,
+}
+
+/// The body until the stream ends, with `Over` naming a payload past the per-request cap.
+fn drain_body(read: &mut dyn Read, cap: usize) -> Drained {
+    let mut body = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match read.read(&mut buf) {
+            Ok(0) => return Drained::Done(body),
+            Ok(n) => {
+                body.extend_from_slice(&buf[..n]);
+                if body.len() > cap {
+                    return Drained::Over;
+                }
+            }
+            Err(_) => return Drained::Broken,
+        }
+    }
 }
 
 #[allow(
@@ -1333,29 +1422,41 @@ pub(crate) fn accept_core<
     mut write: W,
     settings: &XhttpSettings,
     h2: Option<crate::xhttp_h2::H2StreamOut>,
-) -> Option<(Box<dyn Read + Send>, XhttpWriter)> {
-    let text = std::str::from_utf8(head).ok()?;
-    let first = text.lines().next()?;
+) -> Served<R, W> {
+    let Ok(text) = std::str::from_utf8(head) else {
+        return Served::Closed;
+    };
+    let Some(first) = text.lines().next() else {
+        return Served::Closed;
+    };
     let mut parts = first.split_ascii_whitespace();
-    let method = parts.next()?;
-    let target = parts.next()?;
+    let Some(method) = parts.next() else {
+        return Served::Closed;
+    };
+    let Some(target) = parts.next() else {
+        return Served::Closed;
+    };
 
     if !path_covers(settings.path.as_str(), bare_path(target)) {
         emit_404(&mut write);
-        return None;
+        return Served::Closed;
     }
 
     let padded = pad_value(settings.x_padding_method, pad_target_len(settings));
 
     if method == "OPTIONS" {
-        let mut head = String::from("HTTP/1.1 200 OK\r\n");
+        let alive = keeps_alive(head);
+        let mut resp = String::from("HTTP/1.1 200 OK\r\n");
         if !settings.x_padding_obfs {
-            let _ = write!(head, "X-Padding: {padded}\r\n");
+            let _ = write!(resp, "X-Padding: {padded}\r\n");
         }
-        head.push_str("Access-Control-Allow-Methods: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Origin: *\r\n");
-        head.push_str("Content-Length: 0\r\nConnection: keep-alive\r\n\r\n");
-        let _ = write.write_all(head.as_bytes());
-        return None;
+        resp.push_str("Access-Control-Allow-Methods: *\r\nAccess-Control-Allow-Headers: *\r\nAccess-Control-Allow-Origin: *\r\n");
+        resp.push_str("Content-Length: 0\r\nConnection: keep-alive\r\n\r\n");
+        let _ = write.write_all(resp.as_bytes());
+        if h2.is_none() && alive {
+            return Served::Again(read, write, prefix);
+        }
+        return Served::Closed;
     }
 
     let pad_ok = match extract_padding(head, target, settings) {
@@ -1369,7 +1470,7 @@ pub(crate) fn accept_core<
     };
     if !pad_ok {
         emit_400(&mut write);
-        return None;
+        return Served::Closed;
     }
 
     let (sid, seq) = extract_meta(head, target, settings);
@@ -1380,14 +1481,17 @@ pub(crate) fn accept_core<
                 && !matches!(settings.mode, XhttpMode::StreamOne | XhttpMode::StreamUp)
             {
                 emit_400(&mut write);
-                return None;
+                return Served::Closed;
             }
             if method == "GET" {
                 sse_ok(&mut write, settings, &padded);
                 let writer = writer_for(write, h2);
                 let session = get_or_create_session("__none__");
                 session.state.lock().expect("session lock").ended = true;
-                return Some((Box::new(SessionReader::new(session, String::new())), writer));
+                return Served::Session(
+                    Box::new(SessionReader::new(session, String::new())),
+                    writer,
+                );
             }
             if method == settings.uplink_method.as_str() {
                 if h2.is_none()
@@ -1395,7 +1499,7 @@ pub(crate) fn accept_core<
                         .is_some_and(has_chunked)
                 {
                     emit_400(&mut write);
-                    return None;
+                    return Served::Closed;
                 }
                 sse_ok(&mut write, settings, &padded);
                 let reader: Box<dyn Read + Send> = if h2.is_some() {
@@ -1411,34 +1515,34 @@ pub(crate) fn accept_core<
                     })
                 };
                 let writer = writer_for(write, h2);
-                return Some((reader, writer));
+                return Served::Session(reader, writer);
             }
             emit_405(&mut write);
-            None
+            Served::Closed
         }
         (Some(sid), None) => {
             if method == "GET" {
                 if settings.mode == XhttpMode::StreamOne {
                     emit_400(&mut write);
-                    return None;
+                    return Served::Closed;
                 }
                 let session = bound_session(sid, h2.as_ref());
                 sse_ok(&mut write, settings, &padded);
                 let writer = writer_for(write, h2);
-                return Some((
+                return Served::Session(
                     Box::new(SessionReader::new(session, sid.to_owned())),
                     writer,
-                ));
+                );
             }
             if settings.mode != XhttpMode::StreamUp {
                 emit_400(&mut write);
-                return None;
+                return Served::Closed;
             }
             if !crate::proxy::header_value(head, "transfer-encoding").is_some_and(has_chunked)
                 && h2.is_none()
             {
                 emit_400(&mut write);
-                return None;
+                return Served::Closed;
             }
             let session = bound_session(sid, h2.as_ref());
             if h2.is_some() {
@@ -1455,18 +1559,61 @@ pub(crate) fn accept_core<
             }
             plain_ok(&mut write, settings, &padded);
             session.wait_ended();
-            None
+            Served::Closed
         }
         (Some(sid), Some(seq)) => {
             if settings.mode != XhttpMode::PacketUp {
                 emit_400(&mut write);
-                return None;
+                return Served::Closed;
             }
             let Ok(seq_num) = seq.parse::<u64>() else {
                 emit_500(&mut write);
-                return None;
+                return Served::Closed;
             };
             let session = bound_session(sid, h2.as_ref());
+            // The body arrives whatever the placement carries the packet in: an unread one would leave the next request's head sitting in its bytes.
+            let mut body = Vec::new();
+            let mut carry = Vec::new();
+            let mut resumable = true;
+            if let Some(n) = content_length(head) {
+                if n > settings.sc_max_each_post {
+                    emit_413(&mut write);
+                    return Served::Closed;
+                }
+                let Some((buf, pre)) = read_body(&mut read, &prefix, n) else {
+                    return Served::Closed;
+                };
+                carry = prefix[pre..].to_vec();
+                body = buf;
+            } else if crate::proxy::header_value(head, "transfer-encoding").is_some_and(has_chunked)
+            {
+                // A chunked body leaves no length behind that the next request's head could be found after.
+                resumable = false;
+                let mut chain = ChainReader::new(prefix, &mut read);
+                let drained = if h2.is_some() {
+                    drain_body(&mut chain, settings.sc_max_each_post)
+                } else {
+                    let mut framed = Reader {
+                        read: &mut chain,
+                        prefix: Vec::new(),
+                        at: 0,
+                        left: 0,
+                        ended: false,
+                        reads: 0,
+                    };
+                    drain_body(&mut framed, settings.sc_max_each_post)
+                };
+                match drained {
+                    Drained::Done(buf) => body = buf,
+                    Drained::Over => {
+                        emit_413(&mut write);
+                        return Served::Closed;
+                    }
+                    Drained::Broken => return Served::Closed,
+                }
+            } else {
+                carry = prefix;
+            }
             let payload = match settings.uplink_data_placement {
                 Placement::Header => {
                     let key = if settings.uplink_data_key.is_empty() {
@@ -1498,102 +1645,31 @@ pub(crate) fn accept_core<
                     }
                     b64_url_decode(&joined)
                 }
-                _ => {
-                    if let Some(n) = content_length(head) {
-                        if n > settings.sc_max_each_post {
-                            emit_413(&mut write);
-                            return None;
-                        }
-                        let mut buf = vec![0u8; n];
-                        let pre = prefix.len().min(n);
-                        buf[..pre].copy_from_slice(&prefix[..pre]);
-                        let mut at = pre;
-                        while at < n {
-                            match read.read(&mut buf[at..]) {
-                                Ok(0) => break,
-                                Ok(r) => at += r,
-                                Err(_) => return None,
-                            }
-                        }
-                        if at < n {
-                            None
-                        } else {
-                            Some(buf)
-                        }
-                    } else if crate::proxy::header_value(head, "transfer-encoding")
-                        .is_some_and(has_chunked)
-                    {
-                        let mut payload = Vec::new();
-                        let mut tmp = [0u8; 8192];
-                        if h2.is_some() {
-                            let mut read = read;
-                            let mut pre = &prefix[..];
-                            while !pre.is_empty() {
-                                payload.extend_from_slice(pre);
-                                pre = &[];
-                            }
-                            loop {
-                                match read.read(&mut tmp) {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        payload.extend_from_slice(&tmp[..n]);
-                                        if payload.len() > settings.sc_max_each_post {
-                                            emit_413(&mut write);
-                                            return None;
-                                        }
-                                    }
-                                    Err(_) => return None,
-                                }
-                            }
-                        } else {
-                            let mut reader = Reader {
-                                read,
-                                prefix,
-                                at: 0,
-                                left: 0,
-                                ended: false,
-                                reads: 0,
-                            };
-                            loop {
-                                match reader.read(&mut tmp) {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        payload.extend_from_slice(&tmp[..n]);
-                                        if payload.len() > settings.sc_max_each_post {
-                                            emit_413(&mut write);
-                                            return None;
-                                        }
-                                    }
-                                    Err(_) => return None,
-                                }
-                            }
-                        }
-                        Some(payload)
-                    } else {
-                        Some(Vec::new())
-                    }
-                }
+                _ => Some(body),
             };
             let Some(payload) = payload else {
                 emit_400(&mut write);
-                return None;
+                return Served::Closed;
             };
             if payload.len() > settings.sc_max_each_post {
                 emit_413(&mut write);
-                return None;
+                return Served::Closed;
             }
             if !session.push_packet(seq_num, payload, settings.sc_max_buffered) {
                 // A refused packet is a lost one — the reader waits on strict sequence — so the session is over; keeping it alive would park its reader on a sequence that can never arrive.
                 end_session(sid);
                 emit_500(&mut write);
-                return None;
+                return Served::Closed;
             }
             plain_ok(&mut write, settings, &padded);
-            None
+            if resumable && h2.is_none() && keeps_alive(head) {
+                return Served::Again(read, write, carry);
+            }
+            Served::Closed
         }
         (None, Some(_)) => {
             emit_405(&mut write);
-            None
+            Served::Closed
         }
     }
 }
@@ -2147,7 +2223,7 @@ mod tests {
         }
     }
 
-    /// The status a hub answers a head with. `accept_core` writes a refusal and returns `None`, and writes 200 and returns the pair when it serves, so the bytes it wrote answer either way.
+    /// The status a hub answers a head with. `accept_core` writes a refusal and ends the connection, and writes 200 and returns the pair when it serves, so the bytes it wrote answer either way.
     fn status_through_core(head: &str, settings: &XhttpSettings) -> u16 {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let _ = accept_core(
@@ -2330,15 +2406,17 @@ mod tests {
         );
         let seen = Arc::new(Mutex::new(Vec::new()));
         assert!(
-            accept_core(
-                head.as_bytes(),
-                Vec::new(),
-                std::io::Cursor::new(vec![30u8]),
-                Sink(Arc::clone(&seen)),
-                &settings,
-                None,
-            )
-            .is_none(),
+            matches!(
+                accept_core(
+                    head.as_bytes(),
+                    Vec::new(),
+                    std::io::Cursor::new(vec![30u8]),
+                    Sink(Arc::clone(&seen)),
+                    &settings,
+                    None,
+                ),
+                Served::Closed
+            ),
             "a refused packet must not hand the caller a session to read"
         );
         let answered = String::from_utf8(seen.lock().expect("sink").clone())
@@ -2351,6 +2429,70 @@ mod tests {
             !session_is_carried("overflowed"),
             "the overflowed session stayed alive with its parked reader"
         );
+    }
+
+    /// A packet-up uplink is one POST per `scMaxEachPostBytes`, not one per TCP connection: the reference hub answers a request and waits for the next on the same socket (`hub.go:562` sets a 4 s read-header timeout, it does not close). Answering once and dropping the connection costs a handshake per 4 KiB of uplink.
+    #[test]
+    fn one_connection_carries_the_packet_up_uplink() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/up", "mode": "packet-up"}}}"#,
+        );
+        let referer = "http://127.0.0.1/up?x_padding=".to_owned() + &"X".repeat(500);
+        let post = |seq: u64, body: &str| {
+            format!(
+                "POST /up/wire/{seq} HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n{body}",
+                body.len()
+            )
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let served = accept_split_with_settings(
+            std::io::Cursor::new(format!("{}{}", post(0, "ping"), post(1, "pong")).into_bytes()),
+            Sink(Arc::clone(&seen)),
+            &settings,
+        );
+        let text = String::from_utf8(seen.lock().expect("sink").clone()).unwrap_or_default();
+        assert_eq!(
+            text.matches("HTTP/1.1 200 OK").count(),
+            2,
+            "the second post arrived on a connection the first one closed"
+        );
+        assert!(
+            served.is_none(),
+            "an uplink with nothing left to read owns no session"
+        );
+        let mut reader = SessionReader::new(get_or_create_session("wire"), "wire".to_owned());
+        let mut buf = [0u8; 4];
+        reader.read_exact(&mut buf).expect("the first packet");
+        assert_eq!(&buf, b"ping", "the first post reached no session");
+        reader.read_exact(&mut buf).expect("the second packet");
+        assert_eq!(&buf, b"pong", "the second post reached no session");
+    }
+
+    /// A `Connection: close` request ends the reuse: the hub answers it and lets the socket go, so a client that asked for one request per connection never waits on a half-open one.
+    #[test]
+    fn a_request_that_says_close_takes_the_connection_with_it() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/up", "mode": "packet-up"}}}"#,
+        );
+        let referer = "http://127.0.0.1/up?x_padding=".to_owned() + &"X".repeat(500);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let served = accept_split_with_settings(
+            std::io::Cursor::new(
+                format!(
+                    "POST /up/farewell/0 HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\nContent-Length: 4\r\nConnection: close\r\n\r\npingPOST /up/farewell/1 HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\nContent-Length: 4\r\n\r\npong"
+                )
+                .into_bytes(),
+            ),
+            Sink(Arc::clone(&seen)),
+            &settings,
+        );
+        let text = String::from_utf8(seen.lock().expect("sink").clone()).unwrap_or_default();
+        assert_eq!(
+            text.matches("HTTP/1.1 200 OK").count(),
+            1,
+            "a request that asked to close left the next one unanswered"
+        );
+        assert!(served.is_none(), "the closed request owned no session");
     }
 
     #[test]
