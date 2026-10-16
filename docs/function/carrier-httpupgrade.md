@@ -17,6 +17,32 @@ same fix; sing-box's httpupgrade server instead does `buf.NewSize(reader.Buffere
 plus a `ReadFullFrom` to preserve its coalesced bytes, which spends an
 allocation to achieve the same thing.
 
+## The teardown
+
+The other thing worth writing down is what happens when a served connection ends.
+`?ed` exists so the client can ride payload in ahead of the `101`, which means a
+served connection routinely holds received bytes nobody has read — every exit after
+the `101` (decode refused, id refused, no uplink) reads the head and never touches
+them. A socket whose last handle closes with received bytes unread is answered with
+an RST, and an RST makes the peer discard whatever it has not read yet, including the
+`101` written a moment earlier.
+
+That is the whole of the Windows failure this lane used to carry:
+`a_configured_budget_serves_the_bare_path` was red there and green here, because
+macOS delivers the already-buffered `101` and reports the reset on the *next* read,
+while Windows discards it. `quiet` drains the pending bytes before the close with one
+4 KiB scratch: **one** read when nothing is pending (it ends on the `SESSION_POLL`
+timeout), at most `HEAD_LIMIT / 4096` = **16** reads when a peer keeps talking, so the
+close is a FIN and the answer stands. The bound is deliberate — an unbounded drain
+would let a chatty peer postpone the teardown forever.
+
+The checker is `a_drained_teardown_ends_the_upgrade_with_a_fin`, witnessed on this
+machine: with the drain disabled it fails 3/3 with
+`Os { code: 54, kind: ConnectionReset }`; with it the read ends in EOF. The bare-path
+test cannot gate this — it passes on macOS either way — so it was retargeted to the
+teardown production actually has (`quiet`, then drop) rather than a shape only the test
+uses.
+
 ## Data path
 
 ```mermaid
@@ -27,6 +53,8 @@ graph TD
     P --> X["UpReader: drain the prefix,<br/>then delegate"]
     X --> B["inner socket: bytes in, bytes out"]
     B --> Z["0 framing bytes added<br/>1 copy per byte, the relay's own"]
+    Z --> Q["teardown: `quiet` drains what is pending<br/>4 KiB per read, bounded by `HEAD_LIMIT`"]
+    Q --> F["close sends FIN, so the peer keeps the `101`"]
 ```
 
 ## Measured
@@ -89,8 +117,14 @@ skips that empty line, which the fanout reached only after returning first, and
 `check_response_accepts_and_refuses_the_vectors_it_did` hold the vectors.
 
 Nothing removed on the parse path beyond the branch and the fanout above, which
-is the point. What is recorded here is that, and which two claims about this
-carrier are false:
+is the point. What is recorded here is that, that the teardown *gains* one read
+syscall (16 at the cap) to buy the FIN, and which three claims about this carrier
+are false:
+
+- Only the **served** role drains. The dial side of this carrier leaves the same
+  hazard at its exits (`dial_vless`'s `Rung::HttpUpgrade`, and the VMess, Trojan and
+  Shadowsocks httpupgrade dials), where a tunnel that ends while the server's tail is
+  unread still closes over an RST. Not fixed here, and not claimed.
 
 - Xray's `transport/internet/httpupgrade/connection.go` is a 19-line
   pass-through over `net.Conn` with no framing and no data-path allocations —
