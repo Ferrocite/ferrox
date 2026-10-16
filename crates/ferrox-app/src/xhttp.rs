@@ -1605,8 +1605,12 @@ pub(crate) fn accept_core<
                         settings.uplink_data_key.clone()
                     };
                     let mut joined = String::new();
+                    // One reusable name buffer, so the loop does not hand a fresh allocation to every part — and the final miss that only ends the run costs nothing.
+                    let mut name = String::with_capacity(key.len() + 4);
                     for i in 0.. {
-                        match crate::proxy::header_value(head, &format!("{key}-{i}")) {
+                        name.clear();
+                        let _ = write!(name, "{key}-{i}");
+                        match crate::proxy::header_value(head, &name) {
                             Some(v) => joined.push_str(v),
                             None => break,
                         }
@@ -1620,8 +1624,12 @@ pub(crate) fn accept_core<
                         settings.uplink_data_key.clone()
                     };
                     let mut joined = String::new();
+                    // One reusable name buffer, so the loop does not hand a fresh allocation to every part — and the final miss that only ends the run costs nothing.
+                    let mut name = String::with_capacity(key.len() + 4);
                     for i in 0.. {
-                        match header_cookie(head, &format!("{key}_{i}")) {
+                        name.clear();
+                        let _ = write!(name, "{key}_{i}");
+                        match header_cookie(head, &name) {
                             Some(v) => joined.push_str(v),
                             None => break,
                         }
