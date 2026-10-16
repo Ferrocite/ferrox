@@ -28,6 +28,26 @@ read without moving them, and the dead prefix is reclaimed before the next body
 is appended, which is what keeps one buffer enough. There is no second buffer to
 stage into and no backlog to join one to.
 
+One listener serves both methods the service defines. `rpc Tun` streams a `Hunk`
+— one `bytes Data = 1` — and `rpc TunMulti` streams a `MultiHunk`, whose field 1
+is `repeated bytes`, so one message carries the batch a writer's `WriteMultiBuffer`
+holds: Xray's server reads the echo through a `readv` reader that doubles up to
+eight 8 KiB buffers and puts one element per buffer into a single message
+(`transport/internet/grpc/encoding/multiconn.go:115-134`). A served call's method
+is the `:path` it used — the configured path, or the same path with `TunMulti` for
+the last segment — because the two shapes cannot share a decoder: a `MultiHunk`
+read as a `Hunk` hands the caller only the last element of every message, which is
+a silent truncation rather than an error. The mode is the caller's choice, not the
+listener's, the way Xray's hub registers both handlers from one config
+(`transport/internet/grpc/hub.go:124`). In multi mode the cursor stops being
+per-message and becomes per-element: an element's own bytes end exactly where the
+next element's key begins, so a batch is delivered from the one message buffer in
+order, element by element, with no staging move — `8` on the batched row is eight
+8 KiB elements arriving from two messages, and its `0` is the same `staged` counter
+the single-mode rows use. What is not here: this lane still writes one element per
+message, and an outbound dialled with `grpcSettings.multiMode` still asks for
+`Tun`, so the batching win is only on the side that receives it.
+
 ## Data path
 
 ```mermaid
@@ -40,7 +60,9 @@ graph TD
     F --> G{"compressed?"}
     G -- no --> H["parsed where it landed,<br/>0 staging copies"]
     G -- yes --> I["inflate, the rare path"]
-    H --> J["the one message buffer,<br/>cursor-skipped and reclaimed in place"]
+    H --> M{"which method<br/>did this call use?"}
+    M -- "Tun: one Hunk" --> J
+    M -- "TunMulti: a batch, cursor-stopped per element" --> J["the one message buffer,<br/>cursor-skipped and reclaimed in place"]
     J --> K["1 copy into the caller's buffer"]
 ```
 
@@ -57,6 +79,8 @@ graph TD
 | window-update-writes-per-data-frame | 1 | ferrox-app-grpc::tests::a_credit_grants_both_windows_in_one_write |
 | window-update-frames-per-data-frame | 2 | ferrox-app-grpc::tests::a_credit_grants_both_windows_in_one_write |
 | message-buffer-reallocations-per-same-sized-frame | 0 | ferrox-app-grpc::tests::the_message_buffer_is_reused_not_reallocated |
+| batched-elements-served-per-message | 8 | ferrox-app-grpc::tests::a_batched_downlink_arrives_element_by_element |
+| grpc-methods-served-per-listener | 2 | ferrox-app-grpc::tests::one_listener_serves_both_methods |
 <!-- counts:end -->
 
 `payload-staging-copies-per-byte-read` is the reader's own `staged` counter, the
@@ -69,8 +93,15 @@ parser steps over the byte and the frame's length drops the tail, so nothing
 moves; a second padded test cuts a pad byte into a message the frame before had
 started and shows the counter at `5`, the move that shape still pays. The two
 window rows come from one test: the two `WINDOW_UPDATE` frames a credit grants
-are the peer's bytes exactly as before, and they now leave in a single write.
-None of those numbers is a duration, and `## Time` says why.
+are the peer's bytes exactly as before, and they now leave in a single write. The
+batched row counts the elements one `TunMulti` message hands over before the
+caller sees a gap: eight 8 KiB elements in two messages, each element delivered
+from where it lay, so the row's `0` is the same `staged` counter and the eight
+8 KiB runs are the assertion that no element was dropped or reordered — the
+failure `hunk_decode` would give is the last element of each message and nothing
+else. The methods row is served from a scripted wire: `Tun` with a `Hunk`,
+`TunMulti` with a batch, and a third path that is neither and is refused. None of
+those numbers is a duration, and `## Time` says why.
 
 ## Ops
 
@@ -167,6 +198,7 @@ unreturned — conservative, and never taken back.
 | what | where |
 | --- | --- |
 | `Hunk` encoding, per-write allocation, 32 KiB bufWriter | `upstream/xray-core/transport/internet/grpc/encoding/` |
+| `MultiHunk{repeated bytes}`, `WriteMultiBuffer` batching into one message | `upstream/xray-core/transport/internet/grpc/encoding/multiconn.go` |
 | `copy(b, hunk.Data)`, per-write protobuf marshal | `upstream/sing-box` → `transport/v2raygrpc/conn.go` |
 | one in-place assembly, `advance` instead of `drain` | `upstream/zeronet/crates/zero-transport/src/grpc.rs` |
 

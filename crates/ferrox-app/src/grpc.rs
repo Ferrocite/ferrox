@@ -66,6 +66,15 @@ fn take_window(shared: &Shared, need: u64) -> bool {
     true
 }
 
+/// Which of the service's two methods a call used, and so what shape its messages have.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Method {
+    /// `rpc Tun`: one `Hunk` per message, one payload in each.
+    Hunk,
+    /// `rpc TunMulti`: one `MultiHunk` per message, a batch of elements in each.
+    MultiHunk,
+}
+
 #[derive(Debug)]
 pub(crate) struct GrpcReader<R: Read = TcpStream> {
     read: R,
@@ -74,6 +83,10 @@ pub(crate) struct GrpcReader<R: Read = TcpStream> {
     stream: u32,
     server: bool,
     path: String,
+    /// The same call with the multi-mode stream name: one listener serves both methods, the way Xray's hub registers `Tun` and `TunMulti` from one config.
+    multi_path: String,
+    /// The method this call used, read off its `:path`, because the two shapes cannot share a decoder.
+    method: Method,
     answered: bool,
     head: Vec<u8>,
     head_id: u32,
@@ -213,14 +226,21 @@ impl<R: Read> GrpcReader<R> {
             }
             return Some(());
         }
-        let ok = Self::find(headers, ":method") == Some(b"POST".as_slice())
-            && Self::find(headers, ":path") == Some(self.path.as_bytes())
+        let path = Self::find(headers, ":path");
+        let multi = path == Some(self.multi_path.as_bytes());
+        let ok = (multi || path == Some(self.path.as_bytes()))
+            && Self::find(headers, ":method") == Some(b"POST".as_slice())
             && Self::find(headers, "content-type")
                 .is_some_and(|v| v.starts_with(b"application/grpc"));
         if !ok {
             self.refuse(id);
             return None;
         }
+        self.method = if multi {
+            Method::MultiHunk
+        } else {
+            Method::Hunk
+        };
         let block = block_encode(&[
             (":status", "200"),
             ("content-type", "application/grpc"),
@@ -340,6 +360,10 @@ impl<R: Read> GrpcReader<R> {
                 return Some(());
             }
             if self.msg_at < self.msg_end {
+                if self.method == Method::MultiHunk {
+                    self.next_element()?;
+                    continue;
+                }
                 self.msg_at = self.msg_end;
             }
             let live = &self.msg[self.msg_at..];
@@ -356,10 +380,47 @@ impl<R: Read> GrpcReader<R> {
             if live.len() < 5 + len {
                 return Some(());
             }
+            let body = self.msg_at + 5;
+            self.msg_end = body + len;
+            if self.method == Method::MultiHunk {
+                self.msg_at = body;
+                self.next_element()?;
+                continue;
+            }
             let (at, payload) = hunk_decode(&live[5..5 + len])?;
-            self.msg_end = self.msg_at + 5 + len;
-            self.msg_at += 5 + at;
+            self.msg_at = body + at;
             self.pay_end = self.msg_at + payload.len();
+        }
+    }
+
+    /// The next element of the `MultiHunk` the cursor sits in: `repeated bytes` means an element's own bytes end exactly where the next element's key begins, so a batch is handed out where it lies and the cursor only leaves the message when it has no element left.
+    fn next_element(&mut self) -> Option<()> {
+        let end = self.msg_end;
+        let mut at = self.msg_at;
+        loop {
+            if at >= end {
+                self.msg_at = end;
+                return Some(());
+            }
+            let key = read_varint(&self.msg, &mut at)?;
+            let field = (key >> 3) as u32;
+            let wire = (key & 0x07) as u8;
+            if field == 0 {
+                return None;
+            }
+            if field != 1 || wire != 2 {
+                skip_field(&self.msg, &mut at, wire)?;
+                continue;
+            }
+            let len = usize::try_from(read_varint(&self.msg, &mut at)?).ok()?;
+            let start = at;
+            let stop = start.checked_add(len)?;
+            if stop > end {
+                return None;
+            }
+            self.msg_at = start;
+            self.pay_end = stop;
+            return Some(());
         }
     }
 
@@ -707,6 +768,14 @@ fn new_shared(write: Box<dyn crate::proxy::FrameWrite + Send>) -> Arc<Shared> {
     })
 }
 
+/// The `TunMulti` peer of a configured path: the same service prefix, the multi-mode stream name, the way Xray derives both names from one service name.
+fn multi_path(path: &str) -> String {
+    match path.rfind('/') {
+        Some(at) => format!("{}TunMulti", &path[..=at]),
+        None => "TunMulti".to_owned(),
+    }
+}
+
 fn new_reader<R: Read>(
     read: R,
     shared: Arc<Shared>,
@@ -721,6 +790,8 @@ fn new_reader<R: Read>(
         stream,
         server,
         path: path.to_owned(),
+        multi_path: multi_path(path),
+        method: Method::Hunk,
         answered: false,
         head: Vec::new(),
         head_id: 0,
@@ -936,6 +1007,139 @@ mod tests {
         let mut body = prefix[..plen].to_vec();
         body.extend_from_slice(payload);
         body
+    }
+
+    /// One gRPC message carrying a `MultiHunk`: field 1 is `repeated bytes`, so each element is a tag, its own varint length and its bytes, in order.
+    fn multi_message(elements: &[&[u8]]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for element in elements {
+            body.push(0x0A);
+            push_varint(&mut body, element.len() as u64);
+            body.extend_from_slice(element);
+        }
+        let mut out = vec![0u8];
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        out.extend_from_slice(&body);
+        out
+    }
+
+    /// The served side of a call over a scripted wire: the preface, the HEADERS that open it, then its DATA frames.
+    fn served(
+        path: &str,
+        frames: &[(u8, Vec<u8>)],
+    ) -> Option<GrpcReader<std::io::Cursor<Vec<u8>>>> {
+        let mut wire = MAGIC.to_vec();
+        wire.extend_from_slice(&frame(
+            T_HEADERS,
+            F_END_HEADERS,
+            1,
+            &block_encode(&[
+                (":method", "POST"),
+                (":path", path),
+                ("content-type", "application/grpc"),
+            ]),
+        ));
+        for (flags, body) in frames {
+            wire.extend_from_slice(&frame(T_DATA, *flags, 1, body));
+        }
+        let (reader, writer) = accept_split(
+            std::io::Cursor::new(wire),
+            Sink::default(),
+            "/TunnelService/Tun",
+        )?;
+        drop(writer);
+        Some(reader)
+    }
+
+    /// Everything the caller is handed, and the bytes the reader moved for itself to hand it.
+    fn drain_all(reader: &mut GrpcReader<std::io::Cursor<Vec<u8>>>) -> (Vec<u8>, usize) {
+        let mut got = Vec::new();
+        let mut buf = [0u8; 3000];
+        loop {
+            let n = reader.read(&mut buf).expect("reads");
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        (got, reader.staged)
+    }
+
+    /// The two methods cannot share a decoder: a `MultiHunk` read as a `Hunk` hands the caller only the last element of every message, which is the silent truncation the served mode exists to refuse.
+    #[test]
+    fn a_multi_message_hands_every_element_in_order() {
+        let batch = multi_message(&[b"ab", b"cdef", b"", b"g"]);
+        for (name, frames, want) in [
+            (
+                "one message, four elements",
+                vec![(F_END, batch.clone())],
+                b"abcdefg".to_vec(),
+            ),
+            (
+                "two messages, two elements each",
+                vec![
+                    (0, multi_message(&[b"ab", b"c"])),
+                    (F_END, multi_message(&[b"d", b"ef"])),
+                ],
+                b"abcdef".to_vec(),
+            ),
+            (
+                "one element cut across frames",
+                vec![(0, batch[..11].to_vec()), (F_END, batch[11..].to_vec())],
+                b"abcdefg".to_vec(),
+            ),
+        ] {
+            let mut multi = served("/TunnelService/TunMulti", &frames).expect("serves");
+            let (got, staged) = drain_all(&mut multi);
+            assert_eq!(got, want, "{name}");
+            assert_eq!(staged, 0, "{name} staged bytes for itself");
+        }
+        let mut blind = served("/TunnelService/Tun", &[(F_END, batch)]).expect("serves");
+        assert_eq!(
+            drain_all(&mut blind).0,
+            b"g".to_vec(),
+            "single mode takes the last element and drops the batch"
+        );
+        assert!(
+            served("/other/TunMulti", &[]).is_none(),
+            "a multi call on another service is refused"
+        );
+    }
+
+    /// The batch the reference server writes: eight `readv` buffers is its ceiling, so one message carries the set and the caller still gets every byte in order, unstaged.
+    #[test]
+    fn a_batched_downlink_arrives_element_by_element() {
+        let parts: Vec<Vec<u8>> = (0..8u8).map(|i| vec![b'a' + i; 8 * 1024]).collect();
+        let batch: Vec<&[u8]> = parts.iter().map(Vec::as_slice).collect();
+        let mut reader = served(
+            "/TunnelService/TunMulti",
+            &[
+                (0, multi_message(&batch[..4])),
+                (F_END, multi_message(&batch[4..])),
+            ],
+        )
+        .expect("serves");
+        let (got, staged) = drain_all(&mut reader);
+        assert_eq!(got, parts.concat(), "eight elements of 8 KiB, in order");
+        assert_eq!(staged, 0, "a batch is delivered where it lies");
+    }
+
+    /// The single-mode call is untouched by the second method, and a path that is neither is refused.
+    #[test]
+    fn one_listener_serves_both_methods() {
+        for (path, want) in [
+            ("/TunnelService/Tun", b"ping".to_vec()),
+            ("/TunnelService/TunMulti", b"pin".to_vec()),
+        ] {
+            let frames = if path.ends_with("Multi") {
+                vec![(F_END, multi_message(&[b"pi", b"n"]))]
+            } else {
+                vec![(F_END, message(b"ping"))]
+            };
+            let mut reader = served(path, &frames).expect("serves");
+            assert_eq!(drain_all(&mut reader).0, want, "{path}");
+        }
+        assert!(served("/TunnelService/TunExtra", &[]).is_none());
     }
 
     fn dial(frames: &[(u8, Vec<u8>)]) -> GrpcReader<std::io::Cursor<Vec<u8>>> {
