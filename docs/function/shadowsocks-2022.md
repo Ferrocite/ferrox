@@ -144,7 +144,9 @@ Read against the pinned implementations, all of which are in
   it. Nothing past a reported read escapes: the staging test seals through the
   uninitialised buffer, and the open-path tests refuse a short or damaged
   chunk without reading the unfilled rest. What retires is the memset per
-  flow, witnessed by the CI RSS matrix, not by a count row.
+  flow, witnessed by the CI RSS matrix, not by a count row. The UDP server's
+  two receive slots and its reply slot join them on the same shape: each is a
+  `recv_from` target whose reported prefix is all any path reads.
 
 What is **not** removed, and is named rather than claimed: `rc4-md5`,
 `aes-192-gcm`, `none` and the stream ciphers (`aes-*-ctr`, `aes-*-cfb`,

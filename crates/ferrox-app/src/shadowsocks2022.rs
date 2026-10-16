@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ferrox_core::shadowsocks2022::{self, Cipher, Method, BLOCK_LEN, MAX_CHUNK, TAG_LEN};
 
 use crate::budgets::RELAY_POLL;
-use crate::proxy::{push_addr, read_exact, UDP_BUF};
+use crate::proxy::{push_addr, read_exact};
 
 const READ_CHUNK: usize = 0x4000;
 const SKEW: u64 = 30;
@@ -1423,7 +1423,7 @@ pub(crate) fn serve_udp_relay(
         by_addr.insert(*addr, idx);
     }
     let mut client_of: HashMap<u64, SocketAddr> = HashMap::new();
-    let mut buf = vec![0u8; UDP_BUF];
+    let mut buf = crate::proxy::udp_buffer();
     loop {
         match clients.recv_from(&mut buf) {
             Ok((n, src)) => {
@@ -1486,8 +1486,8 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
     let mut table: HashMap<SocketAddr, SocketAddr> = HashMap::new();
     let mut users: HashMap<SocketAddr, usize> = HashMap::new();
     let mut sessions: HashMap<SocketAddr, u64> = HashMap::new();
-    let mut buf = vec![0u8; UDP_BUF];
-    let mut reply = vec![0u8; UDP_BUF];
+    let mut buf = crate::proxy::udp_buffer();
+    let mut reply = crate::proxy::udp_buffer();
     let mut datagrams = Datagrams::new();
     loop {
         match clients.recv_from(&mut buf) {
@@ -1995,7 +1995,7 @@ mod tests {
         let client_relay = relay_psk.clone();
         let client_dest = dest_psk.clone();
         thread::spawn(move || {
-            let mut buf = vec![0u8; UDP_BUF];
+            let mut buf = vec![0u8; crate::proxy::UDP_BUF];
             while let Ok((n, src)) = echo.recv_from(&mut buf) {
                 let _ = echo.send_to(&buf[..n], src);
             }
@@ -2017,7 +2017,7 @@ mod tests {
             .expect("seals")
             .to_vec();
         client.send_to(&packet, relay_addr).expect("sends");
-        let mut buf = vec![0u8; UDP_BUF];
+        let mut buf = vec![0u8; crate::proxy::UDP_BUF];
         let (n, _) = client.recv_from(&mut buf).expect("receives");
         let (_, payload) = datagrams
             .open_server(&client_dest, method, &buf[..n])

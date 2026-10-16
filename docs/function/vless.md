@@ -170,6 +170,24 @@ CI-only. No artefact from this branch has been read.
   `header_address_families_encode_stably` still fixes the encoded bytes for all
   three families.
 
+- **The UDP relay loops' zero fill.** Nineteen SOCKS-inbound loops in this file
+  and two in `shadowsocks2022.rs` (`serve_socks_udp_{freedom,foxy,foxy_ip,
+  vless,vless_xudp,vmess,trojan,shadowsocks2022}`, `serve_vless_udp`,
+  `pump_vmess_udp`, `serve_trojan_udp`, the three `spawn_*_udp_reader` loops,
+  `serve_udp_on`, `serve_udp_relay`) each calloc'd a 64 KiB `UDP_BUF` per flow
+  before the first datagram arrived. They now take `udp_buffer()`, which asks
+  for the bytes through `RelayBuf::with_len` without filling them; the fill is
+  the only difference, the shape `an_uninitialised_tail_is_allocated_but_not_
+  filled` measures. Nothing past a datagram escapes: every use is a `recv`
+  target followed by `&buf[..n]`, or an `&mut buf` handed to `read_udp_datagram`
+  / `read_trojan_datagram` / `pump_trojan_replies`, each of which `read_exact`s
+  or `recv_from`s only the length it reports. Syscalls, read granularity and the
+  datagram bytes are unchanged, which is what the exact-ops job holds steady;
+  what retires is the 64 KiB fill per flow, witnessed by the CI RSS matrix.
+  The handshake and small fixed buffers beside these loops stay zeroed, and the
+  KCP lanes' two receive buffers are untouched — that page still carries its own
+  argument for them.
+
 ## Rows that are dialled
 
 `security=reality` outbounds dial raw TCP and every carried carrier
