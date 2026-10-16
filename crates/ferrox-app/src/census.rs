@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::thread::ThreadId;
@@ -28,7 +29,8 @@ static LIVE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
 static NEXT: AtomicU64 = AtomicU64::new(0);
 
 fn live() -> MutexGuard<'static, Vec<Entry>> {
-    LIVE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    LIVE.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 /// One wait in progress; the census forgets it when this drops, which is the return, the timeout or the panic alike.
@@ -86,14 +88,13 @@ pub(crate) fn dump() -> String {
             Some(budget) => format!("{budget:?}"),
             None => "none".to_owned(),
         };
-        out.push_str(&format!(
-            "census thread {:?} name={} fd={} armed={} waited={}ms\n",
+        let _ = writeln!(
+            out,
+            "census thread {:?} name={} fd={fd} armed={armed} waited={}ms",
             entry.thread,
             entry.name,
-            fd,
-            armed,
             entry.started.elapsed().as_millis()
-        ));
+        );
     }
     out
 }

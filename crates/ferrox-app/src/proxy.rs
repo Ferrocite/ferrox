@@ -19462,13 +19462,16 @@ mod census_tests {
             let mut reader = reader;
             let mut sink = sink;
             let _ = reports.send((census::handle(&reader), census::handle(&sink)));
-            copy_all_memcpy(&mut reader, &mut sink)
+            copy_all_memcpy(&mut reader, &mut sink);
         });
         let leg_id = leg.thread().id();
         let (read_fd, write_fd) = reported
             .recv_timeout(PATIENCE)
             .expect("the leg reports both descriptors");
-        assert_ne!(read_fd, write_fd, "one descriptor for both legs proves nothing");
+        assert_ne!(
+            read_fd, write_fd,
+            "one descriptor for both legs proves nothing"
+        );
         let held = wait_for("relay-leg-read", leg_id);
         assert!(held.contains(&format!("fd={read_fd} ")), "{held}");
         // A raw relay leg holds no deadline at its wait: its caller restores `None`, so the census says none.
@@ -19494,7 +19497,8 @@ mod census_tests {
         // A leg through the shared relay half is a `dyn Read`, so no descriptor reaches its census line.
         assert!(held.contains("fd=none "), "{held}");
         thread::sleep(Duration::from_millis(30));
-        let held = census::held("tunnel-leg-read", leg_id).expect("the leg left the census while parked");
+        let held =
+            census::held("tunnel-leg-read", leg_id).expect("the leg left the census while parked");
         assert!(census::number(&held, "waited") >= 30, "{held}");
         drop(lift);
         leg.join().expect("joins").expect("reads");
@@ -19515,7 +19519,8 @@ mod census_tests {
         assert!(held.contains("armed=500ms "), "{held}");
         assert!(held.contains("fd=none "), "{held}");
         thread::sleep(Duration::from_millis(30));
-        let held = census::held("relay-join", waiter_id).expect("the join left the census while parked");
+        let held =
+            census::held("relay-join", waiter_id).expect("the join left the census while parked");
         assert!(census::number(&held, "waited") >= 30, "{held}");
         // A partner whose sender is gone hands back on its own, so the park ends before its budget.
         drop(handed);
