@@ -274,19 +274,26 @@ impl Rc4 {
             self.keystream(&mut block);
             fold_keystream(chunk, &block);
         }
-        if !tail.is_empty() {
-            self.keystream(&mut block[..tail.len()]);
-            fold_keystream(tail, &block[..tail.len()]);
+        for cell in &mut block[..tail.len()] {
+            *cell = self.next_byte();
         }
+        fold_keystream(tail, &block[..tail.len()]);
     }
 
-    fn keystream(&mut self, out: &mut [u8]) {
+    /// One PRGA step: three wrapping adds, two swaps and one table read.
+    fn next_byte(&mut self) -> u8 {
+        self.i = self.i.wrapping_add(1);
+        self.j = self.j.wrapping_add(self.s[usize::from(self.i)]);
+        self.s.swap(usize::from(self.i), usize::from(self.j));
+        let at = self.s[usize::from(self.i)].wrapping_add(self.s[usize::from(self.j)]);
+        self.s[usize::from(at)]
+    }
+
+    /// The fill over a fixed array: the step count is in the type, so the walk
+    /// of the state is straight-line code rather than a loop with its own trip.
+    fn keystream<const N: usize>(&mut self, out: &mut [u8; N]) {
         for cell in out.iter_mut() {
-            self.i = self.i.wrapping_add(1);
-            self.j = self.j.wrapping_add(self.s[usize::from(self.i)]);
-            self.s.swap(usize::from(self.i), usize::from(self.j));
-            let at = self.s[usize::from(self.i)].wrapping_add(self.s[usize::from(self.j)]);
-            *cell = self.s[usize::from(at)];
+            *cell = self.next_byte();
         }
     }
 }
