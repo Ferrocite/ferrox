@@ -19418,6 +19418,47 @@ mod poll_relay {
         )
     }
 
+    #[cfg(test)]
+    static PUMP: [std::sync::atomic::AtomicU64; 3] = [
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+        std::sync::atomic::AtomicU64::new(0),
+    ];
+
+    /// Direction wakes, of which those reporting `POLLIN`, and ingest splices that found no
+    /// pipe slot while the pipe still held bytes with byte room left. Probe only.
+    #[cfg(test)]
+    pub(crate) fn pump_counts() -> (u64, u64, u64) {
+        (
+            PUMP[0].load(Ordering::Relaxed),
+            PUMP[1].load(Ordering::Relaxed),
+            PUMP[2].load(Ordering::Relaxed),
+        )
+    }
+
+    #[cfg(test)]
+    fn note_wake(revents: libc::c_short) {
+        PUMP[0].fetch_add(1, Ordering::Relaxed);
+        if revents & libc::POLLIN != 0 {
+            PUMP[2].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(test)]
+    fn note_idle_ingest(pending: usize, capacity: usize) {
+        if pending > 0 && pending < capacity {
+            PUMP[1].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn note_wake(_revents: libc::c_short) {}
+
+    #[cfg(not(test))]
+    #[inline]
+    fn note_idle_ingest(_pending: usize, _capacity: usize) {}
+
     /// A blocking socket parks the worker inside a splice when a wake arrives for a
     /// queue that has gone — `SPLICE_F_NONBLOCK` guards the pipe half only. `held` stops
     /// the descriptor being recycled under a restore that writes back the flags it found.
@@ -19513,9 +19554,12 @@ mod poll_relay {
                     self.pending += moved as usize;
                 } else if moved == 0 {
                     self.src_at_eof = true;
-                } else if !retryable() {
-                    self.end();
-                    return;
+                } else {
+                    note_idle_ingest(self.pending, pipe.capacity);
+                    if !retryable() {
+                        self.end();
+                        return;
+                    }
                 }
             }
             while self.pending > 0 {
@@ -19687,6 +19731,7 @@ mod poll_relay {
                     .get_mut(flow_index)
                     .and_then(|flow| flow.directions.get_mut(direction_index))
                 {
+                    note_wake(entry.revents);
                     direction.advance();
                 }
             }
@@ -20071,26 +20116,26 @@ mod relay_tests {
         let stalled_relay = thread::spawn(move || relay(&stalled_client, &stalled_target));
 
         thread::sleep(Duration::from_millis(150));
-        let before = pump_cpu_millis();
+        let (wake_before, idle_before, in_before) = poll_relay::pump_counts();
+        let cpu_before = pump_cpu_millis();
         thread::sleep(WINDOW);
-        let burned = pump_cpu_millis().saturating_sub(before);
+        let (wake_after, idle_after, in_after) = poll_relay::pump_counts();
+        let burned = pump_cpu_millis().saturating_sub(cpu_before);
 
         let _ = release.send(());
         let held = draining.join().expect("joins");
         let pushed = feeding.join().expect("joins");
         stalled_relay.join().expect("joins");
 
-        assert!(
-            burned < 100,
-            "the pump burned {burned} ms of cpu across a {} ms window in which no byte could \
-             move: a wake that moves nothing must not be re-armed",
-            WINDOW.as_millis(),
-        );
         assert_eq!(
-            held, pushed,
-            "the parked flow carried {} bytes of the {} its client wrote once its destination \
-             read again",
-            held, pushed
+            wake_after - wake_before,
+            u64::MAX,
+            "PROBE window={}ms wakes={} pollin={} idle_ingest={} cpu_ms={} pushed={pushed} held={held}",
+            WINDOW.as_millis(),
+            wake_after - wake_before,
+            in_after - in_before,
+            idle_after - idle_before,
+            burned
         );
     }
 
