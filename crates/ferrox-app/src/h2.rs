@@ -142,52 +142,57 @@ pub(crate) fn prefixed(block: &[u8], prefix: u8) -> Option<(usize, &[u8])> {
     }
 }
 
-pub(crate) fn string_decode(block: &[u8]) -> Option<(Vec<u8>, &[u8])> {
-    let huffman = block.first()? & 0x80 != 0;
-    let (len, mut rest) = prefixed(block, 7)?;
-    if rest.len() < len {
+/// The head of a literal string: whether it is Huffman-coded, the bytes it occupies, and where the block continues.
+fn literal(block: &[u8]) -> Option<(bool, &[u8], &[u8])> {
+    let coded = *block.first()? & 0x80 != 0;
+    let (len, rest) = prefixed(block, 7)?;
+    let raw = rest.get(..len)?;
+    Some((coded, raw, &rest[len..]))
+}
+
+/// One string as the field sees it: a raw literal is the block's own bytes, a Huffman one lands in the buffer the caller warmed. Either way the field borrows, so neither costs an allocation.
+fn string<'o, 'b: 'o>(block: &'b [u8], buf: &'o mut Vec<u8>) -> Option<(&'o [u8], &'b [u8])> {
+    let (coded, raw, rest) = literal(block)?;
+    if coded {
+        ferrox_core::foxy::hpack::huffman_decode(raw, buf)?;
+        return Some((buf, rest));
+    }
+    Some((raw, rest))
+}
+
+/// One string appended to the caller's buffer, whichever way it came: the copy is what the field's allocation used to be.
+fn append<'b>(block: &'b [u8], buf: &mut Vec<u8>) -> Option<&'b [u8]> {
+    let (coded, raw, rest) = literal(block)?;
+    if coded {
+        ferrox_core::foxy::hpack::huffman_decode(raw, buf)?;
+    } else {
+        buf.extend_from_slice(raw);
+    }
+    Some(rest)
+}
+
+/// What an index stands for, borrowed from the table that already holds it: the static table's `&'static str`, or the dynamic entry's own bytes. It reads the table rather than the decoder so an indexed name stays readable while a literal is filled.
+fn indexed(table: &VecDeque<(Vec<u8>, Vec<u8>)>, index: usize) -> Option<(&[u8], &[u8])> {
+    if index == 0 {
         return None;
     }
-    let (raw, tail) = rest.split_at(len);
-    rest = tail;
-    if huffman {
-        let mut out = Vec::new();
-        ferrox_core::foxy::hpack::huffman_decode(raw, &mut out)?;
-        Some((out, rest))
-    } else {
-        Some((raw.to_vec(), rest))
+    if index <= STATIC.len() {
+        let (name, value) = STATIC[index - 1];
+        return Some((name.as_bytes(), value.as_bytes()));
     }
+    let (name, value) = table.get(index - STATIC.len() - 1)?;
+    Some((&name[..], &value[..]))
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct Decoder {
     table: VecDeque<(Vec<u8>, Vec<u8>)>,
     size: usize,
+    name: Vec<u8>,
+    value: Vec<u8>,
 }
 
 impl Decoder {
-    fn entry(&self, index: usize) -> Option<(Vec<u8>, Vec<u8>)> {
-        if index == 0 {
-            return None;
-        }
-        if index <= STATIC.len() {
-            let (name, value) = STATIC[index - 1];
-            return Some((name.as_bytes().to_vec(), value.as_bytes().to_vec()));
-        }
-        self.table.get(index - STATIC.len() - 1).cloned()
-    }
-
-    fn named<'a>(&self, block: &'a [u8], index: usize) -> Option<(Vec<u8>, &'a [u8])> {
-        if index == 0 {
-            let (name, rest) = string_decode(block)?;
-            if name.is_empty() {
-                return None;
-            }
-            return Some((name, rest));
-        }
-        Some((self.entry(index)?.0, block))
-    }
-
     fn insert(&mut self, name: Vec<u8>, value: Vec<u8>) {
         self.size += 32 + name.len() + value.len();
         self.table.push_front((name, value));
@@ -199,23 +204,36 @@ impl Decoder {
         }
     }
 
+    /// Every field of a header block, in order, as borrowed bytes: an indexed field borrows its table entry and a plain literal borrows the block, so neither allocates nor copies; only a Huffman string and what the dynamic table keeps are owned. A refusal stops the block where the reference stops it.
     pub(crate) fn decode(
         &mut self,
         mut block: &[u8],
-        out: &mut Vec<(Vec<u8>, Vec<u8>)>,
+        field: &mut dyn FnMut(&[u8], &[u8]),
     ) -> Option<()> {
         while !block.is_empty() {
             let first = block[0];
             if first & 0x80 != 0 {
                 let (index, rest) = prefixed(block, 7)?;
-                out.push(self.entry(index)?);
+                let (name, value) = indexed(&self.table, index)?;
+                field(name, value);
                 block = rest;
             } else if first & 0x40 != 0 {
                 let (index, rest) = prefixed(block, 6)?;
-                let (name, rest) = self.named(rest, index)?;
-                let (value, rest) = string_decode(rest)?;
-                self.insert(name.clone(), value.clone());
-                out.push((name, value));
+                let mut name = Vec::new();
+                let mut value = Vec::new();
+                let rest = if index == 0 {
+                    let rest = append(rest, &mut name)?;
+                    if name.is_empty() {
+                        return None;
+                    }
+                    rest
+                } else {
+                    name.extend_from_slice(indexed(&self.table, index)?.0);
+                    rest
+                };
+                let rest = append(rest, &mut value)?;
+                field(&name, &value);
+                self.insert(name, value);
                 block = rest;
             } else if first & 0x20 != 0 {
                 let (max, rest) = prefixed(block, 5)?;
@@ -231,9 +249,19 @@ impl Decoder {
                 block = rest;
             } else {
                 let (index, rest) = prefixed(block, 4)?;
-                let (name, rest) = self.named(rest, index)?;
-                let (value, rest) = string_decode(rest)?;
-                out.push((name, value));
+                self.name.clear();
+                self.value.clear();
+                let (name, rest) = if index == 0 {
+                    let (name, rest) = string(rest, &mut self.name)?;
+                    if name.is_empty() {
+                        return None;
+                    }
+                    (name, rest)
+                } else {
+                    (indexed(&self.table, index)?.0, rest)
+                };
+                let (value, rest) = string(rest, &mut self.value)?;
+                field(name, value);
                 block = rest;
             }
         }
@@ -282,4 +310,92 @@ pub(crate) fn write_frame(
     head[4] = flags;
     head[5..9].copy_from_slice(&id.to_be_bytes());
     stream.write_slices(&[&head, body])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A field's offset into the block it was read from, witnessed by address rather than by bytes.
+    fn offset(block: &[u8], field: &[u8]) -> usize {
+        let range = block.as_ptr_range();
+        assert!(range.contains(&field.as_ptr()));
+        field.as_ptr() as usize - range.start as usize
+    }
+
+    #[test]
+    fn a_plain_field_borrows_the_block() {
+        let block = block_encode(&[("x-sid", "mux"), ("x-token", "abc")]);
+        let mut fields = Vec::new();
+        let mut decoder = Decoder::default();
+        decoder
+            .decode(&block, &mut |name, value| {
+                fields.push((offset(&block, name), offset(&block, value)));
+            })
+            .expect("decodes");
+        for (name, value) in [("x-sid", "mux"), ("x-token", "abc")] {
+            let (name_at, value_at) = fields.remove(0);
+            assert_eq!(&block[name_at..name_at + name.len()], name.as_bytes());
+            assert_eq!(&block[value_at..value_at + value.len()], value.as_bytes());
+        }
+    }
+
+    #[test]
+    fn an_indexed_field_borrows_the_table() {
+        // One insert of a fresh pair, then a static index and the index it just made: 0x3e is 62, the first dynamic entry.
+        let mut block = vec![0x40, 5, b'x', b'-', b's', b'i', b'd', 3, b'm', b'u', b'x'];
+        block.push(0x80 | 8);
+        block.push(0x80 | 0x3E);
+        let mut kept = Vec::new();
+        let mut status = false;
+        let mut decoder = Decoder::default();
+        decoder
+            .decode(&block, &mut |name, value| {
+                if name == b"x-sid" {
+                    kept.push((name.as_ptr(), value.as_ptr()));
+                } else {
+                    status = value == b"200";
+                }
+            })
+            .expect("decodes");
+        assert!(status);
+        // The pair the table keeps is the pair the consumer was handed, twice over: the insert costed no copy and the index costs no allocation.
+        assert_eq!(
+            kept,
+            vec![(decoder.table[0].0.as_ptr(), decoder.table[0].1.as_ptr()); 2]
+        );
+    }
+
+    #[test]
+    fn a_borrowed_block_leaves_the_scratch_alone() {
+        // Warm the decoder's buffers with a Huffman name, then read a block that borrows everything — one index, one plain literal: nothing may land in them.
+        let coded = [
+            0x00, 0x8C, 0xF1, 0xE3, 0xC2, 0xE5, 0xF2, 0x3A, 0x6B, 0xA0, 0xAB, 0x90, 0xF4, 0xFF,
+            0x03, b'm', b'u', b'x',
+        ];
+        let mut decoder = Decoder::default();
+        decoder.decode(&coded, &mut |_, _| {}).expect("decodes");
+        assert_eq!(decoder.name, b"www.example.com".to_vec());
+        let warm = (
+            decoder.name.as_ptr(),
+            decoder.name.capacity(),
+            decoder.value.capacity(),
+        );
+        let mut block = block_encode(&[("x-sid", "mux")]);
+        block.push(0x80 | 8);
+        let mut fields = 0;
+        decoder
+            .decode(&block, &mut |_, _| fields += 1)
+            .expect("decodes");
+        assert_eq!(fields, 2);
+        assert_eq!(
+            (
+                decoder.name.as_ptr(),
+                decoder.name.capacity(),
+                decoder.value.capacity()
+            ),
+            warm
+        );
+        assert!(decoder.name.is_empty() && decoder.value.is_empty());
+    }
 }

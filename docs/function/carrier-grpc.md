@@ -57,10 +57,12 @@ graph TD
     C --> D["HTTP/2 DATA frame,<br/>flow-control window applied"]
     D --> E(("wire"))
     E --> F["read the DATA body onto the end<br/>of the message buffer"]
+    E --> L["HEADERS block: every field<br/>handed over borrowed, 0 allocations"]
     F --> G{"compressed?"}
     G -- no --> H["parsed where it landed,<br/>0 staging copies"]
     G -- yes --> I["inflate, the rare path"]
     H --> M{"which method<br/>did this call use?"}
+    L --> M
     M -- "Tun: one Hunk" --> J
     M -- "TunMulti: a batch, cursor-stopped per element" --> J["the one message buffer,<br/>cursor-skipped and reclaimed in place"]
     J --> K["1 copy into the caller's buffer"]
@@ -81,6 +83,10 @@ graph TD
 | message-buffer-reallocations-per-same-sized-frame | 0 | ferrox-app-grpc::tests::the_message_buffer_is_reused_not_reallocated |
 | batched-elements-served-per-message | 8 | ferrox-app-grpc::tests::a_batched_downlink_arrives_element_by_element |
 | grpc-methods-served-per-listener | 2 | ferrox-app-grpc::tests::one_listener_serves_both_methods |
+| header-field-copies-per-head | 0 | ferrox-app-h2::tests::a_plain_field_borrows_the_block |
+| table-entry-copies-per-indexed-field | 0 | ferrox-app-h2::tests::an_indexed_field_borrows_the_table |
+| decoder-buffer-writes-per-borrowed-field | 0 | ferrox-app-h2::tests::a_borrowed_block_leaves_the_scratch_alone |
+| header-field-allocations-per-inserted-field | 2 | ferrox-app-h2::tests::an_indexed_field_borrows_the_table |
 <!-- counts:end -->
 
 `payload-staging-copies-per-byte-read` is the reader's own `staged` counter, the
@@ -100,8 +106,20 @@ from where it lay, so the row's `0` is the same `staged` counter and the eight
 8 KiB runs are the assertion that no element was dropped or reordered — the
 failure `hunk_decode` would give is the last element of each message and nothing
 else. The methods row is served from a scripted wire: `Tun` with a `Hunk`,
-`TunMulti` with a batch, and a third path that is neither and is refused. None of
-those numbers is a duration, and `## Time` says why.
+`TunMulti` with a batch, and a third path that is neither and is refused. The four
+header rows are the decoder handing a block's fields over borrowed rather than
+built: `header-field-copies-per-head` records the address every field arrives at
+and fails unless it lies inside the block the caller passed, at the offset where
+that field's own bytes are.
+`table-entry-copies-per-indexed-field` requires the pair a dynamic entry is and
+the pair the consumer was handed to be the same two addresses — once for the
+insert that made the entry, once for the index that names it afterwards.
+`decoder-buffer-writes-per-borrowed-field` warms the decoder's Huffman buffers,
+then reads a block of one index and one plain literal, and fails if either
+buffer's pointer or capacity moves or either ends the block holding bytes. The
+inserted row is the `2` those two allocations still cost: a name and a value the
+table keeps after the block is gone. None of those numbers is a duration, and
+`## Time` says why.
 
 ## Ops
 
@@ -175,6 +193,21 @@ until it is closed.
   write — the same two frames, in the same order, one write syscall fewer per
   DATA frame. What this leaves alone: `xhttp_h2`'s `replenish` credits the same
   pair as two frames over two writes, and its page owns that row.
+- **The pair per header field.** `Decoder::decode` used to answer with a
+  `Vec<(Vec<u8>, Vec<u8>)>`: a name and a value allocated for every field of
+  every block, which the consumer then read from and dropped. gRPC's `headers()`
+  built one to look up four fields — `:status`, `:path`, `:method`,
+  `content-type` — and xHTTP/H2's `open_stream` built one to take `:method` and
+  `:path` out of it and re-emit the rest as head lines. The block now walks
+  itself and hands each field to the visitor as it is read: an index gives up the
+  table's own entry, a plain literal gives up the block's own run, so a field
+  that is only read costs neither an allocation nor a copy. gRPC keeps four
+  `Option<bool>` judged as the fields pass, and xHTTP/H2 keeps the one head
+  buffer it was going to write anyway — sized for the bytes it carries, and its
+  page owns that row. What is not removed: the two allocations an inserted field
+  costs, because the dynamic table outlives the block, and one copy into the
+  decoder's warm buffer for a Huffman-coded string, which is what the
+  `## Measured` capacity gate is written against.
 
 What is **not** removed: HTTP/2's own framing. `T_DATA`, `T_HEADERS` and
 `T_SETTINGS`, HPACK and the flow-control window are the cost of the carrier,
