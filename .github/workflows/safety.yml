@@ -29,10 +29,14 @@ jobs:
             package: ferrox-core
             target: --lib
             filters: "poly1305::"
-          - shard: record-aead
+          - shard: aead-record
             package: ferrox-core
             target: --lib
-            filters: "record:: aead:: aesgcm::"
+            filters: "record:: aead::"
+          - shard: aesgcm
+            package: ferrox-core
+            target: --lib
+            filters: "aesgcm::"
           - shard: chacha
             package: ferrox-core
             target: --lib
