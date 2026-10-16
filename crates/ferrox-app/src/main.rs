@@ -1,4 +1,13 @@
+// The census is a test-shape instrument: here its call expands to nothing, so no shipped relay carries a map, a lock or a name.
+#[cfg(not(test))]
+macro_rules! census {
+    ($name:literal, $fd:expr, $armed:expr) => {};
+}
+
 mod budgets;
+#[cfg(test)]
+#[macro_use]
+mod census;
 mod config;
 mod foxy;
 mod foxy_account;

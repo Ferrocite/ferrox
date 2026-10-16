@@ -2132,6 +2132,7 @@ impl<T> Half<T> {
 
 impl<T: Read> Half<T> {
     fn read_once(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        census!("tunnel-leg-read", crate::census::NO_FD, None);
         let result = match self.inner.lock() {
             Ok(mut guard) => guard.read(buf),
             Err(_) => Err(std::io::Error::other("relay half poisoned")),
@@ -7229,6 +7230,7 @@ impl RelayPool {
 }
 
 fn join_within(direction: &std::sync::mpsc::Receiver<()>, budget: Duration) -> bool {
+    census!("relay-join", crate::census::NO_FD, Some(budget));
     match direction.recv_timeout(budget) {
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
             eprintln!(
@@ -7327,11 +7329,19 @@ fn copy_all(from: &mut TcpStream, to: &mut TcpStream) {
 fn copy_all_memcpy(from: &mut TcpStream, to: &mut TcpStream) {
     let mut buffer = RelayBuf::new();
     loop {
-        let n = match from.read(buffer.as_mut()) {
+        let read = {
+            census!("relay-leg-read", crate::census::handle(from), None);
+            from.read(buffer.as_mut())
+        };
+        let n = match read {
             Ok(0) | Err(_) => return,
             Ok(n) => n,
         };
-        if to.write_all(buffer.filled(n)).is_err() {
+        let written = {
+            census!("relay-leg-write", crate::census::handle(to), None);
+            to.write_all(buffer.filled(n))
+        };
+        if written.is_err() {
             return;
         }
     }
@@ -7381,6 +7391,7 @@ impl SplicePipe {
     }
 
     fn pull(&self, from: &mut TcpStream) -> std::io::Result<usize> {
+        census!("relay-leg-read", crate::census::handle(from), None);
         loop {
             let n = unsafe {
                 libc::splice(
@@ -7404,6 +7415,7 @@ impl SplicePipe {
     }
 
     fn push(&self, to: &mut TcpStream, n: usize) -> bool {
+        census!("relay-leg-write", crate::census::handle(to), None);
         let mut left = n;
         while left > 0 {
             let moved = unsafe {
@@ -19445,5 +19457,137 @@ mod foxy_exit_tests {
         assert!(!probes_reachable(&[None, None, None]));
         assert!(probes_reachable(&[None, Some(false)]));
         assert!(!probes_reachable(&[]));
+    }
+}
+
+#[cfg(test)]
+mod census_tests {
+    use super::*;
+    use crate::census;
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    const PATIENCE: Duration = Duration::from_secs(10);
+
+    /// A stream that answers nothing until its lift is dropped: the in-memory peer a census dump is taken against.
+    struct Silent {
+        until_lifted: mpsc::Receiver<()>,
+    }
+
+    impl Read for Silent {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            let _ = self.until_lifted.recv();
+            Ok(0)
+        }
+    }
+
+    /// The census line a parked thread's named wait holds, once it is there: registration happens on that thread, so a dump taken too early says nothing yet.
+    fn wait_for(name: &str, waiter: std::thread::ThreadId) -> String {
+        let until = Instant::now() + PATIENCE;
+        loop {
+            if let Some(found) = census::held(name, waiter) {
+                return found;
+            }
+            assert!(
+                Instant::now() < until,
+                "`{name}` never registered itself in the census:\n{}",
+                census::dump()
+            );
+            thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn a_parked_leg_read_names_the_descriptor_it_waits_on() {
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let back = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let back_port = back.local_addr().expect("addr").port();
+        let reader = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let sink = TcpStream::connect(("127.0.0.1", back_port)).expect("connects");
+        // Both peers stay open and say nothing, so the only progress a leg can make is its own bound.
+        let _silent_front = front.accept().map(|(stream, _)| stream).expect("accepts");
+        let _silent_back = back.accept().map(|(stream, _)| stream).expect("accepts");
+        reader
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("bounds the leg");
+        let (reports, reported) = mpsc::channel();
+        let leg = thread::spawn(move || {
+            let mut reader = reader;
+            let mut sink = sink;
+            let _ = reports.send((census::handle(&reader), census::handle(&sink)));
+            copy_all_memcpy(&mut reader, &mut sink);
+        });
+        let leg_id = leg.thread().id();
+        let (read_fd, write_fd) = reported
+            .recv_timeout(PATIENCE)
+            .expect("the leg reports both descriptors");
+        assert_ne!(
+            read_fd, write_fd,
+            "one descriptor for both legs proves nothing"
+        );
+        let held = wait_for("relay-leg-read", leg_id);
+        assert!(held.contains(&format!("fd={read_fd} ")), "{held}");
+        // A raw relay leg holds no deadline at its wait: its caller restores `None`, so the census says none.
+        assert!(held.contains("armed=none "), "{held}");
+        leg.join().expect("joins");
+        assert!(
+            census::held("relay-leg-read", leg_id).is_none(),
+            "a returned leg is still in the census:\n{}",
+            census::dump()
+        );
+    }
+
+    #[test]
+    fn a_parked_tunnel_leg_reports_the_time_it_has_waited() {
+        // Dropping the sender is what lifts the park, so the leg returns on its own.
+        let (lift, until_lifted) = mpsc::channel::<()>();
+        let leg = thread::spawn(move || {
+            let half = Half::new(Silent { until_lifted });
+            half.read_once(&mut [0u8; 16])
+        });
+        let leg_id = leg.thread().id();
+        let held = wait_for("tunnel-leg-read", leg_id);
+        // A leg through the shared relay half is a `dyn Read`, so no descriptor reaches its census line.
+        assert!(held.contains("fd=none "), "{held}");
+        thread::sleep(Duration::from_millis(30));
+        let held =
+            census::held("tunnel-leg-read", leg_id).expect("the leg left the census while parked");
+        assert!(census::number(&held, "waited") >= 30, "{held}");
+        drop(lift);
+        leg.join().expect("joins").expect("reads");
+        assert!(
+            census::held("tunnel-leg-read", leg_id).is_none(),
+            "a returned leg is still in the census:\n{}",
+            census::dump()
+        );
+    }
+
+    #[test]
+    fn a_parked_join_reports_the_budget_it_armed() {
+        let (handed, receiver) = mpsc::channel::<()>();
+        let budget = Duration::from_millis(500);
+        let waiter = thread::spawn(move || join_within(&receiver, budget));
+        let waiter_id = waiter.thread().id();
+        let held = wait_for("relay-join", waiter_id);
+        assert!(held.contains("armed=500ms "), "{held}");
+        assert!(held.contains("fd=none "), "{held}");
+        thread::sleep(Duration::from_millis(30));
+        let held =
+            census::held("relay-join", waiter_id).expect("the join left the census while parked");
+        assert!(census::number(&held, "waited") >= 30, "{held}");
+        // A partner whose sender is gone hands back on its own, so the park ends before its budget.
+        drop(handed);
+        assert!(
+            waiter.join().expect("joins"),
+            "a gone partner is not a finished flow"
+        );
+        assert!(
+            census::held("relay-join", waiter_id).is_none(),
+            "a returned join is still in the census:\n{}",
+            census::dump()
+        );
     }
 }
