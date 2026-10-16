@@ -13,6 +13,23 @@ pub const BOOTSTRAP_SEED: u64 = 20_260_902;
 
 pub const RSS_TOLERANCE: f64 = 0.05;
 
+/// Whether a run's cpu span is long enough for a per-GiB ratio to resolve: one tick of the sampler
+/// has to be a smaller change than the tolerance this harness decides at, or the row measures the
+/// tick rather than the engine.
+pub fn cpu_span_is_pricable(cpu_millis: u64) -> bool {
+    cpu_millis as f64 * TOLERANCE >= crate::parity::cpu_resolution_floor_millis() as f64
+}
+
+/// The shortest span [`cpu_span_is_pricable`] accepts, so a report can name it. Walked from the
+/// predicate rather than divided, so the printed number cannot disagree with the gate it describes.
+pub fn min_pricable_cpu_millis() -> u64 {
+    let mut millis = 0;
+    while !cpu_span_is_pricable(millis) {
+        millis += 1;
+    }
+    millis
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     Higher,
@@ -181,6 +198,8 @@ pub struct Row {
     pub interval: Option<Interval>,
     pub gates: bool,
     pub runner_blamed: bool,
+    /// A per-GiB row the workload prices no rate for; it reports, and says why it is not gated.
+    pub unpriced: bool,
 }
 
 impl Row {
@@ -195,6 +214,7 @@ impl Row {
             interval,
             gates: true,
             runner_blamed: false,
+            unpriced: false,
         }
     }
 
@@ -209,6 +229,18 @@ impl Row {
             interval,
             gates: false,
             runner_blamed: false,
+            unpriced: false,
+        }
+    }
+
+    pub fn reported_unpriced(
+        label: impl Into<String>,
+        direction: Direction,
+        interval: Option<Interval>,
+    ) -> Self {
+        Self {
+            unpriced: true,
+            ..Self::reported(label, direction, interval)
         }
     }
 
@@ -233,6 +265,16 @@ pub fn gate_rows(rows: &[Row]) -> Gate {
         let v = verdict(row.interval, row.direction);
         let mut note = if row.gates {
             String::new()
+        } else if row.unpriced {
+            format!(
+                " — reported, not gated: pricing a per-GiB rate takes {} ms of cpu, so that \
+                 one {} ms tick of the sampler moves the ratio by less than the {:.0}% this row \
+                 decides at, and these runs span less; the ratio is the sampler's, not the \
+                 engine's",
+                min_pricable_cpu_millis(),
+                crate::parity::cpu_resolution_floor_millis(),
+                TOLERANCE * 100.0
+            )
         } else {
             " — reported, not gated: this row is a pinned comparator, so its \
              verdict is published and does not decide the job"
@@ -786,6 +828,58 @@ mod tests {
         assert_eq!(BOOTSTRAP_SEED, 20_260_902);
         assert!((TOLERANCE - 0.05).abs() < f64::EPSILON);
         assert!((HARNESS_BOUND - 0.85).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn the_cpu_price_floor_is_the_sampler_tick_over_the_tolerance() {
+        let resolution = crate::parity::cpu_resolution_floor_millis();
+        let floor = min_pricable_cpu_millis();
+        assert!(
+            cpu_span_is_pricable(floor),
+            "the floor prices by definition"
+        );
+        assert!(
+            !cpu_span_is_pricable(floor - 1),
+            "one millisecond below the floor is one tick of the sampler's own error"
+        );
+        assert!(
+            floor > resolution,
+            "a {resolution} ms run reads 0 or {resolution}, so one tick is never a priced span"
+        );
+        assert!(
+            !cpu_span_is_pricable(resolution),
+            "and the nightly setup row, at one tick, is exactly that run"
+        );
+    }
+
+    #[test]
+    fn an_unpriced_row_names_the_workload_and_not_a_comparator() {
+        let better = Interval {
+            low: 1.20,
+            mid: 1.30,
+            high: 1.40,
+            pairs: 5,
+        };
+        let g = gate_rows(&[
+            Row::gating(
+                "throughput (ferrox vs xray-core)",
+                Direction::Higher,
+                Some(better),
+            ),
+            Row::reported_unpriced("cpu per GiB (ferrox vs xray-core)", Direction::Lower, None),
+        ]);
+        assert!(g.passed, "{:?}", g.lines);
+        let line = g
+            .lines
+            .iter()
+            .find(|line| line.starts_with("cpu per GiB"))
+            .expect("an unpriced row is still published");
+        assert!(line.contains("UNPROVEN"), "{line}");
+        assert!(line.contains("reported, not gated"), "{line}");
+        assert!(
+            !line.contains("pinned comparator"),
+            "this row reports because of the workload, not because of the engine's role: {line}"
+        );
     }
 
     #[test]

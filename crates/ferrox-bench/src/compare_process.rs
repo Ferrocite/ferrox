@@ -111,6 +111,13 @@ pub struct Comparison {
     pub machine: String,
 }
 
+/// Whether every run moves bytes and spans enough cpu for a per-GiB ratio to resolve the
+/// tolerance. An engine with no runs vacates the check, so missing data keeps its gate.
+fn prices_per_gib(runs: &[Run]) -> bool {
+    runs.iter()
+        .all(|run| run.bytes_moved() > 0 && stats::cpu_span_is_pricable(run.outcome.cpu_millis))
+}
+
 fn run_cell_json(run: &Run) -> Json {
     let mut cell = Json::object();
     cell.insert("throughput_mib_s", Json::Num(run.throughput_mib_s()));
@@ -252,6 +259,8 @@ impl Comparison {
             .into_iter()
             .flat_map(|candidate| {
                 let gates = Some(candidate) == self.gated;
+                let priced =
+                    prices_per_gib(self.runs(candidate)) && prices_per_gib(self.runs(reference));
                 [
                     (
                         format!("throughput ({candidate} vs {reference})"),
@@ -261,6 +270,7 @@ impl Comparison {
                             &self.throughput_cells(reference),
                             Direction::Higher,
                         )),
+                        true,
                         true,
                     ),
                     (
@@ -272,6 +282,7 @@ impl Comparison {
                             Direction::Lower,
                         )),
                         true,
+                        priced,
                     ),
                     (
                         format!(
@@ -285,6 +296,7 @@ impl Comparison {
                             Direction::Lower,
                         )),
                         true,
+                        true,
                     ),
                     // The kernel's asks and bytes per GiB attribute the cpu row; they never gate it.
                     (
@@ -296,6 +308,7 @@ impl Comparison {
                             Direction::Lower,
                         )),
                         false,
+                        true,
                     ),
                     (
                         format!("kernel bytes per GiB ({candidate} vs {reference})"),
@@ -306,12 +319,17 @@ impl Comparison {
                             Direction::Lower,
                         )),
                         false,
+                        true,
                     ),
                 ]
                 .into_iter()
-                .map(move |(label, direction, interval, gates_row)| {
+                .map(move |(label, direction, interval, gates_row, priced_row)| {
                     let row = if gates && gates_row {
-                        stats::Row::gating(label.clone(), direction, interval)
+                        if priced_row {
+                            stats::Row::gating(label.clone(), direction, interval)
+                        } else {
+                            stats::Row::reported_unpriced(label.clone(), direction, interval)
+                        }
                     } else {
                         stats::Row::reported(label.clone(), direction, interval)
                     };
@@ -387,6 +405,7 @@ impl Comparison {
                 Json::Str(stats::verdict(row.interval, row.direction).as_str().into()),
             );
             item.insert("gates", Json::Bool(row.gates));
+            item.insert("unpriced", Json::Bool(row.unpriced));
             rows.push(item);
         }
         root.insert("rows", Json::Arr(rows));
@@ -746,12 +765,20 @@ impl Comparison {
              where it sits, but a comparator measuring worse than the reference is \
              a fact about that comparator, and gating on it would make this job's \
              verdict a property of a binary this repository does not build. Those \
-             rows carry a `reported, not gated` marker.\n",
+             rows carry a `reported, not gated` marker.\n\
+             A per-GiB row gates only over runs that price one: one tick of the sampler is {} ms, \
+             so a rate the {:.0}% tolerance can resolve takes {} ms of cpu, and a shorter span \
+             measures the tick instead of the engine. Such a row reports with that reason while \
+             the throughput and peak rss rows — same repeats, no per-GiB unit — still decide the \
+             job, so an unpriced row never hides a missing engine.\n",
             stats::BOOTSTRAP_RESAMPLES,
             stats::BOOTSTRAP_SEED,
             stats::TOLERANCE * 100.0,
             stats::MIN_PAIRS,
             self.gated.unwrap_or("(none)"),
+            parity::cpu_resolution_floor_millis(),
+            stats::TOLERANCE * 100.0,
+            stats::min_pricable_cpu_millis(),
         );
         for line in &gate.lines {
             let _ = writeln!(s, "- {line}");
@@ -1515,6 +1542,24 @@ mod tests {
         }
     }
 
+    /// Three repeats whose runs cross a fraction of a mebibyte, the shape of a setup scenario:
+    /// `bytes` crossed in `transfer_ms`, on `cpu_millis` of cpu and `rss_kib` of memory.
+    fn synth_micro_engine(engine: &'static str, runs: [(u64, u64, u64, u64); 3]) -> EngineRuns {
+        EngineRuns {
+            engine,
+            dialect: parity::Dialect::Xray,
+            runs: runs
+                .map(|(bytes, transfer_ms, cpu_millis, rss_kib)| {
+                    let mut run = synth_run(0, cpu_millis, rss_kib);
+                    run.outcome.bytes_sent = bytes;
+                    run.outcome.transfer = std::time::Duration::from_millis(transfer_ms);
+                    run
+                })
+                .into_iter()
+                .collect(),
+        }
+    }
+
     fn dialect_engine(name: &'static str, dialect: parity::Dialect) -> Engine {
         Engine {
             name,
@@ -1668,11 +1713,11 @@ mod tests {
             by_engine: vec![
                 synth_engine(
                     "xray-core",
-                    [(100, 300, 20480), (110, 310, 20500), (120, 320, 20600)],
+                    [(100, 6000, 20480), (110, 6200, 20500), (120, 6400, 20600)],
                 ),
                 synth_engine(
                     "ferrox",
-                    [(200, 150, 10240), (220, 155, 10250), (240, 160, 10260)],
+                    [(200, 3000, 10240), (220, 3100, 10250), (240, 3200, 10260)],
                 ),
             ],
             ceilings_mib_s: vec![900.0, 950.0, 1000.0],
@@ -1762,6 +1807,139 @@ mod tests {
         assert_eq!(
             first_run.get("transfer_seconds").and_then(Json::as_num),
             Some(1.0)
+        );
+    }
+
+    /// One connection crossing 8 KiB in the whole run, the shape of `vless-raw-setup-1k`: the
+    /// reference burns `cpu_millis` per repeat, the candidate finishes inside a single tick.
+    fn micro_comparison(cpu_millis: [u64; 3]) -> Comparison {
+        const EIGHT_KIB: u64 = 8 * 1024;
+        Comparison {
+            workload: workload(),
+            repeats: 3,
+            by_engine: vec![
+                synth_micro_engine(
+                    "xray-core",
+                    [
+                        (EIGHT_KIB, 512, cpu_millis[0], 35_900),
+                        (EIGHT_KIB, 512, cpu_millis[1], 36_100),
+                        (EIGHT_KIB, 512, cpu_millis[2], 36_300),
+                    ],
+                ),
+                synth_micro_engine(
+                    "ferrox",
+                    [
+                        (EIGHT_KIB, 10, 0, 6_500),
+                        (EIGHT_KIB, 10, 0, 6_600),
+                        (EIGHT_KIB, 11, 0, 6_700),
+                    ],
+                ),
+            ],
+            ceilings_mib_s: vec![900.0, 950.0, 1000.0],
+            gated: Some("ferrox"),
+            failures: Vec::new(),
+            skipped: Vec::new(),
+            machine: "test".into(),
+        }
+    }
+
+    fn gated_row(comparison: &Comparison, prefix: &str) -> stats::Row {
+        comparison
+            .rows()
+            .into_iter()
+            .find(|row| row.label.starts_with(prefix) && row.label.contains("(ferrox vs xray-core"))
+            .unwrap_or_else(|| panic!("no {prefix} row for the gated engine"))
+    }
+
+    #[test]
+    fn a_workload_that_prices_no_per_gib_rate_reports_the_cpu_row_with_its_reason() {
+        let comparison = micro_comparison([0, 0, stats::min_pricable_cpu_millis() - 1]);
+        let cpu = gated_row(&comparison, "cpu per GiB");
+        assert_eq!(
+            stats::verdict(cpu.interval, cpu.direction),
+            stats::Verdict::Unproven,
+            "the nightly setup row: every pair divides by a zero tick count"
+        );
+        assert!(
+            !cpu.gates && cpu.unpriced,
+            "one tick of the sampler is the whole cpu span, so this row measures the tick: {cpu:?}"
+        );
+        for prefix in ["throughput", "peak rss"] {
+            let row = gated_row(&comparison, prefix);
+            assert!(
+                row.gates && !row.unpriced,
+                "the {prefix} row reads the same repeats and still decides the job"
+            );
+        }
+        let gate = comparison.gate();
+        assert!(gate.passed, "{:?}", gate.lines);
+        let line = gate
+            .lines
+            .iter()
+            .find(|line| line.starts_with("cpu per GiB"))
+            .expect("the cpu row is published");
+        assert!(line.contains("reported, not gated"), "{line}");
+        assert!(line.contains("sampler"), "{line}");
+        assert!(
+            !line.contains("pinned comparator"),
+            "the reason is the size of the workload, not the role of the engine: {line}"
+        );
+        let root = json::parse(&comparison.comparison_json("t").expect("serialises"))
+            .expect("the document parses");
+        let flags: Vec<(String, bool)> = match root.get("rows").expect("rows") {
+            Json::Arr(items) => items
+                .iter()
+                .map(|row| {
+                    (
+                        row.get("label")
+                            .and_then(Json::as_str)
+                            .unwrap_or_default()
+                            .to_owned(),
+                        row.get("unpriced").and_then(Json::as_bool) == Some(true),
+                    )
+                })
+                .collect(),
+            _ => panic!("rows is an array"),
+        };
+        assert_eq!(
+            flags.iter().filter(|(_, unpriced)| *unpriced).count(),
+            1,
+            "exactly the per-GiB row this workload cannot price: {flags:?}"
+        );
+        assert!(flags[1].0.starts_with("cpu per GiB"), "{:?}", flags[1].0);
+    }
+
+    #[test]
+    fn an_unpriced_cpu_row_never_hides_a_missing_repeat() {
+        let mut thin = synth_engine(
+            "ferrox",
+            [(200, 3000, 10240), (220, 3100, 10250), (240, 3200, 10260)],
+        );
+        thin.runs.truncate(1);
+        let comparison = Comparison {
+            workload: workload(),
+            repeats: 3,
+            by_engine: vec![
+                synth_engine(
+                    "xray-core",
+                    [(100, 6000, 20480), (110, 6200, 20500), (120, 6400, 20600)],
+                ),
+                thin,
+            ],
+            ceilings_mib_s: vec![900.0, 950.0, 1000.0],
+            gated: Some("ferrox"),
+            failures: Vec::new(),
+            skipped: Vec::new(),
+            machine: "test".into(),
+        };
+        let cpu = gated_row(&comparison, "cpu per GiB");
+        assert!(
+            cpu.gates && !cpu.unpriced,
+            "these repeats price a per-GiB rate, so one repeat short is missing data: {cpu:?}"
+        );
+        assert!(
+            !comparison.gate().passed,
+            "and missing data must not pass on the strength of an unpriced row"
         );
     }
 
