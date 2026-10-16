@@ -1286,24 +1286,19 @@ fn check_io(root: &Json, moved: f64) -> Result<(), Error> {
     matches("io_calls_per_gib", calls / gib)?;
     matches("io_bytes_per_gib", bytes / gib)?;
     let samples = read_samples(root);
-    let io_at = |sample: &(parity::Phase, crate::ps::Sample)| sample.1.io;
-    if let (Some(first), Some(last)) = (
-        samples.first().and_then(io_at),
-        samples.last().and_then(io_at),
-    ) {
-        let delta = last.since(&first).ok_or_else(|| {
-            Error::Invalid("the kernel tally went backwards between its own samples".into())
-        })?;
-        let (calls_seen, bytes_seen) = (delta.calls() as f64, delta.bytes() as f64);
-        // Whole counters on both sides, so half a call is the tightest band that still means equal.
-        if (calls_seen - calls).abs() > 0.5 || (bytes_seen - bytes).abs() > 0.5 {
-            return Err(Error::Invalid(format!(
-                "io reports {calls} calls over {bytes} bytes, which is not the samples' delta of \
-                 {} over {}",
-                delta.calls(),
-                delta.bytes(),
-            )));
-        }
+    let Some(delta) = crate::ps::Io::window(samples.into_iter().filter_map(|(_, s)| s.io)) else {
+        // The artefact's samples carry no tally, so the reported one has nothing to be checked against.
+        return Ok(());
+    };
+    let (calls_seen, bytes_seen) = (delta.calls() as f64, delta.bytes() as f64);
+    // Whole counters on both sides, so half a call is the tightest band that still means equal.
+    if (calls_seen - calls).abs() > 0.5 || (bytes_seen - bytes).abs() > 0.5 {
+        return Err(Error::Invalid(format!(
+            "io reports {calls} calls over {bytes} bytes, which is not the samples' window of \
+             {} over {}",
+            delta.calls(),
+            delta.bytes(),
+        )));
     }
     Ok(())
 }
@@ -1396,7 +1391,7 @@ mod tests {
     }
 
     #[test]
-    fn the_kernel_tally_in_an_artefact_has_to_be_its_own_samples_delta() {
+    fn the_kernel_tally_in_an_artefact_has_to_be_its_own_samples_window() {
         let one_gib = 1024.0 * 1024.0 * 1024.0;
         let end = [100.0, 50.0, one_gib, one_gib];
         let mut root = Json::object();
@@ -1415,7 +1410,7 @@ mod tests {
         root.insert("io_calls_per_gib", Json::Num(151.0));
         assert!(
             check_io(&root, one_gib).is_err(),
-            "a tally self-consistent but not its samples' delta is still a fault"
+            "a tally self-consistent but not its samples' window is still a fault"
         );
         root.insert("io", tally(end));
         root.insert("io_calls_per_gib", Json::Num(150.0));
@@ -1428,12 +1423,43 @@ mod tests {
         );
         assert!(
             check_io(&root, one_gib).is_err(),
-            "the kernel's counters only rise, so a delta that goes backwards is a torn artefact"
+            "a run whose every sample sits under its first prices no window, so the calls it \
+             claims did not come from its samples"
         );
         assert!(
             check_io(&Json::object(), one_gib).is_ok(),
             "a run sampled where `/proc/<pid>/io` cannot be read reports no tally, which is a gap \
              in the source and not a fault"
+        );
+    }
+
+    /// The window is why a thread-per-flow engine gets a number: its worker threads exit with the
+    /// traffic, so the settle samples are the idle leader's and only a peak-reaching read prices them.
+    #[test]
+    fn a_tally_that_falls_back_after_its_worker_threads_exit_is_still_the_run_s_window() {
+        let one_gib = 1024.0 * 1024.0 * 1024.0;
+        let base = [18.0, 0.0, 1_150.0, 0.0];
+        let peak = [100.0, 988_719.0, one_gib + 1_150.0, 8.0 * one_gib];
+        let idle = [19.0, 0.0, 1_160.0, 0.0];
+        let mut root = Json::object();
+        root.insert("io", tally([82.0, 988_719.0, one_gib, 8.0 * one_gib]));
+        root.insert("io_calls_per_gib", Json::Num(988_801.0 / 8.0));
+        root.insert("io_bytes_per_gib", Json::Num(1.125 * one_gib));
+        root.insert(
+            "samples",
+            Json::Arr(vec![sample(base), sample(peak), sample(idle), sample(idle)]),
+        );
+        assert!(
+            check_io(&root, 8.0 * one_gib).is_ok(),
+            "the reported tally is the peak's window, not the last sample's"
+        );
+        root.insert("io", tally([1.0, 0.0, 10.0, 0.0]));
+        root.insert("io_calls_per_gib", Json::Null);
+        root.insert("io_bytes_per_gib", Json::Null);
+        assert!(
+            check_io(&root, 8.0 * one_gib).is_err(),
+            "the run's bytes crossed while the tallies that counted them were alive, so a report \
+             that reads the last sample as the run is a fault the window catches"
         );
     }
 
