@@ -427,37 +427,20 @@ impl H2Conn {
     }
 }
 
-fn synth_head(
-    method: &[u8],
-    target: &[u8],
-    headers: &[(Vec<u8>, Vec<u8>)],
-    end_stream: bool,
-) -> Vec<u8> {
-    let mut head = Vec::with_capacity(256);
+fn synth_head(method: &[u8], target: &[u8], lines: &[u8], end_stream: bool) -> Vec<u8> {
+    // " " and " HTTP/2\r\n" and the closing "\r\n", plus the chunked line a stream still open carries.
+    let framing = if end_stream { 12 } else { 40 };
+    let mut head = Vec::with_capacity(method.len() + target.len() + lines.len() + framing);
     head.extend_from_slice(method);
     head.push(b' ');
     head.extend_from_slice(target);
     head.extend_from_slice(b" HTTP/2\r\n");
-    for (name, value) in headers {
-        if name.first() == Some(&b':') {
-            continue;
-        }
-        head.extend_from_slice(name);
-        head.extend_from_slice(b": ");
-        head.extend_from_slice(value);
-        head.extend_from_slice(b"\r\n");
-    }
+    head.extend_from_slice(lines);
     if !end_stream {
         head.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
     }
     head.extend_from_slice(b"\r\n");
     head
-}
-
-fn header<'a>(headers: &'a [(Vec<u8>, Vec<u8>)], name: &[u8]) -> Option<&'a [u8]> {
-    headers
-        .iter()
-        .find_map(|(k, v)| k.eq_ignore_ascii_case(name).then_some(v.as_slice()))
 }
 
 fn open_stream(
@@ -469,21 +452,34 @@ fn open_stream(
     block: &[u8],
     end_stream: bool,
 ) {
-    let headers = {
+    let (method, target, lines) = {
         let mut decoder = conn.decoder.lock().unwrap_or_else(PoisonError::into_inner);
-        let mut out = Vec::new();
-        let ok = decoder.decode(block, &mut out).is_some();
+        let (mut method, mut target, mut lines) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut have_method, mut have_target) = (false, false);
+        let ok = decoder
+            .decode(block, &mut |name, value| {
+                if name.first() == Some(&b':') {
+                    if name.eq_ignore_ascii_case(b":method") && !have_method {
+                        have_method = true;
+                        method.extend_from_slice(value);
+                    } else if name.eq_ignore_ascii_case(b":path") && !have_target {
+                        have_target = true;
+                        target.extend_from_slice(value);
+                    }
+                } else {
+                    lines.extend_from_slice(name);
+                    lines.extend_from_slice(b": ");
+                    lines.extend_from_slice(value);
+                    lines.extend_from_slice(b"\r\n");
+                }
+            })
+            .is_some();
         drop(decoder);
-        if !ok {
+        if !ok || !have_method || !have_target {
             conn.reset_stream(sid);
             return;
         }
-        out
-    };
-    let (Some(method), Some(target)) = (header(&headers, b":method"), header(&headers, b":path"))
-    else {
-        conn.reset_stream(sid);
-        return;
+        (method, target, lines)
     };
     if conn.goaway.load(Ordering::SeqCst) {
         conn.reset_stream(sid);
@@ -512,7 +508,7 @@ fn open_stream(
         }
         streams.insert(sid, Arc::clone(&state));
     }
-    let head = synth_head(method, target, &headers, end_stream);
+    let head = synth_head(&method, &target, &lines, end_stream);
     let reader = H2StreamReader {
         conn: Arc::clone(conn),
         stream: Arc::clone(&state),
@@ -896,17 +892,21 @@ mod tests {
                     self.next_frame(id, |kind| matches!(kind, T_HEADERS | T_CONT));
                 block.extend_from_slice(&frame);
                 if flags & F_END_HEADERS != 0 {
-                    let mut fields = Vec::new();
-                    self.decoder.decode(&block, &mut fields).expect("decodes");
-                    for (name, value) in &fields {
-                        if name == b":status" {
-                            return std::str::from_utf8(value)
+                    let mut status = 0u16;
+                    let mut seen = false;
+                    self.decoder
+                        .decode(&block, &mut |name, value| {
+                            if seen || name != &b":status"[..] {
+                                return;
+                            }
+                            seen = true;
+                            status = std::str::from_utf8(value)
                                 .unwrap_or_default()
                                 .parse()
                                 .unwrap_or(0);
-                        }
-                    }
-                    return 0;
+                        })
+                        .expect("decodes");
+                    return status;
                 }
             }
         }
@@ -1413,6 +1413,20 @@ mod tests {
                 "both windows rise by the bytes consumed"
             );
             at += 13;
+        }
+    }
+
+    #[test]
+    fn the_synthesized_head_is_sized_for_its_bytes() {
+        for end_stream in [true, false] {
+            let head = synth_head(b"GET", b"/path", b"host: x\r\n", end_stream);
+            assert_eq!(head.capacity(), head.len(), "one allocation, no growth");
+            assert!(head.starts_with(b"GET /path HTTP/2\r\nhost: x\r\n"));
+            assert_eq!(
+                head.ends_with(b"Transfer-Encoding: chunked\r\n\r\n"),
+                !end_stream,
+                "only a stream still open is declared chunked"
+            );
         }
     }
 }

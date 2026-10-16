@@ -75,6 +75,36 @@ enum Method {
     MultiHunk,
 }
 
+/// What a header block answers, read while it decodes: each name the gates use is judged at its first field, so a head costs no allocation and no buffer outlives the block.
+#[derive(Debug, Default)]
+struct Gate {
+    /// The first `:status` was `200`; `None` when the block carries no status at all.
+    status: Option<bool>,
+    /// The first `:path` names one of the two served methods.
+    served: Option<bool>,
+    /// and which of them, so the reply is read as a `MultiHunk` rather than silently truncated to the last element of every message.
+    multi: Option<bool>,
+    /// The first `:method` was `POST`.
+    posted: Option<bool>,
+    /// The first `content-type` is a gRPC one.
+    typed: Option<bool>,
+}
+
+impl Gate {
+    fn take(&mut self, name: &[u8], value: &[u8], path: &str, multi_path: &str) {
+        if self.status.is_none() && name.eq_ignore_ascii_case(b":status") {
+            self.status = Some(value == b"200");
+        } else if self.served.is_none() && name.eq_ignore_ascii_case(b":path") {
+            self.multi = Some(value == multi_path.as_bytes());
+            self.served = Some(self.multi == Some(true) || value == path.as_bytes());
+        } else if self.posted.is_none() && name.eq_ignore_ascii_case(b":method") {
+            self.posted = Some(value == b"POST");
+        } else if self.typed.is_none() && name.eq_ignore_ascii_case(b"content-type") {
+            self.typed = Some(value.starts_with(b"application/grpc"));
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct GrpcReader<R: Read = TcpStream> {
     read: R,
@@ -190,25 +220,20 @@ impl<R: Read> GrpcReader<R> {
         self.emit(T_RST, 0, id, &E_REFUSED.to_be_bytes());
     }
 
-    fn find<'a>(headers: &'a [(Vec<u8>, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
-        headers.iter().find_map(|(key, value)| {
-            key.eq_ignore_ascii_case(name.as_bytes())
-                .then_some(value.as_slice())
-        })
-    }
-
     fn headers(&mut self, id: u32, flags: u8, block: &[u8]) -> Option<()> {
-        let mut headers = Vec::new();
-        self.decoder.decode(block, &mut headers)?;
+        let (path, multi_path) = (&self.path[..], &self.multi_path[..]);
+        let mut gate = Gate::default();
+        self.decoder.decode(block, &mut |name, value| {
+            gate.take(name, value, path, multi_path);
+        })?;
         if self.server {
-            return self.serve_headers(id, flags, &headers);
+            return self.serve_headers(id, flags, &gate);
         }
         if id != self.stream {
             return Some(());
         }
         if !self.answered {
-            let status = Self::find(&headers, ":status")?;
-            if status != b"200" {
+            if gate.status != Some(true) {
                 return None;
             }
             self.answered = true;
@@ -219,24 +244,18 @@ impl<R: Read> GrpcReader<R> {
         Some(())
     }
 
-    fn serve_headers(&mut self, id: u32, flags: u8, headers: &[(Vec<u8>, Vec<u8>)]) -> Option<()> {
+    fn serve_headers(&mut self, id: u32, flags: u8, gate: &Gate) -> Option<()> {
         if self.answered {
             if flags & F_END != 0 {
                 self.eof = true;
             }
             return Some(());
         }
-        let path = Self::find(headers, ":path");
-        let multi = path == Some(self.multi_path.as_bytes());
-        let ok = (multi || path == Some(self.path.as_bytes()))
-            && Self::find(headers, ":method") == Some(b"POST".as_slice())
-            && Self::find(headers, "content-type")
-                .is_some_and(|v| v.starts_with(b"application/grpc"));
-        if !ok {
+        if gate.served != Some(true) || gate.posted != Some(true) || gate.typed != Some(true) {
             self.refuse(id);
             return None;
         }
-        self.method = if multi {
+        self.method = if gate.multi == Some(true) {
             Method::MultiHunk
         } else {
             Method::Hunk
@@ -929,8 +948,12 @@ mod tests {
             0x90, 0xF4, 0xFF,
         ];
         let mut decoder = Decoder::default();
-        let mut headers = Vec::new();
-        decoder.decode(&first, &mut headers).expect("decodes");
+        let mut headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        decoder
+            .decode(&first, &mut |name, value| {
+                headers.push((name.to_vec(), value.to_vec()));
+            })
+            .expect("decodes");
         let get = |name: &str| {
             headers
                 .iter()
@@ -947,8 +970,12 @@ mod tests {
     fn headers_round_trip_without_indexing() {
         let block = block_encode(&[(":method", "POST"), (":path", "/TunnelService/Tun")]);
         let mut decoder = Decoder::default();
-        let mut headers = Vec::new();
-        decoder.decode(&block, &mut headers).expect("decodes");
+        let mut headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        decoder
+            .decode(&block, &mut |name, value| {
+                headers.push((name.to_vec(), value.to_vec()));
+            })
+            .expect("decodes");
         assert_eq!(headers.len(), 2);
         assert_eq!(headers[1].1, b"/TunnelService/Tun");
     }

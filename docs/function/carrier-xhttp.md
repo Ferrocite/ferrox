@@ -192,6 +192,7 @@ and the binding does not change it.
 | requests-served-before-a-close | 1 | ferrox-app-xhttp::tests::a_request_that_says_close_takes_the_connection_with_it |
 | writes-per-credit | 1 | ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write |
 | window-update-frames-per-credit | 2 | ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write |
+| head-buffer-reallocations-per-request-head | 0 | ferrox-app-xhttp_h2::tests::the_synthesized_head_is_sized_for_its_bytes |
 <!-- counts:end -->
 
 ## Ops
@@ -355,6 +356,19 @@ by the in-memory writer above, which is the only checker that can count writes.
   `early_decode` keeps its dual-alphabet table and its trim
   for the `Sec-WebSocket-Protocol` peer that sends either alphabet padded; only
   the loop is shared.
+- **A header list per request head.** `open_stream` decoded a `HEADERS` block
+  into a `Vec<(Vec<u8>, Vec<u8>)>` — two allocations for every field — then
+  scanned that list twice to find `:method` and `:path` and a third time inside
+  `synth_head` to write the rest as head lines. The block is now visited once:
+  each field arrives borrowed from the decoder, the two pseudo-headers are
+  copied into their own buffers as they pass, and every other field is written
+  into the head lines as it passes. `synth_head` then asks for the bytes the head
+  carries, so `head-buffer-reallocations-per-request-head` is gated on
+  `capacity == len` for both stream shapes rather than on a byte comparison; the
+  shape it replaces asked for 256 and grew when a head was longer than that.
+  What did not move: the three captures are still one allocation each, and every
+  head byte is still copied once into the request line, because the answer this
+  carrier writes is an HTTP/1 head the block does not already contain.
 - **A third copy of the config walk.** `xhttp.rs` carried its own
   byte-identical `header_value` copy and a third head reader; the roadmap has a
   slice for folding both into `proxy.rs`, and it is open. Until that lands, this
