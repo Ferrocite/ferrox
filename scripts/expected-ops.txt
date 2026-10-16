@@ -103,5 +103,13 @@
 # der_to_pem and the wire bytes are unchanged; base64_matches_the_rfc_vectors
 # (empty, one-byte, two-byte, full and wrapped-tail groups) plus
 # pem_survives_the_pad_and_wrap_boundaries pass on linux, macos and windows.
+# Re-blessed 615 by opt-b64-fullline: base64_encode_block gained a `bytes.len()
+# == 48` fast path for the full PEM line (every chunk but the last), a fixed-range
+# `for gi in 0..16` whose byte and output indices are provable in-bounds induction
+# variables, so the line encodes with no per-access bounds check and no per-group
+# slice re-slicing. The 48-byte input yields the same 64 output bytes in the same
+# order; pem_wraps_at_sixty_four_columns (a single 48-byte chunk) is the driver,
+# and base64_matches_the_rfc_vectors still walks the short tail through the general
+# path, all green on linux, macos and windows.
 
-append_pem 665
+append_pem 615
