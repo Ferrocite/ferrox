@@ -538,10 +538,10 @@ fn open_stream(
             &settings,
             Some(h2out.clone()),
         ) {
-            Some((ureader, xwriter)) => {
+            crate::xhttp::Served::Session(ureader, xwriter) => {
                 crate::proxy::serve_session_xhttp_with(ureader, &xwriter, &id, freedom);
             }
-            None => h2out.end(),
+            _ => h2out.end(),
         }
     });
 }
