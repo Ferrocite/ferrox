@@ -14,9 +14,13 @@ spent three per message before it delivered the first payload byte.
 
 The write side was already right and is left alone: an unmasked frame goes out
 with `writev`, one syscall and zero copies; a masked frame is copied once into a
-thread-local buffer, masked in place with a 16-byte `xor_block`, and written
-once. That is the floor for masking — the mask has to be applied somewhere, and
-doing it in place beats a second buffer.
+thread-local buffer, masked in place there, and written once. What is a floor
+and what is not: the mask has to be applied somewhere, so the copy that stages
+the payload is not the removable step — the caller hands over a `&[u8]`, and
+masking it in place there would widen every carrier's signature. What was
+removable was the *width* of the step: `apply_mask` is now a rung ladder, one
+32-byte `ymm` pass per iteration on a host that reports `avx2`, the 16-byte
+`xor_block` ladder below it, and the byte tail under both.
 
 ## Data path
 
@@ -25,7 +29,7 @@ graph TD
     S["socket"] --> R["one read, up to 32 KiB,<br/>into `have`"]
     R --> P["parse the header out of `have`<br/>2 + 0|2|8 + 0|4 bytes, no syscall"]
     P --> M{"masked?"}
-    M -- yes --> U["unmask in place<br/>16 bytes per xor_block"]
+    M -- yes --> U["unmask in place,<br/>32-byte ymm or 16-byte xmm per pass"]
     M -- no --> D["payload is already in `have`"]
     U --> D
     D --> C["copy out to the caller<br/>1 copy per byte"]
@@ -55,6 +59,9 @@ graph TD
 ```bash
 ./scripts/count-ops.sh report \
   ws::tests::a_read_covers_a_window_not_one_frame_header 'ws::WsReader::pull'
+./scripts/count-ops.sh report \
+  ws::tests::the_masked_frame_costs_the_walk_over_its_payload_and_nothing_else \
+  'ws::tests::the_masked_frame_costs_the_walk_over_its_payload_and_nothing_else'
 ```
 
 `UNBLESSED`, as above.
@@ -115,13 +122,25 @@ branch has been read, so no duration is quoted.
   of holding the same thing; there is now one, which is both smaller and one
   fewer place for a copy to hide.
 
-What is unchanged, deliberately: the `apply_mask` step is 16 bytes per
+What is unchanged, deliberately: the **aarch64** step stays 16 bytes per
 `xor_block` with a tail loop, mirroring Zray's measured `u128` step ("Measured
 on Apple Silicon at opt-level = s, 1 KiB 121 → 71 ns and 16 KiB 1189 → 793",
 with a note that a 32-byte step is slower because four stores into one cache
-line each wait on the three before them). sing-box's `ws.Cipher` uses an 8-byte
+line each wait on the three before them). That measurement is the reason the
+NEON rung does not widen — 128 bits is the whole vector width there, so a wider
+pass is more stores per byte, not fewer, and SVE is not baseline anywhere this
+tree ships to. The same note does not cover the x86 rung, where one `vmovdqu`
+of a `ymm` replaces two of `xmm`. sing-box's `ws.Cipher` uses an 8-byte
 `uint64` step; that is a regression against the measurement Zray published, so
 it was not copied.
+
+The staging copy is **not** removed. Masking while copying into the frame would
+save a pass over the payload, but the carrier hands over a borrowed `&[u8]`, so
+doing it there means changing `CarrierSink::send`, which four carriers
+implement — a wider slice than this method, and one no count here would price:
+`memcpy` for the copy retires in libc's own frame, so the fused version puts
+work *into* the counted frame and reads worse while touching less memory. The
+row is retired instructions, and the change is the one that row can see.
 
 ## Pins
 

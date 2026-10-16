@@ -30,7 +30,36 @@ fn fresh_key() -> Option<String> {
     Some(ferrox_core::b64::encode(&raw))
 }
 
+/// The pass width the `avx2` rung takes: four bytes of mask times eight, so the narrow ladder it hands the remainder to starts a payload phase at zero.
+#[cfg(target_arch = "x86_64")]
+const WIDE_PASS: usize = 32;
+
 fn apply_mask(buf: &mut [u8], mask: [u8; 4]) {
+    #[cfg(target_arch = "x86_64")]
+    if buf.len() >= WIDE_PASS && std::is_x86_feature_detected!("avx2") {
+        unsafe { mask_wide(buf, mask) };
+        return;
+    }
+    mask_narrow(buf, mask);
+}
+
+/// One `ymm` per pass: a load, an xor and a store per thirty-two bytes, half what the sixteen-byte ladder spends on the same span. The remainder is below one wide pass, so it goes to that ladder whole.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn mask_wide(buf: &mut [u8], mask: [u8; 4]) {
+    use core::arch::x86_64::{
+        _mm256_loadu_si256, _mm256_set1_epi32, _mm256_storeu_si256, _mm256_xor_si256,
+    };
+    let wide = _mm256_set1_epi32(i32::from_le_bytes(mask));
+    let (passes, rest) = buf.as_chunks_mut::<WIDE_PASS>();
+    for pass in passes {
+        let data = _mm256_loadu_si256(pass.as_ptr().cast());
+        _mm256_storeu_si256(pass.as_mut_ptr().cast(), _mm256_xor_si256(data, wide));
+    }
+    mask_narrow(rest, mask);
+}
+
+fn mask_narrow(buf: &mut [u8], mask: [u8; 4]) {
     let wide = [
         mask[0], mask[1], mask[2], mask[3], mask[0], mask[1], mask[2], mask[3], mask[0], mask[1],
         mask[2], mask[3], mask[0], mask[1], mask[2], mask[3],
