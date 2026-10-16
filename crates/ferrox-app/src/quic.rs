@@ -165,6 +165,20 @@ const B64_TABLE: [u8; 256] = b64_table();
 
 fn base64_encode_block(out: &mut [u8; 64], bytes: &[u8]) -> usize {
     assert!(bytes.len() <= 48, "base64 lines are 48 input bytes");
+    // A PEM line is 48 input bytes except the last, so the full line is the hot case. Over it the group index is a fixed-range induction variable: bytes[gi*3..][..3] stays under 48 and out[gi*4..][..4] under 64 for every gi in 0..16, so the compiler proves every access in range and the line encodes as straight-line loads, shifts and stores with no bounds check and no per-group slice re-slicing.
+    if bytes.len() == 48 {
+        for gi in 0..16 {
+            let (s, d) = (gi * 3, gi * 4);
+            let word = (u32::from(bytes[s]) << 16)
+                | (u32::from(bytes[s + 1]) << 8)
+                | u32::from(bytes[s + 2]);
+            out[d] = B64[(word >> 18) as usize];
+            out[d + 1] = B64[((word >> 12) & 63) as usize];
+            out[d + 2] = B64[((word >> 6) & 63) as usize];
+            out[d + 3] = B64[(word & 63) as usize];
+        }
+        return 64;
+    }
     let mut written = 0;
     let mut rest = bytes;
     // A full three-byte group needs no serial shift-and-or to build the word and no per-slot branch: the three bytes load straight into a 24-bit window at fixed shifts, and the four sextets are fixed shifts written as four stores. This is the whole 48-byte line sixteen times over; the padding case lands once, on the line's tail.
