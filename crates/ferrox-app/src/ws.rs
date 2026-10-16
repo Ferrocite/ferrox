@@ -634,6 +634,115 @@ mod tests {
         }
     }
 
+    /// The head, then the mask, then the payload xorved at the mask's own four-byte phase: bytes are rebuilt from the frame's own mask, so a rotated mask or a mis-encoded head fails here rather than in a reader that would undo both.
+    #[test]
+    fn a_masked_frame_is_its_head_then_its_mask_then_its_payload_at_four() {
+        for len in [
+            0usize, 1, 2, 3, 4, 5, 15, 16, 17, 125, 126, 127, 128, 200, 4095, 4096, 65_535, 65_536,
+        ] {
+            let payload: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(37)).collect();
+            let mut sink = Sink {
+                capture: true,
+                ..Sink::default()
+            };
+            assert!(write_frame(&mut sink, true, OP_DATA, &payload), "len {len}");
+            let got = std::mem::take(&mut sink.kept);
+            let hlen = if len < 126 {
+                2
+            } else if len <= 65_535 {
+                4
+            } else {
+                10
+            };
+            assert_eq!(got.len(), hlen + 4 + len, "len {len}: head, mask, payload");
+            let (head, rest) = got.split_at(hlen);
+            let (mask, coded) = rest.split_at(4);
+            assert_eq!(head[0], 0x80 | OP_DATA, "len {len}: FIN and the opcode");
+            assert_eq!(head[1] & 0x80, 0x80, "len {len}: the MASK bit is set");
+            let marker = head[1] & 0x7F;
+            let read = match marker {
+                126 => u16::from_be_bytes(head[2..4].try_into().expect("two bytes")) as u64,
+                127 => {
+                    let mut raw = [0u8; 8];
+                    raw.copy_from_slice(&head[2..10]);
+                    u64::from_be_bytes(raw)
+                }
+                short => u64::from(short),
+            };
+            assert_eq!(read, len as u64, "len {len}: the length is in the head");
+            for (i, (byte, plain)) in coded.iter().zip(&payload).enumerate() {
+                assert_eq!(
+                    *byte,
+                    plain ^ mask[i & 3],
+                    "len {len} at byte {i}: the mask starts at the payload"
+                );
+            }
+        }
+    }
+
+    /// The probe behind the masked-write ops row: the relay's 16 KiB chunk staged and written through an in-memory sink, so the frame is the walk over the payload with no socket, thread or checksum loop in it.
+    #[test]
+    fn the_masked_frame_costs_the_walk_over_its_payload_and_nothing_else() {
+        const CHUNK: usize = 16 * 1024;
+        const ROUNDS: usize = 16;
+        let payload: Vec<u8> = (0..CHUNK).map(|i| (i as u8).wrapping_mul(37)).collect();
+        let mut sink = Sink::default();
+        let mut first_capacity = 0usize;
+        for round in 0..ROUNDS {
+            assert!(
+                write_frame(&mut sink, true, OP_DATA, &payload),
+                "round {round}"
+            );
+            let capacity = MASKED_FRAME.with(|cell| cell.borrow().capacity());
+            if round == 0 {
+                first_capacity = capacity;
+            } else {
+                assert_eq!(
+                    capacity, first_capacity,
+                    "round {round}: the staged frame holds its capacity, so no allocator is in the loop"
+                );
+            }
+        }
+        assert_eq!(sink.writes, ROUNDS, "one write per frame");
+        assert_eq!(
+            sink.bytes,
+            ROUNDS * (CHUNK + 8),
+            "a 16 KiB payload costs a four-byte head, a four-byte mask and itself"
+        );
+    }
+
+    /// An in-memory `FrameWrite` for the two witnesses above: it counts the bytes it is handed and keeps them only when `capture` says to, so the probe's frame is the carrier's own staging and `black_box` keeps that from being dead-store-eliminated.
+    #[derive(Default)]
+    struct Sink {
+        bytes: usize,
+        writes: usize,
+        kept: Vec<u8>,
+        capture: bool,
+    }
+
+    impl Write for Sink {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.bytes += data.len();
+            self.writes += 1;
+            if self.capture {
+                self.kept.extend_from_slice(data);
+            } else {
+                std::hint::black_box(data);
+            }
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::proxy::FrameWrite for Sink {
+        fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+            parts.iter().all(|part| self.write_all(part).is_ok())
+        }
+    }
+
     #[test]
     fn frames_round_trip_masked_and_plain() {
         for len in [0, 1, 125, 126, 200, 65_535, 65_536] {
