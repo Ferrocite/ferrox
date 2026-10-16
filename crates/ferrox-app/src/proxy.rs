@@ -2280,30 +2280,30 @@ pub(crate) fn is_timeout(error: &std::io::Error) -> bool {
             .is_some_and(|mapped| matches!(mapped, ferrox_core::tls::TlsError::Timeout))
 }
 
-pub(crate) fn vless_header(id: &[u8; 16], cmd: u8, target: &SocketAddr) -> Vec<u8> {
-    // version + uuid + addonsLen + command + port = 21, then the family byte and 4 or 16 octets.
-    let mut header = Vec::with_capacity(21 + if target.is_ipv6() { 17 } else { 5 });
+pub(crate) fn vless_header(id: &[u8; 16], cmd: u8, target: &Destination) -> Vec<u8> {
+    // version + uuid + addonsLen + command + port = 21, then the family byte and its body.
+    let mut header = Vec::with_capacity(21 + target.addr_len());
     header.push(0);
     header.extend_from_slice(id);
     header.push(0);
     header.push(cmd);
     header.extend_from_slice(&target.port().to_be_bytes());
-    push_addr(&mut header, target, 3);
+    target.push_addr(&mut header, 3, 2);
     header
 }
 
 /// The VLESS header with the Vision flow in its addons, the bytes the core encoder writes.
-pub(crate) fn vless_vision_header(id: &[u8; 16], cmd: u8, target: &SocketAddr) -> Vec<u8> {
+pub(crate) fn vless_vision_header(id: &[u8; 16], cmd: u8, target: &Destination) -> Vec<u8> {
     const ADDONS: &[u8] = b"\x0A\x10xtls-rprx-vision";
-    // The bare header plus the fixed Flow addon, then the family byte and 4 or 16 octets.
-    let mut header = Vec::with_capacity(21 + ADDONS.len() + if target.is_ipv6() { 17 } else { 5 });
+    // The bare header plus the fixed Flow addon, then the family byte and its body.
+    let mut header = Vec::with_capacity(21 + ADDONS.len() + target.addr_len());
     header.push(0);
     header.extend_from_slice(id);
     header.push(ADDONS.len() as u8);
     header.extend_from_slice(ADDONS);
     header.push(cmd);
     header.extend_from_slice(&target.port().to_be_bytes());
-    push_addr(&mut header, target, 3);
+    target.push_addr(&mut header, 3, 2);
     header
 }
 
@@ -2347,7 +2347,7 @@ fn dial_vless(
     client: &TcpStream,
     server: &SocketAddr,
     vless: &VlessOut,
-    target: &SocketAddr,
+    target: &Destination,
     ladder: &Ladder,
 ) {
     let header = vless_header(&vless.id, 1, target);
@@ -2746,7 +2746,7 @@ fn dial_vless_kcp(
     client: &TcpStream,
     conn: &Arc<ferrox_core::kcp::Connection>,
     vless: &VlessOut,
-    target: &SocketAddr,
+    target: &Destination,
 ) {
     let header = vless_header(&vless.id, 1, target);
     if conn.write(&header).is_err() {
@@ -2844,7 +2844,7 @@ fn dial_trojan_kcp(
     client: &TcpStream,
     conn: &Arc<ferrox_core::kcp::Connection>,
     trojan: &TrojanOut,
-    target: &SocketAddr,
+    target: &Destination,
 ) {
     if conn.write(&trojan_header(&trojan.key, 1, target)).is_err() {
         return;
@@ -2856,7 +2856,7 @@ fn dial_vmess_kcp(
     client: &TcpStream,
     conn: &Arc<ferrox_core::kcp::Connection>,
     vmess: &VmessOut,
-    target: &SocketAddr,
+    target: &Destination,
 ) {
     let Some((request, send, recv, response_key, response_iv, auth)) =
         crate::vmess::client_request(&vmess.id, vmess.cipher, target, 1)
@@ -2880,7 +2880,7 @@ fn dial_ss_kcp(
     client: &TcpStream,
     conn: &Arc<ferrox_core::kcp::Connection>,
     ss: &ShadowsocksOut,
-    target: &SocketAddr,
+    target: &Destination,
 ) {
     let mut writer = KcpIo {
         conn: Arc::clone(conn),
@@ -3131,7 +3131,10 @@ fn dial_udp_uplink(
     let endpoint = format!("{}:{}", vless.address, vless.port);
     let server = endpoint.to_socket_addrs().ok()?.next()?;
     let mut uplink = dial_or_report(&server)?;
-    uplink.write_all(&vless_header(&vless.id, 2, dest)).ok()?;
+    // A datagram's destination reaches this tree already resolved by the UDP front, so the header carries that address.
+    uplink
+        .write_all(&vless_header(&vless.id, 2, &Destination::from(*dest)))
+        .ok()?;
     read_vless_response(&mut uplink)?;
     let Ok(read) = uplink.try_clone() else {
         return None;
@@ -3195,7 +3198,7 @@ fn dial_vmess_udp_uplink(
     let server = endpoint.to_socket_addrs().ok()?.next()?;
     let uplink = dial_or_report(&server)?;
     let (request, send, recv, response_key, response_iv, auth) =
-        crate::vmess::client_request(&vmess.id, vmess.cipher, dest, 2)?;
+        crate::vmess::client_request(&vmess.id, vmess.cipher, &Destination::from(*dest), 2)?;
     let mut uplink = uplink;
     uplink.write_all(&request).ok()?;
     let mut reader = uplink.try_clone().ok()?;
@@ -3264,7 +3267,7 @@ fn dial_trojan_udp_uplink(
     let server = endpoint.to_socket_addrs().ok()?.next()?;
     let mut uplink = dial_or_report(&server)?;
     uplink
-        .write_all(&trojan_header(&trojan.key, 3, dest))
+        .write_all(&trojan_header(&trojan.key, 3, &Destination::from(*dest)))
         .ok()?;
     let Ok(read) = uplink.try_clone() else {
         return None;
@@ -3400,7 +3403,7 @@ fn open_vless_mux(vless: &VlessOut) -> Option<TcpStream> {
     request_vless_mux(dial_or_report(&server)?, vless)
 }
 
-fn dial_vless_mux(client: &TcpStream, uplink: TcpStream, vless: &VlessOut, target: &SocketAddr) {
+fn dial_vless_mux(client: &TcpStream, uplink: TcpStream, vless: &VlessOut, target: &Destination) {
     let Some(mut uplink) = request_vless_mux(uplink, vless) else {
         return;
     };
@@ -3408,9 +3411,12 @@ fn dial_vless_mux(client: &TcpStream, uplink: TcpStream, vless: &VlessOut, targe
     let Ok(id) = ids.take() else {
         return;
     };
-    let addr = match target.ip() {
-        std::net::IpAddr::V4(octets) => ferrox_core::addr::Addr::V4(octets.octets()),
-        std::net::IpAddr::V6(octets) => ferrox_core::addr::Addr::V6(octets.octets()),
+    let addr = match target {
+        Destination::Address(address) => match address.ip() {
+            std::net::IpAddr::V4(octets) => ferrox_core::addr::Addr::V4(octets.octets()),
+            std::net::IpAddr::V6(octets) => ferrox_core::addr::Addr::V6(octets.octets()),
+        },
+        Destination::Name(host, _) => ferrox_core::addr::Addr::Name(host.as_bytes()),
     };
     let dest = ferrox_core::mux::Target {
         network: ferrox_core::mux::Network::Tcp,
@@ -3444,7 +3450,7 @@ fn dial_vmess_httpupgrade(
     client: &TcpStream,
     uplink: TcpStream,
     vmess: &VmessOut,
-    target: &SocketAddr,
+    target: &Destination,
     attempt: &RungAttempt<'_>,
     ladder: &Ladder,
 ) -> bool {
@@ -3479,7 +3485,7 @@ fn dial_vmess_grpc(
     client: &TcpStream,
     uplink: TcpStream,
     vmess: &VmessOut,
-    target: &SocketAddr,
+    target: &Destination,
     attempt: &RungAttempt<'_>,
     ladder: &Ladder,
 ) -> bool {
@@ -3510,7 +3516,7 @@ fn dial_vmess_ws(
     client: &TcpStream,
     uplink: TcpStream,
     vmess: &VmessOut,
-    target: &SocketAddr,
+    target: &Destination,
     attempt: &RungAttempt<'_>,
     ladder: &Ladder,
 ) -> bool {
@@ -3544,7 +3550,7 @@ fn dial_vmess(
     client: &TcpStream,
     server: &SocketAddr,
     vmess: &VmessOut,
-    target: &SocketAddr,
+    target: &Destination,
     ladder: &Ladder,
 ) {
     if vmess.tls.is_some() {
@@ -3599,7 +3605,7 @@ fn dial_vmess_headed(
     client: &TcpStream,
     uplink: TcpStream,
     vmess: &VmessOut,
-    target: &SocketAddr,
+    target: &Destination,
 ) -> bool {
     let Carrier::HttpHeader { path } = &vmess.carrier else {
         return true;
@@ -3633,7 +3639,7 @@ fn dial_vmess_rung(
     client: &TcpStream,
     uplink: TcpStream,
     vmess: &VmessOut,
-    target: &SocketAddr,
+    target: &Destination,
     attempt: &RungAttempt<'_>,
     ladder: &Ladder,
 ) -> bool {
@@ -3690,12 +3696,13 @@ fn dial_vmess_rung(
     }
 }
 
-fn trojan_header(key: &[u8; 56], cmd: u8, target: &SocketAddr) -> Vec<u8> {
-    let mut header = Vec::with_capacity(80);
+fn trojan_header(key: &[u8; 56], cmd: u8, target: &Destination) -> Vec<u8> {
+    // key + CRLF + command, then the address and its port, closed by a CRLF.
+    let mut header = Vec::with_capacity(63 + target.addr_len());
     header.extend_from_slice(key);
     header.extend_from_slice(b"\r\n");
     header.push(cmd);
-    push_addr(&mut header, target, 4);
+    target.push_addr(&mut header, 4, 3);
     header.extend_from_slice(&target.port().to_be_bytes());
     header.extend_from_slice(b"\r\n");
     header
@@ -3705,7 +3712,7 @@ fn dial_trojan(
     client: &TcpStream,
     server: &SocketAddr,
     trojan: &TrojanOut,
-    target: &SocketAddr,
+    target: &Destination,
     ladder: &Ladder,
 ) {
     let header = trojan_header(&trojan.key, 1, target);
@@ -3761,7 +3768,7 @@ fn dial_trojan_headed(
     client: &TcpStream,
     uplink: TcpStream,
     trojan: &TrojanOut,
-    _target: &SocketAddr,
+    _target: &Destination,
     header: &[u8],
 ) -> bool {
     let Carrier::HttpHeader { path } = &trojan.carrier else {
@@ -3781,7 +3788,7 @@ fn dial_trojan_rung(
     client: &TcpStream,
     uplink: TcpStream,
     trojan: &TrojanOut,
-    _target: &SocketAddr,
+    _target: &Destination,
     header: &[u8],
     attempt: &RungAttempt<'_>,
     ladder: &Ladder,
@@ -4184,7 +4191,7 @@ fn ride_carrier<S: Dialed>(
     }
 }
 
-fn dial_vless_tls(client: &TcpStream, server: &SocketAddr, vless: &VlessOut, target: &SocketAddr) {
+fn dial_vless_tls(client: &TcpStream, server: &SocketAddr, vless: &VlessOut, target: &Destination) {
     let Some(cfg) = vless.tls.as_deref() else {
         return;
     };
@@ -4231,7 +4238,7 @@ fn dial_vless_reality(
     client: &TcpStream,
     server: &SocketAddr,
     vless: &VlessOut,
-    target: &SocketAddr,
+    target: &Destination,
 ) {
     let Some(cfg) = vless.reality.as_deref() else {
         return;
@@ -4427,7 +4434,7 @@ fn vmess_tls_raw(
     server: &SocketAddr,
     mut session: ferrox_core::tls::RustlsProvider<TcpStream>,
     vmess: &VmessOut,
-    target: &SocketAddr,
+    target: &Destination,
 ) {
     let Some((request, send, recv, response_key, response_iv, auth)) =
         crate::vmess::client_request(&vmess.id, vmess.cipher, target, 1)
@@ -4461,7 +4468,7 @@ fn vmess_tls_carried(
     server: &SocketAddr,
     session: ferrox_core::tls::RustlsProvider<TcpStream>,
     vmess: &VmessOut,
-    target: &SocketAddr,
+    target: &Destination,
 ) {
     let Some((request, send, recv, response_key, response_iv, auth)) =
         crate::vmess::client_request(&vmess.id, vmess.cipher, target, 1)
@@ -4560,7 +4567,7 @@ fn vmess_tls_carried(
     }
 }
 
-fn dial_vmess_tls(client: &TcpStream, server: &SocketAddr, vmess: &VmessOut, target: &SocketAddr) {
+fn dial_vmess_tls(client: &TcpStream, server: &SocketAddr, vmess: &VmessOut, target: &Destination) {
     let Some(cfg) = vmess.tls.as_deref() else {
         return;
     };
@@ -4577,7 +4584,7 @@ fn dial_shadowsocks(
     client: &TcpStream,
     server: &SocketAddr,
     ss: &ShadowsocksOut,
-    target: &SocketAddr,
+    target: &Destination,
     ladder: &Ladder,
 ) {
     let params = stream_params(&ss.carrier);
@@ -4628,7 +4635,7 @@ fn dial_ss_headed(
     client: &TcpStream,
     uplink: TcpStream,
     ss: &ShadowsocksOut,
-    target: &SocketAddr,
+    target: &Destination,
 ) -> bool {
     let Carrier::HttpHeader { path } = &ss.carrier else {
         return true;
@@ -4673,7 +4680,7 @@ fn dial_ss_rung(
     client: &TcpStream,
     uplink: TcpStream,
     ss: &ShadowsocksOut,
-    target: &SocketAddr,
+    target: &Destination,
     attempt: &RungAttempt<'_>,
     ladder: &Ladder,
 ) -> bool {
@@ -4719,7 +4726,7 @@ fn dial_ss_ws(
     client: &TcpStream,
     uplink: TcpStream,
     ss: &ShadowsocksOut,
-    target: &SocketAddr,
+    target: &Destination,
     attempt: &RungAttempt<'_>,
     ladder: &Ladder,
 ) -> bool {
@@ -4760,7 +4767,7 @@ fn dial_ss_httpupgrade(
     client: &TcpStream,
     uplink: TcpStream,
     ss: &ShadowsocksOut,
-    target: &SocketAddr,
+    target: &Destination,
     attempt: &RungAttempt<'_>,
     ladder: &Ladder,
 ) -> bool {
@@ -4809,7 +4816,7 @@ fn dial_ss_grpc(
     client: &TcpStream,
     uplink: TcpStream,
     ss: &ShadowsocksOut,
-    target: &SocketAddr,
+    target: &Destination,
     attempt: &RungAttempt<'_>,
     ladder: &Ladder,
 ) -> bool {
@@ -4849,7 +4856,7 @@ fn dial_ss_xhttp(
     client: &TcpStream,
     uplink: TcpStream,
     ss: &ShadowsocksOut,
-    target: &SocketAddr,
+    target: &Destination,
     attempt: &RungAttempt<'_>,
     ladder: &Ladder,
 ) -> bool {
@@ -5098,16 +5105,13 @@ fn serve_socks(mut client: TcpStream, out: &Outbound) {
 fn serve_connect(
     mut client: TcpStream,
     out: &Outbound,
-    asked: &SocksTarget,
+    asked: &Destination,
     front: Front,
     prefix: &[u8],
 ) {
     if let Outbound::Foxy(foxy) = out {
         return serve_foxy_front(client, foxy, asked, front, prefix);
     }
-    let Some(target) = asked.socket() else {
-        return;
-    };
     let (address, port) = match out {
         Outbound::Vless(vless) => (vless.address.clone(), vless.port),
         Outbound::Vmess(vmess) => (vmess.address.clone(), vmess.port),
@@ -5116,6 +5120,10 @@ fn serve_connect(
         Outbound::Http(http) => (http.address.clone(), http.port),
         Outbound::Foxy(_) => return,
         Outbound::Freedom => {
+            // Nothing carries the destination onward, so this lane is the one that has to look it up.
+            let Some(target) = asked.socket() else {
+                return;
+            };
             let Some(mut upstream) = dial_or_report(&target) else {
                 return;
             };
@@ -5144,20 +5152,20 @@ fn serve_connect(
                         upstream: None,
                         roots: vless.quic_roots.clone(),
                     },
-                    &target,
+                    asked,
                 );
             }
             return;
         }
         if matches!(vless.carrier, Carrier::Kcp(_)) && !vless.mux {
             if let Some(session) = kcp_dial_session(&vless.carrier, &vless.address, vless.port) {
-                dial_vless_kcp(&client, &session, vless, &target);
+                dial_vless_kcp(&client, &session, vless, asked);
             }
             return;
         }
         if matches!(vless.carrier, Carrier::Hysteria(_)) && !vless.mux {
             if let Some(dial) = hysteria_dial_session(vless) {
-                crate::hysteria::dial_vless(&client, &dial, &vless.id, &target);
+                crate::hysteria::dial_vless(&client, &dial, &vless.id, asked);
             }
             return;
         }
@@ -5165,7 +5173,7 @@ fn serve_connect(
     if let Outbound::Vmess(vmess) = out {
         if matches!(vmess.carrier, Carrier::Kcp(_)) {
             if let Some(session) = kcp_dial_session(&vmess.carrier, &vmess.address, vmess.port) {
-                dial_vmess_kcp(&client, &session, vmess, &target);
+                dial_vmess_kcp(&client, &session, vmess, asked);
             }
             return;
         }
@@ -5173,7 +5181,7 @@ fn serve_connect(
     if let Outbound::Trojan(trojan) = out {
         if matches!(trojan.carrier, Carrier::Kcp(_)) {
             if let Some(session) = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port) {
-                dial_trojan_kcp(&client, &session, trojan, &target);
+                dial_trojan_kcp(&client, &session, trojan, asked);
             }
             return;
         }
@@ -5181,7 +5189,7 @@ fn serve_connect(
     if let Outbound::Shadowsocks(ss) = out {
         if matches!(ss.carrier, Carrier::Kcp(_)) {
             if let Some(session) = kcp_dial_session(&ss.carrier, &ss.address, ss.port) {
-                dial_ss_kcp(&client, &session, ss, &target);
+                dial_ss_kcp(&client, &session, ss, asked);
             }
             return;
         }
@@ -5189,14 +5197,14 @@ fn serve_connect(
     let endpoint = format!("{address}:{port}");
     let server = endpoint.to_socket_addrs().ok().and_then(|mut it| it.next());
     let Some(server) = server else { return };
-    dial_socks_outbound(&client, out, &server, &target);
+    dial_socks_outbound(&client, out, &server, asked);
 }
 
 fn dial_socks_outbound(
     client: &TcpStream,
     out: &Outbound,
     server: &SocketAddr,
-    target: &SocketAddr,
+    target: &Destination,
 ) {
     let ladder = Ladder::global();
     match out {
@@ -5223,7 +5231,7 @@ fn dial_socks_outbound(
 }
 
 /// The split-tunnel list: targets this lane does not carry, which leave by the plain dial.
-fn foxy_splits(foxy: &FoxyOut, asked: &SocksTarget) -> bool {
+fn foxy_splits(foxy: &FoxyOut, asked: &Destination) -> bool {
     foxy.direct_ports.contains(&asked.port())
         || foxy
             .direct_suffixes
@@ -5448,7 +5456,7 @@ fn verify_exit(foxy: &FoxyOut) {
 }
 
 /// Shared loop: first answer wins, a refused pass stops every carrier and edge; the grant belongs to the front.
-fn foxy_open(foxy: &FoxyOut, asked: &SocksTarget) -> FoxyOpen {
+fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
     if foxy
         .unauthenticated
         .load(std::sync::atomic::Ordering::Relaxed)
@@ -5556,7 +5564,7 @@ fn foxy_open(foxy: &FoxyOut, asked: &SocksTarget) -> FoxyOpen {
 fn serve_foxy_front(
     mut client: TcpStream,
     foxy: &FoxyOut,
-    asked: &SocksTarget,
+    asked: &Destination,
     front: Front,
     prefix: &[u8],
 ) {
@@ -5606,8 +5614,8 @@ const HTTP_HEAD_LIMIT: usize = 8192;
 
 /// An HTTP proxy request: a tunnel to open, or a head to forward to a raw uplink.
 enum ProxyRequest {
-    Connect(SocksTarget),
-    Forward(SocksTarget, Vec<u8>),
+    Connect(Destination),
+    Forward(Destination, Vec<u8>),
 }
 
 /// CONNECT tunnels; absolute- and origin-form forward the head with its line rewritten to origin-form.
@@ -5681,22 +5689,23 @@ fn origin_head(method: &[u8], path: &[u8], version: &[u8], head: &[u8]) -> Vec<u
 }
 
 /// An authority as a target: a literal address stays one, a name rides the tunnel untouched, no port means 80.
-fn authority_target(authority: &[u8]) -> Option<SocksTarget> {
+fn authority_target(authority: &[u8]) -> Option<Destination> {
     let authority = std::str::from_utf8(authority).ok()?;
     if let Ok(address) = authority.parse::<SocketAddr>() {
-        return Some(SocksTarget::Address(address));
+        return Some(Destination::Address(address));
     }
     if let Ok(ip) = authority.parse::<std::net::IpAddr>() {
-        return Some(SocksTarget::Address(SocketAddr::new(ip, 80)));
+        return Some(Destination::Address(SocketAddr::new(ip, 80)));
     }
     let (host, port) = match authority.rsplit_once(':') {
         Some((host, port)) => (host, port.parse::<u16>().ok()?),
         None => (authority, 80),
     };
-    if host.is_empty() {
+    // A name has no longer than a length byte to be carried by, and a truncated destination is a wrong one.
+    if host.is_empty() || host.len() > ferrox_core::addr::MAX_DOMAIN {
         return None;
     }
-    Some(SocksTarget::Name(host.to_owned(), port))
+    Some(Destination::Name(host.to_owned(), port))
 }
 
 /// The `http` front: CONNECT tunnels like SOCKS, plain HTTP forwards its head, unparsable input closes quietly.
@@ -6874,14 +6883,14 @@ fn relay(client: &TcpStream, target: &TcpStream) {
     join(&done);
 }
 
-/// The CONNECT a hop answers with a 200: one `SocketAddr::Display` authority, reused for `Host` and counted once.
+/// The CONNECT a hop answers with a 200: one authority, reused for `Host` and counted once.
 #[inline]
-fn http_connect_request(target: &SocketAddr, http: &HttpOut, req: &mut Vec<u8>) {
+fn http_connect_request(target: &Destination, http: &HttpOut, req: &mut Vec<u8>) {
     use base64::engine::general_purpose;
     const FIXED: usize = 29; // "CONNECT ", " HTTP/1.1\r\n", "Host: ", and both closing CRLFs
     const AUTH_LINE: usize = 30; // "Proxy-Authorization: Basic " plus its CRLF
     const HEADER_WRAPPER: usize = 4; // ": " plus CRLF
-    let authority = target.to_string();
+    let authority = target.authority();
     let credential_len = match (&http.user, &http.pass) {
         (Some(user), Some(pass)) => (user.len() + pass.len() + 3) / 3 * 4 + AUTH_LINE,
         _ => 0,
@@ -6924,14 +6933,14 @@ fn dial_http_outbound(
     client: &TcpStream,
     server: &SocketAddr,
     http: &HttpOut,
-    target: &SocketAddr,
+    target: &Destination,
     _ladder: &Ladder,
 ) {
     fn do_connect<S: std::io::Read + std::io::Write + Send + 'static>(
         client: &TcpStream,
         mut stream: S,
         http: &HttpOut,
-        target: &SocketAddr,
+        target: &Destination,
     ) {
         use std::io::Write;
         let mut req = Vec::new();
@@ -8441,7 +8450,7 @@ fn parse_socks_udp(packet: &[u8]) -> Option<(SocketAddr, &[u8])> {
 }
 
 /// The handshake that keeps the client's name: resolving here hands the edge an address it cannot route.
-fn socks_target(client: &mut TcpStream, grant: bool) -> Option<(u8, SocksTarget)> {
+fn socks_target(client: &mut TcpStream, grant: bool) -> Option<(u8, Destination)> {
     let mut head = [0u8; 2];
     read_exact(client, &mut head).ok()?;
     if head[0] != 5 {
@@ -8465,7 +8474,7 @@ fn socks_target(client: &mut TcpStream, grant: bool) -> Option<(u8, SocksTarget)
     Some((req[1], target))
 }
 
-fn read_socks_named(stream: &mut dyn Read, atyp: u8) -> Option<SocksTarget> {
+fn read_socks_named(stream: &mut dyn Read, atyp: u8) -> Option<Destination> {
     match atyp {
         3 => {
             let mut len = [0u8; 1];
@@ -8474,23 +8483,23 @@ fn read_socks_named(stream: &mut dyn Read, atyp: u8) -> Option<SocksTarget> {
             read_exact(stream, &mut name).ok()?;
             let mut port = [0u8; 2];
             read_exact(stream, &mut port).ok()?;
-            Some(SocksTarget::Name(
+            Some(Destination::Name(
                 String::from_utf8(name).ok()?,
                 u16::from_be_bytes(port),
             ))
         }
-        _ => Some(SocksTarget::Address(read_socks_addr_rest(stream, atyp)?)),
+        _ => Some(Destination::Address(read_socks_addr_rest(stream, atyp)?)),
     }
 }
 
-/// What the client asked for: a name the edge resolves itself, or an address.
+/// What the client asked for: a name the edge resolves itself, or an address. A name stays a name down to the request bytes, because a client that looks the name up itself sends the edge an address for a destination it never kept, and the lookup itself is visible to whoever watches its resolver.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum SocksTarget {
+pub(crate) enum Destination {
     Name(String, u16),
     Address(SocketAddr),
 }
 
-impl SocksTarget {
+impl Destination {
     fn authority(&self) -> String {
         match self {
             Self::Name(host, port) => ferrox_core::foxy::authority(host, *port),
@@ -8498,6 +8507,7 @@ impl SocksTarget {
         }
     }
 
+    /// The address to connect to directly: only a lane that carries no destination answers the name itself.
     fn socket(&self) -> Option<SocketAddr> {
         match self {
             Self::Address(address) => Some(*address),
@@ -8515,11 +8525,51 @@ impl SocksTarget {
         }
     }
 
-    fn port(&self) -> u16 {
+    pub(crate) fn port(&self) -> u16 {
         match self {
             Self::Name(_, port) => *port,
             Self::Address(address) => address.port(),
         }
+    }
+
+    /// The family byte and its body: `v6` is what this protocol numbers IPv6 and `domain` what it numbers a name, and the two conventions in the tree differ.
+    pub(crate) fn push_addr(&self, out: &mut Vec<u8>, v6: u8, domain: u8) {
+        match self {
+            Self::Address(address) => push_addr(out, address, v6),
+            Self::Name(host, _) => {
+                out.push(domain);
+                out.push(host.len() as u8);
+                out.extend_from_slice(host.as_bytes());
+            }
+        }
+    }
+
+    /// The bytes `push_addr` writes, so a header reserves for the destination it holds.
+    pub(crate) fn addr_len(&self) -> usize {
+        match self {
+            Self::Address(address) => {
+                if address.is_ipv6() {
+                    17
+                } else {
+                    5
+                }
+            }
+            Self::Name(host, _) => host.len() + 2,
+        }
+    }
+}
+
+impl From<SocketAddr> for Destination {
+    fn from(address: SocketAddr) -> Self {
+        Self::Address(address)
+    }
+}
+
+impl std::str::FromStr for Destination {
+    type Err = &'static str;
+
+    fn from_str(authority: &str) -> Result<Self, Self::Err> {
+        authority_target(authority.as_bytes()).ok_or("no destination in this authority")
     }
 }
 
@@ -9731,7 +9781,7 @@ mod tests {
         drop(lane);
 
         let id = [0x5Au8; 16];
-        edge.write_all(&vless_header(&id, 1, &site_addr))
+        edge.write_all(&vless_header(&id, 1, &Destination::from(site_addr)))
             .expect("greets");
         let relay = thread::spawn(move || relay_vless(session, Some(raw), &id, true));
 
@@ -11086,7 +11136,7 @@ mod tests {
                 std::net::IpAddr::V6(ip) => ip.to_string(),
             };
             let core = link.encode_request_header(&host, target.port());
-            let proxy = vless_vision_header(&id, 1, &target);
+            let proxy = vless_vision_header(&id, 1, &Destination::from(target));
             assert_eq!(proxy, core, "the dial writes the core bytes for {target}");
             let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
             let port = listener.local_addr().expect("addr").port();
@@ -11113,9 +11163,9 @@ mod tests {
             SocketAddr::from(([192, 0, 2, 53], 80)),
             SocketAddr::from(([0x2001, 0xdb8, 0, 0, 0, 0, 0, 1], 443)),
         ] {
-            let plain = vless_header(&id, 1, &target);
+            let plain = vless_header(&id, 1, &Destination::from(target));
             assert_eq!(plain.capacity(), plain.len(), "no realloc for {target}");
-            let vision = vless_vision_header(&id, 1, &target);
+            let vision = vless_vision_header(&id, 1, &Destination::from(target));
             assert_eq!(vision.capacity(), vision.len(), "no realloc for {target}");
         }
     }
@@ -11190,7 +11240,12 @@ mod tests {
         let dialled = thread::spawn(move || {
             let (client, _) = front.accept().expect("accepts");
             tx.send(()).expect("signals");
-            dial_socks_outbound(&client, &Outbound::Vless(outbound), &server, &target);
+            dial_socks_outbound(
+                &client,
+                &Outbound::Vless(outbound),
+                &server,
+                &Destination::from(target),
+            );
         });
         let user = TcpStream::connect(addr).expect("connects");
         user.set_read_timeout(Some(Duration::from_secs(30)))
@@ -11337,7 +11392,12 @@ mod tests {
         let dialled = thread::spawn(move || {
             let (client, _) = front.accept().expect("accepts");
             tx.send(()).expect("signals");
-            dial_socks_outbound(&client, &Outbound::Vless(outbound), &server, &inner_addr);
+            dial_socks_outbound(
+                &client,
+                &Outbound::Vless(outbound),
+                &server,
+                &Destination::from(inner_addr),
+            );
         });
         let user = TcpStream::connect(addr).expect("connects");
         user.set_read_timeout(Some(Duration::from_secs(30)))
@@ -12541,7 +12601,13 @@ mod tests {
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let relaying = thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            dial_vless(&stream, &server_addr, &vless, &target, Ladder::global());
+            dial_vless(
+                &stream,
+                &server_addr,
+                &vless,
+                &Destination::from(target),
+                Ladder::global(),
+            );
         });
         let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -12556,6 +12622,91 @@ mod tests {
         drop(client);
         server.join().expect("joins");
         relaying.join().expect("joins");
+    }
+
+    /// The edge has to see the name the client was given: a client that looks it up first sends an address for a host it never kept, and the lookup itself is visible to whoever watches its resolver.
+    #[test]
+    fn vless_sends_the_destination_name_to_the_edge() {
+        const HOST: &str = "www.example.com";
+        let id = [0x26u8; 16];
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut head = [0u8; 23];
+            stream.read_exact(&mut head).expect("reads a vless header");
+            assert_eq!(&head[1..17], &id[..], "the user");
+            assert_eq!(&head[17..19], &[0, 1][..], "no addons, a connect");
+            assert_eq!(&head[19..21], &8443u16.to_be_bytes()[..], "the port");
+            assert_eq!(head[21], 2, "the domain family, not a resolved address");
+            assert_eq!(head[22] as usize, HOST.len(), "and its whole length");
+            let mut name = vec![0u8; HOST.len()];
+            stream.read_exact(&mut name).expect("reads the name");
+            assert_eq!(name, HOST.as_bytes());
+            let mut payload = [0u8; 4];
+            stream
+                .read_exact(&mut payload)
+                .expect("reads the payload of a named target");
+            stream.write_all(&[0, 0]).expect("answers");
+            stream.write_all(&payload).expect("echoes");
+        });
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Raw,
+            host: String::new(),
+            mux: false,
+            quic_roots: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+        };
+        let asked = Destination::Name(HOST.to_owned(), 8443);
+        let relaying = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_vless(&stream, &server_addr, &vless, &asked, Ladder::global());
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client
+            .read_exact(&mut back)
+            .expect("a named target still round-trips");
+        assert_eq!(&back, b"ping");
+        drop(client);
+        server.join().expect("joins");
+        relaying.join().expect("joins");
+    }
+
+    /// Two address conventions live in the tree: VLESS and `VMess` number a domain 2 with the port before the address, Trojan and the Shadowsocks family number it 3 with the port after. A writer that picks the other byte hands the edge a header it reads as an address.
+    #[test]
+    fn each_writer_numbers_a_name_by_its_own_convention() {
+        const HOST: &str = "www.example.com";
+        let asked = Destination::Name(HOST.to_owned(), 8443);
+        assert_eq!(asked.addr_len(), HOST.len() + 2);
+        assert_eq!(asked.authority(), "www.example.com:8443");
+        assert!(asked.socket().is_none(), "a name is not yet an address");
+        let atyp = [2u8, HOST.len() as u8];
+        let head = vless_header(&[0x26u8; 16], 1, &asked);
+        let tail = head.len() - asked.addr_len();
+        assert_eq!(&head[tail..tail + 2], &atyp[..], "vless: family 2");
+        assert_eq!(&head[tail + 2..], HOST.as_bytes());
+        let atyp = [3u8, HOST.len() as u8];
+        let head = trojan_header(&[0x5au8; 56], 1, &asked);
+        let tail = head.len() - 4 - asked.addr_len();
+        assert_eq!(&head[tail..tail + 2], &atyp[..], "trojan: family 3");
+        let mut want = HOST.as_bytes().to_vec();
+        want.extend_from_slice(&8443u16.to_be_bytes());
+        want.extend_from_slice(b"\r\n");
+        assert_eq!(&head[tail + 2..], want, "and the port after the address");
     }
 
     /// The pump belongs to the carrier, not to the socket: a WebSocket server that holds its `[0, 0]` until the first frame arrives must not deadlock either.
@@ -12603,7 +12754,13 @@ mod tests {
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let relaying = thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            dial_vless(&stream, &server_addr, &vless, &target, Ladder::global());
+            dial_vless(
+                &stream,
+                &server_addr,
+                &vless,
+                &Destination::from(target),
+                Ladder::global(),
+            );
         });
         let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -12667,7 +12824,13 @@ mod tests {
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let relaying = thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            dial_vless(&stream, &server_addr, &vless, &target, Ladder::global());
+            dial_vless(
+                &stream,
+                &server_addr,
+                &vless,
+                &Destination::from(target),
+                Ladder::global(),
+            );
         });
         let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -12911,7 +13074,13 @@ mod tests {
                 reality: None,
             };
             echo_trace(&format!("cli {port} dialing"));
-            dial_vless(&client, &server, &vless, &target, Ladder::global());
+            dial_vless(
+                &client,
+                &server,
+                &vless,
+                &Destination::from(target),
+                Ladder::global(),
+            );
             echo_trace(&format!("cli {port} relay over"));
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
@@ -12963,7 +13132,13 @@ mod tests {
                 tls: Some(Arc::new(client_config)),
             };
             echo_trace(&format!("cli {port} dialing"));
-            dial_trojan(&client, &server, &trojan, &target, Ladder::global());
+            dial_trojan(
+                &client,
+                &server,
+                &trojan,
+                &Destination::from(target),
+                Ladder::global(),
+            );
             echo_trace(&format!("cli {port} relay over"));
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
@@ -13030,7 +13205,13 @@ mod tests {
                 tls: Some(Arc::new(client_config)),
             };
             echo_trace(&format!("cli {port} dialing"));
-            dial_vmess(&client, &server, &vmess, &target, Ladder::global());
+            dial_vmess(
+                &client,
+                &server,
+                &vmess,
+                &Destination::from(target),
+                Ladder::global(),
+            );
             echo_trace(&format!("cli {port} relay over"));
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
@@ -13172,7 +13353,7 @@ mod tests {
             let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
             let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
             echo_trace(&format!("cli {port} dialing"));
-            dial_socks_outbound(&client, &out(port), &server, &target);
+            dial_socks_outbound(&client, &out(port), &server, &Destination::from(target));
             echo_trace(&format!("cli {port} relay over"));
         });
         let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
@@ -13327,7 +13508,7 @@ mod tests {
         });
         let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
         let session = dial_tls_session(&server, &client_config).expect("dialled");
-        let header = vless_header(&id, 1, &echo_addr);
+        let header = vless_header(&id, 1, &Destination::from(echo_addr));
         let (mut reader, writer) = tls_ws(&server, session, "127.0.0.1", "/w", 0, &header)
             .expect("handshakes ws inside tls");
         read_vless_response(&mut reader).expect("answers");
@@ -14004,7 +14185,7 @@ mod tests {
             .expect("timeout");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         stream
-            .write_all(&vless_header(&id, 2, &target))
+            .write_all(&vless_header(&id, 2, &Destination::from(target)))
             .expect("requests");
         assert!(read_vless_response(&mut stream).is_some());
         assert!(write_udp_datagram(&mut stream, b"ping"));
@@ -14386,7 +14567,12 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         let Some((request, mut send, mut recv, response_key, response_iv, auth)) =
-            crate::vmess::client_request(&id, crate::vmess::Cipher::Chacha, &target, 2)
+            crate::vmess::client_request(
+                &id,
+                crate::vmess::Cipher::Chacha,
+                &Destination::from(target),
+                2,
+            )
         else {
             panic!("handshake refused");
         };
@@ -16011,7 +16197,7 @@ mod tests {
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let (addr, roots, stop, driver) = quic_serve_loopback(id);
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
-        let header = vless_header(&id, 1, &target);
+        let header = vless_header(&id, 1, &Destination::from(target));
         let payload: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
         let back = quic_vless_round_trip(addr, &roots, &header, &payload);
         assert_eq!(back, payload, "bulk arrives whole over a QUIC stream");
@@ -16045,7 +16231,7 @@ mod tests {
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let (addr, roots, stop, driver) = quic_serve_loopback(id);
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
-        let header = vless_header(&id, 1, &target);
+        let header = vless_header(&id, 1, &Destination::from(target));
         let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", addr.port())
             .expect("a socket the server can be addressed from");
         let sock = crate::quic::Datagram::plain(sock);
@@ -16101,7 +16287,7 @@ mod tests {
         let bad = vless_header(
             &uuid_bytes("bbbbbbbb-cccc-dddd-eeee-ffffffffffff").expect("id"),
             1,
-            &target,
+            &Destination::from(target),
         );
         let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", addr.port())
             .expect("a socket the server can be addressed from");
@@ -16356,7 +16542,13 @@ mod tests {
         let dial_ladder = Arc::clone(&ladder);
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            dial_vless(&stream, &server_addr, &vless, &target, &dial_ladder);
+            dial_vless(
+                &stream,
+                &server_addr,
+                &vless,
+                &Destination::from(target),
+                &dial_ladder,
+            );
         });
         let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -16876,7 +17068,7 @@ mod tests {
             server,
             client_addr,
             server_addr,
-            header: vless_header(&id, 1, &target),
+            header: vless_header(&id, 1, &Destination::from(target)),
         };
         let mut ferry = Ferry::new(FAITHFUL);
         for _ in 0..1000 {
@@ -17076,7 +17268,7 @@ mod tests {
         let quic_sock =
             crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
         let quic_port = quic_sock.local_addr().expect("addr").port();
-        let expected_header = vless_header(&id, 1, &target);
+        let expected_header = vless_header(&id, 1, &Destination::from(target));
         let server = quic_vless_echo_server(
             quic_sock,
             minted.cert.pem().into_bytes(),
@@ -17250,7 +17442,7 @@ mod tests {
         });
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
-        let expected_header = vless_header(&id, 1, &target);
+        let expected_header = vless_header(&id, 1, &Destination::from(target));
         let minted =
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
@@ -17277,7 +17469,7 @@ mod tests {
         };
         let relay = thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            crate::quic::dial_pooled(&stream, &dial, &target);
+            crate::quic::dial_pooled(&stream, &dial, &Destination::from(target));
         });
         let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -17336,7 +17528,7 @@ mod tests {
             quic_sock,
             minted.cert.pem().into_bytes(),
             key_pem,
-            vless_header(&id, 1, &target),
+            vless_header(&id, 1, &Destination::from(target)),
         );
         let dial = crate::quic::QuicDial {
             id,
@@ -17352,7 +17544,7 @@ mod tests {
         let dialed = dial.clone();
         let relay1 = thread::spawn(move || {
             let (stream, _) = task.accept().expect("accepts");
-            crate::quic::dial_pooled(&stream, &dialed, &target);
+            crate::quic::dial_pooled(&stream, &dialed, &Destination::from(target));
         });
         let mut client1 = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
         client1
@@ -17362,7 +17554,7 @@ mod tests {
         pool_read(&mut client1, *b"ping", "client1", quic_port);
         let relay2 = thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            crate::quic::dial_pooled(&stream, &dial, &target);
+            crate::quic::dial_pooled(&stream, &dial, &Destination::from(target));
         });
         let mut client2 = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
         client2
@@ -17406,7 +17598,7 @@ mod tests {
             serve_vless_kcp(&conn, &id, true);
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
-        let header = vless_header(&id, 1, &target);
+        let header = vless_header(&id, 1, &Destination::from(target));
         let server_addr: SocketAddr = format!("127.0.0.1:{kcp_port}").parse().expect("addr");
         let conn = ferrox_core::kcp::dial(
             server_addr,
@@ -17666,7 +17858,7 @@ mod tests {
         };
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            crate::hysteria::dial_vless(&stream, &dial, &id, &target);
+            crate::hysteria::dial_vless(&stream, &dial, &id, &Destination::from(target));
         });
         let client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -17839,7 +18031,7 @@ mod tests {
         let Some(session) = crate::hysteria::connect(&dial) else {
             panic!("client connects");
         };
-        let header = vless_header(&id, 1, &target);
+        let header = vless_header(&id, 1, &Destination::from(target));
         let Some(mut flow) = crate::hysteria::open_flow(&session, &header) else {
             panic!("flow opens");
         };
@@ -17901,7 +18093,7 @@ mod tests {
             }
         };
         assert!(ferrox_core::hysteria::verify_auth_response(&body));
-        let header = vless_header(&id, 1, &target);
+        let header = vless_header(&id, 1, &Destination::from(target));
         let mut prefix = Vec::with_capacity(2 + header.len());
         ferrox_core::hysteria::tcp_prefix(&mut prefix);
         prefix.extend_from_slice(&header);
@@ -18289,6 +18481,16 @@ mod tests {
             req,
             b"CONNECT [2001:db8::7]:8080 HTTP/1.1\r\nHost: [2001:db8::7]:8080\r\n\r\n"
         );
+        req.clear();
+        http_connect_request(
+            &Destination::Name("www.example.com".to_owned(), 443),
+            &http_out(None, None, &[]),
+            &mut req,
+        );
+        assert_eq!(
+            req, b"CONNECT www.example.com:443 HTTP/1.1\r\nHost: www.example.com:443\r\n\r\n",
+            "a name reaches the hop as a name, so no resolver of ours sees it"
+        );
     }
 
     /// The builder never moves the caller's buffer: the only witness that the request is one allocation.
@@ -18299,7 +18501,7 @@ mod tests {
         let http = http_out(Some("u"), Some("password"), &[("X-Trace", "on")]);
         for port in 1..=8u16 {
             let target = SocketAddr::from(([198, 51, 100, 7], port));
-            http_connect_request(&target, &http, &mut req);
+            http_connect_request(&Destination::from(target), &http, &mut req);
             assert!(!req.is_empty(), "port {port} builds a request");
         }
         assert_eq!(req.as_ptr(), ptr, "no reallocation across the sweep");
@@ -18478,7 +18680,7 @@ mod tests {
             verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
             probe_unavailable: std::sync::Arc::new(AtomicBool::new(false)),
         };
-        let target = SocksTarget::Name("target.test".to_owned(), 443);
+        let target = Destination::Name("target.test".to_owned(), 443);
 
         assert!(
             matches!(foxy_open(&foxy, &target), FoxyOpen::Refused(_)),
@@ -18582,7 +18784,7 @@ mod tests {
             ferrox_core::kcp::fresh_conversation(),
         )
         .expect("dials");
-        conn.write(&trojan_header(&key, 1, &target))
+        conn.write(&trojan_header(&key, 1, &Destination::from(target)))
             .expect("writes");
         conn.write(b"ping").expect("writes");
         conn.set_read_deadline(std::time::Instant::now() + std::time::Duration::from_secs(10));

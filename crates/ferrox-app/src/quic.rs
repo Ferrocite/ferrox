@@ -1038,7 +1038,7 @@ fn uplink_stream(pooled: &PooledConn, key: &QuicServer, id: u64, client: &TcpStr
     leave_session(&pooled.conn, &pooled.table, &flush_sock, pool(), key, id);
 }
 
-pub(crate) fn dial_pooled(client: &TcpStream, dial: &QuicDial, target: &SocketAddr) {
+pub(crate) fn dial_pooled(client: &TcpStream, dial: &QuicDial, target: &crate::proxy::Destination) {
     let key = QuicServer {
         address: dial.address.clone(),
         port: dial.port,

@@ -7,6 +7,8 @@ The header is `sha224_hex(password) | CRLF | command(1) | address | port | CRLF`
 The 56 ASCII bytes are compared without an early exit on the server; after that
 the stream is the stream and the relay adds no framing bytes at all.
 
+A dial that was handed a name writes it as ATYP 3 with its own length, the form this method's reader already accepts, so the edge answers the lookup rather than the client's resolver.
+
 Two things are deliberately not implemented and are named rather than rounded
 off: there is no `trojan://` share-link parser (the link column in the README is
 empty for this row), and `security: tls` dials over every diallable carrier

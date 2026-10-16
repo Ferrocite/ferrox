@@ -604,18 +604,9 @@ impl Flow {
     }
 }
 
-fn encode_target(out: &mut Vec<u8>, target: &SocketAddr) {
+fn encode_target(out: &mut Vec<u8>, target: &crate::proxy::Destination) {
     out.extend_from_slice(&target.port().to_be_bytes());
-    match target.ip() {
-        std::net::IpAddr::V4(ip) => {
-            out.push(1);
-            out.extend_from_slice(&ip.octets());
-        }
-        std::net::IpAddr::V6(ip) => {
-            out.push(3);
-            out.extend_from_slice(&ip.octets());
-        }
-    }
+    target.push_addr(out, 3, 2);
 }
 
 fn decode_target(header: &[u8], cursor: &mut usize) -> Option<SocketAddr> {
@@ -643,7 +634,7 @@ type RequestParts = (Vec<u8>, [u8; 16], [u8; 16], u8);
 fn request_bytes(
     uuid: &[u8; 16],
     cipher: Cipher,
-    target: &SocketAddr,
+    target: &crate::proxy::Destination,
     cmd: u8,
 ) -> Option<RequestParts> {
     let (instruction, auth_key) = cached_keys(uuid);
@@ -1018,7 +1009,7 @@ pub(crate) type ClientRequest = (Vec<u8>, Flow, Flow, [u8; 16], [u8; 16], u8);
 pub(crate) fn client_request(
     id: &[u8; 16],
     cipher: Cipher,
-    target: &SocketAddr,
+    target: &crate::proxy::Destination,
     cmd: u8,
 ) -> Option<ClientRequest> {
     let (request, data_key, data_iv, auth) = request_bytes(id, cipher, target, cmd)?;
@@ -1034,7 +1025,7 @@ pub(crate) fn client_handshake(
     uplink: &mut TcpStream,
     id: &[u8; 16],
     cipher: Cipher,
-    target: &SocketAddr,
+    target: &crate::proxy::Destination,
 ) -> Option<ClientSession> {
     let (request, send, recv, response_key, response_iv, auth) =
         client_request(id, cipher, target, 1)?;
@@ -1595,9 +1586,12 @@ mod tests {
         // The stall this guards against is silent on both ends: the server decodes the header and the dial waits for the echo while the ping frame sits in bytes a decode already consumed — no socket, no scheduler, so a loss here fails every run instead of one run in nine.
         let id = [0x77u8; 16];
         let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
-        let Some((request, mut send, _recv, _, _, _)) =
-            client_request(&id, Cipher::Auto, &target, 1)
-        else {
+        let Some((request, mut send, _recv, _, _, _)) = client_request(
+            &id,
+            Cipher::Auto,
+            &crate::proxy::Destination::from(target),
+            1,
+        ) else {
             panic!("builds a request");
         };
         let mut staging = Vec::with_capacity(16 * 1024);
@@ -1732,8 +1726,13 @@ mod tests {
             crate::ws::connect(stream, &format!("127.0.0.1:{port}"), path, 0, &[])
                 .expect("carries");
 
-        let (request, data_key, data_iv, auth) =
-            request_bytes(&id, Cipher::Chacha, &target, 1).expect("request");
+        let (request, data_key, data_iv, auth) = request_bytes(
+            &id,
+            Cipher::Chacha,
+            &crate::proxy::Destination::from(target),
+            1,
+        )
+        .expect("request");
         assert!(writer.send(&request), "request goes out as one message");
 
         let (response_key, response_iv) = response_material(&data_iv, &data_key);
@@ -1799,8 +1798,13 @@ mod tests {
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, mut writer) = connect(stream).expect("carries");
 
-        let (request, data_key, data_iv, auth) =
-            request_bytes(&id, Cipher::Chacha, &target, 1).expect("request");
+        let (request, data_key, data_iv, auth) = request_bytes(
+            &id,
+            Cipher::Chacha,
+            &crate::proxy::Destination::from(target),
+            1,
+        )
+        .expect("request");
         writer.write_all(&request).expect("requests");
         writer.flush().expect("flushes");
 
@@ -1889,8 +1893,13 @@ mod tests {
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, mut writer) =
             crate::grpc::connect(stream, "127.0.0.1", path).expect("carries");
-        let (request, data_key, data_iv, auth) =
-            request_bytes(&id, Cipher::Chacha, &target, 1).expect("request");
+        let (request, data_key, data_iv, auth) = request_bytes(
+            &id,
+            Cipher::Chacha,
+            &crate::proxy::Destination::from(target),
+            1,
+        )
+        .expect("request");
         assert!(writer.send(&request));
         let (response_key, response_iv) = response_material(&data_iv, &data_key);
         assert!(read_response(
@@ -2255,8 +2264,13 @@ mod tests {
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let mut uplink = TcpStream::connect(("127.0.0.1", port)).expect("connects");
-        let (mut send, mut recv, response_key, response_iv, auth) =
-            super::client_handshake(&mut uplink, &id, Cipher::Auto, &target).expect("handshakes");
+        let (mut send, mut recv, response_key, response_iv, auth) = super::client_handshake(
+            &mut uplink,
+            &id,
+            Cipher::Auto,
+            &crate::proxy::Destination::from(target),
+        )
+        .expect("handshakes");
         assert!(super::read_response(
             &mut uplink,
             &response_key,
@@ -2682,12 +2696,14 @@ mod tests {
     fn requests_open_to_their_own_lengths_and_targets() {
         let uuid = [0xabu8; 16];
         let targets = [
-            "127.0.0.1:8080".parse().expect("addr"),
-            "[::1]:443".parse().expect("addr"),
+            "127.0.0.1:8080".parse::<SocketAddr>().expect("addr"),
+            "[::1]:443".parse::<SocketAddr>().expect("addr"),
         ];
         for cipher in [Cipher::Auto, Cipher::Aes, Cipher::Chacha, Cipher::None] {
             for target in targets {
-                let (request, _, _, _) = request_bytes(&uuid, cipher, &target, 1).expect("builds");
+                let (request, _, _, _) =
+                    request_bytes(&uuid, cipher, &crate::proxy::Destination::from(target), 1)
+                        .expect("builds");
                 assert!(request.len() > 42 + TAG_LEN);
                 let instruction = instruction_key(&uuid);
                 let auth_id: [u8; AUTH_LEN] = request[..AUTH_LEN].try_into().expect("auth");
