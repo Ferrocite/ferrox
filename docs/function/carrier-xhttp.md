@@ -356,6 +356,17 @@ by the in-memory writer above, which is the only checker that can count writes.
   `early_decode` keeps its dual-alphabet table and its trim
   for the `Sec-WebSocket-Protocol` peer that sends either alphabet padded; only
   the loop is shared.
+- **An allocation per header part in the placement join.** The same arm reads
+  `X-Data-{i}` headers or `x_data_{i}` cookies by building each name with
+  `format!("{key}-{i}")`, so every part — and the first absent index that only
+  ends the run — handed the allocator a fresh `String`. The suffix is the only
+  part that moves, so one reused buffer `write!`s the name and clears it between
+  parts, costing one allocation per request for both placements instead of one
+  per part plus a free one for the miss. `a_packet_split_across_data_parts_reaches_the_session_whole`
+  drives the arm on both placements with the parts cut mid-group, so the join
+  and the decode it feeds are unchanged bytes. What did not move: the join itself
+  and the single `url_decode` over it stay — a base64 group can straddle a part
+  boundary, so the parts have to be concatenated before the one-pass decode.
 - **A header list per request head.** `open_stream` decoded a `HEADERS` block
   into a `Vec<(Vec<u8>, Vec<u8>)>` — two allocations for every field — then
   scanned that list twice to find `:method` and `:path` and a third time inside
