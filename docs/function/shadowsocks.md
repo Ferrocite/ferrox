@@ -206,6 +206,24 @@ byte is now stored once and reloaded as part of a word, sixteen stores and two
 loads per block, and the table traffic stays exactly the six reads and two writes
 above.
 
+Two CI reads of the probe's row, from `ops.yml`'s `method-ops` artefact against
+the page's 1297641: the fold as shipped is **1258346** at `bbe42b1` (run
+38841207859), 39 295 counts below the baseline, which over the probe's 65 536
+bytes is 0.6 instructions per byte — the payload's read, xor and write, paid
+back by the block's store and reload. The next rung looked like the fill's own
+loop, so a second shape put the step count in the type (`next_byte` plus a
+`keystream::<N>(&mut [u8; N])` fill) and let the sixteen steps be straight-line
+code instead of a slice loop: that read **1258730** at `42f3cc0` (run
+38842276749), 384 counts *above* the shipped fold and six times the band the
+page treats as run-to-run noise. The loop control an unroll would delete is
+already not there, which is the same finding the hoist above reached from the
+other side, so the shorter body ships and the second shape is reverted with both
+numbers.
+
+No matrix scenario dials `rc4-md5` — `scripts/lib-matrix.sh` configures the
+`shadowsocks-raw-*` pair with `aes-256-gcm` — so this rung carries no duration,
+and the `shadowsocks-raw-down-8` cell this branch ran measures the AEAD ladder.
+
 ## Time
 
 Read from two CI runs of one cell of `benchmark-matrix.yml`,
