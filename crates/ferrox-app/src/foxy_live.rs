@@ -98,15 +98,12 @@ fn try_carrier(
         }
         _ => None,
     };
-    let stream = quic.as_ref().map(|(_, _, _, id)| *id);
+    // The lease goes into the open and rides the lane, so the probe gives the pool entry back when it ends.
     let mut tunnel = Tunnel::open(&dial, &format!("{PROBE_HOST}:80"), quic)
         .map_err(|failure| failure.to_string())?;
     let ip = through_tunnel(&mut tunnel, PROBE_HOST, PROBE_PATH)
         .ok_or_else(|| "no answer through the tunnel".to_owned())?;
     let seen = opened(&mut tunnel, country);
-    if let (Some(id), Carrier::H3) = (stream, carrier) {
-        crate::quic::release_stream(&quic_dial, id);
-    }
     Ok(format!(
         "{} {} in {:?}, exit {}",
         ip.split_whitespace().last().unwrap_or("?"),
