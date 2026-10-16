@@ -129,6 +129,15 @@ CI-only. No artefact from this branch has been read.
   reaches `bytespool`. The relay buffer here starts at 16 KiB and is promoted to
   256 KiB only once a read fills it completely, and on Linux the plain `copy`
   path is `splice(2)` with no user-space copy at all.
+- **A `POLLIN` the pipe ring could not serve.** The pump armed it while the pipe
+  held fewer bytes than its capacity, which is a question in bytes, and the ring
+  refuses by *slots*: a wake that is honest about the socket still has nowhere to
+  put what it sees, and re-arming it is a spin on a flow nobody can move. The
+  `vless-raw-up-1` cell priced that spin at 2 501 ms of system time per GiB, where
+  the pump after the fix costs 185 and xray-core 721, and `vless-raw-down-1` stayed
+  inside noise at 536–585. Item 15 of `docs/method-superset.md` carries the counts,
+  and `relay_tests::a_parked_flow_of_a_stuffed_pipe_ring_costs_the_pump_no_wake`
+  gates the wake itself by counting the ingest splices that move nothing.
 - **The relay buffer's own `memset`.** Both of its fills were setup cost paid
   before the first byte arrived: `vec![0u8; 16 KiB]` reaches for `alloc_zeroed`,
   and `resize(256 KiB, 0)` on promotion writes another 240 KiB — 32 KiB per

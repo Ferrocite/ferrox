@@ -19418,6 +19418,28 @@ mod poll_relay {
         )
     }
 
+    /// Ingest splices that found no slot in a pipe that still held bytes with byte room
+    /// left: the wake that must not be re-armed. Counted only under `cfg(test)`, where it
+    /// is the quantity the witness names; a production build emits nothing.
+    #[cfg(test)]
+    static IDLE_INGESTS: AtomicUsize = AtomicUsize::new(0);
+
+    #[cfg(test)]
+    pub(crate) fn idle_ingests() -> usize {
+        IDLE_INGESTS.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn note_idle_ingest(pending: usize, capacity: usize) {
+        if pending > 0 && pending < capacity {
+            IDLE_INGESTS.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[cfg(not(test))]
+    #[inline]
+    fn note_idle_ingest(_pending: usize, _capacity: usize) {}
+
     /// A blocking socket parks the worker inside a splice when a wake arrives for a
     /// queue that has gone — `SPLICE_F_NONBLOCK` guards the pipe half only. `held` stops
     /// the descriptor being recycled under a restore that writes back the flags it found.
@@ -19540,6 +19562,7 @@ mod poll_relay {
                     self.end();
                     return;
                 } else {
+                    note_idle_ingest(self.pending, pipe.capacity);
                     self.ingest_stalled = true;
                 }
             }
@@ -19760,6 +19783,70 @@ mod poll_relay {
         let _ = first_rx.recv();
         let _ = second_rx.recv();
     }
+
+    /// The arm's truth table, in the two units it mixes: `pending` counts bytes and the
+    /// kernel's `EAGAIN` from `splice_to_pipe` counts slots, so a ring that holds bytes with a
+    /// stall recorded has byte room and nowhere to put anything. That is the wake the pump must
+    /// not take, and `can_drain` staying true over it is what keeps one fd armed, so the
+    /// direction waits on the drain instead of spinning on the source.
+    #[cfg(test)]
+    #[test]
+    fn no_pollin_is_armed_on_a_ring_that_holds_bytes_it_cannot_take() {
+        let front = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        let src = TcpStream::connect(("127.0.0.1", port)).expect("dials");
+        let (dst, _) = front.accept().expect("accepts");
+        let (done, _keeper) = mpsc::channel();
+        let mut direction = Direction::new(src, dst, done);
+        let Some(pipe) = direction.pipe.as_ref() else {
+            panic!("a splice pipe is there to size the ring");
+        };
+        let capacity = pipe.capacity;
+
+        direction.pending = 0;
+        direction.ingest_stalled = true;
+        assert!(
+            direction.can_ingest(),
+            "an empty ring has room whatever the last attempt did"
+        );
+        assert!(!direction.can_drain(), "an empty ring has nothing to drain");
+
+        direction.pending = capacity / 2;
+        assert!(
+            direction.can_ingest(),
+            "half a ring with no stall recorded is an ingest worth arming for"
+        );
+        direction.ingest_stalled = true;
+        assert!(
+            !direction.can_ingest(),
+            "the same half ring after an ingest found no slot is a wake that moves nothing"
+        );
+        assert!(
+            direction.can_drain(),
+            "the drain that frees a slot stays armed, so the direction waits on an fd rather \
+             than spinning on one it cannot serve"
+        );
+
+        direction.pending = capacity;
+        assert!(
+            !direction.can_ingest() && direction.can_drain(),
+            "a ring full of bytes is the state the byte predicate already refused"
+        );
+
+        direction.pending = 0;
+        direction.ingest_stalled = false;
+        direction.src_at_eof = true;
+        assert!(
+            !direction.can_ingest(),
+            "an exhausted source is never armed"
+        );
+        direction.src_at_eof = false;
+        direction.pipe = None;
+        assert!(
+            direction.can_ingest(),
+            "a leg with no pipe reads its own socket"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -19895,38 +19982,6 @@ mod relay_tests {
         written
     }
 
-    /// utime plus stime, in milliseconds, of every `ferrox-relay` pump thread. The kernel
-    /// reports these fields in 100 Hz ticks, and `comm` is parenthesised, so the fields
-    /// after the last `") "` start at `state` (field 3) and `utime` is field 14.
-    #[cfg(target_os = "linux")]
-    fn pump_cpu_millis() -> u64 {
-        let mut total = 0u64;
-        let mut seen = 0usize;
-        let Ok(tasks) = std::fs::read_dir("/proc/self/task") else {
-            panic!("/proc/self/task is not there to read");
-        };
-        for task in tasks.flatten() {
-            let Ok(stat) = std::fs::read_to_string(task.path().join("stat")) else {
-                continue;
-            };
-            let Some(close) = stat.rfind(") ") else {
-                continue;
-            };
-            if !stat[..close].ends_with("ferrox-relay") {
-                continue;
-            }
-            let fields: Vec<&str> = stat[close + 2..].split_whitespace().collect();
-            let (Some(utime), Some(stime)) = (fields.get(11), fields.get(12)) else {
-                continue;
-            };
-            let ticks = utime.parse::<u64>().unwrap_or(0) + stime.parse::<u64>().unwrap_or(0);
-            seen += 1;
-            total += ticks * 10;
-        }
-        assert!(seen > 0, "no ferrox-relay pump thread is there to measure");
-        total
-    }
-
     /// The destination of the stalled flow: it reads none of the flow until the
     /// neighbours have been collected, then reports how much of it reached it.
     fn hold_then_read(listener: &TcpListener, release: &mpsc::Receiver<()>) -> usize {
@@ -19934,6 +19989,32 @@ mod relay_tests {
         stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
         let _ = release.recv();
         read_all(&mut stream).len()
+    }
+
+    /// A destination that reads one segment every 2 ms: the flow never fully parks, so neither
+    /// does the pump, and a wake the ring cannot serve is one it is handed again a moment later.
+    #[cfg(target_os = "linux")]
+    fn trickle_then_read(
+        listener: &TcpListener,
+        release: &mpsc::Receiver<()>,
+        want: usize,
+    ) -> usize {
+        let (mut stream, _) = listener.accept().expect("accepts");
+        stream
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .expect("timeout");
+        let mut got = vec![0u8; want];
+        let mut total = 0usize;
+        while release.try_recv().is_err() {
+            match stream.read(&mut got) {
+                Ok(0) => return total,
+                Ok(n) => total += n,
+                Err(_) => {}
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+        let _ = stream.set_read_timeout(Some(PATIENCE));
+        total + read_all(&mut stream).len()
     }
 
     /// One neighbour peer: one chunk, a half-close, and the same bytes back.
@@ -20068,18 +20149,21 @@ mod relay_tests {
         stalled_relay.join().expect("joins");
     }
 
-    /// A pipe ring's slots go before its bytes: sixty-four 512-byte segments fill a 256 KiB
-    /// pipe at 32 KiB, so a `POLLIN` wake is honest and still has nowhere to put what it
-    /// sees. Re-arming that wake is a spin on a flow nobody can move, and the cell that
-    /// first priced it read 2.15 s of system time per GiB of it. This is the shape that
-    /// measures the spin instead of the bytes: loopback only, and the Linux job owns the
-    /// splice pump, so that is where the wake count exists to be seen.
+    /// A pipe ring's slots go before its bytes: 512-byte segments arriving one wake at a time
+    /// stuff the ring at its slot ceiling while byte room remains, so an honest `POLLIN` still
+    /// has nowhere to put what it sees. The destination has to be *moving* for that to spin —
+    /// measured against a pump that re-arms the wake, a trickle of 512 bytes every 2 ms costs
+    /// 78 183 ingest splices that move nothing in a 400 ms window, with the pump's cpu at the
+    /// whole of it, while a destination that reads nothing at all parks the ring full and
+    /// registers zero. What the witness counts is the wake itself, `idle_ingests()`, not its
+    /// side effects. Loopback only; the Linux job owns the splice pump.
     #[cfg(target_os = "linux")]
     #[test]
-    fn a_parked_flow_of_small_chunks_costs_the_pump_nothing() {
+    fn a_trickling_destination_does_not_spin_the_pump() {
         const SEGMENT: usize = 512;
-        const ROUNDS: usize = 4096;
-        const WINDOW: Duration = Duration::from_millis(200);
+        const ROUNDS: usize = 8_192;
+        const WINDOW: Duration = Duration::from_millis(400);
+        const SPIN_LIMIT: usize = 5_000;
 
         let stalled_front = listener();
         let stalled_front_port = port_of(&stalled_front);
@@ -20087,15 +20171,15 @@ mod relay_tests {
         let stalled_back_port = port_of(&stalled_back);
         let (release, drain_now) = mpsc::channel::<()>();
         let feeding = thread::spawn(move || push_until_refused(&stalled_front, ROUNDS, SEGMENT));
-        let draining = thread::spawn(move || hold_then_read(&stalled_back, &drain_now));
+        let draining = thread::spawn(move || trickle_then_read(&stalled_back, &drain_now, SEGMENT));
         let stalled_client = TcpStream::connect(("127.0.0.1", stalled_front_port)).expect("dials");
         let stalled_target = TcpStream::connect(("127.0.0.1", stalled_back_port)).expect("dials");
         let stalled_relay = thread::spawn(move || relay(&stalled_client, &stalled_target));
 
-        thread::sleep(Duration::from_millis(150));
-        let before = pump_cpu_millis();
+        thread::sleep(Duration::from_millis(200));
+        let before = poll_relay::idle_ingests();
         thread::sleep(WINDOW);
-        let burned = pump_cpu_millis().saturating_sub(before);
+        let idle = poll_relay::idle_ingests().saturating_sub(before);
 
         let _ = release.send(());
         let held = draining.join().expect("joins");
@@ -20103,15 +20187,14 @@ mod relay_tests {
         stalled_relay.join().expect("joins");
 
         assert!(
-            burned < 100,
-            "the pump burned {burned} ms of cpu across a {} ms window in which no byte could \
-             move: a wake that moves nothing must not be re-armed",
+            idle < SPIN_LIMIT,
+            "the pump ran {idle} ingest splices that moved nothing across a {} ms window of a \
+             flow whose ring was out of slots: a wake the ring cannot serve must not be re-armed",
             WINDOW.as_millis(),
         );
         assert_eq!(
             held, pushed,
-            "the parked flow carried {held} bytes of the {pushed} its client wrote once its \
-             destination read again"
+            "the trickling flow carried {held} bytes of the {pushed} its client wrote"
         );
     }
 

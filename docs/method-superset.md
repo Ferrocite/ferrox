@@ -220,6 +220,12 @@ removed.
 | --- | --- | --- | --- | --- | --- |
 | 14 | UDP-over-TCP pays two read syscalls per datagram for VLESS and four to six for Trojan, where one window read into a per-connection remainder would amortise to one | `proxy.rs:5965-5974` (`read_udp_datagram`), `proxy.rs:6000-6012` (`read_trojan_datagram`), via `read_socks_addr` (`proxy.rs:7156-7199`) | yes | the `Counting` reader idiom already blessed for this file by `proxy::tests::the_trojan_header_costs_two_reads_not_seven` (`proxy.rs:8883`) | P54 |
 
+### Wakes
+
+| # | what | where | bit-identical | witness | slice |
+| --- | --- | --- | --- | --- | --- |
+| 15 | closed: the splice pump armed `POLLIN` on a predicate in *bytes* (`pending < capacity`) while the kernel's `EAGAIN` from `splice_to_pipe` is about *slots*, so a ring of partially filled buffers woke it on data it had nowhere to put, and re-arming that wake is a spin on a flow nobody can move | `proxy.rs` `poll_relay::run` (the arm) and `poll_relay::Direction::advance` (the attempt) | yes — the same two splices at the same lengths into the same buffers; only when the attempt is made changed | `proxy::relay_tests::a_parked_flow_of_a_stuffed_pipe_ring_costs_the_pump_no_wake` counts `poll_relay::idle_ingests()` (the counter is `cfg(test)`, so production emits nothing) over a 200 ms window on a flow whose destination send buffer is stuffed to 4 KiB, the shape that leaves the ring as the only room for the payload; priced by the `vless-raw-up-1` cell, 2 501 → 185 ms of system time per GiB against xray-core's 721, with `vless-raw-down-1` unregressed at 536–585 | landed (#129) |
+
 ### Zero-fills that are not witnessed by anything
 
 Three of these carry a manifest row whose named checker cannot see the fill,
