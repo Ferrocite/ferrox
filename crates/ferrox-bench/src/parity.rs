@@ -493,17 +493,21 @@ pub struct Run {
 }
 
 impl Run {
+    /// What crossed this run in both directions; every per-GiB row divides by it.
+    pub fn bytes_moved(&self) -> u64 {
+        self.outcome.bytes_sent + self.outcome.bytes_received
+    }
+
     pub fn throughput_mib_s(&self) -> f64 {
         let seconds = self.outcome.transfer.as_secs_f64();
         if seconds <= 0.0 {
             return 0.0;
         }
-        let total = (self.outcome.bytes_sent + self.outcome.bytes_received) as f64;
-        total / (1024.0 * 1024.0) / seconds
+        self.bytes_moved() as f64 / (1024.0 * 1024.0) / seconds
     }
 
     pub fn cpu_millis_per_gib(&self) -> f64 {
-        let bytes = self.outcome.bytes_sent + self.outcome.bytes_received;
+        let bytes = self.bytes_moved();
         if bytes == 0 {
             return 0.0;
         }
@@ -516,7 +520,7 @@ impl Run {
 
     /// The run's cpu split over the bytes it moved; `None` where the sampler has no split.
     pub fn cpu_split_per_gib(&self) -> Option<(f64, f64)> {
-        let bytes = self.outcome.bytes_sent + self.outcome.bytes_received;
+        let bytes = self.bytes_moved();
         if bytes == 0 {
             return None;
         }
@@ -528,10 +532,7 @@ impl Run {
     /// The run's crossing cost per GiB, or nothing for a tally the crossing never reached; see
     /// [`io_crossing_per_gib`].
     pub fn io_per_gib(&self) -> Option<(f64, f64)> {
-        io_crossing_per_gib(
-            self.outcome.io?,
-            self.outcome.bytes_sent + self.outcome.bytes_received,
-        )
+        io_crossing_per_gib(self.outcome.io?, self.bytes_moved())
     }
 
     fn quartiles(values: &[u128]) -> Option<Quartiles> {
