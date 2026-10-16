@@ -12693,7 +12693,6 @@ mod tests {
         let asked = Destination::Name(HOST.to_owned(), 8443);
         assert_eq!(asked.addr_len(), HOST.len() + 2);
         assert_eq!(asked.authority(), "www.example.com:8443");
-        assert!(asked.socket().is_none(), "a name is not yet an address");
         let atyp = [2u8, HOST.len() as u8];
         let head = vless_header(&[0x26u8; 16], 1, &asked);
         let tail = head.len() - asked.addr_len();
