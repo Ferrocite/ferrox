@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::{Mutex, OnceLock};
@@ -63,13 +62,18 @@ impl Cipher {
     }
 }
 
+/// An auth id is valid 120 s either side of the clock, so the window that refuses its replay has to outlast both halves of that span.
+const REPLAY_SPAN: u64 = 240;
+
 fn replay_seen(id: &[u8; AUTH_LEN]) -> bool {
-    static SEEN: OnceLock<Mutex<HashSet<[u8; AUTH_LEN]>>> = OnceLock::new();
-    let mut guard = SEEN
-        .get_or_init(|| Mutex::new(HashSet::new()))
+    static WINDOW: OnceLock<Mutex<crate::proxy::Replay>> = OnceLock::new();
+    let mut key = [0u8; 32];
+    key[..AUTH_LEN].copy_from_slice(id);
+    let mut guard = WINDOW
+        .get_or_init(|| Mutex::new(crate::proxy::Replay::new(REPLAY_SPAN)))
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    !guard.insert(*id)
+    guard.seen(&key, now_secs())
 }
 
 fn hmac_pads(key: &[u8]) -> ([u8; 64], [u8; 64]) {
@@ -2581,6 +2585,48 @@ mod tests {
         let id = [0x77u8; AUTH_LEN];
         assert!(!replay_seen(&id));
         assert!(replay_seen(&id));
+    }
+
+    #[test]
+    fn the_window_refuses_a_replay_for_its_span_and_forgets_after_two() {
+        let mut window = crate::proxy::Replay::new(REPLAY_SPAN);
+        let key = [0x5eu8; 32];
+        assert!(
+            !window.seen(&key, 10_000),
+            "a first sighting is not a replay"
+        );
+        assert!(
+            window.seen(&key, 10_000 + REPLAY_SPAN - 1),
+            "the span the auth id is valid for is refused"
+        );
+        assert!(
+            window.seen(&key, 10_000 + REPLAY_SPAN),
+            "the rotation that moves the key out of the window is the one after it"
+        );
+        assert!(
+            !window.seen(&key, 10_000 + 2 * REPLAY_SPAN),
+            "two spans of quiet empty the window"
+        );
+    }
+
+    #[test]
+    fn the_window_holds_two_rotations_at_most() {
+        let mut window = crate::proxy::Replay::new(REPLAY_SPAN);
+        let first = [0u8; 32];
+        assert!(!window.seen(&first, 5_000));
+        for index in 1..=2 * crate::proxy::REPLAY_KEYS {
+            let mut key = [0u8; 32];
+            key[..8].copy_from_slice(&(index as u64).to_be_bytes());
+            window.seen(&key, 5_000);
+            assert!(
+                window.held() <= 2 * crate::proxy::REPLAY_KEYS,
+                "{index} keys"
+            );
+        }
+        assert!(
+            !window.seen(&first, 5_000),
+            "a flood rotates the oldest keys out without the clock moving"
+        );
     }
 
     #[test]

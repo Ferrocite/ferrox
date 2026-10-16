@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::{Mutex, OnceLock};
@@ -22,36 +22,15 @@ fn now_secs() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
-struct SaltFilter {
-    current: HashSet<[u8; 32]>,
-    prev: HashSet<[u8; 32]>,
-    rotated_at: u64,
-}
-
 fn salt_seen(salt: &[u8]) -> bool {
-    static FILTER: OnceLock<Mutex<SaltFilter>> = OnceLock::new();
-    let mut guard = FILTER
-        .get_or_init(|| {
-            Mutex::new(SaltFilter {
-                current: HashSet::new(),
-                prev: HashSet::new(),
-                rotated_at: now_secs(),
-            })
-        })
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let now = now_secs();
-    if now.wrapping_sub(guard.rotated_at) >= SKEW || guard.current.len() >= 64 * 1024 {
-        guard.prev = std::mem::take(&mut guard.current);
-        guard.rotated_at = now;
-    }
+    static WINDOW: OnceLock<Mutex<crate::proxy::Replay>> = OnceLock::new();
     let mut key = [0u8; 32];
     key[..salt.len()].copy_from_slice(salt);
-    if guard.current.contains(&key) || guard.prev.contains(&key) {
-        return true;
-    }
-    guard.current.insert(key);
-    false
+    let mut guard = WINDOW
+        .get_or_init(|| Mutex::new(crate::proxy::Replay::new(SKEW)))
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    guard.seen(&key, now_secs())
 }
 
 fn psks(password: &str, method: Method) -> Option<Vec<Vec<u8>>> {
