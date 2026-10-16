@@ -20110,9 +20110,8 @@ mod relay_tests {
         );
         assert_eq!(
             held, pushed,
-            "the parked flow carried {} bytes of the {} its client wrote once its destination \
-             read again",
-            held, pushed
+            "the parked flow carried {held} bytes of the {pushed} its client wrote once its \
+             destination read again"
         );
     }
 
