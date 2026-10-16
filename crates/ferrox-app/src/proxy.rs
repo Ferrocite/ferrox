@@ -5411,11 +5411,6 @@ fn foxy_open(foxy: &FoxyOut, asked: &SocksTarget) -> FoxyOpen {
         &foxy.city,
         MAX_FOXY_ALTERNATES,
     );
-    let mut refusals = ferrox_core::foxy::Refusals::new(256);
-    let key = target.clone();
-    if refusals.blocked(&key, 0) {
-        return FoxyOpen::Silent;
-    }
     let mut last = None;
     for edge in ferrox_core::foxy::dial_order(
         &order,
@@ -5428,6 +5423,10 @@ fn foxy_open(foxy: &FoxyOut, asked: &SocksTarget) -> FoxyOpen {
             .as_ref()
             .map_or_else(|| foxy.pass.clone(), |account| account.current());
         for carrier in foxy.carrier.order() {
+            // As on UDP: a silent carrier is left alone for the window, not probed per flow.
+            if foxy.carrier_unanswered(&edge, carrier) {
+                continue;
+            }
             let dial = crate::foxy::FoxyDial {
                 host: edge.host.clone(),
                 port: edge.port,
@@ -5474,9 +5473,6 @@ fn foxy_open(foxy: &FoxyOut, asked: &SocksTarget) -> FoxyOpen {
                         if status == 429 {
                             note_limited(&foxy.limited_strikes, &foxy.limited_until, now_secs());
                             break;
-                        }
-                        if ferrox_core::foxy::target_is_unreachable(status) {
-                            refusals.remember(&key, now_secs() + 30);
                         }
                     }
                     // A status is the edge speaking, so only a silent carrier is remembered as dead.
@@ -18103,6 +18099,106 @@ mod tests {
         )
         .expect("parses");
         assert!(find_foxy_outbound(&root).is_none());
+    }
+
+    /// An edge that names no protocol the lane speaks is silent on that carrier, so the flow that learns it pays one dial and the next pays none.
+    #[test]
+    fn a_silent_carrier_is_dialled_once_rather_than_once_per_rung() {
+        use ferrox_core::tls::TlsProvider as _;
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+        let (server_config, _) = carried_tls_configs();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let edge: SocketAddr = listener.local_addr().expect("addr");
+        let asked = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&asked);
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut tls) = ferrox_core::tls::RustlsServerProvider::accept(
+                    (*server_config).clone(),
+                    stream,
+                ) else {
+                    continue;
+                };
+                let _ = tls.handshake();
+            }
+        });
+
+        let edge_carrier = crate::foxy::Carrier::H1;
+        let foxy = FoxyOut {
+            account: None,
+            country: "US".to_owned(),
+            city: String::new(),
+            carrier: edge_carrier,
+            upstream: None,
+            candidates: vec![ferrox_core::foxy::Candidate {
+                host: "carrier.test".to_owned(),
+                port: edge.port(),
+                country: "US".to_owned(),
+                city: String::new(),
+            }],
+            stored: None,
+            unauthenticated: std::sync::Arc::new(AtomicBool::new(false)),
+            limited_strikes: std::sync::Arc::new(AtomicU32::new(0)),
+            limited_until: std::sync::Arc::new(AtomicU64::new(0)),
+            carrier_dead: std::sync::Arc::new(std::sync::Mutex::new(
+                ferrox_core::foxy::Refusals::new(32),
+            )),
+            roots: vec![CARRIER_CERT.to_vec()],
+            pins: ferrox_core::foxy::pin::Pins::default(),
+            pass: ferrox_core::foxy::Pass {
+                token: "the-pass".to_owned(),
+                expires_at: None,
+                quota_remaining: None,
+                quota_reset: None,
+            },
+            edge_address: Some(edge),
+            direct_ports: Vec::new(),
+            direct_suffixes: Vec::new(),
+            exit_probe: None,
+            verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            probe_unavailable: std::sync::Arc::new(AtomicBool::new(false)),
+        };
+        let target = SocksTarget::Name("target.test".to_owned(), 443);
+
+        assert!(
+            matches!(foxy_open(&foxy, &target), FoxyOpen::Refused(_)),
+            "an edge that names no protocol carries nothing"
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "a named carrier is one rung, not the three its order repeats"
+        );
+
+        assert!(
+            matches!(foxy_open(&foxy, &target), FoxyOpen::Refused(_)),
+            "the silence is still the answer"
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "a carrier the edge went silent on is not probed again inside the window"
+        );
+
+        // The window, not the verdict: an edge left alone for its quarantine is asked again the moment it ends.
+        let edge = &foxy.candidates[0];
+        if let Ok(mut cache) = foxy.carrier_dead.lock() {
+            cache.remember(
+                &carrier_key(edge, edge_carrier),
+                now_secs().saturating_sub(1),
+            );
+        }
+        assert!(
+            matches!(foxy_open(&foxy, &target), FoxyOpen::Refused(_)),
+            "the edge still names no protocol"
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            2,
+            "a rested carrier is asked again once its window has run out"
+        );
     }
 
     #[test]
