@@ -87,7 +87,7 @@ superset of connection ways, a subset of code". Concretely:
 | blackhole | protocol | planned | upstream/xray-core/proxy/blackhole, upstream/sing-box/protocol/block | `none`/`http`/`custom` response |
 | dns-outbound | protocol | planned | upstream/xray-core/proxy/dns, upstream/sing-box/protocol/dns | rules `direct`/`drop`/`return`/`hijack`, `rewrite_server` |
 | masterdns | protocol | planned | upstream/zeronet/crates/zero-masterdns, upstream/zeronet/crates/zero-protocol/src/masterdns | a VPN over DNS queries: the base/codec wire half and the live half that carries it — UDP resolver, optional compression, ARQ reliability, session handshake, SOCKS stream management |
-| loopback-outbound | protocol | planned | upstream/xray-core/proxy/loopback | re-inject into a named inbound tag, with sniffing |
+| loopback | protocol | implemented | upstream/xray-core/proxy/loopback, docs/function/loopback.md | re-inject into a named inbound tag, with sniffing refused |
 | http-protocol | protocol | implemented | upstream/xray-core/proxy/http, upstream/sing-box/protocol/http | front implemented in both directions of the front; the upstream HTTP-proxy outbound is planned |
 | socks | protocol | implemented | upstream/xray-core/proxy/socks, upstream/sing-box/protocol/socks, upstream/zeronet/crates/zero-protocol/src/socks.rs | front implemented; the SOCKS *outbound* is planned (P49's chaining surface) |
 | dokodemo | front | planned | upstream/xray-core/proxy/dokodemo | `tunnel`/`dokodemo-door`, TCP+UDP, `portMap`, `followRedirect`, SNI+ALPN original dst |

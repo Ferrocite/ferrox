@@ -65,6 +65,19 @@ fn serve_root(label: &str, root: &Json) -> ! {
     );
     let freedom = has_protocol(root, "outbounds", "freedom");
     let outbound = find_outbound(root);
+    // A loopback outbound names its inbound by tag, so it resolves only when no concrete dial won.
+    let loopback = find_loopback_outbound(root);
+    let outbound = match outbound {
+        Some(Outbound::Freedom) | None if loopback.is_some() => {
+            let tag = loopback.expect("guarded by is_some");
+            Some(
+                resolve_loopback(root, &tag, freedom).unwrap_or_else(|reason| {
+                    exit(&format!("bad config {label}: loopback {reason}"))
+                }),
+            )
+        }
+        selected => selected,
+    };
     let mut inbounds = 0;
     let mut hysteria_served = false;
     if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
@@ -8678,6 +8691,188 @@ fn find_outbound(root: &Json) -> Option<Outbound> {
 
 fn is_freedom(root: &Json) -> bool {
     has_protocol(root, "outbounds", "freedom")
+}
+
+/// The tag a `loopback` outbound re-injects through, or nothing when no such
+/// outbound is configured to carry. An empty tag and an enabled sniffer skip
+/// the outbound the way other uncarriable settings skip theirs: the tag is
+/// the whole route, and sniffing belongs to the engine sniffer this tree has
+/// not built.
+fn find_loopback_outbound(root: &Json) -> Option<String> {
+    let outbounds = root.get("outbounds").and_then(Json::as_arr)?;
+    for outbound in outbounds {
+        if outbound.get("protocol").and_then(Json::as_str) != Some("loopback") {
+            continue;
+        }
+        let settings = outbound.get("settings")?;
+        let tag = settings
+            .get("inboundTag")
+            .and_then(Json::as_str)
+            .filter(|tag| !tag.is_empty())?;
+        let sniffing = settings
+            .get("sniffing")
+            .and_then(|sniffing| sniffing.get("enabled"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        if sniffing {
+            continue;
+        }
+        return Some(tag.to_owned());
+    }
+    None
+}
+
+/// Whether the redial speaks the named carrier over plain TCP. Datagram
+/// handshakes need a session and roots the inbound JSON does not carry, so
+/// they refuse here rather than dialling half a handshake.
+fn loopback_carrier(carrier: &Carrier) -> bool {
+    matches!(
+        carrier,
+        Carrier::Raw
+            | Carrier::Ws { .. }
+            | Carrier::HttpUpgrade { .. }
+            | Carrier::Grpc { .. }
+            | Carrier::Xhttp { .. }
+            | Carrier::HttpHeader { .. }
+    )
+}
+
+/// The client dial a `loopback` outbound desugars to: the named inbound's own
+/// credentials pointed at where it listens, so the re-injected flow carries a
+/// real handshake on the loopback wire. The tag bookkeeping xray keeps for a
+/// second routing pass has nothing to select here — fronts take the single
+/// outbound and servers take freedom — so resolving at startup is the whole
+/// re-inject, with no per-flow hop of its own.
+fn resolve_loopback(root: &Json, tag: &str, freedom: bool) -> Result<Outbound, String> {
+    let empty = Vec::new();
+    let inbounds = root
+        .get("inbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty);
+    let inbound = inbounds
+        .iter()
+        .find(|inbound| inbound.get("tag").and_then(Json::as_str) == Some(tag))
+        .ok_or_else(|| format!("names an unknown inbound `{tag}`"))?;
+    let protocol = inbound.get("protocol").and_then(Json::as_str).unwrap_or("");
+    // A front would re-enter this same resolution through the single outbound.
+    if matches!(protocol, "socks" | "http" | "mixed") {
+        return Err(format!(
+            "names front `{tag}`, which would re-enter the loopback"
+        ));
+    }
+    if !freedom {
+        return Err(format!(
+            "names `{tag}`, which has no freedom outbound to leave by"
+        ));
+    }
+    let listen = inbound
+        .get("listen")
+        .and_then(Json::as_str)
+        .unwrap_or("127.0.0.1");
+    // An every-interface bind is redialled where it also answers.
+    let listen = match listen {
+        "0.0.0.0" | "::" | "" => "127.0.0.1",
+        named => named,
+    };
+    let Some(port) = inbound.get("port").and_then(Json::as_port) else {
+        return Err(format!("names `{tag}`, which binds no port"));
+    };
+    let address = listen.to_owned();
+    loopback_dial(inbound, protocol, &address, port, tag)
+}
+
+/// The named inbound's own credentials pointed at where it listens, so the
+/// re-injected flow carries a real handshake on the loopback wire.
+fn loopback_dial(
+    inbound: &Json,
+    protocol: &str,
+    address: &str,
+    port: u16,
+    tag: &str,
+) -> Result<Outbound, String> {
+    match protocol {
+        "vless" if vless_security_supported(stream_security(inbound)) => {
+            let (carrier, host) = loopback_carrier_of(inbound, address, tag)?;
+            Ok(Outbound::Vless(VlessOut {
+                address: address.to_owned(),
+                port,
+                id: inbound_id(inbound),
+                carrier,
+                host,
+                mux: false,
+                quic_roots: None,
+                hysteria_roots: None,
+                tls: None,
+                flow: String::new(),
+                reality: None,
+            }))
+        }
+        "trojan" if matches!(stream_security(inbound), "" | "none") => {
+            let (carrier, host) = loopback_carrier_of(inbound, address, tag)?;
+            Ok(Outbound::Trojan(TrojanOut {
+                address: address.to_owned(),
+                port,
+                key: trojan_key(&inbound_password(inbound)),
+                carrier,
+                host,
+                tls: None,
+            }))
+        }
+        "vmess" if matches!(stream_security(inbound), "" | "none") => {
+            let (carrier, host) = loopback_carrier_of(inbound, address, tag)?;
+            let cipher = crate::vmess::Cipher::parse(
+                inbound_first_client(inbound)
+                    .and_then(|client| client.get("security"))
+                    .and_then(Json::as_str)
+                    .unwrap_or("auto"),
+            );
+            Ok(Outbound::Vmess(VmessOut {
+                address: address.to_owned(),
+                port,
+                id: inbound_id(inbound),
+                cipher,
+                carrier,
+                host,
+                tls: None,
+            }))
+        }
+        "shadowsocks" if matches!(stream_security(inbound), "" | "none") => {
+            let method = inbound_method(inbound);
+            if !inbound_ss_destinations(inbound, &method).is_empty() {
+                return Err(format!(
+                    "names `{tag}`, which relays to fixed destinations rather than freedom"
+                ));
+            }
+            let (carrier, host) = loopback_carrier_of(inbound, address, tag)?;
+            Ok(Outbound::Shadowsocks(ShadowsocksOut {
+                address: address.to_owned(),
+                port,
+                method,
+                password: inbound_ss_password(inbound),
+                carrier,
+                host,
+            }))
+        }
+        _ => Err(format!(
+            "names `{tag}` speaking `{protocol}`, which no client dial here replays"
+        )),
+    }
+}
+
+/// The carrier the redial speaks, or the refusal when it speaks none.
+fn loopback_carrier_of(
+    inbound: &Json,
+    address: &str,
+    tag: &str,
+) -> Result<(Carrier, String), String> {
+    let (carrier, host) = outbound_carrier(inbound, address);
+    if loopback_carrier(&carrier) {
+        Ok((carrier, host))
+    } else {
+        Err(format!(
+            "names `{tag}`, whose carrier no plain-TCP redial speaks"
+        ))
+    }
 }
 
 /// Carrier defaults to `auto`: QUIC, HTTP/2, HTTP/1.1. A named edge is dialed whatever the catalogue publishes.
@@ -18627,6 +18822,319 @@ mod tests {
         )
         .expect("parses");
         assert!(find_foxy_outbound(&root).is_none());
+    }
+
+    /// The tag is the whole route: a loopback outbound without one names nowhere.
+    #[test]
+    fn a_loopback_outbound_names_its_inbound_tag() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"loopback","settings":{"inboundTag":"tunnel-in"}}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(find_loopback_outbound(&root).as_deref(), Some("tunnel-in"));
+        for json in [
+            r#"{"outbounds":[{"protocol":"loopback"}]}"#,
+            r#"{"outbounds":[{"protocol":"loopback","settings":{}}]}"#,
+            r#"{"outbounds":[{"protocol":"loopback","settings":{"inboundTag":""}}]}"#,
+            r#"{"outbounds":[{"protocol":"freedom"}]}"#,
+            r#"{"outbounds":[]}"#,
+        ] {
+            let root = crate::json::parse(json).expect("parses");
+            assert!(
+                find_loopback_outbound(&root).is_none(),
+                "{json} names no re-inject"
+            );
+        }
+    }
+
+    /// Sniffing on re-dispatch belongs to the engine sniffer this tree has not
+    /// built, so an enabled sniffer skips the outbound rather than re-injecting
+    /// unsniffed in silence.
+    #[test]
+    fn a_loopback_outbound_with_sniffing_enabled_is_skipped() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"loopback","settings":{"inboundTag":"t","sniffing":{"enabled":true}}}]}"#,
+        )
+        .expect("parses");
+        assert!(find_loopback_outbound(&root).is_none());
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"loopback","settings":{"inboundTag":"t","sniffing":{"enabled":false}}}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(find_loopback_outbound(&root).as_deref(), Some("t"));
+    }
+
+    fn loopback_root(inbounds: &str) -> Json {
+        crate::json::parse(&format!(
+            r#"{{"inbounds":[{inbounds}],"outbounds":[{{"protocol":"loopback","settings":{{"inboundTag":"tunnel-in"}}}},{{"protocol":"freedom"}}]}}"#,
+        ))
+        .expect("parses")
+    }
+
+    /// A tag that names no inbound is a config error, refused by name at
+    /// startup rather than per flow at midnight.
+    #[test]
+    fn a_loopback_to_an_unknown_inbound_is_refused_by_name() {
+        let root = loopback_root(
+            r#"{"tag":"other","protocol":"vless","port":1,"settings":{"clients":[{"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}}"#,
+        );
+        let error = resolve_loopback(&root, "tunnel-in", true).expect_err("refused");
+        assert!(error.contains("tunnel-in"), "{error}");
+    }
+
+    /// A front would re-enter this same resolution through the single outbound,
+    /// so naming one is a cycle of length one, refused rather than spun.
+    #[test]
+    fn a_loopback_into_a_front_would_re_enter() {
+        for protocol in ["socks", "http", "mixed"] {
+            let root = loopback_root(&format!(
+                r#"{{"tag":"tunnel-in","protocol":"{protocol}","port":1}}"#,
+            ));
+            let error = resolve_loopback(&root, "tunnel-in", true).expect_err("refused");
+            assert!(error.contains("tunnel-in"), "{error}");
+        }
+    }
+
+    /// The named server leaves by freedom; without one the re-injected flow
+    /// handshakes and then has nowhere to go, so the config stops at startup.
+    #[test]
+    fn a_loopback_without_freedom_has_nowhere_to_leave_by() {
+        let root = loopback_root(
+            r#"{"tag":"tunnel-in","protocol":"vless","port":1,"settings":{"clients":[{"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}}"#,
+        );
+        let error = resolve_loopback(&root, "tunnel-in", false).expect_err("refused");
+        assert!(error.contains("tunnel-in"), "{error}");
+    }
+
+    /// The redial speaks plain TCP plus the carried carriers. Transport
+    /// security and datagram handshakes need an identity and a session the
+    /// inbound JSON does not carry, so they refuse with the tag that asked.
+    #[test]
+    fn a_loopback_into_an_undiallable_inbound_is_refused() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        for (protocol, stream) in [
+            ("vless", r#","streamSettings":{"security":"tls"}"#),
+            ("vless", r#","streamSettings":{"security":"reality"}"#),
+            ("vless", r#","streamSettings":{"network":"quic"}"#),
+            ("vless", r#","streamSettings":{"network":"kcp"}"#),
+            ("vless", r#","streamSettings":{"network":"hysteria"}"#),
+            ("vless", r#","streamSettings":{"network":"masque"}"#),
+            ("vless", r#","streamSettings":{"network":"bogus"}"#),
+            ("dokodemo", ""),
+            ("blackhole", ""),
+        ] {
+            let settings = if protocol == "vless" {
+                format!(r#","settings":{{"clients":[{{"id":"{id}"}}]}}"#)
+            } else {
+                String::new()
+            };
+            let root = loopback_root(&format!(
+                r#"{{"tag":"tunnel-in","protocol":"{protocol}","port":1{settings}{stream}}}"#,
+            ));
+            let error = resolve_loopback(&root, "tunnel-in", true).expect_err("refused");
+            assert!(error.contains("tunnel-in"), "{protocol}{stream}: {error}");
+        }
+    }
+
+    /// Each servable server protocol resolves to its own dial, pointed at
+    /// where the named inbound listens with that inbound's own credentials.
+    #[test]
+    fn a_loopback_resolves_each_server_protocol_to_its_own_dial() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let id_bytes = uuid_bytes(id).expect("id");
+        let root = loopback_root(&format!(
+            r#"{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":1234,"settings":{{"clients":[{{"id":"{id}"}}]}}}}"#,
+        ));
+        {
+            let Outbound::Vless(dial) = resolve_loopback(&root, "tunnel-in", true).expect("vless")
+            else {
+                panic!("a vless inbound resolves to a vless dial");
+            };
+            assert_eq!(dial.id, id_bytes);
+            assert_eq!((dial.address.as_str(), dial.port), ("127.0.0.1", 1234));
+            assert!(dial.tls.is_none() && dial.reality.is_none());
+        }
+        let root = loopback_root(
+            r#"{"tag":"tunnel-in","protocol":"trojan","listen":"127.0.0.1","port":1235,"settings":{"clients":[{"password":"secret"}]}}"#,
+        );
+        {
+            let Outbound::Trojan(dial) =
+                resolve_loopback(&root, "tunnel-in", true).expect("trojan")
+            else {
+                panic!("a trojan inbound resolves to a trojan dial");
+            };
+            assert_eq!(dial.key, trojan_key("secret"));
+            assert_eq!((dial.address.as_str(), dial.port), ("127.0.0.1", 1235));
+        }
+        let root = loopback_root(&format!(
+            r#"{{"tag":"tunnel-in","protocol":"vmess","listen":"127.0.0.1","port":1236,"settings":{{"clients":[{{"id":"{id}"}}]}}}}"#,
+        ));
+        {
+            let Outbound::Vmess(dial) = resolve_loopback(&root, "tunnel-in", true).expect("vmess")
+            else {
+                panic!("a vmess inbound resolves to a vmess dial");
+            };
+            assert_eq!(dial.id, id_bytes);
+            assert_eq!((dial.address.as_str(), dial.port), ("127.0.0.1", 1236));
+        }
+        let root = loopback_root(
+            r#"{"tag":"tunnel-in","protocol":"shadowsocks","listen":"127.0.0.1","port":1237,"settings":{"method":"aes-128-gcm","password":"pw"}}"#,
+        );
+        {
+            let Outbound::Shadowsocks(dial) =
+                resolve_loopback(&root, "tunnel-in", true).expect("shadowsocks")
+            else {
+                panic!("a shadowsocks inbound resolves to a shadowsocks dial");
+            };
+            assert_eq!((dial.address.as_str(), dial.port), ("127.0.0.1", 1237));
+            assert_eq!(dial.method, "aes-128-gcm");
+        }
+        // An every-interface bind is redialled where it also answers.
+        let root = loopback_root(&format!(
+            r#"{{"tag":"tunnel-in","protocol":"vless","listen":"0.0.0.0","port":1238,"settings":{{"clients":[{{"id":"{id}"}}]}}}}"#,
+        ));
+        {
+            let Outbound::Vless(dial) = resolve_loopback(&root, "tunnel-in", true).expect("vless")
+            else {
+                panic!("resolves");
+            };
+            assert_eq!(dial.address, "127.0.0.1");
+        }
+        // A relay-shaped Shadowsocks inbound answers for fixed destinations, not the re-injected target.
+        let root = loopback_root(
+            r#"{"tag":"tunnel-in","protocol":"shadowsocks","port":1239,"settings":{"method":"2022-blake3-aes-128-gcm","password":"MDEyMzQ1Njc4OUFCQ0RFRg==","destinations":[{"key":"MDEyMzQ1Njc4OUFCQ0RFRg==","address":"127.0.0.1","port":9}]}}"#,
+        );
+        let error = resolve_loopback(&root, "tunnel-in", true).expect_err("refused");
+        assert!(error.contains("tunnel-in"), "{error}");
+    }
+
+    /// The re-injected flow carries a real handshake on the loopback wire: a
+    /// SOCKS front, a loopback resolved to the named VLESS inbound, freedom to
+    /// an echo. The bytes that come back are the bytes that went in.
+    #[test]
+    fn a_re_injected_tcp_stream_carries_an_echo() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let id_bytes = uuid_bytes(id).expect("id");
+        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let Ok(read) = stream.read(&mut buf) else {
+                    return;
+                };
+                if read == 0 {
+                    return;
+                }
+                if stream.write_all(&buf[..read]).is_err() {
+                    return;
+                }
+            }
+        });
+        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = tunnel.accept().expect("accepts");
+            serve_vless_raw(stream, &id_bytes, true);
+        });
+        let root = loopback_root(&format!(
+            r#"{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":{tunnel_port},"settings":{{"clients":[{{"id":"{id}"}}]}}}}"#,
+        ));
+        let out = resolve_loopback(&root, "tunnel-in", true).expect("resolves");
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out);
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        request.extend_from_slice(&echo_port.to_be_bytes());
+        client.write_all(&request).expect("connects");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0);
+        let payload: Vec<u8> = (0..65536).map(|i| (i % 251) as u8).collect();
+        client.write_all(&payload).expect("writes");
+        let mut back = vec![0u8; 65536];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(back, payload, "a re-injected stream is byte-identical");
+    }
+
+    /// UDP takes the same re-inject: the association frames its datagram over
+    /// the redialled TCP session the way a direct dial would.
+    #[test]
+    fn a_re_injected_udp_association_carries_a_datagram() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let id_bytes = uuid_bytes(id).expect("id");
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            loop {
+                let Ok((n, src)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = tunnel.accept().expect("accepts");
+            serve_vless_raw(stream, &id_bytes, true);
+        });
+        let root = loopback_root(&format!(
+            r#"{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":{tunnel_port},"settings":{{"clients":[{{"id":"{id}"}}]}}}}"#,
+        ));
+        let out = resolve_loopback(&root, "tunnel-in", true).expect("resolves");
+        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out);
+        });
+        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let mut datagram = vec![0u8, 0, 0];
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"ping");
+        udp.send_to(&datagram, relay).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = udp.recv_from(&mut back).expect("echoes");
+        let (source, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(source, target);
+        assert_eq!(payload, b"ping");
     }
 
     /// An edge that names no protocol the lane speaks is silent on that carrier, so the flow that learns it pays one dial and the next pays none.
