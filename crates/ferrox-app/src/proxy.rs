@@ -1311,7 +1311,7 @@ fn spawn_mux_udp_reader(
     let id = Arc::clone(&session.id);
     let done = Arc::clone(&session.done);
     Some(RelayPool::global().run(move || {
-        let mut buf = vec![0u8; UDP_BUF];
+        let mut buf = udp_buffer();
         let mut staging = Vec::with_capacity(8192);
         loop {
             match read.recv_from(&mut buf) {
@@ -3155,7 +3155,7 @@ fn spawn_udp_uplink_reader(
 ) -> std::sync::mpsc::Receiver<()> {
     RelayPool::global().run(move || {
         let mut read = read;
-        let mut buf = vec![0u8; UDP_BUF];
+        let mut buf = udp_buffer();
         let mut reply = Vec::with_capacity(UDP_BUF);
         while let Some(n) = read_udp_datagram(&mut read, &mut buf) {
             let dest = match source.lock() {
@@ -3286,7 +3286,7 @@ fn spawn_trojan_uplink_reader(
 ) -> std::sync::mpsc::Receiver<()> {
     RelayPool::global().run(move || {
         let mut read = read;
-        let mut buf = vec![0u8; UDP_BUF];
+        let mut buf = udp_buffer();
         let mut reply = Vec::with_capacity(UDP_BUF);
         while let Some((src_addr, n)) = read_trojan_datagram(&mut read, &mut buf) {
             let dest = match source.lock() {
@@ -4948,7 +4948,7 @@ fn serve_trojan_udp(stream: TcpStream) {
     let done_in = Arc::clone(&done);
     let forward = move || {
         let mut tcp_read = tcp_read;
-        let mut buf = vec![0u8; UDP_BUF];
+        let mut buf = udp_buffer();
         while let Some((dest, n)) = read_trojan_datagram(&mut tcp_read, &mut buf) {
             let sent = if dest.is_ipv6() {
                 match &udp6_send {
@@ -4965,7 +4965,7 @@ fn serve_trojan_udp(stream: TcpStream) {
         done_in.store(true, Ordering::Relaxed);
     };
     let replied = RelayPool::global().run(forward);
-    let mut buf = vec![0u8; UDP_BUF];
+    let mut buf = udp_buffer();
     let mut trojan_head = Vec::with_capacity(32);
     loop {
         if done.load(Ordering::Relaxed) {
@@ -5819,7 +5819,7 @@ fn serve_socks_udp(mut client: TcpStream, out: &Outbound) {
 fn serve_socks_udp_freedom(relay: &UdpSocket) {
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let mut uplinks: HashMap<SocketAddr, (UdpSocket, thread::JoinHandle<()>)> = HashMap::new();
-    let mut buf = vec![0u8; UDP_BUF];
+    let mut buf = udp_buffer();
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
             continue;
@@ -5852,7 +5852,7 @@ fn serve_socks_udp_freedom(relay: &UdpSocket) {
         };
         let _ = up.set_read_timeout(Some(budgets::udp_idle()));
         let done = thread::spawn(move || {
-            let mut back = vec![0u8; UDP_BUF];
+            let mut back = udp_buffer();
             let writer = up;
             while let Ok(read) = writer.recv(&mut back) {
                 let Some(source) = peer.lock().ok().and_then(|slot| *slot) else {
@@ -5882,8 +5882,8 @@ fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut) {
     const POLL: Duration = Duration::from_millis(10);
     let _ = relay.set_read_timeout(Some(POLL));
     let mut streams: HashMap<SocketAddr, crate::foxy::Datagram> = HashMap::new();
-    let mut buf = vec![0u8; UDP_BUF];
-    let mut datagram = vec![0u8; UDP_BUF];
+    let mut buf = udp_buffer();
+    let mut datagram = udp_buffer();
     let mut reply = Vec::with_capacity(UDP_BUF);
     let mut client = None;
     loop {
@@ -5941,7 +5941,7 @@ fn serve_socks_udp_foxy_ip(relay: &UdpSocket, foxy: &FoxyOut) {
     let mut tunnel: Option<crate::foxy::Ip> = None;
     let mut source = [0u8; 16];
     let mut width = 0usize;
-    let mut buf = vec![0u8; UDP_BUF];
+    let mut buf = udp_buffer();
     let mut reply = Vec::with_capacity(UDP_BUF);
     let mut client = None;
     // One port per destination so a reply lands where it was sent from: the address is shared, the port is not.
@@ -6332,7 +6332,7 @@ fn serve_socks_udp_shadowsocks2022(
     ) else {
         return;
     };
-    let mut buf = vec![0u8; UDP_BUF];
+    let mut buf = udp_buffer();
     let mut datagrams = crate::shadowsocks2022::Datagrams::new();
     let multi = !method.is_chacha() && list.len() > 1;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
@@ -6370,7 +6370,7 @@ fn spawn_ss_udp_reader2022(
     let send = relay.try_clone().ok()?;
     let psk = psk.to_vec();
     Some(RelayPool::global().run(move || {
-        let mut buf = vec![0u8; UDP_BUF];
+        let mut buf = udp_buffer();
         let mut reply = Vec::with_capacity(UDP_BUF);
         let mut datagrams = crate::shadowsocks2022::Datagrams::new();
         loop {
@@ -6464,7 +6464,7 @@ fn serve_socks_udp_vmess(relay: &UdpSocket, vmess: &VmessOut) {
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let mut uplink: Option<VmessUdpUplink> = None;
     let mut staging = Vec::with_capacity(UDP_BUF);
-    let mut buf = vec![0u8; UDP_BUF];
+    let mut buf = udp_buffer();
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
             continue;
@@ -6511,7 +6511,7 @@ fn serve_socks_udp_vless(relay: &UdpSocket, vless: &VlessOut) {
     }
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let mut uplink: Option<UdpUplink> = None;
-    let mut buf = vec![0u8; UDP_BUF];
+    let mut buf = udp_buffer();
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
             continue;
@@ -6625,7 +6625,7 @@ fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
     let Some(done) = spawn_xudp_reader(read, relay, Arc::clone(&source)) else {
         return;
     };
-    let mut buf = vec![0u8; UDP_BUF];
+    let mut buf = udp_buffer();
     let mut staging = Vec::with_capacity(UDP_BUF + 64);
     let mut identity: Option<[u8; ferrox_core::mux::GLOBAL_ID]> = None;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
@@ -6668,7 +6668,7 @@ fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
 fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let mut uplink: Option<TrojanUdpUplink> = None;
-    let mut buf = vec![0u8; UDP_BUF];
+    let mut buf = udp_buffer();
     let mut trojan_head = Vec::with_capacity(32);
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
@@ -7000,6 +7000,11 @@ fn dial_http_outbound(
 
 pub(crate) const UDP_BUF: usize = 65535;
 
+/// The datagram slot a UDP relay loop hands every receive: every user reads back only what the receive reported, so the fill `vec![0u8; n]` pays for is work thrown away.
+pub(crate) fn udp_buffer() -> Vec<u8> {
+    RelayBuf::with_len(UDP_BUF).into_vec()
+}
+
 /// The largest SOCKS5 UDP request header: the three-byte opening plus the longest address this tree frames.
 const HEAD: usize = 22;
 
@@ -7077,7 +7082,7 @@ fn serve_vless_udp(mut stream: TcpStream, target: &SocketAddr) {
     let done_in = Arc::clone(&done);
     let forward = move || {
         let mut tcp_read = tcp_read;
-        let mut buf = vec![0u8; UDP_BUF];
+        let mut buf = udp_buffer();
         while let Some(n) = read_udp_datagram(&mut tcp_read, &mut buf) {
             if udp_send.send(&buf[..n]).is_err() {
                 break;
@@ -7086,7 +7091,7 @@ fn serve_vless_udp(mut stream: TcpStream, target: &SocketAddr) {
         done_in.store(true, Ordering::Relaxed);
     };
     let replied = RelayPool::global().run(forward);
-    let mut buf = vec![0u8; UDP_BUF];
+    let mut buf = udp_buffer();
     loop {
         match udp.recv(&mut buf) {
             Ok(n) => {
@@ -7150,7 +7155,7 @@ pub(crate) fn pump_vmess_udp(
     let Some(mut pad) = crate::vmess::PadSource::fresh() else {
         return;
     };
-    let mut buf = vec![0u8; UDP_BUF];
+    let mut buf = udp_buffer();
     let mut tcp_write = tcp_write;
     loop {
         match udp.recv(&mut buf) {
