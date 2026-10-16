@@ -7383,8 +7383,9 @@ impl Drop for SplicePipe {
 /// every offset — but this reads eight bytes per load and lets the wide pass skip the
 /// ~255/256 of offsets that hold no `\n`, doing the four-byte verify only at a real
 /// candidate. Portable integer code: no target feature, no unsafe, one owner of the
-/// terminator shape.
-fn find_double_crlf(head: &[u8]) -> Option<usize> {
+/// terminator shape. It is the one terminator scan: every handshake that ends a head at
+/// `\r\n\r\n` reaches it rather than reopening the `windows(4)` byte loop.
+pub(crate) fn find_double_crlf(head: &[u8]) -> Option<usize> {
     const CR: u8 = b'\r';
     const LF: u8 = b'\n';
     const SPREAD: u64 = 0x0101_0101_0101_0101;

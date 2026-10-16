@@ -528,7 +528,7 @@ pub(crate) fn connect(
     read.write_all(handshake.as_bytes()).ok()?;
     let head = read_head(&mut read)?;
     check_response(&head, &key)?;
-    let at = head.windows(4).position(|w| w == b"\r\n\r\n")? + 4;
+    let at = crate::proxy::find_double_crlf(&head)? + 4;
     let mut behind = Vec::new();
     behind.extend_from_slice(&head[at..]);
     let (reader, writer) = split(read, behind, true)?;
