@@ -11,6 +11,8 @@ bytes and nothing else. For `xtls-rprx-vision` the command byte and the address
 are still written — Vision is a framing *around* VLESS, not a replacement for
 its target field.
 
+A dial keeps the destination the shape the client gave it: a name leaves as ATYP 2 plus its bytes and the edge answers the lookup, so nothing on this machine asks its own resolver for a host the tunnel was meant to carry. Only `Freedom`, the Foxy direct split and a UDP front that already resolved the datagram's destination look a name up here.
+
 `request_header_len` is a pure function of the destination, so the caller knows
 the exact length before reading anything. `encode_into` writes into a buffer the
 caller owns. That combination is why `ferrox-bench` gate 2 can assert zero

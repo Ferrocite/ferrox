@@ -565,7 +565,7 @@ pub(crate) fn client_send_handshake(
     uplink: &mut dyn Write,
     password: &str,
     method: &str,
-    target: &SocketAddr,
+    target: &crate::proxy::Destination,
 ) -> Option<(Cipher, Recv)> {
     let method = Method::parse(method)?;
     let list = psks(password, method)?;
@@ -583,8 +583,8 @@ pub(crate) fn client_send_handshake(
         }
     }
     let mut send = Cipher::from_psk(method, &final_psk, &salt)?;
-    let mut addr = Vec::with_capacity(20);
-    push_addr(&mut addr, target, 4);
+    let mut addr = Vec::with_capacity(2 + target.addr_len());
+    target.push_addr(&mut addr, 4, 3);
     addr.extend_from_slice(&target.port().to_be_bytes());
     let pad_len = padding_for(0);
     let mut variable = Vec::with_capacity(addr.len() + 2 + pad_len);
@@ -1676,8 +1676,12 @@ mod tests {
             uplink
                 .set_read_timeout(Some(Duration::from_secs(30)))
                 .expect("timeout");
-            let Some((mut send, recv)) = client_send_handshake(&mut uplink, &psk, name, &target)
-            else {
+            let Some((mut send, recv)) = client_send_handshake(
+                &mut uplink,
+                &psk,
+                name,
+                &crate::proxy::Destination::from(target),
+            ) else {
                 panic!("{name}: handshake refused");
             };
             assert_eq!(send.method(), method, "{name}");
@@ -2067,9 +2071,12 @@ mod tests {
         uplink
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
-        let Some((mut send, recv)) =
-            client_send_handshake(&mut uplink, &password, "2022-blake3-aes-256-gcm", &target)
-        else {
+        let Some((mut send, recv)) = client_send_handshake(
+            &mut uplink,
+            &password,
+            "2022-blake3-aes-256-gcm",
+            &crate::proxy::Destination::from(target),
+        ) else {
             panic!("relay handshake refused");
         };
         let mut ping = [0u8; SEAL_HEAD + 4 + TAG_LEN];
