@@ -19470,6 +19470,11 @@ mod poll_relay {
         dst: TcpStream,
         pipe: Option<SplicePipe>,
         pending: usize,
+        /// The last ingest splice moved nothing: a pipe ring runs out of slots before it
+        /// runs out of byte capacity, so an honest `POLLIN` can still have nowhere to put
+        /// what it sees, and a level-triggered one would wake us forever. The drain that
+        /// frees a slot clears it.
+        ingest_stalled: bool,
         src_at_eof: bool,
         ended: bool,
         done: Option<mpsc::Sender<()>>,
@@ -19482,10 +19487,27 @@ mod poll_relay {
                 dst,
                 pipe: SplicePipe::new(),
                 pending: 0,
+                ingest_stalled: false,
                 src_at_eof: false,
                 ended: false,
                 done: Some(done),
             }
+        }
+
+        /// Whether a `POLLIN` on `src` could move bytes: `pending` is in bytes and the
+        /// kernel's `EAGAIN` is about slots, so an empty pipe is the one state where the
+        /// byte capacity is certainly available. With `pending` held the drain keeps
+        /// `POLLOUT` armed, which is the wake that frees a slot and re-arms this half.
+        fn can_ingest(&self) -> bool {
+            let has_room = match &self.pipe {
+                Some(pipe) => self.pending < pipe.capacity,
+                None => true,
+            };
+            !self.src_at_eof && has_room && (self.pending == 0 || !self.ingest_stalled)
+        }
+
+        fn can_drain(&self) -> bool {
+            self.pending > 0
         }
 
         fn advance(&mut self) {
@@ -19498,7 +19520,7 @@ mod poll_relay {
                 return;
             };
             let room = pipe.capacity - self.pending;
-            if !self.src_at_eof && room > 0 {
+            if self.can_ingest() {
                 let moved = unsafe {
                     libc::splice(
                         self.src.as_raw_fd(),
@@ -19511,14 +19533,17 @@ mod poll_relay {
                 };
                 if moved > 0 {
                     self.pending += moved as usize;
+                    self.ingest_stalled = false;
                 } else if moved == 0 {
                     self.src_at_eof = true;
                 } else if !retryable() {
                     self.end();
                     return;
+                } else {
+                    self.ingest_stalled = true;
                 }
             }
-            while self.pending > 0 {
+            while self.can_drain() {
                 let moved = unsafe {
                     libc::splice(
                         pipe.fds[0],
@@ -19531,6 +19556,7 @@ mod poll_relay {
                 };
                 if moved > 0 {
                     self.pending -= moved as usize;
+                    self.ingest_stalled = false;
                     continue;
                 }
                 if moved < 0 && !retryable() {
@@ -19648,11 +19674,7 @@ mod poll_relay {
                     if direction.ended {
                         continue;
                     }
-                    let has_room = match &direction.pipe {
-                        Some(pipe) => direction.pending < pipe.capacity,
-                        None => true,
-                    };
-                    if !direction.src_at_eof && has_room {
+                    if direction.can_ingest() {
                         pfds.push(libc::pollfd {
                             fd: direction.src.as_raw_fd(),
                             events: libc::POLLIN,
@@ -19660,7 +19682,7 @@ mod poll_relay {
                         });
                         owners.push((flow_index, direction_index));
                     }
-                    if direction.pending > 0 {
+                    if direction.can_drain() {
                         pfds.push(libc::pollfd {
                             fd: direction.dst.as_raw_fd(),
                             events: libc::POLLOUT,
