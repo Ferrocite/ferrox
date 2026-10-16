@@ -53,8 +53,10 @@ unsafe fn mask_wide(buf: &mut [u8], mask: [u8; 4]) {
     let wide = _mm256_set1_epi32(i32::from_le_bytes(mask));
     let (passes, rest) = buf.as_chunks_mut::<WIDE_PASS>();
     for pass in passes {
-        let data = _mm256_loadu_si256(pass.as_ptr().cast());
-        _mm256_storeu_si256(pass.as_mut_ptr().cast(), _mm256_xor_si256(data, wide));
+        unsafe {
+            let data = _mm256_loadu_si256(pass.as_ptr().cast());
+            _mm256_storeu_si256(pass.as_mut_ptr().cast(), _mm256_xor_si256(data, wide));
+        }
     }
     mask_narrow(rest, mask);
 }
