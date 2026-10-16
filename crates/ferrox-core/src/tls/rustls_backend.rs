@@ -26,12 +26,24 @@ impl<S: Stream> std::fmt::Debug for RustlsProvider<S> {
 }
 
 /// The stock chain verifier with a leaf-pin check bolted on the end, so pinning
-/// narrows what already verified rather than replacing it. `Debug` is derived
-/// because the crate denies its absence.
+/// narrows what already verified — and, when the store this device has cannot
+/// build the chain of a key it does pin, stands in for that store with the leaf
+/// as its own anchor. `Debug` is derived because the crate denies its absence.
 #[derive(Debug)]
 struct Pinned {
     inner: Arc<rustls::client::WebPkiServerVerifier>,
     pins: crate::foxy::pin::Pins,
+}
+
+/// The leaf as the only trust anchor, so a pinned edge still gets the name and validity checks a chain this device cannot build would otherwise skip.
+fn anchored(
+    leaf: &rustls::pki_types::CertificateDer<'_>,
+) -> Result<Arc<rustls::client::WebPkiServerVerifier>, rustls::Error> {
+    let mut roots = RootStore::empty();
+    roots.add(leaf.clone())?;
+    rustls::client::WebPkiServerVerifier::builder_with_provider(Arc::new(roots), provider())
+        .build()
+        .map_err(|e| rustls::Error::General(format!("pinned anchor: {e}")))
 }
 
 impl rustls::client::danger::ServerCertVerifier for Pinned {
@@ -43,14 +55,27 @@ impl rustls::client::danger::ServerCertVerifier for Pinned {
         ocsp_response: &[u8],
         now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        self.inner.verify_server_cert(
+        let pinned = self.pins.holds(end_entity);
+        if let Err(error) = self.inner.verify_server_cert(
             end_entity,
             intermediates,
             server_name,
             ocsp_response,
             now,
-        )?;
-        if self.pins.holds(end_entity) {
+        ) {
+            // The operator pinned this key, so the key is the authority a stale device store withholds; everything else about the certificate is still checked.
+            if !pinned {
+                return Err(error);
+            }
+            anchored(end_entity)?.verify_server_cert(
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+            )?;
+        }
+        if pinned {
             Ok(rustls::client::danger::ServerCertVerified::assertion())
         } else {
             Err(rustls::Error::InvalidCertificate(

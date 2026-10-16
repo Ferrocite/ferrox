@@ -195,6 +195,44 @@ an `exitProbe` is set; the recommended location, and every config with no probe,
 pay nothing, and a runner that cannot carry the trace sets one flag and stops
 probing rather than costing each flow a dead dial.
 
+## The pinned anchor
+
+`spkiPins` names a leaf key. Until now that name was only ever a *narrower*
+filter: `Pinned::verify_server_cert` ran the stock chain verifier first and
+checked the pin against what had already verified, so a device whose trust store
+could not build the edge's chain refused the edge it had been told to trust. The
+newest upstream client in this lane's family fixed the same hazard from the other
+side: FoxyVPN v1.0.5 ships the GlobalSign E46/R46 roots so an out-of-date Android
+store can build the chain again.
+
+This lane does not need a bundled root. The pin replaces **who signed the leaf**
+and nothing else: when the store fails and this leaf's SPKI is one of the pins,
+the same leaf, the same intermediates, the same name and the same instant are
+verified again against a one-anchor store of the leaf itself, which is rustls's
+ordinary path and therefore still enforces the SAN and the validity window.
+
+- **What it costs.** The path where the store verifies is one extra bool. The
+  path where it does not is one `RootStore` and one verifier build, once per
+  handshake, on a dial that used to be a refusal. No data-path count moves.
+- **Against the references.** `upstream/xray-core/transport/internet/tls/config.go`
+  reaches `foundLeaf` and `return nil` — the pin replaces the name check and the
+  expiry check along with the chain. This lane is the same feature with those two
+  checks kept, so a mis-set pin on a key that answers for another host, or an old
+  certificate replayed under a still-held key, is still refused.
+- **What checks it.** `a_pinned_leaf_carries_the_tunnel_when_the_store_cannot_build_the_chain`
+  dials an edge minted by another hand with the right pin and echoes a payload —
+  red with the fallback removed. `a_pinned_leaf_still_has_to_answer_the_name_it_was_dialled_for`
+  is red with the re-verification removed, which is the xray shape.
+  `a_pin_that_is_not_the_edges_key_is_still_refused_without_a_trust_store` holds
+  the stranger's pin at `Failure::Untrusted`, so the ask-once rule above still
+  applies to it.
+- **What it does not reach.** The `h3` carrier is quiche's, and quiche takes its
+  anchors from a CA file (`quic.rs::quiche_config` →
+  `load_verify_locations_from_file`) with no verify callback, so the HTTP/3 leg
+  still needs a store that can build the chain. An `auto` walk over a stale store
+  and a pinned edge therefore fails `h3` and lands on `h2`, which is a downgrade
+  the lane already survives rather than a new failure.
+
 ## Ops
 
 ```bash
@@ -314,7 +352,8 @@ downgrade.
 
 | what | where |
 | --- | --- |
-| the QUIC + HTTP/3 stack behind `h3` | `upstream/quiche` @ `3fc9bc1c` |
+| the QUIC + HTTP/3 stack behind `h3` | `upstream/quiche` @ `b60aff93` |
+| `foundLeaf`: the pin replaces chain, name and expiry | `upstream/xray-core/transport/internet/tls/config.go` |
 | the Android client this lane ports | `/tmp/foxyvpn` (`com.vauth.foxyvpn`) |
 | the Go reference client this lane ports | `/tmp/firefox-vpn-client` |
 
