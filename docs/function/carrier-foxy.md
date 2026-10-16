@@ -23,7 +23,8 @@ seven header fields, read one status, relay. The parts that decide rather than
 move bytes live in `ferrox_core::foxy` (the codecs, the window arithmetic, the
 UDP path and template), and the app crate owns the socket, the pool and the
 TLS session. A caller that relays bytes does not know which carrier produced
-its `Read + Write`.
+its `Read + Write`. The tunnel a dial returns owns the pooled stream it rides
+(`FoxyOpen::Tunnel`), so the flow that ends is what hands that stream back.
 
 ## Data path
 
@@ -402,6 +403,6 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/foxy.rs, crates/ferrox-app/src/foxy_account.rs, crates/ferrox-app/src/foxy_catalog.rs, crates/ferrox-app/src/foxy_challenge.rs, crates/ferrox-app/src/foxy_live.rs, crates/ferrox-core/src/foxy/*
-- symbols: foxy
+- symbols: foxy, FoxyOpen, probe_edge_exit
 - go: ./transport/internet/masque/...
 <!-- scope:end -->
