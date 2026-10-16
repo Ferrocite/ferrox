@@ -407,7 +407,11 @@ mod tests {
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             let configured = ferrox_core::transport::EarlyData::split("/interop-upgrade?ed=2048");
-            let (_reader, write) = accept(stream, &configured.path).expect("upgrades");
+            let (mut reader, write) = accept(stream, &configured.path).expect("upgrades");
+            // Drain the early data before closing: a Windows socket closed with received bytes still unread answers RST, which discards the `101` the client has not yet read.
+            let mut early = [0u8; 5];
+            reader.read_exact(&mut early).expect("reads the early data");
+            assert_eq!(&early, b"first", "the bare path carried the early data");
             drop(write);
         });
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
