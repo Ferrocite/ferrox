@@ -207,11 +207,11 @@ loads per block, and the table traffic stays exactly the six reads and two write
 above.
 
 Two CI reads of the probe's row, from `ops.yml`'s `method-ops` artefact against
-the page's 1297641: the fold as shipped is **1258346** at `bbe42b1` (run
-38841207859), 39 295 counts below the baseline, which over the probe's 65 536
-bytes is 0.6 instructions per byte — the payload's read, xor and write, paid
-back by the block's store and reload. The next rung looked like the fill's own
-loop, so a second shape put the step count in the type (`next_byte` plus a
+the page's 1297641: the fold as shipped is **1258346**, read twice on two heads
+of this branch (`bbe42b1` at run 38841207859, `f606452` at run 38843050039),
+39 295 counts below the baseline, which over the probe's 65 536 bytes is 0.6
+instructions per byte — the payload's read, xor and write, paid back by the
+block's store and reload. The next rung looked like the fill's own loop, so a second shape put the step count in the type (`next_byte` plus a
 `keystream::<N>(&mut [u8; N])` fill) and let the sixteen steps be straight-line
 code instead of a slice loop: that read **1258730** at `42f3cc0` (run
 38842276749), 384 counts *above* the shipped fold and six times the band the
