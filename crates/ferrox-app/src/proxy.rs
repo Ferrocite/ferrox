@@ -20163,7 +20163,7 @@ mod relay_tests {
         const SEGMENT: usize = 512;
         const ROUNDS: usize = 8_192;
         const WINDOW: Duration = Duration::from_millis(400);
-        const SPIN_LIMIT: usize = 5_000;
+        const SPIN_LIMIT: usize = 1;
 
         let stalled_front = listener();
         let stalled_front_port = port_of(&stalled_front);
