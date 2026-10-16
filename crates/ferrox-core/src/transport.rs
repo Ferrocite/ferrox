@@ -223,14 +223,15 @@ fn decode_groups(bytes: &[u8], table: &[u8; 256]) -> Option<Vec<u8>> {
     let (full, rest) = bytes.split_at(bytes.len() / 4 * 4);
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3 + 3);
     for group in full.as_chunks::<4>().0 {
-        let mut word = 0u32;
-        for &byte in group {
-            let digit = table[usize::from(byte)];
-            if digit == 255 {
-                return None;
-            }
-            word = (word << 6) | u32::from(digit);
+        // Four independent lookups fill disjoint six-bit fields, so the word is a sum of fixed shifts rather than a serial shift-and-or chain: the four loads issue at once and the shift tree is not on a loop-carried dependency. One combined mask sees every invalid byte at once — a valid digit is under 64, so it leaves bits 6 and 7 clear, and only the 255 sentinel sets them.
+        let t0 = u32::from(table[usize::from(group[0])]);
+        let t1 = u32::from(table[usize::from(group[1])]);
+        let t2 = u32::from(table[usize::from(group[2])]);
+        let t3 = u32::from(table[usize::from(group[3])]);
+        if (t0 | t1 | t2 | t3) & 0xc0 != 0 {
+            return None;
         }
+        let word = (t0 << 18) | (t1 << 12) | (t2 << 6) | t3;
         out.extend_from_slice(&word.to_be_bytes()[1..]);
     }
     if !rest.is_empty() {
