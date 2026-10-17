@@ -1072,8 +1072,8 @@ mod tests {
     #[test]
     fn the_record_head_hands_over_the_buffer_it_filled() {
         const HEAD: &[u8] = b"GET /tunnel HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
-        let mut wire = Vec::from(HEAD);
         const TAIL: &[u8] = b"\x82\x02hi";
+        let mut wire = Vec::from(HEAD);
         wire.extend_from_slice(TAIL);
         let (reader, _writer) =
             accept_split(std::io::Cursor::new(wire), Sink::default(), "/tunnel").expect("upgrades");
