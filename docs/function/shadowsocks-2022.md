@@ -16,10 +16,10 @@ graph TD
     C2 --> E["payload seals in place<br/>copies of payload: 0"]
     E --> F["write_all, one write syscall"]
     F --> G(("wire"))
-    H["wire, one read per 18 B<br/>then one per size+16 B"] --> I["open the length chunk in place"]
-    I --> J["read the payload chunk into<br/>the connection's own buffer"]
+    H["wire, one windowed read of a batch<br/>lengths served from the window"] --> I["open the length chunk in place"]
+    I --> J["a chunk still arriving is not waited for"]
     J --> K["open in place, zero copies"]
-    K --> L["write_all to the target"]
+    K --> L["one writev of the whole batch<br/>to the target"]
     M["wire datagram AES"] --> N["header block decrypt<br/>session subkey from session id"]
     N --> O["open body in place<br/>no allocation"]
     O --> P["payload is a subslice<br/>after the address"]
@@ -50,7 +50,10 @@ that file disagree.
 | user-space-copies-per-byte-read | 0 | ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage |
 | zero-filled-bytes-per-chunk | 0 | ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage |
 | chunk-buffer-allocations-per-connection | 1 | ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage |
-| downlink-stage-bytes-per-connection | 0 | ferrox-app-shadowsocks2022::tests::the_carrier_and_the_chunk_ask_the_socket_as_one |
+| downlink-stage-bytes-per-connection | 0 | ferrox-app-shadowsocks2022::tests::the_carrier_and_the_window_ask_the_socket_as_one |
+| downlink-chunks-per-carrier-ask | 2 | ferrox-app-shadowsocks2022::tests::the_carrier_and_the_window_ask_the_socket_as_one |
+| target-write-syscalls-per-opened-batch | 1 | ferrox-app-shadowsocks2022::tests::a_bulk_read_serves_every_buffered_chunk |
+| reads-spent-waiting-for-an-incomplete-chunk | 0 | ferrox-app-shadowsocks2022::tests::a_batch_never_waits_for_a_chunk_that_has_not_arrived |
 | udp-payload-buffers-per-datagram | 1 | ferrox-app-shadowsocks2022::tests::an_opened_payload_is_the_datagrams_own_bytes |
 | udp-datagram-reallocations-after-the-first | 0 | ferrox-app-shadowsocks2022::tests::an_opened_payload_is_the_datagrams_own_bytes |
 | udp-multi-user-eih-bytes-per-packet | 16 | ferrox-app-shadowsocks2022::tests::udp_multi_user_packs_one_eih_and_opens_with_the_pinned_psk |
@@ -105,17 +108,37 @@ Read against the pinned implementations, all of which are in
   codec's asks were served from a stage: socket → stage → wire buffer, two
   user-space copies per byte across the whole downlink, because both of this
   rung's asks — the 18-byte sealed header and the length plus its tag — sit
-  under the stage's capacity. The wrap is gone and `relay_downlink` is the
-  downlink the dial runs; the asks now reach the carrier as the codec makes them.
-  `the_carrier_and_the_chunk_ask_the_socket_as_one` seals two chunks into real
-  carrier records and records every width the carrier is asked for — 18 and 1016
-  are there, 32768 is not (`downlink-stage-bytes-per-connection 0`). The named
-  cost is the syscall side of the same fact: a sealed header now costs its own
-  carrier read where the stage answered it from bytes it had already pulled, so
-  a small chunk costs two reads where it cost one. This rung has no window of
-  its own, and coalescing the two asks into one bulk read the classic rung does
-  is the open item — `crates/ferrox-prompt/prompts.md`, `carrier-stage-drop`.
-  No duration is quoted — no CI cell runs Shadowsocks 2022 over xhttp.
+  under the stage's capacity. The wrap is gone; `relay_downlink` is the downlink
+  the dial runs and the witnesses drive, carrier straight into window. The
+  stage's own cost was measured at that boundary rather than the socket's,
+  because the carrier caps a read at its record: `xhttp::Reader` asks the socket
+  for `min(record, buf.len())`, so a stage's capacity never reaches it.
+  `downlink-stage-bytes-per-connection 0`.
+- **Two carrier asks per chunk, and a write per chunk.** `open_chunk` drew the
+  18-byte sealed length from the carrier and then drew the payload it names, so
+  every chunk of the downlink cost two carrier reads and left for the target as
+  one `write_all` of its own. The relay loop now runs the classic rung's shape:
+  `ChunkReader` asks the carrier for the whole 65672-byte window once and opens
+  the chunks where they lie, `open_batch` takes every chunk already in the
+  window while waiting only for the first, and `drain_window` hands the opened
+  plaintexts to the target in one `writev` per batch.
+  `the_carrier_and_the_window_ask_the_socket_as_one` seals two chunks into real
+  carrier records and records every width the carrier is asked for: the window
+  is there, 18 and 1016 are not, and the two chunks arrive on one ask
+  (`downlink-chunks-per-carrier-ask 2`). `a_bulk_read_serves_every_buffered_chunk`
+  counts the other side — four chunks opened from one bulk read leave in one
+  vectored write whose bases all lie inside the window, so no plaintext is
+  gathered out of it (`target-write-syscalls-per-opened-batch 1`) — and
+  `a_batch_never_waits_for_a_chunk_that_has_not_arrived` shows one read spent
+  and no second (`reads-spent-waiting-for-an-incomplete-chunk 0`), which is also
+  the gate for the held length: a chunk whose length is drawn is never drawn
+  again against the next chunk's nonce when its payload lands in the next batch.
+  The named costs: the window is 121 bytes wider than the 65551-byte chunk
+  buffer it replaces, a chunk that straddles the window's end moves its own
+  leftovers once per compaction, and against a peer that frames bodies wider
+  than a chunk the bulk ask reads past a chunk boundary where the two-ask shape
+  stopped at it. A carrier with no `writev` still sees one write per chunk. No
+  duration is quoted — no CI cell runs Shadowsocks 2022 over xhttp.
 - **The write-side staging copy.** The relay uplink first read into a plain
   buffer and then copied every payload byte into a `staging` `Vec` while it
   sealed (`Cipher::seal_into` did the `extend_from_slice`), so a 16 KiB read
