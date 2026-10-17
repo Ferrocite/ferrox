@@ -41,6 +41,11 @@ on:
         required: false
         default: US
 
+# A superseded push should not keep spending live-download quota or a runner slot; a manual dispatch keeps its run.
+concurrency:
+  group: foxy-relay-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 

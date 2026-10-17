@@ -23,8 +23,8 @@ linking for a quarter of an hour with nothing to print, while a test that has st
 and means to finish prints its name the moment it does. The limit drops to the second
 number as soon as the log says a test binary is running. The command's own exit code
 is returned, except for a stall, which returns 124. libtest writes a test's name when
-it finishes, so a parallel run only shows which names are missing; the second pass
-runs the stalled binary's tests one per process and stops on the first that does not
+it finishes, so a parallel run shows which names are missing; the second pass runs only
+those missing tests, one per process, and stops on the first that does not
 return, which is the only test that could have done it.
 EOF
   exit 2
@@ -70,7 +70,9 @@ watch() {
   mkdir -p "$(dirname "$out")"
   printf '%s\n' "$command" >"$out"
   # -C, not -la: `cat -u` would buffer the very output this reads, and a pipe would
-  # hand the kill signal to the reader instead of to the command under watch.
+  # hand the kill signal to the reader instead of to the command under watch. The child
+  # opens the file asynchronously, so create it here or the first poll's read can race it.
+  : >"$out.part"
   stdbuf -oL -eL bash -c "$command" >"$out.part" 2>&1 &
   pid=$!
   while kill -0 "$pid" 2>/dev/null; do
@@ -119,16 +121,25 @@ watch() {
   rm -f "$out.part"
 }
 
-# culprit BINARY: run each of BINARY's tests in its own process and print the first
-# that does not return within the same quiet limit. A test that fails alone is not a
-# stall, so its code is ignored; only silence is evidence here.
+# culprit BINARY: print the test in BINARY that does not return, running each candidate
+# in its own process. libtest writes a finished test's name the moment it finishes, so
+# the stalled log already names every test that DID return; the one still hanging is the
+# only name missing from it. Probe just those, a handful bounded by the runner's thread
+# count, not the whole list of several hundred, so naming a hang costs one pass rather
+# than a walk over every name. Fall back to the full list only when the log yields
+# nothing to subtract. A test that fails alone is not a stall, so its code is ignored;
+# only silence is evidence here.
 culprit() {
-  local binary="$1" keep="$out" names name
+  local binary="$1" keep="$out" names done missing name
   [[ -x "$binary" ]] || return 1
   names=$("$binary" --list --format terse 2>/dev/null | sed -n 's/: test$//p')
   [[ -n "$names" ]] || return 1
+  done=$(grep -E '^test .* \.\.\. (ok|FAILED|ignored)' "$keep" 2>/dev/null |
+    sed -E 's/^test (.*) \.\.\. (ok|FAILED|ignored).*/\1/')
+  missing=$(comm -23 <(printf '%s\n' "$names" | sort) <(printf '%s\n' "$done" | sort))
+  [[ -n "$missing" ]] || missing="$names"
   out="$keep.stall"
-  for name in $names; do
+  for name in $missing; do
     watch "$binary --exact '$name' --test-threads=1" >/dev/null
     if ((STALLED == 1)); then
       cp "$out" "$keep.last" 2>/dev/null || true
@@ -147,33 +158,55 @@ last_binary() {
 }
 
 selftest_run() {
-  local fake="$PWD/target/ci/selftest-fake-abcd" want got
+  local fake="$PWD/target/ci/selftest-fake-abcd" want got probes
   mkdir -p target/ci
+  probes="target/ci/selftest-probes.txt"
   cat >"$fake" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "--list" ]]; then
-  printf 'hangs::forever: test\nquick::done: test\n'
+  printf 'early::done: test\nhangs::forever: test\n'
   exit 0
 fi
 if [[ "${1:-}" == "--exact" ]]; then
+  printf '%s\n' "${2:-}" >>"${FAKE_PROBE:-/dev/null}"
   if [[ "${2:-}" == "hangs::forever" ]]; then sleep 600; fi
   echo "test ${2:-} ... ok"
   exit 0
 fi
 echo "     Running unittests src/lib.rs (target/debug/deps/selftest-fake-abcd)"
 echo "     Running unittests src/lib.rs (target/debug/deps/selftest-fake-abcd)"
-echo "test quick::done ... ok"
+echo "test early::done ... ok"
 sleep 600
 EOF
   chmod +x "$fake"
-  quiet=2
-  bootstrap=2
+  # A 2s limit races the child's own startup: on a loaded runner bash can be slower than
+  # that to reach its echoes, so the suite stalls before it has printed the finished test
+  # and culprit is right to walk the whole list. Give it room to print, then stall.
+  quiet=5
+  bootstrap=5
   out="target/ci/selftest.log"
   watch "$fake" >/dev/null
   ((STALLED == 1)) || { echo "selftest: a sleeping command did not read as stalled" >&2; return 1; }
+  # The stalled log printed `test early::done ... ok`, so culprit must NOT re-run it: the
+  # hang is the one name still missing, and only that name is worth a process of its own.
+  : >"$probes"; export FAKE_PROBE="$PWD/$probes"
   want="$(culprit "$fake")" || { echo "selftest: the stalled test was not named" >&2; return 1; }
+  unset FAKE_PROBE
   [[ "$want" == "hangs::forever" ]] || { echo "selftest: named '$want', want hangs::forever" >&2; return 1; }
-  echo "selftest: ok   a stall stops at the quiet limit and the test that stalls is named"
+  grep -qx 'hangs::forever' "$probes" || { echo "selftest: the hung test was never probed alone" >&2; return 1; }
+  grep -qx 'early::done' "$probes" && { echo "selftest: culprit re-ran a test the log already saw finish" >&2; return 1; }
+  echo "selftest: ok   a stall stops at the quiet limit, and only the test still missing from the log is run alone"
+  # With nothing completed in the log to subtract, culprit falls back to the full list and
+  # must reach every name -- here the finished one, which sorts before the hang, so it is
+  # probed and returns before the hang names itself.
+  out="target/ci/selftest-empty.log"
+  printf '%s\n' '     Running unittests src/lib.rs (target/debug/deps/selftest-fake-abcd)' >"$out"
+  : >"$probes"; export FAKE_PROBE="$PWD/$probes"
+  want="$(culprit "$fake")" || { echo "selftest: the fallback walk did not name the hang" >&2; return 1; }
+  unset FAKE_PROBE
+  [[ "$want" == "hangs::forever" ]] || { echo "selftest: fallback named '$want', want hangs::forever" >&2; return 1; }
+  grep -qx 'early::done' "$probes" || { echo "selftest: an unparseable log did not fall back to the full walk" >&2; return 1; }
+  echo "selftest: ok   when the log names nothing finished, culprit walks every test"
   # culprit() runs only on what last_binary() hands back, and that has to be a runnable path:
   # cargo writes the deps separator as `/` on unix and `\` on Windows.
   out="target/ci/selftest-last.log"
@@ -219,7 +252,7 @@ EOF
   ((STALLED == 1 && SECONDS - started >= 8)) || {
     echo "selftest: a silent build was cut before its bootstrap limit" >&2; return 1; }
   echo "selftest: ok   patient while it builds, strict once a test is running"
-  rm -f "$fake" "$out" "${out}.stall" target/ci/selftest-*.log
+  rm -f "$fake" "$out" "${out}.stall" "$probes" target/ci/selftest-*.log
   return 0
 }
 
