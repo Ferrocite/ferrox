@@ -44,6 +44,8 @@ shadowsocks stream-iv-bytes-per-handshake 16 ferrox-app-shadowsocks::tests::stre
 shadowsocks stream-write-syscalls-per-relay-read 1 ferrox-app-shadowsocks::tests::stream_relay_read_becomes_one_write
 shadowsocks stream-crypt-allocations-per-call 0 ferrox-core-shadowsocks::tests::rc4_crypt_is_in_place_and_allocates_nothing
 shadowsocks stream-crypt-copies-per-byte 0 ferrox-core-shadowsocks::tests::rc4_crypt_is_in_place_and_allocates_nothing
+shadowsocks downlink-stage-bytes-per-connection 0 ferrox-app-shadowsocks::tests::the_carrier_and_the_window_ask_the_socket_as_one
+shadowsocks stream-downlink-stage-bytes-per-connection 0 ferrox-app-shadowsocks::tests::the_stream_downlink_asks_its_own_chunk_of_the_socket
 shadowsocks stream-udp-payload-buffers-per-datagram 1 ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes
 shadowsocks stream-udp-datagram-reallocations-after-the-first 0 ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes
 
@@ -57,6 +59,7 @@ shadowsocks-2022 user-space-copies-per-byte-written 0 ferrox-app-shadowsocks2022
 shadowsocks-2022 user-space-copies-per-byte-read 0 ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage
 shadowsocks-2022 zero-filled-bytes-per-chunk 0 ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage
 shadowsocks-2022 chunk-buffer-allocations-per-connection 1 ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage
+shadowsocks-2022 downlink-stage-bytes-per-connection 0 ferrox-app-shadowsocks2022::tests::the_carrier_and_the_chunk_ask_the_socket_as_one
 shadowsocks-2022 udp-payload-buffers-per-datagram 1 ferrox-app-shadowsocks2022::tests::an_opened_payload_is_the_datagrams_own_bytes
 shadowsocks-2022 udp-datagram-reallocations-after-the-first 0 ferrox-app-shadowsocks2022::tests::an_opened_payload_is_the_datagrams_own_bytes
 shadowsocks-2022 subkey-heap-buffers-per-connection 1 ferrox-core-shadowsocks2022::tests::a_cipher_holds_one_heap_buffer_for_aes_and_none_for_chacha

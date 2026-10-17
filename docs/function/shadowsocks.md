@@ -121,6 +121,8 @@ that file disagree.
 | stream-write-syscalls-per-relay-read | 1 | ferrox-app-shadowsocks::tests::stream_relay_read_becomes_one_write |
 | stream-crypt-allocations-per-call | 0 | ferrox-core-shadowsocks::tests::rc4_crypt_is_in_place_and_allocates_nothing |
 | stream-crypt-copies-per-byte | 0 | ferrox-core-shadowsocks::tests::rc4_crypt_is_in_place_and_allocates_nothing |
+| downlink-stage-bytes-per-connection | 0 | ferrox-app-shadowsocks::tests::the_carrier_and_the_window_ask_the_socket_as_one |
+| stream-downlink-stage-bytes-per-connection | 0 | ferrox-app-shadowsocks::tests::the_stream_downlink_asks_its_own_chunk_of_the_socket |
 | stream-udp-payload-buffers-per-datagram | 1 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes |
 | stream-udp-datagram-reallocations-after-the-first | 0 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes |
 
@@ -408,6 +410,28 @@ Read against the three pinned implementations, all of which are in
   until the function returned while `pump_relay_carried` allocated its own;
   every Shadowsocks connection held 32 KiB where it needed 16. Both handoff
   paths now drop the head buffer once the address has been forwarded.
+- **The 32 KiB stage in front of the codec on the xhttp downlink.**
+  `dial_ss_xhttp` put a `BufReader` between the carrier and the pump. The
+  window's full-batch asks bypassed it, so it bit where an ask fell below its
+  capacity — which a 65668-byte window and the 16384-byte records this tree's
+  writer frames hit twice per batch — and on the stream rung, whose read is one
+  16383-byte chunk, on every byte of the downlink: socket → stage → window
+  where the batch path crosses once. The wrap is gone; `relay_downlink` is the
+  downlink the dial runs and the witnesses drive, carrier straight into window.
+  `the_carrier_and_the_window_ask_the_socket_as_one` frames eight sealed chunks
+  into real carrier records and records every width the codec reaches the
+  carrier with: a batch's 132-byte remainder arrives as 132, which a stage would
+  have answered from bytes it had already pulled and never passed down
+  (`downlink-stage-bytes-per-connection 0`).
+  `the_stream_downlink_asks_its_own_chunk_of_the_socket` holds the stream rung to
+  the same shape — one 16383-byte ask, never a 32768 one
+  (`stream-downlink-stage-bytes-per-connection 0`). The named
+  cost is read granularity against a peer that frames a response body wider than
+  a chunk: the stage answered a second ask from bytes it had already pulled, so
+  without it the carrier hears one ask per 16 KiB rather than one per 32. Our
+  own writer frames at `xhttp::CHUNK`, where the two shapes read the same number
+  of times and only the copy differs. No duration is quoted — no CI cell runs
+  Shadowsocks over xhttp.
 - **The staging buffer on either path.** An AEAD relay read used to copy
   every chunk into staging because two seals shared one write; now both seals
   land beside the payload in the read buffer, which carries 34 B of headroom
