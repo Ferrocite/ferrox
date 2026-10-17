@@ -87,8 +87,9 @@ jobs:
       || contains(needs.plan.outputs.methods, 'foxy')
       || contains(needs.plan.outputs.methods, 'quic')
     runs-on: ${{ matrix.os }}
-    # The backstop, not the clock: every leg carries its own deadline, so a stall fails its step in minutes with the lane log uploaded.
-    timeout-minutes: 60
+    # The backstop, not the clock: every step carries its own budget, so a stall
+    # fails its step in minutes; a warm windows build is six of the twenty.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -176,94 +177,103 @@ jobs:
         run: |
           BIN=target/debug/ferrox-app
           if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
-          PORT="$SOCKS_PORT"
-          wait_port() {
-            PORT="$1" python3 - <<'PY'
-          import os, socket, time
-          port = int(os.environ["PORT"])
-          deadline = time.time() + 180
-          while time.time() < deadline:
-              try:
-                  int(open("ferrox-relay.pid").read().strip())
-              except (OSError, ValueError):
-                  raise SystemExit("the lane exited: see ferrox-relay.log")
-              try:
-                  socket.create_connection(("127.0.0.1", port), timeout=2).close()
-                  raise SystemExit(0)
-              except OSError:
-                  time.sleep(2)
-          raise SystemExit("the lane never listened")
-          PY
-          }
+          # One wall-clock budget for the step, shared by every leg: a runner that cannot
+          # carry bytes has to say so in minutes, not at the job timeout.
+          DEADLINE=$((SECONDS + 300))
+          LANE_PID=""
+          # kill on the pid this shell started, never python's os.kill: on windows $! is an
+          # msys pid and os.kill would take it for a windows one, so the lane outlived its
+          # stop, held its port, and the next leg met the listener it replaced.
           stop_lane() {
-            python3 - <<'PY' || true
-          import os, signal, time
-          try:
-              pid = int(open("ferrox-relay.pid").read().strip())
-          except OSError:
-              raise SystemExit(0)
-          try:
-              os.kill(pid, signal.SIGTERM)
-          except OSError:
-              pass
-          PY
-            sleep 3
+            if [ -n "$LANE_PID" ]; then
+              kill -TERM "$LANE_PID" 2>/dev/null || true
+              for _ in $(seq 1 20); do
+                kill -0 "$LANE_PID" 2>/dev/null || break
+                sleep 0.5
+              done
+              kill -KILL "$LANE_PID" 2>/dev/null || true
+            fi
+            LANE_PID=""
             rm -f ferrox-relay.pid
+          }
+          # A lane that died is named at once: the old pid-file read could only say the file
+          # existed, then polled a port nothing was going to open for three minutes.
+          wait_port() {
+            local pid="$1" want="$2" stop_at=$((SECONDS + 30))
+            while ((SECONDS < stop_at)); do
+              kill -0 "$pid" 2>/dev/null || return 1
+              WANT="$want" python3 -c 'import os, socket; socket.create_connection(("127.0.0.1", int(os.environ["WANT"])), timeout=1).close()' 2>/dev/null && return 0
+              sleep 0.5
+            done
+            return 1
           }
           sha_of() {
             python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$1"
           }
           : > ferrox-relay.log
-          # Every carrier is attempted even when one fails, so one bad method
-          # cannot hide the others; the job fails at the end if any leg did.
+          # Every carrier is attempted even when one fails, so one bad method cannot hide
+          # the others. A leg may spend the whole budget except a floor for each leg
+          # still to come: a slow carrier gets the room its first flow needs, and a dead
+          # one cannot starve the rest. The job fails at the end if any leg did.
           FAILED=""
+          legs=4
+          leg=0
+          reserve=45
           for carrier in h1 h2 h3 auto; do
-            echo "== carrier $carrier =="
+            leg=$((leg + 1))
+            leg_end=$((DEADLINE - (legs - leg) * reserve))
+            if ((leg_end <= SECONDS)); then
+              echo "carrier $carrier skipped: the step's budget is spent" >&2
+              FAILED="$FAILED $carrier(budget)"
+              continue
+            fi
+            # A port per carrier, because a lane that outlives its stop still holds the
+            # listener its successor would bind.
+            PORT=$((SOCKS_PORT + leg - 1))
+            echo "== carrier $carrier on $PORT, $((leg_end - SECONDS))s =="
             CARRIER="$carrier" PORT="$PORT" python3 -c 'import json,os; token=json.load(open("foxy-pass.json"))["pass"]; json.dump({"inbounds":[{"protocol":"socks","listen":"127.0.0.1","port":int(os.environ["PORT"])}],"outbounds":[{"protocol":"foxy","settings":{"pass":token,"country":os.environ["FOXY_COUNTRY"],"carrier":os.environ["CARRIER"],"exitProbe":"www.cloudflare.com/cdn-cgi/trace"}}]}, open("foxy-relay.json","w"))'
             chmod 600 foxy-relay.json
             "$BIN" run -c foxy-relay.json >> ferrox-relay.log 2>&1 &
-            echo "$!" > ferrox-relay.pid
-            if ! wait_port "$PORT"; then
+            LANE_PID=$!
+            echo "$LANE_PID" > ferrox-relay.pid
+            if ! wait_port "$LANE_PID" "$PORT"; then
               echo "carrier $carrier never listened" >&2
               tail -n 30 ferrox-relay.log
               stop_lane
               FAILED="$FAILED $carrier(listen)"
               continue
             fi
-            # Diagnosis first, one shot each: full SOCKS+TLS transcript and the
-            # raw bytes a plain-HTTP GET brings back through the same tunnel.
-            curl -v --max-time 25 --socks5-hostname "127.0.0.1:$PORT" \
-              https://www.cloudflare.com/cdn-cgi/trace -o trace.txt 2>&1 | tail -n 30 || true
-            curl -sS --max-time 25 --socks5-hostname "127.0.0.1:$PORT" \
-              http://www.cloudflare.com/cdn-cgi/trace -o body.bin || true
-            echo "== plain-http body =="
-            wc -c body.bin 2>/dev/null || echo "(no answer)"
-            python3 -c 'print(open("body.bin","rb").read(128).hex())' 2>/dev/null || true
-            # The first flow pays for sign-in, catalogue and edge dial, so the
-            # trace is retried; the deadline keeps one stalled carrier from
-            # spending the job's timeout unnoticed.
-            deadline=$((SECONDS + 120))
-            while [ "$SECONDS" -lt "$deadline" ]; do
-              if curl -sS --max-time 30 --socks5-hostname "127.0.0.1:$PORT" \
+            # The first flow pays for sign-in, catalogue and edge dial, so the trace is
+            # retried inside the leg's share; a lane that never answers fails here rather
+            # than spending a download's budget proving the same thing again.
+            trace_ok=1
+            while ((SECONDS < leg_end)); do
+              if curl -sS --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
                 https://www.cloudflare.com/cdn-cgi/trace -o trace.txt; then
+                grep -qx "loc=$FOXY_COUNTRY" trace.txt && trace_ok=0
                 break
               fi
-              sleep 5
+              sleep 3
             done
+            if ((trace_ok != 0)); then
+              echo "carrier $carrier FAILED: no trace answer on the pin" >&2
+              curl -v --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
+                https://www.cloudflare.com/cdn-cgi/trace -o /dev/null 2>&1 | tail -n 25 || true
+              FAILED="$FAILED $carrier(trace)"
+              stop_lane
+              continue
+            fi
             grep -E '^(loc|ip)=' trace.txt || true
-            trace_ok=0
-            grep -qx "loc=$FOXY_COUNTRY" trace.txt 2>/dev/null || trace_ok=$?
             code=0
-            # Two minutes bounds a stalled megabyte; a healthy one arrives in seconds.
-            curl -sS --max-time 120 --socks5-hostname "127.0.0.1:$PORT" \
+            curl -sS --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
               'https://speed.cloudflare.com/__down?bytes=1000000' -o "file-$carrier.bin" || code=$?
             got=$(wc -c < "file-$carrier.bin" 2>/dev/null | tr -d ' ')
             got="${got:-0}"
-            if test "$trace_ok" = 0 && test "$code" = 0 && test "$got" = 1000000; then
+            if test "$code" = 0 && test "$got" = 1000000; then
               sha_of "file-$carrier.bin"
               echo "carrier $carrier: 1000000 B, exit $FOXY_COUNTRY"
             else
-              echo "carrier $carrier FAILED: trace_ok=$trace_ok curl_exit=$code bytes=$got" >&2
+              echo "carrier $carrier FAILED: curl_exit=$code bytes=$got" >&2
               FAILED="$FAILED $carrier"
             fi
             stop_lane
@@ -332,91 +342,80 @@ jobs:
         run: |
           BIN=target/debug/ferrox-app
           if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
-          PORT="$SOCKS_PORT"
+          DEADLINE=$((SECONDS + 210))
+          LANE_PID=""
+          HOP_PID=""
+          stop_pid() {
+            local pid="$1"
+            [ -n "$pid" ] || return 0
+            kill -TERM "$pid" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              kill -0 "$pid" 2>/dev/null || return 0
+              sleep 0.5
+            done
+            kill -KILL "$pid" 2>/dev/null || true
+          }
+          stop_lane() { stop_pid "$LANE_PID"; LANE_PID=""; rm -f ferrox-relay.pid; }
+          stop_hop() { stop_pid "$HOP_PID"; HOP_PID=""; rm -f foxy-hop.pid; }
           wait_port() {
-            WANT="$1" python3 - <<'PY'
-          import os, socket, time
-          want = int(os.environ["WANT"])
-          deadline = time.time() + 180
-          while time.time() < deadline:
-              try:
-                  int(open("ferrox-relay.pid").read().strip())
-              except (OSError, ValueError):
-                  raise SystemExit("the lane exited: see ferrox-relay.log")
-              try:
-                  socket.create_connection(("127.0.0.1", want), timeout=2).close()
-                  raise SystemExit(0)
-              except OSError:
-                  time.sleep(2)
-          raise SystemExit("the lane never listened")
-          PY
+            local pid="$1" want="$2" stop_at=$((SECONDS + 30))
+            while ((SECONDS < stop_at)); do
+              kill -0 "$pid" 2>/dev/null || return 1
+              WANT="$want" python3 -c 'import os, socket; socket.create_connection(("127.0.0.1", int(os.environ["WANT"])), timeout=1).close()' 2>/dev/null && return 0
+              sleep 0.5
+            done
+            return 1
           }
-          stop_lane() {
-            python3 - <<'PY' || true
-          import os, signal
-          try:
-              pid = int(open("ferrox-relay.pid").read().strip())
-          except OSError:
-              raise SystemExit(0)
-          try:
-              os.kill(pid, signal.SIGTERM)
-          except OSError:
-              pass
-          PY
-            rm -f ferrox-relay.pid
+          legs=6
+          leg=0
+          reserve=30
+          # A leg may spend the whole budget except a floor for each leg still to come,
+          # so a dead one cannot starve the rest and the step ends inside its budget.
+          leg_share() {
+            leg=$((leg + 1))
+            LEG_END=$((DEADLINE - (legs - leg) * reserve))
           }
-          # The first flow of a lane pays for sign-in, catalogue and edge dial,
-          # and a front that is still taking its first connection answers a
-          # reset once: the trace is retried, so a restart costs seconds rather
-          # than a red leg.
+          # The first flow of a lane pays for sign-in, catalogue and edge dial, and a front
+          # that is still taking its first connection answers a reset once: the trace is
+          # retried inside the leg's share.
           trace_front() {
             FRONT="$1" WANT="$2"
-            deadline=$((SECONDS + 120))
-            while [ "$SECONDS" -lt "$deadline" ]; do
+            while ((SECONDS < LEG_END)); do
               if [ "$FRONT" = http ]; then
-                curl -sS --max-time 25 -x "http://127.0.0.1:$PORT" \
+                curl -sS --max-time 15 -x "http://127.0.0.1:$PORT" \
                   https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt && break
               else
-                curl -sS --max-time 25 --socks5-hostname "127.0.0.1:$PORT" \
+                curl -sS --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
                   https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt && break
               fi
-              sleep 5
+              sleep 3
             done
             grep -qx "loc=$WANT" trace-lane.txt
           }
           fetch_mb() {
             FRONT="$1" FILE="$2"
             if [ "$FRONT" = http ]; then
-              curl -sS --max-time 120 -x "http://127.0.0.1:$PORT" \
+              curl -sS --max-time 60 -x "http://127.0.0.1:$PORT" \
                 'https://speed.cloudflare.com/__down?bytes=1000000' -o "$FILE"
             else
-              curl -sS --max-time 120 --socks5-hostname "127.0.0.1:$PORT" \
+              curl -sS --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
                 'https://speed.cloudflare.com/__down?bytes=1000000' -o "$FILE"
             fi
             test "$(wc -c < "$FILE" | tr -d ' ')" = 1000000
           }
-          # A front the app serves with a freedom outbound is a plain local
-          # proxy: it is the hop a captive or corporate network offers, and the
-          # edge dial is chained through it below.
+          # A front the app serves with a freedom outbound is a plain local proxy: it is
+          # the hop a captive or corporate network offers, and the edge dial is chained
+          # through it below.
           start_freedom() {
             FRONT="$1" HOP="$2" python3 -c 'import json,os; json.dump({"inbounds":[{"protocol":os.environ["FRONT"],"listen":"127.0.0.1","port":int(os.environ["HOP"])}],"outbounds":[{"protocol":"freedom"}]}, open("foxy-hop.json","w"))'
             chmod 600 foxy-hop.json
             "$BIN" run -c foxy-hop.json >> ferrox-relay.log 2>&1 &
-            echo "$!" > foxy-hop.pid
-            HOP="$2" python3 - <<'PY'
-          import os, socket, time
-          want = int(os.environ["HOP"])
-          for _ in range(90):
-              try:
-                  socket.create_connection(("127.0.0.1", want), timeout=2).close()
-                  raise SystemExit(0)
-              except OSError:
-                  time.sleep(2)
-          raise SystemExit("the hop never listened")
-          PY
+            HOP_PID=$!
+            echo "$HOP_PID" > foxy-hop.pid
+            wait_port "$HOP_PID" "$2" || { echo "the hop never listened" >&2; return 1; }
           }
-          # One lane per method, on its own port: a lane that is stopping still
-          # holds its listener, so a restart on the same port can meet it.
+          # One lane per method, on its own port: a lane that is stopping still holds its
+          # listener, so a restart on the same port can meet it.
           start_lane() {
             FRONT="$1" PORT="$2" CARRIER="$3" COUNTRY="$FOXY_COUNTRY" UPSTREAM="${4:-}" python3 -c '
           import json, os
@@ -427,11 +426,13 @@ jobs:
           json.dump({"inbounds":[{"protocol":os.environ["FRONT"],"listen":"127.0.0.1","port":int(os.environ["PORT"])}],"outbounds":[{"protocol":"foxy","settings":settings}]}, open("foxy-relay.json","w"))'
             chmod 600 foxy-relay.json
             "$BIN" run -c foxy-relay.json >> ferrox-relay.log 2>&1 &
-            echo "$!" > ferrox-relay.pid
-            wait_port "$PORT"
+            LANE_PID=$!
+            echo "$LANE_PID" > ferrox-relay.pid
+            wait_port "$LANE_PID" "$PORT"
           }
           COUNTRY="$FOXY_COUNTRY"
 
+          leg_share
           echo "== front: socks over h2 =="
           PORT=10808
           start_lane socks "$PORT" h2
@@ -440,6 +441,7 @@ jobs:
           echo "socks front: 1000000 B"
           stop_lane
 
+          leg_share
           echo "== front: http over h2 =="
           PORT=10809
           start_lane http "$PORT" h2
@@ -448,6 +450,7 @@ jobs:
           echo "http front: 1000000 B"
           stop_lane
 
+          leg_share
           echo "== front: mixed over h2 =="
           PORT=10810
           start_lane mixed "$PORT" h2
@@ -456,6 +459,7 @@ jobs:
           echo "mixed front: 1000000 B"
           stop_lane
 
+          leg_share
           echo "== chained: socks5 upstream over h2 =="
           start_freedom socks 10811
           PORT=10812
@@ -464,9 +468,9 @@ jobs:
           fetch_mb socks file-up.bin
           echo "socks5 upstream: 1000000 B"
           stop_lane
-          kill "$(cat foxy-hop.pid)" 2>/dev/null || true
-          rm -f foxy-hop.pid
+          stop_hop
 
+          leg_share
           echo "== chained: http upstream over h2 =="
           start_freedom http 10813
           PORT=10814
@@ -475,12 +479,12 @@ jobs:
           fetch_mb socks file-http-up.bin
           echo "http upstream: 1000000 B"
           stop_lane
-          kill "$(cat foxy-hop.pid)" 2>/dev/null || true
-          rm -f foxy-hop.pid
+          stop_hop
 
-          # HTTP/3 rides a SOCKS5 UDP association: the association is the only
-          # way a QUIC carrier gets through a hop, so the h3 leg is proven
-          # through one rather than around one.
+          # HTTP/3 rides a SOCKS5 UDP association: the association is the only way a QUIC
+          # carrier gets through a hop, so the h3 leg is proven through one rather than
+          # around one.
+          leg_share
           echo "== chained: h3 over the socks5 upstream =="
           start_freedom socks 10815
           PORT=10816
@@ -489,9 +493,7 @@ jobs:
           fetch_mb socks file-h3-up.bin
           echo "h3 over socks5 upstream: 1000000 B"
           stop_lane
-          kill "$(cat foxy-hop.pid)" 2>/dev/null || true
-          rm -f foxy-hop.pid
-
+          stop_hop
       - name: Second country and UDP path
         # One runner proves the legs that are about the lane rather than the
         # platform: a different exit server, and the datagram path. Each
@@ -503,45 +505,28 @@ jobs:
         run: |
           BIN=target/debug/ferrox-app
           COUNTRY="$FOXY_COUNTRY"
-          wait_port() {
-            WANT="$1" python3 - <<'PY'
-          import os, socket, time
-          want = int(os.environ["WANT"])
-          deadline = time.time() + 180
-          while time.time() < deadline:
-              try:
-                  int(open("ferrox-relay.pid").read().strip())
-              except (OSError, ValueError):
-                  raise SystemExit("the lane exited: see ferrox-relay.log")
-              try:
-                  socket.create_connection(("127.0.0.1", want), timeout=2).close()
-                  raise SystemExit(0)
-              except OSError:
-                  time.sleep(2)
-          raise SystemExit("the lane never listened")
-          PY
-          }
-          # A lane holds its port until it has exited, so the stop waits for the
-          # process rather than asking it to leave.
+          DEADLINE=$((SECONDS + 240))
+          LANE_PID=""
           stop_lane() {
-            python3 - <<'PY' || true
-          import os, signal, time
-          try:
-              pid = int(open("ferrox-relay.pid").read().strip())
-          except OSError:
-              raise SystemExit(0)
-          for _ in range(30):
-              try:
-                  os.kill(pid, 0)
-              except OSError:
-                  raise SystemExit(0)
-              try:
-                  os.kill(pid, signal.SIGTERM)
-              except OSError:
-                  pass
-              time.sleep(1)
-          PY
+            if [ -n "$LANE_PID" ]; then
+              kill -TERM "$LANE_PID" 2>/dev/null || true
+              for _ in $(seq 1 20); do
+                kill -0 "$LANE_PID" 2>/dev/null || break
+                sleep 0.5
+              done
+              kill -KILL "$LANE_PID" 2>/dev/null || true
+            fi
+            LANE_PID=""
             rm -f ferrox-relay.pid
+          }
+          wait_port() {
+            local pid="$1" want="$2" stop_at=$((SECONDS + 30))
+            while ((SECONDS < stop_at)); do
+              kill -0 "$pid" 2>/dev/null || return 1
+              WANT="$want" python3 -c 'import os, socket; socket.create_connection(("127.0.0.1", int(os.environ["WANT"])), timeout=1).close()' 2>/dev/null && return 0
+              sleep 0.5
+            done
+            return 1
           }
           start_lane() {
             FRONT="$1" PORT="$2" CARRIER="$3" COUNTRY="$4" python3 -c '
@@ -551,22 +536,32 @@ jobs:
           json.dump({"inbounds":[{"protocol":os.environ["FRONT"],"listen":"127.0.0.1","port":int(os.environ["PORT"])}],"outbounds":[{"protocol":"foxy","settings":settings}]}, open("foxy-relay.json","w"))'
             chmod 600 foxy-relay.json
             "$BIN" run -c foxy-relay.json >> ferrox-relay.log 2>&1 &
-            echo "$!" > ferrox-relay.pid
-            wait_port "$PORT"
+            LANE_PID=$!
+            echo "$LANE_PID" > ferrox-relay.pid
+            wait_port "$LANE_PID" "$PORT"
+          }
+          legs=3
+          leg=0
+          reserve=40
+          # A leg may spend the whole budget except a floor for each leg still to come,
+          # so a dead one cannot starve the rest and the step ends inside its budget.
+          leg_share() {
+            leg=$((leg + 1))
+            LEG_END=$((DEADLINE - (legs - leg) * reserve))
           }
           trace_socks() {
             PORT="$1" WANT="$2"
-            deadline=$((SECONDS + 120))
-            while [ "$SECONDS" -lt "$deadline" ]; do
-              curl -sS --max-time 25 --socks5-hostname "127.0.0.1:$PORT" \
+            while ((SECONDS < LEG_END)); do
+              curl -sS --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
                 https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt && break
-              sleep 5
+              sleep 3
             done
             grep -qx "loc=$WANT" trace-lane.txt
           }
 
           # A different exit server: the trace must pin DE, and 1 MB must
           # arrive through it with its exact byte count.
+          leg_share
           echo "== second country DE over h2 =="
           PORT=10817
           start_lane socks "$PORT" h2 DE
@@ -696,6 +691,7 @@ jobs:
           assert answers, 'no udp answer through the tunnel'
           print('udp through the tunnel:', answers)
           PROBE
+          leg_share
           echo "== udp path over the auto carrier: h3, then h2 =="
           PORT=10818
           start_lane socks "$PORT" auto "$COUNTRY"
@@ -710,6 +706,7 @@ jobs:
           # The other form the lane speaks: the same datagram over the HTTP/2
           # edge the US MASQUE authority publishes, so a runner that never
           # reaches UDP 2499 still carries UDP rather than refusing it.
+          leg_share
           echo "== udp path over h2 =="
           PORT=10819
           start_lane socks "$PORT" h2 "$COUNTRY"
@@ -717,21 +714,12 @@ jobs:
           curl -v --max-time 12 --socks5-hostname "127.0.0.1:$PORT" telnet://one.one.one.one:53 || true
           SOCKS_PORT="$PORT" python3 udp-probe.py
           stop_lane
-          SOCKS_PORT="$PORT" python3 - <<'PY'
       - name: Stop the lane and show its log
         if: always() && steps.secrets.outputs.present == 'true'
         run: |
-          python3 - <<'PY' || true
-          import os, signal
-          try:
-              pid = int(open("ferrox-relay.pid").read().strip())
-          except OSError:
-              raise SystemExit(0)
-          try:
-              os.kill(pid, signal.SIGTERM)
-          except OSError:
-              pass
-          PY
+          if [ -f ferrox-relay.pid ]; then
+            kill -TERM "$(cat ferrox-relay.pid)" 2>/dev/null || true
+          fi
           rm -f ferrox-relay.pid
           echo "== udp lines =="
           grep -iE "udp|masque|datagram" ferrox-relay.log | tail -n 100 || true
