@@ -14374,7 +14374,9 @@ mod tests {
         carrier: Carrier,
         serve: fn(TcpStream, &str, &str, &str, bool),
         path: &str,
+        key: (&str, &str),
     ) {
+        let (method, password) = (key.0.to_owned(), key.1.to_owned());
         let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
@@ -14389,15 +14391,14 @@ mod tests {
                 }
             }
         });
-        let password = "an-example-shared-password";
-        let method = "aes-256-gcm";
         let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         let owned = path.to_owned();
+        let (served_method, served_password) = (method.clone(), password.clone());
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
                 let Ok(stream) = stream else { continue };
-                serve(stream, password, method, &owned, true);
+                serve(stream, &served_password, &served_method, &owned, true);
             }
         });
         let front = TcpListener::bind("127.0.0.1:0").expect("binds");
@@ -14405,8 +14406,8 @@ mod tests {
         let out = Outbound::Shadowsocks(ShadowsocksOut {
             address: "127.0.0.1".to_owned(),
             port: tunnel_port,
-            method: method.to_owned(),
-            password: password.to_owned(),
+            method,
+            password,
             carrier,
             host: "127.0.0.1".to_owned(),
         });
@@ -14443,6 +14444,7 @@ mod tests {
             },
             crate::shadowsocks::serve_ws,
             "/ss-ws",
+            ("aes-256-gcm", "an-example-shared-password"),
         );
     }
 
@@ -14455,6 +14457,7 @@ mod tests {
             },
             crate::shadowsocks::serve_httpupgrade,
             "/ss-upgrade",
+            ("aes-256-gcm", "an-example-shared-password"),
         );
     }
 
@@ -14468,6 +14471,24 @@ mod tests {
             },
             crate::shadowsocks::serve_httpupgrade_answering_after_the_request,
             "/ss-upgrade",
+            ("aes-256-gcm", "an-example-shared-password"),
+        );
+    }
+
+    /// The other family on the same rung: the seal-into-a-buffer path is written twice, so both keys have to reach a dial.
+    #[test]
+    fn socks_dials_ss2022_over_httpupgrade_with_early_data_to_echo() {
+        socks_dials_ss_via(
+            Carrier::HttpUpgrade {
+                path: "/ss-upgrade".to_owned(),
+                ed: 64,
+            },
+            crate::shadowsocks2022::serve_httpupgrade,
+            "/ss-upgrade",
+            (
+                "2022-blake3-aes-256-gcm",
+                &ferrox_core::b64::encode(&[0x42u8; 32]),
+            ),
         );
     }
 
@@ -14479,6 +14500,7 @@ mod tests {
             },
             crate::shadowsocks::serve_grpc,
             "/TunnelService/Tun",
+            ("aes-256-gcm", "an-example-shared-password"),
         );
     }
 
@@ -14490,6 +14512,7 @@ mod tests {
             },
             crate::shadowsocks::serve_xhttp,
             "/ss-xhttp",
+            ("aes-256-gcm", "an-example-shared-password"),
         );
     }
 
@@ -14501,6 +14524,7 @@ mod tests {
             },
             crate::shadowsocks::serve_httpheader,
             "/ss-camouflage",
+            ("aes-256-gcm", "an-example-shared-password"),
         );
     }
 
