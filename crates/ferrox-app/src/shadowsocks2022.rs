@@ -2448,10 +2448,10 @@ mod tests {
             !seen.contains(&STAGE),
             "a stage would ask its capacity here: {seen:?}"
         );
+        // The ask count is no gate here: `connect_split` hands the carrier's pipelined tail to its reader's prefix, so a window ask is answered at that boundary first.
         assert_eq!(
-            seen.len(),
-            2,
-            "one ask carried both chunks to the window, the next found the end: {seen:?}"
+            seen[0], WINDOW,
+            "the batch opens inside one window ask, not a length ask and a payload ask"
         );
     }
 

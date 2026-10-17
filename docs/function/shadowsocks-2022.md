@@ -51,7 +51,7 @@ that file disagree.
 | zero-filled-bytes-per-chunk | 0 | ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage |
 | chunk-buffer-allocations-per-connection | 1 | ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage |
 | downlink-stage-bytes-per-connection | 0 | ferrox-app-shadowsocks2022::tests::the_carrier_and_the_window_ask_the_socket_as_one |
-| downlink-chunks-per-carrier-ask | 2 | ferrox-app-shadowsocks2022::tests::the_carrier_and_the_window_ask_the_socket_as_one |
+| downlink-chunks-per-opened-batch | 4 | ferrox-app-shadowsocks2022::tests::a_bulk_read_serves_every_buffered_chunk |
 | target-write-syscalls-per-opened-batch | 1 | ferrox-app-shadowsocks2022::tests::a_bulk_read_serves_every_buffered_chunk |
 | reads-spent-waiting-for-an-incomplete-chunk | 0 | ferrox-app-shadowsocks2022::tests::a_batch_never_waits_for_a_chunk_that_has_not_arrived |
 | udp-payload-buffers-per-datagram | 1 | ferrox-app-shadowsocks2022::tests::an_opened_payload_is_the_datagrams_own_bytes |
@@ -123,12 +123,16 @@ Read against the pinned implementations, all of which are in
   window while waiting only for the first, and `drain_window` hands the opened
   plaintexts to the target in one `writev` per batch.
   `the_carrier_and_the_window_ask_the_socket_as_one` seals two chunks into real
-  carrier records and records every width the carrier is asked for: the window
-  is there, 18 and 1016 are not, and the two chunks arrive on one ask
-  (`downlink-chunks-per-carrier-ask 2`). `a_bulk_read_serves_every_buffered_chunk`
-  counts the other side — four chunks opened from one bulk read leave in one
-  vectored write whose bases all lie inside the window, so no plaintext is
-  gathered out of it (`target-write-syscalls-per-opened-batch 1`) — and
+  carrier records and records every width the carrier is asked for: the first ask
+  is the window, and 18 and 1016 are absent. How many asks a batch costs over a
+  real carrier is not a gate there — `connect_split` hands the pipelined tail to
+  the carrier reader's prefix, so a window ask is answered at that boundary first
+  and the count is the carrier's, not the codec's. The count lives with a source
+  that answers the whole window: `a_bulk_read_serves_every_buffered_chunk` opens
+  four chunks from one bulk read and hands them on in one vectored write whose
+  bases all lie inside the window, so no plaintext is gathered out of it
+  (`downlink-chunks-per-opened-batch 4`,
+  `target-write-syscalls-per-opened-batch 1`) — and
   `a_batch_never_waits_for_a_chunk_that_has_not_arrived` shows one read spent
   and no second (`reads-spent-waiting-for-an-incomplete-chunk 0`), which is also
   the gate for the held length: a chunk whose length is drawn is never drawn
