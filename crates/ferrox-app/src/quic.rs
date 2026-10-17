@@ -1,6 +1,7 @@
+use crate::conn::Connection;
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs as _, UdpSocket};
+use std::net::{Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -26,7 +27,7 @@ struct QuicServer {
 }
 
 struct PooledState {
-    sessions: HashMap<u64, TcpStream>,
+    sessions: HashMap<u64, Connection>,
     opening: HashSet<u64>,
     next_id: u64,
 }
@@ -684,7 +685,7 @@ pub(crate) struct Datagram {
 #[derive(Clone)]
 struct Relay {
     via: SocketAddr,
-    _control: Arc<TcpStream>,
+    _control: Arc<Connection>,
 }
 
 /// The most one datagram costs in headers: two reserved bytes, one flag byte, the longest address and the port.
@@ -695,7 +696,7 @@ impl Datagram {
         Self { sock, relay: None }
     }
 
-    pub(crate) fn relayed(sock: UdpSocket, via: SocketAddr, control: Arc<TcpStream>) -> Self {
+    pub(crate) fn relayed(sock: UdpSocket, via: SocketAddr, control: Arc<Connection>) -> Self {
         Self {
             sock,
             relay: Some(Relay {
@@ -831,7 +832,7 @@ fn pump(
     sock: &Datagram,
     local: SocketAddr,
 ) {
-    let mut ready: Vec<(u64, TcpStream)> = Vec::new();
+    let mut ready: Vec<(u64, Connection)> = Vec::new();
     let mut chunk = [0u8; 8192];
     let mut buf = [0u8; MAX_DATAGRAM];
     let mut applied: Option<Duration> = None;
@@ -961,7 +962,7 @@ fn leave_session(
     }
 }
 
-fn open_session(pooled: &PooledConn, key: &QuicServer, client: &TcpStream) -> Option<u64> {
+fn open_session(pooled: &PooledConn, key: &QuicServer, client: &Connection) -> Option<u64> {
     let Ok(conn) = pooled.conn.lock() else {
         return None;
     };
@@ -988,7 +989,7 @@ fn open_session(pooled: &PooledConn, key: &QuicServer, client: &TcpStream) -> Op
     Some(id)
 }
 
-fn uplink_stream(pooled: &PooledConn, key: &QuicServer, id: u64, client: &TcpStream) {
+fn uplink_stream(pooled: &PooledConn, key: &QuicServer, id: u64, client: &Connection) {
     let Ok(flush_sock) = pooled.sock.try_clone() else {
         leave_session(&pooled.conn, &pooled.table, &pooled.sock, pool(), key, id);
         return;
@@ -1084,7 +1085,11 @@ fn uplink_stream(pooled: &PooledConn, key: &QuicServer, id: u64, client: &TcpStr
     leave_session(&pooled.conn, &pooled.table, &flush_sock, pool(), key, id);
 }
 
-pub(crate) fn dial_pooled(client: &TcpStream, dial: &QuicDial, target: &crate::proxy::Destination) {
+pub(crate) fn dial_pooled(
+    client: &Connection,
+    dial: &QuicDial,
+    target: &crate::proxy::Destination,
+) {
     let key = QuicServer {
         address: dial.address.clone(),
         port: dial.port,
@@ -1738,9 +1743,9 @@ mod tests {
 
     #[test]
     fn a_relayed_datagram_frames_its_target_ahead_of_its_payload() {
-        use std::net::{TcpListener, TcpStream};
-        let association = TcpListener::bind("127.0.0.1:0").expect("binds");
-        let control = TcpStream::connect(association.local_addr().expect("addr")).expect("dials");
+        use crate::conn::Connection;
+        let association = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let control = Connection::connect(association.local_addr().expect("addr")).expect("dials");
         let _ = association.accept().expect("accepts");
         let hop = bind_datagram("127.0.0.1:0").expect("binds");
         let target = bind_datagram("127.0.0.1:0").expect("binds");

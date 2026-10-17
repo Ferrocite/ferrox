@@ -299,3 +299,8 @@ tls-cipher-suites dialer-hello-cipher-field-equals-reference 1 ferrox-core-tls::
 loopback ops-retired-instructions UNBLESSED scripts/count-ops.sh
 loopback tcp-echo-bytes-preserved 65536 ferrox-app-proxy::tests::a_re_injected_tcp_stream_carries_an_echo
 loopback udp-datagram-bytes-preserved 4 ferrox-app-proxy::tests::a_re_injected_udp_association_carries_a_datagram
+
+# --- unix domain sockets ------------------------------------------------------
+unix ops-retired-instructions UNBLESSED scripts/count-ops.sh
+unix unix-stream-bytes-preserved 65536 ferrox-app-conn::tests::a_unix_connection_carries_the_same_bytes_the_tcp_round_trip_does
+unix unix-head-not-vector-multiple 1501 ferrox-app-conn::tests::a_unix_round_trip_survives_lengths_a_vector_would_split

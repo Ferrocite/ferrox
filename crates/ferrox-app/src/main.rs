@@ -9,6 +9,7 @@ mod budgets;
 #[macro_use]
 mod census;
 mod config;
+mod conn;
 mod foxy;
 mod foxy_account;
 mod foxy_catalog;

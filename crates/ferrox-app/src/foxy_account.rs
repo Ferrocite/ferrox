@@ -1,11 +1,12 @@
 //! One TLS connection per call: the plane is too sparse to pool, and the codec is provable over a pipe.
 
+use crate::conn::Connection;
 use crate::foxy_challenge::{self, Jar};
 use ferrox_core::foxy::account::{self, Signed};
 use ferrox_core::foxy::{Failure, Pass};
 use ferrox_core::tls::{RustlsProvider, TlsConfig, TlsProvider as _};
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpStream};
+use std::net::SocketAddr;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -299,7 +300,7 @@ impl Endpoint {
     }
 
     /// Where an account-plane failure keeps its name instead of flattening to an uninformative "io failed".
-    fn connect(&self) -> Result<RustlsProvider<TcpStream>, String> {
+    fn connect(&self) -> Result<RustlsProvider<Connection>, String> {
         let peer = match self.address {
             Some(address) => address,
             None => format!("{}:{}", self.host, self.port)
@@ -308,7 +309,7 @@ impl Endpoint {
                 .next()
                 .ok_or_else(|| format!("{} resolves to nothing", self.host))?,
         };
-        let stream = TcpStream::connect_timeout(&peer, IO_TIMEOUT)
+        let stream = crate::conn::dial_tcp(&peer, IO_TIMEOUT)
             .map_err(|why| format!("connect {peer}: {why}"))?;
         let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
@@ -912,7 +913,7 @@ mod renewal {
 #[cfg(test)]
 mod loopback {
     use super::*;
-    use std::net::TcpListener;
+    use crate::conn::Listener;
     use std::sync::mpsc;
 
     pub(crate) const HOSTS: [&str; 2] = ["api.accounts.firefox.com", "vpn.mozilla.org"];
@@ -1017,7 +1018,7 @@ mod loopback {
 
     /// The whole account plane on one loopback port: challenge, sign-in, Hawk-signed exchange, pass.
     pub(crate) fn serve(
-        listener: &TcpListener,
+        listener: &Listener,
         root: &ferrox_core::tls::TlsServerConfig,
         tx: &mpsc::Sender<Seen>,
     ) {
@@ -1167,7 +1168,7 @@ mod loopback {
         let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
         let root = ferrox_core::tls::parse_pem_identity(minted.cert.pem().as_bytes(), &key_pem)
             .expect("identity");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let (tx, _rx) = mpsc::channel();
         std::thread::spawn(move || serve(&listener, &root, &tx));
@@ -1192,7 +1193,7 @@ mod loopback {
         let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
         let root = ferrox_core::tls::parse_pem_identity(minted.cert.pem().as_bytes(), &key_pem)
             .expect("identity");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || serve(&listener, &root, &tx));
@@ -1237,7 +1238,6 @@ mod loopback {
 #[cfg(test)]
 mod two_factor {
     use super::loopback::{HOSTS, SESSION, TWO_FACTOR};
-    use std::net::TcpListener;
     use std::sync::mpsc;
 
     #[test]
@@ -1257,7 +1257,7 @@ mod two_factor {
         let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
         let root = ferrox_core::tls::parse_pem_identity(minted.cert.pem().as_bytes(), &key_pem)
             .expect("identity");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let (tx, _rx) = mpsc::channel();
         std::thread::spawn(move || super::loopback::serve(&listener, &root, &tx));

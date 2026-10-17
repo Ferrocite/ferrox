@@ -1,16 +1,16 @@
+use crate::conn::Connection;
 use std::io::{Read, Write};
-use std::net::TcpStream;
 
 const HEAD_LIMIT: usize = 8192;
 
 #[derive(Debug)]
-pub(crate) struct HeadReader<R: Read = TcpStream> {
+pub(crate) struct HeadReader<R: Read = Connection> {
     read: R,
     prefix: Vec<u8>,
     at: usize,
 }
 
-impl HeadReader<TcpStream> {
+impl HeadReader<Connection> {
     /// Arm or clear the poll quantum on the handle this reader reads through; a duplicated socket inherits no read timeout on Windows.
     pub(crate) fn set_poll(&mut self, every: Option<std::time::Duration>) {
         let _ = self.read.set_read_timeout(every);
@@ -37,11 +37,11 @@ impl<R: Read> Read for HeadReader<R> {
 }
 
 /// The head, the octets that arrived with it, and where the head ends: this read consumes what it proves, so bytes pipelined behind the head are already in hand.
-fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, usize)> {
+fn read_head(stream: &mut Connection) -> Option<(Vec<u8>, usize)> {
     crate::proxy::read_http_head_kept(stream, HEAD_LIMIT, crate::budgets::head_arrival())
 }
 
-pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(HeadReader, TcpStream)> {
+pub(crate) fn accept(stream: Connection, path: &str) -> Option<(HeadReader, Connection)> {
     let mut read = stream;
     let (head, at) = read_head(&mut read)?;
     check_request(&head[..at], path)?;
@@ -92,10 +92,10 @@ pub(crate) fn accept_split<R: Read, W: Write>(
 }
 
 pub(crate) fn connect(
-    stream: TcpStream,
+    stream: Connection,
     host: &str,
     path: &str,
-) -> Option<(HeadReader, TcpStream)> {
+) -> Option<(HeadReader, Connection)> {
     let mut read = stream;
     let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n");
     read.write_all(request.as_bytes()).ok()?;
@@ -148,12 +148,11 @@ pub(crate) fn connect_split<R: Read, W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
     use std::thread;
 
     #[test]
     fn header_carries_an_echo_over_loopback() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -163,7 +162,7 @@ mod tests {
             assert_eq!(&buf, b"ping");
             write.write_all(b"pong").expect("writes");
         });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, mut write) =
             connect(stream, "oracle.example", "/camouflage").expect("headers");
         write.write_all(b"ping").expect("writes");
@@ -250,13 +249,13 @@ mod tests {
 
     #[test]
     fn header_rejects_a_wrong_path() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             assert!(accept(stream, "/camouflage").is_none());
         });
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
             .write_all(b"GET /other HTTP/1.1\r\nHost: h\r\n\r\n")
             .expect("writes");
