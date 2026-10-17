@@ -489,6 +489,7 @@ fn open_h2_with(dial: &FoxyDial, block: &[u8]) -> Result<Tls2, Failure> {
         at: 0,
         out: Vec::new(),
         capsule_buf: Vec::new(),
+        frame: FrameState::default(),
         fin: false,
     };
     let status = lane.await_status()?;
@@ -538,21 +539,47 @@ pub(crate) struct Tls2 {
     out: Vec<u8>,
     /// Capsule-stream bytes not parsed yet: one capsule may span DATA frames, so frames accumulate here.
     capsule_buf: Vec<u8>,
+    frame: FrameState,
     fin: bool,
+}
+
+/// How much of the frame in flight has arrived: a read quantum expires between two socket reads, not between two frames.
+#[derive(Default)]
+struct FrameState {
+    head: [u8; frames::H2_HEADER],
+    head_at: usize,
+    payload_at: usize,
+}
+
+/// Fills `buf` from `at` on, leaving `at` where the wire stopped: a timeout mid-buffer is a pause the next call resumes, and only a closed stream ends it.
+fn fill_from<S: Read>(io: &mut S, buf: &mut [u8], at: &mut usize) -> std::io::Result<()> {
+    while *at < buf.len() {
+        match io.read(&mut buf[*at..]) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            Ok(read) => *at += read,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// One frame off the wire into the caller's owned buffer; a socket timeout keeps its kind so a relay can tell an idle quantum from a dead peer.
 fn read_frame(
     tls: &mut ferrox_core::tls::RustlsProvider<Connection>,
+    state: &mut FrameState,
     out: &mut Vec<u8>,
     max_frame: usize,
 ) -> std::io::Result<frames::H2Frame> {
-    let mut header = [0u8; frames::H2_HEADER];
-    read_exact(tls, &mut header)?;
-    let frame = frames::H2Frame::parse(&header)
+    fill_from(tls, &mut state.head, &mut state.head_at)?;
+    let frame = frames::H2Frame::parse(&state.head)
         .ok_or_else(|| std::io::Error::other("foxy: a header that is not a frame"))?;
-    crate::proxy::resize_scratch(out, (frame.length as usize).min(max_frame));
-    read_exact(tls, out)?;
+    if state.payload_at == 0 {
+        crate::proxy::resize_scratch(out, (frame.length as usize).min(max_frame));
+    }
+    fill_from(tls, out, &mut state.payload_at)?;
+    state.head_at = 0;
+    state.payload_at = 0;
+    state.head = [0u8; frames::H2_HEADER];
     Ok(frame)
 }
 
@@ -567,7 +594,7 @@ impl Tls2 {
         body: impl FnOnce(&mut Self, frames::H2Frame, &[u8]) -> R,
     ) -> std::io::Result<R> {
         let mut payload = std::mem::take(&mut self.out);
-        let frame = read_frame(&mut self.tls, &mut payload, self.max_frame);
+        let frame = read_frame(&mut self.tls, &mut self.frame, &mut payload, self.max_frame);
         let out = match frame {
             Ok(frame) => body(self, frame, &payload),
             Err(error) => {
@@ -2820,6 +2847,99 @@ mod loopback {
             .recv_timeout(Duration::from_secs(30))
             .expect("both directions flow at once");
         assert_eq!(back, sent);
+    }
+
+    /// The read quantum is what lets the writer behind the same mutex have a turn, so it must not cost the frame: a pause inside one DATA frame has to resume where it stopped, not abandon the bytes already promised to the header.
+    #[test]
+    fn a_frame_that_straddles_a_read_quantum_arrives_whole() {
+        const BODY: usize = 32 * 1024;
+        const HALF: usize = BODY / 2;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) {
+                return;
+            }
+            let mut ack = Vec::new();
+            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut ack);
+            tls.write_all(&ack).ok();
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                if matches!(
+                    frames::h2_event(frame, &payload, 1),
+                    frames::H2Event::Headers { .. }
+                ) {
+                    break;
+                }
+            }
+            let mut status = Vec::new();
+            h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut status);
+            tls.write_all(&status).expect("answers 200");
+            let body: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
+            std::thread::sleep(Duration::from_millis(200));
+            let head = frames::H2Frame {
+                kind: frames::DATA,
+                flags: 0,
+                stream: 1,
+                length: BODY as u32,
+            }
+            .header();
+            // One frame, two writes: the second lands only after the lane's quantum has expired inside the first.
+            tls.write_all(&head).expect("writes the header");
+            tls.write_all(&body[..HALF]).expect("writes the first half");
+            tls.flush().expect("flushes the first half");
+            std::thread::sleep(Duration::from_millis(300));
+            tls.write_all(&body[HALF..]).expect("writes the tail");
+            tls.flush().expect("flushes the tail");
+        });
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        tunnel
+            .set_read_quantum(Duration::from_millis(20))
+            .expect("bounds one read");
+        let mut back = Vec::new();
+        let mut buf = [0u8; 4096];
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while back.len() < BODY && std::time::Instant::now() < deadline {
+            match tunnel.read(&mut buf) {
+                Ok(0) => panic!("the lane called an end of stream inside a frame"),
+                Ok(read) => back.extend_from_slice(&buf[..read]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("the lane lost the frame: {error}"),
+            }
+        }
+        let want: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
+        assert_eq!(
+            back, want,
+            "a quantum inside a frame must not drop its tail"
+        );
+        edge.join().expect("the edge finishes");
     }
 
     /// A byte-level test cannot see a copy, so capacity is the witness: `out` is the write buffer and `carry` the read one, and a lane that stages a payload before handing it over has grown the buffer it staged in.
