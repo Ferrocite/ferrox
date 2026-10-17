@@ -336,8 +336,8 @@ pub(crate) fn report(rows: &[Row]) -> String {
          So the {:.2}x bar applies to the four decode shapes a running connection\n\
          actually sees — 1.46x to 2.73x, stable on all four runners — and every row,\n\
          gated or not, asserts field-for-field identity and zero allocations on both\n\
-         sides. See `REPORTED_ONLY` in this file and `docs/claims.md`, where the\n\
-         decision is recorded as one with both reference variants that led to it.\n",
+         sides. `REPORTED_ONLY` and `is_reported_only` in this file carry the decision,\n\
+         with both reference variants that led to it.\n",
         crate::ROUNDS,
         crate::BAR
     );
