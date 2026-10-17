@@ -160,6 +160,7 @@ carrier-grpc pinned-threads-per-silent-vmess-request 0 ferrox-app-vmess::tests::
 carrier-grpc pinned-threads-per-silent-shadowsocks-request 0 ferrox-app-shadowsocks::tests::a_silent_peer_cannot_pin_a_grpc_shadowsocks_request
 carrier-grpc pinned-threads-per-silent-2022-request 0 ferrox-app-shadowsocks2022::tests::a_silent_peer_cannot_pin_a_grpc_shadowsocks2022_request
 carrier-grpc message-buffer-reallocations-per-same-sized-frame 0 ferrox-app-grpc::tests::the_message_buffer_is_reused_not_reallocated
+carrier-grpc reclaim-moves-per-drained-buffer 0 ferrox-app-grpc::tests::the_message_buffer_is_reused_not_reallocated
 carrier-grpc batched-elements-served-per-message 8 ferrox-app-grpc::tests::a_batched_downlink_arrives_element_by_element
 carrier-grpc grpc-methods-served-per-listener 2 ferrox-app-grpc::tests::one_listener_serves_both_methods
 carrier-grpc header-field-copies-per-head 0 ferrox-app-h2::tests::a_plain_field_borrows_the_block
