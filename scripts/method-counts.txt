@@ -177,6 +177,7 @@ carrier-foxy datagrams-out-of-one-frame 2 ferrox-app-foxy::loopback::a_frame_of_
 carrier-foxy quic-datagrams-out-of-one-frame 2 ferrox-app-foxy::loopback::a_quic_frame_of_two_datagrams_arrives_as_two_datagrams
 carrier-foxy stream-write-staging-copies-per-byte 0 ferrox-app-foxy::loopback::the_quic_carrier_sends_the_block_reads_the_status_and_carries_the_bytes
 carrier-foxy datagram-write-staging-copies-per-byte 0 ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_and_echoes_a_datagram
+carrier-foxy ip-read-staging-copies-per-byte 0 ferrox-app-foxy::loopback::the_connect_ip_carrier_opens_one_tunnel_and_carries_a_datagram
 carrier-foxy server-roles 0 ferrox-app-proxy::tests::quic_serve_closes_without_handshake
 carrier-foxy dialled-without-ca-cert-file 0 ferrox-app-proxy::tests::quic_outbound_reads_ca_cert_file
 carrier-foxy address-assign-capsule-bytes-per-grant 9 ferrox-core-foxy::connectip::tests::the_assign_a_proxy_writes_is_the_assign_the_lane_reads
