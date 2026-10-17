@@ -65,17 +65,20 @@ fi
 go_version="$(go version)"
 
 echo "baseline: xray-core @ $rev (upstream against itself, no Ferrox binary)"
-echo "  pattern: go test -count=1 -timeout $go_timeout $pattern"
+echo "  pattern: go test -timeout $go_timeout $pattern"
 echo "  $go_version"
 
+# No `-count=1`: this suite runs the pin against itself, so its verdict is a property of $rev
+# and the Go toolchain and never of our diff; the line below names what was reused per PR.
 set +e
-(cd "$dir" && go test -count=1 -timeout "$go_timeout" "${patterns[@]}" >"$log" 2>&1)
+(cd "$dir" && go test -timeout "$go_timeout" "${patterns[@]}" >"$log" 2>&1)
 test_rc=$?
 set -e
 
 pkg_ok="$(grep -c '^ok[[:space:]]' "$log" || true)"; pkg_ok="${pkg_ok:-0}"
 pkg_fail="$(grep -c '^FAIL[[:space:]]' "$log" || true)"; pkg_fail="${pkg_fail:-0}"
 pkg_notest="$(grep -c 'no test files' "$log" || true)"; pkg_notest="${pkg_notest:-0}"
+pkg_cached="$(grep -c '[[:space:]](cached)$' "$log" || true)"; pkg_cached="${pkg_cached:-0}"
 case_fail="$(grep -c '^--- FAIL:' "$log" || true)"; case_fail="${case_fail:-0}"
 sub_fail="$(grep -c '^[[:space:]][[:space:]]*--- FAIL:' "$log" || true)"; sub_fail="${sub_fail:-0}"
 
@@ -95,6 +98,8 @@ sub_fail="$(grep -c '^[[:space:]][[:space:]]*--- FAIL:' "$log" || true)"; sub_fa
   echo "| packages ok | packages FAIL | no test files | \`--- FAIL\` cases | subtest fails |"
   echo "| --- | --- | --- | --- | --- |"
   echo "| $pkg_ok | $pkg_fail | $pkg_notest | $case_fail | $sub_fail |"
+  echo
+  echo "Re-executed this run: $((pkg_ok - pkg_cached)) of $pkg_ok passing package result(s); the other $pkg_cached came from this pin's own Go cache, which holds the verdict \`$rev\` already gave."
   echo
   if ((pkg_fail > 0)); then
     echo "## failing packages"
