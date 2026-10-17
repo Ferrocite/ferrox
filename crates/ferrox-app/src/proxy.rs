@@ -1,6 +1,7 @@
+use crate::conn::{parse_target, Connection, Listener};
 use std::collections::{HashMap, HashSet};
 use std::io::{IoSlice, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
@@ -57,6 +58,53 @@ pub(crate) fn serve_protobuf(label: &str, bytes: &[u8]) -> ! {
     serve_root(label, &root)
 }
 
+/// The listen address an inbound names. A `unix` field is an `AF_UNIX` path standing in for
+/// `listen`+`port`; otherwise it is the TCP `host:port`. `None` is an inbound naming neither,
+/// which the caller skips; a datagram carrier keeps the IP address by the same rule.
+fn inbound_address(inbound: &Json) -> Option<String> {
+    #[cfg(unix)]
+    let unix_path = inbound
+        .get("unix")
+        .and_then(Json::as_str)
+        .filter(|path| !path.is_empty());
+    #[cfg(unix)]
+    if unix_path.is_none() && inbound.get("port").and_then(Json::as_port).is_none() {
+        return None;
+    }
+    #[cfg(not(unix))]
+    if inbound.get("port").and_then(Json::as_port).is_none() {
+        return None;
+    }
+    #[cfg(unix)]
+    let address = match unix_path {
+        Some(path) => format!("unix:{path}"),
+        None => format!(
+            "{}:{}",
+            inbound
+                .get("listen")
+                .and_then(Json::as_str)
+                .unwrap_or("127.0.0.1"),
+            inbound
+                .get("port")
+                .and_then(Json::as_port)
+                .unwrap_or_default()
+        ),
+    };
+    #[cfg(not(unix))]
+    let address = format!(
+        "{}:{}",
+        inbound
+            .get("listen")
+            .and_then(Json::as_str)
+            .unwrap_or("127.0.0.1"),
+        inbound
+            .get("port")
+            .and_then(Json::as_port)
+            .unwrap_or_default()
+    );
+    Some(address)
+}
+
 fn serve_root(label: &str, root: &Json) -> ! {
     // Armed before the first inbound opens, so every flow from here reads the budget the operator named.
     crate::budgets::apply(
@@ -82,15 +130,10 @@ fn serve_root(label: &str, root: &Json) -> ! {
     let mut hysteria_served = false;
     if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
         for inbound in list {
-            let listen = inbound
-                .get("listen")
-                .and_then(Json::as_str)
-                .unwrap_or("127.0.0.1");
-            let Some(port) = inbound.get("port").and_then(Json::as_port) else {
+            let Some(address) = inbound_address(inbound) else {
                 continue;
             };
             let protocol = inbound.get("protocol").and_then(Json::as_str).unwrap_or("");
-            let address = format!("{listen}:{port}");
             if !inbound_served(protocol) {
                 refuse_inbound(protocol, label, inbound);
                 continue;
@@ -270,14 +313,15 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
     }
 }
 
-fn dial(target: &SocketAddr) -> Result<TcpStream, Failure> {
-    let stream = TcpStream::connect_timeout(target, budgets::dial())
+fn dial(target: &SocketAddr) -> Result<Connection, Failure> {
+    // The seam's one dial entry; an IP target is the TCP dial with its budget unchanged, so bytes and calls are identical.
+    let stream = crate::conn::connect(&crate::conn::Target::Ip(*target), budgets::dial())
         .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?;
     no_delay(&stream);
     Ok(stream)
 }
 
-pub(crate) fn dial_or_report(target: &SocketAddr) -> Option<TcpStream> {
+pub(crate) fn dial_or_report(target: &SocketAddr) -> Option<Connection> {
     match dial(target) {
         Ok(stream) => Some(stream),
         Err(failure) => {
@@ -398,7 +442,7 @@ fn report_ladder_rates() {
     );
 }
 
-fn no_delay(stream: &TcpStream) {
+fn no_delay(stream: &Connection) {
     let _ = stream.set_nodelay(true);
 }
 
@@ -654,7 +698,9 @@ struct ShadowsocksOut {
 }
 
 fn accept_loop(address: &str, role: &Role) {
-    let listener = TcpListener::bind(address)
+    let target = parse_target(address)
+        .unwrap_or_else(|error| exit(&format!("cannot resolve {address}: {error}")));
+    let listener = Listener::bind(&target)
         .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
@@ -738,7 +784,7 @@ fn accept_loop(address: &str, role: &Role) {
 }
 
 fn serve_shadowsocks(
-    stream: TcpStream,
+    stream: Connection,
     password: &str,
     method: &str,
     carrier: &Carrier,
@@ -817,7 +863,7 @@ fn serve_shadowsocks(
     }
 }
 
-fn serve_vless(stream: TcpStream, id: &[u8; 16], carrier: &Carrier, freedom: bool) {
+fn serve_vless(stream: Connection, id: &[u8; 16], carrier: &Carrier, freedom: bool) {
     match carrier {
         Carrier::Raw => serve_vless_raw(stream, id, freedom),
         Carrier::Ws { path, .. } => {
@@ -977,7 +1023,7 @@ pub(crate) fn under_handshake<T, R: Read + Carried>(
     out
 }
 
-fn serve_vless_raw(mut stream: TcpStream, id: &[u8; 16], freedom: bool) {
+fn serve_vless_raw(mut stream: Connection, id: &[u8; 16], freedom: bool) {
     // Bound only the opening request read to a wall-clock budget, then restore the blocking relay reads behind it.
     let _ = stream.set_read_timeout(Some(budgets::handshake()));
     let decoded = decode_request_bounded(&mut stream);
@@ -1046,7 +1092,7 @@ fn mux_target_of(addr: SocketAddr) -> ferrox_core::mux::Target<'static> {
 }
 
 fn write_mux_frame(
-    shared: &Arc<Mutex<TcpStream>>,
+    shared: &Arc<Mutex<Connection>>,
     staging: &mut Vec<u8>,
     frame: ferrox_core::mux::Outgoing<'_>,
     data: Option<&[u8]>,
@@ -1072,20 +1118,20 @@ fn write_mux_frame(
 }
 
 /// One vectored write of header and read buffer: both mux directions are zero-copy, gated by pointer identity.
-fn write_mux_two(shared: &Arc<Mutex<TcpStream>>, first: &[u8], second: &[u8]) -> bool {
+fn write_mux_two(shared: &Arc<Mutex<Connection>>, first: &[u8], second: &[u8]) -> bool {
     match shared.lock() {
         Ok(mut stream) => write_all_parts::<2>(&mut *stream, &[first, second]).is_ok(),
         Err(_) => false,
     }
 }
 
-fn send_mux_end(shared: &Arc<Mutex<TcpStream>>, staging: &mut Vec<u8>, id: u16) {
+fn send_mux_end(shared: &Arc<Mutex<Connection>>, staging: &mut Vec<u8>, id: u16) {
     let end = ferrox_core::mux::Outgoing::bare(id, ferrox_core::mux::Status::End, 0);
     let _ = write_mux_frame(shared, staging, end, None);
 }
 
 fn write_mux_keep(
-    shared: &Arc<Mutex<TcpStream>>,
+    shared: &Arc<Mutex<Connection>>,
     staging: &mut Vec<u8>,
     id: u16,
     payload: &[u8],
@@ -1100,7 +1146,7 @@ fn write_mux_keep(
     write_mux_frame(shared, staging, keep, Some(payload))
 }
 
-type MuxTable = Arc<Mutex<HashMap<u16, Arc<Mutex<TcpStream>>>>>;
+type MuxTable = Arc<Mutex<HashMap<u16, Arc<Mutex<Connection>>>>>;
 
 struct UdpMux {
     socket: Arc<UdpSocket>,
@@ -1116,7 +1162,7 @@ type UdpGlobal = HashMap<[u8; ferrox_core::mux::GLOBAL_ID], u16>;
 fn remove_mux_session(
     table: &MuxTable,
     id: u16,
-    shared: &Arc<Mutex<TcpStream>>,
+    shared: &Arc<Mutex<Connection>>,
     staging: &mut Vec<u8>,
 ) {
     if let Ok(mut table) = table.lock() {
@@ -1125,7 +1171,7 @@ fn remove_mux_session(
     send_mux_end(shared, staging, id);
 }
 
-fn serve_vless_mux(stream: TcpStream) {
+fn serve_vless_mux(stream: Connection) {
     let Ok(mut read) = stream.try_clone() else {
         return;
     };
@@ -1199,7 +1245,7 @@ fn handle_mux_frame(
     table: &MuxTable,
     udp: &mut UdpTable,
     global: &mut UdpGlobal,
-    shared: &Arc<Mutex<TcpStream>>,
+    shared: &Arc<Mutex<Connection>>,
     staging: &mut Vec<u8>,
     handles: &mut Vec<std::sync::mpsc::Receiver<()>>,
 ) {
@@ -1257,7 +1303,7 @@ fn handle_mux_frame(
 fn handle_mux_tcp_new(
     frame: ferrox_core::mux::Incoming<'_>,
     table: &MuxTable,
-    shared: &Arc<Mutex<TcpStream>>,
+    shared: &Arc<Mutex<Connection>>,
     staging: &mut Vec<u8>,
     handles: &mut Vec<std::sync::mpsc::Receiver<()>>,
 ) {
@@ -1321,7 +1367,7 @@ fn handle_mux_udp_new(
     frame: ferrox_core::mux::Incoming<'_>,
     udp: &mut UdpTable,
     global: &mut UdpGlobal,
-    shared: &Arc<Mutex<TcpStream>>,
+    shared: &Arc<Mutex<Connection>>,
     staging: &mut Vec<u8>,
     handles: &mut Vec<std::sync::mpsc::Receiver<()>>,
 ) {
@@ -1374,7 +1420,7 @@ fn handle_mux_udp_new(
 
 fn spawn_mux_udp_reader(
     socket: &UdpSocket,
-    shared: &Arc<Mutex<TcpStream>>,
+    shared: &Arc<Mutex<Connection>>,
     session: &Arc<UdpMux>,
 ) -> Option<std::sync::mpsc::Receiver<()>> {
     let read = socket.try_clone().ok()?;
@@ -1656,7 +1702,7 @@ pub(crate) fn serve_session_xhttp_with(
 fn serve_session_httpupgrade<R: Read, W: Write + Clone + Send + 'static>(
     read: R,
     write: W,
-    raw: TcpStream,
+    raw: Connection,
     path: &str,
     id: &[u8; 16],
     freedom: bool,
@@ -1701,7 +1747,7 @@ fn serve_session_httpupgrade<R: Read, W: Write + Clone + Send + 'static>(
 fn serve_session_httpheader<R: Read, W: Write + Clone + Send + 'static>(
     read: R,
     write: W,
-    raw: TcpStream,
+    raw: Connection,
     path: &str,
     id: &[u8; 16],
     freedom: bool,
@@ -1771,7 +1817,7 @@ fn serve_session_grpc<R: Read, W: FrameWrite + 'static>(
 }
 
 fn accept_tls_session(
-    stream: TcpStream,
+    stream: Connection,
     server: &ferrox_core::tls::TlsServerConfig,
 ) -> Option<impl ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send> {
     let Ok(mut session) = ferrox_core::tls::accept(server, stream) else {
@@ -1788,7 +1834,7 @@ fn accept_tls_session(
 }
 
 fn serve_vless_tls(
-    stream: TcpStream,
+    stream: Connection,
     id: &[u8; 16],
     freedom: bool,
     carrier: &Carrier,
@@ -1877,7 +1923,7 @@ fn shake_tls<S: ferrox_core::tls::TlsProvider>(session: &mut S) -> bool {
 }
 
 fn serve_vless_reality(
-    stream: TcpStream,
+    stream: Connection,
     id: &[u8; 16],
     freedom: bool,
     carrier: &Carrier,
@@ -1946,9 +1992,13 @@ fn serve_vless_reality(
 }
 
 /// The ends the cover origin sees: looked up only for a PROXY header, so a handshake without one costs no lookup.
-fn reality_edges(server: &ferrox_core::tls::RealityServerConfig, stream: &TcpStream) -> Edges {
+fn reality_edges(server: &ferrox_core::tls::RealityServerConfig, stream: &Connection) -> Edges {
     if server.xver > 0 {
-        Edges::of(stream)
+        // `Edges::of` takes a `&TcpStream`; reading both ends through the seam lets a unix leg yield the same `None` ends an unbound TCP stream does.
+        Edges {
+            peer: stream.peer_addr().ok(),
+            local: stream.local_addr().ok(),
+        }
     } else {
         Edges::default()
     }
@@ -1956,9 +2006,9 @@ fn reality_edges(server: &ferrox_core::tls::RealityServerConfig, stream: &TcpStr
 
 // REALITY runs on the raw stream because the references read the ClientHello off TCP, not an upgraded one.
 fn serve_carrier_reality(
-    stream: TcpStream,
+    stream: Connection,
     server: &ferrox_core::tls::RealityServerConfig,
-    serve: impl FnOnce(ferrox_core::tls::RealityServer<TcpStream>),
+    serve: impl FnOnce(ferrox_core::tls::RealityServer<Connection>),
 ) {
     let edges = reality_edges(server, &stream);
     match ferrox_core::tls::RealityServer::accept(server, unix_millis(), stream, edges) {
@@ -2021,7 +2071,7 @@ impl Gauge {
 /// An authenticated session carries the record; an unauthenticated peer is spliced to the cover origin.
 fn answer_reality<S: Stream + Send + 'static>(
     accepted: Result<ferrox_core::tls::RealityAccept<S>, ferrox_core::tls::TlsError>,
-    raw: Option<TcpStream>,
+    raw: Option<Connection>,
     id: &[u8; 16],
     freedom: bool,
     server: &ferrox_core::tls::RealityServerConfig,
@@ -2102,7 +2152,7 @@ fn finish_reality<
     S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send + 'static,
 >(
     mut session: S,
-    raw: Option<TcpStream>,
+    raw: Option<Connection>,
     id: &[u8; 16],
     freedom: bool,
 ) {
@@ -2141,7 +2191,7 @@ impl<R: Read, W: Write> ferrox_core::tls::RecordAlignment for CarrierStream<R, W
 
 fn relay_vless<S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'static>(
     mut session: S,
-    raw: Option<TcpStream>,
+    raw: Option<Connection>,
     id: &[u8; 16],
     freedom: bool,
 ) {
@@ -2425,7 +2475,7 @@ struct RungAttempt<'a> {
 }
 
 fn dial_vless(
-    client: &TcpStream,
+    client: &Connection,
     server: &SocketAddr,
     vless: &VlessOut,
     target: &Destination,
@@ -2485,8 +2535,8 @@ fn dial_vless(
 }
 
 fn dial_vless_headed(
-    client: &TcpStream,
-    uplink: TcpStream,
+    client: &Connection,
+    uplink: Connection,
     vless: &VlessOut,
     header: &[u8],
 ) -> bool {
@@ -2511,8 +2561,8 @@ fn dial_vless_headed(
 }
 
 fn dial_vless_rung(
-    client: &TcpStream,
-    uplink: TcpStream,
+    client: &Connection,
+    uplink: Connection,
     vless: &VlessOut,
     header: &[u8],
     attempt: &RungAttempt<'_>,
@@ -2652,7 +2702,7 @@ impl Write for KcpIo {
     }
 }
 
-fn kcp_relay(tcp: &TcpStream, conn: &Arc<ferrox_core::kcp::Connection>) {
+fn kcp_relay(tcp: &Connection, conn: &Arc<ferrox_core::kcp::Connection>) {
     let Ok(tcp_read) = tcp.try_clone() else {
         return;
     };
@@ -2824,7 +2874,7 @@ fn hysteria_dial_session(vless: &VlessOut) -> Option<crate::hysteria::Dial> {
 }
 
 fn dial_vless_kcp(
-    client: &TcpStream,
+    client: &Connection,
     conn: &Arc<ferrox_core::kcp::Connection>,
     vless: &VlessOut,
     target: &Destination,
@@ -2922,7 +2972,7 @@ fn kcp_dial_session(
 }
 
 fn dial_trojan_kcp(
-    client: &TcpStream,
+    client: &Connection,
     conn: &Arc<ferrox_core::kcp::Connection>,
     trojan: &TrojanOut,
     target: &Destination,
@@ -2934,7 +2984,7 @@ fn dial_trojan_kcp(
 }
 
 fn dial_vmess_kcp(
-    client: &TcpStream,
+    client: &Connection,
     conn: &Arc<ferrox_core::kcp::Connection>,
     vmess: &VmessOut,
     target: &Destination,
@@ -2958,7 +3008,7 @@ fn dial_vmess_kcp(
 }
 
 fn dial_ss_kcp(
-    client: &TcpStream,
+    client: &Connection,
     conn: &Arc<ferrox_core::kcp::Connection>,
     ss: &ShadowsocksOut,
     target: &Destination,
@@ -3130,7 +3180,10 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
             let udp_dests = relay_dests.clone();
             let udp_psk = psk.clone();
             thread::spawn(move || {
-                let Ok(listener) = std::net::TcpListener::bind(&tcp_address) else {
+                let Ok(target) = parse_target(&tcp_address) else {
+                    return;
+                };
+                let Ok(listener) = Listener::bind(&target) else {
                     return;
                 };
                 for stream in listener.incoming().flatten() {
@@ -3192,7 +3245,7 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
 }
 
 struct UdpUplink {
-    write: TcpStream,
+    write: Connection,
     target: SocketAddr,
     done: std::sync::mpsc::Receiver<()>,
 }
@@ -3232,7 +3285,7 @@ fn dial_udp_uplink(
 }
 
 fn spawn_udp_uplink_reader(
-    read: TcpStream,
+    read: Connection,
     udp: UdpSocket,
     source: Arc<Mutex<Option<SocketAddr>>>,
     target: SocketAddr,
@@ -3259,7 +3312,7 @@ fn spawn_udp_uplink_reader(
 }
 
 struct VmessUdpUplink {
-    write: TcpStream,
+    write: Connection,
     send: crate::vmess::Flow,
     pad: crate::vmess::PadSource,
     target: SocketAddr,
@@ -3299,7 +3352,7 @@ fn dial_vmess_udp_uplink(
 }
 
 fn spawn_vmess_udp_reader(
-    read: TcpStream,
+    read: Connection,
     udp: UdpSocket,
     source: Arc<Mutex<Option<SocketAddr>>>,
     target: SocketAddr,
@@ -3331,7 +3384,7 @@ fn spawn_vmess_udp_reader(
 }
 
 struct TrojanUdpUplink {
-    write: TcpStream,
+    write: Connection,
     done: std::sync::mpsc::Receiver<()>,
 }
 
@@ -3364,7 +3417,7 @@ fn dial_trojan_udp_uplink(
 }
 
 fn spawn_trojan_uplink_reader(
-    read: TcpStream,
+    read: Connection,
     udp: UdpSocket,
     source: Arc<Mutex<Option<SocketAddr>>>,
 ) -> std::sync::mpsc::Receiver<()> {
@@ -3393,7 +3446,7 @@ fn spawn_trojan_uplink_reader(
 /// run table lives on the stack.
 const MUX_RUNS: usize = 32;
 
-fn mux_dial_downlink(mut down: TcpStream, mut up: TcpStream, id: u16) {
+fn mux_dial_downlink(mut down: Connection, mut up: Connection, id: u16) {
     if mux_downlink(&mut down, &mut up, id) {
         let _ = up.shutdown(Shutdown::Write);
     }
@@ -3478,7 +3531,7 @@ fn write_mux_runs(write: &mut dyn Write, buf: &[u8], runs: &[(usize, usize)]) ->
     write_all_runs::<MUX_RUNS>(write, buf, runs).is_ok()
 }
 
-fn mux_dial_uplink(client: &TcpStream, uplink: &mut TcpStream, id: u16) {
+fn mux_dial_uplink(client: &Connection, uplink: &mut Connection, id: u16) {
     let mut chunk = [0u8; 8192];
     let Ok(mut plain) = client.try_clone() else {
         return;
@@ -3510,7 +3563,7 @@ fn mux_dial_uplink(client: &TcpStream, uplink: &mut TcpStream, id: u16) {
     let _ = uplink.shutdown(Shutdown::Both);
 }
 
-fn request_vless_mux(mut uplink: TcpStream, vless: &VlessOut) -> Option<TcpStream> {
+fn request_vless_mux(mut uplink: Connection, vless: &VlessOut) -> Option<Connection> {
     if !matches!(vless.carrier, Carrier::Raw) {
         return None;
     }
@@ -3519,13 +3572,13 @@ fn request_vless_mux(mut uplink: TcpStream, vless: &VlessOut) -> Option<TcpStrea
     Some(uplink)
 }
 
-fn open_vless_mux(vless: &VlessOut) -> Option<TcpStream> {
+fn open_vless_mux(vless: &VlessOut) -> Option<Connection> {
     let endpoint = format!("{}:{}", vless.address, vless.port);
     let server = endpoint.to_socket_addrs().ok()?.next()?;
     request_vless_mux(dial_or_report(&server)?, vless)
 }
 
-fn dial_vless_mux(client: &TcpStream, uplink: TcpStream, vless: &VlessOut, target: &Destination) {
+fn dial_vless_mux(client: &Connection, uplink: Connection, vless: &VlessOut, target: &Destination) {
     let Some(mut uplink) = request_vless_mux(uplink, vless) else {
         return;
     };
@@ -3569,8 +3622,8 @@ fn dial_vless_mux(client: &TcpStream, uplink: TcpStream, vless: &VlessOut, targe
 }
 
 fn dial_vmess_httpupgrade(
-    client: &TcpStream,
-    uplink: TcpStream,
+    client: &Connection,
+    uplink: Connection,
     vmess: &VmessOut,
     target: &Destination,
     attempt: &RungAttempt<'_>,
@@ -3604,8 +3657,8 @@ fn dial_vmess_httpupgrade(
 }
 
 fn dial_vmess_grpc(
-    client: &TcpStream,
-    uplink: TcpStream,
+    client: &Connection,
+    uplink: Connection,
     vmess: &VmessOut,
     target: &Destination,
     attempt: &RungAttempt<'_>,
@@ -3635,8 +3688,8 @@ fn dial_vmess_grpc(
 }
 
 fn dial_vmess_ws(
-    client: &TcpStream,
-    uplink: TcpStream,
+    client: &Connection,
+    uplink: Connection,
     vmess: &VmessOut,
     target: &Destination,
     attempt: &RungAttempt<'_>,
@@ -3669,7 +3722,7 @@ fn dial_vmess_ws(
 }
 
 fn dial_vmess(
-    client: &TcpStream,
+    client: &Connection,
     server: &SocketAddr,
     vmess: &VmessOut,
     target: &Destination,
@@ -3724,8 +3777,8 @@ fn dial_vmess(
 }
 
 fn dial_vmess_headed(
-    client: &TcpStream,
-    uplink: TcpStream,
+    client: &Connection,
+    uplink: Connection,
     vmess: &VmessOut,
     target: &Destination,
 ) -> bool {
@@ -3758,8 +3811,8 @@ fn dial_vmess_headed(
 }
 
 fn dial_vmess_rung(
-    client: &TcpStream,
-    uplink: TcpStream,
+    client: &Connection,
+    uplink: Connection,
     vmess: &VmessOut,
     target: &Destination,
     attempt: &RungAttempt<'_>,
@@ -3831,7 +3884,7 @@ fn trojan_header(key: &[u8; 56], cmd: u8, target: &Destination) -> Vec<u8> {
 }
 
 fn dial_trojan(
-    client: &TcpStream,
+    client: &Connection,
     server: &SocketAddr,
     trojan: &TrojanOut,
     target: &Destination,
@@ -3887,8 +3940,8 @@ fn dial_trojan(
 }
 
 fn dial_trojan_headed(
-    client: &TcpStream,
-    uplink: TcpStream,
+    client: &Connection,
+    uplink: Connection,
     trojan: &TrojanOut,
     _target: &Destination,
     header: &[u8],
@@ -3907,8 +3960,8 @@ fn dial_trojan_headed(
 }
 
 fn dial_trojan_rung(
-    client: &TcpStream,
-    uplink: TcpStream,
+    client: &Connection,
+    uplink: Connection,
     trojan: &TrojanOut,
     _target: &Destination,
     header: &[u8],
@@ -3991,7 +4044,7 @@ fn tls_failure(error: &ferrox_core::tls::TlsError) -> Failure {
 fn dial_tls_session(
     server: &SocketAddr,
     cfg: &ferrox_core::tls::TlsConfig,
-) -> Option<ferrox_core::tls::RustlsProvider<TcpStream>> {
+) -> Option<ferrox_core::tls::RustlsProvider<Connection>> {
     let uplink = match dial(server) {
         Ok(uplink) => uplink,
         Err(failure) => {
@@ -4021,8 +4074,8 @@ fn dial_tls_session(
 
 // Splits one established session into halves the carrier cores accept, plus the raw socket their teardown needs.
 fn tls_halves(
-    session: ferrox_core::tls::RustlsProvider<TcpStream>,
-) -> Option<(ClientHalf, ClientHalf, Arc<TcpStream>)> {
+    session: ferrox_core::tls::RustlsProvider<Connection>,
+) -> Option<(ClientHalf, ClientHalf, Arc<Connection>)> {
     let raw = Arc::new(session.get_ref().try_clone().ok()?);
     let shared = Arc::new(Mutex::new(session));
     let reader = TlsHalf {
@@ -4045,21 +4098,21 @@ fn session_halves<S>(session: S) -> (TlsHalf<S>, TlsHalf<S>) {
 trait Dialed:
     ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send + 'static
 {
-    fn into_halves(self) -> Option<(TlsHalf<Self>, TlsHalf<Self>, Arc<TcpStream>)>
+    fn into_halves(self) -> Option<(TlsHalf<Self>, TlsHalf<Self>, Arc<Connection>)>
     where
         Self: Sized;
 }
 
-impl Dialed for ferrox_core::tls::RustlsProvider<TcpStream> {
-    fn into_halves(self) -> Option<(TlsHalf<Self>, TlsHalf<Self>, Arc<TcpStream>)> {
+impl Dialed for ferrox_core::tls::RustlsProvider<Connection> {
+    fn into_halves(self) -> Option<(TlsHalf<Self>, TlsHalf<Self>, Arc<Connection>)> {
         tls_halves(self)
     }
 }
 
 impl Dialed
-    for ferrox_core::tls::RealityClientSession<ferrox_core::tls::reality::RecordLimiter<TcpStream>>
+    for ferrox_core::tls::RealityClientSession<ferrox_core::tls::reality::RecordLimiter<Connection>>
 {
-    fn into_halves(self) -> Option<(TlsHalf<Self>, TlsHalf<Self>, Arc<TcpStream>)> {
+    fn into_halves(self) -> Option<(TlsHalf<Self>, TlsHalf<Self>, Arc<Connection>)> {
         let raw = Arc::new(self.get_ref().get_ref().try_clone().ok()?);
         let (reader, writer) = session_halves(self);
         Some((reader, writer, raw))
@@ -4157,7 +4210,7 @@ impl<S> Clone for TlsHalf<S> {
     }
 }
 
-type ClientHalf = TlsHalf<ferrox_core::tls::RustlsProvider<TcpStream>>;
+type ClientHalf = TlsHalf<ferrox_core::tls::RustlsProvider<Connection>>;
 
 impl<S: ferrox_core::tls::TlsProvider> Read for TlsHalf<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -4205,7 +4258,7 @@ impl<S: ferrox_core::tls::TlsProvider> Write for TlsHalf<S> {
 #[derive(Debug, Clone)]
 struct SessionSink<H> {
     half: H,
-    raw: Arc<TcpStream>,
+    raw: Arc<Connection>,
 }
 
 impl<H: Write> Write for SessionSink<H> {
@@ -4238,7 +4291,7 @@ fn ride_carrier<S: Dialed>(
     session: S,
     vless: &VlessOut,
     header: &[u8],
-    client: &TcpStream,
+    client: &Connection,
 ) {
     match &vless.carrier {
         Carrier::Ws { path, ed } => {
@@ -4313,7 +4366,12 @@ fn ride_carrier<S: Dialed>(
     }
 }
 
-fn dial_vless_tls(client: &TcpStream, server: &SocketAddr, vless: &VlessOut, target: &Destination) {
+fn dial_vless_tls(
+    client: &Connection,
+    server: &SocketAddr,
+    vless: &VlessOut,
+    target: &Destination,
+) {
     let Some(cfg) = vless.tls.as_deref() else {
         return;
     };
@@ -4357,7 +4415,7 @@ fn dial_vless_tls(client: &TcpStream, server: &SocketAddr, vless: &VlessOut, tar
 
 /// One REALITY dial: TCP, the sealed handshake, the VLESS header, then the relay.
 fn dial_vless_reality(
-    client: &TcpStream,
+    client: &Connection,
     server: &SocketAddr,
     vless: &VlessOut,
     target: &Destination,
@@ -4463,7 +4521,7 @@ fn dial_vless_reality(
     }
 }
 
-fn dial_trojan_tls(client: &TcpStream, server: &SocketAddr, trojan: &TrojanOut, header: &[u8]) {
+fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut, header: &[u8]) {
     let Some(cfg) = trojan.tls.as_deref() else {
         return;
     };
@@ -4552,9 +4610,9 @@ fn dial_trojan_tls(client: &TcpStream, server: &SocketAddr, trojan: &TrojanOut, 
 }
 
 fn vmess_tls_raw(
-    client: &TcpStream,
+    client: &Connection,
     server: &SocketAddr,
-    mut session: ferrox_core::tls::RustlsProvider<TcpStream>,
+    mut session: ferrox_core::tls::RustlsProvider<Connection>,
     vmess: &VmessOut,
     target: &Destination,
 ) {
@@ -4586,9 +4644,9 @@ fn vmess_tls_raw(
 }
 
 fn vmess_tls_carried(
-    client: &TcpStream,
+    client: &Connection,
     server: &SocketAddr,
-    session: ferrox_core::tls::RustlsProvider<TcpStream>,
+    session: ferrox_core::tls::RustlsProvider<Connection>,
     vmess: &VmessOut,
     target: &Destination,
 ) {
@@ -4689,7 +4747,12 @@ fn vmess_tls_carried(
     }
 }
 
-fn dial_vmess_tls(client: &TcpStream, server: &SocketAddr, vmess: &VmessOut, target: &Destination) {
+fn dial_vmess_tls(
+    client: &Connection,
+    server: &SocketAddr,
+    vmess: &VmessOut,
+    target: &Destination,
+) {
     let Some(cfg) = vmess.tls.as_deref() else {
         return;
     };
@@ -4703,7 +4766,7 @@ fn dial_vmess_tls(client: &TcpStream, server: &SocketAddr, vmess: &VmessOut, tar
 }
 
 fn dial_shadowsocks(
-    client: &TcpStream,
+    client: &Connection,
     server: &SocketAddr,
     ss: &ShadowsocksOut,
     target: &Destination,
@@ -4754,8 +4817,8 @@ fn dial_shadowsocks(
 }
 
 fn dial_ss_headed(
-    client: &TcpStream,
-    uplink: TcpStream,
+    client: &Connection,
+    uplink: Connection,
     ss: &ShadowsocksOut,
     target: &Destination,
 ) -> bool {
@@ -4799,8 +4862,8 @@ fn dial_ss_headed(
 }
 
 fn dial_ss_rung(
-    client: &TcpStream,
-    uplink: TcpStream,
+    client: &Connection,
+    uplink: Connection,
     ss: &ShadowsocksOut,
     target: &Destination,
     attempt: &RungAttempt<'_>,
@@ -4845,8 +4908,8 @@ fn dial_ss_rung(
 }
 
 fn dial_ss_ws(
-    client: &TcpStream,
-    uplink: TcpStream,
+    client: &Connection,
+    uplink: Connection,
     ss: &ShadowsocksOut,
     target: &Destination,
     attempt: &RungAttempt<'_>,
@@ -4886,8 +4949,8 @@ fn dial_ss_ws(
 }
 
 fn dial_ss_httpupgrade(
-    client: &TcpStream,
-    uplink: TcpStream,
+    client: &Connection,
+    uplink: Connection,
     ss: &ShadowsocksOut,
     target: &Destination,
     attempt: &RungAttempt<'_>,
@@ -4942,8 +5005,8 @@ fn dial_ss_httpupgrade(
 }
 
 fn dial_ss_grpc(
-    client: &TcpStream,
-    uplink: TcpStream,
+    client: &Connection,
+    uplink: Connection,
     ss: &ShadowsocksOut,
     target: &Destination,
     attempt: &RungAttempt<'_>,
@@ -4982,8 +5045,8 @@ fn dial_ss_grpc(
 }
 
 fn dial_ss_xhttp(
-    client: &TcpStream,
-    uplink: TcpStream,
+    client: &Connection,
+    uplink: Connection,
     ss: &ShadowsocksOut,
     target: &Destination,
     attempt: &RungAttempt<'_>,
@@ -5022,7 +5085,7 @@ fn dial_ss_xhttp(
     true
 }
 
-fn serve_trojan(mut stream: TcpStream, key: &[u8; 56], freedom: bool) {
+fn serve_trojan(mut stream: Connection, key: &[u8; 56], freedom: bool) {
     // Bound only the opening request read to a wall-clock budget, then restore the blocking relay reads behind it.
     let budget = budgets::handshake();
     let _ = stream.set_read_timeout(Some(budget));
@@ -5052,7 +5115,7 @@ fn serve_trojan(mut stream: TcpStream, key: &[u8; 56], freedom: bool) {
     relay(&stream, &uplink);
 }
 
-fn serve_trojan_udp(stream: TcpStream) {
+fn serve_trojan_udp(stream: Connection) {
     let Ok(udp4) = UdpSocket::bind("0.0.0.0:0") else {
         return;
     };
@@ -5120,7 +5183,7 @@ fn serve_trojan_udp(stream: TcpStream) {
 
 fn pump_trojan_replies(
     udp: &UdpSocket,
-    stream: &mut TcpStream,
+    stream: &mut Connection,
     buf: &mut [u8],
     done: &AtomicBool,
     head: &mut Vec<u8>,
@@ -5137,7 +5200,7 @@ fn pump_trojan_replies(
     }
 }
 
-fn serve_trojan_ws(stream: TcpStream, key: &[u8; 56], path: &str, freedom: bool) {
+fn serve_trojan_ws(stream: Connection, key: &[u8; 56], path: &str, freedom: bool) {
     let Some((mut reader, writer)) = crate::ws::accept(stream, path) else {
         return;
     };
@@ -5153,7 +5216,7 @@ fn serve_trojan_ws(stream: TcpStream, key: &[u8; 56], path: &str, freedom: bool)
     crate::proxy::relay_sink(reader, &writer, &uplink, |_| {});
 }
 
-fn serve_trojan_httpupgrade(stream: TcpStream, key: &[u8; 56], path: &str, freedom: bool) {
+fn serve_trojan_httpupgrade(stream: Connection, key: &[u8; 56], path: &str, freedom: bool) {
     let Some((mut reader, write)) = crate::httpupgrade::accept(stream, path) else {
         return;
     };
@@ -5169,7 +5232,7 @@ fn serve_trojan_httpupgrade(stream: TcpStream, key: &[u8; 56], path: &str, freed
     crate::proxy::relay_carried(reader, &write, &uplink);
 }
 
-fn serve_trojan_grpc(stream: TcpStream, key: &[u8; 56], path: &str, freedom: bool) {
+fn serve_trojan_grpc(stream: Connection, key: &[u8; 56], path: &str, freedom: bool) {
     let Some((mut reader, writer)) = crate::grpc::accept(stream, path) else {
         return;
     };
@@ -5186,7 +5249,7 @@ fn serve_trojan_grpc(stream: TcpStream, key: &[u8; 56], path: &str, freedom: boo
     crate::proxy::relay_sink(reader, &writer, &uplink, crate::grpc::mark_reader_dead);
 }
 
-fn serve_trojan_xhttp(stream: TcpStream, key: &[u8; 56], path: &str, freedom: bool) {
+fn serve_trojan_xhttp(stream: Connection, key: &[u8; 56], path: &str, freedom: bool) {
     let Some((mut reader, writer)) = crate::xhttp::accept(stream, path) else {
         return;
     };
@@ -5202,7 +5265,7 @@ fn serve_trojan_xhttp(stream: TcpStream, key: &[u8; 56], path: &str, freedom: bo
     crate::proxy::relay_sink_drained(reader, &writer, &uplink);
 }
 
-fn serve_trojan_httpheader(stream: TcpStream, key: &[u8; 56], path: &str, freedom: bool) {
+fn serve_trojan_httpheader(stream: Connection, key: &[u8; 56], path: &str, freedom: bool) {
     let Some((mut reader, write)) = crate::httpheader::accept(stream, path) else {
         return;
     };
@@ -5218,7 +5281,7 @@ fn serve_trojan_httpheader(stream: TcpStream, key: &[u8; 56], path: &str, freedo
     crate::proxy::relay_carried(reader, &write, &uplink);
 }
 
-fn serve_socks(mut client: TcpStream, out: &Outbound) {
+fn serve_socks(mut client: Connection, out: &Outbound) {
     // Foxy grants only after its tunnel opens; a doubled grant reads as ten bytes of tunnel data.
     let Some((cmd, asked)) = socks_target(&mut client, !matches!(out, Outbound::Foxy(_))) else {
         return;
@@ -5231,7 +5294,7 @@ fn serve_socks(mut client: TcpStream, out: &Outbound) {
 
 /// One tunnel request from either front: SOCKS or HTTP CONNECT; the Foxy lane grants after its tunnel opens.
 fn serve_connect(
-    mut client: TcpStream,
+    mut client: Connection,
     out: &Outbound,
     asked: &Destination,
     front: Front,
@@ -5329,7 +5392,7 @@ fn serve_connect(
 }
 
 fn dial_socks_outbound(
-    client: &TcpStream,
+    client: &Connection,
     out: &Outbound,
     server: &SocketAddr,
     target: &Destination,
@@ -5684,7 +5747,7 @@ fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
 
 /// The Foxy half of either front: CONNECT grants, plain HTTP forwards its head, a split target dials direct.
 fn serve_foxy_front(
-    mut client: TcpStream,
+    mut client: Connection,
     foxy: &FoxyOut,
     asked: &Destination,
     front: Front,
@@ -5828,7 +5891,7 @@ fn authority_target(authority: &[u8]) -> Option<Destination> {
 }
 
 /// The `http` front: CONNECT tunnels like SOCKS, plain HTTP forwards its head, unparsable input closes quietly.
-fn serve_http(mut client: TcpStream, out: &Outbound) {
+fn serve_http(mut client: Connection, out: &Outbound) {
     let Some(head) = read_http_head(&mut client, HTTP_HEAD_LIMIT, budgets::head_arrival()) else {
         return;
     };
@@ -5851,7 +5914,7 @@ fn serve_http(mut client: TcpStream, out: &Outbound) {
 }
 
 /// The `mixed` front sniffs one byte: 0x05 is SOCKS5, a method token is HTTP, and a peek consumes nothing.
-fn serve_mixed(client: TcpStream, out: &Outbound) {
+fn serve_mixed(client: Connection, out: &Outbound) {
     let mut first = [0u8; 1];
     let Ok(n) = client.peek(&mut first) else {
         return;
@@ -5898,7 +5961,7 @@ fn foxy_exit_country<T: Read + Write>(tunnel: &mut T, foxy: &FoxyOut) -> Option<
     crate::foxy::exit_country(&head)
 }
 
-fn socks_udp_relay(client: &mut TcpStream) -> Option<UdpSocket> {
+fn socks_udp_relay(client: &mut Connection) -> Option<UdpSocket> {
     let local_ip = client
         .local_addr()
         .map_or(std::net::IpAddr::V4([127, 0, 0, 1].into()), |addr| {
@@ -5913,7 +5976,7 @@ fn socks_udp_relay(client: &mut TcpStream) -> Option<UdpSocket> {
     Some(relay)
 }
 
-fn serve_socks_udp(mut client: TcpStream, out: &Outbound) {
+fn serve_socks_udp(mut client: Connection, out: &Outbound) {
     let Some(relay) = socks_udp_relay(&mut client) else {
         return;
     };
@@ -6719,7 +6782,7 @@ fn udp_reply_parts<'a>(
 }
 
 fn spawn_xudp_reader(
-    read: TcpStream,
+    read: Connection,
     relay: &UdpSocket,
     source: Arc<Mutex<Option<SocketAddr>>>,
 ) -> Option<std::sync::mpsc::Receiver<()>> {
@@ -6873,8 +6936,8 @@ fn foxy_quic_dial(foxy: &FoxyOut, edge: &ferrox_core::foxy::Candidate) -> crate:
     }
 }
 
-fn relay_tunnel(
-    client: &TcpStream,
+pub(crate) fn relay_tunnel(
+    client: &Connection,
     tunnel: &std::sync::Arc<std::sync::Mutex<crate::foxy::Tunnel>>,
 ) {
     let Ok(mut client_read) = client.try_clone() else {
@@ -6888,12 +6951,13 @@ fn relay_tunnel(
     let forward = move || copy_locked(&mut client_read, &forward_tunnel, true);
     let done = RelayPool::global().run(forward);
     copy_locked(&mut client_write, &backward_tunnel, false);
-    let _ = client_write.shutdown(Shutdown::Write);
+    // Both halves, because the other leg is parked in a blocking read on this socket: a FIN on the write half alone leaves the parked reader asleep and the flow's worker lost for the life of the process.
+    let _ = client_write.shutdown(Shutdown::Both);
     join(&done);
 }
 
 fn copy_locked(
-    socket: &mut TcpStream,
+    socket: &mut Connection,
     tunnel: &std::sync::Arc<std::sync::Mutex<crate::foxy::Tunnel>>,
     forward: bool,
 ) {
@@ -6999,7 +7063,7 @@ fn write_full(
     total - buf.len()
 }
 
-fn relay(client: &TcpStream, target: &TcpStream) {
+fn relay(client: &Connection, target: &Connection) {
     let Ok(client_read) = client.try_clone() else {
         return;
     };
@@ -7078,14 +7142,14 @@ fn http_connect_request(target: &Destination, http: &HttpOut, req: &mut Vec<u8>)
 }
 
 fn dial_http_outbound(
-    client: &TcpStream,
+    client: &Connection,
     server: &SocketAddr,
     http: &HttpOut,
     target: &Destination,
     _ladder: &Ladder,
 ) {
     fn do_connect<S: std::io::Read + std::io::Write + Send + 'static>(
-        client: &TcpStream,
+        client: &Connection,
         mut stream: S,
         http: &HttpOut,
         target: &Destination,
@@ -7165,7 +7229,7 @@ pub(crate) fn udp_buffer() -> Vec<u8> {
 /// The largest SOCKS5 UDP request header: the three-byte opening plus the longest address this tree frames.
 const HEAD: usize = 22;
 
-fn read_udp_datagram(stream: &mut TcpStream, buf: &mut [u8]) -> Option<usize> {
+fn read_udp_datagram(stream: &mut Connection, buf: &mut [u8]) -> Option<usize> {
     let mut len = [0u8; 2];
     read_exact(stream, &mut len).ok()?;
     let len = usize::from(u16::from_be_bytes(len));
@@ -7176,7 +7240,7 @@ fn read_udp_datagram(stream: &mut TcpStream, buf: &mut [u8]) -> Option<usize> {
     Some(len)
 }
 
-fn write_udp_datagram(stream: &mut TcpStream, payload: &[u8]) -> bool {
+fn write_udp_datagram(stream: &mut Connection, payload: &[u8]) -> bool {
     if payload.is_empty() || payload.len() > u16::MAX as usize {
         return true;
     }
@@ -7185,7 +7249,7 @@ fn write_udp_datagram(stream: &mut TcpStream, payload: &[u8]) -> bool {
 }
 
 fn write_trojan_datagram(
-    stream: &mut TcpStream,
+    stream: &mut Connection,
     dest: &SocketAddr,
     payload: &[u8],
     head: &mut Vec<u8>,
@@ -7200,7 +7264,7 @@ fn write_trojan_datagram(
     write_all_parts::<2>(stream, &[head.as_slice(), payload]).is_ok()
 }
 
-fn read_trojan_datagram(stream: &mut TcpStream, buf: &mut [u8]) -> Option<(SocketAddr, usize)> {
+fn read_trojan_datagram(stream: &mut Connection, buf: &mut [u8]) -> Option<(SocketAddr, usize)> {
     let dest = read_socks_addr(stream)?;
     let mut len = [0u8; 2];
     read_exact(stream, &mut len).ok()?;
@@ -7214,7 +7278,7 @@ fn read_trojan_datagram(stream: &mut TcpStream, buf: &mut [u8]) -> Option<(Socke
     Some((dest, len))
 }
 
-fn serve_vless_udp(mut stream: TcpStream, target: &SocketAddr) {
+fn serve_vless_udp(mut stream: Connection, target: &SocketAddr) {
     let bind = if target.is_ipv6() {
         "[::]:0"
     } else {
@@ -7273,7 +7337,7 @@ fn serve_vless_udp(mut stream: TcpStream, target: &SocketAddr) {
 }
 
 pub(crate) fn pump_vmess_udp(
-    stream: &TcpStream,
+    stream: &Connection,
     udp: &UdpSocket,
     send: crate::vmess::Flow,
     recv: crate::vmess::Flow,
@@ -7491,12 +7555,12 @@ impl Default for RelayBuf {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn copy_all(from: &mut TcpStream, to: &mut TcpStream) {
+fn copy_all(from: &mut Connection, to: &mut Connection) {
     copy_all_memcpy(from, to);
 }
 
 #[inline]
-fn copy_all_memcpy(from: &mut TcpStream, to: &mut TcpStream) {
+fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
     let mut buffer = RelayBuf::new();
     loop {
         let read = {
@@ -7518,7 +7582,7 @@ fn copy_all_memcpy(from: &mut TcpStream, to: &mut TcpStream) {
 }
 
 #[cfg(target_os = "linux")]
-fn copy_all(from: &mut TcpStream, to: &mut TcpStream) {
+fn copy_all(from: &mut Connection, to: &mut Connection) {
     let Some(pipe) = SplicePipe::new() else {
         return copy_all_memcpy(from, to);
     };
@@ -7560,7 +7624,7 @@ impl SplicePipe {
         Some(Self { fds, capacity })
     }
 
-    fn pull(&self, from: &mut TcpStream) -> std::io::Result<usize> {
+    fn pull(&self, from: &mut Connection) -> std::io::Result<usize> {
         census!("relay-leg-read", crate::census::handle(from), None);
         loop {
             let n = unsafe {
@@ -7584,7 +7648,7 @@ impl SplicePipe {
         }
     }
 
-    fn push(&self, to: &mut TcpStream, n: usize) -> bool {
+    fn push(&self, to: &mut Connection, n: usize) -> bool {
         census!("relay-leg-write", crate::census::handle(to), None);
         let mut left = n;
         while left > 0 {
@@ -7764,7 +7828,7 @@ pub(crate) fn find_across(head: &[u8], probe: &[u8], pattern: &[u8]) -> Option<u
 }
 
 /// Arm the poll quantum a head read needs: a budget cannot bound a blocking socket call, so the timeout is never longer than the caller's and the previous value goes back.
-fn with_head_poll<T>(stream: &mut TcpStream, run: impl FnOnce(&mut TcpStream) -> T) -> Option<T> {
+fn with_head_poll<T>(stream: &mut Connection, run: impl FnOnce(&mut Connection) -> T) -> Option<T> {
     let previous = stream.read_timeout().ok().flatten();
     let poll = previous.map_or(RELAY_POLL, |armed| armed.min(RELAY_POLL));
     if stream.set_read_timeout(Some(poll)).is_err() {
@@ -7776,7 +7840,7 @@ fn with_head_poll<T>(stream: &mut TcpStream, run: impl FnOnce(&mut TcpStream) ->
 }
 
 pub(crate) fn read_http_head(
-    stream: &mut TcpStream,
+    stream: &mut Connection,
     limit: usize,
     budget: Duration,
 ) -> Option<Vec<u8>> {
@@ -7789,7 +7853,7 @@ pub(crate) fn read_http_head(
 /// round cost two calls; here `H` crosses once and a round costs one. Nothing that has nowhere to
 /// put the tail — the `http` front and the Shadowsocks rung's wait for a request packet — may take it.
 pub(crate) fn read_http_head_kept(
-    stream: &mut TcpStream,
+    stream: &mut Connection,
     limit: usize,
     budget: Duration,
 ) -> Option<(Vec<u8>, usize)> {
@@ -7849,7 +7913,7 @@ fn kept_head_rounds(
     clippy::uninit_vec,
     reason = "the tail is handed straight to `read_exact`, and the error path truncates it"
 )]
-fn peek_head_rounds(stream: &mut TcpStream, limit: usize, budget: Duration) -> Option<Vec<u8>> {
+fn peek_head_rounds(stream: &mut Connection, limit: usize, budget: Duration) -> Option<Vec<u8>> {
     let mut head = Vec::with_capacity(512);
     let mut probe = [0u8; 512];
     let until = Instant::now() + budget;
@@ -7907,6 +7971,13 @@ pub(crate) trait FrameWrite: Write + Send {
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool;
 }
 
+impl FrameWrite for Connection {
+    fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+        write_all_parts::<VECTOR_PARTS>(self, parts).is_ok()
+    }
+}
+
+// The h2 server seals frames over a concrete `TcpStream`, so the generic coalescing write is impl'd for it beside the seam.
 impl FrameWrite for TcpStream {
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
         write_all_parts::<VECTOR_PARTS>(self, parts).is_ok()
@@ -7925,7 +7996,7 @@ impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send
     }
 }
 
-pub(crate) fn relay_sink<R, W, F>(reader: R, writer: &W, peer: &TcpStream, on_reader_done: F)
+pub(crate) fn relay_sink<R, W, F>(reader: R, writer: &W, peer: &Connection, on_reader_done: F)
 where
     R: Read,
     W: CarrierSink,
@@ -7941,7 +8012,7 @@ const CLOSE_AFTER_JOIN: bool = false;
 fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
     mut reader: R,
     writer: &W,
-    peer: &TcpStream,
+    peer: &Connection,
     on_reader_done: F,
 ) where
     R: Read,
@@ -8048,11 +8119,15 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
     }
 }
 
-pub(crate) fn relay_sink_drained<R: Read, W: CarrierSink>(reader: R, writer: &W, peer: &TcpStream) {
+pub(crate) fn relay_sink_drained<R: Read, W: CarrierSink>(
+    reader: R,
+    writer: &W,
+    peer: &Connection,
+) {
     relay_ordered::<R, W, fn(&mut R), CLOSE_AFTER_JOIN>(reader, writer, peer, |_| {});
 }
 
-pub(crate) fn relay_carried<R: Read>(mut reader: R, write: &TcpStream, peer: &TcpStream) {
+pub(crate) fn relay_carried<R: Read>(mut reader: R, write: &Connection, peer: &Connection) {
     let Ok(peer_read) = peer.try_clone() else {
         return;
     };
@@ -8394,7 +8469,7 @@ pub(crate) struct Pump {
 
 impl Pump {
     /// Pumps the app's bytes through `to_carrier` once the answer is overdue; the leg is the only reader of the app's socket until `end` joins it.
-    fn over(peer: &TcpStream, mut to_carrier: impl FnMut(&[u8]) -> bool + Send + 'static) -> Self {
+    fn over(peer: &Connection, mut to_carrier: impl FnMut(&[u8]) -> bool + Send + 'static) -> Self {
         let (stop, stop_rx) = std::sync::mpsc::channel();
         let running = match peer.try_clone() {
             Ok(reading) => Some(RelayPool::global().run(move || {
@@ -8432,12 +8507,12 @@ impl Pump {
         Self { stop, running }
     }
 
-    fn to_sink<W: CarrierSink>(peer: &TcpStream, writer: &W) -> Self {
+    fn to_sink<W: CarrierSink>(peer: &Connection, writer: &W) -> Self {
         let sink = writer.clone();
         Self::over(peer, move |bytes| sink.send(bytes))
     }
 
-    fn to_stream(peer: &TcpStream, write: &TcpStream) -> Self {
+    fn to_stream(peer: &Connection, write: &Connection) -> Self {
         let Ok(mut uplink) = write.try_clone() else {
             return Self::idle();
         };
@@ -8680,7 +8755,7 @@ fn parse_socks_udp(packet: &[u8]) -> Option<(SocketAddr, &[u8])> {
 }
 
 /// The handshake that keeps the client's name: resolving here hands the edge an address it cannot route.
-fn socks_target(client: &mut TcpStream, grant: bool) -> Option<(u8, Destination)> {
+fn socks_target(client: &mut Connection, grant: bool) -> Option<(u8, Destination)> {
     let mut head = [0u8; 2];
     read_exact(client, &mut head).ok()?;
     if head[0] != 5 {
@@ -10094,15 +10169,16 @@ mod tests {
 
     #[test]
     fn the_cover_origin_splice_carries_the_reply_back_to_the_peer() {
-        let peer_side = TcpListener::bind("127.0.0.1:0").expect("binds");
-        let origin_side = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let peer_side = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let origin_side = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let origin_port = origin_side.local_addr().expect("addr").port();
-        let mut peer = TcpStream::connect(peer_side.local_addr().expect("addr")).expect("connects");
+        let mut peer =
+            Connection::connect(peer_side.local_addr().expect("addr")).expect("connects");
         let client = peer_side.accept().expect("accepts").0;
         client
             .set_read_timeout(Some(RELAY_POLL))
             .expect("polls like the server path");
-        let target = TcpStream::connect(("127.0.0.1", origin_port)).expect("dials");
+        let target = std::net::TcpStream::connect(("127.0.0.1", origin_port)).expect("dials");
         let cover = thread::spawn(move || {
             let (mut origin, _) = origin_side.accept().expect("accepts");
             let mut head = [0u8; 4];
@@ -10146,15 +10222,16 @@ mod tests {
 
     #[test]
     fn the_cover_origin_splice_ends_when_the_peer_finishes() {
-        let peer_side = TcpListener::bind("127.0.0.1:0").expect("binds");
-        let origin_side = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let peer_side = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let origin_side = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let origin_port = origin_side.local_addr().expect("addr").port();
-        let mut peer = TcpStream::connect(peer_side.local_addr().expect("addr")).expect("connects");
+        let mut peer =
+            Connection::connect(peer_side.local_addr().expect("addr")).expect("connects");
         let client = peer_side.accept().expect("accepts").0;
         client
             .set_read_timeout(Some(RELAY_POLL))
             .expect("polls like the server path");
-        let target = TcpStream::connect(("127.0.0.1", origin_port)).expect("dials");
+        let target = std::net::TcpStream::connect(("127.0.0.1", origin_port)).expect("dials");
         let (gone_tx, gone_rx) = std::sync::mpsc::channel();
         let cover = thread::spawn(move || {
             let (mut origin, _) = origin_side.accept().expect("accepts");
@@ -10189,16 +10266,16 @@ mod tests {
     /// Two pumps share one session lock: a read that holds it for a whole idle grain stalls the opposite pump's write for that grain.
     #[test]
     fn a_server_relay_bounds_the_shared_session_to_one_tick() {
-        let site = TcpListener::bind("127.0.0.1:0").expect("binds the site");
+        let site = crate::conn::test_bind("127.0.0.1:0").expect("binds the site");
         let site_addr: SocketAddr = site.local_addr().expect("addr");
         let dialed = thread::spawn(move || {
             let (peer, _) = site.accept().expect("accepts");
             peer
         });
 
-        let lane = TcpListener::bind("127.0.0.1:0").expect("binds the lane");
+        let lane = crate::conn::test_bind("127.0.0.1:0").expect("binds the lane");
         let lane_addr: SocketAddr = lane.local_addr().expect("addr");
-        let mut edge = TcpStream::connect(lane_addr).expect("connects");
+        let mut edge = Connection::connect(lane_addr).expect("connects");
         let (session, _) = lane.accept().expect("accepts");
         session
             .set_read_timeout(Some(RELAY_POLL))
@@ -10236,7 +10313,7 @@ mod tests {
         use ferrox_core::tls::TlsProvider;
 
         let (server_config, client_config) = carried_tls_configs();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let server: SocketAddr = listener.local_addr().expect("addr");
         let lane = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -10244,7 +10321,7 @@ mod tests {
         });
 
         // The hello arrives twelve grains later than the lane's first read; only its deadline may refuse it.
-        let edge = TcpStream::connect(server).expect("connects");
+        let edge = Connection::connect(server).expect("connects");
         thread::sleep(Duration::from_millis(240));
         let mut client = ferrox_core::tls::connect(&client_config, edge).expect("opens");
         let shook = client.handshake();
@@ -10276,10 +10353,10 @@ mod tests {
     #[test]
     fn a_connect_lane_grants_only_after_its_tunnel_opens() {
         fn handshake(grant: bool) -> Vec<u8> {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+            let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
             let port = listener.local_addr().expect("addr").port();
             let accepted = std::thread::spawn(move || listener.accept().expect("accepts").0);
-            let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
             client
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .expect("times out");
@@ -10310,10 +10387,10 @@ mod tests {
     #[test]
     fn a_maximal_method_offer_drains_on_the_stack_and_still_grants() {
         // head[1] = 255 is the largest count a peer can send, and with no method 0x00 offered the reply is still no-auth, so the offer is provably never inspected.
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let accepted = std::thread::spawn(move || listener.accept().expect("accepts").0);
-        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("times out");
@@ -10408,7 +10485,7 @@ mod tests {
     fn a_head_split_across_segments_is_read_whole() {
         use std::time::Duration;
 
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let peer = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accepts");
@@ -10423,7 +10500,7 @@ mod tests {
             }
         });
 
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -10541,7 +10618,7 @@ mod tests {
 
     #[test]
     fn bytes_pipelined_behind_a_head_stay_in_the_kernel() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let peer = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accepts");
@@ -10551,7 +10628,7 @@ mod tests {
             thread::sleep(std::time::Duration::from_millis(50));
         });
 
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -10569,7 +10646,7 @@ mod tests {
 
     #[test]
     fn an_unterminated_head_is_refused_at_the_limit() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let peer = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accepts");
@@ -10577,7 +10654,7 @@ mod tests {
             while stream.write_all(&filler).is_ok() {}
         });
 
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -10592,12 +10669,12 @@ mod tests {
     /// Poll-armed socket, silent peer: the elapsed assert is the witness, since a spinning test never fails.
     #[test]
     fn a_quiet_peer_ends_both_head_readers_at_their_budget() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let budget = Duration::from_millis(60);
         let at = Instant::now();
 
-        let mut peeked = TcpStream::connect(addr).expect("connects");
+        let mut peeked = Connection::connect(addr).expect("connects");
         peeked
             .set_read_timeout(Some(Duration::from_millis(2)))
             .expect("timeout");
@@ -10606,7 +10683,7 @@ mod tests {
             "the peeking reader must give up on a silent peer"
         );
 
-        let mut record = TcpStream::connect(addr).expect("connects");
+        let mut record = Connection::connect(addr).expect("connects");
         record
             .set_read_timeout(Some(Duration::from_millis(2)))
             .expect("timeout");
@@ -10616,7 +10693,7 @@ mod tests {
         );
 
         // A budget cannot bound a blocking `peek`: arm one, and hand the socket back as it came.
-        let unarmed = TcpStream::connect(addr).expect("connects");
+        let unarmed = Connection::connect(addr).expect("connects");
         let mut unarmed = unarmed;
         assert!(
             read_http_head(&mut unarmed, HEAD_LIMIT_TEST, budget).is_none(),
@@ -10661,13 +10738,13 @@ mod tests {
         )
         .expect("parses");
         let header = link.encode_request_header("192.0.2.53", 80);
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let writer = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accepts");
             decode_request(&mut stream).expect("decodes")
         });
-        let mut reader = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut reader = Connection::connect(("127.0.0.1", port)).expect("connects");
         reader.write_all(&header).expect("writes");
         let (id, _flow, cmd, target) = writer.join().expect("joins");
         assert_eq!(
@@ -10689,15 +10766,15 @@ mod tests {
 
     #[test]
     fn the_splice_path_and_the_copying_path_move_the_same_bytes() {
-        fn round_trip(payload: &[u8], copy: fn(&mut TcpStream, &mut TcpStream)) -> Vec<u8> {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        fn round_trip(payload: &[u8], copy: fn(&mut Connection, &mut Connection)) -> Vec<u8> {
+            let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
             let port = listener.local_addr().expect("addr").port();
             let server = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().expect("accepts");
                 let mut other = stream.try_clone().expect("clones");
                 copy(&mut stream, &mut other);
             });
-            let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
             client
                 .set_read_timeout(Some(Duration::from_secs(30)))
                 .expect("timeout");
@@ -10719,7 +10796,7 @@ mod tests {
 
     #[test]
     fn both_sockets_of_a_connection_have_nagle_off() {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("binds");
+        let listener = crate::conn::test_bind(("127.0.0.1", 0)).expect("binds");
         let port = listener.local_addr().expect("has an address").port();
         let server = thread::spawn(move || {
             let (accepted, _) = listener.accept().expect("accepts");
@@ -10924,7 +11001,7 @@ mod tests {
     }
 
     fn relay_against_a_late_peer(drain: bool) -> (bool, Vec<u8>) {
-        let peer = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let peer = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let peer_port = peer.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (mut stream, _) = peer.accept().expect("accepts");
@@ -10938,12 +11015,12 @@ mod tests {
             std::thread::sleep(Duration::from_millis(300));
         });
 
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let sink = ClosingSink::default();
         let carrier = thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            let uplink = TcpStream::connect(("127.0.0.1", peer_port)).expect("dials");
+            let uplink = Connection::connect(("127.0.0.1", peer_port)).expect("dials");
             let sink = sink.clone();
             if drain {
                 relay_sink_drained(stream, &sink, &uplink);
@@ -10953,7 +11030,7 @@ mod tests {
             sink
         });
         let client = thread::spawn(move || {
-            let stream = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+            let stream = Connection::connect(("127.0.0.1", front_port)).expect("connects");
             let mut writer = stream.try_clone().expect("clones");
             writer.write_all(b"request").expect("writes");
             writer.shutdown(Shutdown::Write).expect("half closes");
@@ -11112,7 +11189,7 @@ mod tests {
 
     #[test]
     fn the_relay_moves_a_payload_larger_than_its_copy_buffer() {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -11128,11 +11205,11 @@ mod tests {
                 }
             }
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            let Ok(uplink) = TcpStream::connect(("127.0.0.1", echo_port)) else {
+            let Ok(uplink) = Connection::connect(("127.0.0.1", echo_port)) else {
                 return;
             };
             relay(&stream, &uplink);
@@ -11141,7 +11218,7 @@ mod tests {
         let payload: Vec<u8> = (0..(3 * RELAY_BUFFER + 7))
             .map(|i| (i % 253) as u8)
             .collect();
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -11160,13 +11237,13 @@ mod tests {
 
     #[test]
     fn trojan_relay_round_trips_and_refuses_strangers() {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = echo.accept().expect("accepts");
             relay(&stream, &stream);
         });
-        let server = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = server.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in server.incoming().take(2) {
@@ -11176,7 +11253,7 @@ mod tests {
                 });
             }
         });
-        let mut good = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut good = Connection::connect(("127.0.0.1", port)).expect("connects");
         let mut header = Vec::new();
         header.extend_from_slice(&trojan_key("an-example-shared-password"));
         header.extend_from_slice(b"\r\n\x01\x01\x7f\x00\x00\x01");
@@ -11187,7 +11264,7 @@ mod tests {
         let mut back = [0u8; 4];
         good.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"ping");
-        let mut bad = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut bad = Connection::connect(("127.0.0.1", port)).expect("connects");
         bad.write_all(&[0u8; 64]).expect("writes");
         let mut closed = [0u8; 1];
         assert!(bad.read(&mut closed).is_err() || closed == [0]);
@@ -11344,13 +11421,13 @@ mod tests {
 
     #[test]
     fn rejects_a_wrong_version_and_user() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let writer = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accepts");
             decode_request(&mut stream)
         });
-        let mut reader = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut reader = Connection::connect(("127.0.0.1", port)).expect("connects");
         reader.write_all(&[1u8; 18]).expect("writes");
         assert!(writer.join().expect("joins").is_none());
         drop(reader);
@@ -11375,7 +11452,7 @@ mod tests {
 
         let (server_config, client_config) = carried_tls_configs();
         let id = [9u8; 16];
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -11392,7 +11469,7 @@ mod tests {
             link.write_all(&buf[..n]).expect("echoes");
             link.flush().expect("flushes");
         });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
             .set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
@@ -11418,7 +11495,7 @@ mod tests {
 
         let (server_config, client_config) = carried_tls_configs();
         let id = [9u8; 16];
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -11443,7 +11520,7 @@ mod tests {
                 }
             }
         });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
             .set_read_timeout(Some(Duration::from_secs(20)))
             .expect("timeout");
@@ -11468,9 +11545,9 @@ mod tests {
 
     #[test]
     fn reality_edges_skip_lookups_without_xver() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut site, _) = listener.accept().expect("accepts");
         let _ = &mut site;
         let plain = ferrox_core::tls::RealityServerConfig {
@@ -11647,13 +11724,13 @@ mod tests {
             let core = link.encode_request_header(&host, target.port());
             let proxy = vless_vision_header(&id, 1, &Destination::from(target));
             assert_eq!(proxy, core, "the dial writes the core bytes for {target}");
-            let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+            let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
             let port = listener.local_addr().expect("addr").port();
             let writer = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().expect("accepts");
                 decode_request(&mut stream).expect("decodes")
             });
-            let mut reader = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut reader = Connection::connect(("127.0.0.1", port)).expect("connects");
             reader.write_all(&proxy).expect("writes");
             let (got, flow, cmd, decoded) = writer.join().expect("joins");
             assert_eq!(got, id);
@@ -11693,7 +11770,7 @@ mod tests {
     }
 
     fn reality_pair_with(flow: &str, network: &str, carrier: Carrier) -> RealityPair {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_addr = echo.local_addr().expect("addr");
         let echo = thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -11710,7 +11787,7 @@ mod tests {
             }
         });
         let id = uuid_bytes(REALITY_TEST_ID).expect("id");
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let server_addr = front.local_addr().expect("addr");
         let server_config = reality_server_config();
         let front_handle = thread::spawn(move || {
@@ -11736,8 +11813,8 @@ mod tests {
         }
     }
 
-    fn dial_pair(pair: &RealityPair) -> (TcpStream, thread::JoinHandle<()>) {
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+    fn dial_pair(pair: &RealityPair) -> (Connection, thread::JoinHandle<()>) {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = front.local_addr().expect("addr");
         let (tx, rx) = std::sync::mpsc::channel();
         let outbound = match &pair.outbound {
@@ -11756,7 +11833,7 @@ mod tests {
                 &Destination::from(target),
             );
         });
-        let user = TcpStream::connect(addr).expect("connects");
+        let user = Connection::connect(addr).expect("connects");
         user.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         rx.recv_timeout(Duration::from_secs(30)).expect("dials");
@@ -11764,7 +11841,7 @@ mod tests {
     }
 
     // Writing before reading only completes while the whole payload fits the chain's buffering, so read while writing, and give both arms the same deadline so a blocked one reports instead of parking.
-    fn echo_within(user: &mut TcpStream, payload: &[u8], budget: Duration) -> Vec<u8> {
+    fn echo_within(user: &mut Connection, payload: &[u8], budget: Duration) -> Vec<u8> {
         user.set_write_timeout(Some(budget)).expect("write timeout");
         let mut reader = user.try_clone().expect("clones");
         // A duplicated socket need not inherit the parent's poll timeout, so the reading arm carries its own.
@@ -11778,7 +11855,7 @@ mod tests {
         back.join().expect("joins").expect("echoes")
     }
 
-    fn echo_bulk(user: &mut TcpStream, payload: &[u8]) -> Vec<u8> {
+    fn echo_bulk(user: &mut Connection, payload: &[u8]) -> Vec<u8> {
         echo_within(user, payload, Duration::from_secs(30))
     }
 
@@ -11786,7 +11863,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "echoes")]
     fn a_silent_echo_peer_ends_the_bulk_read_at_its_budget() {
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = front.local_addr().expect("addr");
         let sink = thread::spawn(move || {
             let (mut peer, _) = front.accept().expect("accepts");
@@ -11797,7 +11874,7 @@ mod tests {
                 }
             }
         });
-        let mut user = TcpStream::connect(addr).expect("connects");
+        let mut user = Connection::connect(addr).expect("connects");
         let payload: Vec<u8> = (0..4096u32).map(|index| index as u8).collect();
         echo_within(&mut user, &payload, Duration::from_millis(250));
         sink.join().expect("drains");
@@ -11898,7 +11975,7 @@ mod tests {
 
         let pair = reality_pair(crate::vision::FLOW);
         let (server_config, client_config) = carried_tls_configs();
-        let inner = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let inner = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let inner_addr = inner.local_addr().expect("addr");
         let echo = thread::spawn(move || {
             let (stream, _) = inner.accept().expect("accepts");
@@ -11915,7 +11992,7 @@ mod tests {
                 }
             }
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = front.local_addr().expect("addr");
         let (tx, rx) = std::sync::mpsc::channel();
         let outbound = match &pair.outbound {
@@ -11933,7 +12010,7 @@ mod tests {
                 &Destination::from(inner_addr),
             );
         });
-        let user = TcpStream::connect(addr).expect("connects");
+        let user = Connection::connect(addr).expect("connects");
         user.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         rx.recv_timeout(Duration::from_secs(30)).expect("dials");
@@ -12069,7 +12146,7 @@ mod tests {
     }
 
     fn vless_over_carrier_reaches_echo(carrier: &Carrier, host: &str, path: &str) {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -12086,7 +12163,7 @@ mod tests {
                 }
             }
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let serving: Carrier = carrier.clone();
@@ -12099,7 +12176,7 @@ mod tests {
         )
         .expect("parses");
         let header = link.encode_request_header("127.0.0.1", echo_port);
-        let uplink = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let uplink = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         uplink
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -12145,7 +12222,7 @@ mod tests {
     }
 
     /// Raw HTTP/1.1 clients for the three xhttp modes, padded, with session and seq in the path.
-    fn xhttp_get(stream: &mut TcpStream, target: &str) {
+    fn xhttp_get(stream: &mut Connection, target: &str) {
         stream
             .write_all(
                 format!(
@@ -12157,7 +12234,7 @@ mod tests {
             .expect("writes");
     }
 
-    fn xhttp_post_head(stream: &mut TcpStream, target: &str, chunked: bool) {
+    fn xhttp_post_head(stream: &mut Connection, target: &str, chunked: bool) {
         let framing = if chunked {
             "Transfer-Encoding: chunked"
         } else {
@@ -12174,7 +12251,7 @@ mod tests {
             .expect("writes");
     }
 
-    fn xhttp_chunk(stream: &mut TcpStream, data: &[u8]) {
+    fn xhttp_chunk(stream: &mut Connection, data: &[u8]) {
         stream
             .write_all(format!("{:X}\r\n", data.len()).as_bytes())
             .expect("writes");
@@ -12183,7 +12260,7 @@ mod tests {
         stream.flush().expect("flushes");
     }
 
-    fn xhttp_read_head(stream: &mut TcpStream) -> Vec<u8> {
+    fn xhttp_read_head(stream: &mut Connection) -> Vec<u8> {
         let mut head = Vec::new();
         let mut one = [0u8; 1];
         while !head.ends_with(b"\r\n\r\n") {
@@ -12207,7 +12284,7 @@ mod tests {
     }
 
     /// Reads exactly `n` de-chunked bytes, the way any HTTP layer does before handing over the logical stream.
-    fn xhttp_read_chunked(stream: &mut TcpStream, n: usize) -> Vec<u8> {
+    fn xhttp_read_chunked(stream: &mut Connection, n: usize) -> Vec<u8> {
         let mut out = Vec::with_capacity(n);
         let mut line = Vec::new();
         let mut one = [0u8; 1];
@@ -12244,7 +12321,7 @@ mod tests {
     }
 
     /// Serve exactly `takes` xhttp connections the way the accept loop does.
-    fn xhttp_serve_n(listener: &TcpListener, takes: usize, carrier: &Carrier, id: [u8; 16]) {
+    fn xhttp_serve_n(listener: &Listener, takes: usize, carrier: &Carrier, id: [u8; 16]) {
         for stream in listener.incoming().take(takes) {
             let Ok(stream) = stream else { continue };
             let carrier = carrier.clone();
@@ -12261,7 +12338,7 @@ mod tests {
     }
 
     fn xhttp_echo_server() -> (SocketAddr, thread::JoinHandle<()>) {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = echo.local_addr().expect("addr");
         let handle = thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -12286,7 +12363,7 @@ mod tests {
         id: [u8; 16],
         takes: usize,
     ) -> (SocketAddr, thread::JoinHandle<()>) {
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = front.local_addr().expect("addr");
         let handle = thread::spawn(move || xhttp_serve_n(&front, takes, &carrier, id));
         (addr, handle)
@@ -12302,14 +12379,14 @@ mod tests {
         let (addr, server) = xhttp_front(carrier, id, 2);
         let header = xhttp_vless_header(echo_addr.port());
 
-        let mut down = TcpStream::connect(addr).expect("connects");
+        let mut down = Connection::connect(addr).expect("connects");
         down.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         xhttp_get(&mut down, "/up/sess-up-01");
         let head = xhttp_read_head(&mut down);
         assert_eq!(xhttp_status(&head), 200);
 
-        let mut up = TcpStream::connect(addr).expect("connects");
+        let mut up = Connection::connect(addr).expect("connects");
         up.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         xhttp_post_head(&mut up, "/up/sess-up-01", true);
@@ -12350,7 +12427,7 @@ mod tests {
         let header = xhttp_vless_header(echo_addr.port());
         let payload: Vec<u8> = (0..8192u32).map(|i| (i % 251) as u8).collect();
 
-        let mut down = TcpStream::connect(addr).expect("connects");
+        let mut down = Connection::connect(addr).expect("connects");
         down.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         xhttp_get(&mut down, "/up/sess-pkt-01");
@@ -12358,7 +12435,7 @@ mod tests {
         assert_eq!(xhttp_status(&head), 200);
 
         // Sequence 1 posts before sequence 0: the heap must still deliver in order.
-        let mut one = TcpStream::connect(addr).expect("connects");
+        let mut one = Connection::connect(addr).expect("connects");
         one.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         let body1 = &payload[4096..];
@@ -12376,7 +12453,7 @@ mod tests {
         let head = xhttp_read_head(&mut one);
         assert_eq!(xhttp_status(&head), 200);
 
-        let mut zero = TcpStream::connect(addr).expect("connects");
+        let mut zero = Connection::connect(addr).expect("connects");
         zero.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         let mut body0 = header.clone();
@@ -12409,7 +12486,7 @@ mod tests {
 
     #[test]
     fn xhttp_greeting_first_arrives_before_uplink_payload() {
-        let greet = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let greet = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let greet_addr = greet.local_addr().expect("addr");
         let greeter = thread::spawn(move || {
             let (mut stream, _) = greet.accept().expect("accepts");
@@ -12439,7 +12516,7 @@ mod tests {
         .expect("parses");
         let header = link.encode_request_header("127.0.0.1", greet_addr.port());
 
-        let mut down = TcpStream::connect(addr).expect("connects");
+        let mut down = Connection::connect(addr).expect("connects");
         down.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         xhttp_get(&mut down, "/up/sess-greet-01");
@@ -12447,7 +12524,7 @@ mod tests {
         assert_eq!(xhttp_status(&head), 200);
 
         // Only the VLESS header goes up; the greeting must arrive unprompted.
-        let mut up = TcpStream::connect(addr).expect("connects");
+        let mut up = Connection::connect(addr).expect("connects");
         up.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         xhttp_post_head(&mut up, "/up/sess-greet-01", true);
@@ -12469,7 +12546,7 @@ mod tests {
     #[test]
     fn xhttp_refusals_carry_their_statuses() {
         fn status_of(settings: &crate::xhttp::XhttpSettings, request: &[u8]) -> u16 {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+            let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
             let port = listener.local_addr().expect("addr").port();
             let settings = settings.clone();
             thread::spawn(move || {
@@ -12479,7 +12556,7 @@ mod tests {
                 };
                 let _ = crate::xhttp::accept_split_with_settings(read, stream, &settings);
             });
-            let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
             stream
                 .set_read_timeout(Some(Duration::from_secs(10)))
                 .expect("timeout");
@@ -12612,12 +12689,12 @@ mod tests {
 
     fn carried_round_trip(
         name: &str,
-        accept: impl FnOnce(TcpStream) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)>
+        accept: impl FnOnce(Connection) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)>
             + Send
             + 'static,
-        connect: impl FnOnce(TcpStream) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)>,
+        connect: impl FnOnce(Connection) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)>,
     ) {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -12628,7 +12705,7 @@ mod tests {
             stream.write_all(&buf).expect("echoes");
             stream.flush().expect("flushes");
         });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -12773,7 +12850,7 @@ mod tests {
         use std::time::Instant;
 
         let (server_config, client_config) = carried_tls_configs();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let server: SocketAddr = listener.local_addr().expect("addr");
         let (release, hold) = std::sync::mpsc::channel();
         thread::spawn(move || {
@@ -12814,15 +12891,15 @@ mod tests {
 
     fn tls_over_carrier(
         name: &str,
-        accept: impl FnOnce(TcpStream) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)>
+        accept: impl FnOnce(Connection) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)>
             + Send
             + 'static,
-        connect: impl FnOnce(TcpStream) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)>,
+        connect: impl FnOnce(Connection) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)>,
     ) {
         use ferrox_core::tls::TlsProvider as _;
 
         let (server_config, client_config) = carried_tls_configs();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -12838,7 +12915,7 @@ mod tests {
             tls.read_exact(&mut buf).expect("reads");
             tls.write_all(&buf).expect("echoes");
         });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -12901,7 +12978,7 @@ mod tests {
         use ferrox_core::tls::TlsProvider as _;
 
         let (server_config, client_config) = carried_tls_configs();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -12913,7 +12990,7 @@ mod tests {
             tls.read_exact(&mut buf).expect("reads");
             tls.write_all(&buf).expect("echoes");
         });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         thread::sleep(RELAY_POLL * 5);
         let mut tls = ferrox_core::tls::connect(&client_config, stream).expect("configures");
         tls.handshake().expect("handshakes");
@@ -12933,7 +13010,7 @@ mod tests {
             ..Default::default()
         });
         let id = [0x11u8; 16];
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
@@ -12941,7 +13018,7 @@ mod tests {
             serve_vless_raw(stream, &id, true);
             let _ = done_tx.send(());
         });
-        let _peer = TcpStream::connect(addr).expect("connects");
+        let _peer = Connection::connect(addr).expect("connects");
         let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
         budgets::clear();
         returned.expect("the bounded request read returns instead of pinning the thread");
@@ -12957,7 +13034,7 @@ mod tests {
             ..Default::default()
         });
         let key = [b'k'; 56];
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
@@ -12965,7 +13042,7 @@ mod tests {
             serve_trojan(stream, &key, true);
             let _ = done_tx.send(());
         });
-        let _peer = TcpStream::connect(addr).expect("connects");
+        let _peer = Connection::connect(addr).expect("connects");
         let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
         budgets::clear();
         returned.expect("the bounded request read returns instead of pinning the thread");
@@ -12985,7 +13062,7 @@ mod tests {
             path: "/p".into(),
             ed: 0,
         };
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
@@ -12993,7 +13070,7 @@ mod tests {
             serve_vless(stream, &id, &carrier, true);
             let _ = done_tx.send(());
         });
-        let mut peer = TcpStream::connect(addr).expect("connects");
+        let mut peer = Connection::connect(addr).expect("connects");
         peer.write_all(b"GET /p HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\
                          Connection: Upgrade\r\nSec-WebSocket-Key: aGVsbG8gd29ybGQxMjM0NQ==\r\n\r\n")
             .expect("upgrades");
@@ -13017,7 +13094,7 @@ mod tests {
             path: "/p".into(),
             ed: 0,
         };
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
@@ -13025,7 +13102,7 @@ mod tests {
             serve_vless(stream, &id, &carrier, true);
             let _ = done_tx.send(());
         });
-        let mut peer = TcpStream::connect(addr).expect("connects");
+        let mut peer = Connection::connect(addr).expect("connects");
         peer.write_all(
             b"GET /p HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
         )
@@ -13047,7 +13124,7 @@ mod tests {
         });
         let id = [0x24u8; 16];
         let carrier = Carrier::HttpHeader { path: "/p".into() };
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
@@ -13055,7 +13132,7 @@ mod tests {
             serve_vless(stream, &id, &carrier, true);
             let _ = done_tx.send(());
         });
-        let mut peer = TcpStream::connect(addr).expect("connects");
+        let mut peer = Connection::connect(addr).expect("connects");
         peer.write_all(b"GET /p HTTP/1.1\r\nHost: h\r\n\r\n")
             .expect("sends head");
         let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
@@ -13075,7 +13152,7 @@ mod tests {
         });
         let id = [0x25u8; 16];
         let carrier = Carrier::Grpc { path: "/p".into() };
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
@@ -13083,7 +13160,7 @@ mod tests {
             serve_vless(stream, &id, &carrier, true);
             let _ = done_tx.send(());
         });
-        let _peer = TcpStream::connect(addr).expect("connects");
+        let _peer = Connection::connect(addr).expect("connects");
         let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
         budgets::clear();
         returned.expect("the bounded preface read returns instead of pinning the thread");
@@ -13100,7 +13177,7 @@ mod tests {
         });
         let id = [0x26u8; 16];
         let carrier = Carrier::Grpc { path: "/p".into() };
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
@@ -13108,7 +13185,7 @@ mod tests {
             serve_vless(stream, &id, &carrier, true);
             let _ = done_tx.send(());
         });
-        let mut peer = TcpStream::connect(addr).expect("connects");
+        let mut peer = Connection::connect(addr).expect("connects");
         peer.write_all(crate::h2::MAGIC).expect("sends the preface");
         let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
         budgets::clear();
@@ -13127,7 +13204,7 @@ mod tests {
         });
         let id = [0x27u8; 16];
         let carrier = Carrier::Grpc { path: "/p".into() };
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
@@ -13135,7 +13212,7 @@ mod tests {
             serve_vless(stream, &id, &carrier, true);
             let _ = done_tx.send(());
         });
-        let stream = TcpStream::connect(addr).expect("connects");
+        let stream = Connection::connect(addr).expect("connects");
         let (_reader, _writer) = crate::grpc::connect(stream, "127.0.0.1", "/p").expect("dials");
         let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
         budgets::clear();
@@ -13156,7 +13233,7 @@ mod tests {
         let (server_config, client_config) = carried_tls_configs();
         let id = [0x28u8; 16];
         let carrier = Carrier::Grpc { path: "/p".into() };
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
@@ -13165,7 +13242,7 @@ mod tests {
             let _ = done_tx.send(());
         });
         let mut session =
-            ferrox_core::tls::connect(&client_config, TcpStream::connect(addr).expect("connects"))
+            ferrox_core::tls::connect(&client_config, Connection::connect(addr).expect("connects"))
                 .expect("opens");
         session.handshake().expect("handshakes");
         let (read, write) = session_halves(session);
@@ -13186,7 +13263,7 @@ mod tests {
             ..Default::default()
         });
         let key = trojan_key("secret");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
@@ -13194,7 +13271,7 @@ mod tests {
             serve_trojan_grpc(stream, &key, "/p", true);
             let _ = done_tx.send(());
         });
-        let stream = TcpStream::connect(addr).expect("connects");
+        let stream = Connection::connect(addr).expect("connects");
         let (_reader, _writer) = crate::grpc::connect(stream, "127.0.0.1", "/p").expect("dials");
         let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
         budgets::clear();
@@ -13247,7 +13324,7 @@ mod tests {
             ..Default::default()
         });
         let key = [b'a'; 56];
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
@@ -13255,7 +13332,7 @@ mod tests {
             serve_trojan(stream, &key, true);
             let _ = done_tx.send(());
         });
-        let mut peer = TcpStream::connect(addr).expect("connects");
+        let mut peer = Connection::connect(addr).expect("connects");
         peer.write_all(b"not-a-password-yet")
             .expect("writes a prefix");
         let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
@@ -13269,7 +13346,7 @@ mod tests {
     #[test]
     fn vless_client_pumps_the_upload_before_reading_the_response() {
         let id = [0x26u8; 16];
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accepts");
@@ -13286,7 +13363,7 @@ mod tests {
             stream.write_all(&[0, 0]).expect("answers");
             stream.write_all(&payload).expect("echoes");
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
         let vless = VlessOut {
@@ -13313,7 +13390,7 @@ mod tests {
                 Ladder::global(),
             );
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("timeout");
@@ -13333,7 +13410,7 @@ mod tests {
     fn vless_sends_the_destination_name_to_the_edge() {
         const HOST: &str = "www.example.com";
         let id = [0x26u8; 16];
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accepts");
@@ -13354,7 +13431,7 @@ mod tests {
             stream.write_all(&[0, 0]).expect("answers");
             stream.write_all(&payload).expect("echoes");
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
         let vless = VlessOut {
@@ -13375,7 +13452,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             dial_vless(&stream, &server_addr, &vless, &asked, Ladder::global());
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("timeout");
@@ -13416,7 +13493,7 @@ mod tests {
     #[test]
     fn vless_websocket_client_pumps_the_upload_before_reading_the_response() {
         let id = [0x27u8; 16];
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let Ok((stream, _)) = listener.accept() else {
@@ -13435,7 +13512,7 @@ mod tests {
             assert!(writer.send(&[0, 0]), "answers");
             assert!(writer.send(&payload), "echoes");
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
         let vless = VlessOut {
@@ -13465,7 +13542,7 @@ mod tests {
                 Ladder::global(),
             );
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("timeout");
@@ -13485,7 +13562,7 @@ mod tests {
     fn vless_reality_client_pumps_the_upload_before_reading_the_response() {
         let id = uuid_bytes(REALITY_TEST_ID).expect("id");
         let server_config = reality_server_config();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let server_addr = listener.local_addr().expect("addr");
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -13522,7 +13599,7 @@ mod tests {
         let Outbound::Vless(vless) = find_outbound(&root).expect("a REALITY outbound") else {
             panic!("the outbound dials VLESS");
         };
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let relaying = thread::spawn(move || {
@@ -13535,7 +13612,7 @@ mod tests {
                 Ladder::global(),
             );
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("timeout");
@@ -13737,7 +13814,7 @@ mod tests {
 
         let (server_config, client_config) = carried_tls_configs();
         let id = [0x44u8; 16];
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -13757,7 +13834,7 @@ mod tests {
             echo_trace(&format!("srv {port} ping read"));
             tls.write_all(&buf).expect("echoes");
         });
-        let downstream = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let dport = downstream.local_addr().expect("addr").port();
         let relay = thread::spawn(move || {
             let (client, _) = downstream.accept().expect("accepts");
@@ -13786,7 +13863,7 @@ mod tests {
             );
             echo_trace(&format!("cli {port} relay over"));
         });
-        let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(120)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
@@ -13802,7 +13879,7 @@ mod tests {
 
         let (server_config, client_config) = carried_tls_configs();
         let key = trojan_key("an-example-shared-password");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -13820,7 +13897,7 @@ mod tests {
             echo_trace(&format!("srv {port} ping read"));
             tls.write_all(&buf).expect("echoes");
         });
-        let downstream = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let dport = downstream.local_addr().expect("addr").port();
         let relay = thread::spawn(move || {
             let (client, _) = downstream.accept().expect("accepts");
@@ -13844,7 +13921,7 @@ mod tests {
             );
             echo_trace(&format!("cli {port} relay over"));
         });
-        let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(120)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
@@ -13860,7 +13937,7 @@ mod tests {
 
         let (server_config, client_config) = carried_tls_configs();
         let id = [0x33u8; 16];
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -13892,7 +13969,7 @@ mod tests {
             ));
             echo_trace(&format!("srv {port} echoed vmess"));
         });
-        let downstream = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let dport = downstream.local_addr().expect("addr").port();
         let relay = thread::spawn(move || {
             let (client, _) = downstream.accept().expect("accepts");
@@ -13917,7 +13994,7 @@ mod tests {
             );
             echo_trace(&format!("cli {port} relay over"));
         });
-        let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(120)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
@@ -13927,10 +14004,10 @@ mod tests {
         server.join().expect("joins");
     }
 
-    type ServerHalf = TlsHalf<ferrox_core::tls::RustlsServerProvider<TcpStream>>;
+    type ServerHalf = TlsHalf<ferrox_core::tls::RustlsServerProvider<Connection>>;
 
     /// The relay arms the shared timeout to its own grain, so a quiet socket retries and only a closed one fails.
-    fn read_echo(sock: &mut TcpStream) -> [u8; 4] {
+    fn read_echo(sock: &mut Connection) -> [u8; 4] {
         let start = std::time::Instant::now();
         let mut back = [0u8; 4];
         let mut at = 0;
@@ -13971,7 +14048,7 @@ mod tests {
         use ferrox_core::tls::TlsProvider as _;
 
         let (server_config, _) = carried_tls_configs();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -14049,7 +14126,7 @@ mod tests {
             let mut rest = [0u8; 1024];
             while reader.read(&mut rest).unwrap_or(0) != 0 {}
         });
-        let downstream = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let dport = downstream.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (client, _) = downstream.accept().expect("accepts");
@@ -14059,7 +14136,7 @@ mod tests {
             dial_socks_outbound(&client, &out(port), &server, &Destination::from(target));
             echo_trace(&format!("cli {port} relay over"));
         });
-        let mut sock = TcpStream::connect(("127.0.0.1", dport)).expect("connects");
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(120)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
@@ -14186,7 +14263,7 @@ mod tests {
     fn production_tls_first_ws_matches_the_seam() {
         let (server_config, client_config) = carried_tls_configs();
         let id = [0x44u8; 16];
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds echo");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds echo");
         let echo_addr: SocketAddr = echo.local_addr().expect("addr");
         thread::spawn(move || {
             let (mut s, _) = echo.accept().expect("accepts");
@@ -14194,7 +14271,7 @@ mod tests {
             s.read_exact(&mut buf).expect("reads");
             s.write_all(&buf).expect("echoes");
         });
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -14547,7 +14624,7 @@ mod tests {
 
     #[test]
     fn socks_dials_vmess_over_xhttp_to_echo() {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -14565,7 +14642,7 @@ mod tests {
             }
         });
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
@@ -14573,7 +14650,7 @@ mod tests {
                 crate::vmess::serve_xhttp(stream, "/share", &id, true);
             }
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let out = Outbound::Vmess(VmessOut {
             address: "127.0.0.1".to_owned(),
@@ -14590,7 +14667,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -14630,7 +14707,7 @@ mod tests {
 
     #[test]
     fn trojan_over_ws_reaches_echo() {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -14647,13 +14724,13 @@ mod tests {
                 }
             }
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
             serve_trojan_ws(stream, &trojan_key("secret"), "/tunnel", true);
         });
-        let uplink = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let uplink = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         uplink
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -14679,12 +14756,12 @@ mod tests {
 
     fn socks_dials_ss_via(
         carrier: Carrier,
-        serve: fn(TcpStream, &str, &str, &str, bool),
+        serve: fn(Connection, &str, &str, &str, bool),
         path: &str,
         key: (&str, &str),
     ) {
         let (method, password) = (key.0.to_owned(), key.1.to_owned());
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -14698,7 +14775,7 @@ mod tests {
                 }
             }
         });
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         let owned = path.to_owned();
         let (served_method, served_password) = (method.clone(), password.clone());
@@ -14708,7 +14785,7 @@ mod tests {
                 serve(stream, &served_password, &served_method, &owned, true);
             }
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let out = Outbound::Shadowsocks(ShadowsocksOut {
             address: "127.0.0.1".to_owned(),
@@ -14722,7 +14799,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -14837,7 +14914,7 @@ mod tests {
 
     #[test]
     fn udp_frames_carry_every_length() {
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = tunnel.accept().expect("accepts");
@@ -14853,7 +14930,7 @@ mod tests {
                 }
             }
         });
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -14913,13 +14990,13 @@ mod tests {
             }
         });
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
             serve_vless_raw(stream, &id, true);
         });
-        let mut stream = TcpStream::connect(("127.0.0.1", tunnel_port)).expect("connects");
+        let mut stream = Connection::connect(("127.0.0.1", tunnel_port)).expect("connects");
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -14937,13 +15014,13 @@ mod tests {
     #[test]
     fn vless_udp_with_a_flow_is_refused() {
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
             serve_vless_raw(stream, &id, true);
         });
-        let mut stream = TcpStream::connect(("127.0.0.1", tunnel_port)).expect("connects");
+        let mut stream = Connection::connect(("127.0.0.1", tunnel_port)).expect("connects");
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("timeout");
@@ -14976,13 +15053,13 @@ mod tests {
             }
         });
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
             serve_vless_raw(stream, &id, true);
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let out = Outbound::Vless(VlessOut {
             address: "127.0.0.1".to_owned(),
@@ -15001,7 +15078,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -15050,13 +15127,13 @@ mod tests {
                 }
             }
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &Outbound::Freedom);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -15091,7 +15168,7 @@ mod tests {
 
     #[test]
     fn trojan_udp_frames_carry() {
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = tunnel.accept().expect("accepts");
@@ -15108,7 +15185,7 @@ mod tests {
                 }
             }
         });
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -15142,14 +15219,14 @@ mod tests {
 
     #[test]
     fn trojan_udp_frames_reject_damage() {
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = tunnel.accept().expect("accepts");
             let mut buf = vec![0u8; UDP_BUF];
             while read_trojan_datagram(&mut stream, &mut buf).is_some() {}
         });
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -15179,13 +15256,13 @@ mod tests {
         let first = echo();
         let second = echo();
         let key = trojan_key("secret");
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
             serve_trojan(stream, &key, true);
         });
-        let mut stream = TcpStream::connect(("127.0.0.1", tunnel_port)).expect("connects");
+        let mut stream = Connection::connect(("127.0.0.1", tunnel_port)).expect("connects");
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -15225,13 +15302,13 @@ mod tests {
                 }
             }
         });
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
             serve_trojan(stream, &trojan_key("secret"), true);
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let out = Outbound::Trojan(TrojanOut {
             address: "127.0.0.1".to_owned(),
@@ -15245,7 +15322,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -15295,14 +15372,14 @@ mod tests {
             }
         });
         let id = [0x5au8; 16];
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
             crate::vmess::serve(stream, &id, true);
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
-        let mut uplink = TcpStream::connect(("127.0.0.1", tunnel_port)).expect("connects");
+        let mut uplink = Connection::connect(("127.0.0.1", tunnel_port)).expect("connects");
         uplink
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -15360,7 +15437,7 @@ mod tests {
         let first = echo();
         let second = echo();
         let id = [0x5au8; 16];
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in tunnel.incoming().take(2) {
@@ -15370,7 +15447,7 @@ mod tests {
                 thread::spawn(move || crate::vmess::serve(stream, &id, true));
             }
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let out = Outbound::Vmess(VmessOut {
             address: "127.0.0.1".to_owned(),
@@ -15385,7 +15462,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -15512,7 +15589,7 @@ mod tests {
                 true,
             );
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let out = Outbound::Shadowsocks(ShadowsocksOut {
             address: "127.0.0.1".to_owned(),
@@ -15526,7 +15603,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -15561,7 +15638,7 @@ mod tests {
     }
 
     fn mux_test_echo() -> u16 {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in echo.incoming() {
@@ -15585,7 +15662,7 @@ mod tests {
     }
 
     fn mux_test_send(
-        stream: &mut TcpStream,
+        stream: &mut Connection,
         frame: ferrox_core::mux::Outgoing<'_>,
         data: Option<&[u8]>,
     ) {
@@ -15595,7 +15672,7 @@ mod tests {
     }
 
     fn mux_test_recv_frame(
-        stream: &mut TcpStream,
+        stream: &mut Connection,
     ) -> (u16, ferrox_core::mux::Status, Option<SocketAddr>, Vec<u8>) {
         let mut raw = [0u8; 2];
         stream.read_exact(&mut raw).expect("reads");
@@ -15623,7 +15700,7 @@ mod tests {
         )
     }
 
-    fn mux_test_recv(stream: &mut TcpStream) -> (u16, ferrox_core::mux::Status, Vec<u8>) {
+    fn mux_test_recv(stream: &mut Connection) -> (u16, ferrox_core::mux::Status, Vec<u8>) {
         let (id, status, _, data) = mux_test_recv_frame(stream);
         (id, status, data)
     }
@@ -15636,8 +15713,8 @@ mod tests {
         }
     }
 
-    fn mux_test_connect(id: &[u8; 16], tunnel_port: u16) -> TcpStream {
-        let mut stream = TcpStream::connect(("127.0.0.1", tunnel_port)).expect("connects");
+    fn mux_test_connect(id: &[u8; 16], tunnel_port: u16) -> Connection {
+        let mut stream = Connection::connect(("127.0.0.1", tunnel_port)).expect("connects");
         stream
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -15648,7 +15725,7 @@ mod tests {
         stream
     }
 
-    fn mux_test_expect_close(stream: &mut TcpStream) {
+    fn mux_test_expect_close(stream: &mut Connection) {
         stream
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("timeout");
@@ -15690,7 +15767,7 @@ mod tests {
     fn mux_udp_relays_datagrams_and_reuses_a_global_id() {
         let echo_port = mux_test_udp_echo();
         let id = [0x5au8; 16];
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
@@ -15779,7 +15856,7 @@ mod tests {
         let first = mux_test_udp_echo();
         let second = mux_test_udp_echo();
         let id = [0x5au8; 16];
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         let opens = Arc::new(AtomicU64::new(0));
         let opened = Arc::clone(&opens);
@@ -15792,7 +15869,7 @@ mod tests {
                 thread::spawn(move || serve_vless_raw(stream, &id, true));
             }
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let out = Outbound::Vless(VlessOut {
             address: "127.0.0.1".to_owned(),
@@ -15811,7 +15888,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -15857,7 +15934,7 @@ mod tests {
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let first = mux_test_echo();
         let second = mux_test_echo();
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
@@ -15917,7 +15994,7 @@ mod tests {
     fn mux_serve_refuses_unknown_and_malformed() {
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let echo_port = mux_test_echo();
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
@@ -16284,9 +16361,9 @@ mod tests {
     #[test]
     #[should_panic(expected = "mux chunk longer than a length field")]
     fn a_relay_payload_longer_than_a_frame_is_refused_not_truncated() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("dials");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("dials");
         let shared = Arc::new(Mutex::new(stream));
         let keep = ferrox_core::mux::Outgoing {
             id: 1,
@@ -16306,7 +16383,7 @@ mod tests {
         for total in [1usize, 15, 16, 1400, 8192, 8193, 20_000] {
             let payload: Vec<u8> = (0..total).map(|i| (i as u8).wrapping_mul(7)).collect();
 
-            let upstream = TcpListener::bind("127.0.0.1:0").expect("binds");
+            let upstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
             let upstream_port = upstream.local_addr().expect("addr").port();
             let server = thread::spawn(move || {
                 let (mut sock, _) = upstream.accept().expect("accepts");
@@ -16321,12 +16398,12 @@ mod tests {
                 seen
             });
 
-            let mut uplink = TcpStream::connect(("127.0.0.1", upstream_port)).expect("dials");
-            let client = TcpListener::bind("127.0.0.1:0").expect("binds");
+            let mut uplink = Connection::connect(("127.0.0.1", upstream_port)).expect("dials");
+            let client = crate::conn::test_bind("127.0.0.1:0").expect("binds");
             let client_port = client.local_addr().expect("addr").port();
             let sent = payload.clone();
             let writer = thread::spawn(move || {
-                let mut sock = TcpStream::connect(("127.0.0.1", client_port)).expect("connects");
+                let mut sock = Connection::connect(("127.0.0.1", client_port)).expect("connects");
                 sock.write_all(&sent).expect("writes");
                 sock.shutdown(Shutdown::Write).ok();
             });
@@ -16370,7 +16447,7 @@ mod tests {
 
     #[test]
     fn socks_dials_vless_mux_to_echo() {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -16385,13 +16462,13 @@ mod tests {
             }
         });
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
             serve_vless_raw(stream, &id, true);
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let out = Outbound::Vless(VlessOut {
             address: "127.0.0.1".to_owned(),
@@ -16410,7 +16487,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -16432,13 +16509,13 @@ mod tests {
 
     #[test]
     fn trojan_over_ws_rejects_a_wrong_password() {
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
             serve_trojan_ws(stream, &trojan_key("secret"), "/tunnel", true);
         });
-        let uplink = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let uplink = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         uplink
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -16458,7 +16535,7 @@ mod tests {
 
     #[test]
     fn socks_dials_vmess_over_ws_to_echo() {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -16476,7 +16553,7 @@ mod tests {
             }
         });
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
@@ -16484,7 +16561,7 @@ mod tests {
                 crate::vmess::serve_ws(stream, "/tunnel", &id, true);
             }
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let out = Outbound::Vmess(VmessOut {
             address: "127.0.0.1".to_owned(),
@@ -16502,7 +16579,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -16524,7 +16601,7 @@ mod tests {
 
     #[test]
     fn socks_dials_vmess_over_httpupgrade_to_echo() {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -16542,7 +16619,7 @@ mod tests {
             }
         });
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
@@ -16550,7 +16627,7 @@ mod tests {
                 crate::vmess::serve_httpupgrade(stream, "/tunnel", &id, true);
             }
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let out = Outbound::Vmess(VmessOut {
             address: "127.0.0.1".to_owned(),
@@ -16568,7 +16645,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -16590,7 +16667,7 @@ mod tests {
 
     #[test]
     fn socks_dials_vmess_over_grpc_to_echo() {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -16608,7 +16685,7 @@ mod tests {
             }
         });
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
@@ -16616,7 +16693,7 @@ mod tests {
                 crate::vmess::serve_grpc(stream, "/TunnelService/Tun", &id, true);
             }
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let out = Outbound::Vmess(VmessOut {
             address: "127.0.0.1".to_owned(),
@@ -16633,7 +16710,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -16655,7 +16732,7 @@ mod tests {
 
     #[test]
     fn socks_dials_trojan_over_ws_to_echo() {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -16672,7 +16749,7 @@ mod tests {
                 }
             }
         });
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
@@ -16680,7 +16757,7 @@ mod tests {
                 serve_trojan_ws(stream, &trojan_key("secret"), "/tunnel", true);
             }
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let out = Outbound::Trojan(TrojanOut {
             address: "127.0.0.1".to_owned(),
@@ -16697,7 +16774,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -16719,7 +16796,7 @@ mod tests {
 
     #[test]
     fn socks_dials_trojan_over_httpupgrade_to_echo() {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -16736,7 +16813,7 @@ mod tests {
                 }
             }
         });
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
@@ -16744,7 +16821,7 @@ mod tests {
                 serve_trojan_httpupgrade(stream, &trojan_key("secret"), "/tunnel", true);
             }
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let out = Outbound::Trojan(TrojanOut {
             address: "127.0.0.1".to_owned(),
@@ -16761,7 +16838,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -16783,7 +16860,7 @@ mod tests {
 
     #[test]
     fn socks_dials_trojan_over_grpc_to_echo() {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -16800,7 +16877,7 @@ mod tests {
                 }
             }
         });
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
@@ -16808,7 +16885,7 @@ mod tests {
                 serve_trojan_grpc(stream, &trojan_key("secret"), "/Tun", true);
             }
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let out = Outbound::Trojan(TrojanOut {
             address: "127.0.0.1".to_owned(),
@@ -16824,7 +16901,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -16846,7 +16923,7 @@ mod tests {
 
     #[test]
     fn socks_dials_trojan_over_xhttp_to_echo() {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -16863,7 +16940,7 @@ mod tests {
                 }
             }
         });
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
@@ -16871,7 +16948,7 @@ mod tests {
                 serve_trojan_xhttp(stream, &trojan_key("secret"), "/tunnel", true);
             }
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let out = Outbound::Trojan(TrojanOut {
             address: "127.0.0.1".to_owned(),
@@ -16887,7 +16964,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -16909,7 +16986,7 @@ mod tests {
 
     #[test]
     fn socks_dials_trojan_over_httpheader_to_echo() {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -16926,7 +17003,7 @@ mod tests {
                 }
             }
         });
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
@@ -16934,7 +17011,7 @@ mod tests {
                 serve_trojan_httpheader(stream, &trojan_key("secret"), "/tunnel", true);
             }
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let out = Outbound::Trojan(TrojanOut {
             address: "127.0.0.1".to_owned(),
@@ -16950,7 +17027,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -17106,7 +17183,7 @@ mod tests {
     #[test]
     fn quic_serves_vless_echo_over_loopback() {
         let _serial = quic_serial();
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -17134,7 +17211,7 @@ mod tests {
     #[test]
     fn quic_serves_two_streams_on_one_connection() {
         let _serial = quic_serial();
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in echo.incoming().take(2) {
@@ -17204,7 +17281,7 @@ mod tests {
     #[test]
     fn quic_server_refuses_wrong_id() {
         let _serial = quic_serial();
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         echo.set_nonblocking(true).expect("nonblocking");
         let echo_port = echo.local_addr().expect("addr").port();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
@@ -17284,13 +17361,13 @@ mod tests {
     #[test]
     fn quic_tcp_front_closes_without_handshake() {
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_vless(stream, &id, &Carrier::Quic, true);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -17402,7 +17479,7 @@ mod tests {
 
     #[test]
     fn the_ladder_climbs_past_the_configured_rung_and_relays() {
-        let server = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = server.local_addr().expect("addr").port();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         thread::spawn(move || {
@@ -17444,7 +17521,7 @@ mod tests {
                 });
             }
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let ladder = Arc::new(Ladder::new());
         let vless = VlessOut {
@@ -17476,7 +17553,7 @@ mod tests {
                 &dial_ladder,
             );
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(15)))
             .expect("timeout");
@@ -18201,7 +18278,7 @@ mod tests {
             key_pem,
             expected_header,
         );
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let out = Outbound::Vless(VlessOut {
             address: "127.0.0.1".to_owned(),
@@ -18220,7 +18297,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
             .expect("timeout");
@@ -18246,7 +18323,7 @@ mod tests {
     fn a_quic_carrier_with_mux_never_dials_the_server_tcp_port() {
         let _serial = quic_serial();
         let id = uuid_bytes("bbbbbbbb-cccc-dddd-eeee-ffffffffffff").expect("id");
-        let server_tcp = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let server_tcp = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         server_tcp.set_nonblocking(true).expect("nonblocking");
         let server_port = server_tcp.local_addr().expect("addr").port();
         let out = Outbound::Vless(VlessOut {
@@ -18262,7 +18339,7 @@ mod tests {
             flow: String::new(),
             reality: None,
         });
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let (handed_back, done) = std::sync::mpsc::channel();
         thread::spawn(move || {
@@ -18270,7 +18347,7 @@ mod tests {
             serve_socks(stream, &out);
             let _ = handed_back.send(());
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
             .expect("timeout");
@@ -18352,7 +18429,7 @@ mod tests {
     }
 
     fn quic_loopback_once() {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -18383,7 +18460,7 @@ mod tests {
             key_pem,
             expected_header,
         );
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let dial = crate::quic::QuicDial {
             id,
@@ -18397,7 +18474,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             crate::quic::dial_pooled(&stream, &dial, &Destination::from(target));
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
             .expect("timeout");
@@ -18416,7 +18493,7 @@ mod tests {
         quic_retry_dial(quic_pool_once, 5);
     }
 
-    fn pool_read(client: &mut TcpStream, want: [u8; 4], who: &str, port: u16) {
+    fn pool_read(client: &mut Connection, want: [u8; 4], who: &str, port: u16) {
         let mut back = [0u8; 4];
         if let Err(e) = client.read_exact(&mut back) {
             let prefix = format!("{port} ");
@@ -18464,7 +18541,7 @@ mod tests {
             upstream: None,
             roots: Some(roots),
         };
-        let front = Arc::new(TcpListener::bind("127.0.0.1:0").expect("binds"));
+        let front = Arc::new(crate::conn::test_bind("127.0.0.1:0").expect("binds"));
         let front_port = front.local_addr().expect("addr").port();
         let task = Arc::clone(&front);
         let dialed = dial.clone();
@@ -18472,7 +18549,7 @@ mod tests {
             let (stream, _) = task.accept().expect("accepts");
             crate::quic::dial_pooled(&stream, &dialed, &Destination::from(target));
         });
-        let mut client1 = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client1 = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client1
             .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
             .expect("timeout");
@@ -18482,7 +18559,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             crate::quic::dial_pooled(&stream, &dial, &Destination::from(target));
         });
-        let mut client2 = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client2 = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client2
             .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
             .expect("timeout");
@@ -18499,7 +18576,7 @@ mod tests {
 
     #[test]
     fn kcp_carries_vless_echo_over_loopback() {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -18615,9 +18692,9 @@ mod tests {
             server.write(b"R").expect("peer sends");
             server
         });
-        let sink = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let sink = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let sink_addr = sink.local_addr().expect("addr");
-        let tap = TcpStream::connect(sink_addr).expect("client connects");
+        let tap = Connection::connect(sink_addr).expect("client connects");
         let closer = tap.try_clone().expect("clones");
         let (tcp, _) = sink.accept().expect("relay accepts");
         // The exact stale state the handshake leaves behind: a deadline already in the past when the download loop first reads.
@@ -18769,8 +18846,8 @@ mod tests {
         auth: &str,
         id: [u8; 16],
         target: SocketAddr,
-    ) -> TcpStream {
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+    ) -> Connection {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let dial = crate::hysteria::Dial {
             host: "localhost".to_owned(),
@@ -18786,7 +18863,7 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             crate::hysteria::dial_vless(&stream, &dial, &id, &Destination::from(target));
         });
-        let client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
             .expect("timeout");
@@ -19129,7 +19206,7 @@ mod tests {
     }
 
     fn echo_loop() -> u16 {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in echo.incoming().flatten() {
@@ -19161,8 +19238,8 @@ mod tests {
         port
     }
 
-    fn socks_tcp_client(front_port: u16, echo_port: u16) -> TcpStream {
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+    fn socks_tcp_client(front_port: u16, echo_port: u16) -> Connection {
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -19180,7 +19257,7 @@ mod tests {
     }
 
     fn socks_front_with(out: Outbound) -> u16 {
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -19190,7 +19267,7 @@ mod tests {
     }
 
     fn http_front_with(out: Outbound) -> u16 {
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -19199,8 +19276,8 @@ mod tests {
         port
     }
 
-    fn http_connect(port: u16, authority: &str) -> TcpStream {
-        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+    fn http_connect(port: u16, authority: &str) -> Connection {
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -19212,7 +19289,7 @@ mod tests {
         client
     }
 
-    fn http_status(client: &mut TcpStream) -> String {
+    fn http_status(client: &mut Connection) -> String {
         let head = read_http_head(client, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("reads a head");
         let line = head.split(|byte| *byte == b'\n').next().expect("a line");
         String::from_utf8(line.to_vec()).expect("text")
@@ -19234,7 +19311,7 @@ mod tests {
     fn http_get_forwards_origin_form_to_direct() {
         let echo = echo_loop();
         let front = http_front_with(Outbound::Freedom);
-        let mut client = TcpStream::connect(("127.0.0.1", front)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -19267,7 +19344,7 @@ mod tests {
             flow: String::new(),
             reality: None,
         }));
-        let mut client = TcpStream::connect(("127.0.0.1", front)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -19281,7 +19358,7 @@ mod tests {
     fn http_connect_tunnels_vless_raw_to_echo() {
         let echo = echo_loop();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let server = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let server_port = server.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = server.accept().expect("accepts");
@@ -19310,7 +19387,7 @@ mod tests {
 
     /// This outbound dials *upstream* of a proxy, so no front test reaches it: a fake proxy is the only witness.
     fn fake_http_proxy() -> u16 {
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in front.incoming() {
@@ -19324,7 +19401,7 @@ mod tests {
                         return;
                     };
                     let Some(target) = asked.socket() else { return };
-                    let Ok(upstream) = TcpStream::connect(target) else {
+                    let Ok(upstream) = Connection::connect(target) else {
                         return;
                     };
                     if client.write_all(&Front::Http.grant_line()).is_err() {
@@ -19360,7 +19437,7 @@ mod tests {
     fn mixed_serves_socks_and_http_on_one_port() {
         let echo_socks = echo_loop();
         let echo_http = echo_loop();
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in front.incoming().take(2) {
@@ -19383,7 +19460,7 @@ mod tests {
     #[test]
     fn garbage_closes_the_http_front() {
         let front = http_front_with(Outbound::Freedom);
-        let mut client = TcpStream::connect(("127.0.0.1", front)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -19534,7 +19611,7 @@ mod tests {
     /// Bytes past the `200\r\n\r\n` must reach the client before the relay opens, or the relay steals them.
     #[test]
     fn bytes_pipelined_past_the_connect_head_reach_the_client() {
-        let hop = TcpListener::bind("127.0.0.1:0").expect("bind hop");
+        let hop = crate::conn::test_bind("127.0.0.1:0").expect("bind hop");
         let hop_addr = hop.local_addr().expect("hop addr");
         let hop_thread = thread::spawn(move || {
             let (mut stream, _) = hop.accept().expect("hop accepts");
@@ -19557,7 +19634,7 @@ mod tests {
             assert_eq!(&echoed, b"ping");
         });
 
-        let front = TcpListener::bind("127.0.0.1:0").expect("bind front");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("bind front");
         let front_addr = front.local_addr().expect("front addr");
         let relay = thread::spawn(move || {
             let (client, _) = front.accept().expect("front accepts");
@@ -19570,7 +19647,7 @@ mod tests {
             );
         });
 
-        let mut sock = TcpStream::connect(front_addr).expect("join");
+        let mut sock = Connection::connect(front_addr).expect("join");
         sock.write_all(b"ping").expect("client writes");
         assert_eq!(
             &read_echo(&mut sock),
@@ -19832,7 +19909,7 @@ mod tests {
     fn a_re_injected_tcp_stream_carries_an_echo() {
         let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let id_bytes = uuid_bytes(id).expect("id");
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -19849,7 +19926,7 @@ mod tests {
                 }
             }
         });
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
@@ -19859,13 +19936,13 @@ mod tests {
             r#"{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":{tunnel_port},"settings":{{"clients":[{{"id":"{id}"}}]}}}}"#,
         ));
         let out = resolve_loopback(&root, "tunnel-in", true).expect("resolves");
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -19905,7 +19982,7 @@ mod tests {
                 }
             }
         });
-        let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
@@ -19915,13 +19992,13 @@ mod tests {
             r#"{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":{tunnel_port},"settings":{{"clients":[{{"id":"{id}"}}]}}}}"#,
         ));
         let out = resolve_loopback(&root, "tunnel-in", true).expect("resolves");
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
             serve_socks(stream, &out);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -19961,7 +20038,7 @@ mod tests {
         use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
         let (server_config, _) = carried_tls_configs();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let edge: SocketAddr = listener.local_addr().expect("addr");
         let asked = std::sync::Arc::new(AtomicUsize::new(0));
         let counter = std::sync::Arc::clone(&asked);
@@ -20221,7 +20298,7 @@ mod tests {
 
 #[cfg(target_os = "linux")]
 mod poll_relay {
-    use super::{Shutdown, SplicePipe, TcpStream};
+    use super::{Connection, Shutdown, SplicePipe};
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -20260,12 +20337,12 @@ mod poll_relay {
     /// queue that has gone — `SPLICE_F_NONBLOCK` guards the pipe half only. `held` stops
     /// the descriptor being recycled under a restore that writes back the flags it found.
     struct SpliceGuard {
-        held: TcpStream,
+        held: Connection,
         saved: libc::c_int,
     }
 
     impl SpliceGuard {
-        fn arm(socket: &TcpStream) -> Option<Self> {
+        fn arm(socket: &Connection) -> Option<Self> {
             let held = socket.try_clone().ok()?;
             let fd = held.as_raw_fd();
             let saved = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -20304,8 +20381,8 @@ mod poll_relay {
     }
 
     struct Direction {
-        src: TcpStream,
-        dst: TcpStream,
+        src: Connection,
+        dst: Connection,
         pipe: Option<SplicePipe>,
         pending: usize,
         /// The last ingest splice moved nothing: a pipe ring runs out of slots before it
@@ -20319,7 +20396,7 @@ mod poll_relay {
     }
 
     impl Direction {
-        fn new(src: TcpStream, dst: TcpStream, done: mpsc::Sender<()>) -> Self {
+        fn new(src: Connection, dst: Connection, done: mpsc::Sender<()>) -> Self {
             Self {
                 src,
                 dst,
@@ -20582,10 +20659,10 @@ mod poll_relay {
     }
 
     pub(super) fn drive(
-        client_read: TcpStream,
-        target_write: TcpStream,
-        target_read: TcpStream,
-        client_write: TcpStream,
+        client_read: Connection,
+        target_write: Connection,
+        target_read: Connection,
+        client_write: Connection,
     ) {
         let worker = next();
         let (first_tx, first_rx) = mpsc::channel();
@@ -20608,9 +20685,9 @@ mod poll_relay {
     #[cfg(test)]
     #[test]
     fn no_pollin_is_armed_on_a_ring_that_holds_bytes_it_cannot_take() {
-        let front = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = front.local_addr().expect("addr").port();
-        let src = TcpStream::connect(("127.0.0.1", port)).expect("dials");
+        let src = Connection::connect(("127.0.0.1", port)).expect("dials");
         let (dst, _) = front.accept().expect("accepts");
         let (done, _keeper) = mpsc::channel();
         let mut direction = Direction::new(src, dst, done);
@@ -20670,7 +20747,6 @@ mod poll_relay {
 mod relay_tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -20680,7 +20756,7 @@ mod relay_tests {
     const REQUEST: &[u8] = b"both ways at once";
     const REPLY: &[u8] = b"and back";
 
-    fn read_all(stream: &mut TcpStream) -> Vec<u8> {
+    fn read_all(stream: &mut Connection) -> Vec<u8> {
         let mut got = Vec::new();
         let mut chunk = [0u8; 4096];
         loop {
@@ -20691,11 +20767,11 @@ mod relay_tests {
         }
     }
 
-    fn listener() -> TcpListener {
-        TcpListener::bind("127.0.0.1:0").expect("binds")
+    fn listener() -> Listener {
+        crate::conn::test_bind("127.0.0.1:0").expect("binds")
     }
 
-    fn port_of(listener: &TcpListener) -> u16 {
+    fn port_of(listener: &Listener) -> u16 {
         listener.local_addr().expect("addr").port()
     }
 
@@ -20717,8 +20793,8 @@ mod relay_tests {
             read_all(&mut stream)
         });
 
-        let client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
-        let target = TcpStream::connect(("127.0.0.1", back_port)).expect("connects");
+        let client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        let target = Connection::connect(("127.0.0.1", back_port)).expect("connects");
         let relay_side = thread::spawn(move || relay(&client, &target));
 
         let got = back_far.join().expect("joins");
@@ -20762,8 +20838,8 @@ mod relay_tests {
             got
         });
 
-        let client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
-        let target = TcpStream::connect(("127.0.0.1", back_port)).expect("connects");
+        let client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        let target = Connection::connect(("127.0.0.1", back_port)).expect("connects");
         thread::spawn(move || relay(&client, &target))
             .join()
             .expect("joins");
@@ -20784,7 +20860,7 @@ mod relay_tests {
 
     /// The client of the stalled flow: `rounds` chunks of `chunk_len` as fast as the socket
     /// takes them, then a half-close, reporting how much got out.
-    fn push_until_refused(listener: &TcpListener, rounds: usize, chunk_len: usize) -> usize {
+    fn push_until_refused(listener: &Listener, rounds: usize, chunk_len: usize) -> usize {
         let (mut stream, _) = listener.accept().expect("accepts");
         stream.set_write_timeout(Some(PATIENCE)).expect("timeout");
         let body: Vec<u8> = (0..chunk_len).map(|i| (i % 251) as u8).collect();
@@ -20801,7 +20877,7 @@ mod relay_tests {
 
     /// The destination of the stalled flow: it reads none of the flow until the
     /// neighbours have been collected, then reports how much of it reached it.
-    fn hold_then_read(listener: &TcpListener, release: &mpsc::Receiver<()>) -> usize {
+    fn hold_then_read(listener: &Listener, release: &mpsc::Receiver<()>) -> usize {
         let (mut stream, _) = listener.accept().expect("accepts");
         stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
         let _ = release.recv();
@@ -20811,11 +20887,7 @@ mod relay_tests {
     /// A destination that reads one segment every 2 ms: the flow never fully parks, so neither
     /// does the pump, and a wake the ring cannot serve is one it is handed again a moment later.
     #[cfg(target_os = "linux")]
-    fn trickle_then_read(
-        listener: &TcpListener,
-        release: &mpsc::Receiver<()>,
-        want: usize,
-    ) -> usize {
+    fn trickle_then_read(listener: &Listener, release: &mpsc::Receiver<()>, want: usize) -> usize {
         let (mut stream, _) = listener.accept().expect("accepts");
         stream
             .set_read_timeout(Some(Duration::from_millis(20)))
@@ -20835,7 +20907,7 @@ mod relay_tests {
     }
 
     /// One neighbour peer: one chunk, a half-close, and the same bytes back.
-    fn write_then_read_back(stream: &mut TcpStream) -> usize {
+    fn write_then_read_back(stream: &mut Connection) -> usize {
         stream.set_write_timeout(Some(PATIENCE)).expect("timeout");
         stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
         let body: Vec<u8> = (0..CHUNK).map(|i| (i % 191) as u8).collect();
@@ -20847,7 +20919,7 @@ mod relay_tests {
     }
 
     /// One neighbour origin: it reads the whole body and echoes it back.
-    fn read_then_echo_back(stream: &mut TcpStream) {
+    fn read_then_echo_back(stream: &mut Connection) {
         stream.set_read_timeout(Some(PATIENCE)).expect("timeout");
         stream.set_write_timeout(Some(PATIENCE)).expect("timeout");
         let body = read_all(stream);
@@ -20881,8 +20953,8 @@ mod relay_tests {
         let (release, drain_now) = mpsc::channel::<()>();
         let feeding = thread::spawn(move || push_until_refused(&stalled_front, ROUNDS, CHUNK));
         let draining = thread::spawn(move || hold_then_read(&stalled_back, &drain_now));
-        let stalled_client = TcpStream::connect(("127.0.0.1", stalled_front_port)).expect("dials");
-        let stalled_target = TcpStream::connect(("127.0.0.1", stalled_back_port)).expect("dials");
+        let stalled_client = Connection::connect(("127.0.0.1", stalled_front_port)).expect("dials");
+        let stalled_target = Connection::connect(("127.0.0.1", stalled_back_port)).expect("dials");
         let (ended, returned) = mpsc::channel::<()>();
         let stalled_side = ended.clone();
         let stalled_relay = thread::spawn(move || {
@@ -20914,8 +20986,8 @@ mod relay_tests {
         });
 
         for _ in 0..NEIGHBOURS {
-            let client = TcpStream::connect(("127.0.0.1", front_port)).expect("dials");
-            let target = TcpStream::connect(("127.0.0.1", back_port)).expect("dials");
+            let client = Connection::connect(("127.0.0.1", front_port)).expect("dials");
+            let target = Connection::connect(("127.0.0.1", back_port)).expect("dials");
             let closed = ended.clone();
             thread::spawn(move || {
                 relay(&client, &target);
@@ -20990,8 +21062,8 @@ mod relay_tests {
         let (release, drain_now) = mpsc::channel::<()>();
         let feeding = thread::spawn(move || push_until_refused(&stalled_front, ROUNDS, SEGMENT));
         let draining = thread::spawn(move || trickle_then_read(&stalled_back, &drain_now, SEGMENT));
-        let stalled_client = TcpStream::connect(("127.0.0.1", stalled_front_port)).expect("dials");
-        let stalled_target = TcpStream::connect(("127.0.0.1", stalled_back_port)).expect("dials");
+        let stalled_client = Connection::connect(("127.0.0.1", stalled_front_port)).expect("dials");
+        let stalled_target = Connection::connect(("127.0.0.1", stalled_back_port)).expect("dials");
         let stalled_relay = thread::spawn(move || relay(&stalled_client, &stalled_target));
 
         thread::sleep(Duration::from_millis(200));
@@ -21042,8 +21114,8 @@ mod relay_tests {
             read_all(&mut stream)
         });
 
-        let write = TcpStream::connect(("127.0.0.1", carrier_port)).expect("dials carrier");
-        let peer = TcpStream::connect(("127.0.0.1", target_port)).expect("dials target");
+        let write = Connection::connect(("127.0.0.1", carrier_port)).expect("dials carrier");
+        let peer = Connection::connect(("127.0.0.1", target_port)).expect("dials target");
         let reader: &[u8] = &[];
         relay_carried(reader, &write, &peer);
 
@@ -21113,8 +21185,8 @@ mod relay_tests {
         let (ended, watched) = mpsc::channel();
         let mut relays = Vec::with_capacity(FLOWS);
         for _ in 0..FLOWS {
-            let client = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
-            let target = TcpStream::connect(("127.0.0.1", back_port)).expect("connects");
+            let client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+            let target = Connection::connect(("127.0.0.1", back_port)).expect("connects");
             let ended = ended.clone();
             relays.push(thread::spawn(move || {
                 relay(&client, &target);
@@ -21200,7 +21272,6 @@ mod foxy_exit_tests {
 mod census_tests {
     use super::*;
     use crate::census;
-    use std::net::TcpListener;
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
@@ -21237,12 +21308,12 @@ mod census_tests {
 
     #[test]
     fn a_parked_leg_read_names_the_descriptor_it_waits_on() {
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
-        let back = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let back = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let back_port = back.local_addr().expect("addr").port();
-        let reader = TcpStream::connect(("127.0.0.1", front_port)).expect("connects");
-        let sink = TcpStream::connect(("127.0.0.1", back_port)).expect("connects");
+        let reader = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        let sink = Connection::connect(("127.0.0.1", back_port)).expect("connects");
         // Both peers stay open and say nothing, so the only progress a leg can make is its own bound.
         let _silent_front = front.accept().map(|(stream, _)| stream).expect("accepts");
         let _silent_back = back.accept().map(|(stream, _)| stream).expect("accepts");

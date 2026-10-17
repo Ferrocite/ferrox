@@ -6,6 +6,7 @@ set -uo pipefail
 
 quiet="${WATCH_QUIET:-240}"
 bootstrap="${WATCH_BOOTSTRAP:-900}"
+probe="${WATCH_PROBE:-60}"
 out="${WATCH_OUT:-target/ci/watch-test.log}"
 selftest=0
 
@@ -15,17 +16,21 @@ usage: watch-test.sh [--quiet SECONDS] [--bootstrap SECONDS] [--out FILE] [--sel
 
   --quiet SECONDS     silence allowed once a test is running (240)
   --bootstrap SECONDS silence allowed while the command is still building (900)
+  --probe SECONDS     silence allowed while culprit runs one name alone (60)
   --out FILE          where the log is written as it happens (target/ci/watch-test.log)
 
-WATCH_QUIET, WATCH_BOOTSTRAP and WATCH_OUT set the same three from the environment.
+WATCH_QUIET, WATCH_BOOTSTRAP, WATCH_PROBE and WATCH_OUT set these from the environment.
 Two limits because a suite has two shapes: a cold Windows build can leave one crate
 linking for a quarter of an hour with nothing to print, while a test that has started
 and means to finish prints its name the moment it does. The limit drops to the second
 number as soon as the log says a test binary is running. The command's own exit code
 is returned, except for a stall, which returns 124. libtest writes a test's name when
 it finishes, so a parallel run shows which names are missing; the second pass runs only
-those missing tests, one per process, and stops on the first that does not
-return, which is the only test that could have done it.
+those missing tests, one per process under the probe limit, and stops on the first that
+does not return, which is the only test that could have done it. When none of them stalls
+alone yet the suite did, the pass runs the still-missing names together in one process --
+the shape the suite met them in -- so a deadlock in what they share names its whole group
+rather than reading as a stall with no culprit.
 EOF
   exit 2
 }
@@ -34,14 +39,15 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --quiet) quiet="${2:?--quiet wants a number}"; shift 2 ;;
     --bootstrap) bootstrap="${2:?--bootstrap wants a number}"; shift 2 ;;
+    --probe) probe="${2:?--probe wants a number}"; shift 2 ;;
     --out) out="${2:?--out wants a path}"; shift 2 ;;
     --selftest) selftest=1; shift ;;
     --) shift; break ;;
     *) echo "unknown argument '$1'" >&2; usage ;;
   esac
 done
-[[ "$quiet" =~ ^[0-9]+$ && "$bootstrap" =~ ^[0-9]+$ ]] \
-  || { echo "--quiet and --bootstrap want seconds" >&2; exit 2; }
+[[ "$quiet" =~ ^[0-9]+$ && "$bootstrap" =~ ^[0-9]+$ && "$probe" =~ ^[0-9]+$ ]] \
+  || { echo "--quiet, --bootstrap and --probe want seconds" >&2; exit 2; }
 
 # blocked_under PID: every thread below PID and what procfs says it is waiting in.
 # A deadlock reads as a futex wait and a socket stall as a read on one fd; macOS and
@@ -128,9 +134,12 @@ watch() {
 # count, not the whole list of several hundred, so naming a hang costs one pass rather
 # than a walk over every name. Fall back to the full list only when the log yields
 # nothing to subtract. A test that fails alone is not a stall, so its code is ignored;
-# only silence is evidence here.
+# only silence is evidence here. A stall no single name reproduces is in what they share:
+# after the solo pass, meet the still-missing names the way the suite met them -- together
+# in one process -- and name the whole group when that stalls. probe bounds each solo pass
+# so a shared deadlock the co-run pass alone catches does not first cost the walk quiet.
 culprit() {
-  local binary="$1" keep="$out" names done missing name
+  local binary="$1" keep="$out" names done missing name filters full
   [[ -x "$binary" ]] || return 1
   names=$("$binary" --list --format terse 2>/dev/null | sed -n 's/: test$//p')
   [[ -n "$names" ]] || return 1
@@ -139,15 +148,30 @@ culprit() {
   missing=$(comm -23 <(printf '%s\n' "$names" | sort) <(printf '%s\n' "$done" | sort))
   [[ -n "$missing" ]] || missing="$names"
   out="$keep.stall"
+  full="$quiet"
+  quiet="$probe"
   for name in $missing; do
     watch "$binary --exact '$name' --test-threads=1" >/dev/null
     if ((STALLED == 1)); then
+      quiet="$full"
       cp "$out" "$keep.last" 2>/dev/null || true
       printf '%s\n' "$name"
       out="$keep"
       return 0
     fi
   done
+  # None stalls alone, yet the parallel suite did: reproduce it the way the suite met it,
+  # the still-missing names together in one process, so the shared deadlock names its group.
+  filters=""
+  for name in $missing; do filters="$filters '$name'"; done
+  watch "$binary --exact$filters" >/dev/null
+  quiet="$full"
+  if ((STALLED == 1)); then
+    cp "$out" "$keep.last" 2>/dev/null || true
+    printf '%s\n' "$missing" | tr '\n' ' ' | sed 's/ $//'
+    out="$keep"
+    return 0
+  fi
   out="$keep"
   return 1
 }
@@ -164,13 +188,16 @@ selftest_run() {
   cat >"$fake" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "--list" ]]; then
-  printf 'early::done: test\nhangs::forever: test\n'
+  printf 'early::done: test\nhangs::forever: test\nshared::alpha: test\nshared::beta: test\n'
   exit 0
 fi
 if [[ "${1:-}" == "--exact" ]]; then
-  printf '%s\n' "${2:-}" >>"${FAKE_PROBE:-/dev/null}"
-  if [[ "${2:-}" == "hangs::forever" ]]; then sleep 600; fi
-  echo "test ${2:-} ... ok"
+  shift
+  for one in "$@"; do printf '%s\n' "$one" >>"${FAKE_PROBE:-/dev/null}"; done
+  # hangs::forever never returns alone; the shared pair never returns only when run together.
+  [[ "$*" == *"hangs::forever"* ]] && sleep 600
+  [[ "$*" == *"shared::alpha"* && "$*" == *"shared::beta"* ]] && sleep 600
+  for one in "$@"; do echo "test $one ... ok"; done
   exit 0
 fi
 echo "     Running unittests src/lib.rs (target/debug/deps/selftest-fake-abcd)"
@@ -184,6 +211,7 @@ EOF
   # and culprit is right to walk the whole list. Give it room to print, then stall.
   quiet=5
   bootstrap=5
+  probe=5
   out="target/ci/selftest.log"
   watch "$fake" >/dev/null
   ((STALLED == 1)) || { echo "selftest: a sleeping command did not read as stalled" >&2; return 1; }
@@ -207,6 +235,20 @@ EOF
   [[ "$want" == "hangs::forever" ]] || { echo "selftest: fallback named '$want', want hangs::forever" >&2; return 1; }
   grep -qx 'early::done' "$probes" || { echo "selftest: an unparseable log did not fall back to the full walk" >&2; return 1; }
   echo "selftest: ok   when the log names nothing finished, culprit walks every test"
+  # A deadlock in what the tests share never shows when each runs alone; the co-run pass
+  # meets the still-missing names together in one process and must name the whole group.
+  out="target/ci/selftest-shared.log"
+  printf '%s\n' \
+    '     Running unittests src/lib.rs (target/debug/deps/selftest-fake-abcd)' \
+    'test early::done ... ok' 'test hangs::forever ... ok' >"$out"
+  : >"$probes"; export FAKE_PROBE="$PWD/$probes"
+  want="$(culprit "$fake")" || { echo "selftest: the shared deadlock was not named" >&2; return 1; }
+  unset FAKE_PROBE
+  [[ "$want" == "shared::alpha shared::beta" ]] || {
+    echo "selftest: shared stall named '$want', want 'shared::alpha shared::beta'" >&2; return 1; }
+  grep -qx 'shared::alpha' "$probes" || { echo "selftest: the co-run group was not probed alone first" >&2; return 1; }
+  grep -qx 'shared::beta' "$probes" || { echo "selftest: the co-run group was not probed alone first" >&2; return 1; }
+  echo "selftest: ok   a deadlock only present when tests share a process names its whole group"
   # culprit() runs only on what last_binary() hands back, and that has to be a runnable path:
   # cargo writes the deps separator as `/` on unix and `\` on Windows.
   out="target/ci/selftest-last.log"
@@ -269,10 +311,12 @@ if ((STALLED == 1)); then
   binary="$(last_binary "$out")"
   if [[ -n "$binary" ]]; then
     name="$(culprit "$binary")"
-    if [[ -n "$name" ]]; then
+    if [[ "$name" == *" "* ]]; then
+      echo "STALLED IN the group run together: $name (each returns alone; the deadlock is in what they share)"
+    elif [[ -n "$name" ]]; then
       echo "STALLED IN $name (the only test of $binary that does not return on its own)"
     else
-      echo "no single test of $binary stalls on its own: the stall is in what they share"
+      echo "no test of $binary stalls alone, and the still-missing names do not stall together either: a load-dependent scheduler artifact, not a reproducible deadlock"
     fi
   else
     echo "the log holds no test binary to run alone: the stall is before any test started"

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -8,6 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ferrox_core::shadowsocks2022::{self, Cipher, Method, BLOCK_LEN, MAX_CHUNK, TAG_LEN};
 
 use crate::budgets::RELAY_POLL;
+use crate::conn::Connection;
 use crate::proxy::{push_addr, read_exact, under_handshake, write_all_runs};
 
 const READ_CHUNK: usize = 0x4000;
@@ -51,7 +52,7 @@ fn padding_for(payload_len: usize) -> usize {
     }
 }
 
-pub(crate) fn serve(mut stream: TcpStream, password: &str, method: &str, freedom: bool) {
+pub(crate) fn serve(mut stream: Connection, password: &str, method: &str, freedom: bool) {
     let Some(method) = Method::parse(method) else {
         return;
     };
@@ -104,7 +105,7 @@ fn read_request_header(stream: &mut dyn Read, recv: &mut Cipher) -> Option<(Sock
     Some((target, variable[at..].to_vec()))
 }
 
-fn serve_single(stream: &mut TcpStream, method: Method, psk: &[u8], freedom: bool) {
+fn serve_single(stream: &mut Connection, method: Method, psk: &[u8], freedom: bool) {
     if !freedom {
         return;
     }
@@ -138,7 +139,7 @@ fn serve_single(stream: &mut TcpStream, method: Method, psk: &[u8], freedom: boo
     let Some((recv, salt, target, early)) = opened else {
         return;
     };
-    let Ok(mut uplink) = TcpStream::connect_timeout(&target, Duration::from_secs(8)) else {
+    let Ok(mut uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
     if !early.is_empty() && uplink.write_all(&early).is_err() {
@@ -166,7 +167,7 @@ fn serve_single(stream: &mut TcpStream, method: Method, psk: &[u8], freedom: boo
     pump_relay(&uplink, stream, send, Recv::Ready(recv));
 }
 
-fn serve_multi(stream: &mut TcpStream, method: Method, list: &[Vec<u8>], freedom: bool) {
+fn serve_multi(stream: &mut Connection, method: Method, list: &[Vec<u8>], freedom: bool) {
     if !freedom || list.len() < 2 {
         return;
     }
@@ -215,7 +216,7 @@ fn serve_multi(stream: &mut TcpStream, method: Method, list: &[Vec<u8>], freedom
     let Some((recv, psk, salt, target, early)) = opened else {
         return;
     };
-    let Ok(mut uplink) = TcpStream::connect_timeout(&target, Duration::from_secs(8)) else {
+    let Ok(mut uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
     if !early.is_empty() && uplink.write_all(&early).is_err() {
@@ -244,7 +245,7 @@ fn serve_multi(stream: &mut TcpStream, method: Method, list: &[Vec<u8>], freedom
 }
 
 pub(crate) fn serve_relay(
-    stream: TcpStream,
+    stream: Connection,
     method: &str,
     relay_psk: &[u8],
     dests: &[(Vec<u8>, SocketAddr)],
@@ -259,7 +260,7 @@ pub(crate) fn serve_relay(
 }
 
 fn serve_relay_on(
-    mut stream: TcpStream,
+    mut stream: Connection,
     method: Method,
     relay_psk: &[u8],
     dests: &[(Vec<u8>, SocketAddr)],
@@ -286,7 +287,7 @@ fn serve_relay_on(
         return;
     };
     let target = *target;
-    let Ok(mut next) = TcpStream::connect_timeout(&target, Duration::from_secs(8)) else {
+    let Ok(mut next) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
@@ -304,7 +305,7 @@ fn serve_relay_on(
     relay_raw(&mut stream, &mut next);
 }
 
-fn relay_raw(a: &mut TcpStream, b: &mut TcpStream) {
+fn relay_raw(a: &mut Connection, b: &mut Connection) {
     let Ok(a_read) = a.try_clone() else { return };
     let Ok(mut b_write) = b.try_clone() else {
         return;
@@ -343,7 +344,7 @@ fn accept_on(
     password: &str,
     method: &str,
     freedom: bool,
-) -> Option<(TcpStream, Cipher, Recv)> {
+) -> Option<(Connection, Cipher, Recv)> {
     let method = Method::parse(method)?;
     if !freedom {
         return None;
@@ -369,7 +370,7 @@ fn accept_on(
             .clone();
         let mut recv = Cipher::from_psk(method, &user, &salt_probe)?;
         let target = open_handshake(reader, &mut recv)?;
-        let mut uplink = TcpStream::connect_timeout(&target.0, Duration::from_secs(8)).ok()?;
+        let mut uplink = crate::conn::dial_tcp(&target.0, Duration::from_secs(8)).ok()?;
         uplink.write_all(&target.1).ok()?;
         let server_salt = fresh_salt(method.key_len())?;
         let mut send = Cipher::from_psk(method, &user, &server_salt)?;
@@ -393,7 +394,7 @@ fn accept_on(
     }
     let mut recv = Cipher::from_psk(method, &psk, &salt)?;
     let (target, early) = open_handshake(reader, &mut recv)?;
-    let mut uplink = TcpStream::connect_timeout(&target, Duration::from_secs(8)).ok()?;
+    let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
     uplink.write_all(&early).ok()?;
     let server_salt = fresh_salt(key_len)?;
     let mut send = Cipher::from_psk(method, &psk, &server_salt)?;
@@ -440,7 +441,13 @@ fn open_handshake(reader: &mut dyn Read, recv: &mut Cipher) -> Option<(SocketAdd
     Some((target, variable[at..].to_vec()))
 }
 
-pub(crate) fn serve_ws(stream: TcpStream, password: &str, method: &str, path: &str, freedom: bool) {
+pub(crate) fn serve_ws(
+    stream: Connection,
+    password: &str,
+    method: &str,
+    path: &str,
+    freedom: bool,
+) {
     let Some((mut reader, mut writer)) = crate::ws::accept(stream, path) else {
         return;
     };
@@ -454,7 +461,7 @@ pub(crate) fn serve_ws(stream: TcpStream, password: &str, method: &str, path: &s
 }
 
 pub(crate) fn serve_httpupgrade(
-    stream: TcpStream,
+    stream: Connection,
     password: &str,
     method: &str,
     path: &str,
@@ -477,7 +484,7 @@ pub(crate) fn serve_httpupgrade(
 }
 
 pub(crate) fn serve_grpc(
-    stream: TcpStream,
+    stream: Connection,
     password: &str,
     method: &str,
     path: &str,
@@ -497,7 +504,7 @@ pub(crate) fn serve_grpc(
 }
 
 pub(crate) fn serve_xhttp(
-    stream: TcpStream,
+    stream: Connection,
     password: &str,
     method: &str,
     path: &str,
@@ -517,7 +524,7 @@ pub(crate) fn serve_xhttp(
 }
 
 pub(crate) fn serve_httpheader(
-    stream: TcpStream,
+    stream: Connection,
     password: &str,
     method: &str,
     path: &str,
@@ -608,7 +615,7 @@ pub(crate) enum Recv {
     Waiting(Method, Vec<u8>, Vec<u8>),
 }
 
-pub(crate) fn pump_relay(plain: &TcpStream, sealed: &TcpStream, send: Cipher, recv: Recv) {
+pub(crate) fn pump_relay(plain: &Connection, sealed: &Connection, send: Cipher, recv: Recv) {
     let Ok(sealed_read) = sealed.try_clone() else {
         return;
     };
@@ -625,7 +632,7 @@ pub(crate) fn pump_relay(plain: &TcpStream, sealed: &TcpStream, send: Cipher, re
 }
 
 pub(crate) fn pump_relay_carried<R, W>(
-    plain: &TcpStream,
+    plain: &Connection,
     reader: R,
     mut writer: W,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
@@ -1823,7 +1830,7 @@ mod tests {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
         });
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let psk = psk_b64(32);
@@ -1832,7 +1839,7 @@ mod tests {
             serve(stream, &psk, "2022-blake3-aes-256-gcm", true);
             let _ = done_tx.send(());
         });
-        let _peer = TcpStream::connect(addr).expect("connects");
+        let _peer = Connection::connect(addr).expect("connects");
         let returned = done_rx.recv_timeout(crate::budgets::handshake() + Duration::from_secs(5));
         crate::budgets::clear();
         returned.expect("the bounded request read returns instead of pinning the thread");
@@ -1847,7 +1854,7 @@ mod tests {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
         });
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let psk = psk_b64(32);
@@ -1856,7 +1863,7 @@ mod tests {
             serve_grpc(stream, &psk, "2022-blake3-aes-256-gcm", "/p", true);
             let _ = done_tx.send(());
         });
-        let stream = TcpStream::connect(addr).expect("connects");
+        let stream = Connection::connect(addr).expect("connects");
         let (_reader, _writer) = crate::grpc::connect(stream, "127.0.0.1", "/p").expect("dials");
         let returned = done_rx.recv_timeout(crate::budgets::handshake() + Duration::from_secs(5));
         crate::budgets::clear();
@@ -1871,7 +1878,7 @@ mod tests {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
         });
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let password = format!("{}:{}", psk_b64(32), psk_b64(32));
@@ -1880,7 +1887,7 @@ mod tests {
             serve(stream, &password, "2022-blake3-aes-256-gcm", true);
             let _ = done_tx.send(());
         });
-        let _peer = TcpStream::connect(addr).expect("connects");
+        let _peer = Connection::connect(addr).expect("connects");
         let returned = done_rx.recv_timeout(crate::budgets::handshake() + Duration::from_secs(5));
         crate::budgets::clear();
         returned.expect("the bounded request read returns instead of pinning the thread");
@@ -1895,7 +1902,7 @@ mod tests {
             ("2022-blake3-chacha20-poly1305", Method::Chacha20Poly1305),
         ] {
             let psk = psk_b64(method.key_len());
-            let echo = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+            let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
             let echo_port = echo.local_addr().expect("addr").port();
             thread::spawn(move || {
                 let (mut stream, _) = echo.accept().expect("accepts");
@@ -1906,7 +1913,7 @@ mod tests {
                     }
                 }
             });
-            let server = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+            let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
             let port = server.local_addr().expect("addr").port();
             let announced = psk.clone();
             let named = name.to_owned();
@@ -1921,7 +1928,7 @@ mod tests {
                 }
             });
             let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
-            let mut uplink = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut uplink = Connection::connect(("127.0.0.1", port)).expect("connects");
             uplink
                 .set_read_timeout(Some(Duration::from_secs(30)))
                 .expect("timeout");
@@ -2283,7 +2290,7 @@ mod tests {
         let relay_psk = psk_b64(32);
         let dest_psk = ferrox_core::b64::encode(&[0x66u8; 32]);
         let password = format!("{relay_psk}:{dest_psk}");
-        let echo = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -2294,14 +2301,14 @@ mod tests {
                 }
             }
         });
-        let dest = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let dest = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let dest_port = dest.local_addr().expect("addr").port();
         let dest_psk_thread = dest_psk.clone();
         thread::spawn(move || {
             let (stream, _) = dest.accept().expect("accepts");
             serve(stream, &dest_psk_thread, "2022-blake3-aes-256-gcm", true);
         });
-        let relay = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let relay = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let relay_port = relay.local_addr().expect("addr").port();
         let relay_psk_thread = relay_psk.clone();
         let dest_addr: SocketAddr = format!("127.0.0.1:{dest_port}").parse().expect("addr");
@@ -2316,7 +2323,7 @@ mod tests {
             );
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
-        let mut uplink = TcpStream::connect(("127.0.0.1", relay_port)).expect("connects");
+        let mut uplink = Connection::connect(("127.0.0.1", relay_port)).expect("connects");
         uplink
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");

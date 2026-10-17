@@ -209,6 +209,7 @@ carrier-foxy ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-foxy payload-staging-copies-per-byte-written 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane
 carrier-foxy payload-staging-copies-per-byte-read 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane
 carrier-foxy read-buffer-bytes-per-staged-remainder 1 ferrox-app-foxy::loopback::a_read_leaves_only_what_the_callers_buffer_had_no_room_for
+carrier-foxy h2-bytes-lost-at-a-read-quantum 0 ferrox-app-foxy::loopback::a_frame_that_straddles_a_read_quantum_arrives_whole
 carrier-foxy carriers-dialled 3 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer
 carrier-foxy udp-carriers-dialled 2 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer
 carrier-foxy datagram-frames-per-capsule 1 ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_over_quic_and_echoes_a_datagram
@@ -228,6 +229,7 @@ carrier-foxy catalogue-edges-kept-across-a-failed-fetch 4 ferrox-app-foxy_catalo
 carrier-foxy catalogue-edges-rewritten-from-the-cache-file 5 ferrox-app-foxy_catalog::tests::the_cache_file_one_process_writes_is_the_one_the_next_reads
 carrier-foxy dials-of-a-silent-tcp-carrier 1 ferrox-app-proxy::tests::a_silent_carrier_is_dialled_once_rather_than_once_per_rung
 carrier-foxy dials-across-three-flows-of-a-rested-carrier 2 ferrox-app-proxy::tests::a_silent_carrier_is_dialled_once_rather_than_once_per_rung
+carrier-foxy relay-legs-held-after-their-lane-ended 0 ferrox-app-foxy::loopback::a_lane_that_ends_releases_the_leg_parked_on_its_client
 
 carrier-quic ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-quic zero-filled-bytes-per-relayed-frame 3 ferrox-app-quic::tests::a_relayed_datagram_frames_its_target_ahead_of_its_payload
@@ -302,3 +304,8 @@ tls-cipher-suites dialer-hello-cipher-field-equals-reference 1 ferrox-core-tls::
 loopback ops-retired-instructions UNBLESSED scripts/count-ops.sh
 loopback tcp-echo-bytes-preserved 65536 ferrox-app-proxy::tests::a_re_injected_tcp_stream_carries_an_echo
 loopback udp-datagram-bytes-preserved 4 ferrox-app-proxy::tests::a_re_injected_udp_association_carries_a_datagram
+
+# --- unix domain sockets ------------------------------------------------------
+unix ops-retired-instructions UNBLESSED scripts/count-ops.sh
+unix unix-stream-bytes-preserved 65536 ferrox-app-conn::tests::a_unix_connection_carries_the_same_bytes_the_tcp_round_trip_does
+unix unix-head-not-vector-multiple 1501 ferrox-app-conn::tests::a_unix_round_trip_survives_lengths_a_vector_would_split

@@ -1,5 +1,5 @@
+use crate::conn::Connection;
 use std::io::Read;
-use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
@@ -139,7 +139,7 @@ impl Gate {
 }
 
 #[derive(Debug)]
-pub(crate) struct GrpcReader<R: Read = TcpStream> {
+pub(crate) struct GrpcReader<R: Read = Connection> {
     read: R,
     shared: Arc<Shared>,
     decoder: Decoder,
@@ -182,7 +182,7 @@ pub(crate) struct GrpcWriter {
     stream: u32,
 }
 
-impl GrpcReader<TcpStream> {
+impl GrpcReader<Connection> {
     /// Arm or clear the poll quantum on the socket this reader reads through, so a peer that opens then stalls mid-header cannot pin the serve thread past the header read; as the `ws`, `httpupgrade` and `httpheader` readers do, and a duplicated socket inherits no read timeout on Windows.
     pub(crate) fn set_poll(&mut self, every: Option<std::time::Duration>) {
         let _ = self.read.set_read_timeout(every);
@@ -914,7 +914,7 @@ fn skip_field(msg: &[u8], at: &mut usize, wire: u8) -> Option<()> {
     Some(())
 }
 
-pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(GrpcReader, GrpcWriter)> {
+pub(crate) fn accept(stream: Connection, path: &str) -> Option<(GrpcReader, GrpcWriter)> {
     let read = stream;
     let Ok(write) = read.try_clone() else {
         return None;
@@ -1039,7 +1039,7 @@ pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
 }
 
 pub(crate) fn connect(
-    stream: TcpStream,
+    stream: Connection,
     host: &str,
     path: &str,
 ) -> Option<(GrpcReader, GrpcWriter)> {
@@ -1098,7 +1098,6 @@ pub(crate) fn mark_reader_dead<R: Read>(reader: &mut GrpcReader<R>) {
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::net::TcpListener;
     use std::thread;
 
     #[test]
@@ -1810,7 +1809,7 @@ mod tests {
                 let hunk_len = (want.len() - 5) as u32;
                 want[1..5].copy_from_slice(&hunk_len.to_be_bytes());
 
-                let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+                let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
                 let port = listener.local_addr().expect("addr").port();
                 let handle = thread::spawn(move || {
                     let (stream, _) = listener.accept().expect("accepts");
@@ -1836,7 +1835,7 @@ mod tests {
                     );
                     assert!(batch.flush(&writer.shared), "max {max} len {len}");
                 });
-                let mut read = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+                let mut read = Connection::connect(("127.0.0.1", port)).expect("connects");
                 let mut wire = Vec::new();
                 read.read_to_end(&mut wire).expect("reads");
                 handle.join().expect("joins");
@@ -1895,7 +1894,7 @@ mod tests {
 
     #[test]
     fn tunnel_carries_an_echo_over_loopback() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -1907,7 +1906,7 @@ mod tests {
             drain(&mut reader);
             writer.close();
         });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, writer) =
             connect(stream, "127.0.0.1", "/TunnelService/Tun").expect("dials");
         assert!(writer.send(b"ping"));
@@ -1926,13 +1925,13 @@ mod tests {
 
     #[test]
     fn tunnel_rejects_a_wrong_path() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             assert!(accept(stream, "/TunnelService/Tun").is_none());
         });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (_, writer) = connect(stream, "127.0.0.1", "/other/Tun").expect("dials");
         drop(writer);
         server.join().expect("joins");
