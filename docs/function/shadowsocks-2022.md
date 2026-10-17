@@ -50,6 +50,7 @@ that file disagree.
 | user-space-copies-per-byte-read | 0 | ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage |
 | zero-filled-bytes-per-chunk | 0 | ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage |
 | chunk-buffer-allocations-per-connection | 1 | ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage |
+| downlink-stage-bytes-per-connection | 0 | ferrox-app-shadowsocks2022::tests::the_carrier_and_the_chunk_ask_the_socket_as_one |
 | udp-payload-buffers-per-datagram | 1 | ferrox-app-shadowsocks2022::tests::an_opened_payload_is_the_datagrams_own_bytes |
 | udp-datagram-reallocations-after-the-first | 0 | ferrox-app-shadowsocks2022::tests::an_opened_payload_is_the_datagrams_own_bytes |
 | udp-multi-user-eih-bytes-per-packet | 16 | ferrox-app-shadowsocks2022::tests::udp_multi_user_packs_one_eih_and_opens_with_the_pinned_psk |
@@ -99,6 +100,22 @@ Read against the pinned implementations, all of which are in
   thread's `opened` buffer and returns a subslice; `an_opened_payload_is_the_datagrams_own_bytes`
   asserts the pointer lies inside `opened` and that `opened` neither moves nor
   grows, the same idiom as `frames_reuse_the_callers_buffers`.
+- **The 32 KiB stage in front of the codec on the xhttp downlink.** The dial
+  used to wrap the carrier in a `BufReader` before `pump_relay_carried`, so the
+  codec's asks were served from a stage: socket → stage → wire buffer, two
+  user-space copies per byte across the whole downlink, because both of this
+  rung's asks — the 18-byte sealed header and the length plus its tag — sit
+  under the stage's capacity. The wrap is gone and `relay_downlink` is the
+  downlink the dial runs; the asks now reach the carrier as the codec makes them.
+  `the_carrier_and_the_chunk_ask_the_socket_as_one` seals two chunks into real
+  carrier records and records every width the carrier is asked for — 18 and 1016
+  are there, 32768 is not (`downlink-stage-bytes-per-connection 0`). The named
+  cost is the syscall side of the same fact: a sealed header now costs its own
+  carrier read where the stage answered it from bytes it had already pulled, so
+  a small chunk costs two reads where it cost one. This rung has no window of
+  its own, and coalescing the two asks into one bulk read the classic rung does
+  is the open item — `crates/ferrox-prompt/prompts.md`, `carrier-stage-drop`.
+  No duration is quoted — no CI cell runs Shadowsocks 2022 over xhttp.
 - **The write-side staging copy.** The relay uplink first read into a plain
   buffer and then copied every payload byte into a `staging` `Vec` while it
   sealed (`Cipher::seal_into` did the `extend_from_slice`), so a 16 KiB read

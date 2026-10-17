@@ -452,7 +452,7 @@ pub(crate) fn pump_relay(plain: &TcpStream, sealed: &TcpStream, send: Uplink, re
 
 pub(crate) fn pump_relay_carried<R, W>(
     plain: &TcpStream,
-    mut reader: R,
+    reader: R,
     mut writer: W,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
     send: Uplink,
@@ -489,6 +489,19 @@ pub(crate) fn pump_relay_carried<R, W>(
         thread_close();
         let _ = plain_read.shutdown(Shutdown::Both);
     });
+    if !relay_downlink(reader, recv, &mut plain_write) {
+        return;
+    }
+    close();
+    let _ = plain_write.shutdown(Shutdown::Both);
+    let _ = done.join();
+}
+
+/// The downlink the dials build: the carrier's octets opened into the codec's own window, so the
+/// widest ask the carrier ever hears is a window and a payload byte crosses user space once.
+/// `false` is the handshake never opening, which is the pump's own early exit: the carrier is not
+/// finished and the uplink is not joined, because the dial dropping the sockets is what ends it.
+fn relay_downlink<R: Read>(mut reader: R, recv: Recv, out: &mut dyn Write) -> bool {
     let mut aead: Option<Cipher> = None;
     let mut stream: Option<Rc4> = None;
     match recv {
@@ -497,10 +510,10 @@ pub(crate) fn pump_relay_carried<R, W>(
             let salt_len = method.key_len();
             let mut peer = [0u8; SALT_LEN];
             if read_exact(&mut reader, &mut peer[..salt_len]).is_err() {
-                return;
+                return false;
             }
             let Some(cipher) = Cipher::from_master_key(method, &master, &peer[..salt_len]) else {
-                return;
+                return false;
             };
             aead = Some(cipher);
         }
@@ -508,31 +521,29 @@ pub(crate) fn pump_relay_carried<R, W>(
         Recv::StreamWaiting(master) => {
             let mut peer = [0u8; IV_LEN];
             if read_exact(&mut reader, &mut peer).is_err() {
-                return;
+                return false;
             }
             let Some(key) = rc4_md5_key(master.as_bytes(), &peer) else {
-                return;
+                return false;
             };
             let Some(rc4) = Rc4::new(&key) else {
-                return;
+                return false;
             };
             stream = Some(rc4);
         }
     }
     if let Some(mut cipher) = aead {
         let mut window = ChunkReader::new(reader);
-        let _ = drain_window(&mut window, &mut cipher, &mut plain_write);
+        let _ = drain_window(&mut window, &mut cipher, out);
     } else if let Some(mut rc4) = stream {
         let mut buf = unfilled(READ_CHUNK);
         while let Some(payload) = open_stream(&mut reader, &mut rc4, &mut buf) {
-            if plain_write.write_all(payload).is_err() {
+            if out.write_all(payload).is_err() {
                 break;
             }
         }
     }
-    close();
-    let _ = plain_write.shutdown(Shutdown::Both);
-    let _ = done.join();
+    true
 }
 
 pub(crate) fn serve_udp(address: &str, password: &str, method: &str, freedom: bool) {
@@ -2044,5 +2055,145 @@ mod tests {
         );
         assert!(open_from_wire(&master, method, &packet[..10]).is_none());
         assert!(open_from_wire(&master, method, &[]).is_none());
+    }
+
+    /// What a stage between the carrier and the codec asks for: its own capacity.
+    const STAGE: usize = 32 * 1024;
+
+    /// The record size this tree's own xhttp writer frames a body in.
+    const FRAME: usize = 16 * 1024;
+
+    /// The carrier side of a carried downlink: every width the codec reaches the carrier with, which
+    /// is where a stage's capacity would stand in for the codec's own ask.
+    struct Asks<R> {
+        read: R,
+        widths: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+    }
+
+    impl<R: Read> Read for Asks<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.widths.borrow_mut().push(buf.len());
+            self.read.read(buf)
+        }
+    }
+
+    impl crate::proxy::FrameWrite for std::io::Cursor<Vec<u8>> {
+        fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+            parts.iter().all(|part| self.write_all(part).is_ok())
+        }
+    }
+
+    /// A carrier's answer: the head, the body framed in records the way this tree's writer frames
+    /// them, and the terminator, so the codec below the carrier hears the wire as a dial hands it.
+    fn carrier_answer(body: &[u8]) -> Vec<u8> {
+        const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut wire = Vec::from(HEAD);
+        for frame in body.chunks(FRAME) {
+            let len = frame.len();
+            wire.extend_from_slice(format!("{len:x}\r\n").as_bytes());
+            wire.extend_from_slice(frame);
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b"0\r\n\r\n");
+        wire
+    }
+
+    /// The chain the xhttp arm composes, driven from memory: an AEAD batch arrives through the real
+    /// carrier framing into the window that opens it, and the carrier hears the window's own room —
+    /// a `BufReader` between them would have swallowed the ask below its capacity and answered the
+    /// window from its stage, so the capacity itself is what the carrier would hear.
+    #[test]
+    fn the_carrier_and_the_window_ask_the_socket_as_one() {
+        let salt = [7u8; SALT_LEN];
+        let method = Method::Aes256Gcm;
+        let mut send = Uplink::Aead(
+            Cipher::new(method, "an-example-shared-password", &salt).expect("derives"),
+        );
+        let plain: Vec<u8> = (0..MAX_CHUNK * 8).map(|i| (i % 251) as u8).collect();
+        let mut body = Vec::new();
+        for piece in plain.chunks(MAX_CHUNK) {
+            let len = piece.len();
+            let mut buf = vec![0u8; SEAL_HEAD + len + TAG_LEN];
+            buf[SEAL_HEAD..SEAL_HEAD + len].copy_from_slice(piece);
+            seal_all(&mut send, &mut buf, len, &mut body).expect("seals");
+        }
+        let (carrier, _writer) = crate::xhttp::connect_split(
+            std::io::Cursor::new(carrier_answer(&body)),
+            std::io::Cursor::new(Vec::new()),
+            "h",
+            "/share",
+        )
+        .expect("dials the head");
+        let widths = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recv = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
+        let mut out = Vec::new();
+        assert!(
+            relay_downlink(
+                Asks {
+                    read: carrier,
+                    widths: std::rc::Rc::clone(&widths),
+                },
+                Recv::Ready(recv),
+                &mut out,
+            ),
+            "the batch opens"
+        );
+        assert_eq!(out, plain, "a downlink byte crosses user space once");
+        let seen = widths.borrow();
+        assert!(
+            seen.contains(&BATCH),
+            "the whole window is asked of the carrier: {seen:?}"
+        );
+        assert!(
+            seen.contains(&(BATCH - 4 * FRAME)),
+            "the window's sub-capacity remainder reaches the carrier as the window asked it: {seen:?}"
+        );
+    }
+
+    /// The stream rung's downlink: it asks one chunk at a time and the carrier hears that chunk, not
+    /// a stage's capacity — the shape the `rc4-md5` page claims, witnessed below the carrier.
+    #[test]
+    fn the_stream_downlink_asks_its_own_chunk_of_the_socket() {
+        let master = MasterKey::new("an-example-shared-password", 16);
+        let iv = [9u8; IV_LEN];
+        let key = rc4_md5_key(master.as_bytes(), &iv).expect("derives");
+        let mut send = Rc4::new(&key).expect("cipher");
+        let mut body = vec![0u8; READ_CHUNK * 2 + 10];
+        for (i, byte) in body.iter_mut().enumerate() {
+            *byte = (i % 251) as u8;
+        }
+        send.crypt(&mut body);
+        let widths = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recv = Rc4::new(&key).expect("cipher");
+        let (carrier, _writer) = crate::xhttp::connect_split(
+            std::io::Cursor::new(carrier_answer(&body)),
+            std::io::Cursor::new(Vec::new()),
+            "h",
+            "/share",
+        )
+        .expect("dials the head");
+        let plain: Vec<u8> = (0..READ_CHUNK * 2 + 10).map(|i| (i % 251) as u8).collect();
+        let mut out = Vec::new();
+        assert!(
+            relay_downlink(
+                Asks {
+                    read: carrier,
+                    widths: std::rc::Rc::clone(&widths),
+                },
+                Recv::StreamReady(recv),
+                &mut out,
+            ),
+            "the stream opens"
+        );
+        assert_eq!(out, plain, "the keystream writes where the carrier read");
+        let seen = widths.borrow();
+        assert!(
+            seen.contains(&READ_CHUNK),
+            "the relay read is asked of the carrier whole: {seen:?}"
+        );
+        assert!(
+            !seen.contains(&STAGE),
+            "a stage would ask its capacity here: {seen:?}"
+        );
     }
 }
