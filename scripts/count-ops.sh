@@ -83,9 +83,31 @@ EOF
     # A zero total means no frame was ever active for the symbol, not that the call happened and cost nothing.
     [ "${total:-0}" != "0" ] || {
         echo "count-ops: no frame for symbol: $symbol" >&2
-        echo "count-ops: positions/events header and quic fn records:" >&2
-        grep -E "^(positions|events):" "$produced" >&2 || true
-        grep "^fn=.*quic" "$produced" | head -n 10 >&2 || true
+        # A row that holds no frame has to name which of the two opposite faults it is: a frame
+        # under another path means the row points at the wrong symbol, a dearer caller means the
+        # pass was inlined into it and no gate can price it on its own.
+        python3 - "$produced" "$symbol" <<'EOF'
+import sys
+leaf = sys.argv[2].rsplit("::", 1)[-1]
+cost, active = {}, None
+with open(sys.argv[1], errors="ignore") as f:
+    for line in f:
+        line = line.strip()
+        if line.startswith("fn="):
+            active = line[3:].split(")", 1)[-1]
+            cost.setdefault(active, 0)
+        elif line.startswith("calls="):
+            active = None
+        elif active is not None:
+            fields = line.split()
+            if len(fields) >= 2 and fields[0].isdigit() and fields[1].lstrip("-").isdigit():
+                cost[active] += int(fields[1])
+named = [n for n in cost if leaf in n]
+print("count-ops: frames held: %d, frames naming %s: %s"
+      % (len(cost), leaf, ", ".join(named[:5]) or "none"), file=sys.stderr)
+for name, own in sorted(cost.items(), key=lambda kv: -kv[1])[:5]:
+    print("count-ops: dearest frame %d %s" % (own, name), file=sys.stderr)
+EOF
         return 3
     }
     echo "$total"
