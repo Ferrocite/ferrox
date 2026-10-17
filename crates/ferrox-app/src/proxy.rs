@@ -1688,7 +1688,11 @@ fn serve_session_grpc<R: Read, W: FrameWrite + 'static>(
         echo_trace("session grpc accept refused");
         return;
     };
-    let Some((got, _flow, cmd, target)) = decode_request(&mut creader) else {
+    // The dispatcher already polls the socket behind a session at the relay's grain, so only the request's own clock is armed here: past it a peer that answered the head and then stopped speaking is a refusal, not a thread pinned in `read_exact`'s retry.
+    creader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
+    let decoded = decode_request(&mut creader);
+    creader.set_handshake_budget(None);
+    let Some((got, _flow, cmd, target)) = decoded else {
         echo_trace("session grpc vless decode refused");
         return;
     };
@@ -12781,6 +12785,35 @@ mod tests {
         done_rx
             .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
             .expect("the bounded request read returns instead of pinning the thread");
+        serving.join().expect("joins");
+    }
+
+    /// A session inbound whose peer answers the head and then stops speaking releases the serve thread: the dispatcher's poll makes the session read answer, and the request's own clock makes it refuse.
+    #[test]
+    fn a_silent_peer_cannot_pin_a_grpc_tls_vless_request() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x28u8; 16];
+        let carrier = Carrier::Grpc { path: "/p".into() };
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_tls(stream, &id, true, &carrier, &server_config);
+            let _ = done_tx.send(());
+        });
+        let mut session =
+            ferrox_core::tls::connect(&client_config, TcpStream::connect(addr).expect("connects"))
+                .expect("opens");
+        session.handshake().expect("handshakes");
+        let (read, write) = session_halves(session);
+        let (_reader, _writer) =
+            crate::grpc::connect_split(read, write, "127.0.0.1", "/p").expect("dials the head");
+        done_rx
+            .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
+            .expect("the bounded session request read returns instead of pinning the thread");
         serving.join().expect("joins");
     }
 
