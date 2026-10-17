@@ -6948,7 +6948,11 @@ pub(crate) fn relay_tunnel(
     };
     let forward_tunnel = std::sync::Arc::clone(tunnel);
     let backward_tunnel = std::sync::Arc::clone(tunnel);
-    let forward = move || copy_locked(&mut client_read, &forward_tunnel, true);
+    let forward = move || {
+        // The park's grain, armed on the read handle: a stack that leaves a blocking read asleep through a shutdown still ends it on its own timeout, and the read after that sees the closed socket.
+        let _ = client_read.set_read_timeout(Some(budgets::relay_quantum()));
+        copy_locked(&mut client_read, &forward_tunnel, true);
+    };
     let done = RelayPool::global().run(forward);
     copy_locked(&mut client_write, &backward_tunnel, false);
     // Both halves, because the other leg is parked in a blocking read on this socket: a FIN on the write half alone leaves the parked reader asleep and the flow's worker lost for the life of the process.
@@ -6971,6 +6975,17 @@ fn copy_locked(
                 Ok(0) => {
                     debug_relay(direction, total, None);
                     break;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    // The quantum expired on a client that has not spoken: the flow is idle, not ended.
+                    continue;
                 }
                 Err(error) => {
                     debug_relay(direction, total, Some(error.kind()));
@@ -7409,20 +7424,46 @@ pub(crate) fn pump_vmess_udp(
 
 type RelayTask = Box<dyn FnOnce() + Send + 'static>;
 
+/// A direction's thread is borrowed, not bought: a worker parks on its channel for the worker life after each task and hands the thread back when nothing has claimed it in that window, so a burst of concurrent flows costs threads for the length of the burst rather than for the life of the process.
 struct RelayPool {
-    idle: Mutex<Vec<std::sync::mpsc::Sender<RelayTask>>>,
+    idle: Mutex<Vec<(u64, std::sync::mpsc::Sender<RelayTask>)>>,
+    next_id: AtomicU64,
+    life: Duration,
 }
 
-static RELAY_POOL: OnceLock<RelayPool> = OnceLock::new();
+static RELAY_POOL: OnceLock<Arc<RelayPool>> = OnceLock::new();
 
 impl RelayPool {
-    fn global() -> &'static Self {
-        RELAY_POOL.get_or_init(|| RelayPool {
+    fn global() -> Arc<Self> {
+        Arc::clone(RELAY_POOL.get_or_init(|| {
+            Arc::new(RelayPool {
+                idle: Mutex::new(Vec::new()),
+                next_id: AtomicU64::new(1),
+                life: budgets::RELAY_WORKER_LIFE,
+            })
+        }))
+    }
+
+    /// A pool of one's own, so a gate on what its workers do counts only the threads it borrowed.
+    #[cfg(test)]
+    fn with_life(life: Duration) -> Arc<Self> {
+        Arc::new(RelayPool {
             idle: Mutex::new(Vec::new()),
+            next_id: AtomicU64::new(1),
+            life,
         })
     }
 
-    fn run(&self, direction: impl FnOnce() + Send + 'static) -> std::sync::mpsc::Receiver<()> {
+    /// How many workers have parked themselves where the next claim can find them.
+    #[cfg(test)]
+    fn parked(&self) -> usize {
+        self.idle.lock().map_or(0, |idle| idle.len())
+    }
+
+    fn run(
+        self: &Arc<Self>,
+        direction: impl FnOnce() + Send + 'static,
+    ) -> std::sync::mpsc::Receiver<()> {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let task: RelayTask = Box::new(move || {
             let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(direction));
@@ -7432,32 +7473,52 @@ impl RelayPool {
             }
         });
         let mut task = Some(task);
-        let claimed = self
-            .idle
-            .lock()
-            .ok()
-            .and_then(|mut idle| idle.pop())
-            .is_some_and(|sender| sender.send(task.take().expect("just set")).is_ok());
-        if !claimed {
-            Self::spawn(task.take().expect("unclaimed means unclaimed"));
+        if let Some((_, sender)) = self.idle.lock().ok().and_then(|mut idle| idle.pop()) {
+            // A worker can hand back in the moment between the pop and the send, so a rejected send returns the direction rather than keeping it; a direction dropped here would leave its flow waiting on a hand-back that never comes.
+            if let Err(rejected) = sender.send(task.take().expect("just set")) {
+                task = Some(rejected.0);
+            }
+        }
+        if let Some(orphan) = task {
+            self.spawn(orphan);
         }
         done_rx
     }
 
-    fn spawn(task: RelayTask) {
+    fn spawn(self: &Arc<Self>, task: RelayTask) {
         let (sender, receiver) = std::sync::mpsc::channel::<RelayTask>();
+        let pool = Arc::clone(self);
+        let life = pool.life;
+        let id = pool.next_id.fetch_add(1, Ordering::Relaxed);
         thread::spawn(move || {
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(task));
+            let mut work = task;
             loop {
-                let Ok(next) = receiver.recv() else {
-                    return;
-                };
-                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(next));
-                let pool = RelayPool::global();
+                let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(work));
+                // Parked where the next claim looks, once for every direction including the one that woke the thread.
                 let Ok(mut idle) = pool.idle.lock() else {
                     return;
                 };
-                idle.push(sender.clone());
+                idle.push((id, sender.clone()));
+                drop(idle);
+                match receiver.recv_timeout(life) {
+                    Ok(claimed) => work = claimed,
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    // A claim can pop this worker's sender exactly as its park ends, so one more look at the channel decides: a task that landed here runs, a send into the receiver dropped below fails and is spawned fresh instead.
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        let Ok(mut idle) = pool.idle.lock() else {
+                            return;
+                        };
+                        if let Ok(claimed) = receiver.try_recv() {
+                            drop(idle);
+                            work = claimed;
+                        } else {
+                            // The receiver goes first, so nothing can hand work to a thread that is leaving; the parking lot then holds no entry of this worker's.
+                            drop(receiver);
+                            idle.retain(|(parked, _)| *parked != id);
+                            return;
+                        }
+                    }
+                }
             }
         });
     }
@@ -10866,6 +10927,63 @@ mod tests {
             arrived.load(std::sync::atomic::Ordering::SeqCst),
             DIRECTIONS,
             "every direction must run exactly once"
+        );
+    }
+
+    /// Threads the pool borrows answer live flows, not history: a burst of directions that all finish has to hand its workers back inside the worker life, or every burst of concurrent flows raises the process's thread count for good.
+    #[test]
+    fn a_finished_burst_hands_its_workers_back_to_the_process() {
+        const BURST: usize = 8;
+        let pool = RelayPool::with_life(Duration::from_millis(200));
+        let gate = Arc::new(std::sync::Barrier::new(BURST + 1));
+        let waits: Vec<_> = (0..BURST)
+            .map(|_| {
+                let gate = Arc::clone(&gate);
+                pool.run(move || {
+                    gate.wait();
+                })
+            })
+            .collect();
+        // All eight are in flight at once, so no direction was served by a worker another had already released.
+        gate.wait();
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            pool.parked(),
+            BURST,
+            "each worker a burst borrowed parks where the next claim looks"
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pool.parked() > 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        for wait in waits {
+            wait.recv_timeout(RELAY_JOIN)
+                .expect("every direction of the burst reported that it ended");
+        }
+        assert_eq!(
+            pool.parked(),
+            0,
+            "the threads a finished burst borrowed came back to the process"
+        );
+    }
+
+    /// A claim can reach a worker that handed back in the moment between the pop and the send; the direction it holds has to reach the thread that replaces the gone worker, not die with the rejected send.
+    #[test]
+    fn a_claim_that_reaches_a_gone_worker_keeps_its_direction() {
+        let pool = RelayPool::with_life(Duration::from_millis(50));
+        let (gone_tx, gone_rx) = std::sync::mpsc::channel::<RelayTask>();
+        drop(gone_rx);
+        pool.idle.lock().expect("locks").push((7, gone_tx));
+        let ran = Arc::new(AtomicBool::new(false));
+        let named = Arc::clone(&ran);
+        let did = pool.run(move || {
+            named.store(true, Ordering::SeqCst);
+        });
+        did.recv_timeout(RELAY_JOIN)
+            .expect("the direction of a claim that missed its worker still hands back");
+        assert!(
+            ran.load(Ordering::SeqCst),
+            "and it ran on the thread spawned for it"
         );
     }
 
