@@ -89,6 +89,7 @@ graph TD
 | pinned-threads-per-silent-preface | 0 | ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_preface |
 | pinned-threads-per-silent-request-head | 0 | ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_request_head |
 | pinned-threads-per-silent-vless-request | 0 | ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_vless_request |
+| pinned-threads-per-silent-tls-request | 0 | ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_tls_vless_request |
 | message-buffer-reallocations-per-same-sized-frame | 0 | ferrox-app-grpc::tests::the_message_buffer_is_reused_not_reallocated |
 | batched-elements-served-per-message | 8 | ferrox-app-grpc::tests::a_batched_downlink_arrives_element_by_element |
 | grpc-methods-served-per-listener | 2 | ferrox-app-grpc::tests::one_listener_serves_both_methods |
@@ -115,13 +116,18 @@ of every body since the last grant — `128` frames of `16393` bytes per credit,
 a downlink of full hunks, where the lane used to write one pair per frame. The
 preface row is read off the first write both halves of a call make: the setting
 and the `WINDOW_UPDATE` on stream `0` that lifts the connection to the window the
-setting advertises, which is the grant a batched credit rests on. The three
+setting advertises, which is the grant a batched credit rests on. The four
 `pinned-threads` rows are one serve thread each, watched through a channel: a
 peer that opens and never speaks, one that sends the `24`-octet preface and
-stops, and one that dials a real gRPC client and never sends its first hunk. The
+stops, one that dials a real gRPC client and never sends its first hunk, and one
+that dials the same client through a TLS session, where `accept_split` answers
+the head and only the request's own clock is left to end the flow. The
 `0` is a give-up at `budgets::handshake()` rather than a race, and each row was
 audited by taking its own arm away first — the preface read's deadline, the
-pump's, then the reader's — and reading the test fail at its `15s` bound. The
+pump's, the reader's, then the session caller's — and reading the test fail at
+its `15s` bound. The session row needs no socket arm: the dispatchers behind it
+already poll the session's socket at `RELAY_POLL`, so the read answers on a
+grain and it is the deadline that turns the silence into a refusal. The
 batched row counts the elements one `TunMulti` message hands over before the
 caller sees a gap: eight 8 KiB elements in two messages, each element delivered
 from where it lay, so the row's `0` is the same `staged` counter and the eight
@@ -263,18 +269,29 @@ an RST with data queued rather than a framing error.
   opening read carried neither a poll quantum nor a wall clock: a peer that
   connects and says nothing, or sends the `24` octets of preface and stops, or
   completes the handshake and never sends its first hunk, held a relay-pool
-  thread forever. Arming a quantum alone would have made it worse —
+  thread forever — and behind a TLS session the same stall wore a fourth shape,
+  because `accept_split` answers the head and clears its own clock before
+  handing the reader over, so `serve_session_grpc`'s request decode ran polled
+  at the relay's grain with no clock, which is the pair that retries forever.
+  Arming a quantum alone would have made it worse —
   `proxy::read_exact` retries a timeout by design, so a `20ms` grain with no
   deadline is `50` wakes a second forever — which is why the clock lives inside
-  the reader as it does for `ws`: each of the three phases now reads under
-  `budgets::handshake()` and hands back an un-armed socket, so the relay behind
-  the head waits blocking exactly as it did. What it costs: `4` `setsockopt`
+  the reader as it does for `ws`: each of the four phases now reads under
+  `budgets::handshake()` and is cleared again where its head ends, so the relay
+  behind it waits blocking exactly as it did. What it costs: `4` `setsockopt`
   calls per accepted vless-over-gRPC flow, arm and clear at the preface and at
-  the request head, and up to `500` wakes for a peer that never speaks. What is
-  not unified: the http carriers' request head still runs on
+  the request head, and up to `500` wakes for a peer that never speaks. The
+  session arm costs no `setsockopt` at all: `serve_vless_tls` and
+  `serve_vless_reality` poll the socket under the session at `RELAY_POLL` before
+  the handshake, so the reader only needs the clock to turn a grain into a
+  refusal. What is not unified: the http carriers' request head still runs on
   `budgets::head_arrival()`, because that budget names an HTTP request arriving,
   while this one is the carrier's opening read — the budget `serve_vless_raw`
-  already bounds its own opening read with.
+  already bounds its own opening read with. What is not armed here: `trojan`,
+  `vmess`, `shadowsocks` and `shadowsocks-2022` each decode their own opening
+  request through a reader this carrier has already disarmed, so that wait is
+  theirs to bound and their pages' row to carry — `P13`'s deep-retry add-on
+  holds the list.
 
 What is **not** removed: HTTP/2's own framing. `T_DATA`, `T_HEADERS` and
 `T_SETTINGS`, HPACK and the flow-control window are the cost of the carrier,
