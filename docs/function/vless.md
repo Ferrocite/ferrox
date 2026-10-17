@@ -103,14 +103,27 @@ generator into one reader, so a relay can beat it and it is read as a floor) and
 resolves the row: `ferrox` 5 307 MiB/s against `xray-core`'s 2 674, throughput
 interval [1.943×, 2.067×] median 1.998× better, cpu per GiB [2.369×, 2.425×]
 median 2.403×, peak RSS median 5.718× — where the same row read within noise,
-[0.975×, 1.030×], and the gate blamed the runner's spread. The upload direction was
-the only one bound this way: the ceiling flow and the download both go through the
-reader, which already compared in slices, so a download row has always been a
-comparison of engines. An upload *throughput* row measured before #166 is therefore
+[0.975×, 1.030×], and the gate blamed the runner's spread. Only the upload direction was bound this way: a plain download and the ceiling
+flow both read through the reader, which already compared in slices, so that row
+has always been a comparison of engines — full-duplex carries an upload half and
+was partly bound, which the rows below show. An upload *throughput* row measured
+before #166 is therefore
 evidence about the sink and not about the engines; its cpu and RSS rows still are,
 since the sink's cpu belongs to the harness process — `ferrox`'s cpu per GiB there
 moved 243.75 → 273.75 while its throughput moved 616 → 5 307 MiB/s, which is why
 the pump pricing above stands on the cpu ratio and needs no re-reading.
+
+The branch's own full-tier cell, five repeats on a second runner, reads the same
+way: `ferrox` 4 149 MiB/s against `xray-core`'s 1 772, median 2.282×, and
+full-duplex 3 778 against 2 052 where the nightly's standard-tier cell read
+1.248× — the upload half of a duplex flow rode under the same bound. The plain
+downlink is the control on the reader this change also rewrote: `ferrox`'s own
+median moved 3 011 → 3 023 MiB/s, inside one run's noise, while its interval went
+[1.723×, 1.792×] → [2.359×, 2.459×] because the reference tracked a slower machine
+(1 717 → 1 257) and that cell's ceiling fell with it (4 214 → 2 573 MiB/s). Each
+number above is read from the cell it names; ratios are read inside a cell and
+never across two, so the run-based compare gave nothing up where the slice compare
+already worked, and took nothing off the rows that were already comparing engines.
 
 ## What we removed
 
