@@ -1,0 +1,25 @@
+# Cases for the tun-oracle: one client-side TCP flow per line, rendered into
+# packets by the same rules in the recorder (main.rs, smoltcp at the version the
+# pinned zero-tun references) and in Rust (crates/ferrox-app/src/tun.rs):
+#
+#   FLOW <dst ip:port> <src port> <syn seq> <hex payload> [<hex payload 2> ...]
+#
+# Every flow uses the fixed client address 10.0.0.2. The renderer emits, in order:
+#   SYN(seq), ACK(seq+1, ack=<observed synack seq>+1), PSH(seq+1, payload[k]) per
+#   payload chunk, FIN(seq+1+sum(payload lens)). The ACK needs the SYN-ACK's
+#   sequence number, which each stack picks itself (xray tcp_lightweight.go
+#   newTCPConn: rand.Uint32(); smoltcp its own iss), so it is read off the stack's
+#   own reply rather than pinned in this file; the dial set does not depend on it.
+#
+# All three destinations share one IP because a userspace stack answers only for
+# its own address: the recorder listens on 198.51.100.7. The ports still demux
+# three distinct dials, and the Ferrox inbound takes the whole destination from
+# the header either way — a dial that named the packet's source, or a port off a
+# different packet, fails the differential.
+#
+# Two payload chunks in one flow arrive as two PSH segments; the reference
+# reassembles them into one stream, so the dial set shows the concatenated bytes.
+
+FLOW 198.51.100.7:443 51000 1000 474554202f20485454502f312e300d0a0d0a
+FLOW 198.51.100.7:53 51001 7000 deadbeef
+FLOW 198.51.100.7:8080 51002 300 61626364 6566
