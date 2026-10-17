@@ -81,6 +81,8 @@ graph TD
 | dials-of-a-silent-tcp-carrier | 1 | ferrox-app-proxy::tests::a_silent_carrier_is_dialled_once_rather_than_once_per_rung |
 | dials-across-three-flows-of-a-rested-carrier | 2 | ferrox-app-proxy::tests::a_silent_carrier_is_dialled_once_rather_than_once_per_rung |
 | relay-legs-held-after-their-lane-ended | 0 | ferrox-app-foxy::loopback::a_lane_that_ends_releases_the_leg_parked_on_its_client |
+| pool-workers-held-after-a-finished-burst | 0 | ferrox-app-proxy::tests::a_finished_burst_hands_its_workers_back_to_the_process |
+| pool-directions-lost-on-a-gone-worker | 0 | ferrox-app-proxy::tests::a_claim_that_reaches_a_gone_worker_keeps_its_direction |
 <!-- counts:end -->
 
 `tcp-connections-asked-of-an-untrusted-edge 1` is the retry rule seen from the
@@ -415,11 +417,44 @@ the comparison can be re-read:
   spawn its own worker. The UDP relays joined this way from the start — they shut
   both halves — and the lane now does the same, so the leg waiting in a parked
   read ends with the flow that parked it.
+  The wake is the read's own grain, not only the shutdown: the pooled leg arms
+  `budgets::relay_quantum` on its read handle and reads a timeout as a client that
+  has not spoken rather than a flow that has ended, because a stack that leaves a
+  read already in flight asleep still ends the one after it. Changing a parked
+  read from "never wakes" to "wakes once per quantum" is the count change here,
+  and it costs nothing while bytes move. `windows x86_64` was the platform that
+  said so — the leg stayed parked there through both halves of a shutdown, and
+  `a_lane_that_ends_releases_the_leg_parked_on_its_client` now bounds the whole
+  teardown at two grains, so a fall back to the join budget is red.
   What is **not** removed: a client that vanishes without a FIN while its lane is
   still alive. Nothing in this tree notices that, so such a flow still holds both
   legs; naming it here rather than as a count, because no gate in the harness can
   see it. And the two-socket `relay` still shuts one half for the same reason it
   took a lane to, so it keeps the leg it parked — its own slice, not this one.
+
+- **A pool worker that never handed its thread back.** A worker ran its direction
+  and then parked on its channel with an unbounded `recv`, so a burst of
+  concurrent flows left one thread per flow for the life of the process — `sample`
+  on a live lane counted 194 threads, 157 of them asleep in that `recv`. Worse,
+  the direction that *woke* a worker was handed to it at spawn, before any
+  `idle.push`, so a pool serving flows one after another never found a parked
+  worker either and bought a fresh thread every time. A worker now parks for the
+  worker life (`budgets::RELAY_WORKER_LIFE`, 30 s) after every direction, the
+  first included, and hands its thread back when nothing claimed it in that
+  window, taking its own entries out of the parking lot as it goes. A claim that
+  pops a sender exactly as its worker's park ends is closed by one more look at
+  the channel under the pool's lock: a task that landed there runs, and a send
+  into the receiver dropped on the way out fails into a fresh spawn instead of
+  vanishing, and the direction a rejected send returns is handed to that spawn
+  rather than dropped with it. `a_finished_burst_hands_its_workers_back_to_the_process`
+  holds eight directions in flight at once, sees eight parked workers, then sees
+  none; with an hour's park it stays red at eight, and
+  `a_claim_that_reaches_a_gone_worker_keeps_its_direction` is the red panic of the
+  claim that lands on a receiver being dropped.
+  What is **not** removed: the threads a *live* flow holds. Each direction of a
+  flow is still a thread and a lane of its own, so a lane with N concurrent flows
+  still runs N legs; fewer threads at the same concurrency is the session reuse
+  the `h2`/`h1` carriers do not have yet, not this reap.
 
 What is **not** removed, named rather than claimed: 0-RTT, connection
 migration, key updates and batched datagram I/O are quiche's, and this tree has

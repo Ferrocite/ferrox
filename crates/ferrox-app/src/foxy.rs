@@ -2946,6 +2946,8 @@ mod loopback {
     #[test]
     fn a_lane_that_ends_releases_the_leg_parked_on_its_client() {
         const PARK: Duration = Duration::from_secs(10);
+        // The wake is the armed quantum, not the join budget: two of the 100 ms grains plus scheduling is the honest bound.
+        const WAKE: Duration = Duration::from_secs(2);
         let (roots, server) = minted(b"h2");
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
@@ -3009,7 +3011,7 @@ mod loopback {
         edge.join().expect("the edge finishes");
         let _ = ended_rx.recv_timeout(PARK);
         assert!(
-            started.elapsed() < PARK,
+            started.elapsed() < WAKE,
             "the flow that lost its lane is still holding the leg parked on its client"
         );
     }

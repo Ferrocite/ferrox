@@ -23,6 +23,9 @@ pub(crate) const RELAY_JOIN: Duration = Duration::from_secs(120);
 
 pub(crate) const RELAY_LOCK_TRIES: u32 = 64;
 
+/// How long a relay worker may sit unclaimed before it hands its thread back: long enough for the next flow to reuse it, short enough that a burst of finished flows leaves no residue.
+pub(crate) const RELAY_WORKER_LIFE: Duration = Duration::from_secs(30);
+
 /// A head's arrival budget: without one a quiet peer keeps a task waking once per poll, burning a core.
 pub(crate) const HEAD_DEADLINE: Duration = Duration::from_secs(20);
 

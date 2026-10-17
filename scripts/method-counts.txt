@@ -230,6 +230,8 @@ carrier-foxy catalogue-edges-rewritten-from-the-cache-file 5 ferrox-app-foxy_cat
 carrier-foxy dials-of-a-silent-tcp-carrier 1 ferrox-app-proxy::tests::a_silent_carrier_is_dialled_once_rather_than_once_per_rung
 carrier-foxy dials-across-three-flows-of-a-rested-carrier 2 ferrox-app-proxy::tests::a_silent_carrier_is_dialled_once_rather_than_once_per_rung
 carrier-foxy relay-legs-held-after-their-lane-ended 0 ferrox-app-foxy::loopback::a_lane_that_ends_releases_the_leg_parked_on_its_client
+carrier-foxy pool-workers-held-after-a-finished-burst 0 ferrox-app-proxy::tests::a_finished_burst_hands_its_workers_back_to_the_process
+carrier-foxy pool-directions-lost-on-a-gone-worker 0 ferrox-app-proxy::tests::a_claim_that_reaches_a_gone_worker_keeps_its_direction
 
 carrier-quic ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-quic zero-filled-bytes-per-relayed-frame 3 ferrox-app-quic::tests::a_relayed_datagram_frames_its_target_ahead_of_its_payload
