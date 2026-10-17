@@ -130,10 +130,15 @@ fn serve_root(label: &str, root: &Json) -> ! {
     let mut hysteria_served = false;
     if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
         for inbound in list {
-            let Some(address) = inbound_address(inbound) else {
-                continue;
-            };
             let protocol = inbound.get("protocol").and_then(Json::as_str).unwrap_or("");
+            let address = if crate::tun::is_device(protocol) {
+                String::new()
+            } else {
+                let Some(a) = inbound_address(inbound) else {
+                    continue;
+                };
+                a
+            };
             if !inbound_served(protocol) {
                 refuse_inbound(protocol, label, inbound);
                 continue;
@@ -162,29 +167,25 @@ fn serve_root(label: &str, root: &Json) -> ! {
                         hysteria_served = true;
                     }
                 }
-                "socks" => {
+                "socks" | "http" | "mixed" => {
                     let Some(out) = outbound.clone() else {
                         continue;
                     };
-                    let role = Role::Socks { out };
+                    let role = match protocol {
+                        "socks" => Role::Socks { out },
+                        "http" => Role::Http { out },
+                        _ => Role::Mixed { out },
+                    };
                     thread::spawn(move || accept_loop(&address, &role));
                     inbounds += 1;
                 }
-                "http" => {
+                "tun" => {
                     let Some(out) = outbound.clone() else {
                         continue;
                     };
-                    let role = Role::Http { out };
-                    thread::spawn(move || accept_loop(&address, &role));
-                    inbounds += 1;
-                }
-                "mixed" => {
-                    let Some(out) = outbound.clone() else {
-                        continue;
-                    };
-                    let role = Role::Mixed { out };
-                    thread::spawn(move || accept_loop(&address, &role));
-                    inbounds += 1;
+                    if serve_tun_inbound(inbound, &out, &address) {
+                        inbounds += 1;
+                    }
                 }
                 _ => eprintln!("unsupported inbound protocol `{protocol}` in {label}"),
             }
@@ -226,8 +227,8 @@ fn refuse_inbound(protocol: &str, label: &str, inbound: &Json) {
     }
 }
 
-/// Served inbounds; device inbounds (tun, utun, wintun) are refused by name, never served as silence.
-const SERVED_INBOUNDS: [&str; 8] = [
+/// Served inbounds; the `tun` device inbound opens a native interface and relays TCP flows.
+const SERVED_INBOUNDS: [&str; 9] = [
     "vless",
     "trojan",
     "vmess",
@@ -236,6 +237,7 @@ const SERVED_INBOUNDS: [&str; 8] = [
     "socks",
     "http",
     "mixed",
+    "tun",
 ];
 
 /// Whether this protocol is an inbound this binary serves.
@@ -3242,6 +3244,36 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
             }
         });
     }
+}
+
+/// Open the TUN device and spawn the packet handler. Returns true when the device opens.
+fn serve_tun_inbound(inbound: &Json, out: &Outbound, _address: &str) -> bool {
+    let settings = inbound.get("settings");
+    let field = |key| {
+        settings
+            .as_ref()
+            .and_then(|s| s.get(key))
+            .or_else(|| inbound.get(key))
+    };
+    let spec = crate::tun::Spec::new(
+        field("name").and_then(Json::as_str),
+        field("mtu").and_then(Json::as_u32).map(|m| m as usize),
+    );
+    let Ok(device) = crate::tun::Device::open(&spec) else {
+        eprintln!("tun inbound: {}", crate::tun::refusal_reason(&spec));
+        return false;
+    };
+    let outbound = out.clone();
+    let relay: crate::tun::Relay = std::sync::Arc::new(move |conn, dest| {
+        serve_connect(conn, &outbound, &dest, Front::Socks, &[]);
+    });
+    let mut handler = crate::tun::Handler::new(device, relay);
+    thread::spawn(move || {
+        if let Err(e) = handler.serve() {
+            eprintln!("tun handler ended: {e}");
+        }
+    });
+    true
 }
 
 struct UdpUplink {
@@ -12946,10 +12978,14 @@ mod tests {
         );
     }
 
-    /// Checked, not claimed: a config naming an unopenable device serves nothing; every served front still starts.
+    /// Checked, not claimed: `tun` is served while the device names with no native open behind it are still refused; every served front still starts.
     #[test]
     fn a_device_inbound_is_refused_by_name_rather_than_served() {
-        for name in ["tun", "utun", "wintun", "tun2socks"] {
+        assert!(
+            inbound_served("tun"),
+            "the native device inbound `tun` serves"
+        );
+        for name in ["utun", "wintun", "tun2socks"] {
             assert!(
                 !inbound_served(name),
                 "the device inbound `{name}` is refused by name"
