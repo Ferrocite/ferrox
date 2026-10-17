@@ -34,3 +34,9 @@ __pycache__/
 # nested repository. `/ferrox-opencode-*` siblings are outside and need nothing.
 /.worktrees
 /.workbuddy-ai
+
+# The macOS bundle and the lane configs it writes: build output and account
+# material, never reviewed, never committed.
+/dist
+/lane.json
+/pass.json

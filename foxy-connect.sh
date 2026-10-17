@@ -28,7 +28,7 @@
 set -euo pipefail
 
 FERROX_ROOT="$(cd "$(dirname "$0")" && pwd)"
-BIN="$FERROX_ROOT/target/debug/ferrox-app"
+BIN="${FERROX_BIN:-$FERROX_ROOT/target/release/ferrox-app}"
 # Both live outside this repository: the account, the pass and the exit
 # country are the machine's business, never the tree's. Override with
 # FOXY_CONF_DIR and FOXY_CREDENTIALS when a shared ~/.config is not wanted.
@@ -194,6 +194,8 @@ wait_port() {
       exec 3>&- 2>/dev/null || true
       return 0
     fi
+    # A lane that died at sign-in will never open the port: name it now, not in a minute.
+    lane_running || return 1
     sleep 1
   done
   return 1
@@ -302,7 +304,7 @@ fi
 # Everything after this point needs a lane, so the binary and the pass first.
 if [ "${FORCE_BUILD:-0}" = 1 ] || [ ! -x "$BIN" ]; then
   echo "building ferrox-app (one time)..."
-  (cd "$FERROX_ROOT" && cargo build --locked -p ferrox-app) >&2
+  (cd "$FERROX_ROOT" && cargo build --locked --release --target-dir "$FERROX_ROOT/target" -p ferrox-app) >&2
 fi
 
 if [ -n "$CREDENTIALS" ] && [ -f "$CREDENTIALS" ]; then
