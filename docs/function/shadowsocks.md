@@ -116,6 +116,7 @@ that file disagree.
 | udp-payload-buffers-per-datagram | 1 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes |
 | udp-datagram-reallocations-after-the-first | 0 | ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes |
 | subkey-heap-buffers-per-connection | 1 | ferrox-core-shadowsocks::tests::a_cipher_is_one_heap_buffer |
+| udp-datagram-heap-buffers-per-datagram | 0 | ferrox-core-shadowsocks::tests::a_rekeyed_cipher_streams_datagrams_without_heap_traffic |
 | stream-iv-bytes-per-handshake | 16 | ferrox-app-shadowsocks::tests::stream_relays_an_echo |
 | stream-write-syscalls-per-relay-read | 1 | ferrox-app-shadowsocks::tests::stream_relay_read_becomes_one_write |
 | stream-crypt-allocations-per-call | 0 | ferrox-core-shadowsocks::tests::rc4_crypt_is_in_place_and_allocates_nothing |
@@ -374,13 +375,29 @@ Read against the three pinned implementations, all of which are in
   idiom as `frames_reuse_the_callers_buffers`. The 16-byte tag copy and the
   `memmove` are named rather than counted: no test observes a copy that does
   not happen, so they are not in the table.
+- **The cipher rebuilt for every datagram.** `open_datagram` and `seal_datagram`
+  built a whole `Cipher` per datagram: the HKDF, the key schedule and the GHASH
+  powers must run again because the salt *is* the key, but the build also bought
+  a new engine `Box` per datagram, re-ran the six feature probes and threw away
+  the enum the loop's slot already held. The wire loops now hold one `Cipher`
+  across their stream and rekey it per datagram — the subkey and the counter
+  restart with the rekey, so the nonce is counter zero again and the datagram
+  bytes are unchanged (`a_rekeyed_datagram_seals_like_a_fresh_built_one` seals
+  a rekeyed datagram and a freshly built one sidelong and compares), the engine
+  rekeys in place over its own inline storage (`*self = Self::new(key)`; the
+  box never moves), and the per-datagram allocation is gone
+  (`udp-datagram-heap-buffers-per-datagram 0`, driven over all four methods).
+  `a_cipher_is_one_heap_buffer` keeps its claim for the builds that remain:
+  the cold first datagram in each slot is one buffer. The HKDF, the schedule
+  and the power table are named rather than counted: they depend on the salt,
+  so no test can observe them going away — they do not.
 - **The reply's third buffer.** `spawn_ss_udp_reader` used to hand the opened
   payload to a fresh `Vec` holding the three SOCKS reply bytes, the address and
   the payload. It now opens in place, writes `[0, 0, 0]` and the address header
   into the headroom that lies immediately before the opened payload, and sends
   `&buf[start..at + len]` in one `send_to`: the reply is the caller's read
   buffer, with the reply header composed in front and the trailing tag left
-  out. Named, not counted, for the same reason as the bullet above.
+  out. Named, not counted, for the same reason as the tag-copy bullet below.
 - **A 16-byte tag copy per chunk.** `Cipher::open_in_place` split the tag off
   with `split_at_mut` and then built a `[u8; TAG_LEN]` on the stack to pass by
   reference. It now borrows the sixteen bytes that are already there, which is
