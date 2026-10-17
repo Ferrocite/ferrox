@@ -1,9 +1,9 @@
 use std::cell::RefCell;
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::conn::Connection;
 use ferrox_core::transport::early_decode;
 
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
@@ -134,7 +134,7 @@ fn fresh_mask() -> Option<[u8; 4]> {
 }
 
 /// The head, the octets that arrived with it, and where the head ends: this read consumes what it proves, so a frame pipelined behind the handshake is already in hand.
-fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, usize)> {
+fn read_head(stream: &mut Connection) -> Option<(Vec<u8>, usize)> {
     crate::proxy::read_http_head_kept(stream, HEAD_LIMIT, crate::budgets::head_arrival())
 }
 
@@ -155,7 +155,7 @@ impl std::fmt::Debug for Shared {
 const READ_AHEAD: usize = 32 * 1024;
 
 #[derive(Debug)]
-pub(crate) struct WsReader<R: Read = TcpStream> {
+pub(crate) struct WsReader<R: Read = Connection> {
     read: R,
     shared: Arc<Shared>,
     /// Socket bytes this reader has taken but not yet parsed or delivered.
@@ -179,7 +179,7 @@ pub(crate) struct WsWriter {
     masked: bool,
 }
 
-impl WsReader<TcpStream> {
+impl WsReader<Connection> {
     /// Arm or clear the poll quantum on the handle this reader reads through; a duplicated socket inherits no read timeout on Windows.
     pub(crate) fn set_poll(&mut self, every: Option<std::time::Duration>) {
         let _ = self.read.set_read_timeout(every);
@@ -457,7 +457,7 @@ fn write_frame(
     })
 }
 
-pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(WsReader, WsWriter)> {
+pub(crate) fn accept(stream: Connection, path: &str) -> Option<(WsReader, WsWriter)> {
     let mut read = stream;
     let (head, at) = read_head(&mut read)?;
     let Upgrade {
@@ -540,7 +540,7 @@ pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
 }
 
 pub(crate) fn connect(
-    stream: TcpStream,
+    stream: Connection,
     host: &str,
     path: &str,
     budget: u32,
@@ -626,7 +626,7 @@ fn request(host: &str, path: &str, key: &str, budget: u32, first: &[u8]) -> (Str
 }
 
 fn split(
-    read: TcpStream,
+    read: Connection,
     early: Vec<u8>,
     have: Vec<u8>,
     at: usize,
@@ -681,7 +681,6 @@ impl crate::proxy::CarrierSink for WsWriter {
 mod tests {
     use super::*;
     use ferrox_core::transport::EarlyData;
-    use std::net::TcpListener;
     use std::thread;
 
     #[test]
@@ -827,14 +826,14 @@ mod tests {
         for len in [0, 1, 125, 126, 200, 65_535, 65_536] {
             let payload: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
             for masked in [false, true] {
-                let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+                let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
                 let port = listener.local_addr().expect("addr").port();
                 let expected = payload.clone();
                 let writer = thread::spawn(move || {
                     let (mut stream, _) = listener.accept().expect("accepts");
                     assert!(write_frame(&mut stream, masked, OP_DATA, &expected));
                 });
-                let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+                let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
                 let shared = Arc::new(Shared {
                     stream: Mutex::new(Box::new(stream.try_clone().expect("clones"))
                         as Box<dyn crate::proxy::FrameWrite + Send>),
@@ -868,10 +867,10 @@ mod tests {
     /// A fixed source returns every byte asked for, so the syscall count is exact, not a race with the scheduler.
     #[test]
     fn a_read_covers_a_window_not_one_frame_header() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || listener.accept().expect("accepts").0);
-        let _spare = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let _spare = Connection::connect(("127.0.0.1", port)).expect("connects");
         let shared = Arc::new(Shared {
             stream: Mutex::new(
                 Box::new(server.join().expect("joins")) as Box<dyn crate::proxy::FrameWrite + Send>
@@ -929,7 +928,7 @@ mod tests {
 
     #[test]
     fn handshake_carries_an_echo_over_loopback() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -939,7 +938,7 @@ mod tests {
             assert_eq!(&buf, b"ping");
             assert!(writer.send(b"pong"));
         });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let plain = EarlyData::split("/tunnel");
         let (mut reader, _writer) =
             connect(stream, "127.0.0.1", &plain.path, plain.budget, b"ping").expect("upgrades");
@@ -1144,7 +1143,7 @@ mod tests {
     #[test]
     fn early_data_reaches_the_server_with_and_without_a_budget_that_fits() {
         for budget in [2048u32, 4, 3] {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+            let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
             let port = listener.local_addr().expect("addr").port();
             let server = thread::spawn(move || {
                 let (stream, _) = listener.accept().expect("accepts");
@@ -1155,7 +1154,7 @@ mod tests {
                 reader.read_exact(&mut buf).expect("reads");
                 assert_eq!(&buf, b"ping");
             });
-            let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
             let configured = EarlyData::split(&format!("/tunnel?ed={budget}"));
             connect(
                 stream,
@@ -1175,14 +1174,14 @@ mod tests {
             assert_eq!(EarlyData::split(path).path, "/interop-ws", "{path}");
         }
         assert_eq!(EarlyData::split("/interop-ws?ed=").path, "/interop-ws?ed=");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             let configured = EarlyData::split("/interop-ws?ed=2048");
             assert!(accept(stream, &configured.path).is_some());
         });
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
             .write_all(b"GET /interop-ws HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\
                          Connection: Upgrade\r\nSec-WebSocket-Key: aGVsbG8gd29ybGQxMjM0NQ==\r\n\r\n")
@@ -1193,13 +1192,13 @@ mod tests {
 
     #[test]
     fn handshake_rejects_a_wrong_path_and_key() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             assert!(accept(stream, "/tunnel").is_none());
         });
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
             .write_all(b"GET /other HTTP/1.1\r\nHost: h\r\nSec-WebSocket-Key: k\r\n\r\n")
             .expect("writes");

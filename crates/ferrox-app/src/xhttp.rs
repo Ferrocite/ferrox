@@ -1,10 +1,10 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::io::{Read, Write};
-use std::net::TcpStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 
+use crate::conn::Connection;
 use ferrox_core::transport::url_decode;
 
 const HEAD_LIMIT: usize = 64 * 1024;
@@ -30,7 +30,7 @@ fn bare_path(target: &str) -> &str {
 }
 
 /// The head, the octets that arrived with it, and where the head ends: this read consumes what it proves, so a body pipelined behind the head is already in hand.
-fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, usize)> {
+fn read_head(stream: &mut Connection) -> Option<(Vec<u8>, usize)> {
     crate::proxy::read_http_head_kept(stream, HEAD_LIMIT, crate::budgets::head_arrival())
 }
 
@@ -160,7 +160,7 @@ pub(crate) struct Reader<R> {
     reads: usize,
 }
 
-pub(crate) type XhttpReader = Reader<TcpStream>;
+pub(crate) type XhttpReader = Reader<Connection>;
 
 /// A live stream with sniffed bytes pushed back in front, so a transport decision made on the first bytes does not eat them.
 pub(crate) struct ChainReader<R> {
@@ -381,7 +381,7 @@ impl Write for XhttpWriter {
     }
 }
 
-fn split(read: TcpStream, prefix: Vec<u8>, at: usize) -> Option<(XhttpReader, XhttpWriter)> {
+fn split(read: Connection, prefix: Vec<u8>, at: usize) -> Option<(XhttpReader, XhttpWriter)> {
     let Ok(write) = read.try_clone() else {
         return None;
     };
@@ -1259,7 +1259,7 @@ fn content_length(head: &[u8]) -> Option<usize> {
 // --- Server ------------------------------------------------------------------
 
 // The stream-one handshake the tree has always served: POST with chunked framing on one connection; mode handshakes live in `accept_with_settings`, and this stays so every existing rung keeps dialling.
-pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(XhttpReader, XhttpWriter)> {
+pub(crate) fn accept(stream: Connection, path: &str) -> Option<(XhttpReader, XhttpWriter)> {
     let mut read = stream;
     let (head, at) = read_head(&mut read)?;
     check_request(&head[..at], path)?;
@@ -1677,7 +1677,7 @@ fn dial_head(host: &str, path: &str) -> String {
 }
 
 pub(crate) fn connect(
-    stream: TcpStream,
+    stream: Connection,
     host: &str,
     path: &str,
 ) -> Option<(XhttpReader, XhttpWriter)> {
@@ -1716,7 +1716,6 @@ impl crate::proxy::CarrierSink for XhttpWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
     use std::thread;
 
     /// The tokenish adjust as it was — the whole string re-summed on every one of the 150 steps — kept as the oracle the carried sum is compared against.
@@ -1779,7 +1778,7 @@ mod tests {
             wire.extend_from_slice(b"\r\n");
         }
         wire.extend_from_slice(b"0\r\n\r\n");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let h = thread::spawn(move || {
             let (mut sock, _) = listener.accept().expect("accepts");
@@ -1791,7 +1790,7 @@ mod tests {
             sock.write_all(&wire).expect("sends");
             sock.shutdown(std::net::Shutdown::Write).ok();
         });
-        let sock = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let sock = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, _w) = connect(sock, "h", "/share").expect("dials");
         let mut buf = vec![0u8; CHUNK];
         let mut got = 0usize;
@@ -1929,7 +1928,7 @@ mod tests {
 
     #[test]
     fn exchange_carries_an_echo_over_loopback() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -1940,7 +1939,7 @@ mod tests {
             assert!(writer.send(b"pong"));
             writer.finish();
         });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, writer) = connect(stream, "oracle.example", "/share").expect("dials");
         assert!(writer.send(b"ping"));
         let mut buf = [0u8; 4];
@@ -2124,7 +2123,7 @@ mod tests {
 
     #[test]
     fn chunks_drain_in_order_before_the_close_is_answered() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -2141,7 +2140,7 @@ mod tests {
             assert_eq!(drained, [] as [u8; 0]);
             writer.finish();
         });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .expect("timeout");
@@ -2160,13 +2159,13 @@ mod tests {
 
     #[test]
     fn exchange_rejects_a_wrong_path() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             assert!(accept(stream, "/share").is_none());
         });
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
             .write_all(b"POST /other HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n")
             .expect("writes");
@@ -2377,7 +2376,7 @@ mod tests {
         let settings = settings_from(
             r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share"}}}"#,
         );
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -2391,7 +2390,7 @@ mod tests {
             assert!(writer.send(b"pong"));
             writer.finish();
         });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, writer) =
             connect(stream, "127.0.0.1", "/share").expect("the dial was answered");
         assert!(writer.send(b"ping"));
