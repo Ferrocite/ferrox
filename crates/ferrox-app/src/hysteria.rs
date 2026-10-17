@@ -212,7 +212,14 @@ fn post_auth(session: &Session, host: &str, auth: &str) -> bool {
     hysteria::verify_auth_response(&body)
 }
 
+/// The handshakes this process has paid; a test watches a reused connection leave it untouched.
+#[cfg(test)]
+pub(crate) static HANDSHAKES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
 pub(crate) fn connect(dial: &Dial) -> Option<Session> {
+    #[cfg(test)]
+    HANDSHAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let roots = dial.roots.as_deref().unwrap_or(&[]);
     let (sock, peer, local) = crate::quic::udp_to_server(&dial.address, dial.port)?;
     let mut scid = [0u8; SCID_LEN];
@@ -345,20 +352,20 @@ impl Write for Flow {
     }
 }
 
-pub(crate) fn open_flow(session: &Session, header: &[u8]) -> Option<Flow> {
+pub(crate) fn open_flow(session: &Session, stream: u64, header: &[u8]) -> Option<Flow> {
     let mut prefix = Vec::with_capacity(2 + header.len());
     hysteria::tcp_prefix(&mut prefix);
     prefix.extend_from_slice(header);
-    if !send_all(session, FIRST_FLOW_STREAM, &prefix, false) {
+    if !send_all(session, stream, &prefix, false) {
         return None;
     }
     let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
-    if recv_reply(session, FIRST_FLOW_STREAM, deadline)? != [0, 0] {
+    if recv_reply(session, stream, deadline)? != [0, 0] {
         return None;
     }
     Some(Flow {
         session: session.clone(),
-        stream: FIRST_FLOW_STREAM,
+        stream,
         backlog: Vec::new(),
         at: 0,
         drive: true,
@@ -394,17 +401,136 @@ pub(crate) fn read_request(flow: &mut Flow, deadline: Instant) -> Option<String>
     }
 }
 
+/// One authenticated connection and the next flow stream it can open: the pinned client multiplexes every TCP flow this way, and the server already serves them.
+struct Pooled {
+    session: Session,
+    next_stream: u64,
+    used: Instant,
+}
+
+/// What a pooled connection is a connection to, keyed the way the quic carrier keys its pool: a different credential or CA set is a different connection.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct Server {
+    host: String,
+    address: String,
+    port: u16,
+    cc: &'static str,
+    auth: String,
+    roots: Option<Vec<Vec<u8>>>,
+}
+
+/// How long an unused connection may sit before a dial pays a fresh handshake: half of quiche's idle timeout, so a reuse always lands before either side closes it.
+const REUSE_WINDOW: Duration = Duration::from_millis(crate::quic::IDLE_TIMEOUT_MS / 2);
+
+static POOL: std::sync::OnceLock<Mutex<HashMap<Server, Vec<Pooled>>>> = std::sync::OnceLock::new();
+
+fn pool() -> &'static Mutex<HashMap<Server, Vec<Pooled>>> {
+    POOL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn server_of(dial: &Dial) -> Server {
+    Server {
+        host: dial.host.clone(),
+        address: dial.address.clone(),
+        port: dial.port,
+        cc: dial.config.cc.quiche_name(),
+        auth: dial.config.auth.clone(),
+        roots: dial.roots.clone(),
+    }
+}
+
+/// The connections a flow may ride, each with the stream id reserved to it; closed or stale entries are dropped here, so a dead handle never blocks a dial.
+fn candidates(dial: &Dial) -> Vec<(Session, u64)> {
+    let Ok(mut pool) = pool().lock() else {
+        return Vec::new();
+    };
+    let Some(entries) = pool.get_mut(&server_of(dial)) else {
+        return Vec::new();
+    };
+    let now = Instant::now();
+    entries.retain(|entry| {
+        entry.next_stream / 4 < crate::quic::MAX_STREAMS
+            && now.saturating_duration_since(entry.used) < REUSE_WINDOW
+            && entry
+                .session
+                .shared
+                .lock()
+                .is_ok_and(|conn| !conn.is_closed())
+    });
+    entries
+        .iter_mut()
+        .map(|entry| {
+            let stream = entry.next_stream;
+            entry.next_stream += 4;
+            entry.used = now;
+            (entry.session.clone(), stream)
+        })
+        .collect()
+}
+
+fn evict(dial: &Dial, session: &Session) {
+    let Ok(mut pool) = pool().lock() else {
+        return;
+    };
+    let Some(entries) = pool.get_mut(&server_of(dial)) else {
+        return;
+    };
+    entries.retain(|entry| !Arc::ptr_eq(&entry.session.shared, &session.shared));
+}
+
+fn keep(dial: &Dial, session: Session, next_stream: u64) {
+    let Ok(mut pool) = pool().lock() else {
+        return;
+    };
+    pool.entry(server_of(dial)).or_default().push(Pooled {
+        session,
+        next_stream,
+        used: Instant::now(),
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn handshake_count() -> usize {
+    HANDSHAKES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Closes every pooled connection so a test can watch the next dial pay a fresh handshake.
+#[cfg(test)]
+pub(crate) fn close_pooled() {
+    let Ok(pool) = pool().lock() else {
+        return;
+    };
+    for entry in pool.values().flatten() {
+        if let Ok(mut conn) = entry.session.shared.lock() {
+            let _ = conn.close(false, 0, b"pool closed by test");
+        }
+    }
+}
+
+/// A flow over the outbound's live connection when a stream opens on it, a fresh handshake otherwise; a pooled connection that stopped opening is dropped where it is found.
+fn open_pooled(dial: &Dial, header: &[u8]) -> Option<Flow> {
+    for (session, stream) in candidates(dial) {
+        if let Some(flow) = open_flow(&session, stream, header) {
+            return Some(flow);
+        }
+        if session.shared.lock().is_ok_and(|conn| conn.is_closed()) {
+            evict(dial, &session);
+        }
+    }
+    let session = connect(dial)?;
+    let flow = open_flow(&session, FIRST_FLOW_STREAM, header)?;
+    keep(dial, session, FIRST_FLOW_STREAM + 4);
+    Some(flow)
+}
+
 pub(crate) fn dial_vless(
     client: &TcpStream,
     dial: &Dial,
     id: &[u8; 16],
     target: &crate::proxy::Destination,
 ) {
-    let Some(session) = connect(dial) else {
-        return;
-    };
     let header = crate::proxy::vless_header(id, 1, target);
-    let Some(flow) = open_flow(&session, &header) else {
+    let Some(flow) = open_pooled(dial, &header) else {
         return;
     };
     relay(client, &flow);
