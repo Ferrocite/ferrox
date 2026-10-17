@@ -57,6 +57,14 @@ now takes the cursor instead of being handed an empty buffer.
 `ws::tests::a_frame_that_rode_in_with_the_head_costs_no_syscall` drives that shape from an
 in-memory buffer: two frames delivered with `reads()` still `0`, the buffer's base and capacity
 unchanged; a wrong cursor fails the bytes, a re-read fails the counter.
+The halves that cannot peek took the same shape with it: `proxy::read_exact_head` *is* that
+loop now, so `accept_split` and `connect_split` hand `split_halves` the buffer the read filled
+with `at` past the head instead of a `split_off`'d tail, which was a second allocation that
+copied the riding bytes out of the buffer they arrived in (`head-tail-allocations 0`).
+`ws::tests::the_record_head_hands_over_the_buffer_it_filled` watches the handover: `have` is
+as long as the head plus the frame, and the frame's base is the buffer's base plus the cursor
+— a tail of its own moves it.
+
 What is *not* removed: `proxy::read_http_head` still answers the `http` front, whose prefix has
 one buffer and nowhere else to go, and the Shadowsocks rung, which waits inside a `peek` for the
 first byte of a request packet and must not take it.
@@ -77,6 +85,7 @@ first byte of a request packet and must not take it.
 | response-buffer-reallocations-per-accept | 0 | ferrox-app-ws::tests::the_101_is_the_key_and_the_echoed_subprotocol |
 | early-data-copies-of-the-pipelined-bytes | 0 | ferrox-app-ws::tests::the_pipelined_prefix_is_the_readers_own_buffer |
 | head-tail-read-syscalls | 0 | ferrox-app-ws::tests::a_frame_that_rode_in_with_the_head_costs_no_syscall |
+| head-tail-allocations | 0 | ferrox-app-ws::tests::the_record_head_hands_over_the_buffer_it_filled |
 | early-data-encode-allocations-per-line | 0 | ferrox-bench-gate-8 |
 | early-data-encode-buffers-grown-per-2048-byte-line | 0 | ferrox-core-transport::tests::the_early_data_line_costs_the_encode_and_nothing_else |
 

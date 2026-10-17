@@ -23,7 +23,7 @@ impl UpReader<TcpStream> {
 
 impl<R: Read> Read for UpReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // The peekable carrier never carries a prefix, so its every bulk read is one branch and a delegate.
+        // Once the riding bytes are spent every read is one branch and a delegate to the stream.
         if self.at >= self.prefix.len() {
             return self.read.read(buf);
         }
@@ -118,21 +118,21 @@ fn check_request(head: &[u8], path: &str) -> Option<()> {
     }
 }
 
-// The same accept over halves that cannot peek: pipelined bytes arrive as a prefix.
+// The same accept over halves that cannot peek: the kept read consumes the head, so what rode in behind it is the reader's own prefix.
 pub(crate) fn accept_split<R: Read, W: Write>(
     mut read: R,
     mut write: W,
     path: &str,
 ) -> Option<(UpReader<R>, W)> {
-    let (head, prefix) =
+    let (head, at) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
-    check_request(&head, path)?;
+    check_request(&head[..at], path)?;
     write.write_all(SWITCH).ok()?;
     Some((
         UpReader {
             read,
-            prefix,
-            at: 0,
+            prefix: head,
+            at,
         },
         write,
     ))
@@ -234,7 +234,7 @@ fn check_response(head: &[u8]) -> Option<()> {
     }
 }
 
-// The same connect over halves that cannot peek: pipelined bytes arrive as a prefix.
+// The same connect over halves that cannot peek: the kept read takes what rode in behind the `101`.
 pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite>(
     mut read: R,
     mut write: W,
@@ -245,17 +245,17 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite>(
 ) -> Option<(UpReader<R>, W)> {
     let early = rides(budget, first);
     send_request(&mut write, &upgrade_request(host, path), early, first)?;
-    let (head, prefix) =
+    let (head, at) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
-    check_response(&head)?;
+    check_response(&head[..at])?;
     if !early && !first.is_empty() {
         write.write_all(first).ok()?;
     }
     Some((
         UpReader {
             read,
-            prefix,
-            at: 0,
+            prefix: head,
+            at,
         },
         write,
     ))
@@ -607,6 +607,29 @@ mod tests {
             );
             true
         }
+    }
+
+    /// The record arm takes the buffer its own head read filled, head octets and all: what rode behind the delimiter is handed over inside it, not copied into a second owner.
+    #[test]
+    fn the_record_head_hands_over_the_buffer_it_filled() {
+        const HEAD: &[u8] =
+            b"GET /tunnel HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+        let mut wire = Vec::from(HEAD);
+        const TAIL: &[u8] = b"ping";
+        wire.extend_from_slice(TAIL);
+        let (reader, _write) =
+            accept_split(std::io::Cursor::new(wire), Vec::new(), "/tunnel").expect("upgrades");
+        assert_eq!(reader.at, HEAD.len(), "the cursor sits past the head");
+        assert_eq!(
+            reader.prefix.len(),
+            HEAD.len() + TAIL.len(),
+            "one buffer carries the upgrade and what rode behind it"
+        );
+        assert_eq!(
+            reader.prefix[reader.at..].as_ptr() as usize - reader.prefix.as_ptr() as usize,
+            reader.at,
+            "and those bytes lie inside the allocation the head read made"
+        );
     }
 
     /// The early payload rides as the request's second write part: one call, which the socket packs into one `writev` and the session coalesces into one record, and the part is the caller's own buffer.
