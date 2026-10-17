@@ -731,19 +731,18 @@ fn pump_frame(
             true
         }
         T_DATA => {
-            // The frame's own buffer becomes the queued chunk: no copy in, no copy out.
-            let payload_len = if flags & F_PADDED != 0 {
+            // The credit is the frame's wire length, taken before the in-place cut that makes the frame's own buffer the queued chunk: flow control counts the whole DATA payload, the Pad Length octet and the Padding included (RFC 7540 6.9), as the reference's take of `f.Length` does.
+            let wire_len = body.len();
+            if flags & F_PADDED != 0 {
                 let Some(&pad) = body.first() else {
                     return true;
                 };
-                cut_padded_data(&mut body, pad as usize)
-            } else {
-                body.len()
-            };
+                cut_padded_data(&mut body, pad as usize);
+            }
             let streams = conn.streams.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(state) = streams.get(&sid).cloned() else {
                 drop(streams);
-                conn.replenish(sid, payload_len);
+                conn.replenish(sid, wire_len);
                 return true;
             };
             drop(streams);
@@ -757,7 +756,7 @@ fn pump_frame(
                 }
                 state.cv.notify_all();
             }
-            conn.replenish(sid, payload_len);
+            conn.replenish(sid, wire_len);
             true
         }
         T_RST => {
@@ -1614,6 +1613,139 @@ mod tests {
             );
             at += 13;
         }
+    }
+
+    /// The last bytes the connection wrote are one credit for `sid` of `inc`: the pair of
+    /// four-octet `WINDOW_UPDATE` frames, connection-level then stream-level, both saying `inc`.
+    fn expect_one_credit(
+        written: &Arc<Mutex<Vec<u8>>>,
+        slices: &Arc<AtomicUsize>,
+        sid: u32,
+        inc: u32,
+    ) {
+        assert_eq!(
+            slices.load(Ordering::SeqCst),
+            1,
+            "one credit, one write for stream {sid}"
+        );
+        let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(bytes.len(), 26, "the credit is the pair and nothing else");
+        let mut at = 0usize;
+        for id in [0, sid] {
+            let (len, kind, flags, got) = read_head(&mut &bytes[at..at + 9]).expect("head");
+            assert_eq!(
+                (len, kind, flags, got),
+                (4, T_WINDOW, 0, id),
+                "the frame at {at} is the credit for stream {id}"
+            );
+            assert_eq!(
+                bytes[at + 9..at + 13],
+                inc.to_be_bytes(),
+                "both windows rise by the frame's wire length"
+            );
+            at += 13;
+        }
+    }
+
+    /// A DATA frame's credit is what the frame cost the peer's window — the whole wire payload, Pad Length octet and Padding counted (RFC 7540 6.9, where the reference takes `f.Length`) — so both `WINDOW_UPDATE` halves carry `1 + payload + pad`. Crediting the post-cut payload under-credits every padded frame by `1 + pad`; crediting a swallowed payload nothing starves the peer outright.
+    #[test]
+    fn a_padded_data_credit_counts_the_whole_wire_payload() {
+        let (conn, written, slices) = bare_conn();
+        let settings = XhttpSettings::stream_one();
+        let mut frag: Option<(u32, Vec<u8>)> = None;
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                ended: false,
+                dead: false,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(65_535),
+            responded: AtomicBool::new(false),
+        });
+        conn.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(1, Arc::clone(&state));
+
+        // A live stream: pad byte 2, payload 6, pad tail 2 — nine octets on the wire, six into the queue.
+        assert!(pump_frame(
+            &conn,
+            &settings,
+            [0u8; 16],
+            true,
+            T_DATA,
+            F_PADDED,
+            1,
+            vec![2u8, b'a', b'b', b'c', b'd', b'e', b'f', 2, 2],
+            &mut frag
+        ));
+        {
+            let st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+            assert_eq!(
+                st.body.front().expect("queued").as_slice(),
+                b"abcdef",
+                "the queued chunk is still the cut payload"
+            );
+        }
+        expect_one_credit(&written, &slices, 1, 9);
+
+        // A pad that swallows the payload: the cut returns nothing, the frame still cost the peer its wire length.
+        written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        slices.store(0, Ordering::SeqCst);
+        assert!(pump_frame(
+            &conn,
+            &settings,
+            [0u8; 16],
+            true,
+            T_DATA,
+            F_PADDED,
+            1,
+            vec![200u8, b'x'],
+            &mut frag
+        ));
+        expect_one_credit(&written, &slices, 1, 2);
+
+        // DATA for a stream that is not there is credited at the wire length on its way out, too.
+        written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        slices.store(0, Ordering::SeqCst);
+        assert!(pump_frame(
+            &conn,
+            &settings,
+            [0u8; 16],
+            true,
+            T_DATA,
+            F_PADDED,
+            9,
+            vec![3u8, b'p', 3, 3, 3],
+            &mut frag
+        ));
+        expect_one_credit(&written, &slices, 9, 5);
+
+        // Unpadded: the payload is the wire, and that arm does not move.
+        written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        slices.store(0, Ordering::SeqCst);
+        assert!(pump_frame(
+            &conn,
+            &settings,
+            [0u8; 16],
+            true,
+            T_DATA,
+            0,
+            1,
+            vec![7u8; 5],
+            &mut frag
+        ));
+        expect_one_credit(&written, &slices, 1, 5);
     }
 
     #[test]
