@@ -1,6 +1,7 @@
+use super::mask::Mask;
 use super::segment::DATA_SEGMENT_OVERHEAD;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub mtu: u32,
     pub tti: u32,
@@ -8,6 +9,8 @@ pub struct Config {
     pub downlink_capacity: u32,
     pub cwnd_multiplier: u32,
     pub max_sending_window: u32,
+    /// The mkcp legacy mask stacked under the framing, empty for raw KCP.
+    pub mask: Mask,
 }
 
 impl Default for Config {
@@ -19,6 +22,7 @@ impl Default for Config {
             downlink_capacity: 20,
             cwnd_multiplier: 1,
             max_sending_window: 2 * 1024 * 1024,
+            mask: Mask::default(),
         }
     }
 }

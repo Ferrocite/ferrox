@@ -1554,7 +1554,7 @@ fn serve_vless_tls_inbound(
     };
     let owned = address.to_owned();
     if let Carrier::Kcp(config) = carrier {
-        let config = *config;
+        let config = config.clone();
         let id = *id;
         let serve: KcpServe = Arc::new(move |conn: &Arc<ferrox_core::kcp::Connection>| {
             serve_vless_kcp_tls(conn, &id, freedom, &server);
@@ -1586,7 +1586,7 @@ fn serve_vless_reality_inbound(
     };
     let owned = address.to_owned();
     if let Carrier::Kcp(config) = carrier {
-        let config = *config;
+        let config = config.clone();
         let id = *id;
         let server = Arc::new(server);
         let serve: KcpServe = Arc::new(move |conn: &Arc<ferrox_core::kcp::Connection>| {
@@ -2970,7 +2970,12 @@ fn kcp_dial_session(
     };
     let endpoint = format!("{address}:{port}");
     let server = endpoint.to_socket_addrs().ok()?.next()?;
-    ferrox_core::kcp::dial(server, *config, ferrox_core::kcp::fresh_conversation()).ok()
+    ferrox_core::kcp::dial(
+        server,
+        config.clone(),
+        ferrox_core::kcp::fresh_conversation(),
+    )
+    .ok()
 }
 
 fn dial_trojan_kcp(

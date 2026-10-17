@@ -210,11 +210,12 @@ impl Connection {
         config: Config,
     ) -> Arc<Self> {
         let mss = config.payload_size();
+        let tti = config.tti;
         let ctx = Arc::new(Ctx {
             meta,
             config,
             state: AtomicI32::new(0),
-            round_trip: Mutex::new(RoundTripInfo::new(config.tti)),
+            round_trip: Mutex::new(RoundTripInfo::new(tti)),
             output: Mutex::new(OutputSink {
                 buf: Vec::new(),
                 write: writer,
@@ -232,8 +233,8 @@ impl Connection {
             rd: Mutex::new(None),
             wd: Mutex::new(None),
             mss,
-            receiving: Mutex::new(ReceivingWorker::new(config, Arc::clone(&ctx))),
-            sending: Mutex::new(SendingWorker::new(config, Arc::clone(&ctx))),
+            receiving: Mutex::new(ReceivingWorker::new(&ctx.config, Arc::clone(&ctx))),
+            sending: Mutex::new(SendingWorker::new(&ctx.config, Arc::clone(&ctx))),
             closer: Mutex::new(Some(closer)),
             terminated: AtomicBool::new(false),
         });
@@ -248,7 +249,7 @@ impl Connection {
                 let idle = if draining {
                     Duration::from_secs(1)
                 } else {
-                    Duration::from_millis(u64::from(config.tti))
+                    Duration::from_millis(u64::from(tti))
                 };
                 if conn.update.gen() == seen {
                     conn.update.wait_since(seen, Some(idle));

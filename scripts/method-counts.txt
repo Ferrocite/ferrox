@@ -287,6 +287,11 @@ kcp ack-number-list-reallocations-per-flush 0 ferrox-core-kcp::window::tests::th
 kcp segment-header-staging-copies-per-segment 0 ferrox-core-kcp::segment::tests::a_borrowed_payload_serialises_identically_to_an_owned_one
 kcp segment-list-vectors-per-datagram 1 ferrox-core-kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next
 kcp reader-wakeups-per-datagram 1 ferrox-core-kcp::connection::tests::a_datagram_wakes_the_reader_once_however_many_segments_it_carries
+kcp mask-families-implemented 8 ferrox-core-kcp::listener::tests::every_mask_family_echoes_over_loopback
+kcp mask-chain-wire-overhead-bytes 32 ferrox-core-kcp::listener::tests::the_wire_under_a_masked_session_carries_the_mask
+kcp mask-read-side-payload-copies-per-datagram 0 ferrox-core-kcp::mask::tests::the_original_frame_round_trips_and_the_checks_fire
+kcp mask-encode-buffer-allocations-per-frame 0 ferrox-core-kcp::mask::tests::the_scratch_holds_its_capacity_across_frames
+kcp oracle-mask-lines-against-the-pinned-go 86 ferrox-core-kcp::oracle::the_scripted_core_matches_the_pinned_go
 trojan header-reads-numeric-address 2 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven
 trojan header-reads-domain-address 3 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven
 trojan header-bytes-copied-out-of-the-buffer 0 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven

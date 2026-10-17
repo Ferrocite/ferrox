@@ -414,6 +414,7 @@ pub(crate) fn kcp_config(settings: Option<&Json>) -> ferrox_core::kcp::Config {
         cwnd_multiplier: num("cwndMultiplier", "cwnd_multiplier").unwrap_or(base.cwnd_multiplier),
         max_sending_window: num("maxSendingWindow", "max_sending_window")
             .unwrap_or(base.max_sending_window),
+        mask: base.mask,
     }
 }
 
@@ -593,8 +594,80 @@ fn resolve_quic(_: Option<&Json>, _: &str) -> Carrier {
     Carrier::Quic
 }
 
-fn resolve_kcp(settings: Option<&Json>, _: &str) -> Carrier {
-    Carrier::Kcp(kcp_config(settings))
+fn resolve_kcp(settings: Option<&Json>, network: &str) -> Carrier {
+    let Some(mask) = kcp_mask(settings) else {
+        return Carrier::Unknown {
+            network: network.to_owned(),
+        };
+    };
+    let mut config = kcp_config(settings);
+    config.mask = mask;
+    Carrier::Kcp(config)
+}
+
+/// The `finalmask.udp` `mkcp-legacy` chain for a KCP carrier, already in
+/// wire order (outermost first): the reference reverses the JSON list once
+/// when it builds its mask manager, so the last configured entry is the
+/// outermost on the wire. `Some(default)` means no finalmask at all; `None`
+/// refuses the carrier — an unknown udp mask type, a bad header name or an
+/// unpackable dns domain must never silently dial unmasked.
+fn kcp_mask(settings: Option<&Json>) -> Option<ferrox_core::kcp::Mask> {
+    use ferrox_core::kcp::{HeaderKind, Mask, Spec};
+    let Some(udp) = settings
+        .and_then(|s| s.get("finalmask"))
+        .and_then(|f| f.get("udp"))
+        .and_then(Json::as_arr)
+    else {
+        return Some(Mask::default());
+    };
+    let mut specs = Vec::with_capacity(udp.len());
+    for entry in udp {
+        if entry
+            .get("type")
+            .and_then(Json::as_str)
+            .map(str::to_lowercase)
+            != Some("mkcp-legacy".to_owned())
+        {
+            return None;
+        }
+        let conf = entry.get("settings");
+        let header = conf
+            .and_then(|c| c.get("header"))
+            .and_then(Json::as_str)
+            .unwrap_or("");
+        let value = conf
+            .and_then(|c| c.get("value"))
+            .and_then(Json::as_str)
+            .unwrap_or("");
+        specs.push(if header.is_empty() {
+            if value.is_empty() {
+                Spec::Original
+            } else {
+                Spec::Aes {
+                    password: value.to_owned(),
+                }
+            }
+        } else {
+            match header.to_lowercase().as_str() {
+                "dns" => Spec::HeaderDns {
+                    domain: (if value.is_empty() {
+                        "www.baidu.com"
+                    } else {
+                        value
+                    })
+                    .to_owned(),
+                },
+                "dtls" => Spec::Header(HeaderKind::Dtls),
+                "srtp" => Spec::Header(HeaderKind::Srtp),
+                "utp" => Spec::Header(HeaderKind::Utp),
+                "wechat" => Spec::Header(HeaderKind::Wechat),
+                "wireguard" => Spec::Header(HeaderKind::WireGuard),
+                _ => return None,
+            }
+        });
+    }
+    specs.reverse();
+    Mask::from_spec(&specs).ok()
 }
 
 fn resolve_hysteria(settings: Option<&Json>, network: &str) -> Carrier {
