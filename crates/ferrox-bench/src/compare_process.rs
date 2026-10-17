@@ -1205,8 +1205,8 @@ fn check_samples(root: &Json, cpu_millis: f64) -> Result<(), Error> {
     Ok(())
 }
 
-/// The split is the same cpu counted twice, so it has to add up to it: `/proc` and
-/// `GetProcessTimes` both report the pair, and a `ps` line reports neither.
+/// The split is the same cpu counted twice, and every source that reports it rounds once per half,
+/// so the pair has to add up to the whole exactly; a `ps` line reports neither and is no split.
 fn check_split(root: &Json, cpu_millis: f64) -> Result<(), Error> {
     let user = root.get("cpu_user_millis").and_then(Json::as_num);
     let sys = root.get("cpu_sys_millis").and_then(Json::as_num);
@@ -1214,7 +1214,7 @@ fn check_split(root: &Json, cpu_millis: f64) -> Result<(), Error> {
         (None, None) => Ok(()),
         (Some(user), Some(sys)) => {
             let whole = user + sys;
-            if (whole - cpu_millis).abs() > 1.0 {
+            if whole != cpu_millis {
                 return Err(Error::Invalid(format!(
                     "cpu_user_millis {user} + cpu_sys_millis {sys} = {whole}, which is not \
                      the {cpu_millis} ms of cpu the run reports"
@@ -1374,6 +1374,10 @@ mod tests {
         root.insert("cpu_user_millis", Json::Num(600.0));
         root.insert("cpu_sys_millis", Json::Num(400.0));
         assert!(check_split(&root, 1000.0).is_ok());
+        assert!(
+            check_split(&root, 1001.0).is_err(),
+            "one millisecond apart is two endpoints' roundings disagreeing, which no source may offer"
+        );
         assert!(
             check_split(&root, 1200.0).is_err(),
             "a pair that is not the whole cpu is not a split of it"

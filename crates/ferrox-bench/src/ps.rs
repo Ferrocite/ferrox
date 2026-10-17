@@ -427,16 +427,14 @@ mod win32 {
             return Err(failed("GetProcessMemoryInfo"));
         }
 
+        let (user_millis, sys_millis, cpu_millis) =
+            super::cpu_split_from_ticks(filetime_ticks(user), filetime_ticks(kernel));
         Ok(Sample {
             elapsed_ms,
             rss_kib: (counters.PeakWorkingSetSize / 1024) as u64,
-            cpu_millis: super::cpu_millis_from_ticks(
-                filetime_ticks(exit),
-                filetime_ticks(kernel) + filetime_ticks(user),
-            ),
-            // A live process has no exit time, so the pair is the whole of `cpu_millis`.
-            user_millis: Some(super::ticks_to_millis(filetime_ticks(user))),
-            sys_millis: Some(super::ticks_to_millis(filetime_ticks(kernel))),
+            cpu_millis,
+            user_millis: Some(user_millis),
+            sys_millis: Some(sys_millis),
             threads: thread_count(pid).ok(),
             io: None,
         })
@@ -499,9 +497,11 @@ pub fn ticks_to_millis(ticks: u64) -> u64 {
     (ticks / 10_000) + u64::from((ticks % 10_000) >= 5_000)
 }
 
+/// Each half rounded from its own ticks and the total their sum: rounding the pair together gives a total the halves do not add up to.
 #[cfg(any(target_os = "windows", test))]
-pub fn cpu_millis_from_ticks(exit: u64, cpu: u64) -> u64 {
-    ticks_to_millis(cpu.saturating_sub(exit))
+pub fn cpu_split_from_ticks(user: u64, kernel: u64) -> (u64, u64, u64) {
+    let (user, sys) = (ticks_to_millis(user), ticks_to_millis(kernel));
+    (user, sys, user + sys)
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -534,10 +534,25 @@ mod tests {
     }
 
     #[test]
-    fn cpu_excludes_what_the_process_had_already_spent() {
-        assert_eq!(cpu_millis_from_ticks(0, 100_000_000), 10_000);
-        assert_eq!(cpu_millis_from_ticks(10_000_000, 100_000_000), 9_000);
-        assert_eq!(cpu_millis_from_ticks(20_000_000, 10_000_000), 0);
+    fn a_samples_whole_is_the_sum_of_its_halves_not_of_their_ticks() {
+        assert_eq!(cpu_split_from_ticks(100_000_000, 0), (10_000, 0, 10_000));
+        assert_eq!(
+            cpu_split_from_ticks(5_000, 5_000),
+            (1, 1, 2),
+            "the pair of ticks rounds to one millisecond while each half rounds to its own"
+        );
+        let first = cpu_split_from_ticks(4_999, 4_999);
+        let last = cpu_split_from_ticks(5_000, 5_000);
+        assert_eq!(
+            (last.0 - first.0) + (last.1 - first.1),
+            last.2 - first.2,
+            "endpoints that round apart in opposite directions still add up to their delta"
+        );
+        assert_eq!(
+            ticks_to_millis(5_000 + 5_000) - ticks_to_millis(4_999 + 4_999),
+            0,
+            "the same endpoints read 0 ms when the pair is rounded, 2 ms apart from its halves"
+        );
     }
 
     #[test]
@@ -1092,11 +1107,11 @@ mod tests {
         assert_eq!(ps_only.sys_millis, None);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_live_sample_reports_the_source_it_used() {
         let pid = std::process::id();
-        let s = sample(Host::current(), pid, 0).expect("this process is sampleable");
+        let host = Host::current();
+        let s = sample(host, pid, 0).expect("this process is sampleable");
         let floor = resolution_millis();
         assert_eq!(CpuSource::current().resolution_millis(), floor);
         assert!(floor > 0, "a published resolution of zero resolves nothing");
@@ -1142,6 +1157,38 @@ mod tests {
                     s.threads.is_some(),
                     "ToolHelp counts this process's threads"
                 );
+                // `check_split` reads a run's delta, so a sample that adds up on its own is no gate: spin until
+                // the process spends a quantum and hold the identity over every step between the two endpoints.
+                let mut previous = s;
+                let mut spent = false;
+                for _ in 0..512 {
+                    std::hint::black_box((0..50_000u64).fold(0, |sum, i| sum.wrapping_add(i)));
+                    let next = sample(host, pid, 0).expect("this process stays sampleable");
+                    let (Some(user), Some(sys)) = (next.user_millis, next.sys_millis) else {
+                        panic!("GetProcessTimes reports both halves of every sample: {next:?}");
+                    };
+                    assert_eq!(
+                        user + sys,
+                        next.cpu_millis,
+                        "GetProcessTimes reported a whole its own halves do not add up to"
+                    );
+                    let (Some(was_user), Some(was_sys)) =
+                        (previous.user_millis, previous.sys_millis)
+                    else {
+                        panic!("GetProcessTimes reports both halves of every sample: {previous:?}");
+                    };
+                    assert_eq!(
+                        (user - was_user) + (sys - was_sys),
+                        next.cpu_millis - previous.cpu_millis,
+                        "the split's delta is not the delta of the whole it splits"
+                    );
+                    spent |= next.cpu_millis > previous.cpu_millis;
+                    previous = next;
+                    if spent {
+                        break;
+                    }
+                }
+                assert!(spent, "the loop spent no cpu, so its deltas gated nothing");
             }
             #[cfg(not(target_os = "windows"))]
             Host::Windows => assert_eq!(floor, CpuSource::GetProcessTimes.resolution_millis()),
