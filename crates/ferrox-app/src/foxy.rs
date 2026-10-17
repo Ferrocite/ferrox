@@ -3104,6 +3104,213 @@ mod loopback {
         edge.join().expect("the edge finishes");
     }
 
+    /// The lane is the flow's shared resource: the leg that hands bytes to the client has to give the lane back before it waits on the socket, or a client that has stopped reading costs its own upload the road it came in on.
+    #[test]
+    fn a_client_that_has_stopped_reading_does_not_cost_the_flow_its_lane() {
+        const CHUNK: usize = 16 * 1024;
+        const PARK: Duration = Duration::from_secs(10);
+        const WAKE: Duration = Duration::from_millis(300);
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        // The edge answers, then pushes a download past what a client that never reads can queue: 4 MiB, several times the loopback queue a parked leg leaves behind.
+        let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
+            // Past the 300 ms the test polls at, so the edge is still parked on its push while the lane is asked for its lock.
+            stream
+                .set_write_timeout(Some(Duration::from_millis(800)))
+                .expect("write times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) {
+                return;
+            }
+            let mut ack = Vec::new();
+            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut ack);
+            tls.write_all(&ack).ok();
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                if matches!(
+                    frames::h2_event(frame, &payload, 1),
+                    frames::H2Event::Headers { .. }
+                ) {
+                    break;
+                }
+            }
+            let mut status = Vec::new();
+            h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut status);
+            tls.write_all(&status).expect("answers 200");
+            let body = vec![0xA5u8; CHUNK];
+            for _ in 0..256 {
+                if close_rx.try_recv().is_ok() {
+                    return;
+                }
+                let mut out = Vec::new();
+                h2_frame(frames::DATA, 0, 1, &body, &mut out);
+                if tls.write_all(&out).is_err() {
+                    return;
+                }
+            }
+            let _ = close_rx.recv();
+        });
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        tunnel
+            .set_read_quantum(Duration::from_millis(5))
+            .expect("bounds one read");
+        let lane = Arc::new(std::sync::Mutex::new(tunnel));
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        // The browser asks for the flow and then never reads a byte, which is the whole of a stalled download from the relay's side.
+        let browser = Connection::connect(front.local_addr().expect("addr")).expect("connects");
+        let (client, _) = front.accept().expect("accepts");
+        let (ended_tx, ended_rx) = std::sync::mpsc::channel::<()>();
+        let flow_lane = Arc::clone(&lane);
+        std::thread::spawn(move || {
+            crate::proxy::relay_tunnel(&client, &flow_lane);
+            let _ = ended_tx.send(());
+        });
+        // The leg has to be parked on the client's socket before the lane is asked for, or the test measures a flow that never waited.
+        std::thread::sleep(Duration::from_millis(200));
+        let started = Instant::now();
+        let handed_back = loop {
+            if lane.try_lock().is_ok() {
+                break true;
+            }
+            if started.elapsed() >= WAKE {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            handed_back,
+            "the leg parked writing a client that never reads is still holding the lane"
+        );
+        drop(browser);
+        close_tx.send(()).ok();
+        ended_rx
+            .recv_timeout(PARK)
+            .expect("the flow ends with its client");
+        edge.join().expect("the edge finishes");
+    }
+
+    /// A lane whose peer is gone never says so to a writer that has no credit left: the window check answers before the socket is touched, so a leg parked on a stalled upload ends only when the other direction reports it is done.
+    #[test]
+    fn a_lane_that_dies_while_the_upload_is_parked_ends_the_flow() {
+        const CHUNK: usize = 16 * 1024;
+        const PARK: Duration = Duration::from_secs(10);
+        const WAKE: Duration = Duration::from_millis(500);
+        // One chunk past the lane's whole credit, so the last read is the one that cannot go through.
+        const UPLOAD: usize = frames::WINDOW as usize + CHUNK;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<usize>();
+        // The edge reads the whole credit, grants none of it back, and hangs up once it has had every byte the lane is allowed to send.
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) {
+                return;
+            }
+            let mut ack = Vec::new();
+            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut ack);
+            tls.write_all(&ack).ok();
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                if matches!(
+                    frames::h2_event(frame, &payload, 1),
+                    frames::H2Event::Headers { .. }
+                ) {
+                    break;
+                }
+            }
+            let mut status = Vec::new();
+            h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut status);
+            tls.write_all(&status).expect("answers 200");
+            // The edge reads the whole credit and grants none of it back, then hangs up on the lane that still has a chunk to send.
+            let mut credit = 0usize;
+            while credit < frames::WINDOW as usize {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                if frame.kind == frames::DATA {
+                    credit += payload.len();
+                    let _ = seen_tx.send(payload.len());
+                }
+            }
+        });
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        tunnel
+            .set_read_quantum(Duration::from_millis(5))
+            .expect("bounds one read");
+        let lane = Arc::new(std::sync::Mutex::new(tunnel));
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        // The upload leaves the client's socket before the lane stops taking it, so the leg's only wait is the lane.
+        let browser = std::thread::spawn(move || {
+            let mut socket = Connection::connect(addr).expect("connects");
+            let body = vec![0x5Au8; CHUNK];
+            for _ in 0..UPLOAD / CHUNK {
+                if socket.write_all(&body).is_err() {
+                    return;
+                }
+            }
+        });
+        let (client, _) = front.accept().expect("accepts");
+        let (ended_tx, ended_rx) = std::sync::mpsc::channel::<()>();
+        let flow_lane = Arc::clone(&lane);
+        std::thread::spawn(move || {
+            crate::proxy::relay_tunnel(&client, &flow_lane);
+            let _ = ended_tx.send(());
+        });
+        let mut credit = 0usize;
+        while credit < frames::WINDOW as usize {
+            credit += seen_rx
+                .recv_timeout(PARK)
+                .expect("the edge keeps reading what the lane sends");
+        }
+        ended_rx
+            .recv_timeout(WAKE)
+            .expect("the upload parked on a dead lane is still holding its workers");
+        browser.join().expect("the browser finishes");
+        edge.join().expect("the edge finishes");
+    }
+
     /// A byte-level test cannot see a copy, so capacity is the witness: `out` is the write buffer and `carry` the read one, and a lane that stages a payload before handing it over has grown the buffer it staged in.
     #[test]
     fn a_relayed_byte_is_copied_once_on_its_way_through_the_lane() {
