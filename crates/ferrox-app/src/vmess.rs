@@ -1,9 +1,10 @@
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{Shutdown, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use crate::conn::Connection;
 use crate::proxy::{read_exact, under_handshake};
 
 const AUTH_LEN: usize = 16;
@@ -1022,7 +1023,7 @@ pub(crate) fn client_request(
 }
 
 pub(crate) fn client_handshake(
-    uplink: &mut TcpStream,
+    uplink: &mut Connection,
     id: &[u8; 16],
     cipher: Cipher,
     target: &crate::proxy::Destination,
@@ -1187,7 +1188,7 @@ impl std::io::Write for WsSink {
 }
 
 pub(crate) fn pump_relay_carried<R, W>(
-    plain: &TcpStream,
+    plain: &Connection,
     reader: R,
     mut writer: W,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
@@ -1283,7 +1284,7 @@ pub(crate) fn pump_relay_carried<R, W>(
     let _ = done.join();
 }
 
-pub(crate) fn serve_ws(stream: TcpStream, path: &str, id: &[u8; 16], freedom: bool) {
+pub(crate) fn serve_ws(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
     let Some((mut reader, writer)) = crate::ws::accept(stream, path) else {
         return;
     };
@@ -1293,7 +1294,7 @@ pub(crate) fn serve_ws(stream: TcpStream, path: &str, id: &[u8; 16], freedom: bo
     if !freedom || cmd != 1 {
         return;
     }
-    let Ok(uplink) = TcpStream::connect_timeout(&target, Duration::from_secs(8)) else {
+    let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
     if !writer.send(&prefix) {
@@ -1312,7 +1313,7 @@ pub(crate) fn serve_ws(stream: TcpStream, path: &str, id: &[u8; 16], freedom: bo
     );
 }
 
-pub(crate) fn serve_grpc(stream: TcpStream, path: &str, id: &[u8; 16], freedom: bool) {
+pub(crate) fn serve_grpc(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
     let Some((mut reader, writer)) = crate::grpc::accept(stream, path) else {
         return;
     };
@@ -1324,7 +1325,7 @@ pub(crate) fn serve_grpc(stream: TcpStream, path: &str, id: &[u8; 16], freedom: 
     if !freedom || cmd != 1 {
         return;
     }
-    let Ok(uplink) = TcpStream::connect_timeout(&target, Duration::from_secs(8)) else {
+    let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
     if !writer.send(&prefix) {
@@ -1335,7 +1336,7 @@ pub(crate) fn serve_grpc(stream: TcpStream, path: &str, id: &[u8; 16], freedom: 
     pump_relay_carried(&uplink, reader, writer, &close, send, recv, None);
 }
 
-pub(crate) fn serve_xhttp(stream: TcpStream, path: &str, id: &[u8; 16], freedom: bool) {
+pub(crate) fn serve_xhttp(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
     let Some((mut reader, writer)) = crate::xhttp::accept(stream, path) else {
         return;
     };
@@ -1345,7 +1346,7 @@ pub(crate) fn serve_xhttp(stream: TcpStream, path: &str, id: &[u8; 16], freedom:
     if !freedom || cmd != 1 {
         return;
     }
-    let Ok(uplink) = TcpStream::connect_timeout(&target, Duration::from_secs(8)) else {
+    let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
     if !writer.send(&prefix) {
@@ -1357,7 +1358,7 @@ pub(crate) fn serve_xhttp(stream: TcpStream, path: &str, id: &[u8; 16], freedom:
     pump_relay_carried(&uplink, reader, writer, &close, send, recv, None);
 }
 
-pub(crate) fn serve_httpheader(stream: TcpStream, path: &str, id: &[u8; 16], freedom: bool) {
+pub(crate) fn serve_httpheader(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
     let Some((mut reader, write)) = crate::httpheader::accept(stream, path) else {
         return;
     };
@@ -1367,7 +1368,7 @@ pub(crate) fn serve_httpheader(stream: TcpStream, path: &str, id: &[u8; 16], fre
     if !freedom || cmd != 1 {
         return;
     }
-    let Ok(uplink) = TcpStream::connect_timeout(&target, Duration::from_secs(8)) else {
+    let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
     let Ok(down) = write.try_clone() else {
@@ -1386,7 +1387,7 @@ pub(crate) fn serve_httpheader(stream: TcpStream, path: &str, id: &[u8; 16], fre
     pump_relay_carried(&uplink, reader, write, &close, send, recv, None);
 }
 
-pub(crate) fn serve_httpupgrade(stream: TcpStream, path: &str, id: &[u8; 16], freedom: bool) {
+pub(crate) fn serve_httpupgrade(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
     let Some((mut reader, write)) = crate::httpupgrade::accept(stream, path) else {
         return;
     };
@@ -1396,7 +1397,7 @@ pub(crate) fn serve_httpupgrade(stream: TcpStream, path: &str, id: &[u8; 16], fr
     if !freedom || cmd != 1 {
         return;
     }
-    let Ok(uplink) = TcpStream::connect_timeout(&target, Duration::from_secs(8)) else {
+    let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
     let Ok(down) = write.try_clone() else {
@@ -1431,7 +1432,7 @@ pub(crate) fn serve_kcp<R, W>(
     if !freedom || cmd != 1 {
         return;
     }
-    let Ok(uplink) = TcpStream::connect_timeout(&target, Duration::from_secs(8)) else {
+    let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
     if writer.write_all(&prefix).is_err() {
@@ -1440,7 +1441,7 @@ pub(crate) fn serve_kcp<R, W>(
     pump_relay_carried(&uplink, reader, writer, close, send, recv, None);
 }
 
-pub(crate) fn serve(mut stream: TcpStream, id: &[u8; 16], freedom: bool) {
+pub(crate) fn serve(mut stream: Connection, id: &[u8; 16], freedom: bool) {
     // Bound the opening request read like the raw VLESS handshake, then restore the relay's blocking reads.
     let budget = crate::budgets::handshake();
     let _ = stream.set_read_timeout(Some(budget));
@@ -1464,7 +1465,7 @@ pub(crate) fn serve(mut stream: TcpStream, id: &[u8; 16], freedom: bool) {
     if cmd != 1 {
         return;
     }
-    let Ok(uplink) = TcpStream::connect_timeout(&target, Duration::from_secs(8)) else {
+    let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
     if stream.write_all(&prefix).is_err() {
@@ -1474,7 +1475,7 @@ pub(crate) fn serve(mut stream: TcpStream, id: &[u8; 16], freedom: bool) {
 }
 
 pub(crate) fn serve_vmess_udp(
-    stream: TcpStream,
+    stream: Connection,
     target: &SocketAddr,
     send: Flow,
     recv: Flow,
@@ -1501,8 +1502,8 @@ pub(crate) fn serve_vmess_udp(
 pub(crate) type PendingResponse = ([u8; 16], [u8; 16], u8);
 
 pub(crate) fn pump_relay(
-    plain: &TcpStream,
-    sealed: &TcpStream,
+    plain: &Connection,
+    sealed: &Connection,
     send: Flow,
     recv: Flow,
     pending: Option<PendingResponse>,
@@ -1581,7 +1582,6 @@ pub(crate) fn pump_relay(
 mod tests {
     use super::*;
     use std::io::Cursor;
-    use std::net::TcpListener;
 
     #[test]
     fn a_frame_coalesced_behind_its_header_still_arrives() {
@@ -1657,7 +1657,7 @@ mod tests {
         let options = OPT_STREAM | OPT_MASK | OPT_PAD;
         let mut send = Flow::fresh(cipher, &key, &iv, options, &iv).expect("sends");
         let mut recv = Flow::fresh(cipher, &key, &iv, options, &iv).expect("recvs");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let writer = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accepts");
@@ -1665,7 +1665,7 @@ mod tests {
             let chunk = read_frame(&mut stream, &mut recv, &mut scratch).expect("reads");
             chunk.to_vec()
         });
-        let mut reader = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut reader = Connection::connect(("127.0.0.1", port)).expect("connects");
         let mut staging = Vec::new();
         let mut pad = PadSource::fresh().expect("entropy");
         assert!(write_frame(
@@ -1687,7 +1687,7 @@ mod tests {
             ..Default::default()
         });
         let id = [0x11u8; 16];
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
@@ -1695,7 +1695,7 @@ mod tests {
             serve(stream, &id, true);
             let _ = done_tx.send(());
         });
-        let _peer = TcpStream::connect(addr).expect("connects");
+        let _peer = Connection::connect(addr).expect("connects");
         let returned = done_rx.recv_timeout(crate::budgets::handshake() + Duration::from_secs(5));
         crate::budgets::clear();
         returned.expect("the bounded request read returns instead of pinning the thread");
@@ -1704,7 +1704,7 @@ mod tests {
 
     #[test]
     fn vmess_carries_over_the_ws_carrier_both_ways() {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds echo");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds echo");
         let echo_port = echo.local_addr().expect("echo addr").port();
         thread::spawn(move || {
             for stream in echo.incoming().take(1) {
@@ -1718,7 +1718,7 @@ mod tests {
 
         let id = [0x5au8; 16];
         let path = "/vmess-ws";
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server_id = id;
         let server_path = path.to_string();
@@ -1728,7 +1728,7 @@ mod tests {
         });
 
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("target");
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, writer) =
             crate::ws::connect(stream, &format!("127.0.0.1:{port}"), path, 0, &[])
                 .expect("carries");
@@ -1778,10 +1778,10 @@ mod tests {
 
     fn vmess_over_byte_carrier(
         path: &str,
-        serve: impl FnOnce(TcpStream, [u8; 16]) + Send + 'static,
-        connect: impl FnOnce(TcpStream) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)>,
+        serve: impl FnOnce(Connection, [u8; 16]) + Send + 'static,
+        connect: impl FnOnce(Connection) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)>,
     ) {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds echo");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds echo");
         let echo_port = echo.local_addr().expect("echo addr").port();
         thread::spawn(move || {
             for stream in echo.incoming().take(1) {
@@ -1794,7 +1794,7 @@ mod tests {
         });
 
         let id = [0x5au8; 16];
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -1802,7 +1802,7 @@ mod tests {
         });
 
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("target");
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, mut writer) = connect(stream).expect("carries");
 
         let (request, data_key, data_iv, auth) = request_bytes(
@@ -1884,7 +1884,7 @@ mod tests {
             ..Default::default()
         });
         let id = [0x5bu8; 16];
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
@@ -1892,7 +1892,7 @@ mod tests {
             serve_grpc(stream, "/p", &id, true);
             let _ = done_tx.send(());
         });
-        let stream = TcpStream::connect(addr).expect("connects");
+        let stream = Connection::connect(addr).expect("connects");
         let (_reader, _writer) = crate::grpc::connect(stream, "127.0.0.1", "/p").expect("dials");
         let returned = done_rx.recv_timeout(crate::budgets::handshake() + Duration::from_secs(5));
         crate::budgets::clear();
@@ -1902,7 +1902,7 @@ mod tests {
 
     #[test]
     fn vmess_carries_over_the_grpc_tunnel_both_ways() {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds echo");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds echo");
         let echo_port = echo.local_addr().expect("echo addr").port();
         thread::spawn(move || {
             for stream in echo.incoming().take(1) {
@@ -1915,14 +1915,14 @@ mod tests {
         });
         let id = [0x5au8; 16];
         let path = "/TunnelService/Tun";
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_grpc(stream, path, &id, true);
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("target");
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, mut writer) =
             crate::grpc::connect(stream, "127.0.0.1", path).expect("carries");
         let (request, data_key, data_iv, auth) = request_bytes(
@@ -2162,7 +2162,7 @@ mod tests {
             })
             .collect();
 
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let reader = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accepts");
@@ -2187,7 +2187,7 @@ mod tests {
             got
         });
 
-        let mut uplink = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut uplink = Connection::connect(("127.0.0.1", port)).expect("connects");
         let mut staging = Vec::with_capacity(MAX_PLAIN + TAG_LEN + 2 + 64);
         let mut pad = PadSource::fresh().expect("entropy");
         let addr = staging.as_ptr() as usize;
@@ -2271,7 +2271,7 @@ mod tests {
     fn handshake_relay_round_trips() {
         use std::io::{Read as _, Write as _};
         let id = [0xabu8; 16];
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -2288,14 +2288,14 @@ mod tests {
                 }
             }
         });
-        let server = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = server.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = server.accept().expect("accepts");
             super::serve(stream, &id, true);
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
-        let mut uplink = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut uplink = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut send, mut recv, response_key, response_iv, auth) = super::client_handshake(
             &mut uplink,
             &id,
@@ -2425,7 +2425,7 @@ mod tests {
                 .iter()
                 .map(|&len| (0..len).map(|i| (i % 251) as u8).collect())
                 .collect();
-            let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+            let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
             let port = listener.local_addr().expect("addr").port();
             let writer = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().expect("accepts");
@@ -2440,7 +2440,7 @@ mod tests {
                 }
                 all
             });
-            let mut uplink = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut uplink = Connection::connect(("127.0.0.1", port)).expect("connects");
             let mut send =
                 Flow::fresh(cipher, &[0x55u8; 16], &[0x66u8; 16], options, &[0x66u8; 16])
                     .expect("sends");
@@ -2769,7 +2769,7 @@ mod tests {
     #[test]
     fn garbage_short_and_wrong_user_close_fast() {
         let id = [0xabu8; 16];
-        let server = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = server.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in server.incoming().take(3) {
@@ -2793,7 +2793,7 @@ mod tests {
                 .0[..20]
                 .to_vec(),
         ] {
-            let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
             stream.write_all(&body).expect("writes");
             let _ = stream.shutdown(std::net::Shutdown::Write);
             let mut back = [0u8; 1];

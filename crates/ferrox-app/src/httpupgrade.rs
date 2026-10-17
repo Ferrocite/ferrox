@@ -1,5 +1,5 @@
+use crate::conn::Connection;
 use std::io::{Read, Write};
-use std::net::TcpStream;
 
 pub(crate) const HEAD_LIMIT: usize = 64 * 1024;
 
@@ -8,13 +8,13 @@ pub(crate) const SWITCH: &[u8] =
     b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
 
 #[derive(Debug)]
-pub(crate) struct UpReader<R: Read = TcpStream> {
+pub(crate) struct UpReader<R: Read = Connection> {
     read: R,
     prefix: Vec<u8>,
     at: usize,
 }
 
-impl UpReader<TcpStream> {
+impl UpReader<Connection> {
     /// Arm or clear the poll quantum on the handle this reader reads through; a duplicated socket inherits no read timeout on Windows.
     pub(crate) fn set_poll(&mut self, every: Option<std::time::Duration>) {
         let _ = self.read.set_read_timeout(every);
@@ -40,7 +40,7 @@ impl<R: Read> Read for UpReader<R> {
 }
 
 /// Hand the peer its answer whole: a socket closed with received bytes unread is answered with an RST, and that RST discards the `101` this side already wrote. The drain is bounded, so a peer that keeps talking cannot postpone the close.
-pub(crate) fn quiet(stream: &TcpStream) {
+pub(crate) fn quiet(stream: &Connection) {
     let mut stream = stream;
     let previous = stream.read_timeout().ok().flatten();
     if stream
@@ -61,11 +61,11 @@ pub(crate) fn quiet(stream: &TcpStream) {
 }
 
 /// The head, the octets that arrived with it, and where the head ends: this read consumes what it proves, so a payload pipelined behind the request is already in hand.
-fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, usize)> {
+fn read_head(stream: &mut Connection) -> Option<(Vec<u8>, usize)> {
     crate::proxy::read_http_head_kept(stream, HEAD_LIMIT, crate::budgets::head_arrival())
 }
 
-pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(UpReader, TcpStream)> {
+pub(crate) fn accept(stream: Connection, path: &str) -> Option<(UpReader, Connection)> {
     let mut read = stream;
     let (head, at) = read_head(&mut read)?;
     check_request(&head[..at], path)?;
@@ -175,12 +175,12 @@ fn send_request<W: crate::proxy::FrameWrite>(
 }
 
 pub(crate) fn connect(
-    stream: TcpStream,
+    stream: Connection,
     host: &str,
     path: &str,
     budget: u32,
     first: &[u8],
-) -> Option<(UpReader, TcpStream)> {
+) -> Option<(UpReader, Connection)> {
     let mut read = stream;
     let early = rides(budget, first);
     send_request(&mut read, &upgrade_request(host, path), early, first)?;
@@ -264,13 +264,12 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
     use std::thread;
     use std::time::Duration;
 
     #[test]
     fn upgrade_carries_an_echo_over_loopback() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -281,7 +280,7 @@ mod tests {
             let mut write = write;
             write.write_all(b"pong").expect("writes");
         });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, mut write) =
             connect(stream, "oracle.example", "/tunnel", 0, &[]).expect("upgrades");
         write.write_all(b"ping").expect("writes");
@@ -392,7 +391,7 @@ mod tests {
             "the filler must put the delimiter past one round, not two: {}",
             request.len()
         );
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -401,7 +400,7 @@ mod tests {
             reader.read_exact(&mut payload).expect("reads the payload");
             assert_eq!(&payload, b"01234567");
         });
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         // Split at the round's edge so the delimiter itself straddles, then ride the payload behind it.
         stream
             .write_all(&request.as_bytes()[..510])
@@ -535,7 +534,7 @@ mod tests {
     /// A payload that fits the budget rides with the GET, so the server has it before the reader is even built and the caller sends nothing after.
     #[test]
     fn early_data_rides_ahead_of_the_switch() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -545,7 +544,7 @@ mod tests {
             assert_eq!(&buf, b"ping");
             write.write_all(b"pong").expect("writes");
         });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, _write) =
             connect(stream, "oracle.example", "/tunnel", 4, b"ping").expect("upgrades");
         let mut buf = [0u8; 4];
@@ -558,7 +557,7 @@ mod tests {
     #[test]
     fn an_over_budget_payload_rides_ahead_of_a_lazy_answer() {
         let request = upgrade_request("oracle.example", "/tunnel");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accepts");
@@ -572,7 +571,7 @@ mod tests {
             assert_eq!(&payload, b"ping");
             stream.write_all(SWITCH).expect("answers");
         });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         // `budget` is one short of the payload, so the old length rule held it back; the flag rides it.
         let (_reader, _write) =
             connect(stream, "oracle.example", "/tunnel", 3, b"ping").expect("rides ahead");
@@ -731,7 +730,7 @@ mod tests {
 
     #[test]
     fn a_configured_budget_serves_the_bare_path() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -743,7 +742,7 @@ mod tests {
             assert_eq!(&early, b"first", "the bare path carried the early data");
             drop(write);
         });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let configured = ferrox_core::transport::EarlyData::split("/interop-upgrade?ed=2048");
         let (_reader, _write) = connect(
             stream,
@@ -759,7 +758,7 @@ mod tests {
     /// The close after a `101` has to be a FIN: witnessed on macOS, an undrained teardown leaves the client's early data unread and the stack answers with a reset that discards the answer, so the drained half ends in EOF and the reset half in `ConnectionReset`.
     #[test]
     fn a_drained_teardown_ends_the_upgrade_with_a_fin() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -767,7 +766,7 @@ mod tests {
             quiet(&write);
             drop(write);
         });
-        let mut client = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("timeout");
@@ -787,13 +786,13 @@ mod tests {
 
     #[test]
     fn upgrade_rejects_a_wrong_path_and_headers() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             assert!(accept(stream, "/tunnel").is_none());
         });
-        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
             .write_all(b"GET /other HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
             .expect("writes");

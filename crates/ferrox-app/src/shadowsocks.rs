@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{IoSliceMut, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{Shutdown, SocketAddr, ToSocketAddrs, UdpSocket};
 use std::thread;
 use std::time::Duration;
 
@@ -9,6 +9,7 @@ use ferrox_core::shadowsocks::{
 };
 
 use crate::budgets::RELAY_POLL;
+use crate::conn::Connection;
 use crate::proxy::{read_exact, under_handshake, write_all_runs, Destination, UDP_BUF};
 
 const SALT_LEN: usize = 32;
@@ -28,7 +29,7 @@ pub(crate) enum Uplink {
     Stream(Rc4),
 }
 
-pub(crate) fn serve(mut stream: TcpStream, password: &str, method: &str, freedom: bool) {
+pub(crate) fn serve(mut stream: Connection, password: &str, method: &str, freedom: bool) {
     let Some(method) = Method::parse(method) else {
         return;
     };
@@ -64,7 +65,7 @@ pub(crate) fn serve(mut stream: TcpStream, password: &str, method: &str, freedom
     let Some((target, used)) = parse_addr_header(chunk) else {
         return;
     };
-    let Ok(mut uplink) = TcpStream::connect_timeout(&target, Duration::from_secs(8)) else {
+    let Ok(mut uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
     if uplink.write_all(&chunk[used..]).is_err() {
@@ -86,7 +87,7 @@ pub(crate) fn serve(mut stream: TcpStream, password: &str, method: &str, freedom
 }
 
 /// The stream handshake: a 16-byte IV in the clear, then the address header rides the RC4 stream itself, so the first read already carries payload and whatever arrived with the header is forwarded, not re-read.
-fn serve_stream(mut stream: TcpStream, password: &str) {
+fn serve_stream(mut stream: Connection, password: &str) {
     let master = MasterKey::new(password, Method::Rc4Md5.key_len());
     let mut head = [0u8; 512];
     // Bound the IV and address-header reads to a wall-clock budget, then restore the relay's blocking reads.
@@ -125,7 +126,7 @@ fn serve_stream(mut stream: TcpStream, password: &str) {
     let Some((recv, (target, used), len)) = opened else {
         return;
     };
-    let Ok(mut uplink) = TcpStream::connect_timeout(&target, Duration::from_secs(8)) else {
+    let Ok(mut uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
     if used < len && uplink.write_all(&head[used..len]).is_err() {
@@ -152,7 +153,13 @@ fn serve_stream(mut stream: TcpStream, password: &str) {
     );
 }
 
-pub(crate) fn serve_ws(stream: TcpStream, password: &str, method: &str, path: &str, freedom: bool) {
+pub(crate) fn serve_ws(
+    stream: Connection,
+    password: &str,
+    method: &str,
+    path: &str,
+    freedom: bool,
+) {
     let Some((mut reader, mut writer)) = crate::ws::accept(stream, path) else {
         return;
     };
@@ -166,7 +173,7 @@ pub(crate) fn serve_ws(stream: TcpStream, password: &str, method: &str, path: &s
 }
 
 pub(crate) fn serve_httpupgrade(
-    stream: TcpStream,
+    stream: Connection,
     password: &str,
     method: &str,
     path: &str,
@@ -191,7 +198,7 @@ pub(crate) fn serve_httpupgrade(
 /// The carrier's answer held back until a blocking peek finds the first byte of the request packet, so a dial that waits for the `101` before it writes is never answered: only a dial that puts the packet on the wire with the `GET` finishes.
 #[cfg(test)]
 pub(crate) fn serve_httpupgrade_answering_after_the_request(
-    stream: TcpStream,
+    stream: Connection,
     password: &str,
     method: &str,
     _path: &str,
@@ -233,7 +240,7 @@ pub(crate) fn serve_httpupgrade_answering_after_the_request(
 }
 
 pub(crate) fn serve_grpc(
-    stream: TcpStream,
+    stream: Connection,
     password: &str,
     method: &str,
     path: &str,
@@ -253,7 +260,7 @@ pub(crate) fn serve_grpc(
 }
 
 pub(crate) fn serve_xhttp(
-    stream: TcpStream,
+    stream: Connection,
     password: &str,
     method: &str,
     path: &str,
@@ -273,7 +280,7 @@ pub(crate) fn serve_xhttp(
 }
 
 pub(crate) fn serve_httpheader(
-    stream: TcpStream,
+    stream: Connection,
     password: &str,
     method: &str,
     path: &str,
@@ -322,7 +329,7 @@ fn accept_stream(
     reader: &mut dyn Read,
     writer: &mut dyn Write,
     master: &MasterKey,
-) -> Option<(TcpStream, Uplink, Recv)> {
+) -> Option<(Connection, Uplink, Recv)> {
     let mut iv = [0u8; IV_LEN];
     read_exact(reader, &mut iv).ok()?;
     let key = rc4_md5_key(master.as_bytes(), &iv)?;
@@ -345,7 +352,7 @@ fn accept_stream(
             break found;
         }
     };
-    let mut uplink = TcpStream::connect_timeout(&target, Duration::from_secs(8)).ok()?;
+    let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
     uplink.write_all(&head[used..len]).ok()?;
     let mut iv = [0u8; IV_LEN];
     getrandom::getrandom(&mut iv).ok()?;
@@ -361,7 +368,7 @@ fn accept_on(
     password: &str,
     method: &str,
     freedom: bool,
-) -> Option<(TcpStream, Uplink, Recv)> {
+) -> Option<(Connection, Uplink, Recv)> {
     let method = Method::parse(method)?;
     if !freedom {
         return None;
@@ -377,7 +384,7 @@ fn accept_on(
     let mut head = wire_buffer();
     let chunk = open_chunk(reader, &mut recv, &mut head)?;
     let (target, used) = parse_addr_header(chunk)?;
-    let mut uplink = TcpStream::connect_timeout(&target, Duration::from_secs(8)).ok()?;
+    let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
     uplink.write_all(&chunk[used..]).ok()?;
     drop(head);
     let mut salt = [0u8; SALT_LEN];
@@ -434,7 +441,7 @@ pub(crate) enum Recv {
     StreamWaiting(MasterKey),
 }
 
-pub(crate) fn pump_relay(plain: &TcpStream, sealed: &TcpStream, send: Uplink, recv: Recv) {
+pub(crate) fn pump_relay(plain: &Connection, sealed: &Connection, send: Uplink, recv: Recv) {
     let Ok(sealed_read) = sealed.try_clone() else {
         return;
     };
@@ -451,7 +458,7 @@ pub(crate) fn pump_relay(plain: &TcpStream, sealed: &TcpStream, send: Uplink, re
 }
 
 pub(crate) fn pump_relay_carried<R, W>(
-    plain: &TcpStream,
+    plain: &Connection,
     reader: R,
     mut writer: W,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
@@ -1021,7 +1028,7 @@ mod tests {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
         });
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
@@ -1029,7 +1036,7 @@ mod tests {
             serve(stream, "an-example-shared-password", "aes-256-gcm", true);
             let _ = done_tx.send(());
         });
-        let _peer = TcpStream::connect(addr).expect("connects");
+        let _peer = Connection::connect(addr).expect("connects");
         let returned = done_rx.recv_timeout(crate::budgets::handshake() + Duration::from_secs(5));
         crate::budgets::clear();
         returned.expect("the bounded request read returns instead of pinning the thread");
@@ -1044,7 +1051,7 @@ mod tests {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
         });
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
@@ -1052,7 +1059,7 @@ mod tests {
             serve(stream, "an-example-shared-password", "rc4-md5", true);
             let _ = done_tx.send(());
         });
-        let _peer = TcpStream::connect(addr).expect("connects");
+        let _peer = Connection::connect(addr).expect("connects");
         let returned = done_rx.recv_timeout(crate::budgets::handshake() + Duration::from_secs(5));
         crate::budgets::clear();
         returned.expect("the bounded request read returns instead of pinning the thread");
@@ -1077,7 +1084,7 @@ mod tests {
     #[test]
     fn every_named_method_and_spelling_relays_an_echo() {
         for (name, method) in methods() {
-            let echo = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+            let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
             let echo_port = echo.local_addr().expect("addr").port();
             thread::spawn(move || {
                 let (mut stream, _) = echo.accept().expect("accepts");
@@ -1088,7 +1095,7 @@ mod tests {
                     }
                 }
             });
-            let server = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+            let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
             let port = server.local_addr().expect("addr").port();
             let announced = name.to_owned();
             thread::spawn(move || {
@@ -1101,7 +1108,7 @@ mod tests {
                 }
             });
             let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
-            let mut uplink = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut uplink = Connection::connect(("127.0.0.1", port)).expect("connects");
             uplink
                 .set_read_timeout(Some(std::time::Duration::from_secs(30)))
                 .expect("timeout");
@@ -1156,7 +1163,7 @@ mod tests {
             "chacha20-ietf",
             "xchacha20",
         ] {
-            let server = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+            let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
             let port = server.local_addr().expect("addr").port();
             let refused = name.to_owned();
             thread::spawn(move || {
@@ -1168,7 +1175,7 @@ mod tests {
                     });
                 }
             });
-            let mut uplink = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut uplink = Connection::connect(("127.0.0.1", port)).expect("connects");
             uplink
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .expect("timeout");
@@ -1188,7 +1195,7 @@ mod tests {
 
     #[test]
     fn stream_relays_an_echo() {
-        let echo = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -1199,7 +1206,7 @@ mod tests {
                 }
             }
         });
-        let server = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = server.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in server.incoming().take(1) {
@@ -1210,7 +1217,7 @@ mod tests {
             }
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
-        let mut uplink = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut uplink = Connection::connect(("127.0.0.1", port)).expect("connects");
         uplink
             .set_read_timeout(Some(std::time::Duration::from_secs(30)))
             .expect("timeout");
@@ -1245,7 +1252,7 @@ mod tests {
 
     #[test]
     fn stream_rides_the_ws_carrier() {
-        let echo = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -1256,7 +1263,7 @@ mod tests {
                 }
             }
         });
-        let server = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = server.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = server.accept().expect("accepts");
@@ -1269,7 +1276,7 @@ mod tests {
             );
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, mut writer) =
             crate::ws::connect(stream, "127.0.0.1", "/ss-ws", 0, &[]).expect("carries");
         let Some((mut send, recv)) = client_send_handshake(
@@ -1441,7 +1448,7 @@ mod tests {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
         });
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
@@ -1455,7 +1462,7 @@ mod tests {
             );
             let _ = done_tx.send(());
         });
-        let stream = TcpStream::connect(addr).expect("connects");
+        let stream = Connection::connect(addr).expect("connects");
         let (_reader, _writer) = crate::grpc::connect(stream, "127.0.0.1", "/p").expect("dials");
         let returned = done_rx.recv_timeout(crate::budgets::handshake() + Duration::from_secs(5));
         crate::budgets::clear();
@@ -1465,7 +1472,7 @@ mod tests {
 
     /// A listener that answers every connection with whatever it reads.
     fn echo() -> u16 {
-        let echo = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in echo.incoming() {
@@ -1512,14 +1519,14 @@ mod tests {
             };
             answers(reader, writer, send, recv);
         }
-        fn tunnel(serve: fn(TcpStream, &str, &str, &str, bool), path: &'static str) -> TcpStream {
-            let server = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        fn tunnel(serve: fn(Connection, &str, &str, &str, bool), path: &'static str) -> Connection {
+            let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
             let port = server.local_addr().expect("addr").port();
             thread::spawn(move || {
                 let (stream, _) = server.accept().expect("accepts");
                 serve(stream, PASSWORD, METHOD, path, true);
             });
-            TcpStream::connect(("127.0.0.1", port)).expect("connects")
+            Connection::connect(("127.0.0.1", port)).expect("connects")
         }
         fn sealed(target: &Destination) -> (Vec<u8>, Uplink, Recv) {
             let mut packet = Vec::new();
