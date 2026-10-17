@@ -709,8 +709,9 @@ impl<'a> Gather<'a> {
     }
 
     /// The batch as one write, in the order the frames go out: a head slot and then the payload run it
-    /// opens, for every frame held. An empty batch takes neither lock nor call.
-    fn flush(&self, shared: &Arc<Shared>) -> bool {
+    /// opens, for every frame held. An empty batch takes neither lock nor call, and a held batch is
+    /// emptied by the write, so the frames that follow it start a new one.
+    fn flush(&mut self, shared: &Arc<Shared>) -> bool {
         if self.used == 0 {
             return true;
         }
@@ -728,6 +729,7 @@ impl<'a> Gather<'a> {
                 pieces += 1;
             }
         }
+        self.used = 0;
         let Ok(mut stream) = shared.stream.lock() else {
             return false;
         };
@@ -1540,7 +1542,7 @@ mod tests {
             .count();
         assert_eq!(runs, FRAMES_PER_WRITE, "one payload run per frame");
         let mut at = base;
-        for &(start, len) in peer.parts.iter() {
+        for &(start, len) in &peer.parts {
             if start < base || start >= end {
                 continue;
             }
