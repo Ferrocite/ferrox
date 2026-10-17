@@ -230,6 +230,7 @@ carrier-foxy catalogue-edges-rewritten-from-the-cache-file 5 ferrox-app-foxy_cat
 carrier-foxy dials-of-a-silent-tcp-carrier 1 ferrox-app-proxy::tests::a_silent_carrier_is_dialled_once_rather_than_once_per_rung
 carrier-foxy dials-across-three-flows-of-a-rested-carrier 2 ferrox-app-proxy::tests::a_silent_carrier_is_dialled_once_rather_than_once_per_rung
 carrier-foxy relay-legs-held-after-their-lane-ended 0 ferrox-app-foxy::loopback::a_lane_that_ends_releases_the_leg_parked_on_its_client
+carrier-foxy relay-legs-held-after-their-client-ended 0 ferrox-app-foxy::loopback::a_client_that_ends_releases_the_leg_parked_on_its_lane
 carrier-foxy pool-workers-held-after-a-finished-burst 0 ferrox-app-proxy::tests::a_finished_burst_hands_its_workers_back_to_the_process
 carrier-foxy pool-directions-lost-on-a-gone-worker 0 ferrox-app-proxy::tests::a_claim_that_reaches_a_gone_worker_keeps_its_direction
 carrier-foxy rate-limits-that-stopped-a-renewal 0 ferrox-app-foxy_account::tests::a_refused_credential_is_the_only_answer_a_second_ask_cannot_change
