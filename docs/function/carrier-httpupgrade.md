@@ -152,14 +152,19 @@ drift between the raw and split lanes. Checked by
 `an_over_budget_payload_rides_ahead_of_a_lazy_answer`, red at 20.03 s with the length
 compare restored.
 
-**22 bytes of status literal, and a reason phrase that used to be refused.**
+**22 bytes of status literal, and a reason phrase two of the three references accept.**
 `check_response` compared the whole line against `"HTTP/1.1 101 Switching Protocols"`
-(35 bytes) and so refused a server that answers `101 UPGRADED`, or any other text, or
-no reason phrase at all — both references read only the version token and the three
-digits. It now takes a 12-byte prefix plus one boundary byte, so the answer check
-compares 13 bytes instead of 35 and the accept set matches the references. The check
-gains one branch to keep `HTTP/1.1 1011` out; the vectors are in
-`check_response_accepts_and_refuses_the_vectors_it_did`.
+(35 bytes), so it refused a server answering `101 UPGRADED`, any other text, or no
+reason phrase at all — a 101 carries no reason phrase under RFC 9112, and Go's
+`http.ReadResponse` (xray) and sing-box's `response.StatusCode != 101` both read only
+the digits. It now takes a 12-byte prefix plus one boundary byte: 13 bytes compared
+instead of 35, and the accept set is the two Go references'. Zeronet's client
+(`crates/zero-transport/src/httpupgrade.rs:159`) compares the full literal as this check did, so this tree is
+stricter than it and looser than zeronet only in the free-text field a conforming
+server never sends. The check gains one boundary branch that keeps `HTTP/1.1 1011`
+and `HTTP/1.1 101x` out and lets a bare `HTTP/1.1 101` in; those three vectors plus
+the free-text phrase are in `check_response_accepts_and_refuses_the_vectors_it_did`,
+and removing the branch is red on the first of them.
 
 Nothing removed on the parse path beyond the branch, the fanout and the status literal
 above, which is the point. What is recorded here is that the teardown *gains* one read
