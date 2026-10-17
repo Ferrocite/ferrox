@@ -127,7 +127,7 @@ impl Device {
         self.handle.try_clone()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn from_handle(handle: std::fs::File, mtu: usize) -> Self {
         Self { handle, mtu }
     }
@@ -162,16 +162,16 @@ impl Device {
         const TUNSETIFF: libc::c_ulong = 0x4004_54ca;
         const IFF_TUN: libc::c_short = 0x0001;
         const IFF_NO_PI: libc::c_short = 0x1000;
-        let path = CString::new("/dev/net/tun").unwrap();
-        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
         #[repr(C)]
         struct IfReq {
             ifr_name: [u8; 16],
             ifr_flags: libc::c_short,
             _pad: [u8; 22],
+        }
+        let path = CString::new("/dev/net/tun").unwrap();
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
         }
         let mut req = IfReq {
             ifr_name: [0; 16],
@@ -653,6 +653,7 @@ mod tests {
         }))
     }
 
+    #[cfg(unix)]
     fn hex_decode(s: &str) -> Vec<u8> {
         (0..s.len() / 2)
             .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())
@@ -662,6 +663,7 @@ mod tests {
     /// One `FLOW` line of `scripts/tun-oracle/script.txt`: the destination the packet
     /// names, the client port, the SYN sequence, and the payload chunks as separate
     /// segments — the same rendering rules the Go oracle reads from that file.
+    #[cfg(unix)]
     struct FlowSpec {
         destination: SocketAddr,
         source_port: u16,
@@ -669,8 +671,10 @@ mod tests {
         chunks: Vec<Vec<u8>>,
     }
 
+    #[cfg(unix)]
     const SCRIPT_CLIENT: [u8; 4] = [10, 0, 0, 2];
 
+    #[cfg(unix)]
     fn parse_script(text: &str) -> Vec<FlowSpec> {
         let mut flows = Vec::new();
         for line in text.lines() {
@@ -700,6 +704,7 @@ mod tests {
 
     /// One `DIAL` line of the golden: the target address the stack dialed and every
     /// payload byte the stack handed up on that flow, to EOF.
+    #[cfg(unix)]
     fn parse_expected(text: &str) -> Vec<(String, Vec<u8>)> {
         let mut dials = Vec::new();
         for line in text.lines() {
