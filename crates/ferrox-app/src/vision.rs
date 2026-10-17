@@ -1,9 +1,9 @@
 use std::cell::RefCell;
 
+use crate::conn::Connection;
 use crate::proxy::RELAY_SMALL_BUFFER;
 use ferrox_core::tls::RecordAlignment;
 use std::io::{Read, Write};
-use std::net::TcpStream;
 
 const BUFFER: usize = 2048;
 /// The framed window is one `rustls` record and the relay's own first read: past the switch neither staging buffer is touched again, so neither reaches for a whole relay's worth.
@@ -26,7 +26,7 @@ const ZERO: [u8; BUFFER] = [0u8; BUFFER];
 
 pub(crate) struct Link<S: Read + Write + RecordAlignment> {
     session: S,
-    raw: Option<TcpStream>,
+    raw: Option<Connection>,
     uuid: [u8; 16],
     have: Vec<u8>,
     hat: usize,
@@ -65,7 +65,7 @@ struct Tls {
 }
 
 impl<S: Read + Write + RecordAlignment> Link<S> {
-    pub(crate) fn new(session: S, raw: Option<TcpStream>, uuid: &[u8; 16]) -> Self {
+    pub(crate) fn new(session: S, raw: Option<Connection>, uuid: &[u8; 16]) -> Self {
         Self {
             session,
             raw,
@@ -744,9 +744,8 @@ mod tests {
 
     #[test]
     fn bytes_after_padding_arrive_without_waiting_for_close() {
-        use std::net::TcpListener;
         use std::time::Duration;
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let writer = std::thread::spawn(move || {
             use std::io::Write as _;
@@ -758,7 +757,7 @@ mod tests {
             stream.write_all(b"tail-part-two").expect("writes");
             std::thread::sleep(Duration::from_millis(200));
         });
-        let stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("timeout");

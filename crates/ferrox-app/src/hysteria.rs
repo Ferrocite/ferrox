@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs as _};
+use std::net::{Shutdown, SocketAddr, ToSocketAddrs as _};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ferrox_core::foxy::frames;
 use ferrox_core::hysteria;
 
+use crate::conn::Connection;
 use crate::quic::{Unfilled, MAX_DATAGRAM};
 
 const AUTH_STREAM: u64 = 0;
@@ -528,7 +529,7 @@ fn open_pooled(dial: &Dial, header: &[u8]) -> Option<Flow> {
 }
 
 pub(crate) fn dial_vless(
-    client: &TcpStream,
+    client: &Connection,
     dial: &Dial,
     id: &[u8; 16],
     target: &crate::proxy::Destination,
@@ -540,7 +541,7 @@ pub(crate) fn dial_vless(
     relay(client, &flow);
 }
 
-pub(crate) fn relay(tcp: &TcpStream, flow: &Flow) {
+pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
     let Ok(tcp_read) = tcp.try_clone() else {
         return;
     };

@@ -1,11 +1,12 @@
 //! Foxy lane: a CONNECT tunnel to an account's CDN edge over H1/H2/H3; a lane hands the caller a carrier-agnostic `Read + Write`.
 
+use crate::conn::Connection;
 use ferrox_core::foxy::connectip;
 use ferrox_core::foxy::{self, authority, frames, hpack, masque, Failure, Pass};
 use ferrox_core::tls::RecordAlignment;
 use ferrox_core::tls::TlsProvider;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs as _};
+use std::net::{SocketAddr, ToSocketAddrs as _};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -125,7 +126,7 @@ pub(crate) fn upstream_proxy(text: &str) -> Option<UpstreamProxy> {
 }
 
 /// The TLS session to the edge, dialed address by address — the handshake and ALPN are part of "does this address work"; a configured hop is the dial instead.
-fn tls_to_edge(dial: &FoxyDial) -> Result<ferrox_core::tls::RustlsProvider<TcpStream>, Failure> {
+fn tls_to_edge(dial: &FoxyDial) -> Result<ferrox_core::tls::RustlsProvider<Connection>, Failure> {
     if let Some(proxy) = dial.upstream.as_ref() {
         return edge_over_hop(proxy, dial);
     }
@@ -142,7 +143,7 @@ fn tls_to_edge(dial: &FoxyDial) -> Result<ferrox_core::tls::RustlsProvider<TcpSt
         tried += 1;
         // The edge sometimes closes a handshake it started with no reason, seconds away from carrying the tunnel; 8 quick asks make that a leg, not a flow.
         for attempt in 0..EDGE_ATTEMPTS {
-            let stream = match TcpStream::connect_timeout(&peer, CONNECT_TIMEOUT) {
+            let stream = match crate::conn::dial_tcp(&peer, CONNECT_TIMEOUT) {
                 Ok(stream) => stream,
                 Err(error) => {
                     debug_address(peer, &format!("tcp {error}"));
@@ -182,7 +183,7 @@ fn tls_to_edge(dial: &FoxyDial) -> Result<ferrox_core::tls::RustlsProvider<TcpSt
 fn edge_over_hop(
     proxy: &UpstreamProxy,
     dial: &FoxyDial,
-) -> Result<ferrox_core::tls::RustlsProvider<TcpStream>, Failure> {
+) -> Result<ferrox_core::tls::RustlsProvider<Connection>, Failure> {
     let mut tried = 0usize;
     let mut failure = Failure::Io;
     for attempt in 0..EDGE_ATTEMPTS {
@@ -226,8 +227,8 @@ fn debug_address(peer: SocketAddr, why: &str) {
 /// One address, all the way to a usable session, naming the failed stage — a bare "io" cannot be told apart from any other leg's.
 fn finish_tls(
     dial: &FoxyDial,
-    stream: TcpStream,
-) -> Result<ferrox_core::tls::RustlsProvider<TcpStream>, Failure> {
+    stream: Connection,
+) -> Result<ferrox_core::tls::RustlsProvider<Connection>, Failure> {
     let mut tls = match ferrox_core::tls::RustlsProvider::connect(&tls_config(dial), stream) {
         Ok(tls) => tls,
         Err(error) => {
@@ -255,7 +256,7 @@ fn tls_config(dial: &FoxyDial) -> ferrox_core::tls::TlsConfig {
 }
 
 /// TCP to the edge through one upstream hop: the TLS name stays the edge's, so the hop carries bytes it can neither read nor address.
-fn tcp_via(proxy: &UpstreamProxy, dial: &FoxyDial) -> Result<TcpStream, Failure> {
+fn tcp_via(proxy: &UpstreamProxy, dial: &FoxyDial) -> Result<Connection, Failure> {
     let mut stream = tcp_to_proxy(proxy).ok_or(Failure::Io)?;
     let edge = authority(&dial.host, dial.port);
     if proxy.http {
@@ -301,7 +302,7 @@ fn tcp_via(proxy: &UpstreamProxy, dial: &FoxyDial) -> Result<TcpStream, Failure>
 }
 
 /// One UDP association with a SOCKS5 hop: greeting, a request naming no destination, the relay address; the caller holds the control connection — dropping it ends the association.
-pub(crate) fn associate_udp(proxy: &UpstreamProxy) -> Option<(Arc<TcpStream>, SocketAddr)> {
+pub(crate) fn associate_udp(proxy: &UpstreamProxy) -> Option<(Arc<Connection>, SocketAddr)> {
     let mut control = tcp_to_proxy(proxy)?;
     if socks_greeting(&mut control).is_err() {
         return None;
@@ -316,13 +317,13 @@ pub(crate) fn associate_udp(proxy: &UpstreamProxy) -> Option<(Arc<TcpStream>, So
 }
 
 /// The one hop this tree speaks to, dialed: a proxy that does not answer at all is a failed dial, not a lane running direct.
-fn tcp_to_proxy(proxy: &UpstreamProxy) -> Option<TcpStream> {
+fn tcp_to_proxy(proxy: &UpstreamProxy) -> Option<Connection> {
     // Same reason the edge dial tries each one: a hop answering on the second listed family is still the hop this lane uses.
     for addr in format!("{}:{}", proxy.host, proxy.port)
         .to_socket_addrs()
         .ok()?
     {
-        if let Ok(stream) = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+        if let Ok(stream) = crate::conn::dial_tcp(&addr, CONNECT_TIMEOUT) {
             let _ = stream.set_nodelay(true);
             // The head is read a byte at a time and is small, so a few seconds is the honest bound; without it a missing byte holds the flow for the OS's minutes-long timeout.
             let _ = stream.set_read_timeout(Some(HEADER_TIMEOUT));
@@ -333,7 +334,7 @@ fn tcp_to_proxy(proxy: &UpstreamProxy) -> Option<TcpStream> {
 }
 
 /// No authentication offered, none accepted: a hop that selects anything else is one this lane cannot use.
-fn socks_greeting(stream: &mut TcpStream) -> Result<(), Failure> {
+fn socks_greeting(stream: &mut Connection) -> Result<(), Failure> {
     stream.write_all(&[5, 1, 0]).map_err(|_| Failure::Io)?;
     let mut method = [0u8; 2];
     read_exact(stream, &mut method).map_err(|_| Failure::Io)?;
@@ -344,7 +345,7 @@ fn socks_greeting(stream: &mut TcpStream) -> Result<(), Failure> {
 }
 
 /// Whether the hop granted the request, and the address it bound: a refusal answers the same reply with a non-zero status, and a name in the reply is something this tree cannot address back.
-fn socks_reply(stream: &mut TcpStream) -> Result<Option<SocketAddr>, Failure> {
+fn socks_reply(stream: &mut Connection) -> Result<Option<SocketAddr>, Failure> {
     let mut head = [0u8; 4];
     read_exact(stream, &mut head).map_err(|_| Failure::Io)?;
     if head[1] != 0 {
@@ -488,6 +489,7 @@ fn open_h2_with(dial: &FoxyDial, block: &[u8]) -> Result<Tls2, Failure> {
         at: 0,
         out: Vec::new(),
         capsule_buf: Vec::new(),
+        frame: FrameState::default(),
         fin: false,
     };
     let status = lane.await_status()?;
@@ -527,7 +529,7 @@ const CREDIT_TEMPLATE: [u8; 26] = {
 
 /// A relay over a TLS stream that speaks HTTP/2: a caller writing bytes sees a DATA frame, a caller reading bytes sees one's payload.
 pub(crate) struct Tls2 {
-    tls: ferrox_core::tls::RustlsProvider<TcpStream>,
+    tls: ferrox_core::tls::RustlsProvider<Connection>,
     window: foxy::flow::Window,
     max_frame: usize,
     /// Bytes read from a DATA frame the caller has not taken, with a cursor: draining would move what is left on every call.
@@ -537,21 +539,47 @@ pub(crate) struct Tls2 {
     out: Vec<u8>,
     /// Capsule-stream bytes not parsed yet: one capsule may span DATA frames, so frames accumulate here.
     capsule_buf: Vec<u8>,
+    frame: FrameState,
     fin: bool,
+}
+
+/// How much of the frame in flight has arrived: a read quantum expires between two socket reads, not between two frames.
+#[derive(Default)]
+struct FrameState {
+    head: [u8; frames::H2_HEADER],
+    head_at: usize,
+    payload_at: usize,
+}
+
+/// Fills `buf` from `at` on, leaving `at` where the wire stopped: a timeout mid-buffer is a pause the next call resumes, and only a closed stream ends it.
+fn fill_from<S: Read>(io: &mut S, buf: &mut [u8], at: &mut usize) -> std::io::Result<()> {
+    while *at < buf.len() {
+        match io.read(&mut buf[*at..]) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            Ok(read) => *at += read,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 /// One frame off the wire into the caller's owned buffer; a socket timeout keeps its kind so a relay can tell an idle quantum from a dead peer.
 fn read_frame(
-    tls: &mut ferrox_core::tls::RustlsProvider<TcpStream>,
+    tls: &mut ferrox_core::tls::RustlsProvider<Connection>,
+    state: &mut FrameState,
     out: &mut Vec<u8>,
     max_frame: usize,
 ) -> std::io::Result<frames::H2Frame> {
-    let mut header = [0u8; frames::H2_HEADER];
-    read_exact(tls, &mut header)?;
-    let frame = frames::H2Frame::parse(&header)
+    fill_from(tls, &mut state.head, &mut state.head_at)?;
+    let frame = frames::H2Frame::parse(&state.head)
         .ok_or_else(|| std::io::Error::other("foxy: a header that is not a frame"))?;
-    crate::proxy::resize_scratch(out, (frame.length as usize).min(max_frame));
-    read_exact(tls, out)?;
+    if state.payload_at == 0 {
+        crate::proxy::resize_scratch(out, (frame.length as usize).min(max_frame));
+    }
+    fill_from(tls, out, &mut state.payload_at)?;
+    state.head_at = 0;
+    state.payload_at = 0;
+    state.head = [0u8; frames::H2_HEADER];
     Ok(frame)
 }
 
@@ -566,7 +594,7 @@ impl Tls2 {
         body: impl FnOnce(&mut Self, frames::H2Frame, &[u8]) -> R,
     ) -> std::io::Result<R> {
         let mut payload = std::mem::take(&mut self.out);
-        let frame = read_frame(&mut self.tls, &mut payload, self.max_frame);
+        let frame = read_frame(&mut self.tls, &mut self.frame, &mut payload, self.max_frame);
         let out = match frame {
             Ok(frame) => body(self, frame, &payload),
             Err(error) => {
@@ -781,7 +809,7 @@ impl Tls2 {
 #[cfg(test)]
 pub(crate) fn raw_h2_session(
     dial: &FoxyDial,
-) -> Result<ferrox_core::tls::RustlsProvider<TcpStream>, Failure> {
+) -> Result<ferrox_core::tls::RustlsProvider<Connection>, Failure> {
     open_h2_with_raw(dial)
 }
 
@@ -789,7 +817,7 @@ pub(crate) fn raw_h2_session(
 #[cfg(test)]
 fn open_h2_with_raw(
     dial: &FoxyDial,
-) -> Result<ferrox_core::tls::RustlsProvider<TcpStream>, Failure> {
+) -> Result<ferrox_core::tls::RustlsProvider<Connection>, Failure> {
     let mut tls = tls_to_edge(dial)?;
     let mut opening = Vec::with_capacity(48);
     opening.extend_from_slice(frames::PREFACE);
@@ -885,7 +913,7 @@ impl Read for Tls2 {
 }
 
 /// The HTTP/1.1 relay: bytes in, bytes out, once the status has been read.
-pub(crate) struct Tls1(pub(crate) ferrox_core::tls::RustlsProvider<TcpStream>);
+pub(crate) struct Tls1(pub(crate) ferrox_core::tls::RustlsProvider<Connection>);
 
 /// Undecodable-block dump behind `FOXY_DEBUG`: the hex of a header block no codec here reads, so a red live run names the encoding.
 fn debug_block(block: &[u8]) {
@@ -2111,7 +2139,7 @@ mod tests {
 #[cfg(test)]
 mod loopback {
     use super::*;
-    use std::net::TcpListener;
+    use crate::conn::Listener;
 
     const PAYLOAD: &[u8] = b"the tunnel carries the bytes unchanged";
 
@@ -2158,14 +2186,14 @@ mod loopback {
         use ferrox_core::tls::TlsProvider as _;
 
         let (roots, server) = minted(b"h2");
-        let mute = TcpListener::bind("[::1]:0").expect("binds v6");
+        let mute = crate::conn::test_bind("[::1]:0").expect("binds v6");
         let mute_port = mute.local_addr().expect("addr").port();
         std::thread::spawn(move || {
             // Accepts the connection and then says nothing, which is the whole of an address that cannot carry TLS.
             let (stream, _) = mute.accept().expect("accepts");
             drop(stream);
         });
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds v4");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds v4");
         let port = listener.local_addr().expect("addr").port();
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -2229,7 +2257,7 @@ mod loopback {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         let (_foreign_roots, server) = minted(b"h2");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let asked = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&asked);
@@ -2272,7 +2300,7 @@ mod loopback {
     }
 
     /// A dial whose hop is the only way to the edge: the name the CONNECT carries is not the name anything resolves, so a dial that reaches the edge has gone through the hop.
-    fn hop_stream(proxy: &UpstreamProxy) -> std::net::TcpStream {
+    fn hop_stream(proxy: &UpstreamProxy) -> Connection {
         tcp_via(proxy, &upstream_dial(proxy.clone(), None)).expect("chains through the hop")
     }
 
@@ -2306,7 +2334,7 @@ mod loopback {
 
     #[test]
     fn tcp_through_an_http_upstream_sends_connect_and_carries_bytes() {
-        let proxy = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let proxy = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = proxy.local_addr().expect("addr").port();
         let seen = std::thread::spawn(move || {
             let (mut stream, _) = proxy.accept().expect("accepts");
@@ -2336,7 +2364,7 @@ mod loopback {
 
     #[test]
     fn tcp_through_a_socks5_upstream_shakes_hands_and_carries_bytes() {
-        let proxy = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let proxy = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = proxy.local_addr().expect("addr").port();
         let seen = std::thread::spawn(move || {
             let (mut stream, _) = proxy.accept().expect("accepts");
@@ -2372,9 +2400,9 @@ mod loopback {
     /// A hop that refuses is a failed dial and not a fallback: the edge is never dialed around a proxy the config named, because a lane that bypasses its configured hop is a leak.
     #[test]
     fn a_refused_upstream_is_a_failed_dial_and_not_a_direct_one() {
-        let proxy = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let proxy = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = proxy.local_addr().expect("addr").port();
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let edge_port = listener.local_addr().expect("addr").port();
         let (dialed_tx, dialed_rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
@@ -2413,7 +2441,7 @@ mod loopback {
     #[test]
     fn h1_through_an_http_upstream_reaches_its_edge() {
         let (roots, server) = minted(b"http/1.1");
-        let edge = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let edge = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let edge_port = edge.local_addr().expect("addr").port();
         std::thread::spawn(move || {
             let (stream, _) = edge.accept().expect("accepts");
@@ -2435,7 +2463,7 @@ mod loopback {
             assert_eq!(&buf[..read], PAYLOAD);
             tls.write_all(&buf[..read]).expect("echoes");
         });
-        let proxy = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let proxy = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let proxy_port = proxy.local_addr().expect("addr").port();
         std::thread::spawn(move || {
             let (mut downstream, _) = proxy.accept().expect("accepts");
@@ -2452,7 +2480,7 @@ mod loopback {
             downstream
                 .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
                 .expect("answers");
-            let edge = TcpStream::connect(("127.0.0.1", edge_port)).expect("dials");
+            let edge = Connection::connect(("127.0.0.1", edge_port)).expect("dials");
             let (mut up_read, mut up_write) = (edge.try_clone().expect("clones"), edge);
             let mut down = downstream.try_clone().expect("clones");
             let pipe = std::thread::spawn(move || {
@@ -2479,7 +2507,7 @@ mod loopback {
 
     /// A SOCKS5 hop for the QUIC carrier: a TCP side answering `UDP ASSOCIATE` with the address of its relay socket, and a relay carrying datagrams with the association's own header — both halves write that header themselves, so the framing is witnessed by something other than the code it checks.
     fn socks_relay(edge_port: u16) -> UpstreamProxy {
-        let control = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let control = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let proxy_port = control.local_addr().expect("addr").port();
         let relay = crate::quic::bind_datagram("127.0.0.1:0").expect("binds");
         let relay_addr = relay.local_addr().expect("addr");
@@ -2603,7 +2631,7 @@ mod loopback {
     #[test]
     fn the_http11_carrier_sends_three_fields_and_carries_the_bytes() {
         let (roots, server) = minted(b"http/1.1");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let edge = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -2640,7 +2668,7 @@ mod loopback {
     #[test]
     fn a_rejected_http11_request_is_a_status_not_a_tunnel() {
         let (roots, server) = minted(b"http/1.1");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let edge = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -2693,7 +2721,7 @@ mod loopback {
 
     /// The edge side of the HTTP/2 carrier: preface, settings, one stream, one status, then DATA both ways.
     fn h2_edge(
-        listener: TcpListener,
+        listener: Listener,
         server: ferrox_core::tls::TlsServerConfig,
         seen: std::sync::mpsc::Sender<Vec<u8>>,
     ) -> std::thread::JoinHandle<()> {
@@ -2749,7 +2777,7 @@ mod loopback {
     #[test]
     fn the_http2_carrier_writes_one_literal_header_block_and_relays() {
         let (roots, server) = minted(b"h2");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
         let _edge = h2_edge(listener, server, seen_tx);
@@ -2769,7 +2797,7 @@ mod loopback {
         const BIG: usize = 16 * 1024;
         const STEP: usize = 1024;
         let (roots, server) = minted(b"h2");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let (seen_tx, _seen_rx) = std::sync::mpsc::channel();
         let _edge = h2_edge(listener, server, seen_tx);
@@ -2821,12 +2849,177 @@ mod loopback {
         assert_eq!(back, sent);
     }
 
+    /// The read quantum is what lets the writer behind the same mutex have a turn, so it must not cost the frame: a pause inside one DATA frame has to resume where it stopped, not abandon the bytes already promised to the header.
+    #[test]
+    fn a_frame_that_straddles_a_read_quantum_arrives_whole() {
+        const BODY: usize = 32 * 1024;
+        const HALF: usize = BODY / 2;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) {
+                return;
+            }
+            let mut ack = Vec::new();
+            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut ack);
+            tls.write_all(&ack).ok();
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                if matches!(
+                    frames::h2_event(frame, &payload, 1),
+                    frames::H2Event::Headers { .. }
+                ) {
+                    break;
+                }
+            }
+            let mut status = Vec::new();
+            h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut status);
+            tls.write_all(&status).expect("answers 200");
+            let body: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
+            std::thread::sleep(Duration::from_millis(200));
+            let head = frames::H2Frame {
+                kind: frames::DATA,
+                flags: 0,
+                stream: 1,
+                length: BODY as u32,
+            }
+            .header();
+            // One frame, two writes: the second lands only after the lane's quantum has expired inside the first.
+            tls.write_all(&head).expect("writes the header");
+            tls.write_all(&body[..HALF]).expect("writes the first half");
+            tls.flush().expect("flushes the first half");
+            std::thread::sleep(Duration::from_millis(300));
+            tls.write_all(&body[HALF..]).expect("writes the tail");
+            tls.flush().expect("flushes the tail");
+        });
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        tunnel
+            .set_read_quantum(Duration::from_millis(20))
+            .expect("bounds one read");
+        let mut back = Vec::new();
+        let mut buf = [0u8; 4096];
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        while back.len() < BODY && std::time::Instant::now() < deadline {
+            match tunnel.read(&mut buf) {
+                Ok(0) => panic!("the lane called an end of stream inside a frame"),
+                Ok(read) => back.extend_from_slice(&buf[..read]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("the lane lost the frame: {error}"),
+            }
+        }
+        let want: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
+        assert_eq!(
+            back, want,
+            "a quantum inside a frame must not drop its tail"
+        );
+        edge.join().expect("the edge finishes");
+    }
+
+    /// A flow's forward leg is parked in a blocking read on the client, so the end of a flow has to wake that read: a leg that never wakes keeps its pool worker, its lane and the lane's buffers for the life of the process.
+    #[test]
+    fn a_lane_that_ends_releases_the_leg_parked_on_its_client() {
+        const PARK: Duration = Duration::from_secs(10);
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) {
+                return;
+            }
+            let mut ack = Vec::new();
+            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut ack);
+            tls.write_all(&ack).ok();
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                if matches!(
+                    frames::h2_event(frame, &payload, 1),
+                    frames::H2Event::Headers { .. }
+                ) {
+                    break;
+                }
+            }
+            let mut status = Vec::new();
+            h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut status);
+            tls.write_all(&status).expect("answers 200");
+            let _ = close_rx.recv();
+        });
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        tunnel
+            .set_read_quantum(Duration::from_millis(5))
+            .expect("bounds one read");
+        let lane = Arc::new(std::sync::Mutex::new(tunnel));
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let _browser = Connection::connect(front.local_addr().expect("addr")).expect("connects");
+        let (client, _) = front.accept().expect("accepts");
+        let (ended_tx, ended_rx) = std::sync::mpsc::channel::<()>();
+        let started = Instant::now();
+        let flow_lane = Arc::clone(&lane);
+        std::thread::spawn(move || {
+            crate::proxy::relay_tunnel(&client, &flow_lane);
+            let _ = ended_tx.send(());
+        });
+        // The leg has to be parked before the lane ends, or the test measures a flow that never started.
+        std::thread::sleep(Duration::from_millis(200));
+        close_tx.send(()).expect("ends the edge");
+        edge.join().expect("the edge finishes");
+        let _ = ended_rx.recv_timeout(PARK);
+        assert!(
+            started.elapsed() < PARK,
+            "the flow that lost its lane is still holding the leg parked on its client"
+        );
+    }
+
     /// A byte-level test cannot see a copy, so capacity is the witness: `out` is the write buffer and `carry` the read one, and a lane that stages a payload before handing it over has grown the buffer it staged in.
     #[test]
     fn a_relayed_byte_is_copied_once_on_its_way_through_the_lane() {
         const BIG: usize = 40 * 1024;
         let (roots, server) = minted(b"h2");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let (seen_tx, _seen_rx) = std::sync::mpsc::channel();
         let _edge = h2_edge(listener, server, seen_tx);
@@ -2868,7 +3061,7 @@ mod loopback {
         const FRAME: usize = 16 * 1024;
         const STEP: usize = 100;
         let (roots, server) = minted(b"h2");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let (seen_tx, _seen_rx) = std::sync::mpsc::channel();
         let _edge = h2_edge(listener, server, seen_tx);
@@ -2896,7 +3089,7 @@ mod loopback {
     #[test]
     fn the_http2_carrier_assembles_a_status_split_over_continuation() {
         let (roots, server) = minted(b"h2");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let edge = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -2949,7 +3142,7 @@ mod loopback {
     #[test]
     fn the_connect_ip_carrier_opens_one_tunnel_and_carries_a_datagram() {
         let (roots, server) = minted(b"\x68\x32");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
         let (udp_tx, udp_rx) = std::sync::mpsc::channel();
@@ -3027,7 +3220,7 @@ mod loopback {
     #[test]
     fn one_tunnel_carries_every_destination_at_once() {
         let (roots, server) = minted(b"\x68\x32");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
         let (udp_tx, udp_rx) = std::sync::mpsc::channel();
@@ -3061,7 +3254,7 @@ mod loopback {
 
     /// A loopback HTTP/2 edge that speaks CONNECT-IP: it answers the request, sends an `ADDRESS_ASSIGN` for the tunnel's own address, then relays whichever destination the packet names — one stream carrying more than one destination, where a CONNECT-UDP edge answers only a single target.
     fn ip_h2_edge(
-        listener: TcpListener,
+        listener: Listener,
         server: ferrox_core::tls::TlsServerConfig,
         seen: std::sync::mpsc::Sender<Vec<u8>>,
         udp: std::sync::mpsc::Sender<(Vec<u8>, u16, Vec<u8>)>,
@@ -3114,7 +3307,7 @@ mod loopback {
     }
 
     /// The assignment a CONNECT-IP edge answers with: one address the tunnel owns, flushed so the lane's first read finds it.
-    fn ip_h2_assign(tls: &mut ferrox_core::tls::RustlsServerProvider<TcpStream>) {
+    fn ip_h2_assign(tls: &mut ferrox_core::tls::RustlsServerProvider<Connection>) {
         let mut capsule = Vec::new();
         connectip::address_assign_encode(&[ip_tunnel_grant()], &mut capsule);
         let mut frame = Vec::new();
@@ -3137,7 +3330,7 @@ mod loopback {
 
     /// The packets one CONNECT-IP edge carries: each names its destination, so one stream serves `want` of them and then the edge rests.
     fn ip_h2_relay(
-        tls: &mut ferrox_core::tls::RustlsServerProvider<TcpStream>,
+        tls: &mut ferrox_core::tls::RustlsServerProvider<Connection>,
         udp: &std::sync::mpsc::Sender<(Vec<u8>, u16, Vec<u8>)>,
         want: usize,
     ) {
@@ -3209,7 +3402,7 @@ mod loopback {
     #[test]
     fn the_masque_carrier_opens_connect_udp_and_echoes_a_datagram() {
         let (roots, server) = minted(b"h2");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
         let edge = masque_h2_edge(listener, server, seen_tx, 1);
@@ -3247,7 +3440,7 @@ mod loopback {
     #[test]
     fn a_capsule_split_over_frames_reassembles_as_one_datagram() {
         let (roots, server) = minted(b"h2");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
         let edge = masque_h2_edge(listener, server, seen_tx, 2);
@@ -3267,7 +3460,7 @@ mod loopback {
     #[test]
     fn a_frame_of_two_datagrams_arrives_as_two_datagrams() {
         let (roots, server) = minted(b"h2");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let (seen_tx, _seen_rx) = std::sync::mpsc::channel();
         let _edge = h2_edge(listener, server, seen_tx);
@@ -3300,7 +3493,7 @@ mod loopback {
 
     /// A loopback HTTP/2 edge that answers a CONNECT-UDP request and echoes the datagram back, `parts` bytes of capsule to a DATA frame.
     fn masque_h2_edge(
-        listener: TcpListener,
+        listener: Listener,
         server: ferrox_core::tls::TlsServerConfig,
         seen: std::sync::mpsc::Sender<Vec<u8>>,
         parts: usize,
@@ -3885,7 +4078,7 @@ mod loopback {
     #[test]
     fn the_http2_carrier_reads_a_huffman_coded_status() {
         let (roots, server) = minted(b"h2");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let edge = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -3911,7 +4104,7 @@ mod loopback {
     #[test]
     fn a_pinned_edge_that_is_not_the_pin_is_refused() {
         let (roots, server) = minted(b"http/1.1");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let edge = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -3934,7 +4127,7 @@ mod loopback {
     #[test]
     fn a_pinned_edge_that_is_the_pin_opens_the_tunnel() {
         let (roots, server) = minted(b"http/1.1");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let right =
             foxy::pin::Pins::parse([foxy::pin::spki_pin(&server.cert_chain[0]).expect("pins")]);
@@ -3961,7 +4154,7 @@ mod loopback {
     #[test]
     fn a_pinned_leaf_carries_the_tunnel_when_the_store_cannot_build_the_chain() {
         let (_foreign, server) = minted(b"http/1.1");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let right =
             foxy::pin::Pins::parse([foxy::pin::spki_pin(&server.cert_chain[0]).expect("pins")]);
@@ -3993,7 +4186,7 @@ mod loopback {
     #[test]
     fn a_pin_that_is_not_the_edges_key_is_still_refused_without_a_trust_store() {
         let (_foreign, server) = minted(b"http/1.1");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let edge = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
@@ -4017,7 +4210,7 @@ mod loopback {
     #[test]
     fn a_pinned_leaf_still_has_to_answer_the_name_it_was_dialled_for() {
         let (_foreign, server) = minted(b"http/1.1");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let right =
             foxy::pin::Pins::parse([foxy::pin::spki_pin(&server.cert_chain[0]).expect("pins")]);
