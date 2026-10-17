@@ -562,12 +562,16 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
     let mut table: HashMap<SocketAddr, SocketAddr> = HashMap::new();
     let mut buf = unfilled(DATAGRAM_MAX);
     let mut reply = unfilled(DATAGRAM_MAX);
+    let mut hop: Option<Cipher> = None;
     loop {
         match clients.recv_from(&mut buf[SEAL_ROOM..SEAL_ROOM + UDP_BUF]) {
             Ok((n, src)) => {
-                if let Some((dest, payload)) =
-                    open_datagram(&master, method, &mut buf[SEAL_ROOM..SEAL_ROOM + n])
-                {
+                if let Some((dest, payload)) = open_datagram(
+                    &master,
+                    method,
+                    &mut buf[SEAL_ROOM..SEAL_ROOM + n],
+                    &mut hop,
+                ) {
                     if table.len() >= 4096 {
                         table.clear();
                     }
@@ -588,7 +592,7 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
             while let Ok((n, src)) = sock.recv_from(&mut reply[SEAL_ROOM..SEAL_ROOM + UDP_BUF]) {
                 if let Some(client) = table.get(&src) {
                     if let Some(packet) =
-                        seal_datagram(&master, method, &src, &mut reply, SEAL_ROOM, n)
+                        seal_datagram(&master, method, &src, &mut reply, SEAL_ROOM, n, &mut hop)
                     {
                         let _ = clients.send_to(packet, client);
                     }
@@ -891,6 +895,7 @@ pub(crate) fn seal_datagram<'a>(
     buf: &'a mut [u8],
     at: usize,
     n: usize,
+    hop: &mut Option<Cipher>,
 ) -> Option<&'a [u8]> {
     let addr_bytes = if dest.is_ipv6() { 19 } else { 7 };
     if method.is_stream() {
@@ -915,7 +920,14 @@ pub(crate) fn seal_datagram<'a>(
     }
     let mut salt = [0u8; SALT_LEN];
     getrandom::getrandom(&mut salt[..salt_len]).ok()?;
-    let mut cipher = Cipher::from_master_key(method, master, &salt[..salt_len])?;
+    // The first datagram on the chain builds the engine; every one after rekeys it: the salt is the key, so the HKDF and the schedule run again and the heap holds still.
+    let cipher: &mut Cipher = match hop {
+        Some(cipher) => {
+            cipher.rekey(master, &salt[..salt_len])?;
+            cipher
+        }
+        None => hop.insert(Cipher::from_master_key(method, master, &salt[..salt_len])?),
+    };
     let clear_at = at - head;
     buf[clear_at..clear_at + salt_len].copy_from_slice(&salt[..salt_len]);
     write_addr(&mut buf[clear_at + salt_len..at], dest);
@@ -929,6 +941,7 @@ pub(crate) fn open_datagram<'a>(
     master: &MasterKey,
     method: Method,
     packet: &'a mut [u8],
+    hop: &mut Option<Cipher>,
 ) -> Option<(SocketAddr, &'a [u8])> {
     if method.is_stream() {
         if packet.len() < IV_LEN + 1 {
@@ -946,7 +959,18 @@ pub(crate) fn open_datagram<'a>(
     if packet.len() < salt_len + TAG_LEN + 1 {
         return None;
     }
-    let mut cipher = Cipher::from_master_key(method, master, &packet[..salt_len])?;
+    // The first datagram on the chain builds the engine; every one after rekeys it: the salt is the key, so the HKDF and the schedule run again and the heap holds still.
+    let cipher: &mut Cipher = match hop {
+        Some(cipher) => {
+            cipher.rekey(master, &packet[..salt_len])?;
+            cipher
+        }
+        None => hop.insert(Cipher::from_master_key(
+            method,
+            master,
+            &packet[..salt_len],
+        )?),
+    };
     let body = &mut packet[salt_len..];
     let len = cipher.open_in_place(body)?;
     let (target, used) = parse_addr_header(&body[..len])?;
@@ -1336,9 +1360,18 @@ mod tests {
     ) -> Vec<u8> {
         let mut buf = vec![0u8; DATAGRAM_MAX];
         buf[SEAL_ROOM..SEAL_ROOM + payload.len()].copy_from_slice(payload);
-        seal_datagram(master, method, dest, &mut buf, SEAL_ROOM, payload.len())
-            .expect("seals")
-            .to_vec()
+        let mut hop = None;
+        seal_datagram(
+            master,
+            method,
+            dest,
+            &mut buf,
+            SEAL_ROOM,
+            payload.len(),
+            &mut hop,
+        )
+        .expect("seals")
+        .to_vec()
     }
 
     /// Open one wire datagram and copy out what it carried, for the tests that compare bytes rather than pointers.
@@ -1348,7 +1381,8 @@ mod tests {
         packet: &[u8],
     ) -> Option<(SocketAddr, Vec<u8>)> {
         let mut wire = packet.to_vec();
-        let (target, payload) = open_datagram(master, method, &mut wire)?;
+        let mut hop = None;
+        let (target, payload) = open_datagram(master, method, &mut wire, &mut hop)?;
         Some((target, payload.to_vec()))
     }
 
@@ -1925,6 +1959,7 @@ mod tests {
             let mut wire = vec![0u8; DATAGRAM_MAX];
             let base = wire.as_ptr() as usize;
             let room = wire.capacity();
+            let mut hop = None;
             for round in 0..8 {
                 wire[SEAL_ROOM..SEAL_ROOM + payload.len()].copy_from_slice(payload);
                 let (sealed_at, sealed) = {
@@ -1935,6 +1970,7 @@ mod tests {
                         &mut wire,
                         SEAL_ROOM,
                         payload.len(),
+                        &mut hop,
                     )
                     .expect("seals");
                     let at = packet.as_ptr() as usize;
@@ -1955,9 +1991,13 @@ mod tests {
                     "round {round}: the seal buffer grew, so a datagram reallocates"
                 );
                 let opened_at = {
-                    let (got, opened) =
-                        open_datagram(&master, method, &mut wire[sealed_at..sealed_at + sealed])
-                            .expect("opens");
+                    let (got, opened) = open_datagram(
+                        &master,
+                        method,
+                        &mut wire[sealed_at..sealed_at + sealed],
+                        &mut hop,
+                    )
+                    .expect("opens");
                     assert_eq!(got, target, "round {round}");
                     assert_eq!(opened, payload, "round {round}");
                     opened.as_ptr() as usize
@@ -1996,7 +2036,8 @@ mod tests {
         let last = flipped.len() - 1;
         flipped[last] ^= 1;
         let as_sent = flipped.clone();
-        assert!(open_datagram(&master, method, &mut flipped).is_none());
+        let mut hop = None;
+        assert!(open_datagram(&master, method, &mut flipped, &mut hop).is_none());
         assert_eq!(
             flipped, as_sent,
             "a refused datagram is left exactly as it arrived"

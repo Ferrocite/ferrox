@@ -411,6 +411,22 @@ impl Aes128Gcm {
         }
     }
 
+    /// Rekey in place: the box and the backend pick survive, the schedule and the GHASH powers rebuild, and a caller that rekeys per datagram stops paying an allocation per datagram. The power table depends on the key, so it rebuilds too; what leaves is the `Box` and the probe, not the crypto.
+    pub fn rekey(&mut self, key: &[u8; 16]) {
+        match &mut self.inner {
+            #[cfg(target_arch = "x86_64")]
+            Inner::X86V(e) => unsafe { e.rekey(key) },
+            #[cfg(target_arch = "x86_64")]
+            Inner::X86(e) => unsafe { e.rekey(key) },
+            #[cfg(target_arch = "aarch64")]
+            Inner::Arm(e) => unsafe { e.rekey(key) },
+            Inner::Crate(c) => {
+                **c =
+                    aes_gcm::KeyInit::new_from_slice(key).expect("a 16-byte key is valid AES-128");
+            }
+        }
+    }
+
     #[must_use]
     pub const fn backend(&self) -> &'static str {
         match &self.inner {
@@ -710,6 +726,22 @@ impl Aes256Gcm {
             inner: Inner256::Crate(Box::new(
                 aes_gcm::KeyInit::new_from_slice(key).expect("a 32-byte key is valid AES-256"),
             )),
+        }
+    }
+
+    /// Rekey in place: the box and the backend pick survive, the schedule and the GHASH powers rebuild, and a caller that rekeys per datagram stops paying an allocation per datagram. The power table depends on the key, so it rebuilds too; what leaves is the `Box` and the probe, not the crypto.
+    pub fn rekey(&mut self, key: &[u8; 32]) {
+        match &mut self.inner {
+            #[cfg(target_arch = "x86_64")]
+            Inner256::X86V(e) => unsafe { e.rekey(key) },
+            #[cfg(target_arch = "x86_64")]
+            Inner256::X86(e) => unsafe { e.rekey(key) },
+            #[cfg(target_arch = "aarch64")]
+            Inner256::Arm(e) => unsafe { e.rekey(key) },
+            Inner256::Crate(c) => {
+                **c =
+                    aes_gcm::KeyInit::new_from_slice(key).expect("a 32-byte key is valid AES-256");
+            }
         }
     }
 

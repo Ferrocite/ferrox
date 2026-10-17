@@ -161,6 +161,11 @@ fn grouped(blocks: &[[u8; 16]]) -> usize {
 
 impl Engine {
     #[target_feature(enable = "avx2,vaes,vpclmulqdq,aes,pclmulqdq,ssse3")]
+    pub(crate) unsafe fn rekey(&mut self, key: &[u8; 16]) {
+        unsafe { *self = Self::new(key) };
+    }
+
+    #[target_feature(enable = "avx2,vaes,vpclmulqdq,aes,pclmulqdq,ssse3")]
     pub(crate) unsafe fn new(key: &[u8; 16]) -> Self {
         let rk = super::x86::expand(key);
         let rk2 = rk.map(|k| _mm256_broadcastsi128_si256(k));
@@ -343,6 +348,11 @@ pub(crate) struct Engine256 {
 }
 
 impl Engine256 {
+    #[target_feature(enable = "avx2,vaes,vpclmulqdq,aes,pclmulqdq,ssse3")]
+    pub(crate) unsafe fn rekey(&mut self, key: &[u8; 32]) {
+        unsafe { *self = Self::new(key) };
+    }
+
     #[target_feature(enable = "avx2,vaes,vpclmulqdq,aes,pclmulqdq,ssse3")]
     pub(crate) unsafe fn new(key: &[u8; 32]) -> Self {
         let rk = super::x86::expand256(key);
