@@ -17,6 +17,13 @@ whose prefix goes to a one-buffer `CONNECT` writer, and the Shadowsocks rung, wh
 a `peek` for the first byte of a request packet — keep `read_http_head` and pay its `peek` plus
 its re-read.
 
+The record halves, which have no `peek` to lose, took the same shape when `read_exact_head`
+became that loop: `HeadReader { prefix, at }` is handed the read's own buffer with the cursor
+past the head, so the octets behind the delimiter never leave the allocation they were read
+into (`head-tail-allocations 0`, witnessed by
+`httpheader::tests::the_record_head_hands_over_the_buffer_it_filled`, which fails the base
+arithmetic if the tail is `split_off` into a buffer of its own).
+
 ## Data path
 
 ```mermaid
@@ -36,6 +43,7 @@ graph TD
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | framing-bytes-added | 0 | ferrox-app-httpheader::tests::header_carries_an_echo_over_loopback |
 | head-tail-read-syscalls | 0 | ferrox-app-httpheader::tests::the_bytes_behind_the_head_reach_the_relay_without_a_syscall |
+| head-tail-allocations | 0 | ferrox-app-httpheader::tests::the_record_head_hands_over_the_buffer_it_filled |
 | user-space-copies-per-byte-relayed | 1 | ferrox-app-proxy::tests::carried_streams_round_trip_behind_the_http_camouflage |
 <!-- counts:end -->
 
