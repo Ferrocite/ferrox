@@ -204,8 +204,8 @@ impl Write for H2StreamWriter {
                 if !self.emit_headers(&head[..at + 4]) {
                     return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
                 }
-                let body = head[at + 4..].to_vec();
-                if !body.is_empty() && !self.conn.send_data(self.stream, &body) {
+                let body = &head[at + 4..];
+                if !body.is_empty() && !self.conn.send_data(self.stream, body) {
                     return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
                 }
             }
@@ -585,7 +585,7 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
             break;
         }
         if !pump_frame(
-            &conn, settings, id, freedom, kind, flags, sid, &body, &mut frag,
+            &conn, settings, id, freedom, kind, flags, sid, body, &mut frag,
         ) {
             break;
         }
@@ -596,6 +596,15 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
     }
     conn.kill();
     conn.wake.notify_all();
+}
+
+/// Cuts a padded DATA frame's own buffer to `[payload]` in place — the pad-length byte skipped, the padding tail dropped — and returns the payload length, `0` when the pad swallows the payload. The allocation survives truncated, where a slice-to-`Vec` would have copied the payload out; the saturation matches the borrow-checked reference at every pad length.
+#[inline]
+fn cut_padded_data(body: &mut Vec<u8>, pad: usize) -> usize {
+    let inner = body.len().saturating_sub(1 + pad);
+    body.copy_within(1..=inner, 0);
+    body.truncate(inner);
+    inner
 }
 
 #[allow(
@@ -611,7 +620,7 @@ fn pump_frame(
     kind: u8,
     flags: u8,
     sid: u32,
-    body: &[u8],
+    mut body: Vec<u8>,
     frag: &mut Option<(u32, Vec<u8>)>,
 ) -> bool {
     match kind {
@@ -620,13 +629,13 @@ fn pump_frame(
                 if !body.len().is_multiple_of(6) {
                     return false;
                 }
-                conn.apply_settings(body);
+                conn.apply_settings(&body);
             }
             true
         }
         T_PING => {
             if flags & F_ACK == 0 && body.len() == 8 {
-                conn.frame(T_PING, F_ACK, 0, body);
+                conn.frame(T_PING, F_ACK, 0, &body);
             }
             true
         }
@@ -664,7 +673,7 @@ fn pump_frame(
             if sid == 0 || sid.is_multiple_of(2) {
                 return true;
             }
-            let mut block = body.to_vec();
+            let mut block = body;
             let mut pos = 0;
             if flags & F_PADDED != 0 {
                 let Some(&len) = block.first() else {
@@ -712,7 +721,7 @@ fn pump_frame(
                     conn.refuse(E_PROTOCOL);
                     return false;
                 }
-                gathered.extend_from_slice(body);
+                gathered.extend_from_slice(&body);
                 if flags & F_END_HEADERS != 0 {
                     open_stream(conn, settings, id, freedom, sid, &gathered, false);
                 } else {
@@ -722,33 +731,33 @@ fn pump_frame(
             true
         }
         T_DATA => {
-            let mut payload = body;
-            if flags & F_PADDED != 0 {
-                let Some(&len) = payload.first() else {
+            // The frame's own buffer becomes the queued chunk: no copy in, no copy out.
+            let payload_len = if flags & F_PADDED != 0 {
+                let Some(&pad) = body.first() else {
                     return true;
                 };
-                payload = payload
-                    .get(1..payload.len().saturating_sub(len as usize))
-                    .unwrap_or_default();
-            }
+                cut_padded_data(&mut body, pad as usize)
+            } else {
+                body.len()
+            };
             let streams = conn.streams.lock().unwrap_or_else(PoisonError::into_inner);
             let Some(state) = streams.get(&sid).cloned() else {
                 drop(streams);
-                conn.replenish(sid, payload.len());
+                conn.replenish(sid, payload_len);
                 return true;
             };
             drop(streams);
             {
                 let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
                 if !st.dead {
-                    st.body.push_back(payload.to_vec());
+                    st.body.push_back(body);
                     if flags & F_END != 0 {
                         st.ended = true;
                     }
                 }
                 state.cv.notify_all();
             }
-            conn.replenish(sid, payload.len());
+            conn.replenish(sid, payload_len);
             true
         }
         T_RST => {
@@ -850,6 +859,33 @@ mod tests {
             }
             if end && payload.is_empty() {
                 write_frame(&mut self.stream, T_DATA, F_END, id, &[]);
+            }
+            self.stream.flush().expect("flushes");
+        }
+
+        /// Every DATA frame is padded: a pad-length byte in front of the payload, `pad` bytes after it, the last frame ending the stream. Chunk sizing leaves room for both pad halves inside one frame.
+        fn padded_data(&mut self, id: u32, payload: &[u8], pad: u8, end: bool) {
+            let room = MAX_RECV_FRAME - 1 - pad as usize;
+            let mut at = 0;
+            loop {
+                let end_at = (at + room).min(payload.len());
+                let chunk = &payload[at..end_at];
+                let last = end && end_at == payload.len();
+                let mut frame = Vec::with_capacity(1 + chunk.len() + pad as usize);
+                frame.push(pad);
+                frame.extend_from_slice(chunk);
+                frame.extend(std::iter::repeat_n(pad, pad as usize));
+                write_frame(
+                    &mut self.stream,
+                    T_DATA,
+                    if last { F_PADDED | F_END } else { F_PADDED },
+                    id,
+                    &frame,
+                );
+                at = end_at;
+                if last || at == payload.len() {
+                    break;
+                }
             }
             self.stream.flush().expect("flushes");
         }
@@ -1035,6 +1071,24 @@ mod tests {
         format!("http://127.0.0.1/up/?x_padding={}", "X".repeat(128))
     }
 
+    /// The in-place padded-DATA cut equals the borrow-checked reference at every pad length: a partially padded frame keeps exactly `body[1..len - pad]`, a pad that swallows the payload leaves the empty chunk `get(..).unwrap_or_default()` produced, and the length the caller replenishes by is the same in both.
+    #[test]
+    fn a_padded_data_cut_matches_the_reference_at_every_pad_length() {
+        for len in 1..=8usize {
+            let frame: Vec<u8> = (0..len as u8).map(|b| b * 37 + 5).collect();
+            for pad in 0..=10usize {
+                let mut mine = frame.clone();
+                let cut = cut_padded_data(&mut mine, pad);
+                let want = frame
+                    .get(1..frame.len().saturating_sub(pad))
+                    .unwrap_or_default()
+                    .to_vec();
+                assert_eq!(mine, want, "len {len} pad {pad}: cut bytes differ");
+                assert_eq!(cut, want.len(), "len {len} pad {pad}: cut length differs");
+            }
+        }
+    }
+
     #[test]
     fn h2_stream_up_carries_bulk_both_ways() {
         let (echo_addr, echo) = echo_server();
@@ -1057,6 +1111,37 @@ mod tests {
         let mut body = header;
         body.extend_from_slice(&payload);
         client.data(up, &body, true);
+        assert_eq!(client.response_head(up), 200);
+        assert_eq!(client.response_data(down, 2), [0, 0]);
+        assert_eq!(client.response_data(down, payload.len()), payload);
+        drop(client);
+        echo.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    /// A padded DATA frame is queued as exactly its payload: the pad-length byte and the pad tail are gone before the chunk reaches the session, so an echo over the padded uplink round-trips the payload untouched.
+    #[test]
+    fn a_padded_data_frame_is_its_payload_between_pad_byte_and_pad_tail() {
+        let (echo_addr, echo) = echo_server();
+        let (addr, server) = serve_one(test_settings("stream-up"), [0xccu8; 16], 1);
+        let mut client = H2Client::connect(addr);
+        let pad = padding();
+        let down = client.headers("GET", "/up/sess-h2-pad", &[("referer", pad.as_str())], true);
+        assert_eq!(client.response_head(down), 200);
+        let up = client.headers(
+            "POST",
+            "/up/sess-h2-pad",
+            &[
+                ("referer", pad.as_str()),
+                ("content-type", "application/grpc"),
+            ],
+            false,
+        );
+        let header = vless_header(echo_addr.port());
+        let payload: Vec<u8> = (0..50000u32).map(|i| (i % 251) as u8).collect();
+        let mut body = header;
+        body.extend_from_slice(&payload);
+        client.padded_data(up, &body, 7, true);
         assert_eq!(client.response_head(up), 200);
         assert_eq!(client.response_data(down, 2), [0, 0]);
         assert_eq!(client.response_data(down, payload.len()), payload);

@@ -406,6 +406,8 @@ by the in-memory writer above, which is the only checker that can count writes.
   refused, so the knobs demonstrably reach the accept path and not just the
   parser.
 
+- **A staging copy per inbound DATA frame, and one per riding write.** The h2 server reads each frame body into its own `Vec`, and `pump_frame` copied it a second time on the way into the stream's queue (`st.body.push_back(payload.to_vec())`), while a padded frame was cut with `get(..).unwrap_or_default().to_vec()` and the `H2StreamWriter` early-data arm took `head[at + 4..].to_vec()` before `send_data`. The frame's own buffer is now moved into the queue, the padding is cut in place (`copy_within` then `truncate`), and the write borrows the tail — one allocation and one copy per DATA frame, down from two. `a_padded_data_cut_matches_the_reference_at_every_pad_length` sweeps the in-place cut against the old `get(..).to_vec()` form as the oracle over lengths 1..=8 and pads 0..=10, and `a_padded_data_frame_is_its_payload_between_pad_byte_and_pad_tail` round-trips 50 KB through a pad-7 DATA uplink, so no byte on the wire moves. This is a copy and allocation removal, and the page's own rule wants a pointer-identity or allocator-count witness; neither ships here, because the per-frame body is still one fresh `vec![0u8; len]` that the move merely stops doubling and `count-ops` is CI-only on darwin/aarch64 — so the removal is named in prose and no blessed count moved with it. What did not move: the per-frame read allocation itself, the pad tail still dropped at the cut, and every wire byte.
+
 ## Open rows
 
 - A payload the placement arm refuses answers `400` (or `413`) and returns
