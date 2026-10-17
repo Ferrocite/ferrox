@@ -6021,7 +6021,7 @@ fn serve_socks_udp(mut client: Connection, out: &Outbound) {
     let Some(relay) = socks_udp_relay(&mut client) else {
         return;
     };
-    let _associate = client;
+    // The handler holds the control socket open for its life, and the Foxy arms watch it for the client's goodbye.
     match out {
         Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Raw) && vless.tls.is_none() => {
             serve_socks_udp_vless(&relay, vless);
@@ -6039,8 +6039,8 @@ fn serve_socks_udp(mut client: Connection, out: &Outbound) {
         }
         Outbound::Foxy(foxy) => match foxy.carrier {
             // One tunnel for all destinations: later ones ride the first one opened.
-            crate::foxy::Carrier::H3 => serve_socks_udp_foxy_ip(&relay, foxy),
-            _ => serve_socks_udp_foxy(&relay, foxy),
+            crate::foxy::Carrier::H3 => serve_socks_udp_foxy_ip(&relay, foxy, &client),
+            _ => serve_socks_udp_foxy(&relay, foxy, &client),
         },
         Outbound::Freedom => serve_socks_udp_freedom(&relay),
         _ => {}
@@ -6109,18 +6109,30 @@ fn serve_socks_udp_freedom(relay: &UdpSocket) {
     }
 }
 
+/// The association's own control socket answers a peek with zero (or an error) once the app is gone; a timeout is the answer that says it is still there.
+fn association_left(associate: &Connection) -> bool {
+    let mut byte = [0u8; 1];
+    match associate.peek(&mut byte) {
+        Err(error) => !is_timeout(&error),
+        Ok(read) => read == 0,
+    }
+}
+
 /// Foxy UDP: one CONNECT-UDP stream per destination, HTTP/2 then HTTP/3; the configured carrier does not apply.
-fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut) {
+fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connection) {
     const POLL: Duration = Duration::from_millis(10);
     let _ = relay.set_read_timeout(Some(POLL));
+    let _ = associate.set_read_timeout(Some(budgets::SESSION_POLL));
     let mut streams: HashMap<SocketAddr, crate::foxy::Datagram> = HashMap::new();
     let mut buf = udp_buffer();
     let mut datagram = udp_buffer();
     let mut reply = Vec::with_capacity(UDP_BUF);
     let mut client = None;
+    let mut quiet = Instant::now();
     loop {
         match relay.recv_from(&mut buf) {
             Ok((n, src)) => {
+                quiet = Instant::now();
                 client = Some(src);
                 let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
                     continue;
@@ -6139,14 +6151,20 @@ fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut) {
                     }
                 }
             }
-            Err(error) if is_timeout(&error) => {}
+            Err(error) if is_timeout(&error) => {
+                if association_left(associate) || quiet.elapsed() >= budgets::udp_idle() {
+                    break;
+                }
+            }
             Err(_) => break,
         }
         let mut dead = Vec::new();
         for (dest, lane) in &mut streams {
             match lane.read(&mut datagram) {
-                Ok(0) => {}
+                // A stream the edge closed is gone: the next datagram for that destination dials a fresh one.
+                Ok(0) => dead.push(*dest),
                 Ok(n) => {
+                    quiet = Instant::now();
                     if let Some(src) = client {
                         reply.clear();
                         reply.extend_from_slice(&[0, 0, 0]);
@@ -6166,9 +6184,10 @@ fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut) {
 }
 
 /// CONNECT-IP UDP: one tunnel shared by every destination, so later targets cost a map row, not a dial.
-fn serve_socks_udp_foxy_ip(relay: &UdpSocket, foxy: &FoxyOut) {
+fn serve_socks_udp_foxy_ip(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connection) {
     const POLL: Duration = Duration::from_millis(10);
     let _ = relay.set_read_timeout(Some(POLL));
+    let _ = associate.set_read_timeout(Some(budgets::SESSION_POLL));
     // The tunnel and its owned source address are opened once and shared: that is this row's whole point.
     let mut tunnel: Option<crate::foxy::Ip> = None;
     let mut source = [0u8; 16];
@@ -6179,9 +6198,11 @@ fn serve_socks_udp_foxy_ip(relay: &UdpSocket, foxy: &FoxyOut) {
     // One port per destination so a reply lands where it was sent from: the address is shared, the port is not.
     let mut ports: HashMap<SocketAddr, u16> = HashMap::new();
     let mut next_port = 40_000u16;
+    let mut quiet = Instant::now();
     loop {
         match relay.recv_from(&mut buf) {
             Ok((n, src)) => {
+                quiet = Instant::now();
                 client = Some(src);
                 let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
                     continue;
@@ -6220,13 +6241,18 @@ fn serve_socks_udp_foxy_ip(relay: &UdpSocket, foxy: &FoxyOut) {
                     }
                 }
             }
-            Err(error) if is_timeout(&error) => {}
+            Err(error) if is_timeout(&error) => {
+                if association_left(associate) || quiet.elapsed() >= budgets::udp_idle() {
+                    break;
+                }
+            }
             Err(_) => break,
         }
         // One read per pass serves all destinations: each packet's source names where its reply belongs.
         if let Some(lane) = tunnel.as_mut() {
             match lane.read() {
                 Ok(Some(packet)) => {
+                    quiet = Instant::now();
                     if let Some(read) = ferrox_core::foxy::connectip::udp_from_packet(&packet) {
                         if !read.verified {
                             continue;
@@ -6316,7 +6342,7 @@ fn open_foxy_ip_tunnel(
                 _ => None,
             };
             match crate::foxy::Ip::open(&dial, quic) {
-                Ok((lane, assigned)) => {
+                Ok((mut lane, assigned)) => {
                     debug_lane(&edge, carrier, "connect-ip opened");
                     clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                     foxy.carrier_answered(&edge, carrier);
@@ -6330,6 +6356,8 @@ fn open_foxy_ip_tunnel(
                     };
                     *width = granted.width();
                     source[..*width].copy_from_slice(granted.bytes());
+                    // The tunnel read carries the same quantum as the datagram streams: an unanswered read returns on the tick instead of parking the association thread.
+                    let _ = lane.set_read_quantum(budgets::relay_quantum());
                     *tunnel = Some(lane);
                     return true;
                 }
@@ -15211,6 +15239,137 @@ mod tests {
         stream.write_all(&header).expect("requests");
         let mut back = [0u8; 2];
         assert!(stream.read_exact(&mut back).is_err());
+    }
+
+    /// An outbound with no edges to dial: the association rides nothing, which is exactly what its lifetime budget must cover.
+    fn foxy_without_edges() -> FoxyOut {
+        FoxyOut {
+            account: None,
+            country: "US".to_owned(),
+            city: String::new(),
+            carrier: crate::foxy::Carrier::H2,
+            upstream: None,
+            candidates: Vec::new(),
+            stored: None,
+            unauthenticated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            limited_strikes: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            limited_until: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            carrier_dead: std::sync::Arc::new(std::sync::Mutex::new(
+                ferrox_core::foxy::Refusals::new(32),
+            )),
+            edge_strikes: std::sync::Arc::new(std::sync::Mutex::new(
+                ferrox_core::foxy::EdgeStrikes::new(32),
+            )),
+            roots: Vec::new(),
+            pins: ferrox_core::foxy::pin::Pins::default(),
+            pass: ferrox_core::foxy::Pass {
+                token: "the-pass".to_owned(),
+                expires_at: None,
+                quota_remaining: None,
+                quota_reset: None,
+            },
+            edge_address: None,
+            direct_ports: Vec::new(),
+            direct_suffixes: Vec::new(),
+            exit_probe: None,
+            verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            probe_unavailable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+
+    /// The handler's side of a loopback control socket, and the peer side the test can leave.
+    fn association_pair() -> (Connection, Connection) {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let peer = Connection::connect(addr).expect("connects");
+        let (associate, _) = front.accept().expect("accepts");
+        (associate, peer)
+    }
+
+    /// Silence past the budget is death, not a leak: a stream-per-destination association with no traffic hands its thread back at the idle budget.
+    #[test]
+    fn a_quiet_foxy_udp_association_hands_its_thread_back() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            udp_idle: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let (associate, _peer) = association_pair();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            serve_socks_udp_foxy(&relay, &foxy_without_edges(), &associate);
+            let _ = done_tx.send(());
+        });
+        let returned = done_rx.recv_timeout(Duration::from_millis(250) + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("a quiet association ends on its idle budget");
+        serving.join().expect("joins");
+    }
+
+    /// The client's goodbye outranks the idle budget: an association whose control socket closed hands its thread back at the next tick.
+    #[test]
+    fn a_foxy_udp_association_ends_when_its_client_leaves() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            udp_idle: Some(Duration::from_secs(30)),
+            ..Default::default()
+        });
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let (associate, peer) = association_pair();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            serve_socks_udp_foxy(&relay, &foxy_without_edges(), &associate);
+            let _ = done_tx.send(());
+        });
+        drop(peer);
+        let returned = done_rx.recv_timeout(Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the closed control socket ends the association, not its idle budget");
+        serving.join().expect("joins");
+    }
+
+    /// The shared tunnel obeys the same lifetime as the per-destination streams: silence past the budget hands the thread back.
+    #[test]
+    fn a_quiet_foxy_connect_ip_association_hands_its_thread_back() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            udp_idle: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let (associate, _peer) = association_pair();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            serve_socks_udp_foxy_ip(&relay, &foxy_without_edges(), &associate);
+            let _ = done_tx.send(());
+        });
+        let returned = done_rx.recv_timeout(Duration::from_millis(250) + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("a quiet connect-ip association ends on its idle budget");
+        serving.join().expect("joins");
+    }
+
+    /// And the goodbye outranks the budget here too: no tunnel is left dialled and parked when the app is gone.
+    #[test]
+    fn a_foxy_connect_ip_association_ends_when_its_client_leaves() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            udp_idle: Some(Duration::from_secs(30)),
+            ..Default::default()
+        });
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let (associate, peer) = association_pair();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            serve_socks_udp_foxy_ip(&relay, &foxy_without_edges(), &associate);
+            let _ = done_tx.send(());
+        });
+        drop(peer);
+        let returned = done_rx.recv_timeout(Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the closed control socket ends the tunnel, not its idle budget");
+        serving.join().expect("joins");
     }
 
     #[test]
