@@ -242,6 +242,8 @@ Take the flaky test on {method} — matrix row {index} of table {section} — an
 
 **Add-on — replay:** Seed any corpus-dependent test so a red run prints the case that broke it and replays on any machine.
 
+**Add-on — harness-bound:** Before a bench row is read as an engine's, read the cell's own `harness_ceilings_mib_s`: throughput at a small fraction of it for *every* engine in the cell is the instrument's bound, not the comparators' — that is how every upload cell of `vless-raw-up-1` read 616 MiB/s for three engines at 14% of a 4 294 MiB/s pipe while the same build downloaded at 3 011 (#166 replaced the sink's per-byte modulo with a run compare). A ceiling row is one generator into one reader and the relay rows are two hops, so it is read as a floor. `benchmark-matrix.yml`'s `only` input intersects its comma-separated substrings rather than unioning them, so a multi-scenario dispatch silently plans zero cells: dispatch one scenario per run.
+
 ## P12 · Collapse a duplicated walk, ladder, or dispatch to one copy
 
 **When to use:** The same config walk, header parse, ladder fork, or relay dispatch is written out in more than one file, and a change to one silently diverges from the others.
