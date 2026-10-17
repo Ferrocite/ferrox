@@ -10,7 +10,10 @@ base="${2:-HEAD}"
 
 top="$(git rev-parse --show-toplevel)"
 parent="$(dirname "$top")"
-dest="$parent/ferrox-$name"
+case "$name" in
+  *-ferrox) dest="$parent/$name" ;;
+  *) dest="$parent/ferrox-$name" ;;
+esac
 shared="${FERROX_TARGET_DIR:-$parent/.ferrox-target}"
 
 if [[ -e "$dest" ]]; then
