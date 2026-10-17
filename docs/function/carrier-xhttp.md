@@ -194,6 +194,23 @@ without the call. Not removed: a refusal still answers no reason — the peer le
 its stream ended — and an H1 `stream-up` POST with no downlink still parks its own thread, the
 carrier-side owner named above.
 
+## Padded DATA credit
+
+Flow control counts the whole DATA payload, the Pad Length octet and the Padding included
+(RFC 7540 §6.9), and the reference takes `f.Length` — the wire length — at both levels before
+it refunds the pad immediately and the payload as the body reads it. The H2 dispatch cut the
+padding in place and then credited the *cut* length, so every padded frame under-credited by
+`1 + pad` octets: the peer's view of our receive window shrank a little each frame, and a
+stream-long pad, which the cut turns into an empty chunk, credited nothing at all. The credit
+is now the frame's wire length, taken before the cut, on both the queued path and the path
+that drops DATA for a stream that is not there. `xhttp_h2::tests::a_padded_data_credit_counts_the_whole_wire_payload`
+reads the two `WINDOW_UPDATE` increments off a connection with no socket and fails at
+`1 + payload + pad` without the change. Only the four-byte increment changes — no copy,
+allocation or syscall — so `writes-per-credit` and `window-update-frames-per-credit` below do
+not move, which is why this is prose rather than a row. Not fixed here: the gRPC lane
+(`grpc.rs`, crediting `len - first - pad`) and the Foxy lane (`foxy.rs`, crediting the
+unpadded payload the frame parser hands over) carry the same shortfall and are roadmap rows.
+
 ## Kept head
 
 Both H1 handshakes — the `POST` a server reads and the `200` a dialer reads — used to `peek` for
