@@ -156,6 +156,9 @@ pub(crate) struct GrpcReader<R: Read = TcpStream> {
     /// Bytes the reader moved for itself — the reclaim move and the part of a message a pad byte cuts into: these and nothing else are what the staging gate counts.
     #[cfg_attr(not(test), allow(dead_code, reason = "read by the staging gate"))]
     staged: usize,
+    /// The reclaim moves that copied live bytes: a drained buffer cleared rather than moved is a call fewer here, which the byte counter cannot see.
+    #[cfg_attr(not(test), allow(dead_code, reason = "read by the reclaim gate"))]
+    reclaims: usize,
     /// Scratch for the frames that are not a body: headers, settings, ping.
     frame: Vec<u8>,
     /// Bodies read since the last credit, and the stream they belong to: a credit pays for a window's worth of frames, not for one.
@@ -334,10 +337,17 @@ impl<R: Read> GrpcReader<R> {
 
     /// A DATA body lands at the end of the buffer the decoder reads and the caller takes from, so a payload moves twice at most: out of the socket, and into the caller; `staged` counts every other move.
     fn data(&mut self, id: u32, flags: u8, len: usize) -> Option<()> {
-        // The bytes the caller already had go first, and only when they outweigh what is still live: a move that costs more than it frees is a copy.
-        if self.msg_at * 2 >= self.msg.len() {
+        // A fully drained buffer has nothing live to keep, so the reclaim is a clear, not a move of an empty run.
+        if self.msg_at == self.msg.len() {
+            self.msg.clear();
+            self.msg_at = 0;
+            self.msg_end = 0;
+            self.pay_end = 0;
+        } else if self.msg_at * 2 >= self.msg.len() {
+            // The bytes the caller already had go first, and only when they outweigh what is still live: a move that costs more than it frees is a copy.
             let at = self.msg_at;
             self.staged += self.msg.len() - at;
+            self.reclaims += 1;
             self.msg.copy_within(at.., 0);
             self.msg.truncate(self.msg.len() - at);
             self.msg_at = 0;
@@ -901,6 +911,7 @@ fn new_reader<R: Read>(
         msg_end: 0,
         pay_end: 0,
         staged: 0,
+        reclaims: 0,
         frame: Vec::new(),
         owed: 0,
         owed_id: 0,
@@ -1393,22 +1404,27 @@ mod tests {
         assert_eq!(payload.capacity(), capacity, "the caller's buffer grew");
     }
 
-    /// The same buffer answers every frame: a body the size of the one before it is appended in place, so no message pays a reallocation of the bytes still live in it.
+    /// The same buffer answers every frame: a body the size of the one before it is appended in place, so no message pays a reallocation of the bytes still live in it, and a caller that drains each hunk before the next arrives never pays a reclaim move either.
     #[test]
     fn the_message_buffer_is_reused_not_reallocated() {
+        let hunk = [b'x'; HUNK];
         let mut reader = dial(&[
-            (0, message(b"ping")),
-            (0, message(b"pong")),
-            (F_END, message(b"last")),
+            (0, message(&hunk)),
+            (0, message(&hunk)),
+            (F_END, message(&hunk)),
         ]);
-        let mut buf = [0u8; 8];
-        reader.read_exact(&mut buf).expect("reads two");
-        assert_eq!(&buf, b"pingpong");
+        let mut got = [0u8; HUNK];
+        reader.read_exact(&mut got).expect("reads a hunk");
+        assert_eq!(got, hunk);
         let cap = reader.msg.capacity();
         assert!(cap > 0, "the body landed somewhere");
-        reader.read_exact(&mut buf[..4]).expect("reads the third");
-        assert_eq!(&buf[..4], b"last");
-        assert_eq!(reader.msg.capacity(), cap, "a same-sized body reallocated");
+        for _ in 1..3 {
+            reader.read_exact(&mut got).expect("reads a hunk");
+            assert_eq!(got, hunk);
+            assert_eq!(reader.msg.capacity(), cap, "a same-sized body reallocated");
+        }
+        assert_eq!(reader.staged, 0, "a drained buffer staged nothing");
+        assert_eq!(reader.reclaims, 0, "a drained buffer took a reclaim move");
     }
 
     /// The witnesses for `carrier-grpc credit-bytes 2097152`, `window-update-writes-per-credit 1` and `window-update-frames-per-credit 2`: a credit is still the peer's two frames, byte for byte, in one write — granted once for a whole half-window of bodies, not once per frame, and never so late that the peer has spent its window waiting for it.
