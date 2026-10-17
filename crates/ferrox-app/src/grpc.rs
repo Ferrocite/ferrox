@@ -1566,14 +1566,14 @@ mod tests {
         for piece in data.chunks(HUNK) {
             want.extend_from_slice(&frames(piece));
         }
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let handle = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             let writer = writer_over(stream, HUNK, u64::MAX);
             assert!(writer.send(&data), "the socket took the batch");
         });
-        let mut read = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut read = Connection::connect(("127.0.0.1", port)).expect("connects");
         let mut wire = Vec::new();
         read.read_to_end(&mut wire).expect("reads");
         handle.join().expect("joins");
