@@ -161,6 +161,8 @@ pub(crate) struct GrpcReader<R: Read = TcpStream> {
     /// Bodies read since the last credit, and the stream they belong to: a credit pays for a window's worth of frames, not for one.
     owed: u32,
     owed_id: u32,
+    /// The clock this head must be decoded by, armed only while the preface, the request headers and the opening request arrive: past it a silence is an error rather than a wait, so a peer that stops speaking releases the thread.
+    handshake: Option<std::time::Instant>,
     eof: bool,
 }
 
@@ -170,7 +172,19 @@ pub(crate) struct GrpcWriter {
     stream: u32,
 }
 
+impl GrpcReader<TcpStream> {
+    /// Arm or clear the poll quantum on the socket this reader reads through, so a peer that opens then stalls mid-header cannot pin the serve thread past the header read; as the `ws`, `httpupgrade` and `httpheader` readers do, and a duplicated socket inherits no read timeout on Windows.
+    pub(crate) fn set_poll(&mut self, every: Option<std::time::Duration>) {
+        let _ = self.read.set_read_timeout(every);
+    }
+}
+
 impl<R: Read> GrpcReader<R> {
+    /// Arm or clear the clock the opening head is decoded under; only that head runs armed, a relay waits blocking again, as the `ws` reader's budget does.
+    pub(crate) fn set_handshake_budget(&mut self, until: Option<std::time::Instant>) {
+        self.handshake = until;
+    }
+
     fn emit(&self, kind: u8, flags: u8, id: u32, body: &[u8]) -> bool {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return false;
@@ -385,7 +399,7 @@ impl<R: Read> GrpcReader<R> {
         self.msg.reserve(len);
         // SAFETY: `read_exact` initialises every byte it reports, and the path that does not fill them truncates them away, so no uninitialised byte is ever readable through `msg`.
         unsafe { self.msg.set_len(from + len) };
-        if crate::proxy::read_exact(&mut self.read, &mut self.msg[from..]).is_err() {
+        if fill(&mut self.read, &mut self.msg[from..], self.handshake).is_err() {
             self.msg.truncate(from);
             return None;
         }
@@ -486,14 +500,20 @@ impl<R: Read> GrpcReader<R> {
     }
 
     fn pump(&mut self) -> Option<()> {
-        let head = read_head(&mut self.read);
+        let head = match self.handshake {
+            Some(until) => read_head(&mut crate::proxy::HandshakeDeadline {
+                inner: &mut self.read,
+                until,
+            }),
+            None => read_head(&mut self.read),
+        };
         let (len, kind, flags, id) = head?;
         if kind == T_DATA {
             return self.data(id, flags, len);
         }
         let mut frame = std::mem::take(&mut self.frame);
         crate::proxy::resize_scratch(&mut frame, len);
-        if len > 0 && crate::proxy::read_exact(&mut self.read, &mut frame).is_err() {
+        if len > 0 && fill(&mut self.read, &mut frame, self.handshake).is_err() {
             self.frame = frame;
             return None;
         }
@@ -811,7 +831,12 @@ pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(GrpcReader, GrpcW
     let Ok(write) = read.try_clone() else {
         return None;
     };
-    accept_split(read, write, path)
+    // A head's clock only bites when a read answers it, so the preface and the request headers are polled at the relay's grain and ended by the deadline; the relay behind them waits blocking again.
+    read.set_read_timeout(Some(crate::budgets::RELAY_POLL))
+        .ok()?;
+    let mut accepted = accept_split(read, write, path)?;
+    accepted.0.set_poll(None);
+    Some(accepted)
 }
 
 fn new_shared(write: Box<dyn crate::proxy::FrameWrite + Send>) -> Arc<Shared> {
@@ -834,6 +859,21 @@ fn multi_path(path: &str) -> String {
     match path.rfind('/') {
         Some(at) => format!("{}TunMulti", &path[..=at]),
         None => "TunMulti".to_owned(),
+    }
+}
+
+/// `read_exact` under the clock a head is decoded under, which the site passes while a head arrives: past the deadline a silence is an error, so `read_exact`'s timeout-retry cannot spin a peer that never finishes speaking, and an unarmed reader waits exactly as it did.
+fn fill(
+    read: &mut dyn Read,
+    buf: &mut [u8],
+    until: Option<std::time::Instant>,
+) -> std::io::Result<()> {
+    match until {
+        Some(until) => crate::proxy::read_exact(
+            &mut crate::proxy::HandshakeDeadline { inner: read, until },
+            buf,
+        ),
+        None => crate::proxy::read_exact(read, buf),
     }
 }
 
@@ -864,6 +904,7 @@ fn new_reader<R: Read>(
         frame: Vec::new(),
         owed: 0,
         owed_id: 0,
+        handshake: None,
         eof: false,
     }
 }
@@ -874,8 +915,9 @@ pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     write: W,
     path: &str,
 ) -> Option<(GrpcReader<R>, GrpcWriter)> {
+    let until = std::time::Instant::now() + crate::budgets::handshake();
     let mut magic = [0u8; 24];
-    crate::proxy::read_exact(&mut read, &mut magic).ok()?;
+    fill(&mut read, &mut magic, Some(until)).ok()?;
     if magic != *MAGIC {
         return None;
     }
@@ -889,6 +931,8 @@ pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
         }
     }
     let mut reader = new_reader(read, Arc::clone(&shared), true, path, 0);
+    // The clock the preface was read under covers the request headers too, and ends where the head ends: past it the pump is a give-up rather than a wait, and a reader handed to a caller is unarmed again.
+    reader.set_handshake_budget(Some(until));
     while !reader.answered && !reader.eof {
         if reader.pump().is_none() {
             reader.eof = true;
@@ -897,6 +941,7 @@ pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     if !reader.answered {
         return None;
     }
+    reader.set_handshake_budget(None);
     let writer = GrpcWriter {
         shared,
         stream: reader.stream,

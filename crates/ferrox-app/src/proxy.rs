@@ -849,7 +849,13 @@ fn serve_vless(stream: TcpStream, id: &[u8; 16], carrier: &Carrier, freedom: boo
             let Some((mut reader, writer)) = crate::grpc::accept(stream, path) else {
                 return;
             };
-            let Some((got, _flow, cmd, target)) = decode_request(&mut reader) else {
+            // Past the preface the reader retries timeouts itself, so the opening request is polled at the relay's grain and bounded by the handshake budget, the way the websocket arm bounds its frames.
+            reader.set_poll(Some(RELAY_POLL));
+            reader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
+            let decoded = decode_request(&mut reader);
+            reader.set_handshake_budget(None);
+            reader.set_poll(None);
+            let Some((got, _flow, cmd, target)) = decoded else {
                 return;
             };
             if got != *id || cmd != 1 || !freedom {
@@ -12712,6 +12718,69 @@ mod tests {
             .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
             .expect("the bounded request read returns instead of pinning the thread");
         drop(peer);
+        serving.join().expect("joins");
+    }
+
+    /// Silence before the preface is death, not scheduling: a peer that opens a gRPC connection and never sends must not pin the accept thread past the head's budget.
+    #[test]
+    fn a_silent_peer_cannot_pin_a_grpc_preface() {
+        let id = [0x25u8; 16];
+        let carrier = Carrier::Grpc { path: "/p".into() };
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless(stream, &id, &carrier, true);
+            let _ = done_tx.send(());
+        });
+        let _peer = TcpStream::connect(addr).expect("connects");
+        done_rx
+            .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
+            .expect("the bounded preface read returns instead of pinning the thread");
+        serving.join().expect("joins");
+    }
+
+    /// A peer that sends the 24-octet preface and then stops speaking dies on the same budget: the request headers are read under the clock the preface started on.
+    #[test]
+    fn a_silent_peer_cannot_pin_a_grpc_request_head() {
+        let id = [0x26u8; 16];
+        let carrier = Carrier::Grpc { path: "/p".into() };
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless(stream, &id, &carrier, true);
+            let _ = done_tx.send(());
+        });
+        let mut peer = TcpStream::connect(addr).expect("connects");
+        peer.write_all(crate::h2::MAGIC).expect("sends the preface");
+        done_rx
+            .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
+            .expect("the bounded header read returns instead of pinning the thread");
+        drop(peer);
+        serving.join().expect("joins");
+    }
+
+    /// A client that completes the gRPC handshake and never sends its first hunk releases the serve thread: the opening request is decoded under the reader's own budget, the way the websocket frames are.
+    #[test]
+    fn a_silent_peer_cannot_pin_a_grpc_vless_request() {
+        let id = [0x27u8; 16];
+        let carrier = Carrier::Grpc { path: "/p".into() };
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless(stream, &id, &carrier, true);
+            let _ = done_tx.send(());
+        });
+        let stream = TcpStream::connect(addr).expect("connects");
+        let (_reader, _writer) = crate::grpc::connect(stream, "127.0.0.1", "/p").expect("dials");
+        done_rx
+            .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
+            .expect("the bounded request read returns instead of pinning the thread");
         serving.join().expect("joins");
     }
 
