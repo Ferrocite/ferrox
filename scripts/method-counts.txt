@@ -136,6 +136,7 @@ carrier-httpupgrade framing-bytes-after-the-101 0 ferrox-app-httpupgrade::tests:
 carrier-httpupgrade user-space-copies-per-byte-relayed 1 ferrox-app-httpupgrade::tests::upgrade_carries_an_echo_over_loopback
 carrier-httpupgrade write-calls-per-early-dial 1 ferrox-app-httpupgrade::tests::the_early_data_rides_in_one_write_with_the_request
 carrier-httpupgrade request-reallocations-per-dial 0 ferrox-app-httpupgrade::tests::the_request_is_sized_for_its_bytes
+carrier-httpupgrade round-trips-per-early-dial 0 ferrox-app-httpupgrade::tests::an_over_budget_payload_rides_ahead_of_a_lazy_answer
 
 carrier-httpheader ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-httpheader framing-bytes-added 0 ferrox-app-httpheader::tests::header_carries_an_echo_over_loopback
