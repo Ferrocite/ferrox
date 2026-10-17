@@ -193,6 +193,22 @@ without the call. Not removed: a refusal still answers no reason — the peer le
 its stream ended — and an H1 `stream-up` POST with no downlink still parks its own thread, the
 carrier-side owner named above.
 
+## Kept head
+
+Both H1 handshakes — the `POST` a server reads and the `200` a dialer reads — used to `peek` for
+`\r\n\r\n`, prove the head, then re-read exactly those octets so whatever rode in behind the
+delimiter stayed on the socket: a head of `H` crossed user space twice and a dribbled head cost
+two read-family calls per round. `proxy::read_http_head_kept` reads once into the buffer it hands
+back and returns where the head ends, so the head crosses once, a round costs one call, and the
+bytes behind it start out in `Reader::prefix` at that cursor instead of being read again.
+`xhttp::tests::a_chunk_that_rode_in_with_the_head_costs_no_syscall` drives the walk from an
+in-memory buffer: the size line, the payload and the terminator come out of the head's own
+allocation — `reads()` stays `0`, base and capacity unchanged. A wrong cursor delivers the head
+as body; a re-read trips the counter.
+What is *not* removed: the split arms still use `read_exact_head`, because a record stream has no
+`peek` and their head arrives pre-sliced; `proxy::read_http_head` still answers the `http` front
+and the Shadowsocks rung, named on the WebSocket page.
+
 ## Measured
 
 <!-- counts:begin -->
@@ -208,6 +224,7 @@ carrier-side owner named above.
 | writes-per-credit | 1 | ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write |
 | window-update-frames-per-credit | 2 | ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write |
 | head-buffer-reallocations-per-request-head | 0 | ferrox-app-xhttp_h2::tests::the_synthesized_head_is_sized_for_its_bytes |
+| head-tail-read-syscalls | 0 | ferrox-app-xhttp::tests::a_chunk_that_rode_in_with_the_head_costs_no_syscall |
 | received-data-frames-copied | 0 | ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into |
 | received-header-blocks-copied | 0 | ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into |
 <!-- counts:end -->
