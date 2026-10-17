@@ -1,6 +1,7 @@
 mod config;
 mod connection;
 mod listener;
+mod mask;
 mod roundtrip;
 mod segment;
 mod window;
@@ -12,6 +13,7 @@ mod oracle;
 pub use config::Config;
 pub use connection::{ConnError, ConnMetadata, Connection, State};
 pub use listener::{dial, fresh_conversation, Listener};
+pub use mask::{Encoder, HeaderKind, Mask, Spec, SpecError};
 pub use segment::{
     AckSegment, CmdOnlySegment, Command, DataSegment, Segment, SegmentOption, DATA_SEGMENT_OVERHEAD,
 };
