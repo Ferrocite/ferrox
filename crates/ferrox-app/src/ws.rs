@@ -1073,7 +1073,7 @@ mod tests {
         let base = have.as_ptr();
         let capacity = have.capacity();
         let (mut reader, _writer) = split_halves(
-            std::io::Cursor::new(Vec::from(b"\x81\x02no"[..])),
+            std::io::Cursor::new(Vec::from(&b"\x81\x02no"[..])),
             Sink::default(),
             Vec::new(),
             have,
