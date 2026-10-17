@@ -2001,7 +2001,7 @@ mod tests {
         let base = prefix.as_ptr();
         let capacity = prefix.capacity();
         let (mut reader, _writer) = split_halves(
-            std::io::Cursor::new(Vec::from(b"never read"[..])),
+            std::io::Cursor::new(Vec::from(&b"never read"[..])),
             Sink(Arc::new(Mutex::new(Vec::new()))),
             prefix,
             HEAD.len(),
