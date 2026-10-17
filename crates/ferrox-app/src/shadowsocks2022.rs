@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ferrox_core::shadowsocks2022::{self, Cipher, Method, BLOCK_LEN, MAX_CHUNK, TAG_LEN};
 
 use crate::budgets::RELAY_POLL;
-use crate::proxy::{push_addr, read_exact};
+use crate::proxy::{push_addr, read_exact, under_handshake};
 
 const READ_CHUNK: usize = 0x4000;
 const SKEW: u64 = 30;
@@ -486,8 +486,9 @@ pub(crate) fn serve_grpc(
     let Some((mut reader, mut writer)) = crate::grpc::accept(stream, path) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, password, method, freedom)
-    else {
+    let Some((uplink, send, recv)) = under_handshake(&mut reader, |read| {
+        accept_on(read, &mut writer, password, method, freedom)
+    }) else {
         return;
     };
     let closer = writer.clone();
@@ -1614,6 +1615,26 @@ mod tests {
             let _ = done_tx.send(());
         });
         let _peer = TcpStream::connect(addr).expect("connects");
+        done_rx
+            .recv_timeout(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
+            .expect("the bounded request read returns instead of pinning the thread");
+        serving.join().expect("joins");
+    }
+
+    /// A 2022-blake3 inbound over gRPC whose peer answers the head and never sends its salt releases the serve thread: the carrier puts its clock away with the head, so the handshake reads under its own.
+    #[test]
+    fn a_silent_peer_cannot_pin_a_grpc_shadowsocks2022_request() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let psk = psk_b64(32);
+        let serving = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_grpc(stream, &psk, "2022-blake3-aes-256-gcm", "/p", true);
+            let _ = done_tx.send(());
+        });
+        let stream = TcpStream::connect(addr).expect("connects");
+        let (_reader, _writer) = crate::grpc::connect(stream, "127.0.0.1", "/p").expect("dials");
         done_rx
             .recv_timeout(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
             .expect("the bounded request read returns instead of pinning the thread");
