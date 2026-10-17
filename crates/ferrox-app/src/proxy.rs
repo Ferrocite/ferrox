@@ -92,10 +92,7 @@ fn serve_root(label: &str, root: &Json) -> ! {
             let protocol = inbound.get("protocol").and_then(Json::as_str).unwrap_or("");
             let address = format!("{listen}:{port}");
             if !inbound_served(protocol) {
-                // Named rather than dropped in silence: a device inbound is one this binary cannot open.
-                eprintln!(
-                    "unsupported inbound protocol `{protocol}` in {label}: refused, not served"
-                );
+                refuse_inbound(protocol, label, inbound);
                 continue;
             }
             match protocol {
@@ -160,6 +157,29 @@ fn serve_root(label: &str, root: &Json) -> ! {
     loop {
         thread::park();
         report_dial_failures();
+    }
+}
+
+/// A device inbound is refused with the reason the device layer computes from the config; any other unserved inbound is refused by name.
+fn refuse_inbound(protocol: &str, label: &str, inbound: &Json) {
+    if crate::tun::is_device(protocol) {
+        let settings = inbound.get("settings");
+        let field = |key| {
+            settings
+                .as_ref()
+                .and_then(|s| s.get(key))
+                .or_else(|| inbound.get(key))
+        };
+        let spec = crate::tun::Spec::new(
+            field("name").and_then(Json::as_str),
+            field("mtu").and_then(Json::as_u32).map(|m| m as usize),
+        );
+        eprintln!(
+            "device inbound `{protocol}` in {label}: {}",
+            crate::tun::refusal_reason(&spec)
+        );
+    } else {
+        eprintln!("unsupported inbound protocol `{protocol}` in {label}: refused, not served");
     }
 }
 
