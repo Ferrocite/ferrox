@@ -1325,9 +1325,10 @@ fn read_validated(stream: &mut TcpStream, pattern: &[u8], bytes: u64) -> Result<
                 "download read failed after {read_total} of {bytes} bytes: {e}"
             ));
         }
-        if !matches_pattern(pattern, read_total as usize, &chunk[..want]) {
+        if let Some(at) = pattern_mismatch(pattern, read_total as usize, &chunk[..want]) {
             return Err(format!(
-                "bytes at offset {read_total} are not the validated pattern"
+                "bytes at offset {read_total} are not the validated pattern, first at byte {}",
+                read_total + at as u64
             ));
         }
         read_total += want as u64;
@@ -1335,18 +1336,28 @@ fn read_validated(stream: &mut TcpStream, pattern: &[u8], bytes: u64) -> Result<
     Ok(read_total)
 }
 
-fn matches_pattern(pattern: &[u8], offset: usize, chunk: &[u8]) -> bool {
+/// The first byte of `chunk` that is not its pattern byte at absolute `offset`, or `None` when every byte is. Compared in runs that end at a wrap, so a validated byte costs a slice compare instead of a modulo and a bounds-checked index.
+fn pattern_mismatch(pattern: &[u8], offset: usize, chunk: &[u8]) -> Option<usize> {
     let period = pattern.len();
     if period == 0 {
-        return chunk.is_empty();
+        return if chunk.is_empty() { None } else { Some(0) };
     }
-    let tail = &pattern[offset % period..];
-    let take = chunk.len().min(tail.len());
-    if chunk[..take] != tail[..take] {
-        return false;
+    let mut at = offset % period;
+    let mut done = 0usize;
+    while done < chunk.len() {
+        let run = (period - at).min(chunk.len() - done);
+        if chunk[done..done + run] != pattern[at..at + run] {
+            let first = chunk[done..done + run]
+                .iter()
+                .zip(&pattern[at..at + run])
+                .position(|(got, want)| got != want)
+                .expect("a run that compares unequal holds a first mismatch");
+            return Some(done + first);
+        }
+        done += run;
+        at = 0;
     }
-    let rest = &chunk[take..];
-    rest.len() <= period && rest == &pattern[..rest.len()]
+    None
 }
 
 impl FlowPlan {
@@ -1498,15 +1509,13 @@ fn validate(
             Ok(n) => n,
             Err(e) => return Some(format!("the upload read failed after {seen} bytes: {e}")),
         };
-        for (i, byte) in buffer[..n].iter().enumerate() {
-            if *byte != pattern[(offset + i) % pattern.len()] {
-                eprintln!(
-                    "harness fault: flow {index} received a byte that is not the \
+        if let Some(at) = pattern_mismatch(pattern, offset, &buffer[..n]) {
+            eprintln!(
+                "harness fault: flow {index} received a byte that is not the \
                      validated pattern, at byte {}",
-                    seen + i as u64
-                );
-                std::process::exit(3);
-            }
+                seen + at as u64
+            );
+            std::process::exit(3);
         }
         offset = (offset + n) % pattern.len();
         seen += n as u64;
@@ -2100,44 +2109,79 @@ mod tests {
         }
     }
 
+    /// The pattern byte at an absolute offset, written the way the sink's loop wrote it: one modulo and one index per byte.
+    fn pattern_byte(pattern: &[u8], at: usize) -> u8 {
+        pattern[at % pattern.len()]
+    }
+
     #[test]
     fn the_pattern_check_sees_every_phase_and_both_wrap_points() {
         let template = bulk_pattern_template(4096);
-        let doubled: Vec<u8> = template.iter().chain(template.iter()).copied().collect();
         let period = template.len();
-        assert!(matches_pattern(&template, 0, &template[..]));
+        let triple: Vec<u8> = template.iter().cycle().take(3 * period).copied().collect();
+        let fits = |pattern: &[u8], offset: usize, chunk: &[u8]| {
+            pattern_mismatch(pattern, offset, chunk).is_none()
+        };
+        assert!(fits(&template, 0, &template[..]));
         for phase in (0..period).step_by(29) {
             for len in [1, 2, 63, 64 * 1024, period / 2, period - 1, period] {
-                if phase + len > doubled.len() {
+                if phase + len > triple.len() {
                     continue;
                 }
-                let want = &doubled[phase..phase + len];
-                assert!(
-                    matches_pattern(&template, phase, want),
-                    "phase {phase}, {len} bytes"
-                );
+                let want = &triple[phase..phase + len];
+                assert!(fits(&template, phase, want), "phase {phase}, {len} bytes");
             }
         }
         for over in [1, 2, 17, period / 2, period - 1] {
             let start = period - over;
-            let len = (over * 2).min(doubled.len() - start);
+            let len = (over * 2).min(triple.len() - start);
             assert!(
-                matches_pattern(&template, start, &doubled[start..start + len]),
+                fits(&template, start, &triple[start..start + len]),
                 "chunk of {over} past the end of the ring"
             );
         }
         for at in [0, period / 2, period - 1] {
             let mut bad = template.clone();
             bad[at] ^= 1;
-            assert!(!matches_pattern(&template, 0, &bad), "flipped byte {at}");
+            assert!(!fits(&template, 0, &bad), "flipped byte {at}");
         }
-        assert!(matches_pattern(&template, 7, &[]));
-        assert!(matches_pattern(&[], 0, &[]));
-        assert!(!matches_pattern(&[], 0, &template[..1]));
-        assert!(matches_pattern(&template, 0, &doubled[..]));
-        let mut stretched = doubled.clone();
+        assert!(fits(&template, 7, &[]));
+        assert!(fits(&[], 0, &[]));
+        assert!(!fits(&[], 0, &template[..1]));
+        assert!(fits(&template, 0, &triple[..]));
+        let mut stretched = triple.clone();
         stretched[period + 7] ^= 1;
-        assert!(!matches_pattern(&template, 0, &stretched[..]));
+        assert!(!fits(&template, 0, &stretched[..]));
+        let mut past_second_wrap = triple.clone();
+        past_second_wrap[2 * period + 7] ^= 1;
+        assert_eq!(
+            pattern_mismatch(&template, 0, &past_second_wrap),
+            Some(2 * period + 7),
+            "a read past the second wrap still validates, and names the byte it tripped on"
+        );
+
+        // The runs are the modulo: same verdicts, same first mismatching byte, at every phase and length the sink can read.
+        for phase in (0..period).step_by(251) {
+            for len in [1, 40, 511, period, period + 1, 2 * period, 64 * 1024] {
+                let mut chunk: Vec<u8> = (0..len)
+                    .map(|i| pattern_byte(&template, phase + i))
+                    .collect();
+                assert_eq!(
+                    pattern_mismatch(&template, phase, &chunk),
+                    None,
+                    "phase {phase}, {len} bytes of the ring"
+                );
+                for flip in [0, len / 2, len - 1] {
+                    chunk[flip] ^= 1;
+                    assert_eq!(
+                        pattern_mismatch(&template, phase, &chunk),
+                        Some(flip),
+                        "phase {phase}, {len} bytes, flipped byte {flip}"
+                    );
+                    chunk[flip] ^= 1;
+                }
+            }
+        }
     }
 
     #[test]
@@ -2185,11 +2229,11 @@ mod tests {
         let _ = sink.join();
 
         assert!(
-            matches_pattern(&pattern, 0, &pattern),
+            pattern_mismatch(&pattern, 0, &pattern).is_none(),
             "the pattern matches itself at offset 0, or this test proves nothing"
         );
         assert!(
-            !matches_pattern(&pattern, 0, &[b'z'; 16]),
+            pattern_mismatch(&pattern, 0, &[b'z'; 16]).is_some(),
             "a corrupt chunk does not, so the fatal branch has something to catch"
         );
     }
