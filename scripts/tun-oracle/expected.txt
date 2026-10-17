@@ -1,0 +1,12 @@
+# The dial set the pinned reference stack produces from script.txt, one
+# `DIAL <target> <hex payload>` per flow, payload read to connection EOF.
+# `main.rs` records this file by running the stream through smoltcp 0.12 — the
+# userspace stack the pinned zero-tun `zero-tun` crate builds on — so the bytes
+# here come from a reference run, not from this tree. The convention it pins
+# (dial per flow on handshake, deliver the reassembled payload in order, EOF at
+# FIN) is also what xray's proxy/tun/tcp_lightweight.go does at `input`,
+# `receive` and `ReadMultiBuffer`.
+
+DIAL 198.51.100.7:443 474554202f20485454502f312e300d0a0d0a
+DIAL 198.51.100.7:53 deadbeef
+DIAL 198.51.100.7:8080 616263646566
