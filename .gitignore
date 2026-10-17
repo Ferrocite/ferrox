@@ -33,3 +33,4 @@ __pycache__/
 # Worktrees created under the repository, so a clone never records one as a
 # nested repository. `/ferrox-opencode-*` siblings are outside and need nothing.
 /.worktrees
+/.workbuddy-ai
