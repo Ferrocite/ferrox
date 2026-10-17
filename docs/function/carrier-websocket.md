@@ -133,11 +133,11 @@ no duration row to ask for: every `vless-ws` cell the matrix plans measures a
 never reaches the timer. Its evidence is the instruction count above, which is
 what `ops.yml` can see.
 
-**The `?ed=` line, on this branch, in gate 8.** `bench.yml` run `39005088795`
+**The `?ed=` line, on this branch, in gate 8.** `bench.yml` run `39007012750`
 timed the shipped encode against the shape the four implementations have, on
 both platforms in the one run, each row byte-checked before it was timed: macOS
-aarch64 **2.85x / 3.19x / 3.05x / 2.03x** and linux x86_64 **2.06x / 2.68x /
-2.50x / 2.14x**, at 8, 120, 256 and 2048 bytes, every row gated at 0.95x with
+aarch64 **3.14x / 3.10x / 3.41x / 1.99x** and linux x86_64 **2.03x / 2.54x /
+2.60x / 2.11x**, at 8, 120, 256 and 2048 bytes, every row gated at 0.95x with
 zero allocations per encode on this side. Those are ratios against the
 reference's shape, not against this tree's previous body — the before-and-after
 for this change is the `141610` above, and this is the same-runner half that
