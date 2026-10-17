@@ -19,9 +19,10 @@ side one authenticated connection per outbound, pooled and reused for every
 flow it can carry — stream 4, 8, 12 … — the way the pinned client multiplexes
 (`max_tcp_streams: 64`; this tree caps at quiche's `MAX_STREAMS`). A pooled
 connection is reused within half the server's 300 s idle timeout, dropped when
-it closes, goes stale or runs out of streams, and a dial with no live pool
-entry pays a fresh handshake: `hysteria_shares_one_connection_between_two_flows`
-witnesses one handshake carrying two echoes on the `HANDSHAKES` counter, and
+it stops taking application data (closed, draining or carrying a close), goes
+stale or runs out of streams, and a dial with no live pool entry pays a fresh
+handshake: `hysteria_shares_one_connection_between_two_flows` witnesses one
+handshake carrying two echoes on the `HANDSHAKES` counter, and
 `hysteria_redials_when_a_pooled_connection_closes` the fresh handshake after
 `close_pooled`.
 
@@ -128,6 +129,17 @@ tunnel. No artefact from this branch has been read.
   (`hysteria_shares_one_connection_between_two_flows`), and a closed pooled
   connection pays a fresh one (`hysteria_redials_when_a_pooled_connection_closes`,
   `closed-connections-reused` 0).
+- **A flow handed a connection that had stopped carrying data.** The pool
+  asked only `is_closed()`, so a connection quiche had already stopped taking
+  application data on — draining, or closed locally and not yet drained — was
+  handed the next flow's stream; its `[0, 0]` reply had nothing to arrive on,
+  and the dial sat out `HANDSHAKE_TIMEOUT` before redialling. `candidates` and
+  `open_pooled` now ask `usable` — not closed, not draining, no local or peer
+  error — so the redial gate reaches its fresh-handshake assertion without the
+  wait. A connection that drains between the hand-out and the reply is caught
+  only after the failed open: `usable` is asked at the hand-out and at the
+  eviction, not by the wait itself, so that dial still pays the budget before
+  it redials.
 - **Nine zeroing passes on the flow paths.** `drive_once`'s receive room
   (1350 bytes), `serve_loop`'s packet buffer and the router's output buffer
   (1350 each), `serve_stream`'s head room (64), `drain_settings`' room (128),
