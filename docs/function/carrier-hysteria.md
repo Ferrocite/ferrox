@@ -14,8 +14,16 @@ stream opening with the `0x401` varint, and the connection opens with an
 HTTP/3 `POST` to `/auth` carrying `hysteria-auth`, answered `233`.
 `ferrox-core::hysteria` owns those bytes and proves them bit-exact
 (`ferrox-core-hysteria::*` unit tests); `ferrox-app/src/hysteria.rs` owns the
-sockets: a `Router` keyed by server SCID on the serve side, one QUIC
-connection per dial on the dial side.
+sockets: a `Router` keyed by server SCID on the serve side, and on the dial
+side one authenticated connection per outbound, pooled and reused for every
+flow it can carry — stream 4, 8, 12 … — the way the pinned client multiplexes
+(`max_tcp_streams: 64`; this tree caps at quiche's `MAX_STREAMS`). A pooled
+connection is reused within half the server's 300 s idle timeout, dropped when
+it closes, goes stale or runs out of streams, and a dial with no live pool
+entry pays a fresh handshake: `hysteria_shares_one_connection_between_two_flows`
+witnesses one handshake carrying two echoes on the `HANDSHAKES` counter, and
+`hysteria_redials_when_a_pooled_connection_closes` the fresh handshake after
+`close_pooled`.
 
 A wrong password is refused with `404` then `CONNECTION_CLOSE` and relays
 nothing: `hysteria_refuses_a_wrong_password_without_relaying` is the gate.
@@ -36,13 +44,15 @@ stack posts its auth only once the server's SETTINGS arrive.
 
 ```mermaid
 graph TD
-    S["SOCKS inbound without Mux"] --> D["quiche dial, ALPN h3,<br/>cc from hysteriaSettings"]
+    S["SOCKS inbound without Mux"] --> P{"live pooled connection<br/>for this outbound?"}
+    P -- yes --> F["stream 4, 8, 12 …: 0x401 + VLESS header"]
+    P -- no --> D["quiche dial, ALPN h3,<br/>cc from hysteriaSettings"]
     D --> A["POST /auth on stream 0"]
-    A -- 233 --> F["stream 4: 0x401 + VLESS header"]
+    A -- 233 --> F
     F -- "[0, 0]" --> R["relay TCP both ways"]
     A -- else --> X["404, close, relay nothing"]
     H["serve: UDP socket + SCID routes"] --> A
-    P["protocol: hysteria inbound"] --> Q["stream 4: 0x401 + address + padding"]
+    P2["protocol: hysteria inbound"] --> Q["stream 4, 8, 12 …: 0x401 + address + padding"]
     Q -- "ok, then dial" --> T["freedom target, relay raw"]
     Q -- "dial refused" --> C["close after the ack"]
 ```
@@ -53,7 +63,9 @@ graph TD
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
-| tcp-flows-per-handshake | 1 | ferrox-app-proxy::tests::hysteria_carries_vless_echo_over_loopback |
+| tcp-flows-per-handshake | 2 | ferrox-app-proxy::tests::hysteria_shares_one_connection_between_two_flows |
+| closed-connections-reused | 0 | ferrox-app-proxy::tests::hysteria_redials_when_a_pooled_connection_closes |
+| request-parse-reallocations | 0 | ferrox-app-hysteria::tests::a_parsed_request_leaves_its_payload_where_it_landed |
 | wrong-password-bytes-relayed | 0 | ferrox-app-proxy::tests::hysteria_refuses_a_wrong_password_without_relaying |
 | non-v2-configs-carried | 0 | ferrox-app-proxy::tests::hysteria_settings_parse_with_guarded_fallbacks |
 | udp-bytes-relayed | 0 | ferrox-app-proxy::tests::hysteria_dial_udp_uplink_is_none |
@@ -63,13 +75,18 @@ graph TD
 ## Ops
 
 ```bash
-./scripts/count-ops.sh report \
-  proxy::tests::hysteria_carries_vless_echo_over_loopback 'hysteria::connect'
+./scripts/count-ops.sh report proxy::tests::hysteria_carries_vless_echo_over_loopback \
+  'hysteria::serve_loop' 'hysteria::drive_once' 'hysteria::serve_stream' \
+  'hysteria::read_request' 'hysteria::auth_exchange' 'hysteria::open_pooled'
 ```
 
 `UNBLESSED`, as above. `scripts/expected-ops.txt` still blesses exactly one
 symbol in the whole tree, `der_to_pem 2653`, which is a PEM formatting helper
 rather than a carrier. That is why the whole ops row in this table is open.
+All six symbols are rows in `scripts/method-ops.txt`, so `ops.yml` publishes
+their inclusive cost on every run — the functions whose first store to a
+receive or send buffer used to be a memset, and the pool path a shared flow
+rides.
 
 ## Time
 
@@ -102,12 +119,51 @@ tunnel. No artefact from this branch has been read.
   and forwards `&buf.as_mut()[..n]`, so read granularity, per-chunk copies and
   syscalls are unchanged — what retires is the two memsets per flow, witnessed
   by the CI RSS matrix, not by a count row.
+- **The per-flow handshake.** Every dial used to pay a full QUIC handshake and
+  a `POST /auth` for one stream. The dialer now pools one authenticated
+  connection per outbound — keyed on host, address, port, congestion, auth and
+  roots — and hands each flow the next stream id off it, the pinned client's
+  own shape. `tcp-flows-per-handshake` is 2, not 1: the `HANDSHAKES` counter
+  shows one handshake carrying two echoes
+  (`hysteria_shares_one_connection_between_two_flows`), and a closed pooled
+  connection pays a fresh one (`hysteria_redials_when_a_pooled_connection_closes`,
+  `closed-connections-reused` 0).
+- **Nine zeroing passes on the flow paths.** `drive_once`'s receive room
+  (1350 bytes), `serve_loop`'s packet buffer and the router's output buffer
+  (1350 each), `serve_stream`'s head room (64), `drain_settings`' room (128),
+  `recv_reply`'s two-byte reply, and the 4096-byte rooms in
+  `read_headers_block`, `auth_exchange` and `read_request` all opened zeroed
+  and were overwritten in full by the first read. All take `quic::Unfilled`
+  now. Witnessed in machine code like the quic carrier's own removal: the
+  aarch64 dev-profile asm of `ferrox-app` goes from 9 `_bzero`/`_memset`
+  calls across `ferrox_app::hysteria` frames to 0 — whole-file zeroing calls
+  91 → 82 — and the bytes did not move, because the loopback, hand-rolled
+  client/server and pinned-client suites read the same stream.
+- **The request path's copies.** `serve_stream` used to slice the prefix off
+  (`head[prefix..].to_vec()`); `read_request` used to rebuild the backlog with
+  `flow.backlog[flow.at..].to_vec()`; `read_headers_block` used to `to_vec`
+  the header block; `auth_exchange` used to `to_vec` the auth body before
+  verifying it. The prefix now stays in the buffer with a cursor stepped over
+  it, and each parse reads what already arrived:
+  `a_parsed_request_leaves_its_payload_where_it_landed` pins the backlog's
+  base pointer and capacity across the parse (`request-parse-reallocations`
+  0), and the other three sit under the same loopback and pinned-client gates
+  that read the auth bytes.
+- **`Router::idle`'s two passes and the per-packet SETTINGS drain.** `idle`
+  collected dead route keys into a `Vec` and locked every surviving route
+  twice; it is one `retain` pass with one lock per route. And the server used
+  to pay `stream_recv` on stream 2 for every packet; a `settings_done` latch
+  set on the stream's FIN retires the call, found with the same one route
+  lookup that feeds the auth state.
 
-What is **not** removed, and is named rather than claimed: one handshake per
-flow (the vless-quic pool is not shared here, so `tcp-flows-per-handshake`
-is 1, not 0); 0-RTT, migration and key updates are quiche's; the server keeps
-one UDP socket per inbound with a per-connection route map and a linear scan
-over routes per Initial.
+What is **not** removed, and is named rather than claimed: the pool is one
+process-wide map per outbound key with no eviction policy beyond pruning
+closed, stale and stream-exhausted entries on the next dial, so an outbound
+burst holds one connection each for `REUSE_WINDOW` (150 s, half the idle
+timeout); UDP flows, salamander and the masquerade site are still out; 0-RTT,
+migration and key updates are quiche's; the server keeps one UDP socket per
+inbound with a per-connection route map and a linear scan over routes per
+Initial.
 
 ## CI scope
 

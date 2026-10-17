@@ -18238,7 +18238,7 @@ mod tests {
     }
 
     fn hysteria_client_once() {
-        let echo_port = echo_once();
+        let echo_port = echo_loop();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let minted =
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
@@ -18307,7 +18307,7 @@ mod tests {
             panic!("client connects");
         };
         let header = vless_header(&id, 1, &Destination::from(target));
-        let Some(mut flow) = crate::hysteria::open_flow(&session, &header) else {
+        let Some(mut flow) = crate::hysteria::open_flow(&session, 4, &header) else {
             panic!("flow opens");
         };
         flow.write_all(b"ping").expect("writes");
@@ -18324,7 +18324,7 @@ mod tests {
 
     fn hysteria_server_once() {
         use ferrox_core::foxy::frames as h3;
-        let echo_port = echo_once();
+        let echo_port = echo_loop();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let (port, roots) = hysteria_loop_with("bisect2-auth", id);
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
@@ -18393,7 +18393,7 @@ mod tests {
     }
 
     fn hysteria_echo_once() {
-        let echo_port = echo_once();
+        let echo_port = echo_loop();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let (port, roots) = hysteria_loop_with("test-auth", id);
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
@@ -18405,13 +18405,70 @@ mod tests {
     }
 
     #[test]
+    fn hysteria_shares_one_connection_between_two_flows() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_share_once, 3);
+    }
+
+    fn hysteria_share_once() {
+        let echo_port = echo_loop();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_with("test-auth", id);
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let before = crate::hysteria::handshake_count();
+        let mut back = [0u8; 4];
+        let mut first = hysteria_tcp_pair(port, roots.clone(), "test-auth", id, target);
+        first.write_all(b"ping").expect("writes");
+        first.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        let mut second = hysteria_tcp_pair(port, roots, "test-auth", id, target);
+        second.write_all(b"pong").expect("writes");
+        second.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"pong");
+        assert_eq!(
+            crate::hysteria::handshake_count() - before,
+            1,
+            "one handshake carried both flows"
+        );
+    }
+
+    #[test]
+    fn hysteria_redials_when_a_pooled_connection_closes() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_redial_once, 3);
+    }
+
+    fn hysteria_redial_once() {
+        let echo_port = echo_loop();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_with("test-auth", id);
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut back = [0u8; 4];
+        let mut first = hysteria_tcp_pair(port, roots.clone(), "test-auth", id, target);
+        first.write_all(b"ping").expect("writes");
+        first.read_exact(&mut back).expect("echoes");
+        drop(first);
+        crate::hysteria::close_pooled();
+        let before = crate::hysteria::handshake_count();
+        let mut second = hysteria_tcp_pair(port, roots, "test-auth", id, target);
+        second.write_all(b"pong").expect("writes");
+        second.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"pong");
+        assert_eq!(
+            crate::hysteria::handshake_count() - before,
+            1,
+            "the closed pooled connection was not ridden"
+        );
+    }
+
+    #[test]
     fn hysteria_refuses_a_wrong_password_without_relaying() {
         let _serial = quic_serial();
         quic_retry_dial(hysteria_refuses_once, 3);
     }
 
     fn hysteria_refuses_once() {
-        let echo_port = echo_once();
+        let echo_port = echo_loop();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let (port, roots) = hysteria_loop_with("test-auth", id);
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
@@ -18420,19 +18477,23 @@ mod tests {
         assert_eq!(client.read(&mut probe).expect("reads"), 0);
     }
 
-    fn echo_once() -> u16 {
+    fn echo_loop() -> u16 {
         let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
-            let (mut stream, _) = echo.accept().expect("accepts");
-            let mut buf = [0u8; 1024];
-            loop {
-                let Ok(n) = stream.read(&mut buf) else {
-                    return;
-                };
-                if n == 0 || stream.write_all(&buf[..n]).is_err() {
-                    return;
-                }
+            for stream in echo.incoming().flatten() {
+                thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let Ok(n) = stream.read(&mut buf) else {
+                            return;
+                        };
+                        if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                    }
+                });
             }
         });
         port
@@ -18508,7 +18569,7 @@ mod tests {
 
     #[test]
     fn http_connect_reaches_echo_direct() {
-        let echo = echo_once();
+        let echo = echo_loop();
         let front = http_front_with(Outbound::Freedom);
         let mut client = http_connect(front, &format!("127.0.0.1:{echo}"));
         assert!(http_status(&mut client).starts_with("HTTP/1.1 200"));
@@ -18520,7 +18581,7 @@ mod tests {
 
     #[test]
     fn http_get_forwards_origin_form_to_direct() {
-        let echo = echo_once();
+        let echo = echo_loop();
         let front = http_front_with(Outbound::Freedom);
         let mut client = TcpStream::connect(("127.0.0.1", front)).expect("connects");
         client
@@ -18567,7 +18628,7 @@ mod tests {
 
     #[test]
     fn http_connect_tunnels_vless_raw_to_echo() {
-        let echo = echo_once();
+        let echo = echo_loop();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let server = TcpListener::bind("127.0.0.1:0").expect("binds");
         let server_port = server.local_addr().expect("addr").port();
@@ -18627,7 +18688,7 @@ mod tests {
 
     #[test]
     fn http_outbound_dials_the_upstream_proxy_to_echo() {
-        let echo = echo_once();
+        let echo = echo_loop();
         let proxy = fake_http_proxy();
         let front = socks_front_with(Outbound::Http(HttpOut {
             address: "127.0.0.1".to_owned(),
@@ -18646,8 +18707,8 @@ mod tests {
 
     #[test]
     fn mixed_serves_socks_and_http_on_one_port() {
-        let echo_socks = echo_once();
-        let echo_http = echo_once();
+        let echo_socks = echo_loop();
+        let echo_http = echo_loop();
         let front = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
@@ -19326,7 +19387,7 @@ mod tests {
 
     #[test]
     fn socks_dials_vless_over_kcp_to_echo() {
-        let echo_port = echo_once();
+        let echo_port = echo_loop();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let serve: KcpServe = Arc::new(move |conn| serve_vless_kcp(conn, &id, true));
         let kcp_port = kcp_loop_with(serve);
@@ -19352,7 +19413,7 @@ mod tests {
 
     #[test]
     fn trojan_over_kcp_reaches_echo() {
-        let echo_port = echo_once();
+        let echo_port = echo_loop();
         let key = trojan_key("secret");
         let listener = ferrox_core::kcp::Listener::bind(
             "127.0.0.1:0".parse().expect("addr"),
@@ -19392,7 +19453,7 @@ mod tests {
 
     #[test]
     fn socks_dials_trojan_over_kcp_to_echo() {
-        let echo_port = echo_once();
+        let echo_port = echo_loop();
         let key = trojan_key("secret");
         let serve: KcpServe = Arc::new(move |conn| serve_trojan_kcp(conn, &key, true));
         let kcp_port = kcp_loop_with(serve);
@@ -19413,7 +19474,7 @@ mod tests {
 
     #[test]
     fn socks_dials_vmess_over_kcp_to_echo() {
-        let echo_port = echo_once();
+        let echo_port = echo_loop();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let serve: KcpServe = Arc::new(move |conn| {
             let (reader, writer, close) = kcp_parts(conn);
@@ -19438,7 +19499,7 @@ mod tests {
 
     #[test]
     fn socks_dials_ss_over_kcp_to_echo() {
-        let echo_port = echo_once();
+        let echo_port = echo_loop();
         let password = "an-example-shared-password".to_owned();
         let method = "aes-256-gcm".to_owned();
         let serve_password = password.clone();
