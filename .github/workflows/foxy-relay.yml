@@ -179,7 +179,7 @@ jobs:
           if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
           # One wall-clock budget for the step, shared by every leg: a runner that cannot
           # carry bytes has to say so in minutes, not at the job timeout.
-          DEADLINE=$((SECONDS + 180))
+          DEADLINE=$((SECONDS + 300))
           LANE_PID=""
           # kill on the pid this shell started, never python's os.kill: on windows $! is an
           # msys pid and os.kill would take it for a windows one, so the lane outlived its
@@ -212,14 +212,16 @@ jobs:
           }
           : > ferrox-relay.log
           # Every carrier is attempted even when one fails, so one bad method cannot hide
-          # the others; each takes an even share of what is left, so a dead leg cannot
-          # starve the ones after it, and the job fails at the end if any leg did.
+          # the others. A leg may spend the whole budget except a floor for each leg
+          # still to come: a slow carrier gets the room its first flow needs, and a dead
+          # one cannot starve the rest. The job fails at the end if any leg did.
           FAILED=""
           legs=4
           leg=0
+          reserve=45
           for carrier in h1 h2 h3 auto; do
             leg=$((leg + 1))
-            leg_end=$((SECONDS + (DEADLINE - SECONDS) / (legs - leg + 1)))
+            leg_end=$((DEADLINE - (legs - leg) * reserve))
             if ((leg_end <= SECONDS)); then
               echo "carrier $carrier skipped: the step's budget is spent" >&2
               FAILED="$FAILED $carrier(budget)"
@@ -366,11 +368,12 @@ jobs:
           }
           legs=6
           leg=0
-          # Each leg takes an even share of what is left, so a dead one cannot starve the
-          # rest and the step ends inside its budget, not at the job timeout.
+          reserve=30
+          # A leg may spend the whole budget except a floor for each leg still to come,
+          # so a dead one cannot starve the rest and the step ends inside its budget.
           leg_share() {
             leg=$((leg + 1))
-            LEG_END=$((SECONDS + (DEADLINE - SECONDS) / (legs - leg + 1)))
+            LEG_END=$((DEADLINE - (legs - leg) * reserve))
           }
           # The first flow of a lane pays for sign-in, catalogue and edge dial, and a front
           # that is still taking its first connection answers a reset once: the trace is
@@ -539,11 +542,12 @@ jobs:
           }
           legs=3
           leg=0
-          # Each leg takes an even share of what is left, so a dead one cannot starve the
-          # rest and the step ends inside its budget, not at the job timeout.
+          reserve=40
+          # A leg may spend the whole budget except a floor for each leg still to come,
+          # so a dead one cannot starve the rest and the step ends inside its budget.
           leg_share() {
             leg=$((leg + 1))
-            LEG_END=$((SECONDS + (DEADLINE - SECONDS) / (legs - leg + 1)))
+            LEG_END=$((DEADLINE - (legs - leg) * reserve))
           }
           trace_socks() {
             PORT="$1" WANT="$2"
