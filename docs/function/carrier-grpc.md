@@ -247,11 +247,15 @@ for — `kernel calls per GiB` is `UNPROVEN` on Windows (`fewer than 2 usable
 pairs`, no `strace` there), so the call count is the arithmetic on the page and
 the ratio is the CI number, not the other way round.
 
-Still open, and the reason no local duration is quoted:
-`tunnel_carries_an_echo_over_loopback` is the flakiest loopback test in the tree
-— the roadmap records it failing 23 times in 200 runs with nothing else running,
-where `read_body` sees EOF after a 9-byte frame header, which is a torn write or
-an RST with data queued rather than a framing error.
+Still open, and the reason no local duration is quoted: the same
+`windows-latest` cell after this change, at the tier that prices a ratio — the
+gathered batch is `4096` calls per GiB against the `327_680` sends the control
+cell made, and the number this page has to read is that cell's ratio, not the
+arithmetic above it. And `tunnel_carries_an_echo_over_loopback` is the flakiest
+loopback test in the tree — the roadmap records it failing 23 times in 200 runs
+with nothing else running, where `read_body` sees EOF after a 9-byte frame
+header, which is a torn write or an RST with data queued rather than a framing
+error.
 
 ## What we removed
 
