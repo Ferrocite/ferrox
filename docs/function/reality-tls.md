@@ -93,7 +93,8 @@ frame seam: what `FrameWrite::write_slices` hands the session when a carrier
 frames a write onto a `TLS` stream. Their checker is
 `a_frame_reaches_the_tls_session_in_one_call`, a session that records the calls
 it receives instead of sealing records, driven through the real
-`h2::write_frame` and `h2::write_frame_parts`. It counts one call per frame with
+`h2::write_frame` and the three-segment `write_slices` a gathered batch hands
+over. It counts one call per frame with
 two segments and then three, and it fails if the payload segment is not the
 caller's own buffer — the pointer-identity shape, because a test that compared
 bytes would pass just as happily on a frame staged into one scratch buffer. The
@@ -257,7 +258,7 @@ not this page's to settle.
 
 - **A record per part of a frame.** A carrier frame reaches a session as separate
   slices — a `ws` frame as head and payload (`ws.rs:410`), an `h2` `DATA` frame
-  the same, `h2::write_frame_parts` as head, envelope and payload, an `xhttp`
+  the same, head, envelope and payload as three of them, an `xhttp`
   chunk as size line, body and `CRLF` (`xhttp.rs:342`) — and `FrameWrite for
   TlsHalf` walked that list with one `write_all` per part. Each of those writes
   took the session lock, ran the handshake drive, handed rustls one buffer and

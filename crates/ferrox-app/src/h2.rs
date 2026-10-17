@@ -280,21 +280,16 @@ pub(crate) fn read_head(stream: &mut dyn Read) -> Option<(usize, u8, u8, u32)> {
     Some((len, head[3], head[4], id))
 }
 
-pub(crate) fn write_frame_parts(
-    stream: &mut dyn crate::proxy::FrameWrite,
-    kind: u8,
-    flags: u8,
-    id: u32,
-    first: &[u8],
-    second: &[u8],
-) -> bool {
+/// The nine bytes that open a frame: a gathered batch keeps a head in every frame's own slot, so one
+/// builder serves both the single frame written straight to the socket and the batch built apart from
+/// its payloads.
+pub(crate) fn frame_head(len: usize, kind: u8, flags: u8, id: u32) -> [u8; 9] {
     let mut head = [0u8; 9];
-    let len = first.len() + second.len();
     head[0..3].copy_from_slice(&(len as u32).to_be_bytes()[1..]);
     head[3] = kind;
     head[4] = flags;
     head[5..9].copy_from_slice(&id.to_be_bytes());
-    stream.write_slices(&[&head, first, second])
+    head
 }
 
 pub(crate) fn write_frame(
@@ -304,11 +299,7 @@ pub(crate) fn write_frame(
     id: u32,
     body: &[u8],
 ) -> bool {
-    let mut head = [0u8; 9];
-    head[0..3].copy_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
-    head[3] = kind;
-    head[4] = flags;
-    head[5..9].copy_from_slice(&id.to_be_bytes());
+    let head = frame_head(body.len(), kind, flags, id);
     stream.write_slices(&[&head, body])
 }
 
