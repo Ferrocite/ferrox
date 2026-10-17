@@ -59,7 +59,10 @@ shadowsocks-2022 user-space-copies-per-byte-written 0 ferrox-app-shadowsocks2022
 shadowsocks-2022 user-space-copies-per-byte-read 0 ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage
 shadowsocks-2022 zero-filled-bytes-per-chunk 0 ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage
 shadowsocks-2022 chunk-buffer-allocations-per-connection 1 ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage
-shadowsocks-2022 downlink-stage-bytes-per-connection 0 ferrox-app-shadowsocks2022::tests::the_carrier_and_the_chunk_ask_the_socket_as_one
+shadowsocks-2022 downlink-stage-bytes-per-connection 0 ferrox-app-shadowsocks2022::tests::the_carrier_and_the_window_ask_the_socket_as_one
+shadowsocks-2022 downlink-chunks-per-opened-batch 4 ferrox-app-shadowsocks2022::tests::a_bulk_read_serves_every_buffered_chunk
+shadowsocks-2022 target-write-syscalls-per-opened-batch 1 ferrox-app-shadowsocks2022::tests::a_bulk_read_serves_every_buffered_chunk
+shadowsocks-2022 reads-spent-waiting-for-an-incomplete-chunk 0 ferrox-app-shadowsocks2022::tests::a_batch_never_waits_for_a_chunk_that_has_not_arrived
 shadowsocks-2022 udp-payload-buffers-per-datagram 1 ferrox-app-shadowsocks2022::tests::an_opened_payload_is_the_datagrams_own_bytes
 shadowsocks-2022 udp-datagram-reallocations-after-the-first 0 ferrox-app-shadowsocks2022::tests::an_opened_payload_is_the_datagrams_own_bytes
 shadowsocks-2022 subkey-heap-buffers-per-connection 1 ferrox-core-shadowsocks2022::tests::a_cipher_holds_one_heap_buffer_for_aes_and_none_for_chacha
