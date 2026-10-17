@@ -178,6 +178,21 @@ reconnects under the same session id joins the one global session rather than a 
 which is already two readers popping one sequence — that is the `sessionIDTable` row below,
 and the binding does not change it.
 
+A session that refuses still has to end the stream it owns. `serve_session_xhttp_with` has
+four exits before its relay: an undecodable head, a uuid, command or freedom the hub will not
+serve, a dial that failed, and a reply the carrier would not take. Each returned without
+touching its `XhttpWriter`, and on H2 the stream outlived the thread that served it — a client
+that had already read its `200` then parked on the next read for the life of the connection,
+because a stream is not a connection and nothing closed. A wrong uuid was therefore
+indistinguishable from a stall. The four exits now call `cwriter.finish()`, the same call a served session's sink close makes when its relay ends, so
+the path that answers is untouched; `end_stream` ends a headed stream with an empty `DATA`
+carrying `F_END` and resets one that never got its head, and the H1 arm gains only the chunked
+terminator its `Transfer-Encoding: chunked` head already promised. `xhttp_h2::tests::a_refused_session_ends_the_stream_it_parked` dials a uuid
+the served id does not carry and reads the frame that ends its downlink: it fails by timeout
+without the call. Not removed: a refusal still answers no reason — the peer learns only that
+its stream ended — and an H1 `stream-up` POST with no downlink still parks its own thread, the
+carrier-side owner named above.
+
 ## Measured
 
 <!-- counts:begin -->

@@ -1628,20 +1628,25 @@ pub(crate) fn serve_session_xhttp_with(
     id: &[u8; 16],
     freedom: bool,
 ) {
+    // Every refusal ends the carrier's stream: a session that answers nothing leaves its reader parked on a reply that will never come.
     let Some((got, _flow, cmd, target)) = decode_request(&mut creader) else {
         echo_trace("session xhttp vless decode refused");
+        cwriter.finish();
         return;
     };
     if got != *id || cmd != 1 || !freedom {
         echo_trace("session xhttp vless id or cmd refused");
+        cwriter.finish();
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
         echo_trace("session xhttp uplink refused");
+        cwriter.finish();
         return;
     };
     if !cwriter.send(&[0, 0]) {
         echo_trace("session xhttp vless response refused");
+        cwriter.finish();
         return;
     }
     echo_trace("session xhttp relaying");

@@ -1222,6 +1222,49 @@ mod tests {
         server.join().expect("joins");
     }
 
+    /// A session that refuses the dial still owns the downlink stream its carrier opened: leaving that stream open parks the client's next read on a reply that can no longer arrive.
+    #[test]
+    fn a_refused_session_ends_the_stream_it_parked() {
+        let (addr, server) = serve_one(test_settings("stream-up"), [0xaau8; 16], 1);
+        let mut client = H2Client::connect(addr);
+        let pad = padding();
+        let down = client.headers(
+            "GET",
+            "/up/sess-h2-refused",
+            &[("referer", pad.as_str())],
+            true,
+        );
+        assert_eq!(client.response_head(down), 200);
+        let up = client.headers(
+            "POST",
+            "/up/sess-h2-refused",
+            &[
+                ("referer", pad.as_str()),
+                ("content-type", "application/grpc"),
+            ],
+            false,
+        );
+        // A uuid the served id does not carry, so the session refuses before it dials.
+        let header = ferrox_core::vless::VlessLink::parse(
+            "vless://bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb@192.0.2.1:443?security=none&encryption=none&type=tcp#x",
+        )
+        .expect("parses")
+        .encode_request_header("127.0.0.1", 9);
+        client.data(up, &header, true);
+        // The witness is the frame that lifts the park, so the clock bounds only the failure: 3 s of silence is a read that would never return.
+        client
+            .stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("timeout");
+        let (kind, flags, _, _) = client.next_frame(down, |kind| matches!(kind, T_DATA | T_RST));
+        assert!(
+            kind == T_RST || flags & F_END != 0,
+            "the refused session left stream {down} open: frame {kind} flags {flags:#04x}"
+        );
+        drop(client);
+        server.join().expect("joins");
+    }
+
     /// A peer that opens a downlink and then dies without ever posting leaves the server's stream thread parked on a sequence that can no longer arrive — the connection, not that thread, owns the session, so its death has to end it and free the thread with it.
     #[test]
     fn a_dead_carrier_ends_the_session_it_parked() {
