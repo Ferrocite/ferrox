@@ -65,14 +65,17 @@ ir_of() {
         return 2
     fi
     local total
+    # callgrind names a frame for an associated function `<Type>::method`, so a row that
+    # writes the rustc path `Type::method` finds no frame unless both sides drop the brackets.
     total="$(python3 - "$produced" "$symbol" <<'EOF'
 import sys
+row = sys.argv[2].replace("<", "").replace(">", "")
 total, active = 0, False
 with open(sys.argv[1], errors="ignore") as f:
     for line in f:
         line = line.strip()
         if line.startswith("fn="):
-            active = sys.argv[2] in line
+            active = row in line.replace("<", "").replace(">", "")
         elif active:
             fields = line.split()
             if len(fields) >= 2 and fields[0].isdigit() and fields[1].lstrip("-").isdigit():
