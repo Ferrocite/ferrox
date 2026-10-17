@@ -4,9 +4,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use crate::h2::{
-    block_encode, read_head, write_frame, write_frame_parts, Decoder, E_REFUSED, FRAME_CAP, F_ACK,
-    F_END, F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_MAX_FRAME, S_WINDOW, T_CONT,
-    T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW, WINDOW_MAX,
+    block_encode, frame_head, read_head, write_frame, Decoder, E_REFUSED, FRAME_CAP, F_ACK, F_END,
+    F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_MAX_FRAME, S_WINDOW, T_CONT, T_DATA,
+    T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW, WINDOW_MAX,
 };
 
 const MSG_CAP: usize = 16 * 1024 * 1024;
@@ -76,16 +76,23 @@ impl std::fmt::Debug for Shared {
     }
 }
 
-fn take_window(shared: &Shared, need: u64) -> bool {
+/// Take `need` from both windows, waiting for the peer's credit only when `wait` says to: a gathered
+/// batch flushes before it parks, since a peer grants for bytes it has seen and not for ones still
+/// sitting in the batch.
+fn take_window(shared: &Shared, need: u64, wait: bool) -> bool {
     let mut send = shared.send.lock().unwrap_or_else(PoisonError::into_inner);
-    while send.conn < need || send.stream < need {
-        if shared.dead.load(Ordering::SeqCst) {
-            return false;
+    if wait {
+        while send.conn < need || send.stream < need {
+            if shared.dead.load(Ordering::SeqCst) {
+                return false;
+            }
+            send = shared
+                .wake
+                .wait(send)
+                .unwrap_or_else(PoisonError::into_inner);
         }
-        send = shared
-            .wake
-            .wait(send)
-            .unwrap_or_else(PoisonError::into_inner);
+    } else if send.conn < need || send.stream < need {
+        return false;
     }
     send.conn -= need;
     send.stream -= need;
@@ -655,24 +662,112 @@ impl<R: Read> Read for GrpcReader<R> {
     }
 }
 
+/// The frames one write carries: a relay read is `256 KiB` of full `HUNK`s, and a full hunk leaves as
+/// two DATA frames at the frame size this lane advertises, so one read of the relay's own buffer is
+/// one batch and one socket call. Wider would never fill and narrower would pay a call it was not
+/// asked for.
+const FRAMES_PER_WRITE: usize = 32;
+
+/// A gathered frame's own bytes: its nine-byte head and the envelope prefix it carries, which is at
+/// most the `16` bytes `frame_prefix` can fill.
+const SLOT: usize = 9 + 16;
+
+/// The frame that has not been added to a batch yet, and the part slot of a list still empty.
+const NO_FRAME: &[u8] = &[];
+
+/// A caller write's frames held apart rather than staged together: every head and envelope prefix in
+/// a slot of its own, every payload still the caller's own slice, so one flush is one vectored write
+/// whose body parts point into the buffer the relay handed over.
+struct Gather<'a> {
+    slots: [[u8; SLOT]; FRAMES_PER_WRITE],
+    held: [(&'a [u8], usize); FRAMES_PER_WRITE],
+    used: usize,
+}
+
+impl<'a> Gather<'a> {
+    fn new() -> Self {
+        Self {
+            slots: [[0u8; SLOT]; FRAMES_PER_WRITE],
+            held: [(NO_FRAME, 0); FRAMES_PER_WRITE],
+            used: 0,
+        }
+    }
+
+    fn full(&self) -> bool {
+        self.used == FRAMES_PER_WRITE
+    }
+
+    /// One DATA frame into the batch: its head built where it will be read from, the envelope bytes it
+    /// carries copied in beside it, and its payload left as the caller's slice.
+    fn add(&mut self, id: u32, flags: u8, prefix: &[u8], payload: &'a [u8]) {
+        let at = self.used;
+        self.used += 1;
+        let head = frame_head(prefix.len() + payload.len(), T_DATA, flags, id);
+        self.slots[at][..9].copy_from_slice(&head);
+        self.slots[at][9..9 + prefix.len()].copy_from_slice(prefix);
+        self.held[at] = (payload, prefix.len());
+    }
+
+    /// The batch as one write, in the order the frames go out: a head slot and then the payload run it
+    /// opens, for every frame held. An empty batch takes neither lock nor call.
+    fn flush(&self, shared: &Arc<Shared>) -> bool {
+        if self.used == 0 {
+            return true;
+        }
+        let mut parts: [&[u8]; 2 * FRAMES_PER_WRITE] = [NO_FRAME; 2 * FRAMES_PER_WRITE];
+        let mut pieces = 0;
+        for (slot, held) in self.slots[..self.used]
+            .iter()
+            .zip(self.held[..self.used].iter().copied())
+        {
+            let (payload, prefix) = held;
+            parts[pieces] = &slot[..9 + prefix];
+            pieces += 1;
+            if !payload.is_empty() {
+                parts[pieces] = payload;
+                pieces += 1;
+            }
+        }
+        let Ok(mut stream) = shared.stream.lock() else {
+            return false;
+        };
+        stream.write_slices(&parts[..pieces])
+    }
+}
+
 impl GrpcWriter {
     pub(crate) fn send(&self, data: &[u8]) -> bool {
+        let mut batch = Gather::new();
         for piece in data.chunks(HUNK) {
-            if !self.message(piece, false) {
+            if !self.message(piece, false, &mut batch) {
                 return false;
             }
         }
-        true
+        batch.flush(&self.shared)
     }
 
     pub(crate) fn close(&self) {
         if self.shared.ended.swap(true, Ordering::SeqCst) {
             return;
         }
-        self.message(&[], true);
+        let mut batch = Gather::new();
+        self.message(&[], true, &mut batch);
+        batch.flush(&self.shared);
     }
 
-    fn message(&self, data: &[u8], end: bool) -> bool {
+    /// Window for one more frame, or the batch out to the peer first: a credit the peer has not given
+    /// cannot be waited for while its own bytes sit unwritten.
+    fn credit(&self, batch: &mut Gather<'_>, need: u64) -> bool {
+        if take_window(&self.shared, need, false) {
+            return true;
+        }
+        if !batch.flush(&self.shared) {
+            return false;
+        }
+        take_window(&self.shared, need, true)
+    }
+
+    fn message<'a>(&self, data: &'a [u8], end: bool, batch: &mut Gather<'a>) -> bool {
         let mut prefix = [0u8; 16];
         let plen = frame_prefix(data.len(), &mut prefix);
         let total = plen + data.len();
@@ -686,44 +781,25 @@ impl GrpcWriter {
         while at < total {
             let n = (total - at).min(max);
             let last = at + n == total;
-            if !take_window(&self.shared, n as u64) {
+            if !self.credit(batch, n as u64) {
+                return false;
+            }
+            if batch.full() && !batch.flush(&self.shared) {
                 return false;
             }
             let flags = if last && end { F_END } else { 0 };
-            let Ok(mut stream) = self.shared.stream.lock() else {
-                return false;
-            };
-            let wrote = if at + n <= plen {
-                write_frame(
-                    &mut **stream,
-                    T_DATA,
-                    flags,
-                    self.stream,
-                    &prefix[at..at + n],
-                )
+            if at + n <= plen {
+                batch.add(self.stream, flags, &prefix[at..at + n], &[]);
             } else if at >= plen {
-                let from = at - plen;
-                write_frame(
-                    &mut **stream,
-                    T_DATA,
-                    flags,
-                    self.stream,
-                    &data[from..from + n],
-                )
+                batch.add(self.stream, flags, &[], &data[at - plen..at - plen + n]);
             } else {
-                write_frame_parts(
-                    &mut **stream,
-                    T_DATA,
-                    flags,
+                batch.add(
                     self.stream,
+                    flags,
                     &prefix[at..plen],
                     &data[..n - (plen - at)],
-                )
-            };
-            if !wrote {
-                return false;
+                );
             }
-            drop(stream);
             at += n;
         }
         true
@@ -1135,10 +1211,73 @@ mod tests {
         }
     }
 
+    /// What a peer was given: every write whole, and every part of one by address and length.
+    #[derive(Default)]
+    struct Peer {
+        writes: Vec<Vec<u8>>,
+        parts: Vec<(usize, usize)>,
+    }
+
+    /// A peer socket that records both, so a batch is witnessed by what it carries and by what it
+    /// points at — the second is the only way a gather's zero-copy is ever seen.
+    struct Recorder(Arc<Mutex<Peer>>);
+
+    impl Recorder {
+        fn record(&mut self, parts: &[&[u8]]) -> bool {
+            let mut peer = self.0.lock().unwrap();
+            for part in parts {
+                peer.parts.push((part.as_ptr() as usize, part.len()));
+            }
+            peer.writes.push(parts.concat());
+            true
+        }
+    }
+
+    impl std::io::Write for Recorder {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.record(&[data]);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::proxy::FrameWrite for Recorder {
+        fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+            self.record(parts)
+        }
+    }
+
     fn frame(kind: u8, flags: u8, id: u32, body: &[u8]) -> Vec<u8> {
         let mut sink = Sink::default();
         assert!(write_frame(&mut sink, kind, flags, id, body));
         sink.0
+    }
+
+    /// A writer over the test's own sink, at the frame size it asks for and with the window it owes.
+    fn writer_over<W: crate::proxy::FrameWrite + 'static>(
+        write: W,
+        max_frame: usize,
+        window: u64,
+    ) -> GrpcWriter {
+        let shared = new_shared(Box::new(write) as Box<dyn crate::proxy::FrameWrite + Send>);
+        *shared.max_frame.lock().unwrap() = max_frame;
+        let mut send = shared.send.lock().unwrap();
+        send.conn = window;
+        send.stream = window;
+        GrpcWriter { shared, stream: 1 }
+    }
+
+    /// The frames a hunk leaves as at the frame size this lane advertises: the envelope and its
+    /// payload, cut at `16_384` — the reference a gathered batch is compared frame by frame against.
+    fn frames(payload: &[u8]) -> Vec<u8> {
+        let body = message(payload);
+        let mut out = Vec::new();
+        for piece in body.chunks(16_384) {
+            out.extend_from_slice(&frame(T_DATA, 0, 1, piece));
+        }
+        out
     }
 
     /// One gRPC message: the 5-byte envelope and a `Hunk` whose `Data` is `payload`.
@@ -1349,59 +1488,138 @@ mod tests {
     /// The witness for `carrier-grpc user-space-copies-per-byte-written 0`: the uplink hands the payload to the frame writer as one slice whose base is the caller's buffer, so a `writev` carries it unstaged — a round trip cannot see this, so pointer identity is the only witness.
     #[test]
     fn the_uplink_hands_the_payload_to_the_writer_by_pointer() {
-        struct Recorder(Arc<Mutex<Vec<(usize, usize)>>>);
-        impl std::io::Write for Recorder {
-            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-                self.0
-                    .lock()
-                    .unwrap()
-                    .push((data.as_ptr() as usize, data.len()));
-                Ok(data.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl crate::proxy::FrameWrite for Recorder {
-            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
-                let mut seen = self.0.lock().unwrap();
-                for part in parts {
-                    seen.push((part.as_ptr() as usize, part.len()));
-                }
-                true
-            }
-        }
         let payload: Vec<u8> = (0..1000).map(|i| (i % 251) as u8).collect();
         let base = payload.as_ptr() as usize;
         let capacity = payload.capacity();
-        let seen = Arc::new(Mutex::new(Vec::new()));
-        let recorder = Recorder(Arc::clone(&seen));
-        let writer = GrpcWriter {
-            shared: Arc::new(Shared {
-                stream: Mutex::new(Box::new(recorder) as Box<dyn crate::proxy::FrameWrite + Send>),
-                send: Mutex::new(SendWindow {
-                    conn: u64::MAX,
-                    stream: u64::MAX,
-                }),
-                wake: Condvar::new(),
-                max_frame: Mutex::new(usize::MAX),
-                init: Mutex::new(u64::from(WINDOW)),
-                ended: AtomicBool::new(false),
-                dead: AtomicBool::new(false),
-            }),
-            stream: 1,
-        };
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = writer_over(Recorder(Arc::clone(&peer)), usize::MAX, u64::MAX);
         assert!(writer.send(&payload));
         // The payload reached the frame writer as a slice whose base is the caller's own buffer, so a `writev` carries it and no byte is staged through a second `Vec`.
         assert!(
-            seen.lock()
+            peer.lock()
                 .unwrap()
+                .parts
                 .iter()
                 .any(|&(at, len)| at == base && len == payload.len()),
             "the payload was handed by pointer, not staged through a buffer"
         );
         assert_eq!(payload.as_ptr() as usize, base, "the caller's buffer moved");
         assert_eq!(payload.capacity(), capacity, "the caller's buffer grew");
+    }
+
+    /// The witnesses for `carrier-grpc writes-per-relay-read 1`, `carrier-grpc segments-per-socket-write 64` and `carrier-grpc payload-runs-per-socket-write 32`: a relay read of sixteen full `HUNK`s is thirty-two DATA frames and leaves as one write of sixty-four segments whose bytes are those frames in order, with thirty-two of them still runs of the caller's own buffer — a gather holds heads and envelopes apart, it does not stage a byte of payload.
+    #[test]
+    fn a_relay_read_gathers_its_frames_into_one_write() {
+        let data: Vec<u8> = (0..FRAMES_PER_WRITE / 2 * HUNK)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let base = data.as_ptr() as usize;
+        let capacity = data.capacity();
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, u64::MAX);
+        assert!(writer.send(&data));
+        let peer = peer.lock().unwrap();
+        assert_eq!(peer.writes.len(), 1, "one write for a relay read");
+        let mut want = Vec::new();
+        for piece in data.chunks(HUNK) {
+            want.extend_from_slice(&frames(piece));
+        }
+        assert_eq!(peer.writes[0], want, "the same frames, in the same order");
+        assert_eq!(
+            peer.parts.len(),
+            2 * FRAMES_PER_WRITE,
+            "a head slot and a payload run for every frame"
+        );
+        // The parts that lie in the caller's buffer are its payload, edge to edge: the batch skipped no byte and copied none.
+        let end = base + data.len();
+        let runs = peer
+            .parts
+            .iter()
+            .filter(|&&(start, _)| (base..end).contains(&start))
+            .count();
+        assert_eq!(runs, FRAMES_PER_WRITE, "one payload run per frame");
+        let mut at = base;
+        for &(start, len) in peer.parts.iter() {
+            if start < base || start >= end {
+                continue;
+            }
+            assert_eq!(start, at, "a payload run starts where the last one ended");
+            assert!(start + len <= end, "a run leaves the caller's buffer");
+            at = start + len;
+        }
+        assert_eq!(at, end, "every byte reached the writer");
+        assert_eq!(data.capacity(), capacity, "the caller's buffer grew");
+    }
+
+    /// The same batch driven over a real socket, where the only thing a loopback test can assert is
+    /// its bytes: sixty-four segments is the widest list this carrier hands `writev` or `WSASend`, so
+    /// a platform that split the list or refused its width would answer with missing or reordered
+    /// frames rather than with a count.
+    #[test]
+    fn a_wide_batch_reaches_a_real_socket_whole() {
+        let data: Vec<u8> = (0..FRAMES_PER_WRITE / 2 * HUNK)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut want = Vec::new();
+        for piece in data.chunks(HUNK) {
+            want.extend_from_slice(&frames(piece));
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let writer = writer_over(stream, HUNK, u64::MAX);
+            assert!(writer.send(&data), "the socket took the batch");
+        });
+        let mut read = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut wire = Vec::new();
+        read.read_to_end(&mut wire).expect("reads");
+        handle.join().expect("joins");
+        assert_eq!(wire, want, "the same frames, in the same order, whole");
+    }
+
+    /// The gathered batch reaches the peer before its own credit parks the writer: a peer grants for
+    /// bytes it has seen, so frames held in a batch cannot wait behind the window they are the thing
+    /// that would raise. The witness is a write seen while the thread is still inside `send` — with the
+    /// flush taken away the loop below runs out its bound instead — and the run joins only once the
+    /// credit arrives.
+    #[test]
+    fn a_gathered_batch_flushes_before_a_window_that_has_not_arrived() {
+        let one_hunk = (frame_prefix(HUNK, &mut [0u8; 16]) + HUNK) as u64;
+        let data: Vec<u8> = (0..4 * HUNK).map(|i| (i % 251) as u8).collect();
+        let mut want = Vec::new();
+        for piece in data.chunks(HUNK) {
+            want.extend_from_slice(&frames(piece));
+        }
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, one_hunk);
+        let shared = Arc::clone(&writer.shared);
+        let handle = thread::spawn(move || writer.send(&data));
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while peer.lock().unwrap().writes.is_empty() {
+            assert!(
+                std::time::Instant::now() < until,
+                "the writer parked with its own batch unwritten"
+            );
+            thread::yield_now();
+        }
+        assert!(
+            !handle.is_finished(),
+            "one hunk of window cannot carry four hunks"
+        );
+        {
+            let mut send = shared.send.lock().unwrap();
+            send.conn = u64::MAX;
+            send.stream = u64::MAX;
+        }
+        shared.wake.notify_all();
+        assert!(handle.join().expect("joins"));
+        let peer = peer.lock().unwrap();
+        assert_eq!(
+            peer.writes.concat(),
+            want,
+            "the same frames, in the same order"
+        );
     }
 
     /// The same buffer answers every frame: a body the size of the one before it is appended in place, so no message pays a reallocation of the bytes still live in it, and a caller that drains each hunk before the next arrives never pays a reclaim move either.
@@ -1608,7 +1826,12 @@ mod tests {
                         dead: AtomicBool::new(false),
                     });
                     let writer = GrpcWriter { shared, stream: 1 };
-                    assert!(writer.message(&data, true), "max {max} len {len}");
+                    let mut batch = Gather::new();
+                    assert!(
+                        writer.message(&data, true, &mut batch),
+                        "max {max} len {len}"
+                    );
+                    assert!(batch.flush(&writer.shared), "max {max} len {len}");
                 });
                 let mut read = TcpStream::connect(("127.0.0.1", port)).expect("connects");
                 let mut wire = Vec::new();
