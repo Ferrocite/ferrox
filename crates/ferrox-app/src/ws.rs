@@ -133,8 +133,9 @@ fn fresh_mask() -> Option<[u8; 4]> {
         .ok()?
 }
 
-fn read_head(stream: &mut TcpStream) -> Option<Vec<u8>> {
-    crate::proxy::read_http_head(stream, HEAD_LIMIT, crate::budgets::head_arrival())
+/// The head, the octets that arrived with it, and where the head ends: this read consumes what it proves, so a frame pipelined behind the handshake is already in hand.
+fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, usize)> {
+    crate::proxy::read_http_head_kept(stream, HEAD_LIMIT, crate::budgets::head_arrival())
 }
 
 struct Shared {
@@ -458,11 +459,15 @@ fn write_frame(
 
 pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(WsReader, WsWriter)> {
     let mut read = stream;
-    let head = read_head(&mut read)?;
-    let upgrade = check_request(&head, path)?;
-    let response = accept_response(upgrade.key, upgrade.offered, !upgrade.early.is_empty());
+    let (head, at) = read_head(&mut read)?;
+    let Upgrade {
+        key,
+        offered,
+        early,
+    } = check_request(&head[..at], path)?;
+    let response = accept_response(key, offered, !early.is_empty());
     read.write_all(response.as_bytes()).ok()?;
-    split(read, upgrade.early, false)
+    split(read, early, head, at, false)
 }
 
 /// What the client's head said: the key to accept, the subprotocol it offered and the early data riding in it.
@@ -527,7 +532,7 @@ pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     let upgrade = check_request(&head, path)?;
     let response = accept_response(upgrade.key, upgrade.offered, !upgrade.early.is_empty());
     write.write_all(response.as_bytes()).ok()?;
-    Some(split_halves(read, write, upgrade.early, prefix, false))
+    Some(split_halves(read, write, upgrade.early, prefix, 0, false))
 }
 
 pub(crate) fn connect(
@@ -541,10 +546,10 @@ pub(crate) fn connect(
     let mut read = stream;
     let (handshake, early) = request(host, path, &key, budget, first);
     read.write_all(handshake.as_bytes()).ok()?;
-    let head = read_head(&mut read)?;
-    check_response(&head, &key)?;
-    // The peeked head stops at the delimiter, so the pipelined bytes are whatever the socket still holds.
-    let (reader, writer) = split(read, Vec::new(), true)?;
+    let (head, at) = read_head(&mut read)?;
+    check_response(&head[..at], &key)?;
+    // The kept read takes what rode in behind the `101`, so the first frame is already the reader's own buffer.
+    let (reader, writer) = split(read, Vec::new(), head, at, true)?;
     if !early && !first.is_empty() && !writer.send(first) {
         return None;
     }
@@ -577,7 +582,7 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     let (head, behind) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
     check_response(&head, &key)?;
-    let (reader, writer) = split_halves(read, write, Vec::new(), behind, true);
+    let (reader, writer) = split_halves(read, write, Vec::new(), behind, 0, true);
     if !early && !first.is_empty() && !writer.send(first) {
         return None;
     }
@@ -616,19 +621,26 @@ fn request(host: &str, path: &str, key: &str, budget: u32, first: &[u8]) -> (Str
     (request, early)
 }
 
-fn split(read: TcpStream, early: Vec<u8>, masked: bool) -> Option<(WsReader, WsWriter)> {
+fn split(
+    read: TcpStream,
+    early: Vec<u8>,
+    have: Vec<u8>,
+    at: usize,
+    masked: bool,
+) -> Option<(WsReader, WsWriter)> {
     let Ok(write) = read.try_clone() else {
         return None;
     };
-    Some(split_halves(read, write, early, Vec::new(), masked))
+    Some(split_halves(read, write, early, have, at, masked))
 }
 
-// The same split over halves that cannot clone, with the bytes behind the head handed over as the reader's own buffer.
+// The same split over halves that cannot clone: `have` is the buffer the head read left, with `at` already past the head.
 fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
     read: R,
     write: W,
     early: Vec<u8>,
     have: Vec<u8>,
+    at: usize,
     masked: bool,
 ) -> (WsReader<R>, WsWriter) {
     let shared = Arc::new(Shared {
@@ -639,7 +651,7 @@ fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
         read,
         shared: Arc::clone(&shared),
         have,
-        at: 0,
+        at,
         msg_end: 0,
         early,
         eat: 0,
@@ -1038,6 +1050,7 @@ mod tests {
             Sink::default(),
             b"ping".to_vec(),
             prefix,
+            0,
             false,
         );
         assert_eq!(
@@ -1049,6 +1062,36 @@ mod tests {
             &reader.have, b"the frame behind the head",
             "and it holds them still"
         );
+    }
+
+    /// The kept head hands the reader its own buffer with the head already walked past: a frame that rode in with the handshake is delivered without asking the socket, and its bytes never move.
+    #[test]
+    fn a_frame_that_rode_in_with_the_head_costs_no_syscall() {
+        const HEAD: &[u8] = b"GET /tunnel HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+        let mut have = Vec::from(HEAD);
+        have.extend_from_slice(b"\x81\x02hi\x81\x02yo");
+        let base = have.as_ptr();
+        let capacity = have.capacity();
+        let (mut reader, _writer) = split_halves(
+            std::io::Cursor::new(Vec::from(b"\x81\x02no"[..])),
+            Sink::default(),
+            Vec::new(),
+            have,
+            HEAD.len(),
+            false,
+        );
+        let mut got = [0u8; 2];
+        assert_eq!(reader.read(&mut got).expect("delivers"), 2);
+        assert_eq!(&got, b"hi", "the frame behind the head, not a re-read");
+        assert_eq!(reader.read(&mut got).expect("delivers"), 2);
+        assert_eq!(&got, b"yo");
+        assert_eq!(reader.reads(), 0, "the socket was never asked");
+        assert_eq!(
+            reader.have.as_ptr(),
+            base,
+            "and the bytes were delivered from the buffer they arrived in"
+        );
+        assert_eq!(reader.have.capacity(), capacity, "on a held capacity");
     }
 
     #[test]

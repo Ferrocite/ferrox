@@ -36,15 +36,15 @@ impl<R: Read> Read for HeadReader<R> {
     }
 }
 
-fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
-    crate::proxy::read_http_head(stream, HEAD_LIMIT, crate::budgets::head_arrival())
-        .map(|head| (head, Vec::new()))
+/// The head, the octets that arrived with it, and where the head ends: this read consumes what it proves, so bytes pipelined behind the head are already in hand.
+fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, usize)> {
+    crate::proxy::read_http_head_kept(stream, HEAD_LIMIT, crate::budgets::head_arrival())
 }
 
 pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(HeadReader, TcpStream)> {
     let mut read = stream;
-    let (head, prefix) = read_head(&mut read)?;
-    check_request(&head, path)?;
+    let (head, at) = read_head(&mut read)?;
+    check_request(&head[..at], path)?;
     let Ok(write) = read.try_clone() else {
         return None;
     };
@@ -55,8 +55,8 @@ pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(HeadReader, TcpSt
     Some((
         HeadReader {
             read,
-            prefix,
-            at: 0,
+            prefix: head,
+            at,
         },
         write,
     ))
@@ -99,16 +99,16 @@ pub(crate) fn connect(
     let mut read = stream;
     let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n");
     read.write_all(request.as_bytes()).ok()?;
-    let (head, prefix) = read_head(&mut read)?;
-    check_response(&head)?;
+    let (head, at) = read_head(&mut read)?;
+    check_response(&head[..at])?;
     let Ok(write) = read.try_clone() else {
         return None;
     };
     Some((
         HeadReader {
             read,
-            prefix,
-            at: 0,
+            prefix: head,
+            at,
         },
         write,
     ))
@@ -171,6 +171,36 @@ mod tests {
         reader.read_exact(&mut buf).expect("reads");
         assert_eq!(&buf, b"pong");
         server.join().expect("joins");
+    }
+
+    /// The kept head hands its own buffer to the reader with the head already walked past: the bytes behind it are delivered from that buffer, and a reader that asks the socket at all panics.
+    #[test]
+    fn the_bytes_behind_the_head_reach_the_relay_without_a_syscall() {
+        const HEAD: &[u8] = b"GET /camouflage HTTP/1.1\r\nHost: h\r\n\r\n";
+        struct Refused;
+        impl Read for Refused {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("the head's tail is already in hand")
+            }
+        }
+        let mut prefix = Vec::from(HEAD);
+        prefix.extend_from_slice(b"ping");
+        let base = prefix.as_ptr();
+        let capacity = prefix.capacity();
+        let mut reader = HeadReader {
+            read: Refused,
+            prefix,
+            at: HEAD.len(),
+        };
+        let mut got = [0u8; 4];
+        assert_eq!(reader.read(&mut got).expect("delivers"), 4);
+        assert_eq!(&got, b"ping", "the bytes behind the head, not a re-read");
+        assert_eq!(
+            reader.prefix.as_ptr(),
+            base,
+            "delivered from the buffer those bytes arrived in"
+        );
+        assert_eq!(reader.prefix.capacity(), capacity, "on a held capacity");
     }
 
     #[test]
