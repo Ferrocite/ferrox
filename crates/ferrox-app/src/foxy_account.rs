@@ -20,8 +20,8 @@ const MAX_BODY: usize = 1024 * 1024;
 pub(crate) enum Denied {
     /// The access token or the account is not accepted: sign in again.
     Token,
-    /// The account has no quota left, and the answer says when it resets.
-    Quota,
+    /// The account is not allowed to ask right now, with the seconds it named before it will answer (0 when it said nothing).
+    Quota(u64),
     /// The edge is asking for a client it considers a bot. Named, not guessed.
     Challenged(u16),
     /// The plane could not be reached at all, with the phase that gave up.
@@ -34,7 +34,8 @@ impl std::fmt::Display for Denied {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Token => f.write_str("the account token was refused"),
-            Self::Quota => f.write_str("the account has no quota left"),
+            Self::Quota(0) => f.write_str("the account has no quota left"),
+            Self::Quota(wait) => write!(f, "the account plane asked to wait {wait}s"),
             Self::Challenged(status) => {
                 write!(f, "the edge answered {status} and asked for a challenge")
             }
@@ -51,8 +52,23 @@ impl Denied {
         match status {
             401 | 403 => Some(Self::Token),
             406 => Some(Self::Challenged(status)),
-            429 => Some(Self::Quota),
+            429 => Some(Self::Quota(0)),
             _ => None,
+        }
+    }
+
+    /// The one refusal a second ask cannot change: the credential itself, not the plane's mood.
+    #[must_use]
+    pub(crate) fn is_final(&self) -> bool {
+        matches!(self, Self::Token)
+    }
+
+    /// The seconds the plane asked to wait before answering again, when it named any.
+    #[must_use]
+    pub(crate) fn retry_after(&self) -> u64 {
+        match self {
+            Self::Quota(wait) => *wait,
+            _ => 0,
         }
     }
 }
@@ -109,6 +125,17 @@ impl Reply {
     pub(crate) fn header_number(&self, name: &str) -> Option<u64> {
         self.header(name)
             .and_then(|value| value.trim().parse().ok())
+    }
+
+    /// The status's meaning with the wait the head names: `Denied::of` reads the number, this reads the clock beside it.
+    #[must_use]
+    pub(crate) fn denied(&self) -> Option<Denied> {
+        Denied::of(self.status).map(|denied| match denied {
+            Denied::Quota(_) => {
+                Denied::Quota(self.header_number("Retry-After").unwrap_or_default())
+            }
+            other => other,
+        })
     }
 }
 
@@ -407,7 +434,7 @@ pub(crate) fn login(
             }
             return Err(Denied::Other(reply.status));
         }
-        if let Some(denied) = Denied::of(reply.status) {
+        if let Some(denied) = reply.denied() {
             return Err(denied);
         }
         let token = reply.field("sessionToken").ok_or(Denied::Token)?;
@@ -463,7 +490,7 @@ pub(crate) fn token(
         &headers,
         &body,
     )?;
-    if let Some(denied) = Denied::of(reply.status) {
+    if let Some(denied) = reply.denied() {
         return Err(denied);
     }
     if reply.status != 200 {
@@ -500,7 +527,7 @@ pub(crate) fn pass(
         &[("Authorization", &bearer), ("Content-Type", JSON_ACCEPT)],
         b"",
     )?;
-    if let Some(denied) = Denied::of(reply.status) {
+    if let Some(denied) = reply.denied() {
         return Err(denied);
     }
     if reply.status != 200 {
@@ -616,12 +643,78 @@ mod tests {
         assert_eq!(Denied::of(401), Some(Denied::Token));
         assert_eq!(Denied::of(403), Some(Denied::Token));
         assert_eq!(Denied::of(406), Some(Denied::Challenged(406)));
-        assert_eq!(Denied::of(429), Some(Denied::Quota));
+        assert_eq!(Denied::of(429), Some(Denied::Quota(0)));
         assert_eq!(Denied::of(500), None);
         assert!(Denied::of(406)
             .expect("challenged")
             .to_string()
             .contains("challenge"));
+    }
+
+    /// The wait only a head can name, read where the status is decided.
+    #[test]
+    fn a_rate_limit_carries_the_wait_its_head_names() {
+        let with = Reply {
+            status: 429,
+            headers: vec![("Retry-After".to_owned(), " 37 ".to_owned())],
+            body: Vec::new(),
+        };
+        assert_eq!(with.denied(), Some(Denied::Quota(37)));
+        assert_eq!(with.denied().expect("quota").retry_after(), 37);
+        let without = Reply {
+            status: 429,
+            headers: vec![("Content-Length".to_owned(), "0".to_owned())],
+            body: Vec::new(),
+        };
+        assert_eq!(
+            without.denied(),
+            Denied::of(429),
+            "a silent 429 names no wait"
+        );
+        let date = Reply {
+            status: 429,
+            headers: vec![(
+                "Retry-After".to_owned(),
+                "Wed, 21 Oct 2026 07:28:00 GMT".to_owned(),
+            )],
+            body: Vec::new(),
+        };
+        assert_eq!(
+            date.denied(),
+            Some(Denied::Quota(0)),
+            "the date form is not a number, so no wait"
+        );
+        let refused = Reply {
+            status: 401,
+            headers: vec![("Retry-After".to_owned(), "37".to_owned())],
+            body: Vec::new(),
+        };
+        assert_eq!(
+            refused.denied(),
+            Some(Denied::Token),
+            "only a rate limit names a wait"
+        );
+    }
+
+    /// The refusal that ends a renewal, and the ones that only slow it down.
+    #[test]
+    fn a_refused_credential_is_the_only_answer_a_second_ask_cannot_change() {
+        assert!(Denied::Token.is_final());
+        for slow in [
+            Denied::Quota(0),
+            Denied::Quota(37),
+            Denied::Challenged(406),
+            Denied::Unreachable("dial".to_owned()),
+            Denied::Other(500),
+        ] {
+            assert!(!slow.is_final(), "{slow}");
+        }
+        assert_eq!(Denied::Quota(37).retry_after(), 37);
+        assert_eq!(
+            Denied::Other(429).retry_after(),
+            0,
+            "only a quota names a wait"
+        );
     }
 
     #[test]
@@ -658,6 +751,56 @@ mod tests {
                 .expect("parses")
                 .port,
             8443
+        );
+    }
+
+    /// The pause before the next ask: the plane's own when it names one, else a curve that grows and stops growing.
+    #[test]
+    fn the_next_ask_waits_the_gap_the_plane_names_or_a_curve_that_caps() {
+        let named = Denied::Quota(37);
+        assert_eq!(renewal_gap(&named, 0, Some(600)), Duration::from_secs(37));
+        assert_eq!(
+            renewal_gap(&named, 4, Some(10)),
+            Duration::from_secs(37),
+            "a named wait outlives the pass rather than hammering the plane"
+        );
+        assert_eq!(
+            renewal_gap(&Denied::Quota(u64::MAX), 0, None),
+            Duration::from_secs(crate::budgets::ACCOUNT_NAMED_WAIT_MAX),
+            "a wait past the named ceiling is not slept on"
+        );
+        let guessed = Denied::Unreachable("dial".to_owned());
+        for (attempt, want) in [
+            (0, 5),
+            (1, 10),
+            (2, 20),
+            (3, 40),
+            (4, 80),
+            (5, 160),
+            (6, 320),
+            (7, 640),
+            (8, 900),
+            (64, 900),
+        ] {
+            assert_eq!(
+                renewal_gap(&guessed, attempt, None),
+                Duration::from_secs(want)
+            );
+        }
+        assert_eq!(
+            renewal_gap(&guessed, 2, Some(7)),
+            Duration::from_secs(7),
+            "a pass about to lapse is asked about sooner"
+        );
+        assert_eq!(
+            renewal_gap(&guessed, 2, Some(0)),
+            Duration::from_secs(1),
+            "a lapsed pass still leaves a second between asks"
+        );
+        assert_eq!(
+            renewal_gap(&Denied::Token, 0, Some(7)),
+            Duration::from_secs(5),
+            "a token refusal is asked by nothing: is_final ends the clock before the gap"
         );
     }
 }
@@ -831,6 +974,16 @@ impl Account {
             })
     }
 
+    /// What the carried pass has left before it lapses, for a pause that must not outlive it.
+    #[must_use]
+    pub(crate) fn pass_left(&self) -> Option<u64> {
+        self.pass
+            .lock()
+            .ok()
+            .and_then(|pass| pass.expires_at)
+            .map(|at| at.saturating_sub(epoch()))
+    }
+
     pub(crate) fn current(&self) -> Pass {
         self.pass.lock().map_or_else(
             |_| Pass {
@@ -842,6 +995,23 @@ impl Account {
             |pass| pass.clone(),
         )
     }
+}
+
+/// When to ask the plane again: its own wait when it names one, else a pause that grows, and never one that would land after the pass still being carried has lapsed.
+#[must_use]
+pub(crate) fn renewal_gap(
+    denied: &Denied,
+    attempt: u32,
+    pass_left: Option<u64>,
+) -> std::time::Duration {
+    if let Some(wait) = (denied.retry_after() > 0).then_some(denied.retry_after()) {
+        return std::time::Duration::from_secs(
+            wait.clamp(1, crate::budgets::ACCOUNT_NAMED_WAIT_MAX),
+        );
+    }
+    let guessed = (crate::budgets::ACCOUNT_BACKOFF_SECS << attempt.min(8))
+        .min(crate::budgets::ACCOUNT_RETRY_CAP);
+    std::time::Duration::from_secs(pass_left.map_or(guessed, |left| guessed.min(left).max(1)))
 }
 
 #[cfg(test)]

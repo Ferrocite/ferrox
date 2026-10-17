@@ -83,6 +83,9 @@ graph TD
 | relay-legs-held-after-their-lane-ended | 0 | ferrox-app-foxy::loopback::a_lane_that_ends_releases_the_leg_parked_on_its_client |
 | pool-workers-held-after-a-finished-burst | 0 | ferrox-app-proxy::tests::a_finished_burst_hands_its_workers_back_to_the_process |
 | pool-directions-lost-on-a-gone-worker | 0 | ferrox-app-proxy::tests::a_claim_that_reaches_a_gone_worker_keeps_its_direction |
+| rate-limits-that-stopped-a-renewal | 0 | ferrox-app-foxy_account::tests::a_refused_credential_is_the_only_answer_a_second_ask_cannot_change |
+| named-waits-dropped-from-a-renewal-pause | 0 | ferrox-app-foxy_account::tests::a_rate_limit_carries_the_wait_its_head_names |
+| renewal-pauses-past-their-own-ceiling | 0 | ferrox-app-foxy_account::tests::the_next_ask_waits_the_gap_the_plane_names_or_a_curve_that_caps |
 <!-- counts:end -->
 
 `tcp-connections-asked-of-an-untrusted-edge 1` is the retry rule seen from the
@@ -455,6 +458,30 @@ the comparison can be re-read:
   flow is still a thread and a lane of its own, so a lane with N concurrent flows
   still runs N legs; fewer threads at the same concurrency is the session reuse
   the `h2`/`h1` carriers do not have yet, not this reap.
+
+- **A renewal clock that one rate limit could stop.** `Denied::of(429)` answered
+  `Quota`, and both consumers read `Quota` as final: the renewal thread printed its
+  one line and returned, and the sign-in loop refused the lane outright — the
+  opposite of the comment beside it, which says a plane refusal retries. Every lane
+  start is a fresh sign-in and a fresh mint, so lanes restarted in a row collide on
+  that limiter and the first collision cost the whole lane: the pass it stood over
+  kept running out with nothing asking for another. A `Quota` now carries the
+  seconds its own head named (`Retry-After`, numeric form), `Denied::is_final` is
+  the single answer a second ask cannot change — a refused credential — and
+  `renewal_gap` decides the pause: that named wait, clamped to a second and twelve
+  hours, or else five seconds doubling to a fifteen-minute ceiling, and cut short
+  by whatever the carried pass has left so a lapse is noticed before the curve says
+  to wait. `a_refused_credential_is_the_only_answer_a_second_ask_cannot_change`
+  walks the five refusals and says which one ends the clock,
+  `a_rate_limit_carries_the_wait_its_head_names` reads the wait out of a head, and
+  `the_next_ask_waits_the_gap_the_plane_names_or_a_curve_that_caps` is the pause
+  table, both ceilings included.
+  What is **not** removed: a `Retry-After` in HTTP-date form is not a number, so it
+  falls onto the guessed curve rather than the plane's own clock, and a refusal
+  still costs the pass clock before it — `renews_in` sleeps first, so an ask waits
+  its half-life *plus* the refusal pause, never less than the 15 s floor
+  `renewal_delay` writes. Nothing here keeps a lane alive past a pass that really
+  has lapsed: it asks again instead of never asking again.
 
 What is **not** removed, named rather than claimed: 0-RTT, connection
 migration, key updates and batched datagram I/O are quiche's, and this tree has

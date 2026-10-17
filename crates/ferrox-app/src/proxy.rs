@@ -10,8 +10,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::budgets::{
-    self, ACCOUNT_ATTEMPTS, ACCOUNT_BACKOFF_SECS, CARRIER_DEAD_SECS, RELAY_HANDOFF_SPINS,
-    RELAY_IDLE, RELAY_LOCK_TRIES, RELAY_POLL, SESSION_POLL,
+    self, ACCOUNT_ATTEMPTS, CARRIER_DEAD_SECS, RELAY_HANDOFF_SPINS, RELAY_IDLE, RELAY_LOCK_TRIES,
+    RELAY_POLL, SESSION_POLL,
 };
 use crate::config::{
     inbound_carrier, inbound_reality_config, inbound_tls_identity, outbound_carrier, outbound_flow,
@@ -5437,18 +5437,27 @@ fn foxy_socks_reply(reply: u8) -> [u8; 10] {
 /// Edges past the first a refusal may try: the reference's count, and the most a flow is worth waiting for.
 const MAX_FOXY_ALTERNATES: usize = 3;
 
-/// The renewal thread: one per lane on the clock the pass names, stopping once a pass cannot be replaced.
+/// The renewal thread: one per lane on the clock the pass names, stopping once the account itself is refused.
 fn start_renewal(account: std::sync::Arc<crate::foxy_account::Account>) {
-    thread::spawn(move || loop {
-        thread::sleep(account.renews_in());
-        if let Err(denied) = account.renew() {
-            eprintln!("foxy: the pass could not be replaced: {denied}");
-            if matches!(
-                denied,
-                crate::foxy_account::Denied::Token | crate::foxy_account::Denied::Quota
-            ) {
+    thread::spawn(move || {
+        let mut attempt = 0u32;
+        loop {
+            thread::sleep(account.renews_in());
+            let Err(denied) = account.renew() else {
+                attempt = 0;
+                continue;
+            };
+            // A refused token is the only end: a rate limit, a challenge or an unreachable plane is asked again on the plane's own pause, since the pass it stands over keeps expiring meanwhile.
+            if denied.is_final() {
                 return;
             }
+            let pause = crate::foxy_account::renewal_gap(&denied, attempt, account.pass_left());
+            attempt = attempt.saturating_add(1);
+            eprintln!(
+                "foxy: the pass could not be replaced ({denied}), asking again in {}s",
+                pause.as_secs()
+            );
+            thread::sleep(pause);
         }
     });
 }
@@ -6917,13 +6926,6 @@ fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
     }
 }
 
-/// Whether a refusal is worth asking again: not credentials, not quota — no retry changes those.
-fn transient(denied: &crate::foxy_account::Denied) -> bool {
-    !matches!(
-        denied,
-        crate::foxy_account::Denied::Token | crate::foxy_account::Denied::Quota
-    )
-}
 /// The pooled dial uses the edge's name, not its resolved address, so a country's flows share one connection.
 fn foxy_quic_dial(foxy: &FoxyOut, edge: &ferrox_core::foxy::Candidate) -> crate::quic::QuicDial {
     crate::quic::QuicDial {
@@ -9403,13 +9405,14 @@ fn foxy_account(
         loop {
             match account.sign_in(email, password) {
                 Ok(()) => break,
-                Err(denied) if attempt + 1 < ACCOUNT_ATTEMPTS && transient(&denied) => {
-                    let pause = ACCOUNT_BACKOFF_SECS << attempt;
+                Err(denied) if attempt + 1 < ACCOUNT_ATTEMPTS && !denied.is_final() => {
+                    let pause = crate::foxy_account::renewal_gap(&denied, attempt as u32, None);
                     attempt += 1;
                     eprintln!(
-                        "foxy: the account plane refused the sign-in ({denied}), again in {pause}s"
+                        "foxy: the account plane refused the sign-in ({denied}), again in {}s",
+                        pause.as_secs()
                     );
-                    std::thread::sleep(std::time::Duration::from_secs(pause));
+                    std::thread::sleep(pause);
                 }
                 Err(denied) => {
                     eprintln!("foxy: the account did not sign in: {denied}");
