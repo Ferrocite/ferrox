@@ -1075,7 +1075,9 @@ mod tests {
     #[test]
     fn a_padded_data_cut_matches_the_reference_at_every_pad_length() {
         for len in 1..=8usize {
-            let frame: Vec<u8> = (0..len as u8).map(|b| b * 37 + 5).collect();
+            let frame: Vec<u8> = (0..len as u8)
+                .map(|b| b.wrapping_mul(37).wrapping_add(5))
+                .collect();
             for pad in 0..=10usize {
                 let mut mine = frame.clone();
                 let cut = cut_padded_data(&mut mine, pad);
@@ -1193,7 +1195,7 @@ mod tests {
     #[test]
     fn a_padded_data_frame_is_its_payload_between_pad_byte_and_pad_tail() {
         let (echo_addr, echo) = echo_server();
-        let (addr, server) = serve_one(test_settings("stream-up"), [0xccu8; 16], 1);
+        let (addr, server) = serve_one(test_settings("stream-up"), [0xaau8; 16], 1);
         let mut client = H2Client::connect(addr);
         let pad = padding();
         let down = client.headers("GET", "/up/sess-h2-pad", &[("referer", pad.as_str())], true);
