@@ -39,6 +39,7 @@ shadowsocks chunk-buffer-allocations-per-connection 1 ferrox-app-shadowsocks::te
 shadowsocks udp-payload-buffers-per-datagram 1 ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes
 shadowsocks udp-datagram-reallocations-after-the-first 0 ferrox-app-shadowsocks::tests::an_opened_payload_is_the_callers_own_bytes
 shadowsocks subkey-heap-buffers-per-connection 1 ferrox-core-shadowsocks::tests::a_cipher_is_one_heap_buffer
+shadowsocks udp-datagram-heap-buffers-per-datagram 0 ferrox-core-shadowsocks::tests::a_rekeyed_cipher_streams_datagrams_without_heap_traffic
 shadowsocks stream-iv-bytes-per-handshake 16 ferrox-app-shadowsocks::tests::stream_relays_an_echo
 shadowsocks stream-write-syscalls-per-relay-read 1 ferrox-app-shadowsocks::tests::stream_relay_read_becomes_one_write
 shadowsocks stream-crypt-allocations-per-call 0 ferrox-core-shadowsocks::tests::rc4_crypt_is_in_place_and_allocates_nothing
