@@ -805,11 +805,7 @@ fn serve_vless(stream: TcpStream, id: &[u8; 16], carrier: &Carrier, freedom: boo
                 return;
             };
             // Past the upgrade the frame layer retries timeouts itself, so bound it by wall clock and poll the socket.
-            reader.set_poll(Some(RELAY_POLL));
-            reader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
-            let decoded = decode_request(&mut reader);
-            reader.set_handshake_budget(None);
-            reader.set_poll(None);
+            let decoded = under_handshake(&mut reader, decode_request);
             let Some((got, _flow, cmd, target)) = decoded else {
                 return;
             };
@@ -850,11 +846,7 @@ fn serve_vless(stream: TcpStream, id: &[u8; 16], carrier: &Carrier, freedom: boo
                 return;
             };
             // Past the preface the reader retries timeouts itself, so the opening request is polled at the relay's grain and bounded by the handshake budget, the way the websocket arm bounds its frames.
-            reader.set_poll(Some(RELAY_POLL));
-            reader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
-            let decoded = decode_request(&mut reader);
-            reader.set_handshake_budget(None);
-            reader.set_poll(None);
+            let decoded = under_handshake(&mut reader, decode_request);
             let Some((got, _flow, cmd, target)) = decoded else {
                 return;
             };
@@ -922,6 +914,47 @@ fn decode_request_bounded(stream: &mut dyn Read) -> Option<([u8; 16], String, u8
         until: Instant::now() + budgets::handshake(),
     };
     decode_request(&mut bounded)
+}
+
+/// The two arms a carried reader holds for the length of one decode: the `ws` and `grpc` readers both retry a timeout forever, so a head needs the socket's poll quantum and a wall-clock end.
+pub(crate) trait Carried {
+    fn arm(&mut self, every: std::time::Duration, until: Instant);
+    fn disarm(&mut self);
+}
+
+impl Carried for crate::grpc::GrpcReader {
+    fn arm(&mut self, every: std::time::Duration, until: Instant) {
+        self.set_poll(Some(every));
+        self.set_handshake_budget(Some(until));
+    }
+
+    fn disarm(&mut self) {
+        self.set_handshake_budget(None);
+        self.set_poll(None);
+    }
+}
+
+impl Carried for crate::ws::WsReader {
+    fn arm(&mut self, every: std::time::Duration, until: Instant) {
+        self.set_poll(Some(every));
+        self.set_handshake_budget(Some(until));
+    }
+
+    fn disarm(&mut self) {
+        self.set_handshake_budget(None);
+        self.set_poll(None);
+    }
+}
+
+/// One decode run between the arms, both put away on the way out: a carrier answers its own head and then clears its clock, so the protocol that reads through it would otherwise wait unbounded.
+pub(crate) fn under_handshake<T, R: Read + Carried>(
+    reader: &mut R,
+    decode: impl FnOnce(&mut dyn Read) -> T,
+) -> T {
+    reader.arm(RELAY_POLL, Instant::now() + budgets::handshake());
+    let out = decode(reader);
+    reader.disarm();
+    out
 }
 
 fn serve_vless_raw(mut stream: TcpStream, id: &[u8; 16], freedom: bool) {
@@ -5069,7 +5102,8 @@ fn serve_trojan_grpc(stream: TcpStream, key: &[u8; 56], path: &str, freedom: boo
     let Some((mut reader, writer)) = crate::grpc::accept(stream, path) else {
         return;
     };
-    let Some((cmd, target)) = decode_trojan_request(&mut reader, key) else {
+    let Some((cmd, target)) = under_handshake(&mut reader, |read| decode_trojan_request(read, key))
+    else {
         return;
     };
     if cmd != 1 || !freedom {
@@ -12814,6 +12848,26 @@ mod tests {
         done_rx
             .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
             .expect("the bounded session request read returns instead of pinning the thread");
+        serving.join().expect("joins");
+    }
+
+    /// A trojan inbound over gRPC whose peer answers the head and never writes its hash releases the serve thread: the carrier puts its clock away with the head, so the request reads under its own.
+    #[test]
+    fn a_silent_peer_cannot_pin_a_grpc_trojan_request() {
+        let key = trojan_key("secret");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_trojan_grpc(stream, &key, "/p", true);
+            let _ = done_tx.send(());
+        });
+        let stream = TcpStream::connect(addr).expect("connects");
+        let (_reader, _writer) = crate::grpc::connect(stream, "127.0.0.1", "/p").expect("dials");
+        done_rx
+            .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
+            .expect("the bounded request read returns instead of pinning the thread");
         serving.join().expect("joins");
     }
 

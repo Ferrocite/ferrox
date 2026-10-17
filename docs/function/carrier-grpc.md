@@ -90,6 +90,10 @@ graph TD
 | pinned-threads-per-silent-request-head | 0 | ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_request_head |
 | pinned-threads-per-silent-vless-request | 0 | ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_vless_request |
 | pinned-threads-per-silent-tls-request | 0 | ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_tls_vless_request |
+| pinned-threads-per-silent-trojan-request | 0 | ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_trojan_request |
+| pinned-threads-per-silent-vmess-request | 0 | ferrox-app-vmess::tests::a_silent_peer_cannot_pin_a_grpc_vmess_request |
+| pinned-threads-per-silent-shadowsocks-request | 0 | ferrox-app-shadowsocks::tests::a_silent_peer_cannot_pin_a_grpc_shadowsocks_request |
+| pinned-threads-per-silent-2022-request | 0 | ferrox-app-shadowsocks2022::tests::a_silent_peer_cannot_pin_a_grpc_shadowsocks2022_request |
 | message-buffer-reallocations-per-same-sized-frame | 0 | ferrox-app-grpc::tests::the_message_buffer_is_reused_not_reallocated |
 | batched-elements-served-per-message | 8 | ferrox-app-grpc::tests::a_batched_downlink_arrives_element_by_element |
 | grpc-methods-served-per-listener | 2 | ferrox-app-grpc::tests::one_listener_serves_both_methods |
@@ -116,17 +120,22 @@ of every body since the last grant — `128` frames of `16393` bytes per credit,
 a downlink of full hunks, where the lane used to write one pair per frame. The
 preface row is read off the first write both halves of a call make: the setting
 and the `WINDOW_UPDATE` on stream `0` that lifts the connection to the window the
-setting advertises, which is the grant a batched credit rests on. The four
+setting advertises, which is the grant a batched credit rests on. The eight
 `pinned-threads` rows are one serve thread each, watched through a channel: a
 peer that opens and never speaks, one that sends the `24`-octet preface and
-stops, one that dials a real gRPC client and never sends its first hunk, and one
-that dials the same client through a TLS session, where `accept_split` answers
-the head and only the request's own clock is left to end the flow. The
-`0` is a give-up at `budgets::handshake()` rather than a race, and each row was
-audited by taking its own arm away first — the preface read's deadline, the
-pump's, the reader's, then the session caller's — and reading the test fail at
-its `15s` bound. The session row needs no socket arm: the dispatchers behind it
-already poll the session's socket at `RELAY_POLL`, so the read answers on a
+stops, and six that dial a real gRPC client, answer the head, and never send the
+opening request — for `vless`, for `trojan`, `vmess`, `shadowsocks` and
+`shadowsocks-2022` each decoding its own head, and one through a TLS session,
+where `accept_split` answers the head and only the request's own clock is left to
+end the flow. The `0` is a give-up at `budgets::handshake()` rather than a race,
+and each row was audited by taking its own arm away first — the preface read's
+deadline, the pump's, the reader's, then the session caller's — and reading the
+test fail at its `15s` bound. The five plaintext rows share one arm,
+`proxy::under_handshake`, so the control that audits them removes it once and the
+five fail together; `accept` hands the caller a reader whose poll and clock it
+has already cleared, and a protocol that then reads its own request through it
+would wait unbounded. The session row needs no socket arm: the dispatchers behind
+it already poll the session's socket at `RELAY_POLL`, so the read answers on a
 grain and it is the deadline that turns the silence into a refusal. The
 batched row counts the elements one `TunMulti` message hands over before the
 caller sees a gap: eight 8 KiB elements in two messages, each element delivered
@@ -284,14 +293,18 @@ an RST with data queued rather than a framing error.
   session arm costs no `setsockopt` at all: `serve_vless_tls` and
   `serve_vless_reality` poll the socket under the session at `RELAY_POLL` before
   the handshake, so the reader only needs the clock to turn a grain into a
-  refusal. What is not unified: the http carriers' request head still runs on
-  `budgets::head_arrival()`, because that budget names an HTTP request arriving,
-  while this one is the carrier's opening read — the budget `serve_vless_raw`
-  already bounds its own opening read with. What is not armed here: `trojan`,
-  `vmess`, `shadowsocks` and `shadowsocks-2022` each decode their own opening
-  request through a reader this carrier has already disarmed, so that wait is
-  theirs to bound and their pages' row to carry — `P13`'s deep-retry add-on
-  holds the list.
+  refusal. What is armed by one function now: `proxy::under_handshake` holds the
+  poll and the clock across one decode and puts both away on the way out, and the
+  five plaintext reads of this carrier — `vless` and the four protocols that
+  decode their own head behind `accept` — run through it, so the arm a caller
+  cannot forget is the arm that does not leak. What is not unified: the http
+  carriers' request head still runs on `budgets::head_arrival()`, because that
+  budget names an HTTP request arriving, while this one is the carrier's opening
+  read — the budget `serve_vless_raw` already bounds its own opening read with.
+  What is not armed here: the `ws`, `xhttp`, `httpupgrade` and `http-header`
+  carriers each hand their caller a reader they have already disarmed, so the
+  same four protocols wait unbounded behind those four — `P13`'s deep-retry
+  add-on holds the list.
 
 What is **not** removed: HTTP/2's own framing. `T_DATA`, `T_HEADERS` and
 `T_SETTINGS`, HPACK and the flow-control window are the cost of the carrier,
