@@ -68,6 +68,7 @@ graph TD
 | quic-datagrams-out-of-one-frame | 2 | ferrox-app-foxy::loopback::a_quic_frame_of_two_datagrams_arrives_as_two_datagrams |
 | stream-write-staging-copies-per-byte | 0 | ferrox-app-foxy::loopback::the_quic_carrier_sends_the_block_reads_the_status_and_carries_the_bytes |
 | datagram-write-staging-copies-per-byte | 0 | ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_and_echoes_a_datagram |
+| ip-read-staging-copies-per-byte | 0 | ferrox-app-foxy::loopback::the_connect_ip_carrier_opens_one_tunnel_and_carries_a_datagram |
 | server-roles | 0 | ferrox-app-proxy::tests::quic_serve_closes_without_handshake |
 | dialled-without-ca-cert-file | 0 | ferrox-app-proxy::tests::quic_outbound_reads_ca_cert_file |
 | address-assign-capsule-bytes-per-grant | 9 | ferrox-core-foxy::connectip::tests::the_assign_a_proxy_writes_is_the_assign_the_lane_reads |
@@ -316,6 +317,25 @@ the comparison can be re-read:
   empty that sentinel rather than strengthen it. What is **not** removed on the
   leg that changed: the payload still crosses once into the TLS record — that copy
   is the floor, not this lane's staging.
+
+- **A staging copy on every CONNECT-IP packet read.** The HTTP/2 CONNECT-IP
+  reader copied every inbound packet twice: it staged the whole DATA frame into
+  the capsule buffer, then split the first capsule out of that buffer into the
+  owned `Vec` it returns. Its CONNECT-UDP sibling already handed a capsule whole
+  inside one frame straight out and staged only what followed it; this path had
+  never been brought to the same shape. It now splits the frame where it lies and
+  keeps only the tail behind a whole datagram, so an inbound packet crosses
+  userspace once — into the `Vec` the caller takes — the floor for the
+  Vec-returning read. `ip-read-staging-copies-per-byte 0` is gated by
+  `the_connect_ip_carrier_opens_one_tunnel_and_carries_a_datagram` resetting the
+  capsule buffer with nothing pending and holding its capacity at zero across a
+  read — the packet bytes are identical either way, so capacity is the only
+  witness that can see the staging go. The **HTTP/3 read leg is left alone**: its
+  capsules arrive through the stream window and may span reads, so the
+  whole-in-one-frame precondition the copy removal rests on is not free there, and
+  the staged path stays correct. What is **not** removed on the leg that changed:
+  the one copy into the returned `Vec` — the caller takes ownership, so no borrow
+  of the frame outlives the call.
 
 - **Two copies of every relayed byte.** The lane used to stage a DATA frame's
   payload in its read buffer and then copy it into the caller's, and stage the
