@@ -807,7 +807,7 @@ mod tests {
 
 #[cfg(test)]
 mod activation {
-    use super::loopback::{ACTIVE, EDGE};
+    use super::loopback::{ACTIVE, EDGE, TWO_FACTOR};
 
     /// An account that never activated its entitlement is refused a pass: activate, mint again, one retry.
     #[test]
@@ -816,6 +816,8 @@ mod activation {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         ACTIVE.store(false, std::sync::atomic::Ordering::Relaxed);
+        // The edge mints only for a verified session; a turn that left the two-factor flag set would park this sign-in at the code instead.
+        TWO_FACTOR.store(false, std::sync::atomic::Ordering::Relaxed);
         let (address, roots) = super::loopback::edge();
         let account = super::loopback::account(address, roots);
         account
@@ -1415,6 +1417,8 @@ mod two_factor {
         let _turn = super::loopback::EDGE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Both flags the edge reads are armed, so no earlier turn can leave this sign-in parked at a pass the mint refuses.
+        super::loopback::ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
         TWO_FACTOR.store(true, std::sync::atomic::Ordering::Relaxed);
         let minted = rcgen::generate_simple_self_signed(
             HOSTS
