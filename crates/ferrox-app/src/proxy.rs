@@ -9301,16 +9301,11 @@ fn foxy_account(
     email: &str,
     password: &str,
     code: &str,
-    configured: &str,
+    pasted: &ferrox_core::foxy::Pass,
     guardian: &str,
     roots: &[Vec<u8>],
 ) -> Option<std::sync::Arc<crate::foxy_account::Account>> {
-    let pass = ferrox_core::foxy::Pass {
-        token: configured.to_owned(),
-        expires_at: None,
-        quota_remaining: None,
-        quota_reset: None,
-    };
+    let pass = pasted.clone();
     if email.is_empty() && pass.token.is_empty() {
         return None;
     }
@@ -9358,6 +9353,33 @@ fn foxy_account(
         }
     }
     Some(account)
+}
+
+/// Whether this lane can keep a pass: refuse one it cannot dial or cannot replace, and put the renewal clock on the account that can.
+fn foxy_pass_guard(
+    account: Option<&std::sync::Arc<crate::foxy_account::Account>>,
+    pass: &ferrox_core::foxy::Pass,
+) -> Option<String> {
+    let renews = account.filter(|account| account.can_renew());
+    // A lane that opens fronts over an empty pass answers every flow with a refusal.
+    if pass.token.is_empty() {
+        return Some("the outbound has no pass to dial with".to_owned());
+    }
+    // The pass the edge accepts lives minutes, not hours: a pasted one at the end of its window has nobody to replace it.
+    if renews.is_none()
+        && pass
+            .expires_at
+            .is_some_and(|at| at <= now_secs().saturating_add(30))
+    {
+        return Some(format!(
+            "settings.pass expires at {:?} and nothing can replace it: serve with email and password, or paste a fresh pass",
+            pass.expires_at
+        ));
+    }
+    if let Some(account) = renews {
+        start_renewal(std::sync::Arc::clone(account));
+    }
+    None
 }
 
 fn foxy_text(settings: Option<&Json>, key: &str) -> String {
@@ -9456,25 +9478,19 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             eprintln!("foxy: carrier h3 cannot ride an http upstreamProxy: use socks5(h)://, h1, h2 or auto");
             continue;
         }
-        let account = foxy_account(
-            &email,
-            &password,
-            &code,
-            &configured,
-            link.guardian(),
-            &roots,
-        );
-        let pass = account.as_ref().map_or_else(
-            || ferrox_core::foxy::Pass {
-                token: configured.clone(),
-                expires_at: None,
-                quota_remaining: None,
-                quota_reset: None,
-            },
-            |account| account.current(),
-        );
-        if let Some(account) = &account {
-            start_renewal(std::sync::Arc::clone(account));
+        let pasted = ferrox_core::foxy::Pass {
+            token: configured.clone(),
+            expires_at: ferrox_core::foxy::account::jwt_expiry(&configured),
+            quota_remaining: None,
+            quota_reset: None,
+        };
+        let account = foxy_account(&email, &password, &code, &pasted, link.guardian(), &roots);
+        let pass = account
+            .as_ref()
+            .map_or_else(|| pasted.clone(), |account| account.current());
+        if let Some(reason) = foxy_pass_guard(account.as_ref(), &pass) {
+            eprintln!("foxy: {reason}: serves nothing");
+            continue;
         }
         return Some(FoxyOut {
             account,
@@ -19649,7 +19665,7 @@ mod tests {
     #[test]
     fn a_socks5_hop_carries_the_quic_carrier() {
         let root = crate::json::parse(
-            r#"{"outbounds":[{"protocol":"foxy","settings":{"email":"a@b.c","password":"pw","carrier":"h3","upstreamProxy":"socks5://proxy.local:1080","link":"foxy://edge.example?username=a@b.c"}}]}"#,
+            r#"{"outbounds":[{"protocol":"foxy","settings":{"pass":"a.eyJleHAiOjQwMDAwMDAwMDB9.b","email":"a@b.c","password":"pw","carrier":"h3","upstreamProxy":"socks5://proxy.local:1080","link":"foxy://edge.example?username=a@b.c"}}]}"#,
         )
         .expect("parses");
         let foxy = find_foxy_outbound(&root).expect("serves");
@@ -19664,6 +19680,34 @@ mod tests {
         )
         .expect("parses");
         assert!(find_foxy_outbound(&root).is_none());
+    }
+
+    /// A pasted pass nobody can replace stops carrying at its exp: refuse the lane at start, not at the first flow.
+    #[test]
+    fn an_expired_pasted_pass_refuses_its_outbound() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"foxy","settings":{"pass":"a.eyJleHAiOjF9.b","link":"foxy://edge.example:443"}}]}"#,
+        )
+        .expect("parses");
+        assert!(find_foxy_outbound(&root).is_none());
+    }
+
+    /// Inside its window the same pass serves, and the expiry comes off the JWT rather than staying unknown.
+    #[test]
+    fn a_live_pasted_pass_carries_the_expiry_its_jwt_names() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"foxy","settings":{"pass":"a.eyJleHAiOjQwMDAwMDAwMDB9.b","link":"foxy://edge.example:443"}}]}"#,
+        )
+        .expect("parses");
+        let foxy = find_foxy_outbound(&root).expect("serves");
+        assert_eq!(foxy.pass.expires_at, Some(4_000_000_000));
+        assert!(
+            !foxy
+                .account
+                .as_ref()
+                .is_some_and(|account| account.can_renew()),
+            "a pasted pass has no grant to renew with"
+        );
     }
 
     /// The tag is the whole route: a loopback outbound without one names nowhere.

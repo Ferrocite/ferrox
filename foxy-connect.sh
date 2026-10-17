@@ -179,12 +179,35 @@ system_proxy_on() {
 }
 
 exit_country() {
-  local first
+  local first port
   first="$(fronts_for "$MODE" | head -n 1)"
-  local port
   port="$(front_port "$first")"
-  curl -fsSL --max-time 30 --socks5-hostname "127.0.0.1:$port" \
-    https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^(loc|ip)=' || true
+  local -a via=(-fsSL --max-time 30 --noproxy '')
+  if [ "$first" = http ]; then
+    via+=(-x "http://127.0.0.1:$port")
+  else
+    via+=(--socks5-hostname "127.0.0.1:$port")
+  fi
+  curl "${via[@]}" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null | grep -E '^(loc|ip)=' || true
+}
+
+# One flow through the first front, and the pinned country is the assertion: the
+# machine's own exit answers the same trace, so any answer is not proof of a lane.
+prove_flow() {
+  local answer loc
+  answer="$(exit_country)"
+  loc="$(printf '%s\n' "$answer" | sed -n 's/^loc=//p' | tr '[:lower:]' '[:upper:]')"
+  if [ -z "$loc" ]; then
+    echo "NOT CONNECTED: the fronts listen, but no flow got through them. Tail $LOG." >&2
+    return 1
+  fi
+  if [ "$loc" != "$COUNTRY" ]; then
+    echo "the exit reads $loc, not the pinned $COUNTRY: $(printf '%s\n' "$answer" | tr '\n' ' ')" >&2
+    echo "either another edge answers or this machine went direct; tail $LOG." >&2
+    return 1
+  fi
+  echo "exit through the first front: $(printf '%s\n' "$answer" | tr '\n' ' ')"
+  return 0
 }
 
 wait_port() {
@@ -409,7 +432,12 @@ if [ "$ACTION" = check ]; then
   exit 0
 fi
 
+# Point the machine at the lane only after one flow came through it: an armed
+# system proxy over a lane that carries nothing takes the network down with it.
 if [ "$MODE" = vpn ]; then
+  prove_flow || { echo "the lane stays up so it can be inspected; the system proxy is untouched." >&2; exit 3; }
   system_proxy_on
   echo "browsers may need a restart to pick the new proxy up."
+else
+  prove_flow || exit 3
 fi

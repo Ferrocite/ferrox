@@ -814,6 +814,13 @@ impl Account {
         self.mint(&access_token)
     }
 
+    /// Whether a renewal has anything to renew with: a pasted pass alone does not.
+    pub(crate) fn can_renew(&self) -> bool {
+        self.auth
+            .lock()
+            .is_ok_and(|auth| !auth.refresh_token.is_empty())
+    }
+
     /// How long until the current pass wants replacing.
     pub(crate) fn renews_in(&self) -> std::time::Duration {
         self.pass
@@ -866,6 +873,27 @@ mod renewal {
         });
         let want = account.current().renews_in(epoch());
         assert_eq!(account.renews_in(), want);
+    }
+
+    /// A pasted pass has no grant to renew with, so the renewal thread would only spend plane calls.
+    #[test]
+    fn only_a_signed_in_account_can_renew() {
+        let account = account_with(Pass {
+            token: "t".to_owned(),
+            expires_at: None,
+            quota_remaining: None,
+            quota_reset: None,
+        });
+        assert!(
+            account.can_renew(),
+            "the signed-in account holds a refresh grant"
+        );
+        *account.auth.lock().expect("locks") = Auth {
+            access_token: String::new(),
+            refresh_token: String::new(),
+            expires_at: 0,
+        };
+        assert!(!account.can_renew(), "a pasted pass renews with nothing");
     }
 
     #[test]
