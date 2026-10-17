@@ -188,6 +188,50 @@ pub(crate) fn serve_httpupgrade(
     pump_relay_carried(&uplink, reader, writer, &close, send, recv);
 }
 
+/// The carrier's answer held back until a blocking peek finds the first byte of the request packet, so a dial that waits for the `101` before it writes is never answered: only a dial that puts the packet on the wire with the `GET` finishes.
+#[cfg(test)]
+pub(crate) fn serve_httpupgrade_answering_after_the_request(
+    stream: TcpStream,
+    password: &str,
+    method: &str,
+    _path: &str,
+    freedom: bool,
+) {
+    let mut read = stream;
+    let Ok(write) = read.try_clone() else {
+        return;
+    };
+    let mut write = write;
+    if crate::proxy::read_http_head(
+        &mut read,
+        crate::httpupgrade::HEAD_LIMIT,
+        crate::budgets::head_arrival(),
+    )
+    .is_none()
+    {
+        return;
+    }
+    // A blocking peek waits for the first byte of the request packet without taking it, so nothing is answered until the packet has arrived.
+    let mut probe = [0u8; 1];
+    if read.peek(&mut probe).is_err() {
+        return;
+    }
+    if write.write_all(crate::httpupgrade::SWITCH).is_err() {
+        return;
+    }
+    let Some((uplink, send, recv)) = accept_on(&mut read, &mut write, password, method, freedom)
+    else {
+        return;
+    };
+    let Ok(closer) = write.try_clone() else {
+        return;
+    };
+    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        let _ = closer.shutdown(Shutdown::Both);
+    });
+    pump_relay_carried(&uplink, read, write, &close, send, recv);
+}
+
 pub(crate) fn serve_grpc(
     stream: TcpStream,
     password: &str,
@@ -1359,35 +1403,31 @@ mod tests {
         serving.join().expect("joins");
     }
 
+    /// A listener that answers every connection with whatever it reads.
+    fn echo() -> u16 {
+        let echo = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            for stream in echo.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                thread::spawn(move || {
+                    let mut buf = [0u8; 1024];
+                    while let Ok(read) = stream.read(&mut buf) {
+                        if read == 0 || stream.write_all(&buf[..read]).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
     #[test]
     fn carried_transports_relay_an_echo() {
         const PASSWORD: &str = "an-example-shared-password";
         const METHOD: &str = "aes-256-gcm";
-        fn echo() -> u16 {
-            let echo = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
-            let port = echo.local_addr().expect("addr").port();
-            thread::spawn(move || {
-                for stream in echo.incoming() {
-                    let Ok(mut stream) = stream else {
-                        continue;
-                    };
-                    thread::spawn(move || {
-                        let mut buf = [0u8; 1024];
-                        while let Ok(read) = stream.read(&mut buf) {
-                            if read == 0 || stream.write_all(&buf[..read]).is_err() {
-                                return;
-                            }
-                        }
-                    });
-                }
-            });
-            port
-        }
-        fn round_trip(reader: &mut dyn Read, writer: &mut dyn Write, target: &Destination) {
-            let Some((mut send, recv)) = client_send_handshake(writer, PASSWORD, METHOD, target)
-            else {
-                panic!("handshake refused");
-            };
+        fn answers(reader: &mut dyn Read, writer: &mut dyn Write, mut send: Uplink, recv: Recv) {
             let mut recv = match recv {
                 Recv::Ready(cipher) => cipher,
                 Recv::Waiting(_, master) => {
@@ -1406,59 +1446,75 @@ mod tests {
             let back = open_chunk(reader, &mut recv, &mut buf).expect("opens");
             assert_eq!(back, &b"ping"[..]);
         }
+        fn round_trip(reader: &mut dyn Read, writer: &mut dyn Write, target: &Destination) {
+            let Some((send, recv)) = client_send_handshake(writer, PASSWORD, METHOD, target) else {
+                panic!("handshake refused");
+            };
+            answers(reader, writer, send, recv);
+        }
+        fn tunnel(serve: fn(TcpStream, &str, &str, &str, bool), path: &'static str) -> TcpStream {
+            let server = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+            let port = server.local_addr().expect("addr").port();
+            thread::spawn(move || {
+                let (stream, _) = server.accept().expect("accepts");
+                serve(stream, PASSWORD, METHOD, path, true);
+            });
+            TcpStream::connect(("127.0.0.1", port)).expect("connects")
+        }
+        fn sealed(target: &Destination) -> (Vec<u8>, Uplink, Recv) {
+            let mut packet = Vec::new();
+            let Some((send, recv)) = client_send_handshake(&mut packet, PASSWORD, METHOD, target)
+            else {
+                panic!("handshake refused");
+            };
+            (packet, send, recv)
+        }
         let echo_port = echo();
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
-        let server = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
-        let port = server.local_addr().expect("addr").port();
-        thread::spawn(move || {
-            let (stream, _) = server.accept().expect("accepts");
-            serve_ws(stream, PASSWORD, METHOD, "/ss-ws", true);
-        });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let target = Destination::from(target);
         let (mut reader, mut writer) =
-            crate::ws::connect(stream, "127.0.0.1", "/ss-ws", 0, &[]).expect("carries");
-        round_trip(&mut reader, &mut writer, &target.into());
-        let server = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
-        let port = server.local_addr().expect("addr").port();
-        thread::spawn(move || {
-            let (stream, _) = server.accept().expect("accepts");
-            serve_httpupgrade(stream, PASSWORD, METHOD, "/ss-upgrade", true);
-        });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
-        let (mut reader, mut writer) =
-            crate::httpupgrade::connect(stream, "127.0.0.1", "/ss-upgrade", 0, &[])
+            crate::ws::connect(tunnel(serve_ws, "/ss-ws"), "127.0.0.1", "/ss-ws", 0, &[])
                 .expect("carries");
-        round_trip(&mut reader, &mut writer, &target.into());
-        let server = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
-        let port = server.local_addr().expect("addr").port();
-        thread::spawn(move || {
-            let (stream, _) = server.accept().expect("accepts");
-            serve_grpc(stream, PASSWORD, METHOD, "/TunnelService/Tun", true);
-        });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        round_trip(&mut reader, &mut writer, &target);
+        // What the dial does on this carrier: the request packet is sealed before the connect, so `ed=0` leaves it whole after the answer and a budget puts it on the wire with the `GET`.
+        let (packet, send, recv) = sealed(&target);
+        let (mut reader, mut writer) = crate::httpupgrade::connect(
+            tunnel(serve_httpupgrade, "/ss-upgrade"),
+            "127.0.0.1",
+            "/ss-upgrade",
+            0,
+            &packet,
+        )
+        .expect("carries");
+        answers(&mut reader, &mut writer, send, recv);
+        let (packet, send, recv) = sealed(&target);
+        let (mut reader, mut writer) = crate::httpupgrade::connect(
+            tunnel(serve_httpupgrade, "/ss-upgrade"),
+            "127.0.0.1",
+            "/ss-upgrade",
+            64,
+            &packet,
+        )
+        .expect("rides ahead of the answer");
+        answers(&mut reader, &mut writer, send, recv);
+        let (mut reader, mut writer) = crate::grpc::connect(
+            tunnel(serve_grpc, "/TunnelService/Tun"),
+            "127.0.0.1",
+            "/TunnelService/Tun",
+        )
+        .expect("carries");
+        round_trip(&mut reader, &mut writer, &target);
         let (mut reader, mut writer) =
-            crate::grpc::connect(stream, "127.0.0.1", "/TunnelService/Tun").expect("carries");
-        round_trip(&mut reader, &mut writer, &target.into());
-        let server = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
-        let port = server.local_addr().expect("addr").port();
-        thread::spawn(move || {
-            let (stream, _) = server.accept().expect("accepts");
-            serve_xhttp(stream, PASSWORD, METHOD, "/ss-xhttp", true);
-        });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
-        let (mut reader, mut writer) =
-            crate::xhttp::connect(stream, "127.0.0.1", "/ss-xhttp").expect("carries");
-        round_trip(&mut reader, &mut writer, &target.into());
-        let server = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
-        let port = server.local_addr().expect("addr").port();
-        thread::spawn(move || {
-            let (stream, _) = server.accept().expect("accepts");
-            serve_httpheader(stream, PASSWORD, METHOD, "/ss-camouflage", true);
-        });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
-        let (mut reader, mut writer) =
-            crate::httpheader::connect(stream, "127.0.0.1", "/ss-camouflage").expect("carries");
-        round_trip(&mut reader, &mut writer, &target.into());
+            crate::xhttp::connect(tunnel(serve_xhttp, "/ss-xhttp"), "127.0.0.1", "/ss-xhttp")
+                .expect("carries");
+        round_trip(&mut reader, &mut writer, &target);
+        let (mut reader, mut writer) = crate::httpheader::connect(
+            tunnel(serve_httpheader, "/ss-camouflage"),
+            "127.0.0.1",
+            "/ss-camouflage",
+        )
+        .expect("carries");
+        round_trip(&mut reader, &mut writer, &target);
     }
 
     /// A writer that has `writev`, which is what the relay's own socket is: it counts vectored

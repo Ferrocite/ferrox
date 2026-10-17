@@ -4848,19 +4848,21 @@ fn dial_ss_httpupgrade(
     ladder: &Ladder,
 ) -> bool {
     let rung = attempt.rung;
-    let Some((reader, mut writer)) =
-        crate::httpupgrade::connect(uplink, &ss.host, attempt.path, 0, &[])
-    else {
-        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
-    };
+    // Sealed into a buffer rather than onto the socket, so the carrier writes the request packet with the `GET`: `?ed` takes the `101` off the round trip and `ed=0` still sends the whole handshake in one write.
+    let mut packet = Vec::new();
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
         let Some((send, recv)) = crate::shadowsocks2022::client_send_handshake(
-            &mut writer,
+            &mut packet,
             &ss.password,
             &ss.method,
             target,
         ) else {
-            return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
+        };
+        let Some((reader, writer)) =
+            crate::httpupgrade::connect(uplink, &ss.host, attempt.path, attempt.ed, &packet)
+        else {
+            return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
         };
         note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
         let Ok(closer) = writer.try_clone() else {
@@ -4873,9 +4875,14 @@ fn dial_ss_httpupgrade(
         return true;
     }
     let Some((send, recv)) =
-        crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
+        crate::shadowsocks::client_send_handshake(&mut packet, &ss.password, &ss.method, target)
     else {
-        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
+    };
+    let Some((reader, writer)) =
+        crate::httpupgrade::connect(uplink, &ss.host, attempt.path, attempt.ed, &packet)
+    else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
     note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
     let Ok(closer) = writer.try_clone() else {
@@ -14367,7 +14374,9 @@ mod tests {
         carrier: Carrier,
         serve: fn(TcpStream, &str, &str, &str, bool),
         path: &str,
+        key: (&str, &str),
     ) {
+        let (method, password) = (key.0.to_owned(), key.1.to_owned());
         let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
@@ -14382,15 +14391,14 @@ mod tests {
                 }
             }
         });
-        let password = "an-example-shared-password";
-        let method = "aes-256-gcm";
         let tunnel = TcpListener::bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         let owned = path.to_owned();
+        let (served_method, served_password) = (method.clone(), password.clone());
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
                 let Ok(stream) = stream else { continue };
-                serve(stream, password, method, &owned, true);
+                serve(stream, &served_password, &served_method, &owned, true);
             }
         });
         let front = TcpListener::bind("127.0.0.1:0").expect("binds");
@@ -14398,8 +14406,8 @@ mod tests {
         let out = Outbound::Shadowsocks(ShadowsocksOut {
             address: "127.0.0.1".to_owned(),
             port: tunnel_port,
-            method: method.to_owned(),
-            password: password.to_owned(),
+            method,
+            password,
             carrier,
             host: "127.0.0.1".to_owned(),
         });
@@ -14436,6 +14444,7 @@ mod tests {
             },
             crate::shadowsocks::serve_ws,
             "/ss-ws",
+            ("aes-256-gcm", "an-example-shared-password"),
         );
     }
 
@@ -14448,6 +14457,38 @@ mod tests {
             },
             crate::shadowsocks::serve_httpupgrade,
             "/ss-upgrade",
+            ("aes-256-gcm", "an-example-shared-password"),
+        );
+    }
+
+    /// The dial, not the carrier: this server waits for the request packet's first byte before it answers, so a rung that held the packet back would stall in `read_head` and the SOCKS client would never be served.
+    #[test]
+    fn socks_dials_ss_over_httpupgrade_with_early_data_to_echo() {
+        socks_dials_ss_via(
+            Carrier::HttpUpgrade {
+                path: "/ss-upgrade".to_owned(),
+                ed: 64,
+            },
+            crate::shadowsocks::serve_httpupgrade_answering_after_the_request,
+            "/ss-upgrade",
+            ("aes-256-gcm", "an-example-shared-password"),
+        );
+    }
+
+    /// The other family on the same rung: the seal-into-a-buffer path is written twice, so both keys have to reach a dial.
+    #[test]
+    fn socks_dials_ss2022_over_httpupgrade_with_early_data_to_echo() {
+        socks_dials_ss_via(
+            Carrier::HttpUpgrade {
+                path: "/ss-upgrade".to_owned(),
+                ed: 64,
+            },
+            crate::shadowsocks2022::serve_httpupgrade,
+            "/ss-upgrade",
+            (
+                "2022-blake3-aes-256-gcm",
+                &ferrox_core::b64::encode(&[0x42u8; 32]),
+            ),
         );
     }
 
@@ -14459,6 +14500,7 @@ mod tests {
             },
             crate::shadowsocks::serve_grpc,
             "/TunnelService/Tun",
+            ("aes-256-gcm", "an-example-shared-password"),
         );
     }
 
@@ -14470,6 +14512,7 @@ mod tests {
             },
             crate::shadowsocks::serve_xhttp,
             "/ss-xhttp",
+            ("aes-256-gcm", "an-example-shared-password"),
         );
     }
 
@@ -14481,6 +14524,7 @@ mod tests {
             },
             crate::shadowsocks::serve_httpheader,
             "/ss-camouflage",
+            ("aes-256-gcm", "an-example-shared-password"),
         );
     }
 

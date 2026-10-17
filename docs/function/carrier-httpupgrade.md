@@ -6,7 +6,8 @@ that stops framing the moment the handshake ends.
 
 There is no frame header, no length, no type. `UpReader` drains whatever
 the handshake reader over-read, then delegates every byte to the inner socket.
-The relay adds **zero** framing bytes and the only copy is the relay's own.
+The relay adds **zero** framing bytes and the only copy on the data path is the
+relay's own; what the handshake stages, and why, is under *What we removed*.
 
 The one thing worth writing down is the head scan. It is not quadratic, and the
 reason is where the work lands per round: `proxy::find_across` re-windows only the
@@ -73,6 +74,7 @@ graph TD
 | write-calls-per-early-dial | 1 | ferrox-app-httpupgrade::tests::the_early_data_rides_in_one_write_with_the_request |
 | request-reallocations-per-dial | 0 | ferrox-app-httpupgrade::tests::the_request_is_sized_for_its_bytes |
 | round-trips-per-early-dial | 0 | ferrox-app-httpupgrade::tests::an_over_budget_payload_rides_ahead_of_a_lazy_answer |
+| round-trips-per-shadowsocks-dial | 0 | ferrox-app-proxy::tests::socks_dials_ss_over_httpupgrade_with_early_data_to_echo |
 <!-- counts:end -->
 
 `round-trips-per-early-dial` is witnessed on a socket against a server that answers
@@ -82,6 +84,14 @@ what it does under the length rule (red at 20.03 s). An echo test cannot see the
 difference — a held-back payload arrives eventually either way — and
 `the_early_data_rides_in_one_write_with_the_request` cannot either, because it counts
 writes, not the round trip between them.
+
+`round-trips-per-shadowsocks-dial` is the same witness moved up to the dial: the
+Shadowsocks request packet is produced by the protocol, not by the carrier, so its
+ladder rung used to hold it back whatever the config asked for. The server is
+`serve_httpupgrade_answering_after_the_request`, which reads the head, blocks in a
+`peek` until the first byte of the request packet is there, and only then writes the
+`101`; with `attempt.ed` put back to `0` the test is red at **20.08 s**, and green in
+0.03 s as it stands.
 
 ## Ops
 
@@ -152,6 +162,33 @@ drift between the raw and split lanes. Checked by
 `an_over_budget_payload_rides_ahead_of_a_lazy_answer`, red at 20.03 s with the length
 compare restored.
 
+**The round trip a Shadowsocks dial paid whatever the config asked for.**
+`dial_ss_httpupgrade` handed the carrier `0, &[]`, so the budget held in
+`Carrier::HttpUpgrade { ed }` never reached it: the request packet is produced *after*
+the answer, because `client_send_handshake` seals it straight onto the writer it is
+given. An AES-256-GCM dial to an IPv4 target therefore wrote the `GET`, waited a round
+trip for the `101`, then wrote the salt (32 B) and the sealed header (`18 + 7 + 16` =
+41 B) — **three** `write` syscalls and one round trip that the vless, trojan and vmess
+dials on this carrier did not pay. The packet needs no server input, so it seals into
+a buffer before the dial and reaches the same `first` seam vmess already uses:
+`write_slices([GET, packet])` — **one** write — when the budget is non-zero, and **two**
+when it is zero (the GET, then the packet whole). Checked by
+`socks_dials_ss_over_httpupgrade_with_early_data_to_echo`, red at 20.08 s when the dial
+is put back to `0, &[]`; the bytes and their order are unchanged, which a real server
+witnesses in `carried_transports_relay_an_echo`, where the httpupgrade leg rides the
+packet at `ed=64` and holds it at `ed=0` and both open the echoed chunk. The rung seals
+twice, once per family, so a `2022-blake3-aes-256-gcm` key reaches the same dial in
+`socks_dials_ss2022_over_httpupgrade_with_early_data_to_echo`: one branch's witness does
+not cover the other's code.
+
+What this *adds*, and it is the reason the row is a round trip and not a count: one
+heap buffer per dial and one copy of the packet into it (73 bytes for that IPv4 dial,
+325 for the widest domain target), which the raw rung never pays. Neither `shadowsocks.rs`
+nor `shadowsocks2022.rs` changed — the buffer is filled through the `&mut dyn Write`
+seal the handshake already had. The write half of the claim is the carrier's blessed
+`write-calls-per-early-dial 1`, which counts `write_slices` calls for any `first`; the
+ladder test runs on a loopback socket, which sees bytes and not writes.
+
 **22 bytes of status literal, and a reason phrase two of the three references accept.**
 `check_response` compared the whole line against `"HTTP/1.1 101 Switching Protocols"`
 (35 bytes), so it refused a server answering `101 UPGRADED`, any other text, or no
@@ -192,7 +229,10 @@ which five claims about this carrier are false:
   `Carrier::HttpUpgrade { ed }` so a dial can use it. Non-zero means the client's
   first payload goes out in the same write as the `GET`, ahead of reading the `101`,
   which is the whole saving — one round trip off connection setup, at any payload
-  size. Zero means it is held back and sent after the `101`. The server needs no budget: it peeks the head, reads exactly through
+  size. Zero means it is held back and sent after the `101`. Every protocol's dial on
+  this carrier reads it: vless, trojan and vmess passed `attempt.ed` and their own
+  first payload, and the Shadowsocks dial passed `0, &[]` until this page's entry above
+  sealed its request packet into the same seam. The server needs no budget: it peeks the head, reads exactly through
   `\r\n\r\n`, and leaves the pipelined bytes on the socket (or hands them back
   as the prefix when the halves cannot peek), so the early data is the first
   thing the reader returns. Checked by
