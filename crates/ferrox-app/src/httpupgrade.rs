@@ -119,9 +119,34 @@ pub(crate) fn accept_split<R: Read, W: Write>(
 }
 
 fn upgrade_request(host: &str, path: &str) -> String {
-    format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
-    )
+    // Sized for its bytes: `format!` over-allocated (capacity 132) and grew again once host plus path passed 66.
+    const BEFORE_PATH: &str = "GET ";
+    const BEFORE_HOST: &str = " HTTP/1.1\r\nHost: ";
+    const AFTER_HOST: &str = "\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+    let mut request = String::with_capacity(
+        BEFORE_PATH.len() + path.len() + BEFORE_HOST.len() + host.len() + AFTER_HOST.len(),
+    );
+    request.push_str(BEFORE_PATH);
+    request.push_str(path);
+    request.push_str(BEFORE_HOST);
+    request.push_str(host);
+    request.push_str(AFTER_HOST);
+    request
+}
+
+// One call when the payload rides ahead of the `101` — what `?ed` buys — so the socket packs request and payload into one `writev` and the session coalesces them into one record, where a write per part left two of each.
+fn send_request<W: crate::proxy::FrameWrite>(
+    write: &mut W,
+    request: &str,
+    early: bool,
+    first: &[u8],
+) -> Option<()> {
+    if early {
+        return write
+            .write_slices(&[request.as_bytes(), first])
+            .then_some(());
+    }
+    write.write_all(request.as_bytes()).ok()
 }
 
 pub(crate) fn connect(
@@ -133,12 +158,7 @@ pub(crate) fn connect(
 ) -> Option<(UpReader, TcpStream)> {
     let mut read = stream;
     let early = !first.is_empty() && first.len() as u64 <= u64::from(budget);
-    read.write_all(upgrade_request(host, path).as_bytes())
-        .ok()?;
-    if early {
-        // The payload rides ahead of the `101`: this is what `?ed` buys — one round trip saved.
-        read.write_all(first).ok()?;
-    }
+    send_request(&mut read, &upgrade_request(host, path), early, first)?;
     let (head, prefix) = read_head(&mut read)?;
     check_response(&head)?;
     let Ok(write) = read.try_clone() else {
@@ -179,7 +199,7 @@ fn check_response(head: &[u8]) -> Option<()> {
 }
 
 // The same connect over halves that cannot peek: pipelined bytes arrive as a prefix.
-pub(crate) fn connect_split<R: Read, W: Write>(
+pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite>(
     mut read: R,
     mut write: W,
     host: &str,
@@ -188,12 +208,7 @@ pub(crate) fn connect_split<R: Read, W: Write>(
     first: &[u8],
 ) -> Option<(UpReader<R>, W)> {
     let early = !first.is_empty() && first.len() as u64 <= u64::from(budget);
-    write
-        .write_all(upgrade_request(host, path).as_bytes())
-        .ok()?;
-    if early {
-        write.write_all(first).ok()?;
-    }
+    send_request(&mut write, &upgrade_request(host, path), early, first)?;
     let (head, prefix) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
     check_response(&head)?;
@@ -407,6 +422,95 @@ mod tests {
         server.join().expect("joins");
     }
 
+    const SWITCH: &[u8] =
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+
+    /// Counts calls and part pointers as well as bytes, so "one write" is observed rather than inferred: a `Vec` sink cannot tell one `write_slices` call from two `write_all`s.
+    #[derive(Default)]
+    struct Recorder {
+        calls: Vec<Vec<(usize, Vec<u8>)>>,
+        plain: Vec<Vec<u8>>,
+    }
+
+    impl Write for Recorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.plain.push(buf.to_vec());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::proxy::FrameWrite for Recorder {
+        fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+            self.calls.push(
+                parts
+                    .iter()
+                    .map(|part| (part.as_ptr() as usize, part.to_vec()))
+                    .collect(),
+            );
+            true
+        }
+    }
+
+    /// The early payload rides as the request's second write part: one call, which the socket packs into one `writev` and the session coalesces into one record, and the part is the caller's own buffer.
+    #[test]
+    fn the_early_data_rides_in_one_write_with_the_request() {
+        let first = *b"ping";
+        let (_reader, write) = connect_split(
+            std::io::Cursor::new(SWITCH.to_vec()),
+            Recorder::default(),
+            "oracle.example",
+            "/tunnel",
+            4,
+            &first,
+        )
+        .expect("upgrades");
+        assert_eq!(
+            write.calls.len(),
+            1,
+            "request and payload left in {} calls",
+            write.calls.len()
+        );
+        assert!(write.plain.is_empty(), "the request went out plain");
+        let parts = &write.calls[0];
+        assert_eq!(parts.len(), 2, "the request and the payload");
+        assert_eq!(
+            parts[0].1,
+            upgrade_request("oracle.example", "/tunnel").as_bytes()
+        );
+        assert_eq!(parts[1].1, b"ping");
+        assert_eq!(
+            parts[1].0,
+            first.as_ptr() as usize,
+            "the payload was copied instead of handed over by pointer"
+        );
+    }
+
+    /// A payload over the budget waits for the `101` and leaves in a write of its own; nothing is vectored.
+    #[test]
+    fn a_payload_over_the_budget_follows_the_switch_in_one_write_each() {
+        let first = *b"ping";
+        let (_reader, write) = connect_split(
+            std::io::Cursor::new(SWITCH.to_vec()),
+            Recorder::default(),
+            "oracle.example",
+            "/tunnel",
+            3,
+            &first,
+        )
+        .expect("upgrades");
+        assert!(write.calls.is_empty(), "a held-back payload was vectored");
+        assert_eq!(write.plain.len(), 2, "the request and then the payload");
+        assert_eq!(
+            write.plain[0],
+            upgrade_request("oracle.example", "/tunnel").as_bytes()
+        );
+        assert_eq!(write.plain[1], b"ping");
+    }
+
     #[test]
     fn an_early_data_budget_leaves_the_request_unchanged() {
         for budget in [0u32, 1, 2048, 4_294_967_295] {
@@ -418,6 +522,32 @@ mod tests {
                 "GET /interop-upgrade HTTP/1.1\r\nHost: oracle.example\r\n\
                  Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
                 "{budget}"
+            );
+        }
+    }
+
+    /// The request buffer is its bytes: `format!` reached capacity 132 and grew again once host plus path passed 66, so a long host paid two allocations where this pays one.
+    #[test]
+    fn the_request_is_sized_for_its_bytes() {
+        for (host, path) in [
+            ("oracle.example", "/tunnel"),
+            (
+                "a.host.long.enough.to.push.the.request.past.the.format.capacity.example",
+                "/a/path/long/enough/to/push/it/past/what/format/allocated",
+            ),
+        ] {
+            let request = upgrade_request(host, path);
+            assert_eq!(
+                request.capacity(),
+                request.len(),
+                "{host}{path}: one allocation, no growth"
+            );
+            assert_eq!(
+                request,
+                format!(
+                    "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+                ),
+                "{host}{path}: the bytes are the shape the previous formatter wrote"
             );
         }
     }

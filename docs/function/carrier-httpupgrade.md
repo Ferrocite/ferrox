@@ -65,6 +65,8 @@ graph TD
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | framing-bytes-after-the-101 | 0 | ferrox-app-httpupgrade::tests::upgrade_carries_an_echo_over_loopback |
 | user-space-copies-per-byte-relayed | 1 | ferrox-app-httpupgrade::tests::upgrade_carries_an_echo_over_loopback |
+| write-calls-per-early-dial | 1 | ferrox-app-httpupgrade::tests::the_early_data_rides_in_one_write_with_the_request |
+| request-reallocations-per-dial | 0 | ferrox-app-httpupgrade::tests::the_request_is_sized_for_its_bytes |
 <!-- counts:end -->
 
 ## Ops
@@ -149,6 +151,40 @@ are false:
   This matches xray, whose `Ed == 0` forces a blocking `connRF.Read([]byte{})`
   before the payload while `Ed > 0` pipelines it; sing-box carries no httpupgrade
   early data at all.
+- **A dial that wrote the request and its early payload as two writes.** Both
+  dial paths wrote the `GET` with one `write_all` and then, when the payload fit
+  the budget, the payload with a second: **2 writes per early dial** — on unix
+  two `write` syscalls where `TcpStream::write_slices` packs both parts into one
+  `writev`, and over a session two `RustlsProvider::write` calls sealing one
+  record each (`coalesce`'s own doc: iterating `write_all` per part would emit one
+  record per part). `send_request` now hands `[request, payload]` to
+  `write_slices` in **one call** when the payload rides, and keeps the single
+  `write_all` when it does not. The checker is
+  `the_early_data_rides_in_one_write_with_the_request`: an in-memory `Recorder`
+  counts the calls and keeps each part's base pointer, and the test drives
+  `connect_split` into it and asserts one call, two parts, the request bytes, the
+  payload bytes, and the payload part's base equal to the caller's own buffer —
+  no staging copy. A loopback socket cannot witness it; it sees bytes, not how
+  many writes carried them.
+  `a_payload_over_the_budget_follows_the_switch_in_one_write_each` holds the
+  other half: over the budget the sink sees two plain writes and nothing
+  vectored. What did not move: the bytes on the wire and their order (request,
+  then payload), and the held-back ordering after the `101`. On Windows the
+  socket `write_slices` is two `write_all`s, so the raw dial there is where it
+  was; the record halving holds wherever a session is the sink.
+- **A request built for its template instead of its bytes.** `format!` pushed
+  the five pieces into an unreserved `String`: **capacity 132 on a typical dial**
+  (`oracle.example` + `/tunnel`, 87 bytes), reallocating once past 66 bytes of
+  host plus path — 132 → 264, and two reallocations, to 858, for a 400-byte host
+  (measured with a counting global allocator, rustc 1.99.0). The request is
+  `66 + host.len() + path.len()` bytes, so `upgrade_request` now reserves exactly
+  that and pushes the same five pieces: **one allocation, capacity == len, no
+  reallocation** on either dial path. The checker is
+  `the_request_is_sized_for_its_bytes`, which asserts `capacity() == len()` for a
+  short and a long host and byte equality with what `format!` writes for both;
+  `an_early_data_budget_leaves_the_request_unchanged` still pins the bytes across
+  every budget. What did not move: the bytes, their order, and the request line's
+  independence from the budget.
 
 ## Pins
 
