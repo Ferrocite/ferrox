@@ -141,6 +141,9 @@ carrier-httpupgrade write-calls-per-early-dial 1 ferrox-app-httpupgrade::tests::
 carrier-httpupgrade request-reallocations-per-dial 0 ferrox-app-httpupgrade::tests::the_request_is_sized_for_its_bytes
 carrier-httpupgrade round-trips-per-early-dial 0 ferrox-app-httpupgrade::tests::an_over_budget_payload_rides_ahead_of_a_lazy_answer
 carrier-httpupgrade round-trips-per-shadowsocks-dial 0 ferrox-app-proxy::tests::socks_dials_ss_over_httpupgrade_with_early_data_to_echo
+carrier-httpupgrade head-reads-per-window 1 ferrox-app-proxy::tests::a_kept_head_costs_one_read_per_window_and_takes_its_tail
+carrier-httpupgrade inner-reads-per-pipelined-prefix 0 ferrox-app-httpupgrade::tests::the_pipelined_prefix_reaches_the_reader_without_a_socket_read
+carrier-httpupgrade prefix-bytes-held-after-walk 0 ferrox-app-httpupgrade::tests::the_pipelined_prefix_reaches_the_reader_without_a_socket_read
 
 carrier-httpheader ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-httpheader framing-bytes-added 0 ferrox-app-httpheader::tests::header_carries_an_echo_over_loopback
