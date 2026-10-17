@@ -7757,20 +7757,86 @@ pub(crate) fn find_across(head: &[u8], probe: &[u8], pattern: &[u8]) -> Option<u
     })
 }
 
-pub(crate) fn read_http_head(
-    stream: &mut TcpStream,
-    limit: usize,
-    budget: Duration,
-) -> Option<Vec<u8>> {
-    // A budget cannot bound a blocking `peek`: arm a poll timeout, never longer than the caller's, and restore it.
+/// Arm the poll quantum a head read needs: a budget cannot bound a blocking socket call, so the timeout is never longer than the caller's and the previous value goes back.
+fn with_head_poll<T>(stream: &mut TcpStream, run: impl FnOnce(&mut TcpStream) -> T) -> Option<T> {
     let previous = stream.read_timeout().ok().flatten();
     let poll = previous.map_or(RELAY_POLL, |armed| armed.min(RELAY_POLL));
     if stream.set_read_timeout(Some(poll)).is_err() {
         return None;
     }
-    let head = peek_head_rounds(stream, limit, budget);
+    let got = run(stream);
     let _ = stream.set_read_timeout(previous);
-    head
+    Some(got)
+}
+
+pub(crate) fn read_http_head(
+    stream: &mut TcpStream,
+    limit: usize,
+    budget: Duration,
+) -> Option<Vec<u8>> {
+    with_head_poll(stream, |stream| peek_head_rounds(stream, limit, budget)).flatten()
+}
+
+/// The head and the octets that arrived with it, in the one buffer the caller's reader keeps; the
+/// returned length is where the head ends. The peek reader paid a `peek` and a re-read of the same
+/// bytes to leave that tail in the socket, so a head of `H` octets crossed user space twice and a
+/// round cost two calls; here `H` crosses once and a round costs one. Nothing that has nowhere to
+/// put the tail — the `http` front and the Shadowsocks rung's wait for a request packet — may take it.
+pub(crate) fn read_http_head_kept(
+    stream: &mut TcpStream,
+    limit: usize,
+    budget: Duration,
+) -> Option<(Vec<u8>, usize)> {
+    with_head_poll(stream, |stream| kept_head_rounds(stream, limit, budget)).flatten()
+}
+
+/// One round's worth of octets: the peek probe's width, so a head that arrives in pieces costs the same reads it did.
+const HEAD_ROUND: usize = 512;
+
+#[allow(
+    clippy::uninit_vec,
+    reason = "the reader fills the grown bytes, and every path that does not truncates them back"
+)]
+fn kept_head_rounds(
+    stream: &mut dyn Read,
+    limit: usize,
+    budget: Duration,
+) -> Option<(Vec<u8>, usize)> {
+    let mut head = Vec::with_capacity(HEAD_ROUND);
+    let until = Instant::now() + budget;
+    loop {
+        if head.len() >= limit {
+            return None;
+        }
+        let base = head.len();
+        let want = HEAD_ROUND.min(limit - base);
+        head.reserve(want);
+        // SAFETY: `read` initialises the bytes it reports, and `set_len` is rolled back on every path that does not.
+        unsafe { head.set_len(base + want) };
+        let n = match stream.read(&mut head[base..]) {
+            Ok(n) => n,
+            Err(error) if is_timeout(&error) => {
+                head.truncate(base);
+                if Instant::now() >= until {
+                    return None;
+                }
+                continue;
+            }
+            Err(_) => {
+                head.truncate(base);
+                return None;
+            }
+        };
+        head.truncate(base + n);
+        if n == 0 {
+            return None;
+        }
+        // A fresh delimiter can straddle the round's bytes, so the scan starts three octets before them.
+        let from = base.saturating_sub(3);
+        if let Some(at) = find_double_crlf(&head[from..]).map(|hit| hit + from) {
+            return Some((head, at + 4));
+        }
+    }
 }
 
 #[allow(
@@ -10457,6 +10523,83 @@ mod tests {
         source.read_to_end(&mut rest).expect("drains the reader");
         let joined = [prefix.as_slice(), rest.as_slice()].concat();
         assert_eq!(joined, tail_bytes.to_vec(), "the tail splits cleanly");
+    }
+
+    /// The kept head reader's whole claim, witnessed where a count is exact: one call proves the head *and* takes the bytes behind it. The `peek` reader spent one call proving the head and another taking it, and left the tail in the stream for a third.
+    #[test]
+    fn a_kept_head_costs_one_read_per_window_and_takes_its_tail() {
+        let head = b"GET /tunnel HTTP/1.1\r\nHost: h\r\n\r\n";
+        let tail = b"the first frame's bytes";
+        let mut wire = head.to_vec();
+        wire.extend_from_slice(tail);
+        let whole = wire.len();
+        let mut source = Counted {
+            inner: std::io::Cursor::new(wire),
+            reads: 0,
+        };
+        let (got, at) =
+            kept_head_rounds(&mut source, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("reads a head");
+        assert_eq!(got[..at], head.to_vec(), "the head ends at its delimiter");
+        assert_eq!(
+            got[at..],
+            tail.to_vec(),
+            "the bytes behind it came in the same buffer"
+        );
+        assert_eq!(
+            source.reads, 1,
+            "one read proved the head and took the tail"
+        );
+        assert_eq!(
+            source.inner.position() as usize,
+            whole,
+            "octets were left in the stream for another read"
+        );
+    }
+
+    /// The delimiter split across a round's seam: the scan starts three octets before the new bytes, so a head whose `\r\n\r\n` straddles is still proved, and it costs the two windows it arrived in and no third.
+    #[test]
+    fn a_kept_head_straddling_a_round_is_proved_by_two_reads() {
+        let mut wire: Vec<u8> = b"GET /tunnel HTTP/1.1\r\nX-Pad: ".to_vec();
+        while wire.len() < 510 {
+            wire.push(b'p');
+        }
+        // The delimiter occupies 510..514, so the first 512-byte window ends inside it.
+        wire.extend_from_slice(b"\r\n\r\npayload");
+        assert_eq!(wire[510..], b"\r\n\r\npayload".to_vec());
+        let mut source = Counted {
+            inner: std::io::Cursor::new(wire),
+            reads: 0,
+        };
+        let (got, at) =
+            kept_head_rounds(&mut source, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("straddles");
+        assert_eq!(at, 514, "the head is proved past the seam, not re-windowed");
+        assert_eq!(&got[at..], b"payload");
+        assert_eq!(source.reads, 2, "a round per window: {}", source.reads);
+    }
+
+    /// The worst input the round loop meets: no delimiter at all. It is refused, and so is a stream that holds nothing.
+    #[test]
+    fn a_kept_head_without_a_delimiter_is_refused() {
+        let mut endless = Counted {
+            inner: std::io::Cursor::new(vec![b'x'; 4096]),
+            reads: 0,
+        };
+        assert!(
+            kept_head_rounds(&mut endless, 8 * 1024, HEAD_DEADLINE).is_none(),
+            "a head with no terminator must be refused"
+        );
+        assert!(
+            endless.inner.position() as usize <= 8 * 1024,
+            "the reader went past its limit"
+        );
+        let mut empty = Counted {
+            inner: std::io::Cursor::new(Vec::new()),
+            reads: 0,
+        };
+        assert!(
+            kept_head_rounds(&mut empty, HEAD_LIMIT_TEST, HEAD_DEADLINE).is_none(),
+            "an idle stream is not a head"
+        );
     }
 
     #[test]
