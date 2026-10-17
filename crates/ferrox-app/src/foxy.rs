@@ -1753,7 +1753,7 @@ impl Tls2 {
         Ok(assigned)
     }
 
-    /// One IP packet, as a datagram this lane can read both ends of.
+    /// One IP packet, as a datagram this lane can read both ends of. A capsule whole inside one DATA frame is handed out where it lies, so the packet crosses userspace once instead of through the capsule buffer.
     pub(crate) fn read_ip(&mut self) -> std::io::Result<Option<Vec<u8>>> {
         loop {
             if let Some((used, capsule)) = connectip::capsule_split(&self.capsule_buf) {
@@ -1772,26 +1772,42 @@ impl Tls2 {
             if self.fin {
                 return Ok(None);
             }
-            let read = self.with_frame(|lane, frame, payload| -> std::io::Result<()> {
-                match frames::h2_event(frame, payload, 1) {
-                    frames::H2Event::Data { payload, end } => {
-                        lane.capsule_buf.extend_from_slice(payload);
-                        lane.fin = end;
-                        lane.window.add_stream(payload.len() as u32);
-                        lane.window.add_connection(payload.len() as u32);
-                        if !payload.is_empty() {
-                            lane.credit(payload.len()).map_err(io)?;
+            let read =
+                self.with_frame(|lane, frame, payload| -> std::io::Result<Option<Vec<u8>>> {
+                    match frames::h2_event(frame, payload, 1) {
+                        frames::H2Event::Data { payload, end } => {
+                            lane.fin = end;
+                            lane.window.add_stream(payload.len() as u32);
+                            lane.window.add_connection(payload.len() as u32);
+                            if !payload.is_empty() {
+                                lane.credit(payload.len()).map_err(io)?;
+                            }
+                            // The capsule is usually whole inside one DATA frame, so it is handed out where it lies and only the bytes behind it staged; nothing is handed out while a split capsule waits, because stream order is packet order.
+                            if lane.capsule_buf.is_empty() {
+                                if let Some((used, connectip::Capsule::Datagram(packet))) =
+                                    connectip::capsule_split(payload)
+                                {
+                                    let packet = packet.to_vec();
+                                    lane.capsule_buf.extend_from_slice(&payload[used..]);
+                                    return Ok(Some(packet));
+                                }
+                            }
+                            lane.capsule_buf.extend_from_slice(payload);
+                            Ok(None)
                         }
-                        Ok(())
+                        frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
+                            lane.fin = true;
+                            Ok(None)
+                        }
+                        _ => Ok(None),
                     }
-                    frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
-                        lane.fin = true;
-                        Ok(())
-                    }
-                    _ => Ok(()),
+                });
+            if let Some(packet) = read?? {
+                if !packet.is_empty() {
+                    return Ok(Some(packet));
                 }
-            });
-            read??;
+                // An empty datagram is skipped, exactly as the staged path skips one, so `Ok(None)` stays the end of stream.
+            }
         }
     }
 }
@@ -2975,8 +2991,26 @@ mod loopback {
         assert_eq!(destination, vec![203, 0, 113, 9]);
         assert_eq!(port, 443);
         assert_eq!(payload, b"hello ip");
-        // The reply comes back from the destination, and the lane reads it as a packet whose source is where the datagram went.
+        // The reply is read as a packet whose source is where the datagram went, and a byte-equal packet cannot see a staging copy, so capacity is the witness: reset the capsule buffer with nothing pending, read one reply, and the buffer a whole-in-one-frame capsule would have been staged through must still be empty.
+        {
+            let Ip::H2(inner) = &mut lane else {
+                unreachable!("an h2 dial opens an h2 lane");
+            };
+            assert!(
+                inner.capsule_buf.is_empty(),
+                "the assignment left no capsule bytes pending"
+            );
+            inner.capsule_buf = Vec::new();
+        }
         let packet = lane.read().expect("reads").expect("a reply");
+        let Ip::H2(inner) = &mut lane else {
+            unreachable!("an h2 dial opens an h2 lane");
+        };
+        assert_eq!(
+            inner.capsule_buf.capacity(),
+            0,
+            "a datagram whole inside one DATA frame was handed out, not staged through the capsule buffer"
+        );
         let read = connectip::udp_from_packet(&packet).expect("parses");
         assert!(read.verified);
         assert_eq!(
