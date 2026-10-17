@@ -177,8 +177,8 @@ mod tests {
     #[test]
     fn the_record_head_hands_over_the_buffer_it_filled() {
         const HEAD: &[u8] = b"GET /camouflage HTTP/1.1\r\nHost: h\r\n\r\n";
-        let mut wire = Vec::from(HEAD);
         const TAIL: &[u8] = b"ping";
+        let mut wire = Vec::from(HEAD);
         wire.extend_from_slice(TAIL);
         let (reader, _write) =
             accept_split(std::io::Cursor::new(wire), Vec::new(), "/camouflage").expect("answers");
