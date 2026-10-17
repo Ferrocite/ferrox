@@ -58,6 +58,18 @@ impl std::os::fd::AsRawFd for Connection {
     }
 }
 
+/// The same descriptor under the Windows spelling, so `census::handle` reads a `Connection` the
+/// way it reads a `TcpStream` there. A Windows `Connection` only ever holds a TCP stream, since
+/// the `AF_UNIX` arm is `#[cfg(unix)]`, so this forwards unconditionally.
+#[cfg(windows)]
+impl std::os::windows::io::AsRawSocket for Connection {
+    fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        match self {
+            Connection::Tcp(stream) => stream.as_raw_socket(),
+        }
+    }
+}
+
 /// The record-boundary marker the TLS layer needs of a stream it seals records onto. `TcpStream`
 /// impls it in `ferrox-core`; a `Connection` forwards to whichever family it holds, so a TLS
 /// session over either arm keeps the same record alignment the TCP path had.
