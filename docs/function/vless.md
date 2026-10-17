@@ -83,47 +83,63 @@ traffic reallocates none of it.
 
 ## Time
 
-**Not measured on this branch.** `.github/workflows/parity.yml` runs the
+**Measured on this branch.** `.github/workflows/parity.yml` runs the
 `vless-raw` scenario across the pinned engines for upload, download and
 full-duplex; `.github/workflows/benchmark-matrix.yml` runs the same. Both are
-CI-only. No artefact from this branch has been read; the two cells quoted under
-**What we removed** for the splice pump are main's nightly at `81c48ad` (the build
-before the pump's idle back-off) and the dispatched replays of `vless-raw-up-1` and
-`vless-raw-down-1` on `905962d`, each read from its own run artefact.
+CI-only. This branch's check run (`7fb86bf`, full tier, five repeats, ubuntu
+`x86_64`) carries seven `vless-raw` cells, all of them gate-green with zero engine
+failures, and every row below is read from one of its artefacts or from the cell
+it names. The two cells quoted under **What we removed** for the splice pump are
+main's nightly at `81c48ad` (the build before the pump's idle back-off) and the
+dispatched replays of `vless-raw-up-1` and `vless-raw-down-1` on `905962d`, each
+read from its own run artefact.
 
 **The upload cell measured the harness, not the engines, until #166.** The sink
 compared the bytes it was handed one at a time — a modulo and a bounds-checked
-index per byte — so on main's nightly at `f224c89` (`vless-raw-up-1`, ubuntu
-`x86_64`, 4 logical CPUs, one-hop ceiling 4 294 MiB/s) `xray-core` read 615.7,
-`ferrox` 616.4 and `zeronet` 619.8 MiB/s: every engine within 0.7% of the others,
-at 14% of the pipe, in the same run in which the same `ferrox` build downloads at
-3 011 MiB/s. The dispatched replay on `p69-sink-run-compare`, same runner class and
-same workload, leaves the ceiling where it was (4 470 MiB/s median — one
-generator into one reader, so a relay can beat it and it is read as a floor) and
-resolves the row: `ferrox` 5 307 MiB/s against `xray-core`'s 2 674, throughput
-interval [1.943×, 2.067×] median 1.998× better, cpu per GiB [2.369×, 2.425×]
-median 2.403×, peak RSS median 5.718× — where the same row read within noise,
-[0.975×, 1.030×], and the gate blamed the runner's spread. Only the upload direction was bound this way: a plain download and the ceiling
-flow both read through the reader, which already compared in slices, so that row
-has always been a comparison of engines — full-duplex carries an upload half and
-was partly bound, which the rows below show. An upload *throughput* row measured
-before #166 is therefore
-evidence about the sink and not about the engines; its cpu and RSS rows still are,
-since the sink's cpu belongs to the harness process — `ferrox`'s cpu per GiB there
-moved 243.75 → 273.75 while its throughput moved 616 → 5 307 MiB/s, which is why
-the pump pricing above stands on the cpu ratio and needs no re-reading.
+index per byte — so on main's nightly at `70fdfd0` (run `39001299614`,
+`vless-raw-up-1`, ubuntu `x86_64`, 4 logical CPUs, standard tier, three repeats)
+`xray-core` read 615.7, `ferrox` 616.4 and `zeronet` 619.8 MiB/s at their medians:
+every engine within 0.7% of the others, at 14% of that cell's own one-hop ceiling
+(4 294 MiB/s median), and the row verdict was `within-noise` at
+[0.975×, 1.030×]. That run binds one direction only: the same build on the same
+runner reads `vless-raw-down-8` at `ferrox` 5 885 against `xray-core`'s 2 813,
+[2.092×, 2.150×] median 2.115× better, while `vless-raw-duplex-8` reads 1 466
+against 1 171, median 1.248× — duplex carries an upload half, and it rode under the
+same bound. A ceiling is one generator into one reader, so a relay can beat it and
+it is read as a floor, never as a share to divide by.
 
-The branch's own full-tier cell, five repeats on a second runner, reads the same
-way: `ferrox` 4 149 MiB/s against `xray-core`'s 1 772, median 2.282×, and
-full-duplex 3 778 against 2 052 where the nightly's standard-tier cell read
-1.248× — the upload half of a duplex flow rode under the same bound. The plain
-downlink is the control on the reader this change also rewrote: `ferrox`'s own
-median moved 3 011 → 3 023 MiB/s, inside one run's noise, while its interval went
-[1.723×, 1.792×] → [2.359×, 2.459×] because the reference tracked a slower machine
-(1 717 → 1 257) and that cell's ceiling fell with it (4 214 → 2 573 MiB/s). Each
-number above is read from the cell it names; ratios are read inside a cell and
-never across two, so the run-based compare gave nothing up where the slice compare
-already worked, and took nothing off the rows that were already comparing engines.
+**This branch's check run resolves the row.** At `7fb86bf` (full tier, five
+repeats, same runner class, all seven `vless-raw` cells gate-green with zero engine
+failures) `vless-raw-up-1` reads `ferrox` 4 354 MiB/s against `xray-core`'s 1 805:
+throughput [2.288×, 2.455×] median 2.374× better, cpu per GiB [3.017×, 3.134×]
+median 3.085×, peak RSS [5.604×, 5.700×] median 5.651×. `vless-raw-duplex-8` reads
+5 058 against 2 690, median 1.892×, where the nightly's duplex cell read 1.248× —
+the bound came off the upload half of a duplex flow. `vless-raw-down-1` is the
+control on the reader this change also rewrote and it moves nothing that was
+already moving: `ferrox` 2 911 against `xray-core`'s 1 236, [2.281×, 2.398×],
+`better` in both cells. An upload *throughput* row measured before #166 is
+therefore evidence about the sink and not about the engines; its cpu row survives
+only as a ratio and its RSS row survives whole, since the sink's cpu and resident
+set belong to the harness process — `ferrox` bills 243.75 ms/GiB at 616 MiB/s and
+320 ms/GiB at 4 354, `xray-core` 565 and 977.5, because a parked engine bills less
+per GiB than a busy one, while `ferrox`'s own median RSS is 6.64 MiB in both cells
+and `xray-core`'s 39.3 and 37.7. The ratios (cpu 2.319× pre-fix, 3.085× here; RSS
+5.875× and 5.651×) are what the pump pricing above stands on, and it needs no
+re-reading. Each number here is read from the cell it names, and no ratio is taken
+across two cells.
+
+**The row resolves on a second machine class.** A standard-tier, three-repeat
+dispatch of `vless-raw-up-1` on `ubuntu-24.04-arm` at `906312c` (linux aarch64, 4
+logical CPUs) reads `ferrox` 5 882 MiB/s against `xray-core`'s 2 225, throughput
+[2.413×, 3.497×] median 2.834× better, cpu per GiB [3.006×, 3.117×] median 3.057×,
+`ferrox` at its median 203.75 ms/GiB against `xray-core`'s 635, peak RSS median
+5.521× (5.86 MiB against 32.3), gate green. The arm runner's nightly has no upload
+cell, so nothing in that paragraph is read across machine classes. On `macos-15`
+this workload is not priceable at all: this branch's `vless-raw-duplex-8` dispatch
+there failed every engine in every repeat with `No buffer space available (os error
+55)` on the upload writes and `Connection reset by peer` on the reads at ceilings of
+482–671 MiB/s, and the run-based compare left it exactly as broken, so that row is
+a runner-buffer fault rather than a comparison.
 
 ## What we removed
 
