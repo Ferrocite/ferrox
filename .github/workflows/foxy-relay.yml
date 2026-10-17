@@ -87,7 +87,8 @@ jobs:
       || contains(needs.plan.outputs.methods, 'foxy')
       || contains(needs.plan.outputs.methods, 'quic')
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    # The backstop, not the clock: every leg carries its own deadline, so a stall fails its step in minutes with the lane log uploaded.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -239,19 +240,22 @@ jobs:
             wc -c body.bin 2>/dev/null || echo "(no answer)"
             python3 -c 'print(open("body.bin","rb").read(128).hex())' 2>/dev/null || true
             # The first flow pays for sign-in, catalogue and edge dial, so the
-            # trace is retried; a lane that never answers fails here, loudly.
-            for i in $(seq 1 24); do
+            # trace is retried; the deadline keeps one stalled carrier from
+            # spending the job's timeout unnoticed.
+            deadline=$((SECONDS + 120))
+            while [ "$SECONDS" -lt "$deadline" ]; do
               if curl -sS --max-time 30 --socks5-hostname "127.0.0.1:$PORT" \
                 https://www.cloudflare.com/cdn-cgi/trace -o trace.txt; then
                 break
               fi
-              sleep 20
+              sleep 5
             done
             grep -E '^(loc|ip)=' trace.txt || true
             trace_ok=0
             grep -qx "loc=$FOXY_COUNTRY" trace.txt 2>/dev/null || trace_ok=$?
             code=0
-            curl -sS --max-time 300 --socks5-hostname "127.0.0.1:$PORT" \
+            # Two minutes bounds a stalled megabyte; a healthy one arrives in seconds.
+            curl -sS --max-time 120 --socks5-hostname "127.0.0.1:$PORT" \
               'https://speed.cloudflare.com/__down?bytes=1000000' -o "file-$carrier.bin" || code=$?
             got=$(wc -c < "file-$carrier.bin" 2>/dev/null | tr -d ' ')
             got="${got:-0}"
@@ -367,7 +371,8 @@ jobs:
           # than a red leg.
           trace_front() {
             FRONT="$1" WANT="$2"
-            for _ in $(seq 1 48); do
+            deadline=$((SECONDS + 120))
+            while [ "$SECONDS" -lt "$deadline" ]; do
               if [ "$FRONT" = http ]; then
                 curl -sS --max-time 25 -x "http://127.0.0.1:$PORT" \
                   https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt && break
@@ -382,10 +387,10 @@ jobs:
           fetch_mb() {
             FRONT="$1" FILE="$2"
             if [ "$FRONT" = http ]; then
-              curl -sS --max-time 300 -x "http://127.0.0.1:$PORT" \
+              curl -sS --max-time 120 -x "http://127.0.0.1:$PORT" \
                 'https://speed.cloudflare.com/__down?bytes=1000000' -o "$FILE"
             else
-              curl -sS --max-time 300 --socks5-hostname "127.0.0.1:$PORT" \
+              curl -sS --max-time 120 --socks5-hostname "127.0.0.1:$PORT" \
                 'https://speed.cloudflare.com/__down?bytes=1000000' -o "$FILE"
             fi
             test "$(wc -c < "$FILE" | tr -d ' ')" = 1000000
@@ -551,7 +556,8 @@ jobs:
           }
           trace_socks() {
             PORT="$1" WANT="$2"
-            for _ in $(seq 1 48); do
+            deadline=$((SECONDS + 120))
+            while [ "$SECONDS" -lt "$deadline" ]; do
               curl -sS --max-time 25 --socks5-hostname "127.0.0.1:$PORT" \
                 https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt && break
               sleep 5
@@ -565,7 +571,7 @@ jobs:
           PORT=10817
           start_lane socks "$PORT" h2 DE
           trace_socks "$PORT" DE
-          curl -sS --max-time 300 --socks5-hostname "127.0.0.1:$PORT" \
+          curl -sS --max-time 120 --socks5-hostname "127.0.0.1:$PORT" \
             'https://speed.cloudflare.com/__down?bytes=1000000' -o file-de.bin
           test "$(wc -c < file-de.bin | tr -d ' ')" = 1000000
           echo "second country DE: 1000000 B"
