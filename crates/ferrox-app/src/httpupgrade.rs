@@ -181,7 +181,7 @@ fn check_response(head: &[u8]) -> Option<()> {
     let text = std::str::from_utf8(head).ok()?;
     let mut lines = text.split("\r\n");
     let status = lines.next()?;
-    // Only the version token and the three digits decide: a reason phrase is free text and may be absent, the way both references read it.
+    // xray and sing-box read only the version token and the three digits; a reason phrase is free text and may be absent.
     if !status.starts_with("HTTP/1.1 101")
         || !matches!(status.as_bytes().get(12), Some(b' ' | b'\r') | None)
     {
@@ -393,6 +393,13 @@ mod tests {
             )
             .is_none(),
             "four digits is not 101"
+        );
+        assert!(
+            check_response(
+                b"HTTP/1.1 101x Whatever\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+            )
+            .is_none(),
+            "not a digit and not a space"
         );
         assert!(check_response(b"HTTP/1.1 101 Switching Protocols\r\nConnection: keep-alive\r\nUpgrade: websocket\r\n\r\n").is_none(), "wrong Connection");
         assert!(
