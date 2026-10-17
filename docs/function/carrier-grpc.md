@@ -229,29 +229,48 @@ two cells, so the difference is this carrier's write count and not the runner.
 The after cell's harness ceilings are `1528`–`2270 MiB/s` against ferrox's
 `2153`, which is why the ratio is read as a floor.
 
-The same workload on the runner this tree loses on, `windows-latest`, 3 repeats
-rather than 5:
+The same workload on the runner this tree loses on, `windows-latest`:
 
 | run | what it was | ferrox, median | xray-core in the same cell |
 | --- | --- | --- | --- |
-| 39008558717 | `main`, the control for the gathered batch | 25.9 s (`24.0`–`27.7`), `9955` ms/GiB cpu | 21.3 s (`19.9`–`23.8`), `7633` ms/GiB, throughput ratio `0.838×` WORSE, cpu ratio `0.749×` WORSE |
+| 39008558717 | `main`, control for the gathered batch, 3 repeats | 25.9 s (`24.0`–`27.7`), `9955` ms/GiB cpu | 21.3 s (`19.9`–`23.8`), `7633` ms/GiB, throughput ratio `0.838×` WORSE, cpu ratio `0.749×` WORSE |
+| 39001299614 | `main`, the nightly control, 3 repeats | 12.9 s (`12.9`–`13.4`), `5568` ms/GiB cpu | 9.69 s (`9.32`–`9.79`), `3654` ms/GiB, throughput ratio `0.735×` WORSE, cpu ratio `0.652×` WORSE |
+| 39053349255 | the gathered batch, 5 repeats | 9.10 s (`9.07`–`9.47`), `3385` ms/GiB cpu | 19.8 s (`19.6`–`24.8`), `7580` ms/GiB, throughput ratio `2.263×` better (`2.116`–`2.506`), cpu ratio `2.338×` better (`2.226`–`2.548`) |
 
 The whole of that gap is kernel time: ferrox spends `9473` ms/GiB in the kernel
 and `482` in user on this runner, against `1519` and `108` for the same code on
 ubuntu, where the same cell is `2.115×` better than xray-core. Windows has no
 `writev`, so a frame there was five `send` calls and a GiB was `327_680` of
 them; `zeronet`, at `8.35 s` and `3240` ms/GiB in the same cell, is the bar this
-platform sets for the carrier. The gathered batch is `4096` calls per GiB on
-either platform, and the cell that measures it is the row this one is waiting
-for — `kernel calls per GiB` is `UNPROVEN` on Windows (`fewer than 2 usable
-pairs`, no `strace` there), so the call count is the arithmetic on the page and
-the ratio is the CI number, not the other way round.
+platform sets for the carrier.
 
-Still open, and the reason no local duration is quoted: the same
-`windows-latest` cell after this change, at the tier that prices a ratio — the
-gathered batch is `4096` calls per GiB against the `327_680` sends the control
-cell made, and the number this page has to read is that cell's ratio, not the
-arithmetic above it. And `tunnel_carries_an_echo_over_loopback` is the flakiest
+The after cell is the third run, and it reads better: against the nightly
+control's split, ferrox's own median on this platform goes from `5291` to `3188`
+ms/GiB in the kernel and from `277` to `197` in user, so the buy-back is the
+kernel half, which is where the five `send` calls per frame were paid. `zeronet` in the same cell is `8.21 s` and `3240`
+ms/GiB — `1.11×` this carrier's time and `1.04×` its cpu, against the nightly
+control's `3.0×` and `3.4×` behind that bar. The three cells above are three
+different machines and the comparator's own time moved with them (`9.69 s` to
+`19.8 s`), so a ratio is read inside a cell and never across two of them;
+`kernel calls per GiB` stays `UNPROVEN` on Windows, where there is no `/proc` to
+read, so the call count here is the page's arithmetic and the ratio is the CI
+number, not the other way round.
+
+The machine-independent witness is on ubuntu, where the row's checker is
+`/proc/<pid>/io` `syscw`. Ferrox's writes per GiB go `101_477`
+(`88_505`–`116_082`) → `51_333` (`48_448`–`59_492`) on x86_64 and `80_107` →
+`51_041` on aarch64, while xray-core in the same two cells is flat at `219_704`
+→ `218_832` and `219_521` → `219_626`. The tally names `write` and `writev` and
+not the `recv` half of the route — `syscr` reads `0` for every ferrox run — so
+what it shows is a halving of a lower bound, and the bound it cannot see is the
+reason `32×` arithmetic and this number are not the same number. The four
+runners of the after run all gate better than the reference: `macos-15`
+`1.849×` (`1.415`–`2.413`) and cpu `1.984×`, `ubuntu-latest` `2.163×` and
+`1.938×`, `ubuntu-24.04-arm` `3.386×` and `3.446×`, 5 pairs each. Ferrox's own
+ubuntu throughput in those cells is `2348` → `2433` MiB/s, and its ratio there
+moves with the comparator's machine, not with this change.
+
+Still open: `tunnel_carries_an_echo_over_loopback` is the flakiest
 loopback test in the tree — the roadmap records it failing 23 times in 200 runs
 with nothing else running, where `read_body` sees EOF after a 9-byte frame
 header, which is a torn write or an RST with data queued rather than a framing
