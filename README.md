@@ -70,7 +70,7 @@ printf '%s %s %s %s\n' '<doc>' '<key>' '<value>' '<checker>' >> scripts/method-c
 | VLESS TCP | [vless](docs/function/vless.md) | 1 write per header, 0 framing after | 1 (the relay's own) | `UNBLESSED` | not measured |
 | Trojan TCP | [trojan](docs/function/trojan.md) | 1 write per header, 0 framing after | 1 (the relay's own) | `UNBLESSED` | not measured |
 | XTLS Vision | [xtls-vision](docs/function/xtls-vision.md) | 0 framing after the switch | **2** framed, **0** after the switch | `UNBLESSED` | not measured |
-| Mux.Cool + XUDP | [mux-cool](docs/function/mux-cool.md) | 1 write per frame | **0** written, 1 read | `UNBLESSED` | not measured |
+| Mux.Cool + XUDP | [mux-cool](docs/function/mux-cool.md) | 1 write per uplink frame, **1 per downlink read batch**, 1 `sendmsg` per XUDP datagram | **0** written, 1 read | `UNBLESSED` | not measured |
 | WebSocket | [carrier-websocket](docs/function/carrier-websocket.md) | **1 read per 32 KiB window** (64 frames), 1 write per frame | 0 unmasked write, 1 masked | `UNBLESSED` | not measured |
 | HTTPUpgrade | [carrier-httpupgrade](docs/function/carrier-httpupgrade.md) | 1 read, 1 write | 1 (the relay's own) | `UNBLESSED` | not measured |
 | HTTP masquerade | [carrier-httpheader](docs/function/carrier-httpheader.md) | 1 read, 1 write | 1 (the relay's own) | `UNBLESSED` | not measured |
