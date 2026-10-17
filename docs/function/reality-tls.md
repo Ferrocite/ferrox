@@ -319,6 +319,13 @@ limiter in front of it yet; no row carries inner `TLS` over plain `TLS`, so it
 is a named gap and not a carried cost. The inner-`TLS` lane carried over `KCP`
 (`serve_carried_tls`) still shakes once: its transport is paced by the `KCP`
 pump, not by a socket grain, and no row handshakes a late hello through it.
+- **Three `getrandom` fills per dial.** `RealityClientSession::connect` asked the
+  OS for the x25519 secret, the hello random and the GREASE pair in three
+  separate fills, one syscall each; one 66-byte fill arms all three and no test
+  sees the difference, because the scripted draws both passes read come from the
+  `ScriptedRandom` provider and the oracle pins the seal, not entropy. Two
+  syscalls fewer per dial; no loopback checker observes a `getrandom` fill, so
+  the page records the shape and no row gate runs over it.
 
 ## Pins
 
