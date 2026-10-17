@@ -1035,15 +1035,15 @@ impl<S: Stream> RealityClientSession<S> {
     pub fn connect(cfg: &RealityClientConfig, now: u32, io: S) -> Result<Self, TlsError> {
         let name = rustls::pki_types::ServerName::try_from(cfg.server_name.clone())
             .map_err(|e| TlsError::Other(format!("reality: server name: {e}")))?;
-        let mut ephemeral = [0u8; 32];
-        let mut random = [0u8; 32];
-        let mut grease = [0u8; 2];
-        getrandom::getrandom(&mut ephemeral)
+        // One entropy fill arms the share, the random and the grease pair: one syscall where three ran, the same stream getrandom serves.
+        let mut entropy = [0u8; 66];
+        getrandom::getrandom(&mut entropy)
             .map_err(|e| TlsError::Other(format!("reality: no entropy: {e}")))?;
-        getrandom::getrandom(&mut random)
-            .map_err(|e| TlsError::Other(format!("reality: no entropy: {e}")))?;
-        getrandom::getrandom(&mut grease)
-            .map_err(|e| TlsError::Other(format!("reality: no entropy: {e}")))?;
+        let (secret, tail) = entropy.split_at(32);
+        let (grease, random) = tail.split_at(2);
+        let ephemeral: [u8; 32] = secret.try_into().expect("the x25519 secret is 32 bytes");
+        let grease: [u8; 2] = grease.try_into().expect("the grease pair is 2 bytes");
+        let random: [u8; 32] = random.try_into().expect("the hello random is 32 bytes");
         let shared = x25519_dalek::x25519(ephemeral, cfg.public_key);
         if shared == [0u8; 32] {
             return Err(TlsError::Other(
