@@ -27,7 +27,7 @@ impl std::fmt::Debug for SendingWorker {
 }
 
 impl SendingWorker {
-    pub(crate) fn new(config: Config, ctx: Arc<Ctx>) -> Self {
+    pub(crate) fn new(config: &Config, ctx: Arc<Ctx>) -> Self {
         Self {
             ctx,
             window: SendingWindow::new(),
@@ -227,7 +227,7 @@ impl std::fmt::Debug for ReceivingWorker {
 }
 
 impl ReceivingWorker {
-    pub(crate) fn new(config: Config, ctx: Arc<Ctx>) -> Self {
+    pub(crate) fn new(config: &Config, ctx: Arc<Ctx>) -> Self {
         let window_size = config.receiving_in_flight_size();
         Self {
             ctx,

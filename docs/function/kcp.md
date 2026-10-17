@@ -2,7 +2,9 @@
 
 The core rung is real, bit-identical and proved against the pinned Go, and the
 carrier is now wired: VLESS, VMess, Trojan and Shadowsocks all serve and dial
-over plaintext KCP, plus VLESS over KCP under TLS and REALITY. UDP and Mux stay
+over plaintext KCP, plus VLESS over KCP under TLS and REALITY and under the
+legacy mKCP header stack — the `mkcp-legacy` finalmask families, both roles,
+oracle-proven like the framer beneath them. UDP and Mux stay
 raw-carrier-only tree-wide, so they refuse KCP like every other carrier.
 
 The proof is `kcp::oracle::the_scripted_core_matches_the_pinned_go`: a scripted
@@ -14,9 +16,13 @@ which was recorded from `xray-core/transport/internet/kcp` at the pin in
 right", but byte-for-byte equal to the implementation it replaces, over a
 script that deliberately probes the estimator's edges.
 
-The refusal is equally deliberate. `Carrier::Kcp` is refused by the app and
-`kcpSettings` is read for its `host` only; the `Config` struct has no JSON
-parser, so a `kcpSettings` block in a config is named and not honoured.
+Nothing on this rung is now named-without-being-honoured. `kcpSettings` is
+parsed into `kcp::Config` (`mtu`, `tti`, capacities, multiplier, window, both
+spellings), and every `streamSettings.finalmask.udp` entry of type
+`mkcp-legacy` contributes one mask to the chain. An entry naming any other
+finalmask type is refused by name rather than dialled unmasked — a config
+asking for a mask this tree does not carry either runs the whole chain it
+asked for or does not dial.
 
 ## Data path
 
@@ -30,7 +36,58 @@ graph TD
     O --> P["RTO estimator: srtt, rttvar,<br/>rto capped at 10 s"]
     P --> Q["receiving window: ack list, fast ack"]
     Q --> A2["delivered in order"]
+    W --> X["Encoder::encode: gap copy, then<br/>cascade, fake header or AES-GCM"]
+    X --> Y["sendto: the masked datagram"]
+    Y --> Z["decode_in_place on recv;<br/>None drops the datagram"]
+    Z --> Q
 ```
+
+## Masks
+
+The stack this replaces is
+`upstream/xray-core/transport/internet/finalmask/mkcp/`: three families and a
+manager that chains them. `original` is the legacy mKCP header — an FNV-1a
+hash of the payload, its length, and a lag-4 XOR cascade over the whole
+frame. `header` fakes one of six packet shapes: `dns`, `dtls`, `srtp`, `utp`,
+`wechat`, `wireguard`. `aes128gcm` keys itself with SHA-256 of the password
+truncated to sixteen bytes and frames `nonce ‖ ciphertext ‖ tag`. The spelling
+is the reference's:
+
+```json
+"streamSettings": { "network": "kcp", "finalmask": { "udp": [
+  { "type": "mkcp-legacy", "settings": { "header": "srtp" } },
+  { "type": "mkcp-legacy", "settings": { "header": "dns", "value": "example.com" } },
+  { "type": "mkcp-legacy", "settings": { "value": "password" } }
+] } }
+```
+
+The reference reverses the list as it composes it, so the **last** entry wraps
+most and is the outermost mask on the wire; `Mask::from_spec` takes that wire
+order and `decode_in_place` strips outermost first with the manager's own
+slice arithmetic. Empty `header` and empty `value` is `original`; empty
+`header` with a `value` is `aes128gcm`; `dns` without a `value` packs the
+reference's default `www.baidu.com`. A frame that is shorter than the chain
+prefix, fails the `original` hash, or fails the GCM tag decodes to nothing and
+is dropped there: the socket thread and the accept loop never parse it, never
+deliver it, and never build a session for it —
+`a_raw_dial_never_establishes_a_masked_session` and
+`the_wrong_password_echoes_nothing` are those gates. What actually goes on the
+wire is proven through a plain UDP relay sitting between the two roles:
+`the_wire_under_a_masked_session_carries_the_mask` records the first
+_datagram_, opens it under the same chain and finds the conversation id in
+it, and counts the overhead — `srtp` outside `aes128gcm` adds exactly
+32 bytes — then the session still echoes through the relay.
+
+Two inputs the reference accepts are refused at build time rather than
+half-implemented: a DNS name containing an escaped dot (`\.`, which
+`packDomainName` supports), and anything under `finalmask` that is not
+`mkcp-legacy` — that second family list is in Open rows. The cross-language
+gate covers the stack in `expected.txt`: 86 mask lines — `original` seals at
+21 lengths including the ragged ones, every fake header's counter walk
+including the dtls length wrap, the dns template's packing, fixed-nonce AES
+seals and opens, and five composed chains with their opens, tampers and
+wrong-order refusals — replayed through the shipped `Encoder` and
+`decode_in_place`.
 
 ## Measured
 
@@ -56,6 +113,11 @@ graph TD
 
 
 | reader-wakeups-per-datagram | 1 | ferrox-core-kcp::connection::tests::a_datagram_wakes_the_reader_once_however_many_segments_it_carries |
+| mask-families-implemented | 8 | ferrox-core-kcp::listener::tests::every_mask_family_echoes_over_loopback |
+| mask-chain-wire-overhead-bytes | 32 | ferrox-core-kcp::listener::tests::the_wire_under_a_masked_session_carries_the_mask |
+| mask-read-side-payload-copies-per-datagram | 0 | ferrox-core-kcp::mask::tests::the_original_frame_round_trips_and_the_checks_fire |
+| mask-encode-buffer-allocations-per-frame | 0 | ferrox-core-kcp::mask::tests::the_scratch_holds_its_capacity_across_frames |
+| oracle-mask-lines-against-the-pinned-go | 86 | ferrox-core-kcp::oracle::the_scripted_core_matches_the_pinned_go |
 <!-- counts:end -->
 
 ## Ops
@@ -151,6 +213,34 @@ it is the one this rung replaces:
 - **A `bytes.Buffer` growth per record on the TLS side**, for contrast: REALITY's
   `readFromUntil` is called twice per record and each `Grow`s a `bytes.Buffer`.
   One provider that is the stream avoids the question.
+- **A copy of every masked frame received.** `headerManagerConn.ReadFrom`
+  (`transport/internet/finalmask/finalmask.go:321`) returns `copy(p, buf)` —
+  after every entry has stripped in place, the manager memmoves the plaintext
+  back to the front of the caller's buffer. `decode_in_place` strips with the
+  same slice arithmetic and returns the tail. The witness is pointer identity:
+  `the_original_frame_round_trips_and_the_checks_fire` requires the decoded
+  base to *be* the caller's buffer plus six bytes at nine lengths, and
+  `a_forged_original_leaves_the_buffer_untouched_on_reject` requires a refused
+  frame to stay exactly as it arrived — a byte test passes with the memmove
+  and without it, so it cannot see this removal.
+- **A 4 096-byte pool round-trip per masked frame sent.**
+  `headerManagerConn.WriteTo` (`finalmask.go:326`) does `buf.New()` and
+  `Resize(0, UDPSize)` for every datagram. The `Encoder` holds one scratch for
+  the life of the connection, and the gate is its capacity —
+  `the_scratch_holds_its_capacity_across_frames` settles it over 32 frames of
+  five ragged lengths and fails the moment it grows again.
+- **The gap sum recomputed per datagram.** The reference loops `c.sizes` to
+  total `sum` at the top of both `ReadFrom` and `WriteTo`; the prefix table is
+  built once in `Encoder::new` and the strip indexes it.
+- **The pad-and-truncate dance around the cascade.** The reference rounds the
+  buffer up to a multiple of four before `xorfwd`/`xorbkd` and drops the pad
+  after — the pad can only ever touch bytes that get dropped again. The
+  cascade is a prefix-XOR over the four mod-4 residue classes, so the u128
+  form takes the ragged tail directly: two log-doubled shift-xor steps per
+  block with the carry entering word 0, which the scan then spreads.
+  `the_fast_cascade_is_the_naive_one_at_every_length` sweeps it against the
+  naive scan at every length 0..=209, and the oracle seals 21 lengths
+  including the ragged ones.
 
 The oracle is the gate for all of it: the wire format is fixed by the pinned Go,
 so anything that removed an operation had to do it without moving a byte, and
@@ -175,6 +265,10 @@ one test on that runner only.
 `ferrox-core/examples/kcp_bench.rs` is not wired to a workflow that runs it on a
 named runner, so no throughput figure is quoted. The oracle proves the wire
 format; nothing in CI yet proves the loss behaviour under a real packet layer.
+The same no-figure rule covers the mask: the 86 lines prove bytes, not speed.
+The other `finalmask` families — salamander, noise, sudoku, xdns, xicmp,
+realm, udphop, the custom header, fragment, xmc — are not in this slice and
+route to a `prompts.md` add-on.
 
 
 - **A `malloc` and a `free` for every 1 332 bytes sent.** `Connection::write`
@@ -306,12 +400,34 @@ What is **not** removed, and is named rather than claimed:
   machine (no valgrind on aarch64 macOS, and every local dial measures a VPN).
   Per the rule that unsafe ships only against a measured win, the safe form
   stands and the memset is named here rather than claimed away.
+- **One copy of every masked frame sent.** The `Encoder` copies the payload
+  into the gap it reserved in the scratch — `finalmask.go:341` does the same
+  — because the mask prefix has to grow the frame and the bytes it covers
+  must sit after it. The removal landed on the read side, where the
+  reference's final `copy(p, buf)` had nothing to do with the wire format.
+- **The FNV-1a dependent chain in `original`.** A multiply and an xor per
+  byte where the next input is the previous output: there is no vectorising
+  a dependency, and the frame is hashed byte-serial on the seal and again on
+  the check. The cascade got the SIMD; the hash stays a loop.
+- **A draw per datagram under the dns header.** The reference rolls the
+  transaction id afresh per datagram (`dice.RollUint16()`) and the other
+  header fills are counter walks, not draws; holding the random back would
+  make a visibly static session on the wire, so one getrandom per datagram
+  stays and `the_dns_transaction_id_moves_every_datagram` is its gate.
+- **Per-session fake-header counters on the server.** The reference wraps the
+  listening socket once, so an `srtp` number or a `wechat` sn walks over every
+  session's traffic at once; ours belongs to the session's `Encoder`. A loaded
+  hub's counter position is not something a second implementation can be
+  bit-identical to anyway, and no reader parses these fields on the wire, so
+  the divergence is named: the oracle's single-chain bytes match, the
+  interleaving with other sessions' traffic does not.
 
 ## Pins
 
 | what | where |
 | --- | --- |
 | the reference this rung is proved against | `upstream/xray-core/transport/internet/kcp/` |
+| the mask stack this replaces | `upstream/xray-core/transport/internet/finalmask/mkcp/` and `finalmask/finalmask.go` |
 | the Go recorder that produced `expected.txt` | `scripts/kcp-oracle/main.go` |
 | the pin and the suite seam | `upstream/pins.toml`, `[sources.xray-core]` |
 
