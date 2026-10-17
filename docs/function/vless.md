@@ -128,16 +128,23 @@ and `xray-core`'s 39.3 and 37.7. The ratios (cpu 2.319× pre-fix, 3.085× here; 
 re-reading. Each number here is read from the cell it names, and no ratio is taken
 across two cells.
 
-**The row resolves on a second machine class.** A standard-tier, three-repeat
-dispatch of `vless-raw-up-1` on `ubuntu-24.04-arm` at `906312c` (linux aarch64, 4
-logical CPUs) reads `ferrox` 5 882 MiB/s against `xray-core`'s 2 225, throughput
-[2.413×, 3.497×] median 2.834× better, cpu per GiB [3.006×, 3.117×] median 3.057×,
-`ferrox` at its median 203.75 ms/GiB against `xray-core`'s 635, peak RSS median
-5.521× (5.86 MiB against 32.3), gate green. The arm runner's nightly has no upload
-cell, so nothing in that paragraph is read across machine classes. On `macos-15`
-this workload is not priceable at all: this branch's `vless-raw-duplex-8` dispatch
-there failed every engine in every repeat with `No buffer space available (os error
-55)` on the upload writes and `Connection reset by peer` on the reads at ceilings of
+**One machine class, read before and after, is the cleanest control.** main's
+nightly at `70fdfd0` also ran `vless-raw-up-1` on `ubuntu-24.04-arm` (standard
+tier, three repeats, linux aarch64, 4 logical CPUs): `xray-core` 505.3, `ferrox`
+496.4 and `zeronet` 498.5 MiB/s at their medians, every engine within 1.8% of the
+others at 7.5% of that cell's own 6 593 MiB/s ceiling median, `within-noise` at
+[0.975×, 0.992×] — while its cpu row already read `better`, [2.741×, 2.822×]
+median 2.780×. This branch's arm dispatch at `906312c`, same scenario, tier and
+workload, leaves `ferrox`'s cpu at 203.75 ms/GiB against `xray-core`'s median 635
+and moves the throughput row to `ferrox` 5 882 MiB/s against 2 225,
+[2.413×, 3.497×] median 2.834× better, peak RSS median 5.521× (5.86 MiB against
+32.3), gate green. `ferrox`'s own per-GiB cpu barely moved across the two arm
+cells, 202.5 → 203.75 ms/GiB, while its rate moved 11.9×: from the engine's side
+that is exactly what a harness-side bound looks like — the cpu row was always a
+comparison of engines and the throughput row was not. On `macos-15` this workload
+is not priceable at all: this branch's `vless-raw-duplex-8` dispatch there failed
+every engine in every repeat with `No buffer space available (os error 55)` on the
+upload writes and `Connection reset by peer` on the reads at ceilings of
 482–671 MiB/s, and the run-based compare left it exactly as broken, so that row is
 a runner-buffer fault rather than a comparison.
 
