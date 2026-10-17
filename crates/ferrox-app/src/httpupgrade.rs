@@ -1,7 +1,11 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-const HEAD_LIMIT: usize = 64 * 1024;
+pub(crate) const HEAD_LIMIT: usize = 64 * 1024;
+
+/// The answer every role of this carrier writes: a status line and the two upgrade headers, and nothing else.
+pub(crate) const SWITCH: &[u8] =
+    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
 
 #[derive(Debug)]
 pub(crate) struct UpReader<R: Read = TcpStream> {
@@ -63,9 +67,7 @@ pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(UpReader, TcpStre
         return None;
     };
     let mut write = write;
-    write
-        .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
-        .ok()?;
+    write.write_all(SWITCH).ok()?;
     Some((UpReader { read, prefix }, write))
 }
 
@@ -112,9 +114,7 @@ pub(crate) fn accept_split<R: Read, W: Write>(
     let (head, prefix) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
     check_request(&head, path)?;
-    write
-        .write_all(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
-        .ok()?;
+    write.write_all(SWITCH).ok()?;
     Some((UpReader { read, prefix }, write))
 }
 
@@ -458,9 +458,6 @@ mod tests {
             connect(stream, "oracle.example", "/tunnel", 3, b"ping").expect("rides ahead");
         server.join().expect("joins");
     }
-
-    const SWITCH: &[u8] =
-        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
 
     /// Counts calls and part pointers as well as bytes, so "one write" is observed rather than inferred: a `Vec` sink cannot tell one `write_slices` call from two `write_all`s.
     #[derive(Default)]
