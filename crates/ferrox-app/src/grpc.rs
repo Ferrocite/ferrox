@@ -1266,6 +1266,7 @@ mod tests {
         let mut send = shared.send.lock().unwrap();
         send.conn = window;
         send.stream = window;
+        drop(send);
         GrpcWriter { shared, stream: 1 }
     }
 
