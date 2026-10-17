@@ -8257,7 +8257,12 @@ fn send_to_two(
         msg.msg_name = (&raw const storage).cast_mut().cast();
         msg.msg_namelen = len;
         msg.msg_iov = parts.as_mut_ptr();
-        msg.msg_iovlen = parts.len().try_into().expect("two iovecs fit the field");
+        // glibc sizes `msg_iovlen` as a `usize`, every other unix in scope as a 32-bit count.
+        #[cfg(target_os = "linux")]
+        let count = parts.len();
+        #[cfg(not(target_os = "linux"))]
+        let count: libc::c_int = parts.len().try_into().expect("two iovecs fit the field");
+        msg.msg_iovlen = count;
         loop {
             // SAFETY: `msg` names `parts` and `storage`, both live and sized as the call reads them.
             let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &raw const msg, 0) };
