@@ -6950,13 +6950,22 @@ pub(crate) fn relay_tunnel(
     };
     let forward_tunnel = std::sync::Arc::clone(tunnel);
     let backward_tunnel = std::sync::Arc::clone(tunnel);
+    // One flag per leg, read by the other: a flow whose client said goodbye keeps its lane, its stream and both threads for the life of the process otherwise, and a quantum-bounded read is what lets a parked leg hear about it.
+    let forward_ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let backward_ended = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (report_forward, learn_backward) = (
+        std::sync::Arc::clone(&forward_ended),
+        std::sync::Arc::clone(&backward_ended),
+    );
     let forward = move || {
         // The park's grain, armed on the read handle: a stack that leaves a blocking read asleep through a shutdown still ends it on its own timeout, and the read after that sees the closed socket.
         let _ = client_read.set_read_timeout(Some(budgets::relay_quantum()));
-        copy_locked(&mut client_read, &forward_tunnel, true);
+        copy_locked(&mut client_read, &forward_tunnel, true, &learn_backward);
+        report_forward.store(true, std::sync::atomic::Ordering::Release);
     };
     let done = RelayPool::global().run(forward);
-    copy_locked(&mut client_write, &backward_tunnel, false);
+    copy_locked(&mut client_write, &backward_tunnel, false, &forward_ended);
+    backward_ended.store(true, std::sync::atomic::Ordering::Release);
     // Both halves, because the other leg is parked in a blocking read on this socket: a FIN on the write half alone leaves the parked reader asleep and the flow's worker lost for the life of the process.
     let _ = client_write.shutdown(Shutdown::Both);
     join(&done);
@@ -6966,6 +6975,7 @@ fn copy_locked(
     socket: &mut Connection,
     tunnel: &std::sync::Arc<std::sync::Mutex<crate::foxy::Tunnel>>,
     forward: bool,
+    peer_ended: &std::sync::atomic::AtomicBool,
 ) {
     const CHUNK: usize = 16 * 1024;
     let direction = if forward { "forward" } else { "backward" };
@@ -6986,7 +6996,11 @@ fn copy_locked(
                             | std::io::ErrorKind::Interrupted
                     ) =>
                 {
-                    // The quantum expired on a client that has not spoken: the flow is idle, not ended.
+                    // The quantum expired on a client that has not spoken: idle, unless the lane's own leg has already ended.
+                    if peer_ended.load(std::sync::atomic::Ordering::Acquire) {
+                        debug_relay(direction, total, None);
+                        break;
+                    }
                     continue;
                 }
                 Err(error) => {
@@ -7029,6 +7043,11 @@ fn copy_locked(
                             | std::io::ErrorKind::Interrupted
                     ) =>
                 {
+                    // The lane has not answered inside its quantum: idle, unless the client's own leg has ended and nothing is left to deliver.
+                    if peer_ended.load(std::sync::atomic::Ordering::Acquire) {
+                        debug_relay(direction, total, None);
+                        break;
+                    }
                     drop(lane);
                     std::thread::sleep(RELAY_IDLE);
                     continue;

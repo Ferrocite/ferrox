@@ -81,6 +81,7 @@ graph TD
 | dials-of-a-silent-tcp-carrier | 1 | ferrox-app-proxy::tests::a_silent_carrier_is_dialled_once_rather_than_once_per_rung |
 | dials-across-three-flows-of-a-rested-carrier | 2 | ferrox-app-proxy::tests::a_silent_carrier_is_dialled_once_rather_than_once_per_rung |
 | relay-legs-held-after-their-lane-ended | 0 | ferrox-app-foxy::loopback::a_lane_that_ends_releases_the_leg_parked_on_its_client |
+| relay-legs-held-after-their-client-ended | 0 | ferrox-app-foxy::loopback::a_client_that_ends_releases_the_leg_parked_on_its_lane |
 | pool-workers-held-after-a-finished-burst | 0 | ferrox-app-proxy::tests::a_finished_burst_hands_its_workers_back_to_the_process |
 | pool-directions-lost-on-a-gone-worker | 0 | ferrox-app-proxy::tests::a_claim_that_reaches_a_gone_worker_keeps_its_direction |
 | rate-limits-that-stopped-a-renewal | 0 | ferrox-app-foxy_account::tests::a_refused_credential_is_the_only_answer_a_second_ask_cannot_change |
@@ -434,6 +435,26 @@ the comparison can be re-read:
   legs; naming it here rather than as a count, because no gate in the harness can
   see it. And the two-socket `relay` still shuts one half for the same reason it
   took a lane to, so it keeps the leg it parked — its own slice, not this one.
+
+- **The leg reading the lane never heard the client leave.** The same flow, seen
+  from the other leg: a client that sends its goodbye while the edge keeps the
+  stream open ends the pooled direction, and the direction on the caller's thread
+  stays in `lane.read()`, reading a quantum timeout as "the lane has not answered"
+  rather than "the flow has ended", so it never returns, never reaches the
+  shutdown, and holds the lane, its pooled stream and the flow's own thread for
+  the life of the process. `sample` on a live lane with the macOS system proxy on
+  counted 131 threads over 42 client sockets, and the legs that never ended are
+  the difference a keep-alive browser leaves behind. Each leg now reports its own
+  end into one flag the other reads, and the flag is consulted only on the two
+  timeout arms — the arms that already ran — so a flow with bytes moving costs no
+  extra load, and a parked leg ends within one grain of the other leg ending.
+  `a_client_that_ends_releases_the_leg_parked_on_its_lane` answers a HEADERS with
+  200 and then holds the stream open, shuts the client's write half, and fails at
+  ten seconds if the flow has not returned; with the flags read as `false` it is
+  red, and it passes in 0.23 s. What is **not** removed: the flag pair — two
+  `Arc<AtomicBool>` per flow, and the two `store`s that go with them. A client
+  that vanishes without a FIN still ends neither leg, because the notice this
+  slice adds is a leg finishing, not a socket going quiet.
 
 - **A pool worker that never handed its thread back.** A worker ran its direction
   and then parked on its channel with an unbounded `recv`, so a burst of
