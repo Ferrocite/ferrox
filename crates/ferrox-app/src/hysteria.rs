@@ -7,6 +7,8 @@ use std::time::{Duration, Instant};
 use ferrox_core::foxy::frames;
 use ferrox_core::hysteria;
 
+use crate::quic::{Unfilled, MAX_DATAGRAM};
+
 const AUTH_STREAM: u64 = 0;
 
 const FIRST_FLOW_STREAM: u64 = 4;
@@ -83,8 +85,8 @@ fn drive_once(session: &Session, wait: Duration, applied: &mut Option<Duration>)
     if !crate::proxy::refresh_read_timeout(&session.sock, timeout, applied) {
         return false;
     }
-    let mut buf = [0u8; crate::quic::MAX_DATAGRAM];
-    let incoming = match session.sock.recv_from(&mut buf) {
+    let mut room = Unfilled::<MAX_DATAGRAM>::new();
+    let incoming = match session.sock.recv_from(room.as_mut()) {
         Ok(found) => Some(found),
         Err(e)
             if matches!(
@@ -111,7 +113,7 @@ fn drive_once(session: &Session, wait: Duration, applied: &mut Option<Duration>)
                 from,
                 to: session.local,
             };
-            let _ = conn.recv(&mut buf[..n], info);
+            let _ = conn.recv(&mut room.as_mut()[..n], info);
         }
         None => conn.on_timeout(),
     }
@@ -119,24 +121,24 @@ fn drive_once(session: &Session, wait: Duration, applied: &mut Option<Duration>)
     true
 }
 
-fn recv_exact(session: &Session, stream: u64, want: usize, deadline: Instant) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(want);
-    let mut chunk = [0u8; 8192];
+/// The two-byte `[0, 0]` acknowledgement every flow stream opens with, read into the caller's own buffer rather than a `Vec` per flow.
+fn recv_reply(session: &Session, stream: u64, deadline: Instant) -> Option<[u8; 2]> {
+    let mut room = Unfilled::<2>::new();
+    let mut got = 0usize;
     let mut applied = None;
-    while out.len() < want {
-        let end = (want - out.len()).min(chunk.len());
+    while got < 2 {
         let read = {
             let Ok(mut conn) = session.shared.lock() else {
                 return None;
             };
-            match conn.stream_recv(stream, &mut chunk[..end]) {
+            match conn.stream_recv(stream, &mut room.as_mut()[got..]) {
                 Ok((n, _)) => Some(n),
                 Err(quiche::Error::Done) => None,
                 Err(_) => return None,
             }
         };
         if let Some(n) = read {
-            out.extend_from_slice(&chunk[..n]);
+            got += n;
         } else {
             if Instant::now() >= deadline {
                 return None;
@@ -144,12 +146,13 @@ fn recv_exact(session: &Session, stream: u64, want: usize, deadline: Instant) ->
             let _ = drive_once(session, STREAM_POLL, &mut applied);
         }
     }
-    (out.len() == want).then_some(out)
+    let reply = room.as_mut();
+    Some([reply[0], reply[1]])
 }
 
 fn read_headers_block(session: &Session, stream: u64, deadline: Instant) -> Option<Vec<u8>> {
     let mut head = Vec::with_capacity(128);
-    let mut chunk = [0u8; 4096];
+    let mut room = Unfilled::<4096>::new();
     let mut applied = None;
     loop {
         if head.len() >= HEAD_CAP || Instant::now() >= deadline {
@@ -160,22 +163,25 @@ fn read_headers_block(session: &Session, stream: u64, deadline: Instant) -> Opti
             if frame.kind != frames::H3_HEADERS {
                 return None;
             }
-            if let Some(body) = head.get(at..at + frame.length as usize) {
-                return Some(body.to_vec());
+            let len = frame.length as usize;
+            if head.len() >= at + len {
+                head.drain(..at);
+                head.truncate(len);
+                return Some(head);
             }
         }
         let read = {
             let Ok(mut conn) = session.shared.lock() else {
                 return None;
             };
-            match conn.stream_recv(stream, &mut chunk) {
+            match conn.stream_recv(stream, room.as_mut()) {
                 Ok((n, _)) => Some(n),
                 Err(quiche::Error::Done) => None,
                 Err(_) => return None,
             }
         };
         if let Some(n) = read {
-            head.extend_from_slice(&chunk[..n]);
+            head.extend_from_slice(&room.as_mut()[..n]);
         } else {
             let _ = drive_once(session, STREAM_POLL, &mut applied);
         }
@@ -347,8 +353,7 @@ pub(crate) fn open_flow(session: &Session, header: &[u8]) -> Option<Flow> {
         return None;
     }
     let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
-    let reply = recv_exact(session, FIRST_FLOW_STREAM, 2, deadline)?;
-    if reply.as_slice() != [0, 0] {
+    if recv_reply(session, FIRST_FLOW_STREAM, deadline)? != [0, 0] {
         return None;
     }
     Some(Flow {
@@ -362,26 +367,28 @@ pub(crate) fn open_flow(session: &Session, header: &[u8]) -> Option<Flow> {
 
 /// Reads a Hysteria v2 TCP request body whose `0x401` frame type is already consumed, leaving any payload that followed it in the backlog.
 pub(crate) fn read_request(flow: &mut Flow, deadline: Instant) -> Option<String> {
-    let mut head: Vec<u8> = flow.backlog.split_off(flow.at);
-    flow.backlog.clear();
+    flow.backlog.drain(..flow.at);
     flow.at = 0;
-    let mut chunk = [0u8; 4096];
+    let mut head = std::mem::take(&mut flow.backlog);
+    let mut room = Unfilled::<4096>::new();
     loop {
         match hysteria::decode_tcp_request_body(&head) {
             Ok((address, used)) => {
-                flow.backlog = head[used..].to_vec();
-                return Some(address.to_owned());
+                let address = address.to_owned();
+                flow.backlog = head;
+                flow.at = used;
+                return Some(address);
             }
             Err(hysteria::RequestError::Invalid) => return None,
             Err(hysteria::RequestError::Incomplete) => {
                 if head.len() >= HEAD_CAP || Instant::now() >= deadline {
                     return None;
                 }
-                let n = flow.read(&mut chunk).ok()?;
+                let n = flow.read(room.as_mut()).ok()?;
                 if n == 0 {
                     return None;
                 }
-                head.extend_from_slice(&chunk[..n]);
+                head.extend_from_slice(&room.as_mut()[..n]);
             }
         }
     }
@@ -471,6 +478,7 @@ struct Inbound {
     client_cid: Vec<u8>,
     authed: bool,
     settings_sent: bool,
+    settings_done: bool,
     auth_buf: Vec<u8>,
     served: HashSet<u64>,
 }
@@ -489,11 +497,14 @@ fn answer_auth(conn: &mut quiche::Connection, ok: bool) -> bool {
     conn.stream_send(AUTH_STREAM, &frame, true).is_ok()
 }
 
-fn drain_settings(conn: &mut quiche::Connection) {
-    let mut junk = [0u8; 128];
-    while let Ok((n, _)) = conn.stream_recv(2, &mut junk) {
-        if n == 0 {
-            break;
+/// Drains the client's HTTP/3 SETTINGS so the unread bytes never hold flow control, and reports the stream's FIN so the caller stops paying the call per packet.
+fn drain_settings(conn: &mut quiche::Connection) -> bool {
+    let mut room = Unfilled::<128>::new();
+    loop {
+        match conn.stream_recv(2, room.as_mut()) {
+            Ok((0, _)) => return true,
+            Ok(_) => {}
+            Err(_) => return false,
         }
     }
 }
@@ -506,7 +517,7 @@ fn serve_stream(
     serve: &Serve,
 ) {
     let mut head = Vec::with_capacity(8);
-    let mut chunk = [0u8; 64];
+    let mut room = Unfilled::<64>::new();
     let prefix = loop {
         if head.len() >= 8 {
             return;
@@ -515,14 +526,14 @@ fn serve_stream(
             let Ok(mut conn) = shared.lock() else {
                 return;
             };
-            match conn.stream_recv(stream, &mut chunk) {
+            match conn.stream_recv(stream, room.as_mut()) {
                 Ok((0, _)) | Err(quiche::Error::Done) => None,
                 Ok((n, _)) => Some(n),
                 Err(_) => return,
             }
         };
         if let Some(n) = read {
-            head.extend_from_slice(&chunk[..n]);
+            head.extend_from_slice(&room.as_mut()[..n]);
         } else {
             {
                 let Ok(conn) = shared.lock() else {
@@ -546,26 +557,29 @@ fn serve_stream(
             break consumed;
         }
     };
-    serve(Flow::from_parts(
+    let mut flow = Flow::from_parts(
         Arc::clone(shared),
         Arc::clone(sock),
         local,
         stream,
-        head[prefix..].to_vec(),
+        head,
         false,
-    ));
+    );
+    // The prefix stays in the buffer and the cursor steps over it, so no payload byte is moved.
+    flow.at = prefix;
+    serve(flow);
 }
 
 struct Router<'a> {
     sock: Arc<crate::quic::Datagram>,
     local: SocketAddr,
-    out: [u8; 1350],
+    out: Unfilled<MAX_DATAGRAM>,
     auths: &'a [String],
     serve: &'a Serve,
     routes: HashMap<Vec<u8>, Inbound>,
 }
 
-fn flush(sock: &crate::quic::Datagram, conn: &mut quiche::Connection, out: &mut [u8; 1350]) {
+fn flush(sock: &crate::quic::Datagram, conn: &mut quiche::Connection, out: &mut [u8]) {
     while let Ok((written, info)) = conn.send(out) {
         let _ = sock.send_to(&out[..written], info.to);
     }
@@ -573,30 +587,28 @@ fn flush(sock: &crate::quic::Datagram, conn: &mut quiche::Connection, out: &mut 
 
 fn auth_exchange(
     sock: &crate::quic::Datagram,
-    out: &mut [u8; 1350],
+    out: &mut [u8],
     conn: &mut quiche::Connection,
     auths: &[String],
     inbound: &mut Inbound,
 ) -> Option<bool> {
-    let mut chunk = [0u8; 4096];
+    let mut room = Unfilled::<4096>::new();
     loop {
-        match conn.stream_recv(AUTH_STREAM, &mut chunk) {
+        match conn.stream_recv(AUTH_STREAM, room.as_mut()) {
             Ok((0, _)) | Err(_) => break,
-            Ok((n, _)) => inbound.auth_buf.extend_from_slice(&chunk[..n]),
+            Ok((n, _)) => inbound.auth_buf.extend_from_slice(&room.as_mut()[..n]),
         }
     }
     if inbound.auth_buf.len() >= HEAD_CAP {
         return Some(false);
     }
     let mut at = 0usize;
-    let ready = frames::h3_frame(&inbound.auth_buf, &mut at)
+    let body = frames::h3_frame(&inbound.auth_buf, &mut at)
         .filter(|frame| frame.kind == frames::H3_HEADERS)
-        .and_then(|frame| inbound.auth_buf.get(at..at + frame.length as usize))
-        .map(<[u8]>::to_vec);
-    let body = ready?;
+        .and_then(|frame| inbound.auth_buf.get(at..at + frame.length as usize))?;
     let ok = auths
         .iter()
-        .any(|auth| hysteria::verify_auth_request(&body, auth));
+        .any(|auth| hysteria::verify_auth_request(body, auth));
     if !answer_auth(conn, ok) {
         return None;
     }
@@ -629,7 +641,7 @@ impl Router<'_> {
         if conn.recv(packet, info).is_err() {
             return;
         }
-        flush(&self.sock, &mut conn, &mut self.out);
+        flush(&self.sock, &mut conn, self.out.as_mut());
         self.routes.insert(
             scid.to_vec(),
             Inbound {
@@ -637,6 +649,7 @@ impl Router<'_> {
                 client_cid: client_cid.to_vec(),
                 authed: false,
                 settings_sent: false,
+                settings_done: false,
                 auth_buf: Vec::new(),
                 served: HashSet::new(),
             },
@@ -663,33 +676,45 @@ impl Router<'_> {
             if conn.recv(packet, info).is_err() {
                 return;
             }
-            flush(sock, &mut conn, out);
+            flush(sock, &mut conn, out.as_mut());
             if !conn.is_established() || conn.is_closed() {
                 return;
             }
-            drain_settings(&mut conn);
+            let Some((mut settings_done, settings_sent, authed)) = routes
+                .get(dcid)
+                .map(|i| (i.settings_done, i.settings_sent, i.authed))
+            else {
+                return;
+            };
+            if !settings_done {
+                settings_done = drain_settings(&mut conn);
+                if settings_done {
+                    if let Some(inbound) = routes.get_mut(dcid) {
+                        inbound.settings_done = true;
+                    }
+                }
+            }
             // The server's SETTINGS go out before its auth answer: a client whose H3 stack waits for them, as the pinned one does, posts its auth only after they arrive.
-            if routes.get(dcid).is_some_and(|i| !i.settings_sent) {
+            if !settings_sent {
                 let mut settings = Vec::new();
                 frames::quic_varint(&mut settings, 0x04);
                 frames::quic_varint(&mut settings, 0);
                 let _ = conn.stream_send(3, &settings, true);
-                flush(sock, &mut conn, out);
+                flush(sock, &mut conn, out.as_mut());
                 if let Some(inbound) = routes.get_mut(dcid) {
                     inbound.settings_sent = true;
                 }
             }
-            let authed = routes.get(dcid).is_some_and(|i| i.authed);
             if !authed {
                 let Some(inbound) = routes.get_mut(dcid) else {
                     return;
                 };
-                let Some(ok) = auth_exchange(sock, out, &mut conn, auths, inbound) else {
+                let Some(ok) = auth_exchange(sock, out.as_mut(), &mut conn, auths, inbound) else {
                     return;
                 };
                 if !ok {
                     let _ = conn.close(false, 0, b"refused");
-                    flush(sock, &mut conn, out);
+                    flush(sock, &mut conn, out.as_mut());
                     return;
                 }
             }
@@ -719,21 +744,18 @@ impl Router<'_> {
         let Self {
             routes, sock, out, ..
         } = self;
-        let dead: Vec<Vec<u8>> = routes
-            .iter()
-            .filter(|(_, inbound)| inbound.conn.lock().is_ok_and(|conn| conn.is_closed()))
-            .map(|(id, _)| id.clone())
-            .collect();
-        for id in dead {
-            routes.remove(&id);
-        }
-        for inbound in routes.values() {
+        // One pass, one lock per route: the dead are dropped where they are found, and the living take their turn of the wheel.
+        routes.retain(|_, inbound| {
             let Ok(mut conn) = inbound.conn.lock() else {
-                continue;
+                return true;
             };
+            if conn.is_closed() {
+                return false;
+            }
             conn.on_timeout();
-            flush(sock, &mut conn, out);
-        }
+            flush(sock, &mut conn, out.as_mut());
+            true
+        });
     }
 }
 
@@ -758,19 +780,20 @@ pub(crate) fn serve_loop(
     let mut router = Router {
         sock: Arc::new(crate::quic::Datagram::plain(sock)),
         local,
-        out: [0u8; 1350],
+        out: Unfilled::<MAX_DATAGRAM>::new(),
         auths,
         serve,
         routes: HashMap::new(),
     };
-    let mut buf = [0u8; 1350];
+    let mut buf = Unfilled::<MAX_DATAGRAM>::new();
     if router.sock.set_read_timeout(Some(ROUTE_POLL)).is_err() {
         return;
     }
     loop {
-        match router.sock.recv_from(&mut buf) {
+        match router.sock.recv_from(buf.as_mut()) {
             Ok((n, from)) => {
-                let Ok(header) = quiche::Header::from_slice(&mut buf[..n], SCID_LEN) else {
+                let packet = buf.as_mut();
+                let Ok(header) = quiche::Header::from_slice(&mut packet[..n], SCID_LEN) else {
                     continue;
                 };
                 if header.ty != quiche::Type::Short && header.version != quiche::PROTOCOL_VERSION {
@@ -792,14 +815,14 @@ pub(crate) fn serve_loop(
                     if let Some(key) = router.routes.iter().find_map(|(key, inbound)| {
                         (inbound.client_cid.as_slice() == peer_cid).then(|| key.clone())
                     }) {
-                        router.drive(&key, &mut buf[..n], from);
+                        router.drive(&key, &mut packet[..n], from);
                     } else if !router.routes.contains_key(dcid) {
-                        router.accept(&mut buf[..n], from, &mut template, peer_cid);
+                        router.accept(&mut packet[..n], from, &mut template, peer_cid);
                     } else {
-                        router.drive(dcid, &mut buf[..n], from);
+                        router.drive(dcid, &mut packet[..n], from);
                     }
                 } else {
-                    router.drive(dcid, &mut buf[..n], from);
+                    router.drive(dcid, &mut packet[..n], from);
                 }
             }
             Err(e)
@@ -823,5 +846,49 @@ mod tests {
     fn server_config_refuses_without_a_chain_it_can_read() {
         let cc = hysteria::Congestion::Bbr;
         assert!(server_config("/nonexistent.crt", "/nonexistent.key", cc).is_none());
+    }
+
+    fn idle_session() -> Session {
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
+        config
+            .set_application_protos(&[crate::quic::ALPN])
+            .expect("negotiates");
+        let scid = [7u8; SCID_LEN];
+        let cid = quiche::ConnectionId::from_ref(&scid);
+        let local = "127.0.0.1:0".parse().expect("addr");
+        let peer = "127.0.0.1:1".parse().expect("addr");
+        let conn = quiche::connect(None, &cid, local, peer, &mut config).expect("connects");
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("binds");
+        Session {
+            shared: Arc::new(Mutex::new(conn)),
+            sock: Arc::new(crate::quic::Datagram::plain(sock)),
+            local,
+        }
+    }
+
+    #[test]
+    fn a_parsed_request_leaves_its_payload_where_it_landed() {
+        let session = idle_session();
+        let mut head = Vec::new();
+        hysteria::encode_tcp_request("127.0.0.1:8080", &[9, 9], &mut head);
+        head.extend_from_slice(b"vless-bytes-behind-the-request");
+        let mut flow = Flow::from_parts(
+            Arc::clone(&session.shared),
+            Arc::clone(&session.sock),
+            session.local,
+            FIRST_FLOW_STREAM,
+            head,
+            true,
+        );
+        // The state serve_stream hands over: the frame type stepped over, nothing moved.
+        flow.at = hysteria::read_tcp_prefix(&flow.backlog).expect("prefix");
+        let base = flow.backlog.as_ptr();
+        let room = flow.backlog.capacity();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let address = read_request(&mut flow, deadline).expect("parses");
+        assert_eq!(address, "127.0.0.1:8080");
+        assert_eq!(flow.backlog.as_ptr(), base, "the payload never moved");
+        assert_eq!(flow.backlog.capacity(), room, "no reallocation");
+        assert_eq!(&flow.backlog[flow.at..], b"vless-bytes-behind-the-request");
     }
 }
