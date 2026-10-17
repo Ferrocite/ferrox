@@ -43,6 +43,9 @@ step "method matrix"
 step "prompt library"
 cargo run --locked --quiet -p ferrox-prompt -- check
 
+step "stall detector"
+./scripts/watch-test.sh --selftest
+
 step "tests"
 ./scripts/watch-test.sh -- cargo test --workspace --locked
 

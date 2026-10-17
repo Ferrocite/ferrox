@@ -13,6 +13,11 @@ on:
       - '.github/workflows/ops.yml'
   workflow_dispatch:
 
+# Supersede an older run of the same branch on each new push; a manual dispatch keeps its run.
+concurrency:
+  group: ops-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
