@@ -1069,11 +1069,11 @@ mod tests {
     fn a_frame_that_rode_in_with_the_head_costs_no_syscall() {
         const HEAD: &[u8] = b"GET /tunnel HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
         let mut have = Vec::from(HEAD);
-        have.extend_from_slice(b"\x81\x02hi\x81\x02yo");
+        have.extend_from_slice(b"\x82\x02hi\x82\x02yo");
         let base = have.as_ptr();
         let capacity = have.capacity();
         let (mut reader, _writer) = split_halves(
-            std::io::Cursor::new(Vec::from(&b"\x81\x02no"[..])),
+            std::io::Cursor::new(Vec::from(&b"\x82\x02no"[..])),
             Sink::default(),
             Vec::new(),
             have,
