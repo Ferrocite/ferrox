@@ -84,8 +84,9 @@ pub(crate) fn confirmation_note<'a>(rows: impl Iterator<Item = &'a Row>) -> Stri
     format!(
         "\n**Confirmed: {}.** Each of these first read under {BAR:.2}x, so it was re-measured \
          at four times the budget and the median of {CONFIRMATIONS} independent passes is what \
-         the table above and the gate below read. A row confirmed under the bar is a \
-         regression, not a disturbed runner.\n",
+         the table above and the gate below read. A confirmation is one process's steady \
+         reading, and another runner of the same commit can read the row the other way, so the \
+         gate judges only rows whose ratio a code change can move.\n",
         names.join(", "),
         BAR = crate::BAR,
         CONFIRMATIONS = crate::CONFIRMATIONS,
@@ -177,8 +178,21 @@ fn header_row(host: &str) -> Row {
     )
 }
 
-/// The lengths the seal and its halves are measured at; the two rows between 4 and 16 KiB bracket the crossover gate 7 names, so the threshold is not a guess.
+/// The lengths the seal and its halves are measured at; 64 and 256 bytes are the rows gate 7 judges, and every row from 1 KiB up is a length at which both shapes fill whole passes, so the table shows the boundary `ONE_PASS_BYTES` prices.
 const AEAD_LENGTHS: [usize; 7] = [64, 256, 1024, 2048, 4096, 8192, 16384];
+
+/// The longest message the fused seal can save a pass over the two-call shape: `aarch64`'s eight-block pass covers 448 message bytes beside the head's block, so one invocation does the whole seal there while the split opens a second for block zero. Above it both shapes generate `ceil(len / 64) + 1` blocks in the same passes plus one lone tail block, so the row prices a function call — and no measured length sits between 256 bytes and 1 KiB, where `x86_64`'s wider passes would still save one. `docs/function/record-layer.md` carries the counts.
+const ONE_PASS_BYTES: usize = 448;
+
+/// The seal rows the FRAMING REGRESSION gate judges: whole-pass lengths report a ratio no code change can move.
+pub(crate) fn gated_seals(rows: &[Row]) -> Vec<&Row> {
+    rows.iter().filter(|r| !is_reported_seal(r)).collect()
+}
+
+/// Seal rows carry the tag's 16 bytes beside the message.
+fn is_reported_seal(row: &Row) -> bool {
+    row.name.starts_with("chacha20-poly1305 seal") && row.bytes > ONE_PASS_BYTES + 16
+}
 
 pub(crate) fn gate_aead(key: &[u8; 32], nonce: &[u8; 12]) -> Vec<Row> {
     AEAD_LENGTHS
@@ -386,41 +400,59 @@ pub(crate) fn aead_report(rows: &[Row]) -> String {
          frame carries: this tree's fused keystream pass against the two-call build it\n\
          replaced, where the one-time key came out of its own 64-byte pass and the message\n\
          was encrypted by a second. Same ciphertext and same tag on both sides, asserted\n\
-         before either is timed. Best of {} rounds per side. The bar is the same {:.2}x as\n\
-         gate 3.\n\
+         at every length before either is timed. Best of {} rounds per side. The bar is\n\
+         the same {:.2}x as gate 3.\n\
          \n\
-         The rows bracket the length at which the fused shape's head could stop paying\n\
-         for itself: a head takes a lane of every pass it rides in, so a body that fills\n\
-         whole passes could pay one more of them, while the two-call shape pays a narrow\n\
-         dependent chain once. Measured on all four runners of run `37763295337`, it does\n\
-         not: from 1 KiB up the two shapes read 0.98x-1.06x of each other on every runner\n\
-         and at every length, and the fused shape's win is where a pass is most of the\n\
-         call — 1.44x-1.75x at 64 bytes and 1.25x-1.54x at 256. The 0.96x at 16 KiB on\n\
-         macos aarch64 in run `37749274086` is one runner's noise and not a crossover, so\n\
-         no length threshold belongs in the seal.\n",
+         The gate judges the rows at and under `ONE_PASS_BYTES` and reports the rest,\n\
+         because the two shapes generate the same `ceil(len/64) + 1` blocks and from one\n\
+         pass wide upwards issue them in the same number of passes: the fusion removes an\n\
+         invocation only while the message and the head's block fit one pass, and above it\n\
+         the row is a function call. The rows read as the counts say: run `39064183190`\n\
+         measures 1.41x-1.75x at 64 bytes and 1.24x-1.57x at 256 on all four runners, and\n\
+         0.99x-1.06x across the twenty whole-pass rows. A whole-pass row cannot carry the\n\
+         bar: run `39000283851` passed this gate on macos `aarch64` at `70fdfd0` while the\n\
+         nightly's run `39001299614` confirmed 0.939x on its 16 KiB row at that same commit.\n\
+         The arithmetic, and what still checks these rows, is in\n\
+         `docs/function/record-layer.md`.\n",
         crate::ROUNDS,
         crate::BAR
     );
     let _ = writeln!(
         out,
-        "| seal | bytes | two-call ns/op | fused ns/op | speedup |"
+        "| seal | bytes | two-call ns/op | fused ns/op | speedup | gated |"
     );
-    let _ = writeln!(out, "| --- | ---: | ---: | ---: | ---: |");
+    let _ = writeln!(out, "| --- | ---: | ---: | ---: | ---: | --- |");
     for r in rows {
         let _ = writeln!(
             out,
-            "| {} | {} | {:.1} | {:.1} | {:.2}x |",
+            "| {} | {} | {:.1} | {:.1} | {:.2}x | {} |",
             r.name,
             r.bytes,
             r.base * 1e9,
             r.ours * 1e9,
-            r.ratio()
+            r.ratio(),
+            if is_reported_seal(r) {
+                crate::muxframe::REPORTED_ONLY
+            } else {
+                "yes"
+            }
         );
     }
-    if !rows.is_empty() {
-        let worst = rows.iter().map(Row::ratio).fold(f64::INFINITY, f64::min);
-        let _ = writeln!(out, "\n**Gate: worst {worst:.2}x.**");
-        out.push_str(&confirmation_note(rows.iter()));
+    let judged = gated_seals(rows);
+    if let (Some(worst), Some(best)) = (
+        judged.iter().min_by(|a, b| a.ratio().total_cmp(&b.ratio())),
+        judged.iter().max_by(|a, b| a.ratio().total_cmp(&b.ratio())),
+    ) {
+        let _ = writeln!(
+            out,
+            "\n**Gated rows: {}. Worst {:.2}x ({}), best {:.2}x ({}).**",
+            judged.len(),
+            worst.ratio(),
+            worst.name,
+            best.ratio(),
+            best.name
+        );
+        out.push_str(&confirmation_note(judged.iter().copied()));
     }
     out
 }
@@ -691,6 +723,35 @@ mod tests {
             acc = acc.wrapping_add(i);
         }
         std::hint::black_box(acc);
+    }
+
+    /// The gate judges exactly the lengths at which the fusion removes a pass, and never a row of another gate's.
+    #[test]
+    fn only_the_lengths_that_save_a_pass_are_gated() {
+        let seal = |len: usize| Row {
+            name: format!("chacha20-poly1305 seal, {len}B"),
+            bytes: len + 16,
+            base: 1.0,
+            ours: 1.0,
+            remeasured: false,
+        };
+        for len in AEAD_LENGTHS {
+            assert_eq!(
+                gated_seals(&[seal(len)]).len() == 1,
+                len <= ONE_PASS_BYTES,
+                "{len} bytes is on the wrong side of the gate"
+            );
+        }
+        assert_eq!(gated_seals(&[seal(ONE_PASS_BYTES)]).len(), 1);
+        assert_eq!(gated_seals(&[seal(ONE_PASS_BYTES + 1)]).len(), 0);
+        let mac = Row {
+            name: format!("poly1305 3x44 vs 26-bit horner, {}B", ONE_PASS_BYTES + 1),
+            bytes: ONE_PASS_BYTES + 17,
+            base: 1.0,
+            ours: 1.0,
+            remeasured: false,
+        };
+        assert_eq!(gated_seals(&[mac]).len(), 1, "gate 7c's rows stay judged");
     }
 
     #[test]

@@ -719,8 +719,10 @@ fn gate_four(report: &mut String) -> Vec<framing::Row> {
 fn gate_seven(key: &[u8; 32], nonce: &[u8; 12], report: &mut String) -> Vec<framing::Row> {
     let mut seals = framing::gate_aead(key, nonce);
     println!(
-        "gate 7 passed: {} seal rows, ciphertext and tag identical to their references",
-        seals.len()
+        "gate 7 passed: {} seal rows, ciphertext and tag identical to their references; {} of \
+         them gated, the whole-pass lengths reported only",
+        seals.len(),
+        framing::gated_seals(&seals).len()
     );
     report.push_str(&framing::aead_report(&seals));
 
@@ -851,7 +853,7 @@ fn main() {
 
     let slow_frames: Vec<&framing::Row> = frames
         .iter()
-        .chain(seals.iter())
+        .chain(framing::gated_seals(&seals))
         .chain(muxframe::gated(&muxed))
         .chain(early.iter())
         .chain(aes_gcm_rows.iter())
