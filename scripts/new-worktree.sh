@@ -43,6 +43,12 @@ mkdir -p "$dest/.cargo" "$shared"
   echo "rustflags = [\"--cfg\", \"aes_armv8\", \"--cfg\", \"polyval_armv8\"]"
 } > "$dest/.cargo/config.toml"
 
+## Ensure the worktree's `target/` is the shared target dir, so that every
+## script that writes to `target/` with a relative path (watch-test.sh,
+## run-benchmark-matrix.sh, run-parity.sh, run-live-speedtest.sh, ...) lands
+## in the shared dir and does not create a per-worktree copy.
+ln -sf "$shared" "$dest/target"
+
 linked=0
 for checkout in "$top"/upstream/*/; do
   checkout="${checkout%/}"
