@@ -387,9 +387,13 @@ pub fn decode(buf: &[u8], tail: NewTail) -> Result<(Incoming<'_>, usize), Error>
         return Err(Error::short(2 + meta_len, buf.len()));
     };
 
-    let id = u16::from_be_bytes([meta[0], meta[1]]);
-    let status = Status::from_byte(meta[2]).ok_or(Error::Status(meta[2]))?;
-    let options = meta[3];
+    // One bounded load of the fixed head: four indexed reads would each carry their own length check although `meta_len >= FIXED` proved the bytes are here.
+    let Some((&fixed, _)) = meta.split_first_chunk::<FIXED>() else {
+        return Err(Error::Truncated);
+    };
+    let id = u16::from_be_bytes([fixed[0], fixed[1]]);
+    let status = Status::from_byte(fixed[2]).ok_or(Error::Status(fixed[2]))?;
+    let options = fixed[3];
 
     let mut at = FIXED;
     let mut target = None;
