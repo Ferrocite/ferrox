@@ -232,6 +232,9 @@ carrier-foxy dials-across-three-flows-of-a-rested-carrier 2 ferrox-app-proxy::te
 carrier-foxy relay-legs-held-after-their-lane-ended 0 ferrox-app-foxy::loopback::a_lane_that_ends_releases_the_leg_parked_on_its_client
 carrier-foxy pool-workers-held-after-a-finished-burst 0 ferrox-app-proxy::tests::a_finished_burst_hands_its_workers_back_to_the_process
 carrier-foxy pool-directions-lost-on-a-gone-worker 0 ferrox-app-proxy::tests::a_claim_that_reaches_a_gone_worker_keeps_its_direction
+carrier-foxy rate-limits-that-stopped-a-renewal 0 ferrox-app-foxy_account::tests::a_refused_credential_is_the_only_answer_a_second_ask_cannot_change
+carrier-foxy named-waits-dropped-from-a-renewal-pause 0 ferrox-app-foxy_account::tests::a_rate_limit_carries_the_wait_its_head_names
+carrier-foxy renewal-pauses-past-their-own-ceiling 0 ferrox-app-foxy_account::tests::the_next_ask_waits_the_gap_the_plane_names_or_a_curve_that_caps
 
 carrier-quic ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-quic zero-filled-bytes-per-relayed-frame 3 ferrox-app-quic::tests::a_relayed_datagram_frames_its_target_ahead_of_its_payload

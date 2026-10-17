@@ -38,9 +38,15 @@ pub(crate) const CARRIER_PROBE: Duration = Duration::from_millis(2_500);
 /// A silent edge's quarantine: long enough to skip a per-flow probe, short enough to find it answering again.
 pub(crate) const CARRIER_DEAD_SECS: u64 = 60;
 
-/// Sign-in attempts and the first pause: only wrong credentials and quota are not worth asking again.
+/// Sign-in attempts and the first pause: a refused credential is the only answer that is not worth asking again.
 pub(crate) const ACCOUNT_ATTEMPTS: usize = 4;
 pub(crate) const ACCOUNT_BACKOFF_SECS: u64 = 5;
+
+/// The ceiling on a guessed retry pause: a plane that says nothing is still asked again on a clock, never more rarely than this.
+pub(crate) const ACCOUNT_RETRY_CAP: u64 = 900;
+
+/// The ceiling on a wait the plane named: past this, a `Retry-After` is a number a renewal should not sleep on.
+pub(crate) const ACCOUNT_NAMED_WAIT_MAX: u64 = 12 * 3_600;
 
 /// A quiet poll's sleep: long enough not to spin, short enough that traffic never feels it.
 pub(crate) const RELAY_IDLE: Duration = Duration::from_millis(10);
