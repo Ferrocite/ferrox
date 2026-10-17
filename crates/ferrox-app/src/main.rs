@@ -25,6 +25,7 @@ mod proxy;
 mod quic;
 mod shadowsocks;
 mod shadowsocks2022;
+mod tun;
 mod vision;
 mod vmess;
 mod ws;
