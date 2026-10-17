@@ -7970,7 +7970,11 @@ pub(crate) fn read_exact(stream: &mut dyn Read, mut buf: &mut [u8]) -> std::io::
 }
 
 pub(crate) fn header_value<'a>(head: &'a [u8], name: &str) -> Option<&'a str> {
-    let text = std::str::from_utf8(head).ok()?;
+    header_value_in(std::str::from_utf8(head).ok()?, name)
+}
+
+/// The lookup over a head somebody already paid one `from_utf8` for, so a head read for three names is validated once.
+pub(crate) fn header_value_in<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     let mut lines = text.split("\r\n");
     lines.next()?;
     for line in lines {
@@ -7983,7 +7987,10 @@ pub(crate) fn header_value<'a>(head: &'a [u8], name: &str) -> Option<&'a str> {
 }
 
 pub(crate) fn request_path(head: &[u8]) -> Option<&str> {
-    let text = std::str::from_utf8(head).ok()?;
+    request_path_in(std::str::from_utf8(head).ok()?)
+}
+
+pub(crate) fn request_path_in(text: &str) -> Option<&str> {
     let line = text.split("\r\n").next()?;
     let mut parts = line.split_whitespace();
     if parts.next()? != "GET" {

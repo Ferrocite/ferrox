@@ -73,7 +73,7 @@ pub fn table() -> String {
     );
     let _ = writeln!(
         s,
-        "| 12 | `?ed=N` early data on `ws` / `httpupgrade`, both roles | implemented (`EarlyData`) | `transport::tests`: the rewrite and `Atoi` vectors, RFC 4648 digits, every length 0-192 round trip; `ws`/`httpupgrade` tests: the request bytes, the budget's boundary, the bare path a budget serves; gate 8 (encode vs a per-call-`String` reference, byte-checked before timing, zero allocs per encode here); **two upstream oracle rows green in `conformance.yml` run `37249695646`** against real `Xray-core` at the pin |"
+        "| 12 | `?ed=N` early data on `ws` / `httpupgrade`, both roles | implemented (`EarlyData`) | `transport::tests`: the rewrite and `Atoi` vectors, RFC 4648 digits, every length 0-192 round trip, the encode against the byte path over 0-600 and its 2048-byte probe with the room held steady; `ws`/`httpupgrade` tests: the request bytes, the budget's boundary, the bare path a budget serves, the exact-capacity request and `101`, the head read once, the pipelined prefix held by pointer identity and delivered after the early data; gate 8 (encode vs a per-call-`String` reference, byte-checked before timing, zero allocs per encode here); **two upstream oracle rows green in `conformance.yml` run `37249695646`** against real `Xray-core` at the pin |"
     );
     let _ = writeln!(
         s,

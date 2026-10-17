@@ -104,41 +104,37 @@ pub struct EarlyData {
 impl EarlyData {
     #[must_use]
     pub fn split(path: &str) -> Self {
-        let (head, fragment) = path
-            .split_once('#')
-            .map_or((path, None), |(h, f)| (h, Some(f)));
         let untouched = || Self {
             path: path.to_owned(),
             budget: 0,
         };
+        let (head, fragment) = path
+            .split_once('#')
+            .map_or((path, None), |(h, f)| (h, Some(f)));
         let Some((base, query)) = head.split_once('?') else {
             return untouched();
         };
-        let mut first: Option<&str> = None;
+        // The first `ed=` decides and a path without one is copied whole, so the string below is built once and only when the rewrite fires.
+        let mut first = None;
+        for pair in query.split('&') {
+            if let Some(value) = pair.strip_prefix("ed=") {
+                first = Some(value);
+                break;
+            }
+        }
+        let Some(first) = first.filter(|value| !value.is_empty()) else {
+            return untouched();
+        };
         let mut out = String::with_capacity(path.len());
         out.push_str(base);
         let mut sep = '?';
         for pair in query.split('&') {
-            if pair.is_empty() {
+            if pair.is_empty() || pair.starts_with("ed=") {
                 continue;
-            }
-            if let Some((key, value)) = pair.split_once('=') {
-                if key == "ed" {
-                    if first.is_none() {
-                        first = Some(value);
-                    }
-                    continue;
-                }
             }
             out.push(sep);
             out.push_str(pair);
             sep = '&';
-        }
-        let Some(first) = first else {
-            return untouched();
-        };
-        if first.is_empty() {
-            return untouched();
         }
         if let Some(fragment) = fragment {
             out.push('#');
@@ -252,32 +248,53 @@ fn decode_groups(bytes: &[u8], table: &[u8; 256]) -> Option<Vec<u8>> {
 
 pub fn early_encode_into(out: &mut String, data: &[u8]) {
     out.reserve(data.len().div_ceil(3) * 4);
-    let mut rest = data;
-    // The window's fourth byte is the next group's first byte and every mask drops it, so one load feeds a group; the last under-four bytes take the byte path.
-    while let Some(word) = rest
-        .first_chunk::<4>()
-        .map(|window| u32::from_be_bytes(*window))
-    {
-        out.push(URL_ALPHABET[(word >> 26) as usize] as char);
-        out.push(URL_ALPHABET[((word >> 20) & 63) as usize] as char);
-        out.push(URL_ALPHABET[((word >> 14) & 63) as usize] as char);
-        out.push(URL_ALPHABET[((word >> 8) & 63) as usize] as char);
-        rest = &rest[3..];
+    // Only whole groups go through the block, so the last one to three bytes are the only ones the byte path sees.
+    let wide = if data.is_empty() {
+        0
+    } else {
+        (data.len() - 1) / 3 * 3
+    };
+    // Sixty-four groups land in the block first, so the capacity check and the one validation are paid per 256 characters instead of per character.
+    let mut block = [0u8; 256];
+    for part in data[..wide].chunks(192) {
+        let filled = part.len() / 3 * 4;
+        for (slot, [a, b, c]) in block[..filled]
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(part.as_chunks::<3>().0)
+        {
+            let word = u32::from_be_bytes([0, *a, *b, *c]);
+            slot.copy_from_slice(&[
+                URL_ALPHABET[(word >> 18 & 63) as usize],
+                URL_ALPHABET[(word >> 12 & 63) as usize],
+                URL_ALPHABET[(word >> 6 & 63) as usize],
+                URL_ALPHABET[(word & 63) as usize],
+            ]);
+        }
+        if let Ok(text) = std::str::from_utf8(&block[..filled]) {
+            out.push_str(text);
+        }
     }
-    for chunk in rest.chunks(3) {
-        let mut word = 0u32;
-        for &byte in chunk {
-            word = (word << 8) | u32::from(byte);
-        }
-        word <<= 8 * (3 - chunk.len());
-        out.push(URL_ALPHABET[(word >> 18 & 0x3F) as usize] as char);
-        out.push(URL_ALPHABET[(word >> 12 & 0x3F) as usize] as char);
-        if chunk.len() > 1 {
-            out.push(URL_ALPHABET[(word >> 6 & 0x3F) as usize] as char);
-        }
-        if chunk.len() > 2 {
-            out.push(URL_ALPHABET[(word & 0x3F) as usize] as char);
-        }
+    let rest = &data[wide..];
+    if rest.is_empty() {
+        return;
+    }
+    let mut word = 0u32;
+    for &byte in rest {
+        word = (word << 8) | u32::from(byte);
+    }
+    word <<= 8 * (3 - rest.len());
+    let quad = [
+        URL_ALPHABET[(word >> 18 & 63) as usize],
+        URL_ALPHABET[(word >> 12 & 63) as usize],
+        URL_ALPHABET[(word >> 6 & 63) as usize],
+        URL_ALPHABET[(word & 63) as usize],
+    ];
+    let keep = rest.len() + 1;
+    block[..keep].copy_from_slice(&quad[..keep]);
+    if let Ok(text) = std::str::from_utf8(&block[..keep]) {
+        out.push_str(text);
     }
 }
 
@@ -501,12 +518,44 @@ mod tests {
     #[test]
     fn the_windowed_load_encodes_the_bytes_the_byte_path_encoded() {
         const HEAD: &str = "Sec-WebSocket-Protocol: ";
-        for len in 0..=520usize {
+        for len in 0..=600usize {
             let bytes: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(97)).collect();
             let mut out = String::from(HEAD);
             early_encode_into(&mut out, &bytes);
             assert_eq!(&out[HEAD.len()..], byte_path(&bytes), "{len}: route");
         }
+    }
+
+    /// The probe behind the early-data encode row: one fixed payload encoded round after round into a room that already holds it, so the frame is the walk over the payload and no allocator is in it.
+    #[test]
+    fn the_early_data_line_costs_the_encode_and_nothing_else() {
+        const LEN: usize = 2048;
+        const ROUNDS: usize = 16;
+        let data: Vec<u8> = (0..LEN).map(|i| (i as u8).wrapping_mul(61)).collect();
+        let mut out = String::with_capacity(data.len() * 2);
+        early_encode_into(&mut out, &data);
+        let want = out.clone();
+        let mut capacity = 0;
+        let mut folded = 0usize;
+        for round in 0..ROUNDS {
+            out.clear();
+            early_encode_into(std::hint::black_box(&mut out), std::hint::black_box(&data));
+            folded += out.len();
+            if round == 0 {
+                capacity = out.capacity();
+            }
+            assert_eq!(
+                out.capacity(),
+                capacity,
+                "round {round}: the encode stays in the room it was handed, so nothing reallocated"
+            );
+        }
+        assert_eq!(out, want, "the probe encodes the bytes the vectors pin");
+        assert_eq!(
+            folded,
+            ROUNDS * (data.len() * 4).div_ceil(3),
+            "four per three, unpadded"
+        );
     }
 
     #[test]

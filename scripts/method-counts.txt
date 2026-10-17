@@ -125,6 +125,11 @@ carrier-websocket write-syscalls-per-frame 1 ferrox-app-ws::tests::frames_round_
 carrier-websocket user-space-copies-per-byte-unmasked-write 0 ferrox-app-ws::tests::frames_round_trip_masked_and_plain
 carrier-websocket user-space-copies-per-byte-masked-write 1 ferrox-app-ws::tests::frames_round_trip_masked_and_plain
 carrier-websocket user-space-copies-per-byte-read 1 ferrox-app-ws::tests::a_read_covers_a_window_not_one_frame_header
+carrier-websocket request-buffer-reallocations-per-dial 0 ferrox-app-ws::tests::the_request_is_sized_for_its_bytes
+carrier-websocket response-buffer-reallocations-per-accept 0 ferrox-app-ws::tests::the_101_is_the_key_and_the_echoed_subprotocol
+carrier-websocket early-data-copies-of-the-pipelined-bytes 0 ferrox-app-ws::tests::the_pipelined_prefix_is_the_readers_own_buffer
+carrier-websocket early-data-encode-allocations-per-line 0 ferrox-bench-gate-8
+carrier-websocket early-data-encode-buffers-grown-per-2048-byte-line 0 ferrox-core-transport::tests::the_early_data_line_costs_the_encode_and_nothing_else
 
 carrier-httpupgrade ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-httpupgrade framing-bytes-after-the-101 0 ferrox-app-httpupgrade::tests::upgrade_carries_an_echo_over_loopback

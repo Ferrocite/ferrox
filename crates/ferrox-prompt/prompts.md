@@ -93,6 +93,9 @@ Implement {method} — matrix row {index} of table {section}, currently "{state}
 Move {method} — matrix row {index} of table {section}, state "{state}" — towards the best known implementation among {references}. Throughput and leanness at bit-identical output: fewer retired instructions, fewer copies, fewer branches. Think in eliminated work, not added code: factor the math, fuse passes that touch the buffer twice, hoist per-record dispatch, narrow a parse that re-checks what a caller already checked. Re-measure the exact count with `scripts/count-ops.sh`.
 ```
 
+**Add-on — shared-codec-scope:** When the row's codec lives in a `ferrox-core` module no page owns because a second method calls it too (`early_encode_into` is also `proxy.rs::b64url`'s encoder for a REALITY x25519 key), do not add that module to the page's `paths` or `symbols` to narrow the run: a claim narrows the plan to one carrier and hides the other caller. Leave it shared, take the wide plan, and name the second caller in the page's `CI scope` prose so the next reader knows why the run is wide rather than assuming it is sloppy.
+**Add-on — handshake-entropy:** A carrier's per-connection randomness is a syscall the data path never sees: the ws client asks `getrandom` for the 16-byte key on every dial while `fresh_mask` already pulls 512 bytes at a time into a thread-local. Batching the key the same way is real, is that carrier's own row rather than the row whose handshake happens to ride in the same buffer, and is gated on the syscalls per connection over a loopback dial — so route it to that row's next `next` instead of folding it in.
+
 ## P3 · Take a shipped method's memory footprint down
 
 **When to use:** A row is implemented and its steady-state allocations, buffers, or per-record copies still scale with traffic rather than with the connection.
@@ -126,6 +129,7 @@ For {method} — matrix row {index} of table {section} — replace the argument 
 ```
 
 **Add-on — forged-input:** A malformed or wrong-tag input must leave the buffer exactly as it found it; a sweep that only feeds valid input proves the happy path.
+**Add-on — query-rewrite-spelling:** When the reference strips a query parameter and re-encodes what remains through Go's `url.Values.Encode()` — which sorts by key and re-escapes — the rewrite's *spelling* is part of the wire, and a rewrite that keeps the original order keeps different bytes. No checker in this tree sees it while every server compares `URL.Path` without the query (`request_path` strips it here too), so the divergence only surfaces behind a proxy that routes on the full URI. Prove it or name it: a differential over unsorted multi-parameter paths against the pinned `url.Values` encode, or an explicit sentence on the page saying which spelling ships and why no reference peer can tell.
 
 ## P5 · Rewrite one parser or framer to the best form
 
