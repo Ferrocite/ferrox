@@ -521,18 +521,22 @@ fn accept_response(key: &str, offered: &str, echo: bool) -> String {
     response
 }
 
-// The same accept over halves that cannot peek: pipelined bytes arrive as a prefix, after the early data.
+// The same accept over halves that cannot peek: the kept read consumes the head, so what rode in behind it is the reader's own prefix.
 pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     mut read: R,
     mut write: W,
     path: &str,
 ) -> Option<(WsReader<R>, WsWriter)> {
-    let (head, prefix) =
+    let (head, at) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
-    let upgrade = check_request(&head, path)?;
-    let response = accept_response(upgrade.key, upgrade.offered, !upgrade.early.is_empty());
+    let Upgrade {
+        key,
+        offered,
+        early,
+    } = check_request(&head[..at], path)?;
+    let response = accept_response(key, offered, !early.is_empty());
     write.write_all(response.as_bytes()).ok()?;
-    Some(split_halves(read, write, upgrade.early, prefix, 0, false))
+    Some(split_halves(read, write, early, head, at, false))
 }
 
 pub(crate) fn connect(
@@ -567,7 +571,7 @@ fn check_response(head: &[u8], key: &str) -> Option<()> {
     Some(())
 }
 
-// The same connect over halves that cannot peek: pipelined bytes arrive as a prefix.
+// The same connect over halves that cannot peek: the kept read takes what rode in behind the `101`.
 pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     mut read: R,
     mut write: W,
@@ -579,10 +583,10 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     let key = fresh_key()?;
     let (handshake, early) = request(host, path, &key, budget, first);
     write.write_all(handshake.as_bytes()).ok()?;
-    let (head, behind) =
+    let (head, at) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
-    check_response(&head, &key)?;
-    let (reader, writer) = split_halves(read, write, Vec::new(), behind, 0, true);
+    check_response(&head[..at], &key)?;
+    let (reader, writer) = split_halves(read, write, Vec::new(), head, at, true);
     if !early && !first.is_empty() && !writer.send(first) {
         return None;
     }
@@ -1061,6 +1065,28 @@ mod tests {
         assert_eq!(
             &reader.have, b"the frame behind the head",
             "and it holds them still"
+        );
+    }
+
+    /// The record arm takes the buffer its own head read filled, head octets and all: what rode behind the delimiter is handed over inside it, not copied into a second owner.
+    #[test]
+    fn the_record_head_hands_over_the_buffer_it_filled() {
+        const HEAD: &[u8] = b"GET /tunnel HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+        const TAIL: &[u8] = b"\x82\x02hi";
+        let mut wire = Vec::from(HEAD);
+        wire.extend_from_slice(TAIL);
+        let (reader, _writer) =
+            accept_split(std::io::Cursor::new(wire), Sink::default(), "/tunnel").expect("upgrades");
+        assert_eq!(reader.at, HEAD.len(), "the cursor sits past the head");
+        assert_eq!(
+            reader.have.len(),
+            HEAD.len() + TAIL.len(),
+            "one buffer carries the handshake and what rode behind it"
+        );
+        assert_eq!(
+            reader.have[reader.at..].as_ptr() as usize - reader.have.as_ptr() as usize,
+            reader.at,
+            "and those bytes lie inside the allocation the head read made"
         );
     }
 
