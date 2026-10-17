@@ -457,37 +457,63 @@ fn write_frame(
 }
 
 pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(WsReader, WsWriter)> {
-    use std::fmt::Write as _;
     let mut read = stream;
     let head = read_head(&mut read)?;
-    let (key, early) = check_request(&head, path)?;
-    let mut response = format!(
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n",
-        accept_key(key)
-    );
-    if !early.is_empty() {
-        let offered =
-            crate::proxy::header_value(&head, "sec-websocket-protocol").unwrap_or_default();
-        let _ = write!(response, "Sec-WebSocket-Protocol: {offered}\r\n");
-    }
-    response.push_str("\r\n");
+    let upgrade = check_request(&head, path)?;
+    let response = accept_response(upgrade.key, upgrade.offered, !upgrade.early.is_empty());
     read.write_all(response.as_bytes()).ok()?;
-    split(read, early, false)
+    split(read, upgrade.early, false)
 }
 
-fn check_request<'a>(head: &'a [u8], path: &str) -> Option<(&'a str, Vec<u8>)> {
-    if crate::proxy::request_path(head)? != path {
+/// What the client's head said: the key to accept, the subprotocol it offered and the early data riding in it.
+#[derive(Debug)]
+struct Upgrade<'a> {
+    key: &'a str,
+    offered: &'a str,
+    early: Vec<u8>,
+}
+
+fn check_request<'a>(head: &'a [u8], path: &str) -> Option<Upgrade<'a>> {
+    let text = std::str::from_utf8(head).ok()?;
+    if crate::proxy::request_path_in(text)? != path {
         return None;
     }
-    let key = crate::proxy::header_value(head, "sec-websocket-key")?;
+    let key = crate::proxy::header_value_in(text, "sec-websocket-key")?;
     if key.is_empty() {
         return None;
     }
-    let offered = crate::proxy::header_value(head, "sec-websocket-protocol").unwrap_or_default();
+    let offered = crate::proxy::header_value_in(text, "sec-websocket-protocol").unwrap_or_default();
     let early = early_decode(offered)
         .filter(|bytes| !bytes.is_empty())
         .unwrap_or_default();
-    Some((key, early))
+    Some(Upgrade {
+        key,
+        offered,
+        early,
+    })
+}
+
+/// The `101` in its exact length: the accept key, and the offered subprotocol echoed back when the head carried early data.
+fn accept_response(key: &str, offered: &str, echo: bool) -> String {
+    const HEAD: &str = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ";
+    const PROTOCOL: &str = "Sec-WebSocket-Protocol: ";
+    let accept = accept_key(key);
+    let echoed = if echo {
+        PROTOCOL.len() + offered.len() + 2
+    } else {
+        0
+    };
+    let mut response = String::with_capacity(HEAD.len() + accept.len() + echoed + 4);
+    response.push_str(HEAD);
+    response.push_str(&accept);
+    response.push_str("\r\n");
+    if echo {
+        response.push_str(PROTOCOL);
+        response.push_str(offered);
+        response.push_str("\r\n");
+    }
+    response.push_str("\r\n");
+    response
 }
 
 // The same accept over halves that cannot peek: pipelined bytes arrive as a prefix, after the early data.
@@ -496,23 +522,12 @@ pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     mut write: W,
     path: &str,
 ) -> Option<(WsReader<R>, WsWriter)> {
-    use std::fmt::Write as _;
     let (head, prefix) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
-    let (key, mut early) = check_request(&head, path)?;
-    let mut response = format!(
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n",
-        accept_key(key)
-    );
-    if !early.is_empty() {
-        let offered =
-            crate::proxy::header_value(&head, "sec-websocket-protocol").unwrap_or_default();
-        let _ = write!(response, "Sec-WebSocket-Protocol: {offered}\r\n");
-    }
-    response.push_str("\r\n");
+    let upgrade = check_request(&head, path)?;
+    let response = accept_response(upgrade.key, upgrade.offered, !upgrade.early.is_empty());
     write.write_all(response.as_bytes()).ok()?;
-    early.extend_from_slice(&prefix);
-    Some(split_halves(read, write, early, false))
+    Some(split_halves(read, write, upgrade.early, prefix, false))
 }
 
 pub(crate) fn connect(
@@ -528,10 +543,8 @@ pub(crate) fn connect(
     read.write_all(handshake.as_bytes()).ok()?;
     let head = read_head(&mut read)?;
     check_response(&head, &key)?;
-    let at = crate::proxy::find_double_crlf(&head)? + 4;
-    let mut behind = Vec::new();
-    behind.extend_from_slice(&head[at..]);
-    let (reader, writer) = split(read, behind, true)?;
+    // The peeked head stops at the delimiter, so the pipelined bytes are whatever the socket still holds.
+    let (reader, writer) = split(read, Vec::new(), true)?;
     if !early && !first.is_empty() && !writer.send(first) {
         return None;
     }
@@ -543,7 +556,7 @@ fn check_response(head: &[u8], key: &str) -> Option<()> {
     if text.split("\r\n").next()?.split(' ').nth(1)? != "101" {
         return None;
     }
-    if crate::proxy::header_value(head, "sec-websocket-accept")? != accept_key(key) {
+    if crate::proxy::header_value_in(text, "sec-websocket-accept")? != accept_key(key) {
         return None;
     }
     Some(())
@@ -564,7 +577,7 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     let (head, behind) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
     check_response(&head, &key)?;
-    let (reader, writer) = split_halves(read, write, behind, true);
+    let (reader, writer) = split_halves(read, write, Vec::new(), behind, true);
     if !early && !first.is_empty() && !writer.send(first) {
         return None;
     }
@@ -572,16 +585,34 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
 }
 
 fn request(host: &str, path: &str, key: &str, budget: u32, first: &[u8]) -> (String, bool) {
-    let mut request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
-    );
+    const OPEN: &str = "GET ";
+    const MIDDLE: &str = " HTTP/1.1\r\nHost: ";
+    const KEYS: &str = "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ";
+    const VERSION: &str = "\r\nSec-WebSocket-Version: 13";
+    const END: &str = "\r\n\r\n";
+    const PROTOCOL: &str = "Sec-WebSocket-Protocol: ";
     let early = !first.is_empty() && first.len() as u64 <= u64::from(budget);
+    let coded = if early {
+        (first.len() * 4).div_ceil(3)
+    } else {
+        0
+    };
+    let fixed = OPEN.len() + MIDDLE.len() + KEYS.len() + VERSION.len() + END.len();
+    let room = if early { PROTOCOL.len() + coded + 2 } else { 0 };
+    let mut request = String::with_capacity(fixed + host.len() + path.len() + key.len() + room);
+    request.push_str(OPEN);
+    request.push_str(path);
+    request.push_str(MIDDLE);
+    request.push_str(host);
+    request.push_str(KEYS);
+    request.push_str(key);
+    request.push_str(VERSION);
     if early {
-        request.truncate(request.len() - 2);
-        request.push_str("Sec-WebSocket-Protocol: ");
+        request.push_str("\r\n");
+        request.push_str(PROTOCOL);
         ferrox_core::transport::early_encode_into(&mut request, first);
-        request.push_str("\r\n\r\n");
     }
+    request.push_str(END);
     (request, early)
 }
 
@@ -589,14 +620,15 @@ fn split(read: TcpStream, early: Vec<u8>, masked: bool) -> Option<(WsReader, WsW
     let Ok(write) = read.try_clone() else {
         return None;
     };
-    Some(split_halves(read, write, early, masked))
+    Some(split_halves(read, write, early, Vec::new(), masked))
 }
 
-// The same split over halves that cannot clone: the handshake leaves pipelined bytes as the prefix.
+// The same split over halves that cannot clone, with the bytes behind the head handed over as the reader's own buffer.
 fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
     read: R,
     write: W,
     early: Vec<u8>,
+    have: Vec<u8>,
     masked: bool,
 ) -> (WsReader<R>, WsWriter) {
     let shared = Arc::new(Shared {
@@ -606,7 +638,7 @@ fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
     let reader = WsReader {
         read,
         shared: Arc::clone(&shared),
-        have: Vec::new(),
+        have,
         at: 0,
         msg_end: 0,
         early,
@@ -933,6 +965,111 @@ mod tests {
                 "{payload:?} at {budget}"
             );
         }
+    }
+
+    /// The request is filled into a buffer opened to its own length, so no head is copied into a grown one — over the lengths that are not a multiple of three and over both sides of the budget.
+    #[test]
+    fn the_request_is_sized_for_its_bytes() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        for len in [0usize, 1, 2, 3, 191, 192, 193, 2047, 2048] {
+            let payload: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(61)).collect();
+            for budget in [0u32, 1, len as u32, len as u32 + 1] {
+                let (got, _) = request("example.com", "/tunnel", key, budget, &payload);
+                assert_eq!(
+                    got.capacity(),
+                    got.len(),
+                    "len {len} at {budget}: one allocation, no growth"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_101_is_the_key_and_the_echoed_subprotocol() {
+        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let head = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n";
+        let plain = accept_response(key, "", false);
+        assert_eq!(
+            plain,
+            format!("{head}\r\n"),
+            "no early data, no subprotocol line"
+        );
+        assert_eq!(plain.capacity(), plain.len(), "one allocation, no growth");
+        let echoed = accept_response(key, "cGluZw", true);
+        assert_eq!(
+            echoed,
+            format!("{head}Sec-WebSocket-Protocol: cGluZw\r\n\r\n"),
+            "the offered subprotocol rides back in the 101"
+        );
+        assert_eq!(echoed.capacity(), echoed.len(), "one allocation, no growth");
+    }
+
+    /// The probe behind the early-data head rows: one fixed head read for the path, the key, the subprotocol and the early data, so the frame is that read and not a socket or an allocator.
+    #[test]
+    fn the_head_yields_the_path_the_key_and_the_early_data() {
+        const ROUNDS: usize = 64;
+        let head: Vec<u8> = Vec::from(
+            &b"GET /tunnel HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: cGluZw\r\nSec-WebSocket-Version: 13\r\n\r\n"[..],
+        );
+        let mut folded = 0usize;
+        for _ in 0..ROUNDS {
+            let upgrade = check_request(std::hint::black_box(&head), "/tunnel").expect("upgrades");
+            folded += upgrade.key.len() + upgrade.offered.len() + upgrade.early.len();
+        }
+        assert_eq!(
+            folded,
+            ROUNDS * (24 + 6 + 4),
+            "one key, one subprotocol, four bytes of early data"
+        );
+        assert!(
+            check_request(&[0xff, 0xfe, b'\r', b'\n'], "/tunnel").is_none(),
+            "a head that is not text upgrades nothing"
+        );
+    }
+
+    /// The bytes behind the head are the reader's own buffer, base and all: nothing copies them into the early data, so they arrive where they already were.
+    #[test]
+    fn the_pipelined_prefix_is_the_readers_own_buffer() {
+        let mut prefix = Vec::with_capacity(64);
+        prefix.extend_from_slice(b"the frame behind the head");
+        let base = prefix.as_ptr();
+        let (reader, _writer) = split_halves(
+            std::io::Cursor::new(Vec::new()),
+            Sink::default(),
+            b"ping".to_vec(),
+            prefix,
+            false,
+        );
+        assert_eq!(
+            reader.have.as_ptr(),
+            base,
+            "the reader's buffer is the buffer those bytes were already in"
+        );
+        assert_eq!(
+            &reader.have, b"the frame behind the head",
+            "and it holds them still"
+        );
+    }
+
+    #[test]
+    fn the_early_data_lands_before_the_pipelined_frame() {
+        let mut frame = Sink {
+            capture: true,
+            ..Sink::default()
+        };
+        assert!(write_frame(&mut frame, true, OP_DATA, b"pong"));
+        let mut wire = Vec::from(
+            &b"GET /tunnel HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Protocol: cGluZw\r\n\r\n"[..],
+        );
+        wire.extend_from_slice(&frame.kept);
+        let (mut reader, _writer) =
+            accept_split(std::io::Cursor::new(wire), Sink::default(), "/tunnel").expect("upgrades");
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).expect("reads");
+        assert_eq!(
+            got, b"pingpong",
+            "the early data first, then the pipelined frame"
+        );
     }
 
     #[test]
