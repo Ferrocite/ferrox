@@ -3069,8 +3069,9 @@ mod loopback {
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
+            // A TLS flush performs one read when nothing is pending to write, so the socket's read timeout is a flush's latency: the product's relays arm a quantum, and an edge that arms twenty seconds spends twenty in one idle read.
             stream
-                .set_read_timeout(Some(Duration::from_secs(20)))
+                .set_read_timeout(Some(crate::budgets::RELAY_QUANTUM))
                 .expect("times out");
             let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
                 .expect("accepts");

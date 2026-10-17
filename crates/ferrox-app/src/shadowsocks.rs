@@ -981,6 +981,11 @@ mod tests {
     /// Silence past the budget is death, not scheduling: a peer that opens the connection and never sends must not pin the raw Shadowsocks handshake thread forever.
     #[test]
     fn a_silent_peer_cannot_pin_a_raw_shadowsocks_handshake() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -990,15 +995,20 @@ mod tests {
             let _ = done_tx.send(());
         });
         let _peer = TcpStream::connect(addr).expect("connects");
-        done_rx
-            .recv_timeout(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
-            .expect("the bounded request read returns instead of pinning the thread");
+        let returned = done_rx.recv_timeout(crate::budgets::handshake() + Duration::from_secs(5));
+        crate::budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
         serving.join().expect("joins");
     }
 
     /// Silence past the budget is death, not scheduling: the stream handshake reads a clear IV then scans the encrypted header, and a peer that opens the connection and never sends must not pin that thread forever either.
     #[test]
     fn a_silent_peer_cannot_pin_a_stream_shadowsocks_handshake() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -1008,9 +1018,9 @@ mod tests {
             let _ = done_tx.send(());
         });
         let _peer = TcpStream::connect(addr).expect("connects");
-        done_rx
-            .recv_timeout(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
-            .expect("the bounded request read returns instead of pinning the thread");
+        let returned = done_rx.recv_timeout(crate::budgets::handshake() + Duration::from_secs(5));
+        crate::budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
         serving.join().expect("joins");
     }
 
@@ -1381,6 +1391,11 @@ mod tests {
     /// A shadowsocks inbound over gRPC whose peer answers the head and never sends its IV releases the serve thread: the carrier puts its clock away with the head, so the handshake reads under its own.
     #[test]
     fn a_silent_peer_cannot_pin_a_grpc_shadowsocks_request() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -1397,9 +1412,9 @@ mod tests {
         });
         let stream = TcpStream::connect(addr).expect("connects");
         let (_reader, _writer) = crate::grpc::connect(stream, "127.0.0.1", "/p").expect("dials");
-        done_rx
-            .recv_timeout(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
-            .expect("the bounded request read returns instead of pinning the thread");
+        let returned = done_rx.recv_timeout(crate::budgets::handshake() + Duration::from_secs(5));
+        crate::budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
         serving.join().expect("joins");
     }
 

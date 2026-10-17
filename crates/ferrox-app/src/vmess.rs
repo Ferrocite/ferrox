@@ -1681,6 +1681,11 @@ mod tests {
     /// Silence past the budget is death, not scheduling: a peer that opens the connection and never sends must not pin the raw `VMess` handshake thread forever.
     #[test]
     fn a_silent_peer_cannot_pin_a_raw_vmess_handshake() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
         let id = [0x11u8; 16];
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
@@ -1691,9 +1696,9 @@ mod tests {
             let _ = done_tx.send(());
         });
         let _peer = TcpStream::connect(addr).expect("connects");
-        done_rx
-            .recv_timeout(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
-            .expect("the bounded request read returns instead of pinning the thread");
+        let returned = done_rx.recv_timeout(crate::budgets::handshake() + Duration::from_secs(5));
+        crate::budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
         serving.join().expect("joins");
     }
 
@@ -1873,6 +1878,11 @@ mod tests {
     /// A vmess inbound over gRPC whose peer answers the head and never sends its first hunk releases the serve thread: the carrier puts its clock away with the head, so the auth id reads under its own.
     #[test]
     fn a_silent_peer_cannot_pin_a_grpc_vmess_request() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
         let id = [0x5bu8; 16];
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
@@ -1884,9 +1894,9 @@ mod tests {
         });
         let stream = TcpStream::connect(addr).expect("connects");
         let (_reader, _writer) = crate::grpc::connect(stream, "127.0.0.1", "/p").expect("dials");
-        done_rx
-            .recv_timeout(crate::budgets::HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
-            .expect("the bounded request read returns instead of pinning the thread");
+        let returned = done_rx.recv_timeout(crate::budgets::handshake() + Duration::from_secs(5));
+        crate::budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
         serving.join().expect("joins");
     }
 
