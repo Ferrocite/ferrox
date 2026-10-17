@@ -11896,7 +11896,7 @@ mod tests {
         pair.front.join().expect("joins");
     }
 
-    /// A bulk round trip must not assume the socket holds the payload: 4 KiB per direction is under what a fresh loopback socket gets anywhere, and 4 MiB is over what the write-before-read shape could carry at it (witnessed here: it parked in `sendto`).
+    /// A bulk round trip must not assume the socket holds the payload: 4 KiB per direction is under what a fresh loopback socket gets anywhere, and 256 KiB crosses 64 of those windows, so a hop that parked after one still stalls; 4 MiB crossed 1024 of them for no extra witness and cost the linux job 107s of delayed-ACK-throttled transfer.
     #[test]
     #[cfg(unix)]
     fn a_small_socket_buffer_does_not_park_a_bulk_round_trip() {
@@ -11920,7 +11920,7 @@ mod tests {
             };
             assert_eq!(0, set, "{name} refused");
         }
-        let payload: Vec<u8> = (0..4 * 1024 * 1024usize)
+        let payload: Vec<u8> = (0..256 * 1024usize)
             .map(|index| (index as u8).wrapping_mul(29))
             .collect();
         assert_eq!(echo_bulk(&mut user, &payload), payload);
