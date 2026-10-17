@@ -27,6 +27,7 @@ jobs:
   compare:
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -75,7 +76,9 @@ jobs:
           VLESS_LINK: ${{ inputs.vless_link }}
         run: |
           echo "::add-mask::$VLESS_LINK"
-          cargo run --locked --release -p ferrox-app -- run "$VLESS_LINK"
+          # `run` serves and never returns: this leg asks for the dial and its exit
+          # code, which is what "reachability" means here.
+          cargo run --locked --release -p ferrox-app -- check "$VLESS_LINK"
       - name: publish the table
         if: always()
         run: |
