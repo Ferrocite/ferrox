@@ -95,6 +95,7 @@ graph TD
 | pinned-threads-per-silent-shadowsocks-request | 0 | ferrox-app-shadowsocks::tests::a_silent_peer_cannot_pin_a_grpc_shadowsocks_request |
 | pinned-threads-per-silent-2022-request | 0 | ferrox-app-shadowsocks2022::tests::a_silent_peer_cannot_pin_a_grpc_shadowsocks2022_request |
 | message-buffer-reallocations-per-same-sized-frame | 0 | ferrox-app-grpc::tests::the_message_buffer_is_reused_not_reallocated |
+| reclaim-moves-per-drained-buffer | 0 | ferrox-app-grpc::tests::the_message_buffer_is_reused_not_reallocated |
 | batched-elements-served-per-message | 8 | ferrox-app-grpc::tests::a_batched_downlink_arrives_element_by_element |
 | grpc-methods-served-per-listener | 2 | ferrox-app-grpc::tests::one_listener_serves_both_methods |
 | header-field-copies-per-head | 0 | ferrox-app-h2::tests::a_plain_field_borrows_the_block |
@@ -111,7 +112,14 @@ message per frame, two messages in one frame, one message split over frames. The
 `0` on the padded row is that gate's own message opened behind a pad byte: the
 parser steps over the byte and the frame's length drops the tail, so nothing
 moves; a second padded test cuts a pad byte into a message the frame before had
-started and shows the counter at `5`, the move that shape still pays. The three
+started and shows the counter at `5`, the move that shape still pays.
+`reclaim-moves-per-drained-buffer` counts the reclaim *calls* that copy live bytes
+— the operation `staged` cannot see, because a fully drained buffer leaves an
+empty run that is zero bytes moved either way. A caller that takes each whole
+`HUNK` before the next arrives leaves nothing live, so the reclaim is a `clear`
+and the counter holds at `0` over three `HUNK` frames in
+`the_message_buffer_is_reused_not_reallocated`, the same test that gates the
+buffer's capacity as steady. The three
 credit rows come from one test over an in-memory peer that keeps each write it
 was given: full `HUNK` bodies are delivered and counted, and the test fails if a
 credit leaves before `credit-bytes` of bodies have landed, if the grant is more
