@@ -47,7 +47,7 @@ ir_of() {
         echo "count-ops: no test named $filter in either test binary" >&2
         return 4
     }
-    rm -f "$data" "$data".*
+    rm -f "$data"*
     local status=0
     valgrind --tool=callgrind --callgrind-out-file="$data" \
         --compress-strings=no --compress-pos=no \
@@ -57,9 +57,13 @@ ir_of() {
         tail -n 15 "$outdir/valgrind.err" >&2
         return 2
     fi
-    local produced
-    produced="$(ls "$data" "$data".* 2>/dev/null | head -n 1)"
-    if [ -z "${produced:-}" ]; then
+    # A test that spawns a thread writes a profile of its own, and a relay's work happens on
+    # those threads, so every file the run left is read rather than the first one named.
+    local -a profiles=()
+    local file
+    while IFS= read -r file; do [[ -n "$file" ]] && profiles+=("$file"); done \
+        < <(ls -1 "$data"* 2>/dev/null)
+    if [ "${#profiles[@]}" -eq 0 ]; then
         echo "count-ops: no callgrind output for $filter (valgrind exit $status)" >&2
         tail -n 15 "$outdir/valgrind.err" >&2
         return 2
@@ -67,19 +71,21 @@ ir_of() {
     local total
     # callgrind names a frame for an associated function `<Type>::method`, so a row that
     # writes the rustc path `Type::method` finds no frame unless both sides drop the brackets.
-    total="$(python3 - "$produced" "$symbol" <<'EOF'
+    total="$(python3 - "${profiles[@]}" "$symbol" <<'EOF'
 import sys
-row = sys.argv[2].replace("<", "").replace(">", "")
-total, active = 0, False
-with open(sys.argv[1], errors="ignore") as f:
-    for line in f:
-        line = line.strip()
-        if line.startswith("fn="):
-            active = row in line.replace("<", "").replace(">", "")
-        elif active:
-            fields = line.split()
-            if len(fields) >= 2 and fields[0].isdigit() and fields[1].lstrip("-").isdigit():
-                total += int(fields[1])
+row = sys.argv[-1].replace("<", "").replace(">", "")
+total = 0
+for path in sys.argv[1:-1]:
+    active = False
+    with open(path, errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("fn="):
+                active = row in line.replace("<", "").replace(">", "")
+            elif active:
+                fields = line.split()
+                if len(fields) >= 2 and fields[0].isdigit() and fields[1].lstrip("-").isdigit():
+                    total += int(fields[1])
 print(total)
 EOF
 )"
@@ -89,25 +95,27 @@ EOF
         # A row that holds no frame has to name which of the two opposite faults it is: a frame
         # under another path means the row points at the wrong symbol, a dearer caller means the
         # pass was inlined into it and no gate can price it on its own.
-        python3 - "$produced" "$symbol" <<'EOF'
+        python3 - "${profiles[@]}" "$symbol" <<'EOF'
 import sys
-leaf = sys.argv[2].rsplit("::", 1)[-1]
-cost, active = {}, None
-with open(sys.argv[1], errors="ignore") as f:
-    for line in f:
-        line = line.strip()
-        if line.startswith("fn="):
-            active = line[3:].split(")", 1)[-1]
-            cost.setdefault(active, 0)
-        elif line.startswith("calls="):
-            active = None
-        elif active is not None:
-            fields = line.split()
-            if len(fields) >= 2 and fields[0].isdigit() and fields[1].lstrip("-").isdigit():
-                cost[active] += int(fields[1])
+leaf = sys.argv[-1].rsplit("::", 1)[-1]
+cost = {}
+for path in sys.argv[1:-1]:
+    active = None
+    with open(path, errors="ignore") as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith("fn="):
+                active = line[3:].split(")", 1)[-1]
+                cost.setdefault(active, 0)
+            elif line.startswith("calls="):
+                active = None
+            elif active is not None:
+                fields = line.split()
+                if len(fields) >= 2 and fields[0].isdigit() and fields[1].lstrip("-").isdigit():
+                    cost[active] += int(fields[1])
 named = [n for n in cost if leaf in n]
-print("count-ops: frames held: %d, frames naming %s: %s"
-      % (len(cost), leaf, ", ".join(named[:5]) or "none"), file=sys.stderr)
+print("count-ops: profile files: %d, frames held: %d, frames naming %s: %s"
+      % (len(sys.argv) - 2, len(cost), leaf, ", ".join(named[:5]) or "none"), file=sys.stderr)
 for name, own in sorted(cost.items(), key=lambda kv: -kv[1])[:5]:
     print("count-ops: dearest frame %d %s" % (own, name), file=sys.stderr)
 EOF
