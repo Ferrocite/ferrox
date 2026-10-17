@@ -9933,7 +9933,7 @@ fn b64url(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::budgets::{HANDSHAKE_REQUEST_TIMEOUT, HEAD_DEADLINE, RELAY_JOIN};
+    use crate::budgets::{HEAD_DEADLINE, RELAY_JOIN};
     use crate::config::{grpc_path, stream_carrier};
 
     #[test]
@@ -11901,7 +11901,7 @@ mod tests {
         pair.front.join().expect("joins");
     }
 
-    /// A bulk round trip must not assume the socket holds the payload: 4 KiB per direction is under what a fresh loopback socket gets anywhere, and 4 MiB is over what the write-before-read shape could carry at it (witnessed here: it parked in `sendto`).
+    /// A bulk round trip must not assume the socket holds the payload: 4 KiB per direction is under what a fresh loopback socket gets anywhere, and 256 KiB crosses 64 of those windows, so a hop that parked after one still stalls; 4 MiB crossed 1024 of them for no extra witness and cost the linux job 107s of delayed-ACK-throttled transfer.
     #[test]
     #[cfg(unix)]
     fn a_small_socket_buffer_does_not_park_a_bulk_round_trip() {
@@ -11925,7 +11925,7 @@ mod tests {
             };
             assert_eq!(0, set, "{name} refused");
         }
-        let payload: Vec<u8> = (0..4 * 1024 * 1024usize)
+        let payload: Vec<u8> = (0..256 * 1024usize)
             .map(|index| (index as u8).wrapping_mul(29))
             .collect();
         assert_eq!(echo_bulk(&mut user, &payload), payload);
@@ -12997,6 +12997,11 @@ mod tests {
     /// Silence past the budget is death, not scheduling: a peer that opens the connection and never sends must not pin the raw VLESS handshake thread forever.
     #[test]
     fn a_silent_peer_cannot_pin_a_raw_vless_handshake() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
         let id = [0x11u8; 16];
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
@@ -13007,15 +13012,20 @@ mod tests {
             let _ = done_tx.send(());
         });
         let _peer = TcpStream::connect(addr).expect("connects");
-        done_rx
-            .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
-            .expect("the bounded request read returns instead of pinning the thread");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
         serving.join().expect("joins");
     }
 
     /// Silence past the budget is death, not scheduling: a peer that opens the connection and never sends must not pin the raw Trojan handshake thread forever.
     #[test]
     fn a_silent_peer_cannot_pin_a_raw_trojan_handshake() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
         let key = [b'k'; 56];
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
@@ -13026,15 +13036,20 @@ mod tests {
             let _ = done_tx.send(());
         });
         let _peer = TcpStream::connect(addr).expect("connects");
-        done_rx
-            .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
-            .expect("the bounded request read returns instead of pinning the thread");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
         serving.join().expect("joins");
     }
 
     /// A peer that finishes the websocket upgrade and then goes quiet costs a handshake budget, not a thread.
     #[test]
     fn a_silent_peer_cannot_pin_a_ws_handshake() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
         let id = [0x22u8; 16];
         let carrier = Carrier::Ws {
             path: "/p".into(),
@@ -13052,9 +13067,9 @@ mod tests {
         peer.write_all(b"GET /p HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\
                          Connection: Upgrade\r\nSec-WebSocket-Key: aGVsbG8gd29ybGQxMjM0NQ==\r\n\r\n")
             .expect("upgrades");
-        done_rx
-            .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
-            .expect("the budgeted frame read returns instead of pinning the thread");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the budgeted frame read returns instead of pinning the thread");
         drop(peer);
         serving.join().expect("joins");
     }
@@ -13062,6 +13077,11 @@ mod tests {
     /// A peer that rides the upgrade response then stops speaking releases the handshake thread.
     #[test]
     fn a_silent_peer_cannot_pin_an_httpupgrade_handshake() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
         let id = [0x23u8; 16];
         let carrier = Carrier::HttpUpgrade {
             path: "/p".into(),
@@ -13080,9 +13100,9 @@ mod tests {
             b"GET /p HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
         )
         .expect("upgrades");
-        done_rx
-            .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
-            .expect("the bounded request read returns instead of pinning the thread");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
         drop(peer);
         serving.join().expect("joins");
     }
@@ -13090,6 +13110,11 @@ mod tests {
     /// A peer whose head passes camouflage but whose body never arrives still dies on the budget.
     #[test]
     fn a_silent_peer_cannot_pin_an_httpheader_handshake() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
         let id = [0x24u8; 16];
         let carrier = Carrier::HttpHeader { path: "/p".into() };
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
@@ -13103,9 +13128,9 @@ mod tests {
         let mut peer = TcpStream::connect(addr).expect("connects");
         peer.write_all(b"GET /p HTTP/1.1\r\nHost: h\r\n\r\n")
             .expect("sends head");
-        done_rx
-            .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
-            .expect("the bounded request read returns instead of pinning the thread");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
         drop(peer);
         serving.join().expect("joins");
     }
@@ -13113,6 +13138,11 @@ mod tests {
     /// Silence before the preface is death, not scheduling: a peer that opens a gRPC connection and never sends must not pin the accept thread past the head's budget.
     #[test]
     fn a_silent_peer_cannot_pin_a_grpc_preface() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
         let id = [0x25u8; 16];
         let carrier = Carrier::Grpc { path: "/p".into() };
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
@@ -13124,15 +13154,20 @@ mod tests {
             let _ = done_tx.send(());
         });
         let _peer = TcpStream::connect(addr).expect("connects");
-        done_rx
-            .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
-            .expect("the bounded preface read returns instead of pinning the thread");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded preface read returns instead of pinning the thread");
         serving.join().expect("joins");
     }
 
     /// A peer that sends the 24-octet preface and then stops speaking dies on the same budget: the request headers are read under the clock the preface started on.
     #[test]
     fn a_silent_peer_cannot_pin_a_grpc_request_head() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
         let id = [0x26u8; 16];
         let carrier = Carrier::Grpc { path: "/p".into() };
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
@@ -13145,9 +13180,9 @@ mod tests {
         });
         let mut peer = TcpStream::connect(addr).expect("connects");
         peer.write_all(crate::h2::MAGIC).expect("sends the preface");
-        done_rx
-            .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
-            .expect("the bounded header read returns instead of pinning the thread");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded header read returns instead of pinning the thread");
         drop(peer);
         serving.join().expect("joins");
     }
@@ -13155,6 +13190,11 @@ mod tests {
     /// A client that completes the gRPC handshake and never sends its first hunk releases the serve thread: the opening request is decoded under the reader's own budget, the way the websocket frames are.
     #[test]
     fn a_silent_peer_cannot_pin_a_grpc_vless_request() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
         let id = [0x27u8; 16];
         let carrier = Carrier::Grpc { path: "/p".into() };
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
@@ -13167,9 +13207,9 @@ mod tests {
         });
         let stream = TcpStream::connect(addr).expect("connects");
         let (_reader, _writer) = crate::grpc::connect(stream, "127.0.0.1", "/p").expect("dials");
-        done_rx
-            .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
-            .expect("the bounded request read returns instead of pinning the thread");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
         serving.join().expect("joins");
     }
 
@@ -13177,6 +13217,11 @@ mod tests {
     #[test]
     fn a_silent_peer_cannot_pin_a_grpc_tls_vless_request() {
         use ferrox_core::tls::TlsProvider as _;
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
 
         let (server_config, client_config) = carried_tls_configs();
         let id = [0x28u8; 16];
@@ -13196,15 +13241,20 @@ mod tests {
         let (read, write) = session_halves(session);
         let (_reader, _writer) =
             crate::grpc::connect_split(read, write, "127.0.0.1", "/p").expect("dials the head");
-        done_rx
-            .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
-            .expect("the bounded session request read returns instead of pinning the thread");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded session request read returns instead of pinning the thread");
         serving.join().expect("joins");
     }
 
     /// A trojan inbound over gRPC whose peer answers the head and never writes its hash releases the serve thread: the carrier puts its clock away with the head, so the request reads under its own.
     #[test]
     fn a_silent_peer_cannot_pin_a_grpc_trojan_request() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
         let key = trojan_key("secret");
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
@@ -13216,15 +13266,20 @@ mod tests {
         });
         let stream = TcpStream::connect(addr).expect("connects");
         let (_reader, _writer) = crate::grpc::connect(stream, "127.0.0.1", "/p").expect("dials");
-        done_rx
-            .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
-            .expect("the bounded request read returns instead of pinning the thread");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
         serving.join().expect("joins");
     }
 
     /// A KCP session that registers with a prefix and then falls silent dies on the wall-clock budget, not on the poll quantum.
     #[test]
     fn a_silent_peer_cannot_pin_a_kcp_handshake() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
         let id = [0x25u8; 16];
         let kcp_addr: SocketAddr = "127.0.0.1:0".parse().expect("addr");
         let listener =
@@ -13246,9 +13301,9 @@ mod tests {
         .expect("dials");
         // One small packet registers the session; after it the peer never speaks again.
         peer.write(b"he").expect("writes a prefix");
-        done_rx
-            .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
-            .expect("the bounded request read returns instead of pinning the thread");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded request read returns instead of pinning the thread");
         drop(peer);
         serving.join().expect("joins");
     }
@@ -13256,6 +13311,11 @@ mod tests {
     /// A trojan peer that never finishes the password line releases the handshake thread.
     #[test]
     fn a_silent_peer_cannot_pin_a_trojan_handshake() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
         let key = [b'a'; 56];
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
@@ -13268,9 +13328,9 @@ mod tests {
         let mut peer = TcpStream::connect(addr).expect("connects");
         peer.write_all(b"not-a-password-yet")
             .expect("writes a prefix");
-        done_rx
-            .recv_timeout(HANDSHAKE_REQUEST_TIMEOUT + Duration::from_secs(5))
-            .expect("the bounded password read returns instead of pinning the thread");
+        let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        budgets::clear();
+        returned.expect("the bounded password read returns instead of pinning the thread");
         drop(peer);
         serving.join().expect("joins");
     }

@@ -131,6 +131,7 @@ carrier-websocket user-space-copies-per-byte-read 1 ferrox-app-ws::tests::a_read
 carrier-websocket request-buffer-reallocations-per-dial 0 ferrox-app-ws::tests::the_request_is_sized_for_its_bytes
 carrier-websocket response-buffer-reallocations-per-accept 0 ferrox-app-ws::tests::the_101_is_the_key_and_the_echoed_subprotocol
 carrier-websocket early-data-copies-of-the-pipelined-bytes 0 ferrox-app-ws::tests::the_pipelined_prefix_is_the_readers_own_buffer
+carrier-websocket head-tail-read-syscalls 0 ferrox-app-ws::tests::a_frame_that_rode_in_with_the_head_costs_no_syscall
 carrier-websocket early-data-encode-allocations-per-line 0 ferrox-bench-gate-8
 carrier-websocket early-data-encode-buffers-grown-per-2048-byte-line 0 ferrox-core-transport::tests::the_early_data_line_costs_the_encode_and_nothing_else
 
@@ -147,6 +148,7 @@ carrier-httpupgrade prefix-bytes-held-after-walk 0 ferrox-app-httpupgrade::tests
 
 carrier-httpheader ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-httpheader framing-bytes-added 0 ferrox-app-httpheader::tests::header_carries_an_echo_over_loopback
+carrier-httpheader head-tail-read-syscalls 0 ferrox-app-httpheader::tests::the_bytes_behind_the_head_reach_the_relay_without_a_syscall
 carrier-httpheader user-space-copies-per-byte-relayed 1 ferrox-app-proxy::tests::carried_streams_round_trip_behind_the_http_camouflage
 
 carrier-grpc ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -185,6 +187,7 @@ carrier-xhttp requests-served-before-a-close 1 ferrox-app-xhttp::tests::a_reques
 carrier-xhttp writes-per-credit 1 ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write
 carrier-xhttp window-update-frames-per-credit 2 ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write
 carrier-xhttp head-buffer-reallocations-per-request-head 0 ferrox-app-xhttp_h2::tests::the_synthesized_head_is_sized_for_its_bytes
+carrier-xhttp head-tail-read-syscalls 0 ferrox-app-xhttp::tests::a_chunk_that_rode_in_with_the_head_costs_no_syscall
 carrier-xhttp received-data-frames-copied 0 ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into
 carrier-xhttp received-header-blocks-copied 0 ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into
 

@@ -40,10 +40,26 @@ graph TD
     L --> W1{"masked?"}
     W1 -- no --> V1["writev: head + payload<br/>1 syscall, 0 copies"]
     W1 -- yes --> V2["copy into a thread-local frame,<br/>mask in place, 1 syscall"]
-    S4["accept: one head, one `from_utf8`,<br/>key and subprotocol read once"] --> ED["`early_decode`: four table loads<br/>per group into one buffer"]
+    S4["accept: one kept head read, one `from_utf8`,<br/>key and subprotocol read once"] --> ED["`early_decode`: four table loads<br/>per group into one buffer"]
     ED --> HP["the bytes behind the head<br/>stay the reader's `have`"]
     HP --> R
 ```
+
+## Kept head
+
+The handshake read used to `peek` for `\r\n\r\n`, prove the head there, then re-read exactly
+those octets so the frame behind the delimiter stayed in the socket: a head of `H` octets
+crossed user space twice, and every round of a head that dribbled in cost two read-family calls.
+`proxy::read_http_head_kept` reads once into the buffer it hands back and returns the offset
+where the head ends, so the head crosses once and a round costs one call — and the frame that
+rode in with the head is already the reader's own `have`, `at` that offset, because `split_halves`
+now takes the cursor instead of being handed an empty buffer.
+`ws::tests::a_frame_that_rode_in_with_the_head_costs_no_syscall` drives that shape from an
+in-memory buffer: two frames delivered with `reads()` still `0`, the buffer's base and capacity
+unchanged; a wrong cursor fails the bytes, a re-read fails the counter.
+What is *not* removed: `proxy::read_http_head` still answers the `http` front, whose prefix has
+one buffer and nowhere else to go, and the Shadowsocks rung, which waits inside a `peek` for the
+first byte of a request packet and must not take it.
 
 ## Measured
 
@@ -60,6 +76,7 @@ graph TD
 | request-buffer-reallocations-per-dial | 0 | ferrox-app-ws::tests::the_request_is_sized_for_its_bytes |
 | response-buffer-reallocations-per-accept | 0 | ferrox-app-ws::tests::the_101_is_the_key_and_the_echoed_subprotocol |
 | early-data-copies-of-the-pipelined-bytes | 0 | ferrox-app-ws::tests::the_pipelined_prefix_is_the_readers_own_buffer |
+| head-tail-read-syscalls | 0 | ferrox-app-ws::tests::a_frame_that_rode_in_with_the_head_costs_no_syscall |
 | early-data-encode-allocations-per-line | 0 | ferrox-bench-gate-8 |
 | early-data-encode-buffers-grown-per-2048-byte-line | 0 | ferrox-core-transport::tests::the_early_data_line_costs_the_encode_and_nothing_else |
 

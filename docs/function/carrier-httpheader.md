@@ -5,20 +5,24 @@ cheapest one in the matrix: a request head with `Connection: upgrade` and a
 matching response, and then no framing at all. It exists so a connection looks
 like HTTP to something in the middle, and it costs one `memcmp`-shaped scan.
 
-`read_http_head` is the interesting part and it is shared with every carrier
-that has a handshake head. It uses `peek` to find `\r\n\r\n` and then reads
-exactly that many bytes, so it never over-reads into the payload. The price is
-one syscall for the `peek` and one for the `read`, per handshake. That is the
-cost of *not* over-reading, which is the right trade at the head and the wrong
-one per frame — see [the WebSocket page](carrier-websocket.md) for where the
-per-frame cost was removed instead.
+`read_http_head_kept` is the interesting part and it is shared with every carrier that has a
+handshake head and a place to put the tail. It reads once into the buffer it hands back, finds
+`\r\n\r\n` there, and returns the offset where the head ends: one call per round instead of the
+`peek`-then-re-read it replaces, and whatever rode in behind the delimiter is already the
+reader's own prefix instead of a second trip through the socket.
+`httpheader::tests::the_bytes_behind_the_head_reach_the_relay_without_a_syscall` hands the reader
+that buffer over a delegate that panics on any `read`, so the row is zero because the reader never
+reaches it. The two callers that have nowhere to put a tail — the `http` front,
+whose prefix goes to a one-buffer `CONNECT` writer, and the Shadowsocks rung, which waits inside
+a `peek` for the first byte of a request packet — keep `read_http_head` and pay its `peek` plus
+its re-read.
 
 ## Data path
 
 ```mermaid
 graph TD
-    C["client: POST or GET with the<br/>camouflage head"] --> S["server: peek, scan for CRLFCRLF"]
-    S --> S2["read exactly the head"]
+    C["client: POST or GET with the<br/>camouflage head"] --> S["server: one read into the buffer<br/>it hands on, scan CRLFCRLF there"]
+    S --> S2["the head ends at the returned offset,<br/>its tail stays in that buffer"]
     S2 --> V["validate path and host"]
     V --> B["inner socket: bytes in, bytes out"]
     B --> Z["0 framing bytes added<br/>1 copy per byte, the relay's own"]
@@ -31,6 +35,7 @@ graph TD
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | framing-bytes-added | 0 | ferrox-app-httpheader::tests::header_carries_an_echo_over_loopback |
+| head-tail-read-syscalls | 0 | ferrox-app-httpheader::tests::the_bytes_behind_the_head_reach_the_relay_without_a_syscall |
 | user-space-copies-per-byte-relayed | 1 | ferrox-app-proxy::tests::carried_streams_round_trip_behind_the_http_camouflage |
 <!-- counts:end -->
 

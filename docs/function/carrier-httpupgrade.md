@@ -162,9 +162,9 @@ What this does *not* claim, and the reason `read_http_head` is still in the tree
 callers have nowhere to put the tail. The `http` front hands its prefix to a `CONNECT`
 writer that takes one buffer, and the Shadowsocks rung's server deliberately `peek`s and
 waits in it for the first byte of the request packet, so consuming the segment would
-take the byte it is watching for. Both keep the `peek` reader, as do `ws`, `xhttp` and
-`httpheader` until their carriers take the kept reader too — this is the shared-head-
-reader item, cut here at the one carrier whose prefix slot already exists. Also
+take the byte it is watching for. Both keep the `peek` reader; this slice cut the shared-
+head-reader item at the one carrier whose prefix slot already existed, and `ws`, `xhttp`
+and `httpheader` each took the kept reader after it, on their own pages. Also
 unchanged: the three socket options that arm and restore the poll quantum around a head
 read (a `dup`ed handle shares `SO_RCVTIMEO`, so leaving it armed would park the other
 readers on the same socket), and the request `String`, which is one allocation sized to

@@ -439,6 +439,14 @@ fn server_of(dial: &Dial) -> Server {
     }
 }
 
+/// Whether a pooled connection can still open a flow: quiche takes no new application data once a connection is closed, draining, or carrying a close in either direction.
+fn usable(conn: &quiche::Connection) -> bool {
+    !conn.is_closed()
+        && !conn.is_draining()
+        && conn.local_error().is_none()
+        && conn.peer_error().is_none()
+}
+
 /// The connections a flow may ride, each with the stream id reserved to it; closed or stale entries are dropped here, so a dead handle never blocks a dial.
 fn candidates(dial: &Dial) -> Vec<(Session, u64)> {
     let Ok(mut pool) = pool().lock() else {
@@ -451,11 +459,7 @@ fn candidates(dial: &Dial) -> Vec<(Session, u64)> {
     entries.retain(|entry| {
         entry.next_stream / 4 < crate::quic::MAX_STREAMS
             && now.saturating_duration_since(entry.used) < REUSE_WINDOW
-            && entry
-                .session
-                .shared
-                .lock()
-                .is_ok_and(|conn| !conn.is_closed())
+            && entry.session.shared.lock().is_ok_and(|conn| usable(&conn))
     });
     entries
         .iter_mut()
@@ -513,7 +517,7 @@ fn open_pooled(dial: &Dial, header: &[u8]) -> Option<Flow> {
         if let Some(flow) = open_flow(&session, stream, header) {
             return Some(flow);
         }
-        if session.shared.lock().is_ok_and(|conn| conn.is_closed()) {
+        if session.shared.lock().is_ok_and(|conn| !usable(&conn)) {
             evict(dial, &session);
         }
     }
