@@ -6936,7 +6936,7 @@ fn foxy_quic_dial(foxy: &FoxyOut, edge: &ferrox_core::foxy::Candidate) -> crate:
     }
 }
 
-fn relay_tunnel(
+pub(crate) fn relay_tunnel(
     client: &Connection,
     tunnel: &std::sync::Arc<std::sync::Mutex<crate::foxy::Tunnel>>,
 ) {
@@ -6951,7 +6951,8 @@ fn relay_tunnel(
     let forward = move || copy_locked(&mut client_read, &forward_tunnel, true);
     let done = RelayPool::global().run(forward);
     copy_locked(&mut client_write, &backward_tunnel, false);
-    let _ = client_write.shutdown(Shutdown::Write);
+    // Both halves, because the other leg is parked in a blocking read on this socket: a FIN on the write half alone leaves the parked reader asleep and the flow's worker lost for the life of the process.
+    let _ = client_write.shutdown(Shutdown::Both);
     join(&done);
 }
 

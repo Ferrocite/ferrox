@@ -2942,6 +2942,78 @@ mod loopback {
         edge.join().expect("the edge finishes");
     }
 
+    /// A flow's forward leg is parked in a blocking read on the client, so the end of a flow has to wake that read: a leg that never wakes keeps its pool worker, its lane and the lane's buffers for the life of the process.
+    #[test]
+    fn a_lane_that_ends_releases_the_leg_parked_on_its_client() {
+        const PARK: Duration = Duration::from_secs(10);
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) {
+                return;
+            }
+            let mut ack = Vec::new();
+            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut ack);
+            tls.write_all(&ack).ok();
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                if matches!(
+                    frames::h2_event(frame, &payload, 1),
+                    frames::H2Event::Headers { .. }
+                ) {
+                    break;
+                }
+            }
+            let mut status = Vec::new();
+            h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut status);
+            tls.write_all(&status).expect("answers 200");
+            let _ = close_rx.recv();
+        });
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        tunnel
+            .set_read_quantum(Duration::from_millis(5))
+            .expect("bounds one read");
+        let lane = Arc::new(std::sync::Mutex::new(tunnel));
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let _browser = Connection::connect(front.local_addr().expect("addr")).expect("connects");
+        let (client, _) = front.accept().expect("accepts");
+        let (ended_tx, ended_rx) = std::sync::mpsc::channel::<()>();
+        let started = Instant::now();
+        let flow_lane = Arc::clone(&lane);
+        std::thread::spawn(move || {
+            crate::proxy::relay_tunnel(&client, &flow_lane);
+            let _ = ended_tx.send(());
+        });
+        // The leg has to be parked before the lane ends, or the test measures a flow that never started.
+        std::thread::sleep(Duration::from_millis(200));
+        close_tx.send(()).expect("ends the edge");
+        edge.join().expect("the edge finishes");
+        let _ = ended_rx.recv_timeout(PARK);
+        assert!(
+            started.elapsed() < PARK,
+            "the flow that lost its lane is still holding the leg parked on its client"
+        );
+    }
+
     /// A byte-level test cannot see a copy, so capacity is the witness: `out` is the write buffer and `carry` the read one, and a lane that stages a payload before handing it over has grown the buffer it staged in.
     #[test]
     fn a_relayed_byte_is_copied_once_on_its_way_through_the_lane() {
