@@ -8872,13 +8872,18 @@ fn parse_socks_udp(packet: &[u8]) -> Option<(SocketAddr, &[u8])> {
 fn socks_target(client: &mut Connection, grant: bool) -> Option<(u8, Destination)> {
     // Bound only the greeting to a wall-clock budget, then restore the untimed relay reads behind it.
     let budget = budgets::handshake();
-    let asked = socks_request(client, grant, Instant::now() + Duration::from_secs(3600));
-    let _ = budget;
+    let _ = client.set_read_timeout(Some(budget));
+    let asked = socks_request(client, grant, Instant::now() + budget);
+    let _ = client.set_read_timeout(None);
     asked
 }
 
 /// Each greeting read under the deadline the caller armed: the relay's `read_exact` retries a quiet socket forever, so the socket's poll quantum wakes the read and the deadline ends it.
-fn socks_request(client: &mut Connection, grant: bool, until: Instant) -> Option<(u8, Destination)> {
+fn socks_request(
+    client: &mut Connection,
+    grant: bool,
+    until: Instant,
+) -> Option<(u8, Destination)> {
     let mut head = [0u8; 2];
     read_exact(
         &mut HandshakeDeadline {
