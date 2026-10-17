@@ -208,6 +208,11 @@ pub(crate) fn expand(key: &[u8; 16]) -> [__m128i; 11] {
 
 impl Engine {
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
+    pub(crate) unsafe fn rekey(&mut self, key: &[u8; 16]) {
+        unsafe { *self = Self::new(key) };
+    }
+
+    #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     pub(crate) unsafe fn new(key: &[u8; 16]) -> Self {
         let rk = expand(key);
         let h = super::powers(&rk);
@@ -275,6 +280,11 @@ pub(crate) struct Engine256 {
 }
 
 impl Engine256 {
+    #[target_feature(enable = "aes,pclmulqdq,ssse3")]
+    pub(crate) unsafe fn rekey(&mut self, key: &[u8; 32]) {
+        unsafe { *self = Self::new(key) };
+    }
+
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     pub(crate) unsafe fn new(key: &[u8; 32]) -> Self {
         let rk = expand256(key);

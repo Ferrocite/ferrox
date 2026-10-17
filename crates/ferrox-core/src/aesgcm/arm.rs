@@ -427,6 +427,11 @@ fn ctr_only8_256(rk: &[uint8x16_t; 15], template: uint8x16_t, buf: &mut [u8], mu
 
 impl Engine {
     #[target_feature(enable = "aes,neon")]
+    pub(crate) unsafe fn rekey(&mut self, key: &[u8; 16]) {
+        unsafe { *self = Self::new(key) };
+    }
+
+    #[target_feature(enable = "aes,neon")]
     pub(crate) unsafe fn new(key: &[u8; 16]) -> Self {
         const RCON: [u32; 10] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
         let mut words = [0u32; 44];
@@ -571,6 +576,11 @@ impl GhashTables for Engine256 {
 }
 
 impl Engine256 {
+    #[target_feature(enable = "aes,neon")]
+    pub(crate) unsafe fn rekey(&mut self, key: &[u8; 32]) {
+        unsafe { *self = Self::new(key) };
+    }
+
     #[target_feature(enable = "aes,neon")]
     pub(crate) unsafe fn new(key: &[u8; 32]) -> Self {
         const RCON: [u32; 7] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40];

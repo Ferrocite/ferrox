@@ -42,15 +42,14 @@ pub fn measure<R>(f: impl FnOnce() -> R) -> (R, Counts) {
     COUNTING.with(|counting| counting.set(true));
     let out = f();
     drop(window);
+    // Read the counters while the lock is still held: a concurrent window's reset could otherwise land between the last allocation and the read, and a test would count zero for a closure that allocated.
+    let counts = Counts {
+        allocs: ALLOCS.load(Ordering::Relaxed),
+        bytes: BYTES.load(Ordering::Relaxed),
+        zeroed: ZEROED.load(Ordering::Relaxed),
+    };
     drop(one_at_a_time);
-    (
-        out,
-        Counts {
-            allocs: ALLOCS.load(Ordering::Relaxed),
-            bytes: BYTES.load(Ordering::Relaxed),
-            zeroed: ZEROED.load(Ordering::Relaxed),
-        },
-    )
+    (out, counts)
 }
 
 impl Default for Counting {

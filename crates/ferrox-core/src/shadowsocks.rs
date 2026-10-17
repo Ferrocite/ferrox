@@ -71,7 +71,8 @@ pub struct Cipher {
 
 /// The `Aes` engines box their own key schedules and GHASH tables, so the enum
 /// holds them by value: a second box around the same thing is one allocation
-/// per connection and one per UDP datagram, for a pointer chase.
+/// per connection and one per UDP datagram's build, where the wire relays rekey
+/// the engine they already hold, for a pointer chase.
 enum Aead {
     Aes128(crate::aesgcm::Aes128Gcm),
     Aes256(crate::aesgcm::Aes256Gcm),
@@ -125,6 +126,35 @@ impl Cipher {
             counter: 0,
             aead,
         })
+    }
+
+    /// Rekey in place for the next UDP datagram: the salt is per-datagram on the UDP wire, so the subkey is derived again and the counter restarts, but the engine, its box and the backend pick survive. Costs the HKDF and the key schedule and none of the allocation a rebuild pays.
+    pub fn rekey(&mut self, master: &MasterKey, salt: &[u8]) -> Option<()> {
+        let key_len = self.method.key_len();
+        if master.as_bytes().len() != key_len || salt.len() != key_len {
+            return None;
+        }
+        let mut key: Key = [0u8; 32];
+        hkdf::Hkdf::<sha1::Sha1>::new(Some(salt), master.as_bytes())
+            .expand(b"ss-subkey", &mut key[..key_len])
+            .ok()?;
+        match &mut self.aead {
+            // The method fixed the engine's key size at construction, so the slice it asks for is the method's own length: never a mismatch to convert.
+            Aead::Aes128(aead) => aead.rekey(
+                key[..16]
+                    .try_into()
+                    .expect("an aes-128 subkey is sixteen bytes"),
+            ),
+            Aead::Aes256(aead) => aead.rekey(
+                key[..key_len]
+                    .try_into()
+                    .expect("an aes-256 subkey is the method's own length"),
+            ),
+            Aead::ChaCha | Aead::XChaCha => {}
+        }
+        self.counter = 0;
+        self.key = key;
+        Some(())
     }
 
     #[must_use]
@@ -595,10 +625,10 @@ mod tests {
         assert_eq!(third, fourth, "and both advance together");
     }
 
-    /// One heap buffer per connection, not two: the `Aes` engines already box
-    /// their key schedules and GHASH tables, so a box around the enum added a
-    /// second allocation per connection and a second per UDP datagram, where
-    /// `Datagrams::seal` and `open` build a `Cipher` from scratch.
+    /// One heap buffer per build, not two: the `Aes` engines already box
+    /// their key schedules and GHASH tables, so a box around the enum would
+    /// add a second allocation behind the engine's own. A relay that rekeys
+    /// the engine it holds never pays the engine's box a second time.
     #[test]
     fn a_cipher_is_one_heap_buffer() {
         for (method, buffers) in [
@@ -617,6 +647,89 @@ mod tests {
                 "{method} derives with {buffers} heap buffer(s), counted {counts:?}"
             );
         }
+    }
+
+    /// A relay rekeys the engine it already holds for each UDP datagram: the salt is the key, so the HKDF and the key schedule run again, but the heap stays silent across a steady stream — no box, no probe, no enum churn per datagram.
+    #[test]
+    fn a_rekeyed_cipher_streams_datagrams_without_heap_traffic() {
+        for method in [
+            Method::Aes128Gcm,
+            Method::Aes256Gcm,
+            Method::Chacha20Poly1305,
+            Method::XChacha20Poly1305,
+        ] {
+            let master = MasterKey::new("secret", method.key_len());
+            let mut hop =
+                Some(Cipher::from_master_key(method, &master, &[0x11; 32]).expect("derives"));
+            let cipher = hop.as_mut().expect("holds");
+            for at in 0u8..8 {
+                let salt = vec![0x20 + at; method.key_len()];
+                let (_, counts) = crate::alloc_count::measure(|| cipher.rekey(&master, &salt));
+                assert_eq!(
+                    counts.allocs, 0,
+                    "{method} rekeys datagram {at} with no heap traffic, counted {counts:?}"
+                );
+            }
+        }
+    }
+
+    /// A rekeyed datagram and a freshly built one seal to the same bytes: the rekey restarts the counter, so the nonce, the payload and the tag cannot tell which cipher keyed them.
+    #[test]
+    fn a_rekeyed_datagram_seals_like_a_fresh_built_one() {
+        for method in [
+            Method::Aes128Gcm,
+            Method::Aes256Gcm,
+            Method::Chacha20Poly1305,
+            Method::XChacha20Poly1305,
+        ] {
+            let master = MasterKey::new("secret", method.key_len());
+            for (built, sent) in [([0x11u8; 32], [0x5au8; 32]), ([0x7eu8; 32], [0xffu8; 32])] {
+                let built = &built[..method.key_len()];
+                let sent = &sent[..method.key_len()];
+                let mut warmed = Cipher::from_master_key(method, &master, built).expect("derives");
+                let mut fresh = Cipher::from_master_key(method, &master, sent).expect("derives");
+                warmed.rekey(&master, sent).expect("rekeys");
+                let mut warm_body = [0x42u8; 96];
+                let mut fresh_body = warm_body;
+                let warm_tag = warmed.seal_piece_in_place(&mut warm_body).expect("seals");
+                let fresh_tag = fresh.seal_piece_in_place(&mut fresh_body).expect("seals");
+                assert_eq!(
+                    warm_body, fresh_body,
+                    "{method} seals to the same ciphertext"
+                );
+                assert_eq!(warm_tag, fresh_tag, "{method} seals to the same tag");
+                // The server's flow: rekey to the datagram's salt and open — the counter restarts with the rekey, the subkey is the same, and the datagram the fresh build produced is exactly the one opened: payload beside its tag.
+                warmed.rekey(&master, sent).expect("rekeys");
+                let mut wire = warm_body.to_vec();
+                wire.extend_from_slice(&warm_tag);
+                let opened = warmed.open_in_place(&mut wire).expect("opens");
+                let want = [0x42u8; 96];
+                assert_eq!(&wire[..opened], &want[..], "{method} restores the payload");
+            }
+        }
+    }
+
+    /// A rekey refuses a master or a salt the method's own length does not match, and leaves the cipher it refused to move exactly as it was.
+    #[test]
+    fn a_rekey_refuses_a_mislength_master_or_salt() {
+        let wide = MasterKey::new("secret", 32);
+        let mut cipher =
+            Cipher::from_master_key(Method::Aes256Gcm, &wide, &[0x11; 32]).expect("derives");
+        let before = cipher.key;
+        let short = MasterKey::new("secret", 16);
+        assert!(
+            cipher.rekey(&short, &[0x11; 32]).is_none(),
+            "a 16-byte master keys an aes-256 cipher"
+        );
+        assert!(
+            cipher.rekey(&wide, &[0x11; 16]).is_none(),
+            "a 16-byte salt keys an aes-256 cipher"
+        );
+        assert_eq!(cipher.key, before, "a refused rekey leaves the key");
+        assert_eq!(
+            cipher.counter, 0,
+            "a refused rekey leaves the counter fresh"
+        );
     }
 
     #[test]
