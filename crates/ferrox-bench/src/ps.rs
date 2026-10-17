@@ -1157,12 +1157,11 @@ mod tests {
                     s.threads.is_some(),
                     "ToolHelp counts this process's threads"
                 );
-                // `check_split` reads a run's delta, so a sample that adds up on its own is no gate: spin until
-                // the process spends a quantum and hold the identity over every step between the two endpoints.
+                // `check_split` reads a run's delta, so hold the identity over every step between two endpoints that spent a quantum.
                 let mut previous = s;
                 let mut spent = false;
                 for _ in 0..512 {
-                    std::hint::black_box((0..50_000u64).fold(0, |sum, i| sum.wrapping_add(i)));
+                    std::hint::black_box((0..50_000u64).fold(0u64, |sum, i| sum.wrapping_add(i)));
                     let next = sample(host, pid, 0).expect("this process stays sampleable");
                     let (Some(user), Some(sys)) = (next.user_millis, next.sys_millis) else {
                         panic!("GetProcessTimes reports both halves of every sample: {next:?}");
