@@ -193,6 +193,8 @@ and the binding does not change it.
 | writes-per-credit | 1 | ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write |
 | window-update-frames-per-credit | 2 | ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write |
 | head-buffer-reallocations-per-request-head | 0 | ferrox-app-xhttp_h2::tests::the_synthesized_head_is_sized_for_its_bytes |
+| received-data-frames-copied | 0 | ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into |
+| received-header-blocks-copied | 0 | ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into |
 <!-- counts:end -->
 
 ## Ops
@@ -405,6 +407,23 @@ by the in-memory writer above, which is the only checker that can count writes.
   the configured header padding is accepted, the default `Referer` padding is now
   refused, so the knobs demonstrably reach the accept path and not just the
   parser.
+- **A copy of every received h2 frame body.** The h2 receive loop read each frame
+  into its `vec![0u8; len]` and then copied what it parked: `payload.to_vec()`
+  queued a DATA chunk (a second allocation and a second copy of every inbound
+  byte, on top of the read that filled the frame), `block.to_vec()` copied each
+  HEADERS block before the pad trim, and a padded DATA frame paid the extra
+  allocation after that. `pump_frame` owns the frame now (padding cut in place
+  by `copy_within`, the truncated buffer itself queued, the unterminated block
+  stored owned in the assembly), so a received DATA frame, its padded variant
+  and a received header block each cost zero further copies.
+  `a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into` gates both
+  rows by pointer identity — the queued chunk's base stays the frame buffer's
+  base and its capacity stays the frame's, which bytes-only assertions cannot
+  see — and the test fails on the copied shape (checked before landing by
+  reintroducing the `push_back(body.clone())` it replaces). What did not move:
+  the zeroing of the frame buffer on receipt, the `WINDOW_UPDATE` pair consumed
+  bytes still grant, and the memmove the padded cut needs; the h2 wire is
+  untouched.
 
 ## Open rows
 
