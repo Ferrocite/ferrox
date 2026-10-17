@@ -133,6 +133,7 @@ carrier-websocket request-buffer-reallocations-per-dial 0 ferrox-app-ws::tests::
 carrier-websocket response-buffer-reallocations-per-accept 0 ferrox-app-ws::tests::the_101_is_the_key_and_the_echoed_subprotocol
 carrier-websocket early-data-copies-of-the-pipelined-bytes 0 ferrox-app-ws::tests::the_pipelined_prefix_is_the_readers_own_buffer
 carrier-websocket head-tail-read-syscalls 0 ferrox-app-ws::tests::a_frame_that_rode_in_with_the_head_costs_no_syscall
+carrier-websocket head-tail-allocations 0 ferrox-app-ws::tests::the_record_head_hands_over_the_buffer_it_filled
 carrier-websocket early-data-encode-allocations-per-line 0 ferrox-bench-gate-8
 carrier-websocket early-data-encode-buffers-grown-per-2048-byte-line 0 ferrox-core-transport::tests::the_early_data_line_costs_the_encode_and_nothing_else
 
@@ -144,12 +145,14 @@ carrier-httpupgrade request-reallocations-per-dial 0 ferrox-app-httpupgrade::tes
 carrier-httpupgrade round-trips-per-early-dial 0 ferrox-app-httpupgrade::tests::an_over_budget_payload_rides_ahead_of_a_lazy_answer
 carrier-httpupgrade round-trips-per-shadowsocks-dial 0 ferrox-app-proxy::tests::socks_dials_ss_over_httpupgrade_with_early_data_to_echo
 carrier-httpupgrade head-reads-per-window 1 ferrox-app-proxy::tests::a_kept_head_costs_one_read_per_window_and_takes_its_tail
+carrier-httpupgrade head-tail-allocations 0 ferrox-app-httpupgrade::tests::the_record_head_hands_over_the_buffer_it_filled
 carrier-httpupgrade inner-reads-per-pipelined-prefix 0 ferrox-app-httpupgrade::tests::the_pipelined_prefix_reaches_the_reader_without_a_socket_read
 carrier-httpupgrade prefix-bytes-held-after-walk 0 ferrox-app-httpupgrade::tests::the_pipelined_prefix_reaches_the_reader_without_a_socket_read
 
 carrier-httpheader ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-httpheader framing-bytes-added 0 ferrox-app-httpheader::tests::header_carries_an_echo_over_loopback
 carrier-httpheader head-tail-read-syscalls 0 ferrox-app-httpheader::tests::the_bytes_behind_the_head_reach_the_relay_without_a_syscall
+carrier-httpheader head-tail-allocations 0 ferrox-app-httpheader::tests::the_record_head_hands_over_the_buffer_it_filled
 carrier-httpheader user-space-copies-per-byte-relayed 1 ferrox-app-proxy::tests::carried_streams_round_trip_behind_the_http_camouflage
 
 carrier-grpc ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -189,6 +192,7 @@ carrier-xhttp writes-per-credit 1 ferrox-app-xhttp_h2::tests::a_credit_grants_bo
 carrier-xhttp window-update-frames-per-credit 2 ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write
 carrier-xhttp head-buffer-reallocations-per-request-head 0 ferrox-app-xhttp_h2::tests::the_synthesized_head_is_sized_for_its_bytes
 carrier-xhttp head-tail-read-syscalls 0 ferrox-app-xhttp::tests::a_chunk_that_rode_in_with_the_head_costs_no_syscall
+carrier-xhttp head-tail-allocations 0 ferrox-app-xhttp::tests::the_record_head_hands_over_the_buffer_it_filled
 carrier-xhttp received-data-frames-copied 0 ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into
 carrier-xhttp received-header-blocks-copied 0 ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into
 

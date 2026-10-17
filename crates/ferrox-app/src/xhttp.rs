@@ -1295,8 +1295,10 @@ pub(crate) fn accept_split_with_settings<
     let mut read = ChainReader::new(Vec::new(), read);
     let mut write = write;
     loop {
-        let (head, prefix) =
+        let (mut head, at) =
             crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
+        // The loop hands `accept_core` a head it parses and a tail it keeps, so this is the one reader whose tail still needs its own owner.
+        let prefix = head.split_off(at);
         match accept_core(&head, prefix, read, write, settings, None) {
             Served::Session(reader, writer) => return Some((reader, writer)),
             Served::Again(next, next_write, carry) => {
@@ -1694,10 +1696,10 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     path: &str,
 ) -> Option<(Reader<R>, XhttpWriter)> {
     write.write_all(dial_head(host, path).as_bytes()).ok()?;
-    let (head, prefix) =
+    let (head, at) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
-    check_response(&head)?;
-    Some(split_halves(read, write, prefix, 0))
+    check_response(&head[..at])?;
+    Some(split_halves(read, write, head, at))
 }
 
 impl crate::proxy::CarrierSink for XhttpWriter {
@@ -1989,6 +1991,33 @@ mod tests {
                 "{count} chunks: framing reads must amortise to one per chunk"
             );
         }
+    }
+
+    /// The record arm takes the buffer its own head read filled, head octets and all: what rode behind the delimiter is handed over inside it, not copied into a second owner.
+    #[test]
+    fn the_record_head_hands_over_the_buffer_it_filled() {
+        const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        const TAIL: &[u8] = b"2\r\nhi\r\n";
+        let mut wire = Vec::from(HEAD);
+        wire.extend_from_slice(TAIL);
+        let (reader, _writer) = connect_split(
+            std::io::Cursor::new(wire),
+            Sink(Arc::new(Mutex::new(Vec::new()))),
+            "h",
+            "/share",
+        )
+        .expect("dials the head");
+        assert_eq!(reader.at, HEAD.len(), "the cursor sits past the head");
+        assert_eq!(
+            reader.prefix.len(),
+            HEAD.len() + TAIL.len(),
+            "one buffer carries the answer and what rode behind it"
+        );
+        assert_eq!(
+            reader.prefix[reader.at..].as_ptr() as usize - reader.prefix.as_ptr() as usize,
+            reader.at,
+            "and those bytes lie inside the allocation the head read made"
+        );
     }
 
     /// The kept head hands the reader its own buffer with the head already walked past: the chunk that rode in behind the head is delivered without asking the socket, and its bytes never move.

@@ -77,6 +77,7 @@ graph TD
 | round-trips-per-early-dial | 0 | ferrox-app-httpupgrade::tests::an_over_budget_payload_rides_ahead_of_a_lazy_answer |
 | round-trips-per-shadowsocks-dial | 0 | ferrox-app-proxy::tests::socks_dials_ss_over_httpupgrade_with_early_data_to_echo |
 | head-reads-per-window | 1 | ferrox-app-proxy::tests::a_kept_head_costs_one_read_per_window_and_takes_its_tail |
+| head-tail-allocations | 0 | ferrox-app-httpupgrade::tests::the_record_head_hands_over_the_buffer_it_filled |
 | inner-reads-per-pipelined-prefix | 0 | ferrox-app-httpupgrade::tests::the_pipelined_prefix_reaches_the_reader_without_a_socket_read |
 | prefix-bytes-held-after-walk | 0 | ferrox-app-httpupgrade::tests::the_pipelined_prefix_reaches_the_reader_without_a_socket_read |
 <!-- counts:end -->
@@ -158,6 +159,14 @@ look-back is the one thing a one-shot read cannot show. Zeronet keeps the same s
 (`PrefixedStream`); sing-box pays an allocation for it (`buf.NewSize(Buffered())` plus
 `ReadFullFrom`).
 
+**The record read's second copy of its own head.** A stream with no file descriptor cannot
+`peek`, so `read_exact_head` read into a 512-byte stack probe, copied every octet again into
+the head `Vec` it returned, and `split_off`'d the tail into a third trip through user space.
+It is the kept loop now, so a head of `H` crosses once and both record arms hand `UpReader`
+the buffer the read filled with the cursor past the head (`head-tail-allocations 0`), which
+`httpupgrade::tests::the_record_head_hands_over_the_buffer_it_filled` holds: the base
+arithmetic is off by the head's length the moment the tail gets a buffer of its own.
+
 What this does *not* claim, and the reason `read_http_head` is still in the tree: two
 callers have nowhere to put the tail. The `http` front hands its prefix to a `CONNECT`
 writer that takes one buffer, and the Shadowsocks rung's server deliberately `peek`s and
@@ -185,8 +194,8 @@ finishes the walk: `prefix-bytes-held-after-walk 0`. No count sees the old memmo
 peekable carrier's one-branch delegate and the empty-request case.
 
 **One branch on the bulk read.** `UpReader::read` guarded `buf.is_empty()` before
-testing the prefix, so the peekable carrier — whose prefix is always empty — paid
-two branches on every relay read to reach the delegate. It now tests the prefix
+testing the prefix, so the carrier whose prefix has run out — every relay read after
+the handover — paid two branches to reach the delegate. It now tests the prefix
 first and returns `self.read.read(buf)` in one branch. The empty-buffer guard was
 provably redundant on both paths (empty prefix delegates and a `Read` answers an
 empty request with `Ok(0)`; a present prefix takes `n = min(len, 0) = 0`, copies

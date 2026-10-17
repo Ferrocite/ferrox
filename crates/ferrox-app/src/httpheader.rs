@@ -69,23 +69,23 @@ fn check_request(head: &[u8], path: &str) -> Option<()> {
     Some(())
 }
 
-// The same accept over halves that cannot peek: pipelined bytes arrive as a prefix.
+// The same accept over halves that cannot peek: the kept read consumes the head, so what rode in behind it is the reader's own prefix.
 pub(crate) fn accept_split<R: Read, W: Write>(
     mut read: R,
     mut write: W,
     path: &str,
 ) -> Option<(HeadReader<R>, W)> {
-    let (head, prefix) =
+    let (head, at) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
-    check_request(&head, path)?;
+    check_request(&head[..at], path)?;
     write
         .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")
         .ok()?;
     Some((
         HeadReader {
             read,
-            prefix,
-            at: 0,
+            prefix: head,
+            at,
         },
         write,
     ))
@@ -132,14 +132,14 @@ pub(crate) fn connect_split<R: Read, W: Write>(
 ) -> Option<(HeadReader<R>, W)> {
     let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n");
     write.write_all(request.as_bytes()).ok()?;
-    let (head, prefix) =
+    let (head, at) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
-    check_response(&head)?;
+    check_response(&head[..at])?;
     Some((
         HeadReader {
             read,
-            prefix,
-            at: 0,
+            prefix: head,
+            at,
         },
         write,
     ))
@@ -171,6 +171,28 @@ mod tests {
         reader.read_exact(&mut buf).expect("reads");
         assert_eq!(&buf, b"pong");
         server.join().expect("joins");
+    }
+
+    /// The record arm takes the buffer its own head read filled, head octets and all: what rode behind the delimiter is handed over inside it, not copied into a second owner.
+    #[test]
+    fn the_record_head_hands_over_the_buffer_it_filled() {
+        const HEAD: &[u8] = b"GET /camouflage HTTP/1.1\r\nHost: h\r\n\r\n";
+        const TAIL: &[u8] = b"ping";
+        let mut wire = Vec::from(HEAD);
+        wire.extend_from_slice(TAIL);
+        let (reader, _write) =
+            accept_split(std::io::Cursor::new(wire), Vec::new(), "/camouflage").expect("answers");
+        assert_eq!(reader.at, HEAD.len(), "the cursor sits past the head");
+        assert_eq!(
+            reader.prefix.len(),
+            HEAD.len() + TAIL.len(),
+            "one buffer carries the request and what rode behind it"
+        );
+        assert_eq!(
+            reader.prefix[reader.at..].as_ptr() as usize - reader.prefix.as_ptr() as usize,
+            reader.at,
+            "and those bytes lie inside the allocation the head read made"
+        );
     }
 
     /// The kept head hands its own buffer to the reader with the head already walked past: the bytes behind it are delivered from that buffer, and a reader that asks the socket at all panics.

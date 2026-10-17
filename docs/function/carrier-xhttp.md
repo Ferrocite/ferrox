@@ -133,9 +133,10 @@ What is *not* reusable, and named rather than rounded off:
   consulted on a timeout error, so it does not bound a blocking read — arming it per request is
   the open row below.
 
-The cost is stated too: every kept-alive request copies its own head again (`Vec<u8>` from
-`read_exact_head`) and the carried tail once (`prefix[pre..].to_vec()`), and re-runs the padding
-and placement parse. That is the price of not reconnecting; against a TLS handshake per packet
+The cost is stated too: every kept-alive request copies its head once (`read_exact_head` is
+the kept loop now, so no stack probe stands behind it) and its carried tail twice — once at the
+loop's `head.split_off(at)` and once more on the length path (`prefix[pre..].to_vec()`) — and
+re-runs the padding and placement parse. That is the price of not reconnecting; against a TLS handshake per packet
 it is nothing, but it is a copy this slice adds rather than removes, so it is here rather than
 in "What we removed".
 
@@ -205,9 +206,13 @@ bytes behind it start out in `Reader::prefix` at that cursor instead of being re
 in-memory buffer: the size line, the payload and the terminator come out of the head's own
 allocation — `reads()` stays `0`, base and capacity unchanged. A wrong cursor delivers the head
 as body; a re-read trips the counter.
-What is *not* removed: the split arms still use `read_exact_head`, because a record stream has no
-`peek` and their head arrives pre-sliced; `proxy::read_http_head` still answers the `http` front
-and the Shadowsocks rung, named on the WebSocket page.
+The dial arm took it too: a record stream has no `peek`, so `read_exact_head` is the same
+`kept_head_rounds`, and `connect_split` hands `Reader` the buffer that read filled with the
+Cursor past the `200` (`xhttp::tests::the_record_head_hands_over_the_buffer_it_filled`).
+What is *not* removed: the accept loop still `split_off`s its tail, because `accept_core`
+parses the head and hands the tail on, and a borrow of a buffer cannot outlive the move of that
+buffer; only the dial arm carries `head-tail-allocations 0`. `proxy::read_http_head` still
+answers the `http` front and the Shadowsocks rung, named on the WebSocket page.
 
 ## Measured
 
@@ -225,6 +230,7 @@ and the Shadowsocks rung, named on the WebSocket page.
 | window-update-frames-per-credit | 2 | ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write |
 | head-buffer-reallocations-per-request-head | 0 | ferrox-app-xhttp_h2::tests::the_synthesized_head_is_sized_for_its_bytes |
 | head-tail-read-syscalls | 0 | ferrox-app-xhttp::tests::a_chunk_that_rode_in_with_the_head_costs_no_syscall |
+| head-tail-allocations | 0 | ferrox-app-xhttp::tests::the_record_head_hands_over_the_buffer_it_filled |
 | received-data-frames-copied | 0 | ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into |
 | received-header-blocks-copied | 0 | ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into |
 <!-- counts:end -->

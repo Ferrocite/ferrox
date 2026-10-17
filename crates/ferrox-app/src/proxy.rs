@@ -7099,12 +7099,12 @@ fn dial_http_outbound(
             return;
         }
         // Whole reads, not octets: a byte reader over TLS decrypts one record per byte.
-        let Some((head, pipelined)) =
+        let Some((head, at)) =
             read_exact_head(&mut stream, HTTP_HEAD_LIMIT, budgets::head_arrival())
         else {
             return;
         };
-        let code = head
+        let code = head[..at]
             .split(|b| *b == b'\n')
             .next()
             .and_then(|line| line.split(|b| *b == b' ').nth(1))
@@ -7121,7 +7121,7 @@ fn dial_http_outbound(
         if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
             return;
         }
-        if !pipelined.is_empty() && downstream.write_all(&pipelined).is_err() {
+        if at < head.len() && downstream.write_all(&head[at..]).is_err() {
             return;
         }
         let close_downstream = downstream.try_clone().ok();
@@ -7890,39 +7890,13 @@ fn peek_head_rounds(stream: &mut TcpStream, limit: usize, budget: Duration) -> O
     }
 }
 
-// Head reader for streams without a file descriptor: peek is meaningless over records, so the tail comes back as a prefix.
+/// Head reader for a stream with no `peek`: the kept loop's own buffer and the offset where the head ends, so a head of `H` crosses user space once and its tail is not copied into an allocation of its own.
 pub(crate) fn read_exact_head(
     stream: &mut dyn Read,
     limit: usize,
     budget: Duration,
-) -> Option<(Vec<u8>, Vec<u8>)> {
-    let mut head = Vec::with_capacity(512);
-    let mut chunk = [0u8; 512];
-    let until = Instant::now() + budget;
-    loop {
-        if head.len() >= limit {
-            return None;
-        }
-        // A quiet socket is retried until the head's own budget runs out.
-        let n = match stream.read(&mut chunk) {
-            Ok(0) => return None,
-            Ok(n) => n,
-            Err(error) if is_timeout(&error) => {
-                if Instant::now() >= until {
-                    return None;
-                }
-                continue;
-            }
-            Err(_) => return None,
-        };
-        // A fresh delimiter must overlap the new bytes, so scan from three octets before them.
-        let from = head.len().saturating_sub(3);
-        head.extend_from_slice(&chunk[..n]);
-        if let Some(pos) = find_double_crlf(&head[from..]).map(|hit| hit + from) {
-            let prefix = head.split_off(pos + 4);
-            return Some((head, prefix));
-        }
-    }
+) -> Option<(Vec<u8>, usize)> {
+    kept_head_rounds(stream, limit, budget)
 }
 
 pub(crate) trait CarrierSink: Clone + Send + 'static {
@@ -10523,13 +10497,17 @@ mod tests {
         let mut source = Dribble {
             inner: std::io::Cursor::new(wire),
         };
-        let (head, prefix) =
+        let (head, at) =
             read_exact_head(&mut source, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("reads the head");
-        assert_eq!(head, head_bytes.to_vec(), "the head is returned whole");
+        assert_eq!(
+            &head[..at],
+            head_bytes.to_vec(),
+            "the head comes back whole"
+        );
         // The tail is overflow plus reader bytes: nothing lost at the boundary, nothing handed twice.
         let mut rest = Vec::new();
         source.read_to_end(&mut rest).expect("drains the reader");
-        let joined = [prefix.as_slice(), rest.as_slice()].concat();
+        let joined = [head[at..].to_vec(), rest].concat();
         assert_eq!(joined, tail_bytes.to_vec(), "the tail splits cleanly");
     }
 
@@ -19593,13 +19571,21 @@ mod tests {
             inner: std::io::Cursor::new(b"HTTP/1.1 200 OK\r\n\r\npinned".to_vec()),
             reads: 0,
         };
-        let Some((head, pipelined)) = read_exact_head(&mut source, HTTP_HEAD_LIMIT, HEAD_DEADLINE)
-        else {
+        let Some((head, at)) = read_exact_head(&mut source, HTTP_HEAD_LIMIT, HEAD_DEADLINE) else {
             panic!("the head is read");
         };
         assert_eq!(source.reads, 1, "one read for a head that arrives whole");
-        assert_eq!(head, b"HTTP/1.1 200 OK\r\n\r\n");
-        assert_eq!(pipelined, b"pinned", "the prefix past the head is returned");
+        assert_eq!(&head[..at], b"HTTP/1.1 200 OK\r\n\r\n");
+        assert_eq!(
+            &head[at..],
+            b"pinned",
+            "the prefix past the head is returned"
+        );
+        assert_eq!(
+            head[at..].as_ptr() as usize - head.as_ptr() as usize,
+            at,
+            "head and tail are one allocation, so the tail was never copied out of it"
+        );
     }
 
     /// Bytes past the `200\r\n\r\n` must reach the client before the relay opens, or the relay steals them.
