@@ -176,7 +176,10 @@ when it is zero (the GET, then the packet whole). Checked by
 `socks_dials_ss_over_httpupgrade_with_early_data_to_echo`, red at 20.08 s when the dial
 is put back to `0, &[]`; the bytes and their order are unchanged, which a real server
 witnesses in `carried_transports_relay_an_echo`, where the httpupgrade leg rides the
-packet at `ed=64` and holds it at `ed=0` and both open the echoed chunk.
+packet at `ed=64` and holds it at `ed=0` and both open the echoed chunk. The rung seals
+twice, once per family, so a `2022-blake3-aes-256-gcm` key reaches the same dial in
+`socks_dials_ss2022_over_httpupgrade_with_early_data_to_echo`: one branch's witness does
+not cover the other's code.
 
 What this *adds*, and it is the reason the row is a round trip and not a count: one
 heap buffer per dial and one copy of the packet into it (73 bytes for that IPv4 dial,
