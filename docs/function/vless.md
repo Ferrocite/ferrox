@@ -91,6 +91,27 @@ CI-only. No artefact from this branch has been read; the two cells quoted under
 before the pump's idle back-off) and the dispatched replays of `vless-raw-up-1` and
 `vless-raw-down-1` on `905962d`, each read from its own run artefact.
 
+**The upload cell measured the harness, not the engines, until #166.** The sink
+compared the bytes it was handed one at a time — a modulo and a bounds-checked
+index per byte — so on main's nightly at `f224c89` (`vless-raw-up-1`, ubuntu
+`x86_64`, 4 logical CPUs, one-hop ceiling 4 294 MiB/s) `xray-core` read 615.7,
+`ferrox` 616.4 and `zeronet` 619.8 MiB/s: every engine within 0.7% of the others,
+at 14% of the pipe, in the same run in which the same `ferrox` build downloads at
+3 011 MiB/s. The dispatched replay on `p69-sink-run-compare`, same runner class and
+same workload, leaves the ceiling where it was (4 470 MiB/s median — one
+generator into one reader, so a relay can beat it and it is read as a floor) and
+resolves the row: `ferrox` 5 307 MiB/s against `xray-core`'s 2 674, throughput
+interval [1.943×, 2.067×] median 1.998× better, cpu per GiB [2.369×, 2.425×]
+median 2.403×, peak RSS median 5.718× — where the same row read within noise,
+[0.975×, 1.030×], and the gate blamed the runner's spread. The upload direction was
+the only one bound this way: the ceiling flow and the download both go through the
+reader, which already compared in slices, so a download row has always been a
+comparison of engines. An upload *throughput* row measured before #166 is therefore
+evidence about the sink and not about the engines; its cpu and RSS rows still are,
+since the sink's cpu belongs to the harness process — `ferrox`'s cpu per GiB there
+moved 243.75 → 273.75 while its throughput moved 616 → 5 307 MiB/s, which is why
+the pump pricing above stands on the cpu ratio and needs no re-reading.
+
 ## What we removed
 
 - **A field-at-a-time header read.** This is the largest difference between the
