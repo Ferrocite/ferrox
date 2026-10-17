@@ -299,7 +299,10 @@ fn set_socket_timeout(
     if let Some(timeout) = timeout {
         // Whole microseconds; the sub-microsecond remainder would only round the bound down.
         value.tv_sec = timeout.as_secs().try_into().unwrap_or(i64::MAX);
-        value.tv_usec = timeout.subsec_micros().try_into().unwrap_or(0);
+        // `suseconds_t` is `i32` on macOS, where this conversion can fail, and `i64` on Linux, where it cannot.
+        #[allow(clippy::unnecessary_fallible_conversions)]
+        let usec: libc::suseconds_t = timeout.subsec_micros().try_into().unwrap_or(0);
+        value.tv_usec = usec;
     }
     // SAFETY: `value` is a live `timeval`, sized as the kernel reads the option, on the stream's own descriptor.
     let rc = unsafe {
