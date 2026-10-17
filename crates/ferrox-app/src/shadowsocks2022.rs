@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use ferrox_core::shadowsocks2022::{self, Cipher, Method, BLOCK_LEN, MAX_CHUNK, TAG_LEN};
 
 use crate::budgets::RELAY_POLL;
-use crate::proxy::{push_addr, read_exact, under_handshake};
+use crate::proxy::{push_addr, read_exact, under_handshake, write_all_runs};
 
 const READ_CHUNK: usize = 0x4000;
 const SKEW: u64 = 30;
@@ -666,10 +666,11 @@ pub(crate) fn pump_relay_carried<R, W>(
     let _ = done.join();
 }
 
-/// The downlink the dials build: every ask the carrier hears is the codec's own — a sealed length,
-/// then the chunk it names — opened into the caller's buffer, so a payload byte crosses user space
-/// once. `false` is the handshake never opening, which is the pump's own early exit: the carrier is
-/// not finished and the uplink is not joined, because the dial dropping the sockets is what ends it.
+/// The downlink the dials build: the carrier's octets opened into the codec's own window, so the
+/// widest ask the carrier ever hears is a window, a sealed length never costs its own ask, and a
+/// payload byte crosses user space once. `false` is the handshake never opening, which is the pump's
+/// own early exit: the carrier is not finished and the uplink is not joined, because the dial
+/// dropping the sockets is what ends it.
 fn relay_downlink<R: Read>(mut reader: R, recv: Recv, out: &mut dyn Write) -> bool {
     let mut recv = match recv {
         Recv::Ready(cipher) => cipher,
@@ -719,19 +720,142 @@ fn relay_downlink<R: Read>(mut reader: R, recv: Recv, out: &mut dyn Write) -> bo
             cipher
         }
     };
-    let mut chunk = wire_buffer();
-    while let Some(payload) = open_chunk(&mut reader, &mut recv, &mut chunk) {
-        if out.write_all(payload).is_err() {
-            break;
-        }
-    }
+    let mut window = ChunkReader::new(reader);
+    let _ = drain_window(&mut window, &mut recv, out);
     true
 }
 
-pub(crate) const WIRE_MAX: usize = MAX_CHUNK + TAG_LEN;
+/// Chunks one window batch opens and hands to the target at once.
+const CHUNKS_PER_BATCH: usize = 4;
 
-pub(crate) fn wire_buffer() -> Vec<u8> {
-    crate::proxy::RelayBuf::with_len(WIRE_MAX).into_vec()
+/// The relay's read window: a slot of the uplink's own read size for every chunk of a batch, so one
+/// ask covers a batch of relay-sized chunks, and the widest chunk a peer can name — `MAX_CHUNK` with
+/// its sealed length and tag — still lands in it whole.
+const WINDOW: usize = CHUNKS_PER_BATCH * (SEAL_HEAD + READ_CHUNK + TAG_LEN);
+
+/// One relay connection's downlink window: wire bytes land here once and chunks open where they lie,
+/// so a sealed length never costs its own carrier ask and a payload byte crosses user space once.
+struct ChunkReader<R> {
+    read: R,
+    buf: Vec<u8>,
+    at: usize,
+    end: usize,
+    /// A chunk whose length is drawn but whose bytes have not all arrived.
+    held: Option<usize>,
+}
+
+impl<R: Read> ChunkReader<R> {
+    fn new(read: R) -> Self {
+        Self {
+            read,
+            buf: crate::proxy::RelayBuf::with_len(WINDOW).into_vec(),
+            at: 0,
+            end: 0,
+            held: None,
+        }
+    }
+
+    /// Fill until `need` bytes wait at `at`, compacting only when the buffer is full so leftovers
+    /// move once: one `read` per fill on a live socket, and short reads and quiet sockets loop
+    /// exactly like `read_exact`.
+    fn fill(&mut self, need: usize) -> Option<()> {
+        loop {
+            if self.end - self.at >= need {
+                return Some(());
+            }
+            if self.end == self.buf.len() {
+                self.buf.copy_within(self.at..self.end, 0);
+                self.end -= self.at;
+                self.at = 0;
+            }
+            match self.read.read(&mut self.buf[self.end..]) {
+                Ok(0) => return None,
+                Ok(n) => self.end += n,
+                Err(error) if crate::proxy::is_timeout(&error) => {}
+                Err(_) => return None,
+            }
+        }
+    }
+
+    /// Open one chunk where it lies and say where its plaintext ended up. `None` with `wait` is the
+    /// stream ending or a tag that will not open, and nothing after either is trustworthy; without
+    /// `wait` it also means this chunk has not finished arriving, which is why its length is drawn
+    /// once and held rather than drawn again against the next chunk's nonce.
+    fn open_chunk(&mut self, recv: &mut Cipher, wait: bool) -> Option<(usize, usize)> {
+        let head = LENGTH_LEN + TAG_LEN;
+        let size = if let Some(size) = self.held {
+            size
+        } else {
+            if self.end - self.at < head {
+                if !wait {
+                    return None;
+                }
+                self.fill(head)?;
+            }
+            let length = &mut self.buf[self.at..self.at + head];
+            let size = open_length(recv, length)?;
+            self.held = Some(size);
+            size
+        };
+        let body = size + TAG_LEN;
+        if self.end - self.at < head + body {
+            if !wait {
+                return None;
+            }
+            self.fill(head + body)?;
+        }
+        self.held = None;
+        let start = self.at + head;
+        let plain = recv.open_in_place(&mut self.buf[start..start + body])?;
+        self.at = start + body;
+        Some((start, plain))
+    }
+
+    /// Open the chunks this window already holds, waiting only for the first: a peer that stops to
+    /// hear back from its own target must never find the chunk it is waiting on held for a batch
+    /// that has not arrived. Returns how many opened, or `0` once the stream is over or damaged.
+    fn open_batch(&mut self, recv: &mut Cipher, out: &mut [(usize, usize)]) -> usize {
+        let mut opened = 0usize;
+        let mut wait = true;
+        while opened < out.len() {
+            let Some(chunk) = self.open_chunk(recv, wait) else {
+                break;
+            };
+            out[opened] = chunk;
+            opened += 1;
+            // Only the first chunk of a batch may be waited for.
+            wait = false;
+        }
+        opened
+    }
+}
+
+/// Hand the whole batch the window already holds to the target, and keep doing so until the stream
+/// ends or the target refuses: one `write_vectored` per batch where the socket has `writev`, one
+/// write per chunk where it has not, and no wait for a chunk that has not arrived.
+fn drain_window<R: Read>(
+    window: &mut ChunkReader<R>,
+    recv: &mut Cipher,
+    out: &mut dyn Write,
+) -> std::io::Result<()> {
+    let mut batch = [(0usize, 0usize); CHUNKS_PER_BATCH];
+    loop {
+        let opened = window.open_batch(recv, &mut batch);
+        if opened == 0 {
+            return Ok(());
+        }
+        write_all_runs::<CHUNKS_PER_BATCH>(out, &window.buf, &batch[..opened])?;
+    }
+}
+
+/// Open an 18 B sealed length in place: the payload size it names, or `None` on a forged tag or a
+/// size the rung does not accept — 2022 has no empty chunk, so a zero length ends the stream.
+fn open_length(recv: &mut Cipher, length: &mut [u8]) -> Option<usize> {
+    if recv.open_in_place(length)? != LENGTH_LEN {
+        return None;
+    }
+    let size = usize::from(u16::from_be_bytes([length[0], length[1]]));
+    (size > 0 && size <= MAX_CHUNK).then_some(size)
 }
 
 /// Seal `n` payload bytes at `buf[SEAL_HEAD..]` and hand seals and payload to `out` in one write: a payload byte is never copied in user space, and one call seals one chunk because `READ_CHUNK` is a quarter of `MAX_CHUNK` — a relay read is already one chunk, and oversize input is refused loudly rather than corrupted.
@@ -759,26 +883,6 @@ fn seal_all(
     buf[LENGTH_LEN..SEAL_HEAD].copy_from_slice(&length_tag);
     buf[end..end + TAG_LEN].copy_from_slice(&tag);
     out.write_all(&buf[..end + TAG_LEN])
-}
-
-fn open_chunk<'a>(
-    stream: &mut dyn Read,
-    recv: &mut Cipher,
-    chunk: &'a mut [u8],
-) -> Option<&'a [u8]> {
-    let mut length = [0u8; 2 + TAG_LEN];
-    read_exact(stream, &mut length).ok()?;
-    if recv.open_in_place(&mut length)? != 2 {
-        return None;
-    }
-    let size = usize::from(u16::from_be_bytes([length[0], length[1]]));
-    if size == 0 || size > MAX_CHUNK || size + TAG_LEN > chunk.len() {
-        return None;
-    }
-    let wire = &mut chunk[..size + TAG_LEN];
-    read_exact(stream, wire).ok()?;
-    let plain = recv.open_in_place(wire)?;
-    Some(&wire[..plain])
 }
 
 struct ServerUdp {
@@ -1610,6 +1714,104 @@ fn answer_udp(
 mod tests {
     use super::*;
 
+    /// Bytes one wire chunk can never exceed: what a single-chunk open is given room for.
+    const WIRE_MAX: usize = MAX_CHUNK + TAG_LEN;
+
+    fn wire_buffer() -> Vec<u8> {
+        crate::proxy::RelayBuf::with_len(WIRE_MAX).into_vec()
+    }
+
+    /// One chunk opened out of a buffer of its own, which is how a gate reaches a codec primitive
+    /// without the relay's window standing between them.
+    fn open_chunk<'a>(
+        stream: &mut dyn Read,
+        recv: &mut Cipher,
+        chunk: &'a mut [u8],
+    ) -> Option<&'a [u8]> {
+        let mut length = [0u8; LENGTH_LEN + TAG_LEN];
+        read_exact(stream, &mut length).ok()?;
+        let size = open_length(recv, &mut length)?;
+        if size + TAG_LEN > chunk.len() {
+            return None;
+        }
+        let wire = &mut chunk[..size + TAG_LEN];
+        read_exact(stream, wire).ok()?;
+        let plain = recv.open_in_place(wire)?;
+        Some(&wire[..plain])
+    }
+
+    /// A writer that has `writev`, which is what the relay's own socket is: it counts calls and
+    /// remembers every base it was handed, so a batch that leaves in one vectored write is one
+    /// syscall by the same account the kernel keeps, and a plaintext that left the window where it
+    /// lies is witnessed by its base sitting inside that window.
+    struct Vectored<'a> {
+        seen: &'a mut Vec<u8>,
+        writes: usize,
+        bases: Vec<usize>,
+    }
+    impl Write for Vectored<'_> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes += 1;
+            self.bases.push(buf.as_ptr() as usize);
+            self.seen.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+            self.writes += 1;
+            let mut taken = 0usize;
+            for piece in bufs {
+                self.bases.push(piece.as_ptr() as usize);
+                self.seen.extend_from_slice(piece);
+                taken += piece.len();
+            }
+            Ok(taken)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A source that answers a whole read at once, counting them, so a fill's read count is exact.
+    struct CountingReads<R> {
+        read: R,
+        reads: usize,
+    }
+    impl<R: Read> Read for CountingReads<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            self.read.read(buf)
+        }
+    }
+
+    /// A source that hands back one staged part per read and nothing after the last, so a chunk that
+    /// has not arrived is a chunk the pump can be seen not to wait for.
+    struct Staged {
+        parts: Vec<Vec<u8>>,
+        at: usize,
+        reads: usize,
+    }
+    impl Read for Staged {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            let Some(part) = self.parts.get(self.at) else {
+                return Ok(0);
+            };
+            self.at += 1;
+            let take = part.len().min(buf.len());
+            buf[..take].copy_from_slice(&part[..take]);
+            Ok(take)
+        }
+    }
+
+    /// A chunk of `plain` on the wire, sealed by `send` into a buffer of its slot's width.
+    fn seal_one(send: &mut Cipher, plain: &[u8]) -> Vec<u8> {
+        let mut buf = vec![0u8; SEAL_HEAD + plain.len() + TAG_LEN];
+        buf[SEAL_HEAD..SEAL_HEAD + plain.len()].copy_from_slice(plain);
+        let mut wire = Vec::new();
+        seal_all(send, &mut buf, plain.len(), &mut wire).expect("seals");
+        wire
+    }
+
     fn psk_b64(key_len: usize) -> String {
         ferrox_core::b64::encode(&vec![0x42u8; key_len])
     }
@@ -2190,11 +2392,11 @@ mod tests {
     }
 
     /// The chain the xhttp arm composes, driven from memory: two sealed chunks arrive through the
-    /// real carrier framing, and the carrier hears the codec's own asks — a sealed length and the
-    /// chunk it names. A `BufReader` between them would have asked its capacity of the carrier for
-    /// the first byte of either and answered the rest from its stage.
+    /// real carrier framing, and the carrier hears the window's own ask. A sealed length and the
+    /// chunk it names used to be two asks of the carrier each, which is what a `BufReader` between
+    /// them made worse by asking its capacity for the first byte of either.
     #[test]
-    fn the_carrier_and_the_chunk_ask_the_socket_as_one() {
+    fn the_carrier_and_the_window_ask_the_socket_as_one() {
         let method = Method::Aes256Gcm;
         let psk = vec![7u8; 32];
         let salt = vec![7u8; 32];
@@ -2231,16 +2433,122 @@ mod tests {
         assert_eq!(out, plain, "a downlink byte crosses user space once");
         let seen = widths.borrow();
         assert!(
-            seen.contains(&(LENGTH_LEN + TAG_LEN)),
-            "the sealed length is asked of the carrier as the codec asks it: {seen:?}"
+            seen.contains(&WINDOW),
+            "the whole window is asked of the carrier: {seen:?}"
         );
         assert!(
-            seen.contains(&(1000 + TAG_LEN)),
-            "the payload it names follows as its own ask: {seen:?}"
+            !seen.contains(&(LENGTH_LEN + TAG_LEN)),
+            "a sealed length no longer costs its own ask: {seen:?}"
+        );
+        assert!(
+            !seen.contains(&(1000 + TAG_LEN)),
+            "nor does the chunk it names: {seen:?}"
         );
         assert!(
             !seen.contains(&STAGE),
             "a stage would ask its capacity here: {seen:?}"
+        );
+        // The ask count is no gate here: `connect_split` hands the carrier's pipelined tail to its reader's prefix, so a window ask is answered at that boundary first.
+        assert_eq!(
+            seen[0], WINDOW,
+            "the batch opens inside one window ask, not a length ask and a payload ask"
+        );
+    }
+
+    /// The downlink's batch path end to end, counted where the count is exact: a source that answers
+    /// the whole window in one read, a target that counts vectored writes, and four chunks that open
+    /// and leave without one byte copied out of the window.
+    #[test]
+    fn a_bulk_read_serves_every_buffered_chunk() {
+        let method = Method::Aes256Gcm;
+        let psk = vec![7u8; 32];
+        let salt = vec![7u8; 32];
+        let mut send = Cipher::from_psk(method, &psk, &salt).expect("derives");
+        let sizes = [READ_CHUNK, 100, 4000, 17];
+        let mut plain = Vec::new();
+        let mut wire = Vec::new();
+        for (part, size) in sizes.iter().enumerate() {
+            let piece: Vec<u8> = (0..*size).map(|i| ((i + part * 7) % 251) as u8).collect();
+            plain.extend_from_slice(&piece);
+            wire.extend_from_slice(&seal_one(&mut send, &piece));
+        }
+        let mut recv = Cipher::from_psk(method, &psk, &salt).expect("derives");
+        let mut window = ChunkReader::new(CountingReads {
+            read: std::io::Cursor::new(wire),
+            reads: 0,
+        });
+        let mut got = Vec::new();
+        let (writes, bases) = {
+            let mut out = Vectored {
+                seen: &mut got,
+                writes: 0,
+                bases: Vec::new(),
+            };
+            drain_window(&mut window, &mut recv, &mut out).expect("drains");
+            (out.writes, out.bases)
+        };
+        assert_eq!(
+            window.read.reads, 2,
+            "one bulk read serves the whole batch, the next one finds the end"
+        );
+        assert_eq!(writes, 1, "the opened batch leaves in one write");
+        assert_eq!(bases.len(), sizes.len(), "one piece per opened chunk");
+        assert!(
+            bases.windows(2).all(|pair| pair[0] < pair[1]),
+            "the chunks open where they lie, in wire order"
+        );
+        let base = window.buf.as_ptr() as usize;
+        let room = base + window.buf.len();
+        for at in &bases {
+            assert!(
+                (base..room).contains(at),
+                "a plaintext leaves from the window's own buffer"
+            );
+        }
+        assert_eq!(got, plain, "the batch is the stream the seals made");
+    }
+
+    /// A batch is the chunks the window already holds, and nothing more: a peer that stops to hear
+    /// back from its own target must find the chunk it sent already at the target, so only the first
+    /// chunk of a batch is ever waited for. One read, one opened, no second read spent.
+    #[test]
+    fn a_batch_never_waits_for_a_chunk_that_has_not_arrived() {
+        let method = Method::Aes256Gcm;
+        let psk = vec![7u8; 32];
+        let salt = vec![7u8; 32];
+        let mut send = Cipher::from_psk(method, &psk, &salt).expect("derives");
+        let first: Vec<u8> = (0..READ_CHUNK).map(|i| (i % 251) as u8).collect();
+        let second: Vec<u8> = (0..100).map(|i| (i % 197) as u8).collect();
+        let whole = seal_one(&mut send, &first);
+        let rest = seal_one(&mut send, &second);
+        // Chunk one whole, then the second chunk's sealed length and part of its payload; the rest of that payload is what the pump must not wait for.
+        let split = LENGTH_LEN + TAG_LEN + 8;
+        let mut staged = Staged {
+            parts: vec![
+                [whole.as_slice(), &rest[..split]].concat(),
+                rest[split..].to_vec(),
+            ],
+            at: 0,
+            reads: 0,
+        };
+        let mut recv = Cipher::from_psk(method, &psk, &salt).expect("derives");
+        let mut window = ChunkReader::new(&mut staged);
+        let mut batch = [(0usize, 0usize); CHUNKS_PER_BATCH];
+        assert_eq!(
+            window.open_batch(&mut recv, &mut batch),
+            1,
+            "the second chunk is still arriving"
+        );
+        assert_eq!(window.read.reads, 1, "no read is spent waiting for it");
+        assert_eq!(&window.buf[batch[0].0..batch[0].0 + batch[0].1], &first[..]);
+        assert_eq!(
+            window.open_batch(&mut recv, &mut batch),
+            1,
+            "the held length opens against its own nonce once the payload lands"
+        );
+        assert_eq!(
+            &window.buf[batch[0].0..batch[0].0 + batch[0].1],
+            &second[..]
         );
     }
 }
