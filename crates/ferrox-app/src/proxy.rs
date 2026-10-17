@@ -6109,10 +6109,10 @@ fn serve_socks_udp_freedom(relay: &UdpSocket) {
     }
 }
 
-/// The association's own control socket answers a peek with zero (or an error) once the app is gone; a timeout is the answer that says it is still there.
-fn association_left(associate: &Connection) -> bool {
+/// The client's own socket answers a peek with zero (or an error) once the app is gone; a timeout is the answer that says it is still there.
+fn peer_left(client: &Connection) -> bool {
     let mut byte = [0u8; 1];
-    match associate.peek(&mut byte) {
+    match client.peek(&mut byte) {
         Err(error) => !is_timeout(&error),
         Ok(read) => read == 0,
     }
@@ -6152,7 +6152,7 @@ fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connectio
                 }
             }
             Err(error) if is_timeout(&error) => {
-                if association_left(associate) || quiet.elapsed() >= budgets::udp_idle() {
+                if peer_left(associate) || quiet.elapsed() >= budgets::udp_idle() {
                     break;
                 }
             }
@@ -6242,7 +6242,7 @@ fn serve_socks_udp_foxy_ip(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connec
                 }
             }
             Err(error) if is_timeout(&error) => {
-                if association_left(associate) || quiet.elapsed() >= budgets::udp_idle() {
+                if peer_left(associate) || quiet.elapsed() >= budgets::udp_idle() {
                     break;
                 }
             }
@@ -7072,46 +7072,50 @@ fn copy_locked(
                     if total == 0 {
                         debug_bytes(direction, &buf[..read]);
                     }
-                    write_full(tunnel, &buf[..read])
+                    write_full(tunnel, peer_ended, &buf[..read])
                 }
             }
         } else {
-            let Ok(mut lane) = tunnel.lock() else { break };
-            match lane.read(&mut buf) {
-                Ok(0) => {
-                    debug_relay(direction, total, None);
+            // The lane is handed back before the client is written: a client that has stopped reading would otherwise cost the other direction its turn on the lane, and an upload that cannot start cannot finish the request it waits on.
+            let taken = {
+                let Ok(mut lane) = tunnel.lock() else {
                     break;
-                }
-                Ok(read) => {
-                    if total == 0 {
-                        debug_bytes(direction, &buf[..read]);
-                    }
-                    match socket.write_all(&buf[..read]) {
-                        Ok(()) => read,
-                        Err(error) => {
-                            debug_relay(direction, total, Some(error.kind()));
-                            break;
-                        }
-                    }
-                }
-                // No payload in the quantum: drop the lock so the writer gets a turn.
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock
-                            | std::io::ErrorKind::TimedOut
-                            | std::io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    // The lane has not answered inside its quantum: idle, unless the client's own leg has ended and nothing is left to deliver.
-                    if peer_ended.load(std::sync::atomic::Ordering::Acquire) {
+                };
+                match lane.read(&mut buf) {
+                    Ok(0) => {
                         debug_relay(direction, total, None);
                         break;
                     }
-                    drop(lane);
-                    std::thread::sleep(RELAY_IDLE);
-                    continue;
+                    Ok(read) => read,
+                    // No payload in the quantum: drop the lock so the writer gets a turn.
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        // The lane has not answered inside its quantum: idle, unless the client's own leg has ended and nothing is left to deliver.
+                        if peer_ended.load(std::sync::atomic::Ordering::Acquire) {
+                            debug_relay(direction, total, None);
+                            break;
+                        }
+                        drop(lane);
+                        std::thread::sleep(RELAY_IDLE);
+                        continue;
+                    }
+                    Err(error) => {
+                        debug_relay(direction, total, Some(error.kind()));
+                        break;
+                    }
                 }
+            };
+            if total == 0 {
+                debug_bytes(direction, &buf[..taken]);
+            }
+            match socket.write_all(&buf[..taken]) {
+                Ok(()) => taken,
                 Err(error) => {
                     debug_relay(direction, total, Some(error.kind()));
                     break;
@@ -7129,6 +7133,7 @@ fn copy_locked(
 /// Writes all bytes through the shared lane, taking the lock per call so the other direction interleaves.
 fn write_full(
     tunnel: &std::sync::Arc<std::sync::Mutex<crate::foxy::Tunnel>>,
+    peer_ended: &std::sync::atomic::AtomicBool,
     mut buf: &[u8],
 ) -> usize {
     let total = buf.len();
@@ -7136,12 +7141,12 @@ fn write_full(
         let Ok(mut lane) = tunnel.lock() else {
             break;
         };
-        match lane.write(buf) {
-            Ok(0) => {
-                drop(lane);
-                std::thread::sleep(RELAY_IDLE);
+        let stalled = match lane.write(buf) {
+            Ok(0) => true,
+            Ok(wrote) => {
+                buf = &buf[wrote..];
+                false
             }
-            Ok(wrote) => buf = &buf[wrote..],
             Err(error)
                 if matches!(
                     error.kind(),
@@ -7150,10 +7155,17 @@ fn write_full(
                         | std::io::ErrorKind::Interrupted
                 ) =>
             {
-                drop(lane);
-                std::thread::sleep(RELAY_IDLE);
+                true
             }
             Err(_) => break,
+        };
+        if stalled {
+            drop(lane);
+            // A closed window answers before the socket is touched, so the lane cannot report its own death here: the leg that carried the other way has to say so.
+            if peer_ended.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(RELAY_IDLE);
         }
     }
     total - buf.len()
