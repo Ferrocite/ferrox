@@ -86,9 +86,15 @@ blessed count.
 
 ## Time
 
-**Not measured on this branch.** `.github/workflows/benchmark-matrix.yml` runs
-the HTTPUpgrade scenarios and `parity.yml` runs the paired comparison. No
-artefact from this branch has been read.
+**Not measured on this branch, and no runner can measure it yet.** The matrix
+carries no httpupgrade scenario: `scripts/lib-matrix.sh`'s `scenarios` list
+names VLESS over raw, ws, gRPC and xHTTP plus vmess, trojan and shadowsocks, and
+`scripts/run-parity.sh` walks that same set, so neither
+`benchmark-matrix.yml` nor `parity.yml` has an HTTPUpgrade cell to produce a
+number from. This branch's plan says it in one line — `plan the tier and its
+cells` prints `matrix=false` for a narrow change to this method and every
+measure job skips. The scope block below therefore declares no `scenarios:` key;
+a duration would need a scenario added to `scripts/lib-matrix.sh` first.
 
 ## What we removed
 
