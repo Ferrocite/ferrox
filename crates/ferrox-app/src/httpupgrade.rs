@@ -134,6 +134,11 @@ fn upgrade_request(host: &str, path: &str) -> String {
     request
 }
 
+/// `Ed` is a flag, not a length: any non-zero budget rides, whatever the payload's size, and only `ed=0` holds it back.
+fn rides(budget: u32, first: &[u8]) -> bool {
+    budget != 0 && !first.is_empty()
+}
+
 // One call when the payload rides ahead of the `101` — what `?ed` buys — so the socket packs request and payload into one `writev` and the session coalesces them into one record, where a write per part left two of each.
 fn send_request<W: crate::proxy::FrameWrite>(
     write: &mut W,
@@ -157,7 +162,7 @@ pub(crate) fn connect(
     first: &[u8],
 ) -> Option<(UpReader, TcpStream)> {
     let mut read = stream;
-    let early = !first.is_empty() && first.len() as u64 <= u64::from(budget);
+    let early = rides(budget, first);
     send_request(&mut read, &upgrade_request(host, path), early, first)?;
     let (head, prefix) = read_head(&mut read)?;
     check_response(&head)?;
@@ -175,7 +180,11 @@ fn check_response(head: &[u8]) -> Option<()> {
     // One UTF-8 pass and one line scan for status plus both upgrade headers; the fanout cost three of each.
     let text = std::str::from_utf8(head).ok()?;
     let mut lines = text.split("\r\n");
-    if lines.next()? != "HTTP/1.1 101 Switching Protocols" {
+    let status = lines.next()?;
+    // xray and sing-box read only the version token and the three digits; a reason phrase is free text and may be absent.
+    if !status.starts_with("HTTP/1.1 101")
+        || !matches!(status.as_bytes().get(12), Some(b' ' | b'\r') | None)
+    {
         return None;
     }
     let mut connection = false;
@@ -207,7 +216,7 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite>(
     budget: u32,
     first: &[u8],
 ) -> Option<(UpReader<R>, W)> {
-    let early = !first.is_empty() && first.len() as u64 <= u64::from(budget);
+    let early = rides(budget, first);
     send_request(&mut write, &upgrade_request(host, path), early, first)?;
     let (head, prefix) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
@@ -341,7 +350,7 @@ mod tests {
         );
     }
 
-    /// Status and both upgrade headers fall out of one scan; the same vectors decide the same way.
+    /// Status and both upgrade headers fall out of one scan; the reason phrase is free text, the digits are not.
     #[test]
     fn check_response_accepts_and_refuses_the_vectors_it_did() {
         let ok = b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\
@@ -365,6 +374,32 @@ mod tests {
             check_response(b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\n")
                 .is_none(),
             "missing Upgrade"
+        );
+        assert!(
+            check_response(
+                b"HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+            )
+            .is_some(),
+            "a free-text reason phrase"
+        );
+        assert!(
+            check_response(b"HTTP/1.1 101\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n")
+                .is_some(),
+            "no reason phrase at all"
+        );
+        assert!(
+            check_response(
+                b"HTTP/1.1 1011 Whatever\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+            )
+            .is_none(),
+            "four digits is not 101"
+        );
+        assert!(
+            check_response(
+                b"HTTP/1.1 101x Whatever\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+            )
+            .is_none(),
+            "not a digit and not a space"
         );
         assert!(check_response(b"HTTP/1.1 101 Switching Protocols\r\nConnection: keep-alive\r\nUpgrade: websocket\r\n\r\n").is_none(), "wrong Connection");
         assert!(
@@ -399,26 +434,28 @@ mod tests {
         server.join().expect("joins");
     }
 
-    /// A payload over the budget is held back and sent only after the `101`, yet still reaches the server whole.
+    /// The round trip the flag rule deletes, witnessed on a socket: this server answers only once it has read the payload, so a dial that waited for the `101` first stalls until `head_arrival()` and returns no upgrade.
     #[test]
-    fn a_payload_over_the_budget_follows_the_switch() {
+    fn an_over_budget_payload_rides_ahead_of_a_lazy_answer() {
+        let request = upgrade_request("oracle.example", "/tunnel");
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
-            let (stream, _) = listener.accept().expect("accepts");
-            let (mut reader, mut write) = accept(stream, "/tunnel").expect("upgrades");
-            let mut buf = [0u8; 4];
-            reader.read_exact(&mut buf).expect("reads after the switch");
-            assert_eq!(&buf, b"ping");
-            write.write_all(b"pong").expect("writes");
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut head = vec![0u8; request.len()];
+            stream.read_exact(&mut head).expect("reads the request");
+            assert_eq!(head, request.as_bytes());
+            let mut payload = [0u8; 4];
+            stream
+                .read_exact(&mut payload)
+                .expect("reads the payload before answering");
+            assert_eq!(&payload, b"ping");
+            stream.write_all(SWITCH).expect("answers");
         });
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
-        // `budget` is one short of the payload, so it cannot ride: the reader still sees it whole.
-        let (mut reader, _write) =
-            connect(stream, "oracle.example", "/tunnel", 3, b"ping").expect("upgrades");
-        let mut buf = [0u8; 4];
-        reader.read_exact(&mut buf).expect("reads");
-        assert_eq!(&buf, b"pong");
+        // `budget` is one short of the payload, so the old length rule held it back; the flag rides it.
+        let (_reader, _write) =
+            connect(stream, "oracle.example", "/tunnel", 3, b"ping").expect("rides ahead");
         server.join().expect("joins");
     }
 
@@ -489,16 +526,16 @@ mod tests {
         );
     }
 
-    /// A payload over the budget waits for the `101` and leaves in a write of its own; nothing is vectored.
+    /// `ed=0` is the one hold: the request leaves alone, in its own write, and the payload follows in a second one; nothing is vectored.
     #[test]
-    fn a_payload_over_the_budget_follows_the_switch_in_one_write_each() {
+    fn ed_zero_holds_the_payload_behind_in_one_write_each() {
         let first = *b"ping";
         let (_reader, write) = connect_split(
             std::io::Cursor::new(SWITCH.to_vec()),
             Recorder::default(),
             "oracle.example",
             "/tunnel",
-            3,
+            0,
             &first,
         )
         .expect("upgrades");

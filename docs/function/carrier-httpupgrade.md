@@ -8,11 +8,16 @@ There is no frame header, no length, no type. `UpReader` drains whatever
 the handshake reader over-read, then delegates every byte to the inner socket.
 The relay adds **zero** framing bytes and the only copy is the relay's own.
 
-The one thing worth writing down is the head scan. `find_head_end` carries a
-`scanned` cursor, so searching for `\r\n\r\n` is not quadratic. That matters
-because the server side runs this scan *before any authentication*: a client
-that drips one byte per packet would otherwise make one connection cost billions
-of comparisons before anything is checked. Zray records the same hazard and the
+The one thing worth writing down is the head scan. It is not quadratic, and the
+reason is where the work lands per round: `proxy::find_across` re-windows only the
+up-to-three `\r\n\r\n` candidates that straddle the seam of what it already has and
+what just arrived, and hands the rest of the new chunk to `find_double_crlf`, one SWAR
+pass that tests eight bytes per word and visits only its `\n` lanes. The accumulated
+head is never re-scanned, so the cost is linear in the bytes peeked. Zeronet carries
+the same cursor on its side (`find_head_end`'s `scanned`). That matters because the
+server side runs this scan *before any authentication*: a client that drips one byte
+per packet would otherwise make one connection cost billions of comparisons before
+anything is checked. Zray records the same hazard and the
 same fix; sing-box's httpupgrade server instead does `buf.NewSize(reader.Buffered())`
 plus a `ReadFullFrom` to preserve its coalesced bytes, which spends an
 allocation to achieve the same thing.
@@ -47,7 +52,7 @@ uses.
 
 ```mermaid
 graph TD
-    C["client: GET with Upgrade"] --> S["server: peek, scan for CRLFCRLF<br/>with a scanned cursor, not quadratic"]
+    C["client: one write of the GET and the payload,<br/>ahead of reading the 101"] --> S["server: peek, scan for CRLFCRLF<br/>seam windows + one SWAR pass per chunk"]
     S --> R["read exactly the head, no more"]
     R --> P["keep whatever came with it"]
     P --> X["UpReader: drain the prefix,<br/>then delegate"]
@@ -67,7 +72,16 @@ graph TD
 | user-space-copies-per-byte-relayed | 1 | ferrox-app-httpupgrade::tests::upgrade_carries_an_echo_over_loopback |
 | write-calls-per-early-dial | 1 | ferrox-app-httpupgrade::tests::the_early_data_rides_in_one_write_with_the_request |
 | request-reallocations-per-dial | 0 | ferrox-app-httpupgrade::tests::the_request_is_sized_for_its_bytes |
+| round-trips-per-early-dial | 0 | ferrox-app-httpupgrade::tests::an_over_budget_payload_rides_ahead_of_a_lazy_answer |
 <!-- counts:end -->
+
+`round-trips-per-early-dial` is witnessed on a socket against a server that answers
+only *after* it has read the payload: a dial that held the payload back would sit in
+the head read until `budgets::head_arrival()` and return no upgrade, which is exactly
+what it does under the length rule (red at 20.03 s). An echo test cannot see the
+difference — a held-back payload arrives eventually either way — and
+`the_early_data_rides_in_one_write_with_the_request` cannot either, because it counts
+writes, not the round trip between them.
 
 ## Ops
 
@@ -124,10 +138,42 @@ skips that empty line, which the fanout reached only after returning first, and
 `check_request_accepts_and_refuses_the_vectors_it_did` and
 `check_response_accepts_and_refuses_the_vectors_it_did` hold the vectors.
 
-Nothing removed on the parse path beyond the branch and the fanout above, which
-is the point. What is recorded here is that, that the teardown *gains* one read
-syscall (16 at the cap) to buy the FIN, and which three claims about this carrier
-are false:
+**The round trip an over-budget payload used to pay.** The dial decided
+`!first.is_empty() && first.len() as u64 <= u64::from(budget)`, so a payload larger
+than `?ed=N` was held back until after the `101` and paid a second round trip. `Ed`
+is a flag in the pinned reference, never a length: xray reads `if
+transportConfiguration.Ed == 0` and otherwise returns the connection *without reading
+the answer at all*, so its caller's first write goes ahead whatever its size. (The
+websocket transport is where a length matters, because the payload has to fit inside a
+header value.) The rule is now `rides(budget, first)` = `budget != 0 &&
+!first.is_empty()`, which removes a length compare, a widening cast and a saturating
+path, and pipelines strictly more than before; both dials call it, so the rule cannot
+drift between the raw and split lanes. Checked by
+`an_over_budget_payload_rides_ahead_of_a_lazy_answer`, red at 20.03 s with the length
+compare restored.
+
+**22 bytes of status literal, and a reason phrase two of the three references accept.**
+`check_response` compared the whole line against `"HTTP/1.1 101 Switching Protocols"`
+(35 bytes), so it refused a server answering `101 UPGRADED`, any other text, or no
+reason phrase at all — a 101 carries no reason phrase under RFC 9112, and Go's
+`http.ReadResponse` (xray) and sing-box's `response.StatusCode != 101` both read only
+the digits. It now takes a 12-byte prefix plus one boundary byte: 13 bytes compared
+instead of 35, and the accept set is the two Go references'. Zeronet's client
+(`crates/zero-transport/src/httpupgrade.rs:159`) compares the full literal as this check did, so this tree is
+stricter than it and looser than zeronet only in the free-text field a conforming
+server never sends. The check gains one boundary branch that keeps `HTTP/1.1 1011`
+and `HTTP/1.1 101x` out and lets a bare `HTTP/1.1 101` in; those three vectors plus
+the free-text phrase are in `check_response_accepts_and_refuses_the_vectors_it_did`,
+and removing the branch is red on the first of them.
+
+Nothing removed on the parse path beyond the branch, the fanout and the status literal
+above, which is the point. What is recorded here is that the teardown *gains* one read
+syscall (16 at the cap) to buy the FIN, that the dial's handshake still reads its
+answer twice (`peek` to prove the head, `read_exact` to take it) plus the
+`set_read_timeout` arm and restore that bounds them — **four** syscalls a
+consume-and-keep read would cut to two, which is a shared-head-reader slice across
+`ws`, `xhttp`, `httpheader` and this carrier rather than a hunk in one page — and
+which five claims about this carrier are false:
 
 - Only the **served** role drains. The dial side of this carrier leaves the same
   hazard at its exits (`dial_vless`'s `Rung::HttpUpgrade`, and the VMess, Trojan and
@@ -141,25 +187,26 @@ are false:
   when `Ed == 0`, and `http.ReadRequest` allocating the request, the header map
   and every value string. That is a per-connection cost, once, and it is not
   where a connection spends its time.
-- `?ed=N` early data is **carried on both roles**. The budget is stripped from
-  the path for the request line and, separately, held in `Carrier::HttpUpgrade
-  { ed }` so a dial can use it. When the first payload bytes fit the budget the
-  client writes them straight after the `GET`, ahead of reading the `101`, which
-  is the whole saving — one round trip off connection setup; when they do not,
-  or the budget is zero, the payload is held back and sent after the `101` as
-  before. The server needs no budget: it peeks the head, reads exactly through
+- `?ed=N` early data is **carried on both roles, and the budget is a flag**. The
+  value is stripped from the path for the request line and, separately, held in
+  `Carrier::HttpUpgrade { ed }` so a dial can use it. Non-zero means the client's
+  first payload goes out in the same write as the `GET`, ahead of reading the `101`,
+  which is the whole saving — one round trip off connection setup, at any payload
+  size. Zero means it is held back and sent after the `101`. The server needs no budget: it peeks the head, reads exactly through
   `\r\n\r\n`, and leaves the pipelined bytes on the socket (or hands them back
   as the prefix when the halves cannot peek), so the early data is the first
   thing the reader returns. Checked by
-  `early_data_rides_ahead_of_the_switch` and
-  `a_payload_over_the_budget_follows_the_switch`; the request line itself is
+  `early_data_rides_ahead_of_the_switch`,
+  `an_over_budget_payload_rides_ahead_of_a_lazy_answer` and
+  `ed_zero_holds_the_payload_behind_in_one_write_each`; the request line itself is
   unchanged by the budget (`an_early_data_budget_leaves_the_request_unchanged`).
-  This matches xray, whose `Ed == 0` forces a blocking `connRF.Read([]byte{})`
-  before the payload while `Ed > 0` pipelines it; sing-box carries no httpupgrade
-  early data at all.
+  That is xray's rule read literally — `Ed == 0` blocks on `connRF.Read([]byte{})`
+  before the payload and any other value returns without reading it; sing-box carries
+  no httpupgrade early data at all, and xray-rust's port tests `ed > 0` to *defer*
+  the response read, which is the saving inverted.
 - **A dial that wrote the request and its early payload as two writes.** Both
-  dial paths wrote the `GET` with one `write_all` and then, when the payload fit
-  the budget, the payload with a second: **2 writes per early dial** — on unix
+  dial paths wrote the `GET` with one `write_all` and then, when the payload rode
+  ahead, the payload with a second: **2 writes per early dial** — on unix
   two `write` syscalls where `TcpStream::write_slices` packs both parts into one
   `writev`, and over a session two `RustlsProvider::write` calls sealing one
   record each (`coalesce`'s own doc: iterating `write_all` per part would emit one
@@ -172,8 +219,8 @@ are false:
   payload bytes, and the payload part's base equal to the caller's own buffer —
   no staging copy. A loopback socket cannot witness it; it sees bytes, not how
   many writes carried them.
-  `a_payload_over_the_budget_follows_the_switch_in_one_write_each` holds the
-  other half: over the budget the sink sees two plain writes and nothing
+  `ed_zero_holds_the_payload_behind_in_one_write_each` holds the
+  other half: at `ed=0` the sink sees two plain writes and nothing
   vectored. What did not move: the bytes on the wire and their order (request,
   then payload), and the held-back ordering after the `101`. On Windows the
   socket `write_slices` is two `write_all`s, so the raw dial there is where it
