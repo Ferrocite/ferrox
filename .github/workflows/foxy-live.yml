@@ -40,6 +40,9 @@ jobs:
     # host is issued from, which is a measurement of the runner rather than of
     # the lane.
     runs-on: ubuntu-latest
+    # The live tests dial the real account and the real edge, so a socket that
+    # never answers is a hang with no local witness; the job names its own ceiling.
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
       # The account lives under either spelling: FOXY_EMAIL/FOXY_PASS name what
@@ -87,9 +90,10 @@ jobs:
           FOXY_CODE: ${{ secrets.FOXY_CODE }}
           FOXY_COUNTRY: ${{ inputs.country || vars.FOXY_COUNTRY || 'US' }}
         run: |
-          cargo test -p ferrox-app --locked -- --ignored --nocapture --test-threads=1 \
-            foxy_live::the_lane_carries_a_tunnel_on_the_carrier_the_edge_answers \
-            foxy_live::the_quic_lane_reaches_the_edge_over_udp_or_says_why_not
+          ./scripts/watch-test.sh --quiet 600 --out target/ci/foxy-live.log -- \
+            cargo test -p ferrox-app --locked -- --ignored --nocapture --test-threads=1 \
+              foxy_live::the_lane_carries_a_tunnel_on_the_carrier_the_edge_answers \
+              foxy_live::the_quic_lane_reaches_the_edge_over_udp_or_says_why_not
       # The UDP reachability report is a measurement, not a gate: whether an
       # edge answers QUIC is a fact about the edge, not about this tree, and a
       # network that filters udp/443 must not turn the lane red.
@@ -107,8 +111,9 @@ jobs:
           FOXY_CODE: ${{ secrets.FOXY_CODE }}
           FOXY_COUNTRY: ${{ inputs.country || vars.FOXY_COUNTRY || 'US' }}
         run: |
-          cargo test -p ferrox-app --locked -- --ignored --nocapture --test-threads=1 \
-            foxy_live::a_second_connect_stream_on_one_session_names_what_the_edge_does
+          ./scripts/watch-test.sh --quiet 600 --out target/ci/foxy-live-connect.log -- \
+            cargo test -p ferrox-app --locked -- --ignored --nocapture --test-threads=1 \
+              foxy_live::a_second_connect_stream_on_one_session_names_what_the_edge_does
       - name: What the account host presents
         if: always() && steps.secrets.outputs.present == 'true'
         continue-on-error: true
