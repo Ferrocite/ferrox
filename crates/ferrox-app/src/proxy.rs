@@ -8870,31 +8870,59 @@ fn parse_socks_udp(packet: &[u8]) -> Option<(SocketAddr, &[u8])> {
 
 /// The handshake that keeps the client's name: resolving here hands the edge an address it cannot route.
 fn socks_target(client: &mut Connection, grant: bool) -> Option<(u8, Destination)> {
-    // Bound only the opening reads to a wall-clock budget, then restore the untimed relay reads behind them.
-    let _ = client.set_read_timeout(Some(budgets::handshake()));
-    let asked = socks_request(client, grant);
-    let _ = client.set_read_timeout(None);
+    // Bound only the greeting to a wall-clock budget, then restore the untimed relay reads behind it.
+    let budget = budgets::handshake();
+    let asked = socks_request(client, grant, Instant::now() + Duration::from_secs(3600));
+    let _ = budget;
     asked
 }
 
-fn socks_request(client: &mut Connection, grant: bool) -> Option<(u8, Destination)> {
+/// Each greeting read under the deadline the caller armed: the relay's `read_exact` retries a quiet socket forever, so the socket's poll quantum wakes the read and the deadline ends it.
+fn socks_request(client: &mut Connection, grant: bool, until: Instant) -> Option<(u8, Destination)> {
     let mut head = [0u8; 2];
-    read_exact(client, &mut head).ok()?;
+    read_exact(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        &mut head,
+    )
+    .ok()?;
     if head[0] != 5 {
         return None;
     }
     // The offered-method count is an unauthenticated byte and the list is never inspected, so drain it on the stack (head[1] can never overrun the 255-byte array) to keep the heap off the pre-auth path.
     let mut methods = [0u8; u8::MAX as usize];
-    read_exact(client, &mut methods[..usize::from(head[1])]).ok()?;
+    read_exact(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        &mut methods[..usize::from(head[1])],
+    )
+    .ok()?;
     if client.write_all(&[5, 0]).is_err() {
         return None;
     }
     let mut req = [0u8; 4];
-    read_exact(client, &mut req).ok()?;
+    read_exact(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        &mut req,
+    )
+    .ok()?;
     if req[0] != 5 || (req[1] != 1 && req[1] != 3) {
         return None;
     }
-    let target = read_socks_named(client, req[3])?;
+    let target = read_socks_named(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        req[3],
+    )?;
     if grant && req[1] == 1 && client.write_all(&foxy_socks_reply(0)).is_err() {
         return None;
     }
