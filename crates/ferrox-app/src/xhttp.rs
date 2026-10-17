@@ -29,9 +29,9 @@ fn bare_path(target: &str) -> &str {
     target.split_once('?').map_or(target, |(base, _)| base)
 }
 
-fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
-    crate::proxy::read_http_head(stream, HEAD_LIMIT, crate::budgets::head_arrival())
-        .map(|head| (head, Vec::new()))
+/// The head, the octets that arrived with it, and where the head ends: this read consumes what it proves, so a body pipelined behind the head is already in hand.
+fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, usize)> {
+    crate::proxy::read_http_head_kept(stream, HEAD_LIMIT, crate::budgets::head_arrival())
 }
 
 fn size_line(n: usize, out: &mut [u8; 6]) -> usize {
@@ -381,23 +381,24 @@ impl Write for XhttpWriter {
     }
 }
 
-fn split(read: TcpStream, prefix: Vec<u8>) -> Option<(XhttpReader, XhttpWriter)> {
+fn split(read: TcpStream, prefix: Vec<u8>, at: usize) -> Option<(XhttpReader, XhttpWriter)> {
     let Ok(write) = read.try_clone() else {
         return None;
     };
-    Some(split_halves(read, write, prefix))
+    Some(split_halves(read, write, prefix, at))
 }
 
-// The same split over halves that cannot clone: the handshake leaves pipelined bytes as the prefix.
+// The same split over halves that cannot clone: `prefix` is the buffer the head read left, with `at` already past the head.
 fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
     read: R,
     write: W,
     prefix: Vec<u8>,
+    at: usize,
 ) -> (Reader<R>, XhttpWriter) {
     let reader = Reader {
         read,
         prefix,
-        at: 0,
+        at,
         left: 0,
         ended: false,
         reads: 0,
@@ -1260,10 +1261,10 @@ fn content_length(head: &[u8]) -> Option<usize> {
 // The stream-one handshake the tree has always served: POST with chunked framing on one connection; mode handshakes live in `accept_with_settings`, and this stays so every existing rung keeps dialling.
 pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(XhttpReader, XhttpWriter)> {
     let mut read = stream;
-    let (head, prefix) = read_head(&mut read)?;
-    check_request(&head, path)?;
+    let (head, at) = read_head(&mut read)?;
+    check_request(&head[..at], path)?;
     read.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n").ok()?;
-    split(read, prefix)
+    split(read, head, at)
 }
 
 fn check_request(head: &[u8], path: &str) -> Option<()> {
@@ -1680,9 +1681,9 @@ pub(crate) fn connect(
 ) -> Option<(XhttpReader, XhttpWriter)> {
     let mut read = stream;
     read.write_all(dial_head(host, path).as_bytes()).ok()?;
-    let (head, prefix) = read_head(&mut read)?;
-    check_response(&head)?;
-    split(read, prefix)
+    let (head, at) = read_head(&mut read)?;
+    check_response(&head[..at])?;
+    split(read, head, at)
 }
 
 // The same connect over halves that cannot peek: pipelined bytes arrive as a prefix.
@@ -1696,7 +1697,7 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     let (head, prefix) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
     check_response(&head)?;
-    Some(split_halves(read, write, prefix))
+    Some(split_halves(read, write, prefix, 0))
 }
 
 impl crate::proxy::CarrierSink for XhttpWriter {
@@ -1988,6 +1989,38 @@ mod tests {
                 "{count} chunks: framing reads must amortise to one per chunk"
             );
         }
+    }
+
+    /// The kept head hands the reader its own buffer with the head already walked past: the chunk that rode in behind the head is delivered without asking the socket, and its bytes never move.
+    #[test]
+    fn a_chunk_that_rode_in_with_the_head_costs_no_syscall() {
+        const HEAD: &[u8] =
+            b"POST /share HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut prefix = Vec::from(HEAD);
+        prefix.extend_from_slice(b"2\r\nhi\r\n0\r\n\r\n");
+        let base = prefix.as_ptr();
+        let capacity = prefix.capacity();
+        let (mut reader, _writer) = split_halves(
+            std::io::Cursor::new(Vec::from(&b"never read"[..])),
+            Sink(Arc::new(Mutex::new(Vec::new()))),
+            prefix,
+            HEAD.len(),
+        );
+        let mut got = [0u8; 2];
+        assert_eq!(reader.read(&mut got).expect("delivers"), 2);
+        assert_eq!(&got, b"hi", "the chunk behind the head, not a re-read");
+        assert_eq!(reader.read(&mut got).expect("ends"), 0);
+        assert!(
+            reader.ended,
+            "the terminator was walked out of the same buffer"
+        );
+        assert_eq!(reader.reads(), 0, "the socket was never asked");
+        assert_eq!(
+            reader.prefix.as_ptr(),
+            base,
+            "delivered from the buffer those bytes arrived in"
+        );
+        assert_eq!(reader.prefix.capacity(), capacity, "on a held capacity");
     }
 
     /// The counter must see the *short* reads too: one byte at a time is the worst case, and it is what makes a bounded window better than an unbounded one.
