@@ -150,8 +150,8 @@ pub(crate) fn report(rows: &[Row], windows: &[Window]) -> String {
          soft table implementation without them, while `chacha20-ietf-poly1305` runs this\n\
          crate's own NEON and AVX2 ladder. The ratio is therefore a property of the\n\
          runner's AES as much as of the code. **A `bench.yml` run on four native runners\n\
-         will say whether a bar can be applied here**, and `claims.md` records the decision\n\
-         in the meantime.\n\\
+         will say whether a bar can be applied here**, and the paragraph below is that\n\
+         run's decision.\n\\
          Run `37264964528` is that run, and it settles the question in the direction the\n\
          decision was already pointing: back when `aes-128-gcm` also ran the crate, it\n\
          held **0.96x-1.09x** of `aes-256-gcm` on all four runners and every length, while\n\

@@ -85,11 +85,14 @@ neither reaches the code nor runs the test, and the report says which one it is:
 
 `fill_exact_with_head` is the interesting entry point. ChaCha20-Poly1305 needs
 block 0 as the Poly1305 one-time key and blocks 1.. as the payload keystream,
-and a naive seal generates block 0, throws away 32 of its bytes, generates
-blocks 1.. separately, and pays for the 32 unused bytes. The head form takes
-the first 32 bytes of block 0 out of the same group of states that computes
-blocks 1.., so the fused seal generates `ceil(len / 64) + 1` blocks and
-discards nothing.
+and a naive seal asks for block 0 in its own call and blocks 1.. in a second, so
+it builds the base state twice and runs block 0 as a lone dependent chain beside
+the body. The head form takes the first 32 bytes of block 0 out of the same group
+of states that computes blocks 1..: both shapes generate `ceil(len / 64) + 1`
+blocks — the split asks for 32 bytes, so its key is one block, not one block plus
+32 discarded ones — and the fusion saves an invocation only below a pass's width,
+where one group sized to the blocks left covers the key and the body at once.
+What it discards is nothing.
 
 ## Data path
 
@@ -366,18 +369,38 @@ pass plus a tail and the second a whole pass plus a one-block remainder. Gate
 in either run, so those rows — the 1.15x worst the run before this one carried
 at the same 256 bytes included — are the runner and not either change.
 
-Gate 7 measures the seal against the two-call shape it replaced, and for one
-run it carried a length at which the fused shape's head looked like it stopped
-paying for itself: a head takes a lane of every pass it rides in, so a body that
-fills whole passes pays one more of them, and run `37749274086` read 0.96x at
-16 KiB on macos `aarch64` — the one sub-1.00x row of the seal. Rows at 2 KiB and
-8 KiB were added to bracket it, and in run `37763295337` the crossover is not
-there on any runner: from 1 KiB up the two shapes read 0.98x-1.06x of each other
-at every length, on all four, and the fused shape's win is where a pass is most
-of the call — 1.44x-1.75x at 64 bytes, 1.25x-1.54x at 256 — so the 0.96x was
-one runner's noise and no length threshold belongs in the seal. That is a
-negative result the rows were added to be able to state, and the reason no
-dispatch sits in `aead.rs`.
+Gate 7 measures the seal against the two-call shape it replaced, and the counts
+say what each of its rows can mean. Below one pass the two shapes are different
+*shapes of work*: at 64 bytes the split is two dependent single-block runs where
+the fusion is one wide group, and run `39064183190` reads that as 1.41x-1.75x at
+64 bytes and 1.24x-1.57x at 256, on macos `aarch64`, linux `x86_64`, linux
+`aarch64` and windows `x86_64`. From 1 KiB the message alone fills the passes, so
+both shapes issue the same invocations — at 16 KiB, 33 of them and 257 blocks on
+`aarch64`, the headed pass opening one invocation earlier and the split spending
+its last one on the key block — and the difference left to time is one function
+call and one base state. The same run reads 0.99x-1.06x across those twenty
+whole-pass rows, one of them (windows, 16 KiB) under 1.00x. Run `37749274086`
+called that a crossover and the 2 KiB and 8 KiB rows were added to bracket it;
+`37763295337` and `39064183190` say it is a call boundary, and a call boundary is
+not 5% of anything.
+
+So gate 7 judges the two rows whose ratio a code change can move — the lengths at
+which the fusion removes an invocation, `framing::ONE_PASS_BYTES` and
+`framing::gated_seals`, witnessed by
+`framing::tests::only_the_lengths_that_save_a_pass_are_gated` — and prints the
+whole-pass rows with `reported, not gated` beside them. What still checks every
+length, judged or printed, is `framing::aead_seal_row`: identical ciphertext and
+identical tag asserted at all seven lengths before either side is timed, so a
+fusion that stopped producing the same bytes fails there rather than in a ratio.
+The negative result stands too — no dispatch sits in `aead.rs`, because no length
+was found where the two-call shape does less work.
+
+The nightly is what forced the arithmetic. At `70fdfd0` its
+`measure trojan-raw-down-8 (macos-15)` cell aborted on a confirmed 0.939x 16 KiB
+seal row (`39001299614`) while `bench.yml` `39000283851` passed this gate on the
+same commit and the same runner class. `framing::timed_row`'s confirmation is one
+process's steady reading, not the machine's, and the rows that move between two
+jobs of one commit are the rows with no work behind the ratio.
 
 ## What we removed
 
