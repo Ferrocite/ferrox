@@ -9,12 +9,21 @@ envelope — one `Hunk` is exactly one buffer that came from above, at most
 
 Write never touches the payload. The 5-byte gRPC envelope and the `Hunk` tag
 and varint are assembled in a small prefix buffer, and the caller's payload is
-handed to HTTP/2 as a separate frozen slice beside it — a `writev` of frame
-header, envelope prefix and payload — so the bytes the proxy passed down are
-the bytes the socket carries, and no payload byte is staged into a message
-buffer first. Before this shape the payload was copied into a `Hunk`, then into
-an envelope, then once more per flow-control window; none of those copies
-survive here.
+handed to HTTP/2 as a separate frozen slice beside it — a frame's head and
+envelope prefix in a batch slot of their own, its payload still the caller's
+slice — so the bytes the proxy passed down are the bytes the socket carries, and
+no payload byte is staged into a message buffer first. Before this shape the
+payload was copied into a `Hunk`, then into an envelope, then once more per
+flow-control window; none of those copies survive here.
+
+Those frames do not leave one at a time either. A caller write's frames are
+gathered and flushed as one vectored call, so a relay's full `256 KiB` read —
+sixteen hunks, thirty-two DATA frames, sixty-four segments — is one `writev` on
+unix and one `WSASend` on Windows, where the same read used to cost thirty-two
+socket calls on unix and eighty there, a frame having been sent part by part
+wherever the platform had no `writev`. A batch never waits on credit it has not
+been given: the window is still taken per frame, and when it is not there the
+gathered frames go out first, because a peer grants for bytes it has seen.
 
 Read has one buffer. A DATA frame's body is read onto the end of the message
 buffer, the envelope and the `Hunk` are parsed where they landed, and the payload
@@ -56,9 +65,12 @@ message, and an outbound dialled with `grpcSettings.multiMode` still asks for
 ```mermaid
 graph TD
     A["payload from the proxy above,<br/>up to 16384 B"] --> B["append the 5-byte gRPC envelope<br/>and the Hunk tag and varint"]
-    B --> C["header, envelope and payload<br/>as separate slices, 0 copies"]
-    C --> D["HTTP/2 DATA frame,<br/>flow-control window applied"]
-    D --> E(("wire"))
+    B --> C["frame head and envelope prefix<br/>into a batch slot, 0 payload copies"]
+    C --> D["HTTP/2 DATA frame,<br/>flow-control window taken per frame"]
+    D --> P{"thirty-two frames held,<br/>or the window has not arrived?"}
+    P -- "no: keep gathering" --> C
+    P -- "yes: one flush" --> Q["writev or WSASend of<br/>sixty-four segments, one call"]
+    Q --> E(("wire"))
     E --> F["read the DATA body onto the end<br/>of the message buffer"]
     E --> L["HEADERS block: every field<br/>handed over borrowed, 0 allocations"]
     F --> N["what the bodies owe accumulates;<br/>one credit write per half-window"]
@@ -80,6 +92,9 @@ graph TD
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | hunk-payload-bytes | 16384 | ferrox-app-grpc::tests::hunks_carry_the_xray_schema_bytes |
 | user-space-copies-per-byte-written | 0 | ferrox-app-grpc::tests::the_uplink_hands_the_payload_to_the_writer_by_pointer |
+| writes-per-relay-read | 1 | ferrox-app-grpc::tests::a_relay_read_gathers_its_frames_into_one_write |
+| segments-per-socket-write | 64 | ferrox-app-grpc::tests::a_relay_read_gathers_its_frames_into_one_write |
+| payload-runs-per-socket-write | 32 | ferrox-app-grpc::tests::a_relay_read_gathers_its_frames_into_one_write |
 | payload-staging-copies-per-byte-read | 0 | ferrox-app-grpc::tests::a_body_never_lands_in_a_second_buffer |
 | message-bytes-moved-per-padded-frame | 0 | ferrox-app-grpc::tests::a_padded_frame_opens_a_message_without_moving |
 | credit-bytes | 2097152 | ferrox-app-grpc::tests::a_credit_grants_the_window_it_owes_in_one_write |
@@ -163,7 +178,24 @@ insert that made the entry, once for the index that names it afterwards.
 then reads a block of one index and one plain literal, and fails if either
 buffer's pointer or capacity moves or either ends the block holding bytes. The
 inserted row is the `2` those two allocations still cost: a name and a value the
-table keeps after the block is gone. None of those numbers is a duration, and
+table keeps after the block is gone. The three write rows are one test over the
+same in-memory peer, given a full relay read of sixteen `HUNK`s: it counts the
+writes the batch cost (`1`), the segments the one write carries (`64`, a head
+slot and a payload run for each of the thirty-two frames) and how many of those
+runs are the caller's own buffer (`32`, edge to edge, no gap and no byte twice),
+and it compares the whole batch against a frame-by-frame reference built at the
+same `max_frame`, so a gather that reordered or restaged a frame fails as
+different bytes rather than as a count. `a_wide_batch_reaches_a_real_socket_whole`
+puts the same sixty-four segments through a real socket, which is where a
+platform that split the list or refused its width would show it — as missing
+bytes, the only thing a loopback test can assert. Neither is a count the socket
+can gate: `writes-per-relay-read` is driven from the in-memory peer, exactly as
+`window-update-writes-per-credit` is. `a_gathered_batch_flushes_before_a_window_that_has_not_arrived`
+is the deadlock witness the batch needs and does not carry a row: a peer grants
+for bytes it has seen, so frames held in a batch cannot wait behind the window
+only those frames would raise, and the test watches a real write appear while the
+writer thread is still parked inside the same `send`, then joins it once the
+credit arrives. None of those numbers is a duration, and
 `## Time` says why.
 
 ## Ops
@@ -197,11 +229,52 @@ two cells, so the difference is this carrier's write count and not the runner.
 The after cell's harness ceilings are `1528`–`2270 MiB/s` against ferrox's
 `2153`, which is why the ratio is read as a floor.
 
-Still open, and the reason no local duration is quoted:
-`tunnel_carries_an_echo_over_loopback` is the flakiest loopback test in the tree
-— the roadmap records it failing 23 times in 200 runs with nothing else running,
-where `read_body` sees EOF after a 9-byte frame header, which is a torn write or
-an RST with data queued rather than a framing error.
+The same workload on the runner this tree loses on, `windows-latest`:
+
+| run | what it was | ferrox, median | xray-core in the same cell |
+| --- | --- | --- | --- |
+| 39008558717 | `main`, control for the gathered batch, 3 repeats | 25.9 s (`24.0`–`27.7`), `9955` ms/GiB cpu | 21.3 s (`19.9`–`23.8`), `7633` ms/GiB, throughput ratio `0.838×` WORSE, cpu ratio `0.749×` WORSE |
+| 39001299614 | `main`, the nightly control, 3 repeats | 12.9 s (`12.9`–`13.4`), `5568` ms/GiB cpu | 9.69 s (`9.32`–`9.79`), `3654` ms/GiB, throughput ratio `0.735×` WORSE, cpu ratio `0.652×` WORSE |
+| 39053349255 | the gathered batch, 5 repeats | 9.10 s (`9.07`–`9.47`), `3385` ms/GiB cpu | 19.8 s (`19.6`–`24.8`), `7580` ms/GiB, throughput ratio `2.263×` better (`2.116`–`2.506`), cpu ratio `2.338×` better (`2.226`–`2.548`) |
+
+The whole of that gap is kernel time: ferrox spends `9473` ms/GiB in the kernel
+and `482` in user on this runner, against `1519` and `108` for the same code on
+ubuntu, where the same cell is `2.115×` better than xray-core. Windows has no
+`writev`, so a frame there was five `send` calls and a GiB was `327_680` of
+them; `zeronet`, at `8.35 s` and `3240` ms/GiB in the same cell, is the bar this
+platform sets for the carrier.
+
+The after cell is the third run, and it reads better: against the nightly
+control's split, ferrox's own median on this platform goes from `5291` to `3188`
+ms/GiB in the kernel and from `277` to `197` in user, so the buy-back is the
+kernel half, which is where the five `send` calls per frame were paid. `zeronet` in the same cell is `8.21 s` and `3240`
+ms/GiB — `1.11×` this carrier's time and `1.04×` its cpu, against the nightly
+control's `3.0×` and `3.4×` behind that bar. The three cells above are three
+different machines and the comparator's own time moved with them (`9.69 s` to
+`19.8 s`), so a ratio is read inside a cell and never across two of them;
+`kernel calls per GiB` stays `UNPROVEN` on Windows, where there is no `/proc` to
+read, so the call count here is the page's arithmetic and the ratio is the CI
+number, not the other way round.
+
+The machine-independent witness is on ubuntu, where the row's checker is
+`/proc/<pid>/io` `syscw`. Ferrox's writes per GiB go `101_477`
+(`88_505`–`116_082`) → `51_333` (`48_448`–`59_492`) on x86_64 and `80_107` →
+`51_041` on aarch64, while xray-core in the same two cells is flat at `219_704`
+→ `218_832` and `219_521` → `219_626`. The tally names `write` and `writev` and
+not the `recv` half of the route — `syscr` reads `0` for every ferrox run — so
+what it shows is a halving of a lower bound, and the bound it cannot see is the
+reason `32×` arithmetic and this number are not the same number. The four
+runners of the after run all gate better than the reference: `macos-15`
+`1.849×` (`1.415`–`2.413`) and cpu `1.984×`, `ubuntu-latest` `2.163×` and
+`1.938×`, `ubuntu-24.04-arm` `3.386×` and `3.446×`, 5 pairs each. Ferrox's own
+ubuntu throughput in those cells is `2348` → `2433` MiB/s, and its ratio there
+moves with the comparator's machine, not with this change.
+
+Still open: `tunnel_carries_an_echo_over_loopback` is the flakiest
+loopback test in the tree — the roadmap records it failing 23 times in 200 runs
+with nothing else running, where `read_body` sees EOF after a 9-byte frame
+header, which is a torn write or an RST with data queued rather than a framing
+error.
 
 ## What we removed
 
@@ -252,14 +325,15 @@ an RST with data queued rather than a framing error.
   write — the same two frames, in the same order, one write syscall fewer per
   DATA frame. What this leaves alone: `xhttp_h2`'s `replenish` credits the same
   pair as two frames over two writes, and its page owns that row.
-- **The credit per frame.** A downlink of full hunks is `65_536` DATA frames per
+- **The credit per frame.** A downlink of full hunks is `65_536` messages per
   GiB, and every one of them was credited and locked as it landed: `65_536`
   writes of `26` bytes and `65_536` takes of the frame-write mutex, beside the
-  `65_536` writes that carry the payload. Bodies now add to a counter and one
+  `131_072` writes that carry the payload — two DATA frames per hunk at the
+  `16_384` this lane advertises. Bodies now add to a counter and one
   credit pays the counter when it reaches half the advertised window, so a GiB
-  costs `512` credit writes and `512` locks — `128` frames per credit by the
+  costs `512` credit writes and `512` locks — `128` messages per credit by the
   arithmetic on the page's own `hunk-payload-bytes` and `credit-bytes` rows,
-  witnessed frame by frame by `a_credit_grants_the_window_it_owes_in_one_write`.
+  witnessed message by message by `a_credit_grants_the_window_it_owes_in_one_write`.
   The two windows can only be batched because the preface pays the peer the
   connection window that setting implies: one `13`-byte `WINDOW_UPDATE` on stream
   `0` per connection, added where the settings already went, in the same write.
@@ -267,6 +341,25 @@ an RST with data queued rather than a framing error.
   stream ends is never sent, because the peer still holds at least the other half
   of the window and can fill it without waiting — the bound the same test reads
   off its own measured increment.
+- **The socket call per frame.** The same `131_072` frames per GiB each took the
+  frame-write mutex and made a call of their own: `2` per hunk on unix, where a
+  frame went out as head and body in one `writev`, and `5` per hunk on Windows,
+  where there is no `writev` and the parts were sent one `send` each — head,
+  envelope, payload. Both now cost one call per `256 KiB` relay read, so a GiB
+  pays `4_096` calls and `4_096` mutex takes where it used to pay `131_072` of
+  each: `32×` fewer calls on unix, `80×` on Windows, and every call carries
+  sixty-four segments rather than two or three. That is the shape of the loss the
+  `## Time` cell prices: `95%` of this carrier's Windows cpu is kernel time,
+  against `93%` on ubuntu at six times less of it per call, so the platform's
+  per-call cost is exactly what the call count buys back here. What it costs:
+  `32` slots of `25` bytes live on the stack for a caller write — `800` B written
+  once per write, `0.3%` of the bytes that write carries — and a frame that is
+  not the last of its batch reaches the socket when the batch fills, when the
+  credit is short, or when the write ends, which is what the flush-before-park
+  witness above gates. What is not removed: the frames. Two DATA frames per hunk
+  is what `16_384` advertises on the wire, and merging them would mean a larger
+  `MAX_FRAME_SIZE`, which changes the bytes the peer sees rather than the calls
+  this side makes.
 - **The pair per header field.** `Decoder::decode` used to answer with a
   `Vec<(Vec<u8>, Vec<u8>)>`: a name and a value allocated for every field of
   every block, which the consumer then read from and dropped. gRPC's `headers()`

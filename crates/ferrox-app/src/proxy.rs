@@ -1117,10 +1117,10 @@ fn write_mux_frame(
     }
 }
 
-/// One `writev` of header and read buffer: both mux directions are zero-copy, gated by pointer identity.
+/// One vectored write of header and read buffer: both mux directions are zero-copy, gated by pointer identity.
 fn write_mux_two(shared: &Arc<Mutex<Connection>>, first: &[u8], second: &[u8]) -> bool {
     match shared.lock() {
-        Ok(mut stream) => write_all_two(&mut *stream, first, second),
+        Ok(mut stream) => write_all_parts::<2>(&mut *stream, &[first, second]).is_ok(),
         Err(_) => false,
     }
 }
@@ -3551,7 +3551,7 @@ fn mux_dial_uplink(client: &Connection, uplink: &mut Connection, id: u16) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
                 keep.patch_payload_len(&mut header, at, n);
-                if !write_all_two(uplink, &header, &chunk[..n]) {
+                if write_all_parts::<2>(uplink, &[&header[..], &chunk[..n]]).is_err() {
                     break;
                 }
             }
@@ -6873,7 +6873,7 @@ fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
             global_id: if first { Some(*identity) } else { None },
         };
         let (head, body) = xudp_datagram(&frame, &mut header, payload);
-        if !write_all_two(&mut write, head, body) {
+        if write_all_parts::<2>(&mut write, &[head, body]).is_err() {
             break;
         }
     }
@@ -7245,7 +7245,7 @@ fn write_udp_datagram(stream: &mut Connection, payload: &[u8]) -> bool {
         return true;
     }
     let len = (payload.len() as u16).to_be_bytes();
-    write_all_two(stream, &len, payload)
+    write_all_parts::<2>(stream, &[&len, payload]).is_ok()
 }
 
 fn write_trojan_datagram(
@@ -7261,7 +7261,7 @@ fn write_trojan_datagram(
     push_socks_addr(head, dest);
     head.extend_from_slice(&(payload.len() as u16).to_be_bytes());
     head.extend_from_slice(b"\r\n");
-    write_all_two(stream, head, payload)
+    write_all_parts::<2>(stream, &[head.as_slice(), payload]).is_ok()
 }
 
 fn read_trojan_datagram(stream: &mut Connection, buf: &mut [u8]) -> Option<(SocketAddr, usize)> {
@@ -7966,29 +7966,21 @@ pub(crate) trait CarrierSink: Clone + Send + 'static {
     fn close(&self);
 }
 
-// Vectored write with and without a file descriptor: the socket packs into one writev, the session feeds its record batcher.
+// Vectored write with and without a file descriptor: the socket packs into one `writev` or one `WSASend`, the session feeds its record batcher.
 pub(crate) trait FrameWrite: Write + Send {
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool;
 }
 
 impl FrameWrite for Connection {
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
-        match parts {
-            [first, second] => write_all_two(self, first, second),
-            [first, second, third] => write_all_three(self, first, second, third),
-            _ => parts.iter().all(|part| self.write_all(part).is_ok()),
-        }
+        write_all_parts::<VECTOR_PARTS>(self, parts).is_ok()
     }
 }
 
 // The h2 server seals frames over a concrete `TcpStream`, so the generic coalescing write is impl'd for it beside the seam.
 impl FrameWrite for TcpStream {
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
-        match parts {
-            [first, second] => write_all_two(self, first, second),
-            [first, second, third] => write_all_three(self, first, second, third),
-            _ => parts.iter().all(|part| self.write_all(part).is_ok()),
-        }
+        write_all_parts::<VECTOR_PARTS>(self, parts).is_ok()
     }
 }
 
@@ -8313,70 +8305,6 @@ pub(crate) fn two_iovecs(first: &[u8], second: &[u8]) -> [libc::iovec; 2] {
     ]
 }
 
-#[cfg(unix)]
-pub(crate) fn write_all_two<S: Write + std::os::fd::AsRawFd>(
-    stream: &mut S,
-    first: &[u8],
-    second: &[u8],
-) -> bool {
-    let mut parts = two_iovecs(first, second);
-    writev_loop(stream.as_raw_fd(), &mut parts, first.len() + second.len())
-}
-
-#[cfg(not(unix))]
-pub(crate) fn write_all_two<S: Write>(stream: &mut S, first: &[u8], second: &[u8]) -> bool {
-    stream.write_all(first).is_ok() && stream.write_all(second).is_ok()
-}
-
-#[cfg(unix)]
-pub(crate) fn write_all_three<S: Write + std::os::fd::AsRawFd>(
-    stream: &mut S,
-    first: &[u8],
-    second: &[u8],
-    third: &[u8],
-) -> bool {
-    #[cfg(unix)]
-    {
-        let mut parts = [
-            libc::iovec {
-                iov_base: first.as_ptr() as *mut libc::c_void,
-                iov_len: first.len(),
-            },
-            libc::iovec {
-                iov_base: second.as_ptr() as *mut libc::c_void,
-                iov_len: second.len(),
-            },
-            libc::iovec {
-                iov_base: third.as_ptr() as *mut libc::c_void,
-                iov_len: third.len(),
-            },
-        ];
-        writev_loop(
-            stream.as_raw_fd(),
-            &mut parts,
-            first.len() + second.len() + third.len(),
-        )
-    }
-    #[cfg(not(unix))]
-    {
-        stream.write_all(first).is_ok()
-            && stream.write_all(second).is_ok()
-            && stream.write_all(third).is_ok()
-    }
-}
-
-#[cfg(not(unix))]
-pub(crate) fn write_all_three<S: Write>(
-    stream: &mut S,
-    first: &[u8],
-    second: &[u8],
-    third: &[u8],
-) -> bool {
-    stream.write_all(first).is_ok()
-        && stream.write_all(second).is_ok()
-        && stream.write_all(third).is_ok()
-}
-
 /// One datagram as its two parts. `sendmsg` hands the head and the caller's payload to the kernel
 /// by pointer, so a reply is not gathered into a second buffer first; a platform without it joins
 /// the parts, which is the same datagram in the same one call. The pointer gate
@@ -8475,71 +8403,62 @@ fn sockaddr_of(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     }
 }
 
+/// Segments one vectored write carries: a gathered batch of h2 frames is sixty-four of them, and the
+/// list stays on the stack at that width on every platform in scope.
+const VECTOR_PARTS: usize = 64;
+
+/// The segment that fills a stack list before the live parts overwrite it.
+const NO_PARTS: &[u8] = &[];
+
+/// Hand `parts` to `out` in as few vectored calls as the socket takes: one `writev` per `N` segments
+/// on unix, one `WSASend` on Windows, where a write per part cost one socket call each. A short call
+/// advances the list rather than restaging any byte, so the parts stay where the caller put them
+/// however the kernel splits the write. `N` is the caller's own batch width, so a list is never wider
+/// than the call it serves and never touches the heap.
+pub(crate) fn write_all_parts<const N: usize>(
+    out: &mut dyn Write,
+    mut parts: &[&[u8]],
+) -> std::io::Result<()> {
+    while !parts.is_empty() {
+        let (chunk, rest) = parts.split_at(parts.len().min(N));
+        let mut made: [IoSlice; N] = std::array::from_fn(|_| IoSlice::new(NO_PARTS));
+        let mut pieces = 0usize;
+        for part in chunk.iter().copied().filter(|part| !part.is_empty()) {
+            made[pieces] = IoSlice::new(part);
+            pieces += 1;
+        }
+        let mut slices = &mut made[..pieces];
+        while !slices.is_empty() {
+            let wrote = out.write_vectored(slices)?;
+            if wrote == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+            }
+            IoSlice::advance_slices(&mut slices, wrote);
+        }
+        parts = rest;
+    }
+    Ok(())
+}
+
 /// Hand `parts` runs of `buf` to `out` in one vectored write: one syscall where the socket has
 /// `writev`, one where it has `WSASend`, one per run where the sink has neither, and none at all for
 /// an empty batch — so a caller that opened several records into one buffer leaves them where they
-/// lie instead of gathering them. `N` is the caller's batch width, so the iovec list never touches
+/// lie instead of gathering them. `N` is the caller's batch width, so the segment list never touches
 /// the heap.
 pub(crate) fn write_all_runs<const N: usize>(
     out: &mut dyn Write,
     buf: &[u8],
     parts: &[(usize, usize)],
 ) -> std::io::Result<()> {
-    let mut made: [IoSlice; N] = std::array::from_fn(|_| IoSlice::new(&[]));
+    let mut made: [&[u8]; N] = [NO_PARTS; N];
     let mut pieces = 0usize;
     for (start, len) in parts.iter().copied() {
         if len > 0 {
-            made[pieces] = IoSlice::new(&buf[start..start + len]);
+            made[pieces] = &buf[start..start + len];
             pieces += 1;
         }
     }
-    let mut slices = &mut made[..pieces];
-    while !slices.is_empty() {
-        let written = out.write_vectored(slices)?;
-        if written == 0 {
-            return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
-        }
-        IoSlice::advance_slices(&mut slices, written);
-    }
-    Ok(())
-}
-
-#[cfg(unix)]
-fn writev_loop(fd: std::os::fd::RawFd, iov: &mut [libc::iovec], mut left: usize) -> bool {
-    let mut at = 0;
-    while left > 0 {
-        let count = i32::try_from(iov.len() - at).expect("writev takes at most three entries");
-        let done = unsafe { libc::writev(fd, iov[at..].as_ptr(), count) };
-        if done < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return false;
-        }
-        if done == 0 {
-            return false;
-        }
-        let mut wrote = done as usize;
-        left -= wrote;
-        while wrote > 0 {
-            let len = iov[at].iov_len;
-            if wrote >= len {
-                wrote -= len;
-                at += 1;
-            } else {
-                iov[at].iov_base = unsafe {
-                    iov[at]
-                        .iov_base
-                        .cast::<u8>()
-                        .add(wrote)
-                        .cast::<libc::c_void>()
-                };
-                iov[at].iov_len -= wrote;
-                wrote = 0;
-            }
-        }
-    }
-    true
+    write_all_parts::<N>(out, &made[..pieces])
 }
 
 /// The app's payload pumped while the carrier still owes its answer, because a server may hold that answer until it sees payload — xray flushes its buffered response on the first downstream write and zeronet's `HeaderFirst::hold` waits for the first payload outright — so a client that stops sending to wait hangs both ways.
@@ -16410,14 +16329,8 @@ mod tests {
             crate::h2::write_frame(&mut writer, crate::h2::T_DATA, 0, 7, &body),
             "a DATA frame of head and body is written"
         );
-        assert!(crate::h2::write_frame_parts(
-            &mut writer,
-            crate::h2::T_DATA,
-            0,
-            8,
-            &body,
-            &tail
-        ));
+        let head = crate::h2::frame_head(body.len() + tail.len(), crate::h2::T_DATA, 0, 8);
+        assert!(writer.write_slices(&[&head, &body[..], &tail[..]]));
 
         let seam = seam.lock().expect("records");
         assert_eq!(
