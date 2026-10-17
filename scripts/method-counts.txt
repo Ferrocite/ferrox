@@ -315,3 +315,9 @@ loopback udp-datagram-bytes-preserved 4 ferrox-app-proxy::tests::a_re_injected_u
 unix ops-retired-instructions UNBLESSED scripts/count-ops.sh
 unix unix-stream-bytes-preserved 65536 ferrox-app-conn::tests::a_unix_connection_carries_the_same_bytes_the_tcp_round_trip_does
 unix unix-head-not-vector-multiple 1501 ferrox-app-conn::tests::a_unix_round_trip_survives_lengths_a_vector_would_split
+
+# --- tun device inbound -----------------------------------------------------
+front-tun ops-retired-instructions UNBLESSED scripts/count-ops.sh
+front-tun dial-set-flows-matching-the-pinned-stack 3 ferrox-app-tun::tests::the_dial_set_matches_the_pinned_stream
+front-tun reverse-role-response-round-trips 1 ferrox-app-tun::tests::the_response_bytes_come_back_as_ip_packets
+front-tun parse-copies-per-packet 0 ferrox-app-tun::tests::the_payload_is_borrowed_from_the_read_buffer
