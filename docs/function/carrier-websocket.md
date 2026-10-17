@@ -93,10 +93,19 @@ drives one fixed 190-byte head through `check_request` 64 times and folds the ke
 the subprotocol and the decoded early data, so the frame is the head read; and
 `the_early_data_line_costs_the_encode_and_nothing_else` encodes a 2048-byte
 payload 16 times into a String that already holds it, so the frame is the encode
-and no allocator is in it. **No artefact from this branch has been read, so
-neither row carries a number here** — `ops.yml` prints both on the next run and
-the delta against the shape they replace is quoted in "What we removed" only once
-it has been.
+and no allocator is in it. Each frame has been read on this branch and on a
+branch carrying the body it replaced under the same probe, with the unmoved row
+holding still across the pair — `ws::tests::mask_chunks_match_the_byte_loop`
+reads `437971` on all four runs. The head probe reads **`349434`** where the old
+path's own mirror — `the_head_was_validated_three_times_over`, the same 64
+rounds of the same head, with `header_value` for the echo and the old
+three-validation `check_request` — reads **`520242`**: `170808` is the three
+`from_utf8` passes and the second subprotocol lookup the old shape spent
+(`ops.yml` `39004141049` against `39005361208`). The encode probe reads
+**`361968`** where the four-`String::push` body reads **`503578`**: `141610`
+over the same 16 lines of 2048 bytes (`ops.yml` `39004141049` against
+`39004218090`). Both deltas compare probe to probe, the same frame on both
+sides, and neither is a floor under the method alone.
 
 What the release assembly says on its own, checked by
 `cargo rustc -p ferrox-core --release --lib -- --emit asm` on
@@ -112,16 +121,27 @@ x86_64 is measured by `ops.yml` with the rest.
 
 ## Time
 
-**Not measured on this branch.** The carrier is timed end to end rather than in
-isolation: `.github/workflows/parity.yml` runs `scripts/run-parity.sh` for
+**The carrier, not on this branch.** The carrier is timed end to end rather than
+in isolation: `.github/workflows/parity.yml` runs `scripts/run-parity.sh` for
 `upload`, `download` and `full-duplex` across the pinned engines, and
 `.github/workflows/benchmark-matrix.yml` runs the `vless-ws` scenario. Both are
-CI-only because every developer machine is behind a VPN. No artefact from this
-branch has been read, so no duration is quoted. The wide mask pass in
-particular has no duration row to ask for: every `vless-ws` cell the matrix
-plans measures a *download*, where the server writes unmasked frames, so the
-masked direction never reaches the timer. Its evidence is the instruction count
-above, which is what `ops.yml` can see.
+CI-only because every developer machine is behind a VPN. This change's
+`benchmark-matrix.yml` run (`39004141026`) planned one cell, `vless-raw-down-1`,
+so no `vless-ws` duration exists here, and the wide mask pass in particular has
+no duration row to ask for: every `vless-ws` cell the matrix plans measures a
+*download*, where the server writes unmasked frames, so the masked direction
+never reaches the timer. Its evidence is the instruction count above, which is
+what `ops.yml` can see.
+
+**The `?ed=` line, on this branch, in gate 8.** `bench.yml` run `39005088795`
+timed the shipped encode against the shape the four implementations have, on
+both platforms in the one run, each row byte-checked before it was timed: macOS
+aarch64 **2.85x / 3.19x / 3.05x / 2.03x** and linux x86_64 **2.06x / 2.68x /
+2.50x / 2.14x**, at 8, 120, 256 and 2048 bytes, every row gated at 0.95x with
+zero allocations per encode on this side. Those are ratios against the
+reference's shape, not against this tree's previous body — the before-and-after
+for this change is the `141610` above, and this is the same-runner half that
+agrees with its direction.
 
 ## What we removed
 
@@ -148,7 +168,10 @@ above, which is what `ops.yml` can see.
   the offered subprotocol back in `Upgrade` so the `101` echoes the slice the
   first read found. The bytes are pinned by
   `the_101_is_the_key_and_the_echoed_subprotocol`, and the count is the
-  `the_head_yields_the_path_the_key_and_the_early_data` probe above.
+  `the_head_yields_the_path_the_key_and_the_early_data` probe above: **`349434`**
+  against the **`520242`** its old-path mirror
+  (`the_head_was_validated_three_times_over`) reads, `170808` over the same 64
+  rounds (`ops.yml` `39004141049` against `39005361208`).
 - **A second scan for a delimiter the head reader had already stopped at.** The
   `TcpStream` path's `read_head` peeks until `head.ends_with("\r\n\r\n")` and
   reads exactly up to that offset, so `head[head.len() - 4..]` is the whole
@@ -195,7 +218,9 @@ above, which is what `ops.yml` can see.
   so it crosses two block boundaries and a tail), the RFC vectors and the 0-192
   round trip are unchanged, and gate 8 holds the shipped encode at **zero
   allocations per line** with the counting allocator while the four references'
-  shape stays at two.
+  shape stays at two. The same probe reads `361968` where the four-`String::push`
+  body reads `503578`: `141610` over 16 lines of 2048 bytes (`ops.yml`
+  `39004141049` against `39004218090`).
 - **A string the path parse built and threw away.** `EarlyData::split` opened
   `out` and copied the base and every kept query pair *before* it knew whether an
   `ed` was there, so `/tunnel`, `/p?ed=` and `/p?ed=&ed=4` — the shapes the
