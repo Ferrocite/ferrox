@@ -1669,6 +1669,17 @@ impl Ip {
             Self::H3(lane) => lane.read_ip(),
         }
     }
+
+    /// Bounds one blocking read on either carrier, so a tunnel nobody has answered parks its relay on the quantum's tick rather than forever.
+    pub(crate) fn set_read_quantum(&mut self, quantum: Duration) -> std::io::Result<()> {
+        match self {
+            Self::H2(lane) => lane.set_read_quantum(quantum),
+            Self::H3(lane) => {
+                lane.set_read_quantum(quantum);
+                Ok(())
+            }
+        }
+    }
 }
 
 /// One CONNECT-IP lane as its own H2 connection: the tunnel carries UDP datagrams for every destination, so a lane is one connection rather than a stream per target.
