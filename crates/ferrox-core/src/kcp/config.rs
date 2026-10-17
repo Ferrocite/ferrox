@@ -99,7 +99,16 @@ mod tests {
 
     #[test]
     fn the_reference_bounds_leave_the_formula_alone() {
-        for mtu in 21..=u16::MAX as u32 {
+        // Miri interprets every pair, so it walks the boundaries where the floor binds; the dense sweep runs natively.
+        let mtus: Vec<u32> = if cfg!(miri) {
+            vec![
+                21, 22, 23, 24, 25, 100, 1349, 1350, 1351, 4096, 6553, 6554, 32768, 32769, 65534,
+                65535,
+            ]
+        } else {
+            (21..=u16::MAX as u32).collect()
+        };
+        for mtu in mtus {
             for tti in 10..=1000 {
                 let c = Config {
                     mtu,
