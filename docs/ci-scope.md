@@ -206,7 +206,25 @@ tree a change touches, and the honest summary is that a single-method change now
 pays a fraction of the measurements while any change to shared code still pays
 all of them — which is what run 38657406765 and its siblings, the wide plan of
 this wiring's own pull request, are the evidence for: every job ran, and every
-one passed.
+one passed. One of those jobs no longer pays its whole measurement twice, and
+the paragraph below is that exception, measured.
+
+`xray-baseline.yml`'s wide case is the pinned reference testing itself, so its
+answer is a property of the rev and of the Go toolchain and never of our diff:
+Go's own result cache holds that answer exactly, rather than approximately.
+`scripts/run-xray-baseline.sh` therefore drops `-count=1` and clones the pin to
+one fixed path, because Go keys a cached verdict on the source paths that
+produced it and a `mktemp` tree rebuilds every package on every run. Cold — the
+first run after the key moved — the job was 5 m 54 s, of which 5 m 28 s was
+`go test ./...`, with 90 of 90 passing package results re-executed (run
+39077396186). Warm, on the same pin, pattern and toolchain: 1 m 25 s of job, 59 s
+of `go test`, 6 of 90 re-executed and the other 84 read from the cache (run
+39077826210). The run between those two, with the cache step already restored but
+the tree still a `mktemp` path, is the evidence for the path being the thing
+keyed on: it restored 370 MB of this pin's cache and re-executed all 90 (run
+39073135264). Go never caches a failing package, so a red at the pin still runs
+and still shows, and the job's report names per run how many verdicts it read
+from the cache rather than reached itself.
 
 One row of that table is not a saving, and naming it is the point: `ops.yml`'s
 build is the floor on any change that moves code, and its two VMess rows read
