@@ -626,7 +626,7 @@ pub(crate) fn pump_relay(plain: &TcpStream, sealed: &TcpStream, send: Cipher, re
 
 pub(crate) fn pump_relay_carried<R, W>(
     plain: &TcpStream,
-    mut reader: R,
+    reader: R,
     mut writer: W,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
     send: Cipher,
@@ -658,34 +658,47 @@ pub(crate) fn pump_relay_carried<R, W>(
         thread_close();
         let _ = plain_read.shutdown(std::net::Shutdown::Both);
     });
+    if !relay_downlink(reader, recv, &mut plain_write) {
+        return;
+    }
+    close();
+    let _ = plain_write.shutdown(std::net::Shutdown::Both);
+    let _ = done.join();
+}
+
+/// The downlink the dials build: every ask the carrier hears is the codec's own — a sealed length,
+/// then the chunk it names — opened into the caller's buffer, so a payload byte crosses user space
+/// once. `false` is the handshake never opening, which is the pump's own early exit: the carrier is
+/// not finished and the uplink is not joined, because the dial dropping the sockets is what ends it.
+fn relay_downlink<R: Read>(mut reader: R, recv: Recv, out: &mut dyn Write) -> bool {
     let mut recv = match recv {
         Recv::Ready(cipher) => cipher,
         Recv::Waiting(method, psk, client_salt) => {
             let key_len = method.key_len();
             let mut server_salt = vec![0u8; key_len];
             if read_exact(&mut reader, &mut server_salt).is_err() {
-                return;
+                return false;
             }
             let Some(mut cipher) = Cipher::from_psk(method, &psk, &server_salt) else {
-                return;
+                return false;
             };
             let fixed_len = 1 + 8 + key_len + 2 + TAG_LEN;
             let mut fixed = vec![0u8; fixed_len];
             if read_exact(&mut reader, &mut fixed).is_err() {
-                return;
+                return false;
             }
             let Some(len) = cipher.open_in_place(&mut fixed) else {
-                return;
+                return false;
             };
             if len != 1 + 8 + key_len + 2 || fixed[0] != 1 {
-                return;
+                return false;
             }
             let stamp = u64::from_be_bytes(fixed[1..9].try_into().unwrap_or([0u8; 8]));
             if now_secs().abs_diff(stamp) > SKEW {
-                return;
+                return false;
             }
             if fixed[9..9 + key_len] != client_salt[..] {
-                return;
+                return false;
             }
             let first = usize::from(u16::from_be_bytes([
                 fixed[9 + key_len],
@@ -694,13 +707,13 @@ pub(crate) fn pump_relay_carried<R, W>(
             if first > 0 {
                 let mut chunk = vec![0u8; first + TAG_LEN];
                 if read_exact(&mut reader, &mut chunk).is_err() {
-                    return;
+                    return false;
                 }
                 let Some(got) = cipher.open_in_place(&mut chunk) else {
-                    return;
+                    return false;
                 };
-                if plain_write.write_all(&chunk[..got]).is_err() {
-                    return;
+                if out.write_all(&chunk[..got]).is_err() {
+                    return false;
                 }
             }
             cipher
@@ -708,13 +721,11 @@ pub(crate) fn pump_relay_carried<R, W>(
     };
     let mut chunk = wire_buffer();
     while let Some(payload) = open_chunk(&mut reader, &mut recv, &mut chunk) {
-        if plain_write.write_all(payload).is_err() {
+        if out.write_all(payload).is_err() {
             break;
         }
     }
-    close();
-    let _ = plain_write.shutdown(std::net::Shutdown::Both);
-    let _ = done.join();
+    true
 }
 
 pub(crate) const WIRE_MAX: usize = MAX_CHUNK + TAG_LEN;
@@ -2135,5 +2146,101 @@ mod tests {
         let mut buf = wire_buffer();
         let back = open_chunk(&mut uplink, &mut recv, &mut buf).expect("opens");
         assert_eq!(back, &b"ping"[..]);
+    }
+
+    /// What a stage between the carrier and the codec asks for: its own capacity.
+    const STAGE: usize = 32 * 1024;
+
+    /// The record size this tree's own xhttp writer frames a body in.
+    const FRAME: usize = 16 * 1024;
+
+    /// The carrier side of a carried downlink: every width the codec reaches the carrier with, which
+    /// is where a stage's capacity would stand in for the codec's own chunk asks.
+    struct Asks<R> {
+        read: R,
+        widths: std::rc::Rc<std::cell::RefCell<Vec<usize>>>,
+    }
+
+    impl<R: Read> Read for Asks<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.widths.borrow_mut().push(buf.len());
+            self.read.read(buf)
+        }
+    }
+
+    impl crate::proxy::FrameWrite for Vec<u8> {
+        fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+            parts.iter().all(|part| self.write_all(part).is_ok())
+        }
+    }
+
+    /// A carrier's answer: the head, the body framed in records the way this tree's writer frames
+    /// them, and the terminator, so the codec below the carrier hears the wire as a dial hands it.
+    fn carrier_answer(body: &[u8]) -> Vec<u8> {
+        const HEAD: &[u8] = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut wire = Vec::from(HEAD);
+        for frame in body.chunks(FRAME) {
+            let len = frame.len();
+            wire.extend_from_slice(format!("{len:x}\r\n").as_bytes());
+            wire.extend_from_slice(frame);
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b"0\r\n\r\n");
+        wire
+    }
+
+    /// The chain the xhttp arm composes, driven from memory: two sealed chunks arrive through the
+    /// real carrier framing, and the carrier hears the codec's own asks — a sealed length and the
+    /// chunk it names. A `BufReader` between them would have asked its capacity of the carrier for
+    /// the first byte of either and answered the rest from its stage.
+    #[test]
+    fn the_carrier_and_the_chunk_ask_the_socket_as_one() {
+        let method = Method::Aes256Gcm;
+        let psk = vec![7u8; 32];
+        let salt = vec![7u8; 32];
+        let mut send = Cipher::from_psk(method, &psk, &salt).expect("derives");
+        let plain: Vec<u8> = (0..1000 + 4000).map(|i| (i % 251) as u8).collect();
+        let mut body = Vec::new();
+        for piece in [&plain[..1000], &plain[1000..]] {
+            let len = piece.len();
+            let mut buf = vec![0u8; SEAL_HEAD + len + TAG_LEN];
+            buf[SEAL_HEAD..SEAL_HEAD + len].copy_from_slice(piece);
+            seal_all(&mut send, &mut buf, len, &mut body).expect("seals");
+        }
+        let (carrier, _writer) = crate::xhttp::connect_split(
+            std::io::Cursor::new(carrier_answer(&body)),
+            Vec::new(),
+            "h",
+            "/share",
+        )
+        .expect("dials the head");
+        let widths = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let recv = Cipher::from_psk(method, &psk, &salt).expect("derives");
+        let mut out = Vec::new();
+        assert!(
+            relay_downlink(
+                Asks {
+                    read: carrier,
+                    widths: std::rc::Rc::clone(&widths),
+                },
+                Recv::Ready(recv),
+                &mut out,
+            ),
+            "the chunks open"
+        );
+        assert_eq!(out, plain, "a downlink byte crosses user space once");
+        let seen = widths.borrow();
+        assert!(
+            seen.contains(&(LENGTH_LEN + TAG_LEN)),
+            "the sealed length is asked of the carrier as the codec asks it: {seen:?}"
+        );
+        assert!(
+            seen.contains(&(1000 + TAG_LEN)),
+            "the payload it names follows as its own ask: {seen:?}"
+        );
+        assert!(
+            !seen.contains(&STAGE),
+            "a stage would ask its capacity here: {seen:?}"
+        );
     }
 }

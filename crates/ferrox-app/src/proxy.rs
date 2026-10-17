@@ -5006,7 +5006,6 @@ fn dial_ss_xhttp(
         let closer = writer.clone();
         let close: std::sync::Arc<dyn Fn() + Send + Sync> =
             std::sync::Arc::new(move || closer.finish());
-        let reader = std::io::BufReader::with_capacity(32 * 1024, reader);
         crate::shadowsocks2022::pump_relay_carried(client, reader, writer, &close, send, recv);
         return true;
     }
@@ -5019,7 +5018,6 @@ fn dial_ss_xhttp(
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> =
         std::sync::Arc::new(move || closer.finish());
-    let reader = std::io::BufReader::with_capacity(32 * 1024, reader);
     crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
     true
 }
@@ -12719,7 +12717,6 @@ mod tests {
             "xhttp",
             |stream| {
                 let (reader, writer) = crate::xhttp::accept(stream, "/share")?;
-                let reader = std::io::BufReader::with_capacity(32 * 1024, reader);
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(writer) as Box<dyn Write + Send>,
@@ -12930,7 +12927,6 @@ mod tests {
             "xhttp",
             |stream| {
                 let (reader, writer) = crate::xhttp::accept(stream, "/share")?;
-                let reader = std::io::BufReader::with_capacity(32 * 1024, reader);
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(writer) as Box<dyn Write + Send>,
