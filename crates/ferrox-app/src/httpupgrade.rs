@@ -11,6 +11,7 @@ pub(crate) const SWITCH: &[u8] =
 pub(crate) struct UpReader<R: Read = TcpStream> {
     read: R,
     prefix: Vec<u8>,
+    at: usize,
 }
 
 impl UpReader<TcpStream> {
@@ -23,12 +24,17 @@ impl UpReader<TcpStream> {
 impl<R: Read> Read for UpReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         // The peekable carrier never carries a prefix, so its every bulk read is one branch and a delegate.
-        if self.prefix.is_empty() {
+        if self.at >= self.prefix.len() {
             return self.read.read(buf);
         }
-        let n = self.prefix.len().min(buf.len());
-        buf[..n].copy_from_slice(&self.prefix[..n]);
-        self.prefix.drain(..n);
+        let n = (self.prefix.len() - self.at).min(buf.len());
+        buf[..n].copy_from_slice(&self.prefix[self.at..self.at + n]);
+        self.at += n;
+        if self.at >= self.prefix.len() {
+            // The head and the payload that rode with it leave together, once nothing reads them.
+            self.prefix = Vec::new();
+            self.at = 0;
+        }
         Ok(n)
     }
 }
@@ -54,21 +60,28 @@ pub(crate) fn quiet(stream: &TcpStream) {
     let _ = stream.set_read_timeout(previous);
 }
 
-fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, Vec<u8>)> {
-    crate::proxy::read_http_head(stream, HEAD_LIMIT, crate::budgets::head_arrival())
-        .map(|head| (head, Vec::new()))
+/// The head, the octets that arrived with it, and where the head ends: this read consumes what it proves, so a payload pipelined behind the request is already in hand.
+fn read_head(stream: &mut TcpStream) -> Option<(Vec<u8>, usize)> {
+    crate::proxy::read_http_head_kept(stream, HEAD_LIMIT, crate::budgets::head_arrival())
 }
 
 pub(crate) fn accept(stream: TcpStream, path: &str) -> Option<(UpReader, TcpStream)> {
     let mut read = stream;
-    let (head, prefix) = read_head(&mut read)?;
-    check_request(&head, path)?;
+    let (head, at) = read_head(&mut read)?;
+    check_request(&head[..at], path)?;
     let Ok(write) = read.try_clone() else {
         return None;
     };
     let mut write = write;
     write.write_all(SWITCH).ok()?;
-    Some((UpReader { read, prefix }, write))
+    Some((
+        UpReader {
+            read,
+            prefix: head,
+            at,
+        },
+        write,
+    ))
 }
 
 fn check_request(head: &[u8], path: &str) -> Option<()> {
@@ -115,7 +128,14 @@ pub(crate) fn accept_split<R: Read, W: Write>(
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
     check_request(&head, path)?;
     write.write_all(SWITCH).ok()?;
-    Some((UpReader { read, prefix }, write))
+    Some((
+        UpReader {
+            read,
+            prefix,
+            at: 0,
+        },
+        write,
+    ))
 }
 
 fn upgrade_request(host: &str, path: &str) -> String {
@@ -164,8 +184,8 @@ pub(crate) fn connect(
     let mut read = stream;
     let early = rides(budget, first);
     send_request(&mut read, &upgrade_request(host, path), early, first)?;
-    let (head, prefix) = read_head(&mut read)?;
-    check_response(&head)?;
+    let (head, at) = read_head(&mut read)?;
+    check_response(&head[..at])?;
     let Ok(write) = read.try_clone() else {
         return None;
     };
@@ -173,7 +193,14 @@ pub(crate) fn connect(
     if !early && !first.is_empty() {
         write.write_all(first).ok()?;
     }
-    Some((UpReader { read, prefix }, write))
+    Some((
+        UpReader {
+            read,
+            prefix: head,
+            at,
+        },
+        write,
+    ))
 }
 
 fn check_response(head: &[u8]) -> Option<()> {
@@ -224,7 +251,14 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite>(
     if !early && !first.is_empty() {
         write.write_all(first).ok()?;
     }
-    Some((UpReader { read, prefix }, write))
+    Some((
+        UpReader {
+            read,
+            prefix,
+            at: 0,
+        },
+        write,
+    ))
 }
 
 #[cfg(test)]
@@ -258,13 +292,14 @@ mod tests {
     }
 
     /// The in-memory witness for `UpReader::read`: a real cursor, not a socket, so every returned byte is exact and no scheduler decides the sequence.
-    /// The prefix drains first and the inner reader answers the rest; an empty request is `Ok(0)` on both states and never touches the prefix.
+    /// The prefix is walked by cursor and the inner reader answers the rest; an empty request is `Ok(0)` on both states and never moves the cursor.
     #[test]
-    fn upreader_drains_its_prefix_then_delegates_every_byte() {
-        let drain = |prefix: &[u8], inner: &[u8], want: usize| -> Vec<u8> {
+    fn upreader_walks_its_prefix_then_delegates_every_byte() {
+        let walk = |prefix: &[u8], at: usize, inner: &[u8], want: usize| -> Vec<u8> {
             let mut reader = UpReader {
                 read: std::io::Cursor::new(inner.to_vec()),
                 prefix: prefix.to_vec(),
+                at,
             };
             let mut out = Vec::new();
             let mut buf = vec![0u8; want];
@@ -277,20 +312,105 @@ mod tests {
             }
             out
         };
-        // Prefix longer than the request window: it drains over several calls, then the inner answers, and the whole is prefix ++ inner.
-        assert_eq!(drain(b"abcdef", b"xyz", 3), b"abcdefxyz".to_vec());
+        // The fd carrier: the head rides in the same buffer as the payload that came with it, so the walk starts past the head.
+        assert_eq!(walk(b"HEADabcdef", 4, b"xyz", 3), b"abcdefxyz".to_vec());
+        // A prefix longer than the request window walks over several calls, then the inner answers.
+        assert_eq!(walk(b"abcdef", 0, b"xyz", 3), b"abcdefxyz".to_vec());
+        // The split carrier: prefix only, walked from its first byte.
+        assert_eq!(walk(b"abcdef", 0, b"", 4), b"abcdef".to_vec());
         // The peekable carrier: no prefix, so every byte is the inner reader's, one branch and a delegate.
-        assert_eq!(drain(b"", b"payload", 4), b"payload".to_vec());
-        // An empty request leaves the prefix whole and returns zero, whichever state the reader is in.
+        assert_eq!(walk(b"", 0, b"payload", 4), b"payload".to_vec());
+        // An empty request leaves the walk where it was and returns zero, whichever state the reader is in.
         let mut held = UpReader {
             read: std::io::Cursor::new(b"tail".to_vec()),
             prefix: b"head".to_vec(),
+            at: 0,
         };
         assert_eq!(held.read(&mut []).expect("empty read"), 0);
         assert_eq!(
-            held.prefix, b"head",
-            "an empty request consumed prefix bytes"
+            (held.prefix.as_slice(), held.at),
+            (&b"head"[..], 0),
+            "an empty request moved the walk"
         );
+    }
+
+    /// The gate the kept head read is bought for: a payload that arrived with the head reaches the caller without the reader touching the handle it would otherwise read from, and the buffer that carried it is gone once it has been walked.
+    #[test]
+    fn the_pipelined_prefix_reaches_the_reader_without_a_socket_read() {
+        #[derive(Default)]
+        struct Counted {
+            inner: std::io::Cursor<Vec<u8>>,
+            reads: usize,
+        }
+
+        impl Read for Counted {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                self.inner.read(buf)
+            }
+        }
+
+        let mut reader = UpReader {
+            read: Counted {
+                inner: std::io::Cursor::new(b"z".to_vec()),
+                reads: 0,
+            },
+            prefix: b"HEADbody".to_vec(),
+            at: 4,
+        };
+        let mut out = [0u8; 4];
+        assert_eq!(reader.read(&mut out).expect("walks"), 4);
+        assert_eq!(&out, b"body");
+        assert_eq!(
+            reader.read.reads, 0,
+            "the walked prefix still reached the handle"
+        );
+        assert_eq!(
+            reader.prefix.capacity(),
+            0,
+            "the read that finished the walk kept the buffer that carried the head"
+        );
+        let mut last = [0u8; 1];
+        assert_eq!(reader.read(&mut last).expect("delegates"), 1);
+        assert_eq!(&last, b"z");
+        assert_eq!(
+            reader.read.reads, 1,
+            "the byte past the prefix was not read"
+        );
+    }
+
+    /// A head whose final `\r\n\r\n` lands across two read rounds, with the early payload behind it: the kept read must prove the head from both rounds and hand the payload over whole.
+    #[test]
+    fn a_head_that_straddles_a_read_round_keeps_its_riding_payload() {
+        let request = format!(
+            "GET /tunnel?ed=2048 HTTP/1.1\r\nHost: oracle.example\r\nX-Filler: {}\r\n\
+             Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+            "f".repeat(460)
+        );
+        assert!(
+            request.len() > 512 && request.len() < 600,
+            "the filler must put the delimiter past one round, not two: {}",
+            request.len()
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let (mut reader, _write) = accept(stream, "/tunnel").expect("upgrades");
+            let mut payload = [0u8; 8];
+            reader.read_exact(&mut payload).expect("reads the payload");
+            assert_eq!(&payload, b"01234567");
+        });
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        // Split at the round's edge so the delimiter itself straddles, then ride the payload behind it.
+        stream
+            .write_all(&request.as_bytes()[..510])
+            .expect("writes");
+        stream
+            .write_all(&request.as_bytes()[510..])
+            .expect("writes");
+        stream.write_all(b"01234567").expect("writes");
+        server.join().expect("joins");
     }
 
     /// One UTF-8 pass and one line scan answers the whole request; every byte-level decision matches the previous three-helper fanout.

@@ -72,6 +72,11 @@ jobs:
       - run: cargo doc --workspace --locked --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      - name: prove the stall detector names the hang
+        shell: bash
+        # watch-test.sh is what cuts a hung suite at the quiet limit and points at the
+        # one test that never returns; nothing else runs its selftest, so gate it here.
+        run: ./scripts/watch-test.sh --selftest
       - name: the gates that do not need a toolchain
         env:
           GATES: check-leak-surface check-comments check-fixture-safety check-dependency-policy check-windows-binary-paths check-method-docs check-ci-scope

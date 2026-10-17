@@ -40,6 +40,9 @@ graph TD
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | maximum-frame-payload-bytes | 8192 | ferrox-core-mux::tests::the_decoder_refuses_only_what_it_cannot_frame |
 | relay-copies-per-byte-written | 0 | ferrox-app-proxy::tests::a_two_part_write_hands_the_payload_over_by_pointer |
+| xudp-uplink-copies-per-byte-written | 0 | ferrox-app-proxy::tests::xudp_uplink_hands_the_payload_over_by_pointer |
+| xudp-reply-copies-per-byte-written | 0 | ferrox-app-proxy::tests::a_udp_reply_hands_the_payload_over_by_pointer |
+| downlink-writes-per-read-batch | 1 | ferrox-app-proxy::tests::a_mux_downlink_hands_a_batch_of_frames_over_in_one_call |
 | codec-copies-per-byte-written | 1 | ferrox-core-mux::tests::a_header_plus_a_patched_length_is_the_whole_frame |
 | mux-frame-allocations | 0 | ferrox-bench-gate-6 |
 | live-session-cap | 8 | ferrox-core-mux::tests::the_concurrency_cap_counts_live_sessions_and_not_the_ids_used |
@@ -51,7 +54,7 @@ graph TD
 
 ```bash
 ./scripts/count-ops.sh report \
-  mux::tests::a_new_frame_is_the_bytes_the_fields_add_up_to 'ferrox_core::mux::Frame::encode'
+  mux::tests::a_new_frame_decodes_back_into_what_encoded_it 'ferrox_core::mux::decode'
 ```
 
 `UNBLESSED`, as above.
@@ -185,6 +188,77 @@ a carrier per destination. The client sends the mux request the way upstream
 does — command 3, no address — so a real peer agrees on the wire.
 `KeepAlive` is still a no-op, and the cap is still `DEFAULT_CAP` 8 live
 sessions.
+
+## The open-ended pass
+
+Four things the earlier shape paid for and no longer does. Each one is a copy,
+an allocation, a syscall or a bounds check that a count or a pointer can see;
+none of them moves a byte on the wire, which is why the frame vectors and the
+codec differential are unchanged.
+
+- **The XUDP uplink staged every datagram.** `serve_socks_udp_vless_xudp` sized a
+  `UDP_BUF + 64` buffer and `encode_into`d the payload into it, so every byte a
+  SOCKS association sent was copied once, and every association held a 64 KiB
+  buffer to hold one datagram. A mux payload is framed, not sealed: the header
+  goes into a 64-byte buffer and the payload goes to the socket from where it
+  was read, as the second `writev` part. One copy per byte removed, one syscall
+  unchanged, 64 KiB of per-association memory gone.
+  `xudp_uplink_hands_the_payload_over_by_pointer` is the gate: the returned
+  second part's base **is** the relay's read buffer, and header-plus-payload
+  still equals `encode_into`'s single-buffer frame at 1 400 bytes. The framer
+  keeps the refusal `encode_into` had — a payload longer than the two-byte
+  length field is a panic, not a wrap — which
+  `an_xudp_datagram_longer_than_a_frame_is_refused_not_truncated` holds. The
+  reply reader's source slot is also written only when the client's source changes,
+  so the steady state takes no lock per datagram; the association loopback
+  still answers every datagram on the right socket.
+- **The XUDP reply gathered the datagram before sending it.** The reader built
+  `[0,0,0] | socks address | payload` in a `UDP_BUF` buffer and called
+  `send_to`, so every reply carried one copy of its payload and one more 64 KiB
+  buffer per association. The head is now 22 bytes at most and `sendmsg` takes
+  it and the payload as two segments: one call, unchanged, and no payload byte
+  enters user space a second time.
+  `a_udp_reply_hands_the_payload_over_by_pointer` asserts the second segment's
+  base is the payload's and that the two parts parse back as the same SOCKS5
+  datagram; `socks_associate_reaches_two_udp_targets_over_one_mux_connection`
+  still pins the bytes on a real socket. Where the platform has no `sendmsg` —
+  std has no vectored UDP send — the two parts are gathered into one buffer per
+  datagram, so the fallback keeps the copy it cost before and one allocation it
+  did not; that is the trade, and the pointer gate is what separates the forms.
+- **The mux downlink wrote once per frame.** A read that held eight frames cost
+  eight `write` calls to the app's socket even though every payload already sat
+  in the read buffer. `mux_downlink` now collects the payload subranges of one
+  read into a 32-entry stack table and hands them over with one
+  `write_vectored`, so a batch of frames is one syscall and no payload is
+  copied to become a segment. `write_all_runs` is the same primitive the
+  Shadowsocks chunk writer already hands its batch over with, so the run table
+  is the only new thing and it lives on the stack.
+  `a_mux_downlink_hands_a_batch_of_frames_over_in_one_call` drives a four-frame
+  read through a sink that records its call shape: one call, one segment per
+  non-empty payload, and each segment's offset equals the offset its frame put
+  it at — a staged batch would sit back to back instead.
+- **`mux::decode` read the fixed head four times.** `meta[0]`, `meta[1]`,
+  `meta[2]` and `meta[3]` were four indexed reads, each with its own length
+  check and panic path, even though `meta_len >= FIXED` had already proved the
+  bytes were in the slice. One `split_first_chunk::<FIXED>` replaces them: one
+  length compare instead of four. The bytes are identical by construction and
+  `every_domain_length_survives_a_round_trip` plus the frame vectors still walk
+  every status, option and length.
+
+**Not claimed: the decode count.** `ops.yml` prints per-method instruction
+counts and is informational, never red; `scripts/expected-ops.txt` carries no
+mux row, so the three fewer bounds checks are an argument about the diff, not a
+blessed figure. Blessing one means reading the `ops.yml` artefact for
+`mux::decode` on a branch that has already landed, which this branch has not.
+
+**Not fixed: what an over-frame datagram costs the association.** A SOCKS UDP
+relay read is `UDP_BUF` (65 535) bytes wide and a mux length field is two bytes,
+so a datagram past 8 192 has nowhere to go; the framer refuses it by panicking,
+which is what `encode_into` did before it and what `write_mux_frame` still does.
+The bytes a frame can carry are unchanged, so this is the pre-existing hazard
+named rather than a new one, and the policy that replaces it — refuse the
+datagram and keep the association, or split it the way a TCP chunker does —
+needs the reference's rule read first.
 
 ## Pins
 

@@ -4,19 +4,20 @@ After the 101, HTTPUpgrade is not a carrier. It is a byte pipe with a
 handshake in front of it, and the cheapest correct implementation is the one
 that stops framing the moment the handshake ends.
 
-There is no frame header, no length, no type. `UpReader` drains whatever
+There is no frame header, no length, no type. `UpReader` walks whatever
 the handshake reader over-read, then delegates every byte to the inner socket.
 The relay adds **zero** framing bytes and the only copy on the data path is the
 relay's own; what the handshake stages, and why, is under *What we removed*.
 
 The one thing worth writing down is the head scan. It is not quadratic, and the
-reason is where the work lands per round: `proxy::find_across` re-windows only the
-up-to-three `\r\n\r\n` candidates that straddle the seam of what it already has and
-what just arrived, and hands the rest of the new chunk to `find_double_crlf`, one SWAR
-pass that tests eight bytes per word and visits only its `\n` lanes. The accumulated
-head is never re-scanned, so the cost is linear in the bytes peeked. Zeronet carries
-the same cursor on its side (`find_head_end`'s `scanned`). That matters because the
-server side runs this scan *before any authentication*: a client that drips one byte
+reason is where the work lands per round: the fd read hands `proxy::find_double_crlf`
+the bytes it just consumed, starting three octets before them so a delimiter that
+straddles the seam is still proved, and one SWAR pass tests eight bytes per word and
+visits only its `\n` lanes. The accumulated head is never re-scanned, so the cost is
+linear in the bytes read. `proxy::find_across` carries the same three-octet seam window
+for the `peek` reader that the Shadowsocks rung and the `http` front still use. Zeronet
+carries the same cursor on its side (`find_head_end`'s `scanned`). That matters because
+the server side runs this scan *before any authentication*: a client that drips one byte
 per packet would otherwise make one connection cost billions of comparisons before
 anything is checked. Zray records the same hazard and the
 same fix; sing-box's httpupgrade server instead does `buf.NewSize(reader.Buffered())`
@@ -53,10 +54,10 @@ uses.
 
 ```mermaid
 graph TD
-    C["client: one write of the GET and the payload,<br/>ahead of reading the 101"] --> S["server: peek, scan for CRLFCRLF<br/>seam windows + one SWAR pass per chunk"]
-    S --> R["read exactly the head, no more"]
-    R --> P["keep whatever came with it"]
-    P --> X["UpReader: drain the prefix,<br/>then delegate"]
+    C["client: one write of the GET and the payload,<br/>ahead of reading the 101"] --> S["server: read into the head buffer,<br/>scan CRLFCRLF three octets back from the seam"]
+    S --> R["one `read` per round: the head is consumed, not peeked and re-read"]
+    R --> P["keep whatever came with it, in the same buffer"]
+    P --> X["UpReader: walk the prefix by cursor,<br/>then delegate"]
     X --> B["inner socket: bytes in, bytes out"]
     B --> Z["0 framing bytes added<br/>1 copy per byte, the relay's own"]
     Z --> Q["teardown: `quiet` drains what is pending<br/>4 KiB per read, bounded by `HEAD_LIMIT`"]
@@ -75,6 +76,9 @@ graph TD
 | request-reallocations-per-dial | 0 | ferrox-app-httpupgrade::tests::the_request_is_sized_for_its_bytes |
 | round-trips-per-early-dial | 0 | ferrox-app-httpupgrade::tests::an_over_budget_payload_rides_ahead_of_a_lazy_answer |
 | round-trips-per-shadowsocks-dial | 0 | ferrox-app-proxy::tests::socks_dials_ss_over_httpupgrade_with_early_data_to_echo |
+| head-reads-per-window | 1 | ferrox-app-proxy::tests::a_kept_head_costs_one_read_per_window_and_takes_its_tail |
+| inner-reads-per-pipelined-prefix | 0 | ferrox-app-httpupgrade::tests::the_pipelined_prefix_reaches_the_reader_without_a_socket_read |
+| prefix-bytes-held-after-walk | 0 | ferrox-app-httpupgrade::tests::the_pipelined_prefix_reaches_the_reader_without_a_socket_read |
 <!-- counts:end -->
 
 `round-trips-per-early-dial` is witnessed on a socket against a server that answers
@@ -92,6 +96,21 @@ ladder rung used to hold it back whatever the config asked for. The server is
 `peek` until the first byte of the request packet is there, and only then writes the
 `101`; with `attempt.ed` put back to `0` the test is red at **20.08 s**, and green in
 0.03 s as it stands.
+
+`head-reads-per-window` is counted on `Counted` over an in-memory stream, because a
+loopback socket sees bytes and not the calls that carried them: the same wire through
+the `peek` reader costs two calls per window (`peek` to prove, `read_exact` to take),
+and one here. `inner-reads-per-pipelined-prefix` is the reason the read is worth
+making — the payload that rode in with the head reaches its caller from the buffer it
+already landed in, so the reader does not touch the handle behind it — and
+`prefix-bytes-held-after-walk` is the same test's `capacity()` assertion, that the
+buffer carrying the head and the tail is gone once the walk passes it. What no count
+here can see is the arithmetic on a head of `H` octets with `P` octets riding behind
+it and both arriving in one round: `peek` copied `H + P` into a stack probe and `H`
+again into the head buffer, then the payload was read once more, so the first bulk read
+cost **2H+2P** byte-copies and **three** read-family calls. The kept read costs
+**H+2P** copies and **one** call, and the `P` bytes of that read cost the socket
+nothing.
 
 ## Ops
 
@@ -122,15 +141,57 @@ a duration would need a scenario added to `scripts/lib-matrix.sh` first.
 
 ## What we removed
 
+**The `peek` that only proved what the next call would take.** The fd handshake read
+`peek`ed into a 512-byte stack probe, scanned it for `\r\n\r\n`, then `read_exact`ed the
+same octets into the head buffer — because a `peek` cannot consume, and the bytes behind
+the delimiter had to stay in the socket for the reader. So the head crossed user space
+**twice** and each round of a dribbled head cost **two** read-family calls.
+`proxy::read_http_head_kept` reads straight into the buffer it hands back, finds the
+delimiter there, and returns the buffer with the offset where the head ends: the head
+crosses **once**, a round costs **one** call, and the octets behind the delimiter are
+already in the caller's hands as the prefix — which is what makes the `?ed` payload
+arrive without a second trip to the socket. Counted on `Counted` over an in-memory
+stream (`head-reads-per-window 1`), and the straddling delimiter is held by
+`a_kept_head_straddling_a_round_is_proved_by_two_reads` and
+`a_head_that_straddles_a_read_round_keeps_its_riding_payload`, since the three-octet
+look-back is the one thing a one-shot read cannot show. Zeronet keeps the same shape
+(`PrefixedStream`); sing-box pays an allocation for it (`buf.NewSize(Buffered())` plus
+`ReadFullFrom`).
+
+What this does *not* claim, and the reason `read_http_head` is still in the tree: two
+callers have nowhere to put the tail. The `http` front hands its prefix to a `CONNECT`
+writer that takes one buffer, and the Shadowsocks rung's server deliberately `peek`s and
+waits in it for the first byte of the request packet, so consuming the segment would
+take the byte it is watching for. Both keep the `peek` reader, as do `ws`, `xhttp` and
+`httpheader` until their carriers take the kept reader too — this is the shared-head-
+reader item, cut here at the one carrier whose prefix slot already exists. Also
+unchanged: the three socket options that arm and restore the poll quantum around a head
+read (a `dup`ed handle shares `SO_RCVTIMEO`, so leaving it armed would park the other
+readers on the same socket), and the request `String`, which is one allocation sized to
+its bytes.
+
+**A memmove per byte the handshake over-read.** `UpReader` held the pipelined bytes in
+a `Vec` and served them with `prefix.drain(..n)`, which moves every byte *behind* the
+window each call to keep the prefix flush against the front. The worst input is the one
+the carrier is named for: `P` octets of early data read a byte at a time by a
+length-prefixed caller cost `P + (P-1) + … + 1` = **P(P+1)/2** byte moves (**131 328**
+for the 512-byte round the head read can hand over) and left the tail's bytes at a new
+address each time. The reader now carries a cursor, so the walk is **0** memmove bytes
+and `P` copies into the caller's buffer, and the buffer is dropped by the read that
+finishes the walk: `prefix-bytes-held-after-walk 0`. No count sees the old memmove — a
+`drain` and a cursor return the same bytes, which is exactly why the gate is the walk's
+`capacity()` and the in-memory `Counted` reader rather than a byte test.
+`upreader_walks_its_prefix_then_delegates_every_byte` holds the byte sequence, the
+peekable carrier's one-branch delegate and the empty-request case.
+
 **One branch on the bulk read.** `UpReader::read` guarded `buf.is_empty()` before
 testing the prefix, so the peekable carrier — whose prefix is always empty — paid
 two branches on every relay read to reach the delegate. It now tests the prefix
 first and returns `self.read.read(buf)` in one branch. The empty-buffer guard was
 provably redundant on both paths (empty prefix delegates and a `Read` answers an
 empty request with `Ok(0)`; a present prefix takes `n = min(len, 0) = 0`, copies
-nothing, drains nothing, returns `Ok(0)`), so the bytes are unchanged:
-`upreader_drains_its_prefix_then_delegates_every_byte` witnesses both states and
-the empty-request case over an in-memory cursor.
+nothing, advances the cursor by nothing, returns `Ok(0)`), so the bytes are
+unchanged.
 
 **Two more UTF-8 passes and two more line scans on the handshake parse.**
 `check_request` called `proxy::request_path` then `proxy::header_value` twice, so
@@ -205,12 +266,12 @@ and removing the branch is red on the first of them.
 
 Nothing removed on the parse path beyond the branch, the fanout and the status literal
 above, which is the point. What is recorded here is that the teardown *gains* one read
-syscall (16 at the cap) to buy the FIN, that the dial's handshake still reads its
-answer twice (`peek` to prove the head, `read_exact` to take it) plus the
-`set_read_timeout` arm and restore that bounds them — **four** syscalls a
-consume-and-keep read would cut to two, which is a shared-head-reader slice across
-`ws`, `xhttp`, `httpheader` and this carrier rather than a hunk in one page — and
-which five claims about this carrier are false:
+syscall (16 at the cap) to buy the FIN, that the fd handshake's read went from two calls
+per round to one but keeps the `set_read_timeout` arm and restore that bounds it — **two**
+socket options a budget cannot replace, since a `dup`ed handle shares the timeout — and
+that the kept reader has not yet reached `ws`, `xhttp` and `httpheader`, whose readers
+already hold a prefix slot, nor the `http` front and the Shadowsocks rung, which have
+nowhere to put the tail — and which five claims about this carrier are false:
 
 - Only the **served** role drains. The dial side of this carrier leaves the same
   hazard at its exits (`dial_vless`'s `Rung::HttpUpgrade`, and the VMess, Trojan and
@@ -232,9 +293,10 @@ which five claims about this carrier are false:
   size. Zero means it is held back and sent after the `101`. Every protocol's dial on
   this carrier reads it: vless, trojan and vmess passed `attempt.ed` and their own
   first payload, and the Shadowsocks dial passed `0, &[]` until this page's entry above
-  sealed its request packet into the same seam. The server needs no budget: it peeks the head, reads exactly through
-  `\r\n\r\n`, and leaves the pipelined bytes on the socket (or hands them back
-  as the prefix when the halves cannot peek), so the early data is the first
+  sealed its request packet into the same seam. The server needs no budget: the fd read
+  consumes through `\r\n\r\n` and keeps whatever came with it as the caller's prefix, and
+  a stream that cannot consume (the split halves, the `peek`ing front and rung) hands the
+  tail back instead of leaving it, so the early data is the first
   thing the reader returns. Checked by
   `early_data_rides_ahead_of_the_switch`,
   `an_over_budget_payload_rides_ahead_of_a_lazy_answer` and

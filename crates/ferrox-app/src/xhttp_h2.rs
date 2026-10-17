@@ -1222,7 +1222,7 @@ mod tests {
         server.join().expect("joins");
     }
 
-    /// A session that refuses the dial still owns the downlink stream its carrier opened: leaving it open parks the client's next read on a reply that never comes, while xray and sing-box both close the half they refused.
+    /// A session that refuses the dial still owns the downlink stream its carrier opened: leaving that stream open parks the client's next read on a reply that can no longer arrive.
     #[test]
     fn a_refused_session_ends_the_stream_it_parked() {
         let (addr, server) = serve_one(test_settings("stream-up"), [0xaau8; 16], 1);

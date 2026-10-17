@@ -3389,10 +3389,25 @@ fn spawn_trojan_uplink_reader(
     })
 }
 
+/// Frames one downlink hands the socket per vectored write: a read rarely holds more, and the
+/// run table lives on the stack.
+const MUX_RUNS: usize = 32;
+
 fn mux_dial_downlink(mut down: TcpStream, mut up: TcpStream, id: u16) {
+    if mux_downlink(&mut down, &mut up, id) {
+        let _ = up.shutdown(Shutdown::Write);
+    }
+}
+
+/// One mux session's downlink: every Keep payload of `id` reaches `write` in the order it arrived,
+/// a batch of them in one vectored call whose segments are the read buffer's own payload subranges,
+/// and `true` reports an End frame so the caller can close its half.
+fn mux_downlink(read: &mut impl Read, write: &mut dyn Write, id: u16) -> bool {
     let mut buf: Vec<u8> = Vec::with_capacity(READ_SLICE);
     let mut at = 0;
-    loop {
+    let mut runs = [(0usize, 0usize); MUX_RUNS];
+    let mut batched = 0;
+    'session: loop {
         if at >= buf.len() {
             buf.clear();
             at = 0;
@@ -3401,10 +3416,11 @@ fn mux_dial_downlink(mut down: TcpStream, mut up: TcpStream, id: u16) {
             at = 0;
         }
         let mut progressed = false;
+        let mut ended = false;
         loop {
             match ferrox_core::mux::decode(&buf[at..], ferrox_core::mux::NewTail::Forward) {
                 Err(ferrox_core::mux::Error::Short { .. }) => break,
-                Err(_) => return,
+                Err(_) => break 'session,
                 Ok((frame, used)) => {
                     at += used;
                     progressed = true;
@@ -3413,28 +3429,53 @@ fn mux_dial_downlink(mut down: TcpStream, mut up: TcpStream, id: u16) {
                     }
                     match frame.status {
                         ferrox_core::mux::Status::Keep => {
-                            if let Some(data) = frame.data {
-                                if up.write_all(data).is_err() {
-                                    return;
+                            let Some(data) = frame.data else {
+                                continue;
+                            };
+                            if batched == runs.len() {
+                                if !write_mux_runs(write, &buf, &runs[..batched]) {
+                                    return false;
                                 }
+                                batched = 0;
                             }
+                            let start = data.as_ptr() as usize - buf.as_ptr() as usize;
+                            runs[batched] = (start, data.len());
+                            batched += 1;
                         }
                         ferrox_core::mux::Status::End => {
-                            let _ = up.shutdown(Shutdown::Write);
-                            return;
+                            ended = true;
+                            break;
                         }
                         _ => {}
                     }
                 }
             }
         }
+        if batched > 0 {
+            if !write_mux_runs(write, &buf, &runs[..batched]) {
+                return false;
+            }
+            batched = 0;
+        }
+        if ended {
+            return true;
+        }
         if !progressed {
-            match read_into_tail(&mut down, &mut buf) {
-                Ok(0) | Err(_) => return,
+            match read_into_tail(read, &mut buf) {
+                Ok(0) | Err(_) => return false,
                 Ok(_) => {}
             }
         }
     }
+    // A session that ends on a bad frame still delivers the frames decoded before it, as it did when each was written on its own.
+    if batched > 0 {
+        let _ = write_mux_runs(write, &buf, &runs[..batched]);
+    }
+    false
+}
+
+fn write_mux_runs(write: &mut dyn Write, buf: &[u8], runs: &[(usize, usize)]) -> bool {
+    write_all_runs::<MUX_RUNS>(write, buf, runs).is_ok()
 }
 
 fn mux_dial_uplink(client: &TcpStream, uplink: &mut TcpStream, id: u16) {
@@ -6647,6 +6688,35 @@ fn xudp_identity(source: SocketAddr) -> [u8; ferrox_core::mux::GLOBAL_ID] {
     hash.to_be_bytes()
 }
 
+/// One XUDP datagram as its two wire parts: the frame header just encoded, and the payload the relay
+/// read, which goes to the socket where it lies instead of through a staging copy.
+fn xudp_datagram<'a>(
+    frame: &ferrox_core::mux::Outgoing<'_>,
+    header: &'a mut Vec<u8>,
+    payload: &'a [u8],
+) -> (&'a [u8], &'a [u8]) {
+    assert!(
+        payload.len() <= ferrox_core::mux::CHUNK_MAX,
+        "mux chunk longer than a length field"
+    );
+    let at = frame.encode_header_into(&mut *header);
+    frame.patch_payload_len(&mut *header, at, payload.len());
+    (header.as_slice(), payload)
+}
+
+/// One SOCKS5 UDP reply as its two parts: the request head and the payload that arrived. The reply
+/// socket takes both by pointer, so a datagram is not gathered into a second buffer first.
+fn udp_reply_parts<'a>(
+    head: &'a mut Vec<u8>,
+    target: &SocketAddr,
+    payload: &'a [u8],
+) -> (&'a [u8], &'a [u8]) {
+    head.clear();
+    head.extend_from_slice(&[0, 0, 0]);
+    push_socks_addr(head, target);
+    (head.as_slice(), payload)
+}
+
 fn spawn_xudp_reader(
     read: TcpStream,
     relay: &UdpSocket,
@@ -6657,7 +6727,7 @@ fn spawn_xudp_reader(
         let mut read = read;
         let mut buf: Vec<u8> = Vec::with_capacity(READ_SLICE);
         let mut at = 0;
-        let mut packet = Vec::with_capacity(UDP_BUF);
+        let mut head = Vec::with_capacity(HEAD);
         loop {
             if at >= buf.len() {
                 buf.clear();
@@ -6681,11 +6751,8 @@ fn spawn_xudp_reader(
                         let Some(dest) = source.lock().ok().and_then(|slot| *slot) else {
                             continue;
                         };
-                        packet.clear();
-                        packet.extend_from_slice(&[0, 0, 0]);
-                        push_socks_addr(&mut packet, &target);
-                        packet.extend_from_slice(data);
-                        let _ = reply.send_to(&packet, dest);
+                        let (front, tail) = udp_reply_parts(&mut head, &target, data);
+                        let _ = send_to_two(&reply, front, tail, dest);
                     }
                 }
             }
@@ -6711,8 +6778,9 @@ fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
         return;
     };
     let mut buf = udp_buffer();
-    let mut staging = Vec::with_capacity(UDP_BUF + 64);
+    let mut header = Vec::with_capacity(64);
     let mut identity: Option<[u8; ferrox_core::mux::GLOBAL_ID]> = None;
+    let mut published: Option<SocketAddr> = None;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
             continue;
@@ -6720,8 +6788,12 @@ fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
         if payload.is_empty() {
             continue;
         }
-        if let Ok(mut slot) = source.lock() {
-            *slot = Some(src);
+        // The reply reader only needs the slot once: an association that keeps its socket writes it once.
+        if published != Some(src) {
+            if let Ok(mut slot) = source.lock() {
+                *slot = Some(src);
+                published = Some(src);
+            }
         }
         let first = identity.is_none();
         let identity = identity.get_or_insert_with(|| xudp_identity(src));
@@ -6736,16 +6808,15 @@ fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
             target: Some(mux_target_of(dest)),
             global_id: if first { Some(*identity) } else { None },
         };
-        resize_scratch(&mut staging, frame.frame_len(payload.len()));
-        let written = frame.encode_into(Some(payload), &mut staging);
-        if write.write_all(&staging[..written]).is_err() {
+        let (head, body) = xudp_datagram(&frame, &mut header, payload);
+        if !write_all_two(&mut write, head, body) {
             break;
         }
     }
     let end = ferrox_core::mux::Outgoing::bare(0, ferrox_core::mux::Status::End, 0);
-    resize_scratch(&mut staging, end.frame_len(0));
-    let written = end.encode_into(None, &mut staging);
-    let _ = write.write_all(&staging[..written]);
+    resize_scratch(&mut header, end.frame_len(0));
+    let written = end.encode_into(None, &mut header);
+    let _ = write.write_all(&header[..written]);
     let _ = write.shutdown(Shutdown::Both);
     join(&done);
 }
@@ -7691,20 +7762,86 @@ pub(crate) fn find_across(head: &[u8], probe: &[u8], pattern: &[u8]) -> Option<u
     })
 }
 
-pub(crate) fn read_http_head(
-    stream: &mut TcpStream,
-    limit: usize,
-    budget: Duration,
-) -> Option<Vec<u8>> {
-    // A budget cannot bound a blocking `peek`: arm a poll timeout, never longer than the caller's, and restore it.
+/// Arm the poll quantum a head read needs: a budget cannot bound a blocking socket call, so the timeout is never longer than the caller's and the previous value goes back.
+fn with_head_poll<T>(stream: &mut TcpStream, run: impl FnOnce(&mut TcpStream) -> T) -> Option<T> {
     let previous = stream.read_timeout().ok().flatten();
     let poll = previous.map_or(RELAY_POLL, |armed| armed.min(RELAY_POLL));
     if stream.set_read_timeout(Some(poll)).is_err() {
         return None;
     }
-    let head = peek_head_rounds(stream, limit, budget);
+    let got = run(stream);
     let _ = stream.set_read_timeout(previous);
-    head
+    Some(got)
+}
+
+pub(crate) fn read_http_head(
+    stream: &mut TcpStream,
+    limit: usize,
+    budget: Duration,
+) -> Option<Vec<u8>> {
+    with_head_poll(stream, |stream| peek_head_rounds(stream, limit, budget)).flatten()
+}
+
+/// The head and the octets that arrived with it, in the one buffer the caller's reader keeps; the
+/// returned length is where the head ends. The peek reader paid a `peek` and a re-read of the same
+/// bytes to leave that tail in the socket, so a head of `H` octets crossed user space twice and a
+/// round cost two calls; here `H` crosses once and a round costs one. Nothing that has nowhere to
+/// put the tail — the `http` front and the Shadowsocks rung's wait for a request packet — may take it.
+pub(crate) fn read_http_head_kept(
+    stream: &mut TcpStream,
+    limit: usize,
+    budget: Duration,
+) -> Option<(Vec<u8>, usize)> {
+    with_head_poll(stream, |stream| kept_head_rounds(stream, limit, budget)).flatten()
+}
+
+/// One round's worth of octets: the peek probe's width, so a head that arrives in pieces costs the same reads it did.
+const HEAD_ROUND: usize = 512;
+
+#[allow(
+    clippy::uninit_vec,
+    reason = "the reader fills the grown bytes, and every path that does not truncates them back"
+)]
+fn kept_head_rounds(
+    stream: &mut dyn Read,
+    limit: usize,
+    budget: Duration,
+) -> Option<(Vec<u8>, usize)> {
+    let mut head = Vec::with_capacity(HEAD_ROUND);
+    let until = Instant::now() + budget;
+    loop {
+        if head.len() >= limit {
+            return None;
+        }
+        let base = head.len();
+        let want = HEAD_ROUND.min(limit - base);
+        head.reserve(want);
+        // SAFETY: `read` initialises the bytes it reports, and `set_len` is rolled back on every path that does not.
+        unsafe { head.set_len(base + want) };
+        let n = match stream.read(&mut head[base..]) {
+            Ok(n) => n,
+            Err(error) if is_timeout(&error) => {
+                head.truncate(base);
+                if Instant::now() >= until {
+                    return None;
+                }
+                continue;
+            }
+            Err(_) => {
+                head.truncate(base);
+                return None;
+            }
+        };
+        head.truncate(base + n);
+        if n == 0 {
+            return None;
+        }
+        // A fresh delimiter can straddle the round's bytes, so the scan starts three octets before them.
+        let from = base.saturating_sub(3);
+        if let Some(at) = find_double_crlf(&head[from..]).map(|hit| hit + from) {
+            return Some((head, at + 4));
+        }
+    }
 }
 
 #[allow(
@@ -8169,6 +8306,104 @@ pub(crate) fn write_all_three(
         stream.write_all(first).is_ok()
             && stream.write_all(second).is_ok()
             && stream.write_all(third).is_ok()
+    }
+}
+
+/// One datagram as its two parts. `sendmsg` hands the head and the caller's payload to the kernel
+/// by pointer, so a reply is not gathered into a second buffer first; a platform without it joins
+/// the parts, which is the same datagram in the same one call. The pointer gate
+/// `a_udp_reply_hands_the_payload_over_by_pointer` is what can see the difference.
+fn send_to_two(
+    socket: &UdpSocket,
+    first: &[u8],
+    second: &[u8],
+    dest: SocketAddr,
+) -> std::io::Result<usize> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd as _;
+        let mut parts = two_iovecs(first, second);
+        let (storage, len) = sockaddr_of(dest);
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_name = (&raw const storage).cast_mut().cast();
+        msg.msg_namelen = len;
+        msg.msg_iov = parts.as_mut_ptr();
+        // glibc sizes `msg_iovlen` as a `usize`, every other unix in scope as a 32-bit count.
+        #[cfg(target_os = "linux")]
+        let count = parts.len();
+        #[cfg(not(target_os = "linux"))]
+        let count: libc::c_int = parts.len().try_into().expect("two iovecs fit the field");
+        msg.msg_iovlen = count;
+        loop {
+            // SAFETY: `msg` names `parts` and `storage`, both live and sized as the call reads them.
+            let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &raw const msg, 0) };
+            if sent >= 0 {
+                return Ok(sent as usize);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let mut one = Vec::with_capacity(first.len() + second.len());
+        one.extend_from_slice(first);
+        one.extend_from_slice(second);
+        socket.send_to(&one, dest)
+    }
+}
+
+/// The `sockaddr` a datagram goes to, and its length, in the storage the kernel reads it from.
+#[cfg(unix)]
+fn sockaddr_of(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    match addr {
+        SocketAddr::V4(v4) => {
+            let len = std::mem::size_of::<libc::sockaddr_in>();
+            // SAFETY: a `sockaddr_in` is shorter and no more aligned than the storage it is built in.
+            let sin = unsafe { &mut *(&raw mut storage).cast::<libc::sockaddr_in>() };
+            sin.sin_family = libc::AF_INET as libc::sa_family_t;
+            sin.sin_port = v4.port().to_be();
+            sin.sin_addr = libc::in_addr {
+                s_addr: u32::from_ne_bytes(v4.ip().octets()),
+            };
+            // A BSD sockaddr carries its own length as the first byte; Linux's family starts there.
+            #[cfg(any(
+                target_vendor = "apple",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly"
+            ))]
+            {
+                sin.sin_len = len as u8;
+            }
+            (storage, len as libc::socklen_t)
+        }
+        SocketAddr::V6(v6) => {
+            let len = std::mem::size_of::<libc::sockaddr_in6>();
+            // SAFETY: `sockaddr_in6` is shorter and no more aligned than the storage it is built in.
+            let sin6 = unsafe { &mut *(&raw mut storage).cast::<libc::sockaddr_in6>() };
+            sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sin6.sin6_port = v6.port().to_be();
+            sin6.sin6_addr = libc::in6_addr {
+                s6_addr: v6.ip().octets(),
+            };
+            sin6.sin6_scope_id = v6.scope_id();
+            #[cfg(any(
+                target_vendor = "apple",
+                target_os = "freebsd",
+                target_os = "netbsd",
+                target_os = "openbsd",
+                target_os = "dragonfly"
+            ))]
+            {
+                sin6.sin6_len = len as u8;
+            }
+            (storage, len as libc::socklen_t)
+        }
     }
 }
 
@@ -10293,6 +10528,83 @@ mod tests {
         source.read_to_end(&mut rest).expect("drains the reader");
         let joined = [prefix.as_slice(), rest.as_slice()].concat();
         assert_eq!(joined, tail_bytes.to_vec(), "the tail splits cleanly");
+    }
+
+    /// The kept head reader's whole claim, witnessed where a count is exact: one call proves the head *and* takes the bytes behind it. The `peek` reader spent one call proving the head and another taking it, and left the tail in the stream for a third.
+    #[test]
+    fn a_kept_head_costs_one_read_per_window_and_takes_its_tail() {
+        let head = b"GET /tunnel HTTP/1.1\r\nHost: h\r\n\r\n";
+        let tail = b"the first frame's bytes";
+        let mut wire = head.to_vec();
+        wire.extend_from_slice(tail);
+        let whole = wire.len();
+        let mut source = Counted {
+            inner: std::io::Cursor::new(wire),
+            reads: 0,
+        };
+        let (got, at) =
+            kept_head_rounds(&mut source, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("reads a head");
+        assert_eq!(got[..at], head.to_vec(), "the head ends at its delimiter");
+        assert_eq!(
+            got[at..],
+            tail.to_vec(),
+            "the bytes behind it came in the same buffer"
+        );
+        assert_eq!(
+            source.reads, 1,
+            "one read proved the head and took the tail"
+        );
+        assert_eq!(
+            source.inner.position() as usize,
+            whole,
+            "octets were left in the stream for another read"
+        );
+    }
+
+    /// The delimiter split across a round's seam: the scan starts three octets before the new bytes, so a head whose `\r\n\r\n` straddles is still proved, and it costs the two windows it arrived in and no third.
+    #[test]
+    fn a_kept_head_straddling_a_round_is_proved_by_two_reads() {
+        let mut wire: Vec<u8> = b"GET /tunnel HTTP/1.1\r\nX-Pad: ".to_vec();
+        while wire.len() < 510 {
+            wire.push(b'p');
+        }
+        // The delimiter occupies 510..514, so the first 512-byte window ends inside it.
+        wire.extend_from_slice(b"\r\n\r\npayload");
+        assert_eq!(wire[510..], b"\r\n\r\npayload".to_vec());
+        let mut source = Counted {
+            inner: std::io::Cursor::new(wire),
+            reads: 0,
+        };
+        let (got, at) =
+            kept_head_rounds(&mut source, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("straddles");
+        assert_eq!(at, 514, "the head is proved past the seam, not re-windowed");
+        assert_eq!(&got[at..], b"payload");
+        assert_eq!(source.reads, 2, "a round per window: {}", source.reads);
+    }
+
+    /// The worst input the round loop meets: no delimiter at all. It is refused, and so is a stream that holds nothing.
+    #[test]
+    fn a_kept_head_without_a_delimiter_is_refused() {
+        let mut endless = Counted {
+            inner: std::io::Cursor::new(vec![b'x'; 4096]),
+            reads: 0,
+        };
+        assert!(
+            kept_head_rounds(&mut endless, 8 * 1024, HEAD_DEADLINE).is_none(),
+            "a head with no terminator must be refused"
+        );
+        assert!(
+            endless.inner.position() as usize <= 8 * 1024,
+            "the reader went past its limit"
+        );
+        let mut empty = Counted {
+            inner: std::io::Cursor::new(Vec::new()),
+            reads: 0,
+        };
+        assert!(
+            kept_head_rounds(&mut empty, HEAD_LIMIT_TEST, HEAD_DEADLINE).is_none(),
+            "an idle stream is not a head"
+        );
     }
 
     #[test]
@@ -15671,6 +15983,195 @@ mod tests {
             "the payload must be the writev part itself, not a copy of it"
         );
         assert_eq!(parts[1].iov_len, 1400);
+    }
+
+    /// The XUDP uplink hands its datagram over as the frame header plus the relay's own read
+    /// buffer, and those two parts are the frame the single-buffer encoder writes. A staged payload
+    /// passes the byte half and fails the pointer half, and only the pointer half can see the copy.
+    #[test]
+    fn xudp_uplink_hands_the_payload_over_by_pointer() {
+        let target = mux_target_of("198.51.100.7:5353".parse().expect("addr"));
+        let frame = ferrox_core::mux::Outgoing {
+            id: 4,
+            status: ferrox_core::mux::Status::New,
+            options: ferrox_core::mux::DATA,
+            target: Some(target),
+            global_id: Some([3u8; ferrox_core::mux::GLOBAL_ID]),
+        };
+        let payload: Vec<u8> = (0..1400).map(|i| (i as u8) ^ 0x21).collect();
+        let mut header = Vec::with_capacity(64);
+        let (head, body) = xudp_datagram(&frame, &mut header, &payload);
+        assert_eq!(
+            body.as_ptr(),
+            payload.as_ptr(),
+            "the payload must be the writev part itself, not a copy of it"
+        );
+        assert_eq!(body.len(), payload.len());
+        assert_eq!(
+            head.len(),
+            2 + frame.meta_len() + 2,
+            "the head is the metadata and the payload length"
+        );
+
+        let mut whole = vec![0u8; frame.frame_len(payload.len())];
+        let n = frame.encode_into(Some(&payload), &mut whole);
+        let mut joined = head.to_vec();
+        joined.extend_from_slice(body);
+        assert_eq!(joined, whole[..n], "two parts, one frame");
+    }
+
+    /// The framer keeps the mux uplink's rule: a payload longer than the two-byte length field is refused, not wrapped.
+    #[test]
+    #[should_panic(expected = "mux chunk longer than a length field")]
+    fn an_xudp_datagram_longer_than_a_frame_is_refused_not_truncated() {
+        let frame = ferrox_core::mux::Outgoing::bare(
+            4,
+            ferrox_core::mux::Status::Keep,
+            ferrox_core::mux::DATA,
+        );
+        let mut header = Vec::with_capacity(64);
+        let big = vec![0u8; ferrox_core::mux::CHUNK_MAX + 1];
+        let _ = xudp_datagram(&frame, &mut header, &big);
+    }
+
+    /// What a downlink batch reached the sink with: the call shape, which a byte test cannot see.
+    #[derive(Default)]
+    struct RunSink {
+        calls: Vec<(usize, Vec<(usize, usize)>)>,
+        out: Vec<u8>,
+    }
+
+    impl Write for RunSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls
+                .push((1, vec![(buf.as_ptr() as usize, buf.len())]));
+            self.out.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+
+        fn write_vectored(&mut self, parts: &[IoSlice<'_>]) -> std::io::Result<usize> {
+            self.calls.push((
+                parts.len(),
+                parts
+                    .iter()
+                    .map(|part| (part.as_ptr() as usize, part.len()))
+                    .collect(),
+            ));
+            let mut wrote = 0;
+            for part in parts {
+                self.out.extend_from_slice(part);
+                wrote += part.len();
+            }
+            Ok(wrote)
+        }
+    }
+
+    /// Four frames read at once reach the socket as one vectored call whose segments sit where the
+    /// frames put them. A write per frame is four calls; a staged batch moves the segments back to
+    /// back, so the offsets are what tell the two apart.
+    #[test]
+    fn a_mux_downlink_hands_a_batch_of_frames_over_in_one_call() {
+        let id = 7u16;
+        let payloads: [&[u8]; 4] = [b"ping", b"pong-and-more", b"", b"last"];
+        let mut wire = Vec::new();
+        let mut offsets = Vec::new();
+        let keep = ferrox_core::mux::Status::Keep;
+        for (i, payload) in payloads.iter().enumerate() {
+            if i == 2 {
+                let stray = ferrox_core::mux::Outgoing {
+                    id: id + 1,
+                    status: keep,
+                    options: ferrox_core::mux::DATA,
+                    target: None,
+                    global_id: None,
+                };
+                let mut frame = vec![0u8; stray.frame_len(4)];
+                let n = stray.encode_into(Some(b"nope"), &mut frame);
+                wire.extend_from_slice(&frame[..n]);
+            }
+            let frame = ferrox_core::mux::Outgoing {
+                id,
+                status: keep,
+                options: ferrox_core::mux::DATA,
+                target: None,
+                global_id: None,
+            };
+            let mut buf = vec![0u8; frame.frame_len(payload.len())];
+            let n = frame.encode_into(Some(payload), &mut buf);
+            offsets.push(wire.len() + n - payload.len());
+            wire.extend_from_slice(&buf[..n]);
+        }
+
+        let mut source = std::io::Cursor::new(wire);
+        let mut sink = RunSink::default();
+        assert!(
+            !mux_downlink(&mut source, &mut sink, id),
+            "no End frame, so the caller keeps its half open"
+        );
+        assert_eq!(
+            sink.calls.len(),
+            1,
+            "one write for the whole read, not one per frame"
+        );
+        // An empty payload is nothing to write, so the batch carries a segment per non-empty one.
+        let written: Vec<usize> = (0..payloads.len())
+            .filter(|&i| !payloads[i].is_empty())
+            .collect();
+        let (segments, bases) = &sink.calls[0];
+        assert_eq!(
+            *segments,
+            written.len(),
+            "one segment per non-empty payload"
+        );
+        assert_eq!(sink.out, payloads.concat(), "the payloads in arrival order");
+        for (segment, i) in written.iter().enumerate() {
+            let (base, len) = bases[segment];
+            assert_eq!(
+                len,
+                payloads[*i].len(),
+                "segment {segment} is a whole payload"
+            );
+            assert_eq!(
+                base.wrapping_sub(bases[0].0),
+                offsets[*i] - offsets[written[0]],
+                "segment {segment} is the read buffer at its frame's offset, not a staged copy"
+            );
+        }
+    }
+
+    /// The reply head and the payload leave as two parts. A joined buffer delivers the same
+    /// datagram, so pointer identity is the half that tells the two forms apart.
+    #[cfg(unix)]
+    #[test]
+    fn a_udp_reply_hands_the_payload_over_by_pointer() {
+        let target: SocketAddr = "198.51.100.7:5353".parse().expect("addr");
+        let payload: Vec<u8> = (0..512).map(|i| (i as u8) ^ 0x0f).collect();
+        let mut head = Vec::with_capacity(HEAD);
+        let (front, tail) = udp_reply_parts(&mut head, &target, &payload);
+        assert_eq!(
+            tail.as_ptr(),
+            payload.as_ptr(),
+            "the payload must be the sendmsg part itself, not a copy of it"
+        );
+        let parts = two_iovecs(front, tail);
+        assert_eq!(parts[0].iov_base, front.as_ptr() as *mut libc::c_void);
+        assert_eq!(parts[1].iov_base, payload.as_ptr() as *mut libc::c_void);
+        assert_eq!(parts[1].iov_len, payload.len());
+
+        let mut joined = front.to_vec();
+        joined.extend_from_slice(tail);
+        let (got, body) = parse_socks_udp(&joined).expect("the datagram parses back");
+        assert_eq!(got, target, "reserved pair, no fragment, then the address");
+        assert_eq!(body, &payload[..]);
+        assert_eq!(
+            front.len(),
+            10,
+            "three bytes, an ipv4 family, its body and a port"
+        );
     }
 
     /// What a framed write reached the session with: the call shape, which a byte test cannot see.
