@@ -1214,7 +1214,8 @@ fn check_split(root: &Json, cpu_millis: f64) -> Result<(), Error> {
         (None, None) => Ok(()),
         (Some(user), Some(sys)) => {
             let whole = user + sys;
-            if whole != cpu_millis {
+            // Half-tick margin: the halves are whole ms, so this is an exact add-up that survives float representation.
+            if (whole - cpu_millis).abs() > 0.5 {
                 return Err(Error::Invalid(format!(
                     "cpu_user_millis {user} + cpu_sys_millis {sys} = {whole}, which is not \
                      the {cpu_millis} ms of cpu the run reports"
