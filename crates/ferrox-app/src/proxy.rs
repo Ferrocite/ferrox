@@ -6114,19 +6114,24 @@ fn serve_socks_udp_freedom(relay: &UdpSocket) {
     }
 }
 
-/// The association's own control socket answers a peek with zero (or an error) once the app is gone; a timeout is the answer that says it is still there.
-fn association_left(associate: &Connection) -> bool {
+/// The client's own socket answers a peek with zero (or an error) once the app is gone; a timeout is the answer that says it is still there.
+fn peer_left(client: &Connection) -> bool {
     let mut byte = [0u8; 1];
-    match associate.peek(&mut byte) {
+    match client.peek(&mut byte) {
         Err(error) => !is_timeout(&error),
         Ok(read) => read == 0,
     }
 }
 
+/// The association's own tick: how long the relay socket waits for a datagram and how long any lane it reads waits for a packet, so one silent stream cannot cost a pass more than the tick.
+const UDP_POLL: Duration = Duration::from_millis(10);
+
+/// Datagrams one side may take per pass, so a burst is served in one pass and neither direction starves the other.
+const UDP_BURST: usize = 64;
+
 /// Foxy UDP: one CONNECT-UDP stream per destination, HTTP/2 then HTTP/3; the configured carrier does not apply.
 fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connection) {
-    const POLL: Duration = Duration::from_millis(10);
-    let _ = relay.set_read_timeout(Some(POLL));
+    let _ = relay.set_read_timeout(Some(UDP_POLL));
     let _ = associate.set_read_timeout(Some(budgets::SESSION_POLL));
     let mut streams: HashMap<SocketAddr, crate::foxy::Datagram> = HashMap::new();
     let mut buf = udp_buffer();
@@ -6135,51 +6140,68 @@ fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connectio
     let mut client = None;
     let mut quiet = Instant::now();
     loop {
-        match relay.recv_from(&mut buf) {
-            Ok((n, src)) => {
-                quiet = Instant::now();
-                client = Some(src);
-                let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
-                    continue;
-                };
-                if payload.is_empty() {
-                    continue;
-                }
-                if let std::collections::hash_map::Entry::Vacant(slot) = streams.entry(dest) {
-                    if let Some(lane) = foxy_udp_dial(foxy, &dest) {
-                        slot.insert(lane);
+        // The client's datagrams go out as a burst: one per pass would pace the upload at the tick, and a burst is what an app sends.
+        let mut ended = false;
+        for _ in 0..UDP_BURST {
+            match relay.recv_from(&mut buf) {
+                Ok((n, src)) => {
+                    quiet = Instant::now();
+                    client = Some(src);
+                    let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+                        continue;
+                    };
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    if let std::collections::hash_map::Entry::Vacant(slot) = streams.entry(dest) {
+                        if let Some(lane) = foxy_udp_dial(foxy, &dest) {
+                            slot.insert(lane);
+                        }
+                    }
+                    if let Some(lane) = streams.get_mut(&dest) {
+                        if lane.write(payload).is_err() {
+                            streams.remove(&dest);
+                        }
                     }
                 }
-                if let Some(lane) = streams.get_mut(&dest) {
-                    if lane.write(payload).is_err() {
-                        streams.remove(&dest);
-                    }
+                Err(error) if is_timeout(&error) => {
+                    ended = peer_left(associate) || quiet.elapsed() >= budgets::udp_idle();
+                    break;
                 }
-            }
-            Err(error) if is_timeout(&error) => {
-                if association_left(associate) || quiet.elapsed() >= budgets::udp_idle() {
+                Err(_) => {
+                    ended = true;
                     break;
                 }
             }
-            Err(_) => break,
+        }
+        if ended {
+            break;
         }
         let mut dead = Vec::new();
         for (dest, lane) in &mut streams {
-            match lane.read(&mut datagram) {
-                // A stream the edge closed is gone: the next datagram for that destination dials a fresh one.
-                Ok(0) => dead.push(*dest),
-                Ok(n) => {
-                    quiet = Instant::now();
-                    if let Some(src) = client {
-                        reply.clear();
-                        reply.extend_from_slice(&[0, 0, 0]);
-                        push_socks_addr(&mut reply, dest);
-                        reply.extend_from_slice(&datagram[..n]);
-                        let _ = relay.send_to(&reply, src);
+            for _ in 0..UDP_BURST {
+                match lane.read(&mut datagram) {
+                    // A stream the edge closed is gone: the next datagram for that destination dials a fresh one.
+                    Ok(0) => {
+                        dead.push(*dest);
+                        break;
+                    }
+                    Ok(n) => {
+                        quiet = Instant::now();
+                        if let Some(src) = client {
+                            reply.clear();
+                            reply.extend_from_slice(&[0, 0, 0]);
+                            push_socks_addr(&mut reply, dest);
+                            reply.extend_from_slice(&datagram[..n]);
+                            let _ = relay.send_to(&reply, src);
+                        }
+                    }
+                    Err(error) if is_timeout(&error) => break,
+                    Err(_) => {
+                        dead.push(*dest);
+                        break;
                     }
                 }
-                Err(error) if is_timeout(&error) => {}
-                Err(_) => dead.push(*dest),
             }
         }
         for dest in dead {
@@ -6190,8 +6212,7 @@ fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connectio
 
 /// CONNECT-IP UDP: one tunnel shared by every destination, so later targets cost a map row, not a dial.
 fn serve_socks_udp_foxy_ip(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connection) {
-    const POLL: Duration = Duration::from_millis(10);
-    let _ = relay.set_read_timeout(Some(POLL));
+    let _ = relay.set_read_timeout(Some(UDP_POLL));
     let _ = associate.set_read_timeout(Some(budgets::SESSION_POLL));
     // The tunnel and its owned source address are opened once and shared: that is this row's whole point.
     let mut tunnel: Option<crate::foxy::Ip> = None;
@@ -6205,76 +6226,78 @@ fn serve_socks_udp_foxy_ip(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connec
     let mut next_port = 40_000u16;
     let mut quiet = Instant::now();
     loop {
-        match relay.recv_from(&mut buf) {
-            Ok((n, src)) => {
-                quiet = Instant::now();
-                client = Some(src);
-                let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
-                    continue;
-                };
-                if payload.is_empty() {
-                    continue;
-                }
-                if width == 0 && !open_foxy_ip_tunnel(foxy, &mut tunnel, &mut source, &mut width) {
-                    continue;
-                }
-                let Some(port) = ports.get(&dest).copied().or_else(|| {
-                    let port = next_port;
-                    next_port = next_port.wrapping_add(1).max(1);
-                    ports.insert(dest, port);
-                    Some(port)
-                }) else {
-                    continue;
-                };
-                let destination: Vec<u8> = match dest.ip() {
-                    std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
-                    std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
-                };
-                // The packet's family is the tunnel's: it cannot carry an address the proxy never assigned.
-                if destination.len() != width {
-                    continue;
-                }
-                if let Some(lane) = tunnel.as_mut() {
-                    if lane
-                        .write(&source[..width], &destination, port, dest.port(), payload)
-                        .and_then(|_| lane.flush())
-                        .is_err()
+        // The client's datagrams go out as a burst, and the destination address rides a stack buffer: one packet per pass and one `Vec` per packet are both a cost the association has no reason to pay.
+        let mut ended = false;
+        for _ in 0..UDP_BURST {
+            match relay.recv_from(&mut buf) {
+                Ok((n, src)) => {
+                    quiet = Instant::now();
+                    client = Some(src);
+                    let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+                        continue;
+                    };
+                    if payload.is_empty() {
+                        continue;
+                    }
+                    if width == 0
+                        && !open_foxy_ip_tunnel(foxy, &mut tunnel, &mut source, &mut width)
                     {
-                        tunnel = None;
-                        width = 0;
-                        ports.clear();
+                        continue;
+                    }
+                    let Some(port) = ports.get(&dest).copied().or_else(|| {
+                        let port = next_port;
+                        next_port = next_port.wrapping_add(1).max(1);
+                        ports.insert(dest, port);
+                        Some(port)
+                    }) else {
+                        continue;
+                    };
+                    let mut address = [0u8; 16];
+                    let destination: &[u8] = match dest.ip() {
+                        std::net::IpAddr::V4(ip) => {
+                            address[..4].copy_from_slice(&ip.octets());
+                            &address[..4]
+                        }
+                        std::net::IpAddr::V6(ip) => {
+                            address.copy_from_slice(&ip.octets());
+                            &address
+                        }
+                    };
+                    // The packet's family is the tunnel's: it cannot carry an address the proxy never assigned.
+                    if destination.len() != width {
+                        continue;
+                    }
+                    if let Some(lane) = tunnel.as_mut() {
+                        if lane
+                            .write(&source[..width], destination, port, dest.port(), payload)
+                            .and_then(|_| lane.flush())
+                            .is_err()
+                        {
+                            tunnel = None;
+                            width = 0;
+                            ports.clear();
+                        }
                     }
                 }
-            }
-            Err(error) if is_timeout(&error) => {
-                if association_left(associate) || quiet.elapsed() >= budgets::udp_idle() {
+                Err(error) if is_timeout(&error) => {
+                    ended = peer_left(associate) || quiet.elapsed() >= budgets::udp_idle();
+                    break;
+                }
+                Err(_) => {
+                    ended = true;
                     break;
                 }
             }
-            Err(_) => break,
         }
-        // One read per pass serves all destinations: each packet's source names where its reply belongs.
+        if ended {
+            break;
+        }
+        // One pass reads the tunnel until it goes quiet, so a reply burst leaves on the tick it arrived on.
         if let Some(lane) = tunnel.as_mut() {
-            match lane.read() {
-                Ok(Some(packet)) => {
-                    quiet = Instant::now();
-                    if let Some(read) = ferrox_core::foxy::connectip::udp_from_packet(&packet) {
-                        if !read.verified {
-                            continue;
-                        }
-                        let peer = socket_from_bytes(read.source, read.destination);
-                        if let Some(src) = client {
-                            reply.clear();
-                            reply.extend_from_slice(&[0, 0, 0]);
-                            push_socks_addr(&mut reply, &peer);
-                            reply.extend_from_slice(read.payload);
-                            let _ = relay.send_to(&reply, src);
-                        }
-                        let _ = &mut ports;
-                    }
-                }
-                Err(error) if is_timeout(&error) => {}
-                Ok(None) | Err(_) => {
+            match drain_foxy_ip_tunnel(lane, relay, client, &mut reply) {
+                Some(0) => {}
+                Some(_) => quiet = Instant::now(),
+                None => {
                     tunnel = None;
                     width = 0;
                     ports.clear();
@@ -6282,6 +6305,40 @@ fn serve_socks_udp_foxy_ip(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connec
             }
         }
     }
+}
+
+/// The tunnel's packets, read until it goes quiet and each handed back to the client that sent for its destination: one read per pass would pace a download at one packet per tick. `None` is a tunnel to dial again.
+fn drain_foxy_ip_tunnel(
+    lane: &mut crate::foxy::Ip,
+    relay: &UdpSocket,
+    client: Option<SocketAddr>,
+    reply: &mut Vec<u8>,
+) -> Option<usize> {
+    let mut packets = 0usize;
+    for _ in 0..UDP_BURST {
+        match lane.read() {
+            Ok(Some(packet)) => {
+                packets += 1;
+                let Some(read) = ferrox_core::foxy::connectip::udp_from_packet(&packet) else {
+                    continue;
+                };
+                if !read.verified {
+                    continue;
+                }
+                let peer = socket_from_bytes(read.source, read.destination);
+                if let Some(src) = client {
+                    reply.clear();
+                    reply.extend_from_slice(&[0, 0, 0]);
+                    push_socks_addr(reply, &peer);
+                    reply.extend_from_slice(read.payload);
+                    let _ = relay.send_to(reply, src);
+                }
+            }
+            Err(error) if is_timeout(&error) => break,
+            Ok(None) | Err(_) => return None,
+        }
+    }
+    Some(packets)
 }
 
 /// The sender read out of the packet's own source: a v6 destination never sent to is not a peer, a v4 one is.
@@ -6361,8 +6418,8 @@ fn open_foxy_ip_tunnel(
                     };
                     *width = granted.width();
                     source[..*width].copy_from_slice(granted.bytes());
-                    // The tunnel read carries the same quantum as the datagram streams: an unanswered read returns on the tick instead of parking the association thread.
-                    let _ = lane.set_read_quantum(budgets::relay_quantum());
+                    // The tunnel read waits no longer than the association's own tick: a longer quantum paces every upload at one packet per wait.
+                    let _ = lane.set_read_quantum(UDP_POLL);
                     *tunnel = Some(lane);
                     return true;
                 }
@@ -6447,7 +6504,7 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
                     };
                     match crate::foxy::H3::open_udp(&dial, &host, dest.port(), lease) {
                         Ok(mut lane) => {
-                            lane.set_read_quantum(budgets::relay_quantum());
+                            lane.set_read_quantum(UDP_POLL);
                             debug_lane(&edge, carrier, &format!("udp opened for {dest}"));
                             clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                             foxy.carrier_answered(&edge, carrier);
@@ -6458,7 +6515,7 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
                 }
                 _ => match crate::foxy::open_udp(&dial, &host, dest.port()) {
                     Ok(lane) => {
-                        let _ = lane.set_read_quantum(budgets::relay_quantum());
+                        let _ = lane.set_read_quantum(UDP_POLL);
                         debug_lane(&edge, carrier, &format!("udp opened for {dest}"));
                         clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                         foxy.carrier_answered(&edge, carrier);
@@ -7077,46 +7134,50 @@ fn copy_locked(
                     if total == 0 {
                         debug_bytes(direction, &buf[..read]);
                     }
-                    write_full(tunnel, &buf[..read])
+                    write_full(tunnel, peer_ended, &buf[..read])
                 }
             }
         } else {
-            let Ok(mut lane) = tunnel.lock() else { break };
-            match lane.read(&mut buf) {
-                Ok(0) => {
-                    debug_relay(direction, total, None);
+            // The lane is handed back before the client is written: a client that has stopped reading would otherwise cost the other direction its turn on the lane, and an upload that cannot start cannot finish the request it waits on.
+            let taken = {
+                let Ok(mut lane) = tunnel.lock() else {
                     break;
-                }
-                Ok(read) => {
-                    if total == 0 {
-                        debug_bytes(direction, &buf[..read]);
-                    }
-                    match socket.write_all(&buf[..read]) {
-                        Ok(()) => read,
-                        Err(error) => {
-                            debug_relay(direction, total, Some(error.kind()));
-                            break;
-                        }
-                    }
-                }
-                // No payload in the quantum: drop the lock so the writer gets a turn.
-                Err(error)
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::WouldBlock
-                            | std::io::ErrorKind::TimedOut
-                            | std::io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    // The lane has not answered inside its quantum: idle, unless the client's own leg has ended and nothing is left to deliver.
-                    if peer_ended.load(std::sync::atomic::Ordering::Acquire) {
+                };
+                match lane.read(&mut buf) {
+                    Ok(0) => {
                         debug_relay(direction, total, None);
                         break;
                     }
-                    drop(lane);
-                    std::thread::sleep(RELAY_IDLE);
-                    continue;
+                    Ok(read) => read,
+                    // No payload in the quantum: drop the lock so the writer gets a turn.
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        // The lane has not answered inside its quantum: idle, unless the client's own leg has ended and nothing is left to deliver.
+                        if peer_ended.load(std::sync::atomic::Ordering::Acquire) {
+                            debug_relay(direction, total, None);
+                            break;
+                        }
+                        drop(lane);
+                        std::thread::sleep(RELAY_IDLE);
+                        continue;
+                    }
+                    Err(error) => {
+                        debug_relay(direction, total, Some(error.kind()));
+                        break;
+                    }
                 }
+            };
+            if total == 0 {
+                debug_bytes(direction, &buf[..taken]);
+            }
+            match socket.write_all(&buf[..taken]) {
+                Ok(()) => taken,
                 Err(error) => {
                     debug_relay(direction, total, Some(error.kind()));
                     break;
@@ -7134,6 +7195,7 @@ fn copy_locked(
 /// Writes all bytes through the shared lane, taking the lock per call so the other direction interleaves.
 fn write_full(
     tunnel: &std::sync::Arc<std::sync::Mutex<crate::foxy::Tunnel>>,
+    peer_ended: &std::sync::atomic::AtomicBool,
     mut buf: &[u8],
 ) -> usize {
     let total = buf.len();
@@ -7141,12 +7203,12 @@ fn write_full(
         let Ok(mut lane) = tunnel.lock() else {
             break;
         };
-        match lane.write(buf) {
-            Ok(0) => {
-                drop(lane);
-                std::thread::sleep(RELAY_IDLE);
+        let stalled = match lane.write(buf) {
+            Ok(0) => true,
+            Ok(wrote) => {
+                buf = &buf[wrote..];
+                false
             }
-            Ok(wrote) => buf = &buf[wrote..],
             Err(error)
                 if matches!(
                     error.kind(),
@@ -7155,10 +7217,17 @@ fn write_full(
                         | std::io::ErrorKind::Interrupted
                 ) =>
             {
-                drop(lane);
-                std::thread::sleep(RELAY_IDLE);
+                true
             }
             Err(_) => break,
+        };
+        if stalled {
+            drop(lane);
+            // A closed window answers before the socket is touched, so the lane cannot report its own death here: the leg that carried the other way has to say so.
+            if peer_ended.load(std::sync::atomic::Ordering::Acquire) {
+                break;
+            }
+            std::thread::sleep(RELAY_IDLE);
         }
     }
     total - buf.len()
