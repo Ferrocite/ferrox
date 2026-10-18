@@ -74,6 +74,7 @@ graph TD
 | server-shared-session-poll-millis | 1 | ferrox-app-proxy::tests::a_server_relay_bounds_the_shared_session_to_one_tick |
 | late-hello-grains-survived | 12 | ferrox-app-proxy::tests::a_plain_tls_lane_retries_a_hello_that_arrives_past_the_grain |
 | unsafe-fingerprint-header-bytes-added | 0 | ferrox-core-vless::tests::an_unsafe_fingerprint_adds_no_header_byte |
+| plaintext-to-public-header-bytes-added | 0 | ferrox-core-vless::tests::pattng_plaintext_to_public_needs_opt_in_and_adds_no_byte |
 | certificate-refusals-folded-into-other | 0 | ferrox-core-tls::rustls_backend::tests::mismatched_certificate_name_fails |
 | untrusted-dials-counted-as-retryable | 0 | ferrox-app-proxy::tests::a_refused_chain_is_a_refusal_not_a_drop |
 | session-writes-per-frame | 1 | ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call |
@@ -306,8 +307,14 @@ the stock rustls hello this tree already dials — so row 18 is finished by
 `UnsafeOptIn::allow_unsafe_fingerprint` (`--allow-unsafe-fp`), which clears the
 parse veto so a consented `fp=unsafe-*` reports `Implemented` and dials, while a
 bare link still refuses; `an_unsafe_fingerprint_adds_no_header_byte` proves the
-fingerprint adds no VLESS byte. The sibling consents `allow_plaintext_to_public`
-(row 4) and `cipherSuites` parsing (row 17) are still not constructed here. A
+fingerprint adds no VLESS byte. The sibling consent
+`UnsafeOptIn::allow_plaintext_to_public` (`--allow-plaintext-public`) is built the
+same way: a bare link still vetoes `security=none` to a public address, but a
+consented link reads that session as the private `security=none` it is byte-for-byte,
+so the two consents are independent (`the_two_unsafe_consents_are_independent`) and
+the plaintext consent adds no byte either
+(`pattng_plaintext_to_public_needs_opt_in_and_adds_no_byte`). `cipherSuites` parsing
+(row 17) landed separately in `tls/cipher_suites.rs`. A
 carried REALITY outbound now dials the raw-carrier set the server already
 serves; only the UDP-carrier set stays refused rather than dialled, for want of
 a client leg. The

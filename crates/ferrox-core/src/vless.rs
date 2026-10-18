@@ -135,12 +135,20 @@ impl VlessLink {
             && self.is_vision_flow()
     }
 
+    /// The plain TCP `security=none`, `encryption=none`, `flow=none` session, judged on a security
+    /// the caller has already resolved — the public destination is a policy gate, not a different
+    /// set of bytes, so the classification reads the same for `None` and a consented `NoneToPublic`.
     #[must_use]
-    pub fn is_none_private_method(&self) -> bool {
+    fn is_none_method_for(&self, security: Security) -> bool {
         self.transport_kind() == TransportKind::Tcp
-            && matches!(self.security(), Security::None)
+            && security == Security::None
             && self.param("encryption") == "none"
             && self.flow() == "none"
+    }
+
+    #[must_use]
+    pub fn is_none_private_method(&self) -> bool {
+        self.is_none_method_for(self.security())
     }
 
     /// The verdict under no unsafe consent: what a bare link is worth to a default-configured operator.
@@ -149,10 +157,14 @@ impl VlessLink {
         self.support_opted(UnsafeOptIn::none())
     }
 
-    /// The verdict given an operator's out-of-band consent: an `unsafe-*` fingerprint the bare link
-    /// would veto becomes diallable, because this tree dials the stock stdlib hello under any
-    /// fingerprint (`PattNG`: unsafe means Go `crypto/tls`, not uTLS, so there is nothing to spoof).
-    /// Plaintext-to-public is row 4's separate consent and stays refused here.
+    /// The verdict given an operator's out-of-band consent. Two vetoes a bare link raises become
+    /// diallable only when the matching consent is present: an `unsafe-*` fingerprint, because this
+    /// tree dials the stock stdlib hello under any fingerprint (`PattNG`: unsafe means Go
+    /// `crypto/tls`, not uTLS, so there is nothing to spoof); and `security=none` to a public
+    /// address, because a cleartext credential reaching the internet is a leak the default operator
+    /// never asks for. The two consents are independent — clearing one leaves the other's veto.
+    /// A consented cleartext session is byte-for-byte the private one, so every rung below reads it
+    /// as `Security::None` and reports the method the private link reports.
     #[must_use]
     pub fn support_opted(&self, opt_in: UnsafeOptIn) -> Support {
         if self.has_encryption() {
@@ -170,13 +182,17 @@ impl VlessLink {
                 method: "vless-tcp-reality-vision",
             };
         }
-        if matches!(self.security(), Security::NoneToPublic) {
-            return Support::UnsafeRequiresOptIn {
-                reason:
-                    "security=none to a public address (`PattNG` extension): explicit opt-in required",
-            };
-        }
-        if self.is_none_private_method() {
+        let security = match self.security() {
+            Security::NoneToPublic if opt_in.plaintext_to_public() => Security::None,
+            Security::NoneToPublic => {
+                return Support::UnsafeRequiresOptIn {
+                    reason:
+                        "security=none to a public address (`PattNG` extension): explicit opt-in required",
+                };
+            }
+            other => other,
+        };
+        if self.is_none_method_for(security) {
             if self.wants_unsafe_fingerprint() && !opt_in.unsafe_fingerprint() {
                 return Support::UnsafeRequiresOptIn {
                     reason: "unsafe fingerprint requested: re-run with explicit opt-in",
@@ -186,7 +202,7 @@ impl VlessLink {
                 method: "vless-tcp-none",
             };
         }
-        let session = self.security() == Security::None
+        let session = security == Security::None
             && self.param("encryption") == "none"
             && self.flow() == "none";
         if session {
@@ -195,14 +211,14 @@ impl VlessLink {
             }
         }
         if self.transport_kind() == TransportKind::Tcp
-            && self.security() == Security::Tls
+            && security == Security::Tls
             && matches!(self.flow(), "" | "none")
         {
             return Support::Implemented {
                 method: "vless-tcp-tls",
             };
         }
-        if self.security() == Security::Tls && matches!(self.flow(), "" | "none") {
+        if security == Security::Tls && matches!(self.flow(), "" | "none") {
             let method = match self.transport_kind() {
                 TransportKind::Ws => Some("vless-ws-tls"),
                 TransportKind::Xhttp => Some("vless-xhttp-tls"),
@@ -215,7 +231,7 @@ impl VlessLink {
             }
         }
         Support::Planned {
-            reason: planned_reason(self),
+            reason: planned_reason(self, security),
         }
     }
 
@@ -568,16 +584,14 @@ pub const fn carries_address(command: Command) -> bool {
     matches!(command, Command::Tcp | Command::Udp)
 }
 
-fn planned_reason(link: &VlessLink) -> &'static str {
+fn planned_reason(link: &VlessLink, security: Security) -> &'static str {
     let kind = link.transport_kind();
     match kind {
-        TransportKind::Tcp => match link.security() {
+        TransportKind::Tcp => match security {
             Security::Tls => "vless-tcp-tls with vision: parses, vision framing over TLS is not wired",
-            Security::None => {
+            // A consented public cleartext link reaches here as `Security::None`; the unconsented gate already returned, so the same reason fits.
+            Security::None | Security::NoneToPublic => {
                 "vless-tcp-none without encryption=none and no flow: parses, unsupported combination"
-            }
-            Security::NoneToPublic => {
-                "vless-tcp-none to public: parses, needs explicit opt-in"
             }
             Security::Reality => "vless-tcp-reality without vision: parses, vision rung first",
             Security::Other => "unknown security: parses, transport not scheduled",
@@ -1017,12 +1031,81 @@ mod tests {
     }
 
     #[test]
-    fn pattng_plaintext_to_public_needs_opt_in() {
-        let l = VlessLink::parse(
+    fn pattng_plaintext_to_public_needs_opt_in_and_adds_no_byte() {
+        let public = VlessLink::parse(
             "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:80?security=none&encryption=none&type=tcp#plain",
         )
         .expect("parses");
+        // A bare link vetoes a cleartext credential reaching a public address.
+        assert!(matches!(
+            public.support(),
+            Support::UnsafeRequiresOptIn { .. }
+        ));
+        // The operator's out-of-band consent clears the veto; the session is the private none dial.
+        assert_eq!(
+            public.support_opted(UnsafeOptIn::none().allow_plaintext_to_public()),
+            Support::Implemented {
+                method: "vless-tcp-none"
+            },
+        );
+        // The consent gates a policy and changes no byte: the same session to a private host encodes the identical request header, and the consented public link matches it.
+        let private = VlessLink::parse(
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@127.0.0.1:80?security=none&encryption=none&type=tcp#plain",
+        )
+        .expect("parses");
+        assert_eq!(
+            public.encode_request_header("example.com", 443),
+            private.encode_request_header("example.com", 443),
+            "a plaintext-to-public consent adds no VLESS byte"
+        );
+    }
+
+    #[test]
+    fn the_two_unsafe_consents_are_independent() {
+        // A public cleartext link that also asks for an unsafe fingerprint needs BOTH consents; each alone leaves the other veto standing.
+        let l = VlessLink::parse(
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:80?security=none&encryption=none&type=tcp&fp=unsafe-chrome#plain",
+        )
+        .expect("parses");
         assert!(matches!(l.support(), Support::UnsafeRequiresOptIn { .. }));
+        assert!(matches!(
+            l.support_opted(UnsafeOptIn::none().allow_plaintext_to_public()),
+            Support::UnsafeRequiresOptIn { .. }
+        ));
+        assert!(matches!(
+            l.support_opted(UnsafeOptIn::none().allow_unsafe_fingerprint()),
+            Support::UnsafeRequiresOptIn { .. }
+        ));
+        assert_eq!(
+            l.support_opted(
+                UnsafeOptIn::none()
+                    .allow_plaintext_to_public()
+                    .allow_unsafe_fingerprint()
+            ),
+            Support::Implemented {
+                method: "vless-tcp-none"
+            },
+        );
+    }
+
+    #[test]
+    fn a_consented_public_cleartext_rides_a_carrier() {
+        // The gate is carrier-indifferent: a consented public `security=none` reaches the same cleartext session the private link reports; unconsented it stays vetoed.
+        for (transport, method) in [("ws", "vless-ws"), ("xhttp", "vless-xhttp")] {
+            let link = format!(
+                "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?security=none&encryption=none&type={transport}#plain"
+            );
+            let l = VlessLink::parse(&link).expect("parses");
+            assert!(
+                matches!(l.support(), Support::UnsafeRequiresOptIn { .. }),
+                "{transport}"
+            );
+            assert_eq!(
+                l.support_opted(UnsafeOptIn::none().allow_plaintext_to_public()),
+                Support::Implemented { method },
+                "{transport}"
+            );
+        }
     }
 
     #[test]
