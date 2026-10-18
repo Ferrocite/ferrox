@@ -64,13 +64,17 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: stable
-      # A pin's rev is immutable, so its modules and compiled packages are cacheable by the pin file.
+      # A pin's rev is immutable, so its modules, compiled packages and test verdicts are
+      # cacheable. The recipe that produced them is part of the key too: the tree's path, the
+      # pattern and the flags all sit in the step's own files, and a verdict Go reached for a
+      # different one of them is not this run's answer.
       - uses: actions/cache@v4
         with:
           path: |
             ~/.cache/go-build
             ~/go/pkg/mod
-          key: xray-go-${{ runner.os }}-${{ hashFiles('upstream/pins.toml') }}
+          key: xray-go-${{ runner.os }}-${{ hashFiles('upstream/pins.toml', 'scripts/run-xray-baseline.sh', '.github/workflows/xray-baseline.yml') }}
+          restore-keys: xray-go-${{ runner.os }}-
       - name: plan the scope, so the package list is read from the same plan
         shell: bash
         env:
