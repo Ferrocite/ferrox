@@ -8,7 +8,7 @@ The one thing this carrier actually decides is how many handshakes a connection 
 
 A lane that outlives its last lease is parked, not closed: `pump` ends its own thread when the socket is quiet and no lease rides the table, and the connection, its stream ids and its bound socket stay in the pool for the next flow. The next lease restarts exactly one pump, taking the flag on the same lock the thread left it on. Two bounds keep a parked lane from becoming a pin: the edge's own idle timeout, advanced by one `on_timeout` call at lookup so the gap is quiche's arithmetic rather than a budget of ours, and `flows-per-lane-before-it-is-handed-back`, which is inside the 100-stream grant `MAX_STREAMS` advertises.
 
-Every lane socket asks for a receive buffer at bind — one `setsockopt`, off the hot path — because a parked socket is the only thing holding what the edge sent while no pump owned it, and a Windows default (64 KB) drops it. The ask is read back rather than assumed; `receive-buffer-floor-bytes-armed-per-lane` is the floor it has to land as.
+Every socket `bind_datagram` opens — a lane's, hysteria's client and the server's listen socket — asks for a receive buffer at bind, one `setsockopt` each and off the hot path, because a parked socket is the only thing holding what the edge sent while no pump owned it, and a Windows default (64 KB) drops it. The ask is read back rather than assumed; `receive-buffer-floor-bytes-armed-per-lane` is the floor it has to land as.
 
 The hand-back itself is a pool decision, not a protocol one: a lane that has lent its whole grant leaves the pool's table so the caller's `or_else` dials a fresh one, and only a lane no lease rides is given the `done` frame. `a_lane_that_lent_its_whole_grant_of_flows_is_handed_back` asserts both halves — the entry gone from the pool, and the flow that stayed on it still carrying bytes, which is the witness that no goodbye was sent over it.
 
@@ -56,6 +56,8 @@ graph TD
 ```
 
 `UNBLESSED`: the only symbol `scripts/expected-ops.txt` blesses is `append_pem`, a PEM helper rather than a carrier, so the carrier row stays open until a Linux run reads it. The row reads `append_pem` rather than `der_to_pem` because the exact-capacity reservation left `der_to_pem` a thin wrapper that release inlines away; `pem_capacity` opens the output at its exact length and `append_pem` fills it by memcpy into live capacity. The second command is what that slice moved — `flush_egress` and `pump_once` under a filter that does send datagrams, where the stores those buffers used to zero would show in a callee's inclusive cost. The third and fourth are what this one moved: the pump thread a lease starts and ends, the lease that takes the flag, and the one `setsockopt` per lane socket.
+
+Both were read on a Linux runner against `main`'s own artefact. The new filter gives `quic::pump` 2 427 217 and `quic::pooled_stream_within` 3 474 798 inclusive, and `quic::bind_datagram` comes back `inlined-not-a-frame` — release folds it into its callers, so the arm is not a frame the profiler can name. What it does name is the syscall table of the second filter, where this slice moves exactly one row: `setsockopt` 37 → 40, one per datagram socket the filter binds, with `recvfrom` 66 and `sendto` 63 unchanged. `flush_egress` 1 014 011 → 1 014 259 and `pump_once` 2 436 499 → 2 462 978 are inside the band a loopback-driven row moves run to run, which is why no count here is blessed against it.
 
 ## Time
 
