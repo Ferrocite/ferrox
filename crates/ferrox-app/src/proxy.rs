@@ -19337,7 +19337,7 @@ mod tests {
                 "auth verifies"
             );
             let mut block = Vec::new();
-            ferrox_core::hysteria::build_auth_response(&mut block);
+            ferrox_core::hysteria::build_auth_response(true, &mut block);
             let mut frame = Vec::new();
             ferrox_core::foxy::frames::quic_varint(
                 &mut frame,
@@ -19455,6 +19455,106 @@ mod tests {
     }
 
     #[test]
+    fn hysteria_carries_udp_echo_over_loopback() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_udp_echo_once, 3);
+    }
+
+    fn hysteria_udp_echo_once() {
+        use ferrox_core::foxy::frames as h3;
+        let echo_port = udp_echo_loop();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_with("udp-auth", id);
+        let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", port).expect("udp");
+        let sock = crate::quic::Datagram::plain(sock);
+        let mut config = crate::quic::quiche_config(&roots, Some("bbr")).expect("configures");
+        config.enable_dgram(true, 1024, 1024);
+        let mut scid = [0u8; 16];
+        getrandom::getrandom(&mut scid).expect("random");
+        let cid = quiche::ConnectionId::from_ref(&scid);
+        let mut conn =
+            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
+        crate::quic::drive_handshake(&mut conn, &sock, local).expect("handshakes");
+        let horizon = std::time::Instant::now() + Duration::from_secs(30);
+        let mut settings = Vec::new();
+        h3::quic_varint(&mut settings, 0x04);
+        h3::quic_varint(&mut settings, 0);
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 2, &settings, true, horizon
+        ));
+        let mut block = Vec::new();
+        ferrox_core::hysteria::build_auth_request("localhost", "udp-auth", &mut block);
+        let mut frame = Vec::new();
+        h3::quic_varint(&mut frame, h3::H3_HEADERS);
+        h3::quic_varint(&mut frame, block.len() as u64);
+        frame.extend_from_slice(&block);
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 0, &frame, true, horizon
+        ));
+        let mut head = Vec::new();
+        let body = loop {
+            let piece = crate::quic::stream_recv_exact(&mut conn, &sock, local, 0, 1, horizon)
+                .expect("reads");
+            head.extend_from_slice(&piece);
+            let mut at = 0usize;
+            if let Some(got) = h3::h3_frame(&head, &mut at) {
+                if got.kind == h3::H3_HEADERS {
+                    if let Some(b) = head.get(at..at + got.length as usize) {
+                        break b.to_vec();
+                    }
+                }
+            }
+        };
+        assert!(ferrox_core::hysteria::verify_auth_response(&body));
+        // The auth response advertises the datagram lane, which is what lets the client open a UDP flow.
+        let fields = ferrox_core::foxy::hpack::qpack_fields(&body).expect("fields");
+        assert_eq!(
+            fields
+                .iter()
+                .find(|(k, _)| k == b"hysteria-udp")
+                .map(|(_, v)| v.as_slice()),
+            Some(b"true".as_slice())
+        );
+        // One whole UDP message to the echo target: the server opens the association on this first datagram.
+        let address = format!("127.0.0.1:{echo_port}");
+        let message = ferrox_core::hysteria::UdpMessage {
+            session: 1,
+            packet: 1,
+            frag: 0,
+            frags: 1,
+            address: &address,
+            payload: b"hello",
+        };
+        let mut wire = Vec::new();
+        ferrox_core::hysteria::encode_udp(&message, &mut wire).expect("encodes");
+        conn.dgram_send(&wire).expect("sends");
+        let mut out = [0u8; 1350];
+        while let Ok((written, info)) = conn.send(&mut out) {
+            sock.send_to(&out[..written], info.to).expect("pumps");
+        }
+        // Read until the echo returns over the lane, driving the connection so the reply's packets are delivered.
+        sock.set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("timeout");
+        loop {
+            assert!(std::time::Instant::now() < horizon, "echo never returns");
+            if let Ok((n, from)) = sock.recv_from(&mut out) {
+                let info = quiche::RecvInfo { from, to: local };
+                let _ = conn.recv(&mut out[..n], info);
+            }
+            while let Ok((written, info)) = conn.send(&mut out) {
+                let _ = sock.send_to(&out[..written], info.to);
+            }
+            if let Ok(data) = conn.dgram_recv_buf() {
+                let got = ferrox_core::hysteria::decode_udp(&data).expect("decodes");
+                if got.session == 1 && got.payload == b"hello" {
+                    assert_eq!(got.address, address);
+                    return;
+                }
+            }
+        }
+    }
+
+    #[test]
     fn hysteria_carries_vless_echo_over_loopback() {
         let _serial = quic_serial();
         quic_retry_dial(hysteria_echo_once, 3);
@@ -19543,6 +19643,22 @@ mod tests {
         let mut client = hysteria_tcp_pair(port, roots, "wrong-auth", id, target);
         let mut probe = [0u8; 1];
         assert_eq!(client.read(&mut probe).expect("reads"), 0);
+    }
+
+    /// A UDP echo target: one bound socket that returns every datagram to whoever sent it, the far end the hysteria relay is measured against.
+    fn udp_echo_loop() -> u16 {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            loop {
+                let Ok((n, from)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                let _ = echo.send_to(&buf[..n], from);
+            }
+        });
+        port
     }
 
     fn echo_loop() -> u16 {
