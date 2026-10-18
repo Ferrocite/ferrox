@@ -324,6 +324,11 @@ carrier-hysteria hop-config-forms-parsed 2 ferrox-app-config::tests::a_hysteria_
 carrier-hysteria hop-plan-pool-keys 2 ferrox-app-hysteria::tests::a_hop_plan_is_its_own_pool_key
 carrier-hysteria hopped-datagrams-delivered 200 ferrox-app-quic::tests::a_hopped_dial_spreads_its_datagrams_over_more_than_one_server_port
 carrier-hysteria hopped-reply-source-normalized 1 ferrox-app-quic::tests::a_reply_from_a_hopped_port_reads_back_as_the_nominal_server
+carrier-hysteria gecko-frame-bytes-encoded 10 ferrox-core-hysteria::tests::a_gecko_frame_is_the_exact_bytes_the_reference_emits
+carrier-hysteria gecko-frame-decode-copies 0 ferrox-core-hysteria::tests::a_gecko_frame_decodes_its_payload_without_a_copy
+carrier-hysteria gecko-packet-reassembled-bytes 1234 ferrox-core-hysteria::tests::a_fragmented_long_header_packet_reassembles_bit_identical
+carrier-hysteria gecko-window-forms-parsed 3 ferrox-app-config::tests::a_hysteria_carrier_reads_a_gecko_window
+carrier-hysteria gecko-loopback-reassembled-bytes 900 ferrox-app-quic::tests::a_gecko_dial_reassembles_its_split_long_header
 
 # --- TLS ClientHello `cipher_suites` field (PattNG ext.) --------------------
 tls-cipher-suites ops-retired-instructions UNBLESSED scripts/count-ops.sh

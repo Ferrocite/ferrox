@@ -245,6 +245,16 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
         return None;
     };
     let obfs = hysteria::Salamander::new(&dial.config.obfs_password);
+    // A dial that both hops the port and geckos the framing is refused rather than quietly built with one of the two, since neither alone carries the other's bytes.
+    if dial.config.gecko.is_some()
+        && dial
+            .config
+            .hop
+            .as_ref()
+            .is_some_and(|hop| !hop.ranges.is_empty())
+    {
+        return None;
+    }
     // A hop plan rotates the server port over a fresh socket per stay; salamander still seals each datagram, so only the destination and socket move, never a frame above.
     let sock = match dial
         .config
@@ -261,9 +271,11 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
             crate::quic::Datagram::hopped(peer, hop.ports(), hop.interval_ms, bind, &sock, obfs)
                 .ok()?
         }
-        None => match obfs {
-            Some(obfs) => crate::quic::Datagram::obfuscated(sock, obfs),
-            None => crate::quic::Datagram::plain(sock),
+        None => match (obfs, dial.config.gecko) {
+            // A gecko dial fragments and pads its long-header packets, salamander still sealing each frame; a password too short to mask with is refused at parse, never here.
+            (Some(obfs), Some(window)) => crate::quic::Datagram::gecked(sock, obfs, window).ok()?,
+            (Some(obfs), None) => crate::quic::Datagram::obfuscated(sock, obfs),
+            (None, _) => crate::quic::Datagram::plain(sock),
         },
     };
     crate::quic::drive_handshake(&mut conn, &sock, local)?;
@@ -1821,6 +1833,7 @@ mod tests {
                 cc: hysteria::Congestion::Bbr,
                 obfs_password: String::new(),
                 hop,
+                gecko: None,
             },
             roots: None,
         };

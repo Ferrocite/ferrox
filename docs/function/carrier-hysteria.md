@@ -15,9 +15,10 @@ than negotiated, and no branch of it is dead config. An inbound that names
 `tlsSettings.obfs: salamander` masks every datagram of that lane: an 8-byte
 random salt then the QUIC packet XORed against `BLAKE2b-256(password || salt)`
 tiled at `key[i mod 32]`, applied at the `quic::Datagram` seam so no handshake,
-frame or stream above it changes. Salamander is the only obfuscation carried;
-another named one, or a password below the 4-byte floor the reference accepts,
-is refused as `Unknown` rather than silently sent in the clear. The masked lane
+frame or stream above it changes. Salamander is the only mask carried, and
+`gecko` is the one variant that rides on top of it; any other named obfs, or a
+password below the 4-byte floor the reference accepts, is refused as `Unknown`
+rather than silently sent in the clear. The masked lane
 is proven end to end by `hysteria_carries_a_flow_through_salamander_over_loopback`
 — the same dial-and-echo path as the cleartext gate, over a salamander socket on
 both ends, which only completes if the salted seal and the in-place unmask agree.
@@ -118,6 +119,32 @@ replies, and the plan joins the pool key (`hop-plan-pool-keys` 2:
 `a_hop_plan_is_its_own_pool_key`) so a hopped dial never rides a plain connection to the
 same address, nor the reverse.
 
+An inbound that names `tlsSettings.obfs: gecko` fragments **and** masks: gecko is
+a fragment-plus-pad layer composed on top of salamander, so it shares the
+salamander key and the same `quic::Datagram` seam. A QUIC long-header packet
+(first byte `& 0x80`) is split into 2..=8 chunks, each wrapped in a 5-byte frame
+(`0x80`, a message id, `chunk<<4 | total`, a big-endian pad length) plus random
+padding drawn so the salamander-masked datagram — `salt(8) + frame(5) + pad +
+chunk` — lands inside a `[min, max]` window (defaults 512..1200, cap 2048), then
+sealed exactly as a plain salamander datagram; a short-header packet is masked
+whole and passes through. The receiver reassembles by `(peer, message id)`. The
+frame codec — `encode_gecko_frame`, `decode_gecko_frame`, `gecko_chunk_range`,
+`gecko_pad_len` — is pure `ferrox-core::hysteria` and proven bit-exact: the exact
+emitted bytes (`gecko-frame-bytes-encoded` 10, `a_gecko_frame_is_the_exact_bytes_
+the_reference_emits`), a decode that borrows its payload out of the input with no
+refill (`gecko-frame-decode-copies` 0, pointer-identity), a forged or truncated
+frame refused with the buffer held, and a 1234-byte packet that fragments and
+reassembles byte-identical (`gecko-packet-reassembled-bytes`). The window parses
+from the sing-box `min_packet_size`/`max_packet_size`, their camel spellings, or
+the reference's `packetSize` range as an object or a two-element array
+(`gecko-window-forms-parsed` 3), and an unusable window is refused rather than
+carried as a plain salamander that would silently drop the fragmentation. A dial
+that both hops the port and geckos the framing is refused at `connect`, since
+neither alone carries the other's bytes. The whole split-and-reassemble round
+trip over a real loopback socket is `gecko-loopback-reassembled-bytes` 900
+(`a_gecko_dial_reassembles_its_split_long_header`), which also witnesses that a
+long-header packet leaves the socket as more than one padded datagram.
+
 ## Data path
 
 ```mermaid
@@ -156,6 +183,11 @@ graph TD
     D --> HP{"hysteriaSettings<br/>names serverPorts?"}
     HP -- "yes" --> HH["Datagram::hopped:<br/>fresh socket per stay,<br/>dest port = pick_next,<br/>reply source → nominal"]
     HP -- "no" --> HF["fixed server port"]
+    HF --> GK{"obfs: gecko?"}
+    GK -- "yes" --> GF["Datagram::gecked:<br/>long-header split 2..=8,<br/>frame+pad into [min,max],<br/>reassemble by (peer,id)"]
+    GK -- "no" --> M
+    GF -. "each chunk sealed" .-> M
+    M -. "reassembled" .-> GF
     HH -. "seals, same socket" .-> M
 ```
 
@@ -184,6 +216,11 @@ graph TD
 | hop-plan-pool-keys | 2 | ferrox-app-hysteria::tests::a_hop_plan_is_its_own_pool_key |
 | hopped-datagrams-delivered | 200 | ferrox-app-quic::tests::a_hopped_dial_spreads_its_datagrams_over_more_than_one_server_port |
 | hopped-reply-source-normalized | 1 | ferrox-app-quic::tests::a_reply_from_a_hopped_port_reads_back_as_the_nominal_server |
+| gecko-frame-bytes-encoded | 10 | ferrox-core-hysteria::tests::a_gecko_frame_is_the_exact_bytes_the_reference_emits |
+| gecko-frame-decode-copies | 0 | ferrox-core-hysteria::tests::a_gecko_frame_decodes_its_payload_without_a_copy |
+| gecko-packet-reassembled-bytes | 1234 | ferrox-core-hysteria::tests::a_fragmented_long_header_packet_reassembles_bit_identical |
+| gecko-window-forms-parsed | 3 | ferrox-app-config::tests::a_hysteria_carrier_reads_a_gecko_window |
+| gecko-loopback-reassembled-bytes | 900 | ferrox-app-quic::tests::a_gecko_dial_reassembles_its_split_long_header |
 <!-- counts:end -->
 
 ## Ops
@@ -276,6 +313,16 @@ tunnel. No artefact from this branch has been read.
   hop, obfs and the relay share the one seam rather than a parallel socket type. No new
   task, no rng type, no second socket: `pick_next`/`stay_ms`/`Hop::ports` are proven
   without a socket at all.
+- **Gecko's background expiry thread.** The reference reassembles fragments in a
+  map swept by a dedicated `gcLoop` timer goroutine that ticks to expire stale
+  messages. This tree keeps the same three facts — an 8 s TTL, a per-source cap
+  and a global cap — but drops the thread: each `accept` runs one
+  `retain(|_, m| m.until > now)` over the table it already holds behind its
+  `Mutex`, so an expired message is swept lazily on the next frame rather than
+  by a ticker that wakes with nothing to do. No task, no timer, one owner for
+  the map: `gecko-loopback-reassembled-bytes` witnesses a split long-header
+  round-tripping byte-identical over a real socket, and
+  `gecko-packet-reassembled-bytes` the same reassembly purely in core.
 - **A custom brutal sender.** `brutal` and `force-brutal` pace as quiche `bbr`
   (`Congestion::quiche_name`), stated in the settings test. That is a
   narrower congestion loop, not a second implementation of one.
