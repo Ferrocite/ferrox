@@ -1,8 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs as _, UdpSocket};
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
+use std::net::{Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1077,9 +1075,8 @@ fn fetch_origin(
     let (scheme, rest) = url.split_once("://")?;
     let head = origin_request(request, rest, rewrite_host, x_forwarded, peer);
     match scheme {
-        "unix" => exchange_socket(rest, &head),
-        "http" => exchange_tcp(rest, 80, &head),
-        "https" => exchange_tls(rest, 443, &head, insecure),
+        "unix" | "http" => exchange_plain(scheme, rest, &head),
+        "https" => exchange_tls(rest, &head, insecure),
         _ => None,
     }
 }
@@ -1098,22 +1095,48 @@ fn origin_tls_config(host: &str, insecure: bool) -> ferrox_core::tls::TlsConfig 
     }
 }
 
-/// Dials an `https` origin and runs one closed exchange over the client TLS session: the same authority split and default port as the plain TCP dial, then the request written and the reply read through the encrypted stream, so a cover that dials a real site carries its bytes no further than any other origin answer.
-fn exchange_tls(
-    authority: &str,
-    default_port: u16,
-    head: &[u8],
-    insecure: bool,
-) -> Option<hysteria::OriginResponse> {
-    let host = authority.split('/').next().unwrap_or(authority);
+/// Where an origin scheme dials, and the host an `https` cover carries as SNI: the authority's port defaults to the scheme's own, and one split feeds both the dial and the name check, so they cannot disagree about which host was reached. A scheme this build cannot dial, and an authority whose port is not a port, yield `None` — bad-gateway, never a silent downgrade.
+fn origin_dial<'a>(scheme: &str, rest: &'a str) -> Option<(crate::conn::Target, &'a str)> {
+    let host = rest.split('/').next().unwrap_or(rest);
+    if scheme == "unix" {
+        let target = crate::conn::parse_target(&format!("unix:{rest}")).ok()?;
+        return Some((target, host));
+    }
+    let port = match scheme {
+        "http" => 80,
+        "https" => 443,
+        _ => return None,
+    };
     let (host_only, port) = match host.rsplit_once(':') {
         Some((h, p)) => (h, p.parse().ok()?),
-        None => (host, default_port),
+        None => (host, port),
     };
-    let stream = TcpStream::connect((host_only, port)).ok()?;
+    let target = crate::conn::parse_target(&format!("{host_only}:{port}")).ok()?;
+    Some((target, host_only))
+}
+
+/// The seam's dial for an origin target, every leg of the exchange inside the budget: the connect gets the bound the reads already had, so an origin a firewall pins answers bad-gateway in five seconds instead of parking the stream handler for the kernel's own retransmission — and the request write gets one, so an origin that accepts but never reads cannot hold the cover open either.
+fn dial_origin(target: &crate::conn::Target) -> Option<Connection> {
+    let stream = crate::conn::connect(target, ORIGIN_TIMEOUT).ok()?;
     let _ = stream.set_read_timeout(Some(ORIGIN_TIMEOUT));
-    let mut tls =
-        ferrox_core::tls::connect(&origin_tls_config(host_only, insecure), stream).ok()?;
+    let _ = stream.set_write_timeout(Some(ORIGIN_TIMEOUT));
+    Some(stream)
+}
+
+/// Runs one closed exchange over plain TCP, or over the socket an origin path names, since the seam dials either family the same bounded way.
+fn exchange_plain(scheme: &str, rest: &str, head: &[u8]) -> Option<hysteria::OriginResponse> {
+    let (target, _) = origin_dial(scheme, rest)?;
+    let mut stream = dial_origin(&target)?;
+    stream.write_all(head).ok()?;
+    stream.flush().ok()?;
+    read_origin(&mut stream)
+}
+
+/// Runs one closed exchange over the client TLS session the relay already speaks: the same authority split and default port as the plain dial, then the request written and the reply read through the encrypted stream, so a cover that dials a real site carries its bytes no further than any other origin answer.
+fn exchange_tls(rest: &str, head: &[u8], insecure: bool) -> Option<hysteria::OriginResponse> {
+    let (target, host) = origin_dial("https", rest)?;
+    let stream = dial_origin(&target)?;
+    let mut tls = ferrox_core::tls::connect(&origin_tls_config(host, insecure), stream).ok()?;
     tls.write_all(head).ok()?;
     tls.flush().ok()?;
     read_origin(&mut tls)
@@ -1177,40 +1200,6 @@ fn is_hop_by_hop(name: &str) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
-}
-
-/// Dials an origin over TCP and runs one closed exchange, defaulting the port the scheme implies when the authority omits one.
-fn exchange_tcp(
-    authority: &str,
-    default_port: u16,
-    head: &[u8],
-) -> Option<hysteria::OriginResponse> {
-    let host = authority.split('/').next().unwrap_or(authority);
-    let (host_only, port) = match host.rsplit_once(':') {
-        Some((h, p)) => (h, p.parse().ok()?),
-        None => (host, default_port),
-    };
-    let mut stream = TcpStream::connect((host_only, port)).ok()?;
-    let _ = stream.set_read_timeout(Some(ORIGIN_TIMEOUT));
-    stream.write_all(head).ok()?;
-    stream.flush().ok()?;
-    read_origin(&mut stream)
-}
-
-/// Dials an origin over a Unix socket and runs one closed exchange, with the pseudo authority the socket implies.
-#[cfg(unix)]
-fn exchange_socket(path: &str, head: &[u8]) -> Option<hysteria::OriginResponse> {
-    let mut stream = UnixStream::connect(path).ok()?;
-    let _ = stream.set_read_timeout(Some(ORIGIN_TIMEOUT));
-    stream.write_all(head).ok()?;
-    stream.flush().ok()?;
-    read_origin(&mut stream)
-}
-
-/// On a platform with no Unix socket, the `unix` origin scheme is simply unreachable and answers bad-gateway.
-#[cfg(not(unix))]
-fn exchange_socket(_path: &str, _head: &[u8]) -> Option<hysteria::OriginResponse> {
-    None
 }
 
 /// Reads an origin's whole HTTP/1.1 reply to its close, then reduces it to status, headers, and body; the buffered bytes stop at the cover's cap so a runaway origin never exhausts memory.

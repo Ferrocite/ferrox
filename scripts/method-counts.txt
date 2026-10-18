@@ -337,6 +337,7 @@ carrier-hysteria gecko-window-forms-parsed 3 ferrox-app-config::tests::a_hysteri
 carrier-hysteria gecko-loopback-reassembled-bytes 900 ferrox-app-quic::tests::a_gecko_dial_reassembles_its_split_long_header
 carrier-hysteria masquerade-https-origin-served-bytes 6 ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_an_https_origin
 carrier-hysteria masquerade-https-untrusted-refusals 1 ferrox-app-proxy::tests::hysteria_refuses_a_masquerade_https_origin_whose_chain_is_untrusted
+carrier-hysteria masquerade-unix-origin-served-bytes 6 ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_a_unix_origin
 
 # --- TLS ClientHello `cipher_suites` field (PattNG ext.) --------------------
 tls-cipher-suites ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -353,6 +354,8 @@ loopback udp-datagram-bytes-preserved 4 ferrox-app-proxy::tests::a_re_injected_u
 unix ops-retired-instructions UNBLESSED scripts/count-ops.sh
 unix unix-stream-bytes-preserved 65536 ferrox-app-conn::tests::a_unix_connection_carries_the_same_bytes_the_tcp_round_trip_does
 unix unix-head-not-vector-multiple 1501 ferrox-app-conn::tests::a_unix_round_trip_survives_lengths_a_vector_would_split
+unix unix-timeout-bound-read-back 50 ferrox-app-conn::tests::a_unix_read_timeout_arms_the_way_the_tcp_one_does
+unix unix-path-past-the-field-refused 200 ferrox-app-conn::tests::a_unix_path_past_the_socket_field_is_refused
 
 # --- tun device inbound -----------------------------------------------------
 front-tun ops-retired-instructions UNBLESSED scripts/count-ops.sh
