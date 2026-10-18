@@ -54,7 +54,7 @@ Terse verdicts, never a history of the diff, always in this shape: what changed,
 - Simpler with less code wins every tie at equal performance; no abstraction with one implementor, no second way of doing something, no debt.
 - Unsafe only for a measured win; if the safe form ties, the safe form ships.
 - Fixes leave no trace: one line of comment per item at most, no TODOs, no changelogs (`scripts/check-comments.sh` fails them).
-- Do not widen a slice. If it exposes a larger problem, add a template or an add-on to `prompts.md` instead of fixing it here.
+- Do not widen a slice. If it exposes a larger problem, tighten an existing prompt in `prompts.md` with a surgical edit of ten words at most; add no new template, add-on, or prompt.
 - Checkouts under `upstream/` are for reading and never committed. Re-run `scripts/fetch-upstream.sh` whenever `upstream/pins.toml` changes under you.
 
 ## Roadmap
