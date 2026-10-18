@@ -1,23 +1,12 @@
 # VLESS over TCP
 
-VLESS has no framing. One request header, then the stream is the stream, and
-the whole method's cost is in reading that header without copying it and
-encoding it without allocating.
+VLESS has no framing. One request header, then the stream is the stream, and the whole method's cost is in reading that header without copying it and encoding it without allocating.
 
-The header is `version(1) | uuid(16) | addonsLen(1) | addons | command(1) |
-address | port`. `addons` is a protobuf whose only field this tree honours is
-`Flow`, the XTLS Vision selector; a header that carries a flow gets 2 add-on
-bytes and nothing else. For `xtls-rprx-vision` the command byte and the address
-are still written — Vision is a framing *around* VLESS, not a replacement for
-its target field.
+The header is `version(1) | uuid(16) | addonsLen(1) | addons | command(1) | address | port`. `addons` is a protobuf whose only field this tree honours is `Flow`, the XTLS Vision selector; a header that carries a flow gets 2 add-on bytes and nothing else. For `xtls-rprx-vision` the command byte and the address are still written — Vision is a framing *around* VLESS, not a replacement for its target field.
 
 A dial keeps the destination the shape the client gave it: a name leaves as ATYP 2 plus its bytes and the edge answers the lookup, so nothing on this machine asks its own resolver for a host the tunnel was meant to carry. Only `Freedom`, the Foxy direct split and a UDP front that already resolved the datagram's destination look a name up here.
 
-`request_header_len` is a pure function of the destination, so the caller knows
-the exact length before reading anything. `encode_into` writes into a buffer the
-caller owns. That combination is why `ferrox-bench` gate 2 can assert zero
-allocations, zero allocated bytes and zero zero-fills for the encode at an
-IPv4, an IPv6 and a domain destination.
+`request_header_len` is a pure function of the destination, so the caller knows the exact length before reading anything. `encode_into` writes into a buffer the caller owns. That combination is why `ferrox-bench` gate 2 can assert zero allocations, zero allocated bytes and zero zero-fills for the encode at an IPv4, an IPv6 and a domain destination.
 
 ## Data path
 
@@ -49,28 +38,9 @@ graph TD
 | handshake-pump-buffer-reallocations | 0 | ferrox-app-proxy::tests::the_pump_forwards_its_buffer_by_pointer_and_holds_capacity_steady |
 <!-- counts:end -->
 
-The relay buffer's zero-fills are prose, not a row. A row needs a checker that
-sees the thing it names, and the only counter that sees a fill is `alloc_zeroed`:
-the counting `GlobalAlloc` that could watch one `RelayBuf`'s whole life (`new()`
-and one promotion) has to be installed by the test binary that runs the gate, and
-this crate's test binary is where the tree's one blessed instruction count lives.
-CI measured the collision — `der_to_pem` went `2653 → 2743` because every
-allocation it makes grew a thread-local test — and a harness cost is not a change
-to the product, so the allocator stays in `ferrox-core`'s own test binary, where
-nothing is blessed, and the shape it proves is
-`alloc_count::tests::an_uninitialised_tail_is_allocated_but_not_filled`: capacity
-plus `set_len` and `vec![0u8; n]` are the same allocation and the same bytes, and
-the fill is the only difference. The promotion's 240 KiB was never visible to any
-counter here anyway — growing with `resize(.., 0)` writes the tail with
-`write_bytes`, which is not `alloc_zeroed` — and the only counter that would see
-it is an instruction count, which is the `UNBLESSED` row above.
+The relay buffer's zero-fills are prose, not a row. A row needs a checker that sees the thing it names, and the only counter that sees a fill is `alloc_zeroed`: the counting `GlobalAlloc` that could watch one `RelayBuf`'s whole life (`new()` and one promotion) has to be installed by the test binary that runs the gate, and this crate's test binary is where the tree's one blessed instruction count lives. CI measured the collision — `der_to_pem` went `2653 → 2743` because every allocation it makes grew a thread-local test — and a harness cost is not a change to the product, so the allocator stays in `ferrox-core`'s own test binary, where nothing is blessed, and the shape it proves is `alloc_count::tests::an_uninitialised_tail_is_allocated_but_not_filled`: capacity plus `set_len` and `vec![0u8; n]` are the same allocation and the same bytes, and the fill is the only difference. The promotion's 240 KiB was never visible to any counter here anyway — growing with `resize(.., 0)` writes the tail with `write_bytes`, which is not `alloc_zeroed` — and the only counter that would see it is an instruction count, which is the `UNBLESSED` row above.
 
-The handshake pump now spends that same `RelayBuf`, so a dial stops paying a
-16 KiB `vec![0u8; …]` memset for bytes the first `read` overwrites. That fill is
-prose by the rule just above; the row that is checked is the pump's buffer
-*handoff* — the carrier receives the buffer's own bytes, and 64 sub-buffer
-push/drain cycles neither move the allocation nor grow its `size()`, so steady
-traffic reallocates none of it.
+The handshake pump now spends that same `RelayBuf`, so a dial stops paying a 16 KiB `vec![0u8; …]` memset for bytes the first `read` overwrites. That fill is prose by the rule just above; the row that is checked is the pump's buffer *handoff* — the carrier receives the buffer's own bytes, and 64 sub-buffer push/drain cycles neither move the allocation nor grow its `size()`, so steady traffic reallocates none of it.
 
 ## Ops
 
@@ -83,11 +53,7 @@ traffic reallocates none of it.
 
 ## Time
 
-Durations come from CI only: `.github/workflows/parity.yml` and
-`.github/workflows/benchmark-matrix.yml` run the `vless-raw` scenario across the
-pinned engines. Ratios are `ferrox` against `xray-core`, full tier, ubuntu
-`x86_64`, five repeats, all seven cells gate-green with zero engine failures; no
-ratio is taken across two cells.
+Durations come from CI only: `.github/workflows/parity.yml` and `.github/workflows/benchmark-matrix.yml` run the `vless-raw` scenario across the pinned engines. Ratios are `ferrox` against `xray-core`, full tier, ubuntu `x86_64`, five repeats, all seven cells gate-green with zero engine failures; no ratio is taken across two cells.
 
 | cell | throughput | cpu per GiB | peak RSS |
 | --- | --- | --- | --- |
@@ -95,152 +61,25 @@ ratio is taken across two cells.
 | `vless-raw-down-8` | 2.115× [2.092, 2.150] | — | — |
 | `vless-raw-duplex-8` | 1.892× median | — | — |
 
-An upload *throughput* row is only evidence about the engines once the benchmark
-sink stops comparing bytes one at a time; with the old sink every engine landed
-`within-noise` at ~14% of the cell's own one-hop ceiling — the sink, not the
-cipher, was the floor. The CPU and RSS ratios were always engine comparisons and
-are unaffected by that change. On `ubuntu-24.04-arm` the throughput row reads
-2.834× median [2.413, 3.497] with `ferrox` cpu at ~204 ms/GiB against
-`xray-core`'s 635. On `macos-15` the workload is not priceable: every engine
-fails with `No buffer space available (os error 55)`, a runner-buffer fault
-rather than a comparison.
+An upload *throughput* row is only evidence about the engines once the benchmark sink stops comparing bytes one at a time; with the old sink every engine landed `within-noise` at ~14% of the cell's own one-hop ceiling — the sink, not the cipher, was the floor. The CPU and RSS ratios were always engine comparisons and are unaffected by that change. On `ubuntu-24.04-arm` the throughput row reads 2.834× median [2.413, 3.497] with `ferrox` cpu at ~204 ms/GiB against `xray-core`'s 635. On `macos-15` the workload is not priceable: every engine fails with `No buffer space available (os error 55)`, a runner-buffer fault rather than a comparison.
 
 ## What we removed
 
-- **A field-at-a-time header read.** This is the largest difference between the
-  three implementations and it is not close. Xray's
-  `proxy/vless/encoding/encoding.go:120` calls
-  `addrParser.ReadAddressPort`, which issues a separate `io.ReadFull` for the
-  port, another for the address type byte, then another per family, then one for
-  a domain's length and one for its body — up to seven reads served out of one
-  `BufferedReader`, so one syscall but seven slice splits and seven `Read`
-  calls. sing-box's `sagernet/sing-vmess/vless/protocol.go:29-79` does the same
-  thing against the **bare `net.Conn`**, so it is 6–8 real syscalls for a 19–34
-  byte header, plus a `make([]byte, strLen)` and a `string(strBytes)` second
-  allocation for a domain. Zray parses a slice in place with zero allocations.
-  The core encoder and the in-memory parser here (`parses_the_brief_link`,
-  `header_address_families_encode_stably`) were always the in-place half — but the
-  **server** read, `decode_request` handed a raw `TcpStream` in `serve_vless_raw`,
-  was the field-at-a-time shape this bullet condemns: `read_exact` for the 18-byte
-  head, then the add-ons, then the command, then the port, then the family byte,
-  then the body — five syscalls for an IP target, six for a domain. The reads are
-  now folded on the grain of the wire: the add-ons ride in with the command byte
-  (both always header, and a mux request's frame data starts after the command, so
-  this read is safe for every command), and the port, family, and the body's first
-  byte are the same four bytes for every family — an IPv4 or IPv6 octet, or a
-  domain's length. So the server request costs four reads for every address family
-  and two for mux. `the_vless_request_header_costs_four_reads_not_six` drives it
-  from an in-memory stream that answers the whole buffer, where the count is exact
-  (a loopback socket's read count moves with the scheduler and cannot gate it); the
-  byte-identity is held by the loopback decode tests that dial every reader. No
-  byte was added to the wire and none is over-read: every read is bounded to header
-  bytes, so the first payload byte still reaches the relay untouched.
-- **A header written through a temporary.** sing-box's `WriteBuffer` path is
-  already good — it extends the header into the pooled buffer's headroom and
-  writes header and payload in one call — and this tree matches that shape
-  rather than the `buf.NewSize` + copy shape beside it.
-- **An 8 KiB buffer per connection that is thrown away.** Xray's
-  `proxy/vless/inbound/inbound.go:286` does
-  `buf.FromBytes(make([]byte, buf.Size))`, and because `FromBytes` marks the
-  buffer `ownership: unmanaged` its `Release` is a no-op, so that 8 KiB never
-  reaches `bytespool`. The relay buffer here starts at 16 KiB and is promoted to
-  256 KiB only once a read fills it completely, and on Linux the plain `copy`
-  path is `splice(2)` with no user-space copy at all.
-- **A `POLLIN` the pipe ring could not serve.** The pump armed it while the pipe
-  held fewer bytes than its capacity, which is a question in bytes, and the ring
-  refuses by *slots*: a wake that is honest about the socket still has nowhere to
-  put what it sees, and re-arming it is a spin on a flow nobody can move. The
-  `vless-raw-up-1` cell priced that spin as a resolved regression: main's nightly
-  cost 2 501 ms of system time per GiB where xray-core cost 1 076 on that same
-  runner (0.431× its cost, interval [0.423×, 0.441×], the cell exiting red), and the
-  fixed build costs 185 where xray-core costs 721 (3.818× better, interval
-  [3.606×, 4.020×]). The two cells ran on different machines, so only each one's
-  ratio to its own comparator is comparable — not 2 501 against 185.
-  `vless-raw-down-1` moved the same way it already did (2.271× xray-core's cost to
-  2.459×), so the back-off gave nothing up there. Measured against the pump that
-  re-armed the wake, a destination reading 512 bytes every 2 ms cost 78 183 ingest
-  splices that moved nothing out of 79 013 wakes in a 400 ms window; the same window
-  on this pump measures 2. Item 15 of
-  `docs/method-superset.md` carries the counts, and
-  `poll_relay::no_pollin_is_armed_on_a_ring_that_holds_bytes_it_cannot_take` holds
-  the arm's truth table while
-  `relay_tests::a_trickling_destination_does_not_spin_the_pump` counts the wake.
-  What was not removed: the first refusal of each stall is still an ingest attempt,
-  so the pump pays one splice that moves nothing per stall cycle, and a byte the ring
-  could take now waits for the drain wake that clears the stall rather than the source
-  wake that found it. That delay is priced, not assumed: the same cell's throughput
-  measured inside noise afterwards (mid 0.988×), with the system time at a thirteenth.
-- **The relay buffer's own `memset`.** Both of its fills were setup cost paid
-  before the first byte arrived: `vec![0u8; 16 KiB]` reaches for `alloc_zeroed`,
-  and `resize(256 KiB, 0)` on promotion writes another 240 KiB — 32 KiB per
-  connection up front, since each direction has its own buffer, and 240 KiB per
-  direction that ever sees a full read. None of it is read: the buffer's whole
-  length goes to `read`, and `filled` hands back only the prefix that read
-  reported, so the socket writes every byte before a caller can reach it. Both
-  paths are `with_capacity` plus `set_len` now, the shape `read_into_tail` and
-  the head reader already use. What that trades is stated plainly: the invariant
-  is no longer enforced by the type, it is the fact that `as_mut` is only ever
-  given to a `read`. A caller that compared or printed the whole buffer would be
-  reading bytes nobody wrote, which is why `RelayBuf` lost its `Debug`, and why
-  the two size gates (`a_relay_buffer_promotes_only_on_a_read_that_filled_it`,
-  `a_promoted_buffer_returns_the_bytes_that_were_read`) fill the buffer before
-  reading through it.
+- **A field-at-a-time header read.** This is the largest difference between the three implementations and it is not close. Xray's `proxy/vless/encoding/encoding.go:120` calls `addrParser.ReadAddressPort`, which issues a separate `io.ReadFull` for the port, another for the address type byte, then another per family, then one for a domain's length and one for its body — up to seven reads served out of one `BufferedReader`, so one syscall but seven slice splits and seven `Read` calls. sing-box's `sagernet/sing-vmess/vless/protocol.go:29-79` does the same thing against the **bare `net.Conn`**, so it is 6–8 real syscalls for a 19–34 byte header, plus a `make([]byte, strLen)` and a `string(strBytes)` second allocation for a domain. Zray parses a slice in place with zero allocations. The core encoder and the in-memory parser here (`parses_the_brief_link`, `header_address_families_encode_stably`) were always the in-place half — but the **server** read, `decode_request` handed a raw `TcpStream` in `serve_vless_raw`, was the field-at-a-time shape this bullet condemns: `read_exact` for the 18-byte head, then the add-ons, then the command, then the port, then the family byte, then the body — five syscalls for an IP target, six for a domain. The reads are now folded on the grain of the wire: the add-ons ride in with the command byte (both always header, and a mux request's frame data starts after the command, so this read is safe for every command), and the port, family, and the body's first byte are the same four bytes for every family — an IPv4 or IPv6 octet, or a domain's length. So the server request costs four reads for every address family and two for mux. `the_vless_request_header_costs_four_reads_not_six` drives it from an in-memory stream that answers the whole buffer, where the count is exact (a loopback socket's read count moves with the scheduler and cannot gate it); the byte-identity is held by the loopback decode tests that dial every reader. No byte was added to the wire and none is over-read: every read is bounded to header bytes, so the first payload byte still reaches the relay untouched.
+- **A header written through a temporary.** sing-box's `WriteBuffer` path is already good — it extends the header into the pooled buffer's headroom and writes header and payload in one call — and this tree matches that shape rather than the `buf.NewSize` + copy shape beside it.
+- **An 8 KiB buffer per connection that is thrown away.** Xray's `proxy/vless/inbound/inbound.go:286` does `buf.FromBytes(make([]byte, buf.Size))`, and because `FromBytes` marks the buffer `ownership: unmanaged` its `Release` is a no-op, so that 8 KiB never reaches `bytespool`. The relay buffer here starts at 16 KiB and is promoted to 256 KiB only once a read fills it completely, and on Linux the plain `copy` path is `splice(2)` with no user-space copy at all.
+- **A `POLLIN` the pipe ring could not serve.** The pump armed it while the pipe held fewer bytes than its capacity, which is a question in bytes, and the ring refuses by *slots*: a wake that is honest about the socket still has nowhere to put what it sees, and re-arming it is a spin on a flow nobody can move. The `vless-raw-up-1` cell priced that spin as a resolved regression: main's nightly cost 2 501 ms of system time per GiB where xray-core cost 1 076 on that same runner (0.431× its cost, interval [0.423×, 0.441×], the cell exiting red), and the fixed build costs 185 where xray-core costs 721 (3.818× better, interval [3.606×, 4.020×]). The two cells ran on different machines, so only each one's ratio to its own comparator is comparable — not 2 501 against 185. `vless-raw-down-1` moved the same way it already did (2.271× xray-core's cost to 2.459×), so the back-off gave nothing up there. Measured against the pump that re-armed the wake, a destination reading 512 bytes every 2 ms cost 78 183 ingest splices that moved nothing out of 79 013 wakes in a 400 ms window; the same window on this pump measures 2. Item 15 of `docs/method-superset.md` carries the counts, and `poll_relay::no_pollin_is_armed_on_a_ring_that_holds_bytes_it_cannot_take` holds the arm's truth table while `relay_tests::a_trickling_destination_does_not_spin_the_pump` counts the wake. What was not removed: the first refusal of each stall is still an ingest attempt, so the pump pays one splice that moves nothing per stall cycle, and a byte the ring could take now waits for the drain wake that clears the stall rather than the source wake that found it. That delay is priced, not assumed: the same cell's throughput measured inside noise afterwards (mid 0.988×), with the system time at a thirteenth.
+- **The relay buffer's own `memset`.** Both of its fills were setup cost paid before the first byte arrived: `vec![0u8; 16 KiB]` reaches for `alloc_zeroed`, and `resize(256 KiB, 0)` on promotion writes another 240 KiB — 32 KiB per connection up front, since each direction has its own buffer, and 240 KiB per direction that ever sees a full read. None of it is read: the buffer's whole length goes to `read`, and `filled` hands back only the prefix that read reported, so the socket writes every byte before a caller can reach it. Both paths are `with_capacity` plus `set_len` now, the shape `read_into_tail` and the head reader already use. What that trades is stated plainly: the invariant is no longer enforced by the type, it is the fact that `as_mut` is only ever given to a `read`. A caller that compared or printed the whole buffer would be reading bytes nobody wrote, which is why `RelayBuf` lost its `Debug`, and why the two size gates (`a_relay_buffer_promotes_only_on_a_read_that_filled_it`, `a_promoted_buffer_returns_the_bytes_that_were_read`) fill the buffer before reading through it.
 
-- **A reallocating dial header.** The app-side `vless_header` and
-  `vless_vision_header` reserved a fixed 30 and 30+18 bytes, but an IPv6
-  destination writes 38 and 56 — the family byte plus 16 octets instead of 4 —
-  so every v6 dial, including this row's TLS path, overran the reservation and
-  paid a heap reallocation, a copy, and a free on a 38-byte header. They now
-  reserve the exact length (the fixed prefix plus `1 + 4` or `1 + 16` chosen
-  from the destination family), so `capacity == len` and the buffer never
-  grows. `dial_headers_are_sized_to_the_bytes_they_hold` holds the capacity at
-  the length for both families and both header shapes; nothing got worse — the
-  IPv4 shape also loses its 4 bytes of slack, and the bytes on the wire are the
-  same the core encoder writes.
+- **A reallocating dial header.** The app-side `vless_header` and `vless_vision_header` reserved a fixed 30 and 30+18 bytes, but an IPv6 destination writes 38 and 56 — the family byte plus 16 octets instead of 4 — so every v6 dial, including this row's TLS path, overran the reservation and paid a heap reallocation, a copy, and a free on a 38-byte header. They now reserve the exact length (the fixed prefix plus `1 + 4` or `1 + 16` chosen from the destination family), so `capacity == len` and the buffer never grows. `dial_headers_are_sized_to_the_bytes_they_hold` holds the capacity at the length for both families and both header shapes; nothing got worse — the IPv4 shape also loses its 4 bytes of slack, and the bytes on the wire are the same the core encoder writes.
 
-- **A doomed IPv4 parse on every domain encode.** `Addr::of` scanned for `:`,
-  found none for a domain, and handed the whole host to `std`'s IPv4 parser
-  regardless of shape — so `example.com`, the destination `compare.yml` loops
-  `encode_into` over, paid a parse that can only fail, since an IPv4 literal is
-  `.` and decimal digits and nothing else. The classifier now folds the decision
-  into that single pass: a `:` still breaks to the IPv6 branch as `contains` did,
-  and the IPv4 parse is reached only when every byte is in `[0-9.]` — exactly the
-  set `std` can accept, so the skipped call was always a miss. IPv4 and IPv6
-  hosts are untouched; only the doomed call is gone.
-  `addr::tests::the_fused_classifier_is_the_original_two_call_logic_on_every_host`
-  sweeps well-formed and malformed literals, scope ids and domains against the
-  old two-call logic and holds them byte-identical;
-  `header_address_families_encode_stably` still fixes the encoded bytes for all
-  three families.
+- **A doomed IPv4 parse on every domain encode.** `Addr::of` scanned for `:`, found none for a domain, and handed the whole host to `std`'s IPv4 parser regardless of shape — so `example.com`, the destination `compare.yml` loops `encode_into` over, paid a parse that can only fail, since an IPv4 literal is `.` and decimal digits and nothing else. The classifier now folds the decision into that single pass: a `:` still breaks to the IPv6 branch as `contains` did, and the IPv4 parse is reached only when every byte is in `[0-9.]` — exactly the set `std` can accept, so the skipped call was always a miss. IPv4 and IPv6 hosts are untouched; only the doomed call is gone. `addr::tests::the_fused_classifier_is_the_original_two_call_logic_on_every_host` sweeps well-formed and malformed literals, scope ids and domains against the old two-call logic and holds them byte-identical; `header_address_families_encode_stably` still fixes the encoded bytes for all three families.
 
-- **The UDP relay loops' zero fill.** Nineteen SOCKS-inbound loops in this file
-  and two in `shadowsocks2022.rs` (`serve_socks_udp_{freedom,foxy,foxy_ip,
-  vless,vless_xudp,vmess,trojan,shadowsocks2022}`, `serve_vless_udp`,
-  `pump_vmess_udp`, `serve_trojan_udp`, the three `spawn_*_udp_reader` loops,
-  `serve_udp_on`, `serve_udp_relay`) each calloc'd a 64 KiB `UDP_BUF` per flow
-  before the first datagram arrived. They now take `udp_buffer()`, which asks
-  for the bytes through `RelayBuf::with_len` without filling them; the fill is
-  the only difference, the shape `an_uninitialised_tail_is_allocated_but_not_
-  filled` measures. Nothing past a datagram escapes: every use is a `recv`
-  target followed by `&buf[..n]`, or an `&mut buf` handed to `read_udp_datagram`
-  / `read_trojan_datagram` / `pump_trojan_replies`, each of which `read_exact`s
-  or `recv_from`s only the length it reports. Syscalls, read granularity and the
-  datagram bytes are unchanged, which is what the exact-ops job holds steady;
-  what retires is the 64 KiB fill per flow, witnessed by the CI RSS matrix.
-  The handshake and small fixed buffers beside these loops stay zeroed, and the
-  KCP lanes' two receive buffers are untouched — that page still carries its own
-  argument for them.
+- **The UDP relay loops' zero fill.** Nineteen SOCKS-inbound loops in this file and two in `shadowsocks2022.rs` (`serve_socks_udp_{freedom,foxy,foxy_ip, vless,vless_xudp,vmess,trojan,shadowsocks2022}`, `serve_vless_udp`, `pump_vmess_udp`, `serve_trojan_udp`, the three `spawn_*_udp_reader` loops, `serve_udp_on`, `serve_udp_relay`) each calloc'd a 64 KiB `UDP_BUF` per flow before the first datagram arrived. They now take `udp_buffer()`, which asks for the bytes through `RelayBuf::with_len` without filling them; the fill is the only difference, the shape `an_uninitialised_tail_is_allocated_but_not_ filled` measures. Nothing past a datagram escapes: every use is a `recv` target followed by `&buf[..n]`, or an `&mut buf` handed to `read_udp_datagram` / `read_trojan_datagram` / `pump_trojan_replies`, each of which `read_exact`s or `recv_from`s only the length it reports. Syscalls, read granularity and the datagram bytes are unchanged, which is what the exact-ops job holds steady; what retires is the 64 KiB fill per flow, witnessed by the CI RSS matrix. The handshake and small fixed buffers beside these loops stay zeroed, and the KCP lanes' two receive buffers are untouched — that page still carries its own argument for them.
 
 ## Rows that are dialled
 
-`security=reality` outbounds dial raw TCP and every carried carrier
-(`vless_outbound_with_reality_dials_raw_and_every_carrier`): the dial seals the
-session id into a stock hello, verifies the bound leaf, and relays with or
-without Vision. A carried REALITY row rides the same `ws`, `httpupgrade`,
-`grpc`, `xhttp` and `http-header` framings a plain-`TLS` row does, over the one
-seal the raw dial pays; only the UDP-carrier set stays a server row, so those
-shapes are still skipped rather than dialled. The dial writes the same header
-bytes the core encoder writes (`vision_header_matches_the_core_encoder`).
+`security=reality` outbounds dial raw TCP and every carried carrier (`vless_outbound_with_reality_dials_raw_and_every_carrier`): the dial seals the session id into a stock hello, verifies the bound leaf, and relays with or without Vision. A carried REALITY row rides the same `ws`, `httpupgrade`, `grpc`, `xhttp` and `http-header` framings a plain-`TLS` row does, over the one seal the raw dial pays; only the UDP-carrier set stays a server row, so those shapes are still skipped rather than dialled. The dial writes the same header bytes the core encoder writes (`vision_header_matches_the_core_encoder`).
 
 ## Pins
 

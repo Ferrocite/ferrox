@@ -1,28 +1,10 @@
 # The HTTP masquerade carrier
 
-VLESS and VMess and Shadowsocks and Trojan all ride this carrier, which is the
-cheapest one in the matrix: a request head with `Connection: upgrade` and a
-matching response, and then no framing at all. It exists so a connection looks
-like HTTP to something in the middle, and it costs one `memcmp`-shaped scan.
+VLESS and VMess and Shadowsocks and Trojan all ride this carrier, which is the cheapest one in the matrix: a request head with `Connection: upgrade` and a matching response, and then no framing at all. It exists so a connection looks like HTTP to something in the middle, and it costs one `memcmp`-shaped scan.
 
-`read_http_head_kept` is the interesting part and it is shared with every carrier that has a
-handshake head and a place to put the tail. It reads once into the buffer it hands back, finds
-`\r\n\r\n` there, and returns the offset where the head ends: one call per round instead of the
-`peek`-then-re-read it replaces, and whatever rode in behind the delimiter is already the
-reader's own prefix instead of a second trip through the socket.
-`httpheader::tests::the_bytes_behind_the_head_reach_the_relay_without_a_syscall` hands the reader
-that buffer over a delegate that panics on any `read`, so the row is zero because the reader never
-reaches it. The two callers that have nowhere to put a tail — the `http` front,
-whose prefix goes to a one-buffer `CONNECT` writer, and the Shadowsocks rung, which waits inside
-a `peek` for the first byte of a request packet — keep `read_http_head` and pay its `peek` plus
-its re-read.
+`read_http_head_kept` is the interesting part and it is shared with every carrier that has a handshake head and a place to put the tail. It reads once into the buffer it hands back, finds `\r\n\r\n` there, and returns the offset where the head ends: one call per round instead of the `peek`-then-re-read it replaces, and whatever rode in behind the delimiter is already the reader's own prefix instead of a second trip through the socket. `httpheader::tests::the_bytes_behind_the_head_reach_the_relay_without_a_syscall` hands the reader that buffer over a delegate that panics on any `read`, so the row is zero because the reader never reaches it. The two callers that have nowhere to put a tail — the `http` front, whose prefix goes to a one-buffer `CONNECT` writer, and the Shadowsocks rung, which waits inside a `peek` for the first byte of a request packet — keep `read_http_head` and pay its `peek` plus its re-read.
 
-The record halves, which have no `peek` to lose, took the same shape when `read_exact_head`
-became that loop: `HeadReader { prefix, at }` is handed the read's own buffer with the cursor
-past the head, so the octets behind the delimiter never leave the allocation they were read
-into (`head-tail-allocations 0`, witnessed by
-`httpheader::tests::the_record_head_hands_over_the_buffer_it_filled`, which fails the base
-arithmetic if the tail is `split_off` into a buffer of its own).
+The record halves, which have no `peek` to lose, took the same shape when `read_exact_head` became that loop: `HeadReader { prefix, at }` is handed the read's own buffer with the cursor past the head, so the octets behind the delimiter never leave the allocation they were read into (`head-tail-allocations 0`, witnessed by `httpheader::tests::the_record_head_hands_over_the_buffer_it_filled`, which fails the base arithmetic if the tail is `split_off` into a buffer of its own).
 
 ## Data path
 
@@ -58,71 +40,27 @@ graph TD
   httpheader::tests::header_carries_an_echo_over_loopback 'proxy::kept_head_rounds'
 ```
 
-`UNBLESSED`, as above. The reader named here is the one this carrier reaches; the
-`read_http_head` the page named before it is the `peek` reader row 12 left behind.
+`UNBLESSED`, as above. The reader named here is the one this carrier reaches; the `read_http_head` the page named before it is the `peek` reader row 12 left behind.
 
 ## Time
 
-**Not measured yet.** The HTTP camouflage scenarios run in
-`benchmark-matrix.yml` and `parity.yml`; no CI artefact has been
-read.
+**Not measured yet.** The HTTP camouflage scenarios run in `benchmark-matrix.yml` and `parity.yml`; no CI artefact has been read.
 
 ## What we removed
 
-The dial's own request. It was formatted into a `String` — one allocation per handshake, and every
-octet of it copied there before the socket read it again — and it is now five runs handed to the
-carrier's coalescing write, so the path and host octets reach the socket where they lie.
-`request-staging-copies-per-dial` and `request-buffer-allocations-per-dial` are both `0`, witnessed
-by `the_request_reaches_the_write_as_the_runs_it_is_made_of`, which asserts the segment pointers
-*are* the caller's `path` and `host` — what a staged buffer cannot imitate — and that the bytes it
-concatenates are the ones the removed formatter wrote. One write call per dial either way, which the
-same gate counts as `write-calls-per-dial 1`: a `writev` of five segments on a socket, one coalesced
-record on a TLS session. The serve side had nothing to lose: its `200` is one
-static octet string already, and it stays one `write`.
+The dial's own request. It was formatted into a `String` — one allocation per handshake, and every octet of it copied there before the socket read it again — and it is now five runs handed to the carrier's coalescing write, so the path and host octets reach the socket where they lie. `request-staging-copies-per-dial` and `request-buffer-allocations-per-dial` are both `0`, witnessed by `the_request_reaches_the_write_as_the_runs_it_is_made_of`, which asserts the segment pointers *are* the caller's `path` and `host` — what a staged buffer cannot imitate — and that the bytes it concatenates are the ones the removed formatter wrote. One write call per dial either way, which the same gate counts as `write-calls-per-dial 1`: a `writev` of five segments on a socket, one coalesced record on a TLS session. The serve side had nothing to lose: its `200` is one static octet string already, and it stays one `write`.
 
-The Rust reference still stages it: `render_request` renders into `String::with_capacity(256)` and
-returns `into_bytes()` (`xray-transport/src/headers/http.rs:201-225`), so a dial there pays a
-256-byte heap buffer and a copy of every octet into it; this carrier pays neither.
+The Rust reference still stages it: `render_request` renders into `String::with_capacity(256)` and returns `into_bytes()` (`xray-transport/src/headers/http.rs:201-225`), so a dial there pays a 256-byte heap buffer and a copy of every octet into it; this carrier pays neither.
 
-The price is named: the segment list is the shared `VECTOR_PARTS`-wide stack array every other
-carrier's frame write already fills, and the kernel copies five runs where it copied one. The
-user-space count is what `ops.yml` reads for this row, and a measured rise goes back.
+The price is named: the segment list is the shared `VECTOR_PARTS`-wide stack array every other carrier's frame write already fills, and the kernel copies five runs where it copied one. The user-space count is what `ops.yml` reads for this row, and a measured rise goes back.
 
-The head buffer after its walk. `HeadReader` keeps the read's own `Vec` so the octets pipelined
-behind the delimiter are delivered from where they landed, but once the last of them has been
-handed over nothing reads that buffer again, and a `clear` left its whole capacity — every byte of
-an 8 KiB-capped head — held idle for the life of the tunnel it was built on. The reader now drops
-it back to an empty `Vec` on the read that finishes the walk (the same shape `carrier-httpupgrade`
-already uses), so `prefix-bytes-held-after-walk` is `0`, witnessed by
-`the_bytes_behind_the_head_reach_the_relay_without_a_syscall`: the gate delivers the tail from the
-buffer it arrived in, asserts a zero-capacity prefix once it is spent, and then reaches the handle
-it had not touched for the tail. The handoff itself is unchanged — the release moves the single
-`dealloc` that used to wait for the connection to close up to the last delivered byte, so the
-syscall count, the copies, and the bytes on the wire are all exactly what they were.
+The head buffer after its walk. `HeadReader` keeps the read's own `Vec` so the octets pipelined behind the delimiter are delivered from where they landed, but once the last of them has been handed over nothing reads that buffer again, and a `clear` left its whole capacity — every byte of an 8 KiB-capped head — held idle for the life of the tunnel it was built on. The reader now drops it back to an empty `Vec` on the read that finishes the walk (the same shape `carrier-httpupgrade` already uses), so `prefix-bytes-held-after-walk` is `0`, witnessed by `the_bytes_behind_the_head_reach_the_relay_without_a_syscall`: the gate delivers the tail from the buffer it arrived in, asserts a zero-capacity prefix once it is spent, and then reaches the handle it had not touched for the tail. The handoff itself is unchanged — the release moves the single `dealloc` that used to wait for the connection to close up to the last delivered byte, so the syscall count, the copies, and the bytes on the wire are all exactly what they were.
 
-Three things on the read side are named because they are easy to get
-wrong rather than because they were fixed:
+Three things on the read side are named because they are easy to get wrong rather than because they were fixed:
 
-- The 8 KiB head limit (`HEAD_LIMIT = 8192`) is a *limit*, not a buffer. A
-  carrier that reads its head into a 64 KiB window to be safe pays 64 KiB of
-  allocation per handshake to reject the same request one round later.
-  `proxy::tests::a_kept_head_without_a_delimiter_is_refused` is the gate — it
-  refuses an unterminated head and asserts the reader stopped at the limit — and
-  `header_rejects_a_wrong_path` is the gate beside it for the wrong path.
-- `read_http_head`'s `peek`-then-`read` is two syscalls per round and no
-  allocation: the tail is `read_exact`'d straight into the head's own spare
-  capacity, so the bytes are never staged in a second buffer and zero-filled
-  before they are overwritten. `bytes_pipelined_behind_a_head_stay_in_the_kernel`
-  is the gate that the second pass leaves the pipelined tail untouched.
-- A timed-out read is retried until the head's own budget runs out
-  (`proxy::budgets::head_arrival()`, `HEAD_DEADLINE`'s twenty seconds unless the
-  config's `budgets` object restated it, the header budget the rest of this
-  binary already gives a handshake), and the socket is armed with `RELAY_POLL`
-  for the rounds if the caller armed nothing — so a peer that connects and stays
-  quiet is a refused handshake, not a thread parked in `peek` or a loop that
-  wakes once per poll forever. The price is two `setsockopt` per handshake (arm,
-  restore); the socket is handed back with the timeout it came with, which the
-  gate asserts. `a_quiet_peer_ends_both_head_readers_at_their_budget` is the gate.
+- The 8 KiB head limit (`HEAD_LIMIT = 8192`) is a *limit*, not a buffer. A carrier that reads its head into a 64 KiB window to be safe pays 64 KiB of allocation per handshake to reject the same request one round later. `proxy::tests::a_kept_head_without_a_delimiter_is_refused` is the gate — it refuses an unterminated head and asserts the reader stopped at the limit — and `header_rejects_a_wrong_path` is the gate beside it for the wrong path.
+- `read_http_head`'s `peek`-then-`read` is two syscalls per round and no allocation: the tail is `read_exact`'d straight into the head's own spare capacity, so the bytes are never staged in a second buffer and zero-filled before they are overwritten. `bytes_pipelined_behind_a_head_stay_in_the_kernel` is the gate that the second pass leaves the pipelined tail untouched.
+- A timed-out read is retried until the head's own budget runs out (`proxy::budgets::head_arrival()`, `HEAD_DEADLINE`'s twenty seconds unless the config's `budgets` object restated it, the header budget the rest of this binary already gives a handshake), and the socket is armed with `RELAY_POLL` for the rounds if the caller armed nothing — so a peer that connects and stays quiet is a refused handshake, not a thread parked in `peek` or a loop that wakes once per poll forever. The price is two `setsockopt` per handshake (arm, restore); the socket is handed back with the timeout it came with, which the gate asserts. `a_quiet_peer_ends_both_head_readers_at_their_budget` is the gate.
 
 ## Pins
 

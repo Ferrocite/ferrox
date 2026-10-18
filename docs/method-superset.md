@@ -1,58 +1,22 @@
 # The method matrix this core must carry
 
-This is **not** a method page. A method page under `docs/function/` carries the
-four counts, the `graph TD` of the data path and the `## Time` section for
-something this tree *implements*, and `scripts/check-method-docs.sh` is its
-gate. This file is the other half: **which** methods this tree carries, which
-it refuses by name, and for each row where at least one of the four pinned
-reading copies proves the method exists in the world this core has to drop
-into.
+This is **not** a method page. A method page under `docs/function/` carries the four counts, the `graph TD` of the data path and the `## Time` section for something this tree *implements*, and `scripts/check-method-docs.sh` is its gate. This file is the other half: **which** methods this tree carries, which it refuses by name, and for each row where at least one of the four pinned reading copies proves the method exists in the world this core has to drop into.
 
-`scripts/check-method-superset.sh` is the checker, and it runs in
-`./scripts/check.sh`. It enforces three things and nothing else:
+`scripts/check-method-superset.sh` is the checker, and it runs in `./scripts/check.sh`. It enforces three things and nothing else:
 
-1. every row names a state from a closed vocabulary, a layer, at least one
-   reference path that exists, and a note;
-2. **every method this tree already carries has a row** — every
-   `Support::Implemented` method string in `crates/ferrox-core/src/vless.rs`
-   (above `#[cfg(test)]`) and every page under `docs/function/`;
-3. **every method any of the four pinned trees carries has a row** — every
-   directory in `xray-core/proxy`, `xray-core/transport/internet`,
-   `sing-box/protocol`, `sing-box/transport`, `xray-rust/crates`,
-   `zeronet/crates`, plus `zeronet/bench/hotpath`, `xray-rust/fuzz` and
-   `zeronet/fuzz`, is cited by at least one row's references.
+1. every row names a state from a closed vocabulary, a layer, at least one reference path that exists, and a note;
+2. **every method this tree already carries has a row** — every `Support::Implemented` method string in `crates/ferrox-core/src/vless.rs` (above `#[cfg(test)]`) and every page under `docs/function/`;
+3. **every method any of the four pinned trees carries has a row** — every directory in `xray-core/proxy`, `xray-core/transport/internet`, `sing-box/protocol`, `sing-box/transport`, `xray-rust/crates`, `zeronet/crates`, plus `zeronet/bench/hotpath`, `xray-rust/fuzz` and `zeronet/fuzz`, is cited by at least one row's references.
 
-Rules 2 and 3 together are the superset claim, and they are what makes a
-rewrite safe: the matrix cannot shrink in either direction without a gate
-going red. A row that moves from `planned` to `implemented` is either a
-`docs/function` page with counts, or it is not implemented.
+Rules 2 and 3 together are the superset claim, and they are what makes a rewrite safe: the matrix cannot shrink in either direction without a gate going red. A row that moves from `planned` to `implemented` is either a `docs/function` page with counts, or it is not implemented.
 
 ## Why a superset and not a union
 
-The shared protocol in `crates/ferrox-prompt/prompts.md` states it as "a
-superset of connection ways, a subset of code". Concretely:
+The shared protocol in `crates/ferrox-prompt/prompts.md` states it as "a superset of connection ways, a subset of code". Concretely:
 
-- **The ways**: xray-core is the drop-in target, so every protocol tag, every
-  transport tag, every security key and every `app/` app it accepts is a row.
-  sing-box, xray-rust and ZeroNet are then read for what *they* carry that
-  xray-core does not — AnyTLS, ShadowTLS, Snell, SSH, Naive, TUIC, Tailscale,
-  Tor, OpenVPN/OpenConnect, selectors/urltest, MASQUE as an endpoint, the
-  `finalmask` and `zero-evasion` obfuscation families — and each of those
-  becomes a row too. That is the direction where a core ends up *narrower*
-  than the thing it replaces, which is the failure a drop-in exists to avoid.
-- **The code**: no upstream line enters this tree. A row is a *target*, not a
-  port. Learn where the reference puts each byte, then write the smaller,
-  cheaper, bit-identical thing, and prove it the way everything else here is
-  proved. `upstream/` is a reading copy: it proves what exists, never what to
-  write.
-- **A superset is not an obligation to implement.** `not-scheduled` is an
-  honest state: it says the four trees carry it, this tree does not, and
-  nothing in this tree pretends otherwise. `refused` is a deliberate no with a
-  reason, the way `Carrier::Masque` and `TransportKind::Xdrive` refuse today.
-  What is forbidden is a method that parses to nothing — `TransportKind::Other`
-  with `"unknown type: parses, transport not scheduled"` is exactly that, and
-  it is why rows exist for `tuic`, `anytls`, `shadowtls`, `snell`, `ssh` and
-  `naive` (README table A row 21).
+- **The ways**: xray-core is the drop-in target, so every protocol tag, every transport tag, every security key and every `app/` app it accepts is a row. sing-box, xray-rust and ZeroNet are then read for what *they* carry that xray-core does not — AnyTLS, ShadowTLS, Snell, SSH, Naive, TUIC, Tailscale, Tor, OpenVPN/OpenConnect, selectors/urltest, MASQUE as an endpoint, the `finalmask` and `zero-evasion` obfuscation families — and each of those becomes a row too. That is the direction where a core ends up *narrower* than the thing it replaces, which is the failure a drop-in exists to avoid.
+- **The code**: no upstream line enters this tree. A row is a *target*, not a port. Learn where the reference puts each byte, then write the smaller, cheaper, bit-identical thing, and prove it the way everything else here is proved. `upstream/` is a reading copy: it proves what exists, never what to write.
+- **A superset is not an obligation to implement.** `not-scheduled` is an honest state: it says the four trees carry it, this tree does not, and nothing in this tree pretends otherwise. `refused` is a deliberate no with a reason, the way `Carrier::Masque` and `TransportKind::Xdrive` refuse today. What is forbidden is a method that parses to nothing — `TransportKind::Other` with `"unknown type: parses, transport not scheduled"` is exactly that, and it is why rows exist for `tuic`, `anytls`, `shadowtls`, `snell`, `ssh` and `naive` (README table A row 21).
 
 ## The matrix
 
@@ -163,37 +127,20 @@ superset of connection ways, a subset of code". Concretely:
 | engine-rendezvous | engine | planned | upstream/zeronet/crates/zero-discovery/src/rendezvous.rs | fountain-coded carrier descriptors published as DoH TXT (`f<i>.<zone>`, XOR packets, GF(2) decode), ed25519-signed with epoch anti-replay — carrier recovery through a DNS-only view of the net |
 <!-- matrix:end -->
 
-Rows without a `docs/function` page are targets or refusals; they make no
-count claim. When one of them lands, it lands with its page, and
-`scripts/check-method-docs.sh` plus a new row in
-`scripts/method-counts.txt` are what say so.
+Rows without a `docs/function` page are targets or refusals; they make no count claim. When one of them lands, it lands with its page, and `scripts/check-method-docs.sh` plus a new row in `scripts/method-counts.txt` are what say so.
 
 ## The in-flight methods a rewrite must not lose
 
-These are the rows the checker's rule 2 protects. Every one of them has a page
-with gated counts today, so a rewrite that drops or silently widens any of them
-loses a gate, not just a feature:
+These are the rows the checker's rule 2 protects. Every one of them has a page with gated counts today, so a rewrite that drops or silently widens any of them loses a gate, not just a feature:
 
-- the VLESS method strings `vless-tcp`, `vless-tcp-tls`, `vless-tcp-none`,
-  `vless-tcp-reality-vision`, `vless-ws`, `vless-ws-tls`, `vless-xhttp`,
-  `vless-xhttp-tls`, `vless-grpc`, `vless-grpc-tls`, `vless-httpupgrade`,
-  `vless-httpupgrade-tls`, `vless-quic`, `vless-kcp`, `vless-hysteria`;
-- the pages `record-layer`, `shadowsocks`, `vmess`, `vless`, `trojan`,
-  `xtls-vision`, `mux-cool`, `reality-tls`, `kcp`,
-  `carrier-websocket`, `carrier-httpupgrade`, `carrier-httpheader`,
-  `carrier-grpc`, `carrier-xhttp`, `carrier-quic`, `carrier-hysteria`,
-  `carrier-foxy`.
+- the VLESS method strings `vless-tcp`, `vless-tcp-tls`, `vless-tcp-none`, `vless-tcp-reality-vision`, `vless-ws`, `vless-ws-tls`, `vless-xhttp`, `vless-xhttp-tls`, `vless-grpc`, `vless-grpc-tls`, `vless-httpupgrade`, `vless-httpupgrade-tls`, `vless-quic`, `vless-kcp`, `vless-hysteria`;
+- the pages `record-layer`, `shadowsocks`, `vmess`, `vless`, `trojan`, `xtls-vision`, `mux-cool`, `reality-tls`, `kcp`, `carrier-websocket`, `carrier-httpupgrade`, `carrier-httpheader`, `carrier-grpc`, `carrier-xhttp`, `carrier-quic`, `carrier-hysteria`, `carrier-foxy`.
 
-Two of those rows are the ones a rewrite is most likely to break by accident,
-because they are *not* parity rows: `carrier-foxy` and `mux-cool` exist in no
-xray-core config at the pinned revision, and `kcp`'s arithmetic is proved
-against a Go oracle that a rewrite must not re-derive by hand.
+Two of those rows are the ones a rewrite is most likely to break by accident, because they are *not* parity rows: `carrier-foxy` and `mux-cool` exist in no xray-core config at the pinned revision, and `kcp`'s arithmetic is proved against a Go oracle that a rewrite must not re-derive by hand.
 
 ## Open copies, branches and refills
 
-Optimization targets still standing in this tree. Completed removals live in
-the git history and are witnessed on each method page (a copy claim is proved
-by pointer identity, not by reading), so they are not logged here.
+Optimization targets still standing in this tree. Completed removals live in the git history and are witnessed on each method page (a copy claim is proved by pointer identity, not by reading), so they are not logged here.
 
 ### Copies
 
@@ -221,19 +168,10 @@ by pointer identity, not by reading), so they are not logged here.
 
 Named because a page that lists only wins is not evidence:
 
-- **KCP sends one datagram per 1 332-byte segment** — batching would change the
-  datagram boundaries a peer sees.
-- **The mux uplink copies every payload byte once** — removing it means
-  splitting `mux::Outgoing::encode_into` in two; copy #1 above removes one
-  *further* copy on one path.
-- **The AEAD open path is two keystream passes and no staging buffer** — the
-  named tradeoff (`keystream-passes-per-decrypt 2` vs `staging-bytes-per-decrypt 0`).
-- **The websocket masked-write path copies once** into the thread-local mask
-  buffer; a three-part `writev` of header/mask/data is not available.
-- **The 2022 handshake reader's two reads** — it opens exactly one chunk, so no
-  window can serve a second; a `BufReader` would cost the `shadowsocks
-  user-space-copies-per-byte-read 0` row.
-- **`read_client_hello`** reads the 5-byte record header then the body — the
-  record length is *in* the header.
-- **The KCP arena copy** is load-bearing — a segment is retransmitted after the
-  caller's buffer is gone.
+- **KCP sends one datagram per 1 332-byte segment** — batching would change the datagram boundaries a peer sees.
+- **The mux uplink copies every payload byte once** — removing it means splitting `mux::Outgoing::encode_into` in two; copy #1 above removes one *further* copy on one path.
+- **The AEAD open path is two keystream passes and no staging buffer** — the named tradeoff (`keystream-passes-per-decrypt 2` vs `staging-bytes-per-decrypt 0`).
+- **The websocket masked-write path copies once** into the thread-local mask buffer; a three-part `writev` of header/mask/data is not available.
+- **The 2022 handshake reader's two reads** — it opens exactly one chunk, so no window can serve a second; a `BufReader` would cost the `shadowsocks user-space-copies-per-byte-read 0` row.
+- **`read_client_hello`** reads the 5-byte record header then the body — the record length is *in* the header.
+- **The KCP arena copy** is load-bearing — a segment is retransmitted after the caller's buffer is gone.
