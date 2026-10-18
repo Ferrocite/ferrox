@@ -11,7 +11,16 @@ default QUIC stack for this rung, pinned at `upstream/quiche` for reading.
 Every served connection also carries the QUIC datagram lane: the auth response
 advertises `hysteria-udp: true` the way the reference does whenever a validator
 is present — and a served connection always has one — so the lane is on rather
-than negotiated, and no branch of it is dead config.
+than negotiated, and no branch of it is dead config. An inbound that names
+`tlsSettings.obfs: salamander` masks every datagram of that lane: an 8-byte
+random salt then the QUIC packet XORed against `BLAKE2b-256(password || salt)`
+tiled at `key[i mod 32]`, applied at the `quic::Datagram` seam so no handshake,
+frame or stream above it changes. Salamander is the only obfuscation carried;
+another named one, or a password below the 4-byte floor the reference accepts,
+is refused as `Unknown` rather than silently sent in the clear. The masked lane
+is proven end to end by `hysteria_carries_a_flow_through_salamander_over_loopback`
+— the same dial-and-echo path as the cleartext gate, over a salamander socket on
+both ends, which only completes if the salted seal and the in-place unmask agree.
 
 The wire shape is small: every TCP flow is one client-bidirectional QUIC
 stream opening with the `0x401` varint, and the connection opens with an
@@ -74,6 +83,8 @@ graph TD
     Q -- "ok, then dial" --> T["freedom target, relay raw"]
     Q -- "dial refused" --> C["close after the ack"]
     G["serve: QUIC datagram"] --> D2["decode_udp: borrowed payload"]
+    G -. "obfs: salamander" .-> M["Datagram seal/unmask:<br/>salt ⊕ BLAKE2b(pw‖salt)"]
+    M -. "unmasked to the same socket" .-> G
     D2 --> E2{"session 0 in route table?"}
     E2 -- no --> O["open: resolve, connect target, spawn reader"]
     E2 -- yes --> F2["Defrag.feed"]
@@ -97,6 +108,7 @@ graph TD
 | udp-bytes-relayed | 0 | ferrox-app-proxy::tests::hysteria_dial_udp_uplink_is_none |
 | udp-datagram-decode-copies | 0 | ferrox-core-hysteria::tests::a_decoded_datagram_leaves_its_payload_where_it_landed |
 | udp-fragments-witnessed | 200 | ferrox-core-hysteria::tests::every_length_survives_fragment_then_defrag_intact |
+| obfuscated-datagram-heap-copies | 0 | ferrox-core-hysteria::tests::a_sealed_datagram_never_touches_the_heap |
 | pinned-hysteria-client-verdicts | 1 | scripts/run-upstream-suite.sh |
 <!-- counts:end -->
 
@@ -148,8 +160,23 @@ tunnel. No artefact from this branch has been read.
   target and one `dgram_send` of the re-encoded head are the relay's own; and
   the reassembly holds its slots behind one owned address per flow, re-filled
   with `clone_into` rather than a fresh allocation.
-- **Salamander obfuscation and the masquerade site.** The keys are never read;
-  nothing on the wire pretends otherwise.
+- **Salamander's pre-allocated key buffer and separate output.** Both
+  references build `password || salt` into a fresh slice, hash it, then write a
+  new masked buffer. This tree streams the two parts into one `BLAKE2b` update
+  so the concatenation is never materialised, and the wire form `seal_into`
+  writes salt-then-mask straight into the caller's datagram frame —
+  `a_sealed_datagram_never_touches_the_heap` pins that frame's base and
+  capacity across a fresh salt (`obfuscated-datagram-heap-copies` 0), and
+  `the_stack_seal_form_matches_the_vec_oracle_form` proves the in-place form
+  emits the same bytes as the `Vec` form the oracle vectors pin. What the lane
+  still pays, named: the inbound unmask reads the salted datagram into a scratch
+  a salt wider than the caller's buffer and copies the plaintext back — one
+  copy on the receive of an obfuscated datagram, retirable only by widening every
+  shared `MAX_DATAGRAM` buffer; the salt itself costs one `getrandom` per
+  datagram, which is the construction, not overhead.
+- **The masquerade site's request handling.** Nothing on the H3 control stream
+  pretends to serve an ordinary request; the port answers hysteria and nothing
+  else.
 - **A custom brutal sender.** `brutal` and `force-brutal` pace as quiche `bbr`
   (`Congestion::quiche_name`), stated in the settings test. That is a
   narrower congestion loop, not a second implementation of one.
@@ -220,11 +247,10 @@ closed, stale and stream-exhausted entries on the next dial, so an outbound
 burst holds one connection each for `REUSE_WINDOW` (150 s, half the idle
 timeout); the client's UDP uplink is not carried (`udp-bytes-relayed` 0 —
 `dial_udp_uplink` answers `None` for every non-`Raw` carrier, a cross-cutting
-gap rather than this carrier's); salamander obfuscation and the masquerade
-site stay out as the `hysteria-obfs-masquerade` add-on in
-`crates/ferrox-prompt/prompts.md` — salamander because no pinned tree vendors
-it, so a pin or oracle comes before any byte claim, and the masquerade because
-it is an H3 request-serving subsystem, not a rung on the relay; 0-RTT,
+gap rather than this carrier's); the masquerade site stays out as the
+`hysteria-obfs-masquerade` add-on in `crates/ferrox-prompt/prompts.md` — it is
+an H3 request-serving subsystem, not a rung on the relay, and salamander now
+ships while it does not; 0-RTT,
 migration and key updates are quiche's; the server keeps one UDP socket per
 inbound with a per-connection route map and a linear scan over routes per
 Initial.

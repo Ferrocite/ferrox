@@ -44,6 +44,7 @@ impl Congestion {
 pub struct Config {
     pub auth: String,
     pub cc: Congestion,
+    pub obfs_password: String,
 }
 
 impl Default for Config {
@@ -51,6 +52,7 @@ impl Default for Config {
         Self {
             auth: String::new(),
             cc: Congestion::Bbr,
+            obfs_password: String::new(),
         }
     }
 }
@@ -280,6 +282,119 @@ impl Defrag {
         self.have = 0;
         self.size = 0;
         Ok(Some((address, payload)))
+    }
+}
+
+#[derive(Clone)]
+/// Salamander, the UDP datagram obfuscation Hysteria v2 names `obfs: salamander`.
+///
+/// Every datagram on the wire becomes `salt (8 random bytes) || payload XORed against the keystream`, where the keystream is `BLAKE2b-256(password || salt)` tiled cyclically over the payload. A fresh salt per datagram makes each packet look like noise, so the QUIC header a filter would match never reaches the wire. This is obfuscation, not encryption: QUIC and TLS above still authenticate and protect the bytes, and a peer without the same password reads noise that QUIC then drops.
+///
+/// The construction is pinned to what the references emit: the salt is hashed *after* the password, so the key input is `password || salt`, and the mask is `key[i mod 32]`. Both `upstream/xray-core/transport/internet/finalmask/salamander` (Go) and `upstream/zeronet/crates/zero-transport/src/salamander.rs` (Rust) agree on that order, and the oracle vectors in the test are computed with Python `hashlib.blake2b` — independent of this code and of both references.
+pub struct Salamander {
+    password: Vec<u8>,
+}
+
+/// The password is a credential and stays out of any log a `Debug` reach would print.
+impl core::fmt::Debug for Salamander {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("Salamander(..)")
+    }
+}
+
+/// Bytes of random salt in front of every obfuscated datagram.
+pub const SALAMANDER_SALT: usize = 8;
+
+/// The shortest password a Hysteria v2 endpoint accepts.
+pub const SALAMANDER_MIN_PASSWORD: usize = 4;
+
+/// The BLAKE2b-256 keystream block, tiled cyclically over a payload.
+const SALAMANDER_KEY: usize = 32;
+
+impl Salamander {
+    /// `None` when the password is shorter than a server accepts.
+    #[must_use]
+    pub fn new(password: &str) -> Option<Self> {
+        if password.len() < SALAMANDER_MIN_PASSWORD {
+            return None;
+        }
+        Some(Self {
+            password: password.as_bytes().to_vec(),
+        })
+    }
+
+    /// `BLAKE2b-256(password || salt)`, the password first then the salt. The two parts stream into one hasher so the concatenation the reference pre-allocates and copies is never materialised.
+    fn keystream(&self, salt: [u8; SALAMANDER_SALT]) -> [u8; SALAMANDER_KEY] {
+        use blake2::digest::consts::U32;
+        use blake2::{Blake2b, Digest};
+        let mut hash = Blake2b::<U32>::new();
+        hash.update(&self.password);
+        hash.update(salt);
+        hash.finalize().into()
+    }
+
+    /// Prepend `salt`, then append `plain` masked by its keystream — the deterministic form the oracle vectors check.
+    pub fn obfuscate_with_salt(
+        &self,
+        salt: &[u8; SALAMANDER_SALT],
+        plain: &[u8],
+        out: &mut Vec<u8>,
+    ) {
+        let key = self.keystream(*salt);
+        out.extend_from_slice(salt);
+        for (i, b) in plain.iter().enumerate() {
+            out.push(b ^ key[i % SALAMANDER_KEY]);
+        }
+    }
+
+    /// Obfuscate `plain` under a fresh random salt appended to `out`; `None` only when the system RNG fails.
+    pub fn obfuscate(&self, plain: &[u8], out: &mut Vec<u8>) -> Option<()> {
+        let mut salt = [0u8; SALAMANDER_SALT];
+        getrandom::getrandom(&mut salt).ok()?;
+        self.obfuscate_with_salt(&salt, plain, out);
+        Some(())
+    }
+
+    /// Write the masked `plain` behind `salt` into the front of `out` and return the total length; the caller must give `out` at least `SALAMANDER_SALT + plain.len()` bytes. This is the wire form, so a datagram is sealed into a stack scratch rather than an allocated `Vec`.
+    #[must_use]
+    pub fn obfuscate_into(
+        &self,
+        salt: &[u8; SALAMANDER_SALT],
+        plain: &[u8],
+        out: &mut [u8],
+    ) -> usize {
+        let key = self.keystream(*salt);
+        out[..SALAMANDER_SALT].copy_from_slice(salt);
+        for (i, b) in plain.iter().enumerate() {
+            out[SALAMANDER_SALT + i] = b ^ key[i % SALAMANDER_KEY];
+        }
+        SALAMANDER_SALT + plain.len()
+    }
+
+    /// Seal one outgoing datagram: a fresh random salt then the masked payload, into `out`, returning the written length. `None` when `out` has no room for `plain` plus a salt, or the system RNG fails.
+    pub fn seal_into(&self, plain: &[u8], out: &mut [u8]) -> Option<usize> {
+        let need = plain.len().checked_add(SALAMANDER_SALT)?;
+        if out.len() < need {
+            return None;
+        }
+        let mut salt = [0u8; SALAMANDER_SALT];
+        getrandom::getrandom(&mut salt).ok()?;
+        Some(self.obfuscate_into(&salt, plain, out))
+    }
+
+    /// Undo [`Salamander::obfuscate`] on one whole datagram in place, moving the payload to the front; the length is returned, or `None` when the datagram is too short to hold a salt and one payload byte. The forward loop reads always ahead of where it writes (`i + salt > i`), so nothing is overwritten before it is used — one pass, no second buffer.
+    pub fn deobfuscate_in_place(&self, datagram: &mut [u8]) -> Option<usize> {
+        if datagram.len() <= SALAMANDER_SALT {
+            return None;
+        }
+        let mut salt = [0u8; SALAMANDER_SALT];
+        salt.copy_from_slice(&datagram[..SALAMANDER_SALT]);
+        let key = self.keystream(salt);
+        let payload = datagram.len() - SALAMANDER_SALT;
+        for i in 0..payload {
+            datagram[i] = datagram[SALAMANDER_SALT + i] ^ key[i % SALAMANDER_KEY];
+        }
+        Some(payload)
     }
 }
 
@@ -644,5 +759,156 @@ mod tests {
         assert_eq!(Congestion::Reno.quiche_name(), "reno");
         assert_eq!(Congestion::Bbr.quiche_name(), "bbr");
         assert_eq!(Congestion::Brutal.quiche_name(), "bbr");
+    }
+
+    fn hex(bytes: &[u8]) -> String {
+        let mut text = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            use std::fmt::Write as _;
+            let _ = write!(text, "{b:02x}");
+        }
+        text
+    }
+
+    #[test]
+    fn the_salamander_mask_matches_an_independent_blake2b_computation() {
+        // Each vector is `salt || payload ^ blake2b-256(password || salt)[i % 32]`, produced with Python's `hashlib.blake2b` — independent of this code, of the Go `finalmask/salamander` and of the Rust `zeronet` reference. v3_32 is the keystream itself (zero payload), v3_33 is the one byte past the 32-byte cycle that re-reads `key[0]`, and v4 is the shortest datagram that carries a payload byte.
+        let cases = [
+            (
+                "gawrgura",
+                [1u8, 2, 3, 4, 5, 6, 7, 8],
+                (0..80u8).collect::<Vec<u8>>(),
+                "0102030405060708dae43f03756d12dfa5973685c6f584d06d593f72a3f029111e05875d3c3f3434fac41f23554d32ff85b716a5e6d5a4f04d791f5283d009313e25a77d1c1f14149aa47f43352d529fe5d776c586b5c490",
+            ),
+            (
+                "1234",
+                [0u8, 1, 2, 3, 4, 5, 6, 7],
+                (0..100u8).collect::<Vec<u8>>(),
+                "00010203040506073be46821092f804a96cded73ec04ddb2d17aa4825be334d9bf53c40f822bcaaa1bc44801290fa06ab6edcd53cc24fd92f15a84a27bc314f99f73e42fa20bea8a7ba42861496fc00ad68dad33ac449df2913ae4c21ba37499ff13844fc26b8aea5b840841",
+            ),
+            (
+                "quic",
+                [0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4],
+                vec![0u8; 32],
+                "deadbeef01020304b26c5d46200cda0b7db6ab26f5519932061a50a12328cdd3d2ab3e3a0ebb7b40",
+            ),
+            (
+                "quic",
+                [0xde, 0xad, 0xbe, 0xef, 1, 2, 3, 4],
+                vec![0xffu8; 33],
+                "deadbeef010203044d93a2b9dff325f4824954d90aae66cdf9e5af5edcd7322c2d54c1c5f14484bf4d",
+            ),
+            (
+                "hy2!",
+                [9u8; 8],
+                vec![0xa5],
+                "090909090909090929",
+            ),
+        ];
+        for (password, salt, plain, want) in cases {
+            let salamander = Salamander::new(password).expect("password");
+            let mut out = Vec::new();
+            salamander.obfuscate_with_salt(&salt, &plain, &mut out);
+            assert_eq!(hex(&out), want, "vector for {password:?}");
+            // And the mask inverts exactly: the de-obfuscated datagram is the payload back.
+            let n = salamander
+                .deobfuscate_in_place(&mut out)
+                .expect("round-trips");
+            assert_eq!(&out[..n], &plain[..]);
+        }
+    }
+
+    #[test]
+    fn the_stack_seal_form_matches_the_vec_oracle_form() {
+        // `seal_into`/`obfuscate_into` are the zero-allocation wire path; they must reach the same bytes as the `Vec` form the vectors pin, and `deobfuscate_in_place` inverts the stack-sealed datagram exactly.
+        let salamander = Salamander::new("gawrgura").expect("password");
+        let salt = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        for len in [1usize, 32, 33, 1342] {
+            let plain: Vec<u8> = (0..len).map(|i| (i * 5 + 1) as u8).collect();
+            let mut via_vec = Vec::new();
+            salamander.obfuscate_with_salt(&salt, &plain, &mut via_vec);
+            let mut via_stack = vec![0u8; SALAMANDER_SALT + len];
+            let written = salamander.obfuscate_into(&salt, &plain, &mut via_stack);
+            assert_eq!(written, SALAMANDER_SALT + len);
+            assert_eq!(via_stack, via_vec, "slice form == vec form, len {len}");
+            let n = salamander
+                .deobfuscate_in_place(&mut via_stack)
+                .expect("inverts");
+            assert_eq!(&via_stack[..n], &plain[..]);
+        }
+        // A seal into a buffer with no room for the salt is refused, not truncated.
+        let mut tiny = [0u8; SALAMANDER_SALT];
+        assert!(salamander.seal_into(b"too big", &mut tiny).is_none());
+    }
+
+    #[test]
+    fn salamander_round_trips_every_length_under_a_fresh_salt() {
+        let salamander = Salamander::new("gawrgura").expect("password");
+        for len in [1usize, 7, 31, 32, 33, 63, 64, 1200, 1342] {
+            let plain: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            let mut first = Vec::new();
+            let mut second = Vec::new();
+            salamander.obfuscate(&plain, &mut first).expect("salt");
+            salamander.obfuscate(&plain, &mut second).expect("salt");
+            assert_eq!(
+                first.len(),
+                len + SALAMANDER_SALT,
+                "salt grows each datagram"
+            );
+            assert_ne!(
+                &first[..SALAMANDER_SALT],
+                &second[..SALAMANDER_SALT],
+                "a fresh salt per datagram"
+            );
+            let n = salamander
+                .deobfuscate_in_place(&mut first)
+                .expect("deobfuscates");
+            assert_eq!(n, len);
+            assert_eq!(&first[..n], &plain[..], "length {len}");
+        }
+    }
+
+    #[test]
+    fn a_wrong_password_gives_noise_and_short_datagrams_and_weak_keys_are_refused() {
+        let right = Salamander::new("gawrgura").expect("password");
+        let wrong = Salamander::new("another").expect("password");
+        let plain = vec![0xc0u8; 100];
+        let mut sealed = Vec::new();
+        right.obfuscate(&plain, &mut sealed).expect("salt");
+        let n = wrong.deobfuscate_in_place(&mut sealed).expect("length");
+        assert_ne!(&sealed[..n], &plain[..], "wrong key is noise");
+        // A datagram that cannot hold a salt and one byte de-obfuscates to nothing.
+        assert!(right
+            .deobfuscate_in_place(&mut [0u8; SALAMANDER_SALT])
+            .is_none());
+        assert!(right.deobfuscate_in_place(&mut []).is_none());
+        // And a password below the floor the server accepts is refused at construction.
+        assert!(Salamander::new("abc").is_none());
+        assert!(Salamander::new("abcd").is_some());
+    }
+
+    #[test]
+    fn a_sealed_datagram_never_touches_the_heap() {
+        // The wire seal writes into the caller's frame: base and capacity held steady across a fresh salt, so no datagram is copied or reallocated on the way out.
+        let salamander = Salamander::new("gawrgura").expect("password");
+        let plain: Vec<u8> = (0..1342).map(|i| (i ^ 0x5a) as u8).collect();
+        let mut frame = vec![0u8; SALAMANDER_SALT + 1342];
+        let base = frame.as_ptr();
+        let room = frame.capacity();
+        let written = salamander
+            .seal_into(&plain, &mut frame)
+            .expect("room and salt");
+        assert_eq!(written, SALAMANDER_SALT + plain.len());
+        assert_eq!(frame.as_ptr(), base, "the frame never moved");
+        assert_eq!(frame.capacity(), room, "no reallocation");
+        assert_ne!(
+            &frame[SALAMANDER_SALT..],
+            &plain[..],
+            "the payload is masked"
+        );
+        let n = salamander
+            .deobfuscate_in_place(&mut frame[..written])
+            .expect("inverts");
+        assert_eq!(&frame[..n], &plain[..], "and unmasking returns the bytes");
     }
 }

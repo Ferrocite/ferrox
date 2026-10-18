@@ -675,10 +675,11 @@ pub(crate) fn bind_datagram(address: &str) -> std::io::Result<UdpSocket> {
     Ok(sock)
 }
 
-/// One datagram socket: a relay below changes no handshake, frame or stream above, so the hop lives here.
+/// One datagram socket: a relay or an obfuscation below changes no handshake, frame or stream above, so the hops live here.
 pub(crate) struct Datagram {
     sock: UdpSocket,
     relay: Option<Relay>,
+    obfs: Option<ferrox_core::hysteria::Salamander>,
 }
 
 /// Where datagrams go. The association's control connection is held, never read: dropping it ends it.
@@ -691,9 +692,25 @@ struct Relay {
 /// The most one datagram costs in headers: two reserved bytes, one flag byte, the longest address and the port.
 const RELAY_HEADER: usize = 22;
 
+/// One obfuscated datagram is a salt ahead of the QUIC packet it masks, so the wire frame is a salt wider than the largest plain datagram.
+const SALAMANDER_SALT: usize = ferrox_core::hysteria::SALAMANDER_SALT;
+
 impl Datagram {
     pub(crate) fn plain(sock: UdpSocket) -> Self {
-        Self { sock, relay: None }
+        Self {
+            sock,
+            relay: None,
+            obfs: None,
+        }
+    }
+
+    /// A socket whose every datagram is salamander-masked under `obfs`, the Hysteria v2 `obfs: salamander` lane.
+    pub(crate) fn obfuscated(sock: UdpSocket, obfs: ferrox_core::hysteria::Salamander) -> Self {
+        Self {
+            sock,
+            relay: None,
+            obfs: Some(obfs),
+        }
     }
 
     pub(crate) fn relayed(sock: UdpSocket, via: SocketAddr, control: Arc<Connection>) -> Self {
@@ -703,40 +720,53 @@ impl Datagram {
                 via,
                 _control: control,
             }),
+            obfs: None,
         }
     }
 
     pub(crate) fn send_to(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
-        let Some(relay) = self.relay.as_ref() else {
+        if self.obfs.is_none() && self.relay.is_none() {
             return self.sock.send_to(buf, to);
-        };
-        // The header carries the real target; the socket itself is addressed to the hop.
+        }
         let mut room = Unfilled::<{ RELAY_HEADER + MAX_DATAGRAM }>::new();
         let framed = room.as_mut();
-        let Some(into) = framed.get_mut(..RELAY_HEADER + buf.len()) else {
-            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        // The socket is addressed to the hop rather than the target whenever a relay frames the datagram.
+        let target = self.relay.as_ref().map_or(to, |relay| relay.via);
+        let plain = match self.relay.as_ref() {
+            None => buf,
+            Some(_) => relay_frame(buf, to, framed)
+                .ok_or(std::io::Error::from(std::io::ErrorKind::InvalidInput))?,
         };
-        // The hop reads these three before the target, so they are filled rather than left as stack garbage.
-        into[..3].fill(0);
-        let header = match to {
-            SocketAddr::V4(addr) => {
-                into[3] = 1;
-                into[4..8].copy_from_slice(&addr.ip().octets());
-                into[8..10].copy_from_slice(&addr.port().to_be_bytes());
-                10
-            }
-            SocketAddr::V6(addr) => {
-                into[3] = 4;
-                into[4..20].copy_from_slice(&addr.ip().octets());
-                into[20..22].copy_from_slice(&addr.port().to_be_bytes());
-                22
-            }
+        let Some(obfs) = self.obfs.as_ref() else {
+            return self.sock.send_to(plain, target);
         };
-        into[header..header + buf.len()].copy_from_slice(buf);
-        self.sock.send_to(&framed[..header + buf.len()], relay.via)
+        // A fresh salt masks whatever the hop above produced.
+        let mut wire = Unfilled::<{ MAX_DATAGRAM + SALAMANDER_SALT }>::new();
+        let sealed = obfs
+            .seal_into(plain, wire.as_mut())
+            .ok_or(std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        self.sock.send_to(&wire.as_mut()[..sealed], target)
     }
 
     pub(crate) fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        let Some(obfs) = self.obfs.as_ref() else {
+            return self.raw_recv_from(buf);
+        };
+        // The salt on the wire is a payload byte the caller's buffer was not sized for, so an obfuscated read lands in a scratch a salt wider and unmasks in place before copying back.
+        let mut room = Unfilled::<{ MAX_DATAGRAM + SALAMANDER_SALT }>::new();
+        let (found, from) = self.raw_recv_from(room.as_mut())?;
+        let Some(plain) = obfs.deobfuscate_in_place(&mut room.as_mut()[..found]) else {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        };
+        let Some(out) = buf.get_mut(..plain) else {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        };
+        out.copy_from_slice(&room.as_mut()[..plain]);
+        Ok((plain, from))
+    }
+
+    /// A read with no obfuscation on it: plain bytes straight from the socket, or the relay hop stripped.
+    fn raw_recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         let Some(relay) = self.relay.as_ref() else {
             return self.sock.recv_from(buf);
         };
@@ -760,12 +790,36 @@ impl Datagram {
         Ok(Self {
             sock: self.sock.try_clone()?,
             relay: self.relay.clone(),
+            obfs: self.obfs.clone(),
         })
     }
 
     pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
         self.sock.set_read_timeout(timeout)
     }
+}
+
+/// Frame one datagram behind the relay header that carries its real target, returning the bytes for the hop; `None` when `into` has no room. The socket itself is addressed to the hop, not `to`.
+fn relay_frame<'a>(buf: &[u8], to: SocketAddr, into: &'a mut [u8]) -> Option<&'a [u8]> {
+    let into = into.get_mut(..RELAY_HEADER + buf.len())?;
+    // The hop reads these three before the target, so they are filled rather than left as stack garbage.
+    into[..3].fill(0);
+    let header = match to {
+        SocketAddr::V4(addr) => {
+            into[3] = 1;
+            into[4..8].copy_from_slice(&addr.ip().octets());
+            into[8..10].copy_from_slice(&addr.port().to_be_bytes());
+            10
+        }
+        SocketAddr::V6(addr) => {
+            into[3] = 4;
+            into[4..20].copy_from_slice(&addr.ip().octets());
+            into[20..22].copy_from_slice(&addr.port().to_be_bytes());
+            22
+        }
+    };
+    into[header..header + buf.len()].copy_from_slice(buf);
+    Some(&into[..header + buf.len()])
 }
 
 /// A relayed datagram's header and target address; fragments are never reassembled, so they do not read.
@@ -1771,6 +1825,29 @@ mod tests {
             &got[..n],
             &want[..],
             "reserved, fragment, family, address, port, payload"
+        );
+    }
+
+    #[test]
+    fn an_obfuscated_lane_round_trips_a_full_datagram_over_loopback() {
+        let obfs = || ferrox_core::hysteria::Salamander::new("hy2!").expect("four-byte key");
+        let server = Datagram::obfuscated(bind_datagram("127.0.0.1:0").expect("binds"), obfs());
+        let client = Datagram::obfuscated(bind_datagram("127.0.0.1:0").expect("binds"), obfs());
+        let peer = server.local_addr().expect("addr");
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("times out");
+        // A full-sized plain datagram is salt wider on the wire, so the send frame is one the caller buffer was never sized for.
+        let plain = [0x5au8; MAX_DATAGRAM];
+        client.send_to(&plain, peer).expect("seals and sends");
+        let mut got = [0u8; MAX_DATAGRAM];
+        let (n, from) = server.recv_from(&mut got).expect("reads a salted frame");
+        assert_eq!(n, plain.len(), "the salt never reaches the caller");
+        assert_eq!(&got[..n], &plain[..], "unmasked to the bytes that went in");
+        assert_eq!(
+            from,
+            client.local_addr().expect("addr"),
+            "the peer survives the hop"
         );
     }
 
