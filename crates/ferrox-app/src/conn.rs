@@ -782,9 +782,8 @@ mod winunix {
     }
 
     /// One `recv`, peeking or not: a zero return is the peer's EOF, an interrupted call is retried,
-    /// and a read parked on a socket that was shut down answers that same EOF — which is what a
-    /// unix stream hands back after `shutdown(Read)`, so a leg drained past its half-close stays
-    /// a clean end rather than an error.
+    /// and `WSAESHUTDOWN` — the code for a socket this side already shut down for reading — answers
+    /// that same clean end, so a leg reading past its own shutdown stops instead of erroring.
     fn receive(socket: SOCKET, buf: &mut [u8], flags: i32) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
@@ -883,7 +882,10 @@ mod winunix {
         /// The other leg of the same socket: the handle is shared behind the `Arc`, not
         /// duplicated, so the last leg to drop closes it — the lifetime a `dup`ed unix
         /// descriptor has.
-        #[allow(clippy::unnecessary_wraps)] // The shape the unix arm's fallible `try_clone` has; the seam matches on one signature.
+        #[allow(
+            clippy::unnecessary_wraps,
+            reason = "the seam matches one fallible clone signature"
+        )]
         pub(crate) fn try_clone(&self) -> io::Result<UnixStream> {
             Ok(UnixStream {
                 socket: Arc::clone(&self.socket),
