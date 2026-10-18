@@ -6049,7 +6049,7 @@ fn serve_http(mut client: Connection, out: &Outbound) {
 }
 
 /// The `mixed` front sniffs one byte: 0x05 is SOCKS5, a method token is HTTP, and a peek consumes nothing.
-fn serve_mixed(mut client: Connection, out: &Outbound) {
+fn serve_mixed(client: Connection, out: &Outbound) {
     // Bound only the sniff to the greeting's budget, then restore the untimed reads the fronts behind it expect.
     let _ = client.set_read_timeout(Some(budgets::handshake()));
     let mut first = [0u8; 1];
