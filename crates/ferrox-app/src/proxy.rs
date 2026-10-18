@@ -9075,14 +9075,46 @@ pub(crate) fn push_socks_addr(out: &mut Vec<u8>, addr: &SocketAddr) {
     out.extend_from_slice(&addr.port().to_be_bytes());
 }
 
+/// Read a SOCKS address body straight off a slice: the same field order `read_socks_addr_rest` draws from a stream, read where the bytes already lie, so a relayed datagram pays no cursor, no `dyn Read` call per field and no copy into scratch.
+fn parse_socks_addr_rest(buf: &[u8], atyp: u8) -> Option<(SocketAddr, usize)> {
+    match atyp {
+        1 => {
+            let ip: [u8; 4] = buf.get(..4)?.try_into().ok()?;
+            let port: [u8; 2] = buf.get(4..6)?.try_into().ok()?;
+            Some((
+                SocketAddr::new(std::net::IpAddr::V4(ip.into()), u16::from_be_bytes(port)),
+                6,
+            ))
+        }
+        3 => {
+            let len = usize::from(*buf.first()?);
+            let name = buf.get(1..1 + len)?;
+            let port: [u8; 2] = buf.get(1 + len..3 + len)?.try_into().ok()?;
+            let host = std::str::from_utf8(name).ok()?;
+            let addr = format!("{host}:{}", u16::from_be_bytes(port))
+                .to_socket_addrs()
+                .ok()?
+                .next()?;
+            Some((addr, 3 + len))
+        }
+        4 => {
+            let ip: [u8; 16] = buf.get(..16)?.try_into().ok()?;
+            let port: [u8; 2] = buf.get(16..18)?.try_into().ok()?;
+            Some((
+                SocketAddr::new(std::net::IpAddr::V6(ip.into()), u16::from_be_bytes(port)),
+                18,
+            ))
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn parse_socks_udp(packet: &[u8]) -> Option<(SocketAddr, &[u8])> {
     if packet.len() < 4 || packet[2] != 0 {
         return None;
     }
-    let mut cursor = std::io::Cursor::new(&packet[4..]);
-    let addr = read_socks_addr_rest(&mut cursor, packet[3])?;
-    let used = 4 + cursor.position() as usize;
-    Some((addr, &packet[used..]))
+    let (addr, used) = parse_socks_addr_rest(&packet[4..], packet[3])?;
+    Some((addr, &packet[4 + used..]))
 }
 
 /// The handshake that keeps the client's name: resolving here hands the edge an address it cannot route.
@@ -15463,6 +15495,48 @@ mod tests {
         assert!(parse_socks_udp(&[0, 0, 0]).is_none());
         assert!(parse_socks_udp(&[0, 0, 0, 9, 1, 2, 3]).is_none());
         assert!(parse_socks_udp(&[0, 0, 0, 1, 127, 0, 0]).is_none());
+    }
+
+    /// The slice reader must agree with the stream reader on the address and on whether the body parses at all: that identity, over every shape a relayed datagram carries and the forged tails a peer can send, is the gate that dropping the cursor changed nothing but the copies.
+    #[test]
+    fn the_slice_socks_reader_matches_the_stream_one_byte_for_byte() {
+        let domain = |name: &[u8], port: [u8; 2]| {
+            let mut v = vec![name.len() as u8];
+            v.extend_from_slice(name);
+            v.extend_from_slice(&port);
+            v
+        };
+        let cases: Vec<(u8, Vec<u8>)> = vec![
+            (1, vec![127, 0, 0, 1, 0, 53]),
+            (1, vec![127, 0, 0, 1]),
+            (1, vec![10, 0, 0, 1, 0x1f, 0x90, 0xff]),
+            (4, vec![0u8; 16]),
+            (4, {
+                let mut v = vec![0u8; 16];
+                v[15] = 1;
+                v.extend([0, 53]);
+                v
+            }),
+            (4, vec![0u8; 10]),
+            (3, domain(b"localhost", [0, 53])),
+            (3, domain(b"", [0, 53])),
+            (3, vec![3, b'a', b'b']),
+            (9, vec![0, 0]),
+            (0, vec![]),
+        ];
+        for (atyp, body) in cases {
+            let mut cursor = std::io::Cursor::new(&body);
+            let stream = read_socks_addr_rest(&mut cursor, atyp);
+            let stream_used = cursor.position() as usize;
+            match (parse_socks_addr_rest(&body, atyp), stream) {
+                (Some((got, used)), Some(want)) => {
+                    assert_eq!(got, want, "atyp {atyp} address");
+                    assert_eq!(used, stream_used, "atyp {atyp} bytes consumed");
+                }
+                (None, None) => {}
+                (got, want) => panic!("atyp {atyp} disagreed: slice {got:?} stream {want:?}"),
+            }
+        }
     }
 
     #[test]
