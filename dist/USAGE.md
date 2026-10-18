@@ -1,0 +1,157 @@
+# Ferrox on macOS
+
+Two things were built here, from the same release binary — a release package from the `release` workflow ships the second and third of these beside the binary, and finds it without cargo:
+
+| what | where |
+| --- | --- |
+| the binary | `target/release/ferrox-app` (arm64, `ferrox-app 0.0.1`) |
+| the CLI | `dist/ferrox-cli.sh` — every lane, every front, ports, system proxy |
+| the app | `dist/Ferrox.app` — the same CLI behind a double-click |
+
+`ferrox-cli.sh`, this page and `README.md` are tracked so the release job can ship them; everything else under `dist/` — the bundle, its build script, any lane config — stays git-ignored, and so does every file that carries an account.
+
+## 1. The account
+
+The Foxy lane needs a Firefox account, and it is the only credential this tool holds — an email and a password, with no server to name: the edge comes from Mozilla's catalogue. The simplest way in is the connect command itself: the first `up --foxy` notices there is no account stored, asks for the email and the password (hidden), saves them once, and connects:
+
+```bash
+./dist/ferrox-cli.sh up --foxy --vpn         # asks once on a fresh machine, then carries
+```
+
+Saving up front is the same one prompt, ahead of time, and `login --email E --password P` is its non-interactive form. Either way the account lands in `~/.config/ferrox/credentials`, outside the repository, mode 0600:
+
+```
+~/.config/ferrox/credentials
+FOXY_EMAIL='you@example.com'
+FOXY_PASS='the-password'
+```
+
+`ferrox-cli` reads it, or `--email` / `--password`, or `FOXY_EMAIL` / `FOXY_PASS` in the environment. A copy inside the repository is refused when git tracks it. Nothing in this tool writes a password into a tracked file, and `/lane.json` and `/pass.json` are ignored.
+
+The lane is handed the account, not a saved token: the pass the edge accepts lives 600 seconds, so a lane given only a pasted token stops carrying when it expires and cannot replace it. Signed in, it renews on its own clock and a lane left running overnight keeps working. The account plane rate-limits logins with `429`, so `up` signs in once and the lane reuses that session's refresh grant.
+
+## 2. Connect (CLI)
+
+```bash
+./dist/ferrox-cli.sh up --foxy                 # lane up, three local fronts (asks for the account first time)
+./dist/ferrox-cli.sh up --foxy --vpn           # plus the macOS system proxy
+./dist/ferrox-cli.sh up --foxy --country DE --carrier h2
+./dist/ferrox-cli.sh up --foxy --socks 1080 --http 8081 --mixed 1082
+./dist/ferrox-cli.sh status                    # exit IP and country
+./dist/ferrox-cli.sh down                      # stop, clear the system proxy
+```
+
+`up` prints the port map, then proves one flow through the first front. With `--vpn` it arms the macOS system proxy only after that flow answers, so a lane that carries nothing never takes the machine's traffic with it. If the fronts are open but no flow gets through, it says so and shows the lane log: that is a refused sign-in, an expired pass, or an edge that cannot be reached.
+
+## 3. Ports, and what each one serves
+
+| front | default | what it is |
+| --- | --- | --- |
+| SOCKS5 | `127.0.0.1:10808` | SOCKS5, no local auth, hostnames resolved at the exit, UDP ASSOCIATE rides the lane |
+| HTTP + HTTPS | `127.0.0.1:8080` | one port for both: `CONNECT` tunnels (that is HTTPS) and plain `http://` forwards |
+| mixed | `127.0.0.1:10809` | sniffs the first byte, serves SOCKS5 or HTTP on one port |
+
+All three bind loopback only. Change them with `--socks`, `--http`, `--mixed`, or serve a subset with `--fronts socks,http`.
+
+### macOS system proxy
+
+System Settings > Network > the active service > Details... > Proxies:
+
+- **Web proxy (HTTP)** `127.0.0.1:8080`
+- **Secure web proxy (HTTPS)** `127.0.0.1:8080`
+- **SOCKS proxy** `127.0.0.1:10808`
+
+Leave "Proxy server requires password" off: the fronts are unauthenticated and only reachable from this machine. HTTPS needs no certificate: the proxy opens a `CONNECT` tunnel and TLS stays end to end between the app and the site.
+
+`ferrox-cli up --vpn` writes exactly those three settings on every network service and `down` clears them. `scutil --proxy` shows what macOS believes.
+
+### One app instead of the whole system
+
+```bash
+curl --socks5-hostname 127.0.0.1:10808 https://www.cloudflare.com/cdn-cgi/trace
+curl -x http://127.0.0.1:8080 https://www.cloudflare.com/cdn-cgi/trace
+HTTPS_PROXY=http://127.0.0.1:8080 ALL_PROXY=socks5h://127.0.0.1:10808 git clone ...
+```
+
+Use `socks5h://` (not `socks5://`) so the name is resolved at the exit instead of on this machine.
+
+## 4. Modes
+
+**Ports mode** (`up --foxy`): the three fronts, nothing else touched. One app at a time, or a browser profile pointed at a port.
+
+**VPN mode** (`up --vpn`): the same fronts plus the macOS system proxy. This covers TCP apps that honour the system proxy — browsers, most Electron apps. It is not a tunnel: apps that ignore the system proxy, and UDP, are not captured.
+
+**TUN mode** (`--tun`): refused by name. This binary has no `tun`/`utun` inbound and no tun2socks engine (README rows 29 and 58), so there is no device-wide capture. `ferrox-cli tun` prints the same explanation. A config that names a device inbound is refused with its reason rather than served as silence.
+
+## 5. Every other lane
+
+The binary serves and dials far more than Foxy; `ferrox-cli` writes the config for each:
+
+```bash
+ferrox-cli up --vless 'vless://uuid@host:443?type=ws&security=tls&sni=host&path=/ws'
+ferrox-cli up --vmess host:443 --uuid ID --network tcp
+ferrox-cli up --trojan host:443 --password PW
+ferrox-cli up --ss host:8388 --method aes-256-gcm --password PW
+ferrox-cli up --config mine.json          # served verbatim, any inbound/outbound
+```
+
+The vless converter writes `tcp`, `ws`, `grpc`, `httpupgrade` and `xhttp`, with `security=none|tls|reality`. Anything else (kcp, quic, hysteria, httpheader, masque, xdrive) goes through `--config`: those are config shapes this binary already serves, and the converter does not guess at them.
+
+A config file can carry any inbound the binary serves — `vless`, `vmess`, `trojan`, `shadowsocks`, `hysteria`, `socks`, `http`, `mixed` — and any outbound — those plus `foxy`, `http` and `freedom`.
+
+## 6. The app
+
+```bash
+open dist/Ferrox.app
+```
+
+Double-clicking it opens a Terminal window with a menu: connect with the system proxy, connect ports-only, change the ports, another lane, status, the port map, the TUN explanation, stop. Closing the window stops the lane.
+
+Drag `dist/Ferrox.app` to `/Applications` to keep it. It is ad-hoc signed, so the first launch may need right-click > Open.
+
+## 7. Rebuild
+
+```bash
+./dist/build-macos-app.sh        # binary + CLI + connect script into the bundle
+```
+
+## 8. When it does not work
+
+| symptom | cause |
+| --- | --- |
+| `lane up`, then "no flow got through" with `429` in the log | the account plane is rate-limiting sign-ins; wait it out, a second login does not buy bytes back |
+| same, with `did not sign in` | the account or password is refused, or the account wants a two-factor code: `up --foxy --code 123456` |
+| same, with `401`/`403` after a sign-in that worked | the edge refuses this account's pass at this exit: the subscription or its devices say otherwise; try `--country`, and check the account on vpn.mozilla.org |
+| same, with "the TLS handshake with the edge failed" | this network blocks TLS to `*.fastly-masque.net:2499`; see below |
+| `the lane did not open its fronts` | the port is taken (`lsof -nP -iTCP:8080`), the config names an inbound this binary refuses, or its `settings.pass` is past its `exp` and nothing can replace it |
+| a browser works, `curl` does not | `curl` ignores the system proxy: pass `-x` or `--socks5-hostname` |
+| `git`/`ssh` still go direct | they do not read the system proxy: set `HTTPS_PROXY`, or `ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:10808 %h %p'` |
+| DNS looks local | the SOCKS front resolves at the exit; the HTTP front receives a hostname in `CONNECT`. A browser's own DNS-over-HTTPS setting bypasses both |
+
+### When the edge itself is unreachable
+
+A lane that signs in, listens, and then fails every flow with "the TLS handshake with the edge failed" is a network problem, not an account problem. Check it by hand:
+
+```bash
+ferrox-app edges -c ~/.config/ferrox/lane.json | head    # the edges the catalogue offers
+python3 - <<'PY'
+import socket, ssl, time
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT); ctx.check_hostname = False
+ctx.verify_mode = ssl.CERT_NONE; ctx.set_alpn_protocols(["h2"])
+t0 = time.time()
+raw = socket.create_connection(("us.m1.fastly-masque.net", 2499), timeout=8)
+ctx.wrap_socket(raw, server_hostname="us.m1.fastly-masque.net")
+print("edge TLS ok in", round(time.time() - t0, 2), "s")
+PY
+```
+
+If that handshake times out while ordinary HTTPS works, the network drops the edge port. Two ways through, both on the CLI:
+
+```bash
+# chain the edge dial through a proxy this network does allow
+ferrox-cli up --foxy --upstream socks5://127.0.0.1:1080
+ferrox-cli up --foxy --upstream http://127.0.0.1:8080     # h3 cannot ride http; use h1/h2/auto
+
+# or use a lane this network does carry
+ferrox-cli up --vless 'vless://...' --vpn
+```

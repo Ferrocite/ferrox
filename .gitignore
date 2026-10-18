@@ -36,7 +36,11 @@ __pycache__/
 /.workbuddy-ai
 
 # The macOS bundle and the lane configs it writes: build output and account
-# material, never reviewed, never committed.
-/dist
+# material, never reviewed, never committed. The CLI and its two pages are the
+# exception the release job packages, so they are tracked.
+/dist/*
+!/dist/ferrox-cli.sh
+!/dist/README.md
+!/dist/USAGE.md
 /lane.json
 /pass.json
