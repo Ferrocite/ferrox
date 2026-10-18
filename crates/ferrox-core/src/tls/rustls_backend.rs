@@ -232,47 +232,86 @@ fn build_material(cfg: &TlsConfig) -> Result<Material, TlsError> {
     })
 }
 
+/// What selects a cached client config: a material, the `ALPN` list the builder writes into it, and whether the verifier is the unverified one. The server name stays out — it reaches the connection, not the config.
+#[derive(PartialEq, Eq)]
+struct ConfigKey {
+    material: MaterialKey,
+    alpn: Vec<Vec<u8>>,
+    insecure: bool,
+}
+
+type Configs = Vec<(ConfigKey, Arc<rustls::ClientConfig>)>;
+
+static CONFIGS: OnceLock<Mutex<Configs>> = OnceLock::new();
+
+/// The client config the cache above keeps one of: the material's provider and roots, the named `ALPN`, and the verifier the config forces.
+fn build_config(cfg: &TlsConfig, built: &Material) -> Result<rustls::ClientConfig, TlsError> {
+    let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&built.provider))
+        .with_safe_default_protocol_versions()
+        .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?
+        .with_root_certificates(Arc::clone(&built.roots))
+        .with_no_client_auth();
+    config.alpn_protocols.clone_from(&cfg.alpn);
+    if cfg.insecure {
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(Unverified));
+    } else if let Some(verifier) = &built.verifier {
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::clone(verifier));
+    }
+    Ok(config)
+}
+
 impl<S: Stream> RustlsProvider<S> {
-    /// The parts a client config is built from, memoised per the anchors, pins and suite order a config names: the same three inputs get one build, whatever host or ALPN dials next.
+    /// The parts a client config is built from, memoised per the anchors, pins and suite order a config names: the same three inputs get one build, whatever host or ALPN dials next. A pin-based verifier must keep its pointer across dials for rustls to resume, so a hit moves its entry to the back and the cap drops only the least-recently-used.
     fn material(cfg: &TlsConfig) -> Result<Arc<Material>, TlsError> {
         let key = MaterialKey::of(cfg);
         let all = MATERIALS.get_or_init(Default::default);
-        if let Some(found) = all
-            .lock()
-            .expect("one build at a time")
-            .iter()
-            .find(|(at, _)| *at == key)
-            .map(|(_, built)| Arc::clone(built))
-        {
-            return Ok(found);
+        let mut kept = all.lock().expect("one build at a time");
+        let at = kept.iter().position(|(k, _)| *k == key);
+        if let Some(at) = at {
+            let entry = kept.remove(at);
+            let hit = Arc::clone(&entry.1);
+            kept.push(entry);
+            return Ok(hit);
         }
+        drop(kept);
         let built = Arc::new(build_material(cfg)?);
         let mut kept = all.lock().expect("one build at a time");
         if kept.len() == MATERIALS_MAX {
-            kept.clear();
+            kept.remove(0);
         }
         kept.push((key, Arc::clone(&built)));
         Ok(built)
     }
 
+    /// One build per (material, alpn, `insecure`), kept for the life of the process: rustls resumes only under a pointer-equal certificate verifier, so a config rebuilt for each dial discards the ticket the last dial stored, and every flow after the first pays for a full handshake again. At the cap the least-recently-used entry goes, and a hit moves its entry to the back: clearing the whole cache would drop the stores holding every edge's ticket at once, which is the very loss this cache exists to prevent.
     fn config(cfg: &TlsConfig) -> Result<Arc<rustls::ClientConfig>, TlsError> {
-        let built = Self::material(cfg)?;
-        let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&built.provider))
-            .with_safe_default_protocol_versions()
-            .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?
-            .with_root_certificates(Arc::clone(&built.roots))
-            .with_no_client_auth();
-        config.alpn_protocols.clone_from(&cfg.alpn);
-        if cfg.insecure {
-            config
-                .dangerous()
-                .set_certificate_verifier(Arc::new(Unverified));
-        } else if let Some(verifier) = &built.verifier {
-            config
-                .dangerous()
-                .set_certificate_verifier(Arc::clone(verifier));
+        let key = ConfigKey {
+            material: MaterialKey::of(cfg),
+            alpn: cfg.alpn.clone(),
+            insecure: cfg.insecure,
+        };
+        let all = CONFIGS.get_or_init(Default::default);
+        let mut kept = all.lock().expect("one build at a time");
+        let at = kept.iter().position(|(k, _)| *k == key);
+        if let Some(at) = at {
+            let entry = kept.remove(at);
+            let hit = Arc::clone(&entry.1);
+            kept.push(entry);
+            return Ok(hit);
         }
-        Ok(Arc::new(config))
+        drop(kept);
+        let material = Self::material(cfg)?;
+        let built = Arc::new(build_config(cfg, &material)?);
+        let mut kept = all.lock().expect("one build at a time");
+        if kept.len() == MATERIALS_MAX {
+            kept.remove(0);
+        }
+        kept.push((key, Arc::clone(&built)));
+        Ok(built)
     }
 
     pub fn connect(cfg: &TlsConfig, io: S) -> Result<Self, TlsError> {
@@ -287,6 +326,17 @@ impl<S: Stream> RustlsProvider<S> {
     /// its tag into the session id, so the stock random hello cannot go out.
     pub fn from_connection(conn: rustls::ClientConnection, io: S) -> Self {
         Self { conn, io }
+    }
+
+    #[cfg(test)]
+    fn tls13_tickets(&self) -> u32 {
+        self.conn.tls13_tickets_received()
+    }
+
+    /// Whether this session did a full handshake or rode a ticket: the only public witness of resumption, because rustls hands a resumed session its cached chain.
+    #[cfg(test)]
+    fn handshake_kind(&self) -> Option<rustls::HandshakeKind> {
+        self.conn.handshake_kind()
     }
 
     fn drive(&mut self) -> Result<(), TlsError> {
@@ -955,7 +1005,7 @@ mod tests {
         );
     }
 
-    /// The shared parts do not make a shared session: a second dial with the same config still fetches and verifies the chain, because a hello that resumed would be a different hello on the wire.
+    /// The shared parts do not invent a shared server: a ticket one listener left is unknown to the other, so the second dial here is handed a chain again — two listeners, not one edge, is what this shape keeps true.
     #[cfg_attr(
         miri,
         ignore = "needs a loopback socket, and ring's assembly behind it"
@@ -980,6 +1030,103 @@ mod tests {
                 "both dials were handed a chain, so neither rode the other's session"
             );
         });
+    }
+
+    /// The test edge: a chain both dials trust, and a ticket maker that keeps nothing between them.
+    fn edge_config() -> rustls::ServerConfig {
+        let cert = rustls::pki_types::CertificateDer::from(ANCHOR.to_vec());
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(ANCHOR_KEY.to_vec()),
+        );
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("server versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .expect("server cert");
+        config.alpn_protocols = vec![b"test-only".to_vec()];
+        // A builder's config tickets statefully through one shared store, and `take` spends a stored session at first use, so the second dial's offer would already be consumed: a stateless ticketer carries the secret inside the ticket itself.
+        config.ticketer = rustls::crypto::ring::Ticketer::new().expect("edge ticketer");
+        config
+    }
+
+    /// One dial to the edge on a config the caller holds: both dials of the resumption witness must ride one `Arc`, which is what rustls compares for its verifier and its store.
+    fn dial(
+        config: &Arc<rustls::ClientConfig>,
+        name: &rustls::pki_types::ServerName<'static>,
+        port: u16,
+    ) -> RustlsProvider<TcpStream> {
+        let io = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut tls = RustlsProvider::<TcpStream>::from_connection(
+            rustls::ClientConnection::new(Arc::clone(config), name.clone()).expect("session"),
+            io,
+        );
+        tls.handshake().expect("handshakes");
+        tls.write_all(b"ping").expect("writes");
+        tls.read_exact(&mut [0u8; 4]).expect("echoes");
+        tls
+    }
+
+    /// One edge, two dials: a resumed TLS 1.3 handshake carries no certificate, which rustls reports as `HandshakeKind::Resumed` while still handing the session its cached chain.
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn the_second_dial_to_one_edge_resumes() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            // One ticket maker behind both accepts: only this listener can open the ticket the first dial left.
+            let config = Arc::new(edge_config());
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accepts");
+                let mut conn =
+                    rustls::ServerConnection::new(Arc::clone(&config)).expect("server session");
+                let mut tls = rustls::Stream::new(&mut conn, &mut stream);
+                let mut buf = [0u8; 4];
+                if tls.read_exact(&mut buf).is_ok() {
+                    let _ = tls.write_all(&buf);
+                }
+            }
+        });
+        // "localhost" rather than the shared "tls.test": the session store keys on the name, and a ticket a parallel test's listener left would be handed to this second dial.
+        let cfg = client("localhost", &[b"test-only"]);
+        // Both dials ride one cached config: rustls gates resumption on the verifier and store a config holds, so a cache miss here sinks the whole witness.
+        let kept = RustlsProvider::<TcpStream>::config(&cfg).expect("first config builds");
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("a dns name");
+        let a = dial(&kept, &name, port);
+        assert_eq!(
+            a.handshake_kind(),
+            Some(rustls::HandshakeKind::Full),
+            "the first dial had no ticket to offer"
+        );
+        assert!(a.peer_leaf().is_some(), "the first dial verified a chain");
+        // The stock rustls server hands more than one ticket per session: the witness is that the first dial left the config's own store with one to lend.
+        assert!(a.tls13_tickets() >= 1, "the first dial was handed a ticket");
+        // A parallel suite could push the config cache to its cap between the dials; if this lapsed, the miss below is eviction's, not the resume path's.
+        assert!(
+            Arc::ptr_eq(
+                &kept,
+                &RustlsProvider::<TcpStream>::config(&cfg).expect("config after the first dial")
+            ),
+            "the cache held the first dial's config across that dial"
+        );
+        drop(a);
+        let b = dial(&kept, &name, port);
+        assert_eq!(
+            b.handshake_kind(),
+            Some(rustls::HandshakeKind::Resumed),
+            "the second dial carried no chain: it resumed"
+        );
+        assert!(
+            b.peer_leaf().is_some(),
+            "a resumed session keeps the chain it cached"
+        );
+        drop(b);
+        server.join().expect("joins");
     }
 
     #[cfg_attr(
