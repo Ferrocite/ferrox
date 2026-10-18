@@ -148,6 +148,7 @@ fn serve_root(label: &str, root: &Json) -> ! {
         selected => selected,
     };
     let mut inbounds = 0;
+    let dial = outbound.as_ref();
     let mut hysteria_served = false;
     if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
         for inbound in list {
@@ -205,11 +206,7 @@ fn serve_root(label: &str, root: &Json) -> ! {
                     thread::spawn(move || accept_loop(&address, &role));
                     inbounds += 1;
                 }
-                "dokodemo-door" => {
-                    let served =
-                        serve_dokodemo_inbound(&address, inbound, outbound.as_ref(), label);
-                    inbounds += served as usize;
-                }
+                "dokodemo-door" => inbounds += serve_dokodemo(&address, inbound, dial, label),
                 "tun" => {
                     let Some(out) = outbound.clone() else {
                         continue;
@@ -3205,27 +3202,28 @@ fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
     }
 }
 
-/// Bind a dokodemo-door flow and rewrite it to the target its config names. Only the tcp flow
-/// is served; a udp-only inbound is refused by name so it never reads as a silent no-op.
-fn serve_dokodemo_inbound(
-    address: &str,
-    inbound: &Json,
-    outbound: Option<&Outbound>,
-    label: &str,
-) -> bool {
-    let Some(out) = outbound.cloned() else {
-        return false;
+/// Bind a dokodemo-door flow and rewrite it to the target its config names, and say how many
+/// inbounds it armed. Only the tcp flow is served; a udp-only inbound is refused by name so it
+/// never reads as a silent no-op.
+fn serve_dokodemo(address: &str, inbound: &Json, out: Option<&Outbound>, label: &str) -> usize {
+    let Some(out) = out.cloned() else {
+        return 0;
     };
     let Some(dest) = dokodemo_target(inbound) else {
         eprintln!("dokodemo-door rewrite target unusable in {label}: refused, not served");
-        return false;
+        return 0;
     };
     if !dokodemo_networks(inbound).contains(&"tcp") {
         eprintln!("dokodemo-door without tcp in {label}: only the tcp flow is served");
-        return false;
+        return 0;
+    }
+    // A raw front has no tcp carrier to arm a chain on, so a masked inbound is refused rather than served unmasked.
+    if crate::config::has_tcp_mask(inbound.get("streamSettings")) {
+        eprintln!("dokodemo-door in {label} asks for a finalmask tcp chain it cannot arm");
+        return 0;
     }
     spawn_role(address, Role::Dokodemo { out, dest });
-    true
+    1
 }
 
 fn inbound_ss_destinations(inbound: &Json, method: &str) -> Vec<(Vec<u8>, SocketAddr)> {
