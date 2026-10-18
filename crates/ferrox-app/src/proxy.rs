@@ -5578,7 +5578,7 @@ fn foxy_splits(foxy: &FoxyOut, asked: &Destination) -> bool {
             .any(|suffix| asked.host().to_ascii_lowercase().ends_with(suffix))
 }
 
-const fn foxy_socks_reply(reply: u8) -> [u8; 10] {
+fn foxy_socks_reply(reply: u8) -> [u8; 10] {
     [5, reply, 0, 1, 0, 0, 0, 0, 0, 0]
 }
 
@@ -5644,7 +5644,7 @@ enum Front {
 
 impl Front {
     fn grant_line(self) -> &'static [u8] {
-        const SOCKS_GRANTED: [u8; 10] = foxy_socks_reply(0);
+        const SOCKS_GRANTED: [u8; 10] = [5, 0, 0, 1, 0, 0, 0, 0, 0, 0]; // `foxy_socks_reply`'s code 0
         match self {
             Self::Socks => &SOCKS_GRANTED,
             Self::Http => b"HTTP/1.1 200 Connection established\r\n\r\n",
