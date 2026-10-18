@@ -1,4 +1,4 @@
-//! Hysteria version 2 framing: the bytes around the QUIC streams, not the streams — every TCP flow is one bidirectional stream opening with the `0x401` type as a QUIC varint, the connection authenticates by HTTP/3 `POST /auth` answered with status `233`, and UDP datagrams carry `BE32` session ids this layer parses but never relays.
+//! Hysteria version 2 framing: the bytes around the QUIC streams and datagrams — every TCP flow is one bidirectional stream opening with the `0x401` type as a QUIC varint, the connection authenticates by HTTP/3 `POST /auth` answered with status `233`, and the UDP lane rides QUIC datagrams each carrying a `BE32` session id ahead of a packet id, fragment metadata, a varint address and its payload.
 
 use crate::foxy::{frames, hpack};
 
@@ -129,15 +129,156 @@ pub fn encode_tcp_response(ok: bool, message: &[u8], padding: &[u8], out: &mut V
     out.extend_from_slice(padding);
 }
 
-pub fn wrap_dgram(session: u32, payload: &[u8], out: &mut Vec<u8>) {
-    out.extend_from_slice(&session.to_be_bytes());
-    out.extend_from_slice(payload);
+pub const MAX_UDP_PAYLOAD: usize = 65535;
+
+/// One UDP message as it rides a QUIC datagram: `BE32 session || BE16 packet || frag id || frag count || varint address || address || data`, the exact shape `proxy/hysteria`'s `UDPMessage.Serialize` and `ParseUDPMessage` put on every datagram of the reliable lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UdpMessage<'a> {
+    pub session: u32,
+    pub packet: u16,
+    pub frag: u8,
+    pub frags: u8,
+    pub address: &'a str,
+    pub payload: &'a [u8],
 }
 
+impl UdpMessage<'_> {
+    /// Bytes before the payload: the fixed eight-byte head plus the varint-framed address.
+    #[must_use]
+    pub fn header_len(&self) -> usize {
+        8 + frames::quic_varint_len(self.address.len() as u64) + self.address.len()
+    }
+
+    /// The refusals encoder and parser make alike before any byte moves: an empty or over-long address, an empty or over-large payload, and a fragment id outside its count.
+    fn validate(&self) -> Result<(), RequestError> {
+        if self.address.is_empty() || self.address.len() > MAX_ADDRESS_LENGTH as usize {
+            return Err(RequestError::Invalid);
+        }
+        if self.payload.is_empty() || self.payload.len() > MAX_UDP_PAYLOAD {
+            return Err(RequestError::Invalid);
+        }
+        if self.frags == 0 || (self.frags > 1 && self.frag >= self.frags) {
+            return Err(RequestError::Invalid);
+        }
+        Ok(())
+    }
+}
+
+/// Append a whole UDP message to `out`; the session id is written here rather than left for the transport, so a datagram is self-describing.
+pub fn encode_udp(message: &UdpMessage, out: &mut Vec<u8>) -> Result<(), RequestError> {
+    message.validate()?;
+    out.extend_from_slice(&message.session.to_be_bytes());
+    out.extend_from_slice(&message.packet.to_be_bytes());
+    out.push(message.frag);
+    out.push(message.frags);
+    frames::quic_varint(out, message.address.len() as u64);
+    out.extend_from_slice(message.address.as_bytes());
+    out.extend_from_slice(message.payload);
+    Ok(())
+}
+
+/// Read one whole UDP message from a datagram; the payload is whatever follows the address, borrowed from the caller's buffer, so a relay never copies it to look at it.
 #[must_use]
-pub fn open_dgram(packet: &[u8]) -> Option<(u32, &[u8])> {
-    let (id, body) = packet.split_at_checked(4)?;
-    Some((u32::from_be_bytes([id[0], id[1], id[2], id[3]]), body))
+pub fn decode_udp(packet: &[u8]) -> Result<UdpMessage<'_>, RequestError> {
+    let head = packet.get(..8).ok_or(RequestError::Incomplete)?;
+    let mut at = 8usize;
+    let raw = bounded(packet, &mut at, MAX_ADDRESS_LENGTH)?;
+    if raw.is_empty() {
+        return Err(RequestError::Invalid);
+    }
+    let address = std::str::from_utf8(raw).map_err(|_| RequestError::Invalid)?;
+    let message = UdpMessage {
+        session: u32::from_be_bytes([head[0], head[1], head[2], head[3]]),
+        packet: u16::from_be_bytes([head[4], head[5]]),
+        frag: head[6],
+        frags: head[7],
+        address,
+        payload: &packet[at..],
+    };
+    message.validate()?;
+    Ok(message)
+}
+
+/// Split a whole message across datagrams no larger than `max` — the peer's writable datagram size — without copying its payload; a head already at or over `max` is refused rather than truncated.
+pub fn fragment_udp<'a>(
+    message: &UdpMessage<'a>,
+    max: usize,
+    out: &mut Vec<UdpMessage<'a>>,
+) -> Result<(), RequestError> {
+    message.validate()?;
+    if message.frags != 1 {
+        return Err(RequestError::Invalid);
+    }
+    let capacity = max
+        .checked_sub(message.header_len())
+        .filter(|room| *room > 0)
+        .ok_or(RequestError::Invalid)?;
+    let count = u8::try_from(message.payload.len().div_ceil(capacity))
+        .map_err(|_| RequestError::Invalid)?;
+    for (index, chunk) in message.payload.chunks(capacity).enumerate() {
+        out.push(UdpMessage {
+            frag: index as u8,
+            frags: count,
+            payload: chunk,
+            ..*message
+        });
+    }
+    Ok(())
+}
+
+/// The reassembly of one session's datagrams: at most one incomplete packet, a new packet id discarding the previous partial, fragments delivered in id order once every slot fills — the pinned `Defragger`'s contract, minus its byte budget and timer, which the relay's own idle reap replaces.
+#[derive(Debug, Default)]
+pub struct Defrag {
+    packet: u16,
+    address: String,
+    slots: Vec<Option<Vec<u8>>>,
+    have: usize,
+    size: usize,
+}
+
+impl Defrag {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Fold one message in; `Some((address, payload))` when a datagram is whole. A single fragment clears any partial and passes straight through, so an unfragmented datagram never waits on the state.
+    pub fn feed(&mut self, message: &UdpMessage<'_>) -> Result<Option<(String, Vec<u8>)>, RequestError> {
+        message.validate()?;
+        if message.frags == 1 {
+            *self = Self::default();
+            return Ok(Some((message.address.to_owned(), message.payload.to_vec())));
+        }
+        if self.slots.is_empty() || self.packet != message.packet {
+            self.packet = message.packet;
+            self.address = message.address.to_owned();
+            self.slots = vec![None; usize::from(message.frags)];
+            self.have = 0;
+            self.size = 0;
+        }
+        if self.address != message.address || self.slots.len() != usize::from(message.frags) {
+            *self = Self::default();
+            return Err(RequestError::Invalid);
+        }
+        let slot = &mut self.slots[usize::from(message.frag)];
+        if slot.is_some() {
+            return Ok(None);
+        }
+        self.size += message.payload.len();
+        *slot = Some(message.payload.to_vec());
+        self.have += 1;
+        if self.have != self.slots.len() {
+            return Ok(None);
+        }
+        let address = std::mem::take(&mut self.address);
+        let mut payload = Vec::with_capacity(self.size);
+        for fragment in std::mem::take(&mut self.slots).into_iter().flatten() {
+            payload.extend_from_slice(&fragment);
+        }
+        self.have = 0;
+        self.size = 0;
+        Ok(Some((address, payload)))
+    }
 }
 
 pub fn build_auth_request(host: &str, auth: &str, out: &mut Vec<u8>) {
@@ -154,11 +295,11 @@ pub fn build_auth_request(host: &str, auth: &str, out: &mut Vec<u8>) {
     );
 }
 
-pub fn build_auth_response(out: &mut Vec<u8>) {
+pub fn build_auth_response(udp: bool, out: &mut Vec<u8>) {
     hpack::qpack_literal_many(
         &[
             (":status", "233"),
-            (UDP_HEADER, "false"),
+            (UDP_HEADER, if udp { "true" } else { "false" }),
             (CC_RX_HEADER, "0"),
         ],
         out,
@@ -254,16 +395,118 @@ mod tests {
     }
 
     #[test]
-    fn a_datagram_is_a_session_id_ahead_of_its_payload() {
+    fn a_udp_datagram_is_session_packet_frag_address_then_payload() {
+        // A hand-computed vector of the pinned wire: BE32 session, BE16 packet, frag id, frag count, 1-byte varint address length, address, payload.
+        let message = UdpMessage {
+            session: 1,
+            packet: 2,
+            frag: 0,
+            frags: 1,
+            address: "127.0.0.1:80",
+            payload: b"hi",
+        };
         let mut out = Vec::new();
-        wrap_dgram(1, b"ping", &mut out);
-        assert_eq!(out, vec![0, 0, 0, 1, b'p', b'i', b'n', b'g']);
-        assert_eq!(open_dgram(&out), Some((1, b"ping".as_slice())));
-        let mut empty = Vec::new();
-        wrap_dgram(u32::MAX, b"", &mut empty);
-        assert_eq!(open_dgram(&empty), Some((u32::MAX, &[][..])));
-        assert_eq!(open_dgram(&[0, 0, 0]), None);
-        assert_eq!(open_dgram(&[]), None);
+        encode_udp(&message, &mut out).expect("encodes");
+        let mut want = vec![0, 0, 0, 1, 0, 2, 0, 1, 12];
+        want.extend_from_slice(b"127.0.0.1:80");
+        want.extend_from_slice(b"hi");
+        assert_eq!(out, want);
+        assert_eq!(message.header_len(), want.len() - 2);
+        let back = decode_udp(&out).expect("decodes");
+        assert_eq!(back, message);
+        // The payload is borrowed, never copied: its base is the byte right after the head in the caller's own buffer.
+        assert_eq!(back.payload.as_ptr(), out[message.header_len()..].as_ptr());
+    }
+
+    #[test]
+    fn a_udp_datagram_refuses_the_same_shapes_on_both_ends() {
+        // Too short for the fixed head.
+        assert_eq!(decode_udp(&[0; 7]), Err(RequestError::Incomplete));
+        // Empty address.
+        assert_eq!(
+            decode_udp(&[0, 0, 0, 1, 0, 2, 0, 1, 0, b'x']),
+            Err(RequestError::Invalid)
+        );
+        // Address present but no payload byte, which the pinned parser rejects.
+        assert_eq!(
+            decode_udp(&[0, 0, 0, 1, 0, 2, 0, 1, 1, b'a']),
+            Err(RequestError::Invalid)
+        );
+        // A fragment id outside its count is refused on encode and on decode alike.
+        assert_eq!(
+            encode_udp(
+                &UdpMessage {
+                    session: 1,
+                    packet: 1,
+                    frag: 3,
+                    frags: 2,
+                    address: "h:1",
+                    payload: b"x",
+                },
+                &mut Vec::new(),
+            ),
+            Err(RequestError::Invalid)
+        );
+        // A length that cannot be a real address is refused before any slice is taken.
+        let mut long = vec![0, 0, 0, 1, 0, 1, 0, 1];
+        frames::quic_varint(&mut long, MAX_ADDRESS_LENGTH + 1);
+        assert_eq!(decode_udp(&long), Err(RequestError::Invalid));
+    }
+
+    #[test]
+    fn fragmenting_keeps_payload_whole_and_ids_sequential() {
+        // A 10-byte payload behind a 12-byte head in a 16-byte datagram leaves four bytes a fragment, so three carry it.
+        let message = UdpMessage {
+            session: 7,
+            packet: 42,
+            frag: 0,
+            frags: 1,
+            address: "a:1",
+            payload: b"0123456789",
+        };
+        // header_len is 8 + 1 varint + 3 address = 12, so capacity is 16 - 12 = 4 -> three fragments.
+        let mut frags = Vec::new();
+        fragment_udp(&message, 16, &mut frags).expect("fragments");
+        assert_eq!(frags.len(), 3);
+        assert!(frags.iter().all(|f| f.frags == 3));
+        assert_eq!(frags[0].frag, 0);
+        assert_eq!(frags[2].frag, 2);
+        let joined: Vec<u8> = frags.iter().flat_map(|f| f.payload.iter().copied()).collect();
+        assert_eq!(joined, b"0123456789");
+        // A capacity no larger than the head cannot carry even one byte.
+        assert_eq!(fragment_udp(&message, 12, &mut Vec::new()), Err(RequestError::Invalid));
+        // Feeding fragments out of order still reassembles in id order.
+        let mut defrag = Defrag::new();
+        assert_eq!(defrag.feed(&frags[2]).expect("ok"), None);
+        assert_eq!(defrag.feed(&frags[0]).expect("ok"), None);
+        let whole = defrag.feed(&frags[1]).expect("ok").expect("complete");
+        assert_eq!(whole.0, "a:1");
+        assert_eq!(whole.1, b"0123456789");
+    }
+
+    #[test]
+    fn a_new_packet_id_discards_the_partial_before_it() {
+        let mut defrag = Defrag::new();
+        let first = UdpMessage {
+            session: 1,
+            packet: 1,
+            frag: 0,
+            frags: 2,
+            address: "a:1",
+            payload: b"x",
+        };
+        assert_eq!(defrag.feed(&first).expect("ok"), None);
+        // A new packet id on the same session drops the half-filled packet.
+        let next = UdpMessage { packet: 2, ..first };
+        assert_eq!(defrag.feed(&next).expect("ok"), None);
+        let tail = UdpMessage {
+            packet: 2,
+            frag: 1,
+            payload: b"y",
+            ..first
+        };
+        let whole = defrag.feed(&tail).expect("ok").expect("complete");
+        assert_eq!(whole.1, b"xy");
     }
 
     #[test]
@@ -306,10 +549,16 @@ mod tests {
     }
 
     #[test]
-    fn an_auth_response_is_status_233_and_nothing_else_counts() {
+    fn an_auth_response_is_status_233_and_advertises_the_udp_lane() {
         let mut block = Vec::new();
-        build_auth_response(&mut block);
+        build_auth_response(true, &mut block);
         assert!(verify_auth_response(&block));
+        let fields = hpack::qpack_fields(&block).expect("reads");
+        assert_eq!(find(&fields, UDP_HEADER), Some(b"true".as_slice()));
+        let mut off = Vec::new();
+        build_auth_response(false, &mut off);
+        let fields = hpack::qpack_fields(&off).expect("reads");
+        assert_eq!(find(&fields, UDP_HEADER), Some(b"false".as_slice()));
         let mut block = Vec::new();
         hpack::qpack_literal_many(&[(":status", "200")], &mut block);
         assert!(!verify_auth_response(&block));

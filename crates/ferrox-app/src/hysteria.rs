@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, ToSocketAddrs as _};
+use std::net::{Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ferrox_core::foxy::frames;
-use ferrox_core::hysteria;
+use ferrox_core::hysteria::{self, Defrag, UdpMessage};
 
 use crate::conn::Connection;
 use crate::quic::{Unfilled, MAX_DATAGRAM};
@@ -21,6 +22,15 @@ const ROUTE_POLL: Duration = Duration::from_millis(100);
 const STREAM_POLL: Duration = Duration::from_millis(5);
 
 const SCID_LEN: usize = 16;
+
+/// How long a QUIC datagram lane may sit without traffic before its association is reaped, matching the reference's `udp_idle_timeout`.
+const UDP_IDLE: Duration = Duration::from_secs(60);
+
+/// The reader's socket poll, matching the reference's one-second cleanup tick: it bounds how long a reaped association's thread lives, since a UDP socket has no shutdown to wake a blocked read.
+const UDP_POLL: Duration = Duration::from_secs(1);
+
+/// A target reply is a whole UDP datagram, so one buffer of the wire's UDP ceiling holds any single response the association reads.
+const UDP_TARGET_BUF: usize = hysteria::MAX_UDP_PAYLOAD;
 
 pub(crate) struct Dial {
     pub(crate) host: String,
@@ -590,6 +600,8 @@ pub(crate) fn server_config(
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?;
     config.set_application_protos(&[crate::quic::ALPN]).ok()?;
     config.set_cc_algorithm_name(cc.quiche_name()).ok()?;
+    // A served connection always carries an auth validator, and the reference enables the datagram lane exactly when one is present, so the lane is on unconditionally here; the depths are the peer's unsent-datagram queue, matching `udpMessageChanSize`.
+    config.enable_dgram(true, 1024, 1024);
     config.set_max_idle_timeout(crate::quic::IDLE_TIMEOUT_MS);
     config.set_initial_max_data(crate::quic::MAX_DATA);
     config.set_initial_max_stream_data_bidi_local(crate::quic::MAX_STREAM_DATA);
@@ -612,12 +624,21 @@ struct Inbound {
     settings_done: bool,
     auth_buf: Vec<u8>,
     served: HashSet<u64>,
+    udp: HashMap<u32, UdpFlow>,
+}
+
+/// One datagram association: the connected target socket the router relays through, the reassembly its inbound fragments run through, the last activity the idle reap watches, and the flag that tells its reader thread to end. A UDP socket cannot be shut down to wake a blocked read, so the reader polls on the timeout and watches the flag the reap sets.
+struct UdpFlow {
+    target: Arc<UdpSocket>,
+    defrag: Defrag,
+    last: Instant,
+    stop: Arc<AtomicBool>,
 }
 
 fn answer_auth(conn: &mut quiche::Connection, ok: bool) -> bool {
     let mut block = Vec::with_capacity(32);
     if ok {
-        hysteria::build_auth_response(&mut block);
+        hysteria::build_auth_response(true, &mut block);
     } else {
         ferrox_core::foxy::hpack::qpack_literal_many(&[(":status", "404")], &mut block);
     }
@@ -699,6 +720,94 @@ fn serve_stream(
     // The prefix stays in the buffer and the cursor steps over it, so no payload byte is moved.
     flow.at = prefix;
     serve(flow);
+}
+
+/// Bring one datagram association up: resolve the address the client named, connect a target socket of the matching family, and hand a reader thread the same socket so its replies return over the lane. `None` when the address is unresolvable or no socket can be raised, and the datagram is then dropped.
+fn open_udp(
+    shared: &Arc<Mutex<quiche::Connection>>,
+    sock: &Arc<crate::quic::Datagram>,
+    session: u32,
+    address: &str,
+) -> Option<UdpFlow> {
+    let peer = address.to_socket_addrs().ok().and_then(|mut it| it.next())?;
+    let bind = if peer.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let target = UdpSocket::bind(bind).ok()?;
+    target.connect(peer).ok()?;
+    target.set_read_timeout(Some(UDP_POLL)).ok()?;
+    let target = Arc::new(target);
+    let stop = Arc::new(AtomicBool::new(false));
+    std::thread::spawn({
+        let shared = Arc::clone(shared);
+        let sock = Arc::clone(sock);
+        let target = Arc::clone(&target);
+        let stop = Arc::clone(&stop);
+        let address = address.to_owned();
+        move || udp_reader(&shared, &sock, &target, &stop, session, &address)
+    });
+    Some(UdpFlow {
+        target,
+        defrag: Defrag::new(),
+        last: Instant::now(),
+        stop,
+    })
+}
+
+/// Read the target socket and put every reply back on the lane, fragmenting to the peer's writable datagram size so a large response still arrives: one packet id per reply, its fragments sharing it, exactly as the client sends to us. A read that only timed out checks whether the reap or the closed connection told it to stop, so the thread lives no longer than one poll past its association.
+fn udp_reader(
+    shared: &Arc<Mutex<quiche::Connection>>,
+    sock: &Arc<crate::quic::Datagram>,
+    target: &Arc<UdpSocket>,
+    stop: &AtomicBool,
+    session: u32,
+    address: &str,
+) {
+    // One buffer for a whole target reply and one for the wire, both kept at capacity across the association's life so a steady relay never reallocates; the fragments view `buf`, so they are rebuilt each read rather than carried.
+    let mut buf = vec![0u8; UDP_TARGET_BUF];
+    let mut wire = Vec::new();
+    let mut out = Unfilled::<MAX_DATAGRAM>::new();
+    let mut packet = 0u16;
+    loop {
+        let n = match target.recv(&mut buf) {
+            Ok(n) => n,
+            Err(ref error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                let closed = shared.lock().map_or(true, |conn| conn.is_closed());
+                if closed || stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                continue;
+            }
+            Err(_) => break,
+        };
+        let Ok(mut conn) = shared.lock() else {
+            break;
+        };
+        if conn.is_closed() {
+            break;
+        }
+        let Some(max) = conn.dgram_max_writable_len() else {
+            break;
+        };
+        packet = packet.wrapping_add(1);
+        let message = UdpMessage {
+            session,
+            packet,
+            frag: 0,
+            frags: 1,
+            address,
+            payload: &buf[..n],
+        };
+        let mut frags = Vec::new();
+        if hysteria::fragment_udp(&message, max, &mut frags).is_err() {
+            break;
+        }
+        for frag in &frags {
+            wire.clear();
+            if hysteria::encode_udp(frag, &mut wire).is_ok() {
+                let _ = conn.dgram_send(&wire);
+            }
+        }
+        flush(sock, &mut conn, out.as_mut());
+    }
 }
 
 struct Router<'a> {
@@ -783,6 +892,7 @@ impl Router<'_> {
                 settings_done: false,
                 auth_buf: Vec::new(),
                 served: HashSet::new(),
+                udp: HashMap::new(),
             },
         );
     }
@@ -868,6 +978,42 @@ impl Router<'_> {
                     serve_stream(&thread_shared, &thread_sock, local, id, &thread_serve);
                 });
             }
+            // Drain the datagram lane: every received message is folded into its session's reassembly and, once whole, relayed to that session's target socket; the first datagram of a session raises the association. A datagram before auth is not for the lane yet, and a reassembly that rejects a forged fragment retires the session.
+            while let Ok(data) = conn.dgram_recv_buf() {
+                let Ok(message) = hysteria::decode_udp(&data) else {
+                    continue;
+                };
+                let Some(inbound) = routes.get_mut(dcid) else {
+                    return;
+                };
+                if !inbound.authed {
+                    continue;
+                }
+                if !inbound.udp.contains_key(&message.session) {
+                    let Some(flow) = open_udp(&shared, sock, message.session, message.address) else {
+                        continue;
+                    };
+                    inbound.udp.insert(message.session, flow);
+                }
+                let mut retire = false;
+                if let Some(flow) = inbound.udp.get_mut(&message.session) {
+                    flow.last = Instant::now();
+                    match flow.defrag.feed(&message) {
+                        Ok(Some((_address, payload))) => {
+                            let _ = flow.target.send(&payload);
+                        }
+                        Ok(None) => {}
+                        Err(_) => {
+                            flow.stop.store(true, Ordering::Relaxed);
+                            retire = true;
+                        }
+                    }
+                }
+                if retire {
+                    inbound.udp.remove(&message.session);
+                }
+            }
+            flush(sock, &mut conn, out.as_mut());
         }
     }
 
@@ -875,16 +1021,29 @@ impl Router<'_> {
         let Self {
             routes, sock, out, ..
         } = self;
-        // One pass, one lock per route: the dead are dropped where they are found, and the living take their turn of the wheel.
+        let now = Instant::now();
+        // One pass, one lock per route: the dead are dropped where they are found, the living take their turn of the wheel, and a datagram association idle past the timeout is told to stop so its reader ends within one poll.
         routes.retain(|_, inbound| {
             let Ok(mut conn) = inbound.conn.lock() else {
                 return true;
             };
             if conn.is_closed() {
+                for flow in inbound.udp.values() {
+                    flow.stop.store(true, Ordering::Relaxed);
+                }
+                inbound.udp.clear();
                 return false;
             }
             conn.on_timeout();
             flush(sock, &mut conn, out.as_mut());
+            inbound.udp.retain(|_, flow| {
+                if now.duration_since(flow.last) > UDP_IDLE {
+                    flow.stop.store(true, Ordering::Relaxed);
+                    false
+                } else {
+                    true
+                }
+            });
             true
         });
     }
