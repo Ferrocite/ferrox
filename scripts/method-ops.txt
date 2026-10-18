@@ -112,3 +112,4 @@ finalmask  finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lies  
 finalmask  finalmask::tests::the_last_configured_width_governs_every_later_segment  ferrox_core::finalmask::Fragment::write_pieces
 http-proxy  proxy::tests::the_connect_request_builds_in_one_buffer  proxy::http_connect_request
 http-proxy  proxy::tests::http_request_parses_connect_and_both_get_forms  proxy::http_proxy_request
+front-tun  tun::tests::an_emitted_packet_reuses_its_render_buffer  ferrox_app::tun::render_tcp_packet
