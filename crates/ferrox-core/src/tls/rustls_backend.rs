@@ -482,11 +482,13 @@ impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RustlsServer
 
 /// Hand `parts` to a rustls writer in one `write_vectored` so the fragmenter sees one payload and emits one record; iterating `write_all` per part would emit one record per part.
 ///
-/// The framer hands at most `uuid | head | payload | padding` — four segments — so they
-/// are laid out on the stack like [`RustlsProvider::write_parts`] does its two, rather
-/// than spending one heap `Vec<IoSlice>` on every framed write.
+/// The framer hands at most `uuid | head | payload | padding` — four segments — and the
+/// camouflage head gather hands five, so they are laid out on the stack like
+/// [`RustlsProvider::write_parts`] does its two, rather than spending one heap `Vec<IoSlice>`
+/// on every framed write.
 fn coalesce<W: Write + ?Sized>(writer: &mut W, parts: &[&[u8]]) -> std::io::Result<()> {
     let mut stack = [
+        std::io::IoSlice::new(&[]),
         std::io::IoSlice::new(&[]),
         std::io::IoSlice::new(&[]),
         std::io::IoSlice::new(&[]),
@@ -1162,6 +1164,41 @@ mod tests {
         );
         assert_eq!(recorder.calls, 1, "one `write_vectored`, so one record");
         assert_eq!(recorder.bytes, 16 + 5 + 1400 + 200);
+    }
+
+    /// The camouflage head gather is one piece wider than the framer — `GET `, the path, the
+    /// middle, the host, the trailer — and a repeated dial cycle still enters the allocator zero
+    /// times: the fifth run rides the stack too, where it once bought a `Vec<IoSlice>` per dial.
+    #[test]
+    fn the_camouflage_gather_coalesces_without_a_heap_buffer() {
+        let before = b"GET ";
+        let path = "/camouflage";
+        let middle = b" HTTP/1.1\r\nHost: ";
+        let host = "oracle.example";
+        let after = b"\r\nConnection: keep-alive\r\n\r\n";
+        let parts: [&[u8]; 5] = [before, path.as_bytes(), middle, host.as_bytes(), after];
+        let mut recorder = SegmentRecorder { calls: 0, bytes: 0 };
+        // Three dials' gathers inside one window: a reclaim that stopped firing would show as a rising count.
+        let (result, counts) = crate::alloc_count::measure(|| {
+            let mut last = Ok(());
+            for _ in 0..3 {
+                last = coalesce(&mut recorder, &parts);
+            }
+            last
+        });
+        result.expect("coalesces");
+        assert_eq!(
+            counts.allocs, 0,
+            "five segments ride the stack over every dial, counted {counts:?}"
+        );
+        assert_eq!(
+            recorder.calls, 3,
+            "one `write_vectored` per gather, so one record each"
+        );
+        assert_eq!(
+            recorder.bytes,
+            3 * (before.len() + path.len() + middle.len() + host.len() + after.len())
+        );
     }
 
     /// Past the stack bound the same segments still go out in one call, and empty runs never
