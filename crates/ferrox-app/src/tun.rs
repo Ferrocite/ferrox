@@ -1,5 +1,6 @@
-//! The native TUN device inbound: opens a virtual interface, reads IP packets, turns each
-//! TCP flow into a proxy dial through the existing outbound relay machinery.
+//! The native TUN device inbound: opens a virtual interface, reads IP packets, turns each TCP
+//! flow into a proxy dial through `serve_connect` and each UDP flow into a datagram dial through
+//! a SOCKS5 UDP association — the same two entries every other front reaches, no second dialer.
 //!
 //! Byte-identity: a TUN carries no wire byte-stream to diff, so this row's identity claim is
 //! the (target, payload) dial-set differential — the set of (destination, payload) pairs the
@@ -12,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::sync::{mpsc, Arc};
 
@@ -21,9 +22,14 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 
 use crate::budgets;
 use crate::conn::Connection;
-use ferrox_core::foxy::connectip::{checksum, ipv4_checksum, ipv4_head, Ipv4Head, IPV4_HEADER};
+use ferrox_core::foxy::connectip::{
+    checksum, ipv4_checksum, ipv4_head, udp_datagram, udp_head, Ipv4Head, UdpDatagram, IPV4_HEADER,
+    PROTOCOL_UDP, UDP_HEADER,
+};
 
 const DEFAULT_MTU: usize = 1500;
+/// The association's framed datagram: the relay's largest payload plus the RSV/FRAG prefix and an address.
+const FRAME_CAP: usize = crate::proxy::UDP_BUF + 3 + 19;
 const TCP_PROTO: u8 = 6;
 const FLAG_FIN: u8 = 0x01;
 const FLAG_SYN: u8 = 0x02;
@@ -88,6 +94,20 @@ struct FlowKey {
     source_port: u16,
     destination: [u8; 4],
     destination_port: u16,
+}
+
+/// One datagram flow, keyed the same way as a stream flow: the device's own address is implied by the packet's destination.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct UdpKey {
+    source_port: u16,
+    destination: [u8; 4],
+    destination_port: u16,
+}
+
+/// A flow a thread has left: its entry goes at the next packet, so the packet path pays nothing for the reap.
+enum Ended {
+    Stream(FlowKey),
+    Datagram(UdpKey),
 }
 
 /// A TUN device: a file descriptor carrying raw IP packets (`IFF_TUN` | `IFF_NO_PI` on Linux).
@@ -333,22 +353,79 @@ struct Flow {
 /// the destination extracted from the packet headers.
 pub(crate) type Relay = Arc<dyn Fn(Connection, crate::proxy::Destination) + Send + Sync>;
 
-/// The TUN handler: reads packets, relays TCP flows through the proxy outbound.
+/// The datagram entry the TUN handler rides per UDP flow: handed the client half of an association, it runs the same SOCKS5 UDP server the SOCKS inbound reaches, `serve_socks_udp`.
+pub(crate) type Associate = Arc<dyn Fn(Connection) + Send + Sync>;
+
+/// The device's one association: the control leg stays open for its life, as every other SOCKS front's does, and `relay` is where every flow's framed datagram is sent.
+struct Association {
+    control: Connection,
+    relay: SocketAddr,
+}
+
+impl Association {
+    /// Associate over a loopback pair and read the relay address off the reply: the greeting, the request and the reply are the same bytes a SOCKS5 client writes, so the outbound's UDP arms cannot tell a device from a proxy client.
+    fn open(associate: &Associate) -> io::Result<Self> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let pair_addr = listener.local_addr()?;
+        let client = TcpStream::connect(pair_addr)?;
+        let (server, _) = listener.accept()?;
+        drop(listener);
+        let associate = Arc::clone(associate);
+        std::thread::spawn(move || associate(Connection::from(server)));
+
+        let budget = budgets::handshake();
+        let mut control = Connection::from(client);
+        control.set_read_timeout(Some(budget))?;
+        control.write_all(&[5, 1, 0])?;
+        let mut method = [0u8; 2];
+        control.read_exact(&mut method)?;
+        if method != [5, 0] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the association refused no authentication",
+            ));
+        }
+        control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])?;
+        let mut reply = [0u8; 10];
+        control.read_exact(&mut reply)?;
+        if reply[..4] != [5, 0, 0, 1] {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the association refused its address type",
+            ));
+        }
+        let relay = SocketAddr::new(
+            IpAddr::V4([reply[4], reply[5], reply[6], reply[7]].into()),
+            u16::from_be_bytes([reply[8], reply[9]]),
+        );
+        Ok(Self { control, relay })
+    }
+}
+
+/// The TUN handler: reads packets, relays each TCP flow and each UDP flow through the proxy outbound.
 pub(crate) struct Handler {
     device: Device,
     relay: Relay,
+    associate: Associate,
     flows: HashMap<FlowKey, Flow>,
-    ended_tx: mpsc::Sender<FlowKey>,
-    ended_rx: mpsc::Receiver<FlowKey>,
+    legs: HashMap<UdpKey, UdpSocket>,
+    frame: Vec<u8>,
+    association: Option<Association>,
+    ended_tx: mpsc::Sender<Ended>,
+    ended_rx: mpsc::Receiver<Ended>,
 }
 
 impl Handler {
-    pub(crate) fn new(device: Device, relay: Relay) -> Self {
+    pub(crate) fn new(device: Device, relay: Relay, associate: Associate) -> Self {
         let (ended_tx, ended_rx) = mpsc::channel();
         Self {
             device,
             relay,
+            associate,
             flows: HashMap::new(),
+            legs: HashMap::new(),
+            frame: Vec::with_capacity(FRAME_CAP),
+            association: None,
             ended_tx,
             ended_rx,
         }
@@ -368,13 +445,69 @@ impl Handler {
     }
 
     fn dispatch(&mut self, packet: &[u8]) -> io::Result<()> {
+        // Threads that left their flow report here, so neither table keeps a dead entry or the socket inside it.
+        while let Ok(ended) = self.ended_rx.try_recv() {
+            match ended {
+                Ended::Stream(key) => {
+                    self.flows.remove(&key);
+                }
+                Ended::Datagram(key) => {
+                    self.legs.remove(&key);
+                }
+            }
+        }
         let Some((ip, body)) = ipv4_head(packet) else {
             return Ok(());
         };
         match ip.protocol {
             TCP_PROTO => self.handle_tcp(&ip, body),
+            PROTOCOL_UDP => self.handle_udp(&ip, body),
             _ => Ok(()),
         }
+    }
+
+    /// Relay one datagram: the flow's leg is raised on the association's relay address and every packet afterwards rides it, framed with the destination the device asked for. A packet whose association or leg cannot be raised is lost, as an unroutable datagram is at every other front.
+    fn handle_udp(&mut self, ip: &Ipv4Head, body: &[u8]) -> io::Result<()> {
+        let Some((udp, payload)) = udp_head(body) else {
+            return Ok(());
+        };
+        if self.association.is_none() {
+            if let Ok(association) = Association::open(&self.associate) {
+                self.association = Some(association);
+            }
+        }
+        let Some(association) = &self.association else {
+            return Ok(());
+        };
+        let relay = association.relay;
+        let target = SocketAddr::from((ip.destination, udp.destination_port));
+        let key = UdpKey {
+            source_port: udp.source_port,
+            destination: ip.destination,
+            destination_port: udp.destination_port,
+        };
+        let leg = match self.legs.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(vacant) => vacant.insert(open_leg(
+                &self.device,
+                relay,
+                (ip.destination, udp.destination_port),
+                (ip.source, udp.source_port),
+                key,
+                &self.ended_tx,
+            )?),
+        };
+        let mut frame = std::mem::take(&mut self.frame);
+        frame.clear();
+        frame.extend_from_slice(&[0u8, 0, 0]);
+        crate::proxy::push_socks_addr(&mut frame, &target);
+        frame.extend_from_slice(payload);
+        let sent = leg.send(&frame);
+        self.frame = frame;
+        if sent.is_err() {
+            self.legs.remove(&key);
+        }
+        Ok(())
     }
 
     fn handle_tcp(&mut self, ip: &Ipv4Head, body: &[u8]) -> io::Result<()> {
@@ -433,10 +566,6 @@ impl Handler {
     }
 
     fn accept_flow(&mut self, ip: &Ipv4Head, tcp: &TcpHead, key: FlowKey) -> io::Result<()> {
-        // Flows whose response thread has already left are removed here, so the packet path pays nothing for the reap.
-        while let Ok(ended) = self.ended_rx.try_recv() {
-            self.flows.remove(&ended);
-        }
         let local_ip = ip.destination;
         let remote_ip = ip.source;
         let local_port = tcp.destination_port;
@@ -506,14 +635,9 @@ impl Handler {
                             65535,
                             &buf[..n],
                         );
-                        let mut dev = Device {
-                            handle: dev_writer,
-                            mtu: 65535,
-                        };
-                        if dev.write_packet(&pkt).is_err() {
+                        if dev_writer.write_all(&pkt).is_err() {
                             break;
                         }
-                        dev_writer = dev.handle;
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                     // The budget expired with nothing to carry: the upload leg gets one more budget to speak, and a silent one ends the flow.
@@ -532,7 +656,7 @@ impl Handler {
             }
             // Both halves, because the handler's write half is a clone of this descriptor and only a shutdown tells it the flow is over.
             let _ = read_half.shutdown(Shutdown::Both);
-            let _ = ended_tx.send(key);
+            let _ = ended_tx.send(Ended::Stream(key));
         });
 
         Ok(())
@@ -543,6 +667,62 @@ impl Handler {
             let _ = flow.write_half.shutdown(Shutdown::Both);
         }
     }
+}
+
+impl Drop for Handler {
+    /// The device is gone: closing the control leg ends the association, whose relay socket and reader threads would otherwise outlive the inbound that opened them.
+    fn drop(&mut self) {
+        if let Some(association) = self.association.take() {
+            let _ = association.control.shutdown(Shutdown::Both);
+        }
+    }
+}
+
+/// Raise one flow's leg: a socket on the association's own address that the handler sends framed datagrams through, answered by a reader that re-wraps each reply as a packet back to the flow's source. Silence past the idle budget ends the flow, so neither its thread nor its leg outlives a target that stopped answering.
+fn open_leg(
+    device: &Device,
+    relay: SocketAddr,
+    endpoint: ([u8; 4], u16),
+    client: ([u8; 4], u16),
+    key: UdpKey,
+    ended: &mpsc::Sender<Ended>,
+) -> io::Result<UdpSocket> {
+    let leg = UdpSocket::bind(SocketAddr::new(relay.ip(), 0))?;
+    leg.connect(relay)?;
+    leg.set_read_timeout(Some(budgets::udp_idle()))?;
+    let target = SocketAddr::from(endpoint);
+    let reader = leg.try_clone()?;
+    let mut dev_writer = device.clone_writer()?;
+    let mtu = device.mtu;
+    let ended = ended.clone();
+    std::thread::spawn(move || {
+        let mut buf = crate::proxy::udp_buffer();
+        let mut out: Vec<u8> = Vec::with_capacity(IPV4_HEADER + UDP_HEADER + mtu);
+        while let Ok(n) = reader.recv(&mut buf) {
+            let Some((source, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
+                continue;
+            };
+            if source != target {
+                continue;
+            }
+            let datagram = UdpDatagram {
+                source: endpoint.0.as_slice(),
+                destination: client.0.as_slice(),
+                source_port: endpoint.1,
+                destination_port: client.1,
+                payload,
+            };
+            out.clear();
+            if !udp_datagram(&datagram, &mut out) {
+                continue;
+            }
+            if dev_writer.write_all(&out).is_err() {
+                break;
+            }
+        }
+        let _ = ended.send(Ended::Datagram(key));
+    });
+    Ok(leg)
 }
 
 pub(crate) fn refusal_reason(spec: &Spec) -> String {
@@ -643,6 +823,71 @@ mod tests {
         assert_eq!(payload, b"x");
     }
 
+    /// One reply packet, built the way the lane builds it.
+    fn datagram(
+        source: [u8; 4],
+        destination: [u8; 4],
+        source_port: u16,
+        destination_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let mut out = Vec::new();
+        assert!(udp_datagram(
+            &UdpDatagram {
+                source: source.as_slice(),
+                destination: destination.as_slice(),
+                source_port,
+                destination_port,
+                payload,
+            },
+            &mut out,
+        ));
+        out
+    }
+
+    #[test]
+    fn udp_head_parses_a_datagram() {
+        let pkt = datagram([10, 0, 0, 2], [10, 0, 0, 1], 51500, 53, b"query");
+        let (ip, body) = ipv4_head(&pkt).unwrap();
+        assert_eq!(ip.protocol, PROTOCOL_UDP);
+        let (udp, payload) = udp_head(body).unwrap();
+        assert_eq!((udp.source_port, udp.destination_port), (51500, 53));
+        assert_eq!(payload, b"query");
+    }
+
+    #[test]
+    fn udp_head_refuses_a_forged_length() {
+        // A length field that disagrees with the body is refused, never read past.
+        let mut pkt = datagram([10, 0, 0, 2], [10, 0, 0, 1], 5, 6, b"ab");
+        let forged = ((UDP_HEADER + 400) as u16).to_be_bytes();
+        pkt[IPV4_HEADER + 4..IPV4_HEADER + 6].copy_from_slice(&forged);
+        let (_ip, body) = ipv4_head(&pkt).unwrap();
+        assert!(udp_head(body).is_none());
+        assert!(udp_head(&[0u8; 4]).is_none());
+    }
+
+    #[test]
+    fn the_datagram_is_borrowed_from_the_read_buffer() {
+        // Pointer identity, not bytes: the parse returns the packet's own storage.
+        let pkt = datagram([10, 0, 0, 2], [10, 0, 0, 1], 5, 6, b"borrow me");
+        let (_ip, body) = ipv4_head(&pkt).unwrap();
+        let (_udp, payload) = udp_head(body).unwrap();
+        let base = pkt.as_ptr() as usize;
+        assert_eq!(payload.as_ptr() as usize, base + IPV4_HEADER + UDP_HEADER);
+        assert!(payload.as_ptr() as usize + payload.len() <= base + pkt.len());
+    }
+
+    #[test]
+    fn the_reply_packet_verifies_at_the_reference_reader() {
+        // Built here, verified by the core's own checksumming walk: the same bytes a peer's stack reads.
+        let pkt = datagram([198, 51, 100, 7], [10, 0, 0, 2], 53, 51500, b"an answer");
+        let read =
+            ferrox_core::foxy::connectip::udp_from_packet(&pkt).expect("a readable datagram");
+        assert!(read.verified, "both checksums hold");
+        assert_eq!(read.payload, b"an answer");
+        assert_eq!((read.source_port, read.destination_port), (53, 51500));
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_syn_flow_replies_syn_ack_over_a_socketpair() {
@@ -651,7 +896,7 @@ mod tests {
         let mut peer = b;
 
         let relay: Relay = Arc::new(|_conn, _dest| {});
-        let mut handler = Handler::new(device, relay);
+        let mut handler = Handler::new(device, relay, no_associate());
 
         let syn = build_tcp_packet(
             ([10, 0, 0, 2], 44444),
@@ -771,6 +1016,12 @@ mod tests {
     #[cfg(unix)]
     type Dials = Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
 
+    /// An association that answers nothing: the stream tests never frame a datagram, and a leg closed at once is what a datagram they did send would deserve.
+    #[cfg(unix)]
+    fn no_associate() -> Associate {
+        Arc::new(|_conn| {})
+    }
+
     /// A dial recorder behind the same `Relay` seam the app installs: it reads each
     /// flow to EOF, exactly as `serve_connect` does, and keeps (target, payload).
     #[cfg(unix)]
@@ -884,6 +1135,7 @@ mod tests {
         let mut handler = Handler::new(
             Device::from_handle(a, DEFAULT_MTU),
             recording_relay(results.clone()),
+            no_associate(),
         );
 
         let mut buf = vec![0u8; DEFAULT_MTU + 64];
@@ -895,6 +1147,122 @@ mod tests {
         let mut got: Vec<(String, Vec<u8>)> = results.lock().unwrap().clone();
         got.sort();
         assert_eq!(got, expected, "the dial set is the reference's own");
+    }
+
+    #[cfg(unix)]
+    type Frames = Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
+
+    /// The association a test answers with: a SOCKS5 UDP server on loopback that keeps every frame it is handed and echoes each one back, so the device's datagram lane is walked end to end without dialing a target.
+    #[cfg(unix)]
+    fn echo_associate(frames: Frames) -> Associate {
+        Arc::new(move |mut client: Connection| {
+            let mut greeting = [0u8; 3];
+            if client.read_exact(&mut greeting).is_err() || client.write_all(&[5, 0]).is_err() {
+                return;
+            }
+            let mut request = [0u8; 10];
+            if client.read_exact(&mut request).is_err() {
+                return;
+            }
+            let Ok(relay) = UdpSocket::bind("127.0.0.1:0") else {
+                return;
+            };
+            let Ok(addr) = relay.local_addr() else {
+                return;
+            };
+            let mut reply = vec![5, 0, 0];
+            crate::proxy::push_socks_addr(&mut reply, &addr);
+            if client.write_all(&reply).is_err() {
+                return;
+            }
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let Ok((n, src)) = relay.recv_from(&mut buf) else {
+                    return;
+                };
+                let frame = buf[..n].to_vec();
+                let Some((target, payload)) = crate::proxy::parse_socks_udp(&frame) else {
+                    continue;
+                };
+                let mut back = vec![0u8, 0, 0];
+                crate::proxy::push_socks_addr(&mut back, &target);
+                back.extend_from_slice(payload);
+                frames.lock().unwrap().push(frame);
+                if relay.send_to(&back, src).is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    #[cfg(unix)]
+    fn wait_for_frames(frames: &Frames, count: usize) {
+        for _ in 0..2_500 {
+            if frames.lock().unwrap().len() == count {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        panic!("{count} frames did not arrive");
+    }
+
+    /// The next packet the device wrote, with the same bounded wait the stream tests use: a lane that answers nothing fails rather than parking the suite.
+    #[cfg(unix)]
+    fn next_datagram(peer: &mut std::fs::File, buf: &mut [u8]) -> usize {
+        for _ in 0..2_500 {
+            match peer.read(buf) {
+                Ok(n) if n > 0 => return n,
+                Ok(_) => {}
+                Err(ref e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::Interrupted =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(_) => break,
+            }
+        }
+        panic!("no datagram answer came back to the device");
+    }
+
+    /// The row's datagram claim, checked: a packet off the device becomes the RFC 1928 request the association names, and the answer comes back re-wrapped for the flow that asked.
+    #[cfg(unix)]
+    #[test]
+    fn a_datagram_flow_frames_the_association_and_returns_the_echo() {
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let relay: Relay = Arc::new(|_conn, _dest| {});
+        let mut handler = Handler::new(
+            Device::from_handle(a, DEFAULT_MTU),
+            relay,
+            echo_associate(frames.clone()),
+        );
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let query = datagram(SCRIPT_CLIENT, [198, 51, 100, 7], 51500, 53, b"who-is");
+        peer.write_all(&query).unwrap();
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+
+        // Reserved, fragment, address type, the destination the packet named, then the datagram itself.
+        let mut want = vec![0u8, 0, 0, 1, 198, 51, 100, 7, 0, 53];
+        want.extend_from_slice(b"who-is");
+        wait_for_frames(&frames, 1);
+        assert_eq!(
+            frames.lock().unwrap().first().map(Vec::as_slice),
+            Some(want.as_slice()),
+            "the association carries the request the spec writes"
+        );
+
+        let n = next_datagram(&mut peer, &mut buf);
+        let (ip, body) = ipv4_head(&buf[..n]).unwrap();
+        assert_eq!(ip.protocol, PROTOCOL_UDP);
+        assert_eq!(
+            (ip.source, ip.destination),
+            ([198, 51, 100, 7], SCRIPT_CLIENT)
+        );
+        let (udp, payload) = udp_head(body).unwrap();
+        assert_eq!((udp.source_port, udp.destination_port), (53, 51500));
+        assert_eq!(payload, b"who-is");
     }
 
     /// A nonblocking peer: a frame that never arrives fails the assertions instead
@@ -947,7 +1315,7 @@ mod tests {
             use std::io::Write;
             let _ = conn.write_all(b"pong\n");
         });
-        let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay);
+        let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
         let flow = FlowSpec {
             destination: "203.0.113.53:53".parse().unwrap(),
             source_port: 51001,
@@ -1051,7 +1419,7 @@ mod tests {
             let _ = conn.read_to_end(&mut sink);
             let _ = gone_tx.send(());
         });
-        let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay);
+        let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
         let mut buf = vec![0u8; DEFAULT_MTU + 64];
         let destination: SocketAddr = "203.0.113.9:443".parse().unwrap();
         let key = open_flow(&mut handler, &mut peer, destination, 51500, 9000, &mut buf);
@@ -1153,7 +1521,7 @@ mod tests {
     fn the_syn_ack_numbers_wrap_at_the_sequence_space_boundary() {
         let (a, mut peer) = unix_socketpair().unwrap();
         let relay: Relay = Arc::new(|_conn, _dest| {});
-        let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay);
+        let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
         let syn = build_tcp_packet(
             ([10, 0, 0, 2], 44444),
             ([10, 0, 0, 1], 80),

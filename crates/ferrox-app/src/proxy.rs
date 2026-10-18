@@ -3285,7 +3285,10 @@ fn serve_tun_inbound(inbound: &Json, out: &Outbound, _address: &str) -> bool {
     let relay: crate::tun::Relay = std::sync::Arc::new(move |conn, dest| {
         serve_connect(conn, &outbound, &dest, Front::Socks, &[]);
     });
-    let mut handler = crate::tun::Handler::new(device, relay);
+    let datagram = out.clone();
+    let associate: crate::tun::Associate =
+        std::sync::Arc::new(move |conn| serve_socks_udp(conn, &datagram));
+    let mut handler = crate::tun::Handler::new(device, relay, associate);
     thread::spawn(move || {
         if let Err(e) = handler.serve() {
             eprintln!("tun handler ended: {e}");
@@ -8977,12 +8980,12 @@ pub(crate) fn push_addr(header: &mut Vec<u8>, target: &SocketAddr, v6: u8) {
     }
 }
 
-fn push_socks_addr(out: &mut Vec<u8>, addr: &SocketAddr) {
+pub(crate) fn push_socks_addr(out: &mut Vec<u8>, addr: &SocketAddr) {
     push_addr(out, addr, 4);
     out.extend_from_slice(&addr.port().to_be_bytes());
 }
 
-fn parse_socks_udp(packet: &[u8]) -> Option<(SocketAddr, &[u8])> {
+pub(crate) fn parse_socks_udp(packet: &[u8]) -> Option<(SocketAddr, &[u8])> {
     if packet.len() < 4 || packet[2] != 0 {
         return None;
     }
