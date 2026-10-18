@@ -334,3 +334,6 @@ front-tun dial-set-flows-matching-the-pinned-stack 3 ferrox-app-tun::tests::the_
 front-tun reverse-role-response-round-trips 1 ferrox-app-tun::tests::the_response_bytes_come_back_as_ip_packets
 front-tun parse-copies-per-packet 0 ferrox-app-tun::tests::the_payload_is_borrowed_from_the_read_buffer
 front-tun flows-handed-back-at-the-idle-budget 2 ferrox-app-tun::tests::a_quiet_tun_flow_hands_its_threads_back
+front-tun datagram-association-round-trips 1 ferrox-app-tun::tests::a_datagram_flow_frames_the_association_and_returns_the_echo
+front-tun datagram-parse-copies-per-packet 0 ferrox-app-tun::tests::the_datagram_is_borrowed_from_the_read_buffer
+front-tun datagram-reply-packets-checksummed 1 ferrox-app-tun::tests::the_reply_packet_verifies_at_the_reference_reader
