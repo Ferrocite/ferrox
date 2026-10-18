@@ -91,14 +91,30 @@ pub(crate) fn accept_split<R: Read, W: Write>(
     ))
 }
 
+const BEFORE_PATH: &[u8] = b"GET ";
+const BEFORE_HOST: &[u8] = b" HTTP/1.1\r\nHost: ";
+const AFTER_HOST: &[u8] = b"\r\nConnection: keep-alive\r\n\r\n";
+
+// The request is written as the runs it is made of: the socket packs them into one `writev` and the session coalesces them into one record, so no byte is staged in a buffer of its own first.
+fn send_request<W: crate::proxy::FrameWrite>(write: &mut W, host: &str, path: &str) -> Option<()> {
+    write
+        .write_slices(&[
+            BEFORE_PATH,
+            path.as_bytes(),
+            BEFORE_HOST,
+            host.as_bytes(),
+            AFTER_HOST,
+        ])
+        .then_some(())
+}
+
 pub(crate) fn connect(
     stream: Connection,
     host: &str,
     path: &str,
 ) -> Option<(HeadReader, Connection)> {
     let mut read = stream;
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n");
-    read.write_all(request.as_bytes()).ok()?;
+    send_request(&mut read, host, path)?;
     let (head, at) = read_head(&mut read)?;
     check_response(&head[..at])?;
     let Ok(write) = read.try_clone() else {
@@ -124,14 +140,13 @@ fn check_response(head: &[u8]) -> Option<()> {
 }
 
 // The same connect over halves that cannot peek: pipelined bytes arrive as a prefix.
-pub(crate) fn connect_split<R: Read, W: Write>(
+pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite>(
     mut read: R,
     mut write: W,
     host: &str,
     path: &str,
 ) -> Option<(HeadReader<R>, W)> {
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n");
-    write.write_all(request.as_bytes()).ok()?;
+    send_request(&mut write, host, path)?;
     let (head, at) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
     check_response(&head[..at])?;
@@ -222,6 +237,81 @@ mod tests {
             "delivered from the buffer those bytes arrived in"
         );
         assert_eq!(reader.prefix.capacity(), capacity, "on a held capacity");
+    }
+
+    /// The camouflage request reaches the write as the runs it is made of: the path and host octets go over where they lie, so the handshake stages no copy of itself.
+    #[test]
+    fn the_request_reaches_the_write_as_the_runs_it_is_made_of() {
+        #[derive(Default)]
+        struct Runs {
+            calls: usize,
+            segments: Vec<(usize, usize)>,
+            bytes: Vec<u8>,
+        }
+
+        impl Write for Runs {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.segments.push((buf.as_ptr() as usize, buf.len()));
+                self.bytes.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl crate::proxy::FrameWrite for Runs {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                self.calls += 1;
+                for part in parts {
+                    self.segments.push((part.as_ptr() as usize, part.len()));
+                    self.bytes.extend_from_slice(part);
+                }
+                true
+            }
+        }
+
+        const ANSWER: &[u8] = b"HTTP/1.1 200 OK\r\n\r\n";
+        // One binding each, so the pointer the callee was handed is the pointer the gate asserts.
+        let host = "oracle.example";
+        let path = "/camouflage";
+        let (_reader, write) = connect_split(
+            std::io::Cursor::new(Vec::from(ANSWER)),
+            Runs::default(),
+            host,
+            path,
+        )
+        .expect("answers");
+        assert_eq!(
+            write.bytes,
+            format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: keep-alive\r\n\r\n")
+                .as_bytes(),
+            "the bytes the removed formatter wrote"
+        );
+        let lengths: Vec<usize> = write.segments.iter().map(|(_, len)| *len).collect();
+        assert_eq!(
+            lengths,
+            [
+                BEFORE_PATH.len(),
+                path.len(),
+                BEFORE_HOST.len(),
+                host.len(),
+                AFTER_HOST.len()
+            ],
+            "one run per piece, gathered rather than staged"
+        );
+        assert_eq!(
+            write.segments[1].0,
+            path.as_ptr() as usize,
+            "the path's own octets, not a copy of them"
+        );
+        assert_eq!(
+            write.segments[3].0,
+            host.as_ptr() as usize,
+            "and the host's own"
+        );
+        assert_eq!(write.calls, 1, "one gathered call carries all five runs");
     }
 
     #[test]
