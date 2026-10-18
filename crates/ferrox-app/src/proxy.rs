@@ -105,6 +105,27 @@ fn inbound_address(inbound: &Json) -> Option<String> {
     Some(address)
 }
 
+/// The address dokodemo-door rewrites every flow to; no usable target means the inbound serves nothing.
+fn dokodemo_target(inbound: &Json) -> Option<Destination> {
+    let settings = inbound.get("settings")?;
+    let address = settings.get("address").and_then(Json::as_str)?;
+    let port = settings.get("port").and_then(Json::as_port)?;
+    Some(match address.parse::<std::net::IpAddr>() {
+        Ok(ip) => Destination::Address(std::net::SocketAddr::new(ip, port)),
+        Err(_) => Destination::Name(address.to_owned(), port),
+    })
+}
+
+/// The networks dokodemo-door is told to carry; this binary relays the tcp flow.
+fn dokodemo_networks(inbound: &Json) -> Vec<&str> {
+    inbound
+        .get("settings")
+        .and_then(|s| s.get("network"))
+        .and_then(Json::as_str)
+        .map(|network| network.split(',').collect())
+        .unwrap_or_default()
+}
+
 fn serve_root(label: &str, root: &Json) -> ! {
     // Armed before the first inbound opens, so every flow from here reads the budget the operator named.
     crate::budgets::apply(
@@ -127,6 +148,7 @@ fn serve_root(label: &str, root: &Json) -> ! {
         selected => selected,
     };
     let mut inbounds = 0;
+    let dial = outbound.as_ref();
     let mut hysteria_served = false;
     if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
         for inbound in list {
@@ -184,6 +206,7 @@ fn serve_root(label: &str, root: &Json) -> ! {
                     thread::spawn(move || accept_loop(&address, &role));
                     inbounds += 1;
                 }
+                "dokodemo-door" => inbounds += serve_dokodemo(&address, inbound, dial, label),
                 "tun" => {
                     let Some(out) = outbound.clone() else {
                         continue;
@@ -233,7 +256,7 @@ fn refuse_inbound(protocol: &str, label: &str, inbound: &Json) {
 }
 
 /// Served inbounds; the `tun` device inbound opens a native interface and relays TCP flows.
-const SERVED_INBOUNDS: [&str; 9] = [
+const SERVED_INBOUNDS: [&str; 10] = [
     "vless",
     "trojan",
     "vmess",
@@ -243,6 +266,7 @@ const SERVED_INBOUNDS: [&str; 9] = [
     "http",
     "mixed",
     "tun",
+    "dokodemo-door",
 ];
 
 /// Whether this protocol is an inbound this binary serves.
@@ -505,6 +529,11 @@ enum Role {
     Mixed {
         out: Outbound,
     },
+    /// dokodemo-door: a raw stream to the address its config rewrites every flow to.
+    Dokodemo {
+        out: Outbound,
+        dest: Destination,
+    },
 }
 
 impl Role {
@@ -518,7 +547,9 @@ impl Role {
             | Role::Vmess { carrier, .. }
             | Role::Shadowsocks { carrier, .. } => carrier.tcp_mask(),
             // A front with no tcp carrier has nowhere to arm a chain, so its inbound refuses one.
-            Role::Socks { .. } | Role::Http { .. } | Role::Mixed { .. } => None,
+            Role::Socks { .. } | Role::Http { .. } | Role::Mixed { .. } | Role::Dokodemo { .. } => {
+                None
+            }
         }
     }
 }
@@ -810,6 +841,9 @@ fn accept_loop(address: &str, role: &Role) {
                 Role::Socks { out } => serve_socks(stream, &out),
                 Role::Http { out } => serve_http(stream, &out),
                 Role::Mixed { out } => serve_mixed(stream, &out),
+                Role::Dokodemo { out, dest } => {
+                    serve_connect(stream, &out, &dest, Front::Socks, &[]);
+                }
             }
         });
     }
@@ -3166,6 +3200,30 @@ fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
             },
         ),
     }
+}
+
+/// Bind a dokodemo-door flow and rewrite it to the target its config names, and say how many
+/// inbounds it armed. Only the tcp flow is served; a udp-only inbound is refused by name so it
+/// never reads as a silent no-op.
+fn serve_dokodemo(address: &str, inbound: &Json, out: Option<&Outbound>, label: &str) -> usize {
+    let Some(out) = out.cloned() else {
+        return 0;
+    };
+    let Some(dest) = dokodemo_target(inbound) else {
+        eprintln!("dokodemo-door rewrite target unusable in {label}: refused, not served");
+        return 0;
+    };
+    if !dokodemo_networks(inbound).contains(&"tcp") {
+        eprintln!("dokodemo-door without tcp in {label}: only the tcp flow is served");
+        return 0;
+    }
+    // A raw front has no tcp carrier to arm a chain on, so a masked inbound is refused rather than served unmasked.
+    if crate::config::has_tcp_mask(inbound.get("streamSettings")) {
+        eprintln!("dokodemo-door in {label} asks for a finalmask tcp chain it cannot arm");
+        return 0;
+    }
+    spawn_role(address, Role::Dokodemo { out, dest });
+    1
 }
 
 fn inbound_ss_destinations(inbound: &Json, method: &str) -> Vec<(Vec<u8>, SocketAddr)> {
@@ -10313,6 +10371,25 @@ mod tests {
     use crate::budgets::{HEAD_DEADLINE, RELAY_JOIN};
     use crate::config::{grpc_path, stream_carrier};
     use ferrox_core::finalmask::Chain;
+
+    #[test]
+    fn dokodemo_rewrites_to_the_named_address_and_port() {
+        let inbound = crate::json::parse(
+            r#"{"settings": {"address": "127.0.0.1", "port": 8080, "network": "tcp,udp"}}"#,
+        )
+        .expect("parses");
+        let dest = dokodemo_target(&inbound).expect("a rewrite target");
+        assert_eq!(dest.port(), 8080);
+        assert_eq!(dest.host(), "127.0.0.1");
+        assert_eq!(dokodemo_networks(&inbound), ["tcp", "udp"]);
+    }
+
+    #[test]
+    fn dokodemo_without_a_rewrite_target_serves_nothing() {
+        let inbound = crate::json::parse(r#"{"settings": {"network": "tcp"}}"#).expect("parses");
+        assert!(dokodemo_target(&inbound).is_none());
+        assert!(dokodemo_networks(&inbound).contains(&"tcp"));
+    }
 
     #[test]
     fn the_seam_split_find_across_agrees_with_the_per_byte_branch_scan() {

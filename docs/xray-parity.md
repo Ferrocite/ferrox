@@ -23,7 +23,7 @@ What runs against what: `xray-rust` interop (23 tests, seam `XRAY_VLESS_FULL_BIN
 | --- | --- |
 | VMess (AEAD) — full matrix: UDP over ws/grpc/xhttp/tls, all encodings | partial: no UDP except raw carrier; no auth-length framing bits (matches client default only) |
 | Trojan share-link `trojan://` parser | absent |
-| Dokodemo transparent inbound | planned (row 24) |
+| Dokodemo transparent inbound | tcp rewrite served (row 24); udp relay and the `SO_ORIGINAL_DST`/TPROXY transparent spelling planned |
 | Freedom — `domainStrategy`, fragment, dialer fields | direct dial (`Outbound::Freedom`); fragment/`domainStrategy`/`proxyProtocol`/dialer options planned (rows 117, 120) |
 | DNS proxy + fakeDNS + hosts + DoH/DoQ/local nameservers (`app/dns`) | planned (rows 26, 80) |
 | Blackhole outbound | planned (row 25) |
