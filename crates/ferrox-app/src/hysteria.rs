@@ -45,6 +45,8 @@ pub(crate) struct Session {
     shared: Arc<Mutex<quiche::Connection>>,
     sock: Arc<crate::quic::Datagram>,
     local: SocketAddr,
+    // Written once by `connect` from the auth response and read by the UDP dial that follows: a server that skips the lane header still carries TCP flows, so the flag gates datagrams only, never the connection.
+    udp_supported: bool,
 }
 
 fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
@@ -206,7 +208,7 @@ fn control_settings(session: &Session) -> bool {
     send_all(session, 2, &settings, true)
 }
 
-fn post_auth(session: &Session, host: &str, auth: &str) -> bool {
+fn post_auth(session: &Session, host: &str, auth: &str) -> Option<bool> {
     let mut block = Vec::with_capacity(64 + host.len() + auth.len());
     hysteria::build_auth_request(host, auth, &mut block);
     let mut frame = Vec::with_capacity(16 + block.len());
@@ -214,13 +216,11 @@ fn post_auth(session: &Session, host: &str, auth: &str) -> bool {
     frames::quic_varint(&mut frame, block.len() as u64);
     frame.extend_from_slice(&block);
     if !send_all(session, AUTH_STREAM, &frame, true) {
-        return false;
+        return None;
     }
     let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
-    let Some(body) = read_headers_block(session, AUTH_STREAM, deadline) else {
-        return false;
-    };
-    hysteria::verify_auth_response(&body)
+    let body = read_headers_block(session, AUTH_STREAM, deadline)?;
+    hysteria::read_auth_response(&body)
 }
 
 /// The handshakes this process has paid; a test watches a reused connection leave it untouched.
@@ -237,6 +237,8 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     getrandom::getrandom(&mut scid).ok()?;
     let cid = quiche::ConnectionId::from_ref(&scid);
     let mut config = crate::quic::quiche_config(roots, Some(dial.config.cc.quiche_name()))?;
+    // The client enables the datagram lane exactly as the served connection does: advertising it changes no stream byte of a TCP-only flow, and it is what lets `dgram_max_writable_len` answer for a UDP dial on this connection.
+    config.enable_dgram(true, 1024, 1024);
     let Ok(mut conn) = quiche::connect(Some(&dial.host), &cid, local, peer, &mut config) else {
         return None;
     };
@@ -245,17 +247,17 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
         None => crate::quic::Datagram::plain(sock),
     };
     crate::quic::drive_handshake(&mut conn, &sock, local)?;
-    let session = Session {
+    let mut session = Session {
         shared: Arc::new(Mutex::new(conn)),
         sock: Arc::new(sock),
         local,
+        udp_supported: false,
     };
     if !control_settings(&session) {
         return None;
     }
-    if !post_auth(&session, &dial.host, &dial.config.auth) {
-        return None;
-    }
+    let udp = post_auth(&session, &dial.host, &dial.config.auth)?;
+    session.udp_supported = udp;
     Some(session)
 }
 
@@ -283,6 +285,7 @@ impl Flow {
                 shared,
                 sock,
                 local,
+                udp_supported: false,
             },
             stream,
             backlog,
@@ -820,6 +823,162 @@ fn udp_reader(
     }
 }
 
+/// The one datagram flow a client association currently relays: the session id its datagrams carry (never reused on the connection, so a late server packet cannot misroute to a new flow) and the destination the socks front asked for, which is what a reply is re-wrapped with.
+struct Association {
+    session_id: u32,
+    destination: SocketAddr,
+}
+
+/// What the writer and the reader of one client association share: the flow now relayed, the reassembly its fragments feed, and the client address the relay last sent from. Only the writer rotates a flow, and only after the connection lock is held, so the reader never relays against a half-applied change and a retired flow's late datagrams land on the floor rather than on the new association.
+struct Lane {
+    flow: Mutex<Option<Association>>,
+    defrag: Mutex<Defrag>,
+    source: Mutex<Option<SocketAddr>>,
+}
+
+/// The client's UDP uplink over the hysteria carrier: read the relay socket, put every datagram on the connection's datagram lane, and let a companion thread drive the connection and carry replies back. One destination at a time — a change rotates the association, stamping a fresh session id that the connection has never used, over a connection of its own: the pool is a TCP instrument, its staleness caught by a flow's reply deadline a datagram send has no answer to, so a lane dials fresh and is live from the first packet. The relay's read timeout, `budgets::udp_idle()`, is already armed where the front was raised, so silence ends the loop and retires the association with its reader; a server that refused the lane in auth is answered in silence, as the references do. Salamander obfuscation, when the outbound names it, is already wrapped at the `quic::Datagram` seam by `connect`, so no byte of this path changes when the password is set.
+pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
+    let Some(session) = connect(dial) else {
+        return;
+    };
+    if !session.udp_supported {
+        return;
+    }
+    // The reader answers through its own handle on the same relay socket; a clone that fails means the front is already gone.
+    let Ok(reply) = relay.try_clone() else {
+        return;
+    };
+    let lane = Arc::new(Lane {
+        flow: Mutex::new(None),
+        defrag: Mutex::new(Defrag::new()),
+        source: Mutex::new(None),
+    });
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = std::thread::spawn({
+        let session = session.clone();
+        let lane = Arc::clone(&lane);
+        let stop = Arc::clone(&stop);
+        move || client_reader(&session, &lane, &stop, &reply)
+    });
+    let mut buf = vec![0u8; UDP_TARGET_BUF];
+    // One wire buffer and one packet buffer, kept at capacity across the association's life so a steady relay never reallocates. The fragment list is born in the loop because its messages borrow the message's own bytes.
+    let mut wire = Vec::with_capacity(UDP_TARGET_BUF + 64);
+    let mut out = Unfilled::<MAX_DATAGRAM>::new();
+    let mut packet = 0u16;
+    // Ids the lane stamps, taken in order and never reused on this connection, so a late reply to a retired flow cannot land on a new one.
+    let mut next_id = 1u32;
+    // The flow now relayed, cached off the rotation: the id it stamps, the destination compared per packet, and the string the wire's address field borrows — so no steady packet re-formats the address or takes the flow lock.
+    let mut relayed: Option<(u32, SocketAddr, String)> = None;
+    while let Ok((n, src)) = relay.recv_from(&mut buf) {
+        let Some((dest, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
+            continue;
+        };
+        if payload.is_empty() {
+            continue;
+        }
+        let Ok(mut conn) = session.shared.lock() else {
+            break;
+        };
+        if conn.is_closed() {
+            break;
+        }
+        // A connection that takes no datagrams cannot carry the lane.
+        let Some(max) = conn.dgram_max_writable_len() else {
+            break;
+        };
+        if let Ok(mut slot) = lane.source.lock() {
+            *slot = Some(src);
+        }
+        if relayed.as_ref().is_none_or(|(_, held, _)| *held != dest) {
+            let id = next_id;
+            next_id += 1;
+            let address = dest.to_string();
+            if let Ok(mut slot) = lane.flow.lock() {
+                *slot = Some(Association {
+                    session_id: id,
+                    destination: dest,
+                });
+            }
+            if let Ok(mut reassembly) = lane.defrag.lock() {
+                *reassembly = Defrag::new();
+            }
+            relayed = Some((id, dest, address));
+        }
+        let Some((session_id, _, address)) = &relayed else {
+            continue;
+        };
+        let session_id = *session_id;
+        packet = packet.wrapping_add(1);
+        let message = UdpMessage {
+            session: session_id,
+            packet,
+            frag: 0,
+            frags: 1,
+            address,
+            payload,
+        };
+        let mut frags = Vec::new();
+        if hysteria::fragment_udp(&message, max, &mut frags).is_err() {
+            continue;
+        }
+        for frag in &frags {
+            wire.clear();
+            if hysteria::encode_udp(frag, &mut wire).is_ok() {
+                let _ = conn.dgram_send(&wire);
+            }
+        }
+        flush(&session.sock, &mut conn, out.as_mut());
+    }
+    stop.store(true, Ordering::Relaxed);
+    let _ = reader.join();
+}
+
+/// Drive the connection and hand every whole datagram of the flow being relayed back to the relay socket, re-wrapped in the socks5 UDP frame the client sent its first packet in. The drive stays `drive_once`'s, shared with the TCP pump, so writer and reader take the connection lock in the same one-turn shape and neither holds it across a socket wait; the `UDP_POLL` bound is how long a stop flag outlives the reader, since a UDP socket has no shutdown to wake a blocked read.
+fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpSocket) {
+    let mut applied = None;
+    let mut reply = Vec::with_capacity(3 + 25 + UDP_TARGET_BUF);
+    loop {
+        if stop.load(Ordering::Relaxed) || !drive_once(session, UDP_POLL, &mut applied) {
+            break;
+        }
+        let Ok(mut conn) = session.shared.lock() else {
+            break;
+        };
+        while let Ok(data) = conn.dgram_recv_buf() {
+            let Ok(message) = hysteria::decode_udp(&data) else {
+                continue;
+            };
+            let Ok(held) = lane.flow.lock() else {
+                break;
+            };
+            let Some(association) = held.as_ref() else {
+                continue;
+            };
+            if message.session != association.session_id {
+                continue;
+            }
+            let destination = association.destination;
+            drop(held);
+            let Some((_address, payload)) = lane
+                .defrag
+                .lock()
+                .ok()
+                .and_then(|mut reassembly| reassembly.feed(&message).ok().flatten())
+            else {
+                continue;
+            };
+            let Some(src) = lane.source.lock().ok().and_then(|slot| *slot) else {
+                continue;
+            };
+            reply.clear();
+            reply.extend_from_slice(&[0, 0, 0]);
+            crate::proxy::push_socks_addr(&mut reply, &destination);
+            reply.extend_from_slice(&payload);
+            let _ = relay.send_to(&reply, src);
+        }
+    }
+}
+
 /// Fold every datagram that arrived on this connection into its session's reassembly and relay the whole messages to their target sockets, raising an association on a session's first datagram. A datagram before auth is not for the lane yet, and a reassembly that rejects a forged fragment retires its session.
 fn relay_datagrams(
     routes: &mut HashMap<Vec<u8>, Inbound>,
@@ -1178,6 +1337,7 @@ mod tests {
             shared: Arc::new(Mutex::new(conn)),
             sock: Arc::new(crate::quic::Datagram::plain(sock)),
             local,
+            udp_supported: false,
         }
     }
 
