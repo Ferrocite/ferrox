@@ -44,6 +44,7 @@ graph TD
 | framing-bytes-added | 0 | ferrox-app-httpheader::tests::header_carries_an_echo_over_loopback |
 | head-tail-read-syscalls | 0 | ferrox-app-httpheader::tests::the_bytes_behind_the_head_reach_the_relay_without_a_syscall |
 | head-tail-allocations | 0 | ferrox-app-httpheader::tests::the_record_head_hands_over_the_buffer_it_filled |
+| prefix-bytes-held-after-walk | 0 | ferrox-app-httpheader::tests::the_bytes_behind_the_head_reach_the_relay_without_a_syscall |
 | write-calls-per-dial | 1 | ferrox-app-httpheader::tests::the_request_reaches_the_write_as_the_runs_it_is_made_of |
 | request-staging-copies-per-dial | 0 | ferrox-app-httpheader::tests::the_request_reaches_the_write_as_the_runs_it_is_made_of |
 | request-buffer-allocations-per-dial | 0 | ferrox-app-httpheader::tests::the_request_reaches_the_write_as_the_runs_it_is_made_of |
@@ -86,6 +87,18 @@ returns `into_bytes()` (`xray-transport/src/headers/http.rs:201-225`), so a dial
 The price is named: the segment list is the shared `VECTOR_PARTS`-wide stack array every other
 carrier's frame write already fills, and the kernel copies five runs where it copied one. The
 user-space count is what `ops.yml` reads for this row, and a measured rise goes back.
+
+The head buffer after its walk. `HeadReader` keeps the read's own `Vec` so the octets pipelined
+behind the delimiter are delivered from where they landed, but once the last of them has been
+handed over nothing reads that buffer again, and a `clear` left its whole capacity — every byte of
+an 8 KiB-capped head — held idle for the life of the tunnel it was built on. The reader now drops
+it back to an empty `Vec` on the read that finishes the walk (the same shape `carrier-httpupgrade`
+already uses), so `prefix-bytes-held-after-walk` is `0`, witnessed by
+`the_bytes_behind_the_head_reach_the_relay_without_a_syscall`: the gate delivers the tail from the
+buffer it arrived in, asserts a zero-capacity prefix once it is spent, and then reaches the handle
+it had not touched for the tail. The handoff itself is unchanged — the release moves the single
+`dealloc` that used to wait for the connection to close up to the last delivered byte, so the
+syscall count, the copies, and the bytes on the wire are all exactly what they were.
 
 Three things on the read side are named because they are easy to get
 wrong rather than because they were fixed:
