@@ -68,7 +68,7 @@ What runs against what: `xray-rust` interop (23 tests, seam `XRAY_VLESS_FULL_BIN
 | `app/commander` gRPC API (config/inbound/outbound/log/router/stats) | planned (row 82) |
 | Geodata (.dat) loader/downloader | planned (row 78) |
 | Sniffer (HTTP/TLS/QUIC/bittorrent) + dispatcher sniffer | planned (engine-sniffing) |
-| Config schema for every protocol (`infra/conf`) | ferrox-app's own JSON dialect; the protobuf `xray.core.Config` covers the shapes the http, dokodemo, vmess and vless scenarios write (`xray_pb.rs`), every other field refused by number or name |
+| Config schema for every protocol (`infra/conf`) | ferrox-app's own JSON dialect; the protobuf `xray.core.Config` covers the shapes the http, dokodemo, vmess, vless and shadowsocks scenarios write (`xray_pb.rs`), every other field refused by number or name |
 | OCSP, antireplay, time-window caches | planned |
 | Freedom fragment, VLESS encryption fragment | planned (rows 117, 34) |
 | finalmask: fragment, header/custom, noise, realm, salamander, sudoku, udphop, xdns, xicmp, xmc | `fragment` done (row 31), salamander on hysteria, mkcp-legacy on KCP; the rest planned (`obfs-finalmask`) |
