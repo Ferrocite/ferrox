@@ -1087,6 +1087,15 @@ mod tests {
         chunks: Vec<Vec<u8>>,
     }
 
+    /// One `UFLOW` line of the same script: a client source port, a destination, and
+    /// each datagram body, rendered by the oracle as one independent IPv4 UDP packet.
+    #[cfg(unix)]
+    struct DatagramSpec {
+        destination: SocketAddr,
+        source_port: u16,
+        datagrams: Vec<Vec<u8>>,
+    }
+
     #[cfg(unix)]
     const SCRIPT_CLIENT: [u8; 4] = [10, 0, 0, 2];
 
@@ -1099,11 +1108,11 @@ mod tests {
                 continue;
             }
             let mut fields = line.split_whitespace();
-            assert_eq!(
-                fields.next(),
-                Some("FLOW"),
-                "the script holds only FLOW lines"
-            );
+            match fields.next() {
+                Some("FLOW") => {}
+                Some("UFLOW") => continue,
+                other => panic!("the script holds only FLOW and UFLOW lines, found {other:?}"),
+            }
             let destination = fields.next().unwrap().parse().unwrap();
             let source_port = fields.next().unwrap().parse().unwrap();
             let syn_seq = fields.next().unwrap().parse().unwrap();
@@ -1118,10 +1127,37 @@ mod tests {
         flows
     }
 
-    /// One `DIAL` line of the golden: the target address the stack dialed and every
-    /// payload byte the stack handed up on that flow, to EOF.
     #[cfg(unix)]
-    fn parse_expected(text: &str) -> Vec<(String, Vec<u8>)> {
+    fn parse_datagram_script(text: &str) -> Vec<DatagramSpec> {
+        let mut flows = Vec::new();
+        for line in text.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let mut fields = line.split_whitespace();
+            match fields.next() {
+                Some("UFLOW") => {}
+                Some("FLOW") => continue,
+                other => panic!("the script holds only FLOW and UFLOW lines, found {other:?}"),
+            }
+            let destination = fields.next().unwrap().parse().unwrap();
+            let source_port = fields.next().unwrap().parse().unwrap();
+            let datagrams = fields.map(hex_decode).collect();
+            flows.push(DatagramSpec {
+                destination,
+                source_port,
+                datagrams,
+            });
+        }
+        flows
+    }
+
+    /// The dial set the golden records for one transport: every `<keyword> <target>
+    /// <hex>` line, sorted. `DIAL` is the TCP half and `UDIAL` the datagram half, so
+    /// one file carries both and each differential reads its own kind.
+    #[cfg(unix)]
+    fn parse_dials(text: &str, keyword: &str) -> Vec<(String, Vec<u8>)> {
         let mut dials = Vec::new();
         for line in text.lines() {
             let line = line.trim();
@@ -1129,11 +1165,9 @@ mod tests {
                 continue;
             }
             let mut fields = line.split_whitespace();
-            assert_eq!(
-                fields.next(),
-                Some("DIAL"),
-                "the golden holds only DIAL lines"
-            );
+            if fields.next() != Some(keyword) {
+                continue;
+            }
             dials.push((
                 fields.next().unwrap().to_owned(),
                 hex_decode(fields.next().unwrap()),
@@ -1261,7 +1295,10 @@ mod tests {
     #[test]
     fn the_dial_set_matches_the_pinned_stream() {
         let flows = parse_script(include_str!("../../../scripts/tun-oracle/script.txt"));
-        let expected = parse_expected(include_str!("../../../scripts/tun-oracle/expected.txt"));
+        let expected = parse_dials(
+            include_str!("../../../scripts/tun-oracle/expected.txt"),
+            "DIAL",
+        );
         let results = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (a, mut peer) = peer_with_deadline().unwrap();
         let mut handler = Handler::new(
@@ -1395,6 +1432,101 @@ mod tests {
         let (udp, payload) = udp_head(body).unwrap();
         assert_eq!((udp.source_port, udp.destination_port), (53, 51500));
         assert_eq!(payload, b"who-is");
+    }
+
+    /// A recording association: the SOCKS5 UDP server the device's leg reaches, but
+    /// it keeps each frame's (target, datagram) instead of echoing, so the outbound
+    /// half of the datagram lane is witnessed without dialing a real target.
+    #[cfg(unix)]
+    fn recording_associate(dials: Dials) -> Associate {
+        use std::io::Write;
+        Arc::new(move |mut client: Connection| {
+            let mut greeting = [0u8; 3];
+            if client.read_exact(&mut greeting).is_err() || client.write_all(&[5, 0]).is_err() {
+                return;
+            }
+            let mut request = [0u8; 10];
+            if client.read_exact(&mut request).is_err() {
+                return;
+            }
+            let Ok(relay) = UdpSocket::bind("127.0.0.1:0") else {
+                return;
+            };
+            let Ok(addr) = relay.local_addr() else {
+                return;
+            };
+            let mut reply = vec![5, 0, 0];
+            crate::proxy::push_socks_addr(&mut reply, &addr);
+            if client.write_all(&reply).is_err() {
+                return;
+            }
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let Ok((n, _src)) = relay.recv_from(&mut buf) else {
+                    return;
+                };
+                if let Some((target, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) {
+                    dials
+                        .lock()
+                        .unwrap()
+                        .push((target.to_string(), payload.to_vec()));
+                }
+            }
+        })
+    }
+
+    /// The row's datagram identity claim, checked against the reference stack rather
+    /// than the spec's own frame: the set of (target, datagram) the inbound hands to
+    /// its association equals the golden `scripts/tun-oracle` recorded by running
+    /// smoltcp's UDP socket over the same pinned stream. Where it bites and the
+    /// frame test does not: two bodies to one port stay two dials (a datagram is
+    /// never coalesced the way a TCP stream is), a body shaped like a frame header
+    /// survives verbatim, and an odd length is delivered whole.
+    #[cfg(unix)]
+    #[test]
+    fn the_datagram_dial_set_matches_the_pinned_stream() {
+        let flows = parse_datagram_script(include_str!("../../../scripts/tun-oracle/script.txt"));
+        let expected = parse_dials(
+            include_str!("../../../scripts/tun-oracle/expected.txt"),
+            "UDIAL",
+        );
+        let wanted: usize = flows.iter().map(|flow| flow.datagrams.len()).sum();
+        let dials: Dials = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let relay: Relay = Arc::new(|_conn, _dest| {});
+        let mut handler = Handler::new(
+            Device::from_handle(a, DEFAULT_MTU),
+            relay,
+            recording_associate(dials.clone()),
+        );
+
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        for flow in &flows {
+            let SocketAddr::V4(destination) = flow.destination else {
+                panic!("the script names IPv4 destinations only");
+            };
+            let dst = destination.ip().octets();
+            for body in &flow.datagrams {
+                let packet = datagram(
+                    SCRIPT_CLIENT,
+                    dst,
+                    flow.source_port,
+                    destination.port(),
+                    body,
+                );
+                peer.write_all(&packet).unwrap();
+                let n = handler.device.read_packet(&mut buf).unwrap();
+                handler.dispatch(&buf[..n]).unwrap();
+            }
+        }
+        wait_for(&dials, wanted);
+
+        let mut got: Vec<(String, Vec<u8>)> = dials.lock().unwrap().clone();
+        got.sort();
+        assert_eq!(
+            got, expected,
+            "the datagram dial set is the reference's own"
+        );
     }
 
     /// A nonblocking peer: a frame that never arrives fails the assertions instead
