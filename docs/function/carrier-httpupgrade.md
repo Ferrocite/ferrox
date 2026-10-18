@@ -368,6 +368,45 @@ nowhere to put the tail — and which five claims about this carrier are false:
   every budget, now dialled through the same `Recorder`. What did not move: the
   bytes, their order, and the request line's independence from the budget.
 
+### The floor, argued
+
+Each of the four kinds this row was hunted for is resolved, and the residue is
+named rather than kept quietly.
+
+- **A `Vec` that reallocates under steady traffic** — closed: the dial stages its
+  request in the thread's own buffer, so a repeat dial enters no allocator.
+- **A second copy of a payload already in the caller's buffer** — closed: the
+  riding payload reaches the writer as the caller's own slice by pointer
+  (`the_early_data_rides_in_one_write_with_the_request`) and the head's tail is
+  handed over inside the buffer the head read filled
+  (`the_record_head_hands_over_the_buffer_it_filled`).
+- **A per-record buffer that could be reused** — none is held. The record lane
+  stacks four `IoSlice`s in `coalesce` and a fifth piece would heap-allocate,
+  which is why the ride stays two segments. The buffers that remain belong to one
+  connection for its life — the head `Vec`, one 512-byte reservation grown in
+  `HEAD_ROUND` rounds by `kept_head_rounds` — and reusing those needs a pool.
+  That read is shared with `ws`, `grpc`, `xhttp` and `http-header`, so pooling it
+  is a shared-infrastructure slice and not this row's.
+- **A zero-fill before a read that overwrites every byte** — the head read, the
+  relay and the pump buffers are all `with_capacity` plus `set_len`, so they are
+  allocated and not filled. The one fill left in this file is `quiet`'s 4 KiB
+  teardown scratch (`httpupgrade.rs:53`). Removing it takes `MaybeUninit`, and the
+  only counter that sees a stack fill is an instruction count: `httpupgrade`
+  blesses no symbol and this platform has no valgrind, so the number would be a CI
+  figure nobody had read before writing it down. *Unsafe only for a measured win*
+  refuses that, and the row above stays `UNBLESSED`.
+
+`quiet`'s first read parks for a whole `SESSION_POLL` (1 ms) on the ordinary exit
+where nothing was pipelined, and the handshake looks as if it already knows that —
+one comparison, `at == prefix.len()`. It does not: the dial's `ed=0` path writes
+the request, reads the `101`, then writes its payload as a *second* write, so those
+octets can reach the receive queue before the close, and a queue left unread at
+close is answered with the RST that discards the `101`
+(`a_drained_teardown_ends_the_upgrade_with_a_fin`). `at == prefix.len()` proves
+only that the last round over-read nothing, so skipping the drain on it trades a
+bounded 1 ms for a race spread over the whole connection. The bound is the feature
+and the park stays.
+
 ## Pins
 
 | what | where |
