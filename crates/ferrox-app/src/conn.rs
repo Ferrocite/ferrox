@@ -22,14 +22,64 @@ use std::os::unix::net::{UnixListener, UnixStream};
 #[cfg(unix)]
 use std::path::PathBuf;
 
-/// A live proxy connection: a TCP stream, or on a Unix host an `AF_UNIX` stream, carried the
-/// same way. Every method forwards to whichever it holds, so the relay, the carriers and the
-/// handshake never learn which family they were handed.
+/// A live proxy connection: a TCP stream, that stream under a post-TLS write mask, or on a Unix
+/// host an `AF_UNIX` stream, carried the same way. Every method forwards to whichever it holds,
+/// so the relay, the carriers and the handshake never learn which family they were handed.
 #[derive(Debug)]
 pub(crate) enum Connection {
     Tcp(TcpStream),
+    Masked(Masked),
     #[cfg(unix)]
     Unix(UnixStream),
+}
+
+/// A TCP stream with the `finalmask` chain under it, which is what the reference's wrapped conn
+/// is: reads, timeouts, addresses and teardown reach the socket itself and only writes pass through
+/// the chain. The chain is shared behind a lock because a cloned handle must keep counting the same
+/// writes, and because a relay leg holds its stream by shared reference.
+#[derive(Debug)]
+pub(crate) struct Masked {
+    stream: TcpStream,
+    chain: std::sync::Arc<std::sync::Mutex<ferrox_core::finalmask::Chain>>,
+}
+
+impl Masked {
+    /// The chain's write over a shared handle: the socket side is `&TcpStream`, which `std` also
+    /// makes a writer, so a leg drained by reference masks exactly as one moved by value.
+    fn send(&self, buf: &[u8]) -> io::Result<usize> {
+        // A stage never panics while held, so a poisoned lock is a broken process, not a wire state.
+        let Ok(mut chain) = self.chain.lock() else {
+            return Err(io::Error::other("the mask chain is gone"));
+        };
+        chain.write(&mut &self.stream, buf)
+    }
+
+    // A chain is a byte writer, so a gathered write answers its first run and the caller's loop hands the rest over as the write it would have been.
+    fn send_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        bufs.first().map_or(Ok(0), |first| self.send(first))
+    }
+}
+
+impl Connection {
+    /// The same socket with this chain's clone beneath it; `None`, or a chain with no stage, leaves
+    /// the stream exactly as it came, which is the ordinary case.
+    pub(crate) fn with_mask(self, mask: Option<&ferrox_core::finalmask::Chain>) -> Self {
+        match (self, mask.filter(|chain| !chain.is_empty())) {
+            (Connection::Tcp(stream), Some(chain)) => Connection::Masked(Masked {
+                stream,
+                chain: std::sync::Arc::new(std::sync::Mutex::new(chain.clone())),
+            }),
+            (this, _) => this,
+        }
+    }
+
+    /// Whether a write to this stream must pass the chain, which a descriptor-level fast path
+    /// addressing the socket would skip. Reads, teardown and the census are unaffected by it.
+    /// Only linux has such a lane to gate, so only linux builds the question.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn masked(&self) -> bool {
+        matches!(self, Connection::Masked(_))
+    }
 }
 
 impl From<TcpStream> for Connection {
@@ -45,27 +95,30 @@ impl From<UnixStream> for Connection {
     }
 }
 
-/// The raw descriptor the vectored-write and splice fast paths address. Both families are
-/// sockets, so `writev`/`splice` reach the queue identically; `AsRawFd` is a Unix trait, and on
-/// a non-Unix host a `Connection` is TCP-only and those `#[cfg(unix)]` paths are not built.
+/// The raw descriptor the vectored-write and splice fast paths address. Every arm is a socket, so
+/// `writev`/`splice` reach the queue identically and a masked stream answers with the socket its
+/// chain writes through; `AsRawFd` is a Unix trait, and on a non-Unix host a `Connection` is
+/// TCP-only and those `#[cfg(unix)]` paths are not built.
 #[cfg(unix)]
 impl std::os::fd::AsRawFd for Connection {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
         match self {
             Connection::Tcp(stream) => stream.as_raw_fd(),
+            Connection::Masked(masked) => masked.stream.as_raw_fd(),
             Connection::Unix(stream) => stream.as_raw_fd(),
         }
     }
 }
 
 /// The same descriptor under the Windows spelling, so `census::handle` reads a `Connection` the
-/// way it reads a `TcpStream` there. A Windows `Connection` only ever holds a TCP stream, since
-/// the `AF_UNIX` arm is `#[cfg(unix)]`, so this forwards unconditionally.
+/// way it reads a `TcpStream` there. A Windows `Connection` only ever holds a TCP stream, whether
+/// masked or not, since the `AF_UNIX` arm is `#[cfg(unix)]`, so this forwards to the socket.
 #[cfg(windows)]
 impl std::os::windows::io::AsRawSocket for Connection {
     fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
         match self {
             Connection::Tcp(stream) => stream.as_raw_socket(),
+            Connection::Masked(masked) => masked.stream.as_raw_socket(),
         }
     }
 }
@@ -79,6 +132,7 @@ impl Read for Connection {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Connection::Tcp(stream) => stream.read(buf),
+            Connection::Masked(masked) => masked.stream.read(buf),
             #[cfg(unix)]
             Connection::Unix(stream) => stream.read(buf),
         }
@@ -87,6 +141,7 @@ impl Read for Connection {
     fn read_vectored(&mut self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
         match self {
             Connection::Tcp(stream) => stream.read_vectored(bufs),
+            Connection::Masked(masked) => masked.stream.read_vectored(bufs),
             #[cfg(unix)]
             Connection::Unix(stream) => stream.read_vectored(bufs),
         }
@@ -97,6 +152,7 @@ impl Write for Connection {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             Connection::Tcp(stream) => stream.write(buf),
+            Connection::Masked(masked) => masked.send(buf),
             #[cfg(unix)]
             Connection::Unix(stream) => stream.write(buf),
         }
@@ -106,6 +162,7 @@ impl Write for Connection {
     fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
         match self {
             Connection::Tcp(stream) => stream.write_vectored(bufs),
+            Connection::Masked(masked) => masked.send_vectored(bufs),
             #[cfg(unix)]
             Connection::Unix(stream) => stream.write_vectored(bufs),
         }
@@ -114,18 +171,23 @@ impl Write for Connection {
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Connection::Tcp(stream) => stream.flush(),
+            Connection::Masked(masked) => masked.stream.flush(),
             #[cfg(unix)]
             Connection::Unix(stream) => stream.flush(),
         }
     }
 }
 
-// A socket answers on a shared descriptor, so `std` impls `Read`/`Write` for `&TcpStream` and the relay drains each leg by shared reference; `&Connection` does the same for whichever arm it holds.
+// A socket answers on a shared descriptor, so `std` impls `Read`/`Write` for `&TcpStream` and the relay drains each leg by shared reference; `&Connection` does the same for whichever arm it holds, and a masked leg's writes reach its chain the same way.
 impl Read for &Connection {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match *self {
             Connection::Tcp(stream) => {
                 let mut inner = stream;
+                inner.read(buf)
+            }
+            Connection::Masked(masked) => {
+                let mut inner = &masked.stream;
                 inner.read(buf)
             }
             #[cfg(unix)]
@@ -140,6 +202,10 @@ impl Read for &Connection {
         match *self {
             Connection::Tcp(stream) => {
                 let mut inner = stream;
+                inner.read_vectored(bufs)
+            }
+            Connection::Masked(masked) => {
+                let mut inner = &masked.stream;
                 inner.read_vectored(bufs)
             }
             #[cfg(unix)]
@@ -158,6 +224,7 @@ impl Write for &Connection {
                 let mut inner = stream;
                 inner.write(buf)
             }
+            Connection::Masked(masked) => masked.send(buf),
             #[cfg(unix)]
             Connection::Unix(stream) => {
                 let mut inner = stream;
@@ -172,6 +239,7 @@ impl Write for &Connection {
                 let mut inner = stream;
                 inner.write_vectored(bufs)
             }
+            Connection::Masked(masked) => masked.send_vectored(bufs),
             #[cfg(unix)]
             Connection::Unix(stream) => {
                 let mut inner = stream;
@@ -186,6 +254,10 @@ impl Write for &Connection {
                 let mut inner = stream;
                 inner.flush()
             }
+            Connection::Masked(masked) => {
+                let mut inner = &masked.stream;
+                inner.flush()
+            }
             #[cfg(unix)]
             Connection::Unix(stream) => {
                 let mut inner = stream;
@@ -196,10 +268,18 @@ impl Write for &Connection {
 }
 
 impl Connection {
-    /// A second handle to the same socket, so a relay reads on one leg and writes on the other.
+    /// A second handle to the same socket, so a relay reads on one leg and writes on the other. A
+    /// masked handle shares its chain rather than starting a fresh one, because the reference's
+    /// wrapped conn counts writes once per connection, not once per handle.
     pub(crate) fn try_clone(&self) -> io::Result<Connection> {
         match self {
             Connection::Tcp(stream) => stream.try_clone().map(Connection::Tcp),
+            Connection::Masked(masked) => masked.stream.try_clone().map(|stream| {
+                Connection::Masked(Masked {
+                    stream,
+                    chain: std::sync::Arc::clone(&masked.chain),
+                })
+            }),
             #[cfg(unix)]
             Connection::Unix(stream) => stream.try_clone().map(Connection::Unix),
         }
@@ -209,6 +289,7 @@ impl Connection {
     pub(crate) fn shutdown(&self, how: Shutdown) -> io::Result<()> {
         match self {
             Connection::Tcp(stream) => stream.shutdown(how),
+            Connection::Masked(masked) => masked.stream.shutdown(how),
             #[cfg(unix)]
             Connection::Unix(stream) => stream.shutdown(how),
         }
@@ -220,6 +301,7 @@ impl Connection {
     pub(crate) fn peek(&self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Connection::Tcp(stream) => stream.peek(buf),
+            Connection::Masked(masked) => masked.stream.peek(buf),
             #[cfg(unix)]
             Connection::Unix(stream) => unix_peek(stream, buf),
         }
@@ -232,6 +314,7 @@ impl Connection {
     pub(crate) fn peer_addr(&self) -> io::Result<SocketAddr> {
         match self {
             Connection::Tcp(stream) => stream.peer_addr(),
+            Connection::Masked(masked) => masked.stream.peer_addr(),
             #[cfg(unix)]
             Connection::Unix(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -245,6 +328,7 @@ impl Connection {
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
         match self {
             Connection::Tcp(stream) => stream.local_addr(),
+            Connection::Masked(masked) => masked.stream.local_addr(),
             #[cfg(unix)]
             Connection::Unix(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -259,6 +343,7 @@ impl Connection {
     pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         match self {
             Connection::Tcp(stream) => stream.set_read_timeout(timeout),
+            Connection::Masked(masked) => masked.stream.set_read_timeout(timeout),
             #[cfg(unix)]
             Connection::Unix(stream) => set_socket_timeout(stream, libc::SO_RCVTIMEO, timeout),
         }
@@ -268,6 +353,7 @@ impl Connection {
     pub(crate) fn set_write_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         match self {
             Connection::Tcp(stream) => stream.set_write_timeout(timeout),
+            Connection::Masked(masked) => masked.stream.set_write_timeout(timeout),
             #[cfg(unix)]
             Connection::Unix(stream) => set_socket_timeout(stream, libc::SO_SNDTIMEO, timeout),
         }
@@ -279,6 +365,7 @@ impl Connection {
     pub(crate) fn read_timeout(&self) -> io::Result<Option<Duration>> {
         match self {
             Connection::Tcp(stream) => stream.read_timeout(),
+            Connection::Masked(masked) => masked.stream.read_timeout(),
             #[cfg(unix)]
             Connection::Unix(stream) => get_socket_timeout(stream, libc::SO_RCVTIMEO),
         }
@@ -291,6 +378,7 @@ impl Connection {
     pub(crate) fn set_nodelay(&self, nodelay: bool) -> io::Result<()> {
         match self {
             Connection::Tcp(stream) => stream.set_nodelay(nodelay),
+            Connection::Masked(masked) => masked.stream.set_nodelay(nodelay),
             #[cfg(unix)]
             Connection::Unix(_) => Ok(()),
         }
@@ -510,6 +598,7 @@ impl Connection {
     pub(crate) fn nodelay(&self) -> io::Result<bool> {
         match self {
             Connection::Tcp(stream) => stream.nodelay(),
+            Connection::Masked(masked) => masked.stream.nodelay(),
             #[cfg(unix)]
             Connection::Unix(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -613,7 +702,9 @@ mod tests {
             .expect("arms a read timeout on a unix stream");
         let mut reader = match server {
             Connection::Unix(stream) => stream,
-            Connection::Tcp(_) => unreachable!("a unix pair yields a unix stream"),
+            Connection::Tcp(_) | Connection::Masked(_) => {
+                unreachable!("a unix pair yields a unix stream")
+            }
         };
         let mut buf = [0u8; 4];
         let error = reader
