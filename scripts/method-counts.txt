@@ -330,3 +330,4 @@ front-tun ops-retired-instructions UNBLESSED scripts/count-ops.sh
 front-tun dial-set-flows-matching-the-pinned-stack 3 ferrox-app-tun::tests::the_dial_set_matches_the_pinned_stream
 front-tun reverse-role-response-round-trips 1 ferrox-app-tun::tests::the_response_bytes_come_back_as_ip_packets
 front-tun parse-copies-per-packet 0 ferrox-app-tun::tests::the_payload_is_borrowed_from_the_read_buffer
+front-tun flows-handed-back-at-the-idle-budget 2 ferrox-app-tun::tests::a_quiet_tun_flow_hands_its_threads_back
