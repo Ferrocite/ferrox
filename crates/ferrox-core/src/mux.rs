@@ -388,7 +388,7 @@ pub fn decode(buf: &[u8], tail: NewTail) -> Result<(Incoming<'_>, usize), Error>
     };
 
     // One bounded load of the fixed head: four indexed reads would each carry their own length check although `meta_len >= FIXED` proved the bytes are here.
-    let Some((&fixed, _)) = meta.split_first_chunk::<FIXED>() else {
+    let Some((&fixed, rest)) = meta.split_first_chunk::<FIXED>() else {
         return Err(Error::Truncated);
     };
     let id = u16::from_be_bytes([fixed[0], fixed[1]]);
@@ -397,8 +397,13 @@ pub fn decode(buf: &[u8], tail: NewTail) -> Result<(Incoming<'_>, usize), Error>
 
     let mut at = FIXED;
     let mut target = None;
-    let udp = meta.get(at) == Some(&Network::Udp.byte());
-    if status == Status::New || (status == Status::Keep && udp) {
+    // Only `New`, or a `Keep` whose metadata reaches past the fixed head and names UDP, carries a target; `rest` is already cut at that boundary, so the bulk TCP `Keep` sees it empty and pays neither the byte compare nor the option it used to build to ask.
+    let carries = match status {
+        Status::New => true,
+        Status::Keep => matches!(rest.first(), Some(&byte) if byte == Network::Udp.byte()),
+        Status::End | Status::KeepAlive => false,
+    };
+    if carries {
         let (found, used) = Target::take(&meta[at..])?;
         at += used;
         target = Some(found);
@@ -849,6 +854,20 @@ mod tests {
         assert_eq!(frame, again, "decoding is a function of the bytes");
     }
 
+    /// `decode` driven over one fixed frame, again and again, so a callgrind
+    /// frame prices the decoder and nothing else: no socket, no allocation, no
+    /// fixture — the fold is the only other work in the loop. This is the probe
+    /// the `mux-cool` decode row in `scripts/method-ops.txt` points at.
+    #[test]
+    fn the_decode_probe_costs_the_frame_walk_and_nothing_else() {
+        let mut sink = 0usize;
+        for _ in 0..4096 {
+            let (frame, used) = decode(&NEW_DOMAIN, NewTail::Forward).expect("decodes");
+            sink += used + frame.data.map_or(0, <[u8]>::len) + usize::from(frame.id);
+        }
+        assert_eq!(sink, 4096 * (NEW_DOMAIN.len() + 4 + 1), "the loop ran");
+    }
+
     #[test]
     fn the_ipv4_and_ipv6_families_sit_where_the_field_says() {
         let v4 = Outgoing {
@@ -976,6 +995,68 @@ mod tests {
         let frame = decode(&buf[..n], NewTail::Forward).expect("decodes").0;
         assert_eq!(frame.target, None, "no network byte, no address");
         assert_eq!(frame.data, Some(&b"hi"[..]));
+    }
+    /// The head split cut the metadata at the fixed boundary once for all four
+    /// statuses, and which shapes still carry a target plus how many bytes a
+    /// frame consumes is the only thing that decision had to preserve. This walks
+    /// every status against a bare head, a head naming UDP, and a head naming
+    /// TCP — the last a `Keep` forging a destination the encoder itself refuses —
+    /// and pins the target/no-target answer and the consumed length, so the
+    /// per-frame probe that used to ask cannot be missed.
+    #[test]
+    fn every_status_decides_its_target_from_the_bytes_a_head_split_reveals() {
+        let shapes: [(Option<Network>, &[u8]); 3] = [
+            (None, &[]),
+            (
+                Some(Network::Udp),
+                &[Network::Udp.byte(), 0, 53, 1, 192, 0, 2, 9],
+            ),
+            (
+                Some(Network::Tcp),
+                &[Network::Tcp.byte(), 1, 187, 1, 192, 0, 2, 9],
+            ),
+        ];
+        for status in [Status::New, Status::Keep, Status::End, Status::KeepAlive] {
+            for (net, trailing) in shapes {
+                let mut meta = vec![0, 5, status.byte(), 0];
+                meta.extend_from_slice(trailing);
+                let mut frame = vec![(meta.len() >> 8) as u8, (meta.len() & 0xff) as u8];
+                frame.extend_from_slice(&meta);
+                // a New with no trailing metadata promises a target it cannot find: the probe and the match both reach the same Truncated
+                if status == Status::New && trailing.is_empty() {
+                    assert_eq!(
+                        decode(&frame, NewTail::Forward),
+                        Err(Error::Truncated),
+                        "{status:?}: a New with nowhere to read its target"
+                    );
+                    continue;
+                }
+                let (decoded, used) = decode(&frame, NewTail::Forward)
+                    .unwrap_or_else(|e| panic!("{status:?} net {net:?}: {e}"));
+                let want = match status {
+                    Status::New => true,
+                    Status::Keep => net == Some(Network::Udp),
+                    Status::End | Status::KeepAlive => false,
+                };
+                assert_eq!(
+                    decoded.target.is_some(),
+                    want,
+                    "{status:?} net {net:?}: the target decision moved"
+                );
+                if want {
+                    assert_eq!(
+                        decoded.target.unwrap().network,
+                        net.expect("a decided target names a transport"),
+                        "{status:?}: the wrong transport was read"
+                    );
+                }
+                assert_eq!(
+                    used,
+                    2 + meta.len(),
+                    "{status:?} net {net:?}: the consumed length moved"
+                );
+            }
+        }
     }
 
     #[test]
