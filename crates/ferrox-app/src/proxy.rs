@@ -17693,8 +17693,7 @@ mod tests {
         let address = listener.local_addr().expect("address");
         let source = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let mut feeder = Connection::connect(source.local_addr().expect("address")).expect("dials");
-        let (stream, _) = source.accept().expect("accepts the feeder");
-        let mut from = Connection::from(stream);
+        let (mut from, _) = source.accept().expect("accepts the feeder");
         let mut to = Connection::connect(address)
             .expect("connects")
             .with_mask(carrier.tcp_mask());
