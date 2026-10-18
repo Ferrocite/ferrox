@@ -15,7 +15,8 @@ pub const PING: u8 = 0x6;
 pub const GOAWAY: u8 = 0x7;
 pub const WINDOW_UPDATE: u8 = 0x8;
 
-const END_STREAM: u8 = 0x1;
+/// The flag a DATA or HEADERS frame carries when it is the stream's last.
+pub const END_STREAM: u8 = 0x1;
 const PADDED: u8 = 0x8;
 const FLAG_ACK: u8 = 0x1;
 
