@@ -4,7 +4,10 @@ A `tun` inbound opens a virtual network device and reads raw IPv4 packets off
 it; every TCP flow the packets form becomes a proxy dial through the machinery
 the tree already had, and the bytes that come back leave again as IP packets on
 the same descriptor. Both roles the row has are served and both are proved:
-device-to-dial and dial-to-device.
+device-to-dial and dial-to-device. A flow also *ends*: the response read is
+armed at the idle budget, so a peer that stops speaking hands its thread, its
+pair and the relay leg it holds back instead of parking them for the life of
+the process.
 
 A device carries no wire byte-stream to diff, so this row's identity claim is
 the (target, payload) dial set: the pairs the inbound produces from a pinned
@@ -36,9 +39,12 @@ graph TD
     D --> E["SYN: accept_flow<br/>SYN-ACK written on the device, loopback pair opened"]
     E --> F["relay: serve_connect over the pair<br/>Front::Socks — the front layer's own dial"]
     D --> G["segment with payload: write_all to the pair<br/>rcv_nxt advances; delayed ACK at push, finish, or MTU"]
-    F --> H["response thread: reads the pair's other half"]
+    F --> H["response thread: reads the pair's other half<br/>armed at the idle budget"]
     H --> I["build_tcp_packet<br/>PSH|ACK, snd_nxt cursor"]
     I --> C
+    H --> J["budget expires twice with neither side speaking<br/>shutdown both halves, send the key"]
+    J --> K["accept_flow drains ended keys<br/>flows.remove, so the packet path pays nothing"]
+    E --> K
 ```
 
 ## Measured
@@ -50,6 +56,7 @@ graph TD
 | dial-set-flows-matching-the-pinned-stack | 3 | ferrox-app-tun::tests::the_dial_set_matches_the_pinned_stream |
 | reverse-role-response-round-trips | 1 | ferrox-app-tun::tests::the_response_bytes_come_back_as_ip_packets |
 | parse-copies-per-packet | 0 | ferrox-app-tun::tests::the_payload_is_borrowed_from_the_read_buffer |
+| flows-handed-back-at-the-idle-budget | 2 | ferrox-app-tun::tests::a_quiet_tun_flow_hands_its_threads_back |
 <!-- counts:end -->
 
 The first row is the identity claim itself: three flows — a request line, a
@@ -60,13 +67,23 @@ them back as an IP packet carrying those bytes on the same descriptor. The
 copies row is gated by pointer identity, not bytes:
 `the_payload_is_borrowed_from_the_read_buffer` asserts the parsed payload's
 base *is* the read buffer plus the fixed headers, because a byte test passes
-with a parsing copy and without one.
+with a parsing copy and without one. The last row is the lifetime claim: two
+flows opened against a relay that reads to EOF and reports back — one ended by
+silence past the armed idle budget, one ended by the client's RST inside it —
+and both must report back, with the quiet flow's entry already gone from the
+table at the next dial and the reset flow's gone at once. Before the arm, a
+peer that stopped speaking left the response thread parked in an untimed
+`read(2)` for the life of the process: one thread, one loopback pair, one relay
+leg and — under a `foxy` outbound — one tunnel and its lane, per dead flow,
+which is what a long `--vpn` session's thread count was climbing.
 
 Syscalls: the serve loop is one `read(2)` per inbound packet and one
-`write(2)` per emitted packet — SYN-ACK, pure ACK, response — but a loopback
-socketpair test cannot gate a syscall total, so no row claims one; the shape is
-prose. The one allocation the emit path makes is named under what was not
-removed. Time: not measured locally, see below.
+`write(2)` per emitted packet — SYN-ACK, pure ACK, response — plus one
+`setsockopt` per flow to arm the response read at the idle budget and one
+`shutdown` per flow when it dies. A loopback socketpair test cannot gate a
+syscall total, so no row claims one; the shape is prose. The one allocation the
+emit path makes is named under what was not removed. Time: not measured
+locally, see below.
 
 ## Ops
 
@@ -102,7 +119,11 @@ Against the pinned references, which is where the bar is:
   the convention the differential can see and the handshake-number rule of
   `newTCPConn`; the stack machinery was removed down to the smallest thing
   that still produces the reference's dial set, and the removed reassembly and
-  retransmit are named below rather than claimed away.
+  retransmit are named below rather than claimed away. The same rule holds the
+  flow's *lifetime*: xray keeps a reassembly list and an RTO goroutine per
+  connection and smoltcp a socket timer per flow, here one armed `SO_RCVTIMEO`
+  on the pair's read half plus a channel of ended keys expires a quiet flow and
+  reaps it — no timer, no reaper thread, and no clock read in the serve loop.
 - **A second dialer.** The tun2socks shape this tree could have grown is a
   bespoke outbound call from the packet handler. It does not: `accept_flow`
   opens a loopback `TcpStream` pair and calls the same
@@ -130,6 +151,16 @@ Named rather than claimed, with the worst input worked out first:
   ACK, per response packet. A reused per-handler buffer with a
   `write_vectored` header would remove it, but nothing counts allocations on
   this path yet, so it stays a named cost, not a row.
+- **One relaxed store per payload-bearing packet.** `busy` is set where the
+  upload is written, because the reap has to tell a live flow from one the
+  device merely retransmits to; a per-packet clock read would be the same cost
+  paid by *every* packet instead of only the ones carrying payload, and a timer
+  per flow is the machinery this row already removed.
+- **The reap rides the next SYN.** An ended key is drained in `accept_flow`,
+  not by a reaper: a dead flow whose device never dials again keeps its table
+  entry until the next dial comes. Two threads and a socket pair do return at
+  the budget — the entry is the smaller half of what a quiet flow holds, and it
+  is held by the one thread that owns the map.
 - **Out-of-order and duplicate segments are not reassembled.** The handler
   delivers payload in arrival order and advances `rcv_nxt` to the last
   segment's end. A script does not reorder; a network does. Xray holds
