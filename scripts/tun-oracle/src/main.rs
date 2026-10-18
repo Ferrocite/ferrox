@@ -3,7 +3,8 @@
 //! come from running smoltcp 0.12 — the stack the pinned zero-tun `zero-tun`
 //! crate builds its TUN inbound on — over the rendered packet stream, not from
 //! this tree. `tun::tests::the_dial_set_matches_the_pinned_stream` diffs the
-//! Ferrox inbound against the same pair.
+//! Ferrox inbound's TCP half against the same pair, and
+//! `tun::tests::the_datagram_dial_set_matches_the_pinned_stream` its UDP half.
 //!
 //! Run: `cargo run --manifest-path scripts/tun-oracle/Cargo.toml` in the workspace.
 
@@ -12,8 +13,13 @@ use std::collections::VecDeque;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp::{Socket as TcpSocket, SocketBuffer};
+use smoltcp::socket::udp::{
+    PacketBuffer as UdpPacketBuffer, PacketMetadata as UdpPacketMetadata, Socket as UdpSocket,
+};
 use smoltcp::time::Instant;
-use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Packet, TcpPacket};
+use smoltcp::wire::{
+    HardwareAddress, IpAddress, IpCidr, IpEndpoint, Ipv4Address, Ipv4Packet, TcpPacket,
+};
 
 struct Frame {
     at: Instant,
@@ -74,10 +80,39 @@ impl Device for QueueDevice {
     }
 }
 
-/// The rendering rules, shared with `script.txt` and the Rust test: SYN, then
-/// the ACK whose acknowledgement number is this stack's own SYN-ACK sequence
-/// plus one, then each payload chunk as one PSH, then FIN.
-fn build_packet(src: Ipv4Address, dst: Ipv4Address, src_port: u16, dst_port: u16, seq: u32, ack: u32, syn: bool, ack_flag: bool, fin: bool, psh: bool, payload: &[u8]) -> Vec<u8> {
+/// The one's-complement sum over a slice of big-endian words, folded to a
+/// checksum; the trailing odd byte (which both IP and the pseudo-header can
+/// carry) enters as the high byte of one word, as the spec draws it.
+fn checksum(mut sum: u32, bytes: &[u8]) -> u16 {
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        sum += u32::from(u16::from_be_bytes([bytes[i], bytes[i + 1]]));
+        i += 2;
+    }
+    if i < bytes.len() {
+        sum += u32::from(bytes[i]) << 8;
+    }
+    sum = (sum >> 16) + (sum & 0xffff);
+    sum = (sum >> 16) + (sum & 0xffff);
+    !(sum as u16)
+}
+
+/// The rendering rules for a TCP flow, shared with `script.txt` and the Rust
+/// test: SYN, then the ACK whose acknowledgement number is this stack's own
+/// SYN-ACK sequence plus one, then each payload chunk as one PSH, then FIN.
+fn build_tcp_packet(
+    src: Ipv4Address,
+    dst: Ipv4Address,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    syn: bool,
+    ack_flag: bool,
+    fin: bool,
+    psh: bool,
+    payload: &[u8],
+) -> Vec<u8> {
     let tcp_len = 20 + payload.len();
     let ip_len = 20 + tcp_len;
     let mut pkt = vec![0u8; ip_len];
@@ -88,20 +123,18 @@ fn build_packet(src: Ipv4Address, dst: Ipv4Address, src_port: u16, dst_port: u16
     pkt[9] = 6;
     pkt[12..16].copy_from_slice(&src.octets());
     pkt[16..20].copy_from_slice(&dst.octets());
-    let mut sum: u32 = 0;
-    for w in pkt[..20].chunks(2) {
-        sum += u32::from(u16::from_be_bytes([w[0], w[1]]));
-    }
-    sum = (sum >> 16) + (sum & 0xffff);
-    sum = (sum >> 16) + (sum & 0xffff);
-    pkt[10..12].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    let ip_sum = checksum(0, &pkt[..20]);
+    pkt[10..12].copy_from_slice(&ip_sum.to_be_bytes());
     let t = &mut pkt[20..40];
     t[0..2].copy_from_slice(&src_port.to_be_bytes());
     t[2..4].copy_from_slice(&dst_port.to_be_bytes());
     t[4..8].copy_from_slice(&seq.to_be_bytes());
     t[8..12].copy_from_slice(&ack.to_be_bytes());
     t[12] = 0x50;
-    t[13] = (if fin { 1 } else { 0 } | if syn { 2 } else { 0 } | if psh { 8 } else { 0 } | if ack_flag { 16 } else { 0 });
+    t[13] = (if fin { 1 } else { 0 }
+        | if syn { 2 } else { 0 }
+        | if psh { 8 } else { 0 }
+        | if ack_flag { 16 } else { 0 });
     t[14..16].copy_from_slice(&65535u16.to_be_bytes());
     pkt[40..].copy_from_slice(payload);
     let mut pseudo: Vec<u8> = Vec::new();
@@ -111,18 +144,52 @@ fn build_packet(src: Ipv4Address, dst: Ipv4Address, src_port: u16, dst_port: u16
     pseudo.push(6);
     pseudo.extend_from_slice(&(tcp_len as u16).to_be_bytes());
     pseudo.extend_from_slice(&pkt[20..]);
-    let mut sum: u32 = 0;
-    let mut i = 0;
-    while i + 1 < pseudo.len() {
-        sum += u32::from(u16::from_be_bytes([pseudo[i], pseudo[i + 1]]));
-        i += 2;
-    }
-    if i < pseudo.len() {
-        sum += u32::from(pseudo[i]) << 8;
-    }
-    sum = (sum >> 16) + (sum & 0xffff);
-    sum = (sum >> 16) + (sum & 0xffff);
-    pkt[36..38].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    pkt[36..38].copy_from_slice(&checksum(0, &pseudo).to_be_bytes());
+    pkt
+}
+
+/// One IPv4 UDP datagram: the header carries the two ports, the length over the
+/// header plus body, and a checksum over the same pseudo-header a TCP segment
+/// uses but with protocol 17. Every body byte is delivered verbatim, so two
+/// datagrams to one port stay two, never one coalesced stream.
+fn build_udp_packet(
+    src: Ipv4Address,
+    dst: Ipv4Address,
+    src_port: u16,
+    dst_port: u16,
+    payload: &[u8],
+) -> Vec<u8> {
+    let udp_len = 8 + payload.len();
+    let ip_len = 20 + udp_len;
+    let mut pkt = vec![0u8; ip_len];
+    pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
+    pkt[6] = 0x40;
+    pkt[8] = 64;
+    pkt[9] = 17;
+    pkt[12..16].copy_from_slice(&src.octets());
+    pkt[16..20].copy_from_slice(&dst.octets());
+    let ip_sum = checksum(0, &pkt[..20]);
+    pkt[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+    let u = &mut pkt[20..28];
+    u[0..2].copy_from_slice(&src_port.to_be_bytes());
+    u[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    u[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    pkt[28..].copy_from_slice(payload);
+    let mut pseudo: Vec<u8> = Vec::new();
+    pseudo.extend_from_slice(&src.octets());
+    pseudo.extend_from_slice(&dst.octets());
+    pseudo.push(0);
+    pseudo.push(17);
+    pseudo.extend_from_slice(&(udp_len as u16).to_be_bytes());
+    pseudo.extend_from_slice(&pkt[20..]);
+    let sum = checksum(0, &pseudo);
+    // A zero UDP checksum means "not computed"; the fold rarely lands there, and where it does the datagram still carries its own length, so pin the field to the one value that is never the sentinel.
+    pkt[26..28].copy_from_slice(&if sum == 0 {
+        [0xff, 0xff]
+    } else {
+        sum.to_be_bytes()
+    });
     pkt
 }
 
@@ -133,40 +200,69 @@ struct Flow {
     chunks: Vec<Vec<u8>>,
 }
 
-fn parse_script(path: &std::path::Path) -> Vec<Flow> {
+/// One `UFLOW` line: a client source port, a destination endpoint, and every
+/// datagram body that flows, each rendered as its own IPv4 UDP packet.
+struct DatagramFlow {
+    destination: IpEndpoint,
+    source_port: u16,
+    datagrams: Vec<Vec<u8>>,
+}
+
+fn parse_endpoint(field: &str) -> IpEndpoint {
+    let destination = field.parse::<std::net::SocketAddr>().unwrap();
+    let std::net::IpAddr::V4(ip) = destination.ip() else {
+        panic!("the script names IPv4 endpoints only");
+    };
+    let o = ip.octets();
+    IpEndpoint::new(
+        IpAddress::Ipv4(Ipv4Address::new(o[0], o[1], o[2], o[3])),
+        destination.port(),
+    )
+}
+
+fn parse_script(path: &std::path::Path) -> (Vec<Flow>, Vec<DatagramFlow>) {
     let text = std::fs::read_to_string(path).expect("script.txt beside this file");
     let mut flows = Vec::new();
+    let mut datagrams = Vec::new();
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
         let mut fields = line.split_whitespace();
-        assert_eq!(fields.next(), Some("FLOW"));
-        let destination = fields.next().unwrap().parse::<std::net::SocketAddr>().unwrap();
-        let std::net::IpAddr::V4(destination_ip) = destination.ip() else {
-            panic!("the script names IPv4 endpoints only");
-        };
-        let o = destination_ip.octets();
-        let destination = IpEndpoint::new(
-            IpAddress::Ipv4(Ipv4Address::new(o[0], o[1], o[2], o[3])),
-            destination.port(),
-        );
-        let source_port = fields.next().unwrap().parse().unwrap();
-        let syn_seq = fields.next().unwrap().parse().unwrap();
-        let chunks = fields.map(hex_decode).collect();
-        flows.push(Flow {
-            destination,
-            source_port,
-            syn_seq,
-            chunks,
-        });
+        match fields.next() {
+            Some("FLOW") => {
+                let destination = parse_endpoint(fields.next().unwrap());
+                let source_port = fields.next().unwrap().parse().unwrap();
+                let syn_seq = fields.next().unwrap().parse().unwrap();
+                let chunks = fields.map(hex_decode).collect();
+                flows.push(Flow {
+                    destination,
+                    source_port,
+                    syn_seq,
+                    chunks,
+                });
+            }
+            Some("UFLOW") => {
+                let destination = parse_endpoint(fields.next().unwrap());
+                let source_port = fields.next().unwrap().parse().unwrap();
+                let bodies = fields.map(hex_decode).collect();
+                datagrams.push(DatagramFlow {
+                    destination,
+                    source_port,
+                    datagrams: bodies,
+                });
+            }
+            other => panic!("the script holds only FLOW and UFLOW lines, found {other:?}"),
+        }
     }
-    flows
+    (flows, datagrams)
 }
 
 fn hex_decode(s: &str) -> Vec<u8> {
-    (0..s.len() / 2).map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap()).collect()
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap())
+        .collect()
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -190,52 +286,146 @@ fn observed_syn_ack_seq(frames: &VecDeque<Frame>) -> u32 {
 
 fn main() {
     let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("script.txt");
-    let flows = parse_script(&script);
+    let (flows, dgram_flows) = parse_script(&script);
 
-    let mut device = QueueDevice { rx: VecDeque::new(), tx: VecDeque::new() };
+    let mut device = QueueDevice {
+        rx: VecDeque::new(),
+        tx: VecDeque::new(),
+    };
     let mut iface = Interface::new(Config::new(HardwareAddress::Ip), &mut device, Instant::ZERO);
     iface.update_ip_addrs(|addrs| {
-        addrs.push(IpCidr::new(flows[0].destination.addr, 32)).unwrap();
+        let mut seen: Vec<IpAddress> = Vec::new();
+        for destination in flows
+            .iter()
+            .map(|flow| flow.destination)
+            .chain(dgram_flows.iter().map(|flow| flow.destination))
+        {
+            if !seen.contains(&destination.addr) {
+                seen.push(destination.addr);
+                addrs.push(IpCidr::new(destination.addr, 32)).unwrap();
+            }
+        }
     });
     let mut sockets = SocketSet::new(vec![]);
 
     let mut handles = Vec::new();
     for flow in &flows {
-        let mut socket = TcpSocket::new(SocketBuffer::new(vec![0u8; 8192]), SocketBuffer::new(vec![0u8; 8192]));
-        socket.listen(flow.destination).expect("listen on the script endpoint");
+        let mut socket = TcpSocket::new(
+            SocketBuffer::new(vec![0u8; 8192]),
+            SocketBuffer::new(vec![0u8; 8192]),
+        );
+        socket
+            .listen(flow.destination)
+            .expect("listen on the script endpoint");
         handles.push(sockets.add(socket));
+    }
+    let mut udp_handles = Vec::new();
+    for flow in &dgram_flows {
+        let mut socket = UdpSocket::new(
+            UdpPacketBuffer::new(vec![UdpPacketMetadata::EMPTY; 8], vec![0u8; 8192]),
+            UdpPacketBuffer::new(vec![UdpPacketMetadata::EMPTY; 8], vec![0u8; 512]),
+        );
+        socket
+            .bind(flow.destination)
+            .expect("bind on the script endpoint");
+        udp_handles.push(sockets.add(socket));
     }
 
     let client = Ipv4Address::new(10, 0, 0, 2);
-    let mut dials: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut tcp_dials: Vec<(String, Vec<u8>)> = Vec::new();
+    let mut udp_dials: Vec<(String, Vec<u8>)> = Vec::new();
     let mut now = Instant::ZERO;
 
     for (flow, handle) in flows.iter().zip(handles.iter()) {
         let IpAddress::Ipv4(dst) = flow.destination.addr;
-        let syn = build_packet(client, dst, flow.source_port, flow.destination.port, flow.syn_seq, 0, true, false, false, false, &[]);
+        let syn = build_tcp_packet(
+            client,
+            dst,
+            flow.source_port,
+            flow.destination.port,
+            flow.syn_seq,
+            0,
+            true,
+            false,
+            false,
+            false,
+            &[],
+        );
         now += smoltcp::time::Duration::from_millis(1);
-        device.rx.push_back(Frame { at: now, bytes: syn });
+        device.rx.push_back(Frame {
+            at: now,
+            bytes: syn,
+        });
         poll(&mut iface, &mut device, &mut sockets, now, 8);
         let peer_ack = observed_syn_ack_seq(&device.tx) + 1;
         device.tx.clear();
 
-        let ack = build_packet(client, dst, flow.source_port, flow.destination.port, flow.syn_seq + 1, peer_ack, false, true, false, false, &[]);
+        let ack = build_tcp_packet(
+            client,
+            dst,
+            flow.source_port,
+            flow.destination.port,
+            flow.syn_seq + 1,
+            peer_ack,
+            false,
+            true,
+            false,
+            false,
+            &[],
+        );
         now += smoltcp::time::Duration::from_millis(1);
-        device.rx.push_back(Frame { at: now, bytes: ack });
+        device.rx.push_back(Frame {
+            at: now,
+            bytes: ack,
+        });
         poll(&mut iface, &mut device, &mut sockets, now, 4);
-        assert_eq!(state(&sockets, *handle), smoltcp::socket::tcp::State::Established, "the handshake established");
+        assert_eq!(
+            state(&sockets, *handle),
+            smoltcp::socket::tcp::State::Established,
+            "the handshake established"
+        );
 
         let mut seq = flow.syn_seq + 1;
         for chunk in &flow.chunks {
-            let psh = build_packet(client, dst, flow.source_port, flow.destination.port, seq, peer_ack, false, true, false, true, chunk);
+            let psh = build_tcp_packet(
+                client,
+                dst,
+                flow.source_port,
+                flow.destination.port,
+                seq,
+                peer_ack,
+                false,
+                true,
+                false,
+                true,
+                chunk,
+            );
             now += smoltcp::time::Duration::from_millis(1);
-            device.rx.push_back(Frame { at: now, bytes: psh });
+            device.rx.push_back(Frame {
+                at: now,
+                bytes: psh,
+            });
             poll(&mut iface, &mut device, &mut sockets, now, 4);
             seq += chunk.len() as u32;
         }
-        let fin = build_packet(client, dst, flow.source_port, flow.destination.port, seq, peer_ack, false, true, true, false, &[]);
+        let fin = build_tcp_packet(
+            client,
+            dst,
+            flow.source_port,
+            flow.destination.port,
+            seq,
+            peer_ack,
+            false,
+            true,
+            true,
+            false,
+            &[],
+        );
         now += smoltcp::time::Duration::from_millis(1);
-        device.rx.push_back(Frame { at: now, bytes: fin });
+        device.rx.push_back(Frame {
+            at: now,
+            bytes: fin,
+        });
         poll(&mut iface, &mut device, &mut sockets, now, 8);
 
         let mut payload = Vec::new();
@@ -249,12 +439,33 @@ fn main() {
             }
         }
         let target = format!("{}", flow.destination);
-        dials.push((target, payload));
+        tcp_dials.push((target, payload));
     }
 
-    dials.sort();
-    for (target, payload) in &dials {
+    for (flow, handle) in dgram_flows.iter().zip(udp_handles.iter()) {
+        let IpAddress::Ipv4(dst) = flow.destination.addr;
+        for body in &flow.datagrams {
+            let pkt = build_udp_packet(client, dst, flow.source_port, flow.destination.port, body);
+            now += smoltcp::time::Duration::from_millis(1);
+            device.rx.push_back(Frame {
+                at: now,
+                bytes: pkt,
+            });
+            poll(&mut iface, &mut device, &mut sockets, now, 4);
+        }
+        // Drain in arrival order: the stack hands each datagram up on its own, so a flow of two bodies is two dials, never the concatenation a TCP stream would form.
+        let socket = sockets.get_mut::<UdpSocket>(*handle);
+        let target = format!("{}", flow.destination);
+        while let Ok((payload, _meta)) = socket.recv() {
+            udp_dials.push((target.clone(), payload.to_vec()));
+        }
+    }
+
+    for (target, payload) in &tcp_dials {
         println!("DIAL {target} {}", hex_encode(payload));
+    }
+    for (target, payload) in &udp_dials {
+        println!("UDIAL {target} {}", hex_encode(payload));
     }
 }
 

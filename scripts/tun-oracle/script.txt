@@ -19,7 +19,24 @@
 #
 # Two payload chunks in one flow arrive as two PSH segments; the reference
 # reassembles them into one stream, so the dial set shows the concatenated bytes.
+#
+#   UFLOW <dst ip:port> <src port> <hex datagram> [<hex datagram 2> ...]
+#
+# A UDP line names one client source port, one destination, and each datagram
+# body in order; the renderer emits one independent IPv4 UDP packet per body.
+# This is where UDP and TCP part ways and the differential has to see it: the
+# same two bodies (`61626364`, `6566`) that the TCP flow above concatenates into
+# one dial stay TWO dials over UDP, because a datagram is never merged with its
+# neighbour. A body that happens to look like a SOCKS5 request header (`00000001`)
+# is delivered verbatim rather than re-parsed, an odd length (five bytes) is not
+# a multiple of anything, and an identical body to a different port demuxes to a
+# different target.
 
 FLOW 198.51.100.7:443 51000 1000 474554202f20485454502f312e300d0a0d0a
 FLOW 198.51.100.7:53 51001 7000 deadbeef
 FLOW 198.51.100.7:8080 51002 300 61626364 6566
+
+UFLOW 198.51.100.7:53 60000 deadbeef
+UFLOW 198.51.100.7:8080 60001 61626364 6566
+UFLOW 198.51.100.7:443 60002 00000001
+UFLOW 198.51.100.7:5353 60003 6162636465

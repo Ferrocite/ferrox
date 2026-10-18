@@ -21,12 +21,16 @@ the golden `expected.txt` that run recorded. The convention the golden pins
 (dial on handshake, deliver the reassembled payload in order, EOF at FIN) is
 also what xray's `proxy/tun/tcp_lightweight.go` reaches at `input`, `receive`
 and `ReadMultiBuffer`, and the SYN-ACK numbers follow its `newTCPConn` rule.
-The datagram half is gated by the wire itself instead: the frame the handler
-writes onto the association is asserted byte-for-byte as the RFC 1928
-`RSV || FRAG || ATYP || ADDR || PORT || DATA` a SOCKS5 client sends, and the
-answer is required to verify at `connectip::udp_from_packet`, the reader the
-pinned connectip surface is checked with. The oracle records TCP flows today,
-so no smoltcp-run UDP dial set is claimed here; see below.
+The datagram half now rides the same oracle: `scripts/tun-oracle` also binds
+smoltcp's UDP socket and records the (target, datagram) set the reference stack
+delivers from `script.txt`, and
+`the_datagram_dial_set_matches_the_pinned_stream` diffs the (target, datagram)
+pairs the inbound hands its association against that golden. So the cases where
+UDP and TCP part ways — two bodies to one port staying two dials rather than one
+concatenated stream, a body shaped like a frame header surviving verbatim, an odd
+length delivered whole — are pinned against the reference run, not merely against
+the RFC 1928 frame `a_datagram_flow_frames_the_association_and_returns_the_echo`
+already asserts byte-for-byte.
 
 The platform opens are Linux (`/dev/net/tun` + `TUNSETIFF`, `IFF_TUN|IFF_NO_PI`
 so no protocol-info header to strip), macOS (`AF_SYSTEM` utun control channel)
@@ -78,6 +82,7 @@ graph TD
 | datagram-association-round-trips | 1 | ferrox-app-tun::tests::a_datagram_flow_frames_the_association_and_returns_the_echo |
 | datagram-parse-copies-per-packet | 0 | ferrox-app-tun::tests::the_datagram_is_borrowed_from_the_read_buffer |
 | datagram-reply-packets-checksummed | 1 | ferrox-app-tun::tests::the_reply_packet_verifies_at_the_reference_reader |
+| datagram-dial-set-flows-matching-the-pinned-stack | 5 | ferrox-app-tun::tests::the_datagram_dial_set_matches_the_pinned_stream |
 | icmp-echo-replies-verified | 1 | ferrox-app-tun::tests::an_icmp_echo_request_is_answered_as_a_reply |
 | icmp-non-echo-messages-refused | 3 | ferrox-app-tun::tests::a_non_echo_icmp_message_is_refused |
 <!-- counts:end -->
@@ -104,9 +109,14 @@ which is what a long `--vpn` session's thread count was climbing.
 The datagram rows are the same claim on the other front: one flow that frames
 onto the association and returns the echo, with the frame asserted byte-for-byte
 (`[0,0,0,1,198.51.100.7,0,53] ++ b"who-is"`) and the answer required to carry
-both checksums a peer's stack verifies. A leg is reaped by the same channel:
-silent past `budgets::udp_idle()`, its reader shuts, names its key, and
-`dispatch` drops the socket it held.
+both checksums a peer's stack verifies. The dial-set row is the reference
+half of it: five datagrams rendered from `script.txt` are handed to a recording
+association, each frame parsed back to its (target, datagram) pair, and that set
+required to equal the five `UDIAL` lines smoltcp's UDP socket recorded — the no-
+coalescing case (`61626364`, `6566` staying two dials where the TCP flow above
+concatenates them) is the one this row and no frame-only test can see. A leg is
+reaped by the same channel: silent past `budgets::udp_idle()`, its reader shuts,
+names its key, and `dispatch` drops the socket it held.
 
 The ICMP rows are the third protocol `dispatch` answers: an IPv4 echo request
 (type 8, code 0) is returned as an echo reply — the message's type flipped to 0,
@@ -245,12 +255,12 @@ Named rather than claimed, with the worst input worked out first:
   are all still left, so `dispatch` answers type-8/code-0 and returns on every
   other type rather than minting a destination-unreachable. Growing the responder
   past the echo is its own slice, named here rather than claimed away.
-- **The datagram lane has no reference golden yet.** The oracle runs smoltcp's
-  TCP socket, so the UDP half of the identity claim is the wire bytes RFC 1928
-  names plus the core reader's checksum walk, not a reference-vs-Ferrox dial
-  set. Extending the recorder to smoltcp's UDP socket and re-blessing
-  `expected.txt` is a CI run: the crate resolves from crates.io, which no
-  contributor machine reaches from behind its own proxy.
+- **The golden feeds whole datagrams and names none empty or oversized.** The
+  oracle now runs smoltcp's UDP socket as it runs its TCP socket, so the
+  outbound (target, datagram) set is a reference-vs-Ferrox differential, not a
+  spec-frame assertion. Two shapes that differential cannot witness: a datagram
+  over the device MTU, which smoltcp would fragment and the handler sends as
+  one, and an empty one — neither is in `script.txt`, so neither is claimed.
 - **The association is proved against a stand-in that speaks the spec.**
   `echo_associate` answers the greeting, the `UDP ASSOCIATE` request and the
   relay-address reply the way `serve_socks_udp` does, and the shipped inbound

@@ -7,4 +7,4 @@ description = "Records the (target, payload) dial set a pinned userspace stack p
 [workspace]
 
 [dependencies]
-smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp"] }
+smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ip", "proto-ipv4", "socket-tcp", "socket-udp"] }
