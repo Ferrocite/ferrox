@@ -157,9 +157,7 @@ pub fn datagram_encode(payload: &[u8], out: &mut Vec<u8>) {
 #[must_use]
 pub fn datagram_prefix_into(out: &mut [u8; 10], payload: usize) -> usize {
     out[0] = 0x00;
-    let mut code = [0u8; 9];
-    let n = quic_varint_into(&mut code, 1 + payload as u64);
-    out[1..=n].copy_from_slice(&code[..n]);
+    let n = quic_varint_into(&mut out[1..], 1 + payload as u64);
     out[1 + n] = 0x00;
     2 + n
 }
