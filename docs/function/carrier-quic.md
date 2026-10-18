@@ -59,7 +59,7 @@ graph TD
 
 ## Time
 
-**Not measured on this branch.** QUIC throughput belongs to `.github/workflows/speedtest.yml`, which is dispatch-only because it downloads a real target per config per core; a number from a machine behind a VPN measures the tunnel. The per-flow half of this claim belongs to `.github/workflows/foxy-relay.yml`, whose `Lane durations` table is the only artefact that times one request per carrier against a real edge; a parked lane shortens that row, and no number from this branch has been read yet.
+**Not measured on this branch.** QUIC throughput belongs to `.github/workflows/speedtest.yml`, which is dispatch-only because it downloads a real target per config per core; a number from a machine behind a VPN measures the tunnel. `.github/workflows/foxy-relay.yml`'s `Lane durations` table cannot see a parked lane at all: it restarts the lane for every carrier row (`a port per carrier, because a lane that outlives its stop still holds the port`) and takes one flow per row, so every row is a cold lane and a spent handshake. What that table can gate is the arm a cold lane pays at bind, and this branch's h3 rows are where it would show: 1.00 MB/s against a 5.91 MB/s control on macOS, 1.84 against 3.00 on Windows, 2.22 against 5.49 on Ubuntu. A sequential-flow number needs a row that takes N flows on one lane; no such row exists yet, so the reuse is gated by pointer identity in `a_lane_outlives_its_leases_and_the_next_flow_rides_it` and its rate is an open claim.
 
 ## What we removed
 
