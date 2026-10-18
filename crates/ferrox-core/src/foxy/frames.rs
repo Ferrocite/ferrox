@@ -203,8 +203,8 @@ pub fn quic_varint_len(value: u64) -> usize {
     }
 }
 
-/// The same varint written into a fixed buffer, so a frame header travels beside a payload that already has a home instead of staging it: the first byte carries the length tag and the value's top six bits, every later byte a whole eight, as `quic_varint` writes.
-pub fn quic_varint_into(out: &mut [u8; 9], value: u64) -> usize {
+/// The same varint written into a fixed buffer, so a frame header travels beside a payload that already has a home instead of staging it: the first byte carries the length tag and the value's top six bits, every later byte a whole eight, as `quic_varint` writes. The buffer may be any length; the value's width decides how many bytes it fills.
+pub fn quic_varint_into(out: &mut [u8], value: u64) -> usize {
     // The four forms mirror `quic_varint` op for op — same width, same tag `or` — so the bytes are identical by construction, each one `to_be_bytes` plus a fixed copy instead of a value-sized byte loop; `the_fixed_buffer_varint_is_the_vec_one` reads them against each other at every width.
     match value {
         0..=63 => {
@@ -224,6 +224,13 @@ pub fn quic_varint_into(out: &mut [u8; 9], value: u64) -> usize {
             8
         }
     }
+}
+
+/// An HTTP/3 DATA frame header written where it is read: the type varint — always one byte, since `H3_DATA` is below 64 — then the payload length varint, into a buffer of at least nine bytes. Returns the header's length. The type and length go straight to their own offsets, so a frame header costs two stores rather than a varint, a one-byte shift of it, and a rewrite of the byte just shifted.
+#[must_use]
+pub fn h3_data_header(head: &mut [u8; 9], length: u64) -> usize {
+    head[0] = H3_DATA as u8;
+    1 + quic_varint_into(&mut head[1..], length)
 }
 
 #[must_use]
@@ -322,6 +329,28 @@ mod tests {
             let mut fixed = [0u8; 9];
             let len = quic_varint_into(&mut fixed, value);
             assert_eq!(vec, fixed[..len], "{value}");
+        }
+    }
+
+    /// The DATA frame header is the type byte then the length varint, at every varint width — the exact bytes the write-then-shift-then-rewrite shape produced, without the shift.
+    #[test]
+    fn the_h3_data_header_is_the_type_then_the_length_varint() {
+        for length in [
+            0u64,
+            1,
+            63,
+            64,
+            16_383,
+            16_384,
+            20_000,
+            1_073_741_823,
+            1_073_741_824,
+        ] {
+            let mut head = [0u8; 9];
+            let hl = h3_data_header(&mut head, length);
+            let mut want = vec![H3_DATA as u8];
+            quic_varint(&mut want, length);
+            assert_eq!(&head[..hl], &want[..], "{length}");
         }
     }
 

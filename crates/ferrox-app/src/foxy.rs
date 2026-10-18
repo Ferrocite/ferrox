@@ -1293,10 +1293,8 @@ impl H3 {
         connectip::address_request(2, 6, &[0; 16], &mut request);
         // The request rides one DATA frame the way a packet does: capsules here are framed, and raw bytes would read as a frame header.
         let mut head = [0u8; 9];
-        let len = frames::quic_varint_into(&mut head, request.len() as u64);
-        head.copy_within(0..len, 1);
-        head[0] = frames::H3_DATA as u8;
-        lane.send_pair(lane.quic.id, &head[..=len], &request)?;
+        let hl = frames::h3_data_header(&mut head, request.len() as u64);
+        lane.send_pair(lane.quic.id, &head[..hl], &request)?;
         Ok(lane)
     }
 
@@ -1444,10 +1442,8 @@ impl H3 {
         out.clear();
         masque::datagram_encode(payload, &mut out);
         let mut head = [0u8; 9];
-        let len = frames::quic_varint_into(&mut head, out.len() as u64);
-        head.copy_within(0..len, 1);
-        head[0] = frames::H3_DATA as u8;
-        let sent = self.send_pair(self.quic.id, &head[..=len], &out);
+        let hl = frames::h3_data_header(&mut head, out.len() as u64);
+        let sent = self.send_pair(self.quic.id, &head[..hl], &out);
         self.out = out;
         sent.map_err(io)?;
         Ok(())
@@ -1700,10 +1696,8 @@ impl Write for H3 {
         }
         // The frame's varints are their own send and the payload keeps the caller's buffer: quiche copies every slice it is handed, so staging the two together would be a second copy of every byte.
         let mut head = [0u8; 9];
-        let len = frames::quic_varint_into(&mut head, u64::from(frame));
-        head.copy_within(0..len, 1);
-        head[0] = frames::H3_DATA as u8;
-        self.send_pair(self.quic.id, &head[..=len], &buf[..frame as usize])
+        let hl = frames::h3_data_header(&mut head, u64::from(frame));
+        self.send_pair(self.quic.id, &head[..hl], &buf[..frame as usize])
             .map_err(io)?;
         Ok(frame as usize)
     }
@@ -4940,10 +4934,8 @@ mod loopback {
     /// One H3 DATA frame carrying `payload` on `stream`: capsules on this stream are framed, and the header is its own send because quiche copies every slice it is handed.
     fn send_h3_data(conn: &mut quiche::Connection, stream: u64, payload: &[u8]) {
         let mut head = [0u8; 9];
-        let len = frames::quic_varint_into(&mut head, payload.len() as u64);
-        head.copy_within(0..len, 1);
-        head[0] = frames::H3_DATA as u8;
-        conn.stream_send(stream, &head[..=len], false)
+        let hl = frames::h3_data_header(&mut head, payload.len() as u64);
+        conn.stream_send(stream, &head[..hl], false)
             .expect("frames");
         conn.stream_send(stream, payload, false).expect("carries");
     }
