@@ -35,51 +35,106 @@ fn fresh_key() -> Option<String> {
 const WIDE_PASS: usize = 32;
 
 fn apply_mask(buf: &mut [u8], mask: [u8; 4]) {
+    let len = buf.len();
+    let (src, dst) = (buf.as_ptr(), buf.as_mut_ptr());
+    // SAFETY: both pointers name the buffer itself, and the ladder reads each chunk before that same chunk's store at the identical offset — the old in-place read-modify-write.
     #[cfg(target_arch = "x86_64")]
-    if buf.len() >= WIDE_PASS && std::is_x86_feature_detected!("avx2") {
-        unsafe { mask_wide(buf, mask) };
+    if len >= WIDE_PASS && std::is_x86_feature_detected!("avx2") {
+        unsafe { mask_wide(src, dst, len, mask) };
         return;
     }
-    mask_narrow(buf, mask);
+    unsafe { mask_narrow(src, dst, len, mask) };
+}
+
+/// The masked write's staging fill: the payload is read once and its masked bytes are written once, by the same rungs that unmask in place — a `ymm` per thirty-two bytes where the host reports `avx2`, the sixteen-byte ladder under it. The two-pass shape this replaces walked the same bytes three times: a memcpy's read and write, then the mask's own read-modify-write.
+#[allow(
+    clippy::uninit_vec,
+    reason = "the ladder fills the extended bytes on every rung before this returns"
+)]
+fn mask_copy(frame: &mut Vec<u8>, src: &[u8], mask: [u8; 4]) {
+    frame.reserve(src.len());
+    let base = frame.len();
+    // SAFETY: the ladder below writes every extended byte from `src` before this returns, on every rung.
+    unsafe { frame.set_len(base + src.len()) };
+    let (_filled, rest) = frame.split_at_mut(base);
+    debug_assert_eq!(rest.len(), src.len());
+    // SAFETY: `rest` is exactly `src.len()` fresh bytes disjoint from the live-immutable `src`, and the ladder reads each chunk before storing that same chunk.
+    unsafe { mask_wide_dispatch(src.as_ptr(), rest.as_mut_ptr(), src.len(), mask) };
+}
+
+#[cfg(target_arch = "x86_64")]
+unsafe fn mask_wide_dispatch(src: *const u8, dst: *mut u8, len: usize, mask: [u8; 4]) {
+    if len >= WIDE_PASS && std::is_x86_feature_detected!("avx2") {
+        unsafe { mask_wide(src, dst, len, mask) };
+        return;
+    }
+    unsafe { mask_narrow(src, dst, len, mask) };
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+unsafe fn mask_wide_dispatch(src: *const u8, dst: *mut u8, len: usize, mask: [u8; 4]) {
+    unsafe { mask_narrow(src, dst, len, mask) };
 }
 
 /// One `ymm` per pass: a load, an xor and a store per thirty-two bytes, half what the sixteen-byte ladder spends on the same span. The remainder is below one wide pass, so it goes to that ladder whole.
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn mask_wide(buf: &mut [u8], mask: [u8; 4]) {
+unsafe fn mask_wide(src: *const u8, dst: *mut u8, len: usize, mask: [u8; 4]) {
     use core::arch::x86_64::{
         _mm256_loadu_si256, _mm256_set1_epi32, _mm256_storeu_si256, _mm256_xor_si256,
     };
     let wide = _mm256_set1_epi32(i32::from_le_bytes(mask));
-    let (passes, rest) = buf.as_chunks_mut::<WIDE_PASS>();
-    for pass in passes {
+    let done = len / WIDE_PASS * WIDE_PASS;
+    let mut at = 0usize;
+    while at < done {
+        // SAFETY: `at..at + WIDE_PASS` lies inside the whole passes both ranges were carved with, and the caller holds `src` live and `dst` writable over all `len`.
         unsafe {
-            let data = _mm256_loadu_si256(pass.as_ptr().cast());
-            _mm256_storeu_si256(pass.as_mut_ptr().cast(), _mm256_xor_si256(data, wide));
+            let data = _mm256_loadu_si256(src.add(at).cast());
+            _mm256_storeu_si256(dst.add(at).cast(), _mm256_xor_si256(data, wide));
         }
+        at += WIDE_PASS;
     }
-    mask_narrow(rest, mask);
+    // SAFETY: the tail is the bytes past the whole passes of the same two ranges the caller proved.
+    unsafe { mask_narrow(src.add(done), dst.add(done), len - done, mask) };
 }
 
-fn mask_narrow(buf: &mut [u8], mask: [u8; 4]) {
+/// The sixteen-byte ladder, read and write split: it walks `src` and lands the masked bytes in `dst`, which may be the very space it reads from — an in-place unmask — or space that has never held anything — a staging fill. Every stride is a multiple of the four-byte mask, so each chunk's own first byte sits at the payload's phase zero either way.
+///
+/// # Safety
+/// `src` readable and `dst` writable over `len`; the two ranges either are the same range (the
+/// in-place case, where every read of a byte precedes that byte's write at the identical offset)
+/// or do not overlap at all.
+unsafe fn mask_narrow(src: *const u8, dst: *mut u8, len: usize, mask: [u8; 4]) {
     let wide = [
         mask[0], mask[1], mask[2], mask[3], mask[0], mask[1], mask[2], mask[3], mask[0], mask[1],
         mask[2], mask[3], mask[0], mask[1], mask[2], mask[3],
     ];
-    let (blocks, rest) = buf.as_chunks_mut::<64>();
-    for block in blocks {
-        let lanes = block.as_chunks_mut::<16>().0;
-        xor_block(&mut lanes[0], &wide);
-        xor_block(&mut lanes[1], &wide);
-        xor_block(&mut lanes[2], &wide);
-        xor_block(&mut lanes[3], &wide);
+    let blocks = len / 64;
+    for b in 0..blocks {
+        let at = b * 64;
+        for lane in 0..4 {
+            let off = at + lane * 16;
+            // SAFETY: `off..off + 16` sits inside the whole 64-byte blocks of both ranges.
+            let chunk = unsafe { core::slice::from_raw_parts(src.add(off), 16) };
+            let out = unsafe { core::slice::from_raw_parts_mut(dst.add(off), 16) };
+            xor_block(chunk, &wide, out);
+        }
     }
-    let (chunks, tail) = rest.as_chunks_mut::<16>();
-    for chunk in chunks {
-        xor_block(chunk, &wide);
+    let chunks = (len - blocks * 64) / 16;
+    for c in 0..chunks {
+        let at = blocks * 64 + c * 16;
+        // SAFETY: `at..at + 16` sits inside the whole 16-byte chunks past the blocks.
+        let chunk = unsafe { core::slice::from_raw_parts(src.add(at), 16) };
+        let out = unsafe { core::slice::from_raw_parts_mut(dst.add(at), 16) };
+        xor_block(chunk, &wide, out);
     }
-    for (i, byte) in tail.iter_mut().enumerate() {
-        *byte ^= mask[i & 3];
+    let tail_at = blocks * 64 + chunks * 16;
+    for i in tail_at..len {
+        // SAFETY: the tail is the bytes past the whole chunks, inside `len` of both ranges; each byte is read and written at the same offset or in disjoint ranges.
+        unsafe {
+            let byte = *src.add(i);
+            *dst.add(i) = byte ^ mask[i & 3];
+        }
     }
 }
 
@@ -88,14 +143,14 @@ fn mask_narrow(buf: &mut [u8], mask: [u8; 4]) {
     reason = "load-bearing: keeps the vector op inlined at every call site"
 )]
 #[inline(always)]
-fn xor_block(chunk: &mut [u8; 16], wide: &[u8; 16]) {
+fn xor_block(chunk: &[u8], wide: &[u8; 16], out: &mut [u8]) {
     #[cfg(target_arch = "x86_64")]
     {
         use core::arch::x86_64::{_mm_loadu_si128, _mm_storeu_si128, _mm_xor_si128};
         unsafe {
             let data = _mm_loadu_si128(chunk.as_ptr().cast());
             let key = _mm_loadu_si128(wide.as_ptr().cast());
-            _mm_storeu_si128(chunk.as_mut_ptr().cast(), _mm_xor_si128(data, key));
+            _mm_storeu_si128(out.as_mut_ptr().cast(), _mm_xor_si128(data, key));
         }
     }
     #[cfg(target_arch = "aarch64")]
@@ -104,13 +159,13 @@ fn xor_block(chunk: &mut [u8; 16], wide: &[u8; 16]) {
         unsafe {
             let data = vld1q_u8(chunk.as_ptr());
             let key = vld1q_u8(wide.as_ptr());
-            vst1q_u8(chunk.as_mut_ptr(), veorq_u8(data, key));
+            vst1q_u8(out.as_mut_ptr(), veorq_u8(data, key));
         }
     }
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     {
-        for (byte, key) in chunk.iter_mut().zip(wide.iter()) {
-            *byte ^= *key;
+        for ((out, &byte), &key) in out.iter_mut().zip(chunk).zip(wide.iter()) {
+            *out = byte ^ key;
         }
     }
 }
@@ -450,9 +505,7 @@ fn write_frame(
         frame.reserve(hlen + 4 + data.len());
         frame.extend_from_slice(&head[..hlen]);
         frame.extend_from_slice(&mask);
-        let base = frame.len();
-        frame.extend_from_slice(data);
-        apply_mask(&mut frame[base..], mask);
+        mask_copy(&mut frame, data, mask);
         stream.write_all(&frame).is_ok()
     })
 }
@@ -708,6 +761,31 @@ mod tests {
                 assert_eq!(got, want, "len {len} mask {mask:?}");
                 apply_mask(&mut got, mask);
                 assert_eq!(got, plain, "len {len} unmasks");
+            }
+        }
+    }
+
+    /// The fused staging fill is the old two-pass shape byte for byte: the head bytes already in the
+    /// frame keep their place, and every payload lands as the byte loop would have written it, at
+    /// every width the rungs switch at and from every staging base a real frame leaves them at.
+    #[test]
+    fn the_fused_fill_is_the_memcpy_then_mask_byte_for_byte() {
+        for len in [
+            0, 1, 3, 4, 5, 15, 16, 17, 31, 32, 33, 63, 64, 65, 96, 127, 128, 129, 255, 256, 1024,
+            4096, 16_384,
+        ] {
+            for base in [0usize, 2, 6, 7, 13, 14] {
+                for mask in [[0u8, 0, 0, 0], [1, 2, 3, 4], [0xFF, 0x00, 0xA5, 0x5A]] {
+                    let plain: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(37)).collect();
+                    let mut want: Vec<u8> = vec![0xA5u8; base];
+                    for (i, &byte) in plain.iter().enumerate() {
+                        want.push(byte ^ mask[i & 3]);
+                    }
+                    let mut got = vec![0xA5u8; base];
+                    mask_copy(&mut got, &plain, mask);
+                    assert_eq!(got, want, "len {len} base {base} mask {mask:?}");
+                    assert_eq!(&got[..base], &want[..base], "the head keeps its bytes");
+                }
             }
         }
     }
