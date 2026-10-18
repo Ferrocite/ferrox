@@ -68,7 +68,7 @@ graph TD
 
 ## Time
 
-**Not measured on this branch.** `ferrox-bench` runs a Vision allocation gate
+**Not measured yet.** `ferrox-bench` runs a Vision allocation gate
 (`gate_vision_allocs`) over content lengths 0, 1, 64, 1400 and 8171 and refuses
 any allocation, any allocated byte and any zero-fill; the wall clock for this
 framing is not separately timed and no duration is quoted here. Allocation

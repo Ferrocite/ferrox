@@ -65,8 +65,8 @@ and the drop below `main`'s `81735` is read as prose, never quoted as a figure.
 
 ## Time
 
-**Not measured on this branch.** `.github/workflows/parity.yml` and
-`benchmark-matrix.yml` run a `trojan-raw` scenario. No artefact from this branch
+**Not measured yet.** `.github/workflows/parity.yml` and
+`benchmark-matrix.yml` run a `trojan-raw` scenario. No CI artefact
 has been read, so no duration is quoted.
 
 ## What we removed

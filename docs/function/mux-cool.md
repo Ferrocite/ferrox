@@ -61,10 +61,10 @@ graph TD
 
 ## Time
 
-**Not measured on this branch.** `ferrox-bench` gate 6 compares Mux rows
+**Not measured yet.** `ferrox-bench` gate 6 compares Mux rows
 field-for-field and requires zero allocations on both sides; that is a
 correctness and allocation gate, not a clock. The clock is `.github/workflows/parity.yml`.
-No artefact from this branch has been read.
+No CI artefact has been read.
 
 ## What we removed
 
@@ -249,7 +249,7 @@ codec differential are unchanged.
 counts and is informational, never red; `scripts/expected-ops.txt` carries no
 mux row, so the three fewer bounds checks are an argument about the diff, not a
 blessed figure. Blessing one means reading the `ops.yml` artefact for
-`mux::decode` on a branch that has already landed, which this branch has not.
+`mux::decode`, and no such run has been recorded.
 
 **Not fixed: what an over-frame datagram costs the association.** A SOCKS UDP
 relay read is `UDP_BUF` (65 535) bytes wide and a mux length field is two bytes,

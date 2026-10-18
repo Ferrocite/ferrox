@@ -160,12 +160,11 @@ honest report. What is measurable is the probe `scripts/method-ops.txt` points
 this method's row at —
 `shadowsocks::tests::the_stream_cipher_costs_the_prga_loop_and_nothing_else`,
 64 in-place `crypt` calls over one 1 KiB stack buffer with one fold as the
-witness. Three CI runs of that row read `1297641`, `1297641` and `1297577`; the
-first two are the same code on two different bases, which is what makes this row
-a usable delta instead of a duration. A fourth, `ops.yml` at this branch's head
-(run 38752349893), reads `1297641` again: the batch does not reach this probe's
-loop at all, which is the only instruction-level check it has, since
-`Cipher::seal_into` and `Cipher::open_in_place` both still report
+witness. Repeated CI runs of that row read `1297641` (and once `1297577`), the
+same code on different bases landing on the same number — which is what makes
+this row a usable delta instead of a duration. The batch does not reach this
+probe's loop at all, the only instruction-level check it has, since
+`Cipher::seal_into` and `Cipher::open_in_place` both report
 `inlined-not-a-frame`.
 
 The third is the delta, and it says there is nothing to win. A hoist of `i` and
@@ -212,41 +211,35 @@ loads per block, and the table traffic stays exactly the six reads and two write
 above.
 
 Two CI reads of the probe's row, from `ops.yml`'s `method-ops` artefact against
-the page's 1297641: the fold as shipped is **1258346**, read twice on two heads
-of this branch (`bbe42b1` at run 38841207859, `f606452` at run 38843050039),
-39 295 counts below the baseline, which over the probe's 65 536 bytes is 0.6
-instructions per byte — the payload's read, xor and write, paid back by the
-block's store and reload. The next rung looked like the fill's own loop, so a second shape put the step count in the type (`next_byte` plus a
-`keystream::<N>(&mut [u8; N])` fill) and let the sixteen steps be straight-line
-code instead of a slice loop: that read **1258730** at `42f3cc0` (run
-38842276749), 384 counts *above* the shipped fold and six times the band the
-page treats as run-to-run noise. The loop control an unroll would delete is
-already not there, which is the same finding the hoist above reached from the
-other side, so the shorter body ships and the second shape is reverted with both
-numbers.
+the page's 1297641: the shipped fold is **1258346**, read twice on separate
+rebuilds — 39 295 counts below the baseline, which over the probe's 65 536
+bytes is 0.6 instructions per byte, the payload's read, xor and write paid back
+by the block's store and reload. A second shape put the step count in the type
+(`next_byte` plus a `keystream::<N>(&mut [u8; N])` fill) and let the sixteen
+steps be straight-line code instead of a slice loop: that read **1258730**,
+384 counts *above* the shipped fold and six times the run-to-run noise band. The
+loop control an unroll would delete is already not there, so the shorter body
+ships and the second shape is reverted with both numbers.
 
 No matrix scenario dials `rc4-md5` — `scripts/lib-matrix.sh` configures the
 `shadowsocks-raw-*` pair with `aes-256-gcm` — so this rung carries no duration,
-and the `shadowsocks-raw-down-8` cell this branch ran measures the AEAD ladder.
+and the `shadowsocks-raw-down-8` cell measures the AEAD ladder.
 
 ## Time
 
-Read from two CI runs of one cell of `benchmark-matrix.yml`,
-`shadowsocks-raw-down-8` (download, 8 connections, 16 384 × 65 536 B, full tier,
-5 paired repeats, ubuntu-24.04, 4 logical CPUs, `xray-core` `c77a4d0` as the
-reference): this branch at `77c8254` (run 38752349541, `ferrox-app`
-`12d0da94…`) and `main` at `98f2e08` — the tree with neither of this slice's
-commits on it — dispatched as a matched baseline (run 38754603708, `5781e5f3…`).
-Both cells pass their gates.
+Read from two CI runs of one `benchmark-matrix.yml` cell, `shadowsocks-raw-down-8`
+(download, 8 connections, 16 384 × 65 536 B, full tier, 5 paired repeats,
+ubuntu-24.04, 4 logical CPUs, `xray-core` as the reference): one run carrying the
+batch and one baseline run without it. Both cells pass their gates.
 
 The two runs are not on the same machine. The harness's own raw-pipe ceiling —
 its measurement of the pipe with no cipher in it — read a median of 1260 MiB/s
-in the baseline run and 2703 MiB/s in this branch's, so absolute MiB/s across
+in the baseline run and 2703 MiB/s in the batched run, so absolute MiB/s across
 the two runs says nothing. What does compare is the ratio each repeat measures
 against the reference on the same machine at the same moment, and those
 intervals do not touch:
 
-| row, vs `xray-core` in the same repeat | before (`98f2e08`) | after (this branch) |
+| row, vs `xray-core` in the same repeat | before | after |
 | --- | --- | --- |
 | throughput (higher better) | 1.162× [1.125, 1.219] | **1.394× [1.360, 1.434]** |
 | CPU per GiB (lower better) | 1.125× [1.114, 1.136] | **1.345× [1.333, 1.358]** |
@@ -265,26 +258,14 @@ did not move at all (36 before, 36 after), and RSS is still 6.6× under the
 reference.
 
 The relay harness (`parity.yml` gate 5: 1 flow × 131 072 × 65 536 B, 4 engines ×
-5 paired repeats, `linux x86_64`) agrees, and says so more quietly. Before, on
-`main` at `6550eca` (run 38689059947): throughput vs `xray-core` median 0.923×
-[0.858, 0.978] and CPU per GiB median 0.888× [0.787, 0.989] — under the
-reference on both. After, on this branch's code commit `d656187` (run
-38748697816): 1.026× [0.952, 1.083] and 1.082× [1.003, 1.138] — over it on both.
-Every one of those four intervals includes 1.0, so no single run of this
-harness resolves 5%; `gate 5 passed: 9` both times, and what the pair of runs
-shows is the direction, which is the same direction the matrix cell proves.
+5 paired repeats, `linux x86_64`) agrees, more quietly: before, throughput vs
+`xray-core` median 0.923× [0.858, 0.978] and CPU per GiB 0.888× [0.787, 0.989]
+(under the reference on both); after, 1.026× [0.952, 1.083] and 1.082×
+[1.003, 1.138] (over it on both). Every interval includes 1.0, so this harness
+resolves direction, not 5% — and the direction matches what the matrix cell
+proves.
 
-The byte-differential was re-measured, not assumed: at `d656187` the same run
-passes `gate 1 passed: bit-identical at 7200 shapes`, `gate 7 passed: 7 seal
-rows, ciphertext and tag identical to their references` and `gate 9 passed: 10
-shadowsocks cipher rows, byte-identical to the reference and zero allocations
-per chunk on all three methods` on `linux x86_64`, `linux aarch64`,
-`macos aarch64` and `windows x86_64`. Gate 9's self-timed seal rows are printed
-and not gated; on the linux runner they read 119.5 / 281.3 / 686.2 / 3346.3 /
-6482.1 ns per chunk at 64 / 512 / 1400 / 8171 / 16 383 B, against 137.9 / 323.7 /
-822.4 / 3849.0 / 7570.3 ns on `main` that morning. The batch moves no byte of
-the cipher, so those rows are a machine difference and are reported as that, not
-as a win.
+The byte-differential is re-measured, not assumed: the run passes `gate 1: bit-identical at 7200 shapes`, `gate 7: 7 seal rows, ciphertext and tag identical`, and `gate 9: 10 cipher rows, byte-identical and zero allocations per chunk` on all four runners. Gate 9's self-timed seal rows are printed, not gated; the batch moves no byte of the cipher, so any difference there is a machine difference, reported as that.
 
 ## What we removed
 

@@ -118,7 +118,7 @@ this rung, and the call count above is the measurement.
 
 ## Time
 
-**Not measured on this branch.** `der_to_pem 2653` is the single instruction
+**Not measured yet.** `der_to_pem 2653` is the single instruction
 count this repository has ever blessed, and it is measured by `ops.yml` on
 `ubuntu-latest` because valgrind does not exist on the other runners. No
 handshake duration is quoted from a machine without a named runner.

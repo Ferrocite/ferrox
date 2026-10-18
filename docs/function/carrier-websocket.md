@@ -119,18 +119,18 @@ drives one fixed 190-byte head through `check_request` 64 times and folds the ke
 the subprotocol and the decoded early data, so the frame is the head read; and
 `the_early_data_line_costs_the_encode_and_nothing_else` encodes a 2048-byte
 payload 16 times into a String that already holds it, so the frame is the encode
-and no allocator is in it. Each frame has been read on this branch and on a
-branch carrying the body it replaced under the same probe, with the unmoved row
-holding still across the pair — `ws::tests::mask_chunks_match_the_byte_loop`
+and no allocator is in it. Each frame is read against the body it replaced under
+the same probe, with the unmoved row holding still across the pair —
+`ws::tests::mask_chunks_match_the_byte_loop`
 reads `437971` on all four runs. The head probe reads **`349434`** where the old
 path's own mirror — `the_head_was_validated_three_times_over`, the same 64
 rounds of the same head, with `header_value` for the echo and the old
 three-validation `check_request` — reads **`520242`**: `170808` is the three
 `from_utf8` passes and the second subprotocol lookup the old shape spent
-(`ops.yml` `39004141049` against `39005361208`). The encode probe reads
+(`ops.yml` artefact). The encode probe reads
 **`361968`** where the four-`String::push` body reads **`503578`**: `141610`
-over the same 16 lines of 2048 bytes (`ops.yml` `39004141049` against
-`39004218090`). Both deltas compare probe to probe, the same frame on both
+over the same 16 lines of 2048 bytes. Both deltas compare probe to probe, the same
+frame on both
 sides, and neither is a floor under the method alone.
 
 What the release assembly says on its own, checked by
@@ -147,20 +147,19 @@ x86_64 is measured by `ops.yml` with the rest.
 
 ## Time
 
-**The carrier, not on this branch.** The carrier is timed end to end rather than
+**The carrier.** The carrier is timed end to end rather than
 in isolation: `.github/workflows/parity.yml` runs `scripts/run-parity.sh` for
 `upload`, `download` and `full-duplex` across the pinned engines, and
 `.github/workflows/benchmark-matrix.yml` runs the `vless-ws` scenario. Both are
-CI-only because every developer machine is behind a VPN. This change's
-`benchmark-matrix.yml` run (`39004141026`) planned one cell, `vless-raw-down-1`,
-so no `vless-ws` duration exists here, and the wide mask pass in particular has
+CI-only because every developer machine is behind a VPN. No `vless-ws` cell is in
+the current matrix plan, and the wide mask pass in particular has
 no duration row to ask for: every `vless-ws` cell the matrix plans measures a
 *download*, where the server writes unmasked frames, so the masked direction
 never reaches the timer. Its evidence is the instruction count above, which is
 what `ops.yml` can see.
 
-**The `?ed=` line, on this branch, in gate 8.** `bench.yml` run `39007012750`
-timed the shipped encode against the shape the four implementations have, on
+**The `?ed=` line, in gate 8.** `bench.yml` timed the shipped encode against the
+shape the four implementations have, on
 both platforms in the one run, each row byte-checked before it was timed: macOS
 aarch64 **3.14x / 3.10x / 3.41x / 1.99x** and linux x86_64 **2.03x / 2.54x /
 2.60x / 2.11x**, at 8, 120, 256 and 2048 bytes, every row gated at 0.95x with
@@ -315,8 +314,7 @@ agrees with its direction.
   past the last whole pass — still through the old ladder. The bytes do not
   change: xor has no width. `ops.yml` read
   `ws::tests::the_masked_frame_costs_the_walk_over_its_payload_and_nothing_else`
-  at `330417` on the gate commit (`9020d7f`, run 38849151187) and `294378` on
-  the wide pass (`d202c28`, run 38851963288): **−36 039 Ir, −10.9%** for the
+  at `330417` before the wide pass and `294378` after: **−36 039 Ir, −10.9%** for the
   same 16 rounds of the relay's 16 KiB chunk. The mask loop's own probe,
   `ws::tests::mask_chunks_match_the_byte_loop`, moved `452984` → `437971`, and
   `ws::write_frame`, which is driven over a loopback socket and so moves between

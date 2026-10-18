@@ -204,13 +204,7 @@ is the only number that would mean anything here.
 
 ## Time
 
-Measured in `bench.yml` run `37728743550`, which carries the pass (`66c704e`
-over `89f9714`), against the same rows in run `37720316104`, which carried the
-ladder alone (`4bb63c5`). Gate 3 times this rung against the pinned `chacha20`
-0.9 crate at 235 lengths from 65 to 65 537, interleaved best of five per side,
-and re-measures any length under 0.95x before the job can fail on it; gate 1
-runs the differential identity check first, so a backend that is fast because
-it is wrong cannot pass.
+`bench.yml` gate 3 times this rung against the pinned `chacha20` 0.9 crate at 235 lengths from 65 to 65 537, interleaved best of five per side, re-measuring any length under 0.95x before the job can fail; gate 1 runs the differential identity check first, so a backend that is fast because it is wrong cannot pass. The 512-byte pass against the ladder it replaced, each read against its own reference:
 
 | bytes | linux aarch64, ladder | linux aarch64, pass | macos aarch64, ladder | macos aarch64, pass |
 | ---: | ---: | ---: | ---: | ---: |
@@ -219,15 +213,11 @@ it is wrong cannot pass.
 | 16 KiB | 1.50x | 1.70x | 2.95x | 3.19x |
 | 64 KiB | 1.50x | 1.70x | 2.98x | 3.25x |
 
-Both runs measured their own reference in the same process, so the ratios
-compare, but they are different runner instances. Lengths below 512 bytes
-compile to the same ladder in both runs, and those 203 rows are this
-comparison's noise floor: 0.94x to 1.01x on linux aarch64, 0.61x to 1.30x on
-macos aarch64. Against that floor, the 32 measured lengths at or above 512
-bytes — the ones the pass handles — run 1.04x to 1.14x, median 1.11x, on linux
-aarch64, every one of them above it, and 0.92x to 1.42x, median 1.05x, on macos
-aarch64, where the three rows under 1.0x (769, 1024 and 2047 bytes) move less
-than the noise beside them does.
+The two columns are different runner instances but each reads its own reference,
+so the ratios compare. Lengths below 512 bytes compile to the same ladder and are
+this comparison's noise floor (0.94x–1.01x linux aarch64, 0.61x–1.30x macos
+aarch64). Against it, the lengths the pass handles (≥ 512 bytes) run 1.04x–1.14x
+median 1.11x on linux aarch64 and 0.92x–1.42x median 1.05x on macos aarch64.
 
 Gate 7b's halves are printed and not gated, and at these sizes they are the
 weaker instrument: on macos aarch64 its 16 KiB keystream row read 9356 ns for
@@ -235,18 +225,13 @@ the pass against 9041 ns for the ladder, while gate 3 read the pass 1.08x faster
 at the same length. The self-timed row has no reference to cancel a drifting
 runner, so the claim here rests on gate 3.
 
-`c8e19b4` then sized the ladder's last group to every block a buffer has left
-rather than leaving one over for the single-block path, and `701298f` made the
-calibration time the chain that one block pays for. The pair is measured in
-`bench.yml` run `37737912879` against run `37730127644`, which carried the pass
-at `d31ddae`, and the lengths it moves are the ones whose remainder is exactly a
-group: on `aarch64` that is any length of the form `k × 512 + 449..511`, where
-eight states in one group replace seven states and a whole dependent round
-chain. Four of the 235 timed lengths sit in that window — 449, 511, 1023 and
-1535 — and all four are most of what separates the two runs on linux aarch64,
-0.08x of ratio being this pair's noise floor there. The macos rows move further
-because its small lengths are the noisier ones, so its four are quoted beside
-them rather than claimed:
+Sizing the ladder's last group to every block a buffer has left (rather than
+leaving one over for the single-block path), and making the calibration pay for
+that one block, moves the lengths whose remainder is exactly a group: on
+`aarch64`, any length of the form `k × 512 + 449..511`, where eight states in one
+group replace seven states plus a dependent round chain. Four of the 235 timed
+lengths sit there (the macos rows are noisier at small lengths, so they are
+quoted beside the linux rows rather than claimed):
 
 | bytes | linux aarch64, before | linux aarch64, after | macos aarch64, before | macos aarch64, after |
 | ---: | ---: | ---: | ---: | ---: |
@@ -255,23 +240,14 @@ them rather than claimed:
 | 1023 | 1.44x (1 146 ns) | 1.60x (1 042 ns) | 2.33x (655 ns) | 2.97x (549 ns) |
 | 1535 | 1.52x (1 632 ns) | 1.62x (1 528 ns) | 2.55x (893 ns) | 3.01x (810 ns) |
 
-Run `37740838172` repeats those two rows on the same two runners — 449 bytes
-reads 1.53x (543 ns) on linux aarch64 and 2.93x (274 ns) on macos aarch64 — so
-the change is the tail and not the run.
+Repeats on the same runners agree within the tail's noise floor, so the change is
+the tail and not the run.
 
-`d207fe2` then answered the same question on `x86_64`, where a group of four
-`A8` states spills and the split groups are what fit, and it lowered
-`TAIL_STATES` on every arch — which took `aarch64` back to the shape `c8e19b4`
-had just measured away: seven states and a dependent round chain for the one to
-three blocks a remainder of 449 to 511 leaves over. The `aarch64` runner was
-never re-read for that.
-
-`TAIL_STATES` is per-arch now — the group itself on `aarch64`, one fewer
-elsewhere. The two runs that name the difference are `bench.yml` run
-`37981057929` (main at `c54fae6`, the clamp at seven) against run `37976368393`
-(this branch), each `ferrox` column read against its own reference column so the
-runner cancels. The control is 448 bytes, the last length seven states cover,
-and it does not move:
+`TAIL_STATES` is per-arch — the group itself on `aarch64`, one fewer elsewhere. On
+`x86_64` a group of four `A8` states spills and the split groups fit, so it takes
+one fewer; the `aarch64` clamp keeps the whole remainder in one group. Each
+column is read against its own reference so the runner cancels. The control is
+448 bytes, the last length seven states cover, and it does not move:
 
 | bytes | linux aarch64, before | linux aarch64, after | macos aarch64, before | macos aarch64, after |
 | ---: | ---: | ---: | ---: | ---: |
@@ -293,23 +269,18 @@ group loop a pass's remainder can never reach: on `aarch64` the ladder is what t
 tests read the pass against, and it ships with them rather than in the release
 binary.
 
-The `x86_64` rows of those two runs are not usable for that comparison, and the
-reason is the one the `x86_64` pass below exists for. GitHub moved those runners
-between the runs: the rows before and after were read on an `avx2` + `vaes`
-machine, and run `37737912879` landed on one carrying `avx512f`, where the same
-`x86_64` binary read 0.76x to 0.96x of the reference at 512 bytes and above
-against 1.20x on the machine before it, while the reference's own clock moved
-18%. The ladder's pass-length loop is untouched by both commits and the same
-binary ran on both machines, so that was a property of the runner: the ladder
-spends forty shuffle ops a double round for the eight blocks it holds, where the
-pass spends sixteen, and a machine that issues one shuffle a cycle charges for
-the difference.
+The `x86_64` rows above are not usable for that comparison, and the reason is the
+one the `x86_64` pass below exists for. When the runners moved between reads, the
+same binary landed on an `avx512f` machine and read 0.76x–0.96x at 512 bytes and
+above against 1.20x on the machine before it, while the reference's own clock
+moved 18%. The ladder spends forty shuffle ops a double round for the eight
+blocks it holds, where the pass spends sixteen, so a machine that issues one
+shuffle a cycle charges for the difference.
 
-Run `37740838172` carries the pass, against run `37737912879`, which is the same
-ladder on the same runner class — the reference's own clock at 16 KiB reads
-9 316 ns against 9 175 ns on linux `x86_64` and 7 781 ns against 6 974 ns on
-windows `x86_64`, so the windows runner is the slower of the two by about a
-tenth and its absolute column is read with that in mind:
+The pass against the same ladder on the same runner class — the reference's own
+clock at 16 KiB reads 9 316 ns against 9 175 ns on linux `x86_64` and 7 781 ns
+against 6 974 ns on windows `x86_64`, so the windows runner is the slower of the
+two and its absolute column is read with that in mind:
 
 | bytes | linux x86_64, ladder | linux x86_64, pass | windows x86_64, ladder | windows x86_64, pass |
 | ---: | ---: | ---: | ---: | ---: |
@@ -331,20 +302,15 @@ own groups — 320 bytes reads 1.47x (185 ns) in the pass's run against 1.48x
 (179 ns) in the run before it, and 448 bytes 1.51x (312 ns) against 1.52x
 (304 ns).
 
-Run `37749274086` carries the sixteen-block pass — `f2c624e`, the commit this
-page ships with — against run `37740838172`, the eight-block pass at
-`d31ddae`, on the same two runner classes. Both `x86_64` reports name the pass in
-their own machine line: `ferrox core` reads `4-lane core: AVX-512, one word per
-register, 16 blocks a pass, the eight-block pass below a pass, at
-runtime-detected width`, and that line is `ferrox_core::chacha_backend()`, which
-returns it only when the runner's own `is_x86_feature_detected!("avx512f")` and
-`is_x86_feature_detected!("avx2")` both read true — the same condition that lets
-`chacha::avx512`'s differential test execute its body, so a run whose machine
-line names the pass is a run in which gate 1's 7 200 shapes went through it.
-Every length below 1024 bytes compiles to the same call in both runs, and the
-reference's own clock moved between them — 8 057 ns at 16 KiB against 9 316 ns
-on linux `x86_64`, 9 203 ns against 7 781 ns on windows `x86_64` — so each pair
-of columns is read as two runs and not one:
+The sixteen-block AVX-512 pass against the eight-block pass, on the same two
+runner classes. Each `x86_64` run names its pass in `ferrox_core::chacha_backend()`,
+which reports AVX-512 sixteen-blocks-a-pass only when the runner's own
+`is_x86_feature_detected!("avx512f")` and `is_x86_feature_detected!("avx2")` both
+read true — the same condition that lets `chacha::avx512`'s differential test run
+its body, so a run naming the pass is a run in which gate 1's 7 200 shapes went
+through it. Every length below 1024 bytes compiles to the same call in both, and
+the reference's own clock moved between them, so each pair of columns is read as
+two runs:
 
 | bytes | linux x86_64, eight-block pass | linux x86_64, sixteen-block pass | windows x86_64, eight-block pass | windows x86_64, sixteen-block pass |
 | ---: | ---: | ---: | ---: | ---: |
@@ -369,20 +335,14 @@ pass plus a tail and the second a whole pass plus a one-block remainder. Gate
 in either run, so those rows — the 1.15x worst the run before this one carried
 at the same 256 bytes included — are the runner and not either change.
 
-Gate 7 measures the seal against the two-call shape it replaced, and the counts
-say what each of its rows can mean. Below one pass the two shapes are different
-*shapes of work*: at 64 bytes the split is two dependent single-block runs where
-the fusion is one wide group, and run `39064183190` reads that as 1.41x-1.75x at
-64 bytes and 1.24x-1.57x at 256, on macos `aarch64`, linux `x86_64`, linux
-`aarch64` and windows `x86_64`. From 1 KiB the message alone fills the passes, so
-both shapes issue the same invocations — at 16 KiB, 33 of them and 257 blocks on
-`aarch64`, the headed pass opening one invocation earlier and the split spending
-its last one on the key block — and the difference left to time is one function
-call and one base state. The same run reads 0.99x-1.06x across those twenty
-whole-pass rows, one of them (windows, 16 KiB) under 1.00x. Run `37749274086`
-called that a crossover and the 2 KiB and 8 KiB rows were added to bracket it;
-`37763295337` and `39064183190` say it is a call boundary, and a call boundary is
-not 5% of anything.
+Gate 7 measures the seal against the two-call shape it replaced. Below one pass
+the two shapes are different *shapes of work* (at 64 bytes the split is two
+dependent single-block runs where the fusion is one wide group), and the fusion
+reads 1.41x–1.75x at 64 bytes and 1.24x–1.57x at 256 across the four runners.
+From 1 KiB the message alone fills the passes, so both shapes issue the same
+invocations and the difference left to time is one function call and one base
+state — 0.99x–1.06x across the whole-pass rows. That is a call boundary, not a
+crossover.
 
 So gate 7 judges the two rows whose ratio a code change can move — the lengths at
 which the fusion removes an invocation, `framing::ONE_PASS_BYTES` and
@@ -395,12 +355,11 @@ fusion that stopped producing the same bytes fails there rather than in a ratio.
 The negative result stands too — no dispatch sits in `aead.rs`, because no length
 was found where the two-call shape does less work.
 
-The nightly is what forced the arithmetic. At `70fdfd0` its
-`measure trojan-raw-down-8 (macos-15)` cell aborted on a confirmed 0.939x 16 KiB
-seal row (`39001299614`) while `bench.yml` `39000283851` passed this gate on the
-same commit and the same runner class. `framing::timed_row`'s confirmation is one
-process's steady reading, not the machine's, and the rows that move between two
-jobs of one commit are the rows with no work behind the ratio.
+The nightly is what forced the arithmetic: one cell aborted on a confirmed 0.939x
+16 KiB seal row while another passed the same gate on the same runner class.
+`framing::timed_row`'s confirmation is one process's steady reading, not the
+machine's, so the rows that move between two jobs of one commit are the rows with
+no work behind the ratio.
 
 ## What we removed
 
@@ -518,16 +477,16 @@ What is **not** removed, and is named rather than claimed:
   aarch64 and `{128 stride-2, 1024 AVX2}` on x86_64, so any page that quotes a
   threshold has to say which architecture it means — the two do not agree, and
   each four-lane rung moved to 1 KiB where the other's gate sits: the AVX2 one
-  in `815eeb2` because its fixed setup cost is repaid by then, and the NEON-4
-  one in `89f9714` on the same measurement, taken again after the four blocks'
-  limbs came out of one `TBL4` a group.
+  because its fixed setup cost is repaid by then, and the NEON-4 one on the same
+  measurement, taken again after the four blocks' limbs came out of one `TBL4` a
+  group.
 
   **The two-lane rung below the four-lane one was unreachable, and it is gone.**
-  `89f9714` moved `NEON4_THRESHOLD_BYTES` down to 1 024 where the two-lane
-  threshold sat, and `absorb` tested the four-lane rung first, so every slice
-  of 1 024 bytes or more reached `absorb_neon4` and `absorb_two_lane` ran only
-  where a test called it by name. P45 deleted the rung, its threshold, its
-  dispatch arm, its two helpers and that test: a second Horner step, its own
+  The four-lane threshold sat at the two-lane threshold and `absorb` tested the
+  four-lane rung first, so every slice of 1 024 bytes or more reached
+  `absorb_neon4` and `absorb_two_lane` ran only where a test called it by name.
+  The rung is deleted with its threshold, its dispatch arm, its two helpers and
+  that test: a second Horner step, its own
   pair of `q`/`qs` powers and its own tail walk, none of them reachable from
   any input. The shipping ladders were already `{128 stride-2, 1024 NEON-4}`
   on aarch64 and `{128 stride-2, 1024 AVX2}` on x86_64; now the code says so

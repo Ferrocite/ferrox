@@ -133,7 +133,7 @@ count, and the two are not substitutes: `expected.txt` is an output oracle,
 
 ## Time
 
-**Not measured on this branch.** `ferrox-core/examples/kcp_bench.rs` exists and
+**Not measured yet.** `ferrox-core/examples/kcp_bench.rs` exists and
 is not wired to a workflow that runs it on a named runner, so no throughput
 figure is quoted. A KCP number measured over a VPN is a measurement of the VPN.
 
