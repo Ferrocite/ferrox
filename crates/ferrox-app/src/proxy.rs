@@ -5609,13 +5609,19 @@ fn pick_verified_edge(probes: &[Option<bool>]) -> Option<usize> {
         .position(|answer| matches!(answer, Some(true)))
 }
 
+/// Whether the answers read so far already fix the pick: once an edge honours the pin, a later probe cannot un-prefer it, so the walk is settled and every probe past here is dead work.
+#[must_use]
+fn probe_settled(probes: &[Option<bool>]) -> bool {
+    pick_verified_edge(probes).is_some()
+}
+
 /// Whether any edge answered a probe at all: none did means this runner cannot dial the probe tunnel, so stop trying.
 #[must_use]
 fn probes_reachable(probes: &[Option<bool>]) -> bool {
     probes.iter().any(Option::is_some)
 }
 
-/// The exit country one edge really hands back: a disposable H3 tunnel to the probe authority, asked for the trace, then dropped, which is what gives its pooled stream back. It never rides a flow's own tunnel, so a per-target carrier is left intact; `None` means this runner could not carry or read the trace here.
+/// The exit country one edge really hands back: a disposable H3 tunnel to the probe authority, asked for the trace, then dropped, which is what gives its pooled stream back. It never rides a flow's own tunnel, so a per-target carrier is left intact; `None` means this runner could not carry or read the trace here. The probe is a probe, so its dial gets the probe budget rather than a named carrier's full handshake: a lane whose UDP is blackholed has to say so before the first flow's client gives up.
 fn probe_edge_exit(
     foxy: &FoxyOut,
     edge: &ferrox_core::foxy::Candidate,
@@ -5636,7 +5642,7 @@ fn probe_edge_exit(
         pass,
     };
     let quic_dial = foxy_quic_dial(foxy, edge);
-    let quic = crate::quic::pooled_stream_within(&quic_dial, crate::quic::HANDSHAKE_TIMEOUT)?;
+    let quic = crate::quic::pooled_stream_within(&quic_dial, budgets::carrier_probe())?;
     // The lease goes into the open and comes back with the lane: whoever ends the flow hands the pool entry over, and a probe that ends early ends with it.
     let opened = crate::foxy::Tunnel::open(&dial, authority, Some(quic));
     match opened {
@@ -5649,7 +5655,7 @@ fn probe_edge_exit(
     }
 }
 
-/// The pinned-country edge that really exits in the pin, chosen once per lane over disposable probes and cached so every carrier rides it. Falls back to the label order when no edge agrees, records the truth when one cannot, and stops probing when none can be reached here.
+/// The pinned-country edge that really exits in the pin, chosen once per lane over disposable probes and cached so every carrier rides it. The walk stops at the first edge that honours the pin, since a later probe cannot change that pick. Falls back to the label order when no edge agrees, records the truth when one cannot, and stops probing when none can be reached here.
 fn verify_exit(foxy: &FoxyOut) {
     if !exit_needs_probe(foxy) || foxy.probe_unavailable.load(Ordering::Relaxed) {
         return;
@@ -5691,6 +5697,9 @@ fn verify_exit(foxy: &FoxyOut) {
             agrees
         });
         flags.push(agreed);
+        if probe_settled(&flags) {
+            break;
+        }
     }
     if let Some(chosen) = pick_verified_edge(&flags).map(|at| edges[at].clone()) {
         if let Ok(mut kept) = foxy.verified.lock() {
@@ -21879,7 +21888,7 @@ mod relay_tests {
 
 #[cfg(test)]
 mod foxy_exit_tests {
-    use super::{exit_agrees, pick_verified_edge, probes_reachable};
+    use super::{exit_agrees, pick_verified_edge, probe_settled, probes_reachable};
 
     #[test]
     fn a_pinned_country_accepts_its_own_exit_and_refuses_a_single_edge_anycast_that_egresses_elsewhere(
@@ -21918,6 +21927,33 @@ mod foxy_exit_tests {
         assert!(!probes_reachable(&[None, None, None]));
         assert!(probes_reachable(&[None, Some(false)]));
         assert!(!probes_reachable(&[]));
+    }
+
+    #[test]
+    fn the_walk_ends_at_the_agreeing_edge_without_losing_the_pick() {
+        for answers in [
+            vec![Some(true)],
+            vec![Some(false), Some(true), Some(false)],
+            vec![None, Some(false), Some(true), None],
+            vec![Some(false), None, Some(false)],
+            vec![None, None],
+            vec![],
+        ] {
+            let whole = pick_verified_edge(&answers);
+            // The walk truncates where `probe_settled` first fires; the truncated table must pick the same edge.
+            let mut walked = 0usize;
+            while walked < answers.len() {
+                walked += 1;
+                if probe_settled(&answers[..walked]) {
+                    break;
+                }
+            }
+            assert_eq!(
+                whole,
+                pick_verified_edge(&answers[..walked]),
+                "{walked} probe(s) of {answers:?} lost the pick"
+            );
+        }
     }
 }
 

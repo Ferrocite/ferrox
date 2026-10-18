@@ -31,7 +31,7 @@ its `Read + Write`. The tunnel a dial returns owns the pooled stream it rides
 ```mermaid
 graph TD
     S["SOCKS front, no Mux"] --> V{"exit pinned and a probe set?"}
-    V -- "once per lane" --> P["verify_exit: disposable H3 probe per edge, cache the first whose exit agrees"]
+    V -- "once per lane" --> P["verify_exit: disposable H3 probes, each on the probe budget, until one exits in the pin"]
     P --> O["dial_order: verified edge, then stored, then the country's"]
     V -- "no pin / already verified" --> O
     O --> T{"which carrier?"}
@@ -200,9 +200,12 @@ the two lanes reassemble independently and a fix to one says nothing about the
 other.
 
 `edges-preferred-by-verified-exit 1` is the lane's exit-country selection: when a
-pinned country offers more than one edge, a once-per-lane pre-flight asks each
+pinned country offers more than one edge, a once-per-lane pre-flight asks a
 disposable HTTP/3 probe tunnel where it really exits and dials the first whose
-observed `loc` matches the pin, not the first that merely opened. The value is
+observed `loc` matches the pin, not the first that merely opened. The walk ends at
+that edge: an answer past the first agreement cannot demote it, and `probe_settled`
+says so for the same tables the pick is tested on
+(`the_walk_ends_at_the_agreeing_edge_without_losing_the_pick`). The value is
 the one disagreeing edge the kernel passes over before the agreeing one, which is
 what `the_preferred_edge_is_the_first_one_whose_exit_agrees_not_the_first_one_opened`
 observes. A country the serverlist publishes as a single anycast edge — the
@@ -211,12 +214,19 @@ the lane records the truth (`exit CA differs from pin US`, under `FOXY_DEBUG`) a
 dials the one edge it was given: which CDN point of presence answers a country's
 anycast from a given runner is not a choice the client can make.
 
-What the pre-flight costs, named rather than hidden: up to `MAX_FOXY_ALTERNATES +
-1` disposable HTTP/3 dials, once per lane, then cached on `FoxyOut` — so it is
-paid on the first flow, not every one. It runs only when a country is pinned and
-an `exitProbe` is set; the recommended location, and every config with no probe,
-pay nothing, and a runner that cannot carry the trace sets one flag and stops
-probing rather than costing each flow a dead dial.
+What the pre-flight costs, named rather than hidden: one disposable HTTP/3 dial
+when the first edge honours the pin, and at most `MAX_FOXY_ALTERNATES + 1` when
+none does — once per lane, cached on `FoxyOut`, so it is paid on the first flow,
+not every one. Each probe dials on `budgets::carrier_probe()`, the same 2.5-second
+budget an `auto` carrier walk uses, rather than the 30-second handshake a named
+carrier is allowed: a probe is a probe. This is what a runner whose UDP path to
+the edge is blackholed pays, and it is why the budget matters — on the full
+handshake budget three unreachable edges cost a lane's first flow up to 90 seconds
+before its first byte, which is longer than the client in front of it waits. It
+runs only when a country is pinned and an `exitProbe` is set; the recommended
+location, and every config with no probe, pay nothing, and a runner that cannot
+carry the trace sets one flag and stops probing rather than costing each flow a
+dead dial.
 
 ## The pinned anchor
 
