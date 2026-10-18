@@ -2,12 +2,13 @@
 
 A `tun` inbound opens a virtual network device and reads raw IPv4 packets off
 it; every TCP flow the packets form becomes a proxy dial through the machinery
-the tree already had, and the bytes that come back leave again as IP packets on
-the same descriptor. Both roles the row has are served and both are proved:
-device-to-dial and dial-to-device. A flow also *ends*: the response read is
-armed at the idle budget, so a peer that stops speaking hands its thread, its
-pair and the relay leg it holds back instead of parking them for the life of
-the process.
+the tree already had, every UDP flow becomes a datagram dial through the SOCKS5
+UDP association the same front layer serves, and the bytes that come back leave
+again as IP packets on the same descriptor. Both roles the row has are served
+and both are proved: device-to-dial and dial-to-device. A flow also *ends*: the
+response read is armed at the idle budget, so a peer that stops speaking hands
+its thread, its pair and the relay leg it holds back instead of parking them for
+the life of the process.
 
 A device carries no wire byte-stream to diff, so this row's identity claim is
 the (target, payload) dial set: the pairs the inbound produces from a pinned
@@ -19,6 +20,12 @@ the golden `expected.txt` that run recorded. The convention the golden pins
 (dial on handshake, deliver the reassembled payload in order, EOF at FIN) is
 also what xray's `proxy/tun/tcp_lightweight.go` reaches at `input`, `receive`
 and `ReadMultiBuffer`, and the SYN-ACK numbers follow its `newTCPConn` rule.
+The datagram half is gated by the wire itself instead: the frame the handler
+writes onto the association is asserted byte-for-byte as the RFC 1928
+`RSV || FRAG || ATYP || ADDR || PORT || DATA` a SOCKS5 client sends, and the
+answer is required to verify at `connectip::udp_from_packet`, the reader the
+pinned connectip surface is checked with. The oracle records TCP flows today,
+so no smoltcp-run UDP dial set is claimed here; see below.
 
 The platform opens are Linux (`/dev/net/tun` + `TUNSETIFF`, `IFF_TUN|IFF_NO_PI`
 so no protocol-info header to strip), macOS (`AF_SYSTEM` utun control channel)
@@ -35,16 +42,22 @@ delivers whole packets, and `SOCK_SEQPACKET` does not exist on macOS.
 graph TD
     A["inbound config: protocol tun"] --> B["Device::open<br/>FERROX_TUN_FD, TUNSETIFF, or utun"]
     B --> C["serve loop: one read_packet per device read"]
-    C --> D["ipv4_head + tcp_head<br/>borrowed slices, no staging"]
+    C --> O["dispatch drains ended first<br/>flows and legs both lose the entry"]
+    O --> D["ipv4_head, then tcp_head or udp_head<br/>borrowed slices, no staging"]
     D --> E["SYN: accept_flow<br/>SYN-ACK written on the device, loopback pair opened"]
     E --> F["relay: serve_connect over the pair<br/>Front::Socks — the front layer's own dial"]
     D --> G["segment with payload: write_all to the pair<br/>rcv_nxt advances; delayed ACK at push, finish, or MTU"]
     F --> H["response thread: reads the pair's other half<br/>armed at the idle budget"]
     H --> I["build_tcp_packet<br/>PSH|ACK, snd_nxt cursor"]
     I --> C
-    H --> J["budget expires twice with neither side speaking<br/>shutdown both halves, send the key"]
-    J --> K["accept_flow drains ended keys<br/>flows.remove, so the packet path pays nothing"]
-    E --> K
+    D --> J["first datagram: Association::open once<br/>SOCKS5 UDP ASSOCIATE over a loopback pair"]
+    J --> K["serve_socks_udp on its other half<br/>the datagram front every socks inbound reaches"]
+    K --> L["per-flow leg: reused frame buffer<br/>RSV|FRAG|address|data to the relay address"]
+    L --> M["leg reader: parse_socks_udp, source filter<br/>udp_datagram into the bound reply buffer"]
+    M --> C
+    H --> N["budget expires with neither side speaking<br/>shutdown both halves, name the ended flow"]
+    M --> N
+    N --> O
 ```
 
 ## Measured
@@ -57,6 +70,9 @@ graph TD
 | reverse-role-response-round-trips | 1 | ferrox-app-tun::tests::the_response_bytes_come_back_as_ip_packets |
 | parse-copies-per-packet | 0 | ferrox-app-tun::tests::the_payload_is_borrowed_from_the_read_buffer |
 | flows-handed-back-at-the-idle-budget | 2 | ferrox-app-tun::tests::a_quiet_tun_flow_hands_its_threads_back |
+| datagram-association-round-trips | 1 | ferrox-app-tun::tests::a_datagram_flow_frames_the_association_and_returns_the_echo |
+| datagram-parse-copies-per-packet | 0 | ferrox-app-tun::tests::the_datagram_is_borrowed_from_the_read_buffer |
+| datagram-reply-packets-checksummed | 1 | ferrox-app-tun::tests::the_reply_packet_verifies_at_the_reference_reader |
 <!-- counts:end -->
 
 The first row is the identity claim itself: three flows — a request line, a
@@ -64,18 +80,26 @@ four-byte blob, and a two-chunk payload whose lengths are not a segment
 boundary — dialed with exactly the (target, payload) pairs the smoltcp run
 recorded. The reverse-role row sends bytes out through the relay and requires
 them back as an IP packet carrying those bytes on the same descriptor. The
-copies row is gated by pointer identity, not bytes:
-`the_payload_is_borrowed_from_the_read_buffer` asserts the parsed payload's
+copies rows are gated by pointer identity, not bytes:
+`the_payload_is_borrowed_from_the_read_buffer` and
+`the_datagram_is_borrowed_from_the_read_buffer` assert each parsed payload's
 base *is* the read buffer plus the fixed headers, because a byte test passes
-with a parsing copy and without one. The last row is the lifetime claim: two
-flows opened against a relay that reads to EOF and reports back — one ended by
-silence past the armed idle budget, one ended by the client's RST inside it —
-and both must report back, with the quiet flow's entry already gone from the
-table at the next dial and the reset flow's gone at once. Before the arm, a
+with a parsing copy and without one. The flows-handed-back row is the lifetime
+claim: two flows opened against a relay that reads to EOF and reports back — one
+ended by silence past the armed idle budget, one ended by the client's RST inside
+it — and both must report back, with the quiet flow's entry already gone from the
+table at the next packet and the reset flow's gone at once. Before the arm, a
 peer that stopped speaking left the response thread parked in an untimed
 `read(2)` for the life of the process: one thread, one loopback pair, one relay
 leg and — under a `foxy` outbound — one tunnel and its lane, per dead flow,
 which is what a long `--vpn` session's thread count was climbing.
+
+The datagram rows are the same claim on the other front: one flow that frames
+onto the association and returns the echo, with the frame asserted byte-for-byte
+(`[0,0,0,1,198.51.100.7,0,53] ++ b"who-is"`) and the answer required to carry
+both checksums a peer's stack verifies. A leg is reaped by the same channel:
+silent past `budgets::udp_idle()`, its reader shuts, names its key, and
+`dispatch` drops the socket it held.
 
 Syscalls: the serve loop is one `read(2)` per inbound packet and one
 `write(2)` per emitted packet — SYN-ACK, pure ACK, response — plus one
@@ -128,19 +152,30 @@ Against the pinned references, which is where the bar is:
   bespoke outbound call from the packet handler. It does not: `accept_flow`
   opens a loopback `TcpStream` pair and calls the same
   `serve_connect(conn, out, dest, Front::Socks, &[])` every other front
-  reaches, so the destination from the IP header rides the existing SOCKS
-  front and no protocol code is duplicated — the idea zeptun sells (translate
-  the device onto the SOCKS machinery, do not re-implement it), taken without
-  its translator thread. `is_device` refuses `utun`/`wintun`/`tun2socks` as
+  reaches, and `handle_udp` opens one loopback association whose other half runs
+  the same `serve_socks_udp` the SOCKS inbound reaches — the greeting, the
+  `UDP ASSOCIATE` request and the relay-address reply are the bytes a SOCKS5
+  client writes, so the outbound's UDP arms cannot tell a device from a proxy
+  client. The destination from the IP header rides the existing front either
+  way and no protocol code is duplicated — the idea zeptun sells (translate the
+  device onto the SOCKS machinery, do not re-implement it), taken without its
+  translator thread. `is_device` refuses `utun`/`wintun`/`tun2socks` as
   *protocol* names while serving `tun` with all three device spellings, so the
   config surface keeps one way in.
 - **The parsing copy.** The references stage each packet: xray's stack reads
   through a `buf.Buffer` it copies into segments, smoltcp parses into its own
   `IoBuffers`. Here `ipv4_head` and `tcp_head` hand back slices *of the read
   buffer*, the payload goes from that borrowed slice straight into the pair's
-  `write_all`, and the pointer-identity row above is the gate. A segment with
+  `write_all`, and the pointer-identity rows above are the gate. A segment with
   TCP options parses at its real data offset (`a_syn_with_options_leaves_the_payload_where_the_header_ends`), and a forged length or short header is
-  refused, not repaired (`a_forged_packet_is_refused_not_repaired`).
+  refused, not repaired (`a_forged_packet_is_refused_not_repaired`,
+  `udp_head_refuses_a_forged_length`).
+- **The datagram reply's buffer.** `open_leg` renders each answer with
+  `connectip::udp_datagram` into one `Vec` allocated before the thread starts and
+  `clear()`ed per packet, and `handle_udp` frames onto the association through
+  the handler's reused buffer, so a steady-state datagram both ways allocates
+  nothing. Reusing the read buffer for the outbound frame would need a vectored
+  send, and the row does not count that yet.
 
 ## What was not removed
 
@@ -156,11 +191,11 @@ Named rather than claimed, with the worst input worked out first:
   device merely retransmits to; a per-packet clock read would be the same cost
   paid by *every* packet instead of only the ones carrying payload, and a timer
   per flow is the machinery this row already removed.
-- **The reap rides the next SYN.** An ended key is drained in `accept_flow`,
-  not by a reaper: a dead flow whose device never dials again keeps its table
-  entry until the next dial comes. Two threads and a socket pair do return at
-  the budget — the entry is the smaller half of what a quiet flow holds, and it
-  is held by the one thread that owns the map.
+- **The reap rides the next packet.** An ended key is drained in `dispatch`,
+  not by a reaper: a dead flow whose device sees no further packet keeps its
+  table entry until one arrives. Two threads and a socket pair do return at the
+  budget — the entry is the smaller half of what a quiet flow holds, and it is
+  held by the one thread that owns the map.
 - **Out-of-order and duplicate segments are not reassembled.** The handler
   delivers payload in arrival order and advances `rcv_nxt` to the last
   segment's end. A script does not reorder; a network does. Xray holds
@@ -174,14 +209,21 @@ Named rather than claimed, with the worst input worked out first:
   depend on it, and the wrap case is gated instead by
   `the_syn_ack_numbers_wrap_at_the_sequence_space_boundary` (`u32::MAX-1`
   replies `u32::MAX`).
-- **UDP and ICMP are dropped, not demuxed.** The add-on's increment (b) says
-  the packet demux should land on "the dials the front layer already makes",
-  and the arithmetic of this tree says the datagram half of that does not
-  exist yet: every `serve_socks_udp_*` path is welded to a bound `UdpSocket`
-  relay, so a TUN datagram has no seam to dial onto without first growing a
-  datagram relay through the front — the seam refactor is its own slice, the
-  way row 30's `Connection` seam was, and it is named here rather than folded
-  half-proven into this one. TCP-only is what the differential can see today.
+- **ICMP is dropped, not demuxed.** `dispatch` serves TCP and UDP and answers
+  every other protocol by returning, so a ping off the device is lost the way
+  an unroutable datagram is. The pinned references each grew their own ICMP
+  responder; that answer is its own slice.
+- **The datagram lane has no reference golden yet.** The oracle runs smoltcp's
+  TCP socket, so the UDP half of the identity claim is the wire bytes RFC 1928
+  names plus the core reader's checksum walk, not a reference-vs-Ferrox dial
+  set. Extending the recorder to smoltcp's UDP socket and re-blessing
+  `expected.txt` is a CI run: the crate resolves from crates.io, which no
+  contributor machine reaches from behind its own proxy.
+- **The association is proved against a stand-in that speaks the spec.**
+  `echo_associate` answers the greeting, the `UDP ASSOCIATE` request and the
+  relay-address reply the way `serve_socks_udp` does, and the shipped inbound
+  wires that function; what no test here reaches is a datagram that leaves the
+  tree to a real target.
 - **The privileged opens are compile-checked only.** No CI runner holds
   `CAP_NET_ADMIN`, so nothing runs `TUNSETIFF` or the utun control connect;
   the inherited-fd path is the one the tests and any real CI use, and that no
