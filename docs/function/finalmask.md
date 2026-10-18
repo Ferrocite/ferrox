@@ -82,7 +82,7 @@ graph TD
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
-| pieces-restaged-per-hello | 0 | ferrox-core-finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lands |
+| pieces-restaged-per-hello | 0 | ferrox-core-finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lies |
 | merged-buffer-regrowths-per-hello | 0 | ferrox-core-finalmask::tests::the_merged_run_is_the_only_buffer_the_mask_owns |
 | records-past-max-split | 0 | ferrox-core-finalmask::tests::a_max_split_ends_the_run_on_the_whole_hello |
 | socket-writes-for-a-merged-hello | 1 | ferrox-core-finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths |
@@ -97,7 +97,7 @@ graph TD
 ```bash
 ./scripts/count-ops.sh report finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths \
   'ferrox_core::finalmask::Chain::write' 'ferrox_core::finalmask::Fragment::write_hello'
-./scripts/count-ops.sh report finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lands \
+./scripts/count-ops.sh report finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lies \
   'ferrox_core::finalmask::write_record'
 ./scripts/count-ops.sh report finalmask::tests::the_last_configured_width_governs_every_later_segment \
   'ferrox_core::finalmask::Fragment::write_pieces'
@@ -125,7 +125,7 @@ throughput claim until those two runs are.
   body) before writing. The delayed lane here gathers the five-byte header and the
   caller's own body slice into one `write_vectored`
   (`ferrox-core::finalmask::write_record`), so the body never lands in a buffer of its
-  own: `a_delayed_piece_hands_the_body_over_where_it_lands` pins each piece's base
+  own: `a_delayed_piece_hands_the_body_over_where_it_lies` pins each piece's base
   inside the caller's hello (`pieces-restaged-per-hello` 0). The header is still this
   stage's own five bytes, because a re-headed record cannot be the caller's bytes.
 - **A fresh `hello` list per merged write.** The reference's merge branch starts from
