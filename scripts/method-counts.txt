@@ -213,6 +213,7 @@ carrier-foxy payload-staging-copies-per-byte-written 0 ferrox-app-foxy::loopback
 carrier-foxy payload-staging-copies-per-byte-read 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane
 carrier-foxy read-buffer-bytes-per-staged-remainder 1 ferrox-app-foxy::loopback::a_read_leaves_only_what_the_callers_buffer_had_no_room_for
 carrier-foxy h2-bytes-lost-at-a-read-quantum 0 ferrox-app-foxy::loopback::a_frame_that_straddles_a_read_quantum_arrives_whole
+carrier-foxy h2-upload-bytes-blocked-by-an-unread-grant 0 ferrox-app-foxy::loopback::an_upload_is_paced_by_the_grants_the_edge_sends_rather_than_by_the_bytes_it_reads
 carrier-foxy carriers-dialled 3 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer
 carrier-foxy udp-carriers-dialled 2 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer
 carrier-foxy datagram-frames-per-capsule 1 ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_over_quic_and_echoes_a_datagram

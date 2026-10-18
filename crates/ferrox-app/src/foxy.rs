@@ -483,7 +483,11 @@ fn open_h2_with(dial: &FoxyDial, block: &[u8]) -> Result<Tls2, Failure> {
 
     let mut lane = Tls2 {
         tls,
-        window: foxy::flow::Window::new(i64::from(frames::WINDOW), i64::from(frames::WINDOW)),
+        // What this lane may put on the wire is only what the edge grants: the stream window arrives in its settings and the connection window only moves by a `WINDOW_UPDATE` on stream 0, so both start at the protocol default rather than at the window this lane asks the edge to keep open for it.
+        window: foxy::flow::Window::new(
+            i64::from(frames::DEFAULT_WINDOW),
+            i64::from(frames::DEFAULT_WINDOW),
+        ),
         max_frame: MAX_FRAME,
         carry: Vec::new(),
         at: 0,
@@ -615,6 +619,20 @@ impl Tls2 {
         self.tls.write_all(&out).map_err(|_| Failure::Io)
     }
 
+    /// The credit this lane may spend on one frame: the edge grants the stream and the connection windows independently, so the tighter of the two is the limit.
+    fn spend(&self) -> u32 {
+        self.window.stream().min(self.window.connection())
+    }
+
+    /// Applies one `WINDOW_UPDATE` from the edge: stream 0 moves the connection credit and our own stream moves the stream credit; nothing else gets spent by receiving DATA.
+    fn grant(&mut self, stream: u32, increment: u32) {
+        if stream == 0 {
+            self.window.add_connection(increment);
+        } else if stream == 1 {
+            self.window.add_stream(increment);
+        }
+    }
+
     fn ack(&mut self, kind: u8, payload: &[u8]) -> Result<(), Failure> {
         self.out.clear();
         h2_frame(kind, 0x1, 0, payload, &mut self.out);
@@ -654,6 +672,10 @@ impl Tls2 {
                             lane.ack(frames::PING, payload).map(|()| None)
                         }
                         frames::H2Event::Push => lane.refuse_push().map(|()| None),
+                        frames::H2Event::Window { stream, increment } => {
+                            lane.grant(stream, increment);
+                            Ok(None)
+                        }
                         frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
                             Err(Failure::Stream)
                         }
@@ -705,14 +727,13 @@ impl Tls2 {
         let mut prefix = [0u8; 10];
         let plen = masque::datagram_prefix_into(&mut prefix, payload.len());
         let total = plen + payload.len();
+        // The whole capsule rides or waits: a credit the lane has not been granted would be spent by the capsule's head, and a caller holding this lane cannot read the `WINDOW_UPDATE` that would grant it.
+        if u32::try_from(total).unwrap_or(u32::MAX) > self.spend() {
+            return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+        }
         let mut at = 0usize;
         while at < total {
-            let frame =
-                foxy::flow::frame_size(total - at, self.max_frame).min(self.window.stream());
-            if frame == 0 {
-                std::thread::sleep(Duration::from_millis(5));
-                continue;
-            }
+            let frame = foxy::flow::frame_size(total - at, self.max_frame).min(self.spend());
             self.window.take(frame);
             let frame = frame as usize;
             let header = frames::H2Frame {
@@ -769,8 +790,6 @@ impl Tls2 {
                     frames::H2Event::Data { payload, end } => {
                         let len = payload.len();
                         lane.fin = end;
-                        lane.window.add_stream(len as u32);
-                        lane.window.add_connection(len as u32);
                         if len > 0 {
                             lane.credit(len).map_err(io)?;
                         }
@@ -784,6 +803,10 @@ impl Tls2 {
                             }
                         }
                         lane.capsule_buf.extend_from_slice(payload);
+                        Ok(0)
+                    }
+                    frames::H2Event::Window { stream, increment } => {
+                        lane.grant(stream, increment);
                         Ok(0)
                     }
                     frames::H2Event::Ping { ack: false, .. } => {
@@ -845,7 +868,7 @@ impl Write for Tls2 {
         if self.fin {
             return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
         }
-        let frame = foxy::flow::frame_size(buf.len(), self.max_frame).min(self.window.stream());
+        let frame = foxy::flow::frame_size(buf.len(), self.max_frame).min(self.spend());
         if frame == 0 {
             return Ok(0);
         }
@@ -885,13 +908,15 @@ impl Read for Tls2 {
                         let taken = buf.len().min(len);
                         buf[..taken].copy_from_slice(&payload[..taken]);
                         lane.stage(payload, taken);
-                        lane.window.add_stream(len as u32);
-                        lane.window.add_connection(len as u32);
                         lane.fin = end;
                         if len > 0 {
                             lane.credit(len).map_err(io)?;
                         }
                         Ok(taken)
+                    }
+                    frames::H2Event::Window { stream, increment } => {
+                        lane.grant(stream, increment);
+                        Ok(0)
                     }
                     frames::H2Event::Ping { ack: false, .. } => {
                         lane.ack(frames::PING, payload).map_err(io)?;
@@ -1710,10 +1735,14 @@ impl Tls2 {
         self.out.extend_from_slice(&request);
         // The request rides the capsule stream inside DATA frames, the way a packet does: raw TLS bytes would desynchronise the edge's frame walk.
         let mut at = 0usize;
+        let send_by = Instant::now() + HEADER_TIMEOUT;
         while at < self.out.len() {
-            let frame = foxy::flow::frame_size(self.out.len() - at, self.max_frame)
-                .min(self.window.stream());
+            let frame =
+                foxy::flow::frame_size(self.out.len() - at, self.max_frame).min(self.spend());
             if frame == 0 {
+                if Instant::now() >= send_by {
+                    return Err(Failure::Stream);
+                }
                 std::thread::sleep(Duration::from_millis(5));
                 continue;
             }
@@ -1773,11 +1802,13 @@ impl Tls2 {
                     frames::H2Event::Data { payload, end } => {
                         lane.capsule_buf.extend_from_slice(payload);
                         lane.fin = end;
-                        lane.window.add_stream(payload.len() as u32);
-                        lane.window.add_connection(payload.len() as u32);
                         if !payload.is_empty() {
                             lane.credit(payload.len()).map_err(io)?;
                         }
+                        Ok(())
+                    }
+                    frames::H2Event::Window { stream, increment } => {
+                        lane.grant(stream, increment);
                         Ok(())
                     }
                     frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
@@ -1816,8 +1847,6 @@ impl Tls2 {
                     match frames::h2_event(frame, payload, 1) {
                         frames::H2Event::Data { payload, end } => {
                             lane.fin = end;
-                            lane.window.add_stream(payload.len() as u32);
-                            lane.window.add_connection(payload.len() as u32);
                             if !payload.is_empty() {
                                 lane.credit(payload.len()).map_err(io)?;
                             }
@@ -1832,6 +1861,10 @@ impl Tls2 {
                                 }
                             }
                             lane.capsule_buf.extend_from_slice(payload);
+                            Ok(None)
+                        }
+                        frames::H2Event::Window { stream, increment } => {
+                            lane.grant(stream, increment);
                             Ok(None)
                         }
                         frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
@@ -3213,8 +3246,8 @@ mod loopback {
         const CHUNK: usize = 16 * 1024;
         const PARK: Duration = Duration::from_secs(10);
         const WAKE: Duration = Duration::from_millis(500);
-        // One chunk past the lane's whole credit, so the last read is the one that cannot go through.
-        const UPLOAD: usize = frames::WINDOW as usize + CHUNK;
+        // One chunk past the credit the edge grants, so the last write is the one that cannot go through.
+        const UPLOAD: usize = frames::DEFAULT_WINDOW as usize + CHUNK;
         let (roots, server) = minted(b"h2");
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
@@ -3255,9 +3288,9 @@ mod loopback {
             let mut status = Vec::new();
             h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut status);
             tls.write_all(&status).expect("answers 200");
-            // The edge reads the whole credit and grants none of it back, then hangs up on the lane that still has a chunk to send.
+            // The edge reads the credit it granted and gives none of it back, then hangs up on the lane that still has a chunk to send.
             let mut credit = 0usize;
-            while credit < frames::WINDOW as usize {
+            while credit < frames::DEFAULT_WINDOW as usize {
                 let mut header = [0u8; frames::H2_HEADER];
                 if !read_exact_poll(&mut tls, &mut header) {
                     return;
@@ -3299,7 +3332,7 @@ mod loopback {
             let _ = ended_tx.send(());
         });
         let mut credit = 0usize;
-        while credit < frames::WINDOW as usize {
+        while credit < frames::DEFAULT_WINDOW as usize {
             credit += seen_rx
                 .recv_timeout(PARK)
                 .expect("the edge keeps reading what the lane sends");
@@ -3308,6 +3341,94 @@ mod loopback {
             .recv_timeout(WAKE)
             .expect("the upload parked on a dead lane is still holding its workers");
         browser.join().expect("the browser finishes");
+        edge.join().expect("the edge finishes");
+    }
+
+    /// An upload is paced by what the edge grants, not by what the lane reads back: this edge answers no payload at all and grants exactly the credit it consumes, so a lane that spends credit on inbound DATA rather than on the edge's `WINDOW_UPDATE` frames stops partway and a lane that reads them finishes the body.
+    #[test]
+    fn an_upload_is_paced_by_the_grants_the_edge_sends_rather_than_by_the_bytes_it_reads() {
+        const GRANT: u32 = 32 * 1024;
+        const CHUNK: usize = 16 * 1024;
+        // Wider than either window the lane starts with, so the body only leaves if both the stream and the connection credit are refilled.
+        const UPLOAD: usize = 8 * GRANT as usize;
+        const PARK: Duration = Duration::from_secs(30);
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel::<usize>();
+        // A consuming edge: it reads every frame, answers with a grant per payload, and never sends a payload of its own.
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) {
+                return;
+            }
+            let mut opening = Vec::new();
+            let mut settings = Vec::new();
+            settings.extend_from_slice(&4u16.to_be_bytes());
+            settings.extend_from_slice(&GRANT.to_be_bytes());
+            h2_frame(frames::SETTINGS, 0, 0, &settings, &mut opening);
+            h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut opening);
+            tls.write_all(&opening).expect("advertises and answers");
+            let mut taken = 0usize;
+            while taken < UPLOAD {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                if frame.kind != frames::DATA {
+                    continue;
+                }
+                taken += payload.len();
+                let _ = seen_tx.send(payload.len());
+                let increment = (payload.len() as u32).to_be_bytes();
+                let mut grant = Vec::new();
+                h2_frame(frames::WINDOW_UPDATE, 0, 1, &increment, &mut grant);
+                h2_frame(frames::WINDOW_UPDATE, 0, 0, &increment, &mut grant);
+                tls.write_all(&grant).expect("grants what it took");
+            }
+        });
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        tunnel
+            .set_read_quantum(Duration::from_millis(5))
+            .expect("bounds one read");
+        let body = vec![0x5Au8; CHUNK];
+        let mut wrote = 0usize;
+        let mut probe = [0u8; 8];
+        let by = Instant::now() + PARK;
+        while wrote < UPLOAD {
+            assert!(
+                Instant::now() < by,
+                "the upload stopped at {wrote} of {UPLOAD} bytes"
+            );
+            match tunnel.write(&body) {
+                Ok(0) => {
+                    // The credit only arrives as a frame, so the way to earn it back is to read the lane.
+                    let _ = tunnel.read(&mut probe);
+                }
+                Ok(written) => wrote += written,
+                Err(error) => panic!("the lane ended the upload: {error}"),
+            }
+        }
+        let mut arrived = 0usize;
+        while arrived < UPLOAD {
+            arrived += seen_rx
+                .recv_timeout(PARK)
+                .expect("the edge keeps taking what the lane sends");
+        }
+        assert_eq!(arrived, UPLOAD);
         edge.join().expect("the edge finishes");
     }
 
