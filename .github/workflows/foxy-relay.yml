@@ -389,6 +389,9 @@ jobs:
           # retried inside the leg's share.
           trace_front() {
             FRONT="$1" WANT="$2"
+            # The stale file is cleared first: a retry loop that never runs must fail
+            # on its own leg, not grep the previous leg's answer.
+            : > trace-lane.txt
             while ((SECONDS < LEG_END)); do
               if [ "$FRONT" = http ]; then
                 curl -sS --max-time 15 -x "http://127.0.0.1:$PORT" \
@@ -403,20 +406,27 @@ jobs:
           }
           # `-w` gives the duration: bytes moved, seconds taken, the rate held.
           # Every leg appends one line to foxy-legs.tsv, including a leg that ran
-          # out of its budget, so the job's own summary can name the slow one.
+          # out of its budget, so the job's own summary can name the slow one. A
+          # curl exit is carried into the answer, never discarded.
           fetch_mb() {
             FRONT="$1" FILE="$2" LABEL="$3"
+            code=0
             if [ "$FRONT" = http ]; then
               timing=$(curl -sS --max-time 60 -x "http://127.0.0.1:$PORT" \
                 -w '%{size_download} %{time_total} %{speed_download}' \
-                'https://speed.cloudflare.com/__down?bytes=1000000' -o "$FILE") || :
+                'https://speed.cloudflare.com/__down?bytes=1000000' -o "$FILE") || code=$?
             else
               timing=$(curl -sS --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
                 -w '%{size_download} %{time_total} %{speed_download}' \
-                'https://speed.cloudflare.com/__down?bytes=1000000' -o "$FILE") || :
+                'https://speed.cloudflare.com/__down?bytes=1000000' -o "$FILE") || code=$?
             fi
             echo "$LABEL ${timing:-0 0 0}" >> foxy-legs.tsv
-            test "$(wc -c < "$FILE" | tr -d ' ')" = 1000000
+            got=$(wc -c < "$FILE" 2>/dev/null | tr -d ' ')
+            got="${got:-0}"
+            test "$code" = 0 && test "$got" = 1000000 || {
+              echo "$LABEL FAILED: curl exit $code after $got of 1000000 B" >&2
+              return 1
+            }
           }
           # A front the app serves with a freedom outbound is a plain local proxy: it is
           # the hop a captive or corporate network offers, and the edge dial is chained
@@ -446,69 +456,70 @@ jobs:
             wait_port "$LANE_PID" "$PORT"
           }
           COUNTRY="$FOXY_COUNTRY"
-
-          leg_share
-          echo "== front: socks over h2 =="
-          PORT=10808
-          start_lane socks "$PORT" h2
-          trace_front socks "$COUNTRY"
-          fetch_mb socks file-socks.bin "front socks"
-          echo "socks front: 1000000 B"
-          stop_lane
-
-          leg_share
-          echo "== front: http over h2 =="
-          PORT=10809
-          start_lane http "$PORT" h2
-          trace_front http "$COUNTRY"
-          fetch_mb http file-http.bin "front http"
-          echo "http front: 1000000 B"
-          stop_lane
-
-          leg_share
-          echo "== front: mixed over h2 =="
-          PORT=10810
-          start_lane mixed "$PORT" h2
-          trace_front socks "$COUNTRY"
-          fetch_mb socks file-mixed.bin "front mixed"
-          echo "mixed front: 1000000 B"
-          stop_lane
-
-          leg_share
-          echo "== chained: socks5 upstream over h2 =="
-          start_freedom socks 10811
-          PORT=10812
-          start_lane socks "$PORT" h2 "socks5://127.0.0.1:10811"
-          trace_front socks "$COUNTRY"
-          fetch_mb socks file-up.bin "socks5 upstream"
-          echo "socks5 upstream: 1000000 B"
-          stop_lane
-          stop_hop
-
-          leg_share
-          echo "== chained: http upstream over h2 =="
-          start_freedom http 10813
-          PORT=10814
-          start_lane socks "$PORT" h2 "http://127.0.0.1:10813"
-          trace_front socks "$COUNTRY"
-          fetch_mb socks file-http-up.bin "http upstream"
-          echo "http upstream: 1000000 B"
-          stop_lane
-          stop_hop
-
-          # HTTP/3 rides a SOCKS5 UDP association: the association is the only way a QUIC
-          # carrier gets through a hop, so the h3 leg is proven through one rather than
-          # around one.
-          leg_share
-          echo "== chained: h3 over the socks5 upstream =="
-          start_freedom socks 10815
-          PORT=10816
-          start_lane socks "$PORT" h3 "socks5://127.0.0.1:10815"
-          trace_front socks "$COUNTRY"
-          fetch_mb socks file-h3-up.bin "h3 over socks5 upstream"
-          echo "h3 over socks5 upstream: 1000000 B"
-          stop_lane
-          stop_hop
+          # One line per leg: label, lane front, trace front, port, carrier, file,
+          # and the freedom hop's front and port when the edge dial is chained
+          # through one. Every leg runs even when an earlier one fails, each failure
+          # names its leg and its curl exit, and the step exits non-zero at the end.
+          LEGS=(
+            "front socks|socks|socks|10808|h2|file-socks.bin||"
+            "front http|http|http|10809|h2|file-http.bin||"
+            "front mixed|mixed|socks|10810|h2|file-mixed.bin||"
+            "socks5 upstream|socks|socks|10812|h2|file-up.bin|socks|10811"
+            "http upstream|socks|socks|10814|h2|file-http-up.bin|http|10813"
+            "h3 over socks5 upstream|socks|socks|10816|h3|file-h3-up.bin|socks|10815"
+          )
+          legs=${#LEGS[@]}
+          FAILED=""
+          for SPEC in "${LEGS[@]}"; do
+            IFS='|' read -r LABEL LANE_FRONT TRACE_FRONT PORT CARRIER FILE HOP_FRONT HOP_PORT <<< "$SPEC"
+            leg_share
+            echo "== $LABEL over $CARRIER =="
+            if ((LEG_END <= SECONDS)); then
+              echo "$LABEL skipped: the step's budget is spent" >&2
+              FAILED="$FAILED ${LABEL}(budget)"
+              continue
+            fi
+            UPSTREAM=""
+            if [ -n "$HOP_FRONT" ]; then
+              if ! start_freedom "$HOP_FRONT" "$HOP_PORT"; then
+                echo "$LABEL FAILED: the hop never listened" >&2
+                tail -n 30 ferrox-relay.log
+                FAILED="$FAILED ${LABEL}(hop)"
+                stop_hop
+                continue
+              fi
+              # The hop serves on the `socks` front but the lane's `upstreamProxy`
+              # names the wire form: SOCKS5.
+              if [ "$HOP_FRONT" = socks ]; then SCHEME=socks5; else SCHEME="$HOP_FRONT"; fi
+              UPSTREAM="$SCHEME://127.0.0.1:$HOP_PORT"
+            fi
+            if ! start_lane "$LANE_FRONT" "$PORT" "$CARRIER" "$UPSTREAM"; then
+              echo "$LABEL FAILED: the lane never listened" >&2
+              tail -n 30 ferrox-relay.log
+              FAILED="$FAILED ${LABEL}(listen)"
+              if [ -n "$HOP_FRONT" ]; then stop_hop; fi
+              continue
+            fi
+            if ! trace_front "$TRACE_FRONT" "$COUNTRY"; then
+              echo "$LABEL FAILED: the trace never pinned $COUNTRY on the front" >&2
+              FAILED="$FAILED ${LABEL}(trace)"
+              stop_lane
+              if [ -n "$HOP_FRONT" ]; then stop_hop; fi
+              continue
+            fi
+            if ! fetch_mb "$TRACE_FRONT" "$FILE" "$LABEL"; then
+              FAILED="$FAILED ${LABEL}(download)"
+            else
+              echo "$LABEL: 1000000 B"
+            fi
+            stop_lane
+            if [ -n "$HOP_FRONT" ]; then stop_hop; fi
+          done
+          if [ -n "$FAILED" ]; then
+            echo "failed legs:$FAILED" >&2
+            tail -n 50 ferrox-relay.log
+            exit 1
+          fi
       - name: Second country and UDP path
         # One runner proves the legs that are about the lane rather than the
         # platform: a different exit server, and the datagram path. Each
@@ -566,6 +577,9 @@ jobs:
           }
           trace_socks() {
             PORT="$1" WANT="$2"
+            # The fronts step's file survives into this job: a retry that never runs
+            # must fail on this leg, not grep the previous step's answer.
+            : > trace-lane.txt
             while ((SECONDS < LEG_END)); do
               curl -sS --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
                 https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt && break
