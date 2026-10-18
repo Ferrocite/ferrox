@@ -240,7 +240,10 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     let Ok(mut conn) = quiche::connect(Some(&dial.host), &cid, local, peer, &mut config) else {
         return None;
     };
-    let sock = crate::quic::Datagram::plain(sock);
+    let sock = match hysteria::Salamander::new(&dial.config.obfs_password) {
+        Some(obfs) => crate::quic::Datagram::obfuscated(sock, obfs),
+        None => crate::quic::Datagram::plain(sock),
+    };
     crate::quic::drive_handshake(&mut conn, &sock, local)?;
     let session = Session {
         shared: Arc::new(Mutex::new(conn)),
@@ -1072,6 +1075,7 @@ pub(crate) fn serve_loop(
     cc: hysteria::Congestion,
     cert_path: &str,
     key_path: &str,
+    obfs_password: &str,
     serve: &Serve,
 ) {
     let Some(bound) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
@@ -1084,8 +1088,12 @@ pub(crate) fn serve_loop(
     let Some(mut template) = server_config(cert_path, key_path, cc) else {
         return;
     };
+    let sock = match hysteria::Salamander::new(obfs_password) {
+        Some(obfs) => crate::quic::Datagram::obfuscated(sock, obfs),
+        None => crate::quic::Datagram::plain(sock),
+    };
     let mut router = Router {
-        sock: Arc::new(crate::quic::Datagram::plain(sock)),
+        sock: Arc::new(sock),
         local,
         out: Unfilled::<MAX_DATAGRAM>::new(),
         auths,
