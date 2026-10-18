@@ -771,14 +771,10 @@ jobs:
           # egress, per carrier and per front. A rate gates nothing here — the
           # byte count above does — but it is the number a throughput claim has
           # to be read against, and a leg that spent its budget shows up as
-          # seconds burned for fewer bytes rather than as a silent skip.
-          {
-            echo
-            echo "### Lane durations, live (${{ matrix.os }})"
-            echo
-            echo "| leg | bytes | seconds | MiB/s | vs this runner's own egress |"
-            echo "| --- | --- | --- | --- | --- |"
-            python3 - <<'PY'
+          # seconds burned for fewer bytes rather than as a silent skip. It goes
+          # to the log as well as the summary, because a number that lives only
+          # in a job summary cannot be read from outside the web UI.
+          table=$(python3 - <<'PY'
           rows = []
           try:
               with open("foxy-legs.tsv") as legs:
@@ -802,4 +798,13 @@ jobs:
           if not rows:
               print("| (no leg recorded a transfer) | 0 | 0.00 | 0.00 | - |")
           PY
+          )
+          echo "$table"
+          {
+            echo
+            echo "### Lane durations, live (${{ matrix.os }})"
+            echo
+            echo "| leg | bytes | seconds | MiB/s | vs this runner's own egress |"
+            echo "| --- | --- | --- | --- | --- |"
+            echo "$table"
           } >> "$GITHUB_STEP_SUMMARY"
