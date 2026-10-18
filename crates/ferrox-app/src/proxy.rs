@@ -5578,7 +5578,7 @@ fn foxy_splits(foxy: &FoxyOut, asked: &Destination) -> bool {
             .any(|suffix| asked.host().to_ascii_lowercase().ends_with(suffix))
 }
 
-fn foxy_socks_reply(reply: u8) -> [u8; 10] {
+const fn foxy_socks_reply(reply: u8) -> [u8; 10] {
     [5, reply, 0, 1, 0, 0, 0, 0, 0, 0]
 }
 
@@ -5643,16 +5643,17 @@ enum Front {
 }
 
 impl Front {
-    fn grant_line(self) -> Vec<u8> {
+    fn grant_line(self) -> &'static [u8] {
+        const SOCKS_GRANTED: [u8; 10] = foxy_socks_reply(0);
         match self {
-            Self::Socks => foxy_socks_reply(0).to_vec(),
-            Self::Http => b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec(),
+            Self::Socks => &SOCKS_GRANTED,
+            Self::Http => b"HTTP/1.1 200 Connection established\r\n\r\n",
         }
     }
     fn direct_grant(self) -> Option<&'static [u8]> {
         match self {
             Self::Socks => None,
-            Self::Http => Some(b"HTTP/1.1 200 Connection established\r\n\r\n"),
+            Self::Http => Some(self.grant_line()),
         }
     }
     fn refusal(self, code: u8) -> Vec<u8> {
@@ -6024,13 +6025,15 @@ enum ProxyRequest {
 }
 
 /// CONNECT tunnels; absolute- and origin-form forward the head with its line rewritten to origin-form.
-fn http_proxy_request(head: &[u8]) -> Option<ProxyRequest> {
-    let line = head.split(|byte| *byte == b'\n').next()?;
-    let line = line.strip_suffix(b"\r").unwrap_or(line);
+fn http_proxy_request(head: Vec<u8>) -> Option<ProxyRequest> {
+    let line_end = head.iter().position(|byte| *byte == b'\n');
+    let raw = &head[..line_end.unwrap_or(head.len())];
+    let line = raw.strip_suffix(b"\r").unwrap_or(raw);
     let mut parts = line.split(|byte| *byte == b' ');
     let method = parts.next()?;
     let target = parts.next()?;
-    let version = parts.next().unwrap_or(b"HTTP/1.1");
+    let sent_version = parts.next();
+    let version = sent_version.unwrap_or(b"HTTP/1.1");
     if method.eq_ignore_ascii_case(b"CONNECT") {
         return authority_target(connect_authority(target)).map(ProxyRequest::Connect);
     }
@@ -6048,15 +6051,24 @@ fn http_proxy_request(head: &[u8]) -> Option<ProxyRequest> {
         let asked = authority_target(authority)?;
         return Some(ProxyRequest::Forward(
             asked,
-            origin_head(method, path, version, head),
+            origin_head(method, path, version, &head, line_end),
         ));
     }
     if target.starts_with(b"/") {
-        let host = header_value(head, "host")?;
+        let host = header_value(&head, "host")?;
         let asked = authority_target(host.as_bytes())?;
+        // The line is already origin-form as it landed, so the head needs no rewrite to reach the uplink.
+        let untouched = line_end.is_some()
+            && raw.len() == line.len() + 1
+            && sent_version.is_some()
+            && parts.next().is_none();
         return Some(ProxyRequest::Forward(
             asked,
-            origin_head(method, target, version, head),
+            if untouched {
+                head
+            } else {
+                origin_head(method, target, version, &head, line_end)
+            },
         ));
     }
     None
@@ -6077,7 +6089,13 @@ fn connect_authority(target: &[u8]) -> &[u8] {
 }
 
 /// Rewrites the request line to origin-form, keeping every header byte as sent.
-fn origin_head(method: &[u8], path: &[u8], version: &[u8], head: &[u8]) -> Vec<u8> {
+fn origin_head(
+    method: &[u8],
+    path: &[u8],
+    version: &[u8],
+    head: &[u8],
+    line_end: Option<usize>,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(head.len());
     out.extend_from_slice(method);
     out.push(b' ');
@@ -6085,11 +6103,7 @@ fn origin_head(method: &[u8], path: &[u8], version: &[u8], head: &[u8]) -> Vec<u
     out.push(b' ');
     out.extend_from_slice(version);
     out.extend_from_slice(b"\r\n");
-    let rest = head
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map_or(0, |at| at + 1);
-    out.extend_from_slice(&head[rest..]);
+    out.extend_from_slice(&head[line_end.map_or(0, |at| at + 1)..]);
     out
 }
 
@@ -6118,7 +6132,7 @@ fn serve_http(mut client: Connection, out: &Outbound) {
     let Some(head) = read_http_head(&mut client, HTTP_HEAD_LIMIT, budgets::head_arrival()) else {
         return;
     };
-    let Some(request) = http_proxy_request(&head) else {
+    let Some(request) = http_proxy_request(head) else {
         return;
     };
     match request {
@@ -7475,7 +7489,7 @@ fn http_connect_request(target: &Destination, http: &HttpOut, req: &mut Vec<u8>)
     const FIXED: usize = 29; // "CONNECT ", " HTTP/1.1\r\n", "Host: ", and both closing CRLFs
     const AUTH_LINE: usize = 30; // "Proxy-Authorization: Basic " plus its CRLF
     const HEADER_WRAPPER: usize = 4; // ": " plus CRLF
-    let authority = target.authority();
+    let authority_len = target.authority_len();
     let credential_len = match (&http.user, &http.pass) {
         (Some(user), Some(pass)) => (user.len() + pass.len() + 3) / 3 * 4 + AUTH_LINE,
         _ => 0,
@@ -7486,11 +7500,13 @@ fn http_connect_request(target: &Destination, http: &HttpOut, req: &mut Vec<u8>)
         .map(|(k, v)| k.len() + v.len() + HEADER_WRAPPER)
         .sum::<usize>();
     req.clear();
-    req.reserve(FIXED + 2 * authority.len() + credential_len + header_len);
+    req.reserve(FIXED + 2 * authority_len + credential_len + header_len);
     req.extend_from_slice(b"CONNECT ");
-    req.extend_from_slice(authority.as_bytes());
+    let at = req.len();
+    target.push_authority(req);
+    let auth_end = req.len();
     req.extend_from_slice(b" HTTP/1.1\r\nHost: ");
-    req.extend_from_slice(authority.as_bytes());
+    req.extend_from_within(at..auth_end);
     req.extend_from_slice(b"\r\n");
     if let (Some(user), Some(pass)) = (&http.user, &http.pass) {
         req.extend_from_slice(b"Proxy-Authorization: Basic ");
@@ -9299,6 +9315,45 @@ impl Destination {
             Self::Name(host, port) => ferrox_core::foxy::authority(host, *port),
             Self::Address(address) => address.to_string(),
         }
+    }
+
+    /// The authority's octet count: exact for a name and a v4 literal, the uncompressed bound for a v6 one.
+    fn authority_len(&self) -> usize {
+        fn digits(value: u16) -> usize {
+            1 + usize::from(value >= 10)
+                + usize::from(value >= 100)
+                + usize::from(value >= 1000)
+                + usize::from(value >= 10000)
+        }
+        match self {
+            Self::Name(host, port) => {
+                host.len() + usize::from(host.contains(':')) * 2 + 1 + digits(*port)
+            }
+            Self::Address(address) => match address.ip() {
+                std::net::IpAddr::V4(ip) => {
+                    ip.octets()
+                        .iter()
+                        .map(|octet| 1 + usize::from(*octet >= 10) + usize::from(*octet >= 100))
+                        .sum::<usize>()
+                        + 4
+                        + digits(address.port())
+                }
+                std::net::IpAddr::V6(_) => 42 + digits(address.port()),
+            },
+        }
+    }
+
+    /// Appends the authority's octets: the same bytes `authority` returns, without the buffer they used to pass through.
+    fn push_authority(&self, out: &mut Vec<u8>) {
+        use std::io::Write;
+        let _ = match self {
+            Self::Name(host, port) if host.contains(':') => write!(out, "[{host}]:{port}"),
+            Self::Name(host, port) => write!(out, "{host}:{port}"),
+            Self::Address(address) if address.ip().is_ipv6() => {
+                write!(out, "[{}]:{}", address.ip(), address.port())
+            }
+            Self::Address(address) => write!(out, "{address}"),
+        };
     }
 
     /// The address to connect to directly: only a lane that carries no destination answers the name itself.
@@ -21143,7 +21198,7 @@ mod tests {
                     else {
                         return;
                     };
-                    let Some(ProxyRequest::Connect(asked)) = http_proxy_request(&head) else {
+                    let Some(ProxyRequest::Connect(asked)) = http_proxy_request(head) else {
                         return;
                     };
                     let Some(target) = asked.socket() else { return };
@@ -21241,18 +21296,18 @@ mod tests {
 
     #[test]
     fn http_request_parses_connect_and_both_get_forms() {
-        let connect = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n";
+        let connect = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n".to_vec();
         let Some(ProxyRequest::Connect(asked)) = http_proxy_request(connect) else {
             panic!("connect parses");
         };
         assert_eq!(asked.authority(), "example.com:443");
-        let golang = b"Connect http://127.0.0.1:8080/ HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n";
+        let golang = b"Connect http://127.0.0.1:8080/ HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n".to_vec();
         let Some(ProxyRequest::Connect(asked)) = http_proxy_request(golang) else {
             panic!("Go's absolute-form connect parses");
         };
         assert_eq!(asked.authority(), "127.0.0.1:8080");
         let absolute =
-            b"GET http://example.com:8080/p?q=1 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n";
+            b"GET http://example.com:8080/p?q=1 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n".to_vec();
         let Some(ProxyRequest::Forward(asked, origin)) = http_proxy_request(absolute) else {
             panic!("absolute-form parses");
         };
@@ -21261,14 +21316,99 @@ mod tests {
             origin,
             b"GET /p?q=1 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n"
         );
-        let origin_form = b"GET /p HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let origin_form = b"GET /p HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
         let Some(ProxyRequest::Forward(asked, origin)) = http_proxy_request(origin_form) else {
             panic!("origin-form parses");
         };
         assert_eq!(asked.authority(), "example.com:80");
-        assert_eq!(origin, origin_form);
-        assert!(http_proxy_request(b"GET /p HTTP/1.1\r\n\r\n").is_none());
-        assert!(http_proxy_request(b"GARBAGE\r\n\r\n").is_none());
+        assert_eq!(origin, b"GET /p HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        assert!(http_proxy_request(b"GET /p HTTP/1.1\r\n\r\n".to_vec()).is_none());
+        assert!(http_proxy_request(b"GARBAGE\r\n\r\n".to_vec()).is_none());
+    }
+
+    /// The rewrite is a copy and a fresh buffer, so the gate is the pointer the untouched head keeps.
+    #[test]
+    fn an_origin_form_head_reaches_the_uplink_where_it_landed() {
+        let head = b"GET /p HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
+        let (ptr, capacity) = (head.as_ptr(), head.capacity());
+        let Some(ProxyRequest::Forward(_, forwarded)) = http_proxy_request(head) else {
+            panic!("origin-form parses");
+        };
+        assert_eq!(
+            forwarded.as_ptr(),
+            ptr,
+            "the head is forwarded where it landed, not rebuilt"
+        );
+        assert_eq!(forwarded.capacity(), capacity, "the buffer never grew");
+        let rewritten = b"GET /p HTTP/1.1 x\r\nHost: example.com\r\n\r\n".to_vec();
+        let other = rewritten.as_ptr();
+        let Some(ProxyRequest::Forward(_, rebuilt)) = http_proxy_request(rewritten) else {
+            panic!("a fourth token still parses");
+        };
+        assert_ne!(rebuilt.as_ptr(), other, "a changed line gets its own buffer");
+        assert_eq!(rebuilt, b"GET /p HTTP/1.1\r\nHost: example.com\r\n\r\n");
+        let bare_lf = b"GET http://example.com:8080/p HTTP/1.1\nHost: example.com:8080\n".to_vec();
+        let Some(ProxyRequest::Forward(_, origin)) = http_proxy_request(bare_lf) else {
+            panic!("a bare-LF absolute form parses");
+        };
+        assert_eq!(
+            origin, b"GET /p HTTP/1.1\r\nHost: example.com:8080\n",
+            "and is rewritten with the CRLF it lacked"
+        );
+    }
+
+    /// A rebuilt grant moved its bytes every call; a static one cannot, so the pointer is the gate.
+    #[test]
+    fn a_connect_grant_costs_no_heap_buffer() {
+        for front in [Front::Socks, Front::Http] {
+            assert_eq!(
+                front.grant_line().as_ptr(),
+                front.grant_line().as_ptr(),
+                "the grant is the same bytes every call, not a fresh buffer"
+            );
+        }
+        assert_eq!(
+            Front::Http.grant_line().as_ptr(),
+            Front::Http.direct_grant().expect("the http front grants").as_ptr(),
+            "one byte string, not two"
+        );
+        assert_eq!(
+            Front::Http.grant_line(),
+            b"HTTP/1.1 200 Connection established\r\n\r\n"
+        );
+        assert_eq!(
+            Front::Socks.grant_line(),
+            [5, 0, 0, 1, 0, 0, 0, 0, 0, 0].as_slice()
+        );
+    }
+
+    #[test]
+    fn the_connect_request_builds_in_one_buffer() {
+        let http = http_out(
+            Some("aladdin"),
+            Some("open sesame"),
+            &[("Proxy-Connection", "keep-alive")],
+        );
+        let mut req = Vec::with_capacity(256);
+        let room = req.capacity();
+        let targets = [
+            Destination::Name("www.example.com".to_owned(), 443),
+            Destination::Name("host:5050".to_owned(), 80),
+            Destination::from("203.0.113.9:443".parse::<SocketAddr>().expect("v4")),
+            Destination::from("[2001:db8::7]:8080".parse::<SocketAddr>().expect("v6")),
+        ];
+        for target in targets {
+            let base = req.as_ptr();
+            http_connect_request(&target, &http, &mut req);
+            assert_eq!(req.as_ptr(), base, "the buffer never moved");
+            assert_eq!(req.capacity(), room, "and never grew: its reserve fits");
+            let authority = target.authority();
+            let line = format!("CONNECT {authority} HTTP/1.1\r\nHost: {authority}\r\n");
+            assert!(
+                req.starts_with(line.as_bytes()),
+                "the pushed authority is the authority's own bytes: {req:?}"
+            );
+        }
     }
 
     fn http_out(user: Option<&str>, pass: Option<&str>, headers: &[(&str, &str)]) -> HttpOut {
