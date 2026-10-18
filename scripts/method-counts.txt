@@ -214,6 +214,7 @@ carrier-foxy payload-staging-copies-per-byte-read 0 ferrox-app-foxy::loopback::a
 carrier-foxy read-buffer-bytes-per-staged-remainder 1 ferrox-app-foxy::loopback::a_read_leaves_only_what_the_callers_buffer_had_no_room_for
 carrier-foxy h2-bytes-lost-at-a-read-quantum 0 ferrox-app-foxy::loopback::a_frame_that_straddles_a_read_quantum_arrives_whole
 carrier-foxy h2-upload-bytes-blocked-by-an-unread-grant 0 ferrox-app-foxy::loopback::an_upload_is_paced_by_the_grants_the_edge_sends_rather_than_by_the_bytes_it_reads
+carrier-foxy dead-carrier-dials-per-connect-ip-packet 0 ferrox-app-proxy::tests::the_connect_ip_lane_leaves_a_dead_carrier_dead
 carrier-foxy carriers-dialled 3 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer
 carrier-foxy udp-carriers-dialled 2 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer
 carrier-foxy datagram-frames-per-capsule 1 ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_over_quic_and_echoes_a_datagram
@@ -273,6 +274,8 @@ reality-tls late-hello-grains-survived 12 ferrox-app-proxy::tests::a_plain_tls_l
 reality-tls unsafe-fingerprint-header-bytes-added 0 ferrox-core-vless::tests::an_unsafe_fingerprint_adds_no_header_byte
 reality-tls plaintext-to-public-header-bytes-added 0 ferrox-core-vless::tests::pattng_plaintext_to_public_needs_opt_in_and_adds_no_byte
 reality-tls certificate-refusals-folded-into-other 0 ferrox-core-tls::rustls_backend::tests::mismatched_certificate_name_fails
+reality-tls trust-anchors-parsed-per-dial-after-the-first 0 ferrox-core-tls::rustls_backend::tests::the_parts_a_config_is_built_from_are_built_once
+reality-tls handshakes-skipped-by-an-earlier-dials-ticket 0 ferrox-core-tls::rustls_backend::tests::a_second_dial_with_the_same_config_still_fetches_the_chain
 reality-tls untrusted-dials-counted-as-retryable 0 ferrox-app-proxy::tests::a_refused_chain_is_a_refusal_not_a_drop
 reality-tls session-writes-per-frame 1 ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call
 reality-tls user-space-copies-per-framed-write 0 ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call
