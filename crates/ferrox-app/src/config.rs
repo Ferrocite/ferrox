@@ -336,6 +336,7 @@ pub(crate) fn outbound_tls(
         roots,
         pins: ferrox_core::foxy::pin::Pins::default(),
         cipher_suites: tls_cipher_suites(tls),
+        insecure: false,
     }))
 }
 

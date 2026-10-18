@@ -329,6 +329,8 @@ carrier-hysteria gecko-frame-decode-copies 0 ferrox-core-hysteria::tests::a_geck
 carrier-hysteria gecko-packet-reassembled-bytes 1234 ferrox-core-hysteria::tests::a_fragmented_long_header_packet_reassembles_bit_identical
 carrier-hysteria gecko-window-forms-parsed 3 ferrox-app-config::tests::a_hysteria_carrier_reads_a_gecko_window
 carrier-hysteria gecko-loopback-reassembled-bytes 900 ferrox-app-quic::tests::a_gecko_dial_reassembles_its_split_long_header
+carrier-hysteria masquerade-https-origin-served-bytes 6 ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_an_https_origin
+carrier-hysteria masquerade-https-untrusted-refusals 1 ferrox-app-proxy::tests::hysteria_refuses_a_masquerade_https_origin_whose_chain_is_untrusted
 
 # --- TLS ClientHello `cipher_suites` field (PattNG ext.) --------------------
 tls-cipher-suites ops-retired-instructions UNBLESSED scripts/count-ops.sh

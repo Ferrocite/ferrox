@@ -323,6 +323,7 @@ impl Endpoint {
             roots: self.roots.clone(),
             pins: ferrox_core::foxy::pin::Pins::default(),
             cipher_suites: Vec::new(),
+            insecure: false,
         }
     }
 

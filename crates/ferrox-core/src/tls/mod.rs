@@ -18,6 +18,12 @@ pub struct TlsConfig {
     /// `tlsSettings.cipherSuites`. Empty means the config named none, so the backend keeps
     /// its stock ordering; see `cipher_suites` for how a non-empty list is built.
     pub cipher_suites: Vec<u16>,
+    /// Accept the peer chain as presented, keeping only the handshake signature that binds
+    /// it to the key exchange. Only a masquerade cover's `masq_url_insecure` origin names
+    /// it; the proxied lane refuses `allowInsecure` outright, so this never trusts an edge
+    /// the tunnel relays through. `false` is the default because verifying is the ordinary
+    /// case, and an unchecked chain is a deliberate, bounded exception rather than a mode.
+    pub insecure: bool,
 }
 
 pub trait TlsProvider: std::io::Read + std::io::Write {
