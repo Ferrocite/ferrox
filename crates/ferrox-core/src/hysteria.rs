@@ -40,11 +40,104 @@ impl Congestion {
     }
 }
 
+/// One inclusive `start..=end` span of server ports a hopped dial moves between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PortRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+impl PortRange {
+    #[must_use]
+    pub fn contains(self, port: u16) -> bool {
+        port >= self.start && port <= self.end
+    }
+
+    #[must_use]
+    pub fn count(self) -> usize {
+        usize::from(self.end - self.start) + 1
+    }
+}
+
+/// A port-hopping plan: the server ports a client dial rotates between and the
+/// window each stay lasts. Held apart from the socket that moves, so the rotation
+/// is chosen — and proven — without a bound socket or a clock. `interval_ms` is
+/// the inclusive low..=high range a stay is drawn from; a plan with no room
+/// (`high <= low`) stays for exactly `low`. The dialed `Config` carries it; the
+/// pool key does too, so a hopped connection is never handed to a plain dial.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Hop {
+    pub ranges: Vec<PortRange>,
+    pub interval_ms: (u64, u64),
+}
+
+impl Hop {
+    /// The distinct ports the plan covers, ascending, an overlap named once.
+    /// Expanded once per dial so the rotation and the wire's source-port check
+    /// share one view of the set.
+    #[must_use]
+    pub fn ports(&self) -> Vec<u16> {
+        let mut set: Vec<u16> = Vec::new();
+        for range in &self.ranges {
+            for port in range.start..=range.end {
+                if !set.contains(&port) {
+                    set.push(port);
+                }
+            }
+        }
+        set.sort_unstable();
+        set
+    }
+}
+
+/// One of the ports a hop plan covers, never the one just left when another
+/// exists: a single-port plan stays, an empty plan yields `avoid` unchanged.
+/// `roll` is caller-supplied entropy folded in, so the choice is a pure function
+/// of the port set, the port to avoid and one number — proven without a rng.
+#[must_use]
+pub fn pick_next(ports: &[u16], avoid: u16, roll: usize) -> u16 {
+    let candidates = ports.iter().filter(|port| **port != avoid).count();
+    if candidates == 0 {
+        return ports.first().copied().unwrap_or(avoid);
+    }
+    let mut index = roll % candidates;
+    for &port in ports.iter().filter(|port| **port != avoid) {
+        if index == 0 {
+            return port;
+        }
+        index -= 1;
+    }
+    avoid
+}
+
+/// The length of the next stay in milliseconds, drawn from `interval`'s inclusive
+/// range: no room (`high <= low`) gives the low bound. `roll` is the entropy
+/// folded in, so a stay is a pure function of the range and one number.
+#[must_use]
+pub fn stay_ms(interval: (u64, u64), roll: u64) -> u64 {
+    let (low, high) = interval;
+    if high <= low {
+        return low;
+    }
+    low + roll % (high - low + 1)
+}
+
+/// Whether a reply's source port belongs to the hop: the nominal port the
+/// connection was named for, or any port the plan moves between. The wire turns
+/// such a source back to the nominal one so QUIC above sees one server.
+#[must_use]
+pub fn is_hop_port(ports: &[u16], nominal: u16, port: u16) -> bool {
+    port == nominal || ports.contains(&port)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub auth: String,
     pub cc: Congestion,
     pub obfs_password: String,
+    /// The port-hopping plan this dial rotates server ports on, or `None` for a
+    /// single fixed port. A plan joins the pool key, so reuse stays hop-faithful.
+    pub hop: Option<Hop>,
 }
 
 impl Default for Config {
@@ -53,6 +146,7 @@ impl Default for Config {
             auth: String::new(),
             cc: Congestion::Bbr,
             obfs_password: String::new(),
+            hop: None,
         }
     }
 }
@@ -1225,5 +1319,53 @@ mod tests {
         assert_eq!(content_type("page.html?v=2"), "text/html; charset=utf-8");
         assert_eq!(content_type("/noextension"), "application/octet-stream");
         assert_eq!(content_type("/file.unknown"), "application/octet-stream");
+    }
+
+    #[test]
+    fn a_hop_never_lands_back_on_the_port_it_just_left() {
+        let ports = [1000u16, 1001, 1002, 1003];
+        for roll in 0..200 {
+            let next = pick_next(&ports, 1001, roll);
+            assert!(ports.contains(&next) && next != 1001, "moved to {next}");
+        }
+        // A single port has nowhere else to go, so the plan stays on it.
+        assert_eq!(pick_next(&[443], 443, 7), 443);
+        // An empty plan yields the port to avoid, unchanged.
+        assert_eq!(pick_next(&[], 443, 7), 443);
+    }
+
+    #[test]
+    fn a_stay_is_drawn_inside_its_range() {
+        for roll in 0..200 {
+            let stay = stay_ms((5000, 10_000), roll);
+            assert!((5000..=10_000).contains(&stay), "stay {stay}");
+        }
+        // No room in the window: the stay is exactly the low bound.
+        assert_eq!(stay_ms((3000, 3000), 999), 3000);
+    }
+
+    #[test]
+    fn the_plan_expands_overlapping_ranges_into_one_sorted_set() {
+        let hop = Hop {
+            ranges: vec![
+                PortRange {
+                    start: 9000,
+                    end: 9001,
+                },
+                PortRange {
+                    start: 9001,
+                    end: 9002,
+                },
+                PortRange {
+                    start: 443,
+                    end: 443,
+                },
+            ],
+            interval_ms: (5000, 5000),
+        };
+        assert_eq!(hop.ports(), vec![443, 9000, 9001, 9002]);
+        assert!(is_hop_port(&hop.ports(), 9, 9001));
+        assert!(is_hop_port(&hop.ports(), 443, 443));
+        assert!(!is_hop_port(&hop.ports(), 443, 50000));
     }
 }

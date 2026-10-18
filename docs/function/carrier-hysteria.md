@@ -95,6 +95,29 @@ cover never walks past authentication, and a browser `GET` beside a live flow is
 served while that flow still relays
 (`hysteria_still_carries_proxy_flows_beside_a_masquerade_get`).
 
+A dial whose `hysteriaSettings` names `serverPorts`/`mport` (a comma spec or an array
+of ports and `start-end` ranges) and `hopInterval`/`hopIntervalMax` **hops its server
+port**: the destination moves among the expanded set every random stay, and the socket
+moves with it — a fresh local bind per move, so a filter or NAT sees a new flow rather
+than one long-lived one, the way the reference's `HoppingSocket` does. It lives at the
+same `quic::Datagram` seam as salamander, so only the destination port and the socket
+change and no handshake, frame or stream above is touched; a salamander seal still
+rides each hopped datagram. The plan is expanded, deduplicated and sorted once per dial
+in `ferrox-core::hysteria` (`Hop::ports`, `hop-port-set-expanded` 4 witnessed by
+`the_plan_expands_overlapping_ranges_into_one_sorted_set`), and the two decisions —
+never land back on the port just left (`pick_next`) and draw the next stay inside its
+window (`stay_ms`) — are pure functions of the port set, the port to avoid and one
+folded-in roll, so they are proven without a clock or an rng. The wire keeps one view
+of the peer: only the server's own address is rewritten, a datagram to any other target
+passes through, and a reply from any hopped port is turned back to the nominal port the
+connection was named for (`is_hop_port`) so QUIC above keeps accepting it —
+`hopped-reply-source-normalized` 1 witnesses that rewrite off a loopback listener, and
+`hopped-datagrams-delivered` 200 that a zero-millisecond schedule spreads a burst over
+more than one port with none lost. The old socket lingers ten seconds for its in-flight
+replies, and the plan joins the pool key (`hop-plan-pool-keys` 2:
+`a_hop_plan_is_its_own_pool_key`) so a hopped dial never rides a plain connection to the
+same address, nor the reverse.
+
 ## Data path
 
 ```mermaid
@@ -130,6 +153,10 @@ graph TD
     SM --> K2["canned response"]
     SM --> K3["static file:<br/>safe_path → index/listing"]
     SM --> K4["reverse proxy:<br/>HTTP/1.1 origin, 502 on error"]
+    D --> HP{"hysteriaSettings<br/>names serverPorts?"}
+    HP -- "yes" --> HH["Datagram::hopped:<br/>fresh socket per stay,<br/>dest port = pick_next,<br/>reply source → nominal"]
+    HP -- "no" --> HF["fixed server port"]
+    HH -. "seals, same socket" .-> M
 ```
 
 ## Measured
@@ -152,6 +179,11 @@ graph TD
 | masquerade-file-bytes-served | 1 | ferrox-app-proxy::tests::hysteria_serves_a_file_from_the_masquerade_directory |
 | masquerade-proxied-round-trips | 1 | ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_an_origin |
 | masquerade-escapes-served | 0 | ferrox-app-proxy::tests::hysteria_refuses_a_masquerade_path_that_escalates_the_directory |
+| hop-port-set-expanded | 4 | ferrox-core-hysteria::tests::the_plan_expands_overlapping_ranges_into_one_sorted_set |
+| hop-config-forms-parsed | 2 | ferrox-app-config::tests::a_hysteria_carrier_reads_a_port_hopping_plan |
+| hop-plan-pool-keys | 2 | ferrox-app-hysteria::tests::a_hop_plan_is_its_own_pool_key |
+| hopped-datagrams-delivered | 200 | ferrox-app-quic::tests::a_hopped_dial_spreads_its_datagrams_over_more_than_one_server_port |
+| hopped-reply-source-normalized | 1 | ferrox-app-quic::tests::a_reply_from_a_hopped_port_reads_back_as_the_nominal_server |
 <!-- counts:end -->
 
 ## Ops
@@ -235,6 +267,15 @@ tunnel. No artefact from this branch has been read.
   `masquerade-escapes-served` 0 pin the file, proxy and traversal paths, and
   `masquerade-answers-browser-on-same-port` pins the canned answer reaching a
   browser on the port hysteria dials.
+- **The hopping socket's async machinery, rewritten to a synchronous schedule.**
+  The reference's port hop is an async `HoppingSocket` wrapping a quinn
+  `AsyncUdpSocket`, with a spawn/replace dance per hop and a `GenRng` threaded
+  through. This tree keeps the same three facts — never the port just left, a stay
+  drawn inside its window, the old socket read until its linger expires — as two pure
+  core functions and one `Mutex<HopState>` behind the existing blocking `Datagram`, so
+  hop, obfs and the relay share the one seam rather than a parallel socket type. No new
+  task, no rng type, no second socket: `pick_next`/`stay_ms`/`Hop::ports` are proven
+  without a socket at all.
 - **A custom brutal sender.** `brutal` and `force-brutal` pace as quiche `bbr`
   (`Congestion::quiche_name`), stated in the settings test. That is a
   narrower congestion loop, not a second implementation of one.
