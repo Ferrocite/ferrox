@@ -58,6 +58,8 @@ that file disagree.
 | udp-datagram-reallocations-after-the-first | 0 | ferrox-app-shadowsocks2022::tests::an_opened_payload_is_the_datagrams_own_bytes |
 | udp-multi-user-eih-bytes-per-packet | 16 | ferrox-app-shadowsocks2022::tests::udp_multi_user_packs_one_eih_and_opens_with_the_pinned_psk |
 | udp-relay-header-bytes-stripped-per-packet | 16 | ferrox-app-shadowsocks2022::tests::udp_relay_strips_one_header_and_still_opens |
+| udp-relay-forward-reallocations-after-the-first | 0 | ferrox-app-shadowsocks2022::tests::a_forwarded_datagram_is_written_into_a_buffer_that_stops_growing |
+| udp-relay-reply-reallocations-after-the-first | 0 | ferrox-app-shadowsocks2022::tests::a_reply_body_is_opened_into_a_buffer_that_stops_growing |
 | udp-server-reply-client-session-bytes | 8 | ferrox-app-shadowsocks2022::tests::udp_server_replies_are_server_typed_and_stay_with_their_session |
 | subkey-heap-buffers-per-connection | 1 | ferrox-core-shadowsocks2022::tests::a_cipher_holds_one_heap_buffer_for_aes_and_none_for_chacha |
 
@@ -179,6 +181,24 @@ Read against the pinned implementations, all of which are in
   payload and every reply into a fresh `Vec` to end a borrow. The borrows now
   end before the maps are touched — the session id travels by value — so both
   directions hand subslices to the sockets.
+- **A fresh `Vec` per relayed datagram, both directions.** `relay_udp_forward`
+  returned a `Vec::with_capacity` and `relay_udp_client_of` opened its body with
+  `packet[16..].to_vec()`, so every datagram the relay carried allocated a buffer
+  and freed it before the next arrived. Both now write into a caller-owned buffer
+  the serve loop reuses. `a_forwarded_datagram_is_written_into_a_buffer_that_stops_growing`
+  and `a_reply_body_is_opened_into_a_buffer_that_stops_growing` carry one size
+  twice and assert the buffer's pointer is unmoved and its capacity did not grow
+  — pointer identity, not a byte comparison, since the bytes are identical either
+  way (`udp-relay-forward-reallocations-after-the-first 0`,
+  `udp-relay-reply-reallocations-after-the-first 0`).
+- **A `user_hash` per destination, per datagram, at the relay.** The forward path
+  matched the decrypted EIH hash by re-deriving `user_hash(dest_psk)` inside the
+  search — once per destination it might yet reach, once per datagram. The
+  destinations are fixed for the relay's life, so their hashes are computed once
+  into `relay_dests` and each forwarded datagram compares hashes it already holds:
+  no derivation on the forward path. `blake3::hash` is not behind a counter a test
+  can read, so this is prose and not a blessed row; the relay suites still witness
+  the match is exact.
 - **The relay buffers' zero fill.** The uplink thread's seal staging, the
   EIHDR relay's three leg buffers and `wire_buffer` — the downlink's 64 KiB
   chunk — were per-flow `vec![0u8; n]` callocs; they now read through
@@ -199,7 +219,12 @@ because they are broken, deprecated or outside the ladder rather than missing;
 `simple-obfs` and `sip003` stay in their own carrier rows and are not carried
 here; ChaCha multi-user stays refused (`NewMultiService` in sing-box and
 `inbound_multi.go` in Xray both reject it), so a colon list with a ChaCha
-method is refused on TCP and UDP alike.
+method is refused on TCP and UDP alike. The relay reply path also still derives
+the session subkey and the AES key schedule on every reply datagram:
+`relay_udp_client_of` rebuilds the cipher per packet rather than caching it per
+session, because a per-session cache would hold up to the relay's 4096-session
+ceiling alive and buy CPU with the very RAM this slice is meant to spend less of
+— a trade measured and left un-taken, not smuggled into a leaner commit.
 
 ## CI scope
 
