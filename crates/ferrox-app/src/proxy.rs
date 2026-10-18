@@ -5980,7 +5980,7 @@ fn serve_foxy_front(
     match foxy_open(foxy, asked) {
         FoxyOpen::Tunnel(tunnel, edge) => {
             let mut tunnel = *tunnel;
-            if prefix.is_empty() && client.write_all(&front.grant_line()).is_err() {
+            if prefix.is_empty() && client.write_all(front.grant_line()).is_err() {
                 return;
             }
             if !prefix.is_empty() && tunnel.write_all(prefix).is_err() {
@@ -6138,7 +6138,7 @@ fn serve_http(mut client: Connection, out: &Outbound) {
     match request {
         ProxyRequest::Connect(asked) => {
             if !matches!(out, Outbound::Foxy(_))
-                && client.write_all(&Front::Http.grant_line()).is_err()
+                && client.write_all(Front::Http.grant_line()).is_err()
             {
                 return;
             }
@@ -21205,7 +21205,7 @@ mod tests {
                     let Ok(upstream) = Connection::connect(target) else {
                         return;
                     };
-                    if client.write_all(&Front::Http.grant_line()).is_err() {
+                    if client.write_all(Front::Http.grant_line()).is_err() {
                         return;
                     }
                     relay(&client, &upstream);
@@ -21301,13 +21301,15 @@ mod tests {
             panic!("connect parses");
         };
         assert_eq!(asked.authority(), "example.com:443");
-        let golang = b"Connect http://127.0.0.1:8080/ HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n".to_vec();
+        let golang =
+            b"Connect http://127.0.0.1:8080/ HTTP/1.1\r\nHost: 127.0.0.1:8080\r\n\r\n".to_vec();
         let Some(ProxyRequest::Connect(asked)) = http_proxy_request(golang) else {
             panic!("Go's absolute-form connect parses");
         };
         assert_eq!(asked.authority(), "127.0.0.1:8080");
         let absolute =
-            b"GET http://example.com:8080/p?q=1 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n".to_vec();
+            b"GET http://example.com:8080/p?q=1 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n"
+                .to_vec();
         let Some(ProxyRequest::Forward(asked, origin)) = http_proxy_request(absolute) else {
             panic!("absolute-form parses");
         };
@@ -21345,7 +21347,11 @@ mod tests {
         let Some(ProxyRequest::Forward(_, rebuilt)) = http_proxy_request(rewritten) else {
             panic!("a fourth token still parses");
         };
-        assert_ne!(rebuilt.as_ptr(), other, "a changed line gets its own buffer");
+        assert_ne!(
+            rebuilt.as_ptr(),
+            other,
+            "a changed line gets its own buffer"
+        );
         assert_eq!(rebuilt, b"GET /p HTTP/1.1\r\nHost: example.com\r\n\r\n");
         let bare_lf = b"GET http://example.com:8080/p HTTP/1.1\nHost: example.com:8080\n".to_vec();
         let Some(ProxyRequest::Forward(_, origin)) = http_proxy_request(bare_lf) else {
@@ -21369,7 +21375,10 @@ mod tests {
         }
         assert_eq!(
             Front::Http.grant_line().as_ptr(),
-            Front::Http.direct_grant().expect("the http front grants").as_ptr(),
+            Front::Http
+                .direct_grant()
+                .expect("the http front grants")
+                .as_ptr(),
             "one byte string, not two"
         );
         assert_eq!(
