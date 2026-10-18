@@ -488,7 +488,10 @@ jobs:
                 stop_hop
                 continue
               fi
-              UPSTREAM="$HOP_FRONT://127.0.0.1:$HOP_PORT"
+              # The hop serves on the `socks` front but the lane's `upstreamProxy`
+              # names the wire form: SOCKS5.
+              if [ "$HOP_FRONT" = socks ]; then SCHEME=socks5; else SCHEME="$HOP_FRONT"; fi
+              UPSTREAM="$SCHEME://127.0.0.1:$HOP_PORT"
             fi
             if ! start_lane "$LANE_FRONT" "$PORT" "$CARRIER" "$UPSTREAM"; then
               echo "$LABEL FAILED: the lane never listened" >&2
