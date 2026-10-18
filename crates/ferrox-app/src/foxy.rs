@@ -1450,6 +1450,8 @@ impl H3 {
     /// One UDP payload out of the capsule stream: DATA frames are parsed until a whole DATAGRAM capsule appears, capsules that span frames accumulate, and empty datagrams are skipped so `Ok(0)` stays the end of stream.
     pub(crate) fn read_datagram(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let started = Instant::now();
+        // One wait per call, armed from its start: re-armed inside the loop the check below could never see an expiry, so a peer that stopped answering cost this lane nothing but its own parking.
+        self.deadline = started + HEADER_TIMEOUT;
         loop {
             if let Some((used, payload)) = masque::datagram_split(&self.capsule_buf) {
                 let take = buf.len().min(payload.len());
@@ -1476,7 +1478,6 @@ impl H3 {
                     "foxy: a capsule stream that never parses",
                 ));
             }
-            self.deadline = Instant::now() + HEADER_TIMEOUT;
             self.fill().map_err(io)?;
             // A capsule is usually whole inside one DATA frame, so a frame's payload is parsed where it lies and only a split capsule staged: the same one copy the tunnel read makes.
             let mut at = self.carried;
@@ -1707,6 +1708,7 @@ impl H3 {
     /// Delivers the frame in flight: what already sits in the window moves first — those bytes crossed once before this lane knew their length — and the rest arrives from the stream straight into the caller's buffer. A quantum that expires mid-frame hands back what was delivered; the next read resumes at the cursor.
     fn body_into(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let started = Instant::now();
+        self.deadline = started + self.head_wait;
         let mut delivered = 0usize;
         while self.body > 0 && delivered < buf.len() {
             if self.carried < self.filled {
@@ -1726,7 +1728,6 @@ impl H3 {
             {
                 break;
             }
-            self.deadline = Instant::now() + self.head_wait;
             let want = self.body.min(buf.len() - delivered);
             let id = self.quic.id;
             let read =
@@ -1779,6 +1780,8 @@ impl Read for H3 {
             return self.body_into(buf);
         }
         let started = Instant::now();
+        // One wait per read call, armed from its own start: re-arming inside the loop would let a peer that answers nothing park this lane forever, where the socket carriers' read timeout costs the caller `head_wait` and returns.
+        self.deadline = started + self.head_wait;
         loop {
             if self.fin {
                 return Ok(0);
@@ -1789,7 +1792,6 @@ impl Read for H3 {
             {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
-            self.deadline = Instant::now() + self.head_wait;
             let mut head = 0usize;
             let Some(frame) = frames::h3_frame(&self.head[self.carried..self.filled], &mut head)
             else {
@@ -5511,7 +5513,7 @@ mod loopback {
         })
     }
 
-    /// Echoes one request stream's DATA payloads until the lane's whole payload has come back, then keeps streaming `downlink`'s bytes as DATA frames: the tunnel half of the loopback proof, and the downlink half the byte-count witnesses stand on.
+    /// Streams `downlink` onto one request stream as DATA frames, held to the length of the lane's own payload until the uplink has come in: a lane that never wrote gets nothing back, and a downlink longer than the uplink still arrives. The tunnel half of the loopback proof, and the downlink half the byte-count witnesses stand on.
     fn echo_stream(
         sock: &crate::quic::Datagram,
         local: SocketAddr,
@@ -5523,43 +5525,70 @@ mod loopback {
     ) {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut received: Vec<u8> = Vec::new();
-        let mut sent = 0usize;
         let mut pending: Vec<u8> = Vec::new();
-        while sent < downlink.len() {
+        let mut frame: Vec<u8> = Vec::new();
+        let mut sent = 0usize;
+        // The head of what the edge sends is the echo's debt: no byte leaves before the uplink paid for it, so a lane that never wrote never reads. Past `PAYLOAD` the stream is the edge's own to give and it flows at the credit's pace, which is what lets a downlink longer than the uplink arrive at all.
+        let echo = PAYLOAD.len().min(downlink.len());
+        let mut quiet = std::time::Instant::now();
+        loop {
             assert!(std::time::Instant::now() < deadline, "the tunnel echoes");
-            if let Some((n, from)) = crate::quic::server_poll(sock, &mut buf[..]) {
-                let info = quiche::RecvInfo { from, to: local };
-                conn.recv(&mut buf[..n], info).expect("drives");
-                pending.extend_from_slice(&drain(&mut *conn, stream));
-                let mut at = 0usize;
-                let mut whole = 0usize;
-                while let Some(frame) = frames::h3_frame(&pending, &mut at) {
-                    let end = at + frame.length as usize;
-                    if end > pending.len() {
-                        break;
-                    }
-                    if let frames::H3Event::Data { payload, .. } =
-                        frames::h3_event(frame, &pending[at..end])
-                    {
-                        received.extend_from_slice(payload);
-                    }
-                    at = end;
-                    whole = end;
+            match crate::quic::server_poll(sock, &mut buf[..]) {
+                Some((n, from)) => {
+                    let info = quiche::RecvInfo { from, to: local };
+                    conn.recv(&mut buf[..n], info).expect("drives");
+                    pending.extend_from_slice(&drain(&mut *conn, stream));
                 }
-                // Only what whole frames cover is spent: a header that arrived without its payload has to wait for the rest of it.
-                pending.drain(..whole);
+                // A quiet turn still drives the connection: its timer is what turns a datagram the loopback dropped back into a retransmission.
+                None => conn.on_timeout(),
             }
-            if received.len() > sent {
-                let n = (received.len() - sent).min(16_384);
-                let mut frame = Vec::new();
-                frames::quic_varint(&mut frame, frames::H3_DATA);
-                frames::quic_varint(&mut frame, n as u64);
-                frame.extend_from_slice(&downlink[sent..sent + n]);
-                conn.stream_send(stream, &frame, false).expect("echoes");
-                sent += n;
+            let mut at = 0usize;
+            let mut whole = 0usize;
+            while let Some(head) = frames::h3_frame(&pending, &mut at) {
+                let end = at + head.length as usize;
+                if end > pending.len() {
+                    break;
+                }
+                if let frames::H3Event::Data { payload, .. } =
+                    frames::h3_event(head, &pending[at..end])
+                {
+                    received.extend_from_slice(payload);
+                }
+                at = end;
+                whole = end;
             }
-            while let Ok((written, info)) = conn.send(&mut out[..]) {
+            // Only what whole frames cover is spent: a header that arrived without its payload has to wait for the rest of it.
+            pending.drain(..whole);
+            if sent < downlink.len() {
+                let owed = if sent < echo {
+                    received.len().min(downlink.len())
+                } else {
+                    downlink.len()
+                };
+                let n = owed.saturating_sub(sent).min(16_384);
+                if n > 0 {
+                    frame.clear();
+                    frames::quic_varint(&mut frame, frames::H3_DATA);
+                    frames::quic_varint(&mut frame, n as u64);
+                    frame.extend_from_slice(&downlink[sent..sent + n]);
+                    // The credit-aware write: a send buffer the reader has not emptied takes only part of a frame, and the rest lives on solely because the writer waited for it.
+                    assert!(
+                        crate::quic::stream_send_all(conn, sock, stream, &frame, false, deadline),
+                        "the echo reaches the lane"
+                    );
+                    sent += n;
+                }
+            }
+            let mut wrote = false;
+            while let Ok((written, info)) = conn.send(out) {
+                wrote = true;
                 let _ = sock.send_to(&out[..written], info.to);
+            }
+            // Handing quiche the bytes is not delivering them: the tail of a burst survives a dropped datagram only while someone is left to retransmit it, so the edge stays until a whole quiet period has nothing to send.
+            if wrote || sent < downlink.len() {
+                quiet = std::time::Instant::now();
+            } else if sent == downlink.len() && quiet.elapsed() >= Duration::from_millis(200) {
+                return;
             }
         }
     }
