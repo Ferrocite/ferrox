@@ -18715,6 +18715,8 @@ mod tests {
         config.set_initial_max_stream_data_uni(crate::quic::MAX_STREAM_DATA);
         config.set_initial_max_streams_bidi(crate::quic::MAX_STREAMS);
         config.set_initial_max_streams_uni(crate::quic::MAX_STREAMS);
+        config.set_max_connection_window(crate::quic::MAX_DATA);
+        config.set_max_stream_window(crate::quic::MAX_STREAM_DATA);
         config
             .load_cert_chain_from_pem_file(cert_path.to_str().expect("ascii"))
             .expect("loads chain");
@@ -19072,6 +19074,8 @@ mod tests {
         server_config.set_initial_max_stream_data_uni(crate::quic::MAX_STREAM_DATA);
         server_config.set_initial_max_streams_bidi(crate::quic::MAX_STREAMS);
         server_config.set_initial_max_streams_uni(crate::quic::MAX_STREAMS);
+        server_config.set_max_connection_window(crate::quic::MAX_DATA);
+        server_config.set_max_stream_window(crate::quic::MAX_STREAM_DATA);
         server_config
             .load_cert_chain_from_pem_file(cert_path.to_str().expect("ascii"))
             .expect("loads chain");
@@ -19157,6 +19161,83 @@ mod tests {
         );
         assert!(ferry.duplicated > 0, "the ferry doubled nothing");
         assert!(ferry.reordered > 0, "the ferry held nothing back");
+    }
+
+    /// The lane's memory claim seen from the edge's side: an edge that writes and is never read is granted exactly the window the lane advertises — `MAX_STREAM_DATA` on one stream, `MAX_DATA` across the connection — no byte more can reach the process because flow control refuses it at the writer, and the credit rolls back on consumption rather than being spent once, so a capped lane is not a throttled one.
+    #[test]
+    fn an_edge_cannot_park_more_than_the_window_unread() {
+        let mut pipe = quic_pipe_endpoints();
+        let mut ferry = Ferry::new(FAITHFUL);
+        let cap = crate::quic::MAX_DATA as usize;
+        let stream_cap = crate::quic::MAX_STREAM_DATA as usize;
+        let block = vec![7u8; 64 * 1024];
+        // quiche caps a write by congestion-control capacity as well as by credit, so the ferry must run between attempts: its acks keep the send window open while a lane that never reads keeps the credit closed. A writer stalled for 40 whole ferry rounds is stopped by flow control, not pacing.
+        let mut fill = |stream: u64| -> usize {
+            let mut total = 0usize;
+            let mut idle = 0usize;
+            while total < cap * 2 {
+                let Pipe { server, .. } = &mut pipe;
+                let want = (cap * 2 - total).min(block.len());
+                match server.stream_send(stream, &block[..want], false) {
+                    Ok(n) if n > 0 => {
+                        total += n;
+                        idle = 0;
+                    }
+                    _ => {
+                        idle += 1;
+                        if idle > 40 {
+                            break;
+                        }
+                    }
+                }
+                ferry.run(&mut pipe);
+            }
+            total
+        };
+        let first = fill(1);
+        assert_eq!(first, stream_cap, "one stream stops at its window");
+        let second = fill(5);
+        assert_eq!(
+            first + second,
+            cap,
+            "the connection stops the second stream"
+        );
+        let third = pipe.server.stream_send(9, &block, false).unwrap_or(0);
+        assert_eq!(third, 0, "a third stream finds no credit at all");
+        // And the credit rolls: a lane that consumes the parked bytes hands the credit back, so a capped window is a rolling one, not a spent one. One stream is not enough to reopen the connection — the credit updates only once the available window falls below half — so the lane drains both streams the edge parked against it.
+        let mut piece = vec![0u8; 64 * 1024];
+        for stream in [1, 5] {
+            let mut taken = 0usize;
+            for _ in 0..20_000 {
+                ferry.run(&mut pipe);
+                let Pipe { client, .. } = &mut pipe;
+                while taken < stream_cap {
+                    match client.stream_recv(stream, &mut piece) {
+                        Ok((0, _)) | Err(_) => break,
+                        Ok((n, _)) => taken += n,
+                    }
+                }
+                if taken >= stream_cap {
+                    break;
+                }
+            }
+            assert_eq!(
+                taken, stream_cap,
+                "the parked bytes reach the lane that reads them"
+            );
+        }
+        let mut granted = 0usize;
+        for _ in 0..20_000 {
+            ferry.run(&mut pipe);
+            let Pipe { server, .. } = &mut pipe;
+            if let Ok(n) = server.stream_send(1, &block[..1024], false) {
+                if n > 0 {
+                    granted = n;
+                    break;
+                }
+            }
+        }
+        assert_eq!(granted, 1024, "consumed credit rolls back to the edge");
     }
 
     #[allow(
@@ -19943,6 +20024,8 @@ mod tests {
         config.set_initial_max_stream_data_uni(crate::quic::MAX_STREAM_DATA);
         config.set_initial_max_streams_bidi(crate::quic::MAX_STREAMS);
         config.set_initial_max_streams_uni(crate::quic::MAX_STREAMS);
+        config.set_max_connection_window(crate::quic::MAX_DATA);
+        config.set_max_stream_window(crate::quic::MAX_STREAM_DATA);
         config
             .load_cert_chain_from_pem_file(cert_path.to_str().expect("ascii"))
             .expect("loads chain");
