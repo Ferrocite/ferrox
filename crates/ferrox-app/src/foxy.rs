@@ -655,7 +655,8 @@ impl Tls2 {
     }
 
     fn await_status(&mut self) -> Result<u16, Failure> {
-        let deadline = Instant::now() + HEADER_TIMEOUT;
+        // The status is the h2 form of the head, so it waits the named head budget; unset, that is the same twenty seconds.
+        let deadline = Instant::now() + crate::budgets::head_arrival();
         let mut block = Vec::with_capacity(64);
         while Instant::now() < deadline {
             let status = self
@@ -2349,12 +2350,16 @@ mod loopback {
         use ferrox_core::tls::TlsProvider as _;
 
         let _guard = crate::budgets::lock();
-        let root = crate::json::parse(r#"{"budgets": {"headArrival": "300ms"}}"#).expect("parses");
-        crate::budgets::apply(&crate::config::budgets(&root).expect("a name the engine acts on"));
         for (alpn, carrier, label) in [
             (&b"http/1.1"[..], Carrier::H1, "h1"),
             (&b"h2"[..], Carrier::H2, "h2"),
         ] {
+            // The budget is re-applied per iteration because each leg clears it before its asserts, so a panic never leaks a tight arm to the next test.
+            let root =
+                crate::json::parse(r#"{"budgets": {"headArrival": "300ms"}}"#).expect("parses");
+            crate::budgets::apply(
+                &crate::config::budgets(&root).expect("a name the engine acts on"),
+            );
             let (roots, server) = minted(alpn);
             let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
             let port = listener.local_addr().expect("addr").port();
