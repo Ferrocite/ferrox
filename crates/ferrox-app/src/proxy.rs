@@ -171,8 +171,7 @@ fn serve_root(label: &str, root: &Json) -> ! {
                     let Some(out) = outbound.clone() else {
                         continue;
                     };
-                    // This role carries no tcp carrier, so nothing arms a chain on its accepted stream:
-                    // the inbound is refused rather than served unmasked.
+                    // A front with no tcp carrier has no chain to arm, so the inbound is refused rather than served unmasked.
                     if crate::config::has_tcp_mask(inbound.get("streamSettings")) {
                         eprintln!("inbound `{protocol}` in {label} asks for a finalmask tcp chain it cannot arm");
                         continue;
@@ -732,82 +731,81 @@ fn accept_loop(address: &str, role: &Role) {
         no_delay(&stream);
         let role = role.clone();
         thread::spawn(move || {
-            // Armed once per accepted stream, as the reference wraps its listener's conn: every write
-            // this connection makes, handshake or relay, goes through the chain.
+            // Armed once per accepted stream, as the reference wraps its listener's conn.
             let stream = stream.with_mask(role.tcp_mask());
             match role {
-            Role::Vless {
-                id,
-                carrier,
-                freedom,
-            } => serve_vless(stream, &id, &carrier, freedom),
-            Role::VlessTls {
-                id,
-                freedom,
-                carrier,
-                server,
-            } => serve_vless_tls(stream, &id, freedom, &carrier, &server),
-            Role::VlessReality {
-                id,
-                freedom,
-                carrier,
-                server,
-            } => serve_vless_reality(stream, &id, freedom, &carrier, &server),
-            Role::Trojan {
-                key,
-                carrier,
-                freedom,
-            } => match carrier {
-                Carrier::Raw(_) => serve_trojan(stream, &key, freedom),
-                Carrier::Ws { path, .. } => {
-                    serve_trojan_ws(stream, &key, path.as_str(), freedom);
-                }
-                Carrier::HttpUpgrade { path, .. } => {
-                    serve_trojan_httpupgrade(stream, &key, path.as_str(), freedom);
-                }
-                Carrier::Grpc { path } => {
-                    serve_trojan_grpc(stream, &key, path.as_str(), freedom);
-                }
-                Carrier::Xhttp { settings, .. } => {
-                    serve_trojan_xhttp(stream, &key, settings.path.as_str(), freedom);
-                }
-                Carrier::HttpHeader { path } => {
-                    serve_trojan_httpheader(stream, &key, path.as_str(), freedom);
-                }
-                refused_carriers!() => {}
-            },
-            Role::Vmess {
-                id,
-                carrier,
-                freedom,
-            } => match carrier {
-                Carrier::Raw(_) => crate::vmess::serve(stream, &id, freedom),
-                Carrier::Ws { path, .. } => {
-                    crate::vmess::serve_ws(stream, path.as_str(), &id, freedom);
-                }
-                Carrier::Xhttp { settings, .. } => {
-                    crate::vmess::serve_xhttp(stream, settings.path.as_str(), &id, freedom);
-                }
-                Carrier::HttpHeader { path } => {
-                    crate::vmess::serve_httpheader(stream, path.as_str(), &id, freedom);
-                }
-                Carrier::HttpUpgrade { path, .. } => {
-                    crate::vmess::serve_httpupgrade(stream, path.as_str(), &id, freedom);
-                }
-                Carrier::Grpc { path } => {
-                    crate::vmess::serve_grpc(stream, path.as_str(), &id, freedom);
-                }
-                refused_carriers!() => {}
-            },
-            Role::Shadowsocks {
-                password,
-                method,
-                carrier,
-                freedom,
-            } => serve_shadowsocks(stream, &password, &method, &carrier, freedom),
-            Role::Socks { out } => serve_socks(stream, &out),
-            Role::Http { out } => serve_http(stream, &out),
-            Role::Mixed { out } => serve_mixed(stream, &out),
+                Role::Vless {
+                    id,
+                    carrier,
+                    freedom,
+                } => serve_vless(stream, &id, &carrier, freedom),
+                Role::VlessTls {
+                    id,
+                    freedom,
+                    carrier,
+                    server,
+                } => serve_vless_tls(stream, &id, freedom, &carrier, &server),
+                Role::VlessReality {
+                    id,
+                    freedom,
+                    carrier,
+                    server,
+                } => serve_vless_reality(stream, &id, freedom, &carrier, &server),
+                Role::Trojan {
+                    key,
+                    carrier,
+                    freedom,
+                } => match carrier {
+                    Carrier::Raw(_) => serve_trojan(stream, &key, freedom),
+                    Carrier::Ws { path, .. } => {
+                        serve_trojan_ws(stream, &key, path.as_str(), freedom);
+                    }
+                    Carrier::HttpUpgrade { path, .. } => {
+                        serve_trojan_httpupgrade(stream, &key, path.as_str(), freedom);
+                    }
+                    Carrier::Grpc { path } => {
+                        serve_trojan_grpc(stream, &key, path.as_str(), freedom);
+                    }
+                    Carrier::Xhttp { settings, .. } => {
+                        serve_trojan_xhttp(stream, &key, settings.path.as_str(), freedom);
+                    }
+                    Carrier::HttpHeader { path } => {
+                        serve_trojan_httpheader(stream, &key, path.as_str(), freedom);
+                    }
+                    refused_carriers!() => {}
+                },
+                Role::Vmess {
+                    id,
+                    carrier,
+                    freedom,
+                } => match carrier {
+                    Carrier::Raw(_) => crate::vmess::serve(stream, &id, freedom),
+                    Carrier::Ws { path, .. } => {
+                        crate::vmess::serve_ws(stream, path.as_str(), &id, freedom);
+                    }
+                    Carrier::Xhttp { settings, .. } => {
+                        crate::vmess::serve_xhttp(stream, settings.path.as_str(), &id, freedom);
+                    }
+                    Carrier::HttpHeader { path } => {
+                        crate::vmess::serve_httpheader(stream, path.as_str(), &id, freedom);
+                    }
+                    Carrier::HttpUpgrade { path, .. } => {
+                        crate::vmess::serve_httpupgrade(stream, path.as_str(), &id, freedom);
+                    }
+                    Carrier::Grpc { path } => {
+                        crate::vmess::serve_grpc(stream, path.as_str(), &id, freedom);
+                    }
+                    refused_carriers!() => {}
+                },
+                Role::Shadowsocks {
+                    password,
+                    method,
+                    carrier,
+                    freedom,
+                } => serve_shadowsocks(stream, &password, &method, &carrier, freedom),
+                Role::Socks { out } => serve_socks(stream, &out),
+                Role::Http { out } => serve_http(stream, &out),
+                Role::Mixed { out } => serve_mixed(stream, &out),
             }
         });
     }
@@ -3655,7 +3653,10 @@ fn request_vless_mux(mut uplink: Connection, vless: &VlessOut) -> Option<Connect
 fn open_vless_mux(vless: &VlessOut) -> Option<Connection> {
     let endpoint = format!("{}:{}", vless.address, vless.port);
     let server = endpoint.to_socket_addrs().ok()?.next()?;
-    request_vless_mux(dial_or_report(&server)?.with_mask(vless.carrier.tcp_mask()), vless)
+    request_vless_mux(
+        dial_or_report(&server)?.with_mask(vless.carrier.tcp_mask()),
+        vless,
+    )
 }
 
 fn dial_vless_mux(client: &Connection, uplink: Connection, vless: &VlessOut, target: &Destination) {
@@ -6081,7 +6082,9 @@ fn serve_socks_udp(mut client: Connection, out: &Outbound) {
     };
     // The handler holds the control socket open for its life, and the Foxy arms watch it for the client's goodbye.
     match out {
-        Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Raw(_)) && vless.tls.is_none() => {
+        Outbound::Vless(vless)
+            if matches!(vless.carrier, Carrier::Raw(_)) && vless.tls.is_none() =>
+        {
             serve_socks_udp_vless(&relay, vless);
         }
         Outbound::Trojan(trojan)
@@ -6089,7 +6092,9 @@ fn serve_socks_udp(mut client: Connection, out: &Outbound) {
         {
             serve_socks_udp_trojan(&relay, trojan);
         }
-        Outbound::Vmess(vmess) if matches!(vmess.carrier, Carrier::Raw(_)) && vmess.tls.is_none() => {
+        Outbound::Vmess(vmess)
+            if matches!(vmess.carrier, Carrier::Raw(_)) && vmess.tls.is_none() =>
+        {
             serve_socks_udp_vmess(&relay, vmess);
         }
         Outbound::Shadowsocks(ss) if matches!(ss.carrier, Carrier::Raw(_)) => {
@@ -7307,8 +7312,7 @@ fn relay(client: &Connection, target: &Connection) {
         return;
     };
     #[cfg(target_os = "linux")]
-    // Splice moves bytes between descriptors without crossing the write mask, so a leg that ends on
-    // a masked stream keeps the buffered copy path.
+    // Splice crosses descriptors without the mask, so a leg ending on a masked stream keeps the buffered copy.
     if !target_write.masked() && !client_write.masked() && poll_relay::available() {
         poll_relay::drive(client_read, target_write, target_read, client_write);
         return;
@@ -10641,7 +10645,13 @@ mod tests {
         let server: SocketAddr = listener.local_addr().expect("addr");
         let lane = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_vless_tls(stream, &[0x9Du8; 16], true, &Carrier::Raw(Default::default()), &server_config);
+            serve_vless_tls(
+                stream,
+                &[0x9Du8; 16],
+                true,
+                &Carrier::Raw(Default::default()),
+                &server_config,
+            );
         });
 
         // The hello arrives twelve grains later than the lane's first read; only its deadline may refuse it.
@@ -17712,11 +17722,17 @@ mod tests {
             // A chain belongs to the tcp connection; a carrier riding another transport has nowhere to arm it.
             r#"{"network":"ws","finalmask":{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":[11]}}]}}"#,
             // The old header masquerade shares the connection the chain would cut.
-            &format!(r#"{{"network":"tcp","tcpSettings":{{"header":{{"type":"http","request":{{"path":"/x"}}}}}},"finalmask":{{"tcp":[{fragment}]}}}}"#),
+            &format!(
+                r#"{{"network":"tcp","tcpSettings":{{"header":{{"type":"http","request":{{"path":"/x"}}}}}},"finalmask":{{"tcp":[{fragment}]}}}}"#
+            ),
             // A window starting at 0 is every write, which the reference refuses outright.
-            &format!(r#"{{"network":"tcp","finalmask":{{"tcp":[{{"type":"fragment","settings":{{"packets":"0-5","lengths":[11]}}}}]}}}}"#),
+            &format!(
+                r#"{{"network":"tcp","finalmask":{{"tcp":[{{"type":"fragment","settings":{{"packets":"0-5","lengths":[11]}}}}]}}}}"#
+            ),
             // A last width entry of 0 is a piece that never advances.
-            &format!(r#"{{"network":"tcp","finalmask":{{"tcp":[{{"type":"fragment","settings":{{"packets":"tlshello","lengths":[11,0]}}}}]}}}}"#),
+            &format!(
+                r#"{{"network":"tcp","finalmask":{{"tcp":[{{"type":"fragment","settings":{{"packets":"tlshello","lengths":[11,0]}}}}]}}}}"#
+            ),
             // A fragment naming no width at all is the reference's zero range.
             r#"{"network":"tcp","finalmask":{"tcp":[{"type":"fragment","settings":{"packets":"tlshello"}}]}}"#,
             r#"{"network":"tcp","finalmask":{"tcp":[{}]}}"#,
@@ -17730,10 +17746,12 @@ mod tests {
             );
         }
         // An empty tcp list is no chain at all, and a bare width list is a chain this tree does arm.
-        let empty = crate::json::parse(r#"{"network":"tcp","finalmask":{"tcp":[]}}"#).expect("parses");
-        let armed =
-            crate::json::parse(&format!(r#"{{"network":"tcp","finalmask":{{"tcp":[{fragment}]}}}}"#))
-                .expect("parses");
+        let empty =
+            crate::json::parse(r#"{"network":"tcp","finalmask":{"tcp":[]}}"#).expect("parses");
+        let armed = crate::json::parse(&format!(
+            r#"{{"network":"tcp","finalmask":{{"tcp":[{fragment}]}}}}"#
+        ))
+        .expect("parses");
         for (settings, want) in [(&empty, false), (&armed, true)] {
             let carrier = stream_carrier(Some(settings));
             assert!(matches!(carrier, Carrier::Raw(_)));
@@ -17757,7 +17775,10 @@ mod tests {
             carrier: stream_carrier(None),
             freedom: false,
         };
-        assert!(bare.tcp_mask().is_none(), "a carrier with no chain arms nothing");
+        assert!(
+            bare.tcp_mask().is_none(),
+            "a carrier with no chain arms nothing"
+        );
         assert!(
             Role::Socks {
                 out: Outbound::Freedom

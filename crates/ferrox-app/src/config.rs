@@ -566,9 +566,7 @@ pub(crate) fn stream_carrier(settings: Option<&Json>) -> Carrier {
         .iter()
         .find(|(aliases, _)| aliases.contains(&network))
         .map_or_else(unknown, |(_, resolve)| resolve(settings, network));
-    // The reference puts the tcp chain on the TCP connection itself, under whichever transport rides
-    // it; this tree arms it where a carrier reaches that connection, so any other carrier refuses the
-    // config rather than dialling or serving it unmasked.
+    // The reference puts the chain on the TCP connection under whichever transport rides it; this tree arms it only where a carrier reaches that connection, so any other carrier refuses the config rather than dialling or serving it unmasked.
     if has_tcp_mask(settings) && !matches!(carrier, Carrier::Raw(_)) {
         return unknown();
     }
@@ -720,8 +718,7 @@ fn resolve_tcp_or_header(settings: Option<&Json>, network: &str) -> Carrier {
         };
     };
     match tcp_http_path(settings) {
-        // A header masquerade and a tcp mask together is not a chain this tree ships: the reference
-        // answers that pairing with `header-custom`, which is refused below.
+        // A header masquerade plus a tcp mask is the pairing the reference answers with the refused `header-custom`.
         Some(_) if !mask.is_empty() => Carrier::Unknown {
             network: network.to_owned(),
         },
@@ -769,8 +766,7 @@ fn fragment(conf: Option<&Json>) -> Option<ferrox_core::finalmask::Fragment> {
     let (packets_from, packets_to) = match packets.as_str() {
         "tlshello" => (0, 1),
         "" => (0, 0),
-        // The reference reads a window as a range and refuses its low end of 0, which would make
-        // every write a hello.
+        // The reference reads a window as a range and refuses a low end of 0, which would make every write a hello.
         other => {
             let window = range_text(other)?;
             if window.low == 0 {
@@ -779,7 +775,8 @@ fn fragment(conf: Option<&Json>) -> Option<ferrox_core::finalmask::Fragment> {
             (window.low as u64, window.high as u64)
         }
     };
-    let widths = range_list(conf, "lengths").or_else(|| Some(vec![single_range(conf, "length")?]))?;
+    let widths =
+        range_list(conf, "lengths").or_else(|| Some(vec![single_range(conf, "length")?]))?;
     let waits = range_list(conf, "delays").or_else(|| Some(vec![single_range(conf, "delay")?]))?;
     Fragment::new(
         packets_from,
@@ -791,10 +788,7 @@ fn fragment(conf: Option<&Json>) -> Option<ferrox_core::finalmask::Fragment> {
 }
 
 /// A `lengths`-style list, or `None` when the key is absent or empty and the singular spelling rules.
-fn range_list(
-    conf: Option<&Json>,
-    key: &str,
-) -> Option<Vec<ferrox_core::finalmask::Range>> {
+fn range_list(conf: Option<&Json>, key: &str) -> Option<Vec<ferrox_core::finalmask::Range>> {
     let items = conf?.get(key)?.as_arr()?;
     if items.is_empty() {
         return None;

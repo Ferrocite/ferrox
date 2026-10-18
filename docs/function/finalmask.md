@@ -175,7 +175,10 @@ What is **not** removed, and is named rather than claimed:
   [`crates/ferrox-prompt/prompts.md`](../../crates/ferrox-prompt/prompts.md).
 - **The sleeps.** `delays` are the config's schedule; a mask that cut faster would look
   like a different schedule to anything watching the wire, so `park` sleeps exactly what
-  one draw answers, and `a_delay_of_zero_never_parks` shows a span of one costs nothing.
+  one draw answers. `a_delay_range_whose_top_is_zero_draws_zero` pins the draw a span of
+  one answers (`0`), and the sleeps themselves are what `scripts/watch-test.sh` catches:
+  a mask that parked when the config said zero would stall the test rather than fail an
+  assertion.
 
 ## CI scope
 

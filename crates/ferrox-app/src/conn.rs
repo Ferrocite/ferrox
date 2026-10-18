@@ -56,8 +56,7 @@ impl Masked {
 
     // A chain is a byte writer, so a gathered write answers its first run and the caller's loop hands the rest over as the write it would have been.
     fn send_vectored(&self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
-        bufs.first()
-            .map_or(Ok(0), |first| self.send(first))
+        bufs.first().map_or(Ok(0), |first| self.send(first))
     }
 }
 
