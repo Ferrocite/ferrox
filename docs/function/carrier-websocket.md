@@ -1,26 +1,10 @@
 # The WebSocket carrier
 
-`ferrox-app`'s WebSocket carrier is where the syscall shape was worst. A frame
-header is 2 bytes, then 0, 2 or 8 bytes of length, then a 4-byte mask, then the
-payload — and this tree used to spend one `read` syscall on each of those three
-groups plus one on the payload. Three syscalls per message, for a header that is
-at most 14 bytes.
+`ferrox-app`'s WebSocket carrier is where the syscall shape was worst. A frame header is 2 bytes, then 0, 2 or 8 bytes of length, then a 4-byte mask, then the payload — and this tree used to spend one `read` syscall on each of those three groups plus one on the payload. Three syscalls per message, for a header that is at most 14 bytes.
 
-Now there is one buffer. A `read` fills as much of it as the socket offers — up
-to 32 KiB — a frame header is parsed out of it without touching the socket, and
-the payload is unmasked where it lies. So a read covers a window, not a frame
-header: 64 frames of 21 472 bytes come out of one `read`, where the old path
-spent three per message before it delivered the first payload byte.
+Now there is one buffer. A `read` fills as much of it as the socket offers — up to 32 KiB — a frame header is parsed out of it without touching the socket, and the payload is unmasked where it lies. So a read covers a window, not a frame header: 64 frames of 21 472 bytes come out of one `read`, where the old path spent three per message before it delivered the first payload byte.
 
-The write side was already right and is left alone: an unmasked frame goes out
-with `writev`, one syscall and zero copies; a masked frame is copied once into a
-thread-local buffer, masked in place there, and written once. What is a floor
-and what is not: the mask has to be applied somewhere, so the copy that stages
-the payload is not the removable step — the caller hands over a `&[u8]`, and
-masking it in place there would widen every carrier's signature. What was
-removable was the *width* of the step: `apply_mask` is now a rung ladder, one
-32-byte `ymm` pass per iteration on a host that reports `avx2`, the 16-byte
-`xor_block` ladder below it, and the byte tail under both.
+The write side was already right and is left alone: an unmasked frame goes out with `writev`, one syscall and zero copies; a masked frame is copied once into a thread-local buffer, masked in place there, and written once. What is a floor and what is not: the mask has to be applied somewhere, so the copy that stages the payload is not the removable step — the caller hands over a `&[u8]`, and masking it in place there would widen every carrier's signature. What was removable was the *width* of the step: `apply_mask` is now a rung ladder, one 32-byte `ymm` pass per iteration on a host that reports `avx2`, the 16-byte `xor_block` ladder below it, and the byte tail under both.
 
 ## Data path
 
@@ -47,27 +31,9 @@ graph TD
 
 ## Kept head
 
-The handshake read used to `peek` for `\r\n\r\n`, prove the head there, then re-read exactly
-those octets so the frame behind the delimiter stayed in the socket: a head of `H` octets
-crossed user space twice, and every round of a head that dribbled in cost two read-family calls.
-`proxy::read_http_head_kept` reads once into the buffer it hands back and returns the offset
-where the head ends, so the head crosses once and a round costs one call — and the frame that
-rode in with the head is already the reader's own `have`, `at` that offset, because `split_halves`
-now takes the cursor instead of being handed an empty buffer.
-`ws::tests::a_frame_that_rode_in_with_the_head_costs_no_syscall` drives that shape from an
-in-memory buffer: two frames delivered with `reads()` still `0`, the buffer's base and capacity
-unchanged; a wrong cursor fails the bytes, a re-read fails the counter.
-The halves that cannot peek took the same shape with it: `proxy::read_exact_head` *is* that
-loop now, so `accept_split` and `connect_split` hand `split_halves` the buffer the read filled
-with `at` past the head instead of a `split_off`'d tail, which was a second allocation that
-copied the riding bytes out of the buffer they arrived in (`head-tail-allocations 0`).
-`ws::tests::the_record_head_hands_over_the_buffer_it_filled` watches the handover: `have` is
-as long as the head plus the frame, and the frame's base is the buffer's base plus the cursor
-— a tail of its own moves it.
+The handshake read used to `peek` for `\r\n\r\n`, prove the head there, then re-read exactly those octets so the frame behind the delimiter stayed in the socket: a head of `H` octets crossed user space twice, and every round of a head that dribbled in cost two read-family calls. `proxy::read_http_head_kept` reads once into the buffer it hands back and returns the offset where the head ends, so the head crosses once and a round costs one call — and the frame that rode in with the head is already the reader's own `have`, `at` that offset, because `split_halves` now takes the cursor instead of being handed an empty buffer. `ws::tests::a_frame_that_rode_in_with_the_head_costs_no_syscall` drives that shape from an in-memory buffer: two frames delivered with `reads()` still `0`, the buffer's base and capacity unchanged; a wrong cursor fails the bytes, a re-read fails the counter. The halves that cannot peek took the same shape with it: `proxy::read_exact_head` *is* that loop now, so `accept_split` and `connect_split` hand `split_halves` the buffer the read filled with `at` past the head instead of a `split_off`'d tail, which was a second allocation that copied the riding bytes out of the buffer they arrived in (`head-tail-allocations 0`). `ws::tests::the_record_head_hands_over_the_buffer_it_filled` watches the handover: `have` is as long as the head plus the frame, and the frame's base is the buffer's base plus the cursor — a tail of its own moves it.
 
-What is *not* removed: `proxy::read_http_head` still answers the `http` front, whose prefix has
-one buffer and nowhere else to go, and the Shadowsocks rung, which waits inside a `peek` for the
-first byte of a request packet and must not take it.
+What is *not* removed: `proxy::read_http_head` still answers the `http` front, whose prefix has one buffer and nowhere else to go, and the Shadowsocks rung, which waits inside a `peek` for the first byte of a request packet and must not take it.
 
 ## Measured
 
@@ -107,259 +73,49 @@ first byte of a request packet and must not take it.
   'ferrox_core::transport::tests::the_early_data_line_costs_the_encode_and_nothing_else'
 ```
 
-`UNBLESSED`, as above, and deliberately so: a probe frame charges its own loop
-entry, its asserts and its fixture fill, so `294378` is a baseline to difference
-against and not this method's cost. The two rows read above are the in-memory
-ones — the masked-write probe and the mask loop's own differential — and both
-hold their bytes across runs; `ws::write_frame` is driven over a loopback
-socket, so its movement is reported as movement, never as a figure.
+`UNBLESSED`, as above, and deliberately so: a probe frame charges its own loop entry, its asserts and its fixture fill, so `294378` is a baseline to difference against and not this method's cost. The two rows read above are the in-memory ones — the masked-write probe and the mask loop's own differential — and both hold their bytes across runs; `ws::write_frame` is driven over a loopback socket, so its movement is reported as movement, never as a figure.
 
-The `?ed=N` rows are the same kind of probe: `the_head_yields_the_path_the_key_and_the_early_data`
-drives one fixed 190-byte head through `check_request` 64 times and folds the key,
-the subprotocol and the decoded early data, so the frame is the head read; and
-`the_early_data_line_costs_the_encode_and_nothing_else` encodes a 2048-byte
-payload 16 times into a String that already holds it, so the frame is the encode
-and no allocator is in it. Each frame is read against the body it replaced under
-the same probe, with the unmoved row holding still across the pair —
-`ws::tests::mask_chunks_match_the_byte_loop`
-reads `437971` on all four runs. The head probe reads **`349434`** where the old
-path's own mirror — `the_head_was_validated_three_times_over`, the same 64
-rounds of the same head, with `header_value` for the echo and the old
-three-validation `check_request` — reads **`520242`**: `170808` is the three
-`from_utf8` passes and the second subprotocol lookup the old shape spent
-(`ops.yml` artefact). The encode probe reads
-**`361968`** where the four-`String::push` body reads **`503578`**: `141610`
-over the same 16 lines of 2048 bytes. Both deltas compare probe to probe, the same
-frame on both
-sides, and neither is a floor under the method alone.
+The `?ed=N` rows are the same kind of probe: `the_head_yields_the_path_the_key_and_the_early_data` drives one fixed 190-byte head through `check_request` 64 times and folds the key, the subprotocol and the decoded early data, so the frame is the head read; and `the_early_data_line_costs_the_encode_and_nothing_else` encodes a 2048-byte payload 16 times into a String that already holds it, so the frame is the encode and no allocator is in it. Each frame is read against the body it replaced under the same probe, with the unmoved row holding still across the pair — `ws::tests::mask_chunks_match_the_byte_loop` reads `437971` on all four runs. The head probe reads **`349434`** where the old path's own mirror — `the_head_was_validated_three_times_over`, the same 64 rounds of the same head, with `header_value` for the echo and the old three-validation `check_request` — reads **`520242`**: `170808` is the three `from_utf8` passes and the second subprotocol lookup the old shape spent (`ops.yml` artefact). The encode probe reads **`361968`** where the four-`String::push` body reads **`503578`**: `141610` over the same 16 lines of 2048 bytes. Both deltas compare probe to probe, the same frame on both sides, and neither is a floor under the method alone.
 
-What the release assembly says on its own, checked by
-`cargo rustc -p ferrox-core --release --lib -- --emit asm` on
-`aarch64-apple-darwin`: the encode's group loop is **23 instructions per group**
-and holds no branch per character — one pass over the input's three bytes, four
-alphabet loads, four stores into the block, one counter and one backward branch.
-The four `String::push` calls it replaced put a `len_utf8` branch and a capacity
-check in front of every one of those four stores and reloaded the vector's
-length, capacity and pointer between them, and the whole function laid out as
-**365 assembly lines against this one's 214**. That is a count of the loop and
-of the function, not of retired instructions, and it is aarch64's own layout:
-x86_64 is measured by `ops.yml` with the rest.
+What the release assembly says on its own, checked by `cargo rustc -p ferrox-core --release --lib -- --emit asm` on `aarch64-apple-darwin`: the encode's group loop is **23 instructions per group** and holds no branch per character — one pass over the input's three bytes, four alphabet loads, four stores into the block, one counter and one backward branch. The four `String::push` calls it replaced put a `len_utf8` branch and a capacity check in front of every one of those four stores and reloaded the vector's length, capacity and pointer between them, and the whole function laid out as **365 assembly lines against this one's 214**. That is a count of the loop and of the function, not of retired instructions, and it is aarch64's own layout: x86_64 is measured by `ops.yml` with the rest.
 
 ## Time
 
-**The carrier.** The carrier is timed end to end rather than
-in isolation: `.github/workflows/parity.yml` runs `scripts/run-parity.sh` for
-`upload`, `download` and `full-duplex` across the pinned engines, and
-`.github/workflows/benchmark-matrix.yml` runs the `vless-ws` scenario. Both are
-CI-only because every developer machine is behind a VPN. No `vless-ws` cell is in
-the current matrix plan, and the wide mask pass in particular has
-no duration row to ask for: every `vless-ws` cell the matrix plans measures a
-*download*, where the server writes unmasked frames, so the masked direction
-never reaches the timer. Its evidence is the instruction count above, which is
-what `ops.yml` can see.
+**The carrier.** The carrier is timed end to end rather than in isolation: `.github/workflows/parity.yml` runs `scripts/run-parity.sh` for `upload`, `download` and `full-duplex` across the pinned engines, and `.github/workflows/benchmark-matrix.yml` runs the `vless-ws` scenario. Both are CI-only because every developer machine is behind a VPN. No `vless-ws` cell is in the current matrix plan, and the wide mask pass in particular has no duration row to ask for: every `vless-ws` cell the matrix plans measures a *download*, where the server writes unmasked frames, so the masked direction never reaches the timer. Its evidence is the instruction count above, which is what `ops.yml` can see.
 
-**The `?ed=` line, in gate 8.** `bench.yml` timed the shipped encode against the
-shape the four implementations have, on
-both platforms in the one run, each row byte-checked before it was timed: macOS
-aarch64 **3.14x / 3.10x / 3.41x / 1.99x** and linux x86_64 **2.03x / 2.54x /
-2.60x / 2.11x**, at 8, 120, 256 and 2048 bytes, every row gated at 0.95x with
-zero allocations per encode on this side. Those are ratios against the
-reference's shape, not against this tree's previous body — the before-and-after
-for this change is the `141610` above, and this is the same-runner half that
-agrees with its direction.
+**The `?ed=` line, in gate 8.** `bench.yml` timed the shipped encode against the shape the four implementations have, on both platforms in the one run, each row byte-checked before it was timed: macOS aarch64 **3.14x / 3.10x / 3.41x / 1.99x** and linux x86_64 **2.03x / 2.54x / 2.60x / 2.11x**, at 8, 120, 256 and 2048 bytes, every row gated at 0.95x with zero allocations per encode on this side. Those are ratios against the reference's shape, not against this tree's previous body — the before-and-after for this change is the `141610` above, and this is the same-runner half that agrees with its direction.
 
 ## What we removed
 
 ### The handshake that carries the `?ed=N` budget
 
-- **Three passes over the whole head per accepted connection, and a fourth to
-  echo a header that had already been read.** `check_request` read the request
-  line, `Sec-WebSocket-Key` and `Sec-WebSocket-Protocol` through three functions
-  that each ran `from_utf8` over the entire head — up to `HEAD_LIMIT`, 16 KiB —
-  and then `accept` and `accept_split` each looked the subprotocol up a *second*
-  time to write it back into the `101`. The references each hold the head as
-  text once and take every field off it: Xray's `ServeHTTP` reads
-  `request.URL.Path` and one `request.Header.Get` off the `*http.Request`
-  `net/http` built (`hub.go:47`, `hub.go:55`) and hands the *raw* offered string
-  to `Upgrade` (`hub.go:58`); sing-box's handler reads `request.URL` and
-  `request.Header` off the parsed request and hands the decoded bytes to
-  `bufio.NewCachedConn` as a buffer ahead of the connection
-  (`v2raywebsocket/server.go:87`, `:107`); ZeroNet's `read_head` finds the
-  delimiter in one pass, converts the head to text **once** and takes the key and
-  the subprotocol off that string (`zero-transport/src/ws/stream.rs:351-372`).
-  Now one `from_utf8` buys the whole handshake here too:
-  `proxy::request_path_in` and `proxy::header_value_in` take the validated `&str`,
-  `header_value` and `request_path` delegate to them, and `check_request` hands
-  the offered subprotocol back in `Upgrade` so the `101` echoes the slice the
-  first read found. The bytes are pinned by
-  `the_101_is_the_key_and_the_echoed_subprotocol`, and the count is the
-  `the_head_yields_the_path_the_key_and_the_early_data` probe above: **`349434`**
-  against the **`520242`** its old-path mirror
-  (`the_head_was_validated_three_times_over`) reads, `170808` over the same 64
-  rounds (`ops.yml` `39004141049` against `39005361208`).
-- **A second scan for a delimiter the head reader had already stopped at.** The
-  `TcpStream` path's `read_head` peeks until `head.ends_with("\r\n\r\n")` and
-  reads exactly up to that offset, so `head[head.len() - 4..]` is the whole
-  tail and `head[head.len()..]` is always empty — the `find_double_crlf` the
-  client ran over the head to find that offset, a full SWAR pass over up to
-  16 KiB, bought an empty `Vec`. The bytes behind the `101` are whatever the
-  socket still holds, so `connect` now splits with nothing behind it. The
-  `read_exact_head` half (xhttp, httpUpgrade, the halves that cannot peek) still
-  needs the offset, because there the read is not bounded by the delimiter.
-- **A copy of every pipelined byte, and a realloc with it.** `accept_split`
-  held the decoded early data in a `Vec` sized exactly for the digits, then
-  `early.extend_from_slice(&prefix)` copied the pipelined frame behind the head
-  into it — a realloc that copied the decoded bytes again and the prefix once
-  more. Xray wraps the decoded `ed` in a `bytes.Reader` and reads the frames
-  after it, which is the same two sources and no merge; Zray's server keeps the
-  bytes behind the head as their own buffer (`early.rs:294`) and hands them
-  forward. Now the prefix *is* the reader's `have` buffer: the reader already
-  delivers `early` before it parses a frame out of `have`, so the two halves are
-  already in the order it reads them.
-  `the_pipelined_prefix_is_the_readers_own_buffer` proves the removal by pointer
-  identity — the reader's base is the base of the `Vec` those bytes were already
-  in — and `the_early_data_lands_before_the_pipelined_frame` pins the order.
-- **Two `format!` buffers per handshake.** `format!` opens its `String` from the
-  *literal* parts of the template only, so a request carrying a host, a path and
-  a 24-byte key always reallocated at least once and copied the prefix again; the
-  `?ed=` line then grew it a second time. Both the request and the `101` are now
-  pushed into a buffer opened to their own length, six `push_str` calls and no
-  `fmt::Write` in between — ZeroNet's `build_request` is the shape this drops: a
-  `format!` per header line, each one a fresh allocation, plus a `into_bytes()`
-  that copies the whole thing again (`zero-transport/src/ws/handshake.rs:69`).
-  `the_request_is_sized_for_its_bytes` and
-  `the_101_is_the_key_and_the_echoed_subprotocol` assert `capacity() == len()`,
-  which is what "one allocation, no growth" means for a per-call buffer, over the
-  payload lengths that are not a multiple of three (191, 192, 193) and over both
-  sides of the budget.
-- **A capacity check and a UTF-8 decision per encoded character.**
-  `early_encode_into` pushed four `char`s per three input bytes, and each
-  `String::push` re-derives `len_utf8`, reloads the length, the capacity and the
-  pointer, and stores one byte. Sixty-four groups now land in a 256-byte block —
-  one 4-byte store per group, no branch per character — and one `push_str`
-  carries the block after one validation per 256 characters. The differential
-  against the previous byte path still sweeps every length 0-600
-  (`the_windowed_load_encodes_the_bytes_the_byte_path_encoded`, raised from 520
-  so it crosses two block boundaries and a tail), the RFC vectors and the 0-192
-  round trip are unchanged, and gate 8 holds the shipped encode at **zero
-  allocations per line** with the counting allocator while the four references'
-  shape stays at two. The same probe reads `361968` where the four-`String::push`
-  body reads `503578`: `141610` over 16 lines of 2048 bytes (`ops.yml`
-  `39004141049` against `39004218090`).
-- **A string the path parse built and threw away.** `EarlyData::split` opened
-  `out` and copied the base and every kept query pair *before* it knew whether an
-  `ed` was there, so `/tunnel`, `/p?ed=` and `/p?ed=&ed=4` — the shapes the
-  rewrite does not fire on, and the common one among them — paid two allocations
-  and two full copies of the path. The first `ed=` now decides and the string is
-  built once, only when the rewrite fires, on the same `Go Atoi` arithmetic the
-  24 oracle vectors pin. **No checker in this tree counts that allocation**: the
-  differential in `early_data_split_matches_go_arithmetic` and the 192-case sweep
-  in `crates/ferrox-core/tests/parsers.rs` see the bytes and not the allocation,
-  so the count of two-to-one is not a row here.
+- **Three passes over the whole head per accepted connection, and a fourth to echo a header that had already been read.** `check_request` read the request line, `Sec-WebSocket-Key` and `Sec-WebSocket-Protocol` through three functions that each ran `from_utf8` over the entire head — up to `HEAD_LIMIT`, 16 KiB — and then `accept` and `accept_split` each looked the subprotocol up a *second* time to write it back into the `101`. The references each hold the head as text once and take every field off it: Xray's `ServeHTTP` reads `request.URL.Path` and one `request.Header.Get` off the `*http.Request` `net/http` built (`hub.go:47`, `hub.go:55`) and hands the *raw* offered string to `Upgrade` (`hub.go:58`); sing-box's handler reads `request.URL` and `request.Header` off the parsed request and hands the decoded bytes to `bufio.NewCachedConn` as a buffer ahead of the connection (`v2raywebsocket/server.go:87`, `:107`); ZeroNet's `read_head` finds the delimiter in one pass, converts the head to text **once** and takes the key and the subprotocol off that string (`zero-transport/src/ws/stream.rs:351-372`). Now one `from_utf8` buys the whole handshake here too: `proxy::request_path_in` and `proxy::header_value_in` take the validated `&str`, `header_value` and `request_path` delegate to them, and `check_request` hands the offered subprotocol back in `Upgrade` so the `101` echoes the slice the first read found. The bytes are pinned by `the_101_is_the_key_and_the_echoed_subprotocol`, and the count is the `the_head_yields_the_path_the_key_and_the_early_data` probe above: **`349434`** against the **`520242`** its old-path mirror (`the_head_was_validated_three_times_over`) reads, `170808` over the same 64 rounds (`ops.yml` `39004141049` against `39005361208`).
+- **A second scan for a delimiter the head reader had already stopped at.** The `TcpStream` path's `read_head` peeks until `head.ends_with("\r\n\r\n")` and reads exactly up to that offset, so `head[head.len() - 4..]` is the whole tail and `head[head.len()..]` is always empty — the `find_double_crlf` the client ran over the head to find that offset, a full SWAR pass over up to 16 KiB, bought an empty `Vec`. The bytes behind the `101` are whatever the socket still holds, so `connect` now splits with nothing behind it. The `read_exact_head` half (xhttp, httpUpgrade, the halves that cannot peek) still needs the offset, because there the read is not bounded by the delimiter.
+- **A copy of every pipelined byte, and a realloc with it.** `accept_split` held the decoded early data in a `Vec` sized exactly for the digits, then `early.extend_from_slice(&prefix)` copied the pipelined frame behind the head into it — a realloc that copied the decoded bytes again and the prefix once more. Xray wraps the decoded `ed` in a `bytes.Reader` and reads the frames after it, which is the same two sources and no merge; Zray's server keeps the bytes behind the head as their own buffer (`early.rs:294`) and hands them forward. Now the prefix *is* the reader's `have` buffer: the reader already delivers `early` before it parses a frame out of `have`, so the two halves are already in the order it reads them. `the_pipelined_prefix_is_the_readers_own_buffer` proves the removal by pointer identity — the reader's base is the base of the `Vec` those bytes were already in — and `the_early_data_lands_before_the_pipelined_frame` pins the order.
+- **Two `format!` buffers per handshake.** `format!` opens its `String` from the *literal* parts of the template only, so a request carrying a host, a path and a 24-byte key always reallocated at least once and copied the prefix again; the `?ed=` line then grew it a second time. Both the request and the `101` are now pushed into a buffer opened to their own length, six `push_str` calls and no `fmt::Write` in between — ZeroNet's `build_request` is the shape this drops: a `format!` per header line, each one a fresh allocation, plus a `into_bytes()` that copies the whole thing again (`zero-transport/src/ws/handshake.rs:69`). `the_request_is_sized_for_its_bytes` and `the_101_is_the_key_and_the_echoed_subprotocol` assert `capacity() == len()`, which is what "one allocation, no growth" means for a per-call buffer, over the payload lengths that are not a multiple of three (191, 192, 193) and over both sides of the budget.
+- **A capacity check and a UTF-8 decision per encoded character.** `early_encode_into` pushed four `char`s per three input bytes, and each `String::push` re-derives `len_utf8`, reloads the length, the capacity and the pointer, and stores one byte. Sixty-four groups now land in a 256-byte block — one 4-byte store per group, no branch per character — and one `push_str` carries the block after one validation per 256 characters. The differential against the previous byte path still sweeps every length 0-600 (`the_windowed_load_encodes_the_bytes_the_byte_path_encoded`, raised from 520 so it crosses two block boundaries and a tail), the RFC vectors and the 0-192 round trip are unchanged, and gate 8 holds the shipped encode at **zero allocations per line** with the counting allocator while the four references' shape stays at two. The same probe reads `361968` where the four-`String::push` body reads `503578`: `141610` over 16 lines of 2048 bytes (`ops.yml` `39004141049` against `39004218090`).
+- **A string the path parse built and threw away.** `EarlyData::split` opened `out` and copied the base and every kept query pair *before* it knew whether an `ed` was there, so `/tunnel`, `/p?ed=` and `/p?ed=&ed=4` — the shapes the rewrite does not fire on, and the common one among them — paid two allocations and two full copies of the path. The first `ed=` now decides and the string is built once, only when the rewrite fires, on the same `Go Atoi` arithmetic the 24 oracle vectors pin. **No checker in this tree counts that allocation**: the differential in `early_data_split_matches_go_arithmetic` and the 192-case sweep in `crates/ferrox-core/tests/parsers.rs` see the bytes and not the allocation, so the count of two-to-one is not a row here.
 
 ### The frame path
 
-- **An unbounded `realloc` chain in the read-ahead buffer.** `WsReader::pull`
-  asks for `reserve_exact(READ_AHEAD)`, which requests exactly the leftover plus
-  32 KiB — one byte more than the previous capacity whenever the leftover grew,
-  so a stream that lands mid-frame reallocates and memcpys once per read.
-  `reserve` amortises that. In the good case, where a read lands on a frame
-  boundary, the branch was already false and this changes nothing.
-- **Widening the mask loop's stride the naive way is a regression; unrolling the
-  loop over four 16-byte lanes ships.** `apply_mask` XORs 16 bytes
-  per iteration, so about a quarter of its work on a long masked frame is loop
-  counter and bounds check rather than XOR. Striding 64 bytes was tried — same
-  vector op count, same bytes at the same offsets, since 64 is a multiple of the
-  4-byte mask — and it is a **regression**, and the arithmetic says so without a
-  benchmark: the remainder is taken scalar, so `as_chunks_mut::<64>()` makes the
-  scalar tail up to 63 bytes where `as_chunks_mut::<16>()` kept it under 16. At 63
-  bytes it is 63 scalar XORs against 3 vector ops plus 15. Every length that is
-  not a multiple of 64 is worse, and the lengths that are multiples of 64 are
-  unchanged, so the change only ever helped frames that were already
-  vector-aligned. Reverted. What ships instead keeps the 16-byte op and strides
-  the *loop* 64: four `xor_block` lanes per iteration, the sub-64 remainder
-  through the old 16-loop, scalar tail still under 16 — same vector ops, a
-  quarter of the loop overhead, identical tail by construction since 64, 16 and
-  the tail start are all multiples of the 4-byte mask. `mask_chunks_match_the_byte_loop`
-  pins it against the byte loop at every 16- and 64-boundary ±1.
-- **Two read syscalls per message, unconditionally, forever.** The old
-  `frame_head` called `read_exact` for 2 bytes, then `read_exact` again for the
-  extended length and the mask, then `read_exact` for the payload. Comparing the
-  three implementations: Xray uses gorilla/websocket with a **4 KiB** read
-  buffer, so it spends roughly one syscall per 4 KiB and splits every 8 KiB
-  payload across two buffers and two writes; sing-box uses `sagernet/ws` over a
-  32 KiB `buf.Buffer`; Zray reads into `read_buf`'s spare capacity with
-  `ReadBuf::uninit`, then `split_to`s the frame out — a view, not a copy. Three
-  syscalls for a 14-byte header is worse than all three, and the new
-  `a_read_covers_a_window_not_one_frame_header` drives the reader over a fixed
-  byte source, where a `read` returns everything it is asked for, and asserts
-  that 64 frames of 21 472 bytes cost exactly **one** read.
-- **The `unsafe { set_len }` that zero-filled first.** The old `data_into` grew
-  the backlog with `reserve` + `set_len`, which is right, but the buffer was then
-  cleared and refilled per message. `pull` keeps one buffer sized once per
-  connection and grows it only when a single frame needs more room than the
-  window holds — a 16 MiB frame costs one `reserve_exact` and then no
-  compaction.
-- **A second buffer.** `backlog`/`bat` and `have`/`at`/`msg_end` were two ways
-  of holding the same thing; there is now one, which is both smaller and one
-  fewer place for a copy to hide.
+- **An unbounded `realloc` chain in the read-ahead buffer.** `WsReader::pull` asks for `reserve_exact(READ_AHEAD)`, which requests exactly the leftover plus 32 KiB — one byte more than the previous capacity whenever the leftover grew, so a stream that lands mid-frame reallocates and memcpys once per read. `reserve` amortises that. In the good case, where a read lands on a frame boundary, the branch was already false and this changes nothing.
+- **Widening the mask loop's stride the naive way is a regression; unrolling the loop over four 16-byte lanes ships.** `apply_mask` XORs 16 bytes per iteration, so about a quarter of its work on a long masked frame is loop counter and bounds check rather than XOR. Striding 64 bytes was tried — same vector op count, same bytes at the same offsets, since 64 is a multiple of the 4-byte mask — and it is a **regression**, and the arithmetic says so without a benchmark: the remainder is taken scalar, so `as_chunks_mut::<64>()` makes the scalar tail up to 63 bytes where `as_chunks_mut::<16>()` kept it under 16. At 63 bytes it is 63 scalar XORs against 3 vector ops plus 15. Every length that is not a multiple of 64 is worse, and the lengths that are multiples of 64 are unchanged, so the change only ever helped frames that were already vector-aligned. Reverted. What ships instead keeps the 16-byte op and strides the *loop* 64: four `xor_block` lanes per iteration, the sub-64 remainder through the old 16-loop, scalar tail still under 16 — same vector ops, a quarter of the loop overhead, identical tail by construction since 64, 16 and the tail start are all multiples of the 4-byte mask. `mask_chunks_match_the_byte_loop` pins it against the byte loop at every 16- and 64-boundary ±1.
+- **Two read syscalls per message, unconditionally, forever.** The old `frame_head` called `read_exact` for 2 bytes, then `read_exact` again for the extended length and the mask, then `read_exact` for the payload. Comparing the three implementations: Xray uses gorilla/websocket with a **4 KiB** read buffer, so it spends roughly one syscall per 4 KiB and splits every 8 KiB payload across two buffers and two writes; sing-box uses `sagernet/ws` over a 32 KiB `buf.Buffer`; Zray reads into `read_buf`'s spare capacity with `ReadBuf::uninit`, then `split_to`s the frame out — a view, not a copy. Three syscalls for a 14-byte header is worse than all three, and the new `a_read_covers_a_window_not_one_frame_header` drives the reader over a fixed byte source, where a `read` returns everything it is asked for, and asserts that 64 frames of 21 472 bytes cost exactly **one** read.
+- **The `unsafe { set_len }` that zero-filled first.** The old `data_into` grew the backlog with `reserve` + `set_len`, which is right, but the buffer was then cleared and refilled per message. `pull` keeps one buffer sized once per connection and grows it only when a single frame needs more room than the window holds — a 16 MiB frame costs one `reserve_exact` and then no compaction.
+- **A second buffer.** `backlog`/`bat` and `have`/`at`/`msg_end` were two ways of holding the same thing; there is now one, which is both smaller and one fewer place for a copy to hide.
 
-- **Half the instructions per masked byte, on every `avx2` host.** The masked
-  pass walked sixteen bytes with a load, an xor and a store, and the sixteen
-  above it with three more of the same, so the arithmetic of the loop was fixed
-  at three instructions per sixteen bytes however long the frame was. One
-  `ymm` does the same work over thirty-two, still three instructions, which is
-  why the rung is a dispatch on `std::is_x86_feature_detected!("avx2")` above a
-  buffer of at least one pass, with everything else — including every byte
-  past the last whole pass — still through the old ladder. The bytes do not
-  change: xor has no width. `ops.yml` read
-  `ws::tests::the_masked_frame_costs_the_walk_over_its_payload_and_nothing_else`
-  at `330417` before the wide pass and `294378` after: **−36 039 Ir, −10.9%** for the
-  same 16 rounds of the relay's 16 KiB chunk. The mask loop's own probe,
-  `ws::tests::mask_chunks_match_the_byte_loop`, moved `452984` → `437971`, and
-  `ws::write_frame`, which is driven over a loopback socket and so moves between
-  runs, moved `168227` → `150445`. All three are in the same direction, and the
-  two in-memory rows are the ones to read.
+- **Half the instructions per masked byte, on every `avx2` host.** The masked pass walked sixteen bytes with a load, an xor and a store, and the sixteen above it with three more of the same, so the arithmetic of the loop was fixed at three instructions per sixteen bytes however long the frame was. One `ymm` does the same work over thirty-two, still three instructions, which is why the rung is a dispatch on `std::is_x86_feature_detected!("avx2")` above a buffer of at least one pass, with everything else — including every byte past the last whole pass — still through the old ladder. The bytes do not change: xor has no width. `ops.yml` read `ws::tests::the_masked_frame_costs_the_walk_over_its_payload_and_nothing_else` at `330417` before the wide pass and `294378` after: **−36 039 Ir, −10.9%** for the same 16 rounds of the relay's 16 KiB chunk. The mask loop's own probe, `ws::tests::mask_chunks_match_the_byte_loop`, moved `452984` → `437971`, and `ws::write_frame`, which is driven over a loopback socket and so moves between runs, moved `168227` → `150445`. All three are in the same direction, and the two in-memory rows are the ones to read.
 
-What is unchanged, deliberately: the **aarch64** step stays 16 bytes per
-`xor_block` with a tail loop, mirroring Zray's measured `u128` step ("Measured
-on Apple Silicon at opt-level = s, 1 KiB 121 → 71 ns and 16 KiB 1189 → 793",
-with a note that a 32-byte step is slower because four stores into one cache
-line each wait on the three before them). That measurement is the reason the
-NEON rung does not widen — 128 bits is the whole vector width there, so a wider
-pass is more stores per byte, not fewer, and SVE is not baseline anywhere this
-tree ships to. The same note does not cover the x86 rung, where one `vmovdqu`
-of a `ymm` replaces two of `xmm`. sing-box's `ws.Cipher` uses an 8-byte
-`uint64` step; that is a regression against the measurement Zray published, so
-it was not copied.
+What is unchanged, deliberately: the **aarch64** step stays 16 bytes per `xor_block` with a tail loop, mirroring Zray's measured `u128` step ("Measured on Apple Silicon at opt-level = s, 1 KiB 121 → 71 ns and 16 KiB 1189 → 793", with a note that a 32-byte step is slower because four stores into one cache line each wait on the three before them). That measurement is the reason the NEON rung does not widen — 128 bits is the whole vector width there, so a wider pass is more stores per byte, not fewer, and SVE is not baseline anywhere this tree ships to. The same note does not cover the x86 rung, where one `vmovdqu` of a `ymm` replaces two of `xmm`. sing-box's `ws.Cipher` uses an 8-byte `uint64` step; that is a regression against the measurement Zray published, so it was not copied.
 
-The staging copy is **not** removed. Masking while copying into the frame would
-save a pass over the payload, but the carrier hands over a borrowed `&[u8]`, so
-doing it there means changing `CarrierSink::send`, which four carriers
-implement — a wider slice than this method, and one no count here would price:
-`memcpy` for the copy retires in libc's own frame, so the fused version puts
-work *into* the counted frame and reads worse while touching less memory. The
-row is retired instructions, and the change is the one that row can see.
+The staging copy is **not** removed. Masking while copying into the frame would save a pass over the payload, but the carrier hands over a borrowed `&[u8]`, so doing it there means changing `CarrierSink::send`, which four carriers implement — a wider slice than this method, and one no count here would price: `memcpy` for the copy retires in libc's own frame, so the fused version puts work *into* the counted frame and reads worse while touching less memory. The row is retired instructions, and the change is the one that row can see.
 
 ## What is not removed, and where
 
-- **The accept key is still a `String`.** `accept_key` returns `b64::encode`'s
-  28 characters, so each role still pays one small allocation per connection to
-  compare or echo it. Removing it means a third base64 encoder in the tree
-  (`b64::encode` padded standard, `early_encode_into` unpadded url, and a
-  `&mut String` one) or an unchecked `&str` over bytes that are ASCII by
-  construction; both are worse trades than the allocation, so it stands.
-- **The decoded early data is still a fresh `Vec`.** Xray's server decodes into
-  `ed` and wraps it in a `bytes.NewReader`, and Zray decodes into the `early`
-  field of its stream; both allocate what they return. Folding it into the
-  reader's `have` instead would need the pipelined bytes *prepended*, which is
-  the merge this slice removed.
-- **The `?ed=` budget is still parsed per configuration**, not per connection —
-  `resolve_ws` and `resolve_httpupgrade` call `EarlyData::split` while the config
-  is read. What the rewrite removes there is the second allocation and the
-  rebuild, not a per-connection cost.
-- **The masked-write staging copy stays**, as above, and the aarch64 mask step
-  stays 16 bytes for Zray's published reason.
+- **The accept key is still a `String`.** `accept_key` returns `b64::encode`'s 28 characters, so each role still pays one small allocation per connection to compare or echo it. Removing it means a third base64 encoder in the tree (`b64::encode` padded standard, `early_encode_into` unpadded url, and a `&mut String` one) or an unchecked `&str` over bytes that are ASCII by construction; both are worse trades than the allocation, so it stands.
+- **The decoded early data is still a fresh `Vec`.** Xray's server decodes into `ed` and wraps it in a `bytes.NewReader`, and Zray decodes into the `early` field of its stream; both allocate what they return. Folding it into the reader's `have` instead would need the pipelined bytes *prepended*, which is the merge this slice removed.
+- **The `?ed=` budget is still parsed per configuration**, not per connection — `resolve_ws` and `resolve_httpupgrade` call `EarlyData::split` while the config is read. What the rewrite removes there is the second allocation and the rebuild, not a per-connection cost.
+- **The masked-write staging copy stays**, as above, and the aarch64 mask step stays 16 bytes for Zray's published reason.
 
 ## Pins
 
@@ -377,15 +133,7 @@ row is retired instructions, and the change is the one that row can see.
 
 ## CI scope
 
-What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
-The `?ed=N` codec itself is **not** claimed by this page's `paths`: `EarlyData`,
-`early_encode_into` and `early_decode` live in the shared
-`crates/ferrox-core/src/transport.rs`, which `early_encode_into` also reaches
-from `proxy.rs::b64url` for a REALITY x25519 key. So a hunk in that file keeps
-the plan wide — the whole matrix, both roles' suites — and a hunk in `ws.rs`
-alone narrows to `vless-ws`. Claiming the codec here would narrow a future edit
-to one carrier and hide that second caller, so the wide plan is what a change to
-the codec costs.
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md). The `?ed=N` codec itself is **not** claimed by this page's `paths`: `EarlyData`, `early_encode_into` and `early_decode` live in the shared `crates/ferrox-core/src/transport.rs`, which `early_encode_into` also reaches from `proxy.rs::b64url` for a REALITY x25519 key. So a hunk in that file keeps the plan wide — the whole matrix, both roles' suites — and a hunk in `ws.rs` alone narrows to `vless-ws`. Claiming the codec here would narrow a future edit to one carrier and hide that second caller, so the wide plan is what a change to the codec costs.
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/ws.rs
