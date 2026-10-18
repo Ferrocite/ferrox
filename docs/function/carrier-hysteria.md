@@ -179,7 +179,7 @@ graph TD
     SM --> K1["404 page"]
     SM --> K2["canned response"]
     SM --> K3["static file:<br/>safe_path → index/listing"]
-    SM --> K4["reverse proxy:<br/>HTTP/1.1 origin, 502 on error"]
+    SM --> K4["reverse proxy:<br/>HTTP/1.1 over http/unix/https<br/>(client TLS), 502 on error"]
     D --> HP{"hysteriaSettings<br/>names serverPorts?"}
     HP -- "yes" --> HH["Datagram::hopped:<br/>fresh socket per stay,<br/>dest port = pick_next,<br/>reply source → nominal"]
     HP -- "no" --> HF["fixed server port"]
@@ -221,6 +221,8 @@ graph TD
 | gecko-packet-reassembled-bytes | 1234 | ferrox-core-hysteria::tests::a_fragmented_long_header_packet_reassembles_bit_identical |
 | gecko-window-forms-parsed | 3 | ferrox-app-config::tests::a_hysteria_carrier_reads_a_gecko_window |
 | gecko-loopback-reassembled-bytes | 900 | ferrox-app-quic::tests::a_gecko_dial_reassembles_its_split_long_header |
+| masquerade-https-origin-served-bytes | 6 | ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_an_https_origin |
+| masquerade-https-untrusted-refusals | 1 | ferrox-app-proxy::tests::hysteria_refuses_a_masquerade_https_origin_whose_chain_is_untrusted |
 <!-- counts:end -->
 
 ## Ops
@@ -303,7 +305,14 @@ tunnel. No artefact from this branch has been read.
   `masquerade-file-bytes-served`, `masquerade-proxied-round-trips` and
   `masquerade-escapes-served` 0 pin the file, proxy and traversal paths, and
   `masquerade-answers-browser-on-same-port` pins the canned answer reaching a
-  browser on the port hysteria dials.
+  browser on the port hysteria dials. An `https` origin wraps that same
+  hand-written exchange in `ferrox_core::tls::connect` — the client TLS the
+  relayed lane already speaks — so the cover adds no second TLS stack and no
+  dependency; `masq_url_insecure` is honoured by one accept-as-presented
+  verifier reachable only from this path, and `masquerade-https-origin-served-bytes` 6
+  and `masquerade-https-untrusted-refusals` 1 pin that a named-insecure chain
+  serves and a verified dial against an untrusted chain refuses rather than
+  silently trusts.
 - **The hopping socket's async machinery, rewritten to a synchronous schedule.**
   The reference's port hop is an async `HoppingSocket` wrapping a quinn
   `AsyncUdpSocket`, with a spawn/replace dance per hop and a `GenRng` threaded
@@ -394,9 +403,10 @@ burst holds one connection each for `REUSE_WINDOW` (150 s, half the idle
 timeout); the client's UDP lane rotates associations on one connection rather
 than retiring the connection per destination, so a retired flow's late
 datagrams land on the floor by the never-reuse rule; the masquerade site's
-`proxy` cover dials `http` and `unix` origins but an `https` origin is a named
-ceiling — it answers `502` rather than pulling a rustls client into the relay —
-and every origin request pays a fresh connection closed after its buffered
+`proxy` cover dials `http`, `unix` and `https` origins — the last through the
+same client TLS the relayed lane already speaks, verified against the platform
+roots or trusted as presented when the config names `masq_url_insecure` — and
+every origin request pays a fresh connection closed after its buffered
 response, so a hot cover page re-dials instead of pooling; 0-RTT,
 migration and key updates are quiche's; the server keeps one UDP socket per
 inbound with a per-connection route map and a linear scan over routes per

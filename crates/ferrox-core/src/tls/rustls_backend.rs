@@ -107,6 +107,51 @@ impl rustls::client::danger::ServerCertVerifier for Pinned {
     }
 }
 
+/// The cover-site verifier a `masq_url_insecure` origin names: it trusts the peer chain
+/// exactly as presented, which is what the reference's `allowInsecure` means — a
+/// masquerade cover dials an arbitrary public site to look convincing and must not fail on
+/// a store this edge cannot reach. It is the one bounded place a certificate is taken on
+/// faith: the relayed lane refuses `allowInsecure` outright and so never reaches this type.
+#[derive(Debug)]
+struct Unverified;
+
+impl rustls::client::danger::ServerCertVerifier for Unverified {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// The expensive halves of a client config, shared by every dial that names the same trust anchors, pins, ALPN list and suite order: parsing an anchor and building a verifier are per-config work, not per-connection work.
 struct Material {
     roots: Arc<RootStore>,
@@ -218,7 +263,11 @@ impl<S: Stream> RustlsProvider<S> {
             .with_root_certificates(Arc::clone(&built.roots))
             .with_no_client_auth();
         config.alpn_protocols.clone_from(&cfg.alpn);
-        if let Some(verifier) = &built.verifier {
+        if cfg.insecure {
+            config
+                .dangerous()
+                .set_certificate_verifier(Arc::new(Unverified));
+        } else if let Some(verifier) = &built.verifier {
             config
                 .dangerous()
                 .set_certificate_verifier(Arc::clone(verifier));
@@ -748,6 +797,7 @@ mod tests {
             roots: vec![ANCHOR.to_vec()],
             pins: crate::foxy::pin::Pins::default(),
             cipher_suites: Vec::new(),
+            insecure: false,
         }
     }
 

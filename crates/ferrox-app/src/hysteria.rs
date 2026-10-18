@@ -1041,12 +1041,12 @@ fn serve_proxy(
     url: &str,
     rewrite_host: bool,
     x_forwarded: bool,
-    _insecure: bool,
+    insecure: bool,
     request: &hysteria::H3Request,
     peer: Option<&str>,
     out: &mut Vec<u8>,
 ) {
-    match fetch_origin(url, request, rewrite_host, x_forwarded, peer) {
+    match fetch_origin(url, request, rewrite_host, x_forwarded, insecure, peer) {
         Some(origin) => {
             let fields: Vec<(&str, &str)> = origin
                 .headers
@@ -1065,12 +1065,13 @@ fn serve_proxy(
     }
 }
 
-/// Dials the origin `url` names and runs one HTTP/1.1 exchange: `unix` connects a socket at the path, `http` resolves host and port, and `https` is a named ceiling the origin client does not carry, so it returns `None` and the caller answers bad-gateway.
+/// Dials the origin `url` names and runs one HTTP/1.1 exchange: `unix` connects a socket at the path, `http` resolves host and port, and `https` wraps that TCP dial in the client TLS the relay already speaks — verifying against the platform roots, or accepting the chain as presented when the cover names `insecure`. Any scheme this build cannot reach answers bad-gateway rather than a silent downgrade.
 fn fetch_origin(
     url: &str,
     request: &hysteria::H3Request,
     rewrite_host: bool,
     x_forwarded: bool,
+    insecure: bool,
     peer: Option<&str>,
 ) -> Option<hysteria::OriginResponse> {
     let (scheme, rest) = url.split_once("://")?;
@@ -1078,8 +1079,44 @@ fn fetch_origin(
     match scheme {
         "unix" => exchange_socket(rest, &head),
         "http" => exchange_tcp(rest, 80, &head),
+        "https" => exchange_tls(rest, 443, &head, insecure),
         _ => None,
     }
+}
+
+/// The trust a cover origin's TLS dial carries: `insecure` names no roots because the verifier accepts the chain as presented, while a verified dial reaches the platform anchors the rest of the build trusts. The server name is the authority host, so SNI and the name check share one view of it.
+fn origin_tls_config(host: &str, insecure: bool) -> ferrox_core::tls::TlsConfig {
+    ferrox_core::tls::TlsConfig {
+        server_name: host.to_owned(),
+        roots: if insecure {
+            Vec::new()
+        } else {
+            crate::quic::system_roots()
+        },
+        insecure,
+        ..Default::default()
+    }
+}
+
+/// Dials an `https` origin and runs one closed exchange over the client TLS session: the same authority split and default port as the plain TCP dial, then the request written and the reply read through the encrypted stream, so a cover that dials a real site carries its bytes no further than any other origin answer.
+fn exchange_tls(
+    authority: &str,
+    default_port: u16,
+    head: &[u8],
+    insecure: bool,
+) -> Option<hysteria::OriginResponse> {
+    let host = authority.split('/').next().unwrap_or(authority);
+    let (host_only, port) = match host.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().ok()?),
+        None => (host, default_port),
+    };
+    let stream = TcpStream::connect((host_only, port)).ok()?;
+    let _ = stream.set_read_timeout(Some(ORIGIN_TIMEOUT));
+    let mut tls =
+        ferrox_core::tls::connect(&origin_tls_config(host_only, insecure), stream).ok()?;
+    tls.write_all(head).ok()?;
+    tls.flush().ok()?;
+    read_origin(&mut tls)
 }
 
 /// Rebuilds the browser request as an HTTP/1.1 exchange line: the method and path, a `Host` from the origin or the request's own authority, the request's ordinary headers minus the hop-by-hop ones, and the forwarded headers when asked. The body follows its copied `content-length`.

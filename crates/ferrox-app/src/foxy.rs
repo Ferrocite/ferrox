@@ -252,6 +252,7 @@ fn tls_config(dial: &FoxyDial) -> ferrox_core::tls::TlsConfig {
         roots: dial.roots.clone(),
         pins: dial.pins.clone(),
         cipher_suites: Vec::new(),
+        insecure: false,
     }
 }
 
