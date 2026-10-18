@@ -5764,7 +5764,7 @@ fn probe_edge_exit(
     let budget = budgets::carrier_probe();
     let quic = crate::quic::pooled_stream_within(&quic_dial, budget)?;
     // The lease goes into the open and comes back with the lane: whoever ends the flow hands the pool entry over, and a probe that ends early ends with it.
-    let opened = crate::foxy::Tunnel::open_within(&dial, authority, Some(quic), budget);
+    let opened = crate::foxy::Tunnel::open_within(&dial, authority, quic, budget);
     match opened {
         Ok(mut tunnel) => {
             // The trace read carries the same budget as the dial: no head inside it is no answer, not a wait.
