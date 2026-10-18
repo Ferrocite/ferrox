@@ -711,9 +711,13 @@ impl Sink {
     }
 
     /// A buffer that reached the store is worth keeping only for its capacity, and only a couple of them.
-    fn reclaim(&self, data: Vec<u8>) {
+    fn reclaim(&self, mut data: Vec<u8>) {
+        if data.is_empty() {
+            return;
+        }
+        data.clear();
         let mut spare = self.spare.lock().unwrap_or_else(PoisonError::into_inner);
-        if spare.len() < 2 && !data.is_empty() {
+        if spare.len() < 2 {
             spare.push(data);
         }
     }
@@ -870,15 +874,14 @@ impl Writer {
         self.ticker.done.store(true, Ordering::Release);
         Clock::global().wakeup();
         self.uploads.shut();
-        if let Some(message) = self.sink.failure() {
-            self.uploads.abort();
-            return Err(carrier_error(message));
-        }
         if !self.uploads.wait_settled(&self.sink.wake) {
             self.uploads.abort();
             return Err(carrier_error(
                 "the store stopped answering the last segments".to_owned(),
             ));
+        }
+        if let Some(message) = self.sink.failure() {
+            return Err(carrier_error(message));
         }
         self.sink
             .storage
@@ -2418,11 +2421,17 @@ impl Vars {
         while let Some(at) = rest.find('{') {
             out.push_str(&rest[..at]);
             let after = &rest[at + 1..];
-            let Some(cut) = after.find('}') else {
+            let Some(cut) = after.find(['{', '}']) else {
                 out.push('{');
                 rest = after;
                 continue;
             };
+            if after.as_bytes()[cut] == b'{' {
+                out.push('{');
+                out.push_str(&after[..cut]);
+                rest = &after[cut..];
+                continue;
+            }
             let name = &after[..cut];
             match self.0.iter().find(|(key, _)| key == name) {
                 Some((_, value)) => out.push_str(value),
@@ -3322,4 +3331,1454 @@ fn shared(
     let made = build(settings, http)?;
     pool.insert(key, Arc::clone(&made));
     Ok(made)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A folder of its own per test, named with the process and the clock so two parallel runs never share one.
+    fn scratch(tag: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-xdrive-{tag}-{}-{stamp}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&path);
+        path
+    }
+
+    /// The store of a folder that test owns.
+    fn local(tag: &str) -> (PathBuf, Arc<dyn Storage>) {
+        let dir = scratch(tag);
+        let text = dir.to_str().expect("utf-8 folder").to_owned();
+        (dir, Arc::new(Local::new(&text).expect("opens")))
+    }
+
+    /// Budgets tuned for a test: a segment small enough to cut twice in one write, a poll small enough to finish long before the deadline.
+    fn quick() -> Params {
+        Params {
+            segment_bytes: 512,
+            flush: Duration::from_millis(2),
+            min_poll: Duration::from_millis(2),
+            max_poll: Duration::from_millis(8),
+            eager: Duration::from_secs(1),
+            hole: Duration::from_secs(30),
+            ttl: Duration::from_secs(60),
+            concurrency: 4,
+        }
+    }
+
+    /// Read until `want` bytes arrive or the deadline passes, so a parked carrier fails the test instead of the run.
+    fn read_up_to(stream: &mut Conn, want: usize, budget: Duration) -> Vec<u8> {
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 1024];
+        let until = Instant::now() + budget;
+        while got.len() < want && Instant::now() < until {
+            match stream.read(&mut buf) {
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(_) => break,
+            }
+        }
+        got
+    }
+
+    #[test]
+    fn names_are_the_shape_the_reference_reads() {
+        assert_eq!(
+            announce_name("ab12", 1_700_000_000_123_456_789),
+            "sessions/1700000000123456789-ab12"
+        );
+        assert_eq!(uplink_prefix("ab12"), "streams/ab12/c2s");
+        assert_eq!(downlink_prefix("ab12"), "streams/ab12/s2c");
+        assert_eq!(
+            object_name("streams/ab12/c2s", 7, SEG_SUFFIX),
+            "streams/ab12/c2s/000000007.seg"
+        );
+        assert_eq!(
+            object_name("streams/ab12/s2c", 0, END_SUFFIX),
+            "streams/ab12/s2c/000000000.end"
+        );
+        assert_eq!(
+            object_name("streams/ab12/s2c", 12, ERR_SUFFIX),
+            "streams/ab12/s2c/000000012.err"
+        );
+        assert!(
+            object_name("p", 9, SEG_SUFFIX) < object_name("p", 10, SEG_SUFFIX),
+            "the padded sequence sorts into send order, which is what the padding is for"
+        );
+    }
+
+    #[test]
+    fn an_announcement_parses_only_its_own_shape() {
+        assert_eq!(
+            parse_announce("1700000000123456789-abcd"),
+            Some(("abcd", 1_700_000_000_123_456_789))
+        );
+        assert_eq!(parse_announce("12-a-b"), Some(("a-b", 12)));
+        for forged in ["-abcd", "1234-", "+12-ab", " 12-ab", "12ab-cd", "12_ab", ""] {
+            assert_eq!(
+                parse_announce(forged),
+                None,
+                "{forged} is not an announcement this carrier wrote"
+            );
+        }
+    }
+
+    #[test]
+    fn a_listed_name_parses_only_what_the_carrier_wrote() {
+        assert_eq!(parse_entry("000000042.seg"), Some((42, SEG_SUFFIX)));
+        assert_eq!(parse_entry("000000000.end"), Some((0, END_SUFFIX)));
+        assert_eq!(parse_entry("000000001.err"), Some((1, ERR_SUFFIX)));
+        for forged in [
+            "000000000.tmp",
+            "x000000000.seg",
+            "00000 0000.seg",
+            "-1.seg",
+            ".seg",
+            "000000000",
+        ] {
+            assert_eq!(
+                parse_entry(forged),
+                None,
+                "{forged} names no segment, end or error"
+            );
+        }
+    }
+
+    #[test]
+    fn budgets_take_the_reference_defaults_and_caps() {
+        let named = |text: &str| {
+            Settings::from_json(Some(&crate::json::parse(text).expect("parses"))).expect("names")
+        };
+        let bare = named(r#"{"xdriveSettings":{"service":"local","remoteFolder":"/tmp/x"}}"#);
+        assert_eq!(bare.params.segment_bytes, 512 * 1024);
+        assert_eq!(bare.params.flush, Duration::from_millis(20));
+        assert_eq!(bare.params.min_poll, Duration::from_millis(50));
+        assert_eq!(bare.params.max_poll, Duration::from_millis(500));
+        assert_eq!(bare.params.eager, Duration::from_millis(2000));
+        assert_eq!(bare.params.hole, Duration::from_secs(30));
+        assert_eq!(bare.params.ttl, Duration::from_secs(300));
+        assert_eq!(bare.params.concurrency, 8);
+        assert_eq!(bare.service, "local");
+        assert_eq!(bare.remote_folder, "/tmp/x");
+
+        let snake = named(
+            r#"{"xdriveSettings":{"service":"local","remote_folder":"/tmp/y","poll_interval_ms":11}}"#,
+        );
+        assert_eq!(snake.remote_folder, "/tmp/y");
+        assert_eq!(snake.params.min_poll, Duration::from_millis(11));
+
+        let capped = named(
+            r#"{"xdriveSettings":{"service":"local","remoteFolder":"/tmp/z","segmentBytes":4000000000,"concurrency":1000,"segmentBytesBelow":0}}"#,
+        );
+        assert_eq!(capped.params.segment_bytes, 16 * 1024 * 1024);
+        assert_eq!(capped.params.concurrency, 64);
+
+        let raised = named(
+            r#"{"xdriveSettings":{"service":"local","remoteFolder":"/tmp/w","pollIntervalMs":100,"maxPollIntervalMs":10}}"#,
+        );
+        assert_eq!(
+            raised.params.max_poll, raised.params.min_poll,
+            "a cap configured under its own floor is raised to it"
+        );
+
+        for refused in [
+            r#"{}"#,
+            r#"{"xdriveSettings":{}}"#,
+            r#"{"xdriveSettings":{"service":"local"}}"#,
+            r#"{"xdriveSettings":{"remoteFolder":"/tmp/x"}}"#,
+            r#"{"xdriveSettings":{"service":"dropbox","remoteFolder":"/tmp/x"}}"#,
+        ] {
+            assert!(
+                Settings::from_json(Some(&crate::json::parse(refused).expect("parses"))).is_none(),
+                "{refused} names no reachable store"
+            );
+        }
+    }
+
+    #[test]
+    fn coalescing_holds_a_growing_buffer_for_a_bounded_run_of_ticks() {
+        let mut held = Pending {
+            buf: Vec::new(),
+            seq: 0,
+            last: 0,
+            held: 0,
+            closed: false,
+            err: None,
+        };
+        for tick in 1..=MAX_COALESCED_TICKS {
+            held.buf.push(b'a');
+            assert!(
+                !held.ready(),
+                "a buffer that grew on tick {tick} of {} is left alone",
+                MAX_COALESCED_TICKS
+            );
+        }
+        assert_eq!(held.held, MAX_COALESCED_TICKS);
+        held.buf.push(b'a');
+        assert!(held.ready(), "the hold is bounded: the next growth cuts");
+        assert_eq!(held.held, 0, "and the count starts over");
+        assert!(held.ready(), "a buffer that stopped growing cuts at once");
+    }
+
+    #[test]
+    fn backoff_doubles_to_the_cap_and_resets_on_progress() {
+        let params = Params {
+            min_poll: Duration::from_millis(50),
+            max_poll: Duration::from_millis(400),
+            eager: Duration::from_millis(2000),
+            ..quick()
+        };
+        let stale = Instant::now() - Duration::from_secs(3);
+        let fresh = Instant::now();
+        assert_eq!(
+            backoff(true, stale, Duration::from_millis(300), &params),
+            params.min_poll
+        );
+        assert_eq!(
+            backoff(false, fresh, Duration::from_millis(300), &params),
+            params.min_poll
+        );
+        assert_eq!(
+            backoff(false, stale, Duration::from_millis(50), &params),
+            Duration::from_millis(100)
+        );
+        assert_eq!(
+            backoff(false, stale, Duration::from_millis(300), &params),
+            Duration::from_millis(400)
+        );
+        assert_eq!(
+            backoff(false, stale, Duration::from_millis(400), &params),
+            Duration::from_millis(400),
+            "the cap is a ceiling, not a step past it"
+        );
+    }
+
+    #[test]
+    fn a_template_name_substitutes_only_what_it_holds() {
+        let secrets = vec!["k0".to_owned(), "k1".to_owned()];
+        let vars = Vars::new("inbox", &secrets);
+        assert_eq!(vars.sub("{folder}/{secret1}/{name}"), "inbox/k1/{name}");
+        assert_eq!(vars.sub("no braces"), "no braces");
+        assert_eq!(vars.sub("{unbalanced"), "{unbalanced");
+        assert_eq!(
+            vars.sub(r#"{"at":"{folder}"}"#),
+            r#"{"at":"inbox"}"#,
+            "a structural brace is left alone and the placeholder inside it still reads"
+        );
+        let mut grown = vars.clone();
+        grown.set("name", "a/b.seg".to_owned());
+        assert_eq!(grown.sub("{folder}/{name}"), "inbox/a/b.seg");
+        grown.set("name", "c.seg".to_owned());
+        assert_eq!(
+            grown.sub("{name}"),
+            "c.seg",
+            "a variable is replaced, not appended"
+        );
+    }
+
+    /// Waits for a prefix to be left holding nothing, because the reader hands its deletes to a pool of its own.
+    fn emptied(store: &Arc<dyn Storage>, prefix: &str, budget: Duration) -> usize {
+        let until = Instant::now() + budget;
+        loop {
+            let left = store.list(prefix).map_or(1, |found| found.len());
+            if left == 0 || Instant::now() >= until {
+                return left;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_local_store_commits_escapes_and_lists_like_the_reference() {
+        let (dir, store) = local("clamp");
+        store
+            .put("streams/a/c2s/000000000.seg", b"hello")
+            .expect("puts");
+        assert_eq!(
+            store.get("streams/a/c2s/000000000.seg").expect("gets"),
+            b"hello"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let object = std::fs::metadata(dir.join("streams/a/c2s/000000000.seg")).expect("stats");
+            assert_eq!(
+                object.permissions().mode() & 0o777,
+                0o600,
+                "an object is readable by the process that wrote it"
+            );
+            let folder = std::fs::metadata(&dir).expect("stats");
+            assert_eq!(
+                folder.permissions().mode() & 0o777,
+                0o700,
+                "and so is the folder that holds the session"
+            );
+        }
+        store
+            .put("../evil", b"out")
+            .expect("a clamp, not a refusal");
+        assert!(dir.join("evil").is_file(), "a dot-dot pops what it can");
+        assert!(
+            !dir.parent().expect("parent").join("evil").is_file(),
+            "and never names its way out of the folder"
+        );
+        assert!(
+            store.put("x/.xdrive-tmp-7", b"").is_err(),
+            "the temp prefix is reserved for a commit in flight"
+        );
+        assert!(
+            store.put("", b"x").is_err(),
+            "an object with no last step is refused, not written at the root"
+        );
+        assert_eq!(
+            store
+                .get("streams/a/c2s/000000001.seg")
+                .err()
+                .expect("absent")
+                .kind(),
+            ErrorKind::NotFound,
+            "an absent object answers the one error a polling reader reads as not yet"
+        );
+        store
+            .delete("streams/a/c2s/000000000.seg")
+            .expect("deletes");
+        store
+            .delete("streams/a/c2s/000000000.seg")
+            .expect("an absent delete is already done");
+        std::fs::write(dir.join("streams/a/c2s/.xdrive-tmp-1"), b"half a segment")
+            .expect("writes an uncommitted object");
+        store
+            .put("streams/a/c2s/000000002.seg", b"b")
+            .expect("puts");
+        let listed = store.list("streams/a/c2s").expect("lists");
+        assert_eq!(
+            listed.len(),
+            1,
+            "a reader is never handed a half-written object"
+        );
+        assert_eq!(listed[0].name, "000000002.seg");
+        assert!(
+            store
+                .list("no/such/prefix")
+                .expect("lists nothing")
+                .is_empty(),
+            "an absent folder lists empty rather than failing the poll"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_segment_stream_is_the_input_cut_at_the_segment_size() {
+        #[derive(Default)]
+        struct Held {
+            puts: Mutex<Vec<(String, Vec<u8>)>>,
+        }
+
+        impl Storage for Held {
+            fn put(&self, name: &str, data: &[u8]) -> io::Result<()> {
+                self.puts
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((name.to_owned(), data.to_vec()));
+                Ok(())
+            }
+
+            fn get(&self, _name: &str) -> io::Result<Vec<u8>> {
+                Err(io::Error::from(ErrorKind::NotFound))
+            }
+
+            fn delete(&self, _name: &str) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn list(&self, _prefix: &str) -> io::Result<Vec<Entry>> {
+                Ok(Vec::new())
+            }
+        }
+
+        let held = Arc::new(Held::default());
+        let params = Arc::new(Params {
+            segment_bytes: 512,
+            ..quick()
+        });
+        let writer = Writer::new(
+            Arc::clone(&held) as Arc<dyn Storage>,
+            "streams/w/c2s".to_owned(),
+            &params,
+            Arc::new(Wake::new()),
+        );
+        let payload: Vec<u8> = (0..1_200usize).map(|at| (at % 253) as u8).collect();
+        assert_eq!(writer.write(&payload).expect("buffers"), payload.len());
+        drop(writer);
+
+        let mut puts = held
+            .puts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        puts.sort_by(|(left, _), (right, _)| left.cmp(right));
+        let names: Vec<&str> = puts.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "streams/w/c2s/000000000.seg",
+                "streams/w/c2s/000000001.seg",
+                "streams/w/c2s/000000002.seg",
+                "streams/w/c2s/000000003.end",
+            ],
+            "three segments and the end marker at the sequence the peer reads"
+        );
+        let mut back = Vec::new();
+        for (name, data) in &puts {
+            if name.ends_with(SEG_SUFFIX) {
+                assert!(
+                    data.len() <= params.segment_bytes,
+                    "{name} overran its segment"
+                );
+                back.extend_from_slice(data);
+            } else {
+                assert!(data.is_empty(), "the end marker carries no payload");
+            }
+        }
+        assert_eq!(
+            back, payload,
+            "the stream cut up and put back is the stream"
+        );
+    }
+
+    #[test]
+    fn a_session_carries_every_byte_both_ways_over_one_folder() {
+        let (dir, store) = local("pair");
+        let params = Arc::new(Params {
+            segment_bytes: 512,
+            ..quick()
+        });
+        let payload: Vec<u8> = (0..5_000usize).map(|at| (at % 251) as u8).collect();
+        let accept: Accept = Arc::new(move |mut session: Conn| {
+            let mut buf = [0u8; 512];
+            loop {
+                match session.read(&mut buf) {
+                    Ok(n) => {
+                        if session.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                    Err(_) => break,
+                }
+            }
+        });
+        let server =
+            Server::serve(Arc::clone(&store), Arc::clone(&params), accept).expect("serves");
+        let mut client = dial(Arc::clone(&store), &params).expect("dials");
+        client.write_all(&payload).expect("writes");
+        let got = read_up_to(&mut client, payload.len(), Duration::from_secs(30));
+        assert_eq!(
+            got, payload,
+            "the echo is the input, across every segment boundary"
+        );
+        client.end_write().expect("ends the uplink");
+        let mut ended = None;
+        let until = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < until {
+            let mut buf = [0u8; 16];
+            match client.read(&mut buf) {
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => {
+                    ended = Some(error.kind());
+                    break;
+                }
+            }
+        }
+        assert_eq!(
+            ended,
+            Some(ErrorKind::UnexpectedEof),
+            "the peer's own handle dropping is what puts its .end and closes our read"
+        );
+        let sessions = store.list("streams").expect("lists");
+        assert_eq!(sessions.len(), 1, "one announcement opened one session");
+        let session = &sessions[0].name;
+        assert_eq!(
+            emptied(&store, &uplink_prefix(session), Duration::from_secs(10)),
+            0,
+            "every uplink object was discarded once it was read"
+        );
+        assert_eq!(
+            emptied(&store, &downlink_prefix(session), Duration::from_secs(10)),
+            0,
+            "and every downlink object too"
+        );
+        assert_eq!(
+            emptied(&store, SESSIONS_DIR, Duration::from_secs(10)),
+            0,
+            "the announcement went to the listener that claimed it"
+        );
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_refused_put_marks_the_segment_and_the_peer_names_it() {
+        struct Full {
+            inner: Arc<dyn Storage>,
+        }
+
+        impl Storage for Full {
+            fn put(&self, name: &str, data: &[u8]) -> io::Result<()> {
+                if name.ends_with(SEG_SUFFIX) {
+                    return Err(carrier_error("the bucket is full"));
+                }
+                self.inner.put(name, data)
+            }
+
+            fn get(&self, name: &str) -> io::Result<Vec<u8>> {
+                self.inner.get(name)
+            }
+
+            fn delete(&self, name: &str) -> io::Result<()> {
+                self.inner.delete(name)
+            }
+
+            fn list(&self, prefix: &str) -> io::Result<Vec<Entry>> {
+                self.inner.list(prefix)
+            }
+        }
+
+        let (dir, store) = local("err");
+        let params = Arc::new(quick());
+        let writer = Writer::new(
+            Arc::new(Full {
+                inner: Arc::clone(&store),
+            }),
+            "streams/a/c2s".to_owned(),
+            &params,
+            Arc::new(Wake::new()),
+        );
+        writer
+            .write(b"hello")
+            .expect("a buffered write is not yet a failure");
+        let refused = writer
+            .close()
+            .expect_err("the close reports the latched failure");
+        assert!(
+            refused.to_string().contains("the bucket is full"),
+            "{refused}"
+        );
+        assert!(
+            dir.join("streams/a/c2s/000000000.err").is_file(),
+            "the sequence that could not be stored is marked for the peer to read"
+        );
+        let rd = Rd {
+            discards: Pool::new(1),
+            storage: Arc::clone(&store),
+            prefix: "streams/a/c2s".to_owned(),
+            params,
+            wake: Arc::new(Wake::new()),
+        };
+        let inbox = Inbox::new();
+        let mut seq = 0u64;
+        let mut hole = None;
+        let why = rd
+            .poll(&mut seq, &mut hole, &inbox)
+            .expect_err("a mark is an end with a reason");
+        assert!(
+            why.to_string()
+                .contains("the peer could not store segment 0"),
+            "{why}"
+        );
+        assert_eq!(
+            emptied(&store, "streams/a/c2s", Duration::from_secs(10)),
+            0,
+            "the mark is read once and then cleared out of the store"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_segment_that_never_arrives_while_later_ones_did_times_out() {
+        let (dir, store) = local("hole");
+        store
+            .put("streams/h/c2s/000000001.seg", b"later")
+            .expect("puts");
+        let params = Arc::new(Params {
+            hole: Duration::ZERO,
+            ..quick()
+        });
+        let rd = Rd {
+            discards: Pool::new(1),
+            storage: Arc::clone(&store),
+            prefix: "streams/h/c2s".to_owned(),
+            params,
+            wake: Arc::new(Wake::new()),
+        };
+        let inbox = Inbox::new();
+        let mut seq = 0u64;
+        let mut hole = None;
+        let (advanced, eof) = rd.poll(&mut seq, &mut hole, &inbox).expect("marks");
+        assert!(
+            !advanced && !eof && hole.is_some(),
+            "the first pass only starts the wait: a gap is not yet a lost segment"
+        );
+        let why = rd
+            .poll(&mut seq, &mut hole, &inbox)
+            .expect_err("the second pass runs out");
+        assert!(
+            why.to_string()
+                .contains("segment 0 never arrived while later ones did"),
+            "{why}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_old_announcement_and_an_idle_session_are_swept_out_of_the_folder() {
+        let (dir, store) = local("sweep");
+        let server = Arc::new(Server {
+            wake: Arc::new(Wake::new()),
+            claims: Mutex::new(Claims::default()),
+        });
+        let rd = Arc::new(Rd {
+            discards: Pool::new(2),
+            storage: Arc::clone(&store),
+            prefix: String::new(),
+            params: Arc::new(quick()),
+            wake: Arc::clone(&server.wake),
+        });
+        store
+            .put("sessions/1000-gone", &[])
+            .expect("an ancient announce");
+        store
+            .put("streams/gone/c2s/000000000.seg", b"orphan")
+            .expect("its bytes");
+        let opened = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&opened);
+        let accept: Accept = Arc::new(move |_: Conn| {
+            counted.fetch_add(1, Ordering::AcqRel);
+        });
+        assert!(
+            !server.accept_pending(&rd, &accept),
+            "nothing in the folder is a session waiting to be opened"
+        );
+        assert_eq!(opened.load(Ordering::Acquire), 0);
+        assert_eq!(
+            emptied(&store, SESSIONS_DIR, Duration::from_secs(10)),
+            0,
+            "a stamp older than the ttl is dropped without a handler"
+        );
+        assert_eq!(
+            emptied(&store, STREAMS_DIR, Duration::from_secs(10)),
+            0,
+            "and so are the streams of the session it announced, on the pool that deletes"
+        );
+
+        store
+            .put("streams/idle/c2s/000000000.seg", b"x")
+            .expect("puts");
+        let short = Arc::new(Rd {
+            discards: Pool::new(2),
+            storage: Arc::clone(&store),
+            prefix: String::new(),
+            params: Arc::new(Params {
+                ttl: Duration::ZERO,
+                ..quick()
+            }),
+            wake: Arc::clone(&server.wake),
+        });
+        server.collect(&short).expect("first sweep notes it idle");
+        assert!(dir.join("streams/idle").exists(), "one pass never deletes");
+        server.collect(&short).expect("second sweep expires it");
+        assert!(
+            !dir.join("streams/idle").exists(),
+            "a session idle for a ttl is bytes no peer will read again"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_finished_upload_hands_its_buffer_back_empty_and_whole() {
+        let (_dir, store) = local("sink");
+        let sink = Sink {
+            storage: Arc::clone(&store),
+            prefix: String::new(),
+            wake: Arc::new(Wake::new()),
+            segment: 64,
+            err: Mutex::new(None),
+            spare: Mutex::new(Vec::new()),
+        };
+        let cold = sink.adopt();
+        assert!(
+            cold.is_empty() && cold.capacity() == 0,
+            "before any upload has finished, a write's buffer is its own first allocation"
+        );
+        let mut used = Vec::with_capacity(64);
+        used.extend_from_slice(b"a segment that reached the store");
+        let ptr = used.as_ptr();
+        let cap = used.capacity();
+        sink.reclaim(used);
+        let again = sink.adopt();
+        assert_eq!(
+            again.as_ptr(),
+            ptr,
+            "the continuation is written into the very allocation the upload left behind"
+        );
+        assert_eq!(again.capacity(), cap, "and it was not grown to hold it");
+        assert!(
+            again.is_empty(),
+            "what comes back is the capacity alone: a recycled buffer never carries the last segment into the next"
+        );
+        drop(again);
+
+        let mut keep = Vec::with_capacity(32);
+        keep.extend_from_slice(b"one");
+        let first = keep.as_ptr();
+        sink.reclaim(keep);
+        let mut second = Vec::with_capacity(32);
+        second.extend_from_slice(b"two");
+        let next = second.as_ptr();
+        sink.reclaim(second);
+        let mut third = Vec::with_capacity(32);
+        third.extend_from_slice(b"three");
+        sink.reclaim(third);
+        let newest = sink.adopt();
+        assert_eq!(newest.as_ptr(), next, "two buffers is the whole pool");
+        let oldest = sink.adopt();
+        assert_eq!(oldest.as_ptr(), first, "and they come back newest first");
+        assert_eq!(
+            sink.adopt().capacity(),
+            0,
+            "and a third ask costs the writer one fresh allocation, no more"
+        );
+    }
+
+    /// The bytes after `\r\n\r\n` of a head, or none until the whole delimiter has arrived.
+    fn head_end(bytes: &[u8]) -> Option<usize> {
+        bytes
+            .windows(4)
+            .position(|at| at == b"\r\n\r\n")
+            .map(|at| at + 4)
+    }
+
+    /// The length a request declared, which is what tells the fake where its body stops.
+    fn declared(head: &[u8]) -> usize {
+        let text = String::from_utf8_lossy(head).to_lowercase();
+        text.lines()
+            .find(|line| line.starts_with("content-length:"))
+            .and_then(|line| line[15..].trim().parse::<usize>().ok())
+            .unwrap_or(0)
+    }
+
+    /// The first line of a request, split into method and target.
+    fn request_line(head: &[u8]) -> (String, String) {
+        let text = String::from_utf8_lossy(head).into_owned();
+        let mut parts = text.split(' ');
+        (
+            parts.next().unwrap_or("").to_owned(),
+            parts.next().unwrap_or("").to_owned(),
+        )
+    }
+
+    /// The state one fake origin shares with every lane it serves.
+    #[derive(Clone)]
+    struct Held {
+        requests: Arc<Mutex<Vec<Vec<u8>>>>,
+        answers: Arc<Mutex<VecDeque<(u16, Vec<u8>)>>>,
+        objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+        lanes: Arc<AtomicUsize>,
+    }
+
+    /// An origin that keeps its connections alive, answers from an in-memory folder or from the queue the test filled, and hands every request byte back to the test that sent it.
+    struct Fake {
+        port: u16,
+        held: Held,
+        stop: Arc<AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Fake {
+        fn start() -> Self {
+            let origin = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let port = origin.local_addr().expect("addr").port();
+            let held = Held {
+                requests: Arc::new(Mutex::new(Vec::new())),
+                answers: Arc::new(Mutex::new(VecDeque::new())),
+                objects: Arc::new(Mutex::new(HashMap::new())),
+                lanes: Arc::new(AtomicUsize::new(0)),
+            };
+            let stop = Arc::new(AtomicBool::new(false));
+            let runner_state = held.clone();
+            let runner_stop = Arc::clone(&stop);
+            let runner = std::thread::spawn(move || {
+                while !runner_stop.load(Ordering::Acquire) {
+                    let Ok((stream, _)) = origin.accept() else {
+                        return;
+                    };
+                    if runner_stop.load(Ordering::Acquire) {
+                        return;
+                    }
+                    runner_state.lanes.fetch_add(1, Ordering::AcqRel);
+                    let served = runner_state.clone();
+                    std::thread::spawn(move || {
+                        let _ = served.connection(stream);
+                    });
+                }
+            });
+            Self {
+                port,
+                held,
+                stop,
+                thread: Some(runner),
+            }
+        }
+
+        /// The origin, with `path` behind it.
+        fn url(&self, path: &str) -> String {
+            format!("http://127.0.0.1:{}/{}", self.port, path)
+        }
+
+        /// Queue one canned answer, consumed in order before the folder is read.
+        fn push(&self, status: u16, body: &str) {
+            self.held
+                .answers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push_back((status, body.as_bytes().to_vec()));
+        }
+
+        /// Every request the origin read, head and body, in the order it read them.
+        fn taken(&self) -> Vec<Vec<u8>> {
+            self.held
+                .requests
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone()
+        }
+
+        fn text(&self, index: usize) -> String {
+            String::from_utf8_lossy(&self.taken()[index]).into_owned()
+        }
+
+        fn asks(&self) -> usize {
+            self.taken().len()
+        }
+
+        /// How many connections the origin has been handed: one per lane, which is the whole point of keeping them.
+        fn lanes(&self) -> usize {
+            self.held.lanes.load(Ordering::Acquire)
+        }
+
+        /// What the folder holds under one name.
+        fn holds(&self, name: &str) -> Option<Vec<u8>> {
+            self.held
+                .objects
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(name)
+                .cloned()
+        }
+    }
+
+    impl Held {
+        /// Serve one connection until the client stops sending: a kept-alive origin that answers the next request on the same lane.
+        fn connection(&self, mut stream: Connection) -> io::Result<()> {
+            let mut got: Vec<u8> = Vec::new();
+            let mut buf = vec![0u8; 8192];
+            loop {
+                let Some(head) = self.read_head(&mut got, &mut stream, &mut buf)? else {
+                    return Ok(());
+                };
+                let stop = head + declared(&got[..head]);
+                while got.len() < stop {
+                    match stream.read(&mut buf) {
+                        Ok(0) => return Ok(()),
+                        Ok(read) => got.extend_from_slice(&buf[..read]),
+                        Err(why) if why.kind() == ErrorKind::Interrupted => {}
+                        Err(why) => return Err(why),
+                    }
+                }
+                let request = got[..stop].to_vec();
+                got.drain(..stop);
+                self.requests
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push(request.clone());
+                let (status, payload) = self.route(&request[..head], &request[head..]);
+                let answer = format!(
+                    "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\n\r\n",
+                    payload.len()
+                );
+                stream.write_all(answer.as_bytes())?;
+                stream.write_all(&payload)?;
+                stream.flush()?;
+            }
+        }
+
+        /// The offset past the next request head, or none once the client has said it is done.
+        fn read_head(
+            &self,
+            got: &mut Vec<u8>,
+            stream: &mut Connection,
+            buf: &mut [u8],
+        ) -> io::Result<Option<usize>> {
+            loop {
+                if let Some(at) = head_end(got) {
+                    return Ok(Some(at));
+                }
+                match stream.read(buf) {
+                    Ok(0) => return Ok(None),
+                    Ok(read) => got.extend_from_slice(&buf[..read]),
+                    Err(why) if why.kind() == ErrorKind::Interrupted => {}
+                    Err(why) => return Err(why),
+                }
+            }
+        }
+
+        /// The folder's own answer, unless the test queued one for this ask.
+        fn route(&self, head: &[u8], body: &[u8]) -> (u16, Vec<u8>) {
+            if let Some(found) = self
+                .answers
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front()
+            {
+                return found;
+            }
+            let (method, target) = request_line(head);
+            let path = target.split('?').next().unwrap_or("").to_owned();
+            let mut objects = self.objects.lock().unwrap_or_else(PoisonError::into_inner);
+            let stored = path.strip_prefix("/o/");
+            let listed = path.strip_prefix("/l/");
+            let held = match (method.as_str(), stored, listed) {
+                ("PUT", Some(name), _) => {
+                    objects.insert(name.to_owned(), body.to_vec());
+                    return (200, Vec::new());
+                }
+                ("GET", Some(name), _) => {
+                    return objects
+                        .get(name)
+                        .map_or((404, Vec::new()), |data| (200, data.clone()))
+                }
+                ("DELETE", Some(name), _) => {
+                    objects.remove(name);
+                    return (200, Vec::new());
+                }
+                ("GET", None, Some(prefix)) => {
+                    let want = format!("{prefix}/");
+                    let mut under: Vec<&String> = objects
+                        .keys()
+                        .filter(|name| name.starts_with(want.as_str()))
+                        .collect();
+                    under.sort();
+                    under
+                        .into_iter()
+                        .map(|name| format!("{name}\n"))
+                        .collect::<String>()
+                }
+                _ => return (404, Vec::new()),
+            };
+            (200, held.into_bytes())
+        }
+    }
+
+    impl Drop for Fake {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Release);
+            let _wake = Connection::connect(("127.0.0.1", self.port));
+            if let Some(runner) = self.thread.take() {
+                let _ = runner.join();
+            }
+        }
+    }
+
+    /// The `xdriveSettings` of a templated store aimed at the test's own origin, with `<p>` standing for its port.
+    fn templated(text: &str, port: u16) -> Settings {
+        Settings {
+            remote_folder: "folder".to_owned(),
+            service: "template".to_owned(),
+            secrets: vec!["s0".to_owned()],
+            template: Some(
+                crate::json::parse(&text.replace("<p>", &port.to_string())).expect("a template"),
+            ),
+            params: quick(),
+            security: String::new(),
+            tls: None,
+        }
+    }
+
+    /// The head of an answer is walked in the lane's own buffer, and what arrived past it stays there for the next answer: no line is staged into a copy, and the walk moves no allocation.
+    #[test]
+    fn a_lane_keeps_what_arrives_past_the_answer_it_read() {
+        const FIRST: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst";
+        const SECOND: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nsecond";
+        const THIRD: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nnext";
+        let origin = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = origin.local_addr().expect("addr").port();
+        let (hold, wait) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = origin.accept().expect("accepts");
+            stream
+                .write_all(&[FIRST, SECOND, THIRD].concat())
+                .expect("answers three");
+            stream.flush().expect("flushes");
+            let _ = wait.recv();
+        });
+        let mut lane = Lane::new(Kind::Plain(
+            Connection::connect(("127.0.0.1", port)).expect("connects"),
+        ));
+        lane.kind
+            .write_all(
+                b"GET /o/a HTTP/1.1\r\nHost: h\r\n\r\nGET /o/b HTTP/1.1\r\nHost: h\r\n\r\nGET /o/c HTTP/1.1\r\nHost: h\r\n\r\n",
+            )
+            .expect("asks three");
+        lane.kind.flush().expect("flushes");
+        let want = FIRST.len() + SECOND.len() + THIRD.len();
+        while lane.buf.len() < want {
+            let read = crate::proxy::read_into_tail(&mut lane.kind, &mut lane.buf)
+                .expect("the origin answers");
+            if read == 0 {
+                panic!("the origin closed after {} of {want} bytes", lane.buf.len());
+            }
+        }
+        let base = lane.buf.as_ptr();
+        let room = lane.buf.capacity();
+        let first = lane.reply(false, None).expect("the first answer");
+        assert_eq!(first.body, b"first");
+        assert!(
+            first.kept,
+            "an answer that says nothing about closing leaves its lane for the next request"
+        );
+        assert_eq!(
+            lane.reply(false, None).expect("the second answer").body,
+            b"second"
+        );
+        assert_eq!(
+            &lane.buf[lane.at..],
+            THIRD,
+            "the bytes that rode in past the answer it read were never handed to a second owner"
+        );
+        let line = lane.line().expect("the third status");
+        assert_eq!(line, b"HTTP/1.1 200 OK");
+        let offset = line.as_ptr() as usize - base as usize;
+        assert!(
+            offset < room,
+            "the head is read out of the buffer it arrived in"
+        );
+        assert_eq!(lane.buf.as_ptr(), base, "and the walk never moved it");
+        assert_eq!(
+            lane.buf.capacity(),
+            room,
+            "nor grew it across one push and three drains"
+        );
+        drop(hold);
+        server.join().expect("stops");
+    }
+
+    /// Every request the templated store makes, read back as the exact bytes it put on the wire.
+    #[test]
+    fn the_templated_store_sends_the_reference_bytes() {
+        const WIRE: &str = r#"{"auth":{"type":"static","header":{"X-Folder":"{folder}/{secret0}"}},"put":{"method":"PUT","url":"http://127.0.0.1:<p>/o/{name}","headers":{"X-Magic":"keep"}},"get":{"url":"http://127.0.0.1:<p>/o/{name}"},"delete":{"method":"DELETE","url":"http://127.0.0.1:<p>/o/{name}"},"list":{"url":"http://127.0.0.1:<p>/l/{prefix}","namesRegex":"streams/a/([a-z0-9./~-]+)"}}"#;
+        let fake = Fake::start();
+        let store =
+            Template::build(&templated(WIRE, fake.port), Http::new(None, None, 8)).expect("builds");
+        let host = format!("127.0.0.1:{}", fake.port);
+        let segment = "streams/a/c2s/000000000.seg";
+        let marker = "streams/a/c2s/000000003.end";
+        store.put(segment, b"hello").expect("stores");
+        store.put(marker, &[]).expect("marks the end");
+        assert_eq!(store.get(segment).expect("reads"), b"hello");
+        let listed = store.list("streams/a").expect("lists");
+        store.delete(segment).expect("drops");
+        assert_eq!(
+            fake.text(0),
+            format!("PUT /o/{segment} HTTP/1.1\r\nHost: {host}\r\nX-Folder: folder/s0\r\nX-Magic: keep\r\nContent-Length: 5\r\n\r\nhello")
+        );
+        assert_eq!(
+            fake.text(1),
+            format!("PUT /o/{marker} HTTP/1.1\r\nHost: {host}\r\nX-Folder: folder/s0\r\nX-Magic: keep\r\nContent-Length: 0\r\n\r\n"),
+            "a bodyless put declares zero, the way the service's own http library writes it"
+        );
+        assert_eq!(
+            fake.text(2),
+            format!("GET /o/{segment} HTTP/1.1\r\nHost: {host}\r\nX-Folder: folder/s0\r\n\r\n"),
+            "and a get declares no length at all"
+        );
+        assert_eq!(
+            fake.text(3),
+            format!("GET /l/streams/a HTTP/1.1\r\nHost: {host}\r\nX-Folder: folder/s0\r\n\r\n")
+        );
+        assert_eq!(
+            fake.text(4),
+            format!("DELETE /o/{segment} HTTP/1.1\r\nHost: {host}\r\nX-Folder: folder/s0\r\n\r\n")
+        );
+        assert_eq!(
+            listed.iter().map(|at| at.name.as_str()).collect::<Vec<_>>(),
+            vec!["c2s/000000000.seg", "c2s/000000003.end"],
+            "the listing hands back exactly what its regex captured, in the order the service wrote it"
+        );
+        assert_eq!(fake.lanes(), 1, "five asks, one kept-alive lane");
+    }
+
+    /// The base64 of a payload reaches the `{data}` slot of a body template, and a `basic` credential is the pair the service's own http library would have sent.
+    #[test]
+    fn a_templated_body_carries_the_data_and_the_credential() {
+        const ENVELOPE: &str = r#"{"auth":{"type":"basic","username":"a","password":"{secret0}"},"put":{"method":"PUT","url":"http://127.0.0.1:<p>/o/{name}","body":"{\"raw\":\"{data}\"}"},"get":{"url":"http://127.0.0.1:<p>/o/{name}"},"delete":{"method":"DELETE","url":"http://127.0.0.1:<p>/o/{name}"},"list":{"url":"http://127.0.0.1:<p>/l/{prefix}","namesRegex":"([a-z0-9./~-]+)"}}"#;
+        let fake = Fake::start();
+        let store = Template::build(&templated(ENVELOPE, fake.port), Http::new(None, None, 8))
+            .expect("builds");
+        store.put("a.seg", b"hello").expect("stores");
+        assert_eq!(
+            fake.text(0),
+            format!(
+                "PUT /o/a.seg HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Basic YTpzMA==\r\nContent-Length: 18\r\n\r\n{{\"raw\":\"aGVsbG8=\"}}",
+                fake.port
+            )
+        );
+    }
+
+    /// An `oauth2` template fetches its token once, rides it through the header template, and asks for another when the service says the old one is dead.
+    #[test]
+    fn an_oauth2_template_fetches_its_token_once_and_again_after_a_401() {
+        const OAUTH: &str = r#"{"auth":{"type":"oauth2","tokenUrl":"http://127.0.0.1:<p>/token","form":{"client_id":"cid","refresh_token":"rtok"},"header":{"Authorization":"Bearer {token}"},"tokenPath":"data.access","expiryPath":"exp"},"put":{"method":"PUT","url":"http://127.0.0.1:<p>/o/{name}"},"get":{"url":"http://127.0.0.1:<p>/o/{name}"},"delete":{"method":"DELETE","url":"http://127.0.0.1:<p>/o/{name}"},"list":{"url":"http://127.0.0.1:<p>/l/{prefix}","namesRegex":"([a-z0-9./~-]+)"}}"#;
+        let fake = Fake::start();
+        let store = Template::build(&templated(OAUTH, fake.port), Http::new(None, None, 8))
+            .expect("builds");
+        let host = format!("127.0.0.1:{}", fake.port);
+        fake.push(200, r#"{"data":{"access":"atok"},"exp":3600}"#);
+        store.put("a.seg", b"one").expect("stores");
+        store.put("b.seg", b"two").expect("stores again");
+        assert_eq!(fake.asks(), 3, "one token for two segments");
+        assert_eq!(
+            fake.text(0),
+            format!(
+                "POST /token HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: 32\r\n\r\nclient_id=cid&refresh_token=rtok",
+                fake.port
+            )
+        );
+        assert_eq!(
+            fake.text(1),
+            format!("PUT /o/a.seg HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\nContent-Length: 3\r\n\r\none"),
+            "the token lands where the header template points it"
+        );
+        fake.push(401, "gone");
+        fake.push(200, r#"{"data":{"access":"atok2"},"exp":3600}"#);
+        store.put("c.seg", b"three").expect("retries the refusal");
+        assert_eq!(
+            fake.asks(),
+            6,
+            "the refused ask, a fresh token, and the ask again"
+        );
+        assert_eq!(
+            fake.text(3),
+            format!("PUT /o/c.seg HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\nContent-Length: 5\r\n\r\nthree"),
+            "the refused try still carried the old token"
+        );
+        assert_eq!(
+            fake.text(5),
+            format!("PUT /o/c.seg HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok2\r\nContent-Length: 5\r\n\r\nthree"),
+            "and the retry carried the new one"
+        );
+        assert_eq!(fake.lanes(), 1, "six asks, one kept-alive lane");
+    }
+
+    /// A status the config named is asked again, and a `403` is only one when its body says the reason the config named.
+    #[test]
+    fn a_configured_answer_is_asked_again() {
+        const LADDER: &str = r#"{"retry":{"status":[503],"rateReason":"slow"},"get":{"url":"http://127.0.0.1:<p>/o/{name}"},"put":{"method":"PUT","url":"http://127.0.0.1:<p>/o/{name}"},"delete":{"method":"DELETE","url":"http://127.0.0.1:<p>/o/{name}"},"list":{"url":"http://127.0.0.1:<p>/l/{prefix}","namesRegex":"([a-z0-9./~-]+)"}}"#;
+        let fake = Fake::start();
+        let store = Template::build(&templated(LADDER, fake.port), Http::new(None, None, 8))
+            .expect("builds");
+        fake.push(503, "busy");
+        fake.push(200, "body");
+        assert_eq!(
+            store.get("streams/a/c2s.seg").expect("asked again"),
+            b"body",
+            "the second answer is the one the reader gets"
+        );
+        assert_eq!(
+            fake.asks(),
+            2,
+            "one rung the ladder waits out, one it takes"
+        );
+        assert!(
+            store.retryable(403, br#"{"slow":"yes"}"#),
+            "a 403 whose body names the configured reason is a rate limit"
+        );
+        assert!(
+            !store.retryable(403, br#"{"other":"yes"}"#),
+            "and a 403 that does not is a refusal"
+        );
+        assert!(
+            !store.retryable(404, r#"{"slow":"yes"}"#.as_bytes()),
+            "a status the list does not name is neither"
+        );
+    }
+
+    /// The four operations a templated store must name, aimed at the fake's in-memory folder.
+    const SIDES: &str = r#"{"put":{"method":"PUT","url":"http://127.0.0.1:<p>/o/{name}"},"get":{"url":"http://127.0.0.1:<p>/o/{name}"},"delete":{"method":"DELETE","url":"http://127.0.0.1:<p>/o/{name}"},"list":{"url":"http://127.0.0.1:<p>/l/{prefix}","namesRegex":"([a-z0-9./~-]+)"}}"#;
+
+    /// A Drive store built over the test's own origin, with the three secrets the reference asks for.
+    fn drive_over(fake: &Fake) -> Drive {
+        let settings = Settings {
+            remote_folder: "root".to_owned(),
+            service: "Google Drive".to_owned(),
+            secrets: vec!["cid".to_owned(), "csecret".to_owned(), "rtok".to_owned()],
+            template: None,
+            params: quick(),
+            security: String::new(),
+            tls: None,
+        };
+        let mut drive = Drive::build(&settings, Http::new(None, None, 8)).expect("builds");
+        drive.token_url = fake.url("token");
+        drive.files_url = fake.url("drive/files");
+        drive.upload_url = fake.url("upload/files?uploadType=multipart");
+        drive
+    }
+
+    /// The Drive calls the carrier makes, read back as the exact bytes the reference's own client would have written.
+    #[test]
+    fn the_drive_service_asks_in_the_reference_shape() {
+        const FORM: &str =
+            "client_id=cid&client_secret=csecret&grant_type=refresh_token&refresh_token=rtok";
+        const INLINE: &str =
+            r#"{"description":"aGVsbG8=","name":"streams~a~c2s~000000000.seg","parents":["root"]}"#;
+        let fake = Fake::start();
+        let host = format!("127.0.0.1:{}", fake.port);
+        let drive = drive_over(&fake);
+        fake.push(200, r#"{"access_token":"atok","expires_in":3600}"#);
+        fake.push(200, r#"{"id":"f0"}"#);
+        let segment = "streams/a/c2s/000000000.seg";
+        drive.put(segment, b"hello").expect("rides the metadata");
+        assert_eq!(
+            fake.text(0),
+            format!("POST /token HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\n\r\n{FORM}", FORM.len())
+        );
+        assert_eq!(
+            fake.text(1),
+            format!("POST /drive/files?fields=id HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\nContent-Type: application/json; charset=UTF-8\r\nContent-Length: {}\r\n\r\n{INLINE}", INLINE.len())
+        );
+        fake.push(200, "payload");
+        assert_eq!(
+            drive.get(segment).expect("reads the media"),
+            b"payload",
+            "the id the upload answered is the id the read uses, so no listing stands between them"
+        );
+        assert_eq!(
+            fake.text(2),
+            format!("GET /drive/files/f0?alt=media&supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n"),
+            "and a get declares no length at all"
+        );
+        drive.remember("streams~a~s2c~000000001.seg", "f%1");
+        fake.push(200, "");
+        fake.push(200, r#"{"description":"aGVsbG8="}"#);
+        assert_eq!(
+            drive
+                .get("streams/a/s2c/000000001.seg")
+                .expect("reads the description"),
+            b"hello",
+            "a media read of nothing is the payload that rode in the description"
+        );
+        assert_eq!(
+            fake.text(3),
+            format!("GET /drive/files/f%251?alt=media&supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n"),
+            "an id is quoted as a path segment is"
+        );
+        assert_eq!(
+            fake.text(4),
+            format!("GET /drive/files/f%251?fields=description&supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n")
+        );
+        assert_eq!(fake.lanes(), 1, "five asks, one kept-alive lane");
+    }
+
+    /// An object too large for the description rides one multipart body: the metadata part, then the payload, then the closing boundary.
+    #[test]
+    fn a_large_drive_object_rides_the_multipart_body() {
+        let fake = Fake::start();
+        let drive = drive_over(&fake);
+        let data: Vec<u8> = (0..=DRIVE_INLINE_LIMIT)
+            .map(|at| b'a' + (at % 26) as u8)
+            .collect();
+        let metadata = r#"{"name":"streams~a~c2s~000000000.seg","parents":["root"]}"#;
+        let mut want = format!(
+            "--{DRIVE_BOUNDARY}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n{metadata}\r\n--{DRIVE_BOUNDARY}\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .into_bytes();
+        want.extend_from_slice(&data);
+        want.extend_from_slice(b"\r\n--");
+        want.extend_from_slice(DRIVE_BOUNDARY.as_bytes());
+        want.extend_from_slice(b"--\r\n");
+        fake.push(200, r#"{"access_token":"atok","expires_in":3600}"#);
+        fake.push(200, r#"{"id":"big"}"#);
+        drive
+            .put("streams/a/c2s/000000000.seg", &data)
+            .expect("uploads");
+        let request = fake.taken()[1].clone();
+        let head = head_end(&request).expect("a head");
+        assert_eq!(
+            &request[..head],
+            format!(
+                "POST /upload/files?uploadType=multipart HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer atok\r\nContent-Type: multipart/related; boundary={DRIVE_BOUNDARY}\r\nContent-Length: {}\r\n\r\n",
+                fake.port,
+                want.len()
+            )
+            .as_bytes(),
+            "the metadata part carries no description, because the payload did not fit in one"
+        );
+        assert_eq!(
+            &request[head..],
+            want.as_slice(),
+            "the whole object in one body"
+        );
+    }
+
+    /// The listing and the tree a Drive delete walks, in the reference's query form: sorted keys, uppercase escapes, a space as `+`.
+    #[test]
+    fn a_drive_listing_is_the_reference_query() {
+        let fake = Fake::start();
+        let host = format!("127.0.0.1:{}", fake.port);
+        let drive = drive_over(&fake);
+        fake.push(200, r#"{"access_token":"atok","expires_in":3600}"#);
+        fake.push(
+            200,
+            r#"{"files":[{"id":"f1","name":"streams~a~c2s~000000000.seg","description":"aGVsbG8="}]}"#,
+        );
+        let listed = drive.list("streams/a").expect("lists");
+        assert_eq!(
+            fake.text(1),
+            format!("GET /drive/files?fields=nextPageToken%2Cfiles%28id%2Cname%2Cdescription%29&includeItemsFromAllDrives=true&pageSize=1000&q=%27root%27+in+parents+and+trashed+%3D+false+and+name+contains+%27streams~a~%27&supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n")
+        );
+        assert_eq!(
+            listed.iter().map(|at| at.name.as_str()).collect::<Vec<_>>(),
+            vec!["c2s"],
+            "one step of the tree, not the whole name"
+        );
+        assert!(
+            listed[0].inline.is_none(),
+            "a child one level down is not the object a read could take from the listing"
+        );
+        fake.push(
+            200,
+            r#"{"files":[{"id":"fold","name":"streams~a"},{"id":"f1","name":"streams~a~c2s~000000000.seg"}]}"#,
+        );
+        fake.push(200, "");
+        fake.push(
+            200,
+            r#"{"files":[{"id":"f1","name":"streams~a~c2s~000000000.seg"}]}"#,
+        );
+        fake.push(200, "");
+        drive.delete("streams/a").expect("empties the prefix");
+        assert_eq!(
+            fake.text(2),
+            format!("GET /drive/files?fields=nextPageToken%2Cfiles%28id%2Cname%2Cdescription%29&includeItemsFromAllDrives=true&pageSize=1000&q=%27root%27+in+parents+and+trashed+%3D+false+and+name+%3D+%27streams~a%27&supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n"),
+            "the prefix itself is looked up before its children"
+        );
+        assert_eq!(
+            fake.text(3),
+            format!("DELETE /drive/files/fold?supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n")
+        );
+        assert_eq!(
+            fake.text(5),
+            format!("DELETE /drive/files/f1?supportsAllDrives=true HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer atok\r\n\r\n")
+        );
+        assert_eq!(fake.asks(), 6, "one token for the whole walk");
+    }
+
+    /// A Drive `403` is a rate limit only when its body says one of the reasons Google writes.
+    #[test]
+    fn a_drive_refusal_is_only_worth_waiting_out_when_it_names_a_limit() {
+        for answer in [
+            r#"{"error":{"errors":[{"reason":"userRateLimitExceeded"}]}}"#,
+            r#"{"error":{"errors":[{"reason":"rateLimitExceeded"},{"reason":"other"}]}}"#,
+            r#"{"error":{"status":"RESOURCE_EXHAUSTED"}}"#,
+        ] {
+            assert!(
+                Drive::rate_limited(answer.as_bytes()),
+                "{answer} is a limit the ladder can outlast"
+            );
+        }
+        for refusal in [
+            r#"{"error":{"errors":[{"reason":"accessNotConfigured"}]}}"#,
+            r#"{"error":{"status":"PERMISSION_DENIED"}}"#,
+            "not json",
+        ] {
+            assert!(
+                !Drive::rate_limited(refusal.as_bytes()),
+                "{refusal} is a refusal, and asking again would only cost"
+            );
+        }
+    }
+
+    /// One store per service and folder, shared by every session that names it, and a refusal by name for what this tree does not build.
+    #[test]
+    fn a_store_is_shared_by_the_settings_that_name_it() {
+        let settings = templated(SIDES, 9);
+        let first = settings.store(None).expect("opens");
+        let second = settings.store(None).expect("opens again");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two sessions on one folder share one lane pool"
+        );
+        let fronted = settings.store(Some(("127.0.0.1", 9))).expect("fronts");
+        assert!(
+            !Arc::ptr_eq(&first, &fronted),
+            "and the address a session fronts through is part of the identity"
+        );
+        let mut secured = settings.clone();
+        secured.security = "tls".to_owned();
+        assert!(
+            !Arc::ptr_eq(&first, &secured.store(None).expect("reopens")),
+            "so does the transport's security"
+        );
+        let mut named = settings.clone();
+        named.secrets = vec!["other".to_owned()];
+        assert!(
+            !Arc::ptr_eq(&first, &named.store(None).expect("reopens again")),
+            "and so does every secret"
+        );
+        let mut disk = settings.clone();
+        disk.service = "local".to_owned();
+        let folder = scratch("shared-local");
+        disk.remote_folder = folder.display().to_string();
+        disk.template = None;
+        let opened = disk.store(None).expect("a folder");
+        assert!(
+            !Arc::ptr_eq(&opened, &disk.store(None).expect("the same folder")),
+            "but a folder on disk is opened fresh each time, never pooled"
+        );
+        let mut reality = settings.clone();
+        reality.security = "reality".to_owned();
+        assert!(
+            reality.store(None).is_err(),
+            "a store lane does not speak reality"
+        );
+        let mut unbuilt = settings.clone();
+        unbuilt.service = "webdav".to_owned();
+        assert!(
+            unbuilt.store(None).is_err(),
+            "and an unknown service is refused by name"
+        );
+        let mut short = settings.clone();
+        short.service = "Google Drive".to_owned();
+        short.secrets = vec!["cid".to_owned(), "csecret".to_owned()];
+        assert!(
+            Drive::build(&short, Http::new(None, None, 8)).is_err(),
+            "Drive refuses a set without three secrets"
+        );
+        let mut blind = templated(SIDES, 9);
+        blind.template = Some(
+            crate::json::parse(
+                r#"{"put":{"method":"PUT","url":"u"},"get":{"url":"u"},"delete":{"method":"DELETE","url":"u"},"list":{"url":"u","namesRegex":"no group"}}"#,
+            )
+            .expect("a template"),
+        );
+        assert!(
+            Template::build(&blind, Http::new(None, None, 8)).is_err(),
+            "and a template whose list names no capture group, because there would be nothing to read back"
+        );
+    }
 }
