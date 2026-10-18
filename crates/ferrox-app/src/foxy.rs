@@ -501,6 +501,7 @@ fn open_h2_with(dial: &FoxyDial, block: &[u8]) -> Result<Tls2, Failure> {
         at: 0,
         out: Vec::new(),
         capsule_buf: Vec::new(),
+        pending_credit: 0,
         frame: FrameState::default(),
         fin: false,
     };
@@ -539,6 +540,9 @@ const CREDIT_TEMPLATE: [u8; 26] = {
     out
 };
 
+/// The credit a lane holds before it grants it back: the edge is granted a 16 MiB window to fill, so a held update cannot stall it, while a write per frame spends a record and a segment on 26 bytes the edge already owes us.
+const CREDIT_FLOOR: u32 = 1 << 16;
+
 /// A relay over a TLS stream that speaks HTTP/2: a caller writing bytes sees a DATA frame, a caller reading bytes sees one's payload.
 pub(crate) struct Tls2 {
     tls: ferrox_core::tls::RustlsProvider<Connection>,
@@ -551,6 +555,8 @@ pub(crate) struct Tls2 {
     out: Vec<u8>,
     /// Capsule-stream bytes not parsed yet: one capsule may span DATA frames, so frames accumulate here.
     capsule_buf: Vec<u8>,
+    /// Bytes the edge has sent into its granted window that this lane has taken but not yet granted back: the update goes out when the held credit reaches `CREDIT_FLOOR`, never per frame.
+    pending_credit: u32,
     frame: FrameState,
     fin: bool,
 }
@@ -561,6 +567,13 @@ struct FrameState {
     head: [u8; frames::H2_HEADER],
     head_at: usize,
     payload_at: usize,
+    /// The DATA frame in flight that has not yet reached its caller: a caller's buffer smaller than the frame, or a quantum that expired mid-frame, leaves the rest here so the next read resumes into its buffer instead of re-fetching what was already paid for.
+    data_at: u32,
+    data_len: u32,
+    /// The `END_STREAM` of the frame in flight: only the delivery that takes its last byte may tell the caller the stream ended.
+    data_end: bool,
+    /// Bytes handed into the caller's buffer by the current call: the frame's total cursor cannot tell one call's delivery from the next's, and the credit is owed per byte the caller actually got.
+    delivered: u32,
 }
 
 /// Fills `buf` from `at` on, leaving `at` where the wire stopped: a timeout mid-buffer is a pause the next call resumes, and only a closed stream ends it.
@@ -575,20 +588,119 @@ fn fill_from<S: Read>(io: &mut S, buf: &mut [u8], at: &mut usize) -> std::io::Re
     Ok(())
 }
 
-/// One frame off the wire into the caller's owned buffer; a socket timeout keeps its kind so a relay can tell an idle quantum from a dead peer.
-fn read_frame(
-    tls: &mut ferrox_core::tls::RustlsProvider<Connection>,
+/// Consumes the payload of the DATA frame in flight, straight into the destination: the destination gets exactly the room left in the frame, so no caller can be fed a byte of the next frame's header, and a quantum that expires mid-frame hands over what arrived and leaves the rest in `state`.
+fn fill_data<S: Read>(
+    io: &mut S,
+    state: &mut FrameState,
+    dst: &mut [u8],
+) -> std::io::Result<usize> {
+    let want = (state.data_len - state.data_at).min(dst.len() as u32) as usize;
+    let mut at = 0usize;
+    while at < want {
+        match io.read(&mut dst[at..want]) {
+            Ok(0) => {
+                state.data_at += at as u32;
+                state.delivered += at as u32;
+                if at == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                }
+                return Ok(at);
+            }
+            Ok(read) => at += read,
+            // The pause mid-frame is a handover, not a loss: what arrived sits in the caller's buffer, and the cursor says where the wire stopped.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                state.data_at += at as u32;
+                state.delivered += at as u32;
+                if at == 0 {
+                    return Err(error);
+                }
+                return Ok(at);
+            }
+            Err(error) => {
+                state.data_at += at as u32;
+                state.delivered += at as u32;
+                return Err(error);
+            }
+        }
+    }
+    state.data_at += at as u32;
+    state.delivered += at as u32;
+    Ok(at)
+}
+
+/// One frame off the wire; a socket timeout keeps its kind so a relay can tell an idle quantum from a dead peer.
+/// A DATA frame whose caller has room goes straight into `dst` with no staging buffer between the lane and its caller: the answer carries the frame's end flag only on the delivery of its last byte, and a caller whose buffer filled mid-frame sees a zero-length marker, the bytes where it put them, and the remainder waiting in `state`.
+fn read_frame<S: Read>(
+    io: &mut S,
     state: &mut FrameState,
     out: &mut Vec<u8>,
     max_frame: usize,
+    dst: &mut [u8],
 ) -> std::io::Result<frames::H2Frame> {
-    fill_from(tls, &mut state.head, &mut state.head_at)?;
+    if state.data_len > 0 {
+        // A caller that cannot receive the rest of the frame into its buffer cannot receive it at all: the bytes already handed over are not replayable, and staging them again would be the loss this path exists to avoid.
+        if dst.is_empty() {
+            return Err(std::io::Error::other(
+                "foxy: a resumed frame met a caller with no room",
+            ));
+        }
+        fill_data(io, state, dst)?;
+        let done = state.data_at == state.data_len;
+        let frame = frames::H2Frame {
+            kind: frames::DATA,
+            flags: if done && state.data_end {
+                frames::END_STREAM
+            } else {
+                0
+            },
+            stream: 0,
+            length: if done { state.data_len } else { 0 },
+        };
+        if done {
+            state.data_len = 0;
+            state.data_at = 0;
+            state.data_end = false;
+        }
+        return Ok(frame);
+    }
+    fill_from(io, &mut state.head, &mut state.head_at)?;
     let frame = frames::H2Frame::parse(&state.head)
         .ok_or_else(|| std::io::Error::other("foxy: a header that is not a frame"))?;
+    if frame.kind == frames::DATA && frame.stream == 1 && frame.length > 0 && !dst.is_empty() {
+        out.clear();
+        state.data_len = frame.length;
+        state.data_at = 0;
+        state.data_end = frame.flags & frames::END_STREAM != 0;
+        state.head_at = 0;
+        state.head = [0u8; frames::H2_HEADER];
+        fill_data(io, state, dst)?;
+        if state.data_at < state.data_len {
+            return Ok(frames::H2Frame {
+                kind: frames::DATA,
+                flags: 0,
+                stream: 0,
+                length: 0,
+            });
+        }
+        let end = std::mem::take(&mut state.data_end);
+        state.data_len = 0;
+        state.data_at = 0;
+        return Ok(frames::H2Frame {
+            kind: frames::DATA,
+            flags: if end { frames::END_STREAM } else { 0 },
+            stream: frame.stream,
+            length: frame.length,
+        });
+    }
     if state.payload_at == 0 {
         crate::proxy::resize_scratch(out, (frame.length as usize).min(max_frame));
     }
-    fill_from(tls, out, &mut state.payload_at)?;
+    fill_from(io, out, &mut state.payload_at)?;
     state.head_at = 0;
     state.payload_at = 0;
     state.head = [0u8; frames::H2_HEADER];
@@ -601,12 +713,21 @@ impl Tls2 {
     }
 
     /// Reads one frame, hands it to `body` with the payload borrowed, and puts the buffer back.
+    /// A `dst` with room takes a DATA frame's payload directly, and `body` then sees that payload already in the caller's buffer through `frame`'s length and end flag, with `payload` empty; the bytes this call delivered are counted in `frame_state.delivered`.
     fn with_frame<R>(
         &mut self,
+        dst: &mut [u8],
         body: impl FnOnce(&mut Self, frames::H2Frame, &[u8]) -> R,
     ) -> std::io::Result<R> {
         let mut payload = std::mem::take(&mut self.out);
-        let frame = read_frame(&mut self.tls, &mut self.frame, &mut payload, self.max_frame);
+        self.frame.delivered = 0;
+        let frame = read_frame(
+            &mut self.tls,
+            &mut self.frame,
+            &mut payload,
+            self.max_frame,
+            dst,
+        );
         let out = match frame {
             Ok(frame) => body(self, frame, &payload),
             Err(error) => {
@@ -618,9 +739,21 @@ impl Tls2 {
         Ok(out)
     }
 
-    /// The window this lane grants back as it reads, one update per frame: the connection update is the one that would otherwise stop a relay in its tracks.
+    /// Holds the credit a DATA payload grants back until it is worth a write: the edge has a 16 MiB window to ride on, so a held update is never the reason it stalls, while one 26-byte frame per inbound frame spends a TLS record and a segment to move a number the edge has already granted.
     fn credit(&mut self, len: usize) -> Result<(), Failure> {
-        let increment = (len as u32).to_be_bytes();
+        // Saturating because the held total is only ever a flush threshold: a lane that has taken the whole 16 MiB window and not yet granted any of it is served by the flush, not by an exact count.
+        self.pending_credit = self
+            .pending_credit
+            .saturating_add(u32::try_from(len).unwrap_or(u32::MAX));
+        if self.pending_credit >= CREDIT_FLOOR {
+            return self.flush_credit();
+        }
+        Ok(())
+    }
+
+    /// Grants back everything the lane has taken: the held total is cleared whether or not the write lands, because a lane that cannot write has lost the flow the credit would have paced.
+    fn flush_credit(&mut self) -> Result<(), Failure> {
+        let increment = std::mem::take(&mut self.pending_credit).to_be_bytes();
         let mut out = CREDIT_TEMPLATE;
         out[9..13].copy_from_slice(&increment);
         out[22..26].copy_from_slice(&increment);
@@ -660,8 +793,8 @@ impl Tls2 {
         let mut block = Vec::with_capacity(64);
         while Instant::now() < deadline {
             let status = self
-                .with_frame(
-                    |lane, frame, payload| match frames::h2_event(frame, payload, 1) {
+                .with_frame(&mut [], |lane, frame, payload| {
+                    match frames::h2_event(frame, payload, 1) {
                         frames::H2Event::Headers { block: more, .. } => {
                             header_status(&mut block, more, frame.flags & frames::END_HEADERS != 0)
                         }
@@ -676,6 +809,14 @@ impl Tls2 {
                                 at += 6;
                             }
                             lane.ack(frames::SETTINGS, &[]).map(|()| None)
+                        }
+                        // A DATA frame that arrives while the status is still out is payload the edge sent early: hold its credit like any other, and let the walk ignore the bytes until `END_STREAM` says the status itself is gone.
+                        frames::H2Event::Data { payload, end } => {
+                            lane.fin = end;
+                            if !payload.is_empty() {
+                                lane.credit(payload.len())?;
+                            }
+                            Ok(None)
                         }
                         frames::H2Event::Ping { ack: false, .. } => {
                             lane.ack(frames::PING, payload).map(|()| None)
@@ -697,8 +838,8 @@ impl Tls2 {
                             )
                         }
                         _ => Ok(None),
-                    },
-                )
+                    }
+                })
                 .map_err(|_| Failure::Stream)??;
             if let Some(status) = status {
                 return Ok(status);
@@ -794,7 +935,7 @@ impl Tls2 {
                     "foxy: a capsule stream that never parses",
                 ));
             }
-            let read = self.with_frame(|lane, frame, payload| -> std::io::Result<usize> {
+            let read = self.with_frame(&mut [], |lane, frame, payload| -> std::io::Result<usize> {
                 match frames::h2_event(frame, payload, 1) {
                     frames::H2Event::Data { payload, end } => {
                         let len = payload.len();
@@ -909,19 +1050,27 @@ impl Read for Tls2 {
             if self.fin {
                 return Ok(0);
             }
-            let read = self.with_frame(|lane, frame, payload| -> std::io::Result<usize> {
+            // The payload is copied once, by the frame reader, straight into the caller's buffer: nothing is staged between the lane and its caller, and a frame the caller has no room left for resumes in the caller's own space on the next read.
+            let read = self.with_frame(buf, |lane, frame, payload| -> std::io::Result<usize> {
+                // A DATA frame the reader delivered arrives with the wire's payload already in the caller's buffer and none left in the lane's hands: what this call handed over is counted in `delivered`, and the credit is owed for exactly that.
+                if frame.kind == frames::DATA && payload.is_empty() {
+                    lane.fin = frame.flags & frames::END_STREAM != 0;
+                    let got = lane.frame.delivered as usize;
+                    if got > 0 {
+                        lane.credit(got).map_err(io)?;
+                    }
+                    return Ok(got);
+                }
                 match frames::h2_event(frame, payload, 1) {
                     frames::H2Event::Data { payload, end } => {
+                        // Only reachable for a caller that asked for nothing: the frame stages whole, and a later read with room is fed from the stage.
                         let len = payload.len();
-                        // The payload is copied once, into the caller's buffer: staging into `carry` first would be a second pass over every byte.
-                        let taken = buf.len().min(len);
-                        buf[..taken].copy_from_slice(&payload[..taken]);
-                        lane.stage(payload, taken);
+                        lane.stage(payload, 0);
                         lane.fin = end;
                         if len > 0 {
                             lane.credit(len).map_err(io)?;
                         }
-                        Ok(taken)
+                        Ok(0)
                     }
                     frames::H2Event::Window { stream, increment } => {
                         lane.grant(stream, increment);
@@ -1820,7 +1969,7 @@ impl Tls2 {
             if self.fin {
                 return Err(Failure::Stream);
             }
-            let read = self.with_frame(|lane, frame, payload| -> std::io::Result<()> {
+            let read = self.with_frame(&mut [], |lane, frame, payload| -> std::io::Result<()> {
                 match frames::h2_event(frame, payload, 1) {
                     frames::H2Event::Data { payload, end } => {
                         lane.capsule_buf.extend_from_slice(payload);
@@ -1865,8 +2014,9 @@ impl Tls2 {
             if self.fin {
                 return Ok(None);
             }
-            let read =
-                self.with_frame(|lane, frame, payload| -> std::io::Result<Option<Vec<u8>>> {
+            let read = self.with_frame(
+                &mut [],
+                |lane, frame, payload| -> std::io::Result<Option<Vec<u8>>> {
                     match frames::h2_event(frame, payload, 1) {
                         frames::H2Event::Data { payload, end } => {
                             lane.fin = end;
@@ -1896,7 +2046,8 @@ impl Tls2 {
                         }
                         _ => Ok(None),
                     }
-                });
+                },
+            );
             if let Some(packet) = read?? {
                 if !packet.is_empty() {
                     return Ok(Some(packet));
@@ -3592,9 +3743,9 @@ mod loopback {
         assert_eq!(lane.at, 0, "the read cursor is where it started");
     }
 
-    /// The remainder the caller has no room for is the only thing that travels through the read buffer, and the lane reads it back out one piece at a time until the frame is done.
+    /// A frame read a hundred bytes at a time leaves nothing staged in the lane: every byte the caller took went from the wire into its own buffer, and between those visits the lane holds only the cursor.
     #[test]
-    fn a_read_leaves_only_what_the_callers_buffer_had_no_room_for() {
+    fn a_frame_read_a_hundred_bytes_at_a_time_stages_nothing() {
         const FRAME: usize = 16 * 1024;
         const STEP: usize = 100;
         let (roots, server) = minted(b"h2");
@@ -3621,6 +3772,347 @@ mod loopback {
         assert_eq!(back, sent, "the bytes are the bytes either way");
         assert!(lane.carry.is_empty(), "the remainder was drained");
         assert_eq!(lane.at, 0, "the read cursor is where it started");
+    }
+
+    /// The downlink edge: it answers the status, writes each named piece (pausing after it if one is named), and reports every `WINDOW_UPDATE` it reads from the lane until the socket ends.
+    fn downlink_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+        pieces: Vec<(Vec<u8>, Option<Duration>)>,
+        updates: std::sync::mpsc::Sender<(u32, u32)>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) {
+                return;
+            }
+            let mut opening = Vec::new();
+            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut opening);
+            h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut opening);
+            tls.write_all(&opening).expect("answers the status");
+            for (piece, pause) in pieces {
+                tls.write_all(&piece).expect("pushes");
+                tls.flush().expect("flushes");
+                if let Some(pause) = pause {
+                    std::thread::sleep(pause);
+                }
+            }
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                if frame.kind == frames::WINDOW_UPDATE && payload.len() == 4 {
+                    let increment = u32::from_be_bytes(payload[..4].try_into().expect("four"));
+                    let _ = updates.send((frame.stream, increment));
+                }
+            }
+        })
+    }
+
+    /// One DATA frame, whole: the header names the payload it carries.
+    fn data_frame(payload: &[u8]) -> Vec<u8> {
+        let mut out = frames::H2Frame {
+            kind: frames::DATA,
+            flags: 0,
+            stream: 1,
+            length: payload.len() as u32,
+        }
+        .header()
+        .to_vec();
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// The rest of a frame the caller only half-takes stays on the wire, not in a buffer the relay copies through: the lane holds a cursor and the next read resumes into the caller's own space.
+    #[test]
+    fn half_a_frame_reaches_the_caller_with_the_rest_left_on_the_wire() {
+        const FRAME: usize = 8 * 1024;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let payload: Vec<u8> = (0..FRAME).map(|i| (i % 251) as u8).collect();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let _edge = downlink_edge(listener, server, vec![(data_frame(&payload), None)], tx);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        let mut half = [0u8; FRAME / 2];
+        let got = lane.read(&mut half).expect("the first half");
+        assert_eq!(
+            got,
+            half.len(),
+            "the caller's buffer was filled and stopped"
+        );
+        assert_eq!(lane.frame.data_len, FRAME as u32);
+        assert_eq!(
+            lane.frame.data_at,
+            FRAME as u32 / 2,
+            "the cursor says what the wire still owes"
+        );
+        assert!(lane.carry.is_empty(), "the rest was not staged anywhere");
+        let mut rest = [0u8; FRAME / 2];
+        let got = lane.read(&mut rest).expect("the second half");
+        assert_eq!(got, rest.len());
+        assert_eq!(lane.frame.data_len, 0, "the frame is spent");
+        assert_eq!(
+            &half[..],
+            &payload[..FRAME / 2],
+            "the first half is the first half"
+        );
+        assert_eq!(
+            &rest[..],
+            &payload[FRAME / 2..],
+            "the second half resumed where the wire stopped"
+        );
+    }
+
+    /// A read quantum that expires mid-frame is a handover, not a loss: what arrived sits in the caller's buffer, the lane keeps the cursor, and the resume re-reads nothing that was already paid for.
+    #[test]
+    fn a_quantum_that_expires_mid_frame_resumes_without_re_reading_a_byte() {
+        const FRAME: usize = 8 * 1024;
+        const PART: usize = 3 * 1024;
+        const STEP: usize = 1000;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let payload: Vec<u8> = (0..FRAME).map(|i| (i % 251) as u8).collect();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut head = data_frame(&payload);
+        head.truncate(frames::H2_HEADER + PART);
+        let tail = payload[PART..FRAME].to_vec();
+        let _edge = downlink_edge(
+            listener,
+            server,
+            vec![
+                (head, Some(Duration::from_millis(200))),
+                (tail, Some(Duration::from_millis(50))),
+            ],
+            tx,
+        );
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        tunnel
+            .set_read_quantum(Duration::from_millis(30))
+            .expect("bounds one read");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        let mut back = vec![0u8; FRAME];
+        let mut at = 0usize;
+        let mut parks = 0usize;
+        let mut mid_frame_parks = 0usize;
+        let stop_by = Instant::now() + Duration::from_secs(20);
+        while at < FRAME {
+            assert!(Instant::now() < stop_by, "the frame never finished");
+            let room = (FRAME - at).min(STEP);
+            match lane.read(&mut back[at..at + room]) {
+                Ok(read) => {
+                    assert!(read > 0, "a read that returns nothing without saying so");
+                    at += read;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    parks += 1;
+                    if lane.frame.data_len > 0 {
+                        mid_frame_parks += 1;
+                        assert!(
+                            lane.frame.data_len == FRAME as u32
+                                && lane.frame.data_at > 0
+                                && lane.frame.data_at < FRAME as u32,
+                            "the pause lost which frame was in flight"
+                        );
+                        assert!(lane.carry.is_empty(), "the pause staged nothing");
+                    }
+                }
+                Err(error) => panic!("the lane died: {error}"),
+            }
+        }
+        assert!(
+            mid_frame_parks > 0,
+            "the witness needs a pause inside the frame, not before it: {parks} parks"
+        );
+        assert_eq!(back, payload, "the pause cost no byte and added none");
+        assert_eq!(lane.frame.data_len, 0);
+    }
+
+    /// A frame whose bytes do not all arrive is a dead lane, not an endless short read: the caller learns the stream broke rather than waiting on payload that will not come.
+    #[test]
+    fn a_frame_truncated_on_the_wire_ends_the_flow_it_was_meant_for() {
+        const CLAIM: usize = 4096;
+        const ARRIVED: usize = 1024;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let payload: Vec<u8> = (0..CLAIM).map(|i| (i % 251) as u8).collect();
+        let mut push = data_frame(&payload);
+        push.truncate(frames::H2_HEADER + ARRIVED);
+        // The edge pushes the truncated frame and leaves: its goodbye is what the lane must read as a break.
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) {
+                return;
+            }
+            let mut opening = Vec::new();
+            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut opening);
+            h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut opening);
+            tls.write_all(&opening).expect("answers the status");
+            tls.write_all(&push).expect("pushes the fragment");
+        });
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        let mut back = [0u8; CLAIM];
+        let mut at = 0usize;
+        let mut broken = false;
+        let stop_by = Instant::now() + Duration::from_secs(20);
+        while !broken {
+            assert!(
+                Instant::now() < stop_by,
+                "no verdict on the truncated frame"
+            );
+            match lane.read(&mut back[at..]) {
+                Ok(read) => {
+                    assert!(
+                        read > 0,
+                        "a clean end is not the answer to a truncated frame"
+                    );
+                    at += read;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(_) => broken = true,
+            }
+        }
+        assert!(at < CLAIM, "the truncation was swallowed as a full frame");
+        assert_eq!(&back[..at], &payload[..at], "what arrived is what was sent");
+        edge.join().expect("the edge finishes");
+    }
+
+    /// The credit a lane owes is held to the floor and granted back in one pair, not written per frame: crossing `CREDIT_FLOOR` costs two `WINDOW_UPDATE` frames no matter how many frames filled it.
+    #[test]
+    fn credit_crossing_the_floor_costs_one_pair_not_one_per_frame() {
+        const FRAME: usize = 16 * 1024;
+        const FRAMES: usize = 5;
+        const TOTAL: usize = FRAME * FRAMES;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+        let pieces = (0..FRAMES)
+            .map(|i| (data_frame(&payload[i * FRAME..(i + 1) * FRAME]), None))
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let edge = downlink_edge(listener, server, pieces, tx);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        let mut back = vec![0u8; TOTAL];
+        let mut at = 0usize;
+        while at < TOTAL {
+            at += lane.read(&mut back[at..]).expect("reads");
+        }
+        assert_eq!(back, payload);
+        assert_eq!(
+            lane.pending_credit,
+            (TOTAL - CREDIT_FLOOR as usize) as u32,
+            "the crossing was granted and the remainder held"
+        );
+        drop(tunnel);
+        let mut tally = Vec::new();
+        while let Ok(update) = rx.recv_timeout(Duration::from_secs(20)) {
+            tally.push(update);
+        }
+        edge.join().expect("the edge finishes");
+        // One pair at the crossing (the template grants stream 1 then stream 0), beside the lane's own opening grant on stream 0.
+        let grants: Vec<_> = tally
+            .iter()
+            .filter(|(_, increment)| *increment == CREDIT_FLOOR)
+            .copied()
+            .collect();
+        assert_eq!(
+            grants,
+            vec![(1, CREDIT_FLOOR), (0, CREDIT_FLOOR)],
+            "five frames cost one pair, not five"
+        );
+        assert_eq!(
+            tally.len(),
+            3,
+            "no other window update left the lane: {tally:?}"
+        );
+    }
+
+    /// Credit held below the floor never reaches the wire: a lane that has taken less than `CREDIT_FLOOR` owes the edge a number, not a write.
+    #[test]
+    fn credit_held_under_the_floor_never_reaches_the_wire() {
+        const FRAME: usize = 16 * 1024;
+        const LAST: usize = 16 * 1024 - 153;
+        const TOTAL: usize = 3 * FRAME + LAST;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let payload: Vec<u8> = (0..TOTAL).map(|i| (i % 251) as u8).collect();
+        let mut pieces = (0..3)
+            .map(|i| (data_frame(&payload[i * FRAME..(i + 1) * FRAME]), None))
+            .collect::<Vec<_>>();
+        pieces.push((data_frame(&payload[3 * FRAME..]), None));
+        let (tx, rx) = std::sync::mpsc::channel();
+        let edge = downlink_edge(listener, server, pieces, tx);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        let mut back = vec![0u8; TOTAL];
+        let mut at = 0usize;
+        while at < TOTAL {
+            at += lane.read(&mut back[at..]).expect("reads");
+        }
+        assert_eq!(back, payload);
+        assert_eq!(
+            lane.pending_credit, TOTAL as u32,
+            "everything taken is still owed, unstated"
+        );
+        drop(tunnel);
+        let tally: Vec<_> = (0..10)
+            .map_while(|_| rx.recv_timeout(Duration::from_millis(500)).ok())
+            .collect();
+        edge.join().expect("the edge finishes");
+        assert!(
+            tally
+                .iter()
+                .all(|(_, increment)| *increment != CREDIT_FLOOR),
+            "a held credit below the floor wrote nothing: {tally:?}"
+        );
     }
 
     #[test]

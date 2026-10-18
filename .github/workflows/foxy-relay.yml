@@ -3,8 +3,11 @@ name: Foxy relay (live download check)
 # Proves the `foxy` lane carries bytes, not just handshakes: on every OS it
 # starts `ferrox-app` with a socks->foxy config on a clean runner, walks every
 # carrier the lane speaks (h1, h2, h3, auto) in the pinned country, downloads a
-# real 1 MB file through each tunnel and asserts the exact byte count, plus
-# the exit country off the Cloudflare trace. Every leg also records its
+# real 1 MB file through each tunnel and asserts the exact byte count, plus the
+# exit country off the Cloudflare trace. Each carrier then rides two further
+# 200 KB flows on the still-open lane: the first flow pays for dial, handshake
+# and slow start, and the warm rows are the number a one-session competitor is
+# read against. Every leg also records its
 # seconds and its rate, and the job summary prints them against the runner's
 # own no-lane egress: a duration gates nothing here — the byte count does — but
 # it is the number a throughput claim has to be read against, and a leg that
@@ -277,6 +280,27 @@ jobs:
             if test "$code" = 0 && test "$got" = 1000000; then
               sha_of "file-$carrier.bin"
               echo "carrier $carrier: 1000000 B, exit $FOXY_COUNTRY"
+              # Warm-lane rows: two more flows ride the lane the first flow
+              # built - no dial, no handshake, no slow-start restart. The
+              # competitors reuse one session across flows, and these rows are
+              # the numbers that comparison is read against. Together they
+              # cross the lane's credit floor, so the batched window grant is
+              # proven against the live edge too, not only on loopback.
+              for flow in 2 3; do
+                code=0
+                timing=$(curl -sS --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
+                  -w '%{size_download} %{time_total} %{speed_download}' \
+                  'https://speed.cloudflare.com/__down?bytes=200000' -o "file-$carrier-w$flow.bin") || code=$?
+                echo "carrier $carrier warm$flow ${timing:-0 0 0}" >> foxy-legs.tsv
+                got=$(wc -c < "file-$carrier-w$flow.bin" 2>/dev/null | tr -d ' ')
+                got="${got:-0}"
+                if test "$code" = 0 && test "$got" = 200000; then
+                  echo "carrier $carrier warm$flow: 200000 B on the open lane"
+                else
+                  echo "carrier $carrier warm$flow FAILED: curl_exit=$code bytes=$got" >&2
+                  FAILED="$FAILED $carrier(warm$flow)"
+                fi
+              done
             else
               echo "carrier $carrier FAILED: curl_exit=$code bytes=$got" >&2
               FAILED="$FAILED $carrier"
