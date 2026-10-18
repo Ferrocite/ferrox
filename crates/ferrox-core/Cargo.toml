@@ -15,6 +15,7 @@ bench-reference = []
 [dependencies]
 aes = "0.8"
 aes-gcm = "0.10"
+blake2 = "0.10"
 blake3 = "1"
 getrandom = "0.2"
 hkdf = "0.12"
