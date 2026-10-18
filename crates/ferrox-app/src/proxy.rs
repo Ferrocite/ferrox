@@ -13234,6 +13234,7 @@ mod tests {
             roots: vec![CARRIER_CERT.to_vec()],
             pins: ferrox_core::foxy::pin::Pins::default(),
             cipher_suites: Vec::new(),
+            insecure: false,
         };
         (server, client)
     }
@@ -19976,6 +19977,90 @@ mod tests {
         assert_eq!(status, 201);
         assert_eq!(content_type_of(&headers), "text/plain");
         assert_eq!(body, b"origin");
+    }
+
+    /// A one-shot `https` masquerade origin: a TLS-terminating loopback listener that answers the first request it accepts with a fixed HTTP/1.1 body, then closes. Returns the port it listens on.
+    fn masq_https_origin() -> u16 {
+        let origin = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = origin.local_addr().expect("addr").port();
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
+        let identity = ferrox_core::tls::parse_pem_identity(
+            minted.cert.pem().as_bytes(),
+            minted.key_pair.serialize_pem().as_bytes(),
+        )
+        .expect("identity");
+        thread::spawn(move || {
+            let Ok((stream, _)) = origin.accept() else {
+                return;
+            };
+            let Ok(mut tls) = ferrox_core::tls::accept(&identity, stream) else {
+                return;
+            };
+            if tls.handshake().is_err() {
+                return;
+            }
+            let mut drain = [0u8; 1024];
+            let _ = tls.read(&mut drain);
+            let _ = tls.write_all(b"HTTP/1.1 201 Created\r\ncontent-type: text/plain\r\ncontent-length: 6\r\n\r\norigin");
+            let _ = tls.flush();
+        });
+        port
+    }
+
+    #[test]
+    fn hysteria_proxies_a_masquerade_request_to_an_https_origin() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_masq_https_insecure_once, 3);
+    }
+
+    fn hysteria_masq_https_insecure_once() {
+        use ferrox_core::hysteria::Masquerade;
+        let origin_port = masq_https_origin();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_masq(
+            "lane-auth",
+            id,
+            "",
+            Masquerade::Proxy {
+                url: format!("https://127.0.0.1:{origin_port}"),
+                rewrite_host: false,
+                x_forwarded: false,
+                insecure: true,
+            },
+        );
+        // The cover dials the https origin through the client TLS the relay already speaks; naming `insecure` accepts the self-signed chain and the body returns byte-identical.
+        let (status, headers, body) = masq_get(port, &roots, "/anything");
+        assert_eq!(status, 201);
+        assert_eq!(content_type_of(&headers), "text/plain");
+        assert_eq!(body, b"origin");
+    }
+
+    #[test]
+    fn hysteria_refuses_a_masquerade_https_origin_whose_chain_is_untrusted() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_masq_https_verified_once, 3);
+    }
+
+    fn hysteria_masq_https_verified_once() {
+        use ferrox_core::hysteria::Masquerade;
+        let origin_port = masq_https_origin();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_masq(
+            "lane-auth",
+            id,
+            "",
+            Masquerade::Proxy {
+                url: format!("https://127.0.0.1:{origin_port}"),
+                rewrite_host: false,
+                x_forwarded: false,
+                insecure: false,
+            },
+        );
+        // A verified dial reaches the same self-signed origin but must not trust it: the chain fails against the platform roots, so `insecure` is honoured as opt-in and the cover answers bad-gateway, relaying no origin bytes.
+        let (status, _, body) = masq_get(port, &roots, "/anything");
+        assert_eq!(status, 502);
+        assert_ne!(body, b"origin".to_vec());
     }
 
     #[test]
