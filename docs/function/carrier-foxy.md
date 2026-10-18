@@ -61,6 +61,7 @@ graph TD
 | payload-staging-copies-per-byte-read | 0 | ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane |
 | read-buffer-bytes-per-staged-remainder | 1 | ferrox-app-foxy::loopback::a_read_leaves_only_what_the_callers_buffer_had_no_room_for |
 | h2-bytes-lost-at-a-read-quantum | 0 | ferrox-app-foxy::loopback::a_frame_that_straddles_a_read_quantum_arrives_whole |
+| h2-upload-bytes-blocked-by-an-unread-grant | 0 | ferrox-app-foxy::loopback::an_upload_is_paced_by_the_grants_the_edge_sends_rather_than_by_the_bytes_it_reads |
 | carriers-dialled | 3 | ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer |
 | udp-carriers-dialled | 2 | ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer |
 | datagram-frames-per-capsule | 1 | ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_over_quic_and_echoes_a_datagram |
@@ -191,6 +192,30 @@ polls that wait for its tail. What was not removed: a frame is still read whole
 before `read` hands anything over, so the granularity the rows above count is
 unchanged, and a closed stream still ends the lane on the error it gave before.
 
+`h2-upload-bytes-blocked-by-an-unread-grant 0` is the credit rule, and the row is
+the shape of the bug: the lane counted what it had *received* as the credit it was
+allowed to *send*, so an upload to an edge that advertises the protocol default
+spent its first 64 KiB, found no more credit, and only moved again when the target
+answered with bytes of its own. On a download-shaped flow that coupling is
+invisible — the inbound DATA refills the outbound window every frame — which is why
+the echo loopback tests stayed green for it; on an upload it is a stall that looks
+like a slow line. What the lane does now is what HTTP/2 says: the send window opens
+at the edge's `SETTINGS_INITIAL_WINDOW_SIZE`, moves only on the edge's
+`WINDOW_UPDATE` frames (stream 1 for the stream, stream 0 for the connection), and
+a frame is at most the tighter of those two. The checker is a consuming edge that
+answers no payload at all and grants back exactly what it takes: 256 KiB leaves,
+and with the grants unread the body stops at the first window.
+
+Three consequences are named rather than hidden. An `h2` datagram whose capsule does
+not fit the credit it has is lost and the lane is kept — the association's own loop
+is the only reader of that lane, so a writer that blocked waiting for a grant would
+be waiting for a frame nobody else is about to read; `address_assign` now bounds its
+own wait by the header budget rather than spinning on it; and a CONNECT-IP tunnel
+that loses a packet loses one packet, which is what UDP is. What did not change is
+the 16 MiB the lane *advertises*: the opening `WINDOW_UPDATE` on stream 0 and the
+`SETTINGS_INITIAL_WINDOW_SIZE` in `client_settings` are both the edge's permission to
+send, so a download is still paced by the edge's grants to us and not by this row.
+
 `datagrams-out-of-one-frame` and `quic-datagrams-out-of-one-frame` count what
 one carrier's stream order costs: a frame boundary is not a capsule boundary, so
 a single DATA frame can hold two capsules, and each has to leave the lane as its
@@ -285,7 +310,10 @@ figure.
 ubuntu job adds a second exit country, the `http` front and the UDP datagram
 path. That job now also sets an `exitProbe` on every pinned-country leg, so the
 pre-flight is what reads the real exit country against the real edge. A duration
-from a machine behind a VPN measures the tunnel, not the lane.
+from a machine behind a VPN measures the tunnel, not the lane. The credit rule above
+is the row a duration would move, because its cost is a rate rather than a byte
+count: an upload that stops at 64 KiB per round trip is the same body of bytes
+arriving later, so only a leg timed against the real edge tells the two apart.
 
 ## What we removed
 
