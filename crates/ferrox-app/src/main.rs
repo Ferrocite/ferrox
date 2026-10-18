@@ -42,8 +42,8 @@ use std::time::Duration;
 
 fn usage() -> ! {
     eprintln!("usage:");
-    eprintln!("  ferrox-app check <vless://...> [--allow-unsafe-fp]   parse + support + header len (no network)");
-    eprintln!("  ferrox-app run <vless://...> [--allow-unsafe-fp]     check + TCP reachability (sends nothing)");
+    eprintln!("  ferrox-app check <vless://...> [--allow-unsafe-fp] [--allow-plaintext-public]   parse + support + header len (no network)");
+    eprintln!("  ferrox-app run <vless://...> [--allow-unsafe-fp] [--allow-plaintext-public]     check + TCP reachability (sends nothing)");
     eprintln!("  ferrox-app version                print the serving binary's version");
     eprintln!("  ferrox-app x25519                 print a fresh X25519 keypair");
     eprintln!("  ferrox-app run -c <config.json>   serve inbounds until killed");
@@ -60,6 +60,7 @@ fn link_and_opt_in<I: Iterator<Item = String>>(args: &mut I) -> (String, UnsafeO
     for arg in args {
         match arg.as_str() {
             "--allow-unsafe-fp" => opt = opt.allow_unsafe_fingerprint(),
+            "--allow-plaintext-public" => opt = opt.allow_plaintext_to_public(),
             _ if link.is_none() => link = Some(arg),
             _ => usage(),
         }
@@ -100,7 +101,7 @@ fn cmd_check(link_str: &str, opt_in: UnsafeOptIn) {
         }
         Support::Planned { reason } => println!("not yet diallable: {reason}"),
         Support::UnsafeRequiresOptIn { reason } => {
-            println!("needs explicit opt-in (policy::UnsafeOptIn, or --allow-unsafe-fp): {reason}");
+            println!("needs explicit opt-in (policy::UnsafeOptIn, or --allow-unsafe-fp / --allow-plaintext-public): {reason}");
         }
     }
 }
@@ -357,5 +358,25 @@ mod tests {
         )
         .expect("parses");
         assert!(link.is_first_method());
+    }
+
+    #[test]
+    fn both_out_of_band_consents_parse_in_either_order() {
+        let mk = |args: [&str; 3]| {
+            let mut it = args.iter().map(|s| (*s).to_owned());
+            crate::link_and_opt_in(&mut it)
+        };
+        // A bare link carries neither consent.
+        let (_, opt) = crate::link_and_opt_in(&mut ["vless://x".to_owned()].into_iter());
+        assert!(!opt.unsafe_fingerprint() && !opt.plaintext_to_public());
+        // Both flags flip their own consent and leave the other off, before or after the link.
+        for (a, b) in [
+            ("--allow-unsafe-fp", "--allow-plaintext-public"),
+            ("--allow-plaintext-public", "--allow-unsafe-fp"),
+        ] {
+            let (link, opt) = mk(["vless://x", a, b]);
+            assert_eq!(link, "vless://x");
+            assert!(opt.unsafe_fingerprint() && opt.plaintext_to_public());
+        }
     }
 }
