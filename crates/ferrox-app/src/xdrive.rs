@@ -69,7 +69,7 @@ pub(crate) struct Params {
     concurrency: usize,
 }
 
-/// `xdriveSettings` as the reference spells its fields: where the objects live, which service holds them, and the budgets, with the snake_case fallback every resolver in this tree accepts.
+/// `xdriveSettings` as the reference spells its fields: where the objects live, which service holds them, and the budgets, with the `snake_case` fallback every resolver in this tree accepts.
 #[derive(Debug, Clone)]
 pub(crate) struct Settings {
     pub remote_folder: String,
@@ -247,7 +247,7 @@ fn transport_tls(stream: &Json, security: &str) -> Option<Arc<TlsConfig>> {
     })
 }
 
-/// The snake_case spelling of a camelCase config name, so either form reaches one field.
+/// The `snake_case` spelling of a `camelCase` config name, so either form reaches one field.
 fn snake_case(name: &str) -> String {
     let mut out = String::with_capacity(name.len() + 4);
     for ch in name.chars() {
@@ -723,10 +723,10 @@ impl Sink {
     }
 
     /// One segment's upload: the store's refusal latches the failure and marks the sequence, and the buffer comes back either way.
-    fn send(&self, name: String, marker: String, buf: Vec<u8>, len: usize) {
-        if let Err(error) = self.storage.put(&name, &buf[..len]) {
+    fn send(&self, name: &str, marker: &str, buf: Vec<u8>, len: usize) {
+        if let Err(error) = self.storage.put(name, &buf[..len]) {
             self.note(format!("the store refused {name}: {error}"));
-            let _ = self.storage.put(&marker, &[]);
+            let _ = self.storage.put(marker, &[]);
         }
         self.reclaim(buf);
     }
@@ -851,7 +851,7 @@ impl Writer {
         let name = object_name(&sink.prefix, seq, SEG_SUFFIX);
         let marker = object_name(&sink.prefix, seq, ERR_SUFFIX);
         let job_sink = Arc::clone(sink);
-        if !uploads.push(Box::new(move || job_sink.send(name, marker, buf, len))) {
+        if !uploads.push(Box::new(move || job_sink.send(&name, &marker, buf, len))) {
             pending
                 .err
                 .get_or_insert("the writer closed with a segment unsent".to_owned());
@@ -1140,9 +1140,7 @@ impl Rd {
                     });
             }
         });
-        let mut answers = answers
-            .into_inner()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut answers = answers.into_inner().unwrap_or_else(PoisonError::into_inner);
         for (slot, place) in got.iter_mut().enumerate() {
             if place.is_some() {
                 continue;
@@ -1392,10 +1390,9 @@ impl Server {
         });
         let accept_loop = Arc::clone(&server);
         let accept_rd = Arc::clone(&rd);
-        let accept_handler = Arc::clone(&accept);
         std::thread::Builder::new()
             .stack_size(WORKER_STACK)
-            .spawn(move || accept_loop.accept(&accept_rd, &accept_handler))
+            .spawn(move || accept_loop.accept(&accept_rd, &accept))
             .map_err(|error| io::Error::other(error.to_string()))?;
         let collect_loop = Arc::clone(&server);
         let collect_rd = Arc::clone(&rd);
@@ -1757,7 +1754,7 @@ impl Drop for Hold<'_> {
 /// The stream one service lane rides: plain to a loopback fake, TLS to a real origin.
 enum Kind {
     Plain(Connection),
-    Secure(RustlsProvider<Connection>),
+    Secure(Box<RustlsProvider<Connection>>),
 }
 
 impl Read for Kind {
@@ -2110,7 +2107,7 @@ fn request_head(
 
 /// The length line the service's own http library would write: a body always declares, and a bodyless `POST`, `PUT` or `PATCH` declares zero while a `GET`, `HEAD` or `DELETE` says nothing at all.
 fn declared_length(method: &str, length: Option<usize>) -> Option<usize> {
-    length.or_else(|| match method {
+    length.or(match method {
         "POST" | "PUT" | "PATCH" => Some(0),
         _ => None,
     })
@@ -2226,7 +2223,7 @@ impl Http {
         }
         let mut cfg = self.tls.as_deref().cloned().unwrap_or_default();
         if cfg.server_name.is_empty() {
-            cfg.server_name = target.host.clone();
+            cfg.server_name.clone_from(&target.host);
         }
         if cfg.roots.is_empty() {
             cfg.roots = crate::quic::system_roots();
@@ -2235,7 +2232,7 @@ impl Http {
             .map_err(|why| carrier_error(format!("tls {}: {why}", target.host)))?;
         tls.handshake()
             .map_err(|why| carrier_error(format!("handshake {}: {why}", target.host)))?;
-        Ok(Lane::new(Kind::Secure(tls)))
+        Ok(Lane::new(Kind::Secure(Box::new(tls))))
     }
 }
 
@@ -2256,14 +2253,16 @@ impl Default for Token {
 
 impl Token {
     fn fresh(&self, now: Instant) -> Option<&str> {
-        (!self.value.is_empty() && now < self.until).then(|| self.value.as_str())
+        (!self.value.is_empty() && now < self.until).then_some(self.value.as_str())
     }
 
     /// The lifetime the service stated, less the minute it may be wrong by, and never less than zero.
     fn set(&mut self, value: String, life: Duration) {
-        let kept = (life > TOKEN_SKEW)
-            .then(|| life - TOKEN_SKEW)
-            .unwrap_or_default();
+        let kept = if life > TOKEN_SKEW {
+            life.saturating_sub(TOKEN_SKEW)
+        } else {
+            Duration::ZERO
+        };
         self.value = value;
         self.until = Instant::now() + kept;
     }
@@ -2275,7 +2274,7 @@ fn roll(top: u64) -> u64 {
         return 0;
     }
     let mut raw = [0u8; 8];
-    getrandom::getrandom(&mut raw).map_or(0, |_| u64::from_le_bytes(raw) % top)
+    getrandom::getrandom(&mut raw).map_or(0, |()| u64::from_le_bytes(raw) % top)
 }
 
 /// Half the wait kept, half of it rolled, so a whole fleet of sessions does not poll one store in lockstep.
@@ -2433,13 +2432,12 @@ impl Vars {
                 continue;
             }
             let name = &after[..cut];
-            match self.0.iter().find(|(key, _)| key == name) {
-                Some((_, value)) => out.push_str(value),
-                None => {
-                    out.push('{');
-                    out.push_str(name);
-                    out.push('}');
-                }
+            if let Some((_, value)) = self.0.iter().find(|(key, _)| key == name) {
+                out.push_str(value);
+            } else {
+                out.push('{');
+                out.push_str(name);
+                out.push('}');
             }
             rest = &after[cut + 1..];
         }
@@ -2965,7 +2963,7 @@ impl Drive {
     fn ask(
         &self,
         method: &str,
-        target: String,
+        target: &str,
         content: &str,
         body: Option<&[u8]>,
     ) -> io::Result<(u16, Vec<u8>)> {
@@ -2974,7 +2972,7 @@ impl Drive {
                 Ok(token) => token,
                 Err(why) => return Control::Again(why.to_string()),
             };
-            let headers = vec![("Authorization", format!("Bearer {token}"))];
+            let headers = [("Authorization", format!("Bearer {token}"))];
             let mut sent: Vec<(&str, &str)> = headers
                 .iter()
                 .map(|(key, value)| (*key, value.as_str()))
@@ -2982,7 +2980,7 @@ impl Drive {
             if !content.is_empty() {
                 sent.push(("Content-Type", content));
             }
-            let answer = self.http.ask(method, &target, &sent, body, None);
+            let answer = self.http.ask(method, target, &sent, body, None);
             let (status, payload) = match answer {
                 Ok(answer) => answer,
                 Err(why) => return Control::Again(format!("Drive request failed: {why}")),
@@ -3040,7 +3038,7 @@ impl Drive {
                 .map(|(key, value)| (*key, value.as_str()))
                 .collect();
             let target = format!("{}?{}", self.files_url, query(&owned));
-            let (status, payload) = self.ask("GET", target, "", None)?;
+            let (status, payload) = self.ask("GET", &target, "", None)?;
             if status != 200 {
                 return Err(carrier_error(format!(
                     "Drive listing answered {status}: {}",
@@ -3069,14 +3067,15 @@ impl Drive {
                     },
                 );
             }
-            page = answer
+            let next = answer
                 .get("nextPageToken")
                 .and_then(Json::as_str)
                 .unwrap_or("")
                 .to_owned();
-            if page.is_empty() {
+            if next.is_empty() {
                 return Ok(found);
             }
+            page = next;
         }
     }
 
@@ -3135,7 +3134,7 @@ impl Drive {
                 body,
             )
         };
-        let (status, payload) = self.ask("POST", target, &content, Some(&body))?;
+        let (status, payload) = self.ask("POST", &target, &content, Some(&body))?;
         if status != 200 {
             return Err(carrier_error(format!(
                 "Drive upload of {name} answered {status}: {}",
@@ -3160,7 +3159,7 @@ impl Drive {
             self.files_url,
             id = path_escape(id)
         );
-        let (status, payload) = self.ask("DELETE", target, "", None)?;
+        let (status, payload) = self.ask("DELETE", &target, "", None)?;
         self.forget(flat);
         if matches!(status, 200 | 204 | 404) {
             return Ok(());
@@ -3178,7 +3177,7 @@ impl Drive {
             self.files_url,
             id = path_escape(id)
         );
-        let (status, payload) = self.ask("GET", target, "", None)?;
+        let (status, payload) = self.ask("GET", &target, "", None)?;
         if status != 200 {
             return Err(carrier_error(format!(
                 "Drive answered {status} for inline data: {}",
@@ -3225,7 +3224,7 @@ impl Storage for Drive {
             self.files_url,
             id = path_escape(&id)
         );
-        let (status, payload) = self.ask("GET", target, "", None)?;
+        let (status, payload) = self.ask("GET", &target, "", None)?;
         match status {
             200 if !payload.is_empty() => Ok(payload),
             200 => self.inline(&id),
@@ -3488,7 +3487,7 @@ mod tests {
         );
 
         for refused in [
-            r#"{}"#,
+            "{}",
             r#"{"xdriveSettings":{}}"#,
             r#"{"xdriveSettings":{"service":"local"}}"#,
             r#"{"xdriveSettings":{"remoteFolder":"/tmp/x"}}"#,
@@ -3515,8 +3514,7 @@ mod tests {
             held.buf.push(b'a');
             assert!(
                 !held.ready(),
-                "a buffer that grew on tick {tick} of {} is left alone",
-                MAX_COALESCED_TICKS
+                "a buffer that grew on tick {tick} of {MAX_COALESCED_TICKS} is left alone"
             );
         }
         assert_eq!(held.held, MAX_COALESCED_TICKS);
@@ -3534,7 +3532,9 @@ mod tests {
             eager: Duration::from_millis(2000),
             ..quick()
         };
-        let stale = Instant::now() - Duration::from_secs(3);
+        let stale = Instant::now()
+            .checked_sub(Duration::from_secs(3))
+            .expect("a clock three seconds back");
         let fresh = Instant::now();
         assert_eq!(
             backoff(true, stale, Duration::from_millis(300), &params),
@@ -3636,12 +3636,11 @@ mod tests {
             store.put("", b"x").is_err(),
             "an object with no last step is refused, not written at the root"
         );
+        let absent = store
+            .get("streams/a/c2s/000000001.seg")
+            .expect_err("absent");
         assert_eq!(
-            store
-                .get("streams/a/c2s/000000001.seg")
-                .err()
-                .expect("absent")
-                .kind(),
+            absent.kind(),
             ErrorKind::NotFound,
             "an absent object answers the one error a polling reader reads as not yet"
         );
@@ -4084,11 +4083,14 @@ mod tests {
         )
     }
 
+    /// One canned answer: the status the test wants and the body that rides with it.
+    type Canned = VecDeque<(u16, Vec<u8>)>;
+
     /// The state one fake origin shares with every lane it serves.
     #[derive(Clone)]
     struct Held {
         requests: Arc<Mutex<Vec<Vec<u8>>>>,
-        answers: Arc<Mutex<VecDeque<(u16, Vec<u8>)>>>,
+        answers: Arc<Mutex<Canned>>,
         objects: Arc<Mutex<HashMap<String, Vec<u8>>>>,
         lanes: Arc<AtomicUsize>,
     }
@@ -4107,7 +4109,7 @@ mod tests {
             let port = origin.local_addr().expect("addr").port();
             let held = Held {
                 requests: Arc::new(Mutex::new(Vec::new())),
-                answers: Arc::new(Mutex::new(VecDeque::new())),
+                answers: Arc::new(Mutex::new(Canned::new())),
                 objects: Arc::new(Mutex::new(HashMap::new())),
                 lanes: Arc::new(AtomicUsize::new(0)),
             };
@@ -4172,16 +4174,6 @@ mod tests {
         fn lanes(&self) -> usize {
             self.held.lanes.load(Ordering::Acquire)
         }
-
-        /// What the folder holds under one name.
-        fn holds(&self, name: &str) -> Option<Vec<u8>> {
-            self.held
-                .objects
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(name)
-                .cloned()
-        }
     }
 
     impl Held {
@@ -4190,7 +4182,7 @@ mod tests {
             let mut got: Vec<u8> = Vec::new();
             let mut buf = vec![0u8; 8192];
             loop {
-                let Some(head) = self.read_head(&mut got, &mut stream, &mut buf)? else {
+                let Some(head) = Self::read_head(&mut got, &mut stream, &mut buf)? else {
                     return Ok(());
                 };
                 let stop = head + declared(&got[..head]);
@@ -4221,7 +4213,6 @@ mod tests {
 
         /// The offset past the next request head, or none once the client has said it is done.
         fn read_head(
-            &self,
             got: &mut Vec<u8>,
             stream: &mut Connection,
             buf: &mut [u8],
@@ -4254,7 +4245,7 @@ mod tests {
             let mut objects = self.objects.lock().unwrap_or_else(PoisonError::into_inner);
             let stored = path.strip_prefix("/o/");
             let listed = path.strip_prefix("/l/");
-            let held = match (method.as_str(), stored, listed) {
+            let listing = match (method.as_str(), stored, listed) {
                 ("PUT", Some(name), _) => {
                     objects.insert(name.to_owned(), body.to_vec());
                     return (200, Vec::new());
@@ -4269,20 +4260,22 @@ mod tests {
                     return (200, Vec::new());
                 }
                 ("GET", None, Some(prefix)) => {
-                    let want = format!("{prefix}/");
-                    let mut under: Vec<&String> = objects
+                    let under = format!("{prefix}/");
+                    let mut names: Vec<&String> = objects
                         .keys()
-                        .filter(|name| name.starts_with(want.as_str()))
+                        .filter(|name| name.starts_with(under.as_str()))
                         .collect();
-                    under.sort();
-                    under
-                        .into_iter()
-                        .map(|name| format!("{name}\n"))
-                        .collect::<String>()
+                    names.sort();
+                    let mut text = String::new();
+                    for name in names {
+                        text.push_str(name);
+                        text.push('\n');
+                    }
+                    text
                 }
                 _ => return (404, Vec::new()),
             };
-            (200, held.into_bytes())
+            (200, listing.into_bytes())
         }
     }
 
@@ -4337,13 +4330,16 @@ mod tests {
             )
             .expect("asks three");
         lane.kind.flush().expect("flushes");
-        let want = FIRST.len() + SECOND.len() + THIRD.len();
-        while lane.buf.len() < want {
+        let total = FIRST.len() + SECOND.len() + THIRD.len();
+        while lane.buf.len() < total {
             let read = crate::proxy::read_into_tail(&mut lane.kind, &mut lane.buf)
                 .expect("the origin answers");
-            if read == 0 {
-                panic!("the origin closed after {} of {want} bytes", lane.buf.len());
-            }
+            assert_ne!(
+                read,
+                0,
+                "the origin closed after {} of {total} bytes",
+                lane.buf.len()
+            );
         }
         let base = lane.buf.as_ptr();
         let room = lane.buf.capacity();
@@ -4362,9 +4358,9 @@ mod tests {
             THIRD,
             "the bytes that rode in past the answer it read were never handed to a second owner"
         );
-        let line = lane.line().expect("the third status");
-        assert_eq!(line, b"HTTP/1.1 200 OK");
-        let offset = line.as_ptr() as usize - base as usize;
+        let status = lane.line().expect("the third status");
+        assert_eq!(status, b"HTTP/1.1 200 OK");
+        let offset = status.as_ptr() as usize - base as usize;
         assert!(
             offset < room,
             "the head is read out of the buffer it arrived in"

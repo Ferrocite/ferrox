@@ -3154,11 +3154,10 @@ fn dial_ss_kcp(
 }
 
 /// The store this outbound's config names, opened as one session: an xdrive lane starts by announcing itself where the listener polls.
-fn xdrive_dial_session(
-    settings: &crate::xdrive::Settings,
-    address: &str,
-    port: u16,
-) -> Option<crate::xdrive::Conn> {
+fn xdrive_dial_session(carrier: &Carrier, address: &str, port: u16) -> Option<crate::xdrive::Conn> {
+    let Carrier::Xdrive { settings } = carrier else {
+        return None;
+    };
     match settings.dial(Some((address, port))) {
         Ok(session) => Some(session),
         Err(error) => {
@@ -3216,12 +3215,10 @@ fn xdrive_close(session: &crate::xdrive::Conn) -> Arc<dyn Fn() + Send + Sync> {
     })
 }
 
-fn dial_vless_xdrive(
-    client: &Connection,
-    mut session: crate::xdrive::Conn,
-    vless: &VlessOut,
-    target: &Destination,
-) {
+fn dial_vless_xdrive(client: &Connection, vless: &VlessOut, target: &Destination) {
+    let Some(mut session) = xdrive_dial_session(&vless.carrier, &vless.address, vless.port) else {
+        return;
+    };
     if session
         .write_all(&vless_header(&vless.id, 1, target))
         .is_err()
@@ -3238,12 +3235,11 @@ fn dial_vless_xdrive(
     xdrive_relay(client, session);
 }
 
-fn dial_trojan_xdrive(
-    client: &Connection,
-    mut session: crate::xdrive::Conn,
-    trojan: &TrojanOut,
-    target: &Destination,
-) {
+fn dial_trojan_xdrive(client: &Connection, trojan: &TrojanOut, target: &Destination) {
+    let Some(mut session) = xdrive_dial_session(&trojan.carrier, &trojan.address, trojan.port)
+    else {
+        return;
+    };
     if session
         .write_all(&trojan_header(&trojan.key, 1, target))
         .is_err()
@@ -3253,12 +3249,10 @@ fn dial_trojan_xdrive(
     xdrive_relay(client, session);
 }
 
-fn dial_vmess_xdrive(
-    client: &Connection,
-    session: crate::xdrive::Conn,
-    vmess: &VmessOut,
-    target: &Destination,
-) {
+fn dial_vmess_xdrive(client: &Connection, vmess: &VmessOut, target: &Destination) {
+    let Some(session) = xdrive_dial_session(&vmess.carrier, &vmess.address, vmess.port) else {
+        return;
+    };
     let Some((request, send, recv, response_key, response_iv, auth)) =
         crate::vmess::client_request(&vmess.id, vmess.cipher, target, 1)
     else {
@@ -3275,12 +3269,10 @@ fn dial_vmess_xdrive(
     crate::vmess::pump_relay_carried(client, reader, session, &close, send, recv, None);
 }
 
-fn dial_ss_xdrive(
-    client: &Connection,
-    session: crate::xdrive::Conn,
-    ss: &ShadowsocksOut,
-    target: &Destination,
-) {
+fn dial_ss_xdrive(client: &Connection, ss: &ShadowsocksOut, target: &Destination) {
+    let Some(session) = xdrive_dial_session(&ss.carrier, &ss.address, ss.port) else {
+        return;
+    };
     let mut writer = session.clone();
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
         let Some((send, recv)) = crate::shadowsocks2022::client_send_handshake(
@@ -3292,14 +3284,7 @@ fn dial_ss_xdrive(
             return;
         };
         let close = xdrive_close(&session);
-        crate::shadowsocks2022::pump_relay_carried(
-            client,
-            session.clone(),
-            writer,
-            &close,
-            send,
-            recv,
-        );
+        crate::shadowsocks2022::pump_relay_carried(client, session, writer, &close, send, recv);
         return;
     }
     let Some((send, recv)) =
@@ -3308,7 +3293,7 @@ fn dial_ss_xdrive(
         return;
     };
     let close = xdrive_close(&session);
-    crate::shadowsocks::pump_relay_carried(client, session.clone(), writer, &close, send, recv);
+    crate::shadowsocks::pump_relay_carried(client, session, writer, &close, send, recv);
 }
 
 /// The listener an xdrive inbound is: the store itself polls for announcements, so there is no socket to bind.
@@ -5779,11 +5764,9 @@ fn serve_connect(
             }
             return;
         }
-        if let Carrier::Xdrive { settings } = &vless.carrier {
+        if let Carrier::Xdrive { .. } = &vless.carrier {
             if !vless.mux {
-                if let Some(session) = xdrive_dial_session(settings, &vless.address, vless.port) {
-                    dial_vless_xdrive(&client, session, vless, asked);
-                }
+                dial_vless_xdrive(&client, vless, asked);
             }
             return;
         }
@@ -5795,10 +5778,8 @@ fn serve_connect(
             }
             return;
         }
-        if let Carrier::Xdrive { settings } = &vmess.carrier {
-            if let Some(session) = xdrive_dial_session(settings, &vmess.address, vmess.port) {
-                dial_vmess_xdrive(&client, session, vmess, asked);
-            }
+        if let Carrier::Xdrive { .. } = &vmess.carrier {
+            dial_vmess_xdrive(&client, vmess, asked);
             return;
         }
     }
@@ -5809,10 +5790,8 @@ fn serve_connect(
             }
             return;
         }
-        if let Carrier::Xdrive { settings } = &trojan.carrier {
-            if let Some(session) = xdrive_dial_session(settings, &trojan.address, trojan.port) {
-                dial_trojan_xdrive(&client, session, trojan, asked);
-            }
+        if let Carrier::Xdrive { .. } = &trojan.carrier {
+            dial_trojan_xdrive(&client, trojan, asked);
             return;
         }
     }
@@ -5823,10 +5802,8 @@ fn serve_connect(
             }
             return;
         }
-        if let Carrier::Xdrive { settings } = &ss.carrier {
-            if let Some(session) = xdrive_dial_session(settings, &ss.address, ss.port) {
-                dial_ss_xdrive(&client, session, ss, asked);
-            }
+        if let Carrier::Xdrive { .. } = &ss.carrier {
+            dial_ss_xdrive(&client, ss, asked);
             return;
         }
     }
