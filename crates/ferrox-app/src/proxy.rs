@@ -6136,10 +6136,10 @@ fn serve_socks_udp_freedom(relay: &UdpSocket) {
     }
 }
 
-/// The client's own socket answers a peek with zero (or an error) once the app is gone; a timeout is the answer that says it is still there.
-fn peer_left(client: &Connection) -> bool {
+/// The association's control socket answers a peek with zero (or an error) once the app is gone; a timeout is the answer that says it is still there.
+fn peer_left(associate: &Connection) -> bool {
     let mut byte = [0u8; 1];
-    match client.peek(&mut byte) {
+    match associate.peek(&mut byte) {
         Err(error) => !is_timeout(&error),
         Ok(read) => read == 0,
     }
