@@ -17645,10 +17645,10 @@ mod tests {
             let carrier = stream_carrier(Some(&settings));
             let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
             let address = listener.local_addr().expect("address");
-            let (mut peer, _) = listener.accept().expect("accepts");
             let mut stream = Connection::connect(address)
                 .expect("connects")
                 .with_mask(carrier.tcp_mask());
+            let (mut peer, _) = listener.accept().expect("accepts");
             let mut hello = vec![22, 3, 1];
             hello.extend_from_slice(&300u16.to_be_bytes());
             hello.extend((0..300).map(|i| i as u8));
@@ -17690,7 +17690,6 @@ mod tests {
         let carrier = stream_carrier(Some(&settings));
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let address = listener.local_addr().expect("address");
-        let (mut peer, _) = listener.accept().expect("accepts");
         let source = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let mut feeder = Connection::connect(source.local_addr().expect("address")).expect("dials");
         let (stream, _) = source.accept().expect("accepts the feeder");
@@ -17698,6 +17697,7 @@ mod tests {
         let mut to = Connection::connect(address)
             .expect("connects")
             .with_mask(carrier.tcp_mask());
+        let (mut peer, _) = listener.accept().expect("accepts");
         let mut hello = vec![22, 3, 1];
         hello.extend_from_slice(&300u16.to_be_bytes());
         hello.extend((0..300).map(|i| i as u8));

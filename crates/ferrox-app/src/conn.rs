@@ -75,6 +75,8 @@ impl Connection {
 
     /// Whether a write to this stream must pass the chain, which a descriptor-level fast path
     /// addressing the socket would skip. Reads, teardown and the census are unaffected by it.
+    /// Only linux has such a lane to gate, so only linux builds the question.
+    #[cfg(target_os = "linux")]
     pub(crate) fn masked(&self) -> bool {
         matches!(self, Connection::Masked(_))
     }
