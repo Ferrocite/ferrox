@@ -6184,8 +6184,13 @@ fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connectio
                         }
                     }
                     if let Some(lane) = streams.get_mut(&dest) {
-                        if lane.write(payload).is_err() {
-                            streams.remove(&dest);
+                        match lane.write(payload) {
+                            // A lane whose credit the edge has not granted yet loses the datagram rather than the lane: reading is what earns the grant back, and this pass reads for every stream below.
+                            Err(error) if is_timeout(&error) => {}
+                            Err(_) => {
+                                streams.remove(&dest);
+                            }
+                            Ok(_) => {}
                         }
                     }
                 }
@@ -6293,14 +6298,16 @@ fn serve_socks_udp_foxy_ip(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connec
                         continue;
                     }
                     if let Some(lane) = tunnel.as_mut() {
-                        if lane
+                        if let Err(error) = lane
                             .write(&source[..width], destination, port, dest.port(), payload)
                             .and_then(|_| lane.flush())
-                            .is_err()
                         {
-                            tunnel = None;
-                            width = 0;
-                            ports.clear();
+                            // No credit is the lane waiting for a grant the next read pass carries, so the packet is lost and the tunnel is not; only a broken lane is dialled again.
+                            if !is_timeout(&error) {
+                                tunnel = None;
+                                width = 0;
+                                ports.clear();
+                            }
                         }
                     }
                 }
