@@ -62,6 +62,7 @@ fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
         }
         "xray.proxy.dokodemo.Config" => ("dokodemo-door", dokodemo_settings(value)?),
         "xray.proxy.vmess.inbound.Config" => ("vmess", vmess_inbound_settings(value)?),
+        "xray.proxy.vless.inbound.Config" => ("vless", vless_inbound_settings(value)?),
         _ => return Err(format!("inbound protocol `{name}` is not carried")),
     };
     Ok(ports
@@ -105,6 +106,10 @@ fn outbound(bytes: &[u8]) -> Result<Json, String> {
         "xray.proxy.vmess.outbound.Config" => Ok(object(vec![
             ("protocol", Json::Str("vmess".to_owned())),
             ("settings", vmess_outbound_settings(value)?),
+        ])),
+        "xray.proxy.vless.outbound.Config" => Ok(object(vec![
+            ("protocol", Json::Str("vless".to_owned())),
+            ("settings", vless_outbound_settings(value)?),
         ])),
         _ => Err(format!("outbound protocol `{name}` is not carried")),
     }
@@ -353,7 +358,7 @@ fn vmess_outbound_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut receiver = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
-            (1, 2) => receiver = Some(server_endpoint(reader.bytes()?)?),
+            (1, 2) => receiver = Some(server_endpoint(reader.bytes()?, vmess_user)?),
             _ => return Err(reader.refuse(field, wire)),
         }
     }
@@ -370,11 +375,15 @@ fn vmess_outbound_settings(bytes: &[u8]) -> Result<Json, String> {
 }
 
 /// `common.protocol.ServerEndpoint`: an address, a port and the user that signs the dial.
-fn server_endpoint(bytes: &[u8]) -> Result<(String, u16, VmessAccount), String> {
+/// Which account proto the user names is the caller's `user` reader's business.
+fn server_endpoint<T>(
+    bytes: &[u8],
+    user: impl Fn(&[u8]) -> Result<T, String>,
+) -> Result<(String, u16, T), String> {
     let mut reader = Reader::new(bytes, "xray.common.protocol.ServerEndpoint");
     let mut address = None;
     let mut port = None;
-    let mut user = None;
+    let mut account = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => address = Some(ip_or_domain(reader.bytes()?)?),
@@ -384,14 +393,14 @@ fn server_endpoint(bytes: &[u8]) -> Result<(String, u16, VmessAccount), String> 
                     format!("xray.common.protocol.ServerEndpoint: port {value} is above 65535")
                 })?);
             }
-            (3, 2) => user = Some(vmess_user(reader.bytes()?)?),
+            (3, 2) => account = Some(user(reader.bytes()?)?),
             _ => return Err(reader.refuse(field, wire)),
         }
     }
     Ok((
         address.ok_or("xray.common.protocol.ServerEndpoint: no address")?,
         port.ok_or("xray.common.protocol.ServerEndpoint: no port")?,
-        user.ok_or("xray.common.protocol.ServerEndpoint: no user")?,
+        account.ok_or("xray.common.protocol.ServerEndpoint: no user")?,
     ))
 }
 
@@ -467,6 +476,124 @@ fn vmess_client(id: String, security: Option<String>) -> Json {
     let mut pairs = vec![("id", Json::Str(id))];
     if let Some(security) = security {
         pairs.push(("security", Json::Str(security)));
+    }
+    object(pairs)
+}
+
+/// A vless account: its uuid, and the two strings that shape the dial when the config names them.
+type VlessAccount = (String, Option<String>, Option<String>);
+
+/// A proto3 string, read as the utf-8 the reference writes it.
+fn account_text(reader: &mut Reader<'_>) -> Result<String, String> {
+    std::str::from_utf8(reader.bytes()?)
+        .map(str::to_owned)
+        .map_err(|_| "not utf-8".to_owned())
+}
+
+/// The uuid a vless session is keyed by, with the flow and encryption the account names.
+/// `padding` and `reverse` change the bytes on the wire or name a tunnel this tree does not carry.
+fn vless_account(bytes: &[u8]) -> Result<VlessAccount, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.vless.Account");
+    let mut id = None;
+    let mut flow = None;
+    let mut encryption = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => id = Some(account_text(&mut reader)?),
+            (2, 2) => flow = Some(account_text(&mut reader)?),
+            (3, 2) => encryption = Some(account_text(&mut reader)?),
+            (6, 2) => return Err(reader.uncarried("the account's padding")),
+            (7, 2) => return Err(reader.uncarried("the account's reverse tunnel")),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok((
+        id.ok_or("xray.proxy.vless.Account: no id".to_owned())?,
+        encryption,
+        flow,
+    ))
+}
+
+/// A `common.protocol.User` whose account is a vless one; level and email feed the policy and
+/// stats nothing here reads.
+fn vless_user(bytes: &[u8]) -> Result<VlessAccount, String> {
+    let mut reader = Reader::new(bytes, "xray.common.protocol.User");
+    let mut account = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => return Err(reader.uncarried("user level")),
+            (2, 2) => return Err(reader.uncarried("user email")),
+            (3, 2) => {
+                let (name, value) = typed_message(reader.bytes()?)?;
+                if name != "xray.proxy.vless.Account" {
+                    return Err(format!("vless account `{name}` is not carried"));
+                }
+                account = Some(vless_account(value)?);
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    account.ok_or("xray.common.protocol.User: no account".to_owned())
+}
+
+/// The clients a vless inbound serves. `decryption` is read and dropped: the uuid is what
+/// authenticates here and nothing in this tree gates on that string. `fallbacks`, `xorMode`,
+/// the `seconds_*` window and a `padding` name bytes this tree does not write.
+fn vless_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.vless.inbound.Config");
+    let mut clients = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => {
+                let (id, _, flow) = vless_user(reader.bytes()?)?;
+                clients.push(vless_client(id, None, flow));
+            }
+            (2, 2) => return Err(reader.uncarried("a fallback destination")),
+            (3, 2) => {
+                account_text(&mut reader)?;
+            }
+            (4, 0) => return Err(reader.uncarried("xorMode")),
+            (5 | 6, 0) => return Err(reader.uncarried("the padding seconds window")),
+            (7, 2) => return Err(reader.uncarried("the inbound's padding")),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    if clients.is_empty() {
+        return Err("xray.proxy.vless.inbound.Config: no user".to_owned());
+    }
+    Ok(object(vec![("clients", Json::Arr(clients))]))
+}
+
+/// A vless outbound dials the one endpoint its config names.
+fn vless_outbound_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.vless.outbound.Config");
+    let mut vnext = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => vnext = Some(server_endpoint(reader.bytes()?, vless_user)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let (address, port, (id, encryption, flow)) =
+        vnext.ok_or("xray.proxy.vless.outbound.Config: no vnext")?;
+    Ok(object(vec![(
+        "vnext",
+        Json::Arr(vec![object(vec![
+            ("address", Json::Str(address)),
+            ("port", Json::Num(f64::from(port))),
+            ("users", Json::Arr(vec![vless_client(id, encryption, flow)])),
+        ])]),
+    )]))
+}
+
+/// The account as this tree's JSON dialect names it; an inbound client carries no encryption.
+fn vless_client(id: String, encryption: Option<String>, flow: Option<String>) -> Json {
+    let mut pairs = vec![("id", Json::Str(id))];
+    if let Some(encryption) = encryption {
+        pairs.push(("encryption", Json::Str(encryption)));
+    }
+    if let Some(flow) = flow {
+        pairs.push(("flow", Json::Str(flow)));
     }
     object(pairs)
 }
@@ -1005,6 +1132,160 @@ mod tests {
         ]);
         let error = to_json(&config(&inbound, &freedom_outbound())).expect_err("refused");
         assert!(error.contains("user level"), "{error}");
+    }
+
+    fn vless_account(id: &[u8], flow: Option<&[u8]>, encryption: Option<&[u8]>) -> Vec<u8> {
+        let mut account = vec![bytes_field(1, id)];
+        if let Some(flow) = flow {
+            account.push(bytes_field(2, flow));
+        }
+        if let Some(encryption) = encryption {
+            account.push(bytes_field(3, encryption));
+        }
+        typed("xray.proxy.vless.Account", &message(&account))
+    }
+
+    fn vless_user(account: &[u8]) -> Vec<u8> {
+        bytes_field(3, account)
+    }
+
+    fn vless_inbound(port: u64, settings: &[u8]) -> Vec<u8> {
+        message(&[
+            bytes_field(
+                2,
+                &typed("xray.app.proxyman.ReceiverConfig", &receiver(port, None)),
+            ),
+            bytes_field(3, &typed("xray.proxy.vless.inbound.Config", settings)),
+        ])
+    }
+
+    /// The shape `TestVlessTCP` names: a vless inbound with its decryption string, a vless
+    /// outbound dialling it.
+    #[test]
+    fn a_vless_scenario_decodes_both_sides() {
+        let settings = message(&[
+            bytes_field(1, &vless_user(&vless_account(b"aaaa-aaaa", None, None))),
+            bytes_field(3, b"always"),
+        ]);
+        let endpoint = message(&[
+            bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
+            varint_field(2, 443),
+            bytes_field(
+                3,
+                &vless_user(&vless_account(
+                    b"aaaa-aaaa",
+                    Some(b"xtls-rprx-vision"),
+                    Some(b"none"),
+                )),
+            ),
+        ]);
+        let outbound = message(&[bytes_field(
+            3,
+            &typed(
+                "xray.proxy.vless.outbound.Config",
+                &bytes_field(1, &endpoint),
+            ),
+        )]);
+        let json =
+            to_json(&config(&vless_inbound(5000, &settings), &outbound)).expect("vless decodes");
+        let inbound = &json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0];
+        assert_eq!(
+            inbound.get("protocol").and_then(Json::as_str),
+            Some("vless")
+        );
+        let client = &inbound
+            .get("settings")
+            .expect("settings")
+            .get("clients")
+            .and_then(Json::as_arr)
+            .expect("clients")[0];
+        assert_eq!(client.get("id").and_then(Json::as_str), Some("aaaa-aaaa"));
+        assert!(
+            inbound
+                .get("settings")
+                .expect("settings")
+                .get("decryption")
+                .is_none(),
+            "the decryption string is read and dropped"
+        );
+        let user = &json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0]
+            .get("settings")
+            .expect("settings")
+            .get("vnext")
+            .and_then(Json::as_arr)
+            .expect("vnext")[0]
+            .get("users")
+            .and_then(Json::as_arr)
+            .expect("users")[0];
+        assert_eq!(user.get("encryption").and_then(Json::as_str), Some("none"));
+        assert_eq!(
+            user.get("flow").and_then(Json::as_str),
+            Some("xtls-rprx-vision")
+        );
+    }
+
+    #[test]
+    fn a_vless_fallback_is_refused() {
+        let settings = message(&[
+            bytes_field(1, &vless_user(&vless_account(b"a", None, None))),
+            bytes_field(2, &message(&[bytes_field(5, b"127.0.0.1:80")])),
+            bytes_field(3, b"always"),
+        ]);
+        let error = to_json(&config(
+            &vless_inbound(5000, &settings),
+            &freedom_outbound(),
+        ))
+        .expect_err("refused");
+        assert!(error.contains("fallback"), "{error}");
+    }
+
+    #[test]
+    fn a_vless_xor_mode_is_refused() {
+        let settings = message(&[
+            bytes_field(1, &vless_user(&vless_account(b"a", None, None))),
+            bytes_field(3, b"always"),
+            varint_field(4, 1),
+        ]);
+        let error = to_json(&config(
+            &vless_inbound(5000, &settings),
+            &freedom_outbound(),
+        ))
+        .expect_err("refused");
+        assert!(error.contains("xorMode"), "{error}");
+    }
+
+    #[test]
+    fn a_vless_account_padding_is_refused() {
+        let account = typed(
+            "xray.proxy.vless.Account",
+            &message(&[
+                bytes_field(1, b"a"),
+                bytes_field(6, b"1234567890abcdef1234567890abcdef"),
+            ]),
+        );
+        let settings = bytes_field(1, &vless_user(&account));
+        let error = to_json(&config(
+            &vless_inbound(5000, &settings),
+            &freedom_outbound(),
+        ))
+        .expect_err("refused");
+        assert!(error.contains("padding"), "{error}");
+    }
+
+    #[test]
+    fn a_vless_inbound_without_a_user_is_refused() {
+        let error = to_json(&config(
+            &vless_inbound(5000, &bytes_field(3, b"always")),
+            &freedom_outbound(),
+        ))
+        .expect_err("refused");
+        assert!(error.contains("no user"), "{error}");
     }
 
     #[test]
