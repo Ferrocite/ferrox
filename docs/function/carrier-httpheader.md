@@ -44,6 +44,9 @@ graph TD
 | framing-bytes-added | 0 | ferrox-app-httpheader::tests::header_carries_an_echo_over_loopback |
 | head-tail-read-syscalls | 0 | ferrox-app-httpheader::tests::the_bytes_behind_the_head_reach_the_relay_without_a_syscall |
 | head-tail-allocations | 0 | ferrox-app-httpheader::tests::the_record_head_hands_over_the_buffer_it_filled |
+| write-calls-per-dial | 1 | ferrox-app-httpheader::tests::the_request_reaches_the_write_as_the_runs_it_is_made_of |
+| request-staging-copies-per-dial | 0 | ferrox-app-httpheader::tests::the_request_reaches_the_write_as_the_runs_it_is_made_of |
+| request-buffer-allocations-per-dial | 0 | ferrox-app-httpheader::tests::the_request_reaches_the_write_as_the_runs_it_is_made_of |
 | user-space-copies-per-byte-relayed | 1 | ferrox-app-proxy::tests::carried_streams_round_trip_behind_the_http_camouflage |
 <!-- counts:end -->
 
@@ -51,10 +54,11 @@ graph TD
 
 ```bash
 ./scripts/count-ops.sh report \
-  httpheader::tests::header_carries_an_echo_over_loopback 'proxy::read_http_head'
+  httpheader::tests::header_carries_an_echo_over_loopback 'proxy::kept_head_rounds'
 ```
 
-`UNBLESSED`, as above.
+`UNBLESSED`, as above. The reader named here is the one this carrier reaches; the
+`read_http_head` the page named before it is the `peek` reader row 12 left behind.
 
 ## Time
 
@@ -64,14 +68,34 @@ read.
 
 ## What we removed
 
-Nothing on the data path. Two things are named because they are easy to get
+The dial's own request. It was formatted into a `String` — one allocation per handshake, and every
+octet of it copied there before the socket read it again — and it is now five runs handed to the
+carrier's coalescing write, so the path and host octets reach the socket where they lie.
+`request-staging-copies-per-dial` and `request-buffer-allocations-per-dial` are both `0`, witnessed
+by `the_request_reaches_the_write_as_the_runs_it_is_made_of`, which asserts the segment pointers
+*are* the caller's `path` and `host` — what a staged buffer cannot imitate — and that the bytes it
+concatenates are the ones the removed formatter wrote. One write call per dial either way, which the
+same gate counts as `write-calls-per-dial 1`: a `writev` of five segments on a socket, one coalesced
+record on a TLS session. The serve side had nothing to lose: its `200` is one
+static octet string already, and it stays one `write`.
+
+The Rust reference still stages it: `render_request` renders into `String::with_capacity(256)` and
+returns `into_bytes()` (`xray-transport/src/headers/http.rs:201-225`), so a dial there pays a
+256-byte heap buffer and a copy of every octet into it; this carrier pays neither.
+
+The price is named: the segment list is the shared `VECTOR_PARTS`-wide stack array every other
+carrier's frame write already fills, and the kernel copies five runs where it copied one. The
+user-space count is what `ops.yml` reads for this row, and a measured rise goes back.
+
+Three things on the read side are named because they are easy to get
 wrong rather than because they were fixed:
 
 - The 8 KiB head limit (`HEAD_LIMIT = 8192`) is a *limit*, not a buffer. A
   carrier that reads its head into a 64 KiB window to be safe pays 64 KiB of
   allocation per handshake to reject the same request one round later.
-  `header_rejects_a_wrong_path` and the shared `read_http_head` limit check are
-  the gate.
+  `proxy::tests::a_kept_head_without_a_delimiter_is_refused` is the gate — it
+  refuses an unterminated head and asserts the reader stopped at the limit — and
+  `header_rejects_a_wrong_path` is the gate beside it for the wrong path.
 - `read_http_head`'s `peek`-then-`read` is two syscalls per round and no
   allocation: the tail is `read_exact`'d straight into the head's own spare
   capacity, so the bytes are never staged in a second buffer and zero-filled
@@ -92,6 +116,7 @@ wrong rather than because they were fixed:
 | what | where |
 | --- | --- |
 | head read, `BufferedReader`, `http.ReadRequest` | `upstream/xray-core/transport/internet/headers/` |
+| `render_request`: the mask as a 256-byte `String`, then `into_bytes()` | `upstream/xray-core-rust/crates/xray-transport/src/headers/http.rs` |
 | head read, pooled buffer | `upstream/sing-box` → `transport/v2rayhttp/` |
 | `scanned` head scan, no over-read | `upstream/zeronet/crates/zero-transport/src/httpupgrade.rs` |
 
