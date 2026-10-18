@@ -127,7 +127,7 @@ while IFS=$'\t' read -r name repo rev enabled suite binary seam path harness; do
     rm -rf "$scratch"
   fi
   if [[ "$enabled" != "true" ]]; then
-    echo "SKIPPED: $name @ ${rev:0:7} — no Ferrox binary wired yet (would need ${binary:-nothing exists for this rung yet}); rung not implemented (see docs/conformance.md)"
+    echo "SKIPPED: $name @ ${rev:0:7} — no Ferrox binary wired yet (would need ${binary:-nothing exists for this rung yet}); rung not implemented (see docs/xray-parity.md)"
     continue
   fi
   if [[ -z "${binary:-}" ]]; then
