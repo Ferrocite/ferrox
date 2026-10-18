@@ -63,6 +63,7 @@ fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
         "xray.proxy.dokodemo.Config" => ("dokodemo-door", dokodemo_settings(value)?),
         "xray.proxy.vmess.inbound.Config" => ("vmess", vmess_inbound_settings(value)?),
         "xray.proxy.vless.inbound.Config" => ("vless", vless_inbound_settings(value)?),
+        "xray.proxy.shadowsocks.ServerConfig" => ("shadowsocks", ss_inbound_settings(value)?),
         _ => return Err(format!("inbound protocol `{name}` is not carried")),
     };
     Ok(ports
@@ -110,6 +111,10 @@ fn outbound(bytes: &[u8]) -> Result<Json, String> {
         "xray.proxy.vless.outbound.Config" => Ok(object(vec![
             ("protocol", Json::Str("vless".to_owned())),
             ("settings", vless_outbound_settings(value)?),
+        ])),
+        "xray.proxy.shadowsocks.ClientConfig" => Ok(object(vec![
+            ("protocol", Json::Str("shadowsocks".to_owned())),
+            ("settings", ss_outbound_settings(value)?),
         ])),
         _ => Err(format!("outbound protocol `{name}` is not carried")),
     }
@@ -596,6 +601,132 @@ fn vless_client(id: String, encryption: Option<String>, flow: Option<String>) ->
         pairs.push(("flow", Json::Str(flow)));
     }
     object(pairs)
+}
+
+/// A shadowsocks account: its password and the AEAD cipher, spelled the way this tree names it.
+type SsAccount = (String, &'static str);
+
+/// The four ciphers the pinned enum names beyond `UNKNOWN`, in the spellings `Method::parse` reads.
+fn ss_cipher(value: u64) -> Result<&'static str, String> {
+    match value {
+        5 => Ok("aes-128-gcm"),
+        6 => Ok("aes-256-gcm"),
+        7 => Ok("chacha20-ietf-poly1305"),
+        8 => Ok("xchacha20-ietf-poly1305"),
+        other => Err(format!(
+            "xray.proxy.shadowsocks.Account: cipher {other} is not carried"
+        )),
+    }
+}
+
+/// The password and cipher a `shadowsocks.Account` names; `iv_check` asks for a check this tree does not run.
+fn ss_account(bytes: &[u8]) -> Result<SsAccount, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.shadowsocks.Account");
+    let mut password = None;
+    let mut cipher = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => password = Some(account_text(&mut reader)?),
+            (2, 0) => cipher = Some(ss_cipher(reader.varint()?)?),
+            (3, 0) => return Err(reader.uncarried("iv_check")),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok((
+        password.ok_or("xray.proxy.shadowsocks.Account: no password".to_owned())?,
+        cipher.ok_or("xray.proxy.shadowsocks.Account: no cipher".to_owned())?,
+    ))
+}
+
+/// A `common.protocol.User` whose account is a shadowsocks one. Every scenario signs its server
+/// user with `level: 1`, which feeds the policy app and the stats nothing here reads, so the level
+/// is dropped; email names nothing here reads either.
+fn ss_user(bytes: &[u8]) -> Result<SsAccount, String> {
+    let mut reader = Reader::new(bytes, "xray.common.protocol.User");
+    let mut account = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => {
+                reader.varint()?;
+            }
+            (2, 2) => return Err(reader.uncarried("user email")),
+            (3, 2) => {
+                let (name, value) = typed_message(reader.bytes()?)?;
+                if name != "xray.proxy.shadowsocks.Account" {
+                    return Err(format!("shadowsocks account `{name}` is not carried"));
+                }
+                account = Some(ss_account(value)?);
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    account.ok_or("xray.common.protocol.User: no account".to_owned())
+}
+
+/// The method and password a shadowsocks inbound serves. Its `network` list is checked, not
+/// carried: this front serves TCP and UDP on every shadowsocks inbound.
+fn ss_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.shadowsocks.ServerConfig");
+    let mut users = Vec::new();
+    let mut networks = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => users.push(ss_user(reader.bytes()?)?),
+            // A repeated enum arrives packed into one field or per field, and the packed payload carries no keys.
+            (2, 2) => {
+                let mut packed =
+                    Reader::new(reader.bytes()?, "xray.proxy.shadowsocks.ServerConfig");
+                while packed.more() {
+                    networks.push(packed.varint()?);
+                }
+            }
+            (2, 0) => networks.push(reader.varint()?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    for value in &networks {
+        if !matches!(value, 2 | 3) {
+            return Err(format!(
+                "xray.proxy.shadowsocks.ServerConfig: network {value} is not served"
+            ));
+        }
+    }
+    let (password, method) = match users.len() {
+        0 => return Err("xray.proxy.shadowsocks.ServerConfig: no user".to_owned()),
+        1 => users.pop().expect("one user"),
+        count => {
+            return Err(format!(
+                "xray.proxy.shadowsocks.ServerConfig: {count} users, one method and password served"
+            ))
+        }
+    };
+    Ok(object(vec![
+        ("method", Json::Str(method.to_owned())),
+        ("password", Json::Str(password)),
+    ]))
+}
+
+/// A shadowsocks outbound dials the one server its config names.
+fn ss_outbound_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.shadowsocks.ClientConfig");
+    let mut server = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => server = Some(server_endpoint(reader.bytes()?, ss_user)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let (address, port, (password, method)) =
+        server.ok_or("xray.proxy.shadowsocks.ClientConfig: no server")?;
+    Ok(object(vec![(
+        "servers",
+        Json::Arr(vec![object(vec![
+            ("address", Json::Str(address)),
+            ("port", Json::Num(f64::from(port))),
+            ("method", Json::Str(method.to_owned())),
+            ("password", Json::Str(password)),
+        ])]),
+    )]))
 }
 
 fn freedom_settings(bytes: &[u8]) -> Result<(), String> {
@@ -1286,6 +1417,150 @@ mod tests {
         ))
         .expect_err("refused");
         assert!(error.contains("no user"), "{error}");
+    }
+
+    fn ss_account(password: &[u8], cipher: u64) -> Vec<u8> {
+        typed(
+            "xray.proxy.shadowsocks.Account",
+            &message(&[bytes_field(1, password), varint_field(2, cipher)]),
+        )
+    }
+
+    fn ss_user(account: &[u8], level: Option<u64>) -> Vec<u8> {
+        let mut user = Vec::new();
+        if let Some(level) = level {
+            user.push(varint_field(1, level));
+        }
+        user.push(bytes_field(3, account));
+        message(&user)
+    }
+
+    fn ss_inbound(port: u64, settings: &[u8]) -> Vec<u8> {
+        message(&[
+            bytes_field(
+                2,
+                &typed("xray.app.proxyman.ReceiverConfig", &receiver(port, None)),
+            ),
+            bytes_field(3, &typed("xray.proxy.shadowsocks.ServerConfig", settings)),
+        ])
+    }
+
+    #[test]
+    fn a_shadowsocks_scenario_decodes_both_sides() {
+        let settings = message(&[
+            bytes_field(
+                1,
+                &ss_user(&ss_account(b"shadowsocks-password", 6), Some(1)),
+            ),
+            bytes_field(2, &[2]),
+        ]);
+        let endpoint = message(&[
+            bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
+            varint_field(2, 443),
+            bytes_field(3, &ss_user(&ss_account(b"shadowsocks-password", 7), None)),
+        ]);
+        let outbound = message(&[bytes_field(
+            3,
+            &typed(
+                "xray.proxy.shadowsocks.ClientConfig",
+                &bytes_field(1, &endpoint),
+            ),
+        )]);
+        let json = to_json(&config(&ss_inbound(5000, &settings), &outbound))
+            .expect("shadowsocks decodes both sides");
+        let server = &json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0];
+        assert_eq!(
+            server.get("protocol").and_then(Json::as_str),
+            Some("shadowsocks")
+        );
+        let settings = server.get("settings").expect("settings");
+        assert_eq!(
+            settings.get("method").and_then(Json::as_str),
+            Some("aes-256-gcm")
+        );
+        assert_eq!(
+            settings.get("password").and_then(Json::as_str),
+            Some("shadowsocks-password")
+        );
+        let client = &json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0]
+            .get("settings")
+            .expect("settings")
+            .get("servers")
+            .and_then(Json::as_arr)
+            .expect("servers")[0];
+        assert_eq!(
+            client.get("address").and_then(Json::as_str),
+            Some("127.0.0.1")
+        );
+        assert_eq!(client.get("port").and_then(Json::as_port), Some(443));
+        assert_eq!(
+            client.get("method").and_then(Json::as_str),
+            Some("chacha20-ietf-poly1305")
+        );
+    }
+
+    #[test]
+    fn a_shadowsocks_iv_check_is_refused() {
+        let account = typed(
+            "xray.proxy.shadowsocks.Account",
+            &message(&[bytes_field(1, b"a"), varint_field(2, 6), varint_field(3, 1)]),
+        );
+        let settings = bytes_field(1, &ss_user(&account, None));
+        let error = to_json(&config(&ss_inbound(5000, &settings), &freedom_outbound()))
+            .expect_err("refused");
+        assert!(error.contains("iv_check"), "{error}");
+    }
+
+    #[test]
+    fn an_unknown_shadowsocks_cipher_is_refused() {
+        let settings = message(&[
+            bytes_field(1, &ss_user(&ss_account(b"a", 0), None)),
+            bytes_field(2, &[2]),
+        ]);
+        let error = to_json(&config(&ss_inbound(5000, &settings), &freedom_outbound()))
+            .expect_err("refused");
+        assert!(error.contains("cipher 0"), "{error}");
+    }
+
+    #[test]
+    fn a_shadowsocks_unix_network_is_refused() {
+        let settings = message(&[
+            bytes_field(1, &ss_user(&ss_account(b"a", 6), None)),
+            bytes_field(2, &[4]),
+        ]);
+        let error = to_json(&config(&ss_inbound(5000, &settings), &freedom_outbound()))
+            .expect_err("refused");
+        assert!(error.contains("network 4"), "{error}");
+    }
+
+    #[test]
+    fn two_shadowsocks_users_are_refused() {
+        let settings = message(&[
+            bytes_field(1, &ss_user(&ss_account(b"a", 6), None)),
+            bytes_field(1, &ss_user(&ss_account(b"b", 6), None)),
+            bytes_field(2, &[2]),
+        ]);
+        let error = to_json(&config(&ss_inbound(5000, &settings), &freedom_outbound()))
+            .expect_err("refused");
+        assert!(error.contains("2 users"), "{error}");
+    }
+
+    #[test]
+    fn a_shadowsocks_user_email_is_refused() {
+        let user = message(&[
+            bytes_field(2, b"who@example"),
+            bytes_field(3, &ss_account(b"a", 6)),
+        ]);
+        let settings = bytes_field(1, &user);
+        let error = to_json(&config(&ss_inbound(5000, &settings), &freedom_outbound()))
+            .expect_err("refused");
+        assert!(error.contains("email"), "{error}");
     }
 
     #[test]
