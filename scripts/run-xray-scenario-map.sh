@@ -68,8 +68,31 @@ run_pattern() {
   printf '^(%s)$' "$(tr ',' '|' <<<"$1")"
 }
 
+# The row's verdict from one family's tally. A go test that runs out of time panics too, so
+# the timeout is read first. A family whose binary panicked for any other reason is not one
+# that ran out of it: go runs a package's tests in one process, so a panic ends the family
+# and every later test of that file reports nothing.
+family_verdict() {
+  local log="$1" pass="$2" fail="$3" absent="$4" total="$5"
+  if ((absent > 0)); then
+    if grep -q 'test timed out after' "$log"; then
+      printf 'TIMEOUT(%s/%s)' "$pass" "$total"
+    elif grep -q 'panic:' "$log"; then
+      printf 'PANIC(%s/%s)' "$pass" "$total"
+    else
+      printf 'STOPPED(%s/%s)' "$pass" "$total"
+    fi
+  elif ((fail == 0 && pass > 0)); then
+    printf 'green'
+  elif ((pass == 0)); then
+    printf 'red'
+  else
+    printf 'mixed'
+  fi
+}
+
 run_selftest() {
-  local tmp failures=0 tallies verdict spec family names got want
+  local tmp failures=0 tallies verdict spec family names got want log
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' RETURN
   mkdir -p "$tmp/scenarios"
@@ -114,6 +137,25 @@ run_selftest() {
     echo "::error::$self self-test: $family built pattern '$got'; it must be '$want'"
     failures=1
   fi
+
+  # The verdict: go runs a package's tests in one process, so a panic ends the family and
+  # the tests after it report nothing. Calling that a timeout would name the wrong culprit,
+  # and a timeout panics too, so the two have to be read apart.
+  printf -- '--- FAIL: TestOne (2.31s)\npanic: dial tcp 127.0.0.1:1: connect: connection refused\n' >"$tmp/panic.log"
+  printf -- 'panic: test timed out after 5m0s\nrunning tests:\n\tTestOne\n' >"$tmp/slow.log"
+  printf -- '=== RUN   TestOne\n--- FAIL: TestOne (2.31s)\n' >"$tmp/calm.log"
+  for shape in "$(family_verdict "$tmp/panic.log" 0 1 7 8)|PANIC(0/8)" \
+               "$(family_verdict "$tmp/slow.log" 0 1 7 8)|TIMEOUT(0/8)" \
+               "$(family_verdict "$tmp/calm.log" 0 1 7 8)|STOPPED(0/8)" \
+               "$(family_verdict "$tmp/calm.log" 0 5 0 5)|red" \
+               "$(family_verdict "$tmp/calm.log" 4 0 0 5)|green" \
+               "$(family_verdict "$tmp/calm.log" 4 1 0 5)|mixed"; do
+    got="${shape%%|*}"; want="${shape##*|}"
+    if [[ "$got" != "$want" ]]; then
+      echo "::error::$self self-test: a family tallied as '$got'; its row must read '$want'"
+      failures=1
+    fi
+  done
   return "$failures"
 }
 
@@ -132,9 +174,9 @@ out_dir="target/xray-scenario-map"
 log_dir="$out_dir/logs"
 summary="$out_dir/xray-scenario-map.md"
 binary_name="ferrox-app"
-# A family that cannot answer inside this is recorded TIMEOUT and the run moves on; the
-# budget is the whole map's ceiling, and what it cannot reach is NOT RUN rather than passed.
-family_timeout="${SCENARIO_FAMILY_TIMEOUT:-120s}"
+# A family that cannot answer inside this is cut short and the run moves on; the budget is
+# the whole map's ceiling, and what it cannot reach is NOT RUN rather than passed.
+family_timeout="${SCENARIO_FAMILY_TIMEOUT:-300s}"
 total_budget="${SCENARIO_MAP_BUDGET:-2100}"
 
 repo="$(awk '/^\[sources\.xray-core\]/{hit=1; next} /^\[/{hit=0} hit && /^repo[[:space:]]*=/ {s=$0; sub(/^[^=]*=[[:space:]]*"/, "", s); sub(/"[[:space:]]*$/, "", s); print s}' "$pins_file")"
@@ -219,7 +261,7 @@ while IFS= read -r spec; do
 done <<<"$families"
 
 rows=()
-pass=0 fail=0 skip=0 absent=0 timeouts=0
+pass=0 fail=0 skip=0 absent=0 cut=0
 started="$SECONDS"
 echo "$self: xray-core @ $rev, $total_tests test(s) across $(count_rows <<<"$families") families, against $binary_name"
 echo "  per-family timeout $family_timeout, whole-map budget ${total_budget}s"
@@ -259,14 +301,9 @@ while IFS= read -r spec; do
     echo "::error::$self: family $family answered no test at all, so it proves nothing"
     exit 1
   fi
-  verdict="mixed"
+  verdict="$(family_verdict "$log" "$f_pass" "$f_fail" "$f_absent" "$f_total")"
   if ((f_absent > 0)); then
-    verdict="TIMEOUT($f_pass/$f_total)"
-    timeouts=$((timeouts + 1))
-  elif ((f_fail == 0 && f_pass > 0)); then
-    verdict="green"
-  elif ((f_pass == 0)); then
-    verdict="red"
+    cut=$((cut + 1))
   fi
   rows+=("| $family | $verdict | $f_total | $f_pass pass, $f_fail fail, $f_skip skip, $f_absent no verdict |")
   echo "  $family: $verdict — $f_pass/$f_total"
@@ -296,9 +333,9 @@ done
   echo
   echo "## totals"
   echo
-  echo "| tests | pass | fail | skip | no verdict | families cut off by a timeout |"
+  echo "| tests | pass | fail | skip | no verdict | families cut short |"
   echo "| --- | --- | --- | --- | --- | --- |"
-  echo "| $total_tests | $pass | $fail | $skip | $absent | $timeouts |"
+  echo "| $total_tests | $pass | $fail | $skip | $absent | $cut |"
   echo
   echo "## families"
   echo
@@ -308,7 +345,7 @@ done
     printf '%s\n' "$row"
   done
   echo
-  echo "A family tallied \`TIMEOUT\` stopped answering inside \`$family_timeout\`: the tests it never reported are counted as no verdict, not as failures."
+  echo "A family whose tally is cut short reads \`TIMEOUT\` when go test ran out of its \`$family_timeout\`, \`PANIC\` when one of its tests crashed the package's process (go runs a file's tests in one process, so the tests after the panic never report), and \`STOPPED\` when the binary ended without answering them. In all three the unanswered tests are counted as no verdict, not as failures."
   echo
   echo "Ferrox answers none of a \`red\` family today; the rows are the work list, and \`docs/xray-parity.md\` states what each family needs from the config surface first."
 } >"$summary"
