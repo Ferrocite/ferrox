@@ -4366,9 +4366,9 @@ mod loopback {
         edge.join().expect("joins");
     }
 
-    /// The pool entry a QUIC lease rode belongs to the leases and not to whichever code remembered to hand it back: it survives until the last one ends and goes with it, taking the connection and its bound socket along.
+    /// A QUIC lane belongs to the pool, not to the lease that opened it: one lease ending leaves the connection the other still rides, the last ending parks the lane with its thread gone, and the next flow rides the same handshake instead of paying for a new one.
     #[test]
-    fn the_pool_holds_the_entry_only_while_a_lease_rides_it() {
+    fn a_lane_outlives_its_leases_and_the_next_flow_rides_it() {
         let (roots, server) = minted(b"h3");
         let sock =
             crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
@@ -4386,6 +4386,7 @@ mod loopback {
         };
         let first = crate::quic::pooled_stream_within(&dial, crate::quic::HANDSHAKE_TIMEOUT)
             .expect("a pooled stream");
+        let lane = std::sync::Arc::clone(&first.conn);
         assert!(crate::quic::pool_holds(&dial), "a live lease holds it");
         let second = crate::quic::pooled_stream_within(&dial, crate::quic::HANDSHAKE_TIMEOUT)
             .expect("a second stream on the same connection");
@@ -4414,10 +4415,87 @@ mod loopback {
                 .expect("the edge read it");
             lane.read().expect("reads").expect("a reply");
         }
+        // The park is the pump's own report and it lands inside one poll of a quiet socket, so waiting for the flag is the witness that an idle edge keeps its connection and drops its thread.
+        for _ in 0..60 {
+            if crate::quic::lane_parked(&dial) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
         assert!(
-            !crate::quic::pool_holds(&dial),
-            "the last lease gave the entry back"
+            crate::quic::pool_holds(&dial),
+            "the lane outlived the last lease that rode it"
         );
+        assert!(crate::quic::lane_parked(&dial), "the pump said it left");
+        let third = crate::quic::pooled_stream_within(&dial, crate::quic::HANDSHAKE_TIMEOUT)
+            .expect("the next flow rides the parked lane");
+        assert!(
+            std::sync::Arc::ptr_eq(&lane, &third.conn),
+            "one handshake serves three flows, not three handshakes"
+        );
+        assert!(
+            !crate::quic::lane_parked(&dial),
+            "the lease put a pump back behind the lane"
+        );
+        drop(third);
+        edge.join().expect("joins");
+    }
+
+    /// A lane lends a bounded number of flows: past its grant the next lease hands it back rather than ride it, so reuse cannot become the pinning the lane was first closed for.
+    #[test]
+    fn a_lane_that_lent_its_whole_grant_of_flows_is_handed_back() {
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let port = sock.local_addr().expect("addr").port();
+        let (seen_tx, _seen_rx) = std::sync::mpsc::channel();
+        let (udp_tx, udp_rx) = std::sync::mpsc::channel();
+        let edge = quic_ip_edge(sock, server, seen_tx, udp_tx, 1);
+        let dial = crate::quic::QuicDial {
+            id: [0u8; 16],
+            host: "localhost".to_owned(),
+            address: "127.0.0.1".to_owned(),
+            port,
+            upstream: None,
+            roots: Some(roots.clone()),
+        };
+        let mut last = None;
+        for flow in 1..=crate::quic::MAX_FLOWS_ON_LANE {
+            let lease = crate::quic::pooled_stream_within(&dial, crate::quic::HANDSHAKE_TIMEOUT)
+                .expect("a lease on the lane");
+            if flow == crate::quic::MAX_FLOWS_ON_LANE {
+                last = Some(lease);
+            } else {
+                drop(lease);
+            }
+        }
+        assert!(
+            crate::quic::pool_holds(&dial),
+            "a spent lane is held until a lease looks at it"
+        );
+        assert!(
+            crate::quic::lane_spent(&dial),
+            "the lane has no flow left to lend"
+        );
+        let foxy = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let (mut tunnel, _) = Ip::open(&foxy, last).expect("the tunnel opens");
+        assert!(
+            tunnel
+                .write(
+                    &[198, 51, 100, 9],
+                    &[203, 0, 113, 9],
+                    40_000,
+                    443,
+                    b"at the cap"
+                )
+                .expect("writes"),
+            "the last flow the lane lends still carries bytes"
+        );
+        tunnel.flush().expect("flushes");
+        udp_rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the edge read it");
+        tunnel.read().expect("reads").expect("a reply");
         edge.join().expect("joins");
     }
 

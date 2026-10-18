@@ -26,10 +26,28 @@ struct QuicServer {
     roots: Option<Vec<Vec<u8>>>,
 }
 
+impl QuicServer {
+    /// What a dial shares with the connections it can ride: everything that changes which edge and which trust the connection belongs to.
+    fn of(dial: &QuicDial) -> Self {
+        Self {
+            address: dial.address.clone(),
+            port: dial.port,
+            host: dial.host.clone(),
+            upstream: dial.upstream.clone(),
+            roots: dial.roots.clone(),
+        }
+    }
+}
+
+/// How many flows one lane lends before it is handed back for a fresh dial: reuse without a bound is the leak the lane was first closed for, and a stream id only comes back if the edge grants it.
+pub(crate) const MAX_FLOWS_ON_LANE: u64 = 64;
+
 struct PooledState {
     sessions: HashMap<u64, Connection>,
     opening: HashSet<u64>,
     next_id: u64,
+    /// When the lane's pump parked with no lease on it, or none while a pump thread owns it: the thread follows the leases, so an idle edge pins no thread and the next flow rides the same handshake.
+    parked: Option<Instant>,
 }
 
 /// The shared connection a flow rides, its socket, its local address, and the bidirectional stream id it opened.
@@ -43,17 +61,10 @@ pub(crate) struct PooledStream {
 }
 
 impl Drop for PooledStream {
-    /// One owner, so a lane that finishes, an open that fails and a caller that returns early all pay the pool back; an id left in `opening` would pin the entry, its connection and its socket for the life of the process.
+    /// One owner, so a lane that finishes, an open that fails and a caller that returns early all pay the pool back; an id left on the table would be a stream the lane lent and never got back.
     fn drop(&mut self) {
         if let Some(entry) = self.entry.take() {
-            leave_session(
-                &entry.conn,
-                &entry.table,
-                &entry.sock,
-                pool(),
-                &entry.key,
-                self.id,
-            );
+            leave_session(&entry.table, self.id);
         }
     }
 }
@@ -71,16 +82,32 @@ struct QuicPool {
 }
 
 impl QuicPool {
-    /// The connection already open to this edge, if there is one.
+    /// The connection already open to this edge, if there is one a flow can still ride.
     fn stream(&self, dial: &QuicDial) -> Option<PooledConn> {
-        let key = QuicServer {
-            address: dial.address.clone(),
-            port: dial.port,
-            host: dial.host.clone(),
-            upstream: dial.upstream.clone(),
-            roots: dial.roots.clone(),
-        };
-        self.inner.lock().ok()?.get(&key).cloned()
+        let key = QuicServer::of(dial);
+        let entry = self.inner.lock().ok()?.get(&key).cloned()?;
+        // Spent or let go by the edge while parked: hand the lane back rather than ride it, and the caller's `or_else` dials the next one.
+        if flow_credit(&entry) && lane_is_live(&entry) {
+            return Some(entry);
+        }
+        self.retire(&key, &entry);
+        None
+    }
+
+    /// Drop this lane and no other: a concurrent dial can have put a fresh connection under the same key while we were reading the old one.
+    fn retire(&self, key: &QuicServer, entry: &PooledConn) {
+        if let Ok(mut pool) = self.inner.lock() {
+            if pool
+                .get(key)
+                .is_some_and(|live| Arc::ptr_eq(&live.conn, &entry.conn))
+            {
+                pool.remove(key);
+            }
+        }
+        if let Ok(mut conn) = entry.conn.lock() {
+            let _ = conn.close(false, 0, b"done");
+            flush_egress(&mut conn, &entry.sock);
+        }
     }
 }
 
@@ -653,7 +680,8 @@ pub(crate) fn system_roots() -> Vec<Vec<u8>> {
     Vec::new()
 }
 
-/// A socket read one packet at a time: Linux coalesces loopback skbs, so GRO is switched off per socket.
+/// A socket read one packet at a time: Linux coalesces loopback skbs, so GRO is switched off per socket,
+/// and every lane asks for a receive buffer before a first datagram can land on it.
 pub(crate) fn bind_datagram(address: &str) -> std::io::Result<UdpSocket> {
     let sock = UdpSocket::bind(address)?;
     #[cfg(target_os = "linux")]
@@ -672,7 +700,99 @@ pub(crate) fn bind_datagram(address: &str) -> std::io::Result<UdpSocket> {
             );
         }
     }
+    set_receive_buffer(&sock, DATAGRAM_RECV_BUF);
     Ok(sock)
+}
+
+/// The receive buffer a lane's socket asks for: the edge is granted a whole stream window of datagrams
+/// at once (`MAX_STREAM_DATA`), so a socket holding a few of them turns every pause in the pump into
+/// loss the lane pays for in retransmit timers rather than in packets.
+const DATAGRAM_RECV_BUF: i32 = 1 << 20;
+
+/// The least the ask has to land as for the lane to be worth reading back: a Linux default already clears it, a macOS and a Windows default do not, which is where the arm is observable.
+#[cfg(test)]
+const DATAGRAM_RECV_BUF_FLOOR: i32 = 1 << 18;
+
+/// Ask the socket for `bytes` of receive buffer; a platform that caps the ask hands back what it granted.
+#[cfg(unix)]
+fn set_receive_buffer(sock: &UdpSocket, bytes: i32) {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: `bytes` outlives the call, and the size is its own.
+    unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            std::ptr::addr_of!(bytes).cast(),
+            libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
+                .unwrap_or(libc::socklen_t::MAX),
+        );
+    }
+}
+
+/// What the socket actually holds, as the kernel reports it.
+#[cfg(all(test, unix))]
+fn receive_buffer(sock: &UdpSocket) -> i32 {
+    use std::os::fd::AsRawFd as _;
+    let mut got: libc::c_int = 0;
+    let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
+        .unwrap_or(libc::socklen_t::MAX);
+    // SAFETY: `got` and `len` are the buffer and the length the kernel writes through.
+    let ok = unsafe {
+        libc::getsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            std::ptr::addr_of_mut!(got).cast(),
+            std::ptr::addr_of_mut!(len),
+        )
+    };
+    if ok == 0 {
+        got
+    } else {
+        0
+    }
+}
+
+/// Ask the socket for `bytes` of receive buffer; a platform that caps the ask hands back what it granted.
+#[cfg(windows)]
+fn set_receive_buffer(sock: &UdpSocket, bytes: i32) {
+    use std::os::windows::io::AsRawSocket as _;
+    use windows_sys::Win32::Networking::WinSock::{setsockopt, SOL_SOCKET, SO_RCVBUF};
+    // SAFETY: `bytes` outlives the call, the handle is the socket's own, and the length is that of the value pointed at.
+    unsafe {
+        setsockopt(
+            sock.as_raw_socket() as usize,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            std::ptr::addr_of!(bytes).cast(),
+            i32::try_from(std::mem::size_of::<i32>()).unwrap_or(i32::MAX),
+        );
+    }
+}
+
+/// What the socket actually holds, as the kernel reports it.
+#[cfg(all(test, windows))]
+fn receive_buffer(sock: &UdpSocket) -> i32 {
+    use std::os::windows::io::AsRawSocket as _;
+    use windows_sys::Win32::Networking::WinSock::{getsockopt, SOL_SOCKET, SO_RCVBUF};
+    let mut got: i32 = 0;
+    let mut len = i32::try_from(std::mem::size_of::<i32>()).unwrap_or(i32::MAX);
+    // SAFETY: `got` and `len` are the buffer and the length the kernel writes through, on the socket's own handle.
+    let ok = unsafe {
+        getsockopt(
+            sock.as_raw_socket() as usize,
+            SOL_SOCKET,
+            SO_RCVBUF,
+            std::ptr::addr_of_mut!(got).cast(),
+            std::ptr::addr_of_mut!(len),
+        )
+    };
+    if ok == 0 {
+        got
+    } else {
+        0
+    }
 }
 
 /// One datagram socket: a relay or an obfuscation below changes no handshake, frame or stream above, so the hops live here.
@@ -1157,6 +1277,37 @@ pub(crate) fn handshake_within(
     Some(conn)
 }
 
+/// The leases a readable stream belongs to: a stream nobody rides is drained here, so its bytes do not sit on a connection waiting for a flow that already ended.
+fn hand_off(
+    conn: &mut quiche::Connection,
+    table: &Arc<Mutex<PooledState>>,
+    chunk: &mut [u8],
+    ready: &mut Vec<(u64, Connection)>,
+) {
+    for id in conn.readable() {
+        let Ok(leases) = table.lock() else {
+            break;
+        };
+        if leases.opening.contains(&id) {
+            continue;
+        }
+        let Some(half) = leases
+            .sessions
+            .get(&id)
+            .and_then(|half| half.try_clone().ok())
+        else {
+            drop(leases);
+            while let Ok((n, _)) = conn.stream_recv(id, chunk) {
+                if n == 0 {
+                    break;
+                }
+            }
+            continue;
+        };
+        ready.push((id, half));
+    }
+}
+
 fn pump(
     shared: &Arc<Mutex<quiche::Connection>>,
     table: &Arc<Mutex<PooledState>>,
@@ -1215,30 +1366,12 @@ fn pump(
                 None => conn.on_timeout(),
             }
             flush_egress(&mut conn, sock);
-            for id in conn.readable() {
-                let half = {
-                    let Ok(table) = table.lock() else {
-                        break;
-                    };
-                    if table.opening.contains(&id) {
-                        continue;
-                    }
-                    table
-                        .sessions
-                        .get(&id)
-                        .and_then(|half| half.try_clone().ok())
-                };
-                if half.is_none() {
-                    while let Ok((n, _)) = conn.stream_recv(id, &mut chunk) {
-                        if n == 0 {
-                            break;
-                        }
-                    }
-                    continue;
-                }
-                ready.push((id, half.expect("cloned")));
-            }
+            hand_off(&mut conn, table, &mut chunk, &mut ready);
             if conn.is_closed() {
+                return;
+            }
+            // A quiet socket and an empty lane ends the thread; the lease that follows it starts the next one on the same connection.
+            if incoming.is_none() && park_if_idle(table) {
                 return;
             }
         }
@@ -1265,68 +1398,74 @@ fn pump(
     }
 }
 
-fn leave_session(
-    shared: &Arc<Mutex<quiche::Connection>>,
-    table: &Arc<Mutex<PooledState>>,
-    flush_sock: &Datagram,
-    pool: &'static QuicPool,
-    key: &QuicServer,
-    id: u64,
-) {
-    let last = match table.lock() {
-        Ok(mut table) => {
-            table.sessions.remove(&id);
-            table.opening.remove(&id);
-            table.sessions.is_empty() && table.opening.is_empty()
-        }
-        Err(_) => false,
-    };
-    if !last {
-        return;
-    }
-    if let Ok(mut conn) = shared.lock() {
-        let _ = conn.close(false, 0, b"done");
-        flush_egress(&mut conn, flush_sock);
-    }
-    if let Ok(mut pool) = pool.inner.lock() {
-        pool.remove(key);
-    }
+/// Whether the lane still has streams to lend: `next_id` moves one bidi id per lease, so it counts every flow the connection has carried.
+fn flow_credit(entry: &PooledConn) -> bool {
+    entry
+        .table
+        .lock()
+        .is_ok_and(|table| table.next_id / 4 < MAX_FLOWS_ON_LANE)
 }
 
-fn open_session(pooled: &PooledConn, key: &QuicServer, client: &Connection) -> Option<u64> {
-    let Ok(conn) = pooled.conn.lock() else {
-        return None;
+/// Whether the edge still holds the lane: quiche's idle timer is an absolute instant, so one timeout call across a park gap is the peer's arithmetic, not a budget of ours.
+fn lane_is_live(entry: &PooledConn) -> bool {
+    let Ok(mut conn) = entry.conn.lock() else {
+        return false;
     };
-    if conn.is_closed() {
-        drop(conn);
-        if let Ok(mut pool) = pool().inner.lock() {
-            pool.remove(key);
-        }
+    conn.on_timeout();
+    !conn.is_closed()
+}
+
+/// Take a stream on the lane, and put a pump behind a parked one in the same table lock: a thread leaving an empty lane and a lease landing on it cannot both win the flag, so no flow waits on a thread that already ended.
+fn lend(pooled: &PooledConn, up: Option<Connection>) -> Option<u64> {
+    let mut table = pooled.table.lock().ok()?;
+    if table.sessions.len() + table.opening.len() >= MAX_STREAMS as usize {
         return None;
     }
-    let Ok(mut table) = pooled.table.lock() else {
-        return None;
-    };
-    if table.sessions.len() >= MAX_STREAMS as usize {
-        return None;
+    if table.parked.take().is_some() {
+        let (Ok(pump_sock), Ok(local)) = (pooled.sock.try_clone(), pooled.sock.local_addr()) else {
+            table.parked = Some(Instant::now());
+            return None;
+        };
+        let (shared, leases) = (Arc::clone(&pooled.conn), Arc::clone(&pooled.table));
+        std::thread::spawn(move || pump(&shared, &leases, &pump_sock, local));
     }
     let id = table.next_id;
     table.next_id += 4;
-    let Ok(up) = client.try_clone() else {
-        return None;
-    };
-    table.sessions.insert(id, up);
+    if let Some(up) = up {
+        table.sessions.insert(id, up);
+    }
     table.opening.insert(id);
     Some(id)
 }
 
-fn uplink_stream(pooled: &PooledConn, key: &QuicServer, id: u64, client: &Connection) {
+/// Whether the pump in hand should end: a lane no lease rides parks with its thread gone, so an idle edge costs no thread and keeps its handshake.
+fn park_if_idle(table: &Arc<Mutex<PooledState>>) -> bool {
+    table.lock().is_ok_and(|mut state| {
+        if !state.sessions.is_empty() || !state.opening.is_empty() {
+            return false;
+        }
+        state.parked = Some(Instant::now());
+        true
+    })
+}
+
+/// Hand the stream id back: the lane stays, and the pump parks itself once nothing else rides it, so the next flow rides the same handshake instead of paying for a new one.
+fn leave_session(table: &Arc<Mutex<PooledState>>, id: u64) {
+    if let Ok(mut table) = table.lock() {
+        table.sessions.remove(&id);
+        table.opening.remove(&id);
+    }
+}
+
+fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection) {
+    #[cfg(test)]
+    let port = pooled.key.port;
     let Ok(flush_sock) = pooled.sock.try_clone() else {
-        leave_session(&pooled.conn, &pooled.table, &pooled.sock, pool(), key, id);
+        leave_session(&pooled.table, id);
         return;
     };
     let Ok(mut plain) = client.try_clone() else {
-        leave_session(&pooled.conn, &pooled.table, &pooled.sock, pool(), key, id);
+        leave_session(&pooled.table, id);
         return;
     };
     let mut chunk = [0u8; 8192];
@@ -1339,7 +1478,7 @@ fn uplink_stream(pooled: &PooledConn, key: &QuicServer, id: u64, client: &Connec
                 #[cfg(test)]
                 qstage(format!(
                     "{} t={} up-read {id} {n} waited {}ms",
-                    key.port,
+                    port,
                     qms(),
                     read_at.elapsed().as_millis()
                 ));
@@ -1350,19 +1489,19 @@ fn uplink_stream(pooled: &PooledConn, key: &QuicServer, id: u64, client: &Connec
                     let waited = Instant::now();
                     let Ok(mut conn) = pooled.conn.lock() else {
                         #[cfg(test)]
-                        qstage(format!("{} t={} up-lock-none {id}", key.port, qms()));
+                        qstage(format!("{} t={} up-lock-none {id}", port, qms()));
                         break false;
                     };
                     #[cfg(test)]
                     qstage(format!(
                         "{} t={} up-lock {id} {}ms",
-                        key.port,
+                        port,
                         qms(),
                         waited.elapsed().as_millis()
                     ));
                     if conn.is_closed() {
                         #[cfg(test)]
-                        qstage(format!("{} t={} up-closed {id}", key.port, qms()));
+                        qstage(format!("{} t={} up-closed {id}", port, qms()));
                         break false;
                     }
                     match conn.stream_send(id, rest, false) {
@@ -1375,7 +1514,7 @@ fn uplink_stream(pooled: &PooledConn, key: &QuicServer, id: u64, client: &Connec
                             if written == 0 {
                                 if Instant::now() >= deadline {
                                     #[cfg(test)]
-                                    qstage(format!("{} t={} up-stall {id}", key.port, qms()));
+                                    qstage(format!("{} t={} up-stall {id}", port, qms()));
                                     break false;
                                 }
                                 drop(conn);
@@ -1385,7 +1524,7 @@ fn uplink_stream(pooled: &PooledConn, key: &QuicServer, id: u64, client: &Connec
                         Err(quiche::Error::Done) => {
                             if Instant::now() >= deadline {
                                 #[cfg(test)]
-                                qstage(format!("{} t={} up-done-timeout {id}", key.port, qms()));
+                                qstage(format!("{} t={} up-done-timeout {id}", port, qms()));
                                 break false;
                             }
                             drop(conn);
@@ -1393,18 +1532,18 @@ fn uplink_stream(pooled: &PooledConn, key: &QuicServer, id: u64, client: &Connec
                         }
                         Err(_) => {
                             #[cfg(test)]
-                            qstage(format!("{} t={} up-err {id}", key.port, qms()));
+                            qstage(format!("{} t={} up-err {id}", port, qms()));
                             break false;
                         }
                     }
                 };
                 if !sent {
                     #[cfg(test)]
-                    qstage(format!("{} t={} up-unsent {id}", key.port, qms()));
+                    qstage(format!("{} t={} up-unsent {id}", port, qms()));
                     break;
                 }
                 #[cfg(test)]
-                qstage(format!("{} t={} up {id} {n}", key.port, qms()));
+                qstage(format!("{} t={} up {id} {n}", port, qms()));
             }
         }
     }
@@ -1412,8 +1551,8 @@ fn uplink_stream(pooled: &PooledConn, key: &QuicServer, id: u64, client: &Connec
         let _ = conn.stream_send(id, &[], true);
     }
     #[cfg(test)]
-    qstage(format!("{} t={} uplink-end {id}", key.port, qms()));
-    leave_session(&pooled.conn, &pooled.table, &flush_sock, pool(), key, id);
+    qstage(format!("{} t={} uplink-end {id}", port, qms()));
+    leave_session(&pooled.table, id);
 }
 
 pub(crate) fn dial_pooled(
@@ -1421,18 +1560,7 @@ pub(crate) fn dial_pooled(
     dial: &QuicDial,
     target: &crate::proxy::Destination,
 ) {
-    let key = QuicServer {
-        address: dial.address.clone(),
-        port: dial.port,
-        host: dial.host.clone(),
-        upstream: dial.upstream.clone(),
-        roots: dial.roots.clone(),
-    };
-    let pooled = if let Ok(pool) = pool().inner.lock() {
-        pool.get(&key).cloned()
-    } else {
-        None
-    };
+    let pooled = pool().stream(dial);
     #[cfg(test)]
     qstage(format!(
         "{} t={} lookup hit={}",
@@ -1447,13 +1575,13 @@ pub(crate) fn dial_pooled(
         let Ok(mut pool) = pool().inner.lock() else {
             return Some(fresh);
         };
-        if let Some(live) = pool.get(&key) {
+        if let Some(live) = pool.get(fresh.key.as_ref()) {
             if let Ok(mut conn) = fresh.conn.lock() {
                 let _ = conn.close(false, 0, b"superseded");
             }
             Some(live.clone())
         } else {
-            pool.insert(key.clone(), fresh.clone());
+            pool.insert(fresh.key.as_ref().clone(), fresh.clone());
             Some(fresh)
         }
     }) else {
@@ -1461,7 +1589,7 @@ pub(crate) fn dial_pooled(
         qstage(format!("{} t={} build-none", dial.port, qms()));
         return;
     };
-    let Some(id) = open_session(&pooled, &key, client) else {
+    let Some(id) = lend(&pooled, client.try_clone().ok()) else {
         #[cfg(test)]
         qstage(format!("{} t={} open-none", dial.port, qms()));
         return;
@@ -1469,18 +1597,18 @@ pub(crate) fn dial_pooled(
     #[cfg(test)]
     qstage(format!("{} t={} opened {id}", dial.port, qms()));
     let Ok(flush_sock) = pooled.sock.try_clone() else {
-        leave_session(&pooled.conn, &pooled.table, &pooled.sock, pool(), &key, id);
+        leave_session(&pooled.table, id);
         return;
     };
     let Ok(local) = pooled.sock.local_addr() else {
-        leave_session(&pooled.conn, &pooled.table, &pooled.sock, pool(), &key, id);
+        leave_session(&pooled.table, id);
         return;
     };
     let header = crate::proxy::vless_header(&dial.id, 1, target);
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let opened = {
         let Ok(mut conn) = pooled.conn.lock() else {
-            leave_session(&pooled.conn, &pooled.table, &pooled.sock, pool(), &key, id);
+            leave_session(&pooled.table, id);
             return;
         };
         stream_send_all(&mut conn, &flush_sock, id, &header, false, deadline)
@@ -1490,7 +1618,7 @@ pub(crate) fn dial_pooled(
     #[cfg(test)]
     qstage(format!("{} t={} header {id} {opened}", dial.port, qms()));
     if !opened {
-        leave_session(&pooled.conn, &pooled.table, &pooled.sock, pool(), &key, id);
+        leave_session(&pooled.table, id);
         return;
     }
     if let Ok(mut table) = pooled.table.lock() {
@@ -1498,7 +1626,7 @@ pub(crate) fn dial_pooled(
     }
     #[cfg(test)]
     qstage(format!("{} t={} graduated {id}", dial.port, qms()));
-    uplink_stream(&pooled, &key, id, client);
+    uplink_stream(&pooled, id, client);
 }
 
 /// A stream on the pooled connection under the named budget; a connection the budget missed is never pooled.
@@ -1516,18 +1644,7 @@ pub(crate) fn pooled_stream_within(dial: &QuicDial, budget: Duration) -> Option<
     })?;
     // The address is read before the id is taken: a lease that cannot say where it is has no id to give back yet.
     let local = pooled.sock.local_addr().ok()?;
-    let id = {
-        let Ok(mut table) = pooled.table.lock() else {
-            return None;
-        };
-        if table.opening.len() >= MAX_STREAMS as usize {
-            return None;
-        }
-        let id = table.next_id;
-        table.next_id += 4;
-        table.opening.insert(id);
-        id
-    };
+    let id = lend(&pooled, None)?;
     Some(PooledStream {
         conn: Arc::clone(&pooled.conn),
         sock: Arc::clone(&pooled.sock),
@@ -1537,10 +1654,33 @@ pub(crate) fn pooled_stream_within(dial: &QuicDial, budget: Duration) -> Option<
     })
 }
 
-/// Whether the pool still holds a connection for this dial: an entry nothing owes no give-back on is pinned, with its connection and its bound socket, for the life of the process.
+/// Whether the pool still holds a connection for this dial: an entry that has lent its whole grant is still held until a lease looks at it.
 #[cfg(test)]
 pub(crate) fn pool_holds(dial: &QuicDial) -> bool {
-    pool().stream(dial).is_some()
+    peek(dial).is_some()
+}
+
+/// Whether a held lane has no pump: the flag is the pump's own way of saying it left, so this is the witness that an idle edge costs no thread.
+#[cfg(test)]
+pub(crate) fn lane_parked(dial: &QuicDial) -> bool {
+    peek(dial).is_some_and(|lane| lane.table.lock().is_ok_and(|table| table.parked.is_some()))
+}
+
+/// Whether a held lane has no stream left to lend: past the grant a lease looks at it, the lane is handed back for a fresh dial.
+#[cfg(test)]
+pub(crate) fn lane_spent(dial: &QuicDial) -> bool {
+    peek(dial).is_some_and(|lane| !flow_credit(&lane))
+}
+
+/// The lane a dial would be handed, read without judging it: a witness that retired what it was looking at would hide the leak it names.
+#[cfg(test)]
+fn peek(dial: &QuicDial) -> Option<PooledConn> {
+    let key = QuicServer::of(dial);
+    pool()
+        .inner
+        .lock()
+        .ok()
+        .and_then(|pool| pool.get(&key).cloned())
 }
 
 fn build_pooled(dial: &QuicDial) -> Option<PooledConn> {
@@ -1581,29 +1721,18 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
         if !send_h3_opening(&mut conn, &sock) {
             continue;
         }
-        let shared = Arc::new(Mutex::new(conn));
         let table = Arc::new(Mutex::new(PooledState {
             sessions: HashMap::new(),
             opening: HashSet::new(),
             next_id: 0,
+            // No thread yet: the first lease on the lane starts the pump, so a connection nobody rode costs none.
+            parked: Some(Instant::now()),
         }));
-        let task_shared = Arc::clone(&shared);
-        let task_table = Arc::clone(&table);
-        let Ok(pump_sock) = sock.try_clone() else {
-            continue;
-        };
-        std::thread::spawn(move || pump(&task_shared, &task_table, &pump_sock, local));
         return Some(PooledConn {
-            conn: shared,
+            conn: Arc::new(Mutex::new(conn)),
             table,
             sock: Arc::new(sock),
-            key: Arc::new(QuicServer {
-                address: dial.address.clone(),
-                port: dial.port,
-                host: dial.host.clone(),
-                roots: dial.roots.clone(),
-                upstream: dial.upstream.clone(),
-            }),
+            key: Arc::new(QuicServer::of(dial)),
         });
     }
     None
@@ -2070,6 +2199,18 @@ mod tests {
         assert_eq!(got, 0, "the kernel knows UDP_GRO");
         assert_eq!(on, 0, "one recv_from carries one packet");
         assert!(udp_to_server("127.0.0.1", 443).is_some(), "still dials");
+    }
+
+    /// The lane asks for a receive buffer before a first datagram can land on it, and the ask is read back rather than assumed: a parked lane holds whatever the edge sent while no pump owned the socket, and a default buffer would drop it.
+    #[test]
+    fn a_quic_socket_arms_its_receive_buffer() {
+        let sock = bind_datagram("127.0.0.1:0").expect("binds");
+        assert!(
+            receive_buffer(&sock) >= DATAGRAM_RECV_BUF_FLOOR,
+            "the lane asked for {} and holds {}",
+            DATAGRAM_RECV_BUF,
+            receive_buffer(&sock)
+        );
     }
 
     #[test]

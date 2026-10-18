@@ -31,3 +31,6 @@ rcgen = "0.13"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.52", features = ["Win32_Networking_WinSock"] }
