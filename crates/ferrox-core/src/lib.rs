@@ -11,6 +11,7 @@ pub mod blake2s;
 pub(crate) mod chacha;
 pub mod core;
 pub mod failure;
+pub mod finalmask;
 pub mod foxy;
 pub mod hysteria;
 pub mod kcp;

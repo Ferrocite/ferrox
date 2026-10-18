@@ -496,7 +496,7 @@ pub(crate) fn vless_security_supported(sec: &str) -> bool {
 
 #[derive(Debug, Clone)]
 pub(crate) enum Carrier {
-    Raw,
+    Raw(ferrox_core::finalmask::Chain),
     Ws {
         path: String,
         ed: u32,
@@ -527,6 +527,18 @@ pub(crate) enum Carrier {
 
 type Resolver = fn(Option<&Json>, &str) -> Carrier;
 
+impl Carrier {
+    /// The post-TLS write chain to put under a connection of this carrier, or `None` when the carrier
+    /// needs none. The chain is the template: every connection clones it, so each counts its own
+    /// writes from one.
+    pub(crate) fn tcp_mask(&self) -> Option<&ferrox_core::finalmask::Chain> {
+        match self {
+            Carrier::Raw(chain) if !chain.is_empty() => Some(chain),
+            _ => None,
+        }
+    }
+}
+
 // One row per network this tree recognises; a new method adds a row, not a match arm.
 const CARRIERS: &[(&[&str], Resolver)] = &[
     (&["ws", "websocket"], resolve_ws),
@@ -547,14 +559,29 @@ pub(crate) fn stream_carrier(settings: Option<&Json>) -> Carrier {
         .and_then(|s| s.get("network"))
         .and_then(Json::as_str)
         .unwrap_or("");
-    for (aliases, resolve) in CARRIERS {
-        if aliases.contains(&network) {
-            return resolve(settings, network);
-        }
-    }
-    Carrier::Unknown {
+    let unknown = || Carrier::Unknown {
         network: network.to_owned(),
+    };
+    let carrier = CARRIERS
+        .iter()
+        .find(|(aliases, _)| aliases.contains(&network))
+        .map_or_else(unknown, |(_, resolve)| resolve(settings, network));
+    // The reference puts the tcp chain on the TCP connection itself, under whichever transport rides
+    // it; this tree arms it where a carrier reaches that connection, so any other carrier refuses the
+    // config rather than dialling or serving it unmasked.
+    if has_tcp_mask(settings) && !matches!(carrier, Carrier::Raw(_)) {
+        return unknown();
     }
+    carrier
+}
+
+/// Whether the transport asks for a post-TLS tcp mask chain at all.
+pub(crate) fn has_tcp_mask(settings: Option<&Json>) -> bool {
+    settings
+        .and_then(|s| s.get("finalmask"))
+        .and_then(|f| f.get("tcp"))
+        .and_then(Json::as_arr)
+        .is_some_and(|tcp| !tcp.is_empty())
 }
 
 fn resolve_ws(settings: Option<&Json>, _: &str) -> Carrier {
@@ -686,11 +713,142 @@ fn resolve_http(_: Option<&Json>, _: &str) -> Carrier {
     Carrier::Http
 }
 
-fn resolve_tcp_or_header(settings: Option<&Json>, _: &str) -> Carrier {
+fn resolve_tcp_or_header(settings: Option<&Json>, network: &str) -> Carrier {
+    let Some(mask) = tcp_mask(settings) else {
+        return Carrier::Unknown {
+            network: network.to_owned(),
+        };
+    };
     match tcp_http_path(settings) {
+        // A header masquerade and a tcp mask together is not a chain this tree ships: the reference
+        // answers that pairing with `header-custom`, which is refused below.
+        Some(_) if !mask.is_empty() => Carrier::Unknown {
+            network: network.to_owned(),
+        },
         Some(path) => Carrier::HttpHeader { path },
-        None => Carrier::Raw,
+        None => Carrier::Raw(mask),
     }
+}
+
+/// The `finalmask.tcp` chain for a tcp carrier, in config order. `Some(empty)` means no finalmask at
+/// all; `None` refuses the carrier — a tcp mask type this tree does not ship, or a fragment the
+/// config cannot drive, must never dial or serve unmasked.
+fn tcp_mask(settings: Option<&Json>) -> Option<ferrox_core::finalmask::Chain> {
+    let Some(tcp) = settings
+        .and_then(|s| s.get("finalmask"))
+        .and_then(|f| f.get("tcp"))
+        .and_then(Json::as_arr)
+    else {
+        return Some(ferrox_core::finalmask::Chain::default());
+    };
+    let mut chain = ferrox_core::finalmask::Chain::default();
+    for entry in tcp {
+        if entry
+            .get("type")
+            .and_then(Json::as_str)
+            .map(str::to_lowercase)
+            != Some("fragment".to_owned())
+        {
+            return None;
+        }
+        chain.push(fragment(entry.get("settings"))?);
+    }
+    Some(chain)
+}
+
+/// One `fragment` stage. `packets` picks the writes it cuts; `lengths` and `delays` fall back to
+/// their singular spelling, and an unset one is the reference's zero range — a last width entry of 0,
+/// which is a stage this tree refuses rather than one that would spin.
+fn fragment(conf: Option<&Json>) -> Option<ferrox_core::finalmask::Fragment> {
+    use ferrox_core::finalmask::Fragment;
+    let packets = conf
+        .and_then(|c| c.get("packets"))
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_lowercase();
+    let (packets_from, packets_to) = match packets.as_str() {
+        "tlshello" => (0, 1),
+        "" => (0, 0),
+        // The reference reads a window as a range and refuses its low end of 0, which would make
+        // every write a hello.
+        other => {
+            let window = range_text(other)?;
+            if window.low == 0 {
+                return None;
+            }
+            (window.low as u64, window.high as u64)
+        }
+    };
+    let widths = range_list(conf, "lengths").or_else(|| Some(vec![single_range(conf, "length")?]))?;
+    let waits = range_list(conf, "delays").or_else(|| Some(vec![single_range(conf, "delay")?]))?;
+    Fragment::new(
+        packets_from,
+        packets_to,
+        widths,
+        waits,
+        single_range(conf, "maxSplit")?,
+    )
+}
+
+/// A `lengths`-style list, or `None` when the key is absent or empty and the singular spelling rules.
+fn range_list(
+    conf: Option<&Json>,
+    key: &str,
+) -> Option<Vec<ferrox_core::finalmask::Range>> {
+    let items = conf?.get(key)?.as_arr()?;
+    if items.is_empty() {
+        return None;
+    }
+    items.iter().map(int32_range).collect()
+}
+
+/// A `length`-style single range, or the reference's zero range when the key is absent.
+fn single_range(conf: Option<&Json>, key: &str) -> Option<ferrox_core::finalmask::Range> {
+    match conf.and_then(|c| c.get(key)) {
+        Some(value) => int32_range(value),
+        None => Some(ferrox_core::finalmask::Range::ordered(0, 0)),
+    }
+}
+
+/// One `Int32Range` as the reference reads it: a plain number, or a string that spells one.
+fn int32_range(value: &Json) -> Option<ferrox_core::finalmask::Range> {
+    use ferrox_core::finalmask::Range;
+    match value {
+        Json::Num(n) if n.fract() == 0.0 => Some(Range::ordered(*n as i64, *n as i64)),
+        Json::Str(text) => range_text(text),
+        _ => None,
+    }
+}
+
+/// `ParseRangeString`: a single number, an empty string as `0`, or `a-b` in either order. A leading
+/// dash belongs to the first end, so `"-114-514"` and `"-1919--810"` split after its second number.
+/// Anything else is a spelling that errors upstream, so it refuses the mask here rather than becoming
+/// a silent `0`.
+fn range_text(text: &str) -> Option<ferrox_core::finalmask::Range> {
+    use ferrox_core::finalmask::Range;
+    if let Ok(single) = text.parse::<i64>() {
+        return Some(Range::ordered(single, single));
+    }
+    if text.is_empty() {
+        return Some(Range::ordered(0, 0));
+    }
+    let (left, right) = match text.strip_prefix('-') {
+        Some(rest) => {
+            let mut parts = rest.splitn(2, '-');
+            (
+                -parts.next()?.parse::<i64>().ok()?,
+                parts.next()?.parse::<i64>().ok()?,
+            )
+        }
+        None => {
+            let mut parts = text.splitn(2, '-');
+            (
+                parts.next()?.parse::<i64>().ok()?,
+                parts.next()?.parse::<i64>().ok()?,
+            )
+        }
+    };
+    Some(Range::ordered(left, right))
 }
 
 fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
@@ -763,7 +921,7 @@ pub(crate) fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, Stri
         Carrier::Hysteria(_) => "hysteriaSettings",
         Carrier::Masque => "masqueSettings",
         Carrier::Xdrive => "xdriveSettings",
-        Carrier::Unknown { .. } | Carrier::Raw | Carrier::Http => "",
+        Carrier::Unknown { .. } | Carrier::Raw(_) | Carrier::Http => "",
     };
     let host = settings
         .and_then(|s| s.get(key))

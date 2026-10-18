@@ -171,6 +171,12 @@ fn serve_root(label: &str, root: &Json) -> ! {
                     let Some(out) = outbound.clone() else {
                         continue;
                     };
+                    // This role carries no tcp carrier, so nothing arms a chain on its accepted stream:
+                    // the inbound is refused rather than served unmasked.
+                    if crate::config::has_tcp_mask(inbound.get("streamSettings")) {
+                        eprintln!("inbound `{protocol}` in {label} asks for a finalmask tcp chain it cannot arm");
+                        continue;
+                    }
                     let role = match protocol {
                         "socks" => Role::Socks { out },
                         "http" => Role::Http { out },
@@ -355,7 +361,7 @@ pub(crate) fn last_dial_failure() -> Option<(SocketAddr, Failure)> {
 // The ladder rung a configured carrier answers, if it is on the ladder.
 fn rung_of(carrier: &Carrier) -> Option<Rung> {
     match carrier {
-        Carrier::Raw => Some(Rung::Raw),
+        Carrier::Raw(_) => Some(Rung::Raw),
         Carrier::Ws { .. } => Some(Rung::Ws),
         Carrier::Xhttp { .. } => Some(Rung::Xhttp),
         Carrier::Grpc { .. } => Some(Rung::Grpc),
@@ -498,6 +504,22 @@ enum Role {
     Mixed {
         out: Outbound,
     },
+}
+
+impl Role {
+    /// The post-TLS write chain an accepted stream of this role carries, from its tcp carrier.
+    fn tcp_mask(&self) -> Option<&ferrox_core::finalmask::Chain> {
+        match self {
+            Role::Vless { carrier, .. }
+            | Role::VlessTls { carrier, .. }
+            | Role::VlessReality { carrier, .. }
+            | Role::Trojan { carrier, .. }
+            | Role::Vmess { carrier, .. }
+            | Role::Shadowsocks { carrier, .. } => carrier.tcp_mask(),
+            // A front with no tcp carrier has nowhere to arm a chain, so its inbound refuses one.
+            Role::Socks { .. } | Role::Http { .. } | Role::Mixed { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -709,7 +731,11 @@ fn accept_loop(address: &str, role: &Role) {
         let Ok(stream) = stream else { continue };
         no_delay(&stream);
         let role = role.clone();
-        thread::spawn(move || match role {
+        thread::spawn(move || {
+            // Armed once per accepted stream, as the reference wraps its listener's conn: every write
+            // this connection makes, handshake or relay, goes through the chain.
+            let stream = stream.with_mask(role.tcp_mask());
+            match role {
             Role::Vless {
                 id,
                 carrier,
@@ -732,7 +758,7 @@ fn accept_loop(address: &str, role: &Role) {
                 carrier,
                 freedom,
             } => match carrier {
-                Carrier::Raw => serve_trojan(stream, &key, freedom),
+                Carrier::Raw(_) => serve_trojan(stream, &key, freedom),
                 Carrier::Ws { path, .. } => {
                     serve_trojan_ws(stream, &key, path.as_str(), freedom);
                 }
@@ -755,7 +781,7 @@ fn accept_loop(address: &str, role: &Role) {
                 carrier,
                 freedom,
             } => match carrier {
-                Carrier::Raw => crate::vmess::serve(stream, &id, freedom),
+                Carrier::Raw(_) => crate::vmess::serve(stream, &id, freedom),
                 Carrier::Ws { path, .. } => {
                     crate::vmess::serve_ws(stream, path.as_str(), &id, freedom);
                 }
@@ -782,6 +808,7 @@ fn accept_loop(address: &str, role: &Role) {
             Role::Socks { out } => serve_socks(stream, &out),
             Role::Http { out } => serve_http(stream, &out),
             Role::Mixed { out } => serve_mixed(stream, &out),
+            }
         });
     }
 }
@@ -795,7 +822,7 @@ fn serve_shadowsocks(
 ) {
     if ferrox_core::shadowsocks2022::Method::parse(method).is_some() {
         match carrier {
-            Carrier::Raw => crate::shadowsocks2022::serve(stream, password, method, freedom),
+            Carrier::Raw(_) => crate::shadowsocks2022::serve(stream, password, method, freedom),
             Carrier::Ws { path, .. } => {
                 crate::shadowsocks2022::serve_ws(stream, password, method, path.as_str(), freedom);
             }
@@ -840,7 +867,7 @@ fn serve_shadowsocks(
         return;
     }
     match carrier {
-        Carrier::Raw => crate::shadowsocks::serve(stream, password, method, freedom),
+        Carrier::Raw(_) => crate::shadowsocks::serve(stream, password, method, freedom),
         Carrier::Ws { path, .. } => {
             crate::shadowsocks::serve_ws(stream, password, method, path.as_str(), freedom);
         }
@@ -868,7 +895,7 @@ fn serve_shadowsocks(
 
 fn serve_vless(stream: Connection, id: &[u8; 16], carrier: &Carrier, freedom: bool) {
     match carrier {
-        Carrier::Raw => serve_vless_raw(stream, id, freedom),
+        Carrier::Raw(_) => serve_vless_raw(stream, id, freedom),
         Carrier::Ws { path, .. } => {
             let Some((mut reader, writer)) = crate::ws::accept(stream, path) else {
                 return;
@@ -1847,7 +1874,7 @@ fn serve_vless_tls(
         return;
     }
     match carrier {
-        Carrier::Raw => {
+        Carrier::Raw(_) => {
             let Ok(raw) = stream.try_clone() else { return };
             let Ok(mut tls) = ferrox_core::tls::accept(server, stream) else {
                 return;
@@ -1936,7 +1963,7 @@ fn serve_vless_reality(
         return;
     }
     match carrier {
-        Carrier::Raw => {
+        Carrier::Raw(_) => {
             let Ok(raw) = stream.try_clone() else { return };
             let edges = reality_edges(server, &stream);
             let accepted =
@@ -2524,7 +2551,7 @@ fn dial_vless(
             break;
         };
         let uplink = match dial(server) {
-            Ok(uplink) => uplink,
+            Ok(uplink) => uplink.with_mask(vless.carrier.tcp_mask()),
             Err(failure) => {
                 let _stop = ladder.record_failure(*rung, &failure);
                 note_dial_failure(server, failure);
@@ -3181,13 +3208,13 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
     let password = inbound_ss_password(inbound);
     let method = inbound_method(inbound);
     let carrier = inbound_carrier(inbound);
-    let udp_raw = matches!(carrier, Carrier::Raw);
+    let udp_raw = matches!(carrier, Carrier::Raw(_));
     let udp_address = address.to_owned();
     let udp_password = password.clone();
     let udp_method = method.clone();
     let is_2022 = ferrox_core::shadowsocks2022::Method::parse(&method).is_some();
     let relay_dests = inbound_ss_destinations(inbound, &method);
-    if !relay_dests.is_empty() && matches!(carrier, Carrier::Raw) {
+    if !relay_dests.is_empty() && matches!(carrier, Carrier::Raw(_)) {
         let parsed = ferrox_core::shadowsocks2022::Method::parse(&method);
         let relay_psk = parsed.and_then(|m| {
             ferrox_core::shadowsocks2022::parse_psk_list(&password, m.key_len())
@@ -3309,7 +3336,7 @@ fn dial_udp_uplink(
     relay: &UdpSocket,
     source: Arc<Mutex<Option<SocketAddr>>>,
 ) -> Option<UdpUplink> {
-    if !matches!(vless.carrier, Carrier::Raw) {
+    if !matches!(vless.carrier, Carrier::Raw(_)) {
         return None;
     }
     if vless.reality.is_some() {
@@ -3317,7 +3344,7 @@ fn dial_udp_uplink(
     }
     let endpoint = format!("{}:{}", vless.address, vless.port);
     let server = endpoint.to_socket_addrs().ok()?.next()?;
-    let mut uplink = dial_or_report(&server)?;
+    let mut uplink = dial_or_report(&server)?.with_mask(vless.carrier.tcp_mask());
     // A datagram's destination reaches this tree already resolved by the UDP front, so the header carries that address.
     uplink
         .write_all(&vless_header(&vless.id, 2, &Destination::from(*dest)))
@@ -3378,12 +3405,12 @@ fn dial_vmess_udp_uplink(
     relay: &UdpSocket,
     source: Arc<Mutex<Option<SocketAddr>>>,
 ) -> Option<VmessUdpUplink> {
-    if !matches!(vmess.carrier, Carrier::Raw) {
+    if !matches!(vmess.carrier, Carrier::Raw(_)) {
         return None;
     }
     let endpoint = format!("{}:{}", vmess.address, vmess.port);
     let server = endpoint.to_socket_addrs().ok()?.next()?;
-    let uplink = dial_or_report(&server)?;
+    let uplink = dial_or_report(&server)?.with_mask(vmess.carrier.tcp_mask());
     let (request, send, recv, response_key, response_iv, auth) =
         crate::vmess::client_request(&vmess.id, vmess.cipher, &Destination::from(*dest), 2)?;
     let mut uplink = uplink;
@@ -3447,12 +3474,12 @@ fn dial_trojan_udp_uplink(
     relay: &UdpSocket,
     source: Arc<Mutex<Option<SocketAddr>>>,
 ) -> Option<TrojanUdpUplink> {
-    if !matches!(trojan.carrier, Carrier::Raw) {
+    if !matches!(trojan.carrier, Carrier::Raw(_)) {
         return None;
     }
     let endpoint = format!("{}:{}", trojan.address, trojan.port);
     let server = endpoint.to_socket_addrs().ok()?.next()?;
-    let mut uplink = dial_or_report(&server)?;
+    let mut uplink = dial_or_report(&server)?.with_mask(trojan.carrier.tcp_mask());
     uplink
         .write_all(&trojan_header(&trojan.key, 3, &Destination::from(*dest)))
         .ok()?;
@@ -3617,7 +3644,7 @@ fn mux_dial_uplink(client: &Connection, uplink: &mut Connection, id: u16) {
 }
 
 fn request_vless_mux(mut uplink: Connection, vless: &VlessOut) -> Option<Connection> {
-    if !matches!(vless.carrier, Carrier::Raw) {
+    if !matches!(vless.carrier, Carrier::Raw(_)) {
         return None;
     }
     uplink.write_all(&vless_mux_header(&vless.id)).ok()?;
@@ -3628,7 +3655,7 @@ fn request_vless_mux(mut uplink: Connection, vless: &VlessOut) -> Option<Connect
 fn open_vless_mux(vless: &VlessOut) -> Option<Connection> {
     let endpoint = format!("{}:{}", vless.address, vless.port);
     let server = endpoint.to_socket_addrs().ok()?.next()?;
-    request_vless_mux(dial_or_report(&server)?, vless)
+    request_vless_mux(dial_or_report(&server)?.with_mask(vless.carrier.tcp_mask()), vless)
 }
 
 fn dial_vless_mux(client: &Connection, uplink: Connection, vless: &VlessOut, target: &Destination) {
@@ -3816,7 +3843,7 @@ fn dial_vmess(
             break;
         };
         let uplink = match dial(server) {
-            Ok(uplink) => uplink,
+            Ok(uplink) => uplink.with_mask(vmess.carrier.tcp_mask()),
             Err(failure) => {
                 let _stop = ladder.record_failure(*rung, &failure);
                 note_dial_failure(server, failure);
@@ -3979,7 +4006,7 @@ fn dial_trojan(
             break;
         };
         let uplink = match dial(server) {
-            Ok(uplink) => uplink,
+            Ok(uplink) => uplink.with_mask(trojan.carrier.tcp_mask()),
             Err(failure) => {
                 let _stop = ladder.record_failure(*rung, &failure);
                 note_dial_failure(server, failure);
@@ -4097,9 +4124,10 @@ fn tls_failure(error: &ferrox_core::tls::TlsError) -> Failure {
 fn dial_tls_session(
     server: &SocketAddr,
     cfg: &ferrox_core::tls::TlsConfig,
+    mask: Option<&ferrox_core::finalmask::Chain>,
 ) -> Option<ferrox_core::tls::RustlsProvider<Connection>> {
     let uplink = match dial(server) {
-        Ok(uplink) => uplink,
+        Ok(uplink) => uplink.with_mask(mask),
         Err(failure) => {
             note_dial_failure(server, failure);
             return None;
@@ -4408,7 +4436,7 @@ fn ride_carrier<S: Dialed>(
             }
             relay_sink(reader, &sink, client, |_| {});
         }
-        Carrier::Raw
+        Carrier::Raw(_)
         | Carrier::Quic
         | Carrier::Kcp(_)
         | Carrier::Hysteria(_)
@@ -4429,7 +4457,7 @@ fn dial_vless_tls(
         return;
     };
     let header = vless_header(&vless.id, 1, target);
-    let Some(mut session) = dial_tls_session(server, cfg) else {
+    let Some(mut session) = dial_tls_session(server, cfg, vless.carrier.tcp_mask()) else {
         return;
     };
     // The session's leg reads the uplink handle it took; un-timed, a parked read outlives the relay that should end it.
@@ -4441,7 +4469,7 @@ fn dial_vless_tls(
         return;
     }
     match &vless.carrier {
-        Carrier::Raw => {
+        Carrier::Raw(_) => {
             if session.write_all(&header).is_err() {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
@@ -4477,7 +4505,7 @@ fn dial_vless_reality(
         return;
     };
     let uplink = match dial(server) {
-        Ok(uplink) => uplink,
+        Ok(uplink) => uplink.with_mask(vless.carrier.tcp_mask()),
         Err(failure) => return note_dial_failure(server, failure),
     };
     let Ok(raw) = uplink.try_clone() else {
@@ -4519,7 +4547,7 @@ fn dial_vless_reality(
         vless_header(&vless.id, 1, target)
     };
     match &vless.carrier {
-        Carrier::Raw => {
+        Carrier::Raw(_) => {
             if session.write_all(&header).is_err() {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
@@ -4578,7 +4606,7 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
     let Some(cfg) = trojan.tls.as_deref() else {
         return;
     };
-    let Some(mut session) = dial_tls_session(server, cfg) else {
+    let Some(mut session) = dial_tls_session(server, cfg, trojan.carrier.tcp_mask()) else {
         return;
     };
     // The session's leg reads the uplink handle it took; un-timed, a parked read outlives the relay that should end it.
@@ -4590,7 +4618,7 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
         return;
     }
     match &trojan.carrier {
-        Carrier::Raw => {
+        Carrier::Raw(_) => {
             let Ok(downstream) = client.try_clone() else {
                 return;
             };
@@ -4789,7 +4817,7 @@ fn vmess_tls_carried(
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
             crate::vmess::pump_relay_carried(client, reader, sink, &close, send, recv, None);
         }
-        Carrier::Raw
+        Carrier::Raw(_)
         | Carrier::Quic
         | Carrier::Kcp(_)
         | Carrier::Hysteria(_)
@@ -4809,11 +4837,11 @@ fn dial_vmess_tls(
     let Some(cfg) = vmess.tls.as_deref() else {
         return;
     };
-    let Some(session) = dial_tls_session(server, cfg) else {
+    let Some(session) = dial_tls_session(server, cfg, vmess.carrier.tcp_mask()) else {
         return;
     };
     match &vmess.carrier {
-        Carrier::Raw => vmess_tls_raw(client, server, session, vmess, target),
+        Carrier::Raw(_) => vmess_tls_raw(client, server, session, vmess, target),
         _ => vmess_tls_carried(client, server, session, vmess, target),
     }
 }
@@ -4856,7 +4884,7 @@ fn dial_shadowsocks(
             break;
         };
         let uplink = match dial(server) {
-            Ok(uplink) => uplink,
+            Ok(uplink) => uplink.with_mask(ss.carrier.tcp_mask()),
             Err(failure) => {
                 let _stop = ladder.record_failure(*rung, &failure);
                 note_dial_failure(server, failure);
@@ -6053,18 +6081,18 @@ fn serve_socks_udp(mut client: Connection, out: &Outbound) {
     };
     // The handler holds the control socket open for its life, and the Foxy arms watch it for the client's goodbye.
     match out {
-        Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Raw) && vless.tls.is_none() => {
+        Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Raw(_)) && vless.tls.is_none() => {
             serve_socks_udp_vless(&relay, vless);
         }
         Outbound::Trojan(trojan)
-            if matches!(trojan.carrier, Carrier::Raw) && trojan.tls.is_none() =>
+            if matches!(trojan.carrier, Carrier::Raw(_)) && trojan.tls.is_none() =>
         {
             serve_socks_udp_trojan(&relay, trojan);
         }
-        Outbound::Vmess(vmess) if matches!(vmess.carrier, Carrier::Raw) && vmess.tls.is_none() => {
+        Outbound::Vmess(vmess) if matches!(vmess.carrier, Carrier::Raw(_)) && vmess.tls.is_none() => {
             serve_socks_udp_vmess(&relay, vmess);
         }
-        Outbound::Shadowsocks(ss) if matches!(ss.carrier, Carrier::Raw) => {
+        Outbound::Shadowsocks(ss) if matches!(ss.carrier, Carrier::Raw(_)) => {
             serve_socks_udp_shadowsocks(&relay, ss);
         }
         Outbound::Foxy(foxy) => match foxy.carrier {
@@ -7279,7 +7307,9 @@ fn relay(client: &Connection, target: &Connection) {
         return;
     };
     #[cfg(target_os = "linux")]
-    if poll_relay::available() {
+    // Splice moves bytes between descriptors without crossing the write mask, so a leg that ends on
+    // a masked stream keeps the buffered copy path.
+    if !target_write.masked() && !client_write.masked() && poll_relay::available() {
         poll_relay::drive(client_read, target_write, target_read, client_write);
         return;
     }
@@ -7398,7 +7428,7 @@ fn dial_http_outbound(
     }
 
     if let Some(cfg) = http.tls.as_deref() {
-        let Some(session) = dial_tls_session(server, cfg) else {
+        let Some(session) = dial_tls_session(server, cfg, None) else {
             return;
         };
         // The session's leg reads the uplink handle it took; un-timed, a parked read outlives the relay that should end it.
@@ -7831,6 +7861,10 @@ fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
 
 #[cfg(target_os = "linux")]
 fn copy_all(from: &mut Connection, to: &mut Connection) {
+    // A masked destination cannot be fed by splice: the pipe would write the socket directly.
+    if to.masked() {
+        return copy_all_memcpy(from, to);
+    }
     let Some(pipe) = SplicePipe::new() else {
         return copy_all_memcpy(from, to);
     };
@@ -9322,7 +9356,7 @@ fn find_loopback_outbound(root: &Json) -> Option<String> {
 fn loopback_carrier(carrier: &Carrier) -> bool {
     matches!(
         carrier,
-        Carrier::Raw
+        Carrier::Raw(_)
             | Carrier::Ws { .. }
             | Carrier::HttpUpgrade { .. }
             | Carrier::Grpc { .. }
@@ -10077,7 +10111,7 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
             let (carrier, host) = outbound_carrier(outbound, &address);
             if !matches!(
                 carrier,
-                Carrier::Raw
+                Carrier::Raw(_)
                     | Carrier::Ws { .. }
                     | Carrier::HttpUpgrade { .. }
                     | Carrier::Grpc { .. }
@@ -10189,7 +10223,7 @@ fn tls_parts(
     }
     let (carrier, host) = outbound_carrier(outbound, address);
     match carrier {
-        Carrier::Raw
+        Carrier::Raw(_)
         | Carrier::Ws { .. }
         | Carrier::HttpUpgrade { .. }
         | Carrier::Grpc { .. }
@@ -10607,7 +10641,7 @@ mod tests {
         let server: SocketAddr = listener.local_addr().expect("addr");
         let lane = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_vless_tls(stream, &[0x9Du8; 16], true, &Carrier::Raw, &server_config);
+            serve_vless_tls(stream, &[0x9Du8; 16], true, &Carrier::Raw(Default::default()), &server_config);
         });
 
         // The hello arrives twelve grains later than the lane's first read; only its deadline may refuse it.
@@ -12113,7 +12147,7 @@ mod tests {
     }
 
     fn reality_pair(flow: &str) -> RealityPair {
-        reality_pair_with(flow, "tcp", Carrier::Raw)
+        reality_pair_with(flow, "tcp", Carrier::Raw(Default::default()))
     }
 
     fn reality_pair_with(flow: &str, network: &str, carrier: Carrier) -> RealityPair {
@@ -12459,7 +12493,7 @@ mod tests {
             crate::json::parse(r#"{"streamSettings": {"network": "tcp"}}"#).expect("parses");
         assert!(matches!(
             stream_carrier(plain.get("streamSettings")),
-            Carrier::Raw
+            Carrier::Raw(_)
         ));
     }
 
@@ -13212,7 +13246,7 @@ mod tests {
             let _ = hold.recv_timeout(Duration::from_secs(10));
         });
 
-        let session = dial_tls_session(&server, &client_config).expect("dialled");
+        let session = dial_tls_session(&server, &client_config, None).expect("dialled");
         let (reader, writer, raw) = tls_halves(session).expect("halves");
         let reading = thread::spawn(move || {
             let mut peer = reader;
@@ -13769,7 +13803,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port,
             id,
-            carrier: Carrier::Raw,
+            carrier: Carrier::Raw(Default::default()),
             host: String::new(),
             mux: false,
             quic_roots: None,
@@ -13837,7 +13871,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port,
             id,
-            carrier: Carrier::Raw,
+            carrier: Carrier::Raw(Default::default()),
             host: String::new(),
             mux: false,
             quic_roots: None,
@@ -14089,7 +14123,7 @@ mod tests {
 
     fn carrier_tag(carrier: &Carrier) -> &'static str {
         match carrier {
-            Carrier::Raw => "raw",
+            Carrier::Raw(_) => "raw",
             Carrier::Ws { .. } => "ws",
             Carrier::HttpUpgrade { .. } => "httpupgrade",
             Carrier::Grpc { .. } => "grpc",
@@ -14243,7 +14277,7 @@ mod tests {
                 address: "127.0.0.1".to_owned(),
                 port,
                 id,
-                carrier: Carrier::Raw,
+                carrier: Carrier::Raw(Default::default()),
                 host: String::new(),
                 mux: false,
                 quic_roots: None,
@@ -14306,7 +14340,7 @@ mod tests {
                 address: "127.0.0.1".to_owned(),
                 port,
                 key,
-                carrier: Carrier::Raw,
+                carrier: Carrier::Raw(Default::default()),
                 host: String::new(),
                 tls: Some(Arc::new(client_config)),
             };
@@ -14379,7 +14413,7 @@ mod tests {
                 port,
                 id,
                 cipher: crate::vmess::Cipher::Auto,
-                carrier: Carrier::Raw,
+                carrier: Carrier::Raw(Default::default()),
                 host: String::new(),
                 tls: Some(Arc::new(client_config)),
             };
@@ -14686,7 +14720,7 @@ mod tests {
             );
         });
         let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-        let session = dial_tls_session(&server, &client_config).expect("dialled");
+        let session = dial_tls_session(&server, &client_config, None).expect("dialled");
         let header = vless_header(&id, 1, &Destination::from(echo_addr));
         let (mut reader, writer) = tls_ws(&server, session, "127.0.0.1", "/w", 0, &header)
             .expect("handshakes ws inside tls");
@@ -15014,7 +15048,7 @@ mod tests {
         )
         .expect("parses");
         let out = find_vmess_outbound(&plain).expect("finds");
-        assert!(matches!(out.carrier, Carrier::Raw));
+        assert!(matches!(out.carrier, Carrier::Raw(_)));
         assert_eq!(out.host, "192.0.2.1");
     }
 
@@ -15100,7 +15134,7 @@ mod tests {
         )
         .expect("parses");
         let out = find_trojan_outbound(&plain).expect("finds");
-        assert!(matches!(out.carrier, Carrier::Raw));
+        assert!(matches!(out.carrier, Carrier::Raw(_)));
         assert_eq!(out.host, "192.0.2.1");
     }
 
@@ -15595,7 +15629,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port: tunnel_port,
             id,
-            carrier: Carrier::Raw,
+            carrier: Carrier::Raw(Default::default()),
             host: "127.0.0.1".to_owned(),
             mux: false,
             quic_roots: None,
@@ -15844,7 +15878,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port: tunnel_port,
             key: trojan_key("secret"),
-            carrier: Carrier::Raw,
+            carrier: Carrier::Raw(Default::default()),
             host: "127.0.0.1".to_owned(),
             tls: None,
         });
@@ -15984,7 +16018,7 @@ mod tests {
             port: tunnel_port,
             id,
             cipher: crate::vmess::Cipher::Chacha,
-            carrier: Carrier::Raw,
+            carrier: Carrier::Raw(Default::default()),
             host: "127.0.0.1".to_owned(),
             tls: None,
         });
@@ -16126,7 +16160,7 @@ mod tests {
             port: tunnel_port,
             method: "aes-256-gcm".to_owned(),
             password: "an-example-shared-password".to_owned(),
-            carrier: Carrier::Raw,
+            carrier: Carrier::Raw(Default::default()),
             host: "127.0.0.1".to_owned(),
         });
         thread::spawn(move || {
@@ -16405,7 +16439,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port: tunnel_port,
             id,
-            carrier: Carrier::Raw,
+            carrier: Carrier::Raw(Default::default()),
             host: "127.0.0.1".to_owned(),
             mux: true,
             quic_roots: None,
@@ -17004,7 +17038,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port: tunnel_port,
             id,
-            carrier: Carrier::Raw,
+            carrier: Carrier::Raw(Default::default()),
             host: "127.0.0.1".to_owned(),
             mux: true,
             quic_roots: None,
@@ -17585,7 +17619,153 @@ mod tests {
             crate::json::parse(r#"{"network":"quic","tcpSettings":{"header":{"type":"http"}}}"#)
                 .expect("parses");
         assert!(matches!(stream_carrier(Some(&masked)), Carrier::Quic));
-        assert!(matches!(stream_carrier(None), Carrier::Raw));
+        assert!(matches!(stream_carrier(None), Carrier::Raw(_)));
+    }
+
+    /// The `streamSettings` the two pinned interop rows write, in both number and string spellings.
+    const FRAGMENT: &str = r#"{"network":"tcp","finalmask":{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":[11,37],"delays":[0],"maxSplit":24}}]}}"#;
+    const FRAGMENT_STRINGS: &str = r#"{"network":"tcp","finalmask":{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":["11","37"],"delays":["0"],"maxSplit":"24"}}]}}"#;
+
+    /// A chain read from the config all the way to the wire: the record headers a real socket write
+    /// leaves behind, for either spelling of the same ranges.
+    #[test]
+    fn a_configured_fragment_chain_cuts_the_hello_on_the_wire() {
+        for doc in [FRAGMENT, FRAGMENT_STRINGS] {
+            let settings = crate::json::parse(doc).expect("parses");
+            let carrier = stream_carrier(Some(&settings));
+            let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let address = listener.local_addr().expect("address");
+            let (mut peer, _) = listener.accept().expect("accepts");
+            let mut stream = Connection::connect(address)
+                .expect("connects")
+                .with_mask(carrier.tcp_mask());
+            let mut hello = vec![22, 3, 1];
+            hello.extend_from_slice(&300u16.to_be_bytes());
+            hello.extend((0..300).map(|i| i as u8));
+            stream.write_all(&hello).expect("writes");
+            // Eleven octets, then the last configured width, and one header per record but the first.
+            let mut wire = vec![0u8; hello.len() + 8 * 5];
+            peer.read_exact(&mut wire).expect("reads every record");
+            let (widths, body) = hello_records(&wire);
+            assert_eq!(
+                widths,
+                vec![11, 37, 37, 37, 37, 37, 37, 37, 30],
+                "the widths the config names, the last clamped to the body's end"
+            );
+            assert_eq!(body, hello[5..], "and the hello arrives whole");
+        }
+    }
+
+    /// What a peer's record walk finds: the width of each record and the message between them.
+    fn hello_records(wire: &[u8]) -> (Vec<usize>, Vec<u8>) {
+        let mut widths = Vec::new();
+        let mut body = Vec::new();
+        let mut at = 0;
+        while at < wire.len() {
+            assert_eq!(wire[at], 22, "every piece is a handshake record");
+            let len = usize::from(u16::from_be_bytes([wire[at + 3], wire[at + 4]]));
+            widths.push(len);
+            body.extend_from_slice(&wire[at + 5..at + 5 + len]);
+            at += 5 + len;
+        }
+        (widths, body)
+    }
+
+    /// The splice lanes address the descriptor, so a leg that ends on a masked stream has to keep the
+    /// buffered copy: on linux this is the difference between cut records and one raw write.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_masked_destination_is_not_fed_by_splice() {
+        let settings = crate::json::parse(FRAGMENT).expect("parses");
+        let carrier = stream_carrier(Some(&settings));
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("address");
+        let (mut peer, _) = listener.accept().expect("accepts");
+        let source = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let mut feeder = Connection::connect(source.local_addr().expect("address")).expect("dials");
+        let (stream, _) = source.accept().expect("accepts the feeder");
+        let mut from = Connection::from(stream);
+        let mut to = Connection::connect(address)
+            .expect("connects")
+            .with_mask(carrier.tcp_mask());
+        let mut hello = vec![22, 3, 1];
+        hello.extend_from_slice(&300u16.to_be_bytes());
+        hello.extend((0..300).map(|i| i as u8));
+        feeder.write_all(&hello).expect("feeds");
+        feeder.shutdown(Shutdown::Write).expect("ends the source");
+        copy_all(&mut from, &mut to);
+        let mut wire = vec![0u8; hello.len() + 8 * 5];
+        peer.read_exact(&mut wire).expect("reads every record");
+        let (widths, body) = hello_records(&wire);
+        assert!(widths.len() > 1, "the chain cut the write, not the socket");
+        assert_eq!(body, hello[5..], "and the hello still arrives whole");
+    }
+
+    /// A chain this tree cannot arm is refused by name, never dialled or served in the clear.
+    #[test]
+    fn a_tcp_mask_this_tree_cannot_arm_is_refused() {
+        let fragment = r#"{"type":"fragment","settings":{"packets":"tlshello","lengths":[11]}}"#;
+        let refused = [
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"sudoku","settings":{}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"header-custom","settings":{}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"xmc","settings":{}}]}}"#,
+            // A chain belongs to the tcp connection; a carrier riding another transport has nowhere to arm it.
+            r#"{"network":"ws","finalmask":{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":[11]}}]}}"#,
+            // The old header masquerade shares the connection the chain would cut.
+            &format!(r#"{{"network":"tcp","tcpSettings":{{"header":{{"type":"http","request":{{"path":"/x"}}}}}},"finalmask":{{"tcp":[{fragment}]}}}}"#),
+            // A window starting at 0 is every write, which the reference refuses outright.
+            &format!(r#"{{"network":"tcp","finalmask":{{"tcp":[{{"type":"fragment","settings":{{"packets":"0-5","lengths":[11]}}}}]}}}}"#),
+            // A last width entry of 0 is a piece that never advances.
+            &format!(r#"{{"network":"tcp","finalmask":{{"tcp":[{{"type":"fragment","settings":{{"packets":"tlshello","lengths":[11,0]}}}}]}}}}"#),
+            // A fragment naming no width at all is the reference's zero range.
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"fragment","settings":{"packets":"tlshello"}}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{}]}}"#,
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"fragment","settings":{"packets":"nonsense","lengths":[11]}}]}}"#,
+        ];
+        for doc in refused {
+            let settings = crate::json::parse(doc).expect("parses");
+            assert!(
+                matches!(stream_carrier(Some(&settings)), Carrier::Unknown { .. }),
+                "{doc} must be refused"
+            );
+        }
+        // An empty tcp list is no chain at all, and a bare width list is a chain this tree does arm.
+        let empty = crate::json::parse(r#"{"network":"tcp","finalmask":{"tcp":[]}}"#).expect("parses");
+        let armed =
+            crate::json::parse(&format!(r#"{{"network":"tcp","finalmask":{{"tcp":[{fragment}]}}}}"#))
+                .expect("parses");
+        for (settings, want) in [(&empty, false), (&armed, true)] {
+            let carrier = stream_carrier(Some(settings));
+            assert!(matches!(carrier, Carrier::Raw(_)));
+            assert_eq!(carrier.tcp_mask().is_some(), want);
+        }
+    }
+
+    /// The serving role hands its carrier's chain to the accepted stream; a front with no carrier has
+    /// none to give.
+    #[test]
+    fn a_role_arms_its_carriers_chain() {
+        let settings = crate::json::parse(FRAGMENT).expect("parses");
+        let role = Role::Trojan {
+            key: [0u8; 56],
+            carrier: stream_carrier(Some(&settings)),
+            freedom: false,
+        };
+        assert!(role.tcp_mask().is_some(), "a raw carrier arms its chain");
+        let bare = Role::Vless {
+            id: [0u8; 16],
+            carrier: stream_carrier(None),
+            freedom: false,
+        };
+        assert!(bare.tcp_mask().is_none(), "a carrier with no chain arms nothing");
+        assert!(
+            Role::Socks {
+                out: Outbound::Freedom
+            }
+            .tcp_mask()
+            .is_none(),
+            "a front with no carrier arms nothing"
+        );
     }
 
     #[test]
@@ -17614,7 +17794,7 @@ mod tests {
             let doc = crate::json::parse(&format!(r#"{{"network":"{network}"}}"#)).expect("parses");
             let got = stream_carrier(Some(&doc));
             let tag = match &got {
-                Carrier::Raw => "Raw",
+                Carrier::Raw(_) => "Raw",
                 Carrier::Ws { .. } => "Ws",
                 Carrier::HttpUpgrade { .. } => "HttpUpgrade",
                 Carrier::Grpc { .. } => "Grpc",
@@ -17966,7 +18146,7 @@ mod tests {
         }
         assert_eq!(ladder.current(), Rung::HttpUpgrade);
         for (carrier, want) in [
-            (Carrier::Raw, Rung::Raw),
+            (Carrier::Raw(Default::default()), Rung::Raw),
             (
                 Carrier::Ws {
                     path: "/t".to_owned(),
@@ -20007,7 +20187,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port: 1,
             id: uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id"),
-            carrier: Carrier::Raw,
+            carrier: Carrier::Raw(Default::default()),
             host: "127.0.0.1".to_owned(),
             mux: false,
             quic_roots: None,
@@ -20040,7 +20220,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port: server_port,
             id,
-            carrier: Carrier::Raw,
+            carrier: Carrier::Raw(Default::default()),
             host: "127.0.0.1".to_owned(),
             mux: false,
             quic_roots: None,

@@ -99,3 +99,7 @@ carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hyste
 carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hysteria::read_request
 carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hysteria::auth_exchange
 carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hysteria::open_pooled
+finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths  ferrox_core::finalmask::Chain::write
+finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths  ferrox_core::finalmask::Fragment::write_hello
+finalmask  finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lands  ferrox_core::finalmask::write_record
+finalmask  finalmask::tests::the_last_configured_width_governs_every_later_segment  ferrox_core::finalmask::Fragment::write_pieces

@@ -126,7 +126,7 @@ superset of connection ways, a subset of code". Concretely:
 | xtls-vision | security | implemented | upstream/xray-core/proxy/vless, upstream/zeronet/crates/zero-protocol/src/vless.rs, docs/function/xtls-vision.md | padding commands 0/1/2, 16-byte first frame, `NumberOfPacketToFilter` 8 |
 | mux-cool | multiplex | implemented | upstream/zeronet/crates/zero-protocol/src/mux.rs, upstream/sing-box/common/mux, docs/function/mux-cool.md | Xray-core removed its own mux, so this row is a superset row, not a parity row |
 | mux-variants | multiplex | planned | upstream/sing-box/common/mux | smux, yamux, h2mux |
-| obfs-finalmask | obfuscation | planned | upstream/xray-core/transport/internet/finalmask, upstream/xray-core/infra/conf/transport_finalmask.go | fragment, noise, salamander, sudoku, xdns, xicmp, realm, udphop, xmc, header-custom |
+| obfs-finalmask | obfuscation | partial | upstream/xray-core/transport/internet/finalmask, upstream/xray-core/infra/conf/transport_finalmask.go, docs/function/finalmask.md | fragment (TCP, both roles) and mkcp-legacy (KCP udp) ship; salamander rides hysteria's datagram lane; noise, sudoku, xdns, xicmp, realm, udphop, xmc, header-custom stay refused by name |
 | obfs-evasion | obfuscation | planned | upstream/zeronet/crates/zero-evasion | ClientHello fragment, UDP noise, fake-SNI inject, keepalive shaping |
 | obfs-dns-tunnel | obfuscation | planned | README.md | DNSTT / NoizDNS / VayDNS / CottenDNS, read off unpinned sources |
 | obfs-sni-spoof | obfuscation | planned | README.md | fake ClientHello without root; nothing in CI checks it yet |
