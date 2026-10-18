@@ -13,12 +13,13 @@
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
+use std::sync::{mpsc, Arc};
 
 #[cfg(unix)]
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 
+use crate::budgets;
 use crate::conn::Connection;
 use ferrox_core::foxy::connectip::{checksum, ipv4_checksum, ipv4_head, Ipv4Head, IPV4_HEADER};
 
@@ -323,6 +324,8 @@ struct Flow {
     write_half: TcpStream,
     rcv_nxt: Arc<AtomicU32>,
     snd_nxt: Arc<AtomicU32>,
+    /// Payload reached the proxy since the response thread's last idle expiry: a flow is alive when either direction spoke inside the budget.
+    busy: Arc<AtomicBool>,
     last_acked: u32,
 }
 
@@ -335,14 +338,19 @@ pub(crate) struct Handler {
     device: Device,
     relay: Relay,
     flows: HashMap<FlowKey, Flow>,
+    ended_tx: mpsc::Sender<FlowKey>,
+    ended_rx: mpsc::Receiver<FlowKey>,
 }
 
 impl Handler {
     pub(crate) fn new(device: Device, relay: Relay) -> Self {
+        let (ended_tx, ended_rx) = mpsc::channel();
         Self {
             device,
             relay,
             flows: HashMap::new(),
+            ended_tx,
+            ended_rx,
         }
     }
 
@@ -385,11 +393,13 @@ impl Handler {
             self.close_flow(key);
             return Ok(());
         }
+        let mut dead = false;
         if let Some(flow) = self.flows.get_mut(&key) {
             let end = tcp.seq.wrapping_add(payload.len() as u32);
             let fin = tcp.flags & FLAG_FIN != 0;
             if !payload.is_empty() {
-                let _ = flow.write_half.write_all(payload);
+                flow.busy.store(true, Relaxed);
+                dead = flow.write_half.write_all(payload).is_err();
                 flow.rcv_nxt.store(end, Relaxed);
             }
             if fin {
@@ -415,10 +425,18 @@ impl Handler {
                 flow.last_acked = flow.rcv_nxt.load(Relaxed);
             }
         }
+        // The proxy half is gone: an upload into a closed lane has no flow to finish, and keeping the entry would keep its socket and its cursors.
+        if dead {
+            self.close_flow(key);
+        }
         Ok(())
     }
 
     fn accept_flow(&mut self, ip: &Ipv4Head, tcp: &TcpHead, key: FlowKey) -> io::Result<()> {
+        // Flows whose response thread has already left are removed here, so the packet path pays nothing for the reap.
+        while let Some(ended) = self.ended_rx.try_recv().ok() {
+            self.flows.remove(&ended);
+        }
         let local_ip = ip.destination;
         let remote_ip = ip.source;
         let local_port = tcp.destination_port;
@@ -449,18 +467,23 @@ impl Handler {
         let write_half = tun_half.try_clone()?;
         let rcv_nxt = Arc::new(AtomicU32::new(syn_seq.wrapping_add(1)));
         let snd_nxt = Arc::new(AtomicU32::new(syn_seq.wrapping_add(2)));
+        let busy = Arc::new(AtomicBool::new(false));
         self.flows.insert(
             key,
             Flow {
                 write_half,
                 rcv_nxt: Arc::clone(&rcv_nxt),
                 snd_nxt: Arc::clone(&snd_nxt),
+                busy: Arc::clone(&busy),
                 last_acked: syn_seq.wrapping_add(1),
             },
         );
 
         let mut read_half = tun_half;
+        // Silence past the idle budget is death: an untimed read parks a thread, and with it the flow's relay leg and its lane, for the life of the process.
+        read_half.set_read_timeout(Some(budgets::udp_idle()))?;
         let mut dev_writer = self.device.clone_writer()?;
+        let ended_tx = self.ended_tx.clone();
 
         std::thread::spawn(move || {
             let conn = Connection::from(proxy_half);
@@ -471,7 +494,7 @@ impl Handler {
             let mut buf = vec![0u8; 4096];
             loop {
                 match read_half.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
                     Ok(n) => {
                         let seq = snd_nxt.fetch_add(n as u32, Relaxed);
                         let pkt = build_tcp_packet(
@@ -492,8 +515,24 @@ impl Handler {
                         }
                         dev_writer = dev.handle;
                     }
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                    // The budget expired with nothing to carry: the upload leg gets one more budget to speak, and a silent one ends the flow.
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        if !busy.swap(false, Relaxed) {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
                 }
             }
+            // Both halves, because the handler's write half is a clone of this descriptor and only a shutdown tells it the flow is over.
+            let _ = read_half.shutdown(Shutdown::Both);
+            let _ = ended_tx.send(key);
         });
 
         Ok(())
@@ -946,6 +985,114 @@ mod tests {
             payload.windows(5).any(|w| w == b"pong\n"),
             "the response bytes ride back as a payload"
         );
+    }
+
+    /// One flow opened and then silent: SYN, the ACK read off this stack's own SYN-ACK, and nothing after.
+    #[cfg(unix)]
+    fn open_flow(
+        handler: &mut Handler,
+        peer: &mut std::fs::File,
+        destination: SocketAddr,
+        source_port: u16,
+        syn_seq: u32,
+        buf: &mut [u8],
+    ) -> FlowKey {
+        let SocketAddr::V4(destination) = destination else {
+            panic!("the flow names an IPv4 destination");
+        };
+        let endpoint = (destination.ip().octets(), destination.port());
+        let client = (SCRIPT_CLIENT, source_port);
+        peer.write_all(&build_tcp_packet(
+            client,
+            endpoint,
+            syn_seq,
+            0,
+            FLAG_SYN,
+            65535,
+            &[],
+        ))
+        .unwrap();
+        let n = handler.device.read_packet(buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+        let syn_ack = next_syn_ack(peer);
+        peer.write_all(&build_tcp_packet(
+            client,
+            endpoint,
+            syn_seq.wrapping_add(1),
+            syn_ack.seq.wrapping_add(1),
+            FLAG_ACK,
+            65535,
+            &[],
+        ))
+        .unwrap();
+        let n = handler.device.read_packet(buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+        FlowKey {
+            source_port,
+            destination: endpoint.0,
+            destination_port: endpoint.1,
+        }
+    }
+
+    /// Silence past the idle budget is death, not a leak: a flow that stops speaking on both sides hands its relay leg back at the budget, and its entry goes at the next dial.
+    #[cfg(unix)]
+    #[test]
+    fn a_quiet_tun_flow_hands_its_threads_back() {
+        let _guard = budgets::lock();
+        let idle = std::time::Duration::from_millis(250);
+        budgets::apply(&crate::config::Budgets {
+            udp_idle: Some(idle),
+            ..Default::default()
+        });
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let (gone_tx, gone_rx) = std::sync::mpsc::channel::<()>();
+        let relay: Relay = Arc::new(move |mut conn: Connection, _dest| {
+            let mut sink = Vec::new();
+            let _ = conn.read_to_end(&mut sink);
+            let _ = gone_tx.send(());
+        });
+        let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay);
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let destination: SocketAddr = "203.0.113.9:443".parse().unwrap();
+        let key = open_flow(&mut handler, &mut peer, destination, 51500, 9000, &mut buf);
+        assert!(
+            handler.flows.contains_key(&key),
+            "the dial opens before its budget runs"
+        );
+        let back = gone_rx.recv_timeout(idle + std::time::Duration::from_secs(5));
+        budgets::clear();
+        assert!(
+            back.is_ok(),
+            "a flow silent past its idle budget still holds its relay leg"
+        );
+
+        // The entry goes at the next dial, so the packet path pays nothing for the reap.
+        let second = open_flow(&mut handler, &mut peer, destination, 51501, 9500, &mut buf);
+        assert!(
+            handler.flows.contains_key(&second) && !handler.flows.contains_key(&key),
+            "the quiet flow's entry is gone at the next dial"
+        );
+        assert_eq!(handler.flows.len(), 1, "only the live flow is left");
+
+        // The client's goodbye outranks the budget: a reset flow hands its leg back at once.
+        peer.write_all(&build_tcp_packet(
+            (SCRIPT_CLIENT, 51501),
+            (destination.ip().octets(), 443),
+            9501,
+            0,
+            FLAG_RST | FLAG_ACK,
+            65535,
+            &[],
+        ))
+        .unwrap();
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+        let second_back = gone_rx.recv_timeout(std::time::Duration::from_secs(5));
+        assert!(
+            second_back.is_ok(),
+            "a reset flow is still holding its relay leg"
+        );
+        assert!(handler.flows.is_empty(), "the reset flow's entry is gone");
     }
 
     #[test]
