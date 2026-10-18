@@ -147,13 +147,17 @@ main() {
       done
     done
   done
-  local measured
+  local measured ok
   measured="$(wc -l <"$out/records.jsonl" | tr -d ' ')"
+  # The gate counts attempts that MEASURED: a run whose every curl failed or
+  # every core was skipped writes records too, and those records are the error.
+  ok="$(grep -c '"status": "ok"' "$out/records.jsonl" 2>/dev/null || true)"
   {
     echo "configs: $index"
     echo "attempts: $measured"
+    echo "ok attempts: ${ok:-0}"
   } | tee "$out/summary.txt" >&2
-  [[ "$measured" != "0" ]]
+  [[ "${ok:-0}" != "0" ]]
 }
 
 sha256_of() {
