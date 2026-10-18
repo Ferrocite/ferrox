@@ -153,8 +153,9 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) const IDLE_TIMEOUT_MS: u64 = 300_000;
 
-pub(crate) const MAX_DATA: u64 = 10_000_000;
-pub(crate) const MAX_STREAM_DATA: u64 = 1_000_000;
+/// The receive credit an edge may hold against this process: quiche parks every delivered byte here until the app reads it, so the advertised window is the memory the edge gets to spend, and the auto-tuning ceiling is the same number — a window that only ever grows is a window that was never capped.
+pub(crate) const MAX_DATA: u64 = 2_097_152;
+pub(crate) const MAX_STREAM_DATA: u64 = 1_048_576;
 pub(crate) const MAX_STREAMS: u64 = 100;
 
 const PUMP_POLL: Duration = Duration::from_millis(500);
@@ -387,6 +388,8 @@ pub(crate) fn tune(config: &mut quiche::Config, alpn: &[u8]) -> bool {
     config.set_initial_max_stream_data_uni(MAX_STREAM_DATA);
     config.set_initial_max_streams_bidi(MAX_STREAMS);
     config.set_initial_max_streams_uni(MAX_STREAMS);
+    config.set_max_connection_window(MAX_DATA);
+    config.set_max_stream_window(MAX_STREAM_DATA);
     true
 }
 
@@ -452,6 +455,8 @@ pub(crate) fn quiche_config(roots: &[Vec<u8>], cc: Option<&str>) -> Option<quich
             config.set_initial_max_stream_data_uni(MAX_STREAM_DATA);
             config.set_initial_max_streams_bidi(MAX_STREAMS);
             config.set_initial_max_streams_uni(MAX_STREAMS);
+            config.set_max_connection_window(MAX_DATA);
+            config.set_max_stream_window(MAX_STREAM_DATA);
             config.load_verify_locations_from_file(&path_text).ok()?;
             Some(config)
         });
@@ -1584,7 +1589,8 @@ fn pump(
     local: SocketAddr,
 ) {
     let mut ready: Vec<(u64, Connection)> = Vec::new();
-    let mut chunk = [0u8; 8192];
+    // One lock per 32 KiB rather than per 8: the drain is the connection's busiest shared path, and every pass pays the mutex twice.
+    let mut chunk = vec![0u8; 32768];
     let mut buf = [0u8; MAX_DATAGRAM];
     let mut applied: Option<Duration> = None;
     loop {
@@ -1737,7 +1743,7 @@ fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection) {
         leave_session(&pooled.table, id);
         return;
     };
-    let mut chunk = [0u8; 8192];
+    let mut chunk = vec![0u8; 32768];
     loop {
         #[cfg(test)]
         let read_at = Instant::now();

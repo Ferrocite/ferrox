@@ -257,6 +257,8 @@ carrier-quic lanes-held-after-the-last-lease 1 ferrox-app-foxy::loopback::a_lane
 carrier-quic pump-threads-owned-by-an-idle-lane 0 ferrox-app-foxy::loopback::a_lane_outlives_its_leases_and_the_next_flow_rides_it
 carrier-quic flows-per-lane-before-it-is-handed-back 64 ferrox-app-foxy::loopback::a_lane_that_lent_its_whole_grant_of_flows_is_handed_back
 carrier-quic receive-buffer-floor-bytes-armed-per-lane 262144 ferrox-app-quic::tests::a_quic_socket_arms_its_receive_buffer
+carrier-quic quic-bytes-parked-per-unread-stream 1048576 ferrox-app-proxy::tests::an_edge_cannot_park_more_than_the_window_unread
+carrier-quic quic-bytes-parked-per-unread-connection 2097152 ferrox-app-proxy::tests::an_edge_cannot_park_more_than_the_window_unread
 
 reality-tls ops-retired-instructions UNBLESSED scripts/count-ops.sh
 reality-tls tls-providers 1 ferrox-core::active_backends

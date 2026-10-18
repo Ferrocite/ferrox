@@ -23,7 +23,7 @@ const SEND_WAIT: Duration = Duration::from_secs(10);
 /// The client's first unidirectional stream, carrying the SETTINGS that make the connection HTTP/3.
 const CONTROL_STREAM: u64 = 2;
 /// Request-stream buffer cap before the lane drops what it already read, and the max DATA frame size.
-const H3_WINDOW: usize = 256 * 1024;
+const H3_WINDOW: usize = 64 * 1024;
 const H3_FRAME: usize = 16 * 1024;
 
 /// The carriers the lane can carry, in `auto`'s preference order: QUIC (one handshake carries every flow), HTTP/2 (the edge speaks it), HTTP/1.1 (every edge does).
@@ -1296,8 +1296,7 @@ impl H3 {
         let len = frames::quic_varint_into(&mut head, request.len() as u64);
         head.copy_within(0..len, 1);
         head[0] = frames::H3_DATA as u8;
-        lane.send(lane.quic.id, &head[..=len], false)?;
-        lane.send(lane.quic.id, &request, false)?;
+        lane.send_pair(lane.quic.id, &head[..=len], &request)?;
         Ok(lane)
     }
 
@@ -1448,9 +1447,7 @@ impl H3 {
         let len = frames::quic_varint_into(&mut head, out.len() as u64);
         head.copy_within(0..len, 1);
         head[0] = frames::H3_DATA as u8;
-        let sent = self
-            .send(self.quic.id, &head[..=len], false)
-            .and_then(|()| self.send(self.quic.id, &out, false));
+        let sent = self.send_pair(self.quic.id, &head[..=len], &out);
         self.out = out;
         sent.map_err(io)?;
         Ok(())
@@ -1571,6 +1568,36 @@ impl H3 {
         Ok(())
     }
 
+    /// The frame's header and its payload accepted under one lock and flushed once: two `send` calls pay the connection mutex twice, and the egress sweep after the header alone puts those nine bytes in a datagram of their own.
+    fn send_pair(&mut self, stream: u64, head: &[u8], payload: &[u8]) -> Result<(), Failure> {
+        let deadline = Instant::now() + SEND_WAIT;
+        let (mut head, mut payload) = (head, payload);
+        loop {
+            let (took_head, took_body) = self
+                .with_conn(|conn| {
+                    let n = conn.stream_send(stream, head, false).ok()?;
+                    if n < head.len() || payload.is_empty() {
+                        return Some((n, 0));
+                    }
+                    let m = conn.stream_send(stream, payload, false).ok()?;
+                    Some((n, m))
+                })
+                .ok_or(Failure::Io)?
+                .ok_or(Failure::Io)?;
+            head = &head[took_head..];
+            payload = &payload[took_body..];
+            if head.is_empty() && payload.is_empty() {
+                return Ok(());
+            }
+            if took_head + took_body == 0 {
+                if Instant::now() >= deadline {
+                    return Err(Failure::Io);
+                }
+                self.pump(Duration::from_millis(5));
+            }
+        }
+    }
+
     fn fin(&mut self, stream: u64) -> Result<(), Failure> {
         let sent = self
             .with_conn(|conn| conn.stream_send(stream, &[], true))
@@ -1676,8 +1703,7 @@ impl Write for H3 {
         let len = frames::quic_varint_into(&mut head, u64::from(frame));
         head.copy_within(0..len, 1);
         head[0] = frames::H3_DATA as u8;
-        self.send(self.quic.id, &head[..=len], false).map_err(io)?;
-        self.send(self.quic.id, &buf[..frame as usize], false)
+        self.send_pair(self.quic.id, &head[..=len], &buf[..frame as usize])
             .map_err(io)?;
         Ok(frame as usize)
     }
