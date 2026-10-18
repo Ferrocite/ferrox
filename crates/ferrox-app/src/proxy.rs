@@ -299,6 +299,7 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
                         config.cc,
                         &cert_path,
                         &key_path,
+                        &config.obfs_password,
                         &serve,
                     );
                 });
@@ -2830,6 +2831,17 @@ fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &s
     };
     let (cert_path, key_path) = (cert_path.to_owned(), key_path.to_owned());
     let owned = address.to_owned();
+    let mut obfs_password = String::new();
+    // A named obfuscation this build cannot honour is refused rather than served in the clear.
+    if let Some(password) = crate::config::salamander_obfs(inbound.get("streamSettings")) {
+        if ferrox_core::hysteria::Salamander::new(&password).is_none() {
+            eprintln!(
+                "hysteria inbound in {path} names an obfuscation it cannot honour: serves nothing"
+            );
+            return false;
+        }
+        obfs_password = password;
+    }
     let serve: crate::hysteria::Serve = Arc::new(move |flow| {
         serve_hysteria_flow(flow, freedom);
     });
@@ -2840,6 +2852,7 @@ fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &s
             ferrox_core::hysteria::Congestion::Bbr,
             &cert_path,
             &key_path,
+            &obfs_password,
             &serve,
         );
     });
@@ -17904,6 +17917,7 @@ mod tests {
             carrier: Carrier::Hysteria(ferrox_core::hysteria::Config {
                 auth: String::new(),
                 cc: ferrox_core::hysteria::Congestion::Bbr,
+                obfs_password: String::new(),
             }),
             host: "127.0.0.1".to_owned(),
             mux: false,
@@ -19298,7 +19312,7 @@ mod tests {
         ));
     }
 
-    fn hysteria_loop_with(auth: &str, id: [u8; 16]) -> (u16, Vec<Vec<u8>>) {
+    fn hysteria_loop_with(auth: &str, id: [u8; 16], obfs: &str) -> (u16, Vec<Vec<u8>>) {
         let minted =
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
         let stamp = std::time::SystemTime::now()
@@ -19318,6 +19332,7 @@ mod tests {
         assert_ne!(roots, Vec::<Vec<u8>>::new());
         let address = format!("127.0.0.1:{port}");
         let auths = vec![auth.to_owned()];
+        let obfs = obfs.to_owned();
         let serve: crate::hysteria::Serve = Arc::new(move |flow| {
             serve_vless_hysteria(flow, &id, true);
         });
@@ -19332,6 +19347,7 @@ mod tests {
                 ferrox_core::hysteria::Congestion::Bbr,
                 &cert_path,
                 &key_path,
+                &obfs,
                 &serve,
             );
         });
@@ -19344,6 +19360,7 @@ mod tests {
         auth: &str,
         id: [u8; 16],
         target: SocketAddr,
+        obfs: &str,
     ) -> Connection {
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -19354,6 +19371,7 @@ mod tests {
             config: ferrox_core::hysteria::Config {
                 auth: auth.to_owned(),
                 cc: ferrox_core::hysteria::Congestion::Bbr,
+                obfs_password: obfs.to_owned(),
             },
             roots: Some(roots),
         };
@@ -19526,6 +19544,7 @@ mod tests {
             config: ferrox_core::hysteria::Config {
                 auth: "bisect-auth".to_owned(),
                 cc: ferrox_core::hysteria::Congestion::Bbr,
+                obfs_password: String::new(),
             },
             roots: Some(roots),
         };
@@ -19552,7 +19571,7 @@ mod tests {
         use ferrox_core::foxy::frames as h3;
         let echo_port = echo_loop();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let (port, roots) = hysteria_loop_with("bisect2-auth", id);
+        let (port, roots) = hysteria_loop_with("bisect2-auth", id, "");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", port).expect("udp");
         let sock = crate::quic::Datagram::plain(sock);
@@ -19622,7 +19641,7 @@ mod tests {
         use ferrox_core::foxy::frames as h3;
         let echo_port = udp_echo_loop();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let (port, roots) = hysteria_loop_with("udp-auth", id);
+        let (port, roots) = hysteria_loop_with("udp-auth", id, "");
         let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", port).expect("udp");
         let sock = crate::quic::Datagram::plain(sock);
         let mut config = crate::quic::quiche_config(&roots, Some("bbr")).expect("configures");
@@ -19721,9 +19740,29 @@ mod tests {
     fn hysteria_echo_once() {
         let echo_port = echo_loop();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let (port, roots) = hysteria_loop_with("test-auth", id);
+        let (port, roots) = hysteria_loop_with("test-auth", id, "");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
-        let mut client = hysteria_tcp_pair(port, roots, "test-auth", id, target);
+        let mut client = hysteria_tcp_pair(port, roots, "test-auth", id, target, "");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn hysteria_carries_a_flow_through_salamander_over_loopback() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_salamander_once, 3);
+    }
+
+    fn hysteria_salamander_once() {
+        // The same dial-and-echo path as the cleartext gate, over a server and a client that both mask every datagram with the salamander key: if the hop on either side were misapplied, the QUIC handshake would never complete.
+        let key = "gawrgura";
+        let echo_port = echo_loop();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_with("test-auth", id, key);
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut client = hysteria_tcp_pair(port, roots, "test-auth", id, target, key);
         client.write_all(b"ping").expect("writes");
         let mut back = [0u8; 4];
         client.read_exact(&mut back).expect("echoes");
@@ -19739,15 +19778,15 @@ mod tests {
     fn hysteria_share_once() {
         let echo_port = echo_loop();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let (port, roots) = hysteria_loop_with("test-auth", id);
+        let (port, roots) = hysteria_loop_with("test-auth", id, "");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let before = crate::hysteria::handshake_count();
         let mut back = [0u8; 4];
-        let mut first = hysteria_tcp_pair(port, roots.clone(), "test-auth", id, target);
+        let mut first = hysteria_tcp_pair(port, roots.clone(), "test-auth", id, target, "");
         first.write_all(b"ping").expect("writes");
         first.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"ping");
-        let mut second = hysteria_tcp_pair(port, roots, "test-auth", id, target);
+        let mut second = hysteria_tcp_pair(port, roots, "test-auth", id, target, "");
         second.write_all(b"pong").expect("writes");
         second.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"pong");
@@ -19767,16 +19806,16 @@ mod tests {
     fn hysteria_redial_once() {
         let echo_port = echo_loop();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let (port, roots) = hysteria_loop_with("test-auth", id);
+        let (port, roots) = hysteria_loop_with("test-auth", id, "");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let mut back = [0u8; 4];
-        let mut first = hysteria_tcp_pair(port, roots.clone(), "test-auth", id, target);
+        let mut first = hysteria_tcp_pair(port, roots.clone(), "test-auth", id, target, "");
         first.write_all(b"ping").expect("writes");
         first.read_exact(&mut back).expect("echoes");
         drop(first);
         crate::hysteria::close_pooled();
         let before = crate::hysteria::handshake_count();
-        let mut second = hysteria_tcp_pair(port, roots, "test-auth", id, target);
+        let mut second = hysteria_tcp_pair(port, roots, "test-auth", id, target, "");
         second.write_all(b"pong").expect("writes");
         second.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"pong");
@@ -19796,9 +19835,9 @@ mod tests {
     fn hysteria_refuses_once() {
         let echo_port = echo_loop();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let (port, roots) = hysteria_loop_with("test-auth", id);
+        let (port, roots) = hysteria_loop_with("test-auth", id, "");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
-        let mut client = hysteria_tcp_pair(port, roots, "wrong-auth", id, target);
+        let mut client = hysteria_tcp_pair(port, roots, "wrong-auth", id, target, "");
         let mut probe = [0u8; 1];
         assert_eq!(client.read(&mut probe).expect("reads"), 0);
     }

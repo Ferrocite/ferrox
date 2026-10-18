@@ -709,6 +709,16 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
             network: network.to_owned(),
         };
     }
+    // Salamander is the only datagram obfuscation carried; any other named one, or one with a password too short to mask with, is refused rather than silently sent in the clear.
+    let obfs_password = match salamander_obfs(settings) {
+        None => String::new(),
+        Some(password) if ferrox_core::hysteria::Salamander::new(&password).is_some() => password,
+        Some(_) => {
+            return Carrier::Unknown {
+                network: network.to_owned(),
+            };
+        }
+    };
     Carrier::Hysteria(Config {
         auth: hy
             .and_then(|h| h.get("auth"))
@@ -720,7 +730,23 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
                 .and_then(Json::as_str)
                 .unwrap_or(""),
         ),
+        obfs_password,
     })
+}
+
+/// The `obfs: salamander` password a hysteria transport names in its `tlsSettings`, or `None` for no obfuscation and `Some("")` for one this build cannot honour; the caller serves cleartext only for the first.
+pub(crate) fn salamander_obfs(stream: Option<&Json>) -> Option<String> {
+    let tls = stream.and_then(|s| s.get("tlsSettings"));
+    match tls.and_then(|t| t.get("obfs")).and_then(Json::as_str) {
+        None | Some("") => None,
+        Some("salamander") => Some(
+            tls.and_then(|t| t.get("obfs-password"))
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_owned(),
+        ),
+        Some(_) => Some(String::new()),
+    }
 }
 
 pub(crate) fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, String) {
@@ -829,6 +855,45 @@ mod tests {
         assert_eq!(short_id("01020304"), Some([1, 2, 3, 4, 0, 0, 0, 0]));
         assert_eq!(short_id(""), None);
         assert_eq!(short_id("abc"), None);
+    }
+
+    #[test]
+    fn a_hysteria_carrier_carries_salamander_and_refuses_what_it_cannot_mask() {
+        let carrier = |text: &str| {
+            stream_carrier(
+                crate::json::parse(text)
+                    .expect("parses")
+                    .get("streamSettings"),
+            )
+        };
+        // A named salamander with a usable password reaches the wire as that password.
+        let Carrier::Hysteria(config) = carrier(
+            r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2}, "tlsSettings": {"obfs": "salamander", "obfs-password": "gawrgura"}}}"#,
+        ) else {
+            panic!("a salamander carrier");
+        };
+        assert_eq!(config.obfs_password, "gawrgura", "the key the config named");
+        // No obfs is cleartext, so the password stays empty.
+        let Carrier::Hysteria(clear) = carrier(
+            r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2}}}"#,
+        ) else {
+            panic!("a v2 hysteria carrier");
+        };
+        assert_eq!(clear.obfs_password, "", "cleartext names no key");
+        // A different named obfuscation is refused, not silently sent in the clear.
+        assert!(matches!(
+            carrier(
+                r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2}, "tlsSettings": {"obfs": "xray-obfs"}}}"#
+            ),
+            Carrier::Unknown { .. }
+        ));
+        // A salamander whose password is too short to mask with is refused for the same reason.
+        assert!(matches!(
+            carrier(
+                r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2}, "tlsSettings": {"obfs": "salamander", "obfs-password": "ab"}}}"#
+            ),
+            Carrier::Unknown { .. }
+        ));
     }
 
     #[test]
