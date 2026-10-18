@@ -105,16 +105,22 @@ graph TD
 
 `UNBLESSED`, as every page here says: `scripts/expected-ops.txt` blesses exactly one
 symbol tree-wide. Those four symbols are rows in `scripts/method-ops.txt`, so `ops.yml`
-publishes their inclusive cost on the next Linux run; the count gate itself needs
-valgrind, which does not exist on macOS/aarch64, so on this machine the row stays open
-by platform and is read from CI rather than skipped.
+runs them, and on the Linux run for this slice it answered `Ir=inlined-not-a-frame` for
+all four — the mask's writes inline into their test harness, so Callgrind attributes no
+inclusive frame and there is no instruction figure to read. The row stays `UNBLESSED`
+because that is what CI measured, not because it was skipped; the count gate itself also
+needs valgrind, which does not exist on macOS/aarch64, so the Linux run is the only one
+that could have moved it.
 
 ## Time
 
-**Not measured on this branch.** Durations in this repository come from a named runner;
-`bench.yml` and `parity.yml` for this row have not been read yet, and a masked lane's
-`delays` are sleeps the config asked for, so nothing here should be quoted as a
-throughput claim until those two runs are.
+**No row measures this lane.** `bench.yml` and `parity.yml` both ran for this slice and
+were read: every row in them is a cipher or record-layer throughput lane, and neither has
+a masked-connection case, so there is no duration to quote for the mask here. What the
+slice is gated on instead is byte-identity — the record reassembly in
+`a_configured_fragment_chain_cuts_the_hello_on_the_wire` and the two pinned conformance
+rows. A masked hello's `delays` are sleeps the config asked for, so any timing on that
+lane measures the schedule, not the code, which is the other reason none is claimed here.
 
 ## What each reference gave
 
