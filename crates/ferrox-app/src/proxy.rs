@@ -6049,9 +6049,13 @@ fn serve_http(mut client: Connection, out: &Outbound) {
 }
 
 /// The `mixed` front sniffs one byte: 0x05 is SOCKS5, a method token is HTTP, and a peek consumes nothing.
-fn serve_mixed(client: Connection, out: &Outbound) {
+fn serve_mixed(mut client: Connection, out: &Outbound) {
+    // Bound only the sniff to the greeting's budget, then restore the untimed reads the fronts behind it expect.
+    let _ = client.set_read_timeout(Some(budgets::handshake()));
     let mut first = [0u8; 1];
-    let Ok(n) = client.peek(&mut first) else {
+    let sniffed = client.peek(&mut first);
+    let _ = client.set_read_timeout(None);
+    let Ok(n) = sniffed else {
         return;
     };
     if n == 0 {
@@ -20968,6 +20972,27 @@ mod tests {
         http.write_all(b"ping").expect("writes");
         http.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"ping");
+    }
+
+    /// A client that connects to the `mixed` front and never speaks is a client the greeting's budget ends: the sniff is a read like any other, and an un-armed one held the per-connection thread for as long as the client kept the session.
+    #[test]
+    fn the_mixed_front_gives_up_a_client_that_never_speaks() {
+        let _guard = budgets::lock();
+        let root = crate::json::parse(r#"{"budgets": {"handshake": "200ms"}}"#).expect("parses");
+        budgets::apply(&crate::config::budgets(&root).expect("a budget the engine acts on"));
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let quiet = Connection::connect(addr).expect("connects");
+        let (stream, _) = front.accept().expect("accepts");
+        let at = Instant::now();
+        serve_mixed(stream, &Outbound::Freedom);
+        budgets::clear();
+        drop(quiet);
+        assert!(
+            at.elapsed() < Duration::from_secs(5),
+            "the sniff ended at the greeting budget, it took {:?}",
+            at.elapsed()
+        );
     }
 
     #[test]
