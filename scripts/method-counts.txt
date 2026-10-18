@@ -303,6 +303,8 @@ carrier-hysteria request-parse-reallocations 0 ferrox-app-hysteria::tests::a_par
 carrier-hysteria wrong-password-bytes-relayed 0 ferrox-app-proxy::tests::hysteria_refuses_a_wrong_password_without_relaying
 carrier-hysteria non-v2-configs-carried 0 ferrox-app-proxy::tests::hysteria_settings_parse_with_guarded_fallbacks
 carrier-hysteria udp-bytes-relayed 0 ferrox-app-proxy::tests::hysteria_dial_udp_uplink_is_none
+carrier-hysteria udp-datagram-decode-copies 0 ferrox-core-hysteria::tests::a_decoded_datagram_leaves_its_payload_where_it_landed
+carrier-hysteria udp-fragments-witnessed 200 ferrox-core-hysteria::tests::every_length_survives_fragment_then_defrag_intact
 carrier-hysteria pinned-hysteria-client-verdicts 1 scripts/run-upstream-suite.sh
 
 # --- TLS ClientHello `cipher_suites` field (PattNG ext.) --------------------

@@ -817,6 +817,50 @@ fn udp_reader(
     }
 }
 
+/// Fold every datagram that arrived on this connection into its session's reassembly and relay the whole messages to their target sockets, raising an association on a session's first datagram. A datagram before auth is not for the lane yet, and a reassembly that rejects a forged fragment retires its session.
+fn relay_datagrams(
+    routes: &mut HashMap<Vec<u8>, Inbound>,
+    sock: &Arc<crate::quic::Datagram>,
+    shared: &Arc<Mutex<quiche::Connection>>,
+    dcid: &[u8],
+    conn: &mut quiche::Connection,
+) {
+    while let Ok(data) = conn.dgram_recv_buf() {
+        let Ok(message) = hysteria::decode_udp(&data) else {
+            continue;
+        };
+        let Some(inbound) = routes.get_mut(dcid) else {
+            return;
+        };
+        if !inbound.authed {
+            continue;
+        }
+        let session = message.session;
+        let flow = match inbound.udp.entry(session) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let Some(opened) = open_udp(shared, sock, session, message.address) else {
+                    continue;
+                };
+                vacant.insert(opened)
+            }
+        };
+        let whole = flow.defrag.feed(&message);
+        flow.last = Instant::now();
+        let forged = whole.is_err();
+        match whole {
+            Ok(Some((_address, payload))) => {
+                let _ = flow.target.send(&payload);
+            }
+            Ok(None) => {}
+            Err(_) => flow.stop.store(true, Ordering::Relaxed),
+        }
+        if forged {
+            inbound.udp.remove(&session);
+        }
+    }
+}
+
 struct Router<'a> {
     sock: Arc<crate::quic::Datagram>,
     local: SocketAddr,
@@ -985,42 +1029,7 @@ impl Router<'_> {
                     serve_stream(&thread_shared, &thread_sock, local, id, &thread_serve);
                 });
             }
-            // Drain the datagram lane: every received message is folded into its session's reassembly and, once whole, relayed to that session's target socket; the first datagram of a session raises the association. A datagram before auth is not for the lane yet, and a reassembly that rejects a forged fragment retires the session.
-            while let Ok(data) = conn.dgram_recv_buf() {
-                let Ok(message) = hysteria::decode_udp(&data) else {
-                    continue;
-                };
-                let Some(inbound) = routes.get_mut(dcid) else {
-                    return;
-                };
-                if !inbound.authed {
-                    continue;
-                }
-                if !inbound.udp.contains_key(&message.session) {
-                    let Some(flow) = open_udp(&shared, sock, message.session, message.address)
-                    else {
-                        continue;
-                    };
-                    inbound.udp.insert(message.session, flow);
-                }
-                let mut retire = false;
-                if let Some(flow) = inbound.udp.get_mut(&message.session) {
-                    flow.last = Instant::now();
-                    match flow.defrag.feed(&message) {
-                        Ok(Some((_address, payload))) => {
-                            let _ = flow.target.send(&payload);
-                        }
-                        Ok(None) => {}
-                        Err(_) => {
-                            flow.stop.store(true, Ordering::Relaxed);
-                            retire = true;
-                        }
-                    }
-                }
-                if retire {
-                    inbound.udp.remove(&message.session);
-                }
-            }
+            relay_datagrams(routes, sock, &shared, dcid, &mut conn);
             flush(sock, &mut conn, out.as_mut());
         }
     }
