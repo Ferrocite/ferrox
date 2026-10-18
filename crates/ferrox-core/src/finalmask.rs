@@ -46,7 +46,7 @@ impl Range {
         }
         let mut draw = [0u8; 8];
         getrandom::getrandom(&mut draw).ok()?;
-        Some(self.low + (u64::from_le_bytes(draw) % span as u64) as i64)
+        Some(self.low + i64::try_from(u64::from_le_bytes(draw) % span as u64).ok()?)
     }
 }
 
@@ -110,7 +110,7 @@ impl Fragment {
     /// always ends on the whole, so a bounded hello is a short hello, never a lost one.
     fn cut(&self, segment: usize, from: usize, end: usize, bound: i64) -> Option<usize> {
         let width = self.lengths[segment.min(self.lengths.len() - 1)].pick()?;
-        let last = bound > 0 && segment as i64 + 1 >= bound;
+        let last = bound > 0 && i64::try_from(segment).ok()? + 1 >= bound;
         let to = from.saturating_add(width as usize);
         Some(if last || to > end { end } else { to })
     }
@@ -145,7 +145,7 @@ impl Fragment {
         };
         let Some(bound) = self.max_split.pick() else {
             // No entropy for the bound: the hello goes out as the one record it was.
-            return raw.write_all(p).map(|_| p.len());
+            return raw.write_all(p).map(|()| p.len());
         };
         let merged = self.delays.len() == 1 && self.delays[0].high == 0;
         self.merged.clear();
@@ -155,7 +155,7 @@ impl Fragment {
             let Some(to) = self.cut(segment, from, record_len, bound) else {
                 // No entropy for a width: the hello goes out as the one record it was.
                 self.merged.clear();
-                return raw.write_all(p).map(|_| p.len());
+                return raw.write_all(p).map(|()| p.len());
             };
             let head = [
                 p[0],
@@ -193,13 +193,13 @@ impl Fragment {
     /// widths, each advance measured by what the socket actually took.
     fn write_pieces<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
         let Some(bound) = self.max_split.pick() else {
-            return raw.write_all(p).map(|_| p.len());
+            return raw.write_all(p).map(|()| p.len());
         };
         let mut from = 0usize;
         let mut segment = 0usize;
         loop {
             let Some(to) = self.cut(segment, from, p.len(), bound) else {
-                return raw.write_all(&p[from..]).map(|_| p.len());
+                return raw.write_all(&p[from..]).map(|()| p.len());
             };
             let written = raw.write(&p[from..to])?;
             from += written;
@@ -561,7 +561,7 @@ mod tests {
         assert_eq!(wire.widths, vec![9], "the first write is outside 2..3");
         wire.widths.clear();
         assert_eq!(
-            mask.write(&mut wire, &vec![8u8; 9]).expect("second"),
+            mask.write(&mut wire, &[8u8; 9]).expect("second"),
             9,
             "inside the window"
         );
@@ -572,14 +572,14 @@ mod tests {
         );
         wire.widths.clear();
         assert_eq!(
-            mask.write(&mut wire, &vec![7u8; 9]).expect("third"),
+            mask.write(&mut wire, &[7u8; 9]).expect("third"),
             9,
             "still inside"
         );
         assert_eq!(wire.widths, vec![4, 4, 1]);
         wire.widths.clear();
         assert_eq!(
-            mask.write(&mut wire, &vec![6u8; 9]).expect("fourth"),
+            mask.write(&mut wire, &[6u8; 9]).expect("fourth"),
             9,
             "past the window again"
         );
@@ -708,7 +708,7 @@ mod tests {
         let mut mask =
             Fragment::new(1, 2, vec![range(4, 4)], vec![range(0, 1)], range(0, 0)).expect("valid");
         let mut wire = Wire::default();
-        mask.write(&mut wire, &vec![1u8; 40]).expect("writes");
+        mask.write(&mut wire, &[1u8; 40]).expect("writes");
         assert_eq!(wire.widths.len(), 10, "and the run really was cut");
         assert_eq!(
             range(0, 1).pick(),
