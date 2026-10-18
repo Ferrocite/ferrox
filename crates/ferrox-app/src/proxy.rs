@@ -289,6 +289,7 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
                     return false;
                 };
                 let (cert_path, key_path) = (cert_path.to_owned(), key_path.to_owned());
+                let masq = crate::config::masquerade_from_stream(Some(settings));
                 let serve: crate::hysteria::Serve = Arc::new(move |flow| {
                     serve_vless_hysteria(flow, &id, freedom);
                 });
@@ -300,6 +301,7 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
                         &cert_path,
                         &key_path,
                         &config.obfs_password,
+                        &masq,
                         &serve,
                     );
                 });
@@ -2847,6 +2849,7 @@ fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &s
     let serve: crate::hysteria::Serve = Arc::new(move |flow| {
         serve_hysteria_flow(flow, freedom);
     });
+    let masq = crate::config::masquerade_from_stream(Some(stream));
     thread::spawn(move || {
         crate::hysteria::serve_loop(
             &owned,
@@ -2855,6 +2858,7 @@ fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &s
             &cert_path,
             &key_path,
             &obfs_password,
+            &masq,
             &serve,
         );
     });
@@ -19403,6 +19407,16 @@ mod tests {
     }
 
     fn hysteria_loop_with(auth: &str, id: [u8; 16], obfs: &str) -> (u16, Vec<Vec<u8>>) {
+        hysteria_loop_masq(auth, id, obfs, ferrox_core::hysteria::Masquerade::NotFound)
+    }
+
+    /// Brings up a hysteria inbound on a free port with the given masquerade cover, so a test can point a browser at it and read what the cover answers.
+    fn hysteria_loop_masq(
+        auth: &str,
+        id: [u8; 16],
+        obfs: &str,
+        masq: ferrox_core::hysteria::Masquerade,
+    ) -> (u16, Vec<Vec<u8>>) {
         let minted =
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
         let stamp = std::time::SystemTime::now()
@@ -19438,6 +19452,7 @@ mod tests {
                 &cert_path,
                 &key_path,
                 &obfs,
+                &masq,
                 &serve,
             );
         });
@@ -19719,6 +19734,397 @@ mod tests {
         let back =
             crate::quic::stream_recv_exact(&mut conn, &sock, local, 4, 4, horizon).expect("echoes");
         assert_eq!(back.as_slice(), b"ping");
+    }
+
+    /// Drives a browser's HTTP/3 `GET` against a masquerade port and reads the cover answer back: it hand-shakes, sends a `HEADERS` request on stream 0 with a FIN, then walks the reply's `HEADERS` and `DATA` frames into a status, its headers, and its body.
+    fn masq_get(port: u16, roots: &[Vec<u8>], path: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        use ferrox_core::foxy::frames as h3;
+        use ferrox_core::foxy::hpack;
+        let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", port).expect("udp");
+        let sock = crate::quic::Datagram::plain(sock);
+        let mut config = crate::quic::quiche_config(roots, Some("bbr")).expect("configures");
+        let mut scid = [0u8; 16];
+        getrandom::getrandom(&mut scid).expect("random");
+        let cid = quiche::ConnectionId::from_ref(&scid);
+        let mut conn =
+            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
+        crate::quic::drive_handshake(&mut conn, &sock, local).expect("handshakes");
+        let horizon = std::time::Instant::now() + Duration::from_secs(15);
+        let mut block = Vec::new();
+        hpack::qpack_literal_many(
+            &[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":authority", "localhost"),
+                (":path", path),
+            ],
+            &mut block,
+        );
+        let mut frame = Vec::new();
+        h3::quic_varint(&mut frame, h3::H3_HEADERS);
+        h3::quic_varint(&mut frame, block.len() as u64);
+        frame.extend_from_slice(&block);
+        assert!(
+            crate::quic::stream_send_all(&mut conn, &sock, 0, &frame, true, horizon),
+            "the browser's request is sent"
+        );
+        let mut head = Vec::new();
+        let mut room = [0u8; 4096];
+        loop {
+            match conn.stream_recv(0, &mut room) {
+                Ok((0, _)) | Err(quiche::Error::Done) => {
+                    if conn.is_closed() || std::time::Instant::now() >= horizon {
+                        break;
+                    }
+                    let left = horizon.saturating_duration_since(std::time::Instant::now());
+                    if !crate::quic::pump_once(&mut conn, &sock, local, left) {
+                        break;
+                    }
+                }
+                Ok((n, fin)) => {
+                    head.extend_from_slice(&room[..n]);
+                    if fin {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let mut at = 0usize;
+        let mut status = 0u16;
+        let mut headers = Vec::new();
+        let mut body = Vec::new();
+        while let Some(frame) = h3::h3_frame(&head, &mut at) {
+            let end = at + frame.length as usize;
+            let Some(payload) = head.get(at..end) else {
+                break;
+            };
+            match frame.kind {
+                h3::H3_HEADERS => {
+                    for (name, value) in hpack::qpack_fields(payload).unwrap_or_default() {
+                        let name = String::from_utf8_lossy(&name).into_owned();
+                        let value = String::from_utf8_lossy(&value).into_owned();
+                        if name == ":status" {
+                            status = value.parse().unwrap_or(0);
+                        } else {
+                            headers.push((name, value));
+                        }
+                    }
+                }
+                h3::H3_DATA => body.extend_from_slice(payload),
+                _ => {}
+            }
+            at = end;
+        }
+        (status, headers, body)
+    }
+
+    /// The `content-type` a browser's answer carried, or an empty string when it named none.
+    fn content_type_of(headers: &[(String, String)]) -> &str {
+        headers
+            .iter()
+            .find(|(name, _)| name == "content-type")
+            .map_or("", |(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn hysteria_answers_a_browser_get_with_the_masquerade_404() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_masq_404_once, 3);
+    }
+
+    fn hysteria_masq_404_once() {
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_masq(
+            "lane-auth",
+            id,
+            "",
+            ferrox_core::hysteria::Masquerade::NotFound,
+        );
+        let (status, headers, body) = masq_get(port, &roots, "/");
+        assert_eq!(status, 404);
+        assert_eq!(body, b"404 page not found\n");
+        assert!(content_type_of(&headers).starts_with("text/plain"));
+    }
+
+    #[test]
+    fn hysteria_serves_a_canned_masquerade_response() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_masq_response_once, 3);
+    }
+
+    fn hysteria_masq_response_once() {
+        use ferrox_core::hysteria::Masquerade;
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_masq(
+            "lane-auth",
+            id,
+            "",
+            Masquerade::Response {
+                status: 200,
+                headers: vec![("content-type".to_owned(), "text/markdown".to_owned())],
+                body: b"a cover page\n".to_vec(),
+            },
+        );
+        let (status, headers, body) = masq_get(port, &roots, "/");
+        assert_eq!(status, 200);
+        assert_eq!(content_type_of(&headers), "text/markdown");
+        assert_eq!(body, b"a cover page\n");
+    }
+
+    #[test]
+    fn hysteria_serves_a_file_from_the_masquerade_directory() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_masq_file_once, 3);
+    }
+
+    fn hysteria_masq_file_once() {
+        use ferrox_core::hysteria::Masquerade;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-masq-file-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("stages dir");
+        std::fs::write(dir.join("hello.txt"), b"static bytes").expect("stages file");
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_masq(
+            "lane-auth",
+            id,
+            "",
+            Masquerade::File {
+                dir: dir.to_str().expect("ascii").to_owned(),
+            },
+        );
+        let (status, headers, body) = masq_get(port, &roots, "/hello.txt");
+        assert_eq!(status, 200);
+        assert_eq!(content_type_of(&headers), "text/plain; charset=utf-8");
+        assert_eq!(body, b"static bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hysteria_refuses_a_masquerade_path_that_escalates_the_directory() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_masq_traversal_once, 3);
+    }
+
+    fn hysteria_masq_traversal_once() {
+        use ferrox_core::hysteria::Masquerade;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let outer =
+            std::env::temp_dir().join(format!("ferrox-masq-out-{}-{stamp}", std::process::id()));
+        let root = outer.join("root");
+        std::fs::create_dir_all(&root).expect("stages root");
+        std::fs::write(outer.join("secret.txt"), b"never served").expect("stages secret");
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_masq(
+            "lane-auth",
+            id,
+            "",
+            Masquerade::File {
+                dir: root.to_str().expect("ascii").to_owned(),
+            },
+        );
+        // A percent-encoded `../secret.txt` names a file above the served root; the cover answers not-found and the secret is never read.
+        let (status, _, body) = masq_get(port, &roots, "/%2e%2e%2fsecret.txt");
+        assert_eq!(status, 404);
+        assert_ne!(body, b"never served".to_vec());
+        let _ = std::fs::remove_dir_all(&outer);
+    }
+
+    #[test]
+    fn hysteria_proxies_a_masquerade_request_to_an_origin() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_masq_proxy_once, 3);
+    }
+
+    fn hysteria_masq_proxy_once() {
+        use ferrox_core::hysteria::Masquerade;
+        // A one-shot HTTP/1.1 origin that answers any request with a fixed body.
+        let origin = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let origin_port = origin.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = origin.accept().expect("accepts");
+            let mut drain = [0u8; 1024];
+            let _ = stream.read(&mut drain);
+            let _ = stream.write_all(b"HTTP/1.1 201 Created\r\ncontent-type: text/plain\r\ncontent-length: 6\r\n\r\norigin");
+        });
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_masq(
+            "lane-auth",
+            id,
+            "",
+            Masquerade::Proxy {
+                url: format!("http://127.0.0.1:{origin_port}"),
+                rewrite_host: false,
+                x_forwarded: false,
+                insecure: false,
+            },
+        );
+        let (status, headers, body) = masq_get(port, &roots, "/anything");
+        assert_eq!(status, 201);
+        assert_eq!(content_type_of(&headers), "text/plain");
+        assert_eq!(body, b"origin");
+    }
+
+    #[test]
+    fn hysteria_still_carries_proxy_flows_beside_a_masquerade_get() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_masq_beside_flow_once, 3);
+    }
+
+    fn hysteria_masq_beside_flow_once() {
+        use ferrox_core::foxy::frames as h3;
+        use ferrox_core::hysteria::Masquerade;
+        let echo_port = echo_loop();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_masq(
+            "bisect2-auth",
+            id,
+            "",
+            Masquerade::Response {
+                status: 200,
+                headers: vec![],
+                body: b"cover".to_vec(),
+            },
+        );
+        // A browser's GET is answered as the cover, and it never disturbs the flow lane a hysteria client uses on its own connection.
+        let (status, _, body) = masq_get(port, &roots, "/");
+        assert_eq!((status, body.as_slice()), (200, b"cover".as_slice()));
+        // A real hysteria client then authenticates and relays a TCP flow across the very same port.
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", port).expect("udp");
+        let sock = crate::quic::Datagram::plain(sock);
+        let mut config = crate::quic::quiche_config(&roots, Some("bbr")).expect("configures");
+        let mut scid = [0u8; 16];
+        getrandom::getrandom(&mut scid).expect("random");
+        let cid = quiche::ConnectionId::from_ref(&scid);
+        let mut conn =
+            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
+        crate::quic::drive_handshake(&mut conn, &sock, local).expect("handshakes");
+        let horizon = std::time::Instant::now() + Duration::from_secs(30);
+        let mut settings = Vec::new();
+        h3::quic_varint(&mut settings, 0x04);
+        h3::quic_varint(&mut settings, 0);
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 2, &settings, true, horizon
+        ));
+        let mut block = Vec::new();
+        ferrox_core::hysteria::build_auth_request("localhost", "bisect2-auth", &mut block);
+        let mut frame = Vec::new();
+        h3::quic_varint(&mut frame, h3::H3_HEADERS);
+        h3::quic_varint(&mut frame, block.len() as u64);
+        frame.extend_from_slice(&block);
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 0, &frame, true, horizon
+        ));
+        let mut head = Vec::new();
+        let body = loop {
+            let piece = crate::quic::stream_recv_exact(&mut conn, &sock, local, 0, 1, horizon)
+                .expect("reads");
+            head.extend_from_slice(&piece);
+            let mut at = 0usize;
+            if let Some(got) = h3::h3_frame(&head, &mut at) {
+                if got.kind == h3::H3_HEADERS {
+                    if let Some(body) = head.get(at..at + got.length as usize) {
+                        break body.to_vec();
+                    }
+                }
+            }
+        };
+        assert!(ferrox_core::hysteria::verify_auth_response(&body));
+        let header = vless_header(&id, 1, &Destination::from(target));
+        let mut prefix = Vec::with_capacity(2 + header.len());
+        ferrox_core::hysteria::tcp_prefix(&mut prefix);
+        prefix.extend_from_slice(&header);
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 4, &prefix, false, horizon
+        ));
+        let reply = crate::quic::stream_recv_exact(&mut conn, &sock, local, 4, 2, horizon)
+            .expect("replies");
+        assert_eq!(reply.as_slice(), &[0, 0]);
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 4, b"ping", false, horizon
+        ));
+        let back =
+            crate::quic::stream_recv_exact(&mut conn, &sock, local, 4, 4, horizon).expect("echoes");
+        assert_eq!(back.as_slice(), b"ping");
+    }
+
+    #[test]
+    fn hysteria_closes_a_wrong_hysteria_password_even_with_masquerade() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_masq_wrong_auth_once, 3);
+    }
+
+    fn hysteria_masq_wrong_auth_once() {
+        use ferrox_core::foxy::frames as h3;
+        use ferrox_core::hysteria::Masquerade;
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_masq(
+            "right-auth",
+            id,
+            "",
+            Masquerade::Response {
+                status: 200,
+                headers: vec![],
+                body: b"cover".to_vec(),
+            },
+        );
+        let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", port).expect("udp");
+        let sock = crate::quic::Datagram::plain(sock);
+        let mut config = crate::quic::quiche_config(&roots, Some("bbr")).expect("configures");
+        let mut scid = [0u8; 16];
+        getrandom::getrandom(&mut scid).expect("random");
+        let cid = quiche::ConnectionId::from_ref(&scid);
+        let mut conn =
+            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
+        crate::quic::drive_handshake(&mut conn, &sock, local).expect("handshakes");
+        let horizon = std::time::Instant::now() + Duration::from_secs(15);
+        // The right handshake shape — a POST to the auth path — but the wrong password must still refuse and close, never quietly serve the cover page.
+        let mut block = Vec::new();
+        ferrox_core::hysteria::build_auth_request("localhost", "wrong-auth", &mut block);
+        let mut frame = Vec::new();
+        h3::quic_varint(&mut frame, h3::H3_HEADERS);
+        h3::quic_varint(&mut frame, block.len() as u64);
+        frame.extend_from_slice(&block);
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 0, &frame, true, horizon
+        ));
+        let mut head = Vec::new();
+        let body = loop {
+            let Some(piece) =
+                crate::quic::stream_recv_exact(&mut conn, &sock, local, 0, 1, horizon)
+            else {
+                break None;
+            };
+            head.extend_from_slice(&piece);
+            let mut at = 0usize;
+            if let Some(got) = h3::h3_frame(&head, &mut at) {
+                if got.kind == h3::H3_HEADERS {
+                    if let Some(body) = head.get(at..at + got.length as usize) {
+                        break Some(body.to_vec());
+                    }
+                }
+            }
+        };
+        // The refusal is a not-found, not the cover page: the connection never masquerades a wrong credential.
+        let refused = body.is_some_and(|body| {
+            ferrox_core::foxy::hpack::qpack_fields(&body)
+                .unwrap_or_default()
+                .iter()
+                .find(|(name, _)| name == b":status")
+                .is_some_and(|(_, value)| String::from_utf8_lossy(value) == "404")
+        });
+        assert!(
+            refused,
+            "a wrong password is refused with a 404, not served the cover"
+        );
     }
 
     #[test]

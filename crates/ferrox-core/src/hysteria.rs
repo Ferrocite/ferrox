@@ -443,6 +443,16 @@ pub fn verify_auth_request(block: &[u8], expected_auth: &str) -> bool {
         && find(&fields, AUTH_HEADER) == Some(expected_auth.as_bytes())
 }
 
+/// Whether a request block carries the shape of a hysteria handshake — a `POST` to the auth path — whatever credential it names. The masquerade server uses it to keep a right-shape, wrong-password attempt refusing exactly as a plain hysteria server would, while any other request (`GET /`, a browser) is answered as the cover site instead.
+#[must_use]
+pub fn is_hysteria_auth_shape(block: &[u8]) -> bool {
+    let Some(fields) = hpack::qpack_fields(block) else {
+        return false;
+    };
+    find(&fields, ":method") == Some(b"POST".as_slice())
+        && find(&fields, ":path") == Some(AUTH_PATH.as_bytes())
+}
+
 #[must_use]
 pub fn verify_auth_response(block: &[u8]) -> bool {
     read_auth_response(block).is_some()
@@ -456,6 +466,195 @@ pub fn read_auth_response(block: &[u8]) -> Option<bool> {
         return None;
     }
     Some(find(&fields, UDP_HEADER) == Some(b"true".as_slice()))
+}
+
+/// What a masquerade site answers a non-hysteria HTTP/3 request with, inbound only: a plain not-found, a canned line, a static directory, or a reverse proxy to an origin. The dialed `Config` never carries it, so the pool key a client connection is filed under stays untouched.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Masquerade {
+    #[default]
+    NotFound,
+    Response {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    },
+    File {
+        dir: String,
+    },
+    Proxy {
+        url: String,
+        rewrite_host: bool,
+        x_forwarded: bool,
+        insecure: bool,
+    },
+}
+
+/// The ordinary HTTP/3 request a browser left on the port: the pseudo-headers ferrox needs both to answer it and to rebuild an HTTP/1.1 request to a masquerade origin, plus the body the caller appended from the stream's `DATA` frame.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct H3Request {
+    pub method: String,
+    pub path: String,
+    pub authority: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// A request stream opens with the `0x401` TCP type when hysteria named a destination and with an HTTP/3 frame when a browser asked for a page; the first varint is the whole difference, so the classifier is one read and shares its width math with `read_tcp_prefix`.
+#[must_use]
+pub fn is_hysteria_flow(bytes: &[u8]) -> bool {
+    let mut at = 0usize;
+    frames::quic_read(bytes, &mut at) == Some(TCP_FRAME)
+}
+
+/// The fields of a QPACK request block, split into the pseudo-headers a masquerade answer and an origin request both need and the ordinary headers copied onward. A block naming no `:method` is not a request; the body stays empty for the caller to fill from the `DATA` frame.
+pub fn parse_h3_request(block: &[u8]) -> Option<H3Request> {
+    let fields = hpack::qpack_fields(block)?;
+    let text =
+        |name: &str| -> Option<String> { String::from_utf8(find(&fields, name)?.to_vec()).ok() };
+    let method = text(":method")?;
+    let path = text(":path")?;
+    let authority = text(":authority").unwrap_or_default();
+    let headers = fields
+        .iter()
+        .filter(|(name, _)| !name.starts_with(b":"))
+        .map(|(name, value)| {
+            (
+                String::from_utf8_lossy(name).into_owned(),
+                String::from_utf8_lossy(value).into_owned(),
+            )
+        })
+        .collect();
+    Some(H3Request {
+        method,
+        path,
+        authority,
+        headers,
+        body: Vec::new(),
+    })
+}
+
+/// An HTTP/3 response on a request stream: a `HEADERS` frame carrying `:status` ahead of the caller's fields, then a `DATA` frame only when the body is not empty, each length-prefixed the way the auth answer frames its headers. The caller sends the stream FIN.
+pub fn encode_h3_response(status: u16, headers: &[(&str, &str)], body: &[u8], out: &mut Vec<u8>) {
+    let code = status.to_string();
+    let mut block = Vec::with_capacity(32 + 16 * headers.len());
+    let mut fields = Vec::with_capacity(headers.len() + 1);
+    fields.push((":status", code.as_str()));
+    fields.extend_from_slice(headers);
+    hpack::qpack_literal_many(&fields, &mut block);
+    frames::quic_varint(out, frames::H3_HEADERS);
+    frames::quic_varint(out, block.len() as u64);
+    out.extend_from_slice(&block);
+    if !body.is_empty() {
+        frames::quic_varint(out, frames::H3_DATA);
+        frames::quic_varint(out, body.len() as u64);
+        out.extend_from_slice(body);
+    }
+}
+
+/// The `content-type` a static masquerade file answers with, guessed from the extension of the last path segment and falling back to the octet stream; a cover page is only convincing if a browser reads it as the kind of file it is.
+#[must_use]
+pub fn content_type(path: &str) -> &'static str {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let tail = match name.rfind('.') {
+        Some(dot) => name[dot + 1..].split(['?', '#']).next().unwrap_or_default(),
+        None => return "application/octet-stream",
+    };
+    match tail.to_ascii_lowercase().as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json",
+        "txt" => "text/plain; charset=utf-8",
+        "xml" => "application/xml",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
+/// One origin HTTP/1.1 response reduced to what ferrox re-emits as HTTP/3: the status code, every header as it arrived (the caller drops the hop-by-hop ones), and the body with any chunked framing or content-length tail already removed. The whole response, read to the origin's close, is the input; a head that never reaches its blank line is not a response.
+pub fn parse_origin_response(raw: &[u8]) -> Option<OriginResponse> {
+    let head_end = raw.windows(4).position(|window| window == b"\r\n\r\n")?;
+    let mut body = &raw[head_end + 4..];
+    let mut lines = raw[..head_end].split(|&byte| byte == b'\n');
+    let status = lines
+        .next()?
+        .split(|&byte| byte == b' ')
+        .nth(1)
+        .and_then(|code| std::str::from_utf8(code).ok())
+        .and_then(|code| code.parse::<u16>().ok())?;
+    let mut headers = Vec::new();
+    let mut chunked = false;
+    let mut length = None;
+    for line in lines {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(2, |&byte| byte == b':');
+        let name = parts.next()?;
+        let value = match parts.next() {
+            Some(value) => value.strip_prefix(b" ").unwrap_or(value),
+            None => continue,
+        };
+        let name = String::from_utf8_lossy(name).into_owned();
+        let value = String::from_utf8_lossy(value).into_owned();
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            && value.to_ascii_lowercase().contains("chunked")
+        {
+            chunked = true;
+        } else if name.eq_ignore_ascii_case("content-length") {
+            length = value.trim().parse::<usize>().ok();
+        }
+        headers.push((name, value));
+    }
+    if chunked {
+        return Some(OriginResponse {
+            status,
+            headers,
+            body: dechunk(body)?,
+        });
+    }
+    if let Some(want) = length {
+        body = body.get(..want).unwrap_or(body);
+    }
+    Some(OriginResponse {
+        status,
+        headers,
+        body: body.to_vec(),
+    })
+}
+
+/// The parts ferrox re-emits from a reverse-proxied origin: kept apart from the HTTP/3 encoder so a chunked body is proven de-framed without a socket in the test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// Strip the chunked transfer framing: each `hex-length\r\n data \r\n` run yields its data until a zero-length chunk closes the body. A short or malformed run is not a complete response.
+fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let line_end = body.windows(2).position(|window| window == b"\r\n")?;
+        let header = std::str::from_utf8(&body[..line_end]).ok()?;
+        let size = usize::from_str_radix(header.split(';').next()?.trim(), 16).ok()?;
+        if size == 0 {
+            return Some(out);
+        }
+        let start = line_end + 2;
+        out.extend_from_slice(body.get(start..start + size)?);
+        body = body.get(start + size + 2..)?;
+    }
 }
 
 #[cfg(test)]
@@ -917,5 +1116,114 @@ mod tests {
             .deobfuscate_in_place(&mut frame[..written])
             .expect("inverts");
         assert_eq!(&frame[..n], &plain[..], "and unmasking returns the bytes");
+    }
+
+    #[test]
+    fn the_flow_frame_tells_hysteria_from_a_browser_request() {
+        let mut hysteria = Vec::new();
+        tcp_prefix(&mut hysteria);
+        assert!(is_hysteria_flow(&hysteria), "0x401 names a destination");
+        assert!(
+            !is_hysteria_flow(&[frames::H3_HEADERS as u8, 0]),
+            "a HEADERS frame is a browser"
+        );
+        assert!(
+            !is_hysteria_flow(&[frames::H3_DATA as u8, 0]),
+            "and so is a DATA frame"
+        );
+    }
+
+    #[test]
+    fn an_h3_response_is_headers_then_data() {
+        let mut out = Vec::new();
+        encode_h3_response(200, &[("content-type", "text/plain")], b"hi", &mut out);
+        let mut at = 0usize;
+        let head = frames::h3_frame(&out, &mut at).expect("headers frame");
+        assert_eq!(head.kind, frames::H3_HEADERS);
+        let block = &out[at..at + head.length as usize];
+        let fields = hpack::qpack_fields(block).expect("a qpack block");
+        assert_eq!(find(&fields, ":status"), Some(b"200".as_slice()));
+        assert_eq!(
+            find(&fields, "content-type"),
+            Some(b"text/plain".as_slice())
+        );
+        at += head.length as usize;
+        let data = frames::h3_frame(&out, &mut at).expect("data frame");
+        assert_eq!(data.kind, frames::H3_DATA);
+        assert_eq!(data.length, 2);
+        assert_eq!(&out[at..at + 2], b"hi");
+    }
+
+    #[test]
+    fn a_bodyless_response_is_headers_alone() {
+        let mut out = Vec::new();
+        encode_h3_response(404, &[("content-type", "text/plain")], b"", &mut out);
+        let mut at = 0usize;
+        let head = frames::h3_frame(&out, &mut at).expect("headers frame");
+        assert_eq!(head.kind, frames::H3_HEADERS);
+        assert_eq!(
+            at + head.length as usize,
+            out.len(),
+            "no DATA frame follows"
+        );
+    }
+
+    #[test]
+    fn a_browser_get_parses_to_method_path_and_authority() {
+        let mut block = Vec::new();
+        hpack::qpack_literal_many(
+            &[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":authority", "example.com"),
+                (":path", "/index.html"),
+                ("user-agent", "curl/8"),
+            ],
+            &mut block,
+        );
+        let request = parse_h3_request(&block).expect("a request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/index.html");
+        assert_eq!(request.authority, "example.com");
+        assert_eq!(
+            request.headers,
+            vec![("user-agent".into(), "curl/8".into())]
+        );
+        assert!(
+            request.body.is_empty(),
+            "the DATA body is the caller's to append"
+        );
+        let mut not_a_request = Vec::new();
+        hpack::qpack_literal_many(&[(":status", "200")], &mut not_a_request);
+        assert!(
+            parse_h3_request(&not_a_request).is_none(),
+            "a response block names no :method"
+        );
+    }
+
+    #[test]
+    fn a_chunked_origin_body_defragments_to_its_bytes() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let response = parse_origin_response(raw).expect("a chunked response");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"hello world");
+        let plain = b"HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\nabctrailing";
+        let response = parse_origin_response(plain).expect("a lengthed response");
+        assert_eq!(response.status, 404);
+        assert_eq!(response.body, b"abc", "content-length bounds the body");
+        assert!(
+            parse_origin_response(b"HTTP/1.1 200 OK\r\n").is_none(),
+            "a head that never reaches its blank line is not a response"
+        );
+    }
+
+    #[test]
+    fn content_type_maps_the_common_extensions() {
+        assert_eq!(content_type("/index.html"), "text/html; charset=utf-8");
+        assert_eq!(content_type("/a/b.PNG"), "image/png");
+        assert_eq!(content_type("/app.js"), "text/javascript; charset=utf-8");
+        assert_eq!(content_type("page.html?v=2"), "text/html; charset=utf-8");
+        assert_eq!(content_type("/noextension"), "application/octet-stream");
+        assert_eq!(content_type("/file.unknown"), "application/octet-stream");
     }
 }
