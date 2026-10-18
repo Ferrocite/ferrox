@@ -434,7 +434,7 @@ impl Handler {
 
     fn accept_flow(&mut self, ip: &Ipv4Head, tcp: &TcpHead, key: FlowKey) -> io::Result<()> {
         // Flows whose response thread has already left are removed here, so the packet path pays nothing for the reap.
-        while let Some(ended) = self.ended_rx.try_recv().ok() {
+        while let Ok(ended) = self.ended_rx.try_recv() {
             self.flows.remove(&ended);
         }
         let local_ip = ip.destination;
@@ -1076,8 +1076,8 @@ mod tests {
 
         // The client's goodbye outranks the budget: a reset flow hands its leg back at once.
         peer.write_all(&build_tcp_packet(
-            (SCRIPT_CLIENT, 51501),
-            (destination.ip().octets(), 443),
+            (SCRIPT_CLIENT, second.source_port),
+            (second.destination, second.destination_port),
             9501,
             0,
             FLAG_RST | FLAG_ACK,
