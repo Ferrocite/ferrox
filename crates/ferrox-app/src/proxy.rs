@@ -10266,6 +10266,7 @@ mod tests {
     use super::*;
     use crate::budgets::{HEAD_DEADLINE, RELAY_JOIN};
     use crate::config::{grpc_path, stream_carrier};
+    use ferrox_core::finalmask::Chain;
 
     #[test]
     fn the_seam_split_find_across_agrees_with_the_per_byte_branch_scan() {
@@ -10649,7 +10650,7 @@ mod tests {
                 stream,
                 &[0x9Du8; 16],
                 true,
-                &Carrier::Raw(Default::default()),
+                &Carrier::Raw(Chain::default()),
                 &server_config,
             );
         });
@@ -12157,7 +12158,7 @@ mod tests {
     }
 
     fn reality_pair(flow: &str) -> RealityPair {
-        reality_pair_with(flow, "tcp", Carrier::Raw(Default::default()))
+        reality_pair_with(flow, "tcp", Carrier::Raw(Chain::default()))
     }
 
     fn reality_pair_with(flow: &str, network: &str, carrier: Carrier) -> RealityPair {
@@ -13813,7 +13814,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port,
             id,
-            carrier: Carrier::Raw(Default::default()),
+            carrier: Carrier::Raw(Chain::default()),
             host: String::new(),
             mux: false,
             quic_roots: None,
@@ -13881,7 +13882,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port,
             id,
-            carrier: Carrier::Raw(Default::default()),
+            carrier: Carrier::Raw(Chain::default()),
             host: String::new(),
             mux: false,
             quic_roots: None,
@@ -14287,7 +14288,7 @@ mod tests {
                 address: "127.0.0.1".to_owned(),
                 port,
                 id,
-                carrier: Carrier::Raw(Default::default()),
+                carrier: Carrier::Raw(Chain::default()),
                 host: String::new(),
                 mux: false,
                 quic_roots: None,
@@ -14350,7 +14351,7 @@ mod tests {
                 address: "127.0.0.1".to_owned(),
                 port,
                 key,
-                carrier: Carrier::Raw(Default::default()),
+                carrier: Carrier::Raw(Chain::default()),
                 host: String::new(),
                 tls: Some(Arc::new(client_config)),
             };
@@ -14423,7 +14424,7 @@ mod tests {
                 port,
                 id,
                 cipher: crate::vmess::Cipher::Auto,
-                carrier: Carrier::Raw(Default::default()),
+                carrier: Carrier::Raw(Chain::default()),
                 host: String::new(),
                 tls: Some(Arc::new(client_config)),
             };
@@ -15639,7 +15640,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port: tunnel_port,
             id,
-            carrier: Carrier::Raw(Default::default()),
+            carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
             mux: false,
             quic_roots: None,
@@ -15888,7 +15889,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port: tunnel_port,
             key: trojan_key("secret"),
-            carrier: Carrier::Raw(Default::default()),
+            carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
             tls: None,
         });
@@ -16028,7 +16029,7 @@ mod tests {
             port: tunnel_port,
             id,
             cipher: crate::vmess::Cipher::Chacha,
-            carrier: Carrier::Raw(Default::default()),
+            carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
             tls: None,
         });
@@ -16170,7 +16171,7 @@ mod tests {
             port: tunnel_port,
             method: "aes-256-gcm".to_owned(),
             password: "an-example-shared-password".to_owned(),
-            carrier: Carrier::Raw(Default::default()),
+            carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
         });
         thread::spawn(move || {
@@ -16449,7 +16450,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port: tunnel_port,
             id,
-            carrier: Carrier::Raw(Default::default()),
+            carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
             mux: true,
             quic_roots: None,
@@ -17048,7 +17049,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port: tunnel_port,
             id,
-            carrier: Carrier::Raw(Default::default()),
+            carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
             mux: true,
             quic_roots: None,
@@ -17726,13 +17727,9 @@ mod tests {
                 r#"{{"network":"tcp","tcpSettings":{{"header":{{"type":"http","request":{{"path":"/x"}}}}}},"finalmask":{{"tcp":[{fragment}]}}}}"#
             ),
             // A window starting at 0 is every write, which the reference refuses outright.
-            &format!(
-                r#"{{"network":"tcp","finalmask":{{"tcp":[{{"type":"fragment","settings":{{"packets":"0-5","lengths":[11]}}}}]}}}}"#
-            ),
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"fragment","settings":{"packets":"0-5","lengths":[11]}}]}}"#,
             // A last width entry of 0 is a piece that never advances.
-            &format!(
-                r#"{{"network":"tcp","finalmask":{{"tcp":[{{"type":"fragment","settings":{{"packets":"tlshello","lengths":[11,0]}}}}]}}}}"#
-            ),
+            r#"{"network":"tcp","finalmask":{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":[11,0]}}]}}"#,
             // A fragment naming no width at all is the reference's zero range.
             r#"{"network":"tcp","finalmask":{"tcp":[{"type":"fragment","settings":{"packets":"tlshello"}}]}}"#,
             r#"{"network":"tcp","finalmask":{"tcp":[{}]}}"#,
@@ -18167,7 +18164,7 @@ mod tests {
         }
         assert_eq!(ladder.current(), Rung::HttpUpgrade);
         for (carrier, want) in [
-            (Carrier::Raw(Default::default()), Rung::Raw),
+            (Carrier::Raw(Chain::default()), Rung::Raw),
             (
                 Carrier::Ws {
                     path: "/t".to_owned(),
@@ -20208,7 +20205,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port: 1,
             id: uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id"),
-            carrier: Carrier::Raw(Default::default()),
+            carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
             mux: false,
             quic_roots: None,
@@ -20241,7 +20238,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port: server_port,
             id,
-            carrier: Carrier::Raw(Default::default()),
+            carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
             mux: false,
             quic_roots: None,

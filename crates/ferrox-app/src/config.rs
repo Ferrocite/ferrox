@@ -826,23 +826,11 @@ fn range_text(text: &str) -> Option<ferrox_core::finalmask::Range> {
     if text.is_empty() {
         return Some(Range::ordered(0, 0));
     }
-    let (left, right) = match text.strip_prefix('-') {
-        Some(rest) => {
-            let mut parts = rest.splitn(2, '-');
-            (
-                -parts.next()?.parse::<i64>().ok()?,
-                parts.next()?.parse::<i64>().ok()?,
-            )
-        }
-        None => {
-            let mut parts = text.splitn(2, '-');
-            (
-                parts.next()?.parse::<i64>().ok()?,
-                parts.next()?.parse::<i64>().ok()?,
-            )
-        }
-    };
-    Some(Range::ordered(left, right))
+    let leading = text.starts_with('-');
+    let mut parts = text.strip_prefix('-').unwrap_or(text).splitn(2, '-');
+    let low = parts.next()?.parse::<i64>().ok()?;
+    let high = parts.next()?.parse::<i64>().ok()?;
+    Some(Range::ordered(if leading { -low } else { low }, high))
 }
 
 fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
