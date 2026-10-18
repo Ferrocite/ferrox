@@ -5506,7 +5506,7 @@ mod loopback {
                 let _ = sock.send_to(&out[..written], info.to);
             }
             echo_stream(
-                &sock, local, &mut conn, &mut buf, &mut out, stream, downlink,
+                &sock, local, &mut conn, &mut buf, &mut out, stream, &downlink,
             );
         })
     }
