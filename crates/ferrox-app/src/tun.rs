@@ -31,6 +31,10 @@ const DEFAULT_MTU: usize = 1500;
 /// The association's framed datagram: the relay's largest payload plus the RSV/FRAG prefix and an address.
 const FRAME_CAP: usize = crate::proxy::UDP_BUF + 3 + 19;
 const TCP_PROTO: u8 = 6;
+const ICMP_PROTO: u8 = 1;
+/// An ICMP echo request is type 8; its answer flips that to type 0 and carries the message back.
+const ICMP_ECHO_REQUEST: u8 = 8;
+const ICMP_ECHO_REPLY: u8 = 0;
 const FLAG_FIN: u8 = 0x01;
 const FLAG_SYN: u8 = 0x02;
 const FLAG_RST: u8 = 0x04;
@@ -87,6 +91,12 @@ fn tcp_head(body: &[u8]) -> Option<(TcpHead, &[u8])> {
         },
         &body[data_offset..],
     ))
+}
+
+/// Whether an ICMP body is an IPv4 echo request worth answering: type 8, code 0, and at
+/// least the eight-byte header. A reply, another code or a truncated message is refused.
+fn is_echo_request(body: &[u8]) -> bool {
+    body.len() >= 8 && body[0] == ICMP_ECHO_REQUEST && body[1] == 0
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -336,6 +346,33 @@ fn build_tcp_packet(
     pkt
 }
 
+/// An ICMP echo request answered as its destination would: the request's own message with
+/// the type flipped to an echo reply, the code and checksum zeroed and the checksum
+/// recomputed, wrapped in an IPv4 header whose source and destination are the request's
+/// swapped. The identifier, sequence and data ride back unchanged, and the message is read
+/// from the borrowed body — one render, one write, no header staging.
+fn build_icmp_reply(src: [u8; 4], dst: [u8; 4], request: &[u8]) -> Vec<u8> {
+    let ip_len = IPV4_HEADER + request.len();
+    let mut pkt = vec![0u8; ip_len];
+    pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
+    pkt[6] = 0x40;
+    pkt[8] = 64;
+    pkt[9] = ICMP_PROTO;
+    pkt[12..16].copy_from_slice(&src);
+    pkt[16..20].copy_from_slice(&dst);
+    let c = ipv4_checksum(&pkt[..IPV4_HEADER]);
+    pkt[10..12].copy_from_slice(&c.to_be_bytes());
+    let m = &mut pkt[IPV4_HEADER..];
+    m.copy_from_slice(request);
+    m[0] = ICMP_ECHO_REPLY;
+    m[1] = 0;
+    m[2..4].copy_from_slice(&[0, 0]);
+    let ic = checksum(m);
+    m[2..4].copy_from_slice(&ic.to_be_bytes());
+    pkt
+}
+
 /// One active TCP flow's state. The two cursors are shared with the response
 /// thread: `rcv_nxt` advances as the handler delivers payload to the proxy, and
 /// `snd_nxt` advances as the response thread sends payload out, so a pure ACK
@@ -462,6 +499,7 @@ impl Handler {
         match ip.protocol {
             TCP_PROTO => self.handle_tcp(&ip, body),
             PROTOCOL_UDP => self.handle_udp(&ip, body),
+            ICMP_PROTO => self.handle_icmp(&ip, body),
             _ => Ok(()),
         }
     }
@@ -660,6 +698,17 @@ impl Handler {
         });
 
         Ok(())
+    }
+
+    /// Answer an ICMP echo request as the device's own address would, so a ping off the
+    /// interface returns instead of vanishing; a message that is not a well-formed echo
+    /// request is left unanswered, exactly as the reference's handler returns.
+    fn handle_icmp(&mut self, ip: &Ipv4Head, body: &[u8]) -> io::Result<()> {
+        if !is_echo_request(body) {
+            return Ok(());
+        }
+        let reply = build_icmp_reply(ip.destination, ip.source, body);
+        self.device.write_packet(&reply)
     }
 
     fn close_flow(&mut self, key: FlowKey) {
@@ -923,6 +972,89 @@ mod tests {
         assert_eq!(rtcp.source_port, 8080);
         assert_eq!(rtcp.destination_port, 44444);
         assert_eq!(rtcp.seq, 1001);
+    }
+
+    #[test]
+    fn a_non_echo_icmp_message_is_refused() {
+        // The three shapes that are not an IPv4 echo request the handler would answer.
+        assert!(!is_echo_request(&[0, 0, 0, 0, 0, 0, 0, 0]), "an echo reply");
+        assert!(
+            !is_echo_request(&[8, 3, 0, 0, 0, 0, 0, 0]),
+            "a non-zero code"
+        );
+        assert!(
+            !is_echo_request(&[8, 0, 0, 0]),
+            "shorter than the eight-byte header"
+        );
+        assert!(
+            is_echo_request(&[8, 0, 0, 0, 0, 0, 0, 0]),
+            "a well-formed request"
+        );
+    }
+
+    /// One IPv4 ICMP echo request, rendered independently of the reply so the round trip
+    /// is not self-consistent: type 8, code 0, a carried identifier, sequence and data.
+    #[cfg(unix)]
+    fn icmp_echo(src: [u8; 4], dst: [u8; 4], id: u16, seq: u16, data: &[u8]) -> Vec<u8> {
+        let ip_len = IPV4_HEADER + 8 + data.len();
+        let mut pkt = vec![0u8; ip_len];
+        pkt[0] = 0x45;
+        pkt[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
+        pkt[6] = 0x40;
+        pkt[8] = 64;
+        pkt[9] = ICMP_PROTO;
+        pkt[12..16].copy_from_slice(&src);
+        pkt[16..20].copy_from_slice(&dst);
+        let c = ipv4_checksum(&pkt[..IPV4_HEADER]);
+        pkt[10..12].copy_from_slice(&c.to_be_bytes());
+        let m = &mut pkt[IPV4_HEADER..];
+        m[0] = ICMP_ECHO_REQUEST;
+        m[4..6].copy_from_slice(&id.to_be_bytes());
+        m[6..8].copy_from_slice(&seq.to_be_bytes());
+        m[8..].copy_from_slice(data);
+        let ic = checksum(m);
+        m[2..4].copy_from_slice(&ic.to_be_bytes());
+        pkt
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_icmp_echo_request_is_answered_as_a_reply() {
+        let (a, b) = unix_socketpair().unwrap();
+        let device = Device::from_handle(a, DEFAULT_MTU);
+        let mut peer = b;
+        let relay: Relay = Arc::new(|_conn, _dest| {});
+        let mut handler = Handler::new(device, relay, no_associate());
+
+        let request = icmp_echo([10, 0, 0, 2], [10, 0, 0, 1], 0x1234, 0x0007, b"ping data");
+        peer.write_all(&request).unwrap();
+
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let n = handler.device.read_packet(&mut buf).unwrap();
+        handler.dispatch(&buf[..n]).unwrap();
+
+        let mut reply = vec![0u8; DEFAULT_MTU + 64];
+        let rn = peer.read(&mut reply).unwrap();
+        let (rip, rbody) = ipv4_head(&reply[..rn]).unwrap();
+        assert_eq!(rip.protocol, ICMP_PROTO);
+        // answered as the address the request asked, back to the pinger
+        assert_eq!(rip.source, [10, 0, 0, 1]);
+        assert_eq!(rip.destination, [10, 0, 0, 2]);
+        assert_eq!(
+            ipv4_checksum(&reply[..IPV4_HEADER]),
+            0,
+            "the header verifies"
+        );
+        // an echo reply whose own checksum holds, carrying the message back unchanged
+        assert_eq!(rbody[0], ICMP_ECHO_REPLY);
+        assert_eq!(rbody[1], 0);
+        assert_eq!(
+            checksum(rbody),
+            0,
+            "the reply carries a valid ICMP checksum"
+        );
+        assert_eq!(&rbody[4..8], &[0x12, 0x34, 0x00, 0x07]);
+        assert_eq!(&rbody[8..], b"ping data");
     }
 
     #[cfg(unix)]
