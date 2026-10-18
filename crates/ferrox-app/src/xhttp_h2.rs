@@ -774,14 +774,15 @@ fn pump_frame(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::conn::{test_bind, Connection};
     use crate::h2::MAGIC;
-    use std::net::{SocketAddr, TcpListener, TcpStream};
+    use std::net::SocketAddr;
     use std::sync::atomic::AtomicUsize;
     use std::thread;
     use std::time::Duration;
 
     struct H2Client {
-        stream: TcpStream,
+        stream: Connection,
         next: u32,
         decoder: Decoder,
         held: VecDeque<(u8, u8, u32, Vec<u8>)>,
@@ -789,7 +790,7 @@ mod tests {
 
     impl H2Client {
         fn connect(addr: SocketAddr) -> Self {
-            let mut stream = TcpStream::connect(addr).expect("connects");
+            let mut stream = Connection::connect(addr).expect("connects");
             stream
                 .set_read_timeout(Some(Duration::from_secs(20)))
                 .expect("timeout");
@@ -996,7 +997,7 @@ mod tests {
     }
 
     /// Fill `buf` from the socket, returning `None` on EOF or a read error (including the timeout that means a window-exhausted peer has stopped) so a drain can distinguish "no more to observe" from a frame count.
-    fn fill(stream: &mut TcpStream, buf: &mut [u8]) -> Option<usize> {
+    fn fill(stream: &mut Connection, buf: &mut [u8]) -> Option<usize> {
         let mut at = 0;
         while at < buf.len() {
             match stream.read(&mut buf[at..]) {
@@ -1010,7 +1011,7 @@ mod tests {
     }
 
     fn echo_server() -> (SocketAddr, thread::JoinHandle<()>) {
-        let echo = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let echo = test_bind("127.0.0.1:0").expect("binds");
         let addr = echo.local_addr().expect("addr");
         let handle = thread::spawn(move || {
             let (mut stream, _) = echo.accept().expect("accepts");
@@ -1051,7 +1052,7 @@ mod tests {
         id: [u8; 16],
         takes: usize,
     ) -> (SocketAddr, thread::JoinHandle<()>) {
-        let front = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let front = test_bind("127.0.0.1:0").expect("binds");
         let addr = front.local_addr().expect("addr");
         let handle = thread::spawn(move || {
             for stream in front.incoming().take(takes) {
@@ -1413,7 +1414,7 @@ mod tests {
     /// rather than only losing them when the scheduler lets two responses interleave.
     #[test]
     fn an_early_frame_waits_for_the_reader_that_asked_for_it() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds a scripted peer");
+        let listener = test_bind("127.0.0.1:0").expect("binds a scripted peer");
         let addr = listener.local_addr().expect("addr");
         let scripted = thread::spawn(move || {
             let (mut peer, _) = listener.accept().expect("the client connects");
