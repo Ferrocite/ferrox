@@ -596,6 +596,8 @@ struct FoxyOut {
     verified: std::sync::Arc<std::sync::Mutex<Option<ferrox_core::foxy::Candidate>>>,
     /// Set when no edge could carry a probe tunnel here: the pre-flight then stops rather than costing every flow a dead dial.
     probe_unavailable: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set while the sweep runs on its own thread: one lane probes once, and a flow that arrives mid-sweep rides the label order rather than waiting.
+    exit_probe_running: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Until when the probes are known to answer a country other than the pin: a sweep that reached an edge and agreed with none is the answer, and re-asking it per flow buys the same refusal again.
     exit_refuted_until: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
@@ -5759,11 +5761,14 @@ fn probe_edge_exit(
         pass,
     };
     let quic_dial = foxy_quic_dial(foxy, edge);
-    let quic = crate::quic::pooled_stream_within(&quic_dial, budgets::carrier_probe())?;
+    let budget = budgets::carrier_probe();
+    let quic = crate::quic::pooled_stream_within(&quic_dial, budget)?;
     // The lease goes into the open and comes back with the lane: whoever ends the flow hands the pool entry over, and a probe that ends early ends with it.
-    let opened = crate::foxy::Tunnel::open(&dial, authority, Some(quic));
+    let opened = crate::foxy::Tunnel::open_within(&dial, authority, Some(quic), budget);
     match opened {
         Ok(mut tunnel) => {
+            // The trace read carries the same budget as the dial: no head inside it is no answer, not a wait.
+            let _ = tunnel.set_read_quantum(budget);
             let seen = foxy_exit_country(&mut tunnel, foxy);
             drop(tunnel);
             seen
@@ -5835,6 +5840,31 @@ fn verify_exit(foxy: &FoxyOut) {
     }
 }
 
+/// The pre-flight belongs to no client's clock: the sweep runs once per lane on its own thread while the flow that scheduled it dials the label order, and the flows after it ride whatever edge the probe confirmed. Every verdict it writes goes through an `Arc`, so the clone the thread holds is only a dial snapshot.
+fn schedule_exit_probe(foxy: &FoxyOut) {
+    if !exit_needs_probe(foxy)
+        || foxy.probe_unavailable.load(Ordering::Relaxed)
+        || edge_limited(&foxy.exit_refuted_until, now_secs())
+        || foxy.verified.lock().is_ok_and(|kept| kept.is_some())
+    {
+        return;
+    }
+    if foxy.exit_probe_running.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let owned = std::sync::Arc::new(foxy.clone());
+    let running = std::sync::Arc::clone(&owned.exit_probe_running);
+    let spawned = std::thread::Builder::new()
+        .name("foxy-exit-probe".to_string())
+        .spawn(move || {
+            verify_exit(&owned);
+            running.store(false, Ordering::Relaxed);
+        });
+    if spawned.is_err() {
+        foxy.exit_probe_running.store(false, Ordering::Relaxed);
+    }
+}
+
 /// Shared loop: first answer wins, a refused pass stops every carrier and edge; the grant belongs to the front.
 fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
     if foxy
@@ -5853,7 +5883,7 @@ fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
         return FoxyOpen::Direct(target);
     }
     let target = asked.authority();
-    verify_exit(foxy);
+    schedule_exit_probe(foxy);
     let preferred = foxy.preferred_edge();
     let order = ferrox_core::foxy::catalog::tier(
         &foxy.candidates,
@@ -9993,6 +10023,7 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             },
             verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
             probe_unavailable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            exit_probe_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             exit_refuted_until: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
     }
@@ -15709,6 +15740,7 @@ mod tests {
             exit_probe: None,
             verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
             probe_unavailable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            exit_probe_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             exit_refuted_until: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -21827,6 +21859,7 @@ mod tests {
             exit_probe: None,
             verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
             probe_unavailable: std::sync::Arc::new(AtomicBool::new(false)),
+            exit_probe_running: std::sync::Arc::new(AtomicBool::new(false)),
             exit_refuted_until: std::sync::Arc::new(AtomicU64::new(0)),
         };
         let target = Destination::Name("target.test".to_owned(), 443);
@@ -21923,6 +21956,7 @@ mod tests {
             exit_probe: None,
             verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
             probe_unavailable: std::sync::Arc::new(AtomicBool::new(false)),
+            exit_probe_running: std::sync::Arc::new(AtomicBool::new(false)),
             exit_refuted_until: std::sync::Arc::new(AtomicU64::new(0)),
         };
         // Both capsule carriers are known silent, and neither is to be knocked on again inside its window.

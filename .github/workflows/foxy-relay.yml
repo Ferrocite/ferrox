@@ -250,23 +250,19 @@ jobs:
               FAILED="$FAILED $carrier(listen)"
               continue
             fi
-            # The first flow pays for sign-in, catalogue and edge dial, so the trace is
-            # retried inside the leg's share; a lane that never answers fails here rather
-            # than spending a download's budget proving the same thing again.
-            trace_ok=1
-            while ((SECONDS < leg_end)); do
-              if curl -sS --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
-                https://www.cloudflare.com/cdn-cgi/trace -o trace.txt; then
-                grep -qx "loc=$FOXY_COUNTRY" trace.txt && trace_ok=0
-                break
-              fi
-              sleep 3
-            done
-            if ((trace_ok != 0)); then
-              echo "carrier $carrier FAILED: no trace answer on the pin" >&2
-              curl -v --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
-                https://www.cloudflare.com/cdn-cgi/trace -o /dev/null 2>&1 | tail -n 25 || true
-              FAILED="$FAILED $carrier(trace)"
+            # The first flow is the measurement: one trace attempt, timed, and its
+            # curl exit taken at face value. A retry here would hide a stalling
+            # lane behind a second attempt's cached answer, so a stall fails this
+            # leg by name instead of scrolling past in a green job.
+            code=0
+            trace_timing=$(curl -sS --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
+              -w '%{size_download} %{time_total} %{speed_download}' \
+              https://www.cloudflare.com/cdn-cgi/trace -o trace.txt) || code=$?
+            echo "trace $carrier ${trace_timing:-0 0 0}" >> foxy-legs.tsv
+            if test "$code" != 0 || ! grep -qx "loc=$FOXY_COUNTRY" trace.txt; then
+              echo "carrier $carrier FAILED: first trace, curl exit $code" >&2
+              tail -n 30 ferrox-relay.log
+              FAILED="$FAILED $carrier(trace$code)"
               stop_lane
               continue
             fi
@@ -384,25 +380,25 @@ jobs:
             leg=$((leg + 1))
             LEG_END=$((DEADLINE - (legs - leg) * reserve))
           }
-          # The first flow of a lane pays for sign-in, catalogue and edge dial, and a front
-          # that is still taking its first connection answers a reset once: the trace is
-          # retried inside the leg's share.
+          # The first flow of a lane is the measurement: one attempt, timed, its curl
+          # exit taken at face value. The stale file is cleared first so a leg that
+          # never answered cannot grep the previous leg's trace, and a stalling lane
+          # fails this leg by name rather than being retried into a green job.
           trace_front() {
-            FRONT="$1" WANT="$2"
-            # The stale file is cleared first: a retry loop that never runs must fail
-            # on its own leg, not grep the previous leg's answer.
+            FRONT="$1" WANT="$2" LABEL="$3"
             : > trace-lane.txt
-            while ((SECONDS < LEG_END)); do
-              if [ "$FRONT" = http ]; then
-                curl -sS --max-time 15 -x "http://127.0.0.1:$PORT" \
-                  https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt && break
-              else
-                curl -sS --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
-                  https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt && break
-              fi
-              sleep 3
-            done
-            grep -qx "loc=$WANT" trace-lane.txt
+            code=0
+            if [ "$FRONT" = http ]; then
+              timing=$(curl -sS --max-time 15 -x "http://127.0.0.1:$PORT" \
+                -w '%{size_download} %{time_total} %{speed_download}' \
+                https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt) || code=$?
+            else
+              timing=$(curl -sS --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
+                -w '%{size_download} %{time_total} %{speed_download}' \
+                https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt) || code=$?
+            fi
+            echo "$LABEL trace ${timing:-0 0 0}" >> foxy-legs.tsv
+            test "$code" = 0 && grep -qx "loc=$WANT" trace-lane.txt
           }
           # `-w` gives the duration: bytes moved, seconds taken, the rate held.
           # Every leg appends one line to foxy-legs.tsv, including a leg that ran
@@ -500,7 +496,7 @@ jobs:
               if [ -n "$HOP_FRONT" ]; then stop_hop; fi
               continue
             fi
-            if ! trace_front "$TRACE_FRONT" "$COUNTRY"; then
+            if ! trace_front "$TRACE_FRONT" "$COUNTRY" "$LABEL"; then
               echo "$LABEL FAILED: the trace never pinned $COUNTRY on the front" >&2
               FAILED="$FAILED ${LABEL}(trace)"
               stop_lane
@@ -575,34 +571,41 @@ jobs:
             leg=$((leg + 1))
             LEG_END=$((DEADLINE - (legs - leg) * reserve))
           }
+          # One attempt, timed, its curl exit taken at face value: a retry here
+          # would hide a stalling lane behind a cached second answer.
           trace_socks() {
-            PORT="$1" WANT="$2"
-            # The fronts step's file survives into this job: a retry that never runs
-            # must fail on this leg, not grep the previous step's answer.
+            PORT="$1" WANT="$2" LABEL="$3"
+            # The fronts step's file survives into this job: a leg that never
+            # answered must fail on its own trace, not grep the previous step's.
             : > trace-lane.txt
-            while ((SECONDS < LEG_END)); do
-              curl -sS --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
-                https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt && break
-              sleep 3
-            done
-            grep -qx "loc=$WANT" trace-lane.txt
+            code=0
+            timing=$(curl -sS --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
+              -w '%{size_download} %{time_total} %{speed_download}' \
+              https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt) || code=$?
+            echo "$LABEL trace ${timing:-0 0 0}" >> foxy-legs.tsv
+            test "$code" = 0 && grep -qx "loc=$WANT" trace-lane.txt
           }
 
           # A different exit server: the trace must pin DE, and 1 MB must
-          # arrive through it with its exact byte count.
+          # arrive through it with its exact byte count. Each answer is a gate,
+          # not scenery: a leg that fails names itself and every other leg still
+          # runs, with the step exiting non-zero at the end.
+          FAILED=""
           leg_share
           echo "== second country DE over h2 =="
           PORT=10817
           start_lane socks "$PORT" h2 DE
-          trace_socks "$PORT" DE
+          trace_socks "$PORT" DE "second country DE" || FAILED="$FAILED de(trace)"
           de_code=0
           de_timing=$(curl -sS --max-time 120 --socks5-hostname "127.0.0.1:$PORT" \
             -w '%{size_download} %{time_total} %{speed_download}' \
             'https://speed.cloudflare.com/__down?bytes=1000000' -o file-de.bin) || de_code=$?
           echo "second country DE ${de_timing:-0 0 0}" >> foxy-legs.tsv
-          test "$de_code" = 0
-          test "$(wc -c < file-de.bin | tr -d ' ')" = 1000000
-          echo "second country DE: 1000000 B"
+          de_got=$(wc -c < file-de.bin 2>/dev/null | tr -d ' ')
+          test "$de_code" = 0 && test "${de_got:-0}" = 1000000 || {
+            echo "second country DE FAILED: curl exit $de_code after ${de_got:-0} of 1000000 B" >&2
+            FAILED="$FAILED de(download)"
+          }
           stop_lane
 
           # DNS through the tunnel over UDP. UDP rides CONNECT-UDP and the lane
@@ -728,13 +731,13 @@ jobs:
           echo "== udp path over the auto carrier: h3, then h2 =="
           PORT=10818
           start_lane socks "$PORT" auto "$COUNTRY"
-          trace_socks "$PORT" "$COUNTRY"
+          trace_socks "$PORT" "$COUNTRY" "udp auto" || FAILED="$FAILED udp-auto(trace)"
           # Control first: plain TCP to the DNS port through the same tunnel.
           # A fast connect proves egress; a refusal proves the target, and any
           # UDP verdict below must be read against this line. Names only, no
           # literals: the fixture gate forbids routable addresses in the tree.
           curl -v --max-time 12 --socks5-hostname "127.0.0.1:$PORT" telnet://one.one.one.one:53 || true
-          SOCKS_PORT="$PORT" python3 udp-probe.py
+          SOCKS_PORT="$PORT" python3 udp-probe.py || FAILED="$FAILED udp-auto(datagram)"
           stop_lane
           # The other form the lane speaks: the same datagram over the HTTP/2
           # edge the US MASQUE authority publishes, so a runner that never
@@ -743,10 +746,15 @@ jobs:
           echo "== udp path over h2 =="
           PORT=10819
           start_lane socks "$PORT" h2 "$COUNTRY"
-          trace_socks "$PORT" "$COUNTRY"
+          trace_socks "$PORT" "$COUNTRY" "udp h2" || FAILED="$FAILED udp-h2(trace)"
           curl -v --max-time 12 --socks5-hostname "127.0.0.1:$PORT" telnet://one.one.one.one:53 || true
-          SOCKS_PORT="$PORT" python3 udp-probe.py
+          SOCKS_PORT="$PORT" python3 udp-probe.py || FAILED="$FAILED udp-h2(datagram)"
           stop_lane
+          if [ -n "$FAILED" ]; then
+            echo "failed ubuntu legs:$FAILED" >&2
+            tail -n 30 ferrox-relay.log
+            exit 1
+          fi
       - name: Stop the lane and show its log
         if: always() && steps.secrets.outputs.present == 'true'
         run: |
