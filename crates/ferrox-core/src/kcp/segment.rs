@@ -165,6 +165,37 @@ pub(crate) fn write_data_header(header: OutgoingHeader, payload_len: u16, dst: &
     dst[16..18].copy_from_slice(&payload_len.to_be_bytes());
 }
 
+/// ACK numbers are borrowed and returned on one thread: `parse_segments` fills
+/// the list and `Connection::input` frees the segment moments later in the same
+/// call stack, so — unlike the payload pool, whose returner is a different thread
+/// — this one needs no lock and no owner across threads. A datagram's count byte
+/// bounds a list to 255 `u32`s, and a parked-count bound of `SPARE_ACK_NUMBERS`
+/// bounds the retained memory however many acks a burst carries.
+const SPARE_ACK_NUMBERS: usize = 64;
+
+thread_local! {
+    static ACK_NUMBERS: std::cell::RefCell<Vec<Vec<u32>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// A cleared number list for the next inbound ack, reused from the parked ones.
+pub(crate) fn take_ack_numbers() -> Vec<u32> {
+    ACK_NUMBERS
+        .with(|pool| pool.borrow_mut().pop())
+        .unwrap_or_default()
+}
+
+/// Returns a spent number list, parking it for reuse until the bound is reached.
+pub(crate) fn reclaim_ack_numbers(mut numbers: Vec<u32>) {
+    numbers.clear();
+    ACK_NUMBERS.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        if pool.len() < SPARE_ACK_NUMBERS {
+            pool.push(numbers);
+        }
+    });
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AckSegment {
     pub conv: u16,
@@ -244,10 +275,12 @@ impl AckSegment {
         let count = usize::from(buf[12]);
         let tail = buf.get(13..13 + count.checked_mul(4)?)?;
         let (chunks, _) = tail.as_chunks::<4>();
-        let numbers: Vec<u32> = chunks
-            .iter()
-            .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]]))
-            .collect();
+        let mut numbers = take_ack_numbers();
+        numbers.extend(
+            chunks
+                .iter()
+                .map(|c| u32::from_be_bytes([c[0], c[1], c[2], c[3]])),
+        );
         Some((
             Self {
                 conv,
@@ -514,6 +547,47 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    /// A received ack's number list is reused, not reallocated. The parsed list's
+    /// base pointer and capacity survive a full take/reclaim cycle and the cycle
+    /// allocates nothing: the decoded numbers are byte-identical either way, so a
+    /// byte test cannot witness the removed `malloc`/`free` and pointer identity is
+    /// the gate.
+    #[test]
+    fn a_received_ack_reuses_its_number_list() {
+        let mut seg = AckSegment::new(ACK_NUMBER_LIMIT);
+        seg.conv = 7;
+        for number in 0..200u32 {
+            seg.put_number(number);
+        }
+        let mut buf = Vec::new();
+        Segment::Ack(seg).serialize(&mut buf);
+        // Warm the pool so the measured cycle reuses a buffer rather than fills a cold one.
+        let (got, _) = read_segment(&buf, &|| Vec::new()).unwrap();
+        let Segment::Ack(a) = got else {
+            panic!("a serialized ack parses back as an ack");
+        };
+        let warm_ptr = a.numbers.as_ptr();
+        let warm_cap = a.numbers.capacity();
+        assert_eq!(a.numbers.len(), 200, "every number decodes");
+        reclaim_ack_numbers(a.numbers);
+        let (reused_ptr, counts) = crate::alloc_count::measure(|| {
+            let (got, _) = read_segment(&buf, &|| Vec::new()).unwrap();
+            let Segment::Ack(a) = got else {
+                panic!("a serialized ack parses back as an ack");
+            };
+            let ptr = a.numbers.as_ptr();
+            assert_eq!(
+                a.numbers.capacity(),
+                warm_cap,
+                "the parked list kept its capacity"
+            );
+            reclaim_ack_numbers(a.numbers);
+            ptr
+        });
+        assert_eq!(counts.allocs, 0, "a reused ack list allocates nothing");
+        assert_eq!(reused_ptr, warm_ptr, "the same buffer serves every ack");
     }
 
     /// The sender writes a data segment from a borrowed payload slice while the

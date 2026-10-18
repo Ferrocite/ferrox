@@ -342,6 +342,8 @@ impl Connection {
                         .unwrap()
                         .process_segment(current, &a, rto);
                     self.data_output.signal();
+                    // The socket thread that parsed this ack is the thread that reaches here, so its number list returns to that thread's pool.
+                    super::segment::reclaim_ack_numbers(a.numbers);
                 }
                 Segment::CmdOnly(c) => {
                     if c.kind() == Some(Command::Terminate) {
