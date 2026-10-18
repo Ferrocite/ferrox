@@ -1,0 +1,229 @@
+name: release
+
+# Ships the lanes. On a version tag (or on demand) this builds `ferrox-app`
+# for every platform a user can run it on and attaches one package per platform
+# to the GitHub Release: the binary, `ferrox-cli.sh` beside it, and the two
+# pages that make trying a lane three commands — `login`, `up --foxy --vpn`,
+# `down` — with no toolchain, no repository and no config by hand.
+#
+# Nothing here dials a connection: the job compiles, smoke-runs the binary's
+# own version line, and packages. Whether a lane carries bytes is gated by
+# foxy-relay.yml and the parity matrix, never by a release build. Every leg
+# must go green for the release to be written; a platform that cannot build
+# holds the release rather than shipping a page that promises it.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: an existing tag (vX.Y.Z) to rebuild onto; leave empty to ship the version Cargo.toml declares
+        required: false
+        default: ""
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+# The release job writes the tag and the assets; the build jobs only read.
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  plan:
+    name: the version to ship
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: name the release
+        id: v
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          WANT: ${{ github.event.inputs.tag }}
+        run: |
+          if [ "$EVENT" = push ]; then
+            echo "version=$REF_NAME" >> "$GITHUB_OUTPUT"
+          elif [ -n "$WANT" ]; then
+            case "$WANT" in
+              v[0-9]*.[0-9]*.[0-9]*) ;;
+              *) echo "::error::the tag input must name an existing vX.Y.Z tag, got: $WANT"; exit 1 ;;
+            esac
+            echo "version=$WANT" >> "$GITHUB_OUTPUT"
+          else
+            # Nothing typed: the version this workspace declares is the version
+            # to ship, so pressing the button once is the whole interaction.
+            DECLARED="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
+            [ -n "$DECLARED" ] || { echo "::error::cannot read the workspace version from Cargo.toml"; exit 1; }
+            echo "version=v$DECLARED" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: ${{ matrix.target }}
+    needs: plan
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-msvc
+            os: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: release-${{ matrix.target }}-${{ matrix.os }}
+      - name: install the QUIC build tool
+        if: runner.os == 'Windows'
+        shell: bash
+        run: choco install nasm -y --no-progress || { choco list --local-only 2>/dev/null | grep -iq nasm; }
+      - name: build the binary
+        shell: bash
+        env:
+          # The same crypto cfgs ci.yml arms and .cargo/config.toml documents:
+          # aarch64 consults them, x86_64 consults neither, so every package
+          # holds the runtime-dispatching build the local gates measured.
+          RUSTFLAGS: --cfg aes_armv8 --cfg polyval_armv8
+        run: cargo build --locked --release -p ferrox-app --target "${{ matrix.target }}"
+      - name: prove the binary runs
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/ferrox-app"
+          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
+          "$BIN" version
+      - name: package the lane kit
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          BIN="target/${{ matrix.target }}/release/ferrox-app"
+          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
+          PKG="ferrox-${VERSION#v}-${{ matrix.target }}"
+          rm -rf "$PKG" && mkdir -p "$PKG"
+          cp "$BIN" dist/ferrox-cli.sh dist/README.md dist/USAGE.md "$PKG/"
+          chmod +x "$PKG/$(basename "$BIN")" "$PKG/ferrox-cli.sh" 2>/dev/null || true
+          case "$(uname -s)" in
+            Darwin|Linux)
+              COPYFILE_DISABLE=1 tar --no-xattrs -czf "$PKG.tar.gz" "$PKG" ;;
+            *)
+              7z a -tzip "$PKG.zip" "$PKG" >/dev/null ;;
+          esac
+          rm -rf "$PKG"
+          ls -l ferrox-*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.target }}
+          path: ferrox-*
+          if-no-files-found: error
+
+  release:
+    name: publish ${{ needs.plan.outputs.version }}
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: pkg-*
+          path: packages
+          merge-multiple: true
+      - name: the handout
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          BODY: |-
+            ## Try a lane in three commands
+
+            Unpack your platform's package and run the CLI beside the binary — no cargo, no repository:
+
+            ```bash
+            tar xzf ferrox-VERSION_PLACEHOLDER-aarch64-apple-darwin.tar.gz
+            cd ferrox-VERSION_PLACEHOLDER-aarch64-apple-darwin
+            ./ferrox-cli.sh up --foxy --vpn   # first run asks for email + password, then connects
+            ./ferrox-cli.sh status            # the exit IP and country through the lane
+            ./ferrox-cli.sh down
+            ```
+
+            The Foxy lane needs an email and a password and **no server**: the first `up --foxy`
+            asks for them once, stores them 0600 outside the repository, and the edge is picked
+            from Mozilla's catalogue — `--country DE` moves the exit. The other lanes dial the
+            server their share link names: `up --vless 'vless://...'`, `--vmess`, `--trojan`,
+            `--ss`, or `--config` for anything the binary serves. `README.md` in each package is
+            the quickstart, `USAGE.md` the manual.
+
+            | package | platform |
+            | --- | --- |
+            | `ferrox-VERSION_PLACEHOLDER-aarch64-apple-darwin.tar.gz` | macOS on Apple Silicon |
+            | `ferrox-VERSION_PLACEHOLDER-x86_64-apple-darwin.tar.gz` | macOS on Intel |
+            | `ferrox-VERSION_PLACEHOLDER-aarch64-unknown-linux-gnu.tar.gz` | Linux on aarch64 |
+            | `ferrox-VERSION_PLACEHOLDER-x86_64-unknown-linux-gnu.tar.gz` | Linux on x86_64 |
+            | `ferrox-VERSION_PLACEHOLDER-x86_64-pc-windows-msvc.zip` | Windows x86_64 (CLI runs in Git Bash) |
+
+            On the Foxy lane a signed-in account renews the edge pass on its own clock, so a lane
+            left running overnight keeps working; accounts with two-factor sign-in pass
+            `--code 123456` once.
+        run: |
+          printf '%s\n\nBuilt by `release.yml` from commit `%s`.\n' "$BODY" "${GITHUB_SHA::8}" \
+            | sed "s/VERSION_PLACEHOLDER/${VERSION#v}/g" >RELEASE-BODY.md
+          head -5 RELEASE-BODY.md
+      - name: publish the release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.plan.outputs.version }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          shopt -s nullglob
+          assets=(packages/*)
+          [ "${#assets[@]}" -gt 0 ] || { echo "::error::no packages came back" ; exit 1; }
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            gh release upload "$VERSION" "${assets[@]}" --clobber
+            gh release edit "$VERSION" --notes-file RELEASE-BODY.md
+          elif [ "$EVENT" = workflow_dispatch ]; then
+            # A dispatched release of a version with no tag yet: cut the tag at
+            # the commit that built these packages, so the assets and the tag
+            # can never disagree about what this version is.
+            gh release create "$VERSION" --target "$GITHUB_SHA" \
+              --title "Ferrox $VERSION" --notes-file RELEASE-BODY.md "${assets[@]}"
+          else
+            gh release create "$VERSION" --title "Ferrox $VERSION" \
+              --notes-file RELEASE-BODY.md "${assets[@]}"
+          fi
+          gh release view "$VERSION" --json tagName,assets \
+            --jq '.tagName + ": " + ([.assets[].name] | join(", "))'
+      - name: the links, on the run page
+        shell: bash
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          {
+            echo "### Ferrox $VERSION is shipping"
+            echo
+            for f in packages/*; do
+              n="$(basename "$f")"
+              echo "- [$n](https://github.com/$GITHUB_REPOSITORY/releases/download/$VERSION/$n)"
+            done
+            echo
+            echo "Three commands from any of them: unpack, \`./ferrox-cli.sh up --foxy --vpn\`, done — the CLI asks for the account the first time."
+          } >> "$GITHUB_STEP_SUMMARY"
