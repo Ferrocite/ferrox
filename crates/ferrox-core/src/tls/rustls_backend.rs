@@ -1,6 +1,6 @@
 use super::{Stream, TlsConfig, TlsError, TlsProvider};
 use std::io::{Read, Write};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 
 type RootStore = rustls::RootCertStore;
 
@@ -107,49 +107,121 @@ impl rustls::client::danger::ServerCertVerifier for Pinned {
     }
 }
 
+/// The expensive halves of a client config, shared by every dial that names the same trust anchors, pins, ALPN list and suite order: parsing an anchor and building a verifier are per-config work, not per-connection work.
+struct Material {
+    roots: Arc<RootStore>,
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    /// Present only when the config pins: the `Pinned` wrapper around the chain verifier, holding the keys a verified chain must still carry.
+    verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
+}
+
+/// The three config fields `build_material` reads. ALPN is not one of them because the anchors and the suite order do not depend on it, and the server name is not one either: it reaches the connection, not the config.
+#[derive(PartialEq, Eq)]
+struct MaterialKey {
+    roots: Vec<Vec<u8>>,
+    pins: crate::foxy::pin::Pins,
+    cipher_suites: Vec<u16>,
+}
+
+impl MaterialKey {
+    fn of(cfg: &TlsConfig) -> Self {
+        Self {
+            roots: cfg.roots.clone(),
+            pins: cfg.pins.clone(),
+            cipher_suites: cfg.cipher_suites.clone(),
+        }
+    }
+}
+
+/// Every set of inputs this process has dialed with; a config comes from a config file, so the set is the number of remotes, and it is capped rather than trusted to stay small.
+const MATERIALS_MAX: usize = 32;
+
+/// A build, and the three inputs that select it.
+type Materials = Vec<(MaterialKey, Arc<Material>)>;
+
+static MATERIALS: OnceLock<Mutex<Materials>> = OnceLock::new();
+
+/// Parses the anchors, orders the suites and builds the verifier a config named, once per set of inputs.
+fn build_material(cfg: &TlsConfig) -> Result<Material, TlsError> {
+    let mut roots = RootStore::empty();
+    for der in &cfg.roots {
+        roots
+            .add(rustls::pki_types::CertificateDer::from(der.as_slice()))
+            .map_err(|e| TlsError::BadCertificate(format!("trust anchor: {e}")))?;
+    }
+    let roots = Arc::new(roots);
+
+    let mut provider = (*provider()).clone();
+    if !cfg.cipher_suites.is_empty() {
+        // The ring backend's set is a subset of `crypto/tls`'s, so the sort only re-orders what is reachable.
+        let order = &cfg.cipher_suites;
+        provider.cipher_suites.sort_by_key(|cs| {
+            let id = u16::from(cs.suite());
+            order
+                .iter()
+                .position(|&want| want == id)
+                .unwrap_or(usize::MAX)
+        });
+    }
+    let provider = Arc::new(provider);
+
+    let verifier = if cfg.pins.is_empty() {
+        None
+    } else {
+        let chain = rustls::client::WebPkiServerVerifier::builder_with_provider(
+            Arc::clone(&roots),
+            Arc::clone(&provider),
+        )
+        .build()
+        .map_err(|e| TlsError::BadCertificate(format!("chain: {e}")))?;
+        Some(Arc::new(Pinned {
+            inner: chain,
+            pins: cfg.pins.clone(),
+        })
+            as Arc<dyn rustls::client::danger::ServerCertVerifier>)
+    };
+    Ok(Material {
+        roots,
+        provider,
+        verifier,
+    })
+}
+
 impl<S: Stream> RustlsProvider<S> {
+    /// The parts a client config is built from, memoised per the anchors, pins and suite order a config names: the same three inputs get one build, whatever host or ALPN dials next.
+    fn material(cfg: &TlsConfig) -> Result<Arc<Material>, TlsError> {
+        let key = MaterialKey::of(cfg);
+        let all = MATERIALS.get_or_init(Default::default);
+        if let Some(found) = all
+            .lock()
+            .expect("one build at a time")
+            .iter()
+            .find(|(at, _)| *at == key)
+            .map(|(_, built)| Arc::clone(built))
+        {
+            return Ok(found);
+        }
+        let built = Arc::new(build_material(cfg)?);
+        let mut kept = all.lock().expect("one build at a time");
+        if kept.len() == MATERIALS_MAX {
+            kept.clear();
+        }
+        kept.push((key, Arc::clone(&built)));
+        Ok(built)
+    }
+
     fn config(cfg: &TlsConfig) -> Result<Arc<rustls::ClientConfig>, TlsError> {
-        let mut roots = RootStore::empty();
-        for der in &cfg.roots {
-            roots
-                .add(rustls::pki_types::CertificateDer::from(der.as_slice()))
-                .map_err(|e| TlsError::BadCertificate(format!("trust anchor: {e}")))?;
-        }
-        let roots = Arc::new(roots);
-
-        let mut provider = (*provider()).clone();
-        if !cfg.cipher_suites.is_empty() {
-            // The ring backend's set is a subset of `crypto/tls`'s, so the sort only re-orders what is reachable.
-            let order = &cfg.cipher_suites;
-            provider.cipher_suites.sort_by_key(|cs| {
-                let id = u16::from(cs.suite());
-                order
-                    .iter()
-                    .position(|&want| want == id)
-                    .unwrap_or(usize::MAX)
-            });
-        }
-        let provider = Arc::new(provider);
-
-        let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&provider))
+        let built = Self::material(cfg)?;
+        let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&built.provider))
             .with_safe_default_protocol_versions()
             .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?
-            .with_root_certificates(roots.clone())
+            .with_root_certificates(Arc::clone(&built.roots))
             .with_no_client_auth();
         config.alpn_protocols.clone_from(&cfg.alpn);
-        if !cfg.pins.is_empty() {
-            let verifier = rustls::client::WebPkiServerVerifier::builder_with_provider(
-                roots,
-                Arc::clone(&provider),
-            )
-            .build()
-            .map_err(|e| TlsError::BadCertificate(format!("chain: {e}")))?;
+        if let Some(verifier) = &built.verifier {
             config
                 .dangerous()
-                .set_certificate_verifier(Arc::new(Pinned {
-                    inner: verifier,
-                    pins: cfg.pins.clone(),
-                }));
+                .set_certificate_verifier(Arc::clone(verifier));
         }
         Ok(Arc::new(config))
     }
@@ -713,6 +785,23 @@ mod tests {
         });
     }
 
+    /// Two dialled sessions to the same server, each answered by its own `serve`: a lane that resumed across them would show it in what the second one was handed.
+    fn twice(mut dial: impl FnMut(TcpStream, TcpStream)) {
+        let first = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let second = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let (first_port, second_port) = (
+            first.local_addr().expect("addr").port(),
+            second.local_addr().expect("addr").port(),
+        );
+        thread::scope(|scope| {
+            scope.spawn(|| serve(&first));
+            scope.spawn(|| serve(&second));
+            let a = TcpStream::connect(("127.0.0.1", first_port)).expect("connects");
+            let b = TcpStream::connect(("127.0.0.1", second_port)).expect("connects");
+            dial(a, b);
+        });
+    }
+
     /// The `cipher_suites` field of a captured `ClientHello` record: skip the 5-byte record and
     /// 4-byte handshake headers, the legacy version and random, then the session id, and read
     /// the length-prefixed suite list — the same span the Go oracle dumps.
@@ -774,6 +863,72 @@ mod tests {
             let mut buf = [0u8; 4];
             client.read_exact(&mut buf).expect("reads");
             assert_eq!(&buf, b"ping");
+        });
+    }
+
+    /// Parsing an anchor and building a verifier is work a config names, not a connection needs: two dials naming the same anchors, pins and suite order share one build, and any input that differs gets its own.
+    #[test]
+    fn the_parts_a_config_is_built_from_are_built_once() {
+        let built = RustlsProvider::<TcpStream>::material(&client("one.test", &[b"test-only"]))
+            .expect("builds");
+        let other_name =
+            RustlsProvider::<TcpStream>::material(&client("two.test", &[b"nope"])).expect("builds");
+        assert!(
+            Arc::ptr_eq(&built, &other_name),
+            "a new host or ALPN asks for no new anchors"
+        );
+
+        let mut pinned = client("one.test", &[b"test-only"]);
+        pinned.pins = crate::foxy::pin::Pins::parse([
+            "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+        ]);
+        let with_pin = RustlsProvider::<TcpStream>::material(&pinned).expect("builds");
+        assert!(
+            !Arc::ptr_eq(&built, &with_pin),
+            "a pinned verifier is not an unpinned one"
+        );
+
+        let mut reordered = client("one.test", &[b"test-only"]);
+        reordered.cipher_suites = vec![0x1302];
+        let other_order = RustlsProvider::<TcpStream>::material(&reordered).expect("builds");
+        assert!(
+            !Arc::ptr_eq(&built, &other_order),
+            "a named suite order is a different provider"
+        );
+
+        let mut no_anchor = client("one.test", &[b"test-only"]);
+        no_anchor.roots.clear();
+        let empty = RustlsProvider::<TcpStream>::material(&no_anchor).expect("builds");
+        assert!(
+            !Arc::ptr_eq(&built, &empty),
+            "a dial that names no anchor stores a different store"
+        );
+    }
+
+    /// The shared parts do not make a shared session: a second dial with the same config still fetches and verifies the chain, because a hello that resumed would be a different hello on the wire.
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_second_dial_with_the_same_config_still_fetches_the_chain() {
+        let cfg = client("tls.test", &[b"test-only"]);
+        twice(|first, second| {
+            let mut echo = [0u8; 4];
+            let mut a = crate::tls::connect(&cfg, first).expect("first configures");
+            a.handshake().expect("handshakes");
+            a.write_all(b"ping").expect("writes");
+            a.flush().expect("flushes");
+            a.read_exact(&mut echo).expect("echoes");
+            let mut b = crate::tls::connect(&cfg, second).expect("second configures");
+            b.handshake().expect("handshakes");
+            b.write_all(b"ping").expect("writes");
+            b.flush().expect("flushes");
+            b.read_exact(&mut echo).expect("echoes");
+            assert!(
+                a.peer_leaf().is_some() && b.peer_leaf().is_some(),
+                "both dials were handed a chain, so neither rode the other's session"
+            );
         });
     }
 

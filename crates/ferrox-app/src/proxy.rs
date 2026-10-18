@@ -542,6 +542,8 @@ struct FoxyOut {
     verified: std::sync::Arc<std::sync::Mutex<Option<ferrox_core::foxy::Candidate>>>,
     /// Set when no edge could carry a probe tunnel here: the pre-flight then stops rather than costing every flow a dead dial.
     probe_unavailable: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Until when the probes are known to answer a country other than the pin: a sweep that reached an edge and agreed with none is the answer, and re-asking it per flow buys the same refusal again.
+    exit_refuted_until: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl FoxyOut {
@@ -5624,6 +5626,27 @@ fn probes_reachable(probes: &[Option<bool>]) -> bool {
     probes.iter().any(Option::is_some)
 }
 
+/// What a finished probe sweep concluded: the edge that honoured the pin, no probe reachable from here, or every reachable edge answering a different country than the pin.
+#[derive(Debug, PartialEq, Eq)]
+enum Sweep {
+    Agreed(usize),
+    Unreachable,
+    Refuted,
+}
+
+/// The verdict of a sweep, in the order the caller acts on it: a pick wins, an unreachable probe set stops the probes, and a set that answered and agreed with none is itself the answer.
+#[must_use]
+fn sweep_verdict(probes: &[Option<bool>]) -> Sweep {
+    if let Some(at) = pick_verified_edge(probes) {
+        return Sweep::Agreed(at);
+    }
+    if probes_reachable(probes) {
+        Sweep::Refuted
+    } else {
+        Sweep::Unreachable
+    }
+}
+
 /// The exit country one edge really hands back: a disposable H3 tunnel to the probe authority, asked for the trace, then dropped, which is what gives its pooled stream back. It never rides a flow's own tunnel, so a per-target carrier is left intact; `None` means this runner could not carry or read the trace here. The probe is a probe, so its dial gets the probe budget rather than a named carrier's full handshake: a lane whose UDP is blackholed has to say so before the first flow's client gives up.
 fn probe_edge_exit(
     foxy: &FoxyOut,
@@ -5660,7 +5683,10 @@ fn probe_edge_exit(
 
 /// The pinned-country edge that really exits in the pin, chosen once per lane over disposable probes and cached so every carrier rides it. The walk stops at the first edge that honours the pin, since a later probe cannot change that pick. Falls back to the label order when no edge agrees, records the truth when one cannot, and stops probing when none can be reached here.
 fn verify_exit(foxy: &FoxyOut) {
-    if !exit_needs_probe(foxy) || foxy.probe_unavailable.load(Ordering::Relaxed) {
+    if !exit_needs_probe(foxy)
+        || foxy.probe_unavailable.load(Ordering::Relaxed)
+        || edge_limited(&foxy.exit_refuted_until, now_secs())
+    {
         return;
     }
     if foxy.verified.lock().is_ok_and(|kept| kept.is_some()) {
@@ -5704,12 +5730,17 @@ fn verify_exit(foxy: &FoxyOut) {
             break;
         }
     }
-    if let Some(chosen) = pick_verified_edge(&flags).map(|at| edges[at].clone()) {
-        if let Ok(mut kept) = foxy.verified.lock() {
-            *kept = Some(chosen);
+    match sweep_verdict(&flags) {
+        Sweep::Agreed(at) => {
+            if let Ok(mut kept) = foxy.verified.lock() {
+                *kept = Some(edges[at].clone());
+            }
         }
-    } else if !probes_reachable(&flags) {
-        foxy.probe_unavailable.store(true, Ordering::Relaxed);
+        // The pin is not what this runner gets out; re-sweeping it per flow would only buy the same refusal again.
+        Sweep::Refuted => foxy
+            .exit_refuted_until
+            .store(now_secs() + CARRIER_DEAD_SECS, Ordering::Relaxed),
+        Sweep::Unreachable => foxy.probe_unavailable.store(true, Ordering::Relaxed),
     }
 }
 
@@ -6420,6 +6451,10 @@ fn open_foxy_ip_tunnel(
             .as_ref()
             .map_or_else(|| foxy.pass.clone(), |account| account.current());
         for carrier in crate::foxy::Carrier::udp_order() {
+            // As on TCP and CONNECT-UDP: a silent carrier is left alone for the window, not probed per packet.
+            if foxy.carrier_unanswered(&edge, carrier) {
+                continue;
+            }
             let dial = crate::foxy::FoxyDial {
                 host: edge.host.clone(),
                 port: edge.port,
@@ -9829,6 +9864,7 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             },
             verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
             probe_unavailable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            exit_refuted_until: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
     }
     None
@@ -15475,6 +15511,7 @@ mod tests {
             exit_probe: None,
             verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
             probe_unavailable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            exit_refuted_until: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -20872,6 +20909,7 @@ mod tests {
             exit_probe: None,
             verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
             probe_unavailable: std::sync::Arc::new(AtomicBool::new(false)),
+            exit_refuted_until: std::sync::Arc::new(AtomicU64::new(0)),
         };
         let target = Destination::Name("target.test".to_owned(), 443);
 
@@ -20910,6 +20948,97 @@ mod tests {
         assert_eq!(
             asked.load(Ordering::SeqCst),
             2,
+            "a rested carrier is asked again once its window has run out"
+        );
+    }
+
+    /// The connect-ip lane marks a silent carrier dead the same way the TCP flow does, so it must not knock on it again with the next packet: a lane whose carriers are all dead opens nothing, and one whose window has rested is asked again.
+    #[test]
+    fn the_connect_ip_lane_leaves_a_dead_carrier_dead() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let edge: SocketAddr = listener.local_addr().expect("addr");
+        let asked = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&asked);
+        // A silent edge: it accepts, names nothing and hangs up, which is a dead carrier rather than a live one.
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let edge_carrier = crate::foxy::Carrier::H2;
+        let foxy = FoxyOut {
+            account: None,
+            country: "US".to_owned(),
+            city: String::new(),
+            carrier: crate::foxy::Carrier::Auto,
+            upstream: None,
+            candidates: vec![ferrox_core::foxy::Candidate {
+                host: "carrier.test".to_owned(),
+                port: edge.port(),
+                country: "US".to_owned(),
+                city: String::new(),
+            }],
+            stored: None,
+            unauthenticated: std::sync::Arc::new(AtomicBool::new(false)),
+            limited_strikes: std::sync::Arc::new(AtomicU32::new(0)),
+            limited_until: std::sync::Arc::new(AtomicU64::new(0)),
+            carrier_dead: std::sync::Arc::new(std::sync::Mutex::new(
+                ferrox_core::foxy::Refusals::new(32),
+            )),
+            edge_strikes: std::sync::Arc::new(std::sync::Mutex::new(
+                ferrox_core::foxy::EdgeStrikes::new(32),
+            )),
+            roots: Vec::new(),
+            pins: ferrox_core::foxy::pin::Pins::default(),
+            pass: ferrox_core::foxy::Pass {
+                token: "the-pass".to_owned(),
+                expires_at: None,
+                quota_remaining: None,
+                quota_reset: None,
+            },
+            edge_address: Some(edge),
+            direct_ports: Vec::new(),
+            direct_suffixes: Vec::new(),
+            exit_probe: None,
+            verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            probe_unavailable: std::sync::Arc::new(AtomicBool::new(false)),
+            exit_refuted_until: std::sync::Arc::new(AtomicU64::new(0)),
+        };
+        // Both capsule carriers are known silent, and neither is to be knocked on again inside its window.
+        for carrier in crate::foxy::Carrier::udp_order() {
+            if let Ok(mut cache) = foxy.carrier_dead.lock() {
+                cache.remember(
+                    &carrier_key(&foxy.candidates[0], carrier),
+                    now_secs() + CARRIER_DEAD_SECS,
+                );
+            }
+        }
+        let mut tunnel = None;
+        let mut source = [0u8; 16];
+        let mut width = 0usize;
+        assert!(
+            !open_foxy_ip_tunnel(&foxy, &mut tunnel, &mut source, &mut width),
+            "an edge silent on every capsule carrier grants no address"
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            0,
+            "the silence the lane already knows is not probed again on this packet"
+        );
+        // The window, not the verdict: a carrier left alone for its quarantine is asked again when it ends.
+        if let Ok(mut cache) = foxy.carrier_dead.lock() {
+            cache.clear(&carrier_key(&foxy.candidates[0], edge_carrier));
+        }
+        assert!(
+            !open_foxy_ip_tunnel(&foxy, &mut tunnel, &mut source, &mut width),
+            "the rested carrier still has nothing to open"
+        );
+        assert_ne!(
+            asked.load(Ordering::SeqCst),
+            0,
             "a rested carrier is asked again once its window has run out"
         );
     }
@@ -22006,7 +22135,38 @@ mod relay_tests {
 
 #[cfg(test)]
 mod foxy_exit_tests {
-    use super::{exit_agrees, pick_verified_edge, probe_settled, probes_reachable};
+    use super::{
+        exit_agrees, pick_verified_edge, probe_settled, probes_reachable, sweep_verdict, Sweep,
+    };
+
+    #[test]
+    fn a_sweep_that_reached_the_edges_and_agreed_with_none_is_itself_an_answer() {
+        assert_eq!(
+            sweep_verdict(&[Some(false), Some(true), Some(true)]),
+            Sweep::Agreed(1),
+            "a pick beats every refusal before and after it"
+        );
+        assert_eq!(
+            sweep_verdict(&[Some(false), Some(false)]),
+            Sweep::Refuted,
+            "the pin is not what this runner gets, and asking again buys the same refusal"
+        );
+        assert_eq!(
+            sweep_verdict(&[None, Some(false)]),
+            Sweep::Refuted,
+            "one edge answering wrongly is still an answer"
+        );
+        assert_eq!(
+            sweep_verdict(&[None, None]),
+            Sweep::Unreachable,
+            "nothing answering means this runner cannot carry a probe at all"
+        );
+        assert_eq!(
+            sweep_verdict(&[]),
+            Sweep::Unreachable,
+            "and no edge to ask is the same verdict"
+        );
+    }
 
     #[test]
     fn a_pinned_country_accepts_its_own_exit_and_refuses_a_single_edge_anycast_that_egresses_elsewhere(

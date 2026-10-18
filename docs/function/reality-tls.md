@@ -76,6 +76,8 @@ graph TD
 | unsafe-fingerprint-header-bytes-added | 0 | ferrox-core-vless::tests::an_unsafe_fingerprint_adds_no_header_byte |
 | plaintext-to-public-header-bytes-added | 0 | ferrox-core-vless::tests::pattng_plaintext_to_public_needs_opt_in_and_adds_no_byte |
 | certificate-refusals-folded-into-other | 0 | ferrox-core-tls::rustls_backend::tests::mismatched_certificate_name_fails |
+| trust-anchors-parsed-per-dial-after-the-first | 0 | ferrox-core-tls::rustls_backend::tests::the_parts_a_config_is_built_from_are_built_once |
+| handshakes-skipped-by-an-earlier-dials-ticket | 0 | ferrox-core-tls::rustls_backend::tests::a_second_dial_with_the_same_config_still_fetches_the_chain |
 | untrusted-dials-counted-as-retryable | 0 | ferrox-app-proxy::tests::a_refused_chain_is_a_refusal_not_a_drop |
 | session-writes-per-frame | 1 | ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call |
 | user-space-copies-per-framed-write | 0 | ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call |
@@ -145,6 +147,19 @@ not this page's to settle.
   reach into anything, which is why
   [the Vision page](xtls-vision.md) can end the framing by handing the socket
    over instead of by copying bytes out of someone else's buffer.
+- **A per-dial rebuild of what only the config names.** Every client dial parsed its
+  trust anchor DERs into a `RootCertStore`, cloned and re-sorted the crypto provider for
+  the `cipherSuites` order, and — where the outbound pins — built a
+  `WebPkiServerVerifier` over that store before assembling a `ClientConfig` around them.
+  None of that depends on which host is being dialed or which ALPN is offered next, so
+  the second outbound to the same remote spent it again; the three inputs now name one
+  shared build, found by pointer identity by `the_parts_a_config_is_built_from_are_built_once`.
+  What was deliberately **not** taken with it is session resumption: each dial still
+  assembles its own `ClientConfig`, so its ticket store is its own and no later flow's
+  ClientHello can come out shaped differently from the one the references send. That is
+  `handshakes-skipped-by-an-earlier-dials-ticket 0` — a decision with a gate, not an
+  oversight, and the page that wants a resumed handshake (a lane whose edge is dialed
+  hundreds of times a minute) has to take it back on purpose.
 - **Reflection and `unsafe` in the handshake.** The gates are
   `an_authenticated_hello_is_accepted`, `every_unauthenticated_hello_is_refused`
   and `the_certificate_differs_per_auth_key`.
