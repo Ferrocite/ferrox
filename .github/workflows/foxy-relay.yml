@@ -4,7 +4,12 @@ name: Foxy relay (live download check)
 # starts `ferrox-app` with a socks->foxy config on a clean runner, walks every
 # carrier the lane speaks (h1, h2, h3, auto) in the pinned country, downloads a
 # real 1 MB file through each tunnel and asserts the exact byte count, plus
-# the exit country off the Cloudflare trace. The loopback tests prove framing
+# the exit country off the Cloudflare trace. Every leg also records its
+# seconds and its rate, and the job summary prints them against the runner's
+# own no-lane egress: a duration gates nothing here — the byte count does — but
+# it is the number a throughput claim has to be read against, and a leg that
+# spent its budget then shows up as seconds burned for fewer bytes instead of
+# as a red step with no shape to it. The loopback tests prove framing
 # against a local edge; only this job proves the relay moves bytes against the
 # real one, on every platform, through every method.
 #
@@ -147,8 +152,10 @@ jobs:
         if: steps.secrets.outputs.present == 'true'
         run: |
           code=0
-          curl -sS --noproxy '*' --max-time 300 \
-            'https://speed.cloudflare.com/__down?bytes=1000000' -o control.bin || code=$?
+          timing=$(curl -sS --noproxy '*' --max-time 300 \
+            -w '%{size_download} %{time_total} %{speed_download}' \
+            'https://speed.cloudflare.com/__down?bytes=1000000' -o control.bin) || code=$?
+          echo "control, no lane ${timing:-0 0 0}" >> foxy-legs.tsv
           got=$(wc -c < control.bin 2>/dev/null | tr -d ' ')
           echo "egress control: curl exit $code, ${got:-0} bytes of 1000000"
           {
@@ -265,8 +272,10 @@ jobs:
             fi
             grep -E '^(loc|ip)=' trace.txt || true
             code=0
-            curl -sS --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
-              'https://speed.cloudflare.com/__down?bytes=1000000' -o "file-$carrier.bin" || code=$?
+            timing=$(curl -sS --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
+              -w '%{size_download} %{time_total} %{speed_download}' \
+              'https://speed.cloudflare.com/__down?bytes=1000000' -o "file-$carrier.bin") || code=$?
+            echo "carrier $carrier ${timing:-0 0 0}" >> foxy-legs.tsv
             got=$(wc -c < "file-$carrier.bin" 2>/dev/null | tr -d ' ')
             got="${got:-0}"
             if test "$code" = 0 && test "$got" = 1000000; then
@@ -392,15 +401,21 @@ jobs:
             done
             grep -qx "loc=$WANT" trace-lane.txt
           }
+          # `-w` gives the duration: bytes moved, seconds taken, the rate held.
+          # Every leg appends one line to foxy-legs.tsv, including a leg that ran
+          # out of its budget, so the job's own summary can name the slow one.
           fetch_mb() {
-            FRONT="$1" FILE="$2"
+            FRONT="$1" FILE="$2" LABEL="$3"
             if [ "$FRONT" = http ]; then
-              curl -sS --max-time 60 -x "http://127.0.0.1:$PORT" \
-                'https://speed.cloudflare.com/__down?bytes=1000000' -o "$FILE"
+              timing=$(curl -sS --max-time 60 -x "http://127.0.0.1:$PORT" \
+                -w '%{size_download} %{time_total} %{speed_download}' \
+                'https://speed.cloudflare.com/__down?bytes=1000000' -o "$FILE") || :
             else
-              curl -sS --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
-                'https://speed.cloudflare.com/__down?bytes=1000000' -o "$FILE"
+              timing=$(curl -sS --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
+                -w '%{size_download} %{time_total} %{speed_download}' \
+                'https://speed.cloudflare.com/__down?bytes=1000000' -o "$FILE") || :
             fi
+            echo "$LABEL ${timing:-0 0 0}" >> foxy-legs.tsv
             test "$(wc -c < "$FILE" | tr -d ' ')" = 1000000
           }
           # A front the app serves with a freedom outbound is a plain local proxy: it is
@@ -437,7 +452,7 @@ jobs:
           PORT=10808
           start_lane socks "$PORT" h2
           trace_front socks "$COUNTRY"
-          fetch_mb socks file-socks.bin
+          fetch_mb socks file-socks.bin "front socks"
           echo "socks front: 1000000 B"
           stop_lane
 
@@ -446,7 +461,7 @@ jobs:
           PORT=10809
           start_lane http "$PORT" h2
           trace_front http "$COUNTRY"
-          fetch_mb http file-http.bin
+          fetch_mb http file-http.bin "front http"
           echo "http front: 1000000 B"
           stop_lane
 
@@ -455,7 +470,7 @@ jobs:
           PORT=10810
           start_lane mixed "$PORT" h2
           trace_front socks "$COUNTRY"
-          fetch_mb socks file-mixed.bin
+          fetch_mb socks file-mixed.bin "front mixed"
           echo "mixed front: 1000000 B"
           stop_lane
 
@@ -465,7 +480,7 @@ jobs:
           PORT=10812
           start_lane socks "$PORT" h2 "socks5://127.0.0.1:10811"
           trace_front socks "$COUNTRY"
-          fetch_mb socks file-up.bin
+          fetch_mb socks file-up.bin "socks5 upstream"
           echo "socks5 upstream: 1000000 B"
           stop_lane
           stop_hop
@@ -476,7 +491,7 @@ jobs:
           PORT=10814
           start_lane socks "$PORT" h2 "http://127.0.0.1:10813"
           trace_front socks "$COUNTRY"
-          fetch_mb socks file-http-up.bin
+          fetch_mb socks file-http-up.bin "http upstream"
           echo "http upstream: 1000000 B"
           stop_lane
           stop_hop
@@ -490,7 +505,7 @@ jobs:
           PORT=10816
           start_lane socks "$PORT" h3 "socks5://127.0.0.1:10815"
           trace_front socks "$COUNTRY"
-          fetch_mb socks file-h3-up.bin
+          fetch_mb socks file-h3-up.bin "h3 over socks5 upstream"
           echo "h3 over socks5 upstream: 1000000 B"
           stop_lane
           stop_hop
@@ -566,8 +581,12 @@ jobs:
           PORT=10817
           start_lane socks "$PORT" h2 DE
           trace_socks "$PORT" DE
-          curl -sS --max-time 120 --socks5-hostname "127.0.0.1:$PORT" \
-            'https://speed.cloudflare.com/__down?bytes=1000000' -o file-de.bin
+          de_code=0
+          de_timing=$(curl -sS --max-time 120 --socks5-hostname "127.0.0.1:$PORT" \
+            -w '%{size_download} %{time_total} %{speed_download}' \
+            'https://speed.cloudflare.com/__down?bytes=1000000' -o file-de.bin) || de_code=$?
+          echo "second country DE ${de_timing:-0 0 0}" >> foxy-legs.tsv
+          test "$de_code" = 0
           test "$(wc -c < file-de.bin | tr -d ' ')" = 1000000
           echo "second country DE: 1000000 B"
           stop_lane
@@ -747,4 +766,40 @@ jobs:
             echo "additionally proves a second exit country and the UDP"
             echo "datagram path. The log names the edge, the carrier that"
             echo "answered, and per-flow relay totals."
+          } >> "$GITHUB_STEP_SUMMARY"
+          # The same legs, in durations: the lane's rate against the runner's own
+          # egress, per carrier and per front. A rate gates nothing here — the
+          # byte count above does — but it is the number a throughput claim has
+          # to be read against, and a leg that spent its budget shows up as
+          # seconds burned for fewer bytes rather than as a silent skip.
+          {
+            echo
+            echo "### Lane durations, live (${{ matrix.os }})"
+            echo
+            echo "| leg | bytes | seconds | MiB/s | vs this runner's own egress |"
+            echo "| --- | --- | --- | --- | --- |"
+            python3 - <<'PY'
+          rows = []
+          try:
+              with open("foxy-legs.tsv") as legs:
+                  lines = legs.read().splitlines()
+          except OSError:
+              lines = []
+          for line in lines:
+              parts = line.rsplit(None, 3)
+              if len(parts) != 4:
+                  continue
+              label, size, seconds, speed = parts
+              try:
+                  size, seconds, speed = float(size), float(seconds), float(speed)
+              except ValueError:
+                  continue
+              rows.append((label, size, seconds, speed))
+          control = next((rate for label, _, _, rate in rows if label.startswith("control")), 0)
+          for label, size, seconds, speed in rows:
+              ratio = f"{speed / control:.2f}" if control > 0 and not label.startswith("control") else "-"
+              print(f"| {label} | {int(size)} | {seconds:.2f} | {speed / 1048576:.2f} | {ratio} |")
+          if not rows:
+              print("| (no leg recorded a transfer) | 0 | 0.00 | 0.00 | - |")
+          PY
           } >> "$GITHUB_STEP_SUMMARY"
