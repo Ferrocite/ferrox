@@ -178,7 +178,6 @@ pub fn encode_udp(message: &UdpMessage, out: &mut Vec<u8>) -> Result<(), Request
 }
 
 /// Read one whole UDP message from a datagram; the payload is whatever follows the address, borrowed from the caller's buffer, so a relay never copies it to look at it.
-#[must_use]
 pub fn decode_udp(packet: &[u8]) -> Result<UdpMessage<'_>, RequestError> {
     let head = packet.get(..8).ok_or(RequestError::Incomplete)?;
     let mut at = 8usize;
@@ -254,7 +253,7 @@ impl Defrag {
         }
         if self.slots.is_empty() || self.packet != message.packet {
             self.packet = message.packet;
-            self.address = message.address.to_owned();
+            message.address.clone_into(&mut self.address);
             self.slots = vec![None; usize::from(message.frags)];
             self.have = 0;
             self.size = 0;
@@ -572,6 +571,66 @@ mod tests {
         hpack::qpack_literal_many(&[(":status", "200")], &mut block);
         assert!(!verify_auth_response(&block));
         assert!(!verify_auth_response(&[0x00]));
+    }
+
+    #[test]
+    fn a_decoded_datagram_leaves_its_payload_where_it_landed() {
+        // The relay hands the decoded payload straight to the target socket, so the borrow is the copy removal: the returned slice's base has to lie inside the datagram that arrived, and the header parse must not grow or move that buffer.
+        let mut wire = Vec::new();
+        encode_udp(
+            &UdpMessage {
+                session: 4,
+                packet: 9,
+                frag: 0,
+                frags: 1,
+                address: "edge.example:443",
+                payload: b"relay-bytes",
+            },
+            &mut wire,
+        )
+        .expect("encodes");
+        let base = wire.as_ptr();
+        let room = wire.capacity();
+        let message = decode_udp(&wire).expect("decodes");
+        assert!(
+            wire.as_ptr_range().contains(&message.payload.as_ptr()),
+            "the payload was never copied out of the datagram"
+        );
+        assert_eq!(wire.as_ptr(), base, "the buffer itself never moved");
+        assert_eq!(wire.capacity(), room, "no reallocation in the parse");
+        assert_eq!(message.payload, b"relay-bytes");
+    }
+
+    #[test]
+    fn every_length_survives_fragment_then_defrag_intact() {
+        // Sweep payload lengths that are and are not a multiple of the fragment capacity, at a window that carries only a few bytes per datagram, so the arithmetic a single echo never reaches is covered here: fragment count, the short last fragment, and reassembly back to the exact bytes.
+        let address = "edge.example:443";
+        for len in 1..=200usize {
+            let payload: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let message = UdpMessage {
+                session: 9,
+                packet: 1,
+                frag: 0,
+                frags: 1,
+                address,
+                payload: &payload,
+            };
+            // A datagram of the head plus seven bytes carries seven payload bytes per fragment.
+            let max = message.header_len() + 7;
+            let mut frags = Vec::new();
+            fragment_udp(&message, max, &mut frags).expect("fragments");
+            assert_eq!(frags.len(), len.div_ceil(7));
+            let mut defrag = Defrag::new();
+            let mut whole = None;
+            for frag in &frags {
+                if let Some(done) = defrag.feed(frag).expect("feeds") {
+                    assert!(whole.replace(done).is_none(), "assembles exactly once");
+                }
+            }
+            let (got_address, got_payload) = whole.expect("reassembles");
+            assert_eq!(got_address, address);
+            assert_eq!(got_payload, payload);
+        }
     }
 
     #[test]
