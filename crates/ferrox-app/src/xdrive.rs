@@ -1,12 +1,16 @@
 //! The xdrive carrier: one proxy stream carried by an object store both ends poll, so a lane survives addresses, restarts and rebindings by naming its segments in send order.
 
 use crate::budgets::RELAY_POLL;
+use crate::conn::Connection;
 use crate::json::Json;
+use ferrox_core::tls::{RustlsProvider, TlsConfig, TlsProvider as _};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fmt::Write as _;
 use std::io::{self, ErrorKind, Read, Write};
+use std::net::ToSocketAddrs as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const SESSIONS_DIR: &str = "sessions";
@@ -71,14 +75,19 @@ pub(crate) struct Settings {
     pub remote_folder: String,
     pub service: String,
     pub secrets: Vec<String>,
-    pub template: String,
+    pub template: Option<Json>,
     pub params: Params,
+    /// The transport's `security`, which the reference counts in the identity of a shared store.
+    pub security: String,
+    /// The transport's own TLS, applied to the lanes the store dials; `None` speaks the url's scheme with system roots.
+    pub tls: Option<Arc<TlsConfig>>,
 }
 
 impl Settings {
     /// An empty folder or an unknown service is a refusal by the caller, not a silent default: a carrier pointed at nowhere must not start polling.
-    pub(crate) fn from_json(settings: Option<&Json>) -> Option<Self> {
-        let drive = settings?.get("xdriveSettings")?;
+    pub(crate) fn from_json(stream: Option<&Json>) -> Option<Self> {
+        let stream = stream?;
+        let drive = stream.get("xdriveSettings")?;
         let text = |name: &str| {
             drive
                 .get(name)
@@ -101,6 +110,11 @@ impl Settings {
         {
             return None;
         }
+        let security = stream
+            .get("security")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_owned();
         let secrets = drive
             .get("secrets")
             .and_then(Json::as_arr)
@@ -129,23 +143,108 @@ impl Settings {
         .clamped();
         Some(Self {
             params,
-            template: text("template"),
+            template: template_of(drive),
             remote_folder,
             service,
             secrets,
+            tls: transport_tls(stream, &security),
+            security,
         })
     }
 
-    /// The store this config names: one per folder for the services that carry a connection pool and an id cache, a fresh one for a folder on disk.
-    pub(crate) fn store(&self) -> io::Result<Arc<dyn Storage>> {
+    /// The store this config names: one per folder for the services that carry a lane pool and an id cache, a fresh one for a folder on disk.
+    ///
+    /// # Errors
+    /// A folder that cannot be created, a template that does not describe four operations, or a Drive set without three secrets.
+    pub(crate) fn store(&self, front: Option<(&str, u16)>) -> io::Result<Arc<dyn Storage>> {
+        if self.security == "reality" {
+            return Err(carrier_error(
+                "a store lane does not speak reality: the service is the destination",
+            ));
+        }
         match self.service.as_str() {
             "local" => Ok(Arc::new(Local::new(&self.remote_folder)?)),
-            _ => Err(io::Error::other(format!(
-                "the {} service is not built here",
-                self.service
+            "template" => {
+                let cap = self
+                    .template
+                    .as_ref()
+                    .and_then(|root| root.get("concurrency"))
+                    .and_then(Json::as_u32)
+                    .unwrap_or(0);
+                shared(
+                    self,
+                    front,
+                    count(cap, DEFAULT_INFLIGHT, MAX_INFLIGHT),
+                    |settings, http| Ok(Arc::new(Template::build(settings, http)?)),
+                )
+            }
+            "Google Drive" => shared(self, front, DEFAULT_INFLIGHT, |settings, http| {
+                Ok(Arc::new(Drive::build(settings, http)?))
+            }),
+            other => Err(carrier_error(format!(
+                "the {other} service is not built here"
             ))),
         }
     }
+
+    /// The store this config names, opened as a client: the session announcement first, then both logs on it.
+    pub(crate) fn dial(&self, front: Option<(&str, u16)>) -> io::Result<Conn> {
+        dial(self.store(front)?, &Arc::new(self.params.clone()))
+    }
+
+    /// The store this config names, watched as a listener: every accepted session goes to `accept` on a thread of its own.
+    pub(crate) fn listen(
+        &self,
+        front: Option<(&str, u16)>,
+        accept: Accept,
+    ) -> io::Result<Arc<Server>> {
+        Server::serve(self.store(front)?, Arc::new(self.params.clone()), accept)
+    }
+
+    /// The template as one text, which is what makes two configs the same store.
+    fn template_text(&self) -> String {
+        let mut text = String::new();
+        if let Some(root) = &self.template {
+            crate::json::write(root, &mut text);
+        }
+        text
+    }
+}
+
+/// The `template` field either as the object it describes or as the JSON text the reference ships it in.
+fn template_of(drive: &Json) -> Option<Json> {
+    match drive
+        .get("template")
+        .or_else(|| drive.get("template_json"))?
+    {
+        Json::Str(text) => crate::json::parse(text).ok(),
+        Json::Obj(items) => Some(Json::Obj(items.clone())),
+        _ => None,
+    }
+}
+
+/// The transport's TLS as the store dials it: the config's server name or the url's host, its roots or the system's, and no `ALPN` because the store speaks `HTTP/1.1`.
+fn transport_tls(stream: &Json, security: &str) -> Option<Arc<TlsConfig>> {
+    (security == "tls").then(|| {
+        let tls = stream.get("tlsSettings").unwrap_or(&Json::Null);
+        Arc::new(TlsConfig {
+            server_name: tls
+                .get("serverName")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            alpn: Vec::new(),
+            roots: tls
+                .get("caCertFile")
+                .and_then(Json::as_str)
+                .and_then(|path| std::fs::read(path).ok())
+                .map(|pem| crate::quic::parse_ca_pem(&pem))
+                .unwrap_or_default(),
+            pins: ferrox_core::foxy::pin::Pins::default(),
+            cipher_suites: Vec::new(),
+            insecure: tls.get("allowInsecure").and_then(Json::as_bool) == Some(true),
+        })
+    })
 }
 
 /// The snake_case spelling of a camelCase config name, so either form reaches one field.
@@ -243,10 +342,7 @@ fn parse_entry(name: &str) -> Option<(u64, &str)> {
     if suffix != SEG_SUFFIX && suffix != END_SUFFIX && suffix != ERR_SUFFIX {
         return None;
     }
-    digits(&name[..dot])?
-        .parse()
-        .ok()
-        .map(|seq| (seq, suffix))
+    digits(&name[..dot])?.parse().ok().map(|seq| (seq, suffix))
 }
 
 fn unix_nanos(now: SystemTime) -> i64 {
@@ -264,15 +360,14 @@ fn session_id() -> io::Result<String> {
     getrandom::getrandom(&mut raw).map_err(|error| io::Error::other(error.to_string()))?;
     let mut hex = String::with_capacity(32);
     for byte in raw {
-        use std::fmt::Write as _;
         let _ = write!(hex, "{byte:02x}");
     }
     Ok(hex)
 }
 
 /// A failure the lane reports as its own end: an object the store refused to hold, a segment that never arrived while later ones did, or a peer that marked one lost.
-fn carrier_error(message: String) -> io::Error {
-    io::Error::other(message)
+fn carrier_error(message: impl Into<String>) -> io::Error {
+    io::Error::other(message.into())
 }
 
 /// Why a loop's wait ended, since a loop woken by the peer polls at once while one woken by a halt returns.
@@ -437,7 +532,10 @@ impl Pool {
 
     /// No further jobs, but every one already promised still runs: the `.end` marker a writer puts after this must not overtake the segments queued before it.
     fn shut(&self) {
-        self.queue.lock().unwrap_or_else(PoisonError::into_inner).shut = true;
+        self.queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .shut = true;
         self.run.notify_all();
     }
 
@@ -788,9 +886,19 @@ impl Writer {
     }
 }
 
+impl Drop for Writer {
+    /// A write log left open by a relay that dropped its handle gets its `.end` here; `close` is idempotent, so the leg that closed in prose costs one atomic swap.
+    fn drop(&mut self) {
+        let _ = self.close();
+    }
+}
+
 /// A writer's tick: decide whether the buffer is ripe and, if it is, hand over a segment.
 fn tick(ticker: &Ticker) {
-    let mut pending = ticker.pending.lock().unwrap_or_else(PoisonError::into_inner);
+    let mut pending = ticker
+        .pending
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     if pending.closed || pending.err.is_some() || pending.buf.is_empty() || !pending.ready() {
         return;
     }
@@ -1002,10 +1110,7 @@ impl Rd {
                 got[slot] = Some(data);
                 continue;
             }
-            need.push((
-                slot,
-                format!("{}/{}", self.prefix, listed[index].name),
-            ));
+            need.push((slot, format!("{}/{}", self.prefix, listed[index].name)));
         }
         if need.is_empty() {
             return Ok(got.into_iter().flatten().collect());
@@ -1021,16 +1126,15 @@ impl Rd {
             for (slot, name) in need {
                 let storage = &self.storage;
                 let filled = &answers;
-                let _ = std::thread::Builder::new().stack_size(WORKER_STACK).spawn_scoped(
-                    scope,
-                    move || {
+                let _ = std::thread::Builder::new()
+                    .stack_size(WORKER_STACK)
+                    .spawn_scoped(scope, move || {
                         let answer = storage.get(&name);
                         filled
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
                             .insert(slot, answer);
-                    },
-                );
+                    });
             }
         });
         let mut answers = answers
@@ -1099,7 +1203,10 @@ fn backoff(advanced: bool, active: Instant, delay: Duration, params: &Params) ->
     if advanced || active.elapsed() < params.eager {
         return params.min_poll;
     }
-    delay.checked_mul(2).unwrap_or(params.max_poll).min(params.max_poll)
+    delay
+        .checked_mul(2)
+        .unwrap_or(params.max_poll)
+        .min(params.max_poll)
 }
 
 /// The read half: a pump thread polling the store, and the mailbox the relay reads.
@@ -1110,7 +1217,12 @@ struct Reader {
 }
 
 impl Reader {
-    fn new(storage: Arc<dyn Storage>, prefix: String, params: Arc<Params>, wake: Arc<Wake>) -> Self {
+    fn new(
+        storage: Arc<dyn Storage>,
+        prefix: String,
+        params: Arc<Params>,
+        wake: Arc<Wake>,
+    ) -> Self {
         let rd = Arc::new(Rd {
             discards: Pool::new(params.concurrency),
             storage,
@@ -1168,6 +1280,14 @@ impl Reader {
     }
 }
 
+impl Drop for Reader {
+    /// The last handle dropping ends the pump and the discards, so a session never outlives the relay that read it.
+    fn drop(&mut self) {
+        self.rd.wake.halt();
+        self.rd.discards.abort();
+    }
+}
+
 /// One xdrive stream: the two write-ahead logs one session names, with the object store the peer reads and writes beside them.
 #[derive(Clone)]
 pub(crate) struct Conn {
@@ -1186,22 +1306,19 @@ impl Conn {
                 params,
                 Arc::clone(&wake),
             )),
-            reader: Arc::new(Reader::new(storage, read, Arc::clone(params), Arc::clone(&wake))),
+            reader: Arc::new(Reader::new(
+                storage,
+                read,
+                Arc::clone(params),
+                Arc::clone(&wake),
+            )),
             wake,
         }
     }
 
-    /// End the stream: flush and mark the write log, then release every loop that waits on it.
-    pub(crate) fn close(&self) -> io::Result<()> {
-        let result = self.writer.close();
-        self.wake.halt();
-        self.reader.rd.discards.abort();
-        result
-    }
-
-    /// Whether the lane is already ending, so a relay can stop polling a stream whose store refused a segment.
-    pub(crate) fn stopped(&self) -> bool {
-        self.wake.stopped()
+    /// End only the write log, so a relay whose source went quiet lets the peer read its `.end` while our own reader keeps serving the reply.
+    pub(crate) fn end_write(&self) -> io::Result<()> {
+        self.writer.close()
     }
 }
 
@@ -1223,14 +1340,6 @@ impl Write for Conn {
     }
 }
 
-impl Drop for Conn {
-    fn drop(&mut self) {
-        let _ = self.writer.close();
-        self.wake.halt();
-        self.reader.rd.discards.abort();
-    }
-}
-
 /// The client's half of a session: name the session where the listener looks, then open both logs on it.
 pub(crate) fn dial(storage: Arc<dyn Storage>, params: &Arc<Params>) -> io::Result<Conn> {
     let session = session_id()?;
@@ -1244,7 +1353,7 @@ pub(crate) fn dial(storage: Arc<dyn Storage>, params: &Arc<Params>) -> io::Resul
 }
 
 /// What a listener hands each accepted session to: the caller's relay, on a thread of its own.
-type Accept = Arc<dyn Fn(Conn) + Send + Sync>;
+pub(crate) type Accept = Arc<dyn Fn(Conn) + Send + Sync>;
 
 /// The sessions one listener has already seen, so a second listing of the same announcement cannot open it twice.
 #[derive(Default)]
@@ -1346,7 +1455,9 @@ impl Server {
                 rd.discard(full);
                 continue;
             };
-            if unix_nanos(SystemTime::now()) - at > i64::try_from(rd.params.ttl.as_nanos()).unwrap_or(i64::MAX) {
+            if unix_nanos(SystemTime::now()) - at
+                > i64::try_from(rd.params.ttl.as_nanos()).unwrap_or(i64::MAX)
+            {
                 rd.discard(full);
                 rd.discard(format!("{STREAMS_DIR}/{session}"));
                 continue;
@@ -1491,7 +1602,9 @@ fn create_dir(dir: &Path) -> io::Result<()> {
 impl Storage for Local {
     fn put(&self, name: &str, data: &[u8]) -> io::Result<()> {
         let full = self.resolve(name)?;
-        let dir = full.parent().map_or_else(|| self.root.clone(), Path::to_path_buf);
+        let dir = full
+            .parent()
+            .map_or_else(|| self.root.clone(), Path::to_path_buf);
         create_dir(&dir)?;
         let temp = dir.join(format!(
             "{TEMP_PREFIX}{}-{}",
@@ -1537,14 +1650,14 @@ impl Storage for Local {
             return Ok(Vec::new());
         };
         let mut found = Vec::new();
-        for name in readable.flatten().filter_map(|entry| entry.file_name().into_string().ok()) {
+        for name in readable
+            .flatten()
+            .filter_map(|entry| entry.file_name().into_string().ok())
+        {
             if name.starts_with(TEMP_PREFIX) {
                 continue;
             }
-            found.push(Entry {
-                name,
-                inline: None,
-            });
+            found.push(Entry { name, inline: None });
         }
         Ok(found)
     }
@@ -1552,4 +1665,1661 @@ impl Storage for Local {
     fn threaded(&self) -> bool {
         false
     }
+}
+
+/// The separator a flattened name uses where the folder step would be a slash.
+const FLAT_SEP: &str = "~";
+const DRIVE_INLINE_LIMIT: usize = 12_000;
+const DRIVE_BOUNDARY: &str = "xdrive-boundary";
+const DRIVE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+const DRIVE_FILES_URL: &str = "https://www.googleapis.com/drive/v3/files";
+const DRIVE_UPLOAD_URL: &str =
+    "https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name";
+const MAX_ATTEMPTS: usize = 8;
+const DEFAULT_INFLIGHT: usize = 32;
+const MAX_INFLIGHT: usize = 256;
+const SERVICE_TIMEOUT: Duration = Duration::from_secs(60);
+const INITIAL_BACKOFF: Duration = Duration::from_millis(200);
+const MAX_BACKOFF: Duration = Duration::from_secs(8);
+const LINE_CAP: usize = 8 * 1024;
+const HEAD_CAP: usize = 16 * 1024;
+const TOKEN_CAP: usize = 1 << 20;
+const TOKEN_SKEW: Duration = Duration::from_secs(60);
+const TOKEN_LIFE: Duration = Duration::from_secs(3600);
+const DRIVE_PAGE_SIZE: usize = 1000;
+
+/// The folder steps an object name carries, replaced by `~` for a service that keeps names in one flat listing.
+fn flatten(name: &str) -> String {
+    name.replace('/', FLAT_SEP)
+}
+
+/// Whether one name sits under the folder prefix a listing was asked for.
+fn under<'a>(name: &'a str, prefix: &str) -> Option<&'a str> {
+    name.strip_prefix(prefix)
+        .and_then(|rest| (!rest.is_empty()).then_some(rest))
+}
+
+/// The first step of a flattened name, which is what a listing of one folder level reports.
+fn first_step(rest: &str) -> &str {
+    rest.split(FLAT_SEP).next().unwrap_or(rest)
+}
+
+/// A bound on how many requests one service answers at once, which is also its connection cap: a lane is held for exactly as long as its holder lives.
+struct Gate {
+    left: Mutex<usize>,
+    room: Condvar,
+}
+
+/// The borrowed slot; dropping it is the release.
+struct Hold<'a> {
+    gate: &'a Gate,
+}
+
+impl Gate {
+    fn new(cap: usize) -> Self {
+        Self {
+            left: Mutex::new(cap),
+            room: Condvar::new(),
+        }
+    }
+
+    /// Wait for a slot, re-checking on a timer so a stuck holder still names itself in the census.
+    fn hold(&self) -> Hold<'_> {
+        let mut left = self.left.lock().unwrap_or_else(PoisonError::into_inner);
+        while *left == 0 {
+            census!("xdrive-gate", crate::census::NO_FD, Some(DRAIN_WAIT));
+            let (guard, _timeout) = self
+                .room
+                .wait_timeout(left, DRAIN_WAIT)
+                .unwrap_or_else(PoisonError::into_inner);
+            left = guard;
+        }
+        *left -= 1;
+        Hold { gate: self }
+    }
+}
+
+impl Drop for Hold<'_> {
+    fn drop(&mut self) {
+        let mut left = self
+            .gate
+            .left
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *left += 1;
+        self.gate.room.notify_one();
+    }
+}
+
+/// The stream one service lane rides: plain to a loopback fake, TLS to a real origin.
+enum Kind {
+    Plain(Connection),
+    Secure(RustlsProvider<Connection>),
+}
+
+impl Read for Kind {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.read(buf),
+            Self::Secure(tls) => tls.read(buf),
+        }
+    }
+}
+
+impl Write for Kind {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.write(buf),
+            Self::Secure(tls) => tls.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.flush(),
+            Self::Secure(tls) => tls.flush(),
+        }
+    }
+}
+
+/// One kept-alive exchange, with the read buffer the lane keeps warm so the next reply costs no allocation and bytes that arrive past an answer are still there for it.
+struct Lane {
+    kind: Kind,
+    buf: Vec<u8>,
+    at: usize,
+}
+
+/// A reply and whether its lane can be kept: a peer that said `close`, or that ended the body at EOF, has nothing left to answer.
+struct Answer {
+    status: u16,
+    body: Vec<u8>,
+    kept: bool,
+}
+
+impl Lane {
+    fn new(kind: Kind) -> Self {
+        Self {
+            kind,
+            buf: Vec::with_capacity(crate::proxy::READ_SLICE),
+            at: 0,
+        }
+    }
+
+    /// At least one unread byte in the buffer, or zero once the peer has said it is done.
+    fn ready(&mut self) -> io::Result<usize> {
+        while self.at >= self.buf.len() {
+            self.settle();
+            if crate::proxy::read_into_tail(&mut self.kind, &mut self.buf)? == 0 {
+                return Ok(0);
+            }
+        }
+        Ok(self.buf.len() - self.at)
+    }
+
+    /// Move the consumed prefix out of the way without moving the unread tail.
+    fn settle(&mut self) {
+        if self.at >= self.buf.len() {
+            self.buf.clear();
+            self.at = 0;
+        }
+    }
+
+    /// One `CRLF`-terminated line as a slice of the lane's own buffer: a head is read out of the buffer it arrived in, and the bytes past the line stay there for the next one.
+    fn line(&mut self) -> io::Result<&[u8]> {
+        loop {
+            if let Some(step) = self.buf[self.at..].iter().position(|byte| *byte == b'\n') {
+                let start = self.at;
+                let stop = start + step;
+                let end = (stop > start && self.buf[stop - 1] == b'\r').then_some(stop - 1);
+                self.at = stop + 1;
+                return Ok(&self.buf[start..end.unwrap_or(stop)]);
+            }
+            if self.ready()? == 0 {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "the service ended the head",
+                ));
+            }
+            if self.buf.len() - self.at > LINE_CAP {
+                return Err(carrier_error("a service head line is too long"));
+            }
+        }
+    }
+
+    /// Exactly `want` body bytes appended to `out`, the chunked framing of a service that has none left being the only thing that ends the read early.
+    fn append_body(&mut self, want: usize, out: &mut Vec<u8>) -> io::Result<()> {
+        let stop = out.len() + want;
+        while out.len() < stop {
+            if self.ready()? == 0 {
+                return Err(io::Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "the service ended the body early",
+                ));
+            }
+            let take = (stop - out.len()).min(self.buf.len() - self.at);
+            out.extend_from_slice(&self.buf[self.at..self.at + take]);
+            self.at += take;
+            self.settle();
+        }
+        Ok(())
+    }
+
+    /// Everything the peer has left to say, which is a reply only a `close`ing service can give.
+    fn read_to_eof(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
+        while self.ready()? > 0 {
+            out.extend_from_slice(&self.buf[self.at..]);
+            self.at = self.buf.len();
+        }
+        Ok(())
+    }
+
+    /// The request, then the answer; `header_only` is a `HEAD`, whose declared length never arrives as bytes.
+    fn exchange(
+        &mut self,
+        head: &[u8],
+        body: Option<&[u8]>,
+        header_only: bool,
+        limit: Option<usize>,
+    ) -> io::Result<Answer> {
+        self.buf.clear();
+        self.at = 0;
+        self.kind.write_all(head)?;
+        if let Some(payload) = body {
+            self.kind.write_all(payload)?;
+        }
+        self.kind.flush()?;
+        self.reply(header_only, limit)
+    }
+
+    fn reply(&mut self, header_only: bool, limit: Option<usize>) -> io::Result<Answer> {
+        let first = self.line()?;
+        let mut counted = first.len();
+        let status =
+            status_of(first).ok_or_else(|| carrier_error("a service head has no status"))?;
+        let mut transfer = false;
+        let mut length = None;
+        let mut closing = false;
+        loop {
+            let line = self.line()?;
+            counted += line.len();
+            if counted > HEAD_CAP {
+                return Err(carrier_error("the service head is too long"));
+            }
+            if line.is_empty() {
+                break;
+            }
+            let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+                continue;
+            };
+            let name = String::from_utf8_lossy(&line[..colon]).to_ascii_lowercase();
+            let value = String::from_utf8_lossy(&line[colon + 1..])
+                .trim()
+                .to_owned();
+            match name.as_str() {
+                "content-length" if !transfer => {
+                    length = value.parse::<usize>().ok().or(length);
+                }
+                "transfer-encoding" => {
+                    transfer |= value.to_ascii_lowercase().contains("chunked");
+                }
+                "connection" => {
+                    closing |= value.to_ascii_lowercase().contains("close");
+                }
+                _ => {}
+            }
+        }
+        if header_only || matches!(status, 204 | 304) {
+            return Ok(Answer {
+                status,
+                body: Vec::new(),
+                kept: !closing,
+            });
+        }
+        let mut body = Vec::new();
+        let kept = if transfer {
+            self.chunks(&mut body, limit)?;
+            !closing
+        } else if let Some(want) = length {
+            guard(want, limit)?;
+            self.append_body(want, &mut body)?;
+            !closing
+        } else {
+            self.read_to_eof(&mut body)?;
+            false
+        };
+        Ok(Answer { status, body, kept })
+    }
+
+    /// A chunked body: the framing read one chunk at a time, so a chunk boundary is never a copy boundary.
+    fn chunks(&mut self, out: &mut Vec<u8>, limit: Option<usize>) -> io::Result<()> {
+        loop {
+            let line = self.line()?;
+            let Some(want) = chunk_size(line) else {
+                return Err(carrier_error("the service framed a chunk badly"));
+            };
+            if want == 0 {
+                while !self.line()?.is_empty() {}
+                return Ok(());
+            }
+            guard(out.len() + want, limit)?;
+            self.append_body(want, out)?;
+            self.line()?;
+        }
+    }
+}
+
+/// A declared length the caller will not let the store spend.
+fn guard(want: usize, limit: Option<usize>) -> io::Result<()> {
+    if limit.is_some_and(|cap| want > cap) {
+        return Err(carrier_error(format!(
+            "the service declared {want} bytes past its limit"
+        )));
+    }
+    Ok(())
+}
+
+/// The status out of `HTTP/1.1 200 OK`.
+fn status_of(line: &[u8]) -> Option<u16> {
+    let mut parts = line.split(|byte| *byte == b' ');
+    let version = parts.next()?;
+    if !version.starts_with(b"HTTP/1.") {
+        return None;
+    }
+    let code = parts.next()?;
+    let text = String::from_utf8_lossy(code);
+    (text.len() == 3)
+        .then(|| text.parse::<u16>().ok())
+        .flatten()
+}
+
+/// A chunk's hex length, with its extension dropped.
+fn chunk_size(line: &[u8]) -> Option<usize> {
+    let hex = line
+        .split(|byte| *byte == b';')
+        .next()
+        .map_or("", |part| std::str::from_utf8(part).unwrap_or(""));
+    usize::from_str_radix(hex.trim(), 16).ok()
+}
+
+/// Where one service url says to go: the authority for the `Host` header, the path and query for the request line.
+#[derive(Debug)]
+struct Target {
+    secure: bool,
+    host: String,
+    port: u16,
+    path: String,
+}
+
+impl Target {
+    fn parse(url: &str) -> Option<Self> {
+        let (secure, rest) = url
+            .strip_prefix("https://")
+            .map(|rest| (true, rest))
+            .or_else(|| url.strip_prefix("http://").map(|rest| (false, rest)))?;
+        let cut = rest.find(['/', '?']).unwrap_or(rest.len());
+        let (authority, tail) = (&rest[..cut], &rest[cut..]);
+        let host = match authority.strip_prefix('[') {
+            Some(bracketed) => bracketed.split(']').next()?,
+            None => authority
+                .rsplit_once(':')
+                .map_or(authority, |(host, _)| host),
+        };
+        let port = match authority.strip_prefix('[') {
+            Some(bracketed) => bracketed
+                .split(']')
+                .nth(1)
+                .and_then(|rest| rest.strip_prefix(':'))
+                .and_then(|digits| digits.parse().ok()),
+            None if authority.contains(':') => authority
+                .rsplit_once(':')
+                .and_then(|(_, digits)| digits.parse().ok()),
+            None => None,
+        }
+        .unwrap_or(if secure { 443 } else { 80 });
+        if host.is_empty() {
+            return None;
+        }
+        Some(Self {
+            secure,
+            host: host.to_owned(),
+            port,
+            path: if tail.is_empty() {
+                "/".to_owned()
+            } else {
+                tail.to_owned()
+            },
+        })
+    }
+
+    /// The bucket this lane belongs to: a scheme, a host and a port, with the fronting the transport arms kept out of it because a lane to a front speaks for the origin.
+    fn origin(&self) -> String {
+        format!(
+            "{}:{}:{}",
+            if self.secure { "https" } else { "http" },
+            self.host,
+            self.port
+        )
+    }
+
+    /// The `Host` header, whose port only shows when it is not the scheme's own.
+    fn authority(&self) -> String {
+        let default = self.port == if self.secure { 443 } else { 80 };
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        if default {
+            host
+        } else {
+            format!("{host}:{}", self.port)
+        }
+    }
+}
+
+/// The request head, with the payload deliberately left out of it: a segment is written behind the head instead of copied into it, which is the one thing a Go `bytes.Reader` gets for free and a merged buffer would not.
+fn request_head(
+    method: &str,
+    authority: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    length: Option<usize>,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(128 + path.len());
+    out.extend_from_slice(method.as_bytes());
+    out.extend_from_slice(b" ");
+    out.extend_from_slice(path.as_bytes());
+    out.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    out.extend_from_slice(authority.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    for (name, value) in headers {
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    if let Some(want) = declared_length(method, length) {
+        let _ = write!(out, "Content-Length: {want}\r\n");
+    }
+    out.extend_from_slice(b"\r\n");
+    out
+}
+
+/// The length line the service's own http library would write: a body always declares, and a bodyless `POST`, `PUT` or `PATCH` declares zero while a `GET`, `HEAD` or `DELETE` says nothing at all.
+fn declared_length(method: &str, length: Option<usize>) -> Option<usize> {
+    length.or_else(|| match method {
+        "POST" | "PUT" | "PATCH" => Some(0),
+        _ => None,
+    })
+}
+
+/// The pooled `HTTP/1.1` lanes one object service shares: a lane per in-flight request, kept for the next rather than handshaken again.
+pub(crate) struct Http {
+    tls: Option<Arc<TlsConfig>>,
+    front: Option<(String, u16)>,
+    gate: Gate,
+    lanes: Mutex<HashMap<String, VecDeque<Lane>>>,
+}
+
+impl Http {
+    fn new(tls: Option<Arc<TlsConfig>>, front: Option<(String, u16)>, cap: usize) -> Arc<Self> {
+        Arc::new(Self {
+            tls,
+            front,
+            gate: Gate::new(cap),
+            lanes: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// One request and its answer, retried by the caller's ladder: a lane taken from the pool gets one second try on a fresh one, because a server that timed out an idle connection is the ordinary reason a first try fails.
+    pub(crate) fn ask(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+        limit: Option<usize>,
+    ) -> io::Result<(u16, Vec<u8>)> {
+        let target = Target::parse(url)
+            .ok_or_else(|| carrier_error(format!("the service url {url} names no origin")))?;
+        let head = request_head(
+            method,
+            &target.authority(),
+            &target.path,
+            headers,
+            body.map(<[u8]>::len),
+        );
+        let key = target.origin();
+        let _hold = self.gate.hold();
+        let header_only = method.eq_ignore_ascii_case("HEAD");
+        let pooled = self.borrow(&key);
+        if let Some(mut lane) = pooled {
+            return match lane.exchange(&head, body, header_only, limit) {
+                Ok(answer) => {
+                    self.finish(&key, lane, &answer);
+                    Ok((answer.status, answer.body))
+                }
+                Err(first) => {
+                    let mut again = self.dial(&target)?;
+                    let answer =
+                        again
+                            .exchange(&head, body, header_only, limit)
+                            .map_err(|why| {
+                                carrier_error(format!(
+                                    "the service lane failed twice: {why}; first {first}"
+                                ))
+                            })?;
+                    self.finish(&key, again, &answer);
+                    Ok((answer.status, answer.body))
+                }
+            };
+        }
+        let mut lane = self.dial(&target)?;
+        let answer = lane.exchange(&head, body, header_only, limit)?;
+        self.finish(&key, lane, &answer);
+        Ok((answer.status, answer.body))
+    }
+
+    fn borrow(&self, key: &str) -> Option<Lane> {
+        let mut lanes = self.lanes.lock().unwrap_or_else(PoisonError::into_inner);
+        let queue = lanes.get_mut(key)?;
+        let lane = queue.pop_front();
+        if queue.is_empty() {
+            lanes.remove(key);
+        }
+        lane
+    }
+
+    fn finish(&self, key: &str, lane: Lane, answer: &Answer) {
+        if !answer.kept {
+            return;
+        }
+        self.lanes
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(key.to_owned())
+            .or_default()
+            .push_back(lane);
+    }
+
+    /// Dial the fronting the outbound names, or the url's own origin, and put TLS on it when the url asks for that scheme.
+    fn dial(&self, target: &Target) -> io::Result<Lane> {
+        let (host, port) = match &self.front {
+            Some((front, 0)) => (front.clone(), target.port),
+            Some((front, at)) => (front.clone(), *at),
+            None => (target.host.clone(), target.port),
+        };
+        let peer = (host.as_str(), port)
+            .to_socket_addrs()
+            .map_err(|why| carrier_error(format!("resolve {host}: {why}")))?
+            .next()
+            .ok_or_else(|| carrier_error(format!("{host} resolves to nothing")))?;
+        let stream = crate::conn::dial_tcp(&peer, SERVICE_TIMEOUT)
+            .map_err(|why| carrier_error(format!("connect {peer}: {why}")))?;
+        let _ = stream.set_read_timeout(Some(SERVICE_TIMEOUT));
+        let _ = stream.set_write_timeout(Some(SERVICE_TIMEOUT));
+        if !target.secure {
+            return Ok(Lane::new(Kind::Plain(stream)));
+        }
+        let mut cfg = self.tls.as_deref().cloned().unwrap_or_default();
+        if cfg.server_name.is_empty() {
+            cfg.server_name = target.host.clone();
+        }
+        if cfg.roots.is_empty() {
+            cfg.roots = crate::quic::system_roots();
+        }
+        let mut tls = RustlsProvider::connect(&cfg, stream)
+            .map_err(|why| carrier_error(format!("tls {}: {why}", target.host)))?;
+        tls.handshake()
+            .map_err(|why| carrier_error(format!("handshake {}: {why}", target.host)))?;
+        Ok(Lane::new(Kind::Secure(tls)))
+    }
+}
+
+/// The bearer both `HTTP` services carry, with the moment it stops being worth sending.
+struct Token {
+    value: String,
+    until: Instant,
+}
+
+impl Default for Token {
+    fn default() -> Self {
+        Self {
+            value: String::new(),
+            until: Instant::now(),
+        }
+    }
+}
+
+impl Token {
+    fn fresh(&self, now: Instant) -> Option<&str> {
+        (!self.value.is_empty() && now < self.until).then(|| self.value.as_str())
+    }
+
+    /// The lifetime the service stated, less the minute it may be wrong by, and never less than zero.
+    fn set(&mut self, value: String, life: Duration) {
+        let kept = (life > TOKEN_SKEW)
+            .then(|| life - TOKEN_SKEW)
+            .unwrap_or_default();
+        self.value = value;
+        self.until = Instant::now() + kept;
+    }
+}
+
+/// A byte below `top`, the way the reference jitters a backoff: no entropy is a roll of zero, which is the smallest wait rather than a failure.
+fn roll(top: u64) -> u64 {
+    if top == 0 {
+        return 0;
+    }
+    let mut raw = [0u8; 8];
+    getrandom::getrandom(&mut raw).map_or(0, |_| u64::from_le_bytes(raw) % top)
+}
+
+/// Half the wait kept, half of it rolled, so a whole fleet of sessions does not poll one store in lockstep.
+fn jitter(backoff: Duration) -> Duration {
+    let half = backoff / 2;
+    let room = u64::try_from(half.as_nanos()).unwrap_or(u64::MAX);
+    if room == 0 {
+        return backoff;
+    }
+    half + Duration::from_nanos(roll(room))
+}
+
+/// One ask, either answered or worth another attempt with the reason it was not.
+enum Control {
+    Done(io::Result<(u16, Vec<u8>)>),
+    Again(String),
+}
+
+/// The reference's attempt ladder: eight tries, the wait doubling from 200 ms to 8 s with half of each rung jittered.
+fn retried(mut ask: impl FnMut() -> Control) -> io::Result<(u16, Vec<u8>)> {
+    let mut backoff = INITIAL_BACKOFF;
+    let mut last = String::from("the service never answered");
+    for attempt in 0..MAX_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(jitter(backoff));
+            backoff = (backoff * 2).min(MAX_BACKOFF);
+        }
+        match ask() {
+            Control::Done(answer) => return answer,
+            Control::Again(why) => last = why,
+        }
+    }
+    Err(carrier_error(last))
+}
+
+/// A value byte that needs quoting in a query: the unreserved set and nothing else.
+fn reserved(byte: u8) -> bool {
+    !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~'))
+}
+
+const UPPER_HEX: &[u8; 16] = b"0123456789ABCDEF";
+
+/// One byte as the percent-escape the services' url library writes: uppercase, two digits.
+fn pct(out: &mut String, byte: u8) {
+    out.push('%');
+    out.push(UPPER_HEX[(byte >> 4) as usize] as char);
+    out.push(UPPER_HEX[(byte & 0x0f) as usize] as char);
+}
+
+/// `url.Values.Encode` of a list of pairs: keys sorted, every value percent-quoted with a space as `+`.
+fn query(pairs: &[(&str, &str)]) -> String {
+    let mut sorted = pairs.to_vec();
+    sorted.sort_unstable();
+    let mut out = String::new();
+    for (index, (key, value)) in sorted.iter().enumerate() {
+        if index > 0 {
+            out.push('&');
+        }
+        out.push_str(key);
+        out.push('=');
+        for byte in value.as_bytes() {
+            match byte {
+                b' ' => out.push('+'),
+                other if reserved(*other) => pct(&mut out, *other),
+                other => out.push(*other as char),
+            }
+        }
+    }
+    out
+}
+
+/// A `'`-quoted value inside a Drive query, with its own quotes and backslashes escaped.
+fn quoted(value: &str) -> String {
+    value.replace('\\', r"\\").replace('\'', r"\'")
+}
+
+/// One step of a dotted answer path.
+fn walk<'a>(node: &'a Json, path: &str) -> Option<&'a Json> {
+    let mut at = node;
+    for key in path.split('.') {
+        at = at.get(key)?;
+    }
+    Some(at)
+}
+
+fn text_of(node: &Json, name: &str) -> String {
+    node.get(name)
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_owned()
+}
+
+fn flag_of(node: &Json, name: &str) -> bool {
+    node.get(name).and_then(Json::as_bool).unwrap_or(false)
+}
+
+/// A `map[string]string` config field, in the order the config wrote it.
+fn pairs_of(node: &Json, name: &str) -> Vec<(String, String)> {
+    let Some(Json::Obj(items)) = node.get(name) else {
+        return Vec::new();
+    };
+    items
+        .iter()
+        .map(|(key, value)| (key.clone(), value.as_str().unwrap_or("").to_owned()))
+        .collect()
+}
+
+fn numbers_of(node: &Json, name: &str) -> Vec<u32> {
+    let Some(items) = node.get(name).and_then(Json::as_arr) else {
+        return Vec::new();
+    };
+    items.iter().filter_map(Json::as_u32).collect()
+}
+
+/// The variables a template name, in one pass over it instead of one pass per variable.
+#[derive(Clone)]
+struct Vars(Vec<(String, String)>);
+
+impl Vars {
+    fn new(folder: &str, secrets: &[String]) -> Self {
+        let mut out = vec![("folder".to_owned(), folder.to_owned())];
+        for (index, secret) in secrets.iter().enumerate() {
+            out.push((format!("secret{index}"), secret.clone()));
+        }
+        Self(out)
+    }
+
+    fn set(&mut self, key: &str, value: String) {
+        if let Some(found) = self.0.iter_mut().find(|(name, _)| name == key) {
+            found.1 = value;
+            return;
+        }
+        self.0.push((key.to_owned(), value));
+    }
+
+    /// Every `{name}` this holds, and nothing else: an unknown brace is left as the config wrote it, which is what the reference's per-key replace leaves.
+    fn sub(&self, text: &str) -> String {
+        if !text.contains('{') {
+            return text.to_owned();
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(at) = rest.find('{') {
+            out.push_str(&rest[..at]);
+            let after = &rest[at + 1..];
+            let Some(cut) = after.find('}') else {
+                out.push('{');
+                rest = after;
+                continue;
+            };
+            let name = &after[..cut];
+            match self.0.iter().find(|(key, _)| key == name) {
+                Some((_, value)) => out.push_str(value),
+                None => {
+                    out.push('{');
+                    out.push_str(name);
+                    out.push('}');
+                }
+            }
+            rest = &after[cut + 1..];
+        }
+        out.push_str(rest);
+        out
+    }
+}
+
+/// One templated operation: `GET` when it names no method, and no body until it writes one.
+struct Op {
+    method: String,
+    url: String,
+    headers: Vec<(String, String)>,
+    body: String,
+    names: String,
+}
+
+fn op_of(node: &Json, name: &str) -> Op {
+    let empty = Json::Null;
+    let at = node.get(name).unwrap_or(&empty);
+    Op {
+        method: text_of(at, "method"),
+        url: text_of(at, "url"),
+        headers: pairs_of(at, "headers"),
+        body: text_of(at, "body"),
+        names: text_of(at, "namesRegex"),
+    }
+}
+
+/// Which answers the templated service wants asked again.
+struct Retry {
+    status: Vec<u32>,
+    reason: String,
+}
+
+/// How a templated service is proved: nothing, a header the config writes, a `Basic` pair, or an `OAuth2` token it fetches first.
+struct Auth {
+    kind: String,
+    headers: Vec<(String, String)>,
+    username: String,
+    password: String,
+    token_url: String,
+    form: Vec<(String, String)>,
+    token_path: String,
+    expiry_path: String,
+}
+
+/// A JSON-described object service: four operations spelled as templates over `{folder}`, `{secret0}`, `{name}`, `{prefix}` and `{data}`, so any store that speaks `HTTP` can carry a session.
+pub(crate) struct Template {
+    http: Arc<Http>,
+    folder: String,
+    secrets: Vec<String>,
+    flatten: bool,
+    names: regex::Regex,
+    auth: Auth,
+    put: Op,
+    get: Op,
+    drop: Op,
+    list: Op,
+    retry: Retry,
+    token: Mutex<Token>,
+}
+
+impl Template {
+    fn build(settings: &Settings, http: Arc<Http>) -> io::Result<Self> {
+        let root = settings
+            .template
+            .as_ref()
+            .ok_or_else(|| carrier_error("the template service has no template"))?;
+        let put = op_of(root, "put");
+        let get = op_of(root, "get");
+        let drop = op_of(root, "delete");
+        let list = op_of(root, "list");
+        if put.url.is_empty() || get.url.is_empty() || drop.url.is_empty() || list.url.is_empty() {
+            return Err(carrier_error(
+                "the template needs put, get, list and delete operations",
+            ));
+        }
+        if list.names.is_empty() {
+            return Err(carrier_error("the template list needs a namesRegex"));
+        }
+        let names = regex::Regex::new(&list.names)
+            .map_err(|why| carrier_error(format!("bad namesRegex: {why}")))?;
+        if names.captures_len() < 2 {
+            return Err(carrier_error("namesRegex needs one capture group"));
+        }
+        let retry = root.get("retry").unwrap_or(&Json::Null);
+        let auth = root.get("auth").unwrap_or(&Json::Null);
+        Ok(Self {
+            http,
+            folder: settings.remote_folder.clone(),
+            secrets: settings.secrets.clone(),
+            flatten: flag_of(root, "flatten"),
+            names,
+            auth: Auth {
+                kind: text_of(auth, "type"),
+                headers: pairs_of(auth, "header"),
+                username: text_of(auth, "username"),
+                password: text_of(auth, "password"),
+                token_url: text_of(auth, "tokenUrl"),
+                form: pairs_of(auth, "form"),
+                token_path: text_of(auth, "tokenPath"),
+                expiry_path: text_of(auth, "expiryPath"),
+            },
+            put,
+            get,
+            drop,
+            list,
+            retry: Retry {
+                status: numbers_of(retry, "status"),
+                reason: text_of(retry, "rateReason"),
+            },
+            token: Mutex::new(Token::default()),
+        })
+    }
+
+    fn stored(&self, name: &str) -> String {
+        if self.flatten {
+            flatten(name)
+        } else {
+            name.to_owned()
+        }
+    }
+
+    fn base(&self) -> Vars {
+        Vars::new(&self.folder, &self.secrets)
+    }
+
+    /// The answer's status against the config's list, and the `403` whose body says the reason the config named.
+    fn retryable(&self, status: u16, payload: &[u8]) -> bool {
+        if self.retry.status.contains(&u32::from(status)) {
+            return true;
+        }
+        if status != 403 || self.retry.reason.is_empty() {
+            return false;
+        }
+        let Ok(answer) = crate::json::parse(&String::from_utf8_lossy(payload)) else {
+            return false;
+        };
+        answer
+            .get(&self.retry.reason)
+            .and_then(Json::as_str)
+            .is_some_and(|reason| !reason.is_empty())
+    }
+
+    fn access(&self, vars: &mut Vars) -> io::Result<String> {
+        let now = Instant::now();
+        if let Some(found) = self
+            .token
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .fresh(now)
+            .map(str::to_owned)
+        {
+            return Ok(found);
+        }
+        let mut form = String::new();
+        for (index, (key, value)) in self.auth.form.iter().enumerate() {
+            if index > 0 {
+                form.push('&');
+            }
+            let _ = write!(form, "{key}={}", vars.sub(value));
+        }
+        let (status, payload) = self.http.ask(
+            "POST",
+            &self.auth.token_url,
+            &[("Content-Type", "application/x-www-form-urlencoded")],
+            Some(form.as_bytes()),
+            Some(TOKEN_CAP),
+        )?;
+        if status != 200 {
+            return Err(carrier_error(format!(
+                "the token endpoint answered {status}: {}",
+                String::from_utf8_lossy(&payload)
+            )));
+        }
+        let answer = crate::json::parse(&String::from_utf8_lossy(&payload))
+            .map_err(|why| carrier_error(format!("the token answer is not json: {why}")))?;
+        let path = if self.auth.token_path.is_empty() {
+            "access_token"
+        } else {
+            &self.auth.token_path
+        };
+        let value = walk(&answer, path)
+            .and_then(Json::as_str)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| carrier_error(format!("the token answer has no token at {path}")))?
+            .to_owned();
+        let life = (!self.auth.expiry_path.is_empty())
+            .then(|| walk(&answer, &self.auth.expiry_path).and_then(Json::as_u32))
+            .flatten()
+            .filter(|seconds| *seconds > 0)
+            .map_or(TOKEN_LIFE, |seconds| {
+                Duration::from_secs(u64::from(seconds))
+            });
+        let mut token = self.token.lock().unwrap_or_else(PoisonError::into_inner);
+        token.set(value.clone(), life);
+        Ok(value)
+    }
+
+    /// The headers the credential needs, with the `oauth2` token put where its template can reach it.
+    fn headers(&self, vars: &mut Vars) -> io::Result<Vec<(String, String)>> {
+        match self.auth.kind.as_str() {
+            "" | "none" => Ok(Vec::new()),
+            "static" => Ok(self
+                .auth
+                .headers
+                .iter()
+                .map(|(key, value)| (key.clone(), vars.sub(value)))
+                .collect()),
+            "oauth2" => {
+                let token = self.access(vars)?;
+                vars.set("token", token);
+                Ok(self
+                    .auth
+                    .headers
+                    .iter()
+                    .map(|(key, value)| (key.clone(), vars.sub(value)))
+                    .collect())
+            }
+            "basic" => {
+                let pair = format!(
+                    "{}:{}",
+                    vars.sub(&self.auth.username),
+                    vars.sub(&self.auth.password)
+                );
+                Ok(vec![(
+                    "Authorization".to_owned(),
+                    format!("Basic {}", ferrox_core::b64::encode(pair.as_bytes())),
+                )])
+            }
+            other => Err(carrier_error(format!("unsupported auth type: {other}"))),
+        }
+    }
+
+    fn do_op(&self, op: &Op, vars: &mut Vars, body: Option<&[u8]>) -> io::Result<(u16, Vec<u8>)> {
+        let method = if op.method.is_empty() {
+            "GET"
+        } else {
+            &op.method
+        };
+        retried(|| {
+            let mut slots = vars.clone();
+            let mut owned: Vec<(String, String)> = match self.headers(&mut slots) {
+                Ok(headers) => headers,
+                Err(why) => return Control::Again(why.to_string()),
+            };
+            owned.extend(
+                op.headers
+                    .iter()
+                    .map(|(key, value)| (key.clone(), slots.sub(value))),
+            );
+            let url = slots.sub(&op.url);
+            let sent: Vec<(&str, &str)> = owned
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str()))
+                .collect();
+            let answer = self.http.ask(method, &url, &sent, body, None);
+            let (status, payload) = match answer {
+                Ok(answer) => answer,
+                Err(why) => return Control::Again(format!("request failed: {why}")),
+            };
+            if status == 401 && self.auth.kind == "oauth2" {
+                self.token
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .value
+                    .clear();
+                return Control::Again("the service rejected the token".to_owned());
+            }
+            if self.retryable(status, &payload) {
+                return Control::Again(format!("the service answered {status}"));
+            }
+            Control::Done(Ok((status, payload)))
+        })
+    }
+}
+
+impl Storage for Template {
+    fn put(&self, name: &str, data: &[u8]) -> io::Result<()> {
+        let mut vars = self.base();
+        vars.set("name", self.stored(name));
+        let encoded: Vec<u8>;
+        let payload: Option<&[u8]> = if self.put.body.is_empty() {
+            (!data.is_empty()).then_some(data)
+        } else {
+            vars.set("data", ferrox_core::b64::encode(data));
+            encoded = vars.sub(&self.put.body).into_bytes();
+            Some(&encoded)
+        };
+        let (status, payload) = self.do_op(&self.put, &mut vars, payload)?;
+        if (200..300).contains(&status) {
+            return Ok(());
+        }
+        Err(carrier_error(format!(
+            "put of {name} answered {status}: {}",
+            String::from_utf8_lossy(&payload)
+        )))
+    }
+
+    fn get(&self, name: &str) -> io::Result<Vec<u8>> {
+        let mut vars = self.base();
+        vars.set("name", self.stored(name));
+        let (status, payload) = self.do_op(&self.get, &mut vars, None)?;
+        if (200..300).contains(&status) {
+            return Ok(payload);
+        }
+        if status == 404 {
+            return Err(io::Error::from(ErrorKind::NotFound));
+        }
+        Err(carrier_error(format!(
+            "get of {name} answered {status}: {}",
+            String::from_utf8_lossy(&payload)
+        )))
+    }
+
+    fn delete(&self, name: &str) -> io::Result<()> {
+        let mut vars = self.base();
+        vars.set("name", self.stored(name));
+        let (status, payload) = self.do_op(&self.drop, &mut vars, None)?;
+        if status == 404 || (200..300).contains(&status) {
+            return Ok(());
+        }
+        Err(carrier_error(format!(
+            "delete of {name} answered {status}: {}",
+            String::from_utf8_lossy(&payload)
+        )))
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<Entry>> {
+        let mut vars = self.base();
+        let flat = self.stored(prefix);
+        vars.set("prefix", flat.clone());
+        let (status, payload) = self.do_op(&self.list, &mut vars, None)?;
+        if status == 404 {
+            return Ok(Vec::new());
+        }
+        if !(200..300).contains(&status) {
+            return Err(carrier_error(format!(
+                "list of {prefix} answered {status}: {}",
+                String::from_utf8_lossy(&payload)
+            )));
+        }
+        let text = String::from_utf8_lossy(&payload);
+        if !self.flatten {
+            return Ok(self
+                .names
+                .captures_iter(text.as_ref())
+                .filter_map(|found| {
+                    found.get(1).map(|at| Entry {
+                        name: at.as_str().to_owned(),
+                        inline: None,
+                    })
+                })
+                .collect());
+        }
+        let mut out = Vec::new();
+        let want = format!("{flat}{FLAT_SEP}");
+        let mut seen: HashSet<String> = HashSet::new();
+        for found in self.names.captures_iter(text.as_ref()) {
+            let Some(at) = found.get(1).map(|at| at.as_str()) else {
+                continue;
+            };
+            let Some(name) = under(at, &want) else {
+                continue;
+            };
+            let step = first_step(name).to_owned();
+            if seen.insert(step.clone()) {
+                out.push(Entry {
+                    name: step,
+                    inline: None,
+                });
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// A file a Drive listing named, with the payload it carried alongside when the object was small enough to ride in the description.
+struct Found {
+    id: String,
+    description: Option<Vec<u8>>,
+}
+
+/// Google Drive as an object store: a name becomes a file id, a small object rides base64 in the file's description, and a larger one its media.
+pub(crate) struct Drive {
+    http: Arc<Http>,
+    folder: String,
+    client_id: String,
+    client_secret: String,
+    refresh: String,
+    token_url: String,
+    files_url: String,
+    upload_url: String,
+    token: Mutex<Token>,
+    ids: Mutex<HashMap<String, String>>,
+}
+
+impl Drive {
+    fn build(settings: &Settings, http: Arc<Http>) -> io::Result<Self> {
+        let [client_id, client_secret, refresh] = settings.secrets.as_slice() else {
+            return Err(carrier_error(
+                "Google Drive needs 3 secrets in order of ClientID, ClientSecret, RefreshToken",
+            ));
+        };
+        if client_id.is_empty() || client_secret.is_empty() || refresh.is_empty() {
+            return Err(carrier_error("a Google Drive secret is empty"));
+        }
+        Ok(Self {
+            http,
+            folder: settings.remote_folder.clone(),
+            client_id: client_id.clone(),
+            client_secret: client_secret.clone(),
+            refresh: refresh.clone(),
+            token_url: DRIVE_TOKEN_URL.to_owned(),
+            files_url: DRIVE_FILES_URL.to_owned(),
+            upload_url: DRIVE_UPLOAD_URL.to_owned(),
+            token: Mutex::new(Token::default()),
+            ids: Mutex::new(HashMap::new()),
+        })
+    }
+
+    fn access(&self) -> io::Result<String> {
+        let now = Instant::now();
+        if let Some(found) = self
+            .token
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .fresh(now)
+            .map(str::to_owned)
+        {
+            return Ok(found);
+        }
+        let form = query(&[
+            ("client_id", &self.client_id),
+            ("client_secret", &self.client_secret),
+            ("grant_type", "refresh_token"),
+            ("refresh_token", &self.refresh),
+        ]);
+        let (status, payload) = self.http.ask(
+            "POST",
+            &self.token_url,
+            &[("Content-Type", "application/x-www-form-urlencoded")],
+            Some(form.as_bytes()),
+            Some(TOKEN_CAP),
+        )?;
+        if status != 200 {
+            return Err(carrier_error(format!(
+                "the token endpoint answered {status}: {}",
+                String::from_utf8_lossy(&payload)
+            )));
+        }
+        let answer = crate::json::parse(&String::from_utf8_lossy(&payload))
+            .map_err(|why| carrier_error(format!("the token answer is not json: {why}")))?;
+        let value = answer
+            .get("access_token")
+            .and_then(Json::as_str)
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| carrier_error("the token endpoint returned no access token"))?
+            .to_owned();
+        let life = answer
+            .get("expires_in")
+            .and_then(Json::as_u32)
+            .map_or(Duration::ZERO, |seconds| {
+                Duration::from_secs(u64::from(seconds))
+            });
+        let mut token = self.token.lock().unwrap_or_else(PoisonError::into_inner);
+        token.set(value.clone(), life);
+        Ok(value)
+    }
+
+    fn forget(&self, name: &str) {
+        self.ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(name);
+    }
+
+    fn remember(&self, name: &str, id: &str) {
+        self.ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(name.to_owned(), id.to_owned());
+    }
+
+    fn cached(&self, name: &str) -> Option<String> {
+        self.ids
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(name)
+            .cloned()
+    }
+
+    /// The `403` that is a rate limit rather than a refusal, which is the one a retry can outlast.
+    fn rate_limited(payload: &[u8]) -> bool {
+        let Ok(answer) = crate::json::parse(&String::from_utf8_lossy(payload)) else {
+            return false;
+        };
+        let Some(error) = answer.get("error") else {
+            return false;
+        };
+        if error
+            .get("errors")
+            .and_then(Json::as_arr)
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|item| item.get("reason").and_then(Json::as_str))
+            .any(|reason| {
+                matches!(
+                    reason,
+                    "rateLimitExceeded" | "userRateLimitExceeded" | "sharingRateLimitExceeded"
+                )
+            })
+        {
+            return true;
+        }
+        error
+            .get("status")
+            .and_then(Json::as_str)
+            .is_some_and(|status| status == "RESOURCE_EXHAUSTED")
+    }
+
+    fn ask(
+        &self,
+        method: &str,
+        target: String,
+        content: &str,
+        body: Option<&[u8]>,
+    ) -> io::Result<(u16, Vec<u8>)> {
+        retried(|| {
+            let token = match self.access() {
+                Ok(token) => token,
+                Err(why) => return Control::Again(why.to_string()),
+            };
+            let headers = vec![("Authorization", format!("Bearer {token}"))];
+            let mut sent: Vec<(&str, &str)> = headers
+                .iter()
+                .map(|(key, value)| (*key, value.as_str()))
+                .collect();
+            if !content.is_empty() {
+                sent.push(("Content-Type", content));
+            }
+            let answer = self.http.ask(method, &target, &sent, body, None);
+            let (status, payload) = match answer {
+                Ok(answer) => answer,
+                Err(why) => return Control::Again(format!("Drive request failed: {why}")),
+            };
+            if status == 401 {
+                self.token
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .value
+                    .clear();
+                return Control::Again("Drive rejected the access token".to_owned());
+            }
+            if status == 403 && Self::rate_limited(&payload) {
+                return Control::Again(format!(
+                    "Drive is rate limiting: {}",
+                    String::from_utf8_lossy(&payload)
+                ));
+            }
+            if matches!(status, 429 | 500 | 502 | 503 | 504) {
+                return Control::Again(format!(
+                    "Drive answered {status}: {}",
+                    String::from_utf8_lossy(&payload)
+                ));
+            }
+            Control::Done(Ok((status, payload)))
+        })
+    }
+
+    /// One page of a Drive listing, and every page after it, keeping the last answer for a name as the reference does.
+    fn query(&self, condition: &str) -> io::Result<HashMap<String, Found>> {
+        let mut found: HashMap<String, Found> = HashMap::new();
+        let mut page = String::new();
+        loop {
+            let mut pairs = vec![
+                (
+                    "fields",
+                    "nextPageToken,files(id,name,description)".to_owned(),
+                ),
+                ("includeItemsFromAllDrives", "true".to_owned()),
+                ("pageSize", DRIVE_PAGE_SIZE.to_string()),
+                (
+                    "q",
+                    format!(
+                        "'{}' in parents and trashed = false and {condition}",
+                        quoted(&self.folder)
+                    ),
+                ),
+                ("supportsAllDrives", "true".to_owned()),
+            ];
+            if !page.is_empty() {
+                pairs.push(("pageToken", page.clone()));
+            }
+            let owned: Vec<(&str, &str)> = pairs
+                .iter()
+                .map(|(key, value)| (*key, value.as_str()))
+                .collect();
+            let target = format!("{}?{}", self.files_url, query(&owned));
+            let (status, payload) = self.ask("GET", target, "", None)?;
+            if status != 200 {
+                return Err(carrier_error(format!(
+                    "Drive listing answered {status}: {}",
+                    String::from_utf8_lossy(&payload)
+                )));
+            }
+            let answer = crate::json::parse(&String::from_utf8_lossy(&payload))
+                .map_err(|why| carrier_error(format!("the Drive listing is not json: {why}")))?;
+            for file in answer.get("files").and_then(Json::as_arr).unwrap_or(&[]) {
+                let name = file.get("name").and_then(Json::as_str).unwrap_or("");
+                let id = file.get("id").and_then(Json::as_str).unwrap_or("");
+                if name.is_empty() || id.is_empty() {
+                    continue;
+                }
+                let description = file
+                    .get("description")
+                    .and_then(Json::as_str)
+                    .filter(|text| !text.is_empty())
+                    .and_then(|text| ferrox_core::b64::decode(text.as_bytes()));
+                self.remember(name, id);
+                found.insert(
+                    name.to_owned(),
+                    Found {
+                        id: id.to_owned(),
+                        description,
+                    },
+                );
+            }
+            page = answer
+                .get("nextPageToken")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_owned();
+            if page.is_empty() {
+                return Ok(found);
+            }
+        }
+    }
+
+    fn resolve(&self, flat: &str) -> io::Result<String> {
+        if let Some(id) = self.cached(flat) {
+            return Ok(id);
+        }
+        let found = self.query(&format!("name = '{}'", quoted(flat)))?;
+        found
+            .get(flat)
+            .map(|file| file.id.clone())
+            .ok_or_else(|| io::Error::from(ErrorKind::NotFound))
+    }
+
+    /// The object as Drive stores it: small enough it rides base64 in the metadata, otherwise the metadata and the payload go out as one multipart body.
+    fn write(&self, name: &str, data: &[u8]) -> io::Result<()> {
+        let flat = flatten(name);
+        let inline = data.len() <= DRIVE_INLINE_LIMIT;
+        // The keys in the order the reference's map marshaller writes them, so the metadata body is byte for byte the same.
+        let mut pairs = Vec::with_capacity(3);
+        if inline {
+            pairs.push((
+                "description".to_owned(),
+                Json::Str(ferrox_core::b64::encode(data)),
+            ));
+        }
+        pairs.push(("name".to_owned(), Json::Str(flat.clone())));
+        pairs.push((
+            "parents".to_owned(),
+            Json::Arr(vec![Json::Str(self.folder.clone())]),
+        ));
+        let mut text = String::new();
+        crate::json::write(&Json::Obj(pairs), &mut text);
+        let (target, content, body) = if inline {
+            (
+                format!("{}?fields=id", self.files_url),
+                "application/json; charset=UTF-8".to_owned(),
+                text.into_bytes(),
+            )
+        } else {
+            let mut body = Vec::with_capacity(text.len() + data.len() + 128);
+            let _ = write!(
+                body,
+                "--{DRIVE_BOUNDARY}\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n"
+            );
+            body.extend_from_slice(text.as_bytes());
+            let _ = write!(
+                body,
+                "\r\n--{DRIVE_BOUNDARY}\r\nContent-Type: application/octet-stream\r\n\r\n"
+            );
+            body.extend_from_slice(data);
+            let _ = write!(body, "\r\n--{DRIVE_BOUNDARY}--\r\n");
+            (
+                self.upload_url.clone(),
+                format!("multipart/related; boundary={DRIVE_BOUNDARY}"),
+                body,
+            )
+        };
+        let (status, payload) = self.ask("POST", target, &content, Some(&body))?;
+        if status != 200 {
+            return Err(carrier_error(format!(
+                "Drive upload of {name} answered {status}: {}",
+                String::from_utf8_lossy(&payload)
+            )));
+        }
+        let answer = crate::json::parse(&String::from_utf8_lossy(&payload))
+            .map_err(|why| carrier_error(format!("the Drive upload answer is not json: {why}")))?;
+        if let Some(id) = answer
+            .get("id")
+            .and_then(Json::as_str)
+            .filter(|id| !id.is_empty())
+        {
+            self.remember(&flat, id);
+        }
+        Ok(())
+    }
+
+    fn remove(&self, flat: &str, id: &str) -> io::Result<()> {
+        let target = format!(
+            "{}/{id}?supportsAllDrives=true",
+            self.files_url,
+            id = path_escape(id)
+        );
+        let (status, payload) = self.ask("DELETE", target, "", None)?;
+        self.forget(flat);
+        if matches!(status, 200 | 204 | 404) {
+            return Ok(());
+        }
+        Err(carrier_error(format!(
+            "Drive deletion of {flat} answered {status}: {}",
+            String::from_utf8_lossy(&payload)
+        )))
+    }
+
+    /// The base64 a small object rode in, which is what a `0`-length media read means.
+    fn inline(&self, id: &str) -> io::Result<Vec<u8>> {
+        let target = format!(
+            "{}/{id}?fields=description&supportsAllDrives=true",
+            self.files_url,
+            id = path_escape(id)
+        );
+        let (status, payload) = self.ask("GET", target, "", None)?;
+        if status != 200 {
+            return Err(carrier_error(format!(
+                "Drive answered {status} for inline data: {}",
+                String::from_utf8_lossy(&payload)
+            )));
+        }
+        let answer = crate::json::parse(&String::from_utf8_lossy(&payload))
+            .map_err(|why| carrier_error(format!("the inline data is not json: {why}")))?;
+        let description = answer
+            .get("description")
+            .and_then(Json::as_str)
+            .unwrap_or("");
+        if description.is_empty() {
+            return Ok(Vec::new());
+        }
+        ferrox_core::b64::decode(description.as_bytes())
+            .ok_or_else(|| carrier_error("the inline data is not valid base64"))
+    }
+}
+
+/// The way a path segment quotes an id: every byte outside the unreserved set, uppercase.
+fn path_escape(id: &str) -> String {
+    let mut out = String::with_capacity(id.len());
+    for byte in id.as_bytes() {
+        if reserved(*byte) {
+            pct(&mut out, *byte);
+        } else {
+            out.push(*byte as char);
+        }
+    }
+    out
+}
+
+impl Storage for Drive {
+    fn put(&self, name: &str, data: &[u8]) -> io::Result<()> {
+        self.write(name, data)
+    }
+
+    fn get(&self, name: &str) -> io::Result<Vec<u8>> {
+        let flat = flatten(name);
+        let id = self.resolve(&flat)?;
+        let target = format!(
+            "{}/{id}?alt=media&supportsAllDrives=true",
+            self.files_url,
+            id = path_escape(&id)
+        );
+        let (status, payload) = self.ask("GET", target, "", None)?;
+        match status {
+            200 if !payload.is_empty() => Ok(payload),
+            200 => self.inline(&id),
+            404 => {
+                self.forget(&flat);
+                Err(io::Error::from(ErrorKind::NotFound))
+            }
+            other => Err(carrier_error(format!(
+                "Drive download of {name} answered {other}: {}",
+                String::from_utf8_lossy(&payload)
+            ))),
+        }
+    }
+
+    fn delete(&self, name: &str) -> io::Result<()> {
+        let flat = flatten(name);
+        match self.resolve(&flat) {
+            Ok(id) => self.remove(&flat, &id)?,
+            Err(why) if why.kind() == ErrorKind::NotFound => {}
+            Err(why) => return Err(why),
+        }
+        let children = self.query(&format!(
+            "name contains '{}'",
+            quoted(&format!("{flat}{FLAT_SEP}"))
+        ))?;
+        for (child, file) in children {
+            self.remove(&child, &file.id)?;
+        }
+        Ok(())
+    }
+
+    fn list(&self, prefix: &str) -> io::Result<Vec<Entry>> {
+        let flat = format!("{}{FLAT_SEP}", flatten(prefix));
+        let found = self.query(&format!("name contains '{}'", quoted(&flat)))?;
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut out = Vec::new();
+        for (name, file) in found {
+            let Some(rest) = under(&name, &flat) else {
+                continue;
+            };
+            let direct = !rest.contains(FLAT_SEP);
+            let step = first_step(rest).to_owned();
+            if !seen.insert(step.clone()) {
+                continue;
+            }
+            out.push(Entry {
+                inline: direct.then_some(file.description).flatten(),
+                name: step,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// One store per folder, shared by every session that names it: a token cache and a file-id map are worth one per service, not one per stream.
+static SHARED: LazyLock<Mutex<HashMap<String, Arc<dyn Storage>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// The identity of one service's store, the way the reference keys it: the service, the folder, every secret, the transport's security, and the address it fronts through.
+fn share_key(settings: &Settings, front: Option<(&str, u16)>) -> String {
+    use sha2::Digest as _;
+    let mut joined = vec![settings.service.clone(), settings.remote_folder.clone()];
+    joined.extend_from_slice(&settings.secrets);
+    joined.push(settings.security.clone());
+    if let Some((host, port)) = front {
+        let host = if host.contains(':') {
+            format!("[{host}]")
+        } else {
+            host.to_owned()
+        };
+        joined.push(if port == 0 {
+            format!("tcp:{host}")
+        } else {
+            format!("tcp:{host}:{port}")
+        });
+    }
+    joined.push(settings.template_text());
+    let digest = sha2::Sha256::digest(joined.join("\0").as_bytes());
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+/// The store the settings name, or the one an earlier session with the same settings already opened.
+fn shared(
+    settings: &Settings,
+    front: Option<(&str, u16)>,
+    cap: usize,
+    build: impl FnOnce(&Settings, Arc<Http>) -> io::Result<Arc<dyn Storage>>,
+) -> io::Result<Arc<dyn Storage>> {
+    let key = share_key(settings, front);
+    let mut pool = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(found) = pool.get(&key) {
+        return Ok(Arc::clone(found));
+    }
+    let http = Http::new(
+        settings.tls.clone(),
+        front.map(|(host, port)| (host.to_owned(), port)),
+        cap,
+    );
+    let made = build(settings, http)?;
+    pool.insert(key, Arc::clone(&made));
+    Ok(made)
 }

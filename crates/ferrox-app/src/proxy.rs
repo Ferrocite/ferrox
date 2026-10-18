@@ -291,6 +291,13 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
         eprintln!("unsupported network `{network}` in {path}: refused, not served");
         return false;
     }
+    // An xdrive inbound has no socket: its `security` belongs to the store's lanes, so the stream is served as it arrives from the log.
+    if let Carrier::Xdrive { settings } = &carrier {
+        let accept: crate::xdrive::Accept =
+            Arc::new(move |session| serve_vless_xdrive(session, &id, freedom));
+        serve_xdrive_loop(settings, address, accept);
+        return true;
+    }
     match sec {
         "tls" => serve_vless_tls_inbound(address, inbound, &id, &carrier, freedom, path),
         "reality" => serve_vless_reality_inbound(address, inbound, &id, &carrier, freedom, path),
@@ -735,7 +742,7 @@ macro_rules! refused_carriers {
             | Carrier::Kcp(_)
             | Carrier::Hysteria(_)
             | Carrier::Masque
-            | Carrier::Xdrive
+            | Carrier::Xdrive { .. }
             | Carrier::Http
             | Carrier::Unknown { .. }
     };
@@ -3146,6 +3153,242 @@ fn dial_ss_kcp(
     crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
 }
 
+/// The store this outbound's config names, opened as one session: an xdrive lane starts by announcing itself where the listener polls.
+fn xdrive_dial_session(
+    settings: &crate::xdrive::Settings,
+    address: &str,
+    port: u16,
+) -> Option<crate::xdrive::Conn> {
+    match settings.dial(Some((address, port))) {
+        Ok(session) => Some(session),
+        Err(error) => {
+            eprintln!("xdrive: the store refused the session: {error}");
+            None
+        }
+    }
+}
+
+/// Both directions of a stream the store carries: the app's bytes land in the write log, the read log's bytes go back, and the store's own poll quantum bounds each wait, so neither leg holds a thread while the other's objects are in flight.
+fn xdrive_relay(app: &Connection, mut down: crate::xdrive::Conn) {
+    let Ok(app_read) = app.try_clone() else {
+        return;
+    };
+    let Ok(mut app_write) = app.try_clone() else {
+        return;
+    };
+    let mut up = down.clone();
+    let done = RelayPool::global().run(move || {
+        let mut app_read = app_read;
+        let mut buf = vec![0u8; 16384];
+        loop {
+            match app_read.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if up.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = up.end_write();
+    });
+    let mut buf = vec![0u8; 16384];
+    loop {
+        match down.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                if app_write.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+            Err(error) if is_timeout(&error) => {}
+            _ => break,
+        }
+    }
+    let _ = app_write.shutdown(Shutdown::Write);
+    join(&done);
+}
+
+/// The end-of-write closure the carried pumps call: the log's `.end` is what the peer reads as EOF, and the reader stays alive until the caller's own handle goes.
+fn xdrive_close(session: &crate::xdrive::Conn) -> Arc<dyn Fn() + Send + Sync> {
+    let closer = session.clone();
+    Arc::new(move || {
+        let _ = closer.end_write();
+    })
+}
+
+fn dial_vless_xdrive(
+    client: &Connection,
+    mut session: crate::xdrive::Conn,
+    vless: &VlessOut,
+    target: &Destination,
+) {
+    if session
+        .write_all(&vless_header(&vless.id, 1, target))
+        .is_err()
+    {
+        return;
+    }
+    let mut up = session.clone();
+    let pump = Pump::over(client, move |bytes| up.write_all(bytes).is_ok());
+    let answered = read_vless_response(&mut session).is_some();
+    pump.end();
+    if !answered {
+        return;
+    }
+    xdrive_relay(client, session);
+}
+
+fn dial_trojan_xdrive(
+    client: &Connection,
+    mut session: crate::xdrive::Conn,
+    trojan: &TrojanOut,
+    target: &Destination,
+) {
+    if session
+        .write_all(&trojan_header(&trojan.key, 1, target))
+        .is_err()
+    {
+        return;
+    }
+    xdrive_relay(client, session);
+}
+
+fn dial_vmess_xdrive(
+    client: &Connection,
+    session: crate::xdrive::Conn,
+    vmess: &VmessOut,
+    target: &Destination,
+) {
+    let Some((request, send, recv, response_key, response_iv, auth)) =
+        crate::vmess::client_request(&vmess.id, vmess.cipher, target, 1)
+    else {
+        return;
+    };
+    let mut reader = session.clone();
+    if reader.write_all(&request).is_err() {
+        return;
+    }
+    if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
+        return;
+    }
+    let close = xdrive_close(&session);
+    crate::vmess::pump_relay_carried(client, reader, session, &close, send, recv, None);
+}
+
+fn dial_ss_xdrive(
+    client: &Connection,
+    session: crate::xdrive::Conn,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+) {
+    let mut writer = session.clone();
+    if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
+        let Some((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+            &mut writer,
+            &ss.password,
+            &ss.method,
+            target,
+        ) else {
+            return;
+        };
+        let close = xdrive_close(&session);
+        crate::shadowsocks2022::pump_relay_carried(
+            client,
+            session.clone(),
+            writer,
+            &close,
+            send,
+            recv,
+        );
+        return;
+    }
+    let Some((send, recv)) =
+        crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
+    else {
+        return;
+    };
+    let close = xdrive_close(&session);
+    crate::shadowsocks::pump_relay_carried(client, session.clone(), writer, &close, send, recv);
+}
+
+/// The listener an xdrive inbound is: the store itself polls for announcements, so there is no socket to bind.
+fn serve_xdrive_loop(
+    settings: &crate::xdrive::Settings,
+    address: &str,
+    accept: crate::xdrive::Accept,
+) {
+    let settings = settings.clone();
+    let address = address.to_owned();
+    thread::spawn(move || {
+        // The listen address only fronts the store's lanes, and a unix path names no host to front.
+        let front = match parse_target(&address) {
+            Ok(crate::conn::Target::Ip(addr)) => Some((addr.ip().to_string(), addr.port())),
+            _ => None,
+        };
+        let named = front.as_ref().map(|(host, port)| (host.as_str(), *port));
+        // Both poll loops hold a reference to their own server, so a listener that started outlives the handle this returns.
+        if let Err(error) = settings.listen(named, accept) {
+            eprintln!("xdrive: the store refused the listener: {error}");
+        }
+    });
+}
+
+fn serve_vless_xdrive(mut session: crate::xdrive::Conn, id: &[u8; 16], freedom: bool) {
+    let Some((got, _flow, cmd, target)) = decode_request_bounded(&mut session) else {
+        return;
+    };
+    if got != *id || cmd != 1 || !freedom {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    if session.write_all(&[0, 0]).is_err() {
+        return;
+    }
+    xdrive_relay(&uplink, session);
+}
+
+fn serve_trojan_xdrive(mut session: crate::xdrive::Conn, key: &[u8; 56], freedom: bool) {
+    let Some((cmd, target)) = decode_trojan_request(&mut session, key) else {
+        return;
+    };
+    if !freedom || cmd != 1 {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    xdrive_relay(&uplink, session);
+}
+
+fn serve_vmess_xdrive(session: crate::xdrive::Conn, id: &[u8; 16], freedom: bool) {
+    let close = xdrive_close(&session);
+    crate::vmess::serve_kcp(session.clone(), session, id, freedom, &close);
+}
+
+fn serve_ss_xdrive(
+    session: crate::xdrive::Conn,
+    password: &str,
+    method: &str,
+    freedom: bool,
+    is_2022: bool,
+) {
+    let close = xdrive_close(&session);
+    if is_2022 {
+        crate::shadowsocks2022::serve_kcp(
+            session.clone(),
+            session,
+            password,
+            method,
+            freedom,
+            &close,
+        );
+        return;
+    }
+    crate::shadowsocks::serve_kcp(session.clone(), session, password, method, freedom, &close);
+}
+
 fn serve_kcp_loop(address: &str, config: ferrox_core::kcp::Config, serve: &KcpServe) {
     let Some(server) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
         return;
@@ -3192,6 +3435,11 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) {
             let owned = address.to_owned();
             thread::spawn(move || serve_kcp_loop(&owned, config, &serve));
         }
+        Carrier::Xdrive { settings } => {
+            let accept: crate::xdrive::Accept =
+                Arc::new(move |session| serve_trojan_xdrive(session, &key, freedom));
+            serve_xdrive_loop(&settings, address, accept);
+        }
         other => spawn_role(
             address,
             Role::Trojan {
@@ -3213,6 +3461,11 @@ fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
             });
             let owned = address.to_owned();
             thread::spawn(move || serve_kcp_loop(&owned, config, &serve));
+        }
+        Carrier::Xdrive { settings } => {
+            let accept: crate::xdrive::Accept =
+                Arc::new(move |session| serve_vmess_xdrive(session, &id, freedom));
+            serve_xdrive_loop(&settings, address, accept);
         }
         other => spawn_role(
             address,
@@ -3349,6 +3602,14 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
             });
             let owned = address.to_owned();
             thread::spawn(move || serve_kcp_loop(&owned, config, &serve));
+        }
+        Carrier::Xdrive { settings } => {
+            let password = password.clone();
+            let method = method.clone();
+            let accept: crate::xdrive::Accept = Arc::new(move |session| {
+                serve_ss_xdrive(session, &password, &method, freedom, is_2022);
+            });
+            serve_xdrive_loop(&settings, address, accept);
         }
         other => spawn_role(
             address,
@@ -4526,7 +4787,7 @@ fn ride_carrier<S: Dialed>(
         | Carrier::Kcp(_)
         | Carrier::Hysteria(_)
         | Carrier::Masque
-        | Carrier::Xdrive
+        | Carrier::Xdrive { .. }
         | Carrier::Http
         | Carrier::Unknown { .. } => {}
     }
@@ -4769,7 +5030,7 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
         | Carrier::Kcp(_)
         | Carrier::Hysteria(_)
         | Carrier::Masque
-        | Carrier::Xdrive
+        | Carrier::Xdrive { .. }
         | Carrier::Http
         | Carrier::Unknown { .. } => {}
     }
@@ -4907,7 +5168,7 @@ fn vmess_tls_carried(
         | Carrier::Kcp(_)
         | Carrier::Hysteria(_)
         | Carrier::Masque
-        | Carrier::Xdrive
+        | Carrier::Xdrive { .. }
         | Carrier::Http
         | Carrier::Unknown { .. } => {}
     }
@@ -5518,11 +5779,25 @@ fn serve_connect(
             }
             return;
         }
+        if let Carrier::Xdrive { settings } = &vless.carrier {
+            if !vless.mux {
+                if let Some(session) = xdrive_dial_session(settings, &vless.address, vless.port) {
+                    dial_vless_xdrive(&client, session, vless, asked);
+                }
+            }
+            return;
+        }
     }
     if let Outbound::Vmess(vmess) = out {
         if matches!(vmess.carrier, Carrier::Kcp(_)) {
             if let Some(session) = kcp_dial_session(&vmess.carrier, &vmess.address, vmess.port) {
                 dial_vmess_kcp(&client, &session, vmess, asked);
+            }
+            return;
+        }
+        if let Carrier::Xdrive { settings } = &vmess.carrier {
+            if let Some(session) = xdrive_dial_session(settings, &vmess.address, vmess.port) {
+                dial_vmess_xdrive(&client, session, vmess, asked);
             }
             return;
         }
@@ -5534,11 +5809,23 @@ fn serve_connect(
             }
             return;
         }
+        if let Carrier::Xdrive { settings } = &trojan.carrier {
+            if let Some(session) = xdrive_dial_session(settings, &trojan.address, trojan.port) {
+                dial_trojan_xdrive(&client, session, trojan, asked);
+            }
+            return;
+        }
     }
     if let Outbound::Shadowsocks(ss) = out {
         if matches!(ss.carrier, Carrier::Kcp(_)) {
             if let Some(session) = kcp_dial_session(&ss.carrier, &ss.address, ss.port) {
                 dial_ss_kcp(&client, &session, ss, asked);
+            }
+            return;
+        }
+        if let Carrier::Xdrive { settings } = &ss.carrier {
+            if let Some(session) = xdrive_dial_session(settings, &ss.address, ss.port) {
+                dial_ss_xdrive(&client, session, ss, asked);
             }
             return;
         }
@@ -10465,7 +10752,7 @@ fn tls_parts(
         | Carrier::Kcp(_)
         | Carrier::Hysteria(_)
         | Carrier::Masque
-        | Carrier::Xdrive
+        | Carrier::Xdrive { .. }
         | Carrier::Http
         | Carrier::Unknown { .. } => return None,
     }
@@ -18118,27 +18405,32 @@ mod tests {
     #[test]
     fn every_upstream_network_name_is_named() {
         let cases = [
-            ("ws", "Ws"),
-            ("websocket", "Ws"),
-            ("httpupgrade", "HttpUpgrade"),
-            ("grpc", "Grpc"),
-            ("xhttp", "Xhttp"),
-            ("splithttp", "Xhttp"),
-            ("quic", "Quic"),
-            ("kcp", "Kcp"),
-            ("mkcp", "Kcp"),
-            ("hysteria", "Hysteria"),
-            ("masque", "Masque"),
-            ("xdrive", "Xdrive"),
-            ("raw", "Raw"),
-            ("tcp", "Raw"),
-            ("h2", "Http"),
-            ("h3", "Http"),
-            ("http", "Http"),
-            ("futureNet", "Unknown"),
+            ("ws", "", "Ws"),
+            ("websocket", "", "Ws"),
+            ("httpupgrade", "", "HttpUpgrade"),
+            ("grpc", "", "Grpc"),
+            ("xhttp", "", "Xhttp"),
+            ("splithttp", "", "Xhttp"),
+            ("quic", "", "Quic"),
+            ("kcp", "", "Kcp"),
+            ("mkcp", "", "Kcp"),
+            ("hysteria", "", "Hysteria"),
+            ("masque", "", "Masque"),
+            (
+                "xdrive",
+                r#","xdriveSettings":{"service":"local","remoteFolder":"drive"}"#,
+                "Xdrive",
+            ),
+            ("raw", "", "Raw"),
+            ("tcp", "", "Raw"),
+            ("h2", "", "Http"),
+            ("h3", "", "Http"),
+            ("http", "", "Http"),
+            ("futureNet", "", "Unknown"),
         ];
-        for (network, want) in cases {
-            let doc = crate::json::parse(&format!(r#"{{"network":"{network}"}}"#)).expect("parses");
+        for (network, store, want) in cases {
+            let doc = crate::json::parse(&format!(r#"{{"network":"{network}"{store}}}"#))
+                .expect("parses");
             let got = stream_carrier(Some(&doc));
             let tag = match &got {
                 Carrier::Raw(_) => "Raw",
@@ -18151,7 +18443,7 @@ mod tests {
                 Carrier::Kcp(_) => "Kcp",
                 Carrier::Hysteria(_) => "Hysteria",
                 Carrier::Masque => "Masque",
-                Carrier::Xdrive => "Xdrive",
+                Carrier::Xdrive { .. } => "Xdrive",
                 Carrier::Http => "Http",
                 Carrier::Unknown { .. } => "Unknown",
             };
