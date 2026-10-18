@@ -151,8 +151,8 @@ one.
 
 ## Time
 
-**Not measured on this branch.** Durations come from CI runners (`bench.yml`,
-`parity.yml`); no artefact from this branch has been read. A device read over a
+**Not measured yet.** Durations come from CI runners (`bench.yml`,
+`parity.yml`); no CI artefact has been read. A device read over a
 real interface involves the kernel routing the packet, and every contributor
 machine sits behind a VPN — a local dial would measure that, not this code.
 

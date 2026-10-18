@@ -78,10 +78,10 @@ the diff that moved it, never copying a measurement to silence a gate.
 
 ## Time
 
-**Not measured on this branch.** Wall clock for this method needs the same
+**Not measured yet.** Wall clock for this method needs the same
 `ferrox-bench` cipher gate the AEAD rung uses, extended to the three 2022
-methods at the same chunk lengths, run on a named CI runner. No artefact from
-a run of this branch has been read, so this page quotes no duration. Timing
+methods at the same chunk lengths, run on a named CI runner. No CI artefact has
+been read, so this page quotes no duration. Timing
 needs a named runner; a number from a laptop behind a VPN measures the tunnel.
 
 ## What we removed

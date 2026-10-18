@@ -189,109 +189,51 @@ because they are *not* parity rows: `carrier-foxy` and `mux-cool` exist in no
 xray-core config at the pinned revision, and `kcp`'s arithmetic is proved
 against a Go oracle that a rewrite must not re-derive by hand.
 
-## Needless copies, branches and refills
+## Open copies, branches and refills
 
-Read out of this tree, verified line by line. Each item states whether a fix
-is bit-identical on the wire and what witnesses it, because a copy claim is
-proved by pointer identity and not by reading. Rows are ordered by work
-removed.
+Optimization targets still standing in this tree. Completed removals live in
+the git history and are witnessed on each method page (a copy claim is proved
+by pointer identity, not by reading), so they are not logged here.
 
 ### Copies
 
-| # | what | where | bit-identical | witness | covered today by | slice |
-| --- | --- | --- | --- | --- | --- | --- |
-| 1 | closed: a `BufReader` in front of a two-read-per-frame codec staged every payload byte a second time, at five sites | the vmess four (`vmess.rs:1396` `pump_relay`, `vmess.rs:1201` `serve_xhttp`, `proxy.rs:3376` `dial_vmess_rung`, `proxy.rs:4097` `vmess_tls_carried`) went with 9ef3719; the fifth, `proxy.rs:4354` `dial_ss_xhttp`, goes with P56, which hands both Shadowsocks rungs' carriers straight to `relay_downlink`; P57 then gave the 2022 `relay_downlink` the classic rung's window, so neither rung asks its header and its payload separately | yes — a read boundary is not a frame boundary | a read-width counter between the carrier and the codec, driven from an in-memory stream that frames real carrier records | `shadowsocks::tests::the_carrier_and_the_window_ask_the_socket_as_one`, `shadowsocks::tests::the_stream_downlink_asks_its_own_chunk_of_the_socket`, `shadowsocks2022::tests::the_carrier_and_the_window_ask_the_socket_as_one`, and the window's own gates `shadowsocks2022::tests::a_bulk_read_serves_every_buffered_chunk` and `a_batch_never_waits_for_a_chunk_that_has_not_arrived`, each with its manifest row. The vmess four went with no ask-width witness of their own — `vmess::tests::frames_reuse_the_callers_buffers` drives `read_frame` directly and never entered the wrap | P54, closed |
-| 2 | closed: the gRPC read path staged every payload byte twice — socket → `frame` → `msg` → `backlog` → caller | `grpc.rs` `GrpcReader::data` reads a DATA body onto the end of `msg`; `read` delivers the payload from `msg_at`..`pay_end` | yes | the reader's own `staged` counter over an in-memory server that answers whole frames, at three shapes: one message per frame, two messages in one frame, one message split over frames | `carrier-grpc payload-staging-copies-per-byte-read 0` by `grpc::tests::a_body_never_lands_in_a_second_buffer`, with the padded frame's one move counted beside it | P55 |
-| 3 | the xudp path is the one mux write that still stages into a scratch buffer instead of handing the payload by pointer | `proxy.rs:5703-5705` (`resize_scratch(&mut staging, frame.frame_len(payload.len()))` then `write.write_all(&staging[..written])`) in `serve_socks_udp_vless_xudp` | yes — `mux::tests::a_header_plus_a_patched_length_is_the_whole_frame` (`mux.rs:667`) already holds the two encoders byte-equal | the app-side cousin of `proxy::tests::a_two_part_write_hands_the_payload_over_by_pointer` (`proxy.rs:11901`): `parts[1].iov_base == payload.as_ptr()`, plus `staging.capacity()` steady | `proxy::tests::xudp_frames_match_the_upstream_layout` (`proxy.rs:11673`) is bytes only | P55 |
-| 4 | `read_http_head` reads every head twice — `peek` into a stack probe, then `read_exact` of the same bytes — **closed for HTTPUpgrade**, whose fd path now reads into the buffer it keeps (`proxy::read_http_head_kept`); the `peek` reader stays for the callers with nowhere to put the tail | `proxy.rs` `peek_head_rounds` (`stream.peek(&mut probe)`, then `read_exact` of the same octets) | yes | `Counted` over an in-memory stream asserting one read per window and the tail taken with the head — `proxy::tests::a_kept_head_costs_one_read_per_window_and_takes_its_tail` | that test, `a_kept_head_straddling_a_round_is_proved_by_two_reads`, `a_head_that_straddles_a_read_round_keeps_its_riding_payload`, and `bytes_pipelined_behind_a_head_stay_in_the_kernel` for the reader that still leaves them | P54, closed for `ws`/`xhttp`/`httpheader` on their pages |
-| 5 | closed: `read_exact_head` copied socket → 512-byte `chunk` → `head` on every step and `split_off`'d the tail into a third trip; it is `kept_head_rounds` now, so the record carriers read straight into the buffer they return and get back the offset where the head ends | `proxy.rs` (`read_exact_head`) | yes | head and tail in one allocation, seen as `tail.as_ptr() - head.as_ptr() == at` over an in-memory stream | `proxy::tests::a_whole_connect_head_costs_one_read` and `a_kept_head_costs_one_read_per_window_and_takes_its_tail`, plus one per record carrier: `ws`, `httpupgrade`, `httpheader` and `xhttp` each have `the_record_head_hands_over_the_buffer_it_filled` | P55 |
-| 6 | closed: the http masquerade dial rendered its camouflage request into a `String` — a heap buffer per handshake, and every octet copied there before the socket read it once more; the reference does the same (`xray-transport/src/headers/http.rs` `render_request`, into a 256-byte capacity) | `httpheader.rs` `send_request`, which hands the request's five runs to the carrier's coalescing write, so `path` and `host` reach the socket where they lie | yes — the gate compares the runs it concatenates against the bytes the removed formatter wrote | `(ptr, len)` per run from a `FrameWrite` sink, with the two caller-owned runs asserted to be the caller's own pointers and one gathered call carrying all five | `carrier-httpheader request-staging-copies-per-dial 0`, `request-buffer-allocations-per-dial 0` and `write-calls-per-dial 1`, all by `httpheader::tests::the_request_reaches_the_write_as_the_runs_it_is_made_of`, with `header_carries_an_echo_over_loopback` and `proxy::tests::vless_over_tls_httpheader_carries_an_echo` dialling the raw and TLS lanes | P3 |
+| # | what | where | fix / witness |
+| --- | --- | --- | --- |
+| 1 | the xudp mux write still stages into a scratch buffer instead of handing the payload by pointer — the only such write left | `proxy.rs` `serve_socks_udp_vless_xudp` (`resize_scratch` + `write_all`) | two-part writev: `parts[1].iov_base == payload.as_ptr()`, `staging.capacity()` steady; cousin test `proxy::tests::a_two_part_write_hands_the_payload_over_by_pointer` |
+| 2 | `read_http_head` still reads a head twice (`peek` into a probe, then `read_exact`) for callers with nowhere to put the tail; HTTPUpgrade, ws, xhttp and httpheader now read into the buffer they keep | `proxy.rs` `peek_head_rounds` | `proxy::tests::a_kept_head_costs_one_read_per_window_and_takes_its_tail` |
 
 ### Branches
 
-| # | what | where | bit-identical | witness | slice |
-| --- | --- | --- | --- | --- | --- |
-| 9 | the dial branch tree is written three times over the same five arms, and the serve branch tree twice more over six — about 450 lines differing in which `connect` is called, not in what is decided | `dial_vless_rung` (`proxy.rs:2269`), `dial_trojan_rung` (`proxy.rs:3491`), `dial_vmess_rung` (`proxy.rs:3342`), `serve_session_*` (`proxy.rs:1301-1465`), `serve_vless` (`proxy.rs:704-801`), `vmess.rs:1132-1261`, `shadowsocks.rs:58-154` | yes | the matrix tests that already exercise every arm (`proxy::tests::vless_over_tls_*_carries_an_echo`, `proxy.rs:10133-10274`) | P57 |
-| 10 | `relay_ordered` re-tests the same `first` flag four times per relay read | `proxy.rs:6521`, `proxy.rs:6524`, `proxy.rs:6528`, `proxy.rs:6532` | yes | no counter needed; the relay gates stay green | P57 |
-| 11 | the relay's teardown path `format!`s a string before `echo_trace` (`proxy.rs:306`) tests its flag | `proxy.rs:6546`, `proxy.rs:6582` | yes | no counter needed | P57 |
-| 12 | `Lanes::xor_chunk` branches on `c == 0` per 16-byte chunk; the neon and portable impls discard `c` entirely | `chacha/mod.rs:38` (the trait), `avx2.rs:137-147`, `neon.rs:95`, `portable.rs:84` | yes | `ferrox-core-chacha::backend` blocks-per-iteration, unchanged | P57 |
-| 13 | `xor_groups` tests `skips_first` per chunk inside the store loop over a value fixed at function entry | `chacha/mod.rs:221`, fixed at `chacha/mod.rs:197` | yes | the same per-length sweeps (`chacha::avx2::tests::the_eight_block_pass_is_the_ladder_at_every_length`) | P57 |
+| # | what | where | bit-identical |
+| --- | --- | --- | --- |
+| 3 | the dial branch tree is written three times over five arms and the serve tree twice more over six — ~450 lines differing only in which `connect` is called | `dial_vless_rung`, `dial_trojan_rung`, `dial_vmess_rung`, `serve_session_*`, `serve_vless`, `vmess.rs`, `shadowsocks.rs` | yes — unify over one seam, gated by the `vless_over_tls_*_carries_an_echo` matrix tests |
+| 4 | `relay_ordered` re-tests the same `first` flag four times per relay read; the teardown path `format!`s before testing `echo_trace` | `proxy.rs` | yes |
+| 5 | `Lanes::xor_chunk` branches on `c == 0` per chunk (neon/portable discard `c`); `xor_groups` tests `skips_first` per chunk over a value fixed at entry | `chacha/mod.rs`, `avx2.rs`, `neon.rs`, `portable.rs` | yes — hoist the loop-invariant |
 
 ### Refills
 
-| # | what | where | bit-identical | witness | slice |
-| --- | --- | --- | --- | --- | --- |
-| 14 | UDP-over-TCP pays two read syscalls per datagram for VLESS and four to six for Trojan, where one window read into a per-connection remainder would amortise to one | `proxy.rs:5965-5974` (`read_udp_datagram`), `proxy.rs:6000-6012` (`read_trojan_datagram`), via `read_socks_addr` (`proxy.rs:7156-7199`) | yes | the `Counting` reader idiom already blessed for this file by `proxy::tests::the_trojan_header_costs_two_reads_not_seven` (`proxy.rs:8883`) | P54 |
-
-### Wakes
-
-| # | what | where | bit-identical | witness | slice |
-| --- | --- | --- | --- | --- | --- |
-| 15 | closed: the splice pump armed `POLLIN` on a predicate in *bytes* (`pending < capacity`) while the kernel's `EAGAIN` from `splice_to_pipe` is about *slots*, so a ring of partially filled buffers woke it on data it had nowhere to put, and re-arming that wake is a spin on a flow nobody can move | `proxy.rs` `poll_relay::run` (the arm) and `poll_relay::Direction::advance` (the attempt) | yes — the same two splices at the same lengths into the same buffers; only when the attempt is made changed | `poll_relay::no_pollin_is_armed_on_a_ring_that_holds_bytes_it_cannot_take` is the arm's truth table and holds the invariant that the drain stays armed; `relay_tests::a_trickling_destination_does_not_spin_the_pump` counts `poll_relay::idle_ingests()` (a `cfg(test)` counter, so production emits nothing) over a 400 ms window, where the same counter against unpumped code measured 78 183 of 79 013 wakes moving nothing and 390 ms of pump cpu, and measures 2 on this one; priced by the `vless-raw-up-1` cell as 0.431× xray-core's cost before (2 501 ms of system time per GiB against its 1 076 on that runner, gate red) and 3.818× better after (185 against 721), each ratio against its own runner since the cells landed on different machines, with `vless-raw-down-1` moving from 2.271× to 2.459× xray-core's cost rather than regressing | landed (#129) |
-
-### Zero-fills that are not witnessed by anything
-
-Three of these carry a manifest row whose named checker cannot see the fill,
-because `count::measure` (`alloc_count.rs:70-97`) hooks `alloc`/`alloc_zeroed`
-and a `resize` into spare capacity is a plain `memset`:
-
-- `mux::Outgoing::encode_header_into` (`mux.rs:253`) zeroes `2 + meta` bytes
-  that `write_meta` (`mux.rs:216-238`) then overwrites byte for byte, per
-  relayed frame. Row `mux-cool mux-frame-allocations 0` passes anyway.
-- **Closed: the relay buffer's two fills.** `RelayBuf::new` was
-  `vec![0u8; RELAY_SMALL_BUFFER]` and `RelayBuf::filled` promoted with
-  `resize(RELAY_BUFFER, 0)`; both are `with_capacity`/`reserve` plus `set_len`
-  now, the shape `read_into_tail` already uses. The difference is witnessed in
-  `ferrox-core` by `alloc_count::tests::an_uninitialised_tail_is_allocated_but_not_filled`,
-  which measures the two shapes against each other: same allocation, same bytes,
-  and `alloc_zeroed` is the only count that moves. There is no row for it. Gating
-  it from the app needed the counting allocator installed in `ferrox-app`'s test
-  binary, and CI showed the price — `der_to_pem Ir=2743` against a blessed
-  `2653`, because a thread-local test joined every allocation that count measures.
-  The promotion's 240 KiB is still the `memset` this section is about:
-  `write_bytes` is not `alloc_zeroed`, so no counter sees it and the page says so
-  instead of blessing a number. The other half of the shape is checked now:
-  `safety.yml`'s `tails` shard interprets `ferrox-app`'s test binary, so a `filled`
-  that stops clipping at `n` aborts on `memory is uninitialized` in
-  `the_relay_buffer_hands_back_only_what_its_read_reported` — Miri watches the read
-  discipline, while the removed fill stays uncounted (P66).
-- the relay's other buffers: `vec![0u8; CHUNK]` at `proxy.rs:6516`,
-  `proxy.rs:6560`, `proxy.rs:6622`, `proxy.rs:6637`, `vmess.rs:1058`,
-  `vmess.rs:1362`, `shadowsocks.rs:272`, `hysteria.rs:417`, `hysteria.rs:431`,
-  `proxy.rs:2403`, `proxy.rs:2416`.
-  Every one is handed straight to `Read::read`, which initialises exactly the
-  bytes it reports.
-- `vec![0u8; 65536]` per KCP connection in both socket threads
-  (`kcp/listener.rs:43`, `kcp/listener.rs:132`), where only `&buf[..n]` is ever
-  read.
+| # | what | where | bit-identical |
+| --- | --- | --- | --- |
+| 6 | UDP-over-TCP pays two read syscalls per datagram for VLESS and four to six for Trojan, where one amortised window read into a per-connection remainder would cost one | `proxy.rs` `read_udp_datagram`, `read_trojan_datagram` via `read_socks_addr` | yes — `Counting` reader idiom |
+| 7 | zero-fills the allocator counter cannot see (`count::measure` hooks `alloc`/`alloc_zeroed`; a `resize` into spare capacity is a plain `memset`) | `mux::Outgoing::encode_header_into` zeroes `2 + meta` bytes `write_meta` overwrites; `vec![0u8; CHUNK]` relay buffers handed straight to `Read::read`; a `vec![0u8; 65536]` per KCP connection | replace with `with_capacity` + `set_len`; Miri (`safety.yml`) watches the read discipline |
 
 ## What is not removed
 
 Named because a page that lists only wins is not evidence:
 
-- **KCP still sends one datagram per 1 332-byte segment.** Batching would
-  change the datagram boundaries a peer sees, so it is named and left alone.
-- **The mux uplink still copies every payload byte once**, because removing
-  that copy means splitting `mux::Outgoing::encode_into` in two. Item 3 above
-  removes one *further* copy on one path; the one that remains is stated.
-- **The AEAD open path is two keystream passes and no staging buffer.** That
-  is the named tradeoff the page records (`keystream-passes-per-decrypt 2`
-  against `staging-bytes-per-decrypt 0`); changing it changes the method
-  rather than tuning it.
-- **The websocket masked-write path still copies once**, into the thread-local
-  mask buffer. A mask must be applied to a copy of the caller's bytes and a
-  three-part `writev` of header, mask and data is not available.
-- **The 2022 handshake reader's two reads** (`relay_downlink`'s `Recv::Waiting`
-  arm reads the sealed header, then the payload) — it opens exactly one chunk, so
-  there is no second chunk for a window to serve, and the relay loop that follows
-  it has had the classic rung's window since P57 (`ChunkReader`, `open_batch`,
-  `drain_window`, held lengths and no-wait batches included). P56 removed the
-  wraps that were in front of both rungs; a `BufReader` is still not the fix for
-  either, because the wrap is what would cost the `shadowsocks
-  user-space-copies-per-byte-read 0` row its test already proves
-  (`shadowsocks::tests::chunks_open_that_seal_sealed_and_reject_damage`).
-- **`read_client_hello`** (`tls/reality.rs:380-432`) reads the 5-byte record
-  header and then the body, and that is necessary: the record length is *in*
-  the header and reading further would steal bytes from the next record.
-- **The KCP arena copy** (`kcp/window.rs`, `push`) is load-bearing: a segment is
-  retransmitted after the caller's buffer is gone.
+- **KCP sends one datagram per 1 332-byte segment** — batching would change the
+  datagram boundaries a peer sees.
+- **The mux uplink copies every payload byte once** — removing it means
+  splitting `mux::Outgoing::encode_into` in two; copy #1 above removes one
+  *further* copy on one path.
+- **The AEAD open path is two keystream passes and no staging buffer** — the
+  named tradeoff (`keystream-passes-per-decrypt 2` vs `staging-bytes-per-decrypt 0`).
+- **The websocket masked-write path copies once** into the thread-local mask
+  buffer; a three-part `writev` of header/mask/data is not available.
+- **The 2022 handshake reader's two reads** — it opens exactly one chunk, so no
+  window can serve a second; a `BufReader` would cost the `shadowsocks
+  user-space-copies-per-byte-read 0` row.
+- **`read_client_hello`** reads the 5-byte record header then the body — the
+  record length is *in* the header.
+- **The KCP arena copy** is load-bearing — a segment is retransmitted after the
+  caller's buffer is gone.

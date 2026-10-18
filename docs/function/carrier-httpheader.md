@@ -63,8 +63,8 @@ graph TD
 
 ## Time
 
-**Not measured on this branch.** The HTTP camouflage scenarios run in
-`benchmark-matrix.yml` and `parity.yml`; no artefact from this branch has been
+**Not measured yet.** The HTTP camouflage scenarios run in
+`benchmark-matrix.yml` and `parity.yml`; no CI artefact has been
 read.
 
 ## What we removed

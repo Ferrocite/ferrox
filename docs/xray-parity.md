@@ -3,7 +3,7 @@
 Pinned reference: `upstream/xray-core` @ `92ccc939` (`upstream/pins.toml`).
 This tree: `crates/ferrox-core`, `crates/ferrox-app`, `docs/function/`.
 
-What runs against what: `xray-rust`'s interop tests drive the pinned Xray client into `ferrox-app` (23 tests, seam `XRAY_VLESS_FULL_BINARY`); `zeronet`'s `xray_oracle` replays its differential checks against a binary injected as Xray (9 tests, seam `ZRAY_XRAY_BINARY`); `xray-core`'s `testing/scenarios` builds `github.com/xtls/xray-core/main` at run time and spawns it with `-config=stdin: -format=pb` (`testing/scenarios/common_regular.go`), and that build is the seam `scripts/xray-scenarios.sh` answers with `go -overlay`: four http tests run unmodified against `ferrox-app`, which reads that wire form in `crates/ferrox-app/src/xray_pb.rs`. The gate is those four; the other 68 tests in the package run on the same seam without gating, family by family, into the map `scripts/run-xray-scenario-map.sh` publishes from `conformance.yml`. Its unit tests are in-process with no seam and stay in `xray-baseline.yml`.
+What runs against what: `xray-rust` interop (23 tests, seam `XRAY_VLESS_FULL_BINARY`), `zeronet` `xray_oracle` (9 tests, seam `ZRAY_XRAY_BINARY`), and `xray-core`'s `testing/scenarios` built at run time and spawned with `-config=stdin: -format=pb` via `go -overlay` (`scripts/xray-scenarios.sh`), which `ferrox-app` reads in `crates/ferrox-app/src/xray_pb.rs`. The gate is four http tests; the other 68 run unmapped into the `conformance.yml` scenario map. `xray-core`'s own unit tests are in-process with no seam and stay in `xray-baseline.yml`.
 
 ## What ferrox has that xray-core does not
 
@@ -24,19 +24,19 @@ What runs against what: `xray-rust`'s interop tests drive the pinned Xray client
 | --- | --- |
 | VMess (AEAD) — full matrix: UDP over ws/grpc/xhttp/tls, all encodings | partial: no UDP except raw carrier; no auth-length framing bits (matches client default only) |
 | Trojan share-link `trojan://` parser | absent |
-| Dokodemo transparent inbound | refused (row 24) |
-| Freedom — `domainStrategy`, fragment, dialer fields | direct dial only (`Outbound::Freedom` in `proxy.rs`); no `fragment`, `domainStrategy`, `proxyProtocol` or dialer options (rows 117, 120) |
-| DNS proxy + fakeDNS + hosts + DoH/DoQ/local nameservers (`app/dns`) | refused (row 26) |
-| Blackhole outbound | refused (row 25) |
-| Loopback | refused (row 27) |
-| WireGuard proxy (`proxy/wireguard`, own `netstack.go` lightweight TCP/IP stack since #7156; gVisor now only in `go.mod`) | absent |
-| Hysteria v1 proxy (`proxy/hysteria`) | absent (only v2 as carrier) |
-| MASQUE proxy (`proxy/masque`) | server not carried; the CONNECT-IP client dials on the Foxy `h3` lane (row 20) |
-| TUN inbound (`proxy/tun`) | refused (row 29) |
-| uTLS fingerprints per connection | refused (row 38) |
-| ECH | refused (row 39) |
-| VLESS stream encryption (`encryption` field, XOR/MLKEM) | refused (row 34) |
-| XTLS Vision UDP-over-443 flow | refused (row 35) |
+| Dokodemo transparent inbound | planned (row 24) |
+| Freedom — `domainStrategy`, fragment, dialer fields | direct dial (`Outbound::Freedom`); fragment/`domainStrategy`/`proxyProtocol`/dialer options planned (rows 117, 120) |
+| DNS proxy + fakeDNS + hosts + DoH/DoQ/local nameservers (`app/dns`) | planned (rows 26, 80) |
+| Blackhole outbound | planned (row 25) |
+| Loopback | done (row 27) |
+| WireGuard proxy (`proxy/wireguard`, lightweight `netstack.go`) | planned (row 45) |
+| Hysteria v1 proxy (`proxy/hysteria`) | planned (only v2 as carrier today) |
+| MASQUE proxy (`proxy/masque`) | planned; CONNECT-IP client dials on the Foxy `h3` lane (row 20) |
+| TUN inbound (`proxy/tun`) | done (row 29) |
+| uTLS fingerprints per connection | planned (row 38) |
+| ECH | planned (row 39) |
+| VLESS stream encryption (`encryption` field, XOR/MLKEM) | planned (row 34) |
+| XTLS Vision UDP-over-443 flow | planned (row 35) |
 | REALITY ML-DSA-65 binding (`mldsa65Seed` / `mldsa65Verify`) | planned (row 118; the ZeroNet oracle row `reality_with_the_mldsa65_binding_matches_the_oracle` is waiting on it) |
 
 ### Transports
@@ -48,32 +48,32 @@ What runs against what: `xray-rust`'s interop tests drive the pinned Xray client
 | gRPC | done, own HTTP/2 |
 | HTTPUpgrade | done, both roles, `?ed=N` carried (row 16) |
 | xHTTP / SplitHTTP modes (packet-up, stream-up, stream-one, padding/placement) | one mode only (POST + chunked) |
-| KCP/mKCP + FinalMask (aes128gcm, header, original) | core done; finalmask refused (row 31) |
-| Hysteria v2 transport (network `hysteria`, masquerade surface) | done as `vless-hysteria` / `protocol: hysteria` over quiche, both roles (row 19); datagrams, salamander obfs and the masquerade site are all carried (an `https` masquerade origin is a named `502` ceiling) |
-| MASQUE transport | CONNECT-IP client dialled (h2/h3) on the Foxy lane; server transport refused (row 20) |
-| XDrive (remote-storage carrier; at this pin it prefers h2, ends stalled requests, and requires VLESS Multiplex+Encryption) | refused (row 32) |
-| Browser dialer | absent |
-| Tagged connections / observatory webhooks | absent |
-| UDP `transport/internet/udp` fullcone/NAT behavior | mux-cool carries XUDP; no standalone UDP transport service parity |
-| Unix sockets | refused (row 30) |
+| KCP/mKCP + FinalMask (aes128gcm, header, original) | core done; finalmask `fragment` done (row 31), other mask types planned |
+| Hysteria v2 transport (network `hysteria`, masquerade surface) | done as `vless-hysteria` / `protocol: hysteria` over quiche, both roles (row 19); datagrams, salamander obfs, masquerade site |
+| MASQUE transport | CONNECT-IP client dialled (h2/h3); server transport planned (row 20) |
+| XDrive (remote-storage carrier) | planned (row 32) |
+| Browser dialer | not scheduled |
+| Tagged connections / observatory webhooks | planned (rows 79, 144) |
+| UDP `transport/internet/udp` fullcone/NAT behavior | mux-cool carries XUDP; standalone UDP transport planned |
+| Unix sockets | done (row 30) |
 
 ### Features / apps
 
 | xray-core | ferrox state |
 | --- | --- |
-| DNS client: DoH, DoQ, local, cached, fakeDNS | refused (row 26) |
-| Router with rules, balancers (leastload/leastping/random), webhook | absent — inbounds bind fixed ports, outbounds pick by protocol |
-| Observatory / burst probe | partially: QUIC ladder climb/descend, no burst |
-| Reverse portal / bridge | absent |
-| Stats, metrics (Prometheus), policy manager | policy.rs is parse-level gate only; no stats/metrics service |
-| `app/commander` gRPC API (config/inbound/outbound/log/router/stats) | absent |
-| Geodata (.dat) loader/downloader | absent |
-| Sniffer (HTTP/TLS/QUIC/bittorrent) + dispatcher sniffer | absent |
-| Config schema for every protocol (`infra/conf`) | ferrox-app's own JSON dialect; the protobuf `xray.core.Config` only for the shape the http scenarios write (`xray_pb.rs`: http inbound, freedom outbound, receiver port/listen, apps skipped) — every other field is refused by number or by name |
-| OCSP, antireplay, time-window caches | absent |
-| Freedom fragment, VLESS encryption fragment | refused |
-| finalmask: fragment, header/custom, noise (Lua scripts since #7124), realm (STUN hole-punch, portmap), salamander, sudoku, udphop, xdns (DoH resolver + Chrome CH, empty User-Agent, since #7140), xicmp, xmc | refused (row 31) |
+| DNS client: DoH, DoQ, local, cached, fakeDNS | planned (rows 26, 80) |
+| Router with rules, balancers (leastload/leastping/random), webhook | planned (rows 78, 79) |
+| Observatory / burst probe | partially planned: QUIC ladder climb/descend, no burst |
+| Reverse portal / bridge | planned (row 81) |
+| Stats, metrics (Prometheus), policy manager | planned: policy.rs is parse-level gate only |
+| `app/commander` gRPC API (config/inbound/outbound/log/router/stats) | planned (row 82) |
+| Geodata (.dat) loader/downloader | planned (row 78) |
+| Sniffer (HTTP/TLS/QUIC/bittorrent) + dispatcher sniffer | planned (engine-sniffing) |
+| Config schema for every protocol (`infra/conf`) | ferrox-app's own JSON dialect; the protobuf `xray.core.Config` covers the shape the http scenarios write (`xray_pb.rs`), every other field refused by number or name |
+| OCSP, antireplay, time-window caches | planned |
+| Freedom fragment, VLESS encryption fragment | planned (rows 117, 34) |
+| finalmask: fragment, header/custom, noise, realm, salamander, sudoku, udphop, xdns, xicmp, xmc | `fragment` done (row 31), salamander on hysteria, mkcp-legacy on KCP; the rest planned (`obfs-finalmask`) |
 
 ## What to build next
 
-Every refused or absent row above is a `README.md` matrix row the `crates/ferrox-prompt/prompts.md` templates draw their target from. `cargo run -p ferrox-prompt -- next` hands over the next outstanding row, ordered by leverage and nearness-to-done, rather than a hand-numbered priority list that goes stale.
+Every planned or absent row above is a `README.md` matrix row the `crates/ferrox-prompt/prompts.md` templates draw their target from. `cargo run -p ferrox-prompt -- next` hands over the next outstanding row, ordered by leverage and nearness-to-done.

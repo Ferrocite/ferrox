@@ -323,11 +323,11 @@ figure.
 
 ## Time
 
-**Not measured on this branch.** The lane's throughput is what
+**Not measured yet.** The lane's throughput is what
 `.github/workflows/foxy-relay.yml` measures — it downloads 1 MB per carrier
 (`h1`, `h2`, `h3`, `auto`) against the real edge on all three runners, and the
 ubuntu job adds a second exit country, the `http` front and the UDP datagram
-path. That job now also sets an `exitProbe` on every pinned-country leg, so the
+path. The job sets an `exitProbe` on every pinned-country leg, so the
 pre-flight is what reads the real exit country against the real edge. A duration
 from a machine behind a VPN measures the tunnel, not the lane. The credit rule above
 is the row a duration would move, because its cost is a rate rather than a byte
@@ -347,7 +347,7 @@ the comparison can be re-read:
   datagram, capsule or extended CONNECT anywhere in the tree, and its server
   list prints `MASQUE` as a protocol name that nothing dialles. So a datagram
   over the account's own edge is a superset of both, not a port of either, and
-  the MASQUE CONNECT-IP row in `docs/xray-parity.md` stays refused — this page
+  the MASQUE CONNECT-IP row in `docs/xray-parity.md` stays planned — this page
   claims CONNECT-UDP, not IP-over-QUIC.
 
 - **Two dials of a carrier the edge already went silent on.** The TCP front wrote

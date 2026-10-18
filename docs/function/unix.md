@@ -79,8 +79,8 @@ CI-only there and has not been read; it is not a number and is not quoted as one
 
 ## Time
 
-**Not measured on this branch.** Durations in this repository come from CI
-runners (`bench.yml`, `parity.yml`); no artefact from this branch has been read,
+**Not measured yet.** Durations in this repository come from CI
+runners (`bench.yml`, `parity.yml`); no CI artefact has been read,
 and a laptop behind a VPN measures a tunnel either way.
 
 ## What we removed

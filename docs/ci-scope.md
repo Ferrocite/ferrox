@@ -47,8 +47,8 @@ crates/ferrox-app/src/proxy.rs::decode_request   -> no page claims it
 A hunk whose item no page claims, a hunk that sits between two items, or a hunk
 at or above its item's own indentation keeps the plan wide; attribution may narrow
 on evidence, never skip a measurement. `decode_request` is the proof the refusal
-works: every inbound calls it, so the pull request that folded the VLESS header
-into four reads of it plans wide, and it should. `scripts/method-counts.txt` and
+works: every inbound calls it, so a change there plans wide, and it should.
+`scripts/method-counts.txt` and
 `scripts/method-ops.txt` need no declaration — each row's first column already
 *is* the page name — and a blessed count in `scripts/expected-ops.txt` is claimed
 by the same `symbols` list that claims the function it measures.
@@ -111,15 +111,12 @@ each is a name CI gates on that no longer resolves to anything.
 
 ## What it saves
 
-Read from the planner on 2026-10-14 with the commands above, against the tree at
-the time of writing. `ops rows` is the `scripts/method-ops.txt` count and the
-number of valgrind runs those rows group into — two rows measured by one test are
-one run. `oracle` is the test names kept in each enabled pin's suite. The last
-two rows are not made-up path lists: they are the diffs of the two pull requests
-that landed just before this was written, replayed through the planner with
-`scope --base <their base>` — VMess's batch (`9ef3719`, its `proxy.rs` hunks in
-`dial_vmess_rung` and `vmess_tls_carried`, its counts rows) and the VLESS header
-fold (`d81b853`, its `proxy.rs` hunk in `decode_request`).
+Read from the planner with the commands above. `ops rows` is the
+`scripts/method-ops.txt` count and the number of valgrind runs those rows group
+into — two rows measured by one test are one run. `oracle` is the test names kept
+in each enabled pin's suite. The last two rows are a narrow and a wide diff
+replayed through the planner: a method-local batch (`dial_vmess_rung`,
+`vmess_tls_carried`) narrows; a hunk in the shared `decode_request` plans wide.
 
 | change | wide | builds and tests | cells | ops rows | oracle names kept | go packages | comparators |
 | --- | --- | --- | --- | --- | --- | --- | --- |
@@ -157,81 +154,40 @@ method*, which is what a change to that method's source file pays — editing
 same scope, and only the second one starts the workflows that measure it.
 
 The `rows` column is the one that costs wall-clock: a valgrind run per row, so a
-VMess change pays 1 measurement instead of 24. A narrow plan also *deepens* what
-it keeps — the touched method's own cells run at the full tier's repeats rather
-than the smoke pair's three, which is the point: the method that moved gets
+VMess change pays one measurement instead of 24. A narrow plan also *deepens*
+what it keeps — the touched method's own cells run at the full tier's repeats
+rather than the smoke pair's — which is the point: the method that moved gets
 measured against every comparator that can serve it, and the methods that did not
 move are not measured at all.
 
-The same day's CI, measured from the step timings of the runs of five recent
-pull requests, is the left column below. The right column is the same change —
-`crates/ferrox-app/src/vmess.rs`, one method's own file — measured on this
-wiring's own runs, with the run id named so a reader can open it:
+The two layers are worth keeping straight. A `docs/**` edit does not even start
+the comparing jobs, because their `paths:` filters name source; a source edit
+starts them all and the plan then decides what each one measures. So a VMess
+change used to pay for a whole reference tree's test suite, three whole oracle
+suites, 24 valgrind runs, a live three-runner dial of a lane it does not touch,
+and a VLESS benchmark. It now pays for one run, two reference packages, the tests
+of the one suite that has a VMess oracle, its own cell at the comparators that
+serve it, and no live lane at all.
 
-| job, on a change that touches one method | what it paid | what it pays now |
-| --- | --- | --- |
-| `ops.yml` | 4 m 17 s build + 22 s of valgrind over 31 rows in 24 runs | 4 m 8 s total: the same one build, 2 of 31 rows in **1** run, report step 1 s — run 38658878715 |
-| `conformance.yml` | 4 m 6 s, every test of every enabled suite against `ferrox-app` | 2 m 41 s: zeronet at `running 2 tests … 17 filtered out`, both xray-rust pins out of scope — run 38658878645 |
-| `interop-baseline.yml` | 5 m 0 s, every suite whole | 2 m 19 s: one suite whole (19 tests), the two pins it does not reach skipped — run 38658878627 |
-| `xray-baseline.yml` | 6 m 21 s, `go test ./...` over the pinned xray-core | 47 s: `go test ./common/crypto/... ./proxy/vmess/...`, 4 packages, all green — run 38658878637 |
-| `benchmark-matrix.yml` | 1 m 31 s per cell, and the smoke pair's cells are **VLESS** cells on a VMess change | one `vmess-raw-down-8` cell at the full tier, five repeats — run 38658878689, and it is **red**, which is the discovery this row exists to make. Its page now rules two of those five engines out, so the next one probes three and fetches two trees, not four |
-| `foxy-relay.yml` | 2 m 48 s … 14 m on three runners, plus real quota | 6 s: the plan answers, the live lane job is skipped — run 38658878623 |
-| `ci.yml`'s `test` | three runners, one workspace build each | still three runners: `.rs` moved. On a page or `README.md` edit the job is skipped outright — run 38658518128 |
-
-The two layers of that table are worth keeping straight. A `docs/**` edit does
-not even start the comparing jobs, because their `paths:` filters name source; a
-source edit starts them all and the plan then decides what each one measures. So
-a VMess change used to pay for a whole reference tree's test suite, three
-whole oracle suites, 24 valgrind runs, a live three-runner dial of a lane it does
-not touch, and a VLESS benchmark. It now pays for one run, two reference
-packages, the tests of the one suite that has a VMess oracle, its own cell at the
-comparators that serve it, and no live lane at all.
-
-What that VMess cell came back with is the reason to run it: 2 663 ms of CPU per
-GiB against xray-core's 2 422 ms over the same 8 GiB on 8 flows, a ~10% gap the
-harness resolves as its own regression gate (interval `[0.907x, 0.917x]` over
-five pairs), at 7.5x lower peak RSS and equal throughput — run 38658878689,
-artefact `matrix-cell-ubuntu-latest-vmess-raw-down-8`. Two of the five engines
-returned nothing there, for reasons the page now carries as a declaration:
-`sing-box` because the matrix's per-cell config is an Xray-dialect document and
-sing-box reads SingBox, and `xray-rust` because it does not serve vmess at its
-pin. A `engines:` list is only ever that — a record of a comparator the cell has
-already shown it cannot serve — so a page declares it beside the prose, and
-narrowing CI away from an engine nobody measured it with is not what this is for.
-None of this was reachable from a pull request before, because a VMess change ran
-a VLESS smoke cell.
+`engines:` is only ever a reduction the page may make: VMess's page records that
+`sing-box` and `xray-rust` return nothing in its cell (an Xray-dialect config
+sing-box does not read, and a pin that does not serve vmess), so a VMess change
+fetches, builds and probes neither. Narrowing CI away from an engine nobody could
+measure with is a record of that fact, not a way to skip a real comparison.
 
 Not claimed: that this is a fixed factor. It is a function of how much of the
-tree a change touches, and the honest summary is that a single-method change now
-pays a fraction of the measurements while any change to shared code still pays
-all of them — which is what run 38657406765 and its siblings, the wide plan of
-this wiring's own pull request, are the evidence for: every job ran, and every
-one passed. One of those jobs no longer pays its whole measurement twice, and
-the paragraph below is that exception, measured.
+tree a change touches — a single-method change pays a fraction of the
+measurements, while any change to shared code still pays all of them.
 
-`xray-baseline.yml`'s wide case is the pinned reference testing itself, so its
-answer is a property of the rev and of the Go toolchain and never of our diff:
-Go's own result cache holds that answer exactly, rather than approximately.
+One real effect of the deepening is worth keeping: `xray-baseline.yml`'s wide case
+is the pinned reference testing itself, so its answer is a property of the rev,
+the Go toolchain and never our diff — Go's own result cache holds it exactly.
 `scripts/run-xray-baseline.sh` therefore drops `-count=1` and clones the pin to
-one fixed path, because Go keys a cached verdict on the source paths that
-produced it and a `mktemp` tree rebuilds every package on every run. Cold — the
-first run after the key moved — the job was 5 m 54 s, of which 5 m 28 s was
-`go test ./...`, with 90 of 90 passing package results re-executed (run
-39077396186). Warm, on the same pin, pattern and toolchain: 1 m 25 s of job, 59 s
-of `go test`, 6 of 90 re-executed and the other 84 read from the cache (run
-39077826210). The run between those two, with the cache step already restored but
-the tree still a `mktemp` path, is the evidence for the path being the thing
-keyed on: it restored 370 MB of this pin's cache and re-executed all 90 (run
-39073135264). Go never caches a failing package, so a red at the pin still runs
-and still shows, and the job's report names per run how many verdicts it read
-from the cache rather than reached itself.
-
-One row of that table is not a saving, and naming it is the point: `ops.yml`'s
-build is the floor on any change that moves code, and its two VMess rows read
-`Ir=inlined-not-a-frame` in the artefact of run 38658878715 — the test ran, the
-profile held no frame for either symbol, so those two blessed counts are not
-being observed at all. That is a gap in the gate, not in the scope planner, and
-it is the next thing to fix.
+one fixed path, because Go keys a cached verdict on the source paths that produced
+it and a `mktemp` tree rebuilds every package every run: cold the job re-executes
+all packages; warm it reads most from the cache. Go never caches a failing
+package, so a red at the pin still runs and still shows, and the report names per
+run how many verdicts it read from the cache.
 
 ## Adding a method
 

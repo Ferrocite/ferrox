@@ -66,8 +66,8 @@ since both legs stay duplex.
 
 ## Time
 
-**Not measured on this branch.** Durations in this repository come from CI
-runners (`bench.yml`, `parity.yml`); no artefact from this branch has been
+**Not measured yet.** Durations in this repository come from CI
+runners (`bench.yml`, `parity.yml`); no CI artefact has been
 read, and a laptop behind a VPN measures a tunnel either way.
 
 ## What we removed

@@ -74,13 +74,13 @@ graph TD
 
 ## Time
 
-**Measured on this branch.** `ferrox-bench` gate 4 (`framing.rs`) compares
+`ferrox-bench` gate 4 (`framing.rs`) compares
 VMess-style framing rows byte for byte against the pinned reference, and gate 7b
 compares the AEAD seals; neither is a clock. The clock is gate 3's ratio at
 every measured length plus `.github/workflows/parity.yml`'s `vmess-raw`
 scenario, and the batch's own number is `benchmark-matrix.yml`'s
 `vmess-raw-down-8` cell: **full tier, ubuntu-latest (4 logical CPUs), 5 medians
-per engine, run 38667435571 on this branch's head.**
+per engine.**
 
 | ratio vs xray-core (higher throughput / lower CPU is better) | interval | verdict |
 | --- | --- | --- |
@@ -96,8 +96,8 @@ The split those two totals are made of, in ms/GiB medians:
 | xray-core | 1 264 | 1 170 | 2 435 | 1 274.8 | 61.2 | 14 |
 | zeronet | 7 578 | 1 614 | 9 201 | 399.2 | 12.5 | 5 |
 
-Against the same branch's own baseline (run 38663342157, standard tier, 3
-repeats: 788 user / 1 850 sys, cpu per GiB 0.921 of xray-core) **the batch moved
+Against the standard-tier baseline (788 user / 1 850 sys, cpu per GiB 0.921 of
+xray-core) **the batch moved
 the kernel half and only the kernel half**: −30 % sys per GiB, user CPU inside
 the noise, and the reference on this run reads 1 170 sys against its baseline's
 1 153, so the runner did not move under the number. zeronet's `vmess` rows are
@@ -155,7 +155,7 @@ frame — apply to every 8 KiB VMess frame on the AVX2 and NEON-4 paths.
   the batch is byte-identical to writing the frames one at a time.
 - **Four write syscalls — and four segments — per relayed batch.** The plain leg of a
   relay wrote one decoded frame per `write_all`: a syscall and a loopback segment for
-  every 8 KiB. On `vmess-raw-down-8` (run 38663342157, ubuntu-latest, 3 repeats each)
+  every 8 KiB. On `vmess-raw-down-8` (ubuntu-latest, 3 repeats each)
   ferrox reads **1 850 ms/GiB of system CPU against xray-core's 1 153**, while the same
   runs read **788 ms/GiB of user CPU against their 1 275**: the user-space half of this
   method already costs 1.6x less than the reference, and the row that is red is entirely
@@ -167,17 +167,17 @@ frame — apply to every 8 KiB VMess frame on the AVX2 and NEON-4 paths.
   a scratch `Vec` and the `resize` that zeroed a frame right before `read_exact`
   overwrote it. `a_batch_of_frames_leaves_the_pump_in_one_write` gates the batch, and
   `a_dribbled_carrier_still_offers_one_frame_and_loses_nothing` that a carrier arriving
-  three bytes at a time still loses nothing. The moved row, measured on this
-  branch (run 38667435571): **1 850 → 1 291 ms/GiB of system CPU**, user CPU left
+  three bytes at a time still loses nothing. The moved row: **1 850 → 1 291 ms/GiB
+  of system CPU**, user CPU left
   where it was (788 → 790), which is what makes this a kernel-side removal rather
   than a relocation into user space.
 - **Three more writes, and three more reads, per relayed batch.** The same lever,
   taken to the width the reference already caps itself at: `FRAMES_PER_WRITE` 4 → 16,
   xray's `one frame, then up to fifteen more from what the buffer holds`. The batch
   still never waits — only the first frame blocks — so the width buys syscalls and
-  costs buffer, nothing else. Measured on `vmess-raw-down-8` (run 38804662396,
-  ubuntu-latest, 5 medians) against the 4-frame shape's own cell (run 38802326890,
-  same runner and reader): **system CPU 1 301 → 1 098 ms/GiB**, which is under
+  costs buffer, nothing else. Measured on `vmess-raw-down-8` (ubuntu-latest, 5
+  medians) against the 4-frame shape's own cell (same runner and reader): **system
+  CPU 1 301 → 1 098 ms/GiB**, which is under
   xray-core's 1 171 for the first time on this cell, and **user CPU 781 → 635**, so
   total CPU **2 083 → 1 737** and the gating rows move with it — `cpu per GiB`
   1.172x → **1.403x**, throughput 1.208x → **1.459x**. What that buys in RAM is
@@ -234,16 +234,15 @@ holds the buffer's pointer and capacity steady across a batch so the gather
 cannot quietly become a reallocating batch. The copy was removed once and put
 back: leaving each frame where its open left it and sending the batch as four
 iovecs of one `write_vectored` moves no byte at all, and on `vmess-raw-down-8`
-that shape read **user 757.5 against system 1 351.7 ms/GiB** (run 38796771414,
-3 repeats) where the gather reads **user 790.3 against system 1 284.2** pooled
-over the run before it (38789957983) and the five after it (38799273839) — 8
-repeats, total CPU spread 2 027 to 2 110 ms/GiB. The vectored batch took
+that shape read **user 757.5 against system 1 351.7 ms/GiB** (3 repeats) where
+the gather reads **user 790.3 against system 1 284.2** pooled over 8 repeats,
+total CPU spread 2 027 to 2 110 ms/GiB. The vectored batch took
 ~33 ms/GiB off user space and put ~68 ms/GiB on the kernel, ending ~35 ms/GiB
 worse on total CPU and tied on throughput (−0.6%): a relocation onto the half of
 the ledger this method is already behind on, so it does not land.
 The same runs clear the other suspect. `vless-raw-down-8` — this relay model with
 no framing — holds **31 threads at peak** and spends **498.75 ms/GiB of system
-CPU against xray-core's 1 225.8** (run 38801134197): 2.6x less kernel than this
+CPU against xray-core's 1 225.8**: 2.6x less kernel than this
 method's 1 284 at four more threads. **35 threads against xray-core's 14** is
 therefore not what makes the sys row red here; the framing is, and which part of
 it the kernel charges for stays open on this page.

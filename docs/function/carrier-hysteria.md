@@ -245,9 +245,9 @@ own yet.
 
 ## Time
 
-**Not measured on this branch.** Every duration in this repository comes from a
+**Not measured yet.** Every duration in this repository comes from a
 named runner, and a number produced off a machine behind a VPN measures the
-tunnel. No artefact from this branch has been read.
+tunnel. No CI artefact has been read.
 
 ## What we removed
 

@@ -266,7 +266,7 @@ slice can bless the one-pass count without moving the target again. The second
 row points at the credit: `a_credit_grants_both_windows_in_one_write` calls
 `replenish` on a connection with no peer, no socket and no thread, so the frame
 it charges is the method and nothing else — which is what the open list asks of
-a row before it earns a number. CI read it on this branch (run 38816058317) and
+a row before it earns a number. CI read it and
 it reported `Ir=inlined-not-a-frame`: in the release profile the harness
 profiles, the credit dissolves into the two callers that reach it, so the row is
 an honest blank, not a figure, and it stays in the open list until a probe keeps
@@ -274,8 +274,7 @@ a frame for it.
 
 ## Time
 
-CI `vless-xhttp-down-8` on this branch (full tier, 5 repeats, linux x86_64, run
-38816058449, gate passed): **2.11× xray-core's throughput** (medians 1598 vs
+CI `vless-xhttp-down-8` (full tier, 5 repeats, linux x86_64, gate passed): **2.11× xray-core's throughput** (medians 1598 vs
 770 MiB/s), **2.02× leaner CPU** (1871 vs 3775 ms/GiB) and **5.6× leaner peak
 RSS** (7.7 vs 42.8 MiB) on 43 threads against its 18 — and ahead of zeronet on
 all three rows (1.82× / 1.73× / 2.57×).

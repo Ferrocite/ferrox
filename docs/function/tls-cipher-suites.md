@@ -50,9 +50,9 @@ a config-load cost, and no row here quotes it as a figure until `ops.yml` measur
 
 ## Time
 
-**Not measured on this branch.** This is a handshake-field builder, not a relay hot path;
+**Not measured yet.** This is a handshake-field builder, not a relay hot path;
 the `benchmark-matrix.yml` and `parity.yml` cells that would exercise a dialer TLS handshake
-run in CI, and no artefact from this branch has been read.
+run in CI, and no CI artefact has been read.
 
 ## The reachable-set ceiling, and what was not removed
 
