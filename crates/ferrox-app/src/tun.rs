@@ -23,11 +23,13 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use crate::budgets;
 use crate::conn::Connection;
 use ferrox_core::foxy::connectip::{
-    checksum, ipv4_checksum, ipv4_head, udp_datagram, udp_head, Ipv4Head, IPV4_HEADER,
-    PROTOCOL_UDP, UDP_HEADER, UdpDatagram,
+    checksum, ipv4_checksum, ipv4_head, udp_datagram, udp_head, Ipv4Head, UdpDatagram, IPV4_HEADER,
+    PROTOCOL_UDP, UDP_HEADER,
 };
 
 const DEFAULT_MTU: usize = 1500;
+/// The association's framed datagram: the relay's largest payload plus the RSV/FRAG prefix and an address.
+const FRAME_CAP: usize = crate::proxy::UDP_BUF + 3 + 19;
 const TCP_PROTO: u8 = 6;
 const FLAG_FIN: u8 = 0x01;
 const FLAG_SYN: u8 = 0x02;
@@ -407,6 +409,7 @@ pub(crate) struct Handler {
     associate: Associate,
     flows: HashMap<FlowKey, Flow>,
     legs: HashMap<UdpKey, UdpSocket>,
+    frame: Vec<u8>,
     association: Option<Association>,
     ended_tx: mpsc::Sender<Ended>,
     ended_rx: mpsc::Receiver<Ended>,
@@ -421,6 +424,7 @@ impl Handler {
             associate,
             flows: HashMap::new(),
             legs: HashMap::new(),
+            frame: Vec::with_capacity(FRAME_CAP),
             association: None,
             ended_tx,
             ended_rx,
@@ -484,24 +488,23 @@ impl Handler {
         };
         let leg = match self.legs.entry(key) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
-            std::collections::hash_map::Entry::Vacant(vacant) => {
-                match open_leg(
-                    &self.device,
-                    relay,
-                    (ip.destination, udp.destination_port),
-                    (ip.source, udp.source_port),
-                    key,
-                    &self.ended_tx,
-                ) {
-                    Ok(leg) => vacant.insert(leg),
-                    Err(error) => return Err(error),
-                }
-            }
+            std::collections::hash_map::Entry::Vacant(vacant) => vacant.insert(open_leg(
+                &self.device,
+                relay,
+                (ip.destination, udp.destination_port),
+                (ip.source, udp.source_port),
+                key,
+                &self.ended_tx,
+            )?),
         };
-        let mut frame = vec![0u8, 0, 0];
+        let mut frame = std::mem::take(&mut self.frame);
+        frame.clear();
+        frame.extend_from_slice(&[0u8, 0, 0]);
         crate::proxy::push_socks_addr(&mut frame, &target);
         frame.extend_from_slice(payload);
-        if leg.send(&frame).is_err() {
+        let sent = leg.send(&frame);
+        self.frame = frame;
+        if sent.is_err() {
             self.legs.remove(&key);
         }
         Ok(())
@@ -632,14 +635,9 @@ impl Handler {
                             65535,
                             &buf[..n],
                         );
-                        let mut dev = Device {
-                            handle: dev_writer,
-                            mtu: 65535,
-                        };
-                        if dev.write_packet(&pkt).is_err() {
+                        if dev_writer.write_all(&pkt).is_err() {
                             break;
                         }
-                        dev_writer = dev.handle;
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                     // The budget expired with nothing to carry: the upload leg gets one more budget to speak, and a silent one ends the flow.
@@ -700,36 +698,26 @@ fn open_leg(
     std::thread::spawn(move || {
         let mut buf = crate::proxy::udp_buffer();
         let mut out: Vec<u8> = Vec::with_capacity(IPV4_HEADER + UDP_HEADER + mtu);
-        loop {
-            match reader.recv(&mut buf) {
-                Ok(n) => {
-                    let Some((source, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
-                        continue;
-                    };
-                    if source != target {
-                        continue;
-                    }
-                    let datagram = UdpDatagram {
-                        source: endpoint.0.as_slice(),
-                        destination: client.0.as_slice(),
-                        source_port: endpoint.1,
-                        destination_port: client.1,
-                        payload,
-                    };
-                    out.clear();
-                    if !udp_datagram(&datagram, &mut out) {
-                        continue;
-                    }
-                    let mut dev = Device {
-                        handle: dev_writer,
-                        mtu: 65535,
-                    };
-                    if dev.write_packet(&out).is_err() {
-                        break;
-                    }
-                    dev_writer = dev.handle;
-                }
-                Err(_) => break,
+        while let Ok(n) = reader.recv(&mut buf) {
+            let Some((source, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
+                continue;
+            };
+            if source != target {
+                continue;
+            }
+            let datagram = UdpDatagram {
+                source: endpoint.0.as_slice(),
+                destination: client.0.as_slice(),
+                source_port: endpoint.1,
+                destination_port: client.1,
+                payload,
+            };
+            out.clear();
+            if !udp_datagram(&datagram, &mut out) {
+                continue;
+            }
+            if dev_writer.write_all(&out).is_err() {
+                break;
             }
         }
         let _ = ended.send(Ended::Datagram(key));
@@ -836,7 +824,13 @@ mod tests {
     }
 
     /// One reply packet, built the way the lane builds it.
-    fn datagram(source: [u8; 4], destination: [u8; 4], source_port: u16, destination_port: u16, payload: &[u8]) -> Vec<u8> {
+    fn datagram(
+        source: [u8; 4],
+        destination: [u8; 4],
+        source_port: u16,
+        destination_port: u16,
+        payload: &[u8],
+    ) -> Vec<u8> {
         let mut out = Vec::new();
         assert!(udp_datagram(
             &UdpDatagram {
@@ -853,13 +847,7 @@ mod tests {
 
     #[test]
     fn udp_head_parses_a_datagram() {
-        let pkt = datagram(
-            [10, 0, 0, 2],
-            [10, 0, 0, 1],
-            51500,
-            53,
-            b"query",
-        );
+        let pkt = datagram([10, 0, 0, 2], [10, 0, 0, 1], 51500, 53, b"query");
         let (ip, body) = ipv4_head(&pkt).unwrap();
         assert_eq!(ip.protocol, PROTOCOL_UDP);
         let (udp, payload) = udp_head(body).unwrap();
@@ -892,14 +880,9 @@ mod tests {
     #[test]
     fn the_reply_packet_verifies_at_the_reference_reader() {
         // Built here, verified by the core's own checksumming walk: the same bytes a peer's stack reads.
-        let pkt = datagram(
-            [198, 51, 100, 7],
-            [10, 0, 0, 2],
-            53,
-            51500,
-            b"an answer",
-        );
-        let read = ferrox_core::foxy::connectip::udp_from_packet(&pkt).expect("a readable datagram");
+        let pkt = datagram([198, 51, 100, 7], [10, 0, 0, 2], 53, 51500, b"an answer");
+        let read =
+            ferrox_core::foxy::connectip::udp_from_packet(&pkt).expect("a readable datagram");
         assert!(read.verified, "both checksums hold");
         assert_eq!(read.payload, b"an answer");
         assert_eq!((read.source_port, read.destination_port), (53, 51500));
@@ -1273,7 +1256,10 @@ mod tests {
         let n = next_datagram(&mut peer, &mut buf);
         let (ip, body) = ipv4_head(&buf[..n]).unwrap();
         assert_eq!(ip.protocol, PROTOCOL_UDP);
-        assert_eq!((ip.source, ip.destination), ([198, 51, 100, 7], SCRIPT_CLIENT));
+        assert_eq!(
+            (ip.source, ip.destination),
+            ([198, 51, 100, 7], SCRIPT_CLIENT)
+        );
         let (udp, payload) = udp_head(body).unwrap();
         assert_eq!((udp.source_port, udp.destination_port), (53, 51500));
         assert_eq!(payload, b"who-is");
