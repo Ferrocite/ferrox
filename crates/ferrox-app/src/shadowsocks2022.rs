@@ -976,8 +976,8 @@ impl Datagrams {
                 || self.client_psk != psk
                 || self.client_session != session;
             if fresh {
-                let sub = shadowsocks2022::session_subkey(psk, &session, key_len);
-                let cipher = Cipher::from_subkey(method, &sub)?;
+                let sub = shadowsocks2022::session_subkey(psk, &session)?;
+                let cipher = Cipher::from_subkey(method, &sub[..key_len])?;
                 self.client_body = Some(cipher);
                 self.client_psk = psk.to_vec();
                 self.client_session = session;
@@ -1023,8 +1023,8 @@ impl Datagrams {
             || self.client_psk != final_psk.as_slice()
             || self.client_session != session;
         if fresh {
-            let sub = shadowsocks2022::session_subkey(final_psk, &session, key_len);
-            let cipher = Cipher::from_subkey(method, &sub)?;
+            let sub = shadowsocks2022::session_subkey(final_psk, &session)?;
+            let cipher = Cipher::from_subkey(method, &sub[..key_len])?;
             self.client_body = Some(cipher);
             self.client_psk.clone_from(final_psk);
             self.client_session = session;
@@ -1120,8 +1120,8 @@ impl Datagrams {
                 return None;
             }
             if entry.cipher.is_none() {
-                let sub = shadowsocks2022::session_subkey(psk, &raw[..8], key_len);
-                entry.cipher = Cipher::from_subkey(method, &sub);
+                let sub = shadowsocks2022::session_subkey(psk, &raw[..8])?;
+                entry.cipher = Cipher::from_subkey(method, &sub[..key_len]);
             }
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(&raw[4..16]);
@@ -1168,8 +1168,8 @@ impl Datagrams {
                 .iter()
                 .position(|p| shadowsocks2022::user_hash(p) == hash)?
                 + 1;
-            let sub = shadowsocks2022::session_subkey(&psks[idx], &raw[..8], key_len);
-            entry.cipher = Cipher::from_subkey(method, &sub);
+            let sub = shadowsocks2022::session_subkey(&psks[idx], &raw[..8])?;
+            entry.cipher = Cipher::from_subkey(method, &sub[..key_len]);
             entry.user = Some(idx);
         }
         let mut nonce = [0u8; 12];
@@ -1214,9 +1214,8 @@ impl Datagrams {
                 });
             entry.server_session = sid;
             if !method.is_chacha() {
-                let sub =
-                    shadowsocks2022::session_subkey(user_psk, &sid.to_be_bytes(), method.key_len());
-                entry.server_cipher = Cipher::from_subkey(method, &sub);
+                let sub = shadowsocks2022::session_subkey(user_psk, &sid.to_be_bytes())?;
+                entry.server_cipher = Cipher::from_subkey(method, &sub[..method.key_len()]);
             }
         }
         if method.is_chacha() {
@@ -1334,8 +1333,8 @@ impl Datagrams {
                 .get(&session)
                 .is_none_or(|peer| peer.cipher.is_none())
             {
-                let sub = shadowsocks2022::session_subkey(psk, &raw[..8], key_len);
-                let cipher = Cipher::from_subkey(method, &sub)?;
+                let sub = shadowsocks2022::session_subkey(psk, &raw[..8])?;
+                let cipher = Cipher::from_subkey(method, &sub[..key_len])?;
                 self.peers.get_mut(&session)?.cipher = Some(cipher);
             }
             let mut nonce = [0u8; 12];
@@ -1523,14 +1522,14 @@ pub(crate) fn relay_udp_client_of(
     let mut enc = [0u8; BLOCK_LEN];
     enc.copy_from_slice(&packet[..16]);
     let raw = shadowsocks2022::block_decrypt(dest_psk, &enc)?;
-    let sub = shadowsocks2022::session_subkey(dest_psk, &raw[..8], dest_psk.len());
+    let sub = shadowsocks2022::session_subkey(dest_psk, &raw[..8])?;
     let cipher = Cipher::from_subkey(
         if dest_psk.len() == 16 {
             Method::Aes128Gcm
         } else {
             Method::Aes256Gcm
         },
-        &sub,
+        &sub[..dest_psk.len()],
     )?;
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&raw[4..16]);

@@ -92,16 +92,10 @@ fn derive32(context: &str, psk: &[u8], salt: &[u8]) -> Option<[u8; 32]> {
     ))
 }
 
+/// The whole 32-byte session subkey on the stack: every caller hands it straight to `Cipher::from_subkey`, which copies the `key_len` bytes it needs, so the derivation costs no heap buffer.
 #[must_use]
-pub fn session_subkey(psk: &[u8], salt: &[u8], key_len: usize) -> Vec<u8> {
+pub fn session_subkey(psk: &[u8], salt: &[u8]) -> Option<[u8; 32]> {
     derive32("shadowsocks 2022 session subkey", psk, salt)
-        .map_or_else(Vec::new, |full| full[..key_len].to_vec())
-}
-
-#[must_use]
-pub fn identity_subkey(psk: &[u8], salt: &[u8], key_len: usize) -> Vec<u8> {
-    derive32("shadowsocks 2022 identity subkey", psk, salt)
-        .map_or_else(Vec::new, |full| full[..key_len].to_vec())
 }
 
 #[must_use]
@@ -582,8 +576,8 @@ mod tests {
     fn seals_match_the_crates_they_replace() {
         let psk16 = [0x11u8; 16];
         let salt16 = [0x22u8; 16];
-        let sub16 = session_subkey(&psk16, &salt16, 16);
-        let reference = aes_gcm::Aes128Gcm::new_from_slice(&sub16).expect("key");
+        let sub16 = session_subkey(&psk16, &salt16).expect("derives");
+        let reference = aes_gcm::Aes128Gcm::new_from_slice(&sub16[..16]).expect("key");
         let mut ours = Cipher::from_psk(Method::Aes128Gcm, &psk16, &salt16).expect("derives");
         let mut wire = Vec::new();
         ours.seal_into(b"ping", &mut wire).expect("seals");
@@ -596,7 +590,7 @@ mod tests {
         assert_eq!(tag, &want_tag[..]);
         let psk32 = [0x33u8; 32];
         let salt32 = [0x44u8; 32];
-        let sub32 = session_subkey(&psk32, &salt32, 32);
+        let sub32 = session_subkey(&psk32, &salt32).expect("derives");
         let reference = aes_gcm::Aes256Gcm::new_from_slice(&sub32).expect("key");
         let mut ours = Cipher::from_psk(Method::Aes256Gcm, &psk32, &salt32).expect("derives");
         let mut wire = Vec::new();
@@ -709,6 +703,39 @@ mod tests {
         assert!(window.check_and_add(9000));
         assert!(!window.check(0));
         assert!(!window.check_and_add(9000));
+    }
+
+    #[test]
+    fn deriving_a_session_subkey_costs_no_heap_buffer() {
+        let psk = [0x11u8; 32];
+        let salt = [0x22u8; 32];
+        for salt_len in [8usize, 16, 32] {
+            let (sub, counts) =
+                crate::alloc_count::measure(|| session_subkey(&psk, &salt[..salt_len]));
+            assert!(sub.is_some(), "derives at salt {salt_len}");
+            assert_eq!(
+                counts.allocs, 0,
+                "the subkey stays in the caller's frame: {counts:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_session_subkey_probe_costs_the_derive_and_nothing_else() {
+        // A repeated derive over one fixed input: the probe's only cost is the subkey, so ops.yml can price the KDF apart from the AEAD.
+        let psk = [0x11u8; 32];
+        let salt = [0x22u8; 8];
+        let word = |sub: &[u8; 32]| u64::from_le_bytes(sub[..8].try_into().expect("eight bytes"));
+        let one = word(&session_subkey(&psk, &salt).expect("derives"));
+        let mut acc = 0u64;
+        for _ in 0..4096 {
+            acc = acc.wrapping_add(word(&session_subkey(&psk, &salt).expect("derives")));
+        }
+        assert_eq!(
+            acc,
+            one.wrapping_mul(4096),
+            "the loop ran and the derive is stable"
+        );
     }
 
     #[test]
