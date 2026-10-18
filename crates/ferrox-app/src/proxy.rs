@@ -17999,6 +17999,7 @@ mod tests {
                 cc: ferrox_core::hysteria::Congestion::Bbr,
                 obfs_password: String::new(),
                 hop: None,
+                gecko: None,
             },
             roots: Some(roots),
         };
@@ -19479,6 +19480,7 @@ mod tests {
                 cc: ferrox_core::hysteria::Congestion::Bbr,
                 obfs_password: obfs.to_owned(),
                 hop: None,
+                gecko: None,
             },
             roots: Some(roots),
         };
@@ -19653,6 +19655,7 @@ mod tests {
                 cc: ferrox_core::hysteria::Congestion::Bbr,
                 obfs_password: String::new(),
                 hop: None,
+                gecko: None,
             },
             roots: Some(roots),
         };
@@ -20252,6 +20255,7 @@ mod tests {
                 cc: ferrox_core::hysteria::Congestion::Bbr,
                 obfs_password: String::new(),
                 hop: None,
+                gecko: None,
             }),
             host: "localhost".to_owned(),
             mux: false,

@@ -263,7 +263,7 @@ The config surface no link exercises: what sits around the protocols in a drop-i
 
 ### K — sing-box-only protocols and transports
 
-What Xray has no equivalent of. Section H already covers Tor as a lane; the Hysteria2 carrier is row 19 — rows 19 and 100 carry its shipped lanes (TCP + UDP, salamander, the masquerade site) and client port-hop; `gecko` obfs is the one option left refused.
+What Xray has no equivalent of. Section H already covers Tor as a lane; the Hysteria2 carrier is row 19 — rows 19 and 100 carry its shipped lanes (TCP + UDP, salamander, the masquerade site), client port-hop and `gecko` obfs; the one combination still refused is a dial that names port-hop and gecko together.
 
 | # | method | state | supported today by |
 | --- | --- | --- | --- |
@@ -282,7 +282,7 @@ What Xray has no equivalent of. Section H already covers Tor as a lane; the Hyst
 | 97 | simple-obfs (http/tls) | planned | sing-box `transport/simple-obfs/`. |
 | 98 | SIP003 plugin manager (obfs/v2ray-plugin) | planned | sing-box `transport/sip003/`. LxBox imports `plugin`/`plugin_opts` (§4) — carried nowhere yet. |
 | 99 | Mux variants smux/yamux/h2mux | planned | sing-box `common/mux/` + `option/multiplex.go`. Tree has mux-cool only (row 22). |
-| 100 | Hysteria2 multiport (`mport`/`server_ports`) | implemented (with salamander obfs, row 19) | sing-box `protocol/hysteria2/`; LxBox §5 (`mport`/`server_ports`, gecko obfs). A dial naming `serverPorts`/`mport` and `hopInterval`/`hopIntervalMax` rotates its server port among the expanded set on a fresh socket per stay, at the `quic::Datagram` seam (`carrier-hysteria`): `the_plan_expands_overlapping_ranges_into_one_sorted_set`, `a_hysteria_carrier_reads_a_port_hopping_plan`, `a_hop_plan_is_its_own_pool_key`, `a_hopped_dial_spreads_its_datagrams_over_more_than_one_server_port`, `a_reply_from_a_hopped_port_reads_back_as_the_nominal_server`. `gecko` obfs is a named ceiling — no in-tree primitive proves its bytes and neither xray-core nor zeronet carries it, so another obfuscation stays refused. |
+| 100 | Hysteria2 multiport (`mport`/`server_ports`) | implemented (with salamander obfs, row 19) | sing-box `protocol/hysteria2/`; LxBox §5 (`mport`/`server_ports`, gecko obfs). A dial naming `serverPorts`/`mport` and `hopInterval`/`hopIntervalMax` rotates its server port among the expanded set on a fresh socket per stay, at the `quic::Datagram` seam (`carrier-hysteria`): `the_plan_expands_overlapping_ranges_into_one_sorted_set`, `a_hysteria_carrier_reads_a_port_hopping_plan`, `a_hop_plan_is_its_own_pool_key`, `a_hopped_dial_spreads_its_datagrams_over_more_than_one_server_port`, `a_reply_from_a_hopped_port_reads_back_as_the_nominal_server`. `gecko` obfs is carried too — a fragment-plus-pad layer over salamander that splits a QUIC long-header packet into 2..=8 padded, masked chunks reassembled by `(peer, id)`, its frame codec proven bit-exact in `ferrox-core::hysteria` (`a_gecko_frame_is_the_exact_bytes_the_reference_emits`, `a_fragmented_long_header_packet_reassembles_bit_identical`) and its round trip over a real socket by `a_gecko_dial_reassembles_its_split_long_header`; the reference's `gcLoop` expiry thread is dropped for a lazy `retain` on each accepted frame. A dial naming both port-hop and gecko is refused at `connect` rather than built with one silently dropped. |
 
 ### L — ZeroNet + LxBox superset
 
