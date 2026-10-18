@@ -601,7 +601,7 @@ and unchanged in count when no edge has rested.
 
 | what | where |
 | --- | --- |
-| the QUIC + HTTP/3 stack behind `h3` | `upstream/quiche` @ `b60aff93` |
+| the QUIC + HTTP/3 stack behind `h3` | `upstream/quiche` @ `acf560f2` |
 | `foundLeaf`: the pin replaces chain, name and expiry | `upstream/xray-core/transport/internet/tls/config.go` |
 | the Android client this lane ports | `/tmp/foxyvpn` (`com.vauth.foxyvpn`) |
 | the Go reference client this lane ports | `/tmp/firefox-vpn-client` |

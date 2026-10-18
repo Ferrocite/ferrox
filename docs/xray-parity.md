@@ -1,6 +1,6 @@
 # Ferrox vs Xray-core feature map
 
-Pinned reference: `upstream/xray-core` @ `c77a4d0e` (`upstream/pins.toml`).
+Pinned reference: `upstream/xray-core` @ `92ccc939` (`upstream/pins.toml`).
 This tree: `crates/ferrox-core`, `crates/ferrox-app`, `docs/function/`.
 
 What runs against what: `xray-rust`'s interop tests drive the pinned Xray client into `ferrox-app` (23 tests, seam `XRAY_VLESS_FULL_BINARY`); `zeronet`'s `xray_oracle` replays its differential checks against a binary injected as Xray (9 tests, seam `ZRAY_XRAY_BINARY`); `xray-core`'s `testing/scenarios` builds `github.com/xtls/xray-core/main` at run time and spawns it with `-config=stdin: -format=pb` (`testing/scenarios/common_regular.go`), and that build is the seam `scripts/xray-scenarios.sh` answers with `go -overlay`: four http tests run unmodified against `ferrox-app`, which reads that wire form in `crates/ferrox-app/src/xray_pb.rs`. Its unit tests are in-process with no seam and stay in `xray-baseline.yml`.
@@ -10,7 +10,7 @@ What runs against what: `xray-rust`'s interop tests drive the pinned Xray client
 | area | ferrox | xray-core |
 | --- | --- | --- |
 | Foxy / FoxyVPN lane | `ferrox-core/src/foxy/` — FxA login + 2FA, Hawk-signed exchange, bot challenge, Guardian token, Remote Settings catalog, country pin, SPKI pins, split tunnel, upstream proxy chain, auto = QUIC → H2 → H1 | none (it is a separate product) |
-| TUN as zeptun-style tun2socks | roadmap goal 3; zeptun pinned as comparator | `proxy/tun` exists, but oriented to gVisor stack only, no zeptun-style policy split documented here |
+| TUN as zeptun-style tun2socks | roadmap goal 3; zeptun pinned as comparator | `proxy/tun` exists, on xray's own lightweight `netstack.go` (gVisor left the source at #7156), no zeptun-style policy split documented here |
 | Record layer, four widths, one source | `record.rs` + `Lanes` trait: portable/NEON/SSE2/AVX2 execute the same source | per-arch crypto with divergent implementations |
 | Count-gated claims | exact ops/syscall/copy counts per method, `scripts/method-counts.txt` ⇔ pages | no equivalent gate |
 | Single TLS stack | rustls behind `TlsProvider`, no feature flags | utls + stdlib TLS, selectable per config |
@@ -29,7 +29,7 @@ What runs against what: `xray-rust`'s interop tests drive the pinned Xray client
 | DNS proxy + fakeDNS + hosts + DoH/DoQ/local nameservers (`app/dns`) | refused (row 26) |
 | Blackhole outbound | refused (row 25) |
 | Loopback | refused (row 27) |
-| WireGuard proxy (`proxy/wireguard`, gVisor netstack) | absent |
+| WireGuard proxy (`proxy/wireguard`, own `netstack.go` lightweight TCP/IP stack since #7156; gVisor now only in `go.mod`) | absent |
 | Hysteria v1 proxy (`proxy/hysteria`) | absent (only v2 as carrier) |
 | MASQUE proxy (`proxy/masque`) | server not carried; the CONNECT-IP client dials on the Foxy `h3` lane (row 20) |
 | TUN inbound (`proxy/tun`) | refused (row 29) |
@@ -51,7 +51,7 @@ What runs against what: `xray-rust`'s interop tests drive the pinned Xray client
 | KCP/mKCP + FinalMask (aes128gcm, header, original) | core done; finalmask refused (row 31) |
 | Hysteria v2 transport (network `hysteria`, masquerade surface) | done as `vless-hysteria` / `protocol: hysteria` over quiche, both roles (row 19); datagrams, salamander obfs and the masquerade site are all carried (an `https` masquerade origin is a named `502` ceiling) |
 | MASQUE transport | CONNECT-IP client dialled (h2/h3) on the Foxy lane; server transport refused (row 20) |
-| XDrive | refused (row 32) |
+| XDrive (remote-storage carrier; at this pin it prefers h2, ends stalled requests, and requires VLESS Multiplex+Encryption) | refused (row 32) |
 | Browser dialer | absent |
 | Tagged connections / observatory webhooks | absent |
 | UDP `transport/internet/udp` fullcone/NAT behavior | mux-cool carries XUDP; no standalone UDP transport service parity |
@@ -72,7 +72,7 @@ What runs against what: `xray-rust`'s interop tests drive the pinned Xray client
 | Config schema for every protocol (`infra/conf`) | ferrox-app's own JSON dialect; the protobuf `xray.core.Config` only for the shape the http scenarios write (`xray_pb.rs`: http inbound, freedom outbound, receiver port/listen, apps skipped) — every other field is refused by number or by name |
 | OCSP, antireplay, time-window caches | absent |
 | Freedom fragment, VLESS encryption fragment | refused |
-| finalmask: fragment, header/custom, noise, realm (STUN hole-punch, portmap), salamander, sudoku, udphop, xdns, xicmp, xmc | refused (row 31) |
+| finalmask: fragment, header/custom, noise (Lua scripts since #7124), realm (STUN hole-punch, portmap), salamander, sudoku, udphop, xdns (DoH resolver + Chrome CH, empty User-Agent, since #7140), xicmp, xmc | refused (row 31) |
 
 ## What to build next
 
