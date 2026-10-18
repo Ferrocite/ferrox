@@ -749,6 +749,64 @@ pub(crate) fn salamander_obfs(stream: Option<&Json>) -> Option<String> {
     }
 }
 
+/// The masquerade cover an inbound hysteria server answers a browser with, read from its `hysteriaSettings`. Absent, empty, or an unknown type falls back to the plain not-found — today's behavior — so only a configured cover ever changes what a browser sees. Field names accept both the camel and the snake spelling the reference's two JSON dialects use.
+pub(crate) fn masquerade_from_stream(stream: Option<&Json>) -> ferrox_core::hysteria::Masquerade {
+    use ferrox_core::hysteria::Masquerade;
+    let Some(hy) = stream.and_then(|s| s.get("hysteriaSettings")) else {
+        return Masquerade::NotFound;
+    };
+    let field = |camel: &str, snake: &str| hy.get(camel).or_else(|| hy.get(snake));
+    let text = |camel: &str, snake: &str| field(camel, snake).and_then(Json::as_str);
+    let flag =
+        |camel: &str, snake: &str| field(camel, snake).and_then(Json::as_bool).unwrap_or(false);
+    match text("masqType", "masq_type").unwrap_or_default() {
+        "file" => {
+            text("masqFile", "masq_file").map_or(Masquerade::NotFound, |dir| Masquerade::File {
+                dir: dir.to_owned(),
+            })
+        }
+        "proxy" => {
+            text("masqUrl", "masq_url").map_or(Masquerade::NotFound, |url| Masquerade::Proxy {
+                url: url.to_owned(),
+                rewrite_host: flag("masqUrlRewriteHost", "masq_url_rewrite_host"),
+                x_forwarded: flag("masqUrlXForwarded", "masq_url_x_forwarded"),
+                insecure: flag("masqUrlInsecure", "masq_url_insecure"),
+            })
+        }
+        "response" => {
+            let status = field("masqStringStatusCode", "masq_string_status_code")
+                .and_then(Json::as_u32)
+                .filter(|code| *code != 0)
+                .map_or(200, |code| code as u16);
+            let body = text("masqString", "masq_string")
+                .unwrap_or_default()
+                .as_bytes()
+                .to_vec();
+            let headers = field("masqStringHeaders", "masq_string_headers")
+                .and_then(Json::as_arr)
+                .map_or_else(Vec::new, |items| {
+                    items
+                        .iter()
+                        .filter_map(Json::as_str)
+                        .filter_map(header_line)
+                        .collect()
+                });
+            Masquerade::Response {
+                status,
+                headers,
+                body,
+            }
+        }
+        _ => Masquerade::NotFound,
+    }
+}
+
+/// One `Name: value` line from a masquerade response's header list, split on its first colon; a line naming nothing is dropped.
+fn header_line(line: &str) -> Option<(String, String)> {
+    let (name, value) = line.split_once(':')?;
+    Some((name.trim().to_owned(), value.trim().to_owned()))
+}
+
 pub(crate) fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, String) {
     let settings = outbound.get("streamSettings");
     let carrier = stream_carrier(settings);

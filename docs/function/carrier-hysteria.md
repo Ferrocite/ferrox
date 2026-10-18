@@ -76,6 +76,25 @@ against `ferrox-app` in `scripts/run-upstream-suite.sh`, which is also where
 the server's SETTINGS-before-auth order is proven — the pinned client's H3
 stack posts its auth only once the server's SETTINGS arrive.
 
+A browser that stumbles on this port with a plain `GET /` is answered rather
+than refused: the masquerade site serves an ordinary HTTP/3 request on the
+*same* connection hysteria rides. The classifier is a stream's first varint —
+`0x401` names a hysteria flow and relays as before, while an HTTP/3
+`HEADERS`/`DATA` frame (`read_tcp_prefix` returning `None` beside those types)
+is a browser and goes to `serve_masquerade`; on stream 0 the same split keys on
+request shape — a `POST` to `/auth` is the handshake and anything else is the
+cover — proven apart by `the_flow_frame_tells_hysteria_from_a_browser_request`
+and `a_browser_get_parses_to_method_path_and_authority`. Four cover answers
+match the reference's `masq` — the default `404` page, a canned `response`
+line, a static `file` directory and a `proxy` to an origin — every one built by
+`ferrox-core::hysteria`'s `encode_h3_response` (a `HEADERS` frame then a `DATA`
+frame) so the bytes are pinned without a socket. A right-shape, wrong-password
+hysteria attempt still refuses with `404` and closes exactly as a plain server
+would (`hysteria_closes_a_wrong_hysteria_password_even_with_masquerade`), so the
+cover never walks past authentication, and a browser `GET` beside a live flow is
+served while that flow still relays
+(`hysteria_still_carries_proxy_flows_beside_a_masquerade_get`).
+
 ## Data path
 
 ```mermaid
@@ -104,6 +123,13 @@ graph TD
     W["SOCKS UDP associate, hysteria outbound"] --> N["serve_udp: one association per destination,<br/>id never reused"]
     N -- "fragment + dgram_send + flush" --> G
     G -. "client_reader: decode, Defrag, socks frame" .-> W
+    B["browser GET / on the same port"] --> MS{"first varint:<br/>0x401 or H3 HEADERS?"}
+    MS -- "H3 HEADERS/DATA" --> SM["serve_masquerade"]
+    MS -- "0x401" --> Q
+    SM --> K1["404 page"]
+    SM --> K2["canned response"]
+    SM --> K3["static file:<br/>safe_path → index/listing"]
+    SM --> K4["reverse proxy:<br/>HTTP/1.1 origin, 502 on error"]
 ```
 
 ## Measured
@@ -122,6 +148,10 @@ graph TD
 | udp-fragments-witnessed | 200 | ferrox-core-hysteria::tests::every_length_survives_fragment_then_defrag_intact |
 | obfuscated-datagram-heap-copies | 0 | ferrox-core-hysteria::tests::a_sealed_datagram_never_touches_the_heap |
 | pinned-hysteria-client-verdicts | 1 | scripts/run-upstream-suite.sh |
+| masquerade-answers-browser-on-same-port | 1 | ferrox-app-proxy::tests::hysteria_serves_a_canned_masquerade_response |
+| masquerade-file-bytes-served | 1 | ferrox-app-proxy::tests::hysteria_serves_a_file_from_the_masquerade_directory |
+| masquerade-proxied-round-trips | 1 | ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_an_origin |
+| masquerade-escapes-served | 0 | ferrox-app-proxy::tests::hysteria_refuses_a_masquerade_path_that_escalates_the_directory |
 <!-- counts:end -->
 
 ## Ops
@@ -190,9 +220,21 @@ tunnel. No artefact from this branch has been read.
   copy on the receive of an obfuscated datagram, retirable only by widening every
   shared `MAX_DATAGRAM` buffer; the salt itself costs one `getrandom` per
   datagram, which is the construction, not overhead.
-- **The masquerade site's request handling.** Nothing on the H3 control stream
-  pretends to serve an ordinary request; the port answers hysteria and nothing
-  else.
+- **The masquerade site's web-server machinery, rewritten minimal.** The
+  reference answers `masq` with a real `net/http` stack — a `Server`, virtual
+  hosts, `http.FileServer` with its full `os` walk, and an `httputil` reverse
+  proxy pooling origin connections. This tree hand-rolls the same four cover
+  answers off its own H3 codec: `serve_file` sanitises the `:path` (percent-
+  decode, reject any `..`/escape) against one root and answers with a
+  content-type read off the extension; `serve_proxy` speaks a hand-written
+  HTTP/1.1 request/response over the existing transport seam, drops the
+  hop-by-hop headers, de-frames a chunked origin body in core
+  (`a_chunked_origin_body_defragments_to_its_bytes`) and buffers it under the
+  datagram cap. No server object, no pooling, no new dependency —
+  `masquerade-file-bytes-served`, `masquerade-proxied-round-trips` and
+  `masquerade-escapes-served` 0 pin the file, proxy and traversal paths, and
+  `masquerade-answers-browser-on-same-port` pins the canned answer reaching a
+  browser on the port hysteria dials.
 - **A custom brutal sender.** `brutal` and `force-brutal` pace as quiche `bbr`
   (`Congestion::quiche_name`), stated in the settings test. That is a
   narrower congestion loop, not a second implementation of one.
@@ -263,10 +305,11 @@ closed, stale and stream-exhausted entries on the next dial, so an outbound
 burst holds one connection each for `REUSE_WINDOW` (150 s, half the idle
 timeout); the client's UDP lane rotates associations on one connection rather
 than retiring the connection per destination, so a retired flow's late
-datagrams land on the floor by the never-reuse rule; the masquerade site stays out as the
-`hysteria-obfs-masquerade` add-on in `crates/ferrox-prompt/prompts.md` — it is
-an H3 request-serving subsystem, not a rung on the relay, and salamander now
-ships while it does not; 0-RTT,
+datagrams land on the floor by the never-reuse rule; the masquerade site's
+`proxy` cover dials `http` and `unix` origins but an `https` origin is a named
+ceiling — it answers `502` rather than pulling a rustls client into the relay —
+and every origin request pays a fresh connection closed after its buffered
+response, so a hot cover page re-dials instead of pooling; 0-RTT,
 migration and key updates are quiche's; the server keeps one UDP socket per
 inbound with a per-connection route map and a linear scan over routes per
 Initial.

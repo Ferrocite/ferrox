@@ -1,12 +1,14 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs as _, UdpSocket};
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use ferrox_core::foxy::frames;
-use ferrox_core::hysteria::{self, Defrag, UdpMessage};
+use ferrox_core::hysteria::{self, Defrag, Masquerade, UdpMessage};
 
 use crate::conn::Connection;
 use crate::quic::{Unfilled, MAX_DATAGRAM};
@@ -673,6 +675,8 @@ fn serve_stream(
     local: SocketAddr,
     stream: u64,
     serve: &Serve,
+    peer: SocketAddr,
+    masq: &Masquerade,
 ) {
     let mut head = Vec::with_capacity(8);
     let mut room = Unfilled::<64>::new();
@@ -710,6 +714,13 @@ fn serve_stream(
         let want = 1usize << usize::from(head[0] >> 6);
         if head.len() >= want {
             let Some(consumed) = hysteria::read_tcp_prefix(&head) else {
+                // Not a hysteria flow prefix. A stream opening with an HTTP/3 frame type is a browser asking for a page in a flow's slot: answer it as the cover site. Any other prefix is dropped, exactly as an unreadable flow was.
+                if matches!(
+                    frames::quic_read(&head, &mut 0usize),
+                    Some(kind) if kind == frames::H3_HEADERS || kind == frames::H3_DATA
+                ) {
+                    serve_masquerade_stream(shared, sock, stream, head, peer, masq);
+                }
                 return;
             };
             break consumed;
@@ -726,6 +737,427 @@ fn serve_stream(
     // The prefix stays in the buffer and the cursor steps over it, so no payload byte is moved.
     flow.at = prefix;
     serve(flow);
+}
+
+/// How long a masquerade origin may take to answer before the cover gives up and answers the bad-gateway line.
+const ORIGIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The most bytes a masquerade origin's reply may grow to before the reader stops, so a cover page never buffers without bound; the wire's own single-datagram ceiling is the natural cap.
+const MASQ_BODY_CAP: usize = hysteria::MAX_UDP_PAYLOAD;
+
+/// Answers a browser request that arrived on a flow slot: read the whole request off the stream, build the cover response, and finish the stream with it so the browser sees a complete reply while the connection stays up for its next request.
+fn serve_masquerade_stream(
+    shared: &Arc<Mutex<quiche::Connection>>,
+    sock: &Arc<crate::quic::Datagram>,
+    stream: u64,
+    seed: Vec<u8>,
+    peer: SocketAddr,
+    masq: &Masquerade,
+) {
+    let Some(request) = read_h3_request(shared, stream, seed) else {
+        return;
+    };
+    let peer = peer.to_string();
+    let mut reply = Vec::new();
+    masq_bytes(masq, &request, Some(&peer), &mut reply);
+    let Ok(mut conn) = shared.lock() else {
+        return;
+    };
+    if conn.is_closed() {
+        return;
+    }
+    let _ = conn.stream_send(stream, &reply, true);
+    crate::quic::flush_egress(&mut conn, sock);
+}
+
+/// Reads a browser's HTTP/3 request off a stream the router has already begun: the bytes in `buf` first, then whatever still arrives. A request whose headers are whole and which declares no body returns at once, so a keep-alive stream the browser leaves open never blocks the cover; a body is drained only until its declared length or the stream's finish.
+fn read_h3_request(
+    shared: &Arc<Mutex<quiche::Connection>>,
+    stream: u64,
+    mut buf: Vec<u8>,
+) -> Option<hysteria::H3Request> {
+    let mut room = Unfilled::<4096>::new();
+    loop {
+        if let Some(request) = assemble_request(&buf) {
+            let declares_body = request.headers.iter().any(|(name, _)| {
+                name.eq_ignore_ascii_case("content-length")
+                    || name.eq_ignore_ascii_case("transfer-encoding")
+            });
+            if !declares_body || !request.body.is_empty() {
+                return Some(request);
+            }
+        }
+        if buf.len() >= HEAD_CAP {
+            return assemble_request(&buf);
+        }
+        let fin = {
+            let Ok(mut conn) = shared.lock() else {
+                return assemble_request(&buf);
+            };
+            if conn.is_closed() {
+                return assemble_request(&buf);
+            }
+            match conn.stream_recv(stream, room.as_mut()) {
+                Ok((0, _)) | Err(quiche::Error::Done) => false,
+                Ok((n, fin)) => {
+                    buf.extend_from_slice(&room.as_mut()[..n]);
+                    fin
+                }
+                Err(_) => return assemble_request(&buf),
+            }
+        };
+        if fin {
+            return assemble_request(&buf);
+        }
+        std::thread::sleep(STREAM_POLL);
+    }
+}
+
+/// Walks a request stream's HTTP/3 frames once: the first `HEADERS` block becomes the request line and fields, and every `DATA` payload that follows becomes the body. `None` while any frame is still incomplete, so the reader keeps waiting rather than answering a half request.
+fn assemble_request(bytes: &[u8]) -> Option<hysteria::H3Request> {
+    let mut at = 0usize;
+    let mut request: Option<hysteria::H3Request> = None;
+    while let Some(frame) = frames::h3_frame(bytes, &mut at) {
+        let end = at + frame.length as usize;
+        let payload = bytes.get(at..end)?;
+        match frame.kind {
+            frames::H3_HEADERS if request.is_none() => {
+                request = hysteria::parse_h3_request(payload);
+            }
+            frames::H3_DATA => {
+                if let Some(request) = request.as_mut() {
+                    request.body.extend_from_slice(payload);
+                }
+            }
+            _ => {}
+        }
+        at = end;
+    }
+    request
+}
+
+/// Builds the HTTP/3 cover response for one request, dispatching on the configured masquerade type: a not-found, a canned line, a static file, or a reverse-proxied origin. The caller finishes the stream with these bytes.
+fn masq_bytes(
+    masq: &Masquerade,
+    request: &hysteria::H3Request,
+    peer: Option<&str>,
+    out: &mut Vec<u8>,
+) {
+    match masq {
+        Masquerade::NotFound => not_found(out),
+        Masquerade::Response {
+            status,
+            headers,
+            body,
+        } => {
+            let fields: Vec<(&str, &str)> = headers
+                .iter()
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            hysteria::encode_h3_response(*status, &fields, body, out);
+        }
+        Masquerade::File { dir } => serve_file(dir, request, out),
+        Masquerade::Proxy {
+            url,
+            rewrite_host,
+            x_forwarded,
+            insecure,
+        } => serve_proxy(
+            url,
+            *rewrite_host,
+            *x_forwarded,
+            *insecure,
+            request,
+            peer,
+            out,
+        ),
+    }
+}
+
+/// The plain not-found line the reference cover answers with, reused as the miss for a static file and the default type.
+fn not_found(out: &mut Vec<u8>) {
+    hysteria::encode_h3_response(
+        404,
+        &[("content-type", "text/plain; charset=utf-8")],
+        b"404 page not found\n",
+        out,
+    );
+}
+
+/// Serves one static file under `dir` to a browser request, refusing any path that steps out of the root. A directory yields its `index.html`, else a minimal listing; an escaping, missing, or unreadable path yields the not-found.
+fn serve_file(dir: &str, request: &hysteria::H3Request, out: &mut Vec<u8>) {
+    let Some(path) = safe_path(dir, &request.path) else {
+        return not_found(out);
+    };
+    if path.is_dir() {
+        let index = path.join("index.html");
+        if let Ok(bytes) = std::fs::read(&index) {
+            let kind = hysteria::content_type(&index.to_string_lossy());
+            return hysteria::encode_h3_response(200, &[("content-type", kind)], &bytes, out);
+        }
+        let listing = directory_listing(&path);
+        return hysteria::encode_h3_response(
+            200,
+            &[("content-type", "text/html; charset=utf-8")],
+            listing.as_bytes(),
+            out,
+        );
+    }
+    let kind = hysteria::content_type(&path.to_string_lossy());
+    match std::fs::read(&path) {
+        Ok(bytes) => hysteria::encode_h3_response(200, &[("content-type", kind)], &bytes, out),
+        Err(_) => not_found(out),
+    }
+}
+
+/// Resolves a browser `:path` to a file under `root`, percent-decoding it and rejecting any `..` step, so the served path never climbs above the masquerade directory. A leading slash names the directory's own root, not the filesystem's.
+fn safe_path(root: &str, path: &str) -> Option<std::path::PathBuf> {
+    let trimmed = path.split(['?', '#']).next().unwrap_or(path);
+    let decoded = percent_decode(trimmed)?;
+    let text = std::str::from_utf8(&decoded).ok()?;
+    let mut joined = std::path::PathBuf::from(root);
+    for segment in text.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => return None,
+            other => {
+                if other.contains('\\') || other.contains('\0') {
+                    return None;
+                }
+                joined.push(other);
+            }
+        }
+    }
+    Some(joined)
+}
+
+/// A minimal HTML directory listing, used only when a masquerade directory has no `index.html`: enough of a page to pass as a static site's index.
+fn directory_listing(dir: &std::path::Path) -> String {
+    let name = dir.to_string_lossy();
+    let mut html = format!("<!doctype html><html><head><title>Index of {name}</title></head><body><h1>Index of {name}</h1><ul>");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        html.push_str("</ul></body></html>");
+        return html;
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    for entry in names {
+        let esc = html_escape(&entry);
+        html.push_str("<li><a href=\"");
+        html.push_str(&esc);
+        html.push_str("\">");
+        html.push_str(&esc);
+        html.push_str("</a></li>");
+    }
+    html.push_str("</ul></body></html>");
+    html
+}
+
+/// The characters that must not leak raw into a listing's HTML, so a crafted filename cannot inject markup into the cover page.
+fn html_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Percent-decodes a URL path; a `%` not followed by two hex digits is not valid and rejects the whole path, so a half-decoded traversal never slips through.
+fn percent_decode(input: &str) -> Option<Vec<u8>> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                let hi = hex_val(*bytes.get(i + 1)?)?;
+                let lo = hex_val(*bytes.get(i + 2)?)?;
+                out.push(hi << 4 | lo);
+                i += 3;
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+fn hex_val(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Forwards a browser request to a masquerade origin over a hand-written HTTP/1.1 exchange and re-emits the reply as HTTP/3, dropping the origin's hop-by-hop headers. One connection per request, closed on the origin's `connection: close`; any failure to reach or parse the origin answers the bad-gateway line.
+fn serve_proxy(
+    url: &str,
+    rewrite_host: bool,
+    x_forwarded: bool,
+    _insecure: bool,
+    request: &hysteria::H3Request,
+    peer: Option<&str>,
+    out: &mut Vec<u8>,
+) {
+    match fetch_origin(url, request, rewrite_host, x_forwarded, peer) {
+        Some(origin) => {
+            let fields: Vec<(&str, &str)> = origin
+                .headers
+                .iter()
+                .filter(|(name, _)| !is_hop_by_hop(name))
+                .map(|(name, value)| (name.as_str(), value.as_str()))
+                .collect();
+            hysteria::encode_h3_response(origin.status, &fields, &origin.body, out);
+        }
+        None => hysteria::encode_h3_response(
+            502,
+            &[("content-type", "text/plain; charset=utf-8")],
+            b"502 Bad Gateway\n",
+            out,
+        ),
+    }
+}
+
+/// Dials the origin `url` names and runs one HTTP/1.1 exchange: `unix` connects a socket at the path, `http` resolves host and port, and `https` is a named ceiling the origin client does not carry, so it returns `None` and the caller answers bad-gateway.
+fn fetch_origin(
+    url: &str,
+    request: &hysteria::H3Request,
+    rewrite_host: bool,
+    x_forwarded: bool,
+    peer: Option<&str>,
+) -> Option<hysteria::OriginResponse> {
+    let (scheme, rest) = url.split_once("://")?;
+    let head = origin_request(request, rest, rewrite_host, x_forwarded, peer);
+    match scheme {
+        "unix" => exchange_socket(rest, &head),
+        "http" => exchange_tcp(rest, 80, &head),
+        _ => None,
+    }
+}
+
+/// Rebuilds the browser request as an HTTP/1.1 exchange line: the method and path, a `Host` from the origin or the request's own authority, the request's ordinary headers minus the hop-by-hop ones, and the forwarded headers when asked. The body follows its copied `content-length`.
+fn origin_request(
+    request: &hysteria::H3Request,
+    authority: &str,
+    rewrite_host: bool,
+    x_forwarded: bool,
+    peer: Option<&str>,
+) -> Vec<u8> {
+    let host = if rewrite_host || request.authority.is_empty() {
+        authority
+    } else {
+        &request.authority
+    };
+    let target = if request.path.is_empty() {
+        "/"
+    } else {
+        request.path.as_str()
+    };
+    let method = if request.method.is_empty() {
+        "GET"
+    } else {
+        request.method.as_str()
+    };
+    let mut head = Vec::with_capacity(256 + request.body.len());
+    let _ = write!(&mut head, "{method} {target} HTTP/1.1\r\n");
+    let _ = write!(&mut head, "Host: {host}\r\n");
+    for (name, value) in &request.headers {
+        if is_hop_by_hop(name) {
+            continue;
+        }
+        let _ = write!(&mut head, "{name}: {value}\r\n");
+    }
+    if x_forwarded {
+        if let Some(for_ip) = peer {
+            let _ = write!(&mut head, "X-Forwarded-For: {for_ip}\r\n");
+        }
+        let _ = write!(&mut head, "X-Forwarded-Proto: https\r\n");
+    }
+    let _ = write!(&mut head, "Connection: close\r\n");
+    head.extend_from_slice(b"\r\n");
+    head.extend_from_slice(&request.body);
+    head
+}
+
+/// A header that belongs to one hop only and must not be copied onto an origin request or back to the browser.
+fn is_hop_by_hop(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+/// Dials an origin over TCP and runs one closed exchange, defaulting the port the scheme implies when the authority omits one.
+fn exchange_tcp(
+    authority: &str,
+    default_port: u16,
+    head: &[u8],
+) -> Option<hysteria::OriginResponse> {
+    let host = authority.split('/').next().unwrap_or(authority);
+    let (host_only, port) = match host.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse().ok()?),
+        None => (host, default_port),
+    };
+    let mut stream = TcpStream::connect((host_only, port)).ok()?;
+    let _ = stream.set_read_timeout(Some(ORIGIN_TIMEOUT));
+    stream.write_all(head).ok()?;
+    stream.flush().ok()?;
+    read_origin(&mut stream)
+}
+
+/// Dials an origin over a Unix socket and runs one closed exchange, with the pseudo authority the socket implies.
+#[cfg(unix)]
+fn exchange_socket(path: &str, head: &[u8]) -> Option<hysteria::OriginResponse> {
+    let mut stream = UnixStream::connect(path).ok()?;
+    let _ = stream.set_read_timeout(Some(ORIGIN_TIMEOUT));
+    stream.write_all(head).ok()?;
+    stream.flush().ok()?;
+    read_origin(&mut stream)
+}
+
+/// On a platform with no Unix socket, the `unix` origin scheme is simply unreachable and answers bad-gateway.
+#[cfg(not(unix))]
+fn exchange_socket(_path: &str, _head: &[u8]) -> Option<hysteria::OriginResponse> {
+    None
+}
+
+/// Reads an origin's whole HTTP/1.1 reply to its close, then reduces it to status, headers, and body; the buffered bytes stop at the cover's cap so a runaway origin never exhausts memory.
+fn read_origin<R: Read>(stream: &mut R) -> Option<hysteria::OriginResponse> {
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 8 * 1024];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                raw.extend_from_slice(&chunk[..n]);
+                if raw.len() >= MASQ_BODY_CAP {
+                    break;
+                }
+            }
+        }
+    }
+    hysteria::parse_origin_response(&raw)
 }
 
 /// Bring one datagram association up: resolve the address the client named, connect a target socket of the matching family, and hand a reader thread the same socket so its replies return over the lane. `None` when the address is unresolvable or no socket can be raised, and the datagram is then dropped.
@@ -1029,6 +1461,7 @@ struct Router<'a> {
     out: Unfilled<MAX_DATAGRAM>,
     auths: &'a [String],
     serve: &'a Serve,
+    masq: Arc<Masquerade>,
     routes: HashMap<Vec<u8>, Inbound>,
 }
 
@@ -1044,6 +1477,8 @@ fn auth_exchange(
     conn: &mut quiche::Connection,
     auths: &[String],
     inbound: &mut Inbound,
+    peer: SocketAddr,
+    masq: &Masquerade,
 ) -> Option<bool> {
     let mut room = Unfilled::<4096>::new();
     loop {
@@ -1059,6 +1494,20 @@ fn auth_exchange(
     let body = frames::h3_frame(&inbound.auth_buf, &mut at)
         .filter(|frame| frame.kind == frames::H3_HEADERS)
         .and_then(|frame| inbound.auth_buf.get(at..at + frame.length as usize))?;
+    // A request that is not the hysteria handshake shape is a browser: it is answered as the cover site on this very stream — the plain not-found when no richer cover is configured — and the connection is kept for its later requests. A right-shape, wrong-password handshake still falls through below and refuses exactly as a plain hysteria server would.
+    if !hysteria::is_hysteria_auth_shape(body) {
+        let request = hysteria::parse_h3_request(body).unwrap_or_default();
+        inbound.auth_buf.clear();
+        inbound.authed = true;
+        let peer = peer.to_string();
+        let mut reply = Vec::new();
+        masq_bytes(masq, &request, Some(&peer), &mut reply);
+        if conn.stream_send(AUTH_STREAM, &reply, true).is_err() {
+            return None;
+        }
+        flush(sock, conn, out);
+        return Some(true);
+    }
     let ok = auths
         .iter()
         .any(|auth| hysteria::verify_auth_request(body, auth));
@@ -1117,6 +1566,7 @@ impl Router<'_> {
             out,
             auths,
             serve,
+            masq,
             local,
         } = self;
         let Some(shared) = routes.get(dcid).map(|i| Arc::clone(&i.conn)) else {
@@ -1163,7 +1613,9 @@ impl Router<'_> {
                 let Some(inbound) = routes.get_mut(dcid) else {
                     return;
                 };
-                let Some(ok) = auth_exchange(sock, out.as_mut(), &mut conn, auths, inbound) else {
+                let Some(ok) =
+                    auth_exchange(sock, out.as_mut(), &mut conn, auths, inbound, from, masq)
+                else {
                     return;
                 };
                 if !ok {
@@ -1186,9 +1638,19 @@ impl Router<'_> {
                 let thread_shared = Arc::clone(&shared);
                 let thread_sock = Arc::clone(sock);
                 let thread_serve = Arc::clone(serve);
+                let thread_masq = Arc::clone(masq);
                 let local = *local;
+                let peer = from;
                 std::thread::spawn(move || {
-                    serve_stream(&thread_shared, &thread_sock, local, id, &thread_serve);
+                    serve_stream(
+                        &thread_shared,
+                        &thread_sock,
+                        local,
+                        id,
+                        &thread_serve,
+                        peer,
+                        &thread_masq,
+                    );
                 });
             }
             relay_datagrams(routes, sock, &shared, dcid, &mut conn);
@@ -1228,6 +1690,7 @@ impl Router<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn serve_loop(
     address: &str,
     auths: &[String],
@@ -1235,6 +1698,7 @@ pub(crate) fn serve_loop(
     cert_path: &str,
     key_path: &str,
     obfs_password: &str,
+    masq: &Masquerade,
     serve: &Serve,
 ) {
     let Some(bound) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
@@ -1257,6 +1721,7 @@ pub(crate) fn serve_loop(
         out: Unfilled::<MAX_DATAGRAM>::new(),
         auths,
         serve,
+        masq: Arc::from(masq.clone()),
         routes: HashMap::new(),
     };
     let mut buf = Unfilled::<MAX_DATAGRAM>::new();

@@ -49,7 +49,7 @@ What runs against what: `xray-rust`'s interop tests drive the pinned Xray client
 | HTTPUpgrade | done, both roles, `?ed=N` carried (row 16) |
 | xHTTP / SplitHTTP modes (packet-up, stream-up, stream-one, padding/placement) | one mode only (POST + chunked) |
 | KCP/mKCP + FinalMask (aes128gcm, header, original) | core done; finalmask refused (row 31) |
-| Hysteria v2 transport (network `hysteria`, masquerade surface) | done as `vless-hysteria` / `protocol: hysteria` over quiche, both roles (row 19); datagrams, salamander and the masquerade site are not carried |
+| Hysteria v2 transport (network `hysteria`, masquerade surface) | done as `vless-hysteria` / `protocol: hysteria` over quiche, both roles (row 19); datagrams, salamander obfs and the masquerade site are all carried (an `https` masquerade origin is a named `502` ceiling) |
 | MASQUE transport | CONNECT-IP client dialled (h2/h3) on the Foxy lane; server transport refused (row 20) |
 | XDrive | refused (row 32) |
 | Browser dialer | absent |

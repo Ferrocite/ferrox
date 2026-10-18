@@ -312,6 +312,10 @@ carrier-hysteria udp-datagram-decode-copies 0 ferrox-core-hysteria::tests::a_dec
 carrier-hysteria udp-fragments-witnessed 200 ferrox-core-hysteria::tests::every_length_survives_fragment_then_defrag_intact
 carrier-hysteria obfuscated-datagram-heap-copies 0 ferrox-core-hysteria::tests::a_sealed_datagram_never_touches_the_heap
 carrier-hysteria pinned-hysteria-client-verdicts 1 scripts/run-upstream-suite.sh
+carrier-hysteria masquerade-answers-browser-on-same-port 1 ferrox-app-proxy::tests::hysteria_serves_a_canned_masquerade_response
+carrier-hysteria masquerade-file-bytes-served 1 ferrox-app-proxy::tests::hysteria_serves_a_file_from_the_masquerade_directory
+carrier-hysteria masquerade-proxied-round-trips 1 ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_an_origin
+carrier-hysteria masquerade-escapes-served 0 ferrox-app-proxy::tests::hysteria_refuses_a_masquerade_path_that_escalates_the_directory
 
 # --- TLS ClientHello `cipher_suites` field (PattNG ext.) --------------------
 tls-cipher-suites ops-retired-instructions UNBLESSED scripts/count-ops.sh
