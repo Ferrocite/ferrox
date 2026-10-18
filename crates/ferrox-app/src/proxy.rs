@@ -1,7 +1,7 @@
 use crate::conn::{parse_target, Connection, Listener};
 use std::collections::{HashMap, HashSet};
 use std::io::{IoSlice, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{Shutdown, SocketAddr, ToSocketAddrs, UdpSocket};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
@@ -8365,13 +8365,6 @@ pub(crate) trait FrameWrite: Write + Send {
 }
 
 impl FrameWrite for Connection {
-    fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
-        write_all_parts::<VECTOR_PARTS>(self, parts).is_ok()
-    }
-}
-
-// The h2 server seals frames over a concrete `TcpStream`, so the generic coalescing write is impl'd for it beside the seam.
-impl FrameWrite for TcpStream {
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
         write_all_parts::<VECTOR_PARTS>(self, parts).is_ok()
     }
@@ -20329,6 +20322,59 @@ mod tests {
         assert_eq!(status, 201);
         assert_eq!(content_type_of(&headers), "text/plain");
         assert_eq!(body, b"origin");
+    }
+
+    /// A one-shot `unix` masquerade origin: the same answer as the TCP origin, served from a socket
+    /// path so the cover's dial goes through the seam's unix arm. Returns the path it listens on.
+    fn masq_unix_origin() -> std::path::PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-masq-origin-{}-{stamp}.sock",
+            std::process::id()
+        ));
+        let origin = crate::conn::Listener::bind(&crate::conn::Target::Unix(path.clone()))
+            .expect("binds a unix origin");
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = origin.accept() else {
+                return;
+            };
+            let mut drain = [0u8; 1024];
+            let _ = stream.read(&mut drain);
+            let _ = stream.write_all(b"HTTP/1.1 201 Created\r\ncontent-type: text/plain\r\ncontent-length: 6\r\n\r\norigin");
+        });
+        path
+    }
+
+    #[test]
+    fn hysteria_proxies_a_masquerade_request_to_a_unix_origin() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_masq_unix_once, 3);
+    }
+
+    fn hysteria_masq_unix_once() {
+        use ferrox_core::hysteria::Masquerade;
+        let path = masq_unix_origin();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_masq(
+            "lane-auth",
+            id,
+            "",
+            Masquerade::Proxy {
+                url: format!("unix://{}", path.display()),
+                rewrite_host: false,
+                x_forwarded: false,
+                insecure: false,
+            },
+        );
+        // The cover dials a socket path with the same bounded call it dials a TCP origin with, and the answer comes back identical.
+        let (status, headers, body) = masq_get(port, &roots, "/anything");
+        assert_eq!(status, 201);
+        assert_eq!(content_type_of(&headers), "text/plain");
+        assert_eq!(body, b"origin");
+        std::fs::remove_file(&path).ok();
     }
 
     /// A one-shot `https` masquerade origin: a TLS-terminating loopback listener that answers the first request it accepts with a fixed HTTP/1.1 body, then closes. Returns the port it listens on.
