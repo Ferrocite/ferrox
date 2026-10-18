@@ -73,7 +73,7 @@ graph TD
 | framing-bytes-after-the-101 | 0 | ferrox-app-httpupgrade::tests::upgrade_carries_an_echo_over_loopback |
 | user-space-copies-per-byte-relayed | 1 | ferrox-app-httpupgrade::tests::upgrade_carries_an_echo_over_loopback |
 | write-calls-per-early-dial | 1 | ferrox-app-httpupgrade::tests::the_early_data_rides_in_one_write_with_the_request |
-| request-reallocations-per-dial | 0 | ferrox-app-httpupgrade::tests::the_request_is_sized_for_its_bytes |
+| request-reallocations-per-dial | 0 | ferrox-app-httpupgrade::tests::the_request_buffer_holds_its_capacity_over_a_dial_cycle |
 | round-trips-per-early-dial | 0 | ferrox-app-httpupgrade::tests::an_over_budget_payload_rides_ahead_of_a_lazy_answer |
 | round-trips-per-shadowsocks-dial | 0 | ferrox-app-proxy::tests::socks_dials_ss_over_httpupgrade_with_early_data_to_echo |
 | head-reads-per-window | 1 | ferrox-app-proxy::tests::a_kept_head_costs_one_read_per_window_and_takes_its_tail |
@@ -336,19 +336,37 @@ nowhere to put the tail — and which five claims about this carrier are false:
   then payload), and the held-back ordering after the `101`. On Windows the
   socket `write_slices` is two `write_all`s, so the raw dial there is where it
   was; the record halving holds wherever a session is the sink.
-- **A request built for its template instead of its bytes.** `format!` pushed
-  the five pieces into an unreserved `String`: **capacity 132 on a typical dial**
+- **A request built for its template, then thrown away.** `format!` pushed the
+  five pieces into an unreserved `String`: **capacity 132 on a typical dial**
   (`oracle.example` + `/tunnel`, 87 bytes), reallocating once past 66 bytes of
   host plus path — 132 → 264, and two reallocations, to 858, for a 400-byte host
-  (measured with a counting global allocator, rustc 1.99.0). The request is
-  `66 + host.len() + path.len()` bytes, so `upgrade_request` now reserves exactly
-  that and pushes the same five pieces: **one allocation, capacity == len, no
-  reallocation** on either dial path. The checker is
-  `the_request_is_sized_for_its_bytes`, which asserts `capacity() == len()` for a
-  short and a long host and byte equality with what `format!` writes for both;
+  (measured with a counting global allocator, rustc 1.99.0). The first step
+  reserved the request's own length, `66 + host.len() + path.len()`, and pushed
+  the same five pieces into it: one allocation, `capacity == len`. The second
+  takes that allocation out of the dial: `send_request` fills the dialling
+  thread's own buffer — `clear`, one `reserve`, five `extend_from_slice` — and
+  hands the writer a slice of it, so a thread that dials again does not enter the
+  allocator. The checker is
+  `the_request_buffer_holds_its_capacity_over_a_dial_cycle`: twelve dials over
+  four host/path shapes through a `Recorder`, the widest first, holding
+  `capacity()` and the buffer's base pointer unchanged from round 0 on — a `Vec`
+  cannot keep its address and have reallocated — and comparing every round's
+  bytes against what the formatter writes; round 0's capacity is exactly
+  `66 + host + path`. `the_early_data_rides_in_one_write_with_the_request` adds
+  that the request part's base *is* that buffer, so the staging is handed over
+  and not copied into the write. What got worse in exchange: the first dial's
+  capacity stays with the thread for its life, so a wide host followed by narrow
+  ones leaves slack no dial asked for (`capacity >= len`, no longer
+  `capacity == len`); each dial pays a thread-local lookup and a `RefCell` borrow
+  the fresh `String` did not; and the write happens with that borrow held, safe
+  only because nothing in a socket write re-enters `REQUEST`. Handing the five
+  pieces to the writer as five segments is the other way to remove the buffer,
+  and it is rejected: on the record lane rustls' `coalesce` stacks four
+  `IoSlice`s and heap-allocates past that, so five pieces there trade this
+  saving for one allocation per write.
   `an_early_data_budget_leaves_the_request_unchanged` still pins the bytes across
-  every budget. What did not move: the bytes, their order, and the request line's
-  independence from the budget.
+  every budget, now dialled through the same `Recorder`. What did not move: the
+  bytes, their order, and the request line's independence from the budget.
 
 ## Pins
 
