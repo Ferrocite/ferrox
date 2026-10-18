@@ -159,6 +159,9 @@ carrier-httpheader ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-httpheader framing-bytes-added 0 ferrox-app-httpheader::tests::header_carries_an_echo_over_loopback
 carrier-httpheader head-tail-read-syscalls 0 ferrox-app-httpheader::tests::the_bytes_behind_the_head_reach_the_relay_without_a_syscall
 carrier-httpheader head-tail-allocations 0 ferrox-app-httpheader::tests::the_record_head_hands_over_the_buffer_it_filled
+carrier-httpheader write-calls-per-dial 1 ferrox-app-httpheader::tests::the_request_reaches_the_write_as_the_runs_it_is_made_of
+carrier-httpheader request-staging-copies-per-dial 0 ferrox-app-httpheader::tests::the_request_reaches_the_write_as_the_runs_it_is_made_of
+carrier-httpheader request-buffer-allocations-per-dial 0 ferrox-app-httpheader::tests::the_request_reaches_the_write_as_the_runs_it_is_made_of
 carrier-httpheader user-space-copies-per-byte-relayed 1 ferrox-app-proxy::tests::carried_streams_round_trip_behind_the_http_camouflage
 
 carrier-grpc ops-retired-instructions UNBLESSED scripts/count-ops.sh
