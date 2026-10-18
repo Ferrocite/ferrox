@@ -731,7 +731,99 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
                 .unwrap_or(""),
         ),
         obfs_password,
+        hop: hysteria_hop(hy),
     })
+}
+
+/// The port-hopping plan a hysteria dial rotates its server port on, read from its
+/// `hysteriaSettings`. `serverPorts`/`mport` names the ports or `start-end` ranges —
+/// an array of numbers/strings or one comma-separated string; `hopInterval` and
+/// `hopIntervalMax` bound the stay in seconds (a bare number, or an `s`/`ms` suffix).
+/// A malformed token is dropped rather than guessed at, and with nothing valid left
+/// the dial stays on its fixed port: a hop is anti-blocking, not correctness, so it
+/// never reroutes a flow to a port the config did not name. Field names take both the
+/// camel and the snake spelling the reference's two JSON dialects use.
+fn hysteria_hop(hy: Option<&Json>) -> Option<ferrox_core::hysteria::Hop> {
+    use ferrox_core::hysteria::{Hop, PortRange};
+    let hy = hy?;
+    let field = |camel: &str, snake: &str| hy.get(camel).or_else(|| hy.get(snake));
+    let spec = field("serverPorts", "server_ports").or_else(|| field("mport", "mport"))?;
+    let mut ranges: Vec<PortRange> = Vec::new();
+    if let Some(items) = spec.as_arr() {
+        for item in items {
+            push_port_spec(item.as_str(), &mut ranges);
+            if let Some(port) = item.as_port() {
+                ranges.push(PortRange {
+                    start: port,
+                    end: port,
+                });
+            }
+        }
+    } else if let Some(port) = spec.as_port() {
+        ranges.push(PortRange {
+            start: port,
+            end: port,
+        });
+    } else {
+        push_port_spec(spec.as_str(), &mut ranges);
+    }
+    if ranges.is_empty() {
+        return None;
+    }
+    let low = stay_ms(field("hopInterval", "hop_interval")).unwrap_or(5_000);
+    let high = stay_ms(field("hopIntervalMax", "hop_interval_max")).unwrap_or(low);
+    Some(Hop {
+        ranges,
+        interval_ms: (low.min(high), low.max(high)),
+    })
+}
+
+/// Append every `port` or `start-end` token of a comma-separated port spec; a token
+/// that is not a valid nonzero port, or a backwards range, is skipped, never guessed.
+fn push_port_spec(text: Option<&str>, ranges: &mut Vec<ferrox_core::hysteria::PortRange>) {
+    use ferrox_core::hysteria::PortRange;
+    let Some(text) = text else { return };
+    for token in text.split(',') {
+        let token = token.trim();
+        match token.split_once('-') {
+            Some((lo, hi)) => {
+                let (Ok(start), Ok(end)) = (lo.trim().parse::<u16>(), hi.trim().parse::<u16>())
+                else {
+                    continue;
+                };
+                if start > 0 && start <= end {
+                    ranges.push(PortRange { start, end });
+                }
+            }
+            None => {
+                if let Some(port) = token.parse::<u16>().ok().filter(|port| *port > 0) {
+                    ranges.push(PortRange {
+                        start: port,
+                        end: port,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// The next stay length in milliseconds: a bare number or string is seconds, an `s`
+/// suffix is seconds, an `ms` suffix is milliseconds; `None` when absent or malformed.
+fn stay_ms(value: Option<&Json>) -> Option<u64> {
+    match value? {
+        Json::Num(n) if n.fract() == 0.0 && *n >= 0.0 => Some(*n as u64 * 1000),
+        Json::Str(text) => {
+            let text = text.trim();
+            if let Some(ms) = text.strip_suffix("ms") {
+                ms.trim().parse::<u64>().ok()
+            } else if let Some(s) = text.strip_suffix('s') {
+                s.trim().parse::<u64>().ok().map(|secs| secs * 1000)
+            } else {
+                text.parse::<u64>().ok().map(|secs| secs * 1000)
+            }
+        }
+        _ => None,
+    }
 }
 
 /// The `obfs: salamander` password a hysteria transport names in its `tlsSettings`, or `None` for no obfuscation and `Some("")` for one this build cannot honour; the caller serves cleartext only for the first.
@@ -952,6 +1044,40 @@ mod tests {
             ),
             Carrier::Unknown { .. }
         ));
+    }
+
+    #[test]
+    fn a_hysteria_carrier_reads_a_port_hopping_plan() {
+        let planned = |text: &str| {
+            let Carrier::Hysteria(config) = stream_carrier(
+                crate::json::parse(text)
+                    .expect("parses")
+                    .get("streamSettings"),
+            ) else {
+                panic!("a v2 hysteria carrier");
+            };
+            config.hop
+        };
+        // A comma spec of a range and a lone port, bounded in seconds and one with a unit, expands to the sorted set the dial rotates over.
+        let spec = r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2, "serverPorts": "20000-20002,443", "hopInterval": 5, "hopIntervalMax": "10s"}}}"#;
+        let plan = planned(spec).expect("a plan");
+        assert_eq!(plan.ports(), vec![443, 20_000, 20_001, 20_002]);
+        assert_eq!(
+            plan.interval_ms,
+            (5_000, 10_000),
+            "seconds reach the dial as ms"
+        );
+        // An array of numbers and range strings is the same plan; with no interval the stay defaults to a fixed five seconds.
+        let arr = r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2, "serverPorts": [443, "9000-9001"]}}}"#;
+        let plan = planned(arr).expect("a plan");
+        assert_eq!(plan.ports(), vec![443, 9_000, 9_001]);
+        assert_eq!(plan.interval_ms, (5_000, 5_000), "an absent stay is fixed");
+        // A malformed port spec leaves no valid range, so the dial stays on its fixed port rather than routing to a port the config never named.
+        assert!(
+            planned(r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2, "serverPorts": "0,70000"}}}"#)
+                .is_none(),
+            "nothing valid means no hop"
+        );
     }
 
     #[test]

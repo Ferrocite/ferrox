@@ -319,6 +319,11 @@ carrier-hysteria masquerade-answers-browser-on-same-port 1 ferrox-app-proxy::tes
 carrier-hysteria masquerade-file-bytes-served 1 ferrox-app-proxy::tests::hysteria_serves_a_file_from_the_masquerade_directory
 carrier-hysteria masquerade-proxied-round-trips 1 ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_an_origin
 carrier-hysteria masquerade-escapes-served 0 ferrox-app-proxy::tests::hysteria_refuses_a_masquerade_path_that_escalates_the_directory
+carrier-hysteria hop-port-set-expanded 4 ferrox-core-hysteria::tests::the_plan_expands_overlapping_ranges_into_one_sorted_set
+carrier-hysteria hop-config-forms-parsed 2 ferrox-app-config::tests::a_hysteria_carrier_reads_a_port_hopping_plan
+carrier-hysteria hop-plan-pool-keys 2 ferrox-app-hysteria::tests::a_hop_plan_is_its_own_pool_key
+carrier-hysteria hopped-datagrams-delivered 200 ferrox-app-quic::tests::a_hopped_dial_spreads_its_datagrams_over_more_than_one_server_port
+carrier-hysteria hopped-reply-source-normalized 1 ferrox-app-quic::tests::a_reply_from_a_hopped_port_reads_back_as_the_nominal_server
 
 # --- TLS ClientHello `cipher_suites` field (PattNG ext.) --------------------
 tls-cipher-suites ops-retired-instructions UNBLESSED scripts/count-ops.sh

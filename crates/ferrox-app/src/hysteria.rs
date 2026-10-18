@@ -244,9 +244,27 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     let Ok(mut conn) = quiche::connect(Some(&dial.host), &cid, local, peer, &mut config) else {
         return None;
     };
-    let sock = match hysteria::Salamander::new(&dial.config.obfs_password) {
-        Some(obfs) => crate::quic::Datagram::obfuscated(sock, obfs),
-        None => crate::quic::Datagram::plain(sock),
+    let obfs = hysteria::Salamander::new(&dial.config.obfs_password);
+    // A hop plan rotates the server port over a fresh socket per stay; salamander still seals each datagram, so only the destination and socket move, never a frame above.
+    let sock = match dial
+        .config
+        .hop
+        .as_ref()
+        .filter(|hop| !hop.ranges.is_empty())
+    {
+        Some(hop) => {
+            let bind = if peer.is_ipv6() {
+                "[::]:0"
+            } else {
+                "0.0.0.0:0"
+            };
+            crate::quic::Datagram::hopped(peer, hop.ports(), hop.interval_ms, bind, &sock, obfs)
+                .ok()?
+        }
+        None => match obfs {
+            Some(obfs) => crate::quic::Datagram::obfuscated(sock, obfs),
+            None => crate::quic::Datagram::plain(sock),
+        },
     };
     crate::quic::drive_handshake(&mut conn, &sock, local)?;
     let mut session = Session {
@@ -435,6 +453,9 @@ struct Server {
     port: u16,
     cc: &'static str,
     auth: String,
+    /// A hop plan is its own connection: a hopped dial never reuses a plain one to the
+    /// same address, nor the reverse, since the two move the server port differently.
+    hop: Option<hysteria::Hop>,
     roots: Option<Vec<Vec<u8>>>,
 }
 
@@ -454,6 +475,7 @@ fn server_of(dial: &Dial) -> Server {
         port: dial.port,
         cc: dial.config.cc.quiche_name(),
         auth: dial.config.auth.clone(),
+        hop: dial.config.hop.clone(),
         roots: dial.roots.clone(),
     }
 }
@@ -1785,6 +1807,45 @@ mod tests {
     fn server_config_refuses_without_a_chain_it_can_read() {
         let cc = hysteria::Congestion::Bbr;
         assert!(server_config("/nonexistent.crt", "/nonexistent.key", cc).is_none());
+    }
+
+    #[test]
+    fn a_hop_plan_is_its_own_pool_key() {
+        // The same address dialed with and without a hop plan is two connections: a hopped flow moves its server port and a plain one does not, so neither may ride the other's pooled socket.
+        let dial = |hop: Option<hysteria::Hop>| Dial {
+            host: "localhost".to_owned(),
+            address: "127.0.0.1".to_owned(),
+            port: 443,
+            config: hysteria::Config {
+                auth: "a".to_owned(),
+                cc: hysteria::Congestion::Bbr,
+                obfs_password: String::new(),
+                hop,
+            },
+            roots: None,
+        };
+        let plan = hysteria::Hop {
+            ranges: vec![hysteria::PortRange {
+                start: 443,
+                end: 444,
+            }],
+            interval_ms: (5_000, 5_000),
+        };
+        assert_eq!(
+            server_of(&dial(None)),
+            server_of(&dial(None)),
+            "plain reuses plain"
+        );
+        assert_eq!(
+            server_of(&dial(Some(plan.clone()))),
+            server_of(&dial(Some(plan.clone()))),
+            "a plan reuses itself"
+        );
+        assert_ne!(
+            server_of(&dial(None)),
+            server_of(&dial(Some(plan))),
+            "a hop never rides a plain connection"
+        );
     }
 
     fn idle_session() -> Session {
