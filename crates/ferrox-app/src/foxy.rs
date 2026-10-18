@@ -1014,6 +1014,8 @@ pub(crate) struct H3 {
     capsule_buf: Vec<u8>,
     fin: bool,
     deadline: Instant,
+    /// How long this lane waits for a CONNECT answer: a carrier's own open gets the head timeout, a disposable probe gets the budget its caller names.
+    head_wait: Duration,
     /// Bounds one blocking `Read::read` the way the socket timeout bounds TCP carriers: set, it returns `WouldBlock` after the quantum so a one-lock relay can interleave.
     quantum: Option<Duration>,
 }
@@ -1024,6 +1026,15 @@ impl H3 {
     }
 
     pub(crate) fn open(dial: &FoxyDial, target: &str, quic: Quic) -> Result<Self, Failure> {
+        Self::open_within(dial, target, quic, HEADER_TIMEOUT)
+    }
+
+    pub(crate) fn open_within(
+        dial: &FoxyDial,
+        target: &str,
+        quic: Quic,
+        head_wait: Duration,
+    ) -> Result<Self, Failure> {
         let mut lane = Self {
             quic,
             head: Self::open_window(),
@@ -1035,6 +1046,7 @@ impl H3 {
             capsule_buf: Vec::new(),
             fin: false,
             deadline: Instant::now(),
+            head_wait,
             quantum: None,
         };
         let status = lane.request(target, &dial.pass.token)?;
@@ -1089,6 +1101,7 @@ impl H3 {
             capsule_buf: Vec::new(),
             fin: false,
             deadline: Instant::now(),
+            head_wait: HEADER_TIMEOUT,
             quantum: None,
         };
         let status = lane.udp_request(dial, target_host, target_port)?;
@@ -1109,6 +1122,7 @@ impl H3 {
             capsule_buf: Vec::new(),
             fin: false,
             deadline: Instant::now(),
+            head_wait: HEADER_TIMEOUT,
             quantum: None,
         };
         let edge = if dial.port == 443 {
@@ -1424,7 +1438,7 @@ impl H3 {
 
     /// Pulls the request stream until a whole HEADERS frame has arrived, then reads the status; bytes read past that frame stay buffered because the edge's first DATA frame is the tunnel, not a header.
     fn read_head(&mut self) -> Result<u16, Failure> {
-        self.deadline = Instant::now() + HEADER_TIMEOUT;
+        self.deadline = Instant::now() + self.head_wait;
         while Instant::now() < self.deadline {
             if let Some(status) = Self::header_in(&self.head[self.carried..self.filled])? {
                 return Ok(status);
@@ -1912,6 +1926,16 @@ impl Tunnel {
             // `auto` is expanded by the caller into the carriers it prefers; an unexpanded one here is a bug, and the answer is not a downgrade.
             (Carrier::Auto, _) => Err(Failure::Frame),
         }
+    }
+
+    /// The disposable probe's open: the same lane, but its CONNECT waits the budget the caller names rather than a carrier's full head timeout.
+    pub(crate) fn open_within(
+        dial: &FoxyDial,
+        target: &str,
+        quic: Quic,
+        head_wait: Duration,
+    ) -> Result<Self, Failure> {
+        H3::open_within(dial, target, quic, head_wait).map(|lane| Self::H3(Box::new(lane)))
     }
 
     /// Bounds one blocking read on every carrier so a relay sharing one lane between its two directions stops holding its lock while idle: reads past the quantum answer `WouldBlock` and the relay retries instead of wedging.
