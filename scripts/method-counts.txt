@@ -267,6 +267,7 @@ reality-tls unauthenticated-servers-accepted 0 ferrox-core-reality::tests::a_cli
 reality-tls server-shared-session-poll-millis 1 ferrox-app-proxy::tests::a_server_relay_bounds_the_shared_session_to_one_tick
 reality-tls late-hello-grains-survived 12 ferrox-app-proxy::tests::a_plain_tls_lane_retries_a_hello_that_arrives_past_the_grain
 reality-tls unsafe-fingerprint-header-bytes-added 0 ferrox-core-vless::tests::an_unsafe_fingerprint_adds_no_header_byte
+reality-tls plaintext-to-public-header-bytes-added 0 ferrox-core-vless::tests::pattng_plaintext_to_public_needs_opt_in_and_adds_no_byte
 reality-tls certificate-refusals-folded-into-other 0 ferrox-core-tls::rustls_backend::tests::mismatched_certificate_name_fails
 reality-tls untrusted-dials-counted-as-retryable 0 ferrox-app-proxy::tests::a_refused_chain_is_a_refusal_not_a_drop
 reality-tls session-writes-per-frame 1 ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call
