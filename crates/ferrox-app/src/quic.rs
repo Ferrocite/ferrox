@@ -104,7 +104,15 @@ impl QuicPool {
                 pool.remove(key);
             }
         }
-        if let Ok(mut conn) = entry.conn.lock() {
+        // A lane still carrying flows leaves the pool without a goodbye: a `done` frame here would end streams a flow is mid-write to. Its own last lease parks it, and the connection goes with the leases that held it.
+        let Ok(mut conn) = entry.conn.lock() else {
+            return;
+        };
+        if entry
+            .table
+            .lock()
+            .is_ok_and(|table| table.sessions.is_empty() && table.opening.is_empty())
+        {
             let _ = conn.close(false, 0, b"done");
             flush_egress(&mut conn, &entry.sock);
         }
@@ -1670,6 +1678,12 @@ pub(crate) fn lane_parked(dial: &QuicDial) -> bool {
 #[cfg(test)]
 pub(crate) fn lane_spent(dial: &QuicDial) -> bool {
     peek(dial).is_some_and(|lane| !flow_credit(&lane))
+}
+
+/// Whether a lookup hands this lane back: the judgement the pool makes, run without taking a lease or dialling the next one, so the witness sees the hand-back rather than a fresh connection.
+#[cfg(test)]
+pub(crate) fn lane_handed_back(dial: &QuicDial) -> bool {
+    pool().stream(dial).is_none()
 }
 
 /// The lane a dial would be handed, read without judging it: a witness that retired what it was looking at would hide the leak it names.

@@ -4441,7 +4441,7 @@ mod loopback {
         edge.join().expect("joins");
     }
 
-    /// A lane lends a bounded number of flows: past its grant the next lease hands it back rather than ride it, so reuse cannot become the pinning the lane was first closed for.
+    /// A lane lends a bounded number of flows: the lookup after its grant is spent hands it back for a fresh dial, and a flow already riding it is left alone rather than closed with it.
     #[test]
     fn a_lane_that_lent_its_whole_grant_of_flows_is_handed_back() {
         let (roots, server) = minted(b"h3");
@@ -4477,8 +4477,16 @@ mod loopback {
             crate::quic::lane_spent(&dial),
             "the lane has no flow left to lend"
         );
+        assert!(
+            crate::quic::lane_handed_back(&dial),
+            "a spent lane is not the one a flow rides"
+        );
+        assert!(
+            !crate::quic::pool_holds(&dial),
+            "the hand-back took the entry out of the pool"
+        );
         let foxy = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
-        let (mut tunnel, _) = Ip::open(&foxy, last).expect("the tunnel opens");
+        let (mut tunnel, _) = Ip::open(&foxy, last).expect("the rode-over lane still carries it");
         assert!(
             tunnel
                 .write(
