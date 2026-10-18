@@ -442,6 +442,7 @@ dependencies = [
  "sha1",
  "sha2",
  "sha3 0.10.9",
+ "windows-sys 0.52.0",
  "x25519-dalek",
 ]
 

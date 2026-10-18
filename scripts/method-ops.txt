@@ -93,6 +93,9 @@ kcp  kcp::connection::tests::every_read_size_delivers_the_same_stream  ferrox_co
 kcp  kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next  ferrox_core::kcp::Connection::input
 carrier-quic  foxy::loopback::the_quic_carrier_rides_a_socks5_upstream_and_carries_the_bytes  quic::flush_egress
 carrier-quic  foxy::loopback::the_quic_carrier_rides_a_socks5_upstream_and_carries_the_bytes  quic::pump_once
+carrier-quic  foxy::loopback::a_lane_outlives_its_leases_and_the_next_flow_rides_it  quic::pump
+carrier-quic  foxy::loopback::a_lane_outlives_its_leases_and_the_next_flow_rides_it  quic::pooled_stream_within
+carrier-quic  quic::tests::a_quic_socket_arms_its_receive_buffer  quic::bind_datagram
 carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hysteria::serve_loop
 carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hysteria::drive_once
 carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hysteria::serve_stream
