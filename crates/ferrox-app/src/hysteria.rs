@@ -729,8 +729,15 @@ fn open_udp(
     session: u32,
     address: &str,
 ) -> Option<UdpFlow> {
-    let peer = address.to_socket_addrs().ok().and_then(|mut it| it.next())?;
-    let bind = if peer.is_ipv6() { "[::]:0" } else { "0.0.0.0:0" };
+    let peer = address
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())?;
+    let bind = if peer.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
     let target = UdpSocket::bind(bind).ok()?;
     target.connect(peer).ok()?;
     target.set_read_timeout(Some(UDP_POLL)).ok()?;
@@ -990,7 +997,8 @@ impl Router<'_> {
                     continue;
                 }
                 if !inbound.udp.contains_key(&message.session) {
-                    let Some(flow) = open_udp(&shared, sock, message.session, message.address) else {
+                    let Some(flow) = open_udp(&shared, sock, message.session, message.address)
+                    else {
                         continue;
                     };
                     inbound.udp.insert(message.session, flow);

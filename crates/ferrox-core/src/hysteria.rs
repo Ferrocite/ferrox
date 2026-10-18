@@ -243,7 +243,10 @@ impl Defrag {
     }
 
     /// Fold one message in; `Some((address, payload))` when a datagram is whole. A single fragment clears any partial and passes straight through, so an unfragmented datagram never waits on the state.
-    pub fn feed(&mut self, message: &UdpMessage<'_>) -> Result<Option<(String, Vec<u8>)>, RequestError> {
+    pub fn feed(
+        &mut self,
+        message: &UdpMessage<'_>,
+    ) -> Result<Option<(String, Vec<u8>)>, RequestError> {
         message.validate()?;
         if message.frags == 1 {
             *self = Self::default();
@@ -471,10 +474,16 @@ mod tests {
         assert!(frags.iter().all(|f| f.frags == 3));
         assert_eq!(frags[0].frag, 0);
         assert_eq!(frags[2].frag, 2);
-        let joined: Vec<u8> = frags.iter().flat_map(|f| f.payload.iter().copied()).collect();
+        let joined: Vec<u8> = frags
+            .iter()
+            .flat_map(|f| f.payload.iter().copied())
+            .collect();
         assert_eq!(joined, b"0123456789");
         // A capacity no larger than the head cannot carry even one byte.
-        assert_eq!(fragment_udp(&message, 12, &mut Vec::new()), Err(RequestError::Invalid));
+        assert_eq!(
+            fragment_udp(&message, 12, &mut Vec::new()),
+            Err(RequestError::Invalid)
+        );
         // Feeding fragments out of order still reassembles in id order.
         let mut defrag = Defrag::new();
         assert_eq!(defrag.feed(&frags[2]).expect("ok"), None);
