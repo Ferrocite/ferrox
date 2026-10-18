@@ -574,6 +574,9 @@ jobs:
           }
           trace_socks() {
             PORT="$1" WANT="$2"
+            # The fronts step's file survives into this job: a retry that never runs
+            # must fail on this leg, not grep the previous step's answer.
+            : > trace-lane.txt
             while ((SECONDS < LEG_END)); do
               curl -sS --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
                 https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt && break
