@@ -17998,6 +17998,7 @@ mod tests {
                 auth: "lane-auth".to_owned(),
                 cc: ferrox_core::hysteria::Congestion::Bbr,
                 obfs_password: String::new(),
+                hop: None,
             },
             roots: Some(roots),
         };
@@ -19477,6 +19478,7 @@ mod tests {
                 auth: auth.to_owned(),
                 cc: ferrox_core::hysteria::Congestion::Bbr,
                 obfs_password: obfs.to_owned(),
+                hop: None,
             },
             roots: Some(roots),
         };
@@ -19650,6 +19652,7 @@ mod tests {
                 auth: "bisect-auth".to_owned(),
                 cc: ferrox_core::hysteria::Congestion::Bbr,
                 obfs_password: String::new(),
+                hop: None,
             },
             roots: Some(roots),
         };
@@ -20248,6 +20251,7 @@ mod tests {
                 auth: "association-auth".to_owned(),
                 cc: ferrox_core::hysteria::Congestion::Bbr,
                 obfs_password: String::new(),
+                hop: None,
             }),
             host: "localhost".to_owned(),
             mux: false,

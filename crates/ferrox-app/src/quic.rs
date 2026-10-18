@@ -680,6 +680,10 @@ pub(crate) struct Datagram {
     sock: UdpSocket,
     relay: Option<Relay>,
     obfs: Option<ferrox_core::hysteria::Salamander>,
+    /// A hopped client dial: the server port moves on a schedule and the socket
+    /// with it, so a UDP flow keeps ending and a new one starting to a filter.
+    /// Shared behind an `Arc` so a writer clone and a reader clone move together.
+    hop: Option<Arc<Hopper>>,
 }
 
 /// Where datagrams go. The association's control connection is held, never read: dropping it ends it.
@@ -695,12 +699,249 @@ const RELAY_HEADER: usize = 22;
 /// One obfuscated datagram is a salt ahead of the QUIC packet it masks, so the wire frame is a salt wider than the largest plain datagram.
 const SALAMANDER_SALT: usize = ferrox_core::hysteria::SALAMANDER_SALT;
 
+/// How long a socket the schedule just left stays readable, so a reply still in
+/// flight on the old flow is not lost the instant the port moves. The reference
+/// lingers the same ten seconds; a datagram that misses both windows is a real loss.
+const HOP_LINGER: u64 = 10_000;
+
+/// The moving part of a hopped dial: the socket the current stay reads and writes
+/// through, the server port it is aimed at, when the stay ends, and — until its
+/// linger expires — the socket the stay just left, still read for its replies.
+struct HopState {
+    current: Arc<UdpSocket>,
+    port: u16,
+    until: Instant,
+    previous: Option<(Arc<UdpSocket>, Instant)>,
+}
+
+/// A client datagram socket that moves its server destination port among `ports`
+/// every `interval_ms`, binding a fresh local socket on each move so a filter sees a
+/// new flow rather than one long-lived one. Only the server's own port moves: a
+/// datagram addressed elsewhere passes through on the same flow. A reply from any
+/// hopped port is turned back to the nominal `server` port so QUIC above, which
+/// named the connection by one peer, keeps accepting it. The rotation and the stay
+/// come from the core's pure `pick_next`/`stay_ms`, fed one rng roll each, so nothing
+/// here is left to prove by reading.
+pub(crate) struct Hopper {
+    server: SocketAddr,
+    ports: Vec<u16>,
+    interval_ms: (u64, u64),
+    bind: &'static str,
+    /// The socket the dial opened with, kept so a poisoned schedule lock — unreachable
+    /// while the guarded sections panic-free — can still carry a fixed flow.
+    anchor: Arc<UdpSocket>,
+    timeout: Mutex<Option<Duration>>,
+    state: Mutex<HopState>,
+}
+
+/// One 64-bit draw folded into the core's pure pick and stay. A failure yields 0,
+/// which still names a valid port and stay, so the hop degrades to a fixed schedule
+/// rather than failing the dial outright.
+fn entropy() -> u64 {
+    let mut bytes = [0u8; 8];
+    getrandom::getrandom(&mut bytes).map_or(0, |()| u64::from_le_bytes(bytes))
+}
+
+impl Hopper {
+    /// Begin a plan from `first`, the socket the dial opened to the nominal port: its
+    /// clone is the first current socket, so a handshake named for `server` can finish
+    /// before the schedule ever moves. The port and stay are drawn up front.
+    fn open(
+        server: SocketAddr,
+        ports: Vec<u16>,
+        interval_ms: (u64, u64),
+        bind: &'static str,
+        first: &UdpSocket,
+    ) -> std::io::Result<Self> {
+        let anchor = Arc::new(first.try_clone()?);
+        let current = Arc::clone(&anchor);
+        let port = ferrox_core::hysteria::pick_next(&ports, server.port(), entropy() as usize);
+        let until = Instant::now()
+            + Duration::from_millis(ferrox_core::hysteria::stay_ms(interval_ms, entropy()));
+        Ok(Self {
+            server,
+            ports,
+            interval_ms,
+            bind,
+            timeout: Mutex::new(None),
+            anchor,
+            state: Mutex::new(HopState {
+                current,
+                port,
+                until,
+                previous: None,
+            }),
+        })
+    }
+
+    /// Stamp the dial's current read timeout onto a freshly bound socket, so a
+    /// timeout set before a rotation still bites the socket bound in between.
+    fn apply_timeout(&self, sock: &UdpSocket) {
+        if let Ok(timeout) = self.timeout.lock() {
+            let _ = sock.set_read_timeout(*timeout);
+        }
+    }
+
+    /// The socket and server port for now, moving the schedule first when the current
+    /// stay has run out: a fresh socket is bound and the old one kept until its linger
+    /// expires, a new port picked and a new stay armed. A bind failure keeps the
+    /// current socket rather than stalling the flow, but still repicks and re-arms so
+    /// the next attempt moves on. Called on both send and receive, so one clock drives
+    /// the whole connection.
+    fn current(&self) -> (Arc<UdpSocket>, u16) {
+        let Ok(mut state) = self.state.lock() else {
+            return (Arc::clone(&self.anchor), self.server.port());
+        };
+        let now = Instant::now();
+        if now >= state.until {
+            let port =
+                ferrox_core::hysteria::pick_next(&self.ports, state.port, entropy() as usize);
+            let stay =
+                Duration::from_millis(ferrox_core::hysteria::stay_ms(self.interval_ms, entropy()));
+            if let Ok(sock) = bind_datagram(self.bind) {
+                self.apply_timeout(&sock);
+                let linger = now + Duration::from_millis(HOP_LINGER);
+                state.previous = Some((
+                    std::mem::replace(&mut state.current, Arc::new(sock)),
+                    linger,
+                ));
+            }
+            state.port = port;
+            state.until = now + stay;
+        }
+        (Arc::clone(&state.current), state.port)
+    }
+
+    /// The socket and destination for a datagram aimed at `to`: only the server's own
+    /// port moves, so a datagram to any other target keeps its address and the flow.
+    fn egress(&self, to: SocketAddr) -> (Arc<UdpSocket>, SocketAddr) {
+        let (sock, port) = self.current();
+        if to != self.server || port == self.server.port() {
+            return (sock, to);
+        }
+        let mut dest = self.server;
+        dest.set_port(port);
+        (sock, dest)
+    }
+
+    /// Write one datagram on the current flow, salting it first when obfuscated. Only
+    /// the server's own datagram has its port rewritten; anything else is passed on.
+    fn send(
+        &self,
+        buf: &[u8],
+        to: SocketAddr,
+        obfs: Option<&ferrox_core::hysteria::Salamander>,
+    ) -> std::io::Result<usize> {
+        let (sock, dest) = self.egress(to);
+        let Some(obfs) = obfs else {
+            return sock.send_to(buf, dest);
+        };
+        let mut wire = Unfilled::<{ MAX_DATAGRAM + SALAMANDER_SALT }>::new();
+        let sealed = obfs
+            .seal_into(buf, wire.as_mut())
+            .ok_or(std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        sock.send_to(&wire.as_mut()[..sealed], dest)
+    }
+
+    /// Read one datagram, advancing the schedule first so a reader sees the same
+    /// rotation a writer would and the socket just left still lingers. The current
+    /// flow is tried, then the lingering one; a hopped reply source is turned back to
+    /// the nominal server port. No data on either is the same `WouldBlock` a plain
+    /// socket returns, so the drive loop keeps its no-packet path.
+    fn recv(
+        &self,
+        buf: &mut [u8],
+        obfs: Option<&ferrox_core::hysteria::Salamander>,
+    ) -> std::io::Result<(usize, SocketAddr)> {
+        let (current, _) = self.current();
+        let previous = match self.state.lock() {
+            Ok(mut state) => {
+                if state
+                    .previous
+                    .as_ref()
+                    .is_some_and(|(_, linger)| Instant::now() >= *linger)
+                {
+                    state.previous = None;
+                }
+                state.previous.as_ref().map(|(sock, _)| Arc::clone(sock))
+            }
+            Err(_) => None,
+        };
+        for sock in [Some(current), previous].into_iter().flatten() {
+            match Self::read_into(&sock, buf, obfs) {
+                Ok((found, mut from)) => {
+                    if from.ip() == self.server.ip()
+                        && ferrox_core::hysteria::is_hop_port(
+                            &self.ports,
+                            self.server.port(),
+                            from.port(),
+                        )
+                    {
+                        from.set_port(self.server.port());
+                    }
+                    return Ok((found, from));
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+    }
+
+    /// Read one datagram off `sock`, unmasking it into the caller's buffer when the
+    /// lane is obfuscated — the salt is a payload byte the caller was not sized for.
+    fn read_into(
+        sock: &UdpSocket,
+        buf: &mut [u8],
+        obfs: Option<&ferrox_core::hysteria::Salamander>,
+    ) -> std::io::Result<(usize, SocketAddr)> {
+        let Some(obfs) = obfs else {
+            return sock.recv_from(buf);
+        };
+        let mut room = Unfilled::<{ MAX_DATAGRAM + SALAMANDER_SALT }>::new();
+        let (found, from) = sock.recv_from(room.as_mut())?;
+        let Some(plain) = obfs.deobfuscate_in_place(&mut room.as_mut()[..found]) else {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        };
+        let Some(out) = buf.get_mut(..plain) else {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
+        };
+        out.copy_from_slice(&room.as_mut()[..plain]);
+        Ok((plain, from))
+    }
+
+    /// The current flow's address, read without moving the schedule.
+    fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        let Ok(state) = self.state.lock() else {
+            return self.anchor.local_addr();
+        };
+        state.current.local_addr()
+    }
+
+    /// Record the timeout for sockets bound by later moves, and stamp it on the one
+    /// reads will use now.
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        if let Ok(mut applied) = self.timeout.lock() {
+            *applied = timeout;
+        }
+        let Ok(state) = self.state.lock() else {
+            return Ok(());
+        };
+        state.current.set_read_timeout(timeout)
+    }
+}
+
 impl Datagram {
     pub(crate) fn plain(sock: UdpSocket) -> Self {
         Self {
             sock,
             relay: None,
             obfs: None,
+            hop: None,
         }
     }
 
@@ -710,6 +951,7 @@ impl Datagram {
             sock,
             relay: None,
             obfs: Some(obfs),
+            hop: None,
         }
     }
 
@@ -721,10 +963,35 @@ impl Datagram {
                 _control: control,
             }),
             obfs: None,
+            hop: None,
         }
     }
 
+    /// A client dial that moves its server port among `ports` every `interval_ms`,
+    /// opening a fresh local socket on each move so NAT sees a distinct flow. `server`
+    /// is the address QUIC above names the connection by (the nominal port); replies
+    /// from any hopped port are turned back to it. `obfs` still seals each datagram.
+    pub(crate) fn hopped(
+        server: SocketAddr,
+        ports: Vec<u16>,
+        interval_ms: (u64, u64),
+        bind: &'static str,
+        first: &UdpSocket,
+        obfs: Option<ferrox_core::hysteria::Salamander>,
+    ) -> std::io::Result<Self> {
+        let hopper = Hopper::open(server, ports, interval_ms, bind, first)?;
+        Ok(Self {
+            sock: first.try_clone()?,
+            relay: None,
+            obfs,
+            hop: Some(Arc::new(hopper)),
+        })
+    }
+
     pub(crate) fn send_to(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        if let Some(hop) = self.hop.as_ref() {
+            return hop.send(buf, to, self.obfs.as_ref());
+        }
         if self.obfs.is_none() && self.relay.is_none() {
             return self.sock.send_to(buf, to);
         }
@@ -749,6 +1016,9 @@ impl Datagram {
     }
 
     pub(crate) fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        if let Some(hop) = self.hop.as_ref() {
+            return hop.recv(buf, self.obfs.as_ref());
+        }
         let Some(obfs) = self.obfs.as_ref() else {
             return self.raw_recv_from(buf);
         };
@@ -783,7 +1053,10 @@ impl Datagram {
     }
 
     pub(crate) fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        self.sock.local_addr()
+        match self.hop.as_ref() {
+            Some(hop) => hop.local_addr(),
+            None => self.sock.local_addr(),
+        }
     }
 
     pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
@@ -791,10 +1064,14 @@ impl Datagram {
             sock: self.sock.try_clone()?,
             relay: self.relay.clone(),
             obfs: self.obfs.clone(),
+            hop: self.hop.clone(),
         })
     }
 
     pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
+        if let Some(hop) = self.hop.as_ref() {
+            return hop.set_read_timeout(timeout);
+        }
         self.sock.set_read_timeout(timeout)
     }
 }
@@ -2047,5 +2324,105 @@ mod tests {
         assert!(quiche_config(&roots, None).is_some());
         assert!(quiche_config(&roots, Some("bbr")).is_some());
         assert!(quiche_config(&roots, Some("no-such-cc")).is_none());
+    }
+
+    /// A handful of listeners stand in for the ports a firewall forwards to one
+    /// server. A zero-millisecond stay forces the schedule to move on every send, so
+    /// a burst aimed at the nominal address must spread over more than one port and
+    /// every datagram must land on exactly one — a witness that the egress port is
+    /// really rewritten and that the move opens a real, delivering socket.
+    #[test]
+    fn a_hopped_dial_spreads_its_datagrams_over_more_than_one_server_port() {
+        let mut ports = Vec::new();
+        let mut listeners = Vec::new();
+        for _ in 0..4 {
+            let sock = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            ports.push(sock.local_addr().expect("addr").port());
+            sock.set_read_timeout(Some(Duration::from_millis(20))).ok();
+            listeners.push(sock);
+        }
+        let server: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().expect("addr");
+        let first = UdpSocket::bind("0.0.0.0:0").expect("binds");
+        let hop = Datagram::hopped(server, ports.clone(), (0, 0), "0.0.0.0:0", &first, None)
+            .expect("hops");
+        let sends = 200;
+        for _ in 0..sends {
+            hop.send_to(b"ping", server).expect("sends");
+        }
+        let mut received = 0usize;
+        let mut touched = std::collections::HashSet::new();
+        for listener in &listeners {
+            let mut buf = [0u8; 64];
+            while let Ok((n, _)) = listener.recv_from(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                received += 1;
+                touched.insert(listener.local_addr().expect("addr").port());
+            }
+        }
+        assert_eq!(received, sends, "every datagram reached exactly one port");
+        assert!(
+            touched.len() > 1,
+            "the plan moved off the single dialed port"
+        );
+    }
+
+    /// A long stay holds the schedule still, so one socket carries the flow. The
+    /// opening pick is some port other than the nominal one; whichever listener
+    /// receives the burst is the current port, and its reply must read back with the
+    /// nominal server port so QUIC above, which named the peer by one address, still
+    /// accepts it — the witness that a hopped reply source is turned back.
+    #[test]
+    fn a_reply_from_a_hopped_port_reads_back_as_the_nominal_server() {
+        let mut ports = Vec::new();
+        let mut listeners = Vec::new();
+        for _ in 0..4 {
+            let sock = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            ports.push(sock.local_addr().expect("addr").port());
+            sock.set_read_timeout(Some(Duration::from_millis(50))).ok();
+            listeners.push(sock);
+        }
+        let server: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().expect("addr");
+        let first = UdpSocket::bind("0.0.0.0:0").expect("binds");
+        let still = u64::MAX / 4;
+        let hop = Datagram::hopped(
+            server,
+            ports.clone(),
+            (still, still),
+            "0.0.0.0:0",
+            &first,
+            None,
+        )
+        .expect("hops");
+        hop.send_to(b"ping", server).expect("sends");
+        let mut landed = None;
+        for listener in &listeners {
+            let mut buf = [0u8; 64];
+            if let Ok((n, src)) = listener.recv_from(&mut buf) {
+                if n > 0 {
+                    listener.send_to(b"pong", src).expect("replies");
+                    landed = Some(listener.local_addr().expect("addr").port());
+                    break;
+                }
+            }
+        }
+        let hop_port = landed.expect("the burst landed on a hopped port");
+        assert_ne!(
+            hop_port,
+            server.port(),
+            "the current port is not the nominal"
+        );
+        let mut buf = [0u8; 64];
+        hop.set_read_timeout(Some(Duration::from_millis(400)))
+            .expect("timeout");
+        let (n, from) = hop.recv_from(&mut buf).expect("reads the reply");
+        assert_eq!(&buf[..n], b"pong");
+        assert_eq!(from.ip(), server.ip());
+        assert_eq!(
+            from.port(),
+            server.port(),
+            "the hopped source became the nominal"
+        );
     }
 }
