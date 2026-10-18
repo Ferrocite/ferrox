@@ -39,9 +39,18 @@ is the pointer-identity witness), reassembled by `Defrag`, and reaped after
 `UDP_IDLE` (60 s, the reference's `udp_idle_timeout`) or the connection's close
 — a UDP socket has no shutdown to wake a blocked read, so the reply-path reader
 threads end on the `UDP_POLL` (1 s, the reference's cleanup tick) timeout
-watching the stop flag the reap sets. `udp-bytes-relayed` 0 still names the
-dial-side gap: `dial_udp_uplink` returns `None` for every non-`Raw` carrier, so
-the client's own UDP flows are a cross-cutting row, not this carrier's. A pooled
+watching the stop flag the reap sets. The dial side answers that lane in its
+own small shape: `serve_udp` relays a socks5 UDP association over a
+connection of its own — the pool is a TCP instrument, and a stale
+connection carries a datagram into a silent blackhole with no reply
+deadline to catch it — one destination at a time, each stamped with a
+session id the connection never reuses, the writer holding the
+connection lock once per datagram and a companion reader driving it
+with `drive_once` — so the client's
+UDP flows are this carrier's row, not a cross-cutting gap:
+`hysteria_udp_lane_carries_a_datagram` witnesses the lane off the front and
+`hysteria_carries_a_udp_association_over_the_carrier` through the full socks
+dispatch. A pooled
 connection is reused within half the server's 300 s idle timeout, dropped when
 it stops taking application data (closed, draining or carrying a close), goes
 stale or runs out of streams, and a dial with no live pool entry pays a fresh
@@ -92,6 +101,9 @@ graph TD
     F2 -- whole --> U["one send to target"]
     U -- "reply " --> V["fragment_udp to dgram_max_writable_len"]
     V -- "dgram_send + flush" --> G
+    W["SOCKS UDP associate, hysteria outbound"] --> N["serve_udp: one association per destination,<br/>id never reused"]
+    N -- "fragment + dgram_send + flush" --> G
+    G -. "client_reader: decode, Defrag, socks frame" .-> W
 ```
 
 ## Measured
@@ -105,7 +117,7 @@ graph TD
 | request-parse-reallocations | 0 | ferrox-app-hysteria::tests::a_parsed_request_leaves_its_payload_where_it_landed |
 | wrong-password-bytes-relayed | 0 | ferrox-app-proxy::tests::hysteria_refuses_a_wrong_password_without_relaying |
 | non-v2-configs-carried | 0 | ferrox-app-proxy::tests::hysteria_settings_parse_with_guarded_fallbacks |
-| udp-bytes-relayed | 0 | ferrox-app-proxy::tests::hysteria_dial_udp_uplink_is_none |
+| datagram-lane-client-round-trips | 1 | ferrox-app-proxy::tests::hysteria_carries_a_udp_association_over_the_carrier |
 | udp-datagram-decode-copies | 0 | ferrox-core-hysteria::tests::a_decoded_datagram_leaves_its_payload_where_it_landed |
 | udp-fragments-witnessed | 200 | ferrox-core-hysteria::tests::every_length_survives_fragment_then_defrag_intact |
 | obfuscated-datagram-heap-copies | 0 | ferrox-core-hysteria::tests::a_sealed_datagram_never_touches_the_heap |
@@ -147,7 +159,11 @@ tunnel. No artefact from this branch has been read.
   living entirely in `ferrox-core::hysteria`, proven by
   `every_length_survives_fragment_then_defrag_intact` (the 200-row sweep is
   `udp-fragments-witnessed`) and end to end by
-  `hysteria_carries_udp_echo_over_loopback`. The reference's
+  `hysteria_carries_udp_echo_over_loopback`, and on the dial side smaller still:
+  one `Association` and one shared `Lane` per socks front — no manager, no
+  channels, the reader a single thread riding `drive_once` — proven by
+  `hysteria_udp_lane_carries_a_datagram` and
+  `hysteria_carries_a_udp_association_over_the_carrier`. The reference's
   `MaxDatagramFrameSize: 1200` is not reimposed; fragmentation sizes to the
   peer's live `dgram_max_writable_len` instead.
 - **The decoder's per-datagram payload copy.** The relay hands
@@ -245,9 +261,9 @@ What is **not** removed, and is named rather than claimed: the pool is one
 process-wide map per outbound key with no eviction policy beyond pruning
 closed, stale and stream-exhausted entries on the next dial, so an outbound
 burst holds one connection each for `REUSE_WINDOW` (150 s, half the idle
-timeout); the client's UDP uplink is not carried (`udp-bytes-relayed` 0 —
-`dial_udp_uplink` answers `None` for every non-`Raw` carrier, a cross-cutting
-gap rather than this carrier's); the masquerade site stays out as the
+timeout); the client's UDP lane rotates associations on one connection rather
+than retiring the connection per destination, so a retired flow's late
+datagrams land on the floor by the never-reuse rule; the masquerade site stays out as the
 `hysteria-obfs-masquerade` add-on in `crates/ferrox-prompt/prompts.md` — it is
 an H3 request-serving subsystem, not a rung on the relay, and salamander now
 ships while it does not; 0-RTT,

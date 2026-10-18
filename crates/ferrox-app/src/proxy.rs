@@ -6056,6 +6056,12 @@ fn serve_socks_udp(mut client: Connection, out: &Outbound) {
         Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Raw) && vless.tls.is_none() => {
             serve_socks_udp_vless(&relay, vless);
         }
+        Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Hysteria(_)) && !vless.mux => {
+            // The datagram lane carries UDP flows the same way it carries TCP ones: one association per destination, ids never reused on the connection.
+            if let Some(dial) = hysteria_dial_session(vless) {
+                crate::hysteria::serve_udp(&relay, &dial);
+            }
+        }
         Outbound::Trojan(trojan)
             if matches!(trojan.carrier, Carrier::Raw) && trojan.tls.is_none() =>
         {
@@ -17920,28 +17926,56 @@ mod tests {
     }
 
     #[test]
-    fn hysteria_dial_udp_uplink_is_none() {
+    fn hysteria_udp_lane_carries_a_datagram() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_udp_lane_once, 3);
+    }
+
+    fn hysteria_udp_lane_once() {
+        // The client's own uplink, off the socks front: serve_udp reads a framed datagram from the relay socket, puts it on the connection's datagram lane, and the companion reader carries the echo back over the same lane.
+        let echo_port = udp_echo_loop();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_with("lane-auth", id, "");
         let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
-        let vless = VlessOut {
+        // The association reaps on this silence, as the production relay does on `budgets::udp_idle()`.
+        relay
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let relay_addr = relay.local_addr().expect("addr");
+        let dial = crate::hysteria::Dial {
+            host: "localhost".to_owned(),
             address: "127.0.0.1".to_owned(),
-            port: 9,
-            id: uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id"),
-            carrier: Carrier::Hysteria(ferrox_core::hysteria::Config {
-                auth: String::new(),
+            port,
+            config: ferrox_core::hysteria::Config {
+                auth: "lane-auth".to_owned(),
                 cc: ferrox_core::hysteria::Congestion::Bbr,
                 obfs_password: String::new(),
-            }),
-            host: "127.0.0.1".to_owned(),
-            mux: false,
-            quic_roots: None,
-            hysteria_roots: None,
-            tls: None,
-            flow: String::new(),
-            reality: None,
+            },
+            roots: Some(roots),
         };
-        let dest: SocketAddr = "127.0.0.1:9".parse().expect("addr");
-        let source = Arc::new(Mutex::new(None));
-        assert!(dial_udp_uplink(&vless, &dest, &relay, source).is_none());
+        thread::spawn(move || crate::hysteria::serve_udp(&relay, &dial));
+        let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        client
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("timeout");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"lane-ping");
+        let mut back = vec![0u8; UDP_BUF];
+        // The lane's handshake is not paid before the relay reads, so an early datagram is simply resent until the association is up.
+        let deadline = std::time::Instant::now() + QUIC_TEST_TIMEOUT;
+        let answer = loop {
+            let _ = client.send_to(&datagram, relay_addr);
+            match client.recv_from(&mut back) {
+                Ok((n, _)) => break n,
+                Err(_) if std::time::Instant::now() < deadline => {}
+                Err(error) => panic!("echo never returns: {error}"),
+            }
+        };
+        let (source, payload) = parse_socks_udp(&back[..answer]).expect("splits");
+        assert_eq!(source, target);
+        assert_eq!(payload, b"lane-ping");
     }
 
     #[test]
@@ -19741,6 +19775,80 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn hysteria_carries_a_udp_association_over_the_carrier() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_udp_association_once, 3);
+    }
+
+    fn hysteria_udp_association_once() {
+        // The whole dispatch: a socks5 UDP associate on a hysteria outbound, framed at the front, carried by the carrier's datagram lane to the echo target, and handed back in the frame the client expects.
+        let echo_port = udp_echo_loop();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_with("association-auth", id, "");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let out = Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Hysteria(ferrox_core::hysteria::Config {
+                auth: "association-auth".to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                obfs_password: String::new(),
+            }),
+            host: "localhost".to_owned(),
+            mux: false,
+            quic_roots: None,
+            hysteria_roots: Some(roots),
+            tls: None,
+            flow: String::new(),
+            reality: None,
+        });
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out);
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("timeout");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"association-ping");
+        let mut back = vec![0u8; UDP_BUF];
+        let deadline = std::time::Instant::now() + QUIC_TEST_TIMEOUT;
+        let answer = loop {
+            let _ = udp.send_to(&datagram, relay);
+            match udp.recv_from(&mut back) {
+                Ok((n, _)) => break n,
+                Err(_) if std::time::Instant::now() < deadline => {}
+                Err(error) => panic!("echo never returns: {error}"),
+            }
+        };
+        let (source, payload) = parse_socks_udp(&back[..answer]).expect("splits");
+        assert_eq!(source, target);
+        assert_eq!(payload, b"association-ping");
     }
 
     #[test]

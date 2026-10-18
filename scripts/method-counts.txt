@@ -306,7 +306,7 @@ carrier-hysteria closed-connections-reused 0 ferrox-app-proxy::tests::hysteria_r
 carrier-hysteria request-parse-reallocations 0 ferrox-app-hysteria::tests::a_parsed_request_leaves_its_payload_where_it_landed
 carrier-hysteria wrong-password-bytes-relayed 0 ferrox-app-proxy::tests::hysteria_refuses_a_wrong_password_without_relaying
 carrier-hysteria non-v2-configs-carried 0 ferrox-app-proxy::tests::hysteria_settings_parse_with_guarded_fallbacks
-carrier-hysteria udp-bytes-relayed 0 ferrox-app-proxy::tests::hysteria_dial_udp_uplink_is_none
+carrier-hysteria datagram-lane-client-round-trips 1 ferrox-app-proxy::tests::hysteria_carries_a_udp_association_over_the_carrier
 carrier-hysteria udp-datagram-decode-copies 0 ferrox-core-hysteria::tests::a_decoded_datagram_leaves_its_payload_where_it_landed
 carrier-hysteria udp-fragments-witnessed 200 ferrox-core-hysteria::tests::every_length_survives_fragment_then_defrag_intact
 carrier-hysteria obfuscated-datagram-heap-copies 0 ferrox-core-hysteria::tests::a_sealed_datagram_never_touches_the_heap

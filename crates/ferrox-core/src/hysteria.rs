@@ -445,10 +445,17 @@ pub fn verify_auth_request(block: &[u8], expected_auth: &str) -> bool {
 
 #[must_use]
 pub fn verify_auth_response(block: &[u8]) -> bool {
-    let Some(fields) = hpack::qpack_fields(block) else {
-        return false;
-    };
-    find(&fields, ":status") == Some(b"233".as_slice())
+    read_auth_response(block).is_some()
+}
+
+/// One parse for both signals the client reads off the auth response: `Some(true)` when the server accepted the credential and advertised the datagram lane, `Some(false)` when it accepted but only carries TCP streams, `None` when the credential was refused. The client caches the flag on the pooled session so a later UDP dial does not re-read the block.
+#[must_use]
+pub fn read_auth_response(block: &[u8]) -> Option<bool> {
+    let fields = hpack::qpack_fields(block)?;
+    if find(&fields, ":status")? != b"233" {
+        return None;
+    }
+    Some(find(&fields, UDP_HEADER) == Some(b"true".as_slice()))
 }
 
 #[cfg(test)]
