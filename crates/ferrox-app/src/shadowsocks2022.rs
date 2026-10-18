@@ -1470,9 +1470,10 @@ pub(crate) fn serve_udp(address: &str, password: &str, method: &str, freedom: bo
 
 pub(crate) fn relay_udp_forward(
     relay_psk: &[u8],
-    dests: &[(Vec<u8>, SocketAddr)],
+    dests: &[RelayDest<'_>],
     packet: &[u8],
-) -> Option<(Vec<u8>, SocketAddr, u64)> {
+    out: &mut Vec<u8>,
+) -> Option<(SocketAddr, u64)> {
     if packet.len() < 32 + TAG_LEN {
         return None;
     }
@@ -1483,17 +1484,39 @@ pub(crate) fn relay_udp_forward(
     let mut eih = [0u8; BLOCK_LEN];
     eih.copy_from_slice(&packet[16..32]);
     let hash = shadowsocks2022::decrypt_udp_eih(relay_psk, &raw, &eih)?;
-    let (dest_psk, dest) = dests
-        .iter()
-        .find(|(k, _)| shadowsocks2022::user_hash(k) == hash)?;
-    let re_enc = shadowsocks2022::block_encrypt(dest_psk, &raw)?;
-    let mut out = Vec::with_capacity(16 + packet.len() - 32);
+    let dest = dests.iter().find(|dest| dest.hash == hash)?;
+    let re_enc = shadowsocks2022::block_encrypt(dest.psk, &raw)?;
+    out.clear();
+    out.reserve(16 + packet.len() - 32);
     out.extend_from_slice(&re_enc);
     out.extend_from_slice(&packet[32..]);
-    Some((out, *dest, session))
+    Some((dest.addr, session))
 }
 
-pub(crate) fn relay_udp_client_of(dest_psk: &[u8], packet: &[u8]) -> Option<u64> {
+/// One relay destination carrying the hash its key is matched by: `user_hash` reads only that key, so a forwarded datagram compares hashes it already has instead of deriving one per destination it might yet reach.
+pub(crate) struct RelayDest<'a> {
+    hash: [u8; BLOCK_LEN],
+    psk: &'a [u8],
+    addr: SocketAddr,
+}
+
+/// The destinations as one relay sees them, hashed once for its whole life.
+pub(crate) fn relay_dests(dests: &[(Vec<u8>, SocketAddr)]) -> Vec<RelayDest<'_>> {
+    dests
+        .iter()
+        .map(|(psk, addr)| RelayDest {
+            hash: shadowsocks2022::user_hash(psk),
+            psk,
+            addr: *addr,
+        })
+        .collect()
+}
+
+pub(crate) fn relay_udp_client_of(
+    dest_psk: &[u8],
+    body: &mut Vec<u8>,
+    packet: &[u8],
+) -> Option<u64> {
     if packet.len() < 16 + 19 + TAG_LEN {
         return None;
     }
@@ -1511,8 +1534,9 @@ pub(crate) fn relay_udp_client_of(dest_psk: &[u8], packet: &[u8]) -> Option<u64>
     )?;
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&raw[4..16]);
-    let mut body = packet[16..].to_vec();
-    let len = cipher.open_with_nonce(&nonce, &mut body)?;
+    body.clear();
+    body.extend_from_slice(&packet[16..]);
+    let len = cipher.open_with_nonce(&nonce, body)?;
     body.truncate(len);
     if body.len() < 19 || body[0] != 1 {
         return None;
@@ -1545,13 +1569,16 @@ pub(crate) fn serve_udp_relay(
     for (idx, (_, addr)) in dests.iter().enumerate() {
         by_addr.insert(*addr, idx);
     }
+    let hashed = relay_dests(dests);
     let mut client_of: HashMap<u64, SocketAddr> = HashMap::new();
+    let mut forwarded: Vec<u8> = Vec::new();
+    let mut body: Vec<u8> = Vec::new();
     let mut buf = crate::proxy::udp_buffer();
     loop {
         match clients.recv_from(&mut buf) {
             Ok((n, src)) => {
-                if let Some((forwarded, dest, session)) =
-                    relay_udp_forward(relay_psk, dests, &buf[..n])
+                if let Some((dest, session)) =
+                    relay_udp_forward(relay_psk, &hashed, &buf[..n], &mut forwarded)
                 {
                     if client_of.len() >= 4096 {
                         client_of.clear();
@@ -1570,7 +1597,7 @@ pub(crate) fn serve_udp_relay(
             let Some((dest_psk, _)) = dests.get(idx) else {
                 continue;
             };
-            if let Some(session) = relay_udp_client_of(dest_psk, &buf[..n]) {
+            if let Some(session) = relay_udp_client_of(dest_psk, &mut body, &buf[..n]) {
                 if let Some(client) = client_of.get(&session) {
                     let _ = clients.send_to(&buf[..n], client);
                 }
@@ -2217,25 +2244,110 @@ mod tests {
             .seal_list(method, &list, &target, b"relay-payload")
             .expect("seals")
             .to_vec();
-        let (forwarded, got, session) =
-            relay_udp_forward(&relay_psk, &[(dest_psk.clone(), dest)], &packet).expect("relays");
+        let mut out: Vec<u8> = Vec::new();
+        let dests = [(dest_psk.clone(), dest)];
+        let (got, session) =
+            relay_udp_forward(&relay_psk, &relay_dests(&dests), &packet, &mut out).expect("relays");
         assert_eq!(got, dest);
-        assert_eq!(forwarded.len(), packet.len() - BLOCK_LEN);
+        assert_eq!(out.len(), packet.len() - BLOCK_LEN);
+        let forwarded = out.clone();
         let mut server = Datagrams::new();
         let (target_back, payload, _) = server.open(&dest_psk, method, &forwarded).expect("opens");
         assert_eq!(target_back, target);
         assert_eq!(payload, b"relay-payload");
         assert_eq!(session, 0x1a1b_1c1d_1e1f_2021);
-        assert!(relay_udp_forward(&relay_psk, &[(dest_psk.clone(), dest)], &forwarded).is_none());
+        assert!(
+            relay_udp_forward(&relay_psk, &relay_dests(&dests), &forwarded, &mut out).is_none(),
+            "a header already stripped is not a client packet"
+        );
         let reply = server
             .seal_server(method, &dest_psk, session, &target, b"relay-reply")
             .expect("seals")
             .to_vec();
         assert_eq!(
-            relay_udp_client_of(&dest_psk, &reply),
+            relay_udp_client_of(&dest_psk, &mut Vec::new(), &reply),
             Some(session),
             "the relay reads the client session out of the response"
         );
+    }
+
+    /// The reply body opens into the caller's buffer: two replies of one size write where the first did, so a relay that answers a thousand requests of one size allocates for the first of them.
+    #[test]
+    fn a_reply_body_is_opened_into_a_buffer_that_stops_growing() {
+        let method = Method::Aes256Gcm;
+        let dest_psk = vec![0x55u8; 32];
+        let target: SocketAddr = "127.0.0.1:53".parse().expect("addr");
+        let mut server = Datagrams::new();
+        let reply = server
+            .seal_server(
+                method,
+                &dest_psk,
+                0x1111_2222_3333_4444,
+                &target,
+                b"relay-reply",
+            )
+            .expect("seals")
+            .to_vec();
+        let mut body: Vec<u8> = Vec::new();
+        assert_eq!(
+            relay_udp_client_of(&dest_psk, &mut body, &reply),
+            Some(0x1111_2222_3333_4444)
+        );
+        let pointer = body.as_ptr();
+        let room = body.capacity();
+        assert_eq!(
+            relay_udp_client_of(&dest_psk, &mut body, &reply),
+            Some(0x1111_2222_3333_4444),
+            "the same reply opens again on the reused buffer"
+        );
+        assert!(
+            std::ptr::eq(pointer, body.as_ptr()),
+            "a repeat reply size allocated no new buffer"
+        );
+        assert_eq!(
+            body.capacity(),
+            room,
+            "a repeat reply size reallocated nothing"
+        );
+    }
+
+    /// The forwarded datagram is written into the caller's buffer: forwarding a size the buffer has already held moves neither its pointer nor its capacity, so a relay that carries a thousand datagrams of one size allocates for the first of them.
+    #[test]
+    fn a_forwarded_datagram_is_written_into_a_buffer_that_stops_growing() {
+        let method = Method::Aes256Gcm;
+        let relay_psk = vec![0x44u8; 32];
+        let dest_psk = vec![0x55u8; 32];
+        let dest: SocketAddr = "127.0.0.1:8388".parse().expect("addr");
+        let target: SocketAddr = "127.0.0.1:53".parse().expect("addr");
+        let list = vec![relay_psk.clone(), dest_psk.clone()];
+        let dests = [(dest_psk.clone(), dest)];
+        let hashed = relay_dests(&dests);
+        let mut client = Datagrams::new();
+        client.session = 0x2b2b_2b2b_2b2b_2b2b;
+        let packet = client
+            .seal_list(method, &list, &target, b"a-relayed-datagram")
+            .expect("seals")
+            .to_vec();
+        let mut out: Vec<u8> = Vec::new();
+        let (got, session) =
+            relay_udp_forward(&relay_psk, &hashed, &packet, &mut out).expect("relays");
+        assert_eq!(got, dest);
+        assert_eq!(session, 0x2b2b_2b2b_2b2b_2b2b);
+        assert_eq!(out.len(), packet.len() - BLOCK_LEN);
+        let written = out.clone();
+        let pointer = out.as_ptr();
+        let room = out.capacity();
+        // The same size again: the write lands where the last one did, and the bytes are the ones a fresh buffer would have held.
+        relay_udp_forward(&relay_psk, &hashed, &packet, &mut out).expect("relays");
+        assert_eq!(
+            out, written,
+            "the reused buffer holds what a fresh one held"
+        );
+        assert!(
+            std::ptr::eq(pointer, out.as_ptr()),
+            "a repeat size allocated no new buffer"
+        );
+        assert_eq!(out.capacity(), room, "a repeat size reallocated nothing");
     }
 
     #[test]
