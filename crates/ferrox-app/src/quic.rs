@@ -684,6 +684,10 @@ pub(crate) struct Datagram {
     /// with it, so a UDP flow keeps ending and a new one starting to a filter.
     /// Shared behind an `Arc` so a writer clone and a reader clone move together.
     hop: Option<Arc<Hopper>>,
+    /// A `obfs: gecko` client dial: long-header packets are fragmented and padded on
+    /// the way out and reassembled on the way in, masking still salamander's. Shared
+    /// behind an `Arc` so the reassembly table and message counter are one owner.
+    gecko: Option<Arc<Gecko>>,
 }
 
 /// Where datagrams go. The association's control connection is held, never read: dropping it ends it.
@@ -935,6 +939,234 @@ impl Hopper {
     }
 }
 
+/// How long one half-reassembled gecko message may sit before a reader drops it, and
+/// how many the socket will hold in total and per source. The reference gives these
+/// the same numbers; a message that outlives its ttl is a real loss, not a leak.
+const GECKO_TTL: Duration = Duration::from_secs(8);
+const GECKO_MAX_MESSAGES: usize = 4096;
+const GECKO_MAX_PER_SOURCE: usize = 8;
+/// The largest frame the `obfs: gecko` window sizes against, so the stack scratch a
+/// fragment is built in is big enough for any padded frame the plan can ask for.
+const GECKO_BUFFER: usize = ferrox_core::hysteria::Gecko::MAX_BUFFER as usize;
+
+/// One message mid-reassembly: its chunk count, the payloads landed so far indexed
+/// by chunk, and when it expires.
+struct GeckoMessage {
+    chunks: Vec<Option<Vec<u8>>>,
+    total: usize,
+    received: usize,
+    until: Instant,
+}
+
+/// A `obfs: gecko` datagram socket: salamander-masks every datagram, and on a QUIC
+/// long-header write splits it into `2..=8` padded frames sent as separate datagrams,
+/// reassembling them on read keyed by `(peer, message id)`. A short-header packet is
+/// masked whole and passes through, so only the handshake Initial is fragmented — the
+/// stream and datagram lanes above see one packet in, one packet out, exactly as an
+/// unobfuscated dial. The chunk count, pad length and message id are drawn here from
+/// the core's pure `gecko_pad_len`/`gecko_chunk_range`, so the frame bytes stay a
+/// bit-tested construction while only the randomisation lives beside the socket.
+/// Expiry is swept lazily on the reader rather than by a background timer thread.
+pub(crate) struct Gecko {
+    sock: UdpSocket,
+    obfs: ferrox_core::hysteria::Salamander,
+    min: usize,
+    max: usize,
+    msg: AtomicU64,
+    reassembly: Mutex<HashMap<(SocketAddr, u8), GeckoMessage>>,
+}
+
+impl Gecko {
+    fn new(
+        sock: UdpSocket,
+        obfs: ferrox_core::hysteria::Salamander,
+        window: ferrox_core::hysteria::Gecko,
+    ) -> Self {
+        Self {
+            sock,
+            obfs,
+            min: usize::from(window.min_pkt),
+            max: usize::from(window.max_pkt),
+            msg: AtomicU64::new(0),
+            reassembly: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Seal one masked datagram and write it, returning the plain bytes consumed.
+    fn send_masked(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        let mut wire = Unfilled::<{ MAX_DATAGRAM + SALAMANDER_SALT }>::new();
+        let sealed = self
+            .obfs
+            .seal_into(buf, wire.as_mut())
+            .ok_or(invalid(std::io::ErrorKind::InvalidInput))?;
+        self.sock.send_to(&wire.as_mut()[..sealed], to)
+    }
+
+    /// Split a long-header packet into `2..=8` chunks, each framed, padded to the
+    /// window and masked as its own datagram. The message id is one draw for the whole
+    /// packet; the chunk count and each pad are drawn per write.
+    fn send_fragmented(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        let total = ferrox_core::hysteria::GECKO_MIN_CHUNKS
+            + (entropy()
+                % (ferrox_core::hysteria::GECKO_MAX_CHUNKS
+                    - ferrox_core::hysteria::GECKO_MIN_CHUNKS
+                    + 1) as u64) as usize;
+        let msg_id = self.msg.fetch_add(1, Ordering::Relaxed) as u8;
+        let mut pad = [0u8; GECKO_BUFFER];
+        let mut frame = Unfilled::<GECKO_BUFFER>::new();
+        let mut wire = Unfilled::<{ GECKO_BUFFER + SALAMANDER_SALT }>::new();
+        for idx in 0..total {
+            let (start, end) = ferrox_core::hysteria::gecko_chunk_range(buf.len(), idx, total)
+                .ok_or(invalid(std::io::ErrorKind::InvalidInput))?;
+            let chunk = &buf[start..end];
+            let base = SALAMANDER_SALT + ferrox_core::hysteria::GECKO_HEADER + chunk.len();
+            let pad_len = usize::from(ferrox_core::hysteria::gecko_pad_len(
+                self.min,
+                self.max,
+                base,
+                entropy(),
+            ));
+            if pad_len > 0 {
+                // Padding is the point of the lane; a failed draw leaves zeros, which salamander still masks to noise.
+                let _ = getrandom::getrandom(&mut pad[..pad_len]);
+            }
+            let written = ferrox_core::hysteria::encode_gecko_frame(
+                ferrox_core::hysteria::GeckoFrame {
+                    msg_id,
+                    chunk_idx: idx as u8,
+                    total_chunks: total as u8,
+                    pad_len: pad_len as u16,
+                },
+                &pad[..pad_len],
+                chunk,
+                frame.as_mut(),
+            )
+            .ok_or(invalid(std::io::ErrorKind::InvalidInput))?;
+            let sealed = self
+                .obfs
+                .seal_into(&frame.as_mut()[..written], wire.as_mut())
+                .ok_or(invalid(std::io::ErrorKind::InvalidInput))?;
+            self.sock.send_to(&wire.as_mut()[..sealed], to)?;
+        }
+        Ok(buf.len())
+    }
+
+    fn send(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        if buf
+            .first()
+            .is_some_and(|b| b & ferrox_core::hysteria::GECKO_FLAG != 0)
+        {
+            return self.send_fragmented(buf, to);
+        }
+        self.send_masked(buf, to)
+    }
+
+    /// Land one frame's payload and return the whole message once every chunk has
+    /// arrived. A duplicate, an inconsistent count, an out-of-range index or a source
+    /// or global cap already reached all drop the chunk rather than growing state.
+    fn accept(
+        &self,
+        from: SocketAddr,
+        frame: ferrox_core::hysteria::GeckoFrame,
+        payload: &[u8],
+    ) -> Option<Vec<u8>> {
+        let total = usize::from(frame.total_chunks);
+        let index = usize::from(frame.chunk_idx);
+        let key = (from, frame.msg_id);
+        let now = Instant::now();
+        let mut table = self.reassembly.lock().ok()?;
+        table.retain(|_, message| message.until > now);
+        if !table.contains_key(&key) {
+            if table.len() >= GECKO_MAX_MESSAGES {
+                return None;
+            }
+            if table.keys().filter(|(source, _)| *source == from).count() >= GECKO_MAX_PER_SOURCE {
+                return None;
+            }
+            table.insert(
+                key,
+                GeckoMessage {
+                    chunks: vec![None; total],
+                    total,
+                    received: 0,
+                    until: now + GECKO_TTL,
+                },
+            );
+        }
+        let message = table.get_mut(&key)?;
+        if message.total != total || index >= total || message.chunks[index].is_some() {
+            return None;
+        }
+        message.chunks[index] = Some(payload.to_vec());
+        message.received += 1;
+        if message.received < total {
+            return None;
+        }
+        let mut out = Vec::with_capacity(payload.len() * total);
+        for chunk in &mut message.chunks {
+            out.extend(chunk.take().unwrap_or_default());
+        }
+        table.remove(&key);
+        Some(out)
+    }
+
+    /// Read frames until a whole message assembles or the socket runs dry, so one call
+    /// consumes every datagram currently waiting — the reference reader's shape. A
+    /// short-header packet is handed straight up; an empty socket is the same
+    /// `WouldBlock` a plain read gives, so the drive loop keeps its no-packet path.
+    fn recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        loop {
+            let mut wire = Unfilled::<{ GECKO_BUFFER + SALAMANDER_SALT }>::new();
+            let (found, from) = match self.sock.recv_from(wire.as_mut()) {
+                Ok(read) => read,
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+                Err(err) => return Err(err),
+            };
+            let Some(plain) = self
+                .obfs
+                .deobfuscate_in_place(&mut wire.as_mut()[..found])
+                .map(|len| &wire.as_mut()[..len])
+            else {
+                return Err(invalid(std::io::ErrorKind::InvalidData));
+            };
+            if plain
+                .first()
+                .is_none_or(|b| b & ferrox_core::hysteria::GECKO_FLAG == 0)
+            {
+                let Some(out) = buf.get_mut(..plain.len()) else {
+                    return Err(invalid(std::io::ErrorKind::InvalidInput));
+                };
+                out.copy_from_slice(plain);
+                return Ok((plain.len(), from));
+            }
+            let Some((frame, payload)) = ferrox_core::hysteria::decode_gecko_frame(plain) else {
+                // A malformed frame is dropped, exactly as the reference reader does.
+                continue;
+            };
+            let Some(message) = self.accept(from, frame, payload) else {
+                continue;
+            };
+            let Some(out) = buf.get_mut(..message.len()) else {
+                return Err(invalid(std::io::ErrorKind::InvalidInput));
+            };
+            out.copy_from_slice(&message);
+            return Ok((message.len(), from));
+        }
+    }
+}
+
+/// An `io::Error` of the given kind, the shape the datagram lane already returns.
+fn invalid(kind: std::io::ErrorKind) -> std::io::Error {
+    std::io::Error::from(kind)
+}
+
 impl Datagram {
     pub(crate) fn plain(sock: UdpSocket) -> Self {
         Self {
@@ -942,6 +1174,7 @@ impl Datagram {
             relay: None,
             obfs: None,
             hop: None,
+            gecko: None,
         }
     }
 
@@ -952,6 +1185,7 @@ impl Datagram {
             relay: None,
             obfs: Some(obfs),
             hop: None,
+            gecko: None,
         }
     }
 
@@ -964,7 +1198,26 @@ impl Datagram {
             }),
             obfs: None,
             hop: None,
+            gecko: None,
         }
+    }
+
+    /// A client dial that fragments its long-header packets and pads them into
+    /// `window`, salamander-masking every frame — the Hysteria v2 `obfs: gecko` lane.
+    /// `obfs` is the mask `Gecko` seals each frame with; the fixed socket never moves.
+    pub(crate) fn gecked(
+        sock: UdpSocket,
+        obfs: ferrox_core::hysteria::Salamander,
+        window: ferrox_core::hysteria::Gecko,
+    ) -> std::io::Result<Self> {
+        let handle = sock.try_clone()?;
+        Ok(Self {
+            sock,
+            relay: None,
+            obfs: None,
+            hop: None,
+            gecko: Some(Arc::new(Gecko::new(handle, obfs, window))),
+        })
     }
 
     /// A client dial that moves its server port among `ports` every `interval_ms`,
@@ -985,10 +1238,14 @@ impl Datagram {
             relay: None,
             obfs,
             hop: Some(Arc::new(hopper)),
+            gecko: None,
         })
     }
 
     pub(crate) fn send_to(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        if let Some(gecko) = self.gecko.as_ref() {
+            return gecko.send(buf, to);
+        }
         if let Some(hop) = self.hop.as_ref() {
             return hop.send(buf, to, self.obfs.as_ref());
         }
@@ -1016,6 +1273,9 @@ impl Datagram {
     }
 
     pub(crate) fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        if let Some(gecko) = self.gecko.as_ref() {
+            return gecko.recv(buf);
+        }
         if let Some(hop) = self.hop.as_ref() {
             return hop.recv(buf, self.obfs.as_ref());
         }
@@ -1065,6 +1325,7 @@ impl Datagram {
             relay: self.relay.clone(),
             obfs: self.obfs.clone(),
             hop: self.hop.clone(),
+            gecko: self.gecko.clone(),
         })
     }
 
@@ -2423,6 +2684,77 @@ mod tests {
             from.port(),
             server.port(),
             "the hopped source became the nominal"
+        );
+    }
+
+    fn gecko_salamander() -> ferrox_core::hysteria::Salamander {
+        ferrox_core::hysteria::Salamander::new("gecko-key").expect("a usable key")
+    }
+
+    fn gecko_window() -> ferrox_core::hysteria::Gecko {
+        ferrox_core::hysteria::Gecko::new(512, 1200).expect("a valid window")
+    }
+
+    /// Two gecko dials face each other over loopback. A long-header packet written by
+    /// one arrives at the other split across several datagrams and reassembles to the
+    /// exact bytes, and a short-header packet passes through as one — the witness that
+    /// the fragmenter, the salamander mask and the reassembly agree end to end.
+    #[test]
+    fn a_gecko_dial_reassembles_its_split_long_header() {
+        let a = UdpSocket::bind("0.0.0.0:0").expect("binds");
+        let b = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let b_addr = b.local_addr().expect("addr");
+        b.set_read_timeout(Some(Duration::from_millis(400)))
+            .expect("timeout");
+        let writer = Datagram::gecked(a, gecko_salamander(), gecko_window()).expect("geckos");
+        let reader = Datagram::gecked(b, gecko_salamander(), gecko_window()).expect("geckos");
+        // A QUIC long header (byte 0 high bit set), at a length no chunk count divides so the last chunk carries a real remainder.
+        let mut packet: Vec<u8> = (0u16..900).map(|i| (i % 251) as u8).collect();
+        packet[0] |= ferrox_core::hysteria::GECKO_FLAG;
+        writer.send_to(&packet, b_addr).expect("sends");
+        let mut buf = [0u8; 2048];
+        let (n, _from) = reader.recv_from(&mut buf).expect("reassembles");
+        assert_eq!(&buf[..n], &packet[..], "the split packet rebuilt exactly");
+        assert_eq!(n, packet.len());
+        // A short-header packet is masked whole and comes back as a single pass-through.
+        let short = vec![0x40u8; 40];
+        writer.send_to(&short, b_addr).expect("sends short");
+        let (m, _) = reader.recv_from(&mut buf).expect("reads short");
+        assert_eq!(&buf[..m], &short[..], "a short header is not fragmented");
+    }
+
+    /// A peer that never fragments still reads back whole: a long-header packet sent
+    /// by a gecko dial is split on the wire, so more than one datagram must reach the
+    /// listening socket — the witness that the fragmentation really happens, not that
+    /// the writer merely happened to send one packet.
+    #[test]
+    fn a_gecko_long_header_leaves_the_socket_as_more_than_one_datagram() {
+        let server = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let server_addr = server.local_addr().expect("addr");
+        server
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .expect("timeout");
+        let client = UdpSocket::bind("0.0.0.0:0").expect("binds");
+        let writer = Datagram::gecked(client, gecko_salamander(), gecko_window()).expect("geckos");
+        let mut packet: Vec<u8> = vec![0xab; 900];
+        packet[0] = ferrox_core::hysteria::GECKO_FLAG;
+        writer.send_to(&packet, server_addr).expect("sends");
+        let mut datagrams = 0usize;
+        let mut buf = [0u8; 2048];
+        while let Ok((n, _)) = server.recv_from(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            datagrams += 1;
+            // Each fragment sits inside the padded window the plan named.
+            assert!(
+                (512..=1200).contains(&n),
+                "a fragment is padded into its window, saw {n}"
+            );
+        }
+        assert!(
+            datagrams >= 2,
+            "a long header really split across datagrams, saw {datagrams}"
         );
     }
 }

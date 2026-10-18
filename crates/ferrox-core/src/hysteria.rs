@@ -138,6 +138,10 @@ pub struct Config {
     /// The port-hopping plan this dial rotates server ports on, or `None` for a
     /// single fixed port. A plan joins the pool key, so reuse stays hop-faithful.
     pub hop: Option<Hop>,
+    /// The `obfs: gecko` fragment window this dial pads its long-header packets
+    /// into, or `None` for a plain salamander (or cleartext) lane. `obfs_password`
+    /// still holds the key salamander masks each frame with.
+    pub gecko: Option<Gecko>,
 }
 
 impl Default for Config {
@@ -147,6 +151,7 @@ impl Default for Config {
             cc: Congestion::Bbr,
             obfs_password: String::new(),
             hop: None,
+            gecko: None,
         }
     }
 }
@@ -489,6 +494,171 @@ impl Salamander {
             datagram[i] = datagram[SALAMANDER_SALT + i] ^ key[i % SALAMANDER_KEY];
         }
         Some(payload)
+    }
+}
+
+/// Gecko, the Hysteria v2 `obfs: gecko` lane: a fragment-and-pad layer that rides on
+/// top of salamander. A QUIC long-header packet (its high bit `0x80` set) is split
+/// into `2..=8` chunks, each wrapped in a five-byte frame header plus random padding
+/// that drags the sealed datagram into a `[min, max]` size window, then masked; a
+/// short-header packet is masked whole. This is the deterministic half of the lane —
+/// the chunk count, pad lengths and message ids are random and drawn by the socket
+/// above, exactly as the port-hop pick and stay are drawn by the dialer.
+///
+/// Wire layout of one frame, before salamander masks it:
+/// - byte 0: `0x80` fragment marker, the low 7 bits reserved
+/// - byte 1: message id
+/// - byte 2: `chunk_idx` in the high nibble, `total_chunks` in the low nibble
+/// - bytes 3-4: pad length, big-endian
+/// - then `pad_len` random bytes, then the chunk payload
+pub const GECKO_FLAG: u8 = 0x80;
+
+/// A frame header: one flag byte, a message id, the chunk/total nibble, and a two
+/// byte pad length.
+pub const GECKO_HEADER: usize = 5;
+
+/// A fragmented message spans at least this many chunks.
+pub const GECKO_MIN_CHUNKS: usize = 2;
+
+/// …and at most this many, so one nibble always holds both the count and the index.
+pub const GECKO_MAX_CHUNKS: usize = 8;
+
+/// A parsed gecko frame header; [`decode_gecko_frame`] returns it with a borrow of the
+/// payload that followed the padding.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GeckoFrame {
+    pub msg_id: u8,
+    pub chunk_idx: u8,
+    pub total_chunks: u8,
+    pub pad_len: u16,
+}
+
+impl GeckoFrame {
+    /// `false` unless the chunk count is in `[2, 8]` and the index is below it — the
+    /// two rules both the encoder and the decoder refuse a frame on.
+    #[must_use]
+    pub fn valid(self) -> bool {
+        (GECKO_MIN_CHUNKS as u8..=GECKO_MAX_CHUNKS as u8).contains(&self.total_chunks)
+            && self.chunk_idx < self.total_chunks
+    }
+}
+
+/// Write one frame's header, then the caller-supplied `pad`, then `payload` into
+/// `out`, returning the total length. `pad` must be exactly `frame.pad_len` long and
+/// `out` must hold the whole frame; anything else is refused with `None` so a forged
+/// or undersized buffer is never written past.
+#[must_use]
+pub fn encode_gecko_frame(
+    frame: GeckoFrame,
+    pad: &[u8],
+    payload: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    if !frame.valid() || usize::from(frame.pad_len) != pad.len() {
+        return None;
+    }
+    let total = GECKO_HEADER + pad.len() + payload.len();
+    let room = out.get_mut(..total)?;
+    room[0] = GECKO_FLAG;
+    room[1] = frame.msg_id;
+    room[2] = frame.chunk_idx << 4 | frame.total_chunks & 0x0f;
+    room[3..5].copy_from_slice(&frame.pad_len.to_be_bytes());
+    room[GECKO_HEADER..GECKO_HEADER + pad.len()].copy_from_slice(pad);
+    room[GECKO_HEADER + pad.len()..].copy_from_slice(payload);
+    Some(total)
+}
+
+/// Parse a frame header and borrow its payload out of `input` with no copy. `None` on
+/// a truncated buffer, a missing flag, an invalid chunk count or index, or a pad
+/// length that would read past the buffer. The payload slice begins at exactly
+/// `GECKO_HEADER + pad_len` inside `input`, so its base pointer witnesses the zero
+/// copy rather than a refill.
+#[must_use]
+pub fn decode_gecko_frame(input: &[u8]) -> Option<(GeckoFrame, &[u8])> {
+    let head = input.get(..GECKO_HEADER)?;
+    if head[0] & GECKO_FLAG == 0 {
+        return None;
+    }
+    let frame = GeckoFrame {
+        msg_id: head[1],
+        chunk_idx: head[2] >> 4,
+        total_chunks: head[2] & 0x0f,
+        pad_len: u16::from_be_bytes([head[3], head[4]]),
+    };
+    if !frame.valid() {
+        return None;
+    }
+    input
+        .get(GECKO_HEADER + usize::from(frame.pad_len)..)
+        .map(|payload| (frame, payload))
+}
+
+/// The byte range `[start, end)` of chunk `idx` when `len` is split into `total`
+/// chunks of `len / total` each and the last takes the remainder — the reference
+/// fragmenter's rule, exposed pure so a test can witness reassembly order instead of
+/// assuming it.
+#[must_use]
+pub fn gecko_chunk_range(len: usize, idx: usize, total: usize) -> Option<(usize, usize)> {
+    if total == 0 || idx >= total {
+        return None;
+    }
+    let size = len / total;
+    let start = idx * size;
+    let end = if idx + 1 == total { len } else { start + size };
+    Some((start, end))
+}
+
+/// The padding a chunk of `chunk_len` plain bytes needs so the sealed datagram —
+/// salt, frame header, padding, payload — lands inside the inclusive `[min, max]`
+/// window. `base` is the salt+header+chunk already committed; when that alone is at
+/// or over `max` there is no room and the pad is 0. Otherwise the low end is the
+/// larger of `min` and `base`, and `roll` spreads the size across `[lo, max]`. Folded
+/// pure so the socket draws the roll and a test pins the bounds with no RNG.
+#[must_use]
+pub fn gecko_pad_len(min: usize, max: usize, base: usize, roll: u64) -> u16 {
+    let lo = min.max(base);
+    if lo > max {
+        return 0;
+    }
+    let span = max - lo + 1;
+    let spread = if span <= 1 {
+        0
+    } else {
+        usize::try_from(roll % span as u64).unwrap_or(0)
+    };
+    u16::try_from(lo - base + spread).unwrap_or(u16::MAX)
+}
+
+/// A `obfs: gecko` plan: the frame size window the socket pads into. It defaults to
+/// `[512, 1200]` and caps the buffer at 2048, the reference's own bounds; a config
+/// outside them is refused at parse rather than guessed at, so this type only ever
+/// carries a valid window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Gecko {
+    pub min_pkt: u16,
+    pub max_pkt: u16,
+}
+
+impl Gecko {
+    /// The window a config that names neither bound gets.
+    pub const DEFAULT_MIN: u16 = 512;
+    pub const DEFAULT_MAX: u16 = 1200;
+    /// The largest frame the reference sizes against; a bigger bound is refused.
+    pub const MAX_BUFFER: u16 = 2048;
+
+    /// A valid window, filling each absent bound with its default. `None` unless
+    /// `0 < min <= max <= 2048`.
+    #[must_use]
+    pub fn new(min: u16, max: u16) -> Option<Self> {
+        let min = if min == 0 { Self::DEFAULT_MIN } else { min };
+        let max = if max == 0 { Self::DEFAULT_MAX } else { max };
+        if min == 0 || min > max || max > Self::MAX_BUFFER {
+            return None;
+        }
+        Some(Self {
+            min_pkt: min,
+            max_pkt: max,
+        })
     }
 }
 
@@ -1367,5 +1537,141 @@ mod tests {
         assert!(is_hop_port(&hop.ports(), 9, 9001));
         assert!(is_hop_port(&hop.ports(), 443, 443));
         assert!(!is_hop_port(&hop.ports(), 443, 50000));
+    }
+
+    #[test]
+    fn a_gecko_frame_is_the_exact_bytes_the_reference_emits() {
+        let frame = GeckoFrame {
+            msg_id: 7,
+            chunk_idx: 2,
+            total_chunks: 6,
+            pad_len: 3,
+        };
+        let mut out = [0u8; 16];
+        let written =
+            encode_gecko_frame(frame, b"pad", b"hi", &mut out).expect("a well-sized frame");
+        // flag, msg, chunk<<4|total, pad_len big-endian, the three pad bytes, then payload.
+        assert_eq!(
+            &out[..written],
+            [0x80, 7, 0x26, 0, 3, b'p', b'a', b'd', b'h', b'i']
+        );
+        assert_eq!(written, GECKO_HEADER + 3 + 2);
+    }
+
+    #[test]
+    fn a_gecko_frame_decodes_its_payload_without_a_copy() {
+        let frame = GeckoFrame {
+            msg_id: 1,
+            chunk_idx: 0,
+            total_chunks: GECKO_MIN_CHUNKS as u8,
+            pad_len: 4,
+        };
+        let mut buf = vec![0u8; GECKO_HEADER + 4 + 5];
+        encode_gecko_frame(frame, b"abcd", b"hello", &mut buf).expect("room");
+        let (got, payload) = decode_gecko_frame(&buf).expect("a valid frame");
+        assert_eq!(got, frame);
+        assert_eq!(payload, b"hello");
+        // The zero-copy witness: the payload borrows the frame buffer, so its base sits at exactly `GECKO_HEADER + pad_len` inside it.
+        let base = buf.as_ptr() as usize;
+        let at = payload.as_ptr() as usize;
+        assert_eq!(at, base + GECKO_HEADER + 4);
+        assert!(at > base && at + payload.len() <= base + buf.len());
+    }
+
+    #[test]
+    fn a_forged_or_truncated_frame_is_refused_and_the_buffer_held() {
+        // A valid header would be idx 2 of 3 (`0x23`), pad length read from bytes 3-4.
+        let mut frame = [GECKO_FLAG, 0, 0x23, 0, 0, b'x'];
+        // A chunk index not below the total is refused.
+        frame[2] = 0x22;
+        assert!(decode_gecko_frame(&frame).is_none());
+        // A total under the two-chunk minimum is refused.
+        frame[2] = 0x11;
+        assert!(decode_gecko_frame(&frame).is_none());
+        // A cleared fragment marker is a short-header packet, not a frame.
+        frame[0] = 0x00;
+        assert!(decode_gecko_frame(&frame).is_none());
+        frame[0] = GECKO_FLAG;
+        // A pad length that fits the buffer parses, with the payload empty at the end.
+        frame[2] = 0x23;
+        frame[4] = 1;
+        assert!(decode_gecko_frame(&frame).is_some());
+        // A pad length reaching past the buffer is refused, and the bytes are held.
+        frame[4] = 200;
+        let before = frame;
+        assert!(decode_gecko_frame(&frame).is_none());
+        assert_eq!(frame, before, "a refusal never rewrote the input");
+        // A buffer too short to even hold a header is refused.
+        assert!(decode_gecko_frame(&frame[..GECKO_HEADER - 1]).is_none());
+    }
+
+    #[test]
+    fn a_fragmented_long_header_packet_reassembles_bit_identical() {
+        // A QUIC long-header packet (byte 0 high bit set) at a length the chunk count does not divide, so the last chunk takes a real remainder.
+        let mut packet: Vec<u8> = (0u8..=255).cycle().take(1234).collect();
+        packet[0] |= GECKO_FLAG;
+        let total = 3usize;
+        let mut frames = Vec::new();
+        for idx in 0..total {
+            let (start, end) = gecko_chunk_range(packet.len(), idx, total).expect("a chunk");
+            let payload = &packet[start..end];
+            let mut buf = vec![0u8; GECKO_HEADER + payload.len()];
+            encode_gecko_frame(
+                GeckoFrame {
+                    msg_id: 42,
+                    chunk_idx: idx as u8,
+                    total_chunks: total as u8,
+                    pad_len: 0,
+                },
+                b"",
+                payload,
+                &mut buf,
+            )
+            .expect("room");
+            frames.push(buf);
+        }
+        let mut out = Vec::new();
+        for buf in &frames {
+            let (frame, payload) = decode_gecko_frame(buf).expect("valid");
+            out.extend_from_slice(payload);
+            assert_eq!(frame.msg_id, 42);
+        }
+        assert_eq!(out, packet, "the chunks rebuild the packet exactly");
+    }
+
+    #[test]
+    fn a_pad_lands_the_sealed_datagram_inside_its_window() {
+        let (min, max) = (512usize, 1200usize);
+        let salt_head = SALAMANDER_SALT + GECKO_HEADER;
+        // A small chunk: the pad drags the sealed size into [min, max] for every roll.
+        let base = salt_head + 40;
+        for roll in 0..64u64 {
+            let pad = gecko_pad_len(min, max, base, roll) as usize;
+            let sealed = base + pad;
+            assert!(
+                (min..=max).contains(&sealed),
+                "a padded datagram fits the window"
+            );
+        }
+        // A chunk already past max gets no pad rather than a negative one.
+        assert_eq!(gecko_pad_len(min, max, salt_head + 2000, 7), 0);
+    }
+
+    #[test]
+    fn a_chunk_range_partitions_a_packet_without_gaps() {
+        for len in [1usize, 7, 1500, 1501] {
+            for total in [2usize, 5, 8] {
+                let mut cursor = 0;
+                for idx in 0..total {
+                    let (start, end) = gecko_chunk_range(len, idx, total).expect("valid");
+                    assert_eq!(start, cursor, "chunks are contiguous");
+                    assert!(end <= len);
+                    cursor = end;
+                }
+                assert_eq!(cursor, len, "the last chunk took the remainder");
+            }
+        }
+        assert!(gecko_chunk_range(10, 0, 0).is_none());
+        assert!(gecko_chunk_range(10, 3, 3).is_none());
     }
 }
