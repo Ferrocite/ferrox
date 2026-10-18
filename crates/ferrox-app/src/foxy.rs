@@ -155,8 +155,10 @@ fn tls_to_edge(dial: &FoxyDial) -> Result<ferrox_core::tls::RustlsProvider<Conne
             let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
             match finish_tls(dial, stream) {
                 Ok(tls) => {
-                    // The budget was the handshake's: leave it set and a relay's read times out at half a second whatever quantum it asked for.
-                    let _ = tls.get_ref().set_read_timeout(None);
+                    // The handshake's budget hands over to the head's: an edge that finishes TLS and never answers the CONNECT costs this open the named head wait, not the life of the flow.
+                    let _ = tls
+                        .get_ref()
+                        .set_read_timeout(Some(crate::budgets::head_arrival()));
                     return Ok(tls);
                 }
                 Err(failure) => {
@@ -2334,6 +2336,45 @@ mod loopback {
             1,
             "an edge that never had the certificate is not asked eight times"
         );
+    }
+
+    /// A silent edge is a peer that is slow, not a peer that is dead: the CONNECT it never answers costs the open the named head wait and a `Stream` failure the walk can move past, where an unbounded head read held the flow for as long as the edge kept the session.
+    #[test]
+    fn a_silent_edge_costs_the_open_its_head_budget_not_the_flow() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let _guard = crate::budgets::lock();
+        let root = crate::json::parse(r#"{"budgets": {"headArrival": "300ms"}}"#).expect("parses");
+        crate::budgets::apply(&crate::config::budgets(&root).expect("a name the engine acts on"));
+        for (alpn, carrier, label) in [
+            (&b"http/1.1"[..], Carrier::H1, "h1"),
+            (&b"h2"[..], Carrier::H2, "h2"),
+        ] {
+            let (roots, server) = minted(alpn);
+            let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let port = listener.local_addr().expect("addr").port();
+            let edge = std::thread::spawn(move || {
+                // Handshakes, reads the request, answers nothing: the session stays open until the client's failure ends it.
+                let (stream, _) = listener.accept().expect("accepts");
+                let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server, stream)
+                    .expect("accepts");
+                tls.handshake().expect("handshakes");
+                let mut sink = [0u8; 64];
+                while tls.read(&mut sink).is_ok_and(|read| read > 0) {}
+            });
+            let dial = dial_for(roots, port, carrier, foxy::pin::Pins::default());
+            let at = Instant::now();
+            let opened = Tunnel::open(&dial, "example.com:443", None).err();
+            crate::budgets::clear();
+            let failure = opened.expect("the head never arrives");
+            assert_eq!(failure, Failure::Stream, "{label} against a silent edge");
+            assert!(
+                at.elapsed() < Duration::from_secs(5),
+                "the head budget expired the dial, it took {:?}",
+                at.elapsed()
+            );
+            edge.join().expect("joins");
+        }
     }
 
     fn round_trip(tunnel: &mut Tunnel) {
