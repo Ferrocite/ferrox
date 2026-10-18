@@ -27,7 +27,8 @@ impl<R: Read> Read for HeadReader<R> {
             buf[..n].copy_from_slice(&self.prefix[self.at..self.at + n]);
             self.at += n;
             if self.at >= self.prefix.len() {
-                self.prefix.clear();
+                // The head and the payload that rode with it leave together, once nothing reads them.
+                self.prefix = Vec::new();
                 self.at = 0;
             }
             return Ok(n);
@@ -209,7 +210,7 @@ mod tests {
         );
     }
 
-    /// The kept head hands its own buffer to the reader with the head already walked past: the bytes behind it are delivered from that buffer, and a reader that asks the socket at all panics.
+    /// The kept head hands its own buffer to the reader with the head already walked past: the bytes behind it are delivered from that buffer and the reader never reaches the socket; once the walk finishes, the buffer that carried the head is released rather than held for the connection's life.
     #[test]
     fn the_bytes_behind_the_head_reach_the_relay_without_a_syscall() {
         const HEAD: &[u8] = b"GET /camouflage HTTP/1.1\r\nHost: h\r\n\r\n";
@@ -221,8 +222,6 @@ mod tests {
         }
         let mut prefix = Vec::from(HEAD);
         prefix.extend_from_slice(b"ping");
-        let base = prefix.as_ptr();
-        let capacity = prefix.capacity();
         let mut reader = HeadReader {
             read: Refused,
             prefix,
@@ -232,11 +231,10 @@ mod tests {
         assert_eq!(reader.read(&mut got).expect("delivers"), 4);
         assert_eq!(&got, b"ping", "the bytes behind the head, not a re-read");
         assert_eq!(
-            reader.prefix.as_ptr(),
-            base,
-            "delivered from the buffer those bytes arrived in"
+            reader.prefix.capacity(),
+            0,
+            "the read that finished the walk released the buffer that carried the head"
         );
-        assert_eq!(reader.prefix.capacity(), capacity, "on a held capacity");
     }
 
     /// The camouflage request reaches the write as the runs it is made of: the path and host octets go over where they lie, so the handshake stages no copy of itself.
