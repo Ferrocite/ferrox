@@ -3,12 +3,13 @@
 A `tun` inbound opens a virtual network device and reads raw IPv4 packets off
 it; every TCP flow the packets form becomes a proxy dial through the machinery
 the tree already had, every UDP flow becomes a datagram dial through the SOCKS5
-UDP association the same front layer serves, and the bytes that come back leave
-again as IP packets on the same descriptor. Both roles the row has are served
-and both are proved: device-to-dial and dial-to-device. A flow also *ends*: the
-response read is armed at the idle budget, so a peer that stops speaking hands
-its thread, its pair and the relay leg it holds back instead of parking them for
-the life of the process.
+UDP association the same front layer serves, an ICMP echo request is answered as
+the device's own destination would rather than dropped, and the bytes that come
+back leave again as IP packets on the same descriptor. Both roles the row has
+are served and both are proved: device-to-dial and dial-to-device. A flow also
+*ends*: the response read is armed at the idle budget, so a peer that stops
+speaking hands its thread, its pair and the relay leg it holds back instead of
+parking them for the life of the process.
 
 A device carries no wire byte-stream to diff, so this row's identity claim is
 the (target, payload) dial set: the pairs the inbound produces from a pinned
@@ -44,6 +45,10 @@ graph TD
     B --> C["serve loop: one read_packet per device read"]
     C --> O["dispatch drains ended first<br/>flows and legs both lose the entry"]
     O --> D["ipv4_head, then tcp_head or udp_head<br/>borrowed slices, no staging"]
+    D --> IC{"protocol 1: ICMP<br/>echo request?"}
+    IC -- "type 8, code 0" --> ICa["build_icmp_reply:<br/>type→0, swap src/dst,<br/>recompute checksum"]
+    ICa --> C
+    IC -- "else" --> ICx["unanswered,<br/>as the reference returns"]
     D --> E["SYN: accept_flow<br/>SYN-ACK written on the device, loopback pair opened"]
     E --> F["relay: serve_connect over the pair<br/>Front::Socks — the front layer's own dial"]
     D --> G["segment with payload: write_all to the pair<br/>rcv_nxt advances; delayed ACK at push, finish, or MTU"]
@@ -73,6 +78,8 @@ graph TD
 | datagram-association-round-trips | 1 | ferrox-app-tun::tests::a_datagram_flow_frames_the_association_and_returns_the_echo |
 | datagram-parse-copies-per-packet | 0 | ferrox-app-tun::tests::the_datagram_is_borrowed_from_the_read_buffer |
 | datagram-reply-packets-checksummed | 1 | ferrox-app-tun::tests::the_reply_packet_verifies_at_the_reference_reader |
+| icmp-echo-replies-verified | 1 | ferrox-app-tun::tests::an_icmp_echo_request_is_answered_as_a_reply |
+| icmp-non-echo-messages-refused | 3 | ferrox-app-tun::tests::a_non_echo_icmp_message_is_refused |
 <!-- counts:end -->
 
 The first row is the identity claim itself: three flows — a request line, a
@@ -101,8 +108,20 @@ both checksums a peer's stack verifies. A leg is reaped by the same channel:
 silent past `budgets::udp_idle()`, its reader shuts, names its key, and
 `dispatch` drops the socket it held.
 
+The ICMP rows are the third protocol `dispatch` answers: an IPv4 echo request
+(type 8, code 0) is returned as an echo reply — the message's type flipped to 0,
+its identifier, sequence and data carried back unchanged, its checksum recomputed
+and its IP header rebuilt with source and destination swapped — witnessed by
+`an_icmp_echo_request_is_answered_as_a_reply` reading the reply off the socketpair
+and requiring both the ICMP checksum (`checksum(&message) == 0`, the all-ones fold
+a receiver verifies) and the header checksum to hold. A reply to a non-request, a
+message with a non-zero code, or one shorter than the eight-byte ICMP header is
+left unanswered, the same three refusals `a_non_echo_icmp_message_is_refused`
+pins — matching the reference's `handleICMP`, which returns without writing
+anything it would not answer as an echo.
+
 Syscalls: the serve loop is one `read(2)` per inbound packet and one
-`write(2)` per emitted packet — SYN-ACK, pure ACK, response — plus one
+`write(2)` per emitted packet — SYN-ACK, pure ACK, response, ICMP reply — plus one
 `setsockopt` per flow to arm the response read at the idle budget and one
 `shutdown` per flow when it dies. A loopback socketpair test cannot gate a
 syscall total, so no row claims one; the shape is prose. The one allocation the
@@ -176,6 +195,17 @@ Against the pinned references, which is where the bar is:
   the handler's reused buffer, so a steady-state datagram both ways allocates
   nothing. Reusing the read buffer for the outbound frame would need a vectored
   send, and the row does not count that yet.
+- **The ICMP responder, trimmed to the one message a ping is.** The references
+  grew a wider ICMP surface — xray's `handleICMP` also answers ICMPv6 and the
+  Windows WFP path carries neighbour and multicast-listener discovery
+  (types 130–137, 143), and smoltcp runs a full `Ipv4RawSocket`/ICMP socket per
+  interface. This inbound answers the one thing a `ping` off the device needs:
+  an IPv4 echo request reflected as an echo reply, reusing the lane's own
+  `checksum`/`ipv4_checksum` and a single borrowed message read — no socket
+  object, no ICMPv6, no discovery protocols, no rate limiter. The message is
+  carried by one `copy_from_slice` into the rendered reply; the reply's render is
+  the same one-`Vec`-per-emitted-packet cost named below, not a new allocation
+  class.
 
 ## What was not removed
 
@@ -209,10 +239,12 @@ Named rather than claimed, with the worst input worked out first:
   depend on it, and the wrap case is gated instead by
   `the_syn_ack_numbers_wrap_at_the_sequence_space_boundary` (`u32::MAX-1`
   replies `u32::MAX`).
-- **ICMP is dropped, not demuxed.** `dispatch` serves TCP and UDP and answers
-  every other protocol by returning, so a ping off the device is lost the way
-  an unroutable datagram is. The pinned references each grew their own ICMP
-  responder; that answer is its own slice.
+- **ICMP is answered only as far as a `ping` reaches.** An IPv4 echo request is
+  reflected as a reply; ICMPv6 echo, the neighbour/multicast discovery messages
+  the Windows WFP path answers, and an ICMP error generated *for* a relayed flow
+  are all still left, so `dispatch` answers type-8/code-0 and returns on every
+  other type rather than minting a destination-unreachable. Growing the responder
+  past the echo is its own slice, named here rather than claimed away.
 - **The datagram lane has no reference golden yet.** The oracle runs smoltcp's
   TCP socket, so the UDP half of the identity claim is the wire bytes RFC 1928
   names plus the core reader's checksum walk, not a reference-vs-Ferrox dial
