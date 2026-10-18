@@ -182,6 +182,8 @@ Give matrix row {index} of table {section} — the implemented method {method} �
 
 **Add-on — pin-honesty:** Any pins edit carries the real rev from a resolved ref; never fabricate one to satisfy a gate.
 
+**Add-on — seamless-byte-row:** When the row's reference tests are in-package Go with no binary seam — matrix row 32 is that case, since `upstream/xray-core/transport/internet/xdrive/*_test.go` calls unexported constructors and no pinned suite names an xdrive test — the page names the absent seam and the byte-identity gate stays in-tree, recorded request bytes over a loopback fake; and the seam worth building afterwards is the reference's own `local` store over one directory both binaries can see, which needs no network and no token: the xray-baseline job's binary serves an xdrive `local` inbound on a shared folder while `ferrox-app` dials it as an outbound and echoes through, then the roles swap, so the object names, the `%09d` sequence, `.end` and the hole rule are proved against the reference rather than restated. That harness is its own slice with its own job, never folded into the row that first shipped the transport.
+
 ## P8 · Find the work the tree does and discards
 
 **When to use:** The standing RAM/CPU hunt on a shipped row — where something is computed, filled, or locked and then thrown away or re-done before the value is ever used.

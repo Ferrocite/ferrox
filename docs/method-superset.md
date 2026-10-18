@@ -74,7 +74,7 @@ The shared protocol in `crates/ferrox-prompt/prompts.md` states it as "a superse
 | carrier-v2ray-quic | carrier | not-scheduled | upstream/sing-box/transport/v2rayquic | the same transport in the second reference, named so the row above is not read as universal |
 | carrier-hysteria | carrier | implemented | upstream/xray-core/transport/internet/hysteria, upstream/zeronet/crates/zero-transport/src/hysteria2.rs, docs/function/carrier-hysteria.md | quiche, ALPN `h3`; one handshake per pooled outbound carrying both the TCP streams and the UDP datagram lane, with salamander + gecko obfs, the masquerade site and client port-hop; method string `vless-hysteria` |
 | carrier-masque | carrier | planned | upstream/xray-core/transport/internet/masque, upstream/sing-box/transport/masque, upstream/zeronet/crates/zero-transport/src/masque.rs | CONNECT-IP client dialled over h2/h3 with both-direction capsules (Foxy lane, row 20); address pool and terminating server refused by name |
-| carrier-xdrive | carrier | planned | upstream/xray-core/transport/internet/xdrive | polls a cloud-drive remote as a transport |
+| carrier-xdrive | carrier | implemented | upstream/xray-core/transport/internet/xdrive, docs/function/carrier-xdrive.md | `local`, `template` and `Google Drive`, both roles; one `HTTP/1.1` lane per store; the in-package Go suites have no seam, so no conformance cell |
 | carrier-device | carrier | planned | upstream/sing-box/transport/device | the generic TUN/IP device abstraction the reference's VPN endpoints share |
 | carrier-simple-obfs | carrier | planned | upstream/sing-box/transport/simple-obfs | http and tls obfs backends |
 | carrier-sip003 | carrier | planned | upstream/sing-box/transport/sip003 | plugin harness: `obfs-local`, `v2ray-plugin` |
