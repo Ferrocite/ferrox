@@ -93,6 +93,7 @@ mux-cool  mux::tests::the_decode_probe_costs_the_frame_walk_and_nothing_else  fe
 kcp  kcp::oracle::the_scripted_core_matches_the_pinned_go  ferrox_core::kcp::Segment::serialize
 kcp  kcp::connection::tests::every_read_size_delivers_the_same_stream  ferrox_core::kcp::worker::ReceivingWorker::read
 kcp  kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_for_the_next  ferrox_core::kcp::Connection::input
+kcp  kcp::segment::tests::a_received_ack_reuses_its_number_list  ferrox_core::kcp::segment::AckSegment::parse
 carrier-quic  foxy::loopback::the_quic_carrier_rides_a_socks5_upstream_and_carries_the_bytes  quic::flush_egress
 carrier-quic  foxy::loopback::the_quic_carrier_rides_a_socks5_upstream_and_carries_the_bytes  quic::pump_once
 carrier-quic  foxy::loopback::a_lane_outlives_its_leases_and_the_next_flow_rides_it  quic::pump
