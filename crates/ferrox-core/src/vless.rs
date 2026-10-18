@@ -608,7 +608,7 @@ fn planned_reason(link: &VlessLink, security: Security) -> &'static str {
             "http/h2/h3: removed by Xray-core in favour of xhttp; parses, no transport"
         }
         TransportKind::Hysteria => {
-            "vless-hysteria: carrier dials TCP; UDP datagrams and masquerade stay refused"
+            "vless-hysteria: the transport dials and carries UDP, salamander, masquerade and port-hop; a bare link query expresses none of those options"
         }
         TransportKind::Masque => {
             "vless-masque: CONNECT-IP dials on the Foxy HTTP/3 lane; VLESS over a MASQUE outbound not wired"

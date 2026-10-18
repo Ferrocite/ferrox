@@ -214,6 +214,7 @@ carrier-foxy payload-staging-copies-per-byte-read 0 ferrox-app-foxy::loopback::a
 carrier-foxy read-buffer-bytes-per-staged-remainder 1 ferrox-app-foxy::loopback::a_read_leaves_only_what_the_callers_buffer_had_no_room_for
 carrier-foxy h2-bytes-lost-at-a-read-quantum 0 ferrox-app-foxy::loopback::a_frame_that_straddles_a_read_quantum_arrives_whole
 carrier-foxy h2-upload-bytes-blocked-by-an-unread-grant 0 ferrox-app-foxy::loopback::an_upload_is_paced_by_the_grants_the_edge_sends_rather_than_by_the_bytes_it_reads
+carrier-foxy dead-carrier-dials-per-connect-ip-packet 0 ferrox-app-proxy::tests::the_connect_ip_lane_leaves_a_dead_carrier_dead
 carrier-foxy carriers-dialled 3 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer
 carrier-foxy udp-carriers-dialled 2 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer
 carrier-foxy datagram-frames-per-capsule 1 ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_over_quic_and_echoes_a_datagram
@@ -246,7 +247,10 @@ carrier-quic zero-filled-bytes-per-relayed-frame 3 ferrox-app-quic::tests::a_rel
 carrier-quic handshakes-per-server 1 ferrox-app-proxy::tests::quic_pool_shares_one_connection_between_two_streams
 carrier-quic server-roles 0 ferrox-app-proxy::tests::quic_serve_closes_without_handshake
 carrier-quic dialled-without-ca-cert-file 0 ferrox-app-proxy::tests::quic_outbound_reads_ca_cert_file
-carrier-quic pool-entries-held-after-the-last-lease 0 ferrox-app-foxy::loopback::the_pool_holds_the_entry_only_while_a_lease_rides_it
+carrier-quic lanes-held-after-the-last-lease 1 ferrox-app-foxy::loopback::a_lane_outlives_its_leases_and_the_next_flow_rides_it
+carrier-quic pump-threads-owned-by-an-idle-lane 0 ferrox-app-foxy::loopback::a_lane_outlives_its_leases_and_the_next_flow_rides_it
+carrier-quic flows-per-lane-before-it-is-handed-back 64 ferrox-app-foxy::loopback::a_lane_that_lent_its_whole_grant_of_flows_is_handed_back
+carrier-quic receive-buffer-floor-bytes-armed-per-lane 262144 ferrox-app-quic::tests::a_quic_socket_arms_its_receive_buffer
 
 reality-tls ops-retired-instructions UNBLESSED scripts/count-ops.sh
 reality-tls tls-providers 1 ferrox-core::active_backends
@@ -273,6 +277,8 @@ reality-tls late-hello-grains-survived 12 ferrox-app-proxy::tests::a_plain_tls_l
 reality-tls unsafe-fingerprint-header-bytes-added 0 ferrox-core-vless::tests::an_unsafe_fingerprint_adds_no_header_byte
 reality-tls plaintext-to-public-header-bytes-added 0 ferrox-core-vless::tests::pattng_plaintext_to_public_needs_opt_in_and_adds_no_byte
 reality-tls certificate-refusals-folded-into-other 0 ferrox-core-tls::rustls_backend::tests::mismatched_certificate_name_fails
+reality-tls trust-anchors-parsed-per-dial-after-the-first 0 ferrox-core-tls::rustls_backend::tests::the_parts_a_config_is_built_from_are_built_once
+reality-tls handshakes-skipped-by-an-earlier-dials-ticket 0 ferrox-core-tls::rustls_backend::tests::a_second_dial_with_the_same_config_still_fetches_the_chain
 reality-tls untrusted-dials-counted-as-retryable 0 ferrox-app-proxy::tests::a_refused_chain_is_a_refusal_not_a_drop
 reality-tls session-writes-per-frame 1 ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call
 reality-tls user-space-copies-per-framed-write 0 ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call
@@ -307,11 +313,27 @@ carrier-hysteria closed-connections-reused 0 ferrox-app-proxy::tests::hysteria_r
 carrier-hysteria request-parse-reallocations 0 ferrox-app-hysteria::tests::a_parsed_request_leaves_its_payload_where_it_landed
 carrier-hysteria wrong-password-bytes-relayed 0 ferrox-app-proxy::tests::hysteria_refuses_a_wrong_password_without_relaying
 carrier-hysteria non-v2-configs-carried 0 ferrox-app-proxy::tests::hysteria_settings_parse_with_guarded_fallbacks
-carrier-hysteria udp-bytes-relayed 0 ferrox-app-proxy::tests::hysteria_dial_udp_uplink_is_none
+carrier-hysteria datagram-lane-client-round-trips 1 ferrox-app-proxy::tests::hysteria_carries_a_udp_association_over_the_carrier
 carrier-hysteria udp-datagram-decode-copies 0 ferrox-core-hysteria::tests::a_decoded_datagram_leaves_its_payload_where_it_landed
 carrier-hysteria udp-fragments-witnessed 200 ferrox-core-hysteria::tests::every_length_survives_fragment_then_defrag_intact
 carrier-hysteria obfuscated-datagram-heap-copies 0 ferrox-core-hysteria::tests::a_sealed_datagram_never_touches_the_heap
 carrier-hysteria pinned-hysteria-client-verdicts 1 scripts/run-upstream-suite.sh
+carrier-hysteria masquerade-answers-browser-on-same-port 1 ferrox-app-proxy::tests::hysteria_serves_a_canned_masquerade_response
+carrier-hysteria masquerade-file-bytes-served 1 ferrox-app-proxy::tests::hysteria_serves_a_file_from_the_masquerade_directory
+carrier-hysteria masquerade-proxied-round-trips 1 ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_an_origin
+carrier-hysteria masquerade-escapes-served 0 ferrox-app-proxy::tests::hysteria_refuses_a_masquerade_path_that_escalates_the_directory
+carrier-hysteria hop-port-set-expanded 4 ferrox-core-hysteria::tests::the_plan_expands_overlapping_ranges_into_one_sorted_set
+carrier-hysteria hop-config-forms-parsed 2 ferrox-app-config::tests::a_hysteria_carrier_reads_a_port_hopping_plan
+carrier-hysteria hop-plan-pool-keys 2 ferrox-app-hysteria::tests::a_hop_plan_is_its_own_pool_key
+carrier-hysteria hopped-datagrams-delivered 200 ferrox-app-quic::tests::a_hopped_dial_spreads_its_datagrams_over_more_than_one_server_port
+carrier-hysteria hopped-reply-source-normalized 1 ferrox-app-quic::tests::a_reply_from_a_hopped_port_reads_back_as_the_nominal_server
+carrier-hysteria gecko-frame-bytes-encoded 10 ferrox-core-hysteria::tests::a_gecko_frame_is_the_exact_bytes_the_reference_emits
+carrier-hysteria gecko-frame-decode-copies 0 ferrox-core-hysteria::tests::a_gecko_frame_decodes_its_payload_without_a_copy
+carrier-hysteria gecko-packet-reassembled-bytes 1234 ferrox-core-hysteria::tests::a_fragmented_long_header_packet_reassembles_bit_identical
+carrier-hysteria gecko-window-forms-parsed 3 ferrox-app-config::tests::a_hysteria_carrier_reads_a_gecko_window
+carrier-hysteria gecko-loopback-reassembled-bytes 900 ferrox-app-quic::tests::a_gecko_dial_reassembles_its_split_long_header
+carrier-hysteria masquerade-https-origin-served-bytes 6 ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_an_https_origin
+carrier-hysteria masquerade-https-untrusted-refusals 1 ferrox-app-proxy::tests::hysteria_refuses_a_masquerade_https_origin_whose_chain_is_untrusted
 
 # --- TLS ClientHello `cipher_suites` field (PattNG ext.) --------------------
 tls-cipher-suites ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -338,6 +360,8 @@ front-tun flows-handed-back-at-the-idle-budget 2 ferrox-app-tun::tests::a_quiet_
 front-tun datagram-association-round-trips 1 ferrox-app-tun::tests::a_datagram_flow_frames_the_association_and_returns_the_echo
 front-tun datagram-parse-copies-per-packet 0 ferrox-app-tun::tests::the_datagram_is_borrowed_from_the_read_buffer
 front-tun datagram-reply-packets-checksummed 1 ferrox-app-tun::tests::the_reply_packet_verifies_at_the_reference_reader
+front-tun icmp-echo-replies-verified 1 ferrox-app-tun::tests::an_icmp_echo_request_is_answered_as_a_reply
+front-tun icmp-non-echo-messages-refused 3 ferrox-app-tun::tests::a_non_echo_icmp_message_is_refused
 
 # --- finalmask post-TLS TCP mask chain --------------------------------------
 finalmask ops-retired-instructions UNBLESSED scripts/count-ops.sh

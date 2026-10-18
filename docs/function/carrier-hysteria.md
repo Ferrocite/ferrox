@@ -15,9 +15,10 @@ than negotiated, and no branch of it is dead config. An inbound that names
 `tlsSettings.obfs: salamander` masks every datagram of that lane: an 8-byte
 random salt then the QUIC packet XORed against `BLAKE2b-256(password || salt)`
 tiled at `key[i mod 32]`, applied at the `quic::Datagram` seam so no handshake,
-frame or stream above it changes. Salamander is the only obfuscation carried;
-another named one, or a password below the 4-byte floor the reference accepts,
-is refused as `Unknown` rather than silently sent in the clear. The masked lane
+frame or stream above it changes. Salamander is the only mask carried, and
+`gecko` is the one variant that rides on top of it; any other named obfs, or a
+password below the 4-byte floor the reference accepts, is refused as `Unknown`
+rather than silently sent in the clear. The masked lane
 is proven end to end by `hysteria_carries_a_flow_through_salamander_over_loopback`
 — the same dial-and-echo path as the cleartext gate, over a salamander socket on
 both ends, which only completes if the salted seal and the in-place unmask agree.
@@ -39,9 +40,18 @@ is the pointer-identity witness), reassembled by `Defrag`, and reaped after
 `UDP_IDLE` (60 s, the reference's `udp_idle_timeout`) or the connection's close
 — a UDP socket has no shutdown to wake a blocked read, so the reply-path reader
 threads end on the `UDP_POLL` (1 s, the reference's cleanup tick) timeout
-watching the stop flag the reap sets. `udp-bytes-relayed` 0 still names the
-dial-side gap: `dial_udp_uplink` returns `None` for every non-`Raw` carrier, so
-the client's own UDP flows are a cross-cutting row, not this carrier's. A pooled
+watching the stop flag the reap sets. The dial side answers that lane in its
+own small shape: `serve_udp` relays a socks5 UDP association over a
+connection of its own — the pool is a TCP instrument, and a stale
+connection carries a datagram into a silent blackhole with no reply
+deadline to catch it — one destination at a time, each stamped with a
+session id the connection never reuses, the writer holding the
+connection lock once per datagram and a companion reader driving it
+with `drive_once` — so the client's
+UDP flows are this carrier's row, not a cross-cutting gap:
+`hysteria_udp_lane_carries_a_datagram` witnesses the lane off the front and
+`hysteria_carries_a_udp_association_over_the_carrier` through the full socks
+dispatch. A pooled
 connection is reused within half the server's 300 s idle timeout, dropped when
 it stops taking application data (closed, draining or carrying a close), goes
 stale or runs out of streams, and a dial with no live pool entry pays a fresh
@@ -66,6 +76,74 @@ runs the pinned client's wrong-password and failed-destination verdicts
 against `ferrox-app` in `scripts/run-upstream-suite.sh`, which is also where
 the server's SETTINGS-before-auth order is proven — the pinned client's H3
 stack posts its auth only once the server's SETTINGS arrive.
+
+A browser that stumbles on this port with a plain `GET /` is answered rather
+than refused: the masquerade site serves an ordinary HTTP/3 request on the
+*same* connection hysteria rides. The classifier is a stream's first varint —
+`0x401` names a hysteria flow and relays as before, while an HTTP/3
+`HEADERS`/`DATA` frame (`read_tcp_prefix` returning `None` beside those types)
+is a browser and goes to `serve_masquerade`; on stream 0 the same split keys on
+request shape — a `POST` to `/auth` is the handshake and anything else is the
+cover — proven apart by `the_flow_frame_tells_hysteria_from_a_browser_request`
+and `a_browser_get_parses_to_method_path_and_authority`. Four cover answers
+match the reference's `masq` — the default `404` page, a canned `response`
+line, a static `file` directory and a `proxy` to an origin — every one built by
+`ferrox-core::hysteria`'s `encode_h3_response` (a `HEADERS` frame then a `DATA`
+frame) so the bytes are pinned without a socket. A right-shape, wrong-password
+hysteria attempt still refuses with `404` and closes exactly as a plain server
+would (`hysteria_closes_a_wrong_hysteria_password_even_with_masquerade`), so the
+cover never walks past authentication, and a browser `GET` beside a live flow is
+served while that flow still relays
+(`hysteria_still_carries_proxy_flows_beside_a_masquerade_get`).
+
+A dial whose `hysteriaSettings` names `serverPorts`/`mport` (a comma spec or an array
+of ports and `start-end` ranges) and `hopInterval`/`hopIntervalMax` **hops its server
+port**: the destination moves among the expanded set every random stay, and the socket
+moves with it — a fresh local bind per move, so a filter or NAT sees a new flow rather
+than one long-lived one, the way the reference's `HoppingSocket` does. It lives at the
+same `quic::Datagram` seam as salamander, so only the destination port and the socket
+change and no handshake, frame or stream above is touched; a salamander seal still
+rides each hopped datagram. The plan is expanded, deduplicated and sorted once per dial
+in `ferrox-core::hysteria` (`Hop::ports`, `hop-port-set-expanded` 4 witnessed by
+`the_plan_expands_overlapping_ranges_into_one_sorted_set`), and the two decisions —
+never land back on the port just left (`pick_next`) and draw the next stay inside its
+window (`stay_ms`) — are pure functions of the port set, the port to avoid and one
+folded-in roll, so they are proven without a clock or an rng. The wire keeps one view
+of the peer: only the server's own address is rewritten, a datagram to any other target
+passes through, and a reply from any hopped port is turned back to the nominal port the
+connection was named for (`is_hop_port`) so QUIC above keeps accepting it —
+`hopped-reply-source-normalized` 1 witnesses that rewrite off a loopback listener, and
+`hopped-datagrams-delivered` 200 that a zero-millisecond schedule spreads a burst over
+more than one port with none lost. The old socket lingers ten seconds for its in-flight
+replies, and the plan joins the pool key (`hop-plan-pool-keys` 2:
+`a_hop_plan_is_its_own_pool_key`) so a hopped dial never rides a plain connection to the
+same address, nor the reverse.
+
+An inbound that names `tlsSettings.obfs: gecko` fragments **and** masks: gecko is
+a fragment-plus-pad layer composed on top of salamander, so it shares the
+salamander key and the same `quic::Datagram` seam. A QUIC long-header packet
+(first byte `& 0x80`) is split into 2..=8 chunks, each wrapped in a 5-byte frame
+(`0x80`, a message id, `chunk<<4 | total`, a big-endian pad length) plus random
+padding drawn so the salamander-masked datagram — `salt(8) + frame(5) + pad +
+chunk` — lands inside a `[min, max]` window (defaults 512..1200, cap 2048), then
+sealed exactly as a plain salamander datagram; a short-header packet is masked
+whole and passes through. The receiver reassembles by `(peer, message id)`. The
+frame codec — `encode_gecko_frame`, `decode_gecko_frame`, `gecko_chunk_range`,
+`gecko_pad_len` — is pure `ferrox-core::hysteria` and proven bit-exact: the exact
+emitted bytes (`gecko-frame-bytes-encoded` 10, `a_gecko_frame_is_the_exact_bytes_
+the_reference_emits`), a decode that borrows its payload out of the input with no
+refill (`gecko-frame-decode-copies` 0, pointer-identity), a forged or truncated
+frame refused with the buffer held, and a 1234-byte packet that fragments and
+reassembles byte-identical (`gecko-packet-reassembled-bytes`). The window parses
+from the sing-box `min_packet_size`/`max_packet_size`, their camel spellings, or
+the reference's `packetSize` range as an object or a two-element array
+(`gecko-window-forms-parsed` 3), and an unusable window is refused rather than
+carried as a plain salamander that would silently drop the fragmentation. A dial
+that both hops the port and geckos the framing is refused at `connect`, since
+neither alone carries the other's bytes. The whole split-and-reassemble round
+trip over a real loopback socket is `gecko-loopback-reassembled-bytes` 900
+(`a_gecko_dial_reassembles_its_split_long_header`), which also witnesses that a
+long-header packet leaves the socket as more than one padded datagram.
 
 ## Data path
 
@@ -92,6 +170,25 @@ graph TD
     F2 -- whole --> U["one send to target"]
     U -- "reply " --> V["fragment_udp to dgram_max_writable_len"]
     V -- "dgram_send + flush" --> G
+    W["SOCKS UDP associate, hysteria outbound"] --> N["serve_udp: one association per destination,<br/>id never reused"]
+    N -- "fragment + dgram_send + flush" --> G
+    G -. "client_reader: decode, Defrag, socks frame" .-> W
+    B["browser GET / on the same port"] --> MS{"first varint:<br/>0x401 or H3 HEADERS?"}
+    MS -- "H3 HEADERS/DATA" --> SM["serve_masquerade"]
+    MS -- "0x401" --> Q
+    SM --> K1["404 page"]
+    SM --> K2["canned response"]
+    SM --> K3["static file:<br/>safe_path → index/listing"]
+    SM --> K4["reverse proxy:<br/>HTTP/1.1 over http/unix/https<br/>(client TLS), 502 on error"]
+    D --> HP{"hysteriaSettings<br/>names serverPorts?"}
+    HP -- "yes" --> HH["Datagram::hopped:<br/>fresh socket per stay,<br/>dest port = pick_next,<br/>reply source → nominal"]
+    HP -- "no" --> HF["fixed server port"]
+    HF --> GK{"obfs: gecko?"}
+    GK -- "yes" --> GF["Datagram::gecked:<br/>long-header split 2..=8,<br/>frame+pad into [min,max],<br/>reassemble by (peer,id)"]
+    GK -- "no" --> M
+    GF -. "each chunk sealed" .-> M
+    M -. "reassembled" .-> GF
+    HH -. "seals, same socket" .-> M
 ```
 
 ## Measured
@@ -105,11 +202,27 @@ graph TD
 | request-parse-reallocations | 0 | ferrox-app-hysteria::tests::a_parsed_request_leaves_its_payload_where_it_landed |
 | wrong-password-bytes-relayed | 0 | ferrox-app-proxy::tests::hysteria_refuses_a_wrong_password_without_relaying |
 | non-v2-configs-carried | 0 | ferrox-app-proxy::tests::hysteria_settings_parse_with_guarded_fallbacks |
-| udp-bytes-relayed | 0 | ferrox-app-proxy::tests::hysteria_dial_udp_uplink_is_none |
+| datagram-lane-client-round-trips | 1 | ferrox-app-proxy::tests::hysteria_carries_a_udp_association_over_the_carrier |
 | udp-datagram-decode-copies | 0 | ferrox-core-hysteria::tests::a_decoded_datagram_leaves_its_payload_where_it_landed |
 | udp-fragments-witnessed | 200 | ferrox-core-hysteria::tests::every_length_survives_fragment_then_defrag_intact |
 | obfuscated-datagram-heap-copies | 0 | ferrox-core-hysteria::tests::a_sealed_datagram_never_touches_the_heap |
 | pinned-hysteria-client-verdicts | 1 | scripts/run-upstream-suite.sh |
+| masquerade-answers-browser-on-same-port | 1 | ferrox-app-proxy::tests::hysteria_serves_a_canned_masquerade_response |
+| masquerade-file-bytes-served | 1 | ferrox-app-proxy::tests::hysteria_serves_a_file_from_the_masquerade_directory |
+| masquerade-proxied-round-trips | 1 | ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_an_origin |
+| masquerade-escapes-served | 0 | ferrox-app-proxy::tests::hysteria_refuses_a_masquerade_path_that_escalates_the_directory |
+| hop-port-set-expanded | 4 | ferrox-core-hysteria::tests::the_plan_expands_overlapping_ranges_into_one_sorted_set |
+| hop-config-forms-parsed | 2 | ferrox-app-config::tests::a_hysteria_carrier_reads_a_port_hopping_plan |
+| hop-plan-pool-keys | 2 | ferrox-app-hysteria::tests::a_hop_plan_is_its_own_pool_key |
+| hopped-datagrams-delivered | 200 | ferrox-app-quic::tests::a_hopped_dial_spreads_its_datagrams_over_more_than_one_server_port |
+| hopped-reply-source-normalized | 1 | ferrox-app-quic::tests::a_reply_from_a_hopped_port_reads_back_as_the_nominal_server |
+| gecko-frame-bytes-encoded | 10 | ferrox-core-hysteria::tests::a_gecko_frame_is_the_exact_bytes_the_reference_emits |
+| gecko-frame-decode-copies | 0 | ferrox-core-hysteria::tests::a_gecko_frame_decodes_its_payload_without_a_copy |
+| gecko-packet-reassembled-bytes | 1234 | ferrox-core-hysteria::tests::a_fragmented_long_header_packet_reassembles_bit_identical |
+| gecko-window-forms-parsed | 3 | ferrox-app-config::tests::a_hysteria_carrier_reads_a_gecko_window |
+| gecko-loopback-reassembled-bytes | 900 | ferrox-app-quic::tests::a_gecko_dial_reassembles_its_split_long_header |
+| masquerade-https-origin-served-bytes | 6 | ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_an_https_origin |
+| masquerade-https-untrusted-refusals | 1 | ferrox-app-proxy::tests::hysteria_refuses_a_masquerade_https_origin_whose_chain_is_untrusted |
 <!-- counts:end -->
 
 ## Ops
@@ -147,7 +260,11 @@ tunnel. No artefact from this branch has been read.
   living entirely in `ferrox-core::hysteria`, proven by
   `every_length_survives_fragment_then_defrag_intact` (the 200-row sweep is
   `udp-fragments-witnessed`) and end to end by
-  `hysteria_carries_udp_echo_over_loopback`. The reference's
+  `hysteria_carries_udp_echo_over_loopback`, and on the dial side smaller still:
+  one `Association` and one shared `Lane` per socks front — no manager, no
+  channels, the reader a single thread riding `drive_once` — proven by
+  `hysteria_udp_lane_carries_a_datagram` and
+  `hysteria_carries_a_udp_association_over_the_carrier`. The reference's
   `MaxDatagramFrameSize: 1200` is not reimposed; fragmentation sizes to the
   peer's live `dgram_max_writable_len` instead.
 - **The decoder's per-datagram payload copy.** The relay hands
@@ -174,9 +291,47 @@ tunnel. No artefact from this branch has been read.
   copy on the receive of an obfuscated datagram, retirable only by widening every
   shared `MAX_DATAGRAM` buffer; the salt itself costs one `getrandom` per
   datagram, which is the construction, not overhead.
-- **The masquerade site's request handling.** Nothing on the H3 control stream
-  pretends to serve an ordinary request; the port answers hysteria and nothing
-  else.
+- **The masquerade site's web-server machinery, rewritten minimal.** The
+  reference answers `masq` with a real `net/http` stack — a `Server`, virtual
+  hosts, `http.FileServer` with its full `os` walk, and an `httputil` reverse
+  proxy pooling origin connections. This tree hand-rolls the same four cover
+  answers off its own H3 codec: `serve_file` sanitises the `:path` (percent-
+  decode, reject any `..`/escape) against one root and answers with a
+  content-type read off the extension; `serve_proxy` speaks a hand-written
+  HTTP/1.1 request/response over the existing transport seam, drops the
+  hop-by-hop headers, de-frames a chunked origin body in core
+  (`a_chunked_origin_body_defragments_to_its_bytes`) and buffers it under the
+  datagram cap. No server object, no pooling, no new dependency —
+  `masquerade-file-bytes-served`, `masquerade-proxied-round-trips` and
+  `masquerade-escapes-served` 0 pin the file, proxy and traversal paths, and
+  `masquerade-answers-browser-on-same-port` pins the canned answer reaching a
+  browser on the port hysteria dials. An `https` origin wraps that same
+  hand-written exchange in `ferrox_core::tls::connect` — the client TLS the
+  relayed lane already speaks — so the cover adds no second TLS stack and no
+  dependency; `masq_url_insecure` is honoured by one accept-as-presented
+  verifier reachable only from this path, and `masquerade-https-origin-served-bytes` 6
+  and `masquerade-https-untrusted-refusals` 1 pin that a named-insecure chain
+  serves and a verified dial against an untrusted chain refuses rather than
+  silently trusts.
+- **The hopping socket's async machinery, rewritten to a synchronous schedule.**
+  The reference's port hop is an async `HoppingSocket` wrapping a quinn
+  `AsyncUdpSocket`, with a spawn/replace dance per hop and a `GenRng` threaded
+  through. This tree keeps the same three facts — never the port just left, a stay
+  drawn inside its window, the old socket read until its linger expires — as two pure
+  core functions and one `Mutex<HopState>` behind the existing blocking `Datagram`, so
+  hop, obfs and the relay share the one seam rather than a parallel socket type. No new
+  task, no rng type, no second socket: `pick_next`/`stay_ms`/`Hop::ports` are proven
+  without a socket at all.
+- **Gecko's background expiry thread.** The reference reassembles fragments in a
+  map swept by a dedicated `gcLoop` timer goroutine that ticks to expire stale
+  messages. This tree keeps the same three facts — an 8 s TTL, a per-source cap
+  and a global cap — but drops the thread: each `accept` runs one
+  `retain(|_, m| m.until > now)` over the table it already holds behind its
+  `Mutex`, so an expired message is swept lazily on the next frame rather than
+  by a ticker that wakes with nothing to do. No task, no timer, one owner for
+  the map: `gecko-loopback-reassembled-bytes` witnesses a split long-header
+  round-tripping byte-identical over a real socket, and
+  `gecko-packet-reassembled-bytes` the same reassembly purely in core.
 - **A custom brutal sender.** `brutal` and `force-brutal` pace as quiche `bbr`
   (`Congestion::quiche_name`), stated in the settings test. That is a
   narrower congestion loop, not a second implementation of one.
@@ -245,12 +400,14 @@ What is **not** removed, and is named rather than claimed: the pool is one
 process-wide map per outbound key with no eviction policy beyond pruning
 closed, stale and stream-exhausted entries on the next dial, so an outbound
 burst holds one connection each for `REUSE_WINDOW` (150 s, half the idle
-timeout); the client's UDP uplink is not carried (`udp-bytes-relayed` 0 —
-`dial_udp_uplink` answers `None` for every non-`Raw` carrier, a cross-cutting
-gap rather than this carrier's); the masquerade site stays out as the
-`hysteria-obfs-masquerade` add-on in `crates/ferrox-prompt/prompts.md` — it is
-an H3 request-serving subsystem, not a rung on the relay, and salamander now
-ships while it does not; 0-RTT,
+timeout); the client's UDP lane rotates associations on one connection rather
+than retiring the connection per destination, so a retired flow's late
+datagrams land on the floor by the never-reuse rule; the masquerade site's
+`proxy` cover dials `http`, `unix` and `https` origins — the last through the
+same client TLS the relayed lane already speaks, verified against the platform
+roots or trusted as presented when the config names `masq_url_insecure` — and
+every origin request pays a fresh connection closed after its buffered
+response, so a hot cover page re-dials instead of pooling; 0-RTT,
 migration and key updates are quiche's; the server keeps one UDP socket per
 inbound with a per-connection route map and a linear scan over routes per
 Initial.

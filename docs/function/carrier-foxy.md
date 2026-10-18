@@ -62,6 +62,7 @@ graph TD
 | read-buffer-bytes-per-staged-remainder | 1 | ferrox-app-foxy::loopback::a_read_leaves_only_what_the_callers_buffer_had_no_room_for |
 | h2-bytes-lost-at-a-read-quantum | 0 | ferrox-app-foxy::loopback::a_frame_that_straddles_a_read_quantum_arrives_whole |
 | h2-upload-bytes-blocked-by-an-unread-grant | 0 | ferrox-app-foxy::loopback::an_upload_is_paced_by_the_grants_the_edge_sends_rather_than_by_the_bytes_it_reads |
+| dead-carrier-dials-per-connect-ip-packet | 0 | ferrox-app-proxy::tests::the_connect_ip_lane_leaves_a_dead_carrier_dead |
 | carriers-dialled | 3 | ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer |
 | udp-carriers-dialled | 2 | ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer |
 | datagram-frames-per-capsule | 1 | ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_over_quic_and_echoes_a_datagram |
@@ -215,6 +216,24 @@ that loses a packet loses one packet, which is what UDP is. What did not change 
 the 16 MiB the lane *advertises*: the opening `WINDOW_UPDATE` on stream 0 and the
 `SETTINGS_INITIAL_WINDOW_SIZE` in `client_settings` are both the edge's permission to
 send, so a download is still paced by the edge's grants to us and not by this row.
+
+`dead-carrier-dials-per-connect-ip-packet 0` is a memo that one of three openers forgot
+to read. The TCP flow and the CONNECT-UDP dialer both ask whether a carrier is already
+known silent before they dial it; the CONNECT-IP opener wrote that verdict into the same
+cache and never consulted it, so every packet that found no tunnel re-probed the carriers
+the lane had just buried — on an edge that answers TCP rather than QUIC, one probe
+timeout plus one TCP+TLS+CONNECT+assign walk per reopen. The checker counts the edge's
+accepts: with both capsule carriers marked dead an open costs the edge nothing and a
+second open costs it nothing again, and clearing one window has it dialled.
+
+The pre-flight's exit probe kept the same amnesia one level up, and no local checker can
+see the saving. A sweep that reached an edge and found its exit *differing* from the
+pinned country cached nothing — a later edge might honour the pin, so the walk kept
+walking — and each flow then paid the disposable tunnel, the CONNECT and the trace again
+to be told what the last flow was told. That verdict is now kept for the window a silent
+carrier is kept for, and the rule itself is `sweep_verdict`, gated beside the pure
+probe-order tests; the round trips it saves need an edge that really answers a trace,
+which is `foxy-relay.yml`'s to measure and not a loopback's.
 
 `datagrams-out-of-one-frame` and `quic-datagrams-out-of-one-frame` count what
 one carrier's stream order costs: a frame boundary is not a capsule boundary, so
@@ -582,7 +601,7 @@ and unchanged in count when no edge has rested.
 
 | what | where |
 | --- | --- |
-| the QUIC + HTTP/3 stack behind `h3` | `upstream/quiche` @ `b60aff93` |
+| the QUIC + HTTP/3 stack behind `h3` | `upstream/quiche` @ `acf560f2` |
 | `foundLeaf`: the pin replaces chain, name and expiry | `upstream/xray-core/transport/internet/tls/config.go` |
 | the Android client this lane ports | `/tmp/foxyvpn` (`com.vauth.foxyvpn`) |
 | the Go reference client this lane ports | `/tmp/firefox-vpn-client` |

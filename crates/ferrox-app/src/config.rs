@@ -336,6 +336,7 @@ pub(crate) fn outbound_tls(
         roots,
         pins: ferrox_core::foxy::pin::Pins::default(),
         cipher_suites: tls_cipher_suites(tls),
+        insecure: false,
     }))
 }
 
@@ -849,7 +850,7 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
             network: network.to_owned(),
         };
     }
-    // Salamander is the only datagram obfuscation carried; any other named one, or one with a password too short to mask with, is refused rather than silently sent in the clear.
+    // Salamander and its gecko fragmentation variant are the datagram obfuscations carried; any other named one, or one whose password is too short to mask with, is refused rather than silently sent in the clear.
     let obfs_password = match salamander_obfs(settings) {
         None => String::new(),
         Some(password) if ferrox_core::hysteria::Salamander::new(&password).is_some() => password,
@@ -858,6 +859,12 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
                 network: network.to_owned(),
             };
         }
+    };
+    // A gecko lane whose window cannot be read is refused, never carried as a plain salamander that would silently drop the fragmentation the config asked for.
+    let Ok(gecko) = hysteria_gecko(settings) else {
+        return Carrier::Unknown {
+            network: network.to_owned(),
+        };
     };
     Carrier::Hysteria(Config {
         auth: hy
@@ -871,15 +878,108 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
                 .unwrap_or(""),
         ),
         obfs_password,
+        hop: hysteria_hop(hy),
+        gecko,
     })
 }
 
-/// The `obfs: salamander` password a hysteria transport names in its `tlsSettings`, or `None` for no obfuscation and `Some("")` for one this build cannot honour; the caller serves cleartext only for the first.
+/// The port-hopping plan a hysteria dial rotates its server port on, read from its
+/// `hysteriaSettings`. `serverPorts`/`mport` names the ports or `start-end` ranges —
+/// an array of numbers/strings or one comma-separated string; `hopInterval` and
+/// `hopIntervalMax` bound the stay in seconds (a bare number, or an `s`/`ms` suffix).
+/// A malformed token is dropped rather than guessed at, and with nothing valid left
+/// the dial stays on its fixed port: a hop is anti-blocking, not correctness, so it
+/// never reroutes a flow to a port the config did not name. Field names take both the
+/// camel and the snake spelling the reference's two JSON dialects use.
+fn hysteria_hop(hy: Option<&Json>) -> Option<ferrox_core::hysteria::Hop> {
+    use ferrox_core::hysteria::{Hop, PortRange};
+    let hy = hy?;
+    let field = |camel: &str, snake: &str| hy.get(camel).or_else(|| hy.get(snake));
+    let spec = field("serverPorts", "server_ports").or_else(|| field("mport", "mport"))?;
+    let mut ranges: Vec<PortRange> = Vec::new();
+    if let Some(items) = spec.as_arr() {
+        for item in items {
+            push_port_spec(item.as_str(), &mut ranges);
+            if let Some(port) = item.as_port() {
+                ranges.push(PortRange {
+                    start: port,
+                    end: port,
+                });
+            }
+        }
+    } else if let Some(port) = spec.as_port() {
+        ranges.push(PortRange {
+            start: port,
+            end: port,
+        });
+    } else {
+        push_port_spec(spec.as_str(), &mut ranges);
+    }
+    if ranges.is_empty() {
+        return None;
+    }
+    let low = stay_ms(field("hopInterval", "hop_interval")).unwrap_or(5_000);
+    let high = stay_ms(field("hopIntervalMax", "hop_interval_max")).unwrap_or(low);
+    Some(Hop {
+        ranges,
+        interval_ms: (low.min(high), low.max(high)),
+    })
+}
+
+/// Append every `port` or `start-end` token of a comma-separated port spec; a token
+/// that is not a valid nonzero port, or a backwards range, is skipped, never guessed.
+fn push_port_spec(text: Option<&str>, ranges: &mut Vec<ferrox_core::hysteria::PortRange>) {
+    use ferrox_core::hysteria::PortRange;
+    let Some(text) = text else { return };
+    for token in text.split(',') {
+        let token = token.trim();
+        match token.split_once('-') {
+            Some((lo, hi)) => {
+                let (Ok(start), Ok(end)) = (lo.trim().parse::<u16>(), hi.trim().parse::<u16>())
+                else {
+                    continue;
+                };
+                if start > 0 && start <= end {
+                    ranges.push(PortRange { start, end });
+                }
+            }
+            None => {
+                if let Some(port) = token.parse::<u16>().ok().filter(|port| *port > 0) {
+                    ranges.push(PortRange {
+                        start: port,
+                        end: port,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// The next stay length in milliseconds: a bare number or string is seconds, an `s`
+/// suffix is seconds, an `ms` suffix is milliseconds; `None` when absent or malformed.
+fn stay_ms(value: Option<&Json>) -> Option<u64> {
+    match value? {
+        Json::Num(n) if n.fract() == 0.0 && *n >= 0.0 => Some(*n as u64 * 1000),
+        Json::Str(text) => {
+            let text = text.trim();
+            if let Some(ms) = text.strip_suffix("ms") {
+                ms.trim().parse::<u64>().ok()
+            } else if let Some(s) = text.strip_suffix('s') {
+                s.trim().parse::<u64>().ok().map(|secs| secs * 1000)
+            } else {
+                text.parse::<u64>().ok().map(|secs| secs * 1000)
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The `obfs: salamander` (or `gecko`) password a hysteria transport names in its `tlsSettings`, or `None` for no obfuscation and `Some("")` for one this build cannot honour; the caller serves cleartext only for the first. Gecko masks each frame with salamander, so it shares this key.
 pub(crate) fn salamander_obfs(stream: Option<&Json>) -> Option<String> {
     let tls = stream.and_then(|s| s.get("tlsSettings"));
     match tls.and_then(|t| t.get("obfs")).and_then(Json::as_str) {
         None | Some("") => None,
-        Some("salamander") => Some(
+        Some("salamander" | "gecko") => Some(
             tls.and_then(|t| t.get("obfs-password"))
                 .and_then(Json::as_str)
                 .unwrap_or("")
@@ -887,6 +987,110 @@ pub(crate) fn salamander_obfs(stream: Option<&Json>) -> Option<String> {
         ),
         Some(_) => Some(String::new()),
     }
+}
+
+/// The `obfs: gecko` fragment window a hysteria transport names, `Ok(None)` when the
+/// obfs is absent or another kind, `Ok(Some(window))` for a valid gecko, and `Err(())`
+/// when gecko is named but its window is unusable — refused rather than carried as a
+/// plain salamander that would silently drop the fragmentation. Bounds accept the
+/// sing-box `min_packet_size`/`max_packet_size`, their camel spellings, and the
+/// reference's `packetSize` range as an object or a two-element array.
+fn hysteria_gecko(stream: Option<&Json>) -> Result<Option<ferrox_core::hysteria::Gecko>, ()> {
+    let Some(tls) = stream.and_then(|s| s.get("tlsSettings")) else {
+        return Ok(None);
+    };
+    if tls.get("obfs").and_then(Json::as_str) != Some("gecko") {
+        return Ok(None);
+    }
+    let size = |keys: [&str; 2]| {
+        keys.into_iter()
+            .find_map(|key| tls.get(key))
+            .and_then(Json::as_u32)
+            .and_then(|value| u16::try_from(value).ok())
+    };
+    let (min, max) = match (
+        size(["minPacketSize", "min_packet_size"]),
+        size(["maxPacketSize", "max_packet_size"]),
+    ) {
+        (Some(min), Some(max)) => (min, max),
+        (min, max) => {
+            // Fall back to the reference's `packetSize` range, object or array form.
+            let edge = |json: &Json, from: bool| {
+                json.get(if from { "from" } else { "to" })
+                    .or_else(|| json.as_arr().and_then(|a| a.get(usize::from(!from))))
+                    .and_then(Json::as_u32)
+                    .and_then(|value| u16::try_from(value).ok())
+            };
+            match tls.get("packetSize") {
+                Some(range) => (
+                    min.or_else(|| edge(range, true)).unwrap_or(0),
+                    max.or_else(|| edge(range, false)).unwrap_or(0),
+                ),
+                None => (min.unwrap_or(0), max.unwrap_or(0)),
+            }
+        }
+    };
+    ferrox_core::hysteria::Gecko::new(min, max)
+        .map(Some)
+        .ok_or(())
+}
+
+/// The masquerade cover an inbound hysteria server answers a browser with, read from its `hysteriaSettings`. Absent, empty, or an unknown type falls back to the plain not-found — today's behavior — so only a configured cover ever changes what a browser sees. Field names accept both the camel and the snake spelling the reference's two JSON dialects use.
+pub(crate) fn masquerade_from_stream(stream: Option<&Json>) -> ferrox_core::hysteria::Masquerade {
+    use ferrox_core::hysteria::Masquerade;
+    let Some(hy) = stream.and_then(|s| s.get("hysteriaSettings")) else {
+        return Masquerade::NotFound;
+    };
+    let field = |camel: &str, snake: &str| hy.get(camel).or_else(|| hy.get(snake));
+    let text = |camel: &str, snake: &str| field(camel, snake).and_then(Json::as_str);
+    let flag =
+        |camel: &str, snake: &str| field(camel, snake).and_then(Json::as_bool).unwrap_or(false);
+    match text("masqType", "masq_type").unwrap_or_default() {
+        "file" => {
+            text("masqFile", "masq_file").map_or(Masquerade::NotFound, |dir| Masquerade::File {
+                dir: dir.to_owned(),
+            })
+        }
+        "proxy" => {
+            text("masqUrl", "masq_url").map_or(Masquerade::NotFound, |url| Masquerade::Proxy {
+                url: url.to_owned(),
+                rewrite_host: flag("masqUrlRewriteHost", "masq_url_rewrite_host"),
+                x_forwarded: flag("masqUrlXForwarded", "masq_url_x_forwarded"),
+                insecure: flag("masqUrlInsecure", "masq_url_insecure"),
+            })
+        }
+        "response" => {
+            let status = field("masqStringStatusCode", "masq_string_status_code")
+                .and_then(Json::as_u32)
+                .filter(|code| *code != 0)
+                .map_or(200, |code| code as u16);
+            let body = text("masqString", "masq_string")
+                .unwrap_or_default()
+                .as_bytes()
+                .to_vec();
+            let headers = field("masqStringHeaders", "masq_string_headers")
+                .and_then(Json::as_arr)
+                .map_or_else(Vec::new, |items| {
+                    items
+                        .iter()
+                        .filter_map(Json::as_str)
+                        .filter_map(header_line)
+                        .collect()
+                });
+            Masquerade::Response {
+                status,
+                headers,
+                body,
+            }
+        }
+        _ => Masquerade::NotFound,
+    }
+}
+
+/// One `Name: value` line from a masquerade response's header list, split on its first colon; a line naming nothing is dropped.
+fn header_line(line: &str) -> Option<(String, String)> {
+    let (name, value) = line.split_once(':')?;
+    Some((name.trim().to_owned(), value.trim().to_owned()))
 }
 
 pub(crate) fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, String) {
@@ -1031,6 +1235,108 @@ mod tests {
         assert!(matches!(
             carrier(
                 r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2}, "tlsSettings": {"obfs": "salamander", "obfs-password": "ab"}}}"#
+            ),
+            Carrier::Unknown { .. }
+        ));
+    }
+
+    #[test]
+    fn a_hysteria_carrier_reads_a_port_hopping_plan() {
+        let planned = |text: &str| {
+            let Carrier::Hysteria(config) = stream_carrier(
+                crate::json::parse(text)
+                    .expect("parses")
+                    .get("streamSettings"),
+            ) else {
+                panic!("a v2 hysteria carrier");
+            };
+            config.hop
+        };
+        // A comma spec of a range and a lone port, bounded in seconds and one with a unit, expands to the sorted set the dial rotates over.
+        let spec = r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2, "serverPorts": "20000-20002,443", "hopInterval": 5, "hopIntervalMax": "10s"}}}"#;
+        let plan = planned(spec).expect("a plan");
+        assert_eq!(plan.ports(), vec![443, 20_000, 20_001, 20_002]);
+        assert_eq!(
+            plan.interval_ms,
+            (5_000, 10_000),
+            "seconds reach the dial as ms"
+        );
+        // An array of numbers and range strings is the same plan; with no interval the stay defaults to a fixed five seconds.
+        let arr = r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2, "serverPorts": [443, "9000-9001"]}}}"#;
+        let plan = planned(arr).expect("a plan");
+        assert_eq!(plan.ports(), vec![443, 9_000, 9_001]);
+        assert_eq!(plan.interval_ms, (5_000, 5_000), "an absent stay is fixed");
+        // A malformed port spec leaves no valid range, so the dial stays on its fixed port rather than routing to a port the config never named.
+        assert!(
+            planned(r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2, "serverPorts": "0,70000"}}}"#)
+                .is_none(),
+            "nothing valid means no hop"
+        );
+    }
+
+    #[test]
+    fn a_hysteria_carrier_reads_a_gecko_window() {
+        use ferrox_core::hysteria::Gecko;
+        let carrier = |text: &str| {
+            stream_carrier(
+                crate::json::parse(text)
+                    .expect("parses")
+                    .get("streamSettings"),
+            )
+        };
+        // A gecko obfs with the sing-box bounds keeps its shared key and reaches the dial as that window.
+        let Carrier::Hysteria(config) = carrier(
+            r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2}, "tlsSettings": {"obfs": "gecko", "obfs-password": "gawrgura", "min_packet_size": 600, "max_packet_size": 1000}}}"#,
+        ) else {
+            panic!("a gecko carrier");
+        };
+        assert_eq!(
+            config.obfs_password, "gawrgura",
+            "gecko masks with the shared key"
+        );
+        assert_eq!(
+            config.gecko,
+            Some(Gecko {
+                min_pkt: 600,
+                max_pkt: 1000
+            })
+        );
+        // The reference's `packetSize` range, in object form, names the same window.
+        let Carrier::Hysteria(range) = carrier(
+            r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2}, "tlsSettings": {"obfs": "gecko", "obfs-password": "gawrgura", "packetSize": {"from": 700, "to": 900}}}}"#,
+        ) else {
+            panic!("a gecko carrier");
+        };
+        assert_eq!(
+            range.gecko,
+            Some(Gecko {
+                min_pkt: 700,
+                max_pkt: 900
+            }),
+            "the camel form is the same window"
+        );
+        // A gecko that names no bounds takes the reference defaults.
+        let Carrier::Hysteria(defaults) = carrier(
+            r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2}, "tlsSettings": {"obfs": "gecko", "obfs-password": "gawrgura"}}}"#,
+        ) else {
+            panic!("a gecko carrier");
+        };
+        assert_eq!(
+            defaults.gecko,
+            Gecko::new(0, 0),
+            "an absent window is defaulted"
+        );
+        // A salamander obfs is not a gecko: the same key, no fragmentation window.
+        let Carrier::Hysteria(salamander) = carrier(
+            r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2}, "tlsSettings": {"obfs": "salamander", "obfs-password": "gawrgura"}}}"#,
+        ) else {
+            panic!("a salamander carrier");
+        };
+        assert_eq!(salamander.gecko, None, "salamander never fragments");
+        // A window past the largest frame is refused, not silently carried as a plain salamander.
+        assert!(matches!(
+            carrier(
+                r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2}, "tlsSettings": {"obfs": "gecko", "obfs-password": "gawrgura", "min_packet_size": 100, "max_packet_size": 5000}}}"#
             ),
             Carrier::Unknown { .. }
         ));

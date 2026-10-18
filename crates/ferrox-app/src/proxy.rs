@@ -294,6 +294,7 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
                     return false;
                 };
                 let (cert_path, key_path) = (cert_path.to_owned(), key_path.to_owned());
+                let masq = crate::config::masquerade_from_stream(Some(settings));
                 let serve: crate::hysteria::Serve = Arc::new(move |flow| {
                     serve_vless_hysteria(flow, &id, freedom);
                 });
@@ -305,6 +306,7 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
                         &cert_path,
                         &key_path,
                         &config.obfs_password,
+                        &masq,
                         &serve,
                     );
                 });
@@ -563,6 +565,8 @@ struct FoxyOut {
     verified: std::sync::Arc<std::sync::Mutex<Option<ferrox_core::foxy::Candidate>>>,
     /// Set when no edge could carry a probe tunnel here: the pre-flight then stops rather than costing every flow a dead dial.
     probe_unavailable: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Until when the probes are known to answer a country other than the pin: a sweep that reached an edge and agreed with none is the answer, and re-asking it per flow buys the same refusal again.
+    exit_refuted_until: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl FoxyOut {
@@ -2870,6 +2874,7 @@ fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &s
     let serve: crate::hysteria::Serve = Arc::new(move |flow| {
         serve_hysteria_flow(flow, freedom);
     });
+    let masq = crate::config::masquerade_from_stream(Some(stream));
     thread::spawn(move || {
         crate::hysteria::serve_loop(
             &owned,
@@ -2878,6 +2883,7 @@ fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &s
             &cert_path,
             &key_path,
             &obfs_password,
+            &masq,
             &serve,
         );
     });
@@ -5653,6 +5659,27 @@ fn probes_reachable(probes: &[Option<bool>]) -> bool {
     probes.iter().any(Option::is_some)
 }
 
+/// What a finished probe sweep concluded: the edge that honoured the pin, no probe reachable from here, or every reachable edge answering a different country than the pin.
+#[derive(Debug, PartialEq, Eq)]
+enum Sweep {
+    Agreed(usize),
+    Unreachable,
+    Refuted,
+}
+
+/// The verdict of a sweep, in the order the caller acts on it: a pick wins, an unreachable probe set stops the probes, and a set that answered and agreed with none is itself the answer.
+#[must_use]
+fn sweep_verdict(probes: &[Option<bool>]) -> Sweep {
+    if let Some(at) = pick_verified_edge(probes) {
+        return Sweep::Agreed(at);
+    }
+    if probes_reachable(probes) {
+        Sweep::Refuted
+    } else {
+        Sweep::Unreachable
+    }
+}
+
 /// The exit country one edge really hands back: a disposable H3 tunnel to the probe authority, asked for the trace, then dropped, which is what gives its pooled stream back. It never rides a flow's own tunnel, so a per-target carrier is left intact; `None` means this runner could not carry or read the trace here. The probe is a probe, so its dial gets the probe budget rather than a named carrier's full handshake: a lane whose UDP is blackholed has to say so before the first flow's client gives up.
 fn probe_edge_exit(
     foxy: &FoxyOut,
@@ -5689,7 +5716,10 @@ fn probe_edge_exit(
 
 /// The pinned-country edge that really exits in the pin, chosen once per lane over disposable probes and cached so every carrier rides it. The walk stops at the first edge that honours the pin, since a later probe cannot change that pick. Falls back to the label order when no edge agrees, records the truth when one cannot, and stops probing when none can be reached here.
 fn verify_exit(foxy: &FoxyOut) {
-    if !exit_needs_probe(foxy) || foxy.probe_unavailable.load(Ordering::Relaxed) {
+    if !exit_needs_probe(foxy)
+        || foxy.probe_unavailable.load(Ordering::Relaxed)
+        || edge_limited(&foxy.exit_refuted_until, now_secs())
+    {
         return;
     }
     if foxy.verified.lock().is_ok_and(|kept| kept.is_some()) {
@@ -5733,12 +5763,17 @@ fn verify_exit(foxy: &FoxyOut) {
             break;
         }
     }
-    if let Some(chosen) = pick_verified_edge(&flags).map(|at| edges[at].clone()) {
-        if let Ok(mut kept) = foxy.verified.lock() {
-            *kept = Some(chosen);
+    match sweep_verdict(&flags) {
+        Sweep::Agreed(at) => {
+            if let Ok(mut kept) = foxy.verified.lock() {
+                *kept = Some(edges[at].clone());
+            }
         }
-    } else if !probes_reachable(&flags) {
-        foxy.probe_unavailable.store(true, Ordering::Relaxed);
+        // The pin is not what this runner gets out; re-sweeping it per flow would only buy the same refusal again.
+        Sweep::Refuted => foxy
+            .exit_refuted_until
+            .store(now_secs() + CARRIER_DEAD_SECS, Ordering::Relaxed),
+        Sweep::Unreachable => foxy.probe_unavailable.store(true, Ordering::Relaxed),
     }
 }
 
@@ -6086,6 +6121,12 @@ fn serve_socks_udp(mut client: Connection, out: &Outbound) {
             if matches!(vless.carrier, Carrier::Raw(_)) && vless.tls.is_none() =>
         {
             serve_socks_udp_vless(&relay, vless);
+        }
+        Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Hysteria(_)) && !vless.mux => {
+            // The datagram lane carries UDP flows the same way it carries TCP ones: one association per destination, ids never reused on the connection.
+            if let Some(dial) = hysteria_dial_session(vless) {
+                crate::hysteria::serve_udp(&relay, &dial);
+            }
         }
         Outbound::Trojan(trojan)
             if matches!(trojan.carrier, Carrier::Raw(_)) && trojan.tls.is_none() =>
@@ -6447,6 +6488,10 @@ fn open_foxy_ip_tunnel(
             .as_ref()
             .map_or_else(|| foxy.pass.clone(), |account| account.current());
         for carrier in crate::foxy::Carrier::udp_order() {
+            // As on TCP and CONNECT-UDP: a silent carrier is left alone for the window, not probed per packet.
+            if foxy.carrier_unanswered(&edge, carrier) {
+                continue;
+            }
             let dial = crate::foxy::FoxyDial {
                 host: edge.host.clone(),
                 port: edge.port,
@@ -9861,6 +9906,7 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             },
             verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
             probe_unavailable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            exit_refuted_until: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         });
     }
     None
@@ -13233,6 +13279,7 @@ mod tests {
             roots: vec![CARRIER_CERT.to_vec()],
             pins: ferrox_core::foxy::pin::Pins::default(),
             cipher_suites: Vec::new(),
+            insecure: false,
         };
         (server, client)
     }
@@ -15514,6 +15561,7 @@ mod tests {
             exit_probe: None,
             verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
             probe_unavailable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            exit_refuted_until: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
 
@@ -18124,28 +18172,58 @@ mod tests {
     }
 
     #[test]
-    fn hysteria_dial_udp_uplink_is_none() {
+    fn hysteria_udp_lane_carries_a_datagram() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_udp_lane_once, 3);
+    }
+
+    fn hysteria_udp_lane_once() {
+        // The client's own uplink, off the socks front: serve_udp reads a framed datagram from the relay socket, puts it on the connection's datagram lane, and the companion reader carries the echo back over the same lane.
+        let echo_port = udp_echo_loop();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_with("lane-auth", id, "");
         let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
-        let vless = VlessOut {
+        // The association reaps on this silence, as the production relay does on `budgets::udp_idle()`.
+        relay
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let relay_addr = relay.local_addr().expect("addr");
+        let dial = crate::hysteria::Dial {
+            host: "localhost".to_owned(),
             address: "127.0.0.1".to_owned(),
-            port: 9,
-            id: uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id"),
-            carrier: Carrier::Hysteria(ferrox_core::hysteria::Config {
-                auth: String::new(),
+            port,
+            config: ferrox_core::hysteria::Config {
+                auth: "lane-auth".to_owned(),
                 cc: ferrox_core::hysteria::Congestion::Bbr,
                 obfs_password: String::new(),
-            }),
-            host: "127.0.0.1".to_owned(),
-            mux: false,
-            quic_roots: None,
-            hysteria_roots: None,
-            tls: None,
-            flow: String::new(),
-            reality: None,
+                hop: None,
+                gecko: None,
+            },
+            roots: Some(roots),
         };
-        let dest: SocketAddr = "127.0.0.1:9".parse().expect("addr");
-        let source = Arc::new(Mutex::new(None));
-        assert!(dial_udp_uplink(&vless, &dest, &relay, source).is_none());
+        thread::spawn(move || crate::hysteria::serve_udp(&relay, &dial));
+        let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        client
+            .set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("timeout");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"lane-ping");
+        let mut back = vec![0u8; UDP_BUF];
+        // The lane's handshake is not paid before the relay reads, so an early datagram is simply resent until the association is up.
+        let deadline = std::time::Instant::now() + QUIC_TEST_TIMEOUT;
+        let answer = loop {
+            let _ = client.send_to(&datagram, relay_addr);
+            match client.recv_from(&mut back) {
+                Ok((n, _)) => break n,
+                Err(_) if std::time::Instant::now() < deadline => {}
+                Err(error) => panic!("echo never returns: {error}"),
+            }
+        };
+        let (source, payload) = parse_socks_udp(&back[..answer]).expect("splits");
+        assert_eq!(source, target);
+        assert_eq!(payload, b"lane-ping");
     }
 
     #[test]
@@ -19529,6 +19607,16 @@ mod tests {
     }
 
     fn hysteria_loop_with(auth: &str, id: [u8; 16], obfs: &str) -> (u16, Vec<Vec<u8>>) {
+        hysteria_loop_masq(auth, id, obfs, ferrox_core::hysteria::Masquerade::NotFound)
+    }
+
+    /// Brings up a hysteria inbound on a free port with the given masquerade cover, so a test can point a browser at it and read what the cover answers.
+    fn hysteria_loop_masq(
+        auth: &str,
+        id: [u8; 16],
+        obfs: &str,
+        masq: ferrox_core::hysteria::Masquerade,
+    ) -> (u16, Vec<Vec<u8>>) {
         let minted =
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
         let stamp = std::time::SystemTime::now()
@@ -19564,6 +19652,7 @@ mod tests {
                 &cert_path,
                 &key_path,
                 &obfs,
+                &masq,
                 &serve,
             );
         });
@@ -19588,6 +19677,8 @@ mod tests {
                 auth: auth.to_owned(),
                 cc: ferrox_core::hysteria::Congestion::Bbr,
                 obfs_password: obfs.to_owned(),
+                hop: None,
+                gecko: None,
             },
             roots: Some(roots),
         };
@@ -19761,6 +19852,8 @@ mod tests {
                 auth: "bisect-auth".to_owned(),
                 cc: ferrox_core::hysteria::Congestion::Bbr,
                 obfs_password: String::new(),
+                hop: None,
+                gecko: None,
             },
             roots: Some(roots),
         };
@@ -19845,6 +19938,481 @@ mod tests {
         let back =
             crate::quic::stream_recv_exact(&mut conn, &sock, local, 4, 4, horizon).expect("echoes");
         assert_eq!(back.as_slice(), b"ping");
+    }
+
+    /// Drives a browser's HTTP/3 `GET` against a masquerade port and reads the cover answer back: it hand-shakes, sends a `HEADERS` request on stream 0 with a FIN, then walks the reply's `HEADERS` and `DATA` frames into a status, its headers, and its body.
+    fn masq_get(port: u16, roots: &[Vec<u8>], path: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
+        use ferrox_core::foxy::frames as h3;
+        use ferrox_core::foxy::hpack;
+        let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", port).expect("udp");
+        let sock = crate::quic::Datagram::plain(sock);
+        let mut config = crate::quic::quiche_config(roots, Some("bbr")).expect("configures");
+        let mut scid = [0u8; 16];
+        getrandom::getrandom(&mut scid).expect("random");
+        let cid = quiche::ConnectionId::from_ref(&scid);
+        let mut conn =
+            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
+        crate::quic::drive_handshake(&mut conn, &sock, local).expect("handshakes");
+        let horizon = std::time::Instant::now() + Duration::from_secs(15);
+        let mut block = Vec::new();
+        hpack::qpack_literal_many(
+            &[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":authority", "localhost"),
+                (":path", path),
+            ],
+            &mut block,
+        );
+        let mut frame = Vec::new();
+        h3::quic_varint(&mut frame, h3::H3_HEADERS);
+        h3::quic_varint(&mut frame, block.len() as u64);
+        frame.extend_from_slice(&block);
+        assert!(
+            crate::quic::stream_send_all(&mut conn, &sock, 0, &frame, true, horizon),
+            "the browser's request is sent"
+        );
+        let mut head = Vec::new();
+        let mut room = [0u8; 4096];
+        loop {
+            match conn.stream_recv(0, &mut room) {
+                Ok((0, _)) | Err(quiche::Error::Done) => {
+                    if conn.is_closed() || std::time::Instant::now() >= horizon {
+                        break;
+                    }
+                    let left = horizon.saturating_duration_since(std::time::Instant::now());
+                    if !crate::quic::pump_once(&mut conn, &sock, local, left) {
+                        break;
+                    }
+                }
+                Ok((n, fin)) => {
+                    head.extend_from_slice(&room[..n]);
+                    if fin {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+        let mut at = 0usize;
+        let mut status = 0u16;
+        let mut headers = Vec::new();
+        let mut body = Vec::new();
+        while let Some(frame) = h3::h3_frame(&head, &mut at) {
+            let end = at + frame.length as usize;
+            let Some(payload) = head.get(at..end) else {
+                break;
+            };
+            match frame.kind {
+                h3::H3_HEADERS => {
+                    for (name, value) in hpack::qpack_fields(payload).unwrap_or_default() {
+                        let name = String::from_utf8_lossy(&name).into_owned();
+                        let value = String::from_utf8_lossy(&value).into_owned();
+                        if name == ":status" {
+                            status = value.parse().unwrap_or(0);
+                        } else {
+                            headers.push((name, value));
+                        }
+                    }
+                }
+                h3::H3_DATA => body.extend_from_slice(payload),
+                _ => {}
+            }
+            at = end;
+        }
+        (status, headers, body)
+    }
+
+    /// The `content-type` a browser's answer carried, or an empty string when it named none.
+    fn content_type_of(headers: &[(String, String)]) -> &str {
+        headers
+            .iter()
+            .find(|(name, _)| name == "content-type")
+            .map_or("", |(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn hysteria_answers_a_browser_get_with_the_masquerade_404() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_masq_404_once, 3);
+    }
+
+    fn hysteria_masq_404_once() {
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_masq(
+            "lane-auth",
+            id,
+            "",
+            ferrox_core::hysteria::Masquerade::NotFound,
+        );
+        let (status, headers, body) = masq_get(port, &roots, "/");
+        assert_eq!(status, 404);
+        assert_eq!(body, b"404 page not found\n");
+        assert!(content_type_of(&headers).starts_with("text/plain"));
+    }
+
+    #[test]
+    fn hysteria_serves_a_canned_masquerade_response() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_masq_response_once, 3);
+    }
+
+    fn hysteria_masq_response_once() {
+        use ferrox_core::hysteria::Masquerade;
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_masq(
+            "lane-auth",
+            id,
+            "",
+            Masquerade::Response {
+                status: 200,
+                headers: vec![("content-type".to_owned(), "text/markdown".to_owned())],
+                body: b"a cover page\n".to_vec(),
+            },
+        );
+        let (status, headers, body) = masq_get(port, &roots, "/");
+        assert_eq!(status, 200);
+        assert_eq!(content_type_of(&headers), "text/markdown");
+        assert_eq!(body, b"a cover page\n");
+    }
+
+    #[test]
+    fn hysteria_serves_a_file_from_the_masquerade_directory() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_masq_file_once, 3);
+    }
+
+    fn hysteria_masq_file_once() {
+        use ferrox_core::hysteria::Masquerade;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-masq-file-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("stages dir");
+        std::fs::write(dir.join("hello.txt"), b"static bytes").expect("stages file");
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_masq(
+            "lane-auth",
+            id,
+            "",
+            Masquerade::File {
+                dir: dir.to_str().expect("ascii").to_owned(),
+            },
+        );
+        let (status, headers, body) = masq_get(port, &roots, "/hello.txt");
+        assert_eq!(status, 200);
+        assert_eq!(content_type_of(&headers), "text/plain; charset=utf-8");
+        assert_eq!(body, b"static bytes");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hysteria_refuses_a_masquerade_path_that_escalates_the_directory() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_masq_traversal_once, 3);
+    }
+
+    fn hysteria_masq_traversal_once() {
+        use ferrox_core::hysteria::Masquerade;
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let outer =
+            std::env::temp_dir().join(format!("ferrox-masq-out-{}-{stamp}", std::process::id()));
+        let root = outer.join("root");
+        std::fs::create_dir_all(&root).expect("stages root");
+        std::fs::write(outer.join("secret.txt"), b"never served").expect("stages secret");
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_masq(
+            "lane-auth",
+            id,
+            "",
+            Masquerade::File {
+                dir: root.to_str().expect("ascii").to_owned(),
+            },
+        );
+        // A percent-encoded `../secret.txt` names a file above the served root; the cover answers not-found and the secret is never read.
+        let (status, _, body) = masq_get(port, &roots, "/%2e%2e%2fsecret.txt");
+        assert_eq!(status, 404);
+        assert_ne!(body, b"never served".to_vec());
+        let _ = std::fs::remove_dir_all(&outer);
+    }
+
+    #[test]
+    fn hysteria_proxies_a_masquerade_request_to_an_origin() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_masq_proxy_once, 3);
+    }
+
+    fn hysteria_masq_proxy_once() {
+        use ferrox_core::hysteria::Masquerade;
+        // A one-shot HTTP/1.1 origin that answers any request with a fixed body.
+        let origin = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let origin_port = origin.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = origin.accept().expect("accepts");
+            let mut drain = [0u8; 1024];
+            let _ = stream.read(&mut drain);
+            let _ = stream.write_all(b"HTTP/1.1 201 Created\r\ncontent-type: text/plain\r\ncontent-length: 6\r\n\r\norigin");
+        });
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_masq(
+            "lane-auth",
+            id,
+            "",
+            Masquerade::Proxy {
+                url: format!("http://127.0.0.1:{origin_port}"),
+                rewrite_host: false,
+                x_forwarded: false,
+                insecure: false,
+            },
+        );
+        let (status, headers, body) = masq_get(port, &roots, "/anything");
+        assert_eq!(status, 201);
+        assert_eq!(content_type_of(&headers), "text/plain");
+        assert_eq!(body, b"origin");
+    }
+
+    /// A one-shot `https` masquerade origin: a TLS-terminating loopback listener that answers the first request it accepts with a fixed HTTP/1.1 body, then closes. Returns the port it listens on.
+    fn masq_https_origin() -> u16 {
+        let origin = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = origin.local_addr().expect("addr").port();
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
+        let identity = ferrox_core::tls::parse_pem_identity(
+            minted.cert.pem().as_bytes(),
+            minted.key_pair.serialize_pem().as_bytes(),
+        )
+        .expect("identity");
+        thread::spawn(move || {
+            let Ok((stream, _)) = origin.accept() else {
+                return;
+            };
+            let Ok(mut tls) = ferrox_core::tls::accept(&identity, stream) else {
+                return;
+            };
+            if tls.handshake().is_err() {
+                return;
+            }
+            let mut drain = [0u8; 1024];
+            let _ = tls.read(&mut drain);
+            let _ = tls.write_all(b"HTTP/1.1 201 Created\r\ncontent-type: text/plain\r\ncontent-length: 6\r\n\r\norigin");
+            let _ = tls.flush();
+        });
+        port
+    }
+
+    #[test]
+    fn hysteria_proxies_a_masquerade_request_to_an_https_origin() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_masq_https_insecure_once, 3);
+    }
+
+    fn hysteria_masq_https_insecure_once() {
+        use ferrox_core::hysteria::Masquerade;
+        let origin_port = masq_https_origin();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_masq(
+            "lane-auth",
+            id,
+            "",
+            Masquerade::Proxy {
+                url: format!("https://127.0.0.1:{origin_port}"),
+                rewrite_host: false,
+                x_forwarded: false,
+                insecure: true,
+            },
+        );
+        // The cover dials the https origin through the client TLS the relay already speaks; naming `insecure` accepts the self-signed chain and the body returns byte-identical.
+        let (status, headers, body) = masq_get(port, &roots, "/anything");
+        assert_eq!(status, 201);
+        assert_eq!(content_type_of(&headers), "text/plain");
+        assert_eq!(body, b"origin");
+    }
+
+    #[test]
+    fn hysteria_refuses_a_masquerade_https_origin_whose_chain_is_untrusted() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_masq_https_verified_once, 3);
+    }
+
+    fn hysteria_masq_https_verified_once() {
+        use ferrox_core::hysteria::Masquerade;
+        let origin_port = masq_https_origin();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_masq(
+            "lane-auth",
+            id,
+            "",
+            Masquerade::Proxy {
+                url: format!("https://127.0.0.1:{origin_port}"),
+                rewrite_host: false,
+                x_forwarded: false,
+                insecure: false,
+            },
+        );
+        // A verified dial reaches the same self-signed origin but must not trust it: the chain fails against the platform roots, so `insecure` is honoured as opt-in and the cover answers bad-gateway, relaying no origin bytes.
+        let (status, _, body) = masq_get(port, &roots, "/anything");
+        assert_eq!(status, 502);
+        assert_ne!(body, b"origin".to_vec());
+    }
+
+    #[test]
+    fn hysteria_still_carries_proxy_flows_beside_a_masquerade_get() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_masq_beside_flow_once, 3);
+    }
+
+    fn hysteria_masq_beside_flow_once() {
+        use ferrox_core::foxy::frames as h3;
+        use ferrox_core::hysteria::Masquerade;
+        let echo_port = echo_loop();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_masq(
+            "bisect2-auth",
+            id,
+            "",
+            Masquerade::Response {
+                status: 200,
+                headers: vec![],
+                body: b"cover".to_vec(),
+            },
+        );
+        // A browser's GET is answered as the cover, and it never disturbs the flow lane a hysteria client uses on its own connection.
+        let (status, _, body) = masq_get(port, &roots, "/");
+        assert_eq!((status, body.as_slice()), (200, b"cover".as_slice()));
+        // A real hysteria client then authenticates and relays a TCP flow across the very same port.
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", port).expect("udp");
+        let sock = crate::quic::Datagram::plain(sock);
+        let mut config = crate::quic::quiche_config(&roots, Some("bbr")).expect("configures");
+        let mut scid = [0u8; 16];
+        getrandom::getrandom(&mut scid).expect("random");
+        let cid = quiche::ConnectionId::from_ref(&scid);
+        let mut conn =
+            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
+        crate::quic::drive_handshake(&mut conn, &sock, local).expect("handshakes");
+        let horizon = std::time::Instant::now() + Duration::from_secs(30);
+        let mut settings = Vec::new();
+        h3::quic_varint(&mut settings, 0x04);
+        h3::quic_varint(&mut settings, 0);
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 2, &settings, true, horizon
+        ));
+        let mut block = Vec::new();
+        ferrox_core::hysteria::build_auth_request("localhost", "bisect2-auth", &mut block);
+        let mut frame = Vec::new();
+        h3::quic_varint(&mut frame, h3::H3_HEADERS);
+        h3::quic_varint(&mut frame, block.len() as u64);
+        frame.extend_from_slice(&block);
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 0, &frame, true, horizon
+        ));
+        let mut head = Vec::new();
+        let body = loop {
+            let piece = crate::quic::stream_recv_exact(&mut conn, &sock, local, 0, 1, horizon)
+                .expect("reads");
+            head.extend_from_slice(&piece);
+            let mut at = 0usize;
+            if let Some(got) = h3::h3_frame(&head, &mut at) {
+                if got.kind == h3::H3_HEADERS {
+                    if let Some(body) = head.get(at..at + got.length as usize) {
+                        break body.to_vec();
+                    }
+                }
+            }
+        };
+        assert!(ferrox_core::hysteria::verify_auth_response(&body));
+        let header = vless_header(&id, 1, &Destination::from(target));
+        let mut prefix = Vec::with_capacity(2 + header.len());
+        ferrox_core::hysteria::tcp_prefix(&mut prefix);
+        prefix.extend_from_slice(&header);
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 4, &prefix, false, horizon
+        ));
+        let reply = crate::quic::stream_recv_exact(&mut conn, &sock, local, 4, 2, horizon)
+            .expect("replies");
+        assert_eq!(reply.as_slice(), &[0, 0]);
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 4, b"ping", false, horizon
+        ));
+        let back =
+            crate::quic::stream_recv_exact(&mut conn, &sock, local, 4, 4, horizon).expect("echoes");
+        assert_eq!(back.as_slice(), b"ping");
+    }
+
+    #[test]
+    fn hysteria_closes_a_wrong_hysteria_password_even_with_masquerade() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_masq_wrong_auth_once, 3);
+    }
+
+    fn hysteria_masq_wrong_auth_once() {
+        use ferrox_core::foxy::frames as h3;
+        use ferrox_core::hysteria::Masquerade;
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_masq(
+            "right-auth",
+            id,
+            "",
+            Masquerade::Response {
+                status: 200,
+                headers: vec![],
+                body: b"cover".to_vec(),
+            },
+        );
+        let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", port).expect("udp");
+        let sock = crate::quic::Datagram::plain(sock);
+        let mut config = crate::quic::quiche_config(&roots, Some("bbr")).expect("configures");
+        let mut scid = [0u8; 16];
+        getrandom::getrandom(&mut scid).expect("random");
+        let cid = quiche::ConnectionId::from_ref(&scid);
+        let mut conn =
+            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
+        crate::quic::drive_handshake(&mut conn, &sock, local).expect("handshakes");
+        let horizon = std::time::Instant::now() + Duration::from_secs(15);
+        // The right handshake shape — a POST to the auth path — but the wrong password must still refuse and close, never quietly serve the cover page.
+        let mut block = Vec::new();
+        ferrox_core::hysteria::build_auth_request("localhost", "wrong-auth", &mut block);
+        let mut frame = Vec::new();
+        h3::quic_varint(&mut frame, h3::H3_HEADERS);
+        h3::quic_varint(&mut frame, block.len() as u64);
+        frame.extend_from_slice(&block);
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 0, &frame, true, horizon
+        ));
+        let mut head = Vec::new();
+        let body = loop {
+            let Some(piece) =
+                crate::quic::stream_recv_exact(&mut conn, &sock, local, 0, 1, horizon)
+            else {
+                break None;
+            };
+            head.extend_from_slice(&piece);
+            let mut at = 0usize;
+            if let Some(got) = h3::h3_frame(&head, &mut at) {
+                if got.kind == h3::H3_HEADERS {
+                    if let Some(body) = head.get(at..at + got.length as usize) {
+                        break Some(body.to_vec());
+                    }
+                }
+            }
+        };
+        // The refusal is a not-found, not the cover page: the connection never masquerades a wrong credential.
+        let refused = body.is_some_and(|body| {
+            ferrox_core::foxy::hpack::qpack_fields(&body)
+                .unwrap_or_default()
+                .iter()
+                .find(|(name, _)| name == b":status")
+                .is_some_and(|(_, value)| String::from_utf8_lossy(value) == "404")
+        });
+        assert!(
+            refused,
+            "a wrong password is refused with a 404, not served the cover"
+        );
     }
 
     #[test]
@@ -19945,6 +20513,82 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn hysteria_carries_a_udp_association_over_the_carrier() {
+        let _serial = quic_serial();
+        quic_retry_dial(hysteria_udp_association_once, 3);
+    }
+
+    fn hysteria_udp_association_once() {
+        // The whole dispatch: a socks5 UDP associate on a hysteria outbound, framed at the front, carried by the carrier's datagram lane to the echo target, and handed back in the frame the client expects.
+        let echo_port = udp_echo_loop();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_with("association-auth", id, "");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let out = Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Hysteria(ferrox_core::hysteria::Config {
+                auth: "association-auth".to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                obfs_password: String::new(),
+                hop: None,
+                gecko: None,
+            }),
+            host: "localhost".to_owned(),
+            mux: false,
+            quic_roots: None,
+            hysteria_roots: Some(roots),
+            tls: None,
+            flow: String::new(),
+            reality: None,
+        });
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out);
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("timeout");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"association-ping");
+        let mut back = vec![0u8; UDP_BUF];
+        let deadline = std::time::Instant::now() + QUIC_TEST_TIMEOUT;
+        let answer = loop {
+            let _ = udp.send_to(&datagram, relay);
+            match udp.recv_from(&mut back) {
+                Ok((n, _)) => break n,
+                Err(_) if std::time::Instant::now() < deadline => {}
+                Err(error) => panic!("echo never returns: {error}"),
+            }
+        };
+        let (source, payload) = parse_socks_udp(&back[..answer]).expect("splits");
+        assert_eq!(source, target);
+        assert_eq!(payload, b"association-ping");
     }
 
     #[test]
@@ -20961,6 +21605,7 @@ mod tests {
             exit_probe: None,
             verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
             probe_unavailable: std::sync::Arc::new(AtomicBool::new(false)),
+            exit_refuted_until: std::sync::Arc::new(AtomicU64::new(0)),
         };
         let target = Destination::Name("target.test".to_owned(), 443);
 
@@ -20999,6 +21644,97 @@ mod tests {
         assert_eq!(
             asked.load(Ordering::SeqCst),
             2,
+            "a rested carrier is asked again once its window has run out"
+        );
+    }
+
+    /// The connect-ip lane marks a silent carrier dead the same way the TCP flow does, so it must not knock on it again with the next packet: a lane whose carriers are all dead opens nothing, and one whose window has rested is asked again.
+    #[test]
+    fn the_connect_ip_lane_leaves_a_dead_carrier_dead() {
+        use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let edge: SocketAddr = listener.local_addr().expect("addr");
+        let asked = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = std::sync::Arc::clone(&asked);
+        // A silent edge: it accepts, names nothing and hangs up, which is a dead carrier rather than a live one.
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                counter.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let edge_carrier = crate::foxy::Carrier::H2;
+        let foxy = FoxyOut {
+            account: None,
+            country: "US".to_owned(),
+            city: String::new(),
+            carrier: crate::foxy::Carrier::Auto,
+            upstream: None,
+            candidates: vec![ferrox_core::foxy::Candidate {
+                host: "carrier.test".to_owned(),
+                port: edge.port(),
+                country: "US".to_owned(),
+                city: String::new(),
+            }],
+            stored: None,
+            unauthenticated: std::sync::Arc::new(AtomicBool::new(false)),
+            limited_strikes: std::sync::Arc::new(AtomicU32::new(0)),
+            limited_until: std::sync::Arc::new(AtomicU64::new(0)),
+            carrier_dead: std::sync::Arc::new(std::sync::Mutex::new(
+                ferrox_core::foxy::Refusals::new(32),
+            )),
+            edge_strikes: std::sync::Arc::new(std::sync::Mutex::new(
+                ferrox_core::foxy::EdgeStrikes::new(32),
+            )),
+            roots: Vec::new(),
+            pins: ferrox_core::foxy::pin::Pins::default(),
+            pass: ferrox_core::foxy::Pass {
+                token: "the-pass".to_owned(),
+                expires_at: None,
+                quota_remaining: None,
+                quota_reset: None,
+            },
+            edge_address: Some(edge),
+            direct_ports: Vec::new(),
+            direct_suffixes: Vec::new(),
+            exit_probe: None,
+            verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            probe_unavailable: std::sync::Arc::new(AtomicBool::new(false)),
+            exit_refuted_until: std::sync::Arc::new(AtomicU64::new(0)),
+        };
+        // Both capsule carriers are known silent, and neither is to be knocked on again inside its window.
+        for carrier in crate::foxy::Carrier::udp_order() {
+            if let Ok(mut cache) = foxy.carrier_dead.lock() {
+                cache.remember(
+                    &carrier_key(&foxy.candidates[0], carrier),
+                    now_secs() + CARRIER_DEAD_SECS,
+                );
+            }
+        }
+        let mut tunnel = None;
+        let mut source = [0u8; 16];
+        let mut width = 0usize;
+        assert!(
+            !open_foxy_ip_tunnel(&foxy, &mut tunnel, &mut source, &mut width),
+            "an edge silent on every capsule carrier grants no address"
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            0,
+            "the silence the lane already knows is not probed again on this packet"
+        );
+        // The window, not the verdict: a carrier left alone for its quarantine is asked again when it ends.
+        if let Ok(mut cache) = foxy.carrier_dead.lock() {
+            cache.clear(&carrier_key(&foxy.candidates[0], edge_carrier));
+        }
+        assert!(
+            !open_foxy_ip_tunnel(&foxy, &mut tunnel, &mut source, &mut width),
+            "the rested carrier still has nothing to open"
+        );
+        assert_ne!(
+            asked.load(Ordering::SeqCst),
+            0,
             "a rested carrier is asked again once its window has run out"
         );
     }
@@ -22095,7 +22831,38 @@ mod relay_tests {
 
 #[cfg(test)]
 mod foxy_exit_tests {
-    use super::{exit_agrees, pick_verified_edge, probe_settled, probes_reachable};
+    use super::{
+        exit_agrees, pick_verified_edge, probe_settled, probes_reachable, sweep_verdict, Sweep,
+    };
+
+    #[test]
+    fn a_sweep_that_reached_the_edges_and_agreed_with_none_is_itself_an_answer() {
+        assert_eq!(
+            sweep_verdict(&[Some(false), Some(true), Some(true)]),
+            Sweep::Agreed(1),
+            "a pick beats every refusal before and after it"
+        );
+        assert_eq!(
+            sweep_verdict(&[Some(false), Some(false)]),
+            Sweep::Refuted,
+            "the pin is not what this runner gets, and asking again buys the same refusal"
+        );
+        assert_eq!(
+            sweep_verdict(&[None, Some(false)]),
+            Sweep::Refuted,
+            "one edge answering wrongly is still an answer"
+        );
+        assert_eq!(
+            sweep_verdict(&[None, None]),
+            Sweep::Unreachable,
+            "nothing answering means this runner cannot carry a probe at all"
+        );
+        assert_eq!(
+            sweep_verdict(&[]),
+            Sweep::Unreachable,
+            "and no edge to ask is the same verdict"
+        );
+    }
 
     #[test]
     fn a_pinned_country_accepts_its_own_exit_and_refuses_a_single_edge_anycast_that_egresses_elsewhere(

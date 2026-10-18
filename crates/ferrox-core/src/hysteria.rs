@@ -40,11 +40,108 @@ impl Congestion {
     }
 }
 
+/// One inclusive `start..=end` span of server ports a hopped dial moves between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PortRange {
+    pub start: u16,
+    pub end: u16,
+}
+
+impl PortRange {
+    #[must_use]
+    pub fn contains(self, port: u16) -> bool {
+        port >= self.start && port <= self.end
+    }
+
+    #[must_use]
+    pub fn count(self) -> usize {
+        usize::from(self.end - self.start) + 1
+    }
+}
+
+/// A port-hopping plan: the server ports a client dial rotates between and the
+/// window each stay lasts. Held apart from the socket that moves, so the rotation
+/// is chosen — and proven — without a bound socket or a clock. `interval_ms` is
+/// the inclusive low..=high range a stay is drawn from; a plan with no room
+/// (`high <= low`) stays for exactly `low`. The dialed `Config` carries it; the
+/// pool key does too, so a hopped connection is never handed to a plain dial.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Hop {
+    pub ranges: Vec<PortRange>,
+    pub interval_ms: (u64, u64),
+}
+
+impl Hop {
+    /// The distinct ports the plan covers, ascending, an overlap named once.
+    /// Expanded once per dial so the rotation and the wire's source-port check
+    /// share one view of the set.
+    #[must_use]
+    pub fn ports(&self) -> Vec<u16> {
+        let mut set: Vec<u16> = Vec::new();
+        for range in &self.ranges {
+            for port in range.start..=range.end {
+                if !set.contains(&port) {
+                    set.push(port);
+                }
+            }
+        }
+        set.sort_unstable();
+        set
+    }
+}
+
+/// One of the ports a hop plan covers, never the one just left when another
+/// exists: a single-port plan stays, an empty plan yields `avoid` unchanged.
+/// `roll` is caller-supplied entropy folded in, so the choice is a pure function
+/// of the port set, the port to avoid and one number — proven without a rng.
+#[must_use]
+pub fn pick_next(ports: &[u16], avoid: u16, roll: usize) -> u16 {
+    let candidates = ports.iter().filter(|port| **port != avoid).count();
+    if candidates == 0 {
+        return ports.first().copied().unwrap_or(avoid);
+    }
+    let mut index = roll % candidates;
+    for &port in ports.iter().filter(|port| **port != avoid) {
+        if index == 0 {
+            return port;
+        }
+        index -= 1;
+    }
+    avoid
+}
+
+/// The length of the next stay in milliseconds, drawn from `interval`'s inclusive
+/// range: no room (`high <= low`) gives the low bound. `roll` is the entropy
+/// folded in, so a stay is a pure function of the range and one number.
+#[must_use]
+pub fn stay_ms(interval: (u64, u64), roll: u64) -> u64 {
+    let (low, high) = interval;
+    if high <= low {
+        return low;
+    }
+    low + roll % (high - low + 1)
+}
+
+/// Whether a reply's source port belongs to the hop: the nominal port the
+/// connection was named for, or any port the plan moves between. The wire turns
+/// such a source back to the nominal one so QUIC above sees one server.
+#[must_use]
+pub fn is_hop_port(ports: &[u16], nominal: u16, port: u16) -> bool {
+    port == nominal || ports.contains(&port)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     pub auth: String,
     pub cc: Congestion,
     pub obfs_password: String,
+    /// The port-hopping plan this dial rotates server ports on, or `None` for a
+    /// single fixed port. A plan joins the pool key, so reuse stays hop-faithful.
+    pub hop: Option<Hop>,
+    /// The `obfs: gecko` fragment window this dial pads its long-header packets
+    /// into, or `None` for a plain salamander (or cleartext) lane. `obfs_password`
+    /// still holds the key salamander masks each frame with.
+    pub gecko: Option<Gecko>,
 }
 
 impl Default for Config {
@@ -53,6 +150,8 @@ impl Default for Config {
             auth: String::new(),
             cc: Congestion::Bbr,
             obfs_password: String::new(),
+            hop: None,
+            gecko: None,
         }
     }
 }
@@ -398,6 +497,171 @@ impl Salamander {
     }
 }
 
+/// Gecko, the Hysteria v2 `obfs: gecko` lane: a fragment-and-pad layer that rides on
+/// top of salamander. A QUIC long-header packet (its high bit `0x80` set) is split
+/// into `2..=8` chunks, each wrapped in a five-byte frame header plus random padding
+/// that drags the sealed datagram into a `[min, max]` size window, then masked; a
+/// short-header packet is masked whole. This is the deterministic half of the lane —
+/// the chunk count, pad lengths and message ids are random and drawn by the socket
+/// above, exactly as the port-hop pick and stay are drawn by the dialer.
+///
+/// Wire layout of one frame, before salamander masks it:
+/// - byte 0: `0x80` fragment marker, the low 7 bits reserved
+/// - byte 1: message id
+/// - byte 2: `chunk_idx` in the high nibble, `total_chunks` in the low nibble
+/// - bytes 3-4: pad length, big-endian
+/// - then `pad_len` random bytes, then the chunk payload
+pub const GECKO_FLAG: u8 = 0x80;
+
+/// A frame header: one flag byte, a message id, the chunk/total nibble, and a two
+/// byte pad length.
+pub const GECKO_HEADER: usize = 5;
+
+/// A fragmented message spans at least this many chunks.
+pub const GECKO_MIN_CHUNKS: usize = 2;
+
+/// …and at most this many, so one nibble always holds both the count and the index.
+pub const GECKO_MAX_CHUNKS: usize = 8;
+
+/// A parsed gecko frame header; [`decode_gecko_frame`] returns it with a borrow of the
+/// payload that followed the padding.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct GeckoFrame {
+    pub msg_id: u8,
+    pub chunk_idx: u8,
+    pub total_chunks: u8,
+    pub pad_len: u16,
+}
+
+impl GeckoFrame {
+    /// `false` unless the chunk count is in `[2, 8]` and the index is below it — the
+    /// two rules both the encoder and the decoder refuse a frame on.
+    #[must_use]
+    pub fn valid(self) -> bool {
+        (GECKO_MIN_CHUNKS as u8..=GECKO_MAX_CHUNKS as u8).contains(&self.total_chunks)
+            && self.chunk_idx < self.total_chunks
+    }
+}
+
+/// Write one frame's header, then the caller-supplied `pad`, then `payload` into
+/// `out`, returning the total length. `pad` must be exactly `frame.pad_len` long and
+/// `out` must hold the whole frame; anything else is refused with `None` so a forged
+/// or undersized buffer is never written past.
+#[must_use]
+pub fn encode_gecko_frame(
+    frame: GeckoFrame,
+    pad: &[u8],
+    payload: &[u8],
+    out: &mut [u8],
+) -> Option<usize> {
+    if !frame.valid() || usize::from(frame.pad_len) != pad.len() {
+        return None;
+    }
+    let total = GECKO_HEADER + pad.len() + payload.len();
+    let room = out.get_mut(..total)?;
+    room[0] = GECKO_FLAG;
+    room[1] = frame.msg_id;
+    room[2] = frame.chunk_idx << 4 | frame.total_chunks & 0x0f;
+    room[3..5].copy_from_slice(&frame.pad_len.to_be_bytes());
+    room[GECKO_HEADER..GECKO_HEADER + pad.len()].copy_from_slice(pad);
+    room[GECKO_HEADER + pad.len()..].copy_from_slice(payload);
+    Some(total)
+}
+
+/// Parse a frame header and borrow its payload out of `input` with no copy. `None` on
+/// a truncated buffer, a missing flag, an invalid chunk count or index, or a pad
+/// length that would read past the buffer. The payload slice begins at exactly
+/// `GECKO_HEADER + pad_len` inside `input`, so its base pointer witnesses the zero
+/// copy rather than a refill.
+#[must_use]
+pub fn decode_gecko_frame(input: &[u8]) -> Option<(GeckoFrame, &[u8])> {
+    let head = input.get(..GECKO_HEADER)?;
+    if head[0] & GECKO_FLAG == 0 {
+        return None;
+    }
+    let frame = GeckoFrame {
+        msg_id: head[1],
+        chunk_idx: head[2] >> 4,
+        total_chunks: head[2] & 0x0f,
+        pad_len: u16::from_be_bytes([head[3], head[4]]),
+    };
+    if !frame.valid() {
+        return None;
+    }
+    input
+        .get(GECKO_HEADER + usize::from(frame.pad_len)..)
+        .map(|payload| (frame, payload))
+}
+
+/// The byte range `[start, end)` of chunk `idx` when `len` is split into `total`
+/// chunks of `len / total` each and the last takes the remainder — the reference
+/// fragmenter's rule, exposed pure so a test can witness reassembly order instead of
+/// assuming it.
+#[must_use]
+pub fn gecko_chunk_range(len: usize, idx: usize, total: usize) -> Option<(usize, usize)> {
+    if total == 0 || idx >= total {
+        return None;
+    }
+    let size = len / total;
+    let start = idx * size;
+    let end = if idx + 1 == total { len } else { start + size };
+    Some((start, end))
+}
+
+/// The padding a chunk of `chunk_len` plain bytes needs so the sealed datagram —
+/// salt, frame header, padding, payload — lands inside the inclusive `[min, max]`
+/// window. `base` is the salt+header+chunk already committed; when that alone is at
+/// or over `max` there is no room and the pad is 0. Otherwise the low end is the
+/// larger of `min` and `base`, and `roll` spreads the size across `[lo, max]`. Folded
+/// pure so the socket draws the roll and a test pins the bounds with no RNG.
+#[must_use]
+pub fn gecko_pad_len(min: usize, max: usize, base: usize, roll: u64) -> u16 {
+    let lo = min.max(base);
+    if lo > max {
+        return 0;
+    }
+    let span = max - lo + 1;
+    let spread = if span <= 1 {
+        0
+    } else {
+        usize::try_from(roll % span as u64).unwrap_or(0)
+    };
+    u16::try_from(lo - base + spread).unwrap_or(u16::MAX)
+}
+
+/// A `obfs: gecko` plan: the frame size window the socket pads into. It defaults to
+/// `[512, 1200]` and caps the buffer at 2048, the reference's own bounds; a config
+/// outside them is refused at parse rather than guessed at, so this type only ever
+/// carries a valid window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Gecko {
+    pub min_pkt: u16,
+    pub max_pkt: u16,
+}
+
+impl Gecko {
+    /// The window a config that names neither bound gets.
+    pub const DEFAULT_MIN: u16 = 512;
+    pub const DEFAULT_MAX: u16 = 1200;
+    /// The largest frame the reference sizes against; a bigger bound is refused.
+    pub const MAX_BUFFER: u16 = 2048;
+
+    /// A valid window, filling each absent bound with its default. `None` unless
+    /// `0 < min <= max <= 2048`.
+    #[must_use]
+    pub fn new(min: u16, max: u16) -> Option<Self> {
+        let min = if min == 0 { Self::DEFAULT_MIN } else { min };
+        let max = if max == 0 { Self::DEFAULT_MAX } else { max };
+        if min == 0 || min > max || max > Self::MAX_BUFFER {
+            return None;
+        }
+        Some(Self {
+            min_pkt: min,
+            max_pkt: max,
+        })
+    }
+}
+
 pub fn build_auth_request(host: &str, auth: &str, out: &mut Vec<u8>) {
     hpack::qpack_literal_many(
         &[
@@ -443,12 +707,218 @@ pub fn verify_auth_request(block: &[u8], expected_auth: &str) -> bool {
         && find(&fields, AUTH_HEADER) == Some(expected_auth.as_bytes())
 }
 
+/// Whether a request block carries the shape of a hysteria handshake — a `POST` to the auth path — whatever credential it names. The masquerade server uses it to keep a right-shape, wrong-password attempt refusing exactly as a plain hysteria server would, while any other request (`GET /`, a browser) is answered as the cover site instead.
 #[must_use]
-pub fn verify_auth_response(block: &[u8]) -> bool {
+pub fn is_hysteria_auth_shape(block: &[u8]) -> bool {
     let Some(fields) = hpack::qpack_fields(block) else {
         return false;
     };
-    find(&fields, ":status") == Some(b"233".as_slice())
+    find(&fields, ":method") == Some(b"POST".as_slice())
+        && find(&fields, ":path") == Some(AUTH_PATH.as_bytes())
+}
+
+#[must_use]
+pub fn verify_auth_response(block: &[u8]) -> bool {
+    read_auth_response(block).is_some()
+}
+
+/// One parse for both signals the client reads off the auth response: `Some(true)` when the server accepted the credential and advertised the datagram lane, `Some(false)` when it accepted but only carries TCP streams, `None` when the credential was refused. The client caches the flag on the pooled session so a later UDP dial does not re-read the block.
+#[must_use]
+pub fn read_auth_response(block: &[u8]) -> Option<bool> {
+    let fields = hpack::qpack_fields(block)?;
+    if find(&fields, ":status")? != b"233" {
+        return None;
+    }
+    Some(find(&fields, UDP_HEADER) == Some(b"true".as_slice()))
+}
+
+/// What a masquerade site answers a non-hysteria HTTP/3 request with, inbound only: a plain not-found, a canned line, a static directory, or a reverse proxy to an origin. The dialed `Config` never carries it, so the pool key a client connection is filed under stays untouched.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum Masquerade {
+    #[default]
+    NotFound,
+    Response {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    },
+    File {
+        dir: String,
+    },
+    Proxy {
+        url: String,
+        rewrite_host: bool,
+        x_forwarded: bool,
+        insecure: bool,
+    },
+}
+
+/// The ordinary HTTP/3 request a browser left on the port: the pseudo-headers ferrox needs both to answer it and to rebuild an HTTP/1.1 request to a masquerade origin, plus the body the caller appended from the stream's `DATA` frame.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct H3Request {
+    pub method: String,
+    pub path: String,
+    pub authority: String,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// A request stream opens with the `0x401` TCP type when hysteria named a destination and with an HTTP/3 frame when a browser asked for a page; the first varint is the whole difference, so the classifier is one read and shares its width math with `read_tcp_prefix`.
+#[must_use]
+pub fn is_hysteria_flow(bytes: &[u8]) -> bool {
+    let mut at = 0usize;
+    frames::quic_read(bytes, &mut at) == Some(TCP_FRAME)
+}
+
+/// The fields of a QPACK request block, split into the pseudo-headers a masquerade answer and an origin request both need and the ordinary headers copied onward. A block naming no `:method` is not a request; the body stays empty for the caller to fill from the `DATA` frame.
+pub fn parse_h3_request(block: &[u8]) -> Option<H3Request> {
+    let fields = hpack::qpack_fields(block)?;
+    let text =
+        |name: &str| -> Option<String> { String::from_utf8(find(&fields, name)?.to_vec()).ok() };
+    let method = text(":method")?;
+    let path = text(":path")?;
+    let authority = text(":authority").unwrap_or_default();
+    let headers = fields
+        .iter()
+        .filter(|(name, _)| !name.starts_with(b":"))
+        .map(|(name, value)| {
+            (
+                String::from_utf8_lossy(name).into_owned(),
+                String::from_utf8_lossy(value).into_owned(),
+            )
+        })
+        .collect();
+    Some(H3Request {
+        method,
+        path,
+        authority,
+        headers,
+        body: Vec::new(),
+    })
+}
+
+/// An HTTP/3 response on a request stream: a `HEADERS` frame carrying `:status` ahead of the caller's fields, then a `DATA` frame only when the body is not empty, each length-prefixed the way the auth answer frames its headers. The caller sends the stream FIN.
+pub fn encode_h3_response(status: u16, headers: &[(&str, &str)], body: &[u8], out: &mut Vec<u8>) {
+    let code = status.to_string();
+    let mut block = Vec::with_capacity(32 + 16 * headers.len());
+    let mut fields = Vec::with_capacity(headers.len() + 1);
+    fields.push((":status", code.as_str()));
+    fields.extend_from_slice(headers);
+    hpack::qpack_literal_many(&fields, &mut block);
+    frames::quic_varint(out, frames::H3_HEADERS);
+    frames::quic_varint(out, block.len() as u64);
+    out.extend_from_slice(&block);
+    if !body.is_empty() {
+        frames::quic_varint(out, frames::H3_DATA);
+        frames::quic_varint(out, body.len() as u64);
+        out.extend_from_slice(body);
+    }
+}
+
+/// The `content-type` a static masquerade file answers with, guessed from the extension of the last path segment and falling back to the octet stream; a cover page is only convincing if a browser reads it as the kind of file it is.
+#[must_use]
+pub fn content_type(path: &str) -> &'static str {
+    let name = path.rsplit('/').next().unwrap_or(path);
+    let tail = match name.rfind('.') {
+        Some(dot) => name[dot + 1..].split(['?', '#']).next().unwrap_or_default(),
+        None => return "application/octet-stream",
+    };
+    match tail.to_ascii_lowercase().as_str() {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "json" => "application/json",
+        "txt" => "text/plain; charset=utf-8",
+        "xml" => "application/xml",
+        "svg" => "image/svg+xml",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "woff" => "font/woff",
+        "woff2" => "font/woff2",
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        _ => "application/octet-stream",
+    }
+}
+
+/// One origin HTTP/1.1 response reduced to what ferrox re-emits as HTTP/3: the status code, every header as it arrived (the caller drops the hop-by-hop ones), and the body with any chunked framing or content-length tail already removed. The whole response, read to the origin's close, is the input; a head that never reaches its blank line is not a response.
+pub fn parse_origin_response(raw: &[u8]) -> Option<OriginResponse> {
+    let head_end = raw.windows(4).position(|window| window == b"\r\n\r\n")?;
+    let mut body = &raw[head_end + 4..];
+    let mut lines = raw[..head_end].split(|&byte| byte == b'\n');
+    let status = lines
+        .next()?
+        .split(|&byte| byte == b' ')
+        .nth(1)
+        .and_then(|code| std::str::from_utf8(code).ok())
+        .and_then(|code| code.parse::<u16>().ok())?;
+    let mut headers = Vec::new();
+    let mut chunked = false;
+    let mut length = None;
+    for line in lines {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(2, |&byte| byte == b':');
+        let name = parts.next()?;
+        let value = match parts.next() {
+            Some(value) => value.strip_prefix(b" ").unwrap_or(value),
+            None => continue,
+        };
+        let name = String::from_utf8_lossy(name).into_owned();
+        let value = String::from_utf8_lossy(value).into_owned();
+        if name.eq_ignore_ascii_case("transfer-encoding")
+            && value.to_ascii_lowercase().contains("chunked")
+        {
+            chunked = true;
+        } else if name.eq_ignore_ascii_case("content-length") {
+            length = value.trim().parse::<usize>().ok();
+        }
+        headers.push((name, value));
+    }
+    if chunked {
+        return Some(OriginResponse {
+            status,
+            headers,
+            body: dechunk(body)?,
+        });
+    }
+    if let Some(want) = length {
+        body = body.get(..want).unwrap_or(body);
+    }
+    Some(OriginResponse {
+        status,
+        headers,
+        body: body.to_vec(),
+    })
+}
+
+/// The parts ferrox re-emits from a reverse-proxied origin: kept apart from the HTTP/3 encoder so a chunked body is proven de-framed without a socket in the test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OriginResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: Vec<u8>,
+}
+
+/// Strip the chunked transfer framing: each `hex-length\r\n data \r\n` run yields its data until a zero-length chunk closes the body. A short or malformed run is not a complete response.
+fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let line_end = body.windows(2).position(|window| window == b"\r\n")?;
+        let header = std::str::from_utf8(&body[..line_end]).ok()?;
+        let size = usize::from_str_radix(header.split(';').next()?.trim(), 16).ok()?;
+        if size == 0 {
+            return Some(out);
+        }
+        let start = line_end + 2;
+        out.extend_from_slice(body.get(start..start + size)?);
+        body = body.get(start + size + 2..)?;
+    }
 }
 
 #[cfg(test)]
@@ -910,5 +1380,298 @@ mod tests {
             .deobfuscate_in_place(&mut frame[..written])
             .expect("inverts");
         assert_eq!(&frame[..n], &plain[..], "and unmasking returns the bytes");
+    }
+
+    #[test]
+    fn the_flow_frame_tells_hysteria_from_a_browser_request() {
+        let mut hysteria = Vec::new();
+        tcp_prefix(&mut hysteria);
+        assert!(is_hysteria_flow(&hysteria), "0x401 names a destination");
+        assert!(
+            !is_hysteria_flow(&[frames::H3_HEADERS as u8, 0]),
+            "a HEADERS frame is a browser"
+        );
+        assert!(
+            !is_hysteria_flow(&[frames::H3_DATA as u8, 0]),
+            "and so is a DATA frame"
+        );
+    }
+
+    #[test]
+    fn an_h3_response_is_headers_then_data() {
+        let mut out = Vec::new();
+        encode_h3_response(200, &[("content-type", "text/plain")], b"hi", &mut out);
+        let mut at = 0usize;
+        let head = frames::h3_frame(&out, &mut at).expect("headers frame");
+        assert_eq!(head.kind, frames::H3_HEADERS);
+        let block = &out[at..at + head.length as usize];
+        let fields = hpack::qpack_fields(block).expect("a qpack block");
+        assert_eq!(find(&fields, ":status"), Some(b"200".as_slice()));
+        assert_eq!(
+            find(&fields, "content-type"),
+            Some(b"text/plain".as_slice())
+        );
+        at += head.length as usize;
+        let data = frames::h3_frame(&out, &mut at).expect("data frame");
+        assert_eq!(data.kind, frames::H3_DATA);
+        assert_eq!(data.length, 2);
+        assert_eq!(&out[at..at + 2], b"hi");
+    }
+
+    #[test]
+    fn a_bodyless_response_is_headers_alone() {
+        let mut out = Vec::new();
+        encode_h3_response(404, &[("content-type", "text/plain")], b"", &mut out);
+        let mut at = 0usize;
+        let head = frames::h3_frame(&out, &mut at).expect("headers frame");
+        assert_eq!(head.kind, frames::H3_HEADERS);
+        assert_eq!(
+            at + head.length as usize,
+            out.len(),
+            "no DATA frame follows"
+        );
+    }
+
+    #[test]
+    fn a_browser_get_parses_to_method_path_and_authority() {
+        let mut block = Vec::new();
+        hpack::qpack_literal_many(
+            &[
+                (":method", "GET"),
+                (":scheme", "https"),
+                (":authority", "example.com"),
+                (":path", "/index.html"),
+                ("user-agent", "curl/8"),
+            ],
+            &mut block,
+        );
+        let request = parse_h3_request(&block).expect("a request");
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.path, "/index.html");
+        assert_eq!(request.authority, "example.com");
+        assert_eq!(
+            request.headers,
+            vec![("user-agent".into(), "curl/8".into())]
+        );
+        assert!(
+            request.body.is_empty(),
+            "the DATA body is the caller's to append"
+        );
+        let mut not_a_request = Vec::new();
+        hpack::qpack_literal_many(&[(":status", "200")], &mut not_a_request);
+        assert!(
+            parse_h3_request(&not_a_request).is_none(),
+            "a response block names no :method"
+        );
+    }
+
+    #[test]
+    fn a_chunked_origin_body_defragments_to_its_bytes() {
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let response = parse_origin_response(raw).expect("a chunked response");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, b"hello world");
+        let plain = b"HTTP/1.1 404 Not Found\r\nContent-Length: 3\r\n\r\nabctrailing";
+        let response = parse_origin_response(plain).expect("a lengthed response");
+        assert_eq!(response.status, 404);
+        assert_eq!(response.body, b"abc", "content-length bounds the body");
+        assert!(
+            parse_origin_response(b"HTTP/1.1 200 OK\r\n").is_none(),
+            "a head that never reaches its blank line is not a response"
+        );
+    }
+
+    #[test]
+    fn content_type_maps_the_common_extensions() {
+        assert_eq!(content_type("/index.html"), "text/html; charset=utf-8");
+        assert_eq!(content_type("/a/b.PNG"), "image/png");
+        assert_eq!(content_type("/app.js"), "text/javascript; charset=utf-8");
+        assert_eq!(content_type("page.html?v=2"), "text/html; charset=utf-8");
+        assert_eq!(content_type("/noextension"), "application/octet-stream");
+        assert_eq!(content_type("/file.unknown"), "application/octet-stream");
+    }
+
+    #[test]
+    fn a_hop_never_lands_back_on_the_port_it_just_left() {
+        let ports = [1000u16, 1001, 1002, 1003];
+        for roll in 0..200 {
+            let next = pick_next(&ports, 1001, roll);
+            assert!(ports.contains(&next) && next != 1001, "moved to {next}");
+        }
+        // A single port has nowhere else to go, so the plan stays on it.
+        assert_eq!(pick_next(&[443], 443, 7), 443);
+        // An empty plan yields the port to avoid, unchanged.
+        assert_eq!(pick_next(&[], 443, 7), 443);
+    }
+
+    #[test]
+    fn a_stay_is_drawn_inside_its_range() {
+        for roll in 0..200 {
+            let stay = stay_ms((5000, 10_000), roll);
+            assert!((5000..=10_000).contains(&stay), "stay {stay}");
+        }
+        // No room in the window: the stay is exactly the low bound.
+        assert_eq!(stay_ms((3000, 3000), 999), 3000);
+    }
+
+    #[test]
+    fn the_plan_expands_overlapping_ranges_into_one_sorted_set() {
+        let hop = Hop {
+            ranges: vec![
+                PortRange {
+                    start: 9000,
+                    end: 9001,
+                },
+                PortRange {
+                    start: 9001,
+                    end: 9002,
+                },
+                PortRange {
+                    start: 443,
+                    end: 443,
+                },
+            ],
+            interval_ms: (5000, 5000),
+        };
+        assert_eq!(hop.ports(), vec![443, 9000, 9001, 9002]);
+        assert!(is_hop_port(&hop.ports(), 9, 9001));
+        assert!(is_hop_port(&hop.ports(), 443, 443));
+        assert!(!is_hop_port(&hop.ports(), 443, 50000));
+    }
+
+    #[test]
+    fn a_gecko_frame_is_the_exact_bytes_the_reference_emits() {
+        let frame = GeckoFrame {
+            msg_id: 7,
+            chunk_idx: 2,
+            total_chunks: 6,
+            pad_len: 3,
+        };
+        let mut out = [0u8; 16];
+        let written =
+            encode_gecko_frame(frame, b"pad", b"hi", &mut out).expect("a well-sized frame");
+        // flag, msg, chunk<<4|total, pad_len big-endian, the three pad bytes, then payload.
+        assert_eq!(
+            &out[..written],
+            [0x80, 7, 0x26, 0, 3, b'p', b'a', b'd', b'h', b'i']
+        );
+        assert_eq!(written, GECKO_HEADER + 3 + 2);
+    }
+
+    #[test]
+    fn a_gecko_frame_decodes_its_payload_without_a_copy() {
+        let frame = GeckoFrame {
+            msg_id: 1,
+            chunk_idx: 0,
+            total_chunks: GECKO_MIN_CHUNKS as u8,
+            pad_len: 4,
+        };
+        let mut buf = vec![0u8; GECKO_HEADER + 4 + 5];
+        encode_gecko_frame(frame, b"abcd", b"hello", &mut buf).expect("room");
+        let (got, payload) = decode_gecko_frame(&buf).expect("a valid frame");
+        assert_eq!(got, frame);
+        assert_eq!(payload, b"hello");
+        // The zero-copy witness: the payload borrows the frame buffer, so its base sits at exactly `GECKO_HEADER + pad_len` inside it.
+        let base = buf.as_ptr() as usize;
+        let at = payload.as_ptr() as usize;
+        assert_eq!(at, base + GECKO_HEADER + 4);
+        assert!(at > base && at + payload.len() <= base + buf.len());
+    }
+
+    #[test]
+    fn a_forged_or_truncated_frame_is_refused_and_the_buffer_held() {
+        // A valid header would be idx 2 of 3 (`0x23`), pad length read from bytes 3-4.
+        let mut frame = [GECKO_FLAG, 0, 0x23, 0, 0, b'x'];
+        // A chunk index not below the total is refused.
+        frame[2] = 0x22;
+        assert!(decode_gecko_frame(&frame).is_none());
+        // A total under the two-chunk minimum is refused.
+        frame[2] = 0x11;
+        assert!(decode_gecko_frame(&frame).is_none());
+        // A cleared fragment marker is a short-header packet, not a frame.
+        frame[0] = 0x00;
+        assert!(decode_gecko_frame(&frame).is_none());
+        frame[0] = GECKO_FLAG;
+        // A pad length that fits the buffer parses, with the payload empty at the end.
+        frame[2] = 0x23;
+        frame[4] = 1;
+        assert!(decode_gecko_frame(&frame).is_some());
+        // A pad length reaching past the buffer is refused, and the bytes are held.
+        frame[4] = 200;
+        let before = frame;
+        assert!(decode_gecko_frame(&frame).is_none());
+        assert_eq!(frame, before, "a refusal never rewrote the input");
+        // A buffer too short to even hold a header is refused.
+        assert!(decode_gecko_frame(&frame[..GECKO_HEADER - 1]).is_none());
+    }
+
+    #[test]
+    fn a_fragmented_long_header_packet_reassembles_bit_identical() {
+        // A QUIC long-header packet (byte 0 high bit set) at a length the chunk count does not divide, so the last chunk takes a real remainder.
+        let mut packet: Vec<u8> = (0u8..=255).cycle().take(1234).collect();
+        packet[0] |= GECKO_FLAG;
+        let total = 3usize;
+        let mut frames = Vec::new();
+        for idx in 0..total {
+            let (start, end) = gecko_chunk_range(packet.len(), idx, total).expect("a chunk");
+            let payload = &packet[start..end];
+            let mut buf = vec![0u8; GECKO_HEADER + payload.len()];
+            encode_gecko_frame(
+                GeckoFrame {
+                    msg_id: 42,
+                    chunk_idx: idx as u8,
+                    total_chunks: total as u8,
+                    pad_len: 0,
+                },
+                b"",
+                payload,
+                &mut buf,
+            )
+            .expect("room");
+            frames.push(buf);
+        }
+        let mut out = Vec::new();
+        for buf in &frames {
+            let (frame, payload) = decode_gecko_frame(buf).expect("valid");
+            out.extend_from_slice(payload);
+            assert_eq!(frame.msg_id, 42);
+        }
+        assert_eq!(out, packet, "the chunks rebuild the packet exactly");
+    }
+
+    #[test]
+    fn a_pad_lands_the_sealed_datagram_inside_its_window() {
+        let (min, max) = (512usize, 1200usize);
+        let salt_head = SALAMANDER_SALT + GECKO_HEADER;
+        // A small chunk: the pad drags the sealed size into [min, max] for every roll.
+        let base = salt_head + 40;
+        for roll in 0..64u64 {
+            let pad = gecko_pad_len(min, max, base, roll) as usize;
+            let sealed = base + pad;
+            assert!(
+                (min..=max).contains(&sealed),
+                "a padded datagram fits the window"
+            );
+        }
+        // A chunk already past max gets no pad rather than a negative one.
+        assert_eq!(gecko_pad_len(min, max, salt_head + 2000, 7), 0);
+    }
+
+    #[test]
+    fn a_chunk_range_partitions_a_packet_without_gaps() {
+        for len in [1usize, 7, 1500, 1501] {
+            for total in [2usize, 5, 8] {
+                let mut cursor = 0;
+                for idx in 0..total {
+                    let (start, end) = gecko_chunk_range(len, idx, total).expect("valid");
+                    assert_eq!(start, cursor, "chunks are contiguous");
+                    assert!(end <= len);
+                    cursor = end;
+                }
+                assert_eq!(cursor, len, "the last chunk took the remainder");
+            }
+        }
+        assert!(gecko_chunk_range(10, 0, 0).is_none());
+        assert!(gecko_chunk_range(10, 3, 3).is_none());
     }
 }
