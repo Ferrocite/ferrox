@@ -1,4 +1,5 @@
 use crate::conn::Connection;
+use std::cell::RefCell;
 use std::io::{Read, Write};
 
 pub(crate) const HEAD_LIMIT: usize = 64 * 1024;
@@ -138,20 +139,9 @@ pub(crate) fn accept_split<R: Read, W: Write>(
     ))
 }
 
-fn upgrade_request(host: &str, path: &str) -> String {
-    // Sized for its bytes: `format!` over-allocated (capacity 132) and grew again once host plus path passed 66.
-    const BEFORE_PATH: &str = "GET ";
-    const BEFORE_HOST: &str = " HTTP/1.1\r\nHost: ";
-    const AFTER_HOST: &str = "\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
-    let mut request = String::with_capacity(
-        BEFORE_PATH.len() + path.len() + BEFORE_HOST.len() + host.len() + AFTER_HOST.len(),
-    );
-    request.push_str(BEFORE_PATH);
-    request.push_str(path);
-    request.push_str(BEFORE_HOST);
-    request.push_str(host);
-    request.push_str(AFTER_HOST);
-    request
+thread_local! {
+    /// The request's five pieces, staged once per dialling thread and refilled in place by every later dial on it.
+    static REQUEST: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 /// `Ed` is a flag, not a length: any non-zero budget rides, whatever the payload's size, and only `ed=0` holds it back.
@@ -159,19 +149,32 @@ fn rides(budget: u32, first: &[u8]) -> bool {
     budget != 0 && !first.is_empty()
 }
 
-// One call when the payload rides ahead of the `101` — what `?ed` buys — so the socket packs request and payload into one `writev` and the session coalesces them into one record, where a write per part left two of each.
+// One call when the payload rides ahead of the `101` — what `?ed` buys — so the socket packs request and payload into one `writev` and the session coalesces them into one record, where a write per part left two of each; and the request staged in the thread's own buffer, because `66 + host + path` is a shape a dialling thread repeats, so the allocator is entered on the first dial and never again.
 fn send_request<W: crate::proxy::FrameWrite>(
     write: &mut W,
-    request: &str,
+    host: &str,
+    path: &str,
     early: bool,
     first: &[u8],
 ) -> Option<()> {
-    if early {
-        return write
-            .write_slices(&[request.as_bytes(), first])
-            .then_some(());
-    }
-    write.write_all(request.as_bytes()).ok()
+    const BEFORE_PATH: &str = "GET ";
+    const BEFORE_HOST: &str = " HTTP/1.1\r\nHost: ";
+    const AFTER_HOST: &str = "\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+    REQUEST.with(|cell| {
+        let mut request = cell.borrow_mut();
+        request.clear();
+        request.reserve(
+            BEFORE_PATH.len() + path.len() + BEFORE_HOST.len() + host.len() + AFTER_HOST.len(),
+        );
+        for piece in [BEFORE_PATH, path, BEFORE_HOST, host, AFTER_HOST] {
+            request.extend_from_slice(piece.as_bytes());
+        }
+        let bytes = request.as_slice();
+        if early {
+            return write.write_slices(&[bytes, first]).then_some(());
+        }
+        write.write_all(bytes).ok()
+    })
 }
 
 pub(crate) fn connect(
@@ -183,7 +186,7 @@ pub(crate) fn connect(
 ) -> Option<(UpReader, Connection)> {
     let mut read = stream;
     let early = rides(budget, first);
-    send_request(&mut read, &upgrade_request(host, path), early, first)?;
+    send_request(&mut read, host, path, early, first)?;
     let (head, at) = read_head(&mut read)?;
     check_response(&head[..at])?;
     let Ok(write) = read.try_clone() else {
@@ -244,7 +247,7 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite>(
     first: &[u8],
 ) -> Option<(UpReader<R>, W)> {
     let early = rides(budget, first);
-    send_request(&mut write, &upgrade_request(host, path), early, first)?;
+    send_request(&mut write, host, path, early, first)?;
     let (head, at) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
     check_response(&head[..at])?;
@@ -556,7 +559,7 @@ mod tests {
     /// The round trip the flag rule deletes, witnessed on a socket: this server answers only once it has read the payload, so a dial that waited for the `101` first stalls until `head_arrival()` and returns no upgrade.
     #[test]
     fn an_over_budget_payload_rides_ahead_of_a_lazy_answer() {
-        let request = upgrade_request("oracle.example", "/tunnel");
+        let request = expected_request("oracle.example", "/tunnel");
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
@@ -608,6 +611,13 @@ mod tests {
         }
     }
 
+    // Spelled here rather than borrowed from the dial: a piece the staging shape drops still fails these.
+    fn expected_request(host: &str, path: &str) -> String {
+        format!(
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+        )
+    }
+
     /// The record arm takes the buffer its own head read filled, head octets and all: what rode behind the delimiter is handed over inside it, not copied into a second owner.
     #[test]
     fn the_record_head_hands_over_the_buffer_it_filled() {
@@ -655,9 +665,14 @@ mod tests {
         assert_eq!(parts.len(), 2, "the request and the payload");
         assert_eq!(
             parts[0].1,
-            upgrade_request("oracle.example", "/tunnel").as_bytes()
+            expected_request("oracle.example", "/tunnel").as_bytes()
         );
         assert_eq!(parts[1].1, b"ping");
+        assert_eq!(
+            parts[0].0,
+            REQUEST.with(|cell| cell.borrow().as_ptr() as usize),
+            "the staged request was copied into the write instead of handed over"
+        );
         assert_eq!(
             parts[1].0,
             first.as_ptr() as usize,
@@ -682,7 +697,7 @@ mod tests {
         assert_eq!(write.plain.len(), 2, "the request and then the payload");
         assert_eq!(
             write.plain[0],
-            upgrade_request("oracle.example", "/tunnel").as_bytes()
+            expected_request("oracle.example", "/tunnel").as_bytes()
         );
         assert_eq!(write.plain[1], b"ping");
     }
@@ -693,38 +708,69 @@ mod tests {
             let configured =
                 ferrox_core::transport::EarlyData::split(&format!("/interop-upgrade?ed={budget}"));
             assert_eq!(configured.budget, budget);
+            // No payload to ride, so every budget leaves the same single write.
+            let (_reader, write) = connect_split(
+                std::io::Cursor::new(SWITCH.to_vec()),
+                Recorder::default(),
+                "oracle.example",
+                &configured.path,
+                budget,
+                b"",
+            )
+            .expect("upgrades");
             assert_eq!(
-                upgrade_request("oracle.example", &configured.path),
-                "GET /interop-upgrade HTTP/1.1\r\nHost: oracle.example\r\n\
-                 Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
+                write.plain,
+                [expected_request("oracle.example", "/interop-upgrade").into_bytes()],
                 "{budget}"
             );
         }
     }
 
-    /// The request buffer is its bytes: `format!` reached capacity 132 and grew again once host plus path passed 66, so a long host paid two allocations where this pays one.
+    /// Steady traffic on one dialling thread: the five pieces push into the thread's own buffer and the write drains it, round after round. `format!` entered the allocator on every dial and grew again past 66 bytes of host plus path; here the first dial's allocation is the last, so the buffer's identity and capacity hold for all the rest.
     #[test]
-    fn the_request_is_sized_for_its_bytes() {
-        for (host, path) in [
+    fn the_request_buffer_holds_its_capacity_over_a_dial_cycle() {
+        // The widest dial first, so the reservation it makes covers every later shape.
+        let long = "a.host.long.enough.to.push.the.request.past.the.format.capacity.example";
+        let deep = "/a/path/long/enough/to/push/it/past/what/format/allocated";
+        let dials = [
+            (long, deep),
             ("oracle.example", "/tunnel"),
-            (
-                "a.host.long.enough.to.push.the.request.past.the.format.capacity.example",
-                "/a/path/long/enough/to/push/it/past/what/format/allocated",
-            ),
-        ] {
-            let request = upgrade_request(host, path);
+            (long, "/tunnel"),
+            ("oracle.example", deep),
+        ];
+        let mut held = None::<(usize, usize)>;
+        for round in 0..dials.len() * 3 {
+            let (host, path) = dials[round % dials.len()];
+            let mut write = Recorder::default();
+            send_request(&mut write, host, path, false, b"").expect("sends");
+            assert_eq!(write.plain.len(), 1, "round {round}: one write");
             assert_eq!(
-                request.capacity(),
-                request.len(),
-                "{host}{path}: one allocation, no growth"
+                write.plain[0],
+                expected_request(host, path).as_bytes(),
+                "round {round}: {host}{path}"
             );
-            assert_eq!(
-                request,
-                format!(
-                    "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+            let current = REQUEST.with(|cell| {
+                let request = cell.borrow();
+                (request.capacity(), request.as_ptr() as usize)
+            });
+            match held {
+                None => assert_eq!(
+                    current.0,
+                    66 + long.len() + deep.len(),
+                    "the first dial reserves its own bytes"
                 ),
-                "{host}{path}: the bytes are the shape the previous formatter wrote"
-            );
+                Some((capacity, pointer)) => {
+                    assert_eq!(
+                        current.0, capacity,
+                        "round {round}: the allocator is entered once"
+                    );
+                    assert_eq!(
+                        current.1, pointer,
+                        "round {round}: and the buffer is the same allocation"
+                    );
+                }
+            }
+            held = Some(current);
         }
     }
 
