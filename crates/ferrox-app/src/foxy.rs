@@ -422,9 +422,14 @@ pub(crate) fn open_h1(dial: &FoxyDial, target: &str) -> Result<Tls1, Failure> {
 fn head<S: Read>(io: &mut S) -> Result<Vec<u8>, Failure> {
     let mut head = Vec::with_capacity(256);
     let mut byte = [0u8; 1];
+    // The budget bounds the whole head, not one byte of it: a drip that keeps every read inside the socket's arm still ends at the wall.
+    let until = Instant::now() + crate::budgets::head_arrival();
     while !head.ends_with(b"\r\n\r\n") {
         if head.len() >= MAX_HEAD {
             return Err(Failure::Frame);
+        }
+        if Instant::now() >= until {
+            return Err(Failure::Stream);
         }
         read_exact(io, &mut byte).map_err(|_| Failure::Stream)?;
         head.push(byte[0]);
@@ -2375,6 +2380,49 @@ mod loopback {
             );
             edge.join().expect("joins");
         }
+    }
+
+    /// A head that arrives a byte at a time is the arithmetic the silent-edge test does not reach: every drip stays inside the armed per-byte wait, so only a wall on the whole head keeps a trickling edge from holding the open for its length times the budget.
+    #[test]
+    fn a_dripping_head_costs_the_open_its_head_budget_not_its_length() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let _guard = crate::budgets::lock();
+        let root = crate::json::parse(r#"{"budgets": {"headArrival": "300ms"}}"#).expect("parses");
+        crate::budgets::apply(&crate::config::budgets(&root).expect("a name the engine acts on"));
+        let (roots, server) = minted(b"http/1.1");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                read_exact(&mut tls, &mut byte).expect("reads the request");
+                request.push(byte[0]);
+            }
+            for byte in b"HTTP/1.1 200 Connection established\r\n\r\n" {
+                if tls.write_all(&[*byte]).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(60));
+            }
+        });
+        let dial = dial_for(roots, port, Carrier::H1, foxy::pin::Pins::default());
+        let at = Instant::now();
+        let opened = Tunnel::open(&dial, "example.com:443", None).err();
+        crate::budgets::clear();
+        let failure = opened.expect("the head never lands whole");
+        assert_eq!(failure, Failure::Stream, "a drip ends at the wall");
+        assert!(
+            at.elapsed() < Duration::from_secs(2),
+            "43 drips of 60 ms are not 2580 ms of open, it took {:?}",
+            at.elapsed()
+        );
+        edge.join().expect("joins");
     }
 
     fn round_trip(tunnel: &mut Tunnel) {
