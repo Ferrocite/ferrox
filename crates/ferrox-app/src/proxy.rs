@@ -565,6 +565,20 @@ enum Outbound {
     Http(HttpOut),
 }
 
+impl Outbound {
+    /// The edge this outbound dials, borrowed straight from the configured parts — no address `String` is cloned and no `host:port` is re-serialised per flow to be taken apart again by the same read.
+    fn edge(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Vless(vless) => resolve_outbound(&vless.address, vless.port),
+            Self::Trojan(trojan) => resolve_outbound(&trojan.address, trojan.port),
+            Self::Vmess(vmess) => resolve_outbound(&vmess.address, vmess.port),
+            Self::Shadowsocks(ss) => resolve_outbound(&ss.address, ss.port),
+            Self::Http(http) => resolve_outbound(&http.address, http.port),
+            Self::Foxy(_) | Self::Freedom => None,
+        }
+    }
+}
+
 /// The Foxy lane: an account's pass over an edge in one pinned country, plus the split-tunnel list.
 #[derive(Debug, Clone)]
 struct FoxyOut {
@@ -2542,6 +2556,14 @@ struct RungAttempt<'a> {
     explicit: bool,
 }
 
+/// The edge a configured address names: a numeric address parses straight from its parts, so no `String` is written only for the parser to take it apart again, and a name keeps the resolver's own host-and-port form rather than a `host:port` serialisation it would re-split. A numeric host in a name field is answered identically by both routes, so the resolution and the bytes on the wire do not change.
+fn resolve_outbound(address: &str, port: u16) -> Option<SocketAddr> {
+    if let Ok(ip) = address.parse::<std::net::IpAddr>() {
+        return Some(SocketAddr::new(ip, port));
+    }
+    (address, port).to_socket_addrs().ok()?.next()
+}
+
 fn dial_vless(
     client: &Connection,
     server: &SocketAddr,
@@ -3048,8 +3070,7 @@ fn kcp_dial_session(
     let Carrier::Kcp(config) = carrier else {
         return None;
     };
-    let endpoint = format!("{address}:{port}");
-    let server = endpoint.to_socket_addrs().ok()?.next()?;
+    let server = resolve_outbound(address, port)?;
     ferrox_core::kcp::dial(
         server,
         config.clone(),
@@ -3406,8 +3427,7 @@ fn dial_udp_uplink(
     if vless.reality.is_some() {
         return None;
     }
-    let endpoint = format!("{}:{}", vless.address, vless.port);
-    let server = endpoint.to_socket_addrs().ok()?.next()?;
+    let server = resolve_outbound(&vless.address, vless.port)?;
     let mut uplink = dial_or_report(&server)?.with_mask(vless.carrier.tcp_mask());
     // A datagram's destination reaches this tree already resolved by the UDP front, so the header carries that address.
     uplink
@@ -3541,8 +3561,7 @@ fn dial_trojan_udp_uplink(
     if !matches!(trojan.carrier, Carrier::Raw(_)) {
         return None;
     }
-    let endpoint = format!("{}:{}", trojan.address, trojan.port);
-    let server = endpoint.to_socket_addrs().ok()?.next()?;
+    let server = resolve_outbound(&trojan.address, trojan.port)?;
     let mut uplink = dial_or_report(&server)?.with_mask(trojan.carrier.tcp_mask());
     uplink
         .write_all(&trojan_header(&trojan.key, 3, &Destination::from(*dest)))
@@ -3717,8 +3736,7 @@ fn request_vless_mux(mut uplink: Connection, vless: &VlessOut) -> Option<Connect
 }
 
 fn open_vless_mux(vless: &VlessOut) -> Option<Connection> {
-    let endpoint = format!("{}:{}", vless.address, vless.port);
-    let server = endpoint.to_socket_addrs().ok()?.next()?;
+    let server = resolve_outbound(&vless.address, vless.port)?;
     request_vless_mux(
         dial_or_report(&server)?.with_mask(vless.carrier.tcp_mask()),
         vless,
@@ -5451,28 +5469,20 @@ fn serve_connect(
     if let Outbound::Foxy(foxy) = out {
         return serve_foxy_front(client, foxy, asked, front, prefix);
     }
-    let (address, port) = match out {
-        Outbound::Vless(vless) => (vless.address.clone(), vless.port),
-        Outbound::Vmess(vmess) => (vmess.address.clone(), vmess.port),
-        Outbound::Trojan(trojan) => (trojan.address.clone(), trojan.port),
-        Outbound::Shadowsocks(shadowsocks) => (shadowsocks.address.clone(), shadowsocks.port),
-        Outbound::Http(http) => (http.address.clone(), http.port),
-        Outbound::Foxy(_) => return,
-        Outbound::Freedom => {
-            // Nothing carries the destination onward, so this lane is the one that has to look it up.
-            let Some(target) = asked.socket() else {
-                return;
-            };
-            let Some(mut upstream) = dial_or_report(&target) else {
-                return;
-            };
-            if !prefix.is_empty() && upstream.write_all(prefix).is_err() {
-                return;
-            }
-            relay(&client, &upstream);
+    if matches!(out, Outbound::Freedom) {
+        // Nothing carries the destination onward, so this lane is the one that has to look it up.
+        let Some(target) = asked.socket() else {
+            return;
+        };
+        let Some(mut upstream) = dial_or_report(&target) else {
+            return;
+        };
+        if !prefix.is_empty() && upstream.write_all(prefix).is_err() {
             return;
         }
-    };
+        relay(&client, &upstream);
+        return;
+    }
     if !prefix.is_empty() {
         // A protocol outbound handshakes over the client's own bytes, so a consumed head has nowhere to go.
         let _ = client.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n");
@@ -5533,9 +5543,7 @@ fn serve_connect(
             return;
         }
     }
-    let endpoint = format!("{address}:{port}");
-    let server = endpoint.to_socket_addrs().ok().and_then(|mut it| it.next());
-    let Some(server) = server else { return };
+    let Some(server) = out.edge() else { return };
     dial_socks_outbound(&client, out, &server, asked);
 }
 
@@ -8972,10 +8980,11 @@ impl Pump {
 pub(crate) fn read_vless_response(stream: &mut dyn Read) -> Option<()> {
     let mut prefix = [0u8; 2];
     read_exact(stream, &mut prefix).ok()?;
+    // `decode_response_header` bounds the addons field against the buffer it is handed, so against this prefix only a zero length answers — the accepted set is unchanged — and a rest longer than zero stays as refused as it was. What changes is where its bytes would land: a legal echo is at most 2 + 255, the addons length is one byte, so the buffer is the stack's and the dial never holds a heap trip for the answer.
     let consumed = ferrox_core::vless::VlessLink::decode_response_header(&prefix).ok()?;
     if consumed > 2 {
-        let mut rest = vec![0u8; consumed - 2];
-        read_exact(stream, &mut rest).ok()?;
+        let mut rest = [0u8; 255];
+        read_exact(stream, &mut rest[..consumed - 2]).ok()?;
     }
     if echo_trace_on() {
         echo_trace("response ok");
@@ -12384,6 +12393,44 @@ mod tests {
             let vision = vless_vision_header(&id, 1, &Destination::from(target));
             assert_eq!(vision.capacity(), vision.len(), "no realloc for {target}");
         }
+    }
+
+    /// The dial answers a bare `[0, 0]` and reads no further — the two-byte prefix bounds any nonzero addons as refused — and a wrong version is no answer; the buffer any legal rest would land in is the stack's, so the whole handshake trips no heap.
+    #[test]
+    fn a_flow_echo_refusal_and_a_bare_answer_never_spend_the_payload() {
+        let mut wire = vec![0u8, 18];
+        wire.extend_from_slice(b"xtls-rprx-vision\0\0\0");
+        wire.extend_from_slice(b"payload");
+        let mut stream = std::io::Cursor::new(wire.clone());
+        assert!(
+            read_vless_response(&mut stream).is_none(),
+            "an addons the prefix cannot bound is refused"
+        );
+        assert_eq!(
+            stream.position(),
+            2,
+            "a refusal reads no byte past the prefix"
+        );
+        assert_eq!(
+            &wire[2..],
+            b"xtls-rprx-vision\0\0\0payload",
+            "the answer and the payload wait on the wire"
+        );
+        let bare = std::io::Cursor::new(vec![0u8, 0, b'p', b'a', b'y']);
+        let mut bare = std::io::Read::take(bare, 5);
+        {
+            let inner = &mut bare as &mut dyn Read;
+            assert!(
+                read_vless_response(inner).is_some(),
+                "a bare answer is an answer"
+            );
+        }
+        assert_eq!(bare.limit(), 3, "the payload is not consumed");
+        let mut wrong = std::io::Cursor::new(vec![1u8, 0]);
+        assert!(
+            read_vless_response(&mut wrong).is_none(),
+            "a wrong version is no answer"
+        );
     }
 
     /// One REALITY pair on loopback: an echo target, an inbound, the dial. The flow is the caller's.
