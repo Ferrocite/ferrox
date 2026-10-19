@@ -1411,7 +1411,7 @@ mod tests {
         String::from_utf8(head).expect("ascii")
     }
 
-    /// The control plane end to end with no network in it: a launch that answers a token, a region list that answers a pair, and the upstream that reads that pair. This is the only gate that runs `access`, `ask` and `walk`, so the `Bearer` a plane ask carries, the anonymous launch that earns it and the `Basic` a tunnel carries are all witnessed by what actually went on the wire.
+    /// The control plane end to end with no network in it: a launch that answers a token, a region list that answers a pair, and the upstream that reads that pair. This is the only gate that runs `access`, `ask` and `walk` to an answer, so the `Bearer` a plane ask carries, the anonymous launch that earns it and the `Basic` a tunnel carries are all witnessed by what actually went on the wire.
     #[test]
     fn the_plane_launches_lists_and_carries_a_flow() {
         use std::io::{Read, Write};
