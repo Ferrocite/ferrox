@@ -103,6 +103,7 @@ kcp  kcp::connection::tests::a_datagram_leaves_the_callers_segment_buffer_ready_
 kcp  kcp::segment::tests::a_received_ack_reuses_its_number_list  ferrox_core::kcp::segment::AckSegment::parse
 carrier-quic  foxy::loopback::the_quic_carrier_rides_a_socks5_upstream_and_carries_the_bytes  quic::flush_egress
 carrier-quic  foxy::loopback::the_quic_carrier_rides_a_socks5_upstream_and_carries_the_bytes  quic::pump_once
+carrier-quic  foxy::loopback::the_quic_carrier_rides_a_socks5_upstream_and_carries_the_bytes  quic::hand_off
 carrier-quic  foxy::loopback::a_lane_outlives_its_leases_and_the_next_flow_rides_it  quic::pump
 carrier-quic  foxy::loopback::a_lane_outlives_its_leases_and_the_next_flow_rides_it  quic::pooled_stream_within
 carrier-quic  quic::tests::a_quic_socket_arms_its_receive_buffer  quic::bind_datagram
