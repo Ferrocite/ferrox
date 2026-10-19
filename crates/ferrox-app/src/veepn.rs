@@ -6,7 +6,7 @@ use crate::json::Json;
 use ferrox_core::foxy::{edge_peer, Pass};
 use ferrox_core::veepn::{self, BASIC_HEAD};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,10 +15,35 @@ use std::time::{Duration, Instant};
 struct Plane {
     /// The `Authorization` value with its scheme already on it, so an ask writes the header without formatting one.
     access: Option<(String, u64)>,
-    /// A region's upstreams, each already a `Foxy` dial shell: the list a flow reads is the list the fetch built.
-    lists: HashMap<String, (Arc<Vec<FoxyDial>>, u64)>,
+    /// A region's upstreams and the silence each has earned: the list a flow reads is the list the fetch built.
+    lists: HashMap<String, (Arc<Servers>, u64)>,
     /// The optimal region the plane named, shared with every flow that reads it.
     region: Option<(Arc<str>, u64)>,
+}
+
+/// One region's upstreams, and one silence deadline per entry. The deadlines are atomics rather than a map behind the plane's lock because a flow reads all of them before it dials: an atomic load per entry costs the walk nothing it was not already paying, and a lock per flow would be new.
+#[derive(Default)]
+struct Servers {
+    dials: Vec<FoxyDial>,
+    silence: Vec<AtomicU64>,
+}
+
+impl std::fmt::Debug for Servers {
+    /// The count and how many are silent, never an edge's name or its coded pair.
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let now = foxy_account::epoch();
+        fmt.debug_struct("Servers")
+            .field("upstreams", &self.dials.len())
+            .field(
+                "silent",
+                &self
+                    .silence
+                    .iter()
+                    .filter(|until| until.load(Ordering::Relaxed) > now)
+                    .count(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 /// The outbound: the plane behind a lock, the rotation in front of it, the identity ahead of both.
@@ -79,29 +104,63 @@ impl VeepnOut {
         })
     }
 
-    /// One flow's tunnel: a listed upstream of the region and the `Foxy` lane's HTTP/1.1 record dialed at the target. The upstream, its pair and the region name are read where the cache holds them, so a flow builds no dial of its own. An upstream that has left the pool is tried for the rest of the list; one that refuses the pair takes the region's cache with it, so the next flow fetches fresh credentials.
+    /// One flow's tunnel: a listed upstream of the region and the `Foxy` lane's HTTP/1.1 record dialed at the target. The upstream, its pair and the region name are read where the cache holds them, so a flow builds no dial of its own. An upstream that declined a flow keeps the edge's silence for [`veepn::EDGE_SILENCE`] seconds, so one flow pays for a gone edge instead of every one after it. When a whole region has gone quiet the walk lifts the silence of the entry whose window ends first — a tie split by the flow's own rotation, so equal windows are probed in turn — and dials that one: a gone region costs a flow one handshake rather than its list, a recovered edge rejoins as soon as it answers, and an edge probed and declined again goes behind the others. One that refuses the pair takes the region's cache with it, so the next flow fetches fresh credentials.
     pub(crate) fn open(&self, target: &str) -> Result<Tunnel, String> {
         let region = self.region()?;
-        let dials = self.servers(&region)?;
-        let count = dials.len();
+        let servers = self.servers(&region)?;
+        let count = servers.dials.len();
+        let now = foxy_account::epoch();
         let start = self.picked.fetch_add(1, Ordering::Relaxed);
         let mut declined: Option<String> = None;
-        for step in 0..count {
-            let dial = picked(&dials[..], start + step);
-            match crate::foxy::open_h1(dial, target, BASIC_HEAD, &dial.pass.token) {
-                Ok(lane) => return Ok(Tunnel::H1(lane)),
-                Err(ferrox_core::foxy::Failure::Rejected(status))
-                    if ferrox_core::foxy::pass_is_rejected(status) =>
-                {
-                    self.forget(&region);
-                    return Err(format!(
-                        "{region} refuses its pairs ({status}): asked again"
-                    ));
+        let mut tried = 0usize;
+        for sweep in 0..2 {
+            if sweep == 1 {
+                let mut probe: Option<usize> = None;
+                let mut soonest = u64::MAX;
+                for step in 0..count {
+                    let at = (start + step) % count;
+                    let until = servers.silence[at].load(Ordering::Relaxed);
+                    if until < soonest {
+                        soonest = until;
+                        probe = Some(at);
+                    }
                 }
-                Err(failure) => declined = Some(failure.to_string()),
+                if let Some(at) = probe {
+                    servers.silence[at].store(0, Ordering::Relaxed);
+                }
+            }
+            for step in 0..count {
+                let at = (start + step) % count;
+                if servers.silence[at].load(Ordering::Relaxed) > now {
+                    continue;
+                }
+                let dial = picked(&servers.dials[..], at);
+                tried += 1;
+                match crate::foxy::open_h1(dial, target, BASIC_HEAD, &dial.pass.token) {
+                    Ok(lane) => return Ok(Tunnel::H1(lane)),
+                    Err(ferrox_core::foxy::Failure::Rejected(status))
+                        if ferrox_core::foxy::pass_is_rejected(status) =>
+                    {
+                        self.forget(&region);
+                        return Err(format!(
+                            "{region} refuses its pairs ({status}): asked again"
+                        ));
+                    }
+                    Err(failure) => {
+                        servers.silence[at]
+                            .store(now.saturating_add(veepn::EDGE_SILENCE), Ordering::Relaxed);
+                        declined = Some(format!("{}:{}: {failure}", dial.host, dial.port));
+                    }
+                }
+            }
+            if tried != 0 {
+                break;
             }
         }
-        Err(declined.unwrap_or_else(|| format!("region {region:?} lists no upstream")))
+        Err(declined.map_or_else(
+            || format!("region {region:?} lists no upstream this lane can dial"),
+            |last| format!("{region}: {tried} of {count} upstream(s) declined, last: {last}"),
+        ))
     }
 
     /// The region the lane serves: the one configured, or the optimal one the plane names, kept for the same window as a list. Either way a flow takes a reference count, not a copy of the name, so an open builds no text of its own.
@@ -134,7 +193,7 @@ impl VeepnOut {
     }
 
     /// A region's upstreams: one ask per 12 hours, each entry's pair coded and its dial built here rather than once per flow, and the list handed out by `Arc` so a flow shares the cached text instead of copying the whole region.
-    fn servers(&self, region: &str) -> Result<Arc<Vec<FoxyDial>>, String> {
+    fn servers(&self, region: &str) -> Result<Arc<Servers>, String> {
         let now = foxy_account::epoch();
         if let Some((list, _)) = self
             .plane
@@ -153,7 +212,11 @@ impl VeepnOut {
         if list.is_empty() {
             return Err(format!("region {region:?} answers no usable upstream"));
         }
-        let list = Arc::new(list);
+        let silence = (0..list.len()).map(|_| AtomicU64::new(0)).collect();
+        let list = Arc::new(Servers {
+            dials: list,
+            silence,
+        });
         if let Ok(mut plane) = self.plane.lock() {
             plane.lists.insert(
                 region.to_owned(),
@@ -485,23 +548,28 @@ mod tests {
     #[test]
     fn a_flow_dials_the_cached_entry_and_not_a_copy_of_it() {
         let out = lane(&["https://antpeak.com", "https://hibchr.com"]).expect("lane");
-        let seeded = Arc::new(vec![
+        let dials = vec![
             listed("192.0.2.12", 443, "MTAwMC1hYmM6czNjcjN0"),
             listed("192.0.2.13", 8443, "eQ=="),
-        ]);
+        ];
+        let silence: Vec<AtomicU64> = (0..dials.len()).map(|_| AtomicU64::new(0)).collect();
+        let seeded = Arc::new(Servers { dials, silence });
         out.plane
             .lock()
             .expect("locks")
             .lists
             .insert("DE".to_owned(), (Arc::clone(&seeded), 4_000_000_000));
-        let dials = out.servers("DE").expect("the cached region");
+        let servers = out.servers("DE").expect("the cached region");
         for at in [0usize, 1, 2, 5, 9] {
             assert!(
-                std::ptr::eq(picked(&dials[..], at), &raw const seeded[at % dials.len()]),
+                std::ptr::eq(
+                    picked(&servers.dials[..], at),
+                    &raw const seeded.dials[at % servers.dials.len()]
+                ),
                 "the {at}th pick is the cached entry, not a copy of it"
             );
         }
-        let first = picked(&dials[..], 0);
+        let first = picked(&servers.dials[..], 0);
         let parts =
             ferrox_core::foxy::connect_request("example.com:443", BASIC_HEAD, &first.pass.token);
         assert_eq!(
@@ -541,7 +609,11 @@ mod tests {
     #[test]
     fn a_cached_list_is_shared_not_copied_per_flow() {
         let out = lane(&["https://antpeak.com"]).expect("lane");
-        let seeded = Arc::new(vec![listed("192.0.2.12", 443, "MTAwMC1hYmM6czNjcjN0")]);
+        let silence = (0..1).map(|_| AtomicU64::new(0)).collect();
+        let seeded = Arc::new(Servers {
+            dials: vec![listed("192.0.2.12", 443, "MTAwMC1hYmM6czNjcjN0")],
+            silence,
+        });
         out.plane
             .lock()
             .expect("locks")
@@ -710,6 +782,207 @@ mod tests {
             "the tunnel carries the bytes unchanged"
         );
         edge.join().expect("joins");
+    }
+
+    /// Accept connections until the listener is gone, counting each one: an edge that is gone answers a handshake with a hang-up, and this says how many times a flow found it. An open costs a visit `EDGE_ATTEMPTS` connects, so the gates read these counters as deltas, never as absolutes.
+    fn gone_edge(listener: crate::conn::Listener, hits: Arc<AtomicUsize>) {
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                hits.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+    }
+
+    /// An edge that declined one flow is not dialled again while its silence lasts: the flow after it skips it and opens on the live edge, and clearing the deadline puts the gone one back in the walk.
+    #[test]
+    fn a_declined_edge_is_skipped_while_its_silence_lasts() {
+        use std::io::{Read, Write};
+        let (roots, server) = crate::foxy::loopback::minted(b"http/1.1");
+        let gone = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let gone_port = gone.local_addr().expect("addr").port();
+        let declined = Arc::new(AtomicUsize::new(0));
+        gone_edge(gone, Arc::clone(&declined));
+
+        let live = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let live_port = live.local_addr().expect("addr").port();
+        let answered = Arc::new(AtomicUsize::new(0));
+        let hits = Arc::clone(&answered);
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (stream, _) = live.accept().expect("accepts");
+                hits.fetch_add(1, Ordering::SeqCst);
+                let mut tls =
+                    ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                        .expect("accepts tls");
+                tls.handshake().expect("handshakes");
+                let text = head(&mut tls);
+                assert!(text.starts_with("CONNECT "), "{text}");
+                tls.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .expect("answers");
+                let mut sink = [0u8; 64];
+                // The flow drops the tunnel without a close_notify, so an error ends the drain as surely as a zero read.
+                while tls.read(&mut sink).unwrap_or(0) > 0 {}
+            }
+        });
+
+        let out = lane(&["https://antpeak.com"]).expect("lane");
+        let dials = vec![
+            crate::foxy::loopback::dial_for(
+                roots.clone(),
+                gone_port,
+                Carrier::H1,
+                ferrox_core::foxy::pin::Pins::default(),
+            ),
+            crate::foxy::loopback::dial_for(
+                roots,
+                live_port,
+                Carrier::H1,
+                ferrox_core::foxy::pin::Pins::default(),
+            ),
+        ];
+        let silence: Vec<AtomicU64> = (0..dials.len()).map(|_| AtomicU64::new(0)).collect();
+        let seeded = Arc::new(Servers { dials, silence });
+        out.plane
+            .lock()
+            .expect("locks")
+            .lists
+            .insert("DE".to_owned(), (Arc::clone(&seeded), 4_000_000_000));
+
+        let first = out
+            .open("example.com:443")
+            .expect("the live edge serves the first flow");
+        drop(first);
+        let paid = declined.load(Ordering::SeqCst);
+        assert!(
+            paid > 0,
+            "the first flow reached the gone edge: {paid} dial(s), then the live one"
+        );
+        assert_eq!(
+            answered.load(Ordering::SeqCst),
+            1,
+            "and one open, no retry of a leg that answered"
+        );
+        assert!(
+            seeded.silence[0].load(Ordering::Relaxed) > foxy_account::epoch(),
+            "the deadline is a window, not a flag"
+        );
+
+        out.picked.store(0, Ordering::Relaxed);
+        let second = out
+            .open("example.com:443")
+            .expect("the second flow opens without the gone edge");
+        drop(second);
+        assert_eq!(
+            declined.load(Ordering::SeqCst),
+            paid,
+            "the silent edge is skipped, not dialled again"
+        );
+        assert_eq!(
+            answered.load(Ordering::SeqCst),
+            2,
+            "and the live one serves it"
+        );
+
+        seeded.silence[0].store(0, Ordering::Relaxed);
+        out.picked.store(0, Ordering::Relaxed);
+        let third = out
+            .open("example.com:443")
+            .expect("the third flow opens through both");
+        drop(third);
+        assert!(
+            declined.load(Ordering::SeqCst) > paid,
+            "an expired deadline puts the edge back in the walk"
+        );
+    }
+
+    /// A region whose every edge has gone quiet is probed, not swept: the first flow pays for the whole list once, and every flow after it dials the single entry whose window ends first. That is how a dead network surfaces as an error instead of a lane that hangs, and how one gone edge stops being a tax on the region.
+    #[test]
+    fn a_silent_region_probes_one_edge_instead_of_its_whole_list() {
+        let (roots, _server) = crate::foxy::loopback::minted(b"http/1.1");
+        let one = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let one_port = one.local_addr().expect("addr").port();
+        let one_hits = Arc::new(AtomicUsize::new(0));
+        gone_edge(one, Arc::clone(&one_hits));
+        let two = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let two_port = two.local_addr().expect("addr").port();
+        let two_hits = Arc::new(AtomicUsize::new(0));
+        gone_edge(two, Arc::clone(&two_hits));
+
+        let out = lane(&["https://antpeak.com"]).expect("lane");
+        let dials = vec![
+            crate::foxy::loopback::dial_for(
+                roots.clone(),
+                one_port,
+                Carrier::H1,
+                ferrox_core::foxy::pin::Pins::default(),
+            ),
+            crate::foxy::loopback::dial_for(
+                roots,
+                two_port,
+                Carrier::H1,
+                ferrox_core::foxy::pin::Pins::default(),
+            ),
+        ];
+        let silence: Vec<AtomicU64> = (0..dials.len()).map(|_| AtomicU64::new(0)).collect();
+        let seeded = Arc::new(Servers { dials, silence });
+        out.plane
+            .lock()
+            .expect("locks")
+            .lists
+            .insert("DE".to_owned(), (Arc::clone(&seeded), 4_000_000_000));
+
+        let why = out.open("example.com:443").err().expect("no edge is there");
+        assert!(
+            why.contains("2 of 2 upstream(s) declined"),
+            "the first flow walks the list: {why}"
+        );
+        assert!(
+            why.contains(&two_port.to_string()),
+            "the message names the edge it last dialled: {why}"
+        );
+        let counts = || {
+            (
+                one_hits.load(Ordering::SeqCst),
+                two_hits.load(Ordering::SeqCst),
+            )
+        };
+        let swept = counts();
+        assert!(
+            swept.0 > 0 && swept.1 > 0,
+            "a first flow finds every edge the region lists: {swept:?}"
+        );
+
+        let why = out
+            .open("example.com:443")
+            .err()
+            .expect("the edges are still gone");
+        assert!(
+            why.contains("1 of 2 upstream(s) declined"),
+            "a silent region is probed, not swept: {why}"
+        );
+        let probed = counts();
+        assert_ne!(
+            probed.0 > swept.0,
+            probed.1 > swept.1,
+            "a probe reaches one edge, never both or neither: {swept:?} then {probed:?}"
+        );
+
+        let why = out
+            .open("example.com:443")
+            .err()
+            .expect("still nothing to dial");
+        assert!(why.contains("1 of 2 upstream(s) declined"), "{why}");
+        let next = counts();
+        assert_ne!(
+            next.0 > probed.0,
+            next.1 > probed.1,
+            "and still one edge per probe: {probed:?} then {next:?}"
+        );
+        assert!(
+            next.0 > swept.0 && next.1 > swept.1,
+            "over two probes the walk reached both entries rather than hammering one: {swept:?} then {next:?}"
+        );
     }
 
     /// One request head read to its delimiter: both branches of the fake plane walk it, and neither needs the octets past it.
