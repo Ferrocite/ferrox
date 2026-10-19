@@ -393,6 +393,7 @@ front-tun datagram-reply-packets-checksummed 1 ferrox-app-tun::tests::the_reply_
 front-tun datagram-dial-set-flows-matching-the-pinned-stack 5 ferrox-app-tun::tests::the_datagram_dial_set_matches_the_pinned_stream
 front-tun icmp-echo-replies-verified 1 ferrox-app-tun::tests::an_icmp_echo_request_is_answered_as_a_reply
 front-tun icmp-non-echo-messages-refused 3 ferrox-app-tun::tests::a_non_echo_icmp_message_is_refused
+front-tun emit-packet-reallocations-per-render 0 ferrox-app-tun::tests::an_emitted_packet_reuses_its_render_buffer
 
 # --- finalmask post-TLS TCP mask chain --------------------------------------
 finalmask ops-retired-instructions UNBLESSED scripts/count-ops.sh
