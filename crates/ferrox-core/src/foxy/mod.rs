@@ -64,6 +64,24 @@ pub fn edge_peer(host: &str, port: u16) -> Option<std::net::SocketAddr> {
     Some(std::net::SocketAddr::new(host.parse().ok()?, port))
 }
 
+/// The authority an edge's own head carries, which is not what its socket is keyed by: the name, bracketed when it already spells an address, and the port only when it is not the one the scheme implies. A plain name at the default port is the caller's text, borrowed, so a lane open there spells its authority without taking a buffer.
+#[must_use]
+pub fn edge_authority(host: &str, port: u16) -> std::borrow::Cow<'_, str> {
+    let address = host.contains(':');
+    if port == 443 {
+        return if address {
+            std::borrow::Cow::Owned(format!("[{host}]"))
+        } else {
+            std::borrow::Cow::Borrowed(host)
+        };
+    }
+    std::borrow::Cow::Owned(if address {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    })
+}
+
 /// The `Proxy-Authorization` line a pass is presented with: the scheme rides the literal because the record lane's gather stack holds seven runs, and a scheme coded into the value would need an eighth.
 pub const BEARER_HEAD: &[u8] = b"\r\nProxy-Authorization: Bearer ";
 
@@ -418,6 +436,46 @@ mod tests {
             (counts.allocs, counts.bytes, counts.zeroed),
             (0, 0, 0),
             "4096 reads of an edge address take no heap at all"
+        );
+    }
+
+    /// The authority as the edge's head wants it: bracketed when the name is an address, ported only off the default, and the caller's own text when neither applies. The borrow is witnessed by pointer identity, not by bytes — a test that only compares text passes with the copy and without it.
+    #[test]
+    fn an_edge_authority_brackets_an_address_and_borrows_a_plain_default_port_name() {
+        let host = String::from("edge.example");
+        let plain = edge_authority(&host, 443);
+        assert_eq!(
+            plain.as_ptr() as usize - host.as_ptr() as usize,
+            0,
+            "the authority IS the caller's own bytes, not a copy of them"
+        );
+        assert_eq!(plain, "edge.example");
+        assert_eq!(edge_authority("edge.example", 8443), "edge.example:8443");
+        assert_eq!(
+            edge_authority("2001:db8::1", 443),
+            "[2001:db8::1]",
+            "an address is bracketed even with no port to write"
+        );
+        assert_eq!(edge_authority("2001:db8::1", 8443), "[2001:db8::1]:8443");
+        assert_eq!(
+            edge_authority("::1", 443),
+            "[::1]",
+            "the shortest address is still not a bare name"
+        );
+        // The shape a lane opens on: plain names at the default port, alternating so the call cannot be folded out of the loop. An address at the default port is a buffer this window does not measure, and the page says so.
+        let hosts = ["edge.example", "edge2.example"];
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for at in 0..4096 {
+                std::hint::black_box(edge_authority(
+                    std::hint::black_box(hosts[at % hosts.len()]),
+                    std::hint::black_box(443),
+                ));
+            }
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "4096 authorities at the default port take no heap at all"
         );
     }
 

@@ -2,7 +2,9 @@
 
 use crate::conn::Connection;
 use ferrox_core::foxy::connectip;
-use ferrox_core::foxy::{self, authority, edge_peer, frames, hpack, masque, Failure, Pass};
+use ferrox_core::foxy::{
+    self, authority, edge_authority, edge_peer, frames, hpack, masque, Failure, Pass,
+};
 use ferrox_core::tls::RecordAlignment;
 use ferrox_core::tls::TlsProvider;
 use std::io::{Read, Write};
@@ -542,11 +544,7 @@ pub(crate) fn open_udp(
     target_host: &str,
     target_port: u16,
 ) -> Result<Tls2, Failure> {
-    let edge = if dial.port == 443 {
-        dial.host.clone()
-    } else {
-        format!("{}:{}", dial.host, dial.port)
-    };
+    let edge = edge_authority(&dial.host, dial.port);
     let mut block = Vec::with_capacity(160 + dial.pass.token.len() + target_host.len());
     masque::connect_udp(
         &edge,
@@ -1375,11 +1373,7 @@ impl H3 {
             head_wait: HEADER_TIMEOUT,
             quantum: None,
         };
-        let edge = if dial.port == 443 {
-            dial.host.clone()
-        } else {
-            format!("{}:{}", dial.host, dial.port)
-        };
+        let edge = edge_authority(&dial.host, dial.port);
         let mut block = Vec::with_capacity(160 + dial.pass.token.len());
         connectip::connect_ip_qpack(&edge, "*", 0, &dial.pass.token, &mut block);
         let mut frame = Vec::with_capacity(16 + block.len());
@@ -1405,11 +1399,7 @@ impl H3 {
         target_host: &str,
         target_port: u16,
     ) -> Result<u16, Failure> {
-        let edge = if dial.port == 443 {
-            dial.host.clone()
-        } else {
-            format!("{}:{}", dial.host, dial.port)
-        };
+        let edge = edge_authority(&dial.host, dial.port);
         let mut block = Vec::with_capacity(160 + dial.pass.token.len() + target_host.len());
         masque::connect_udp_qpack(
             &edge,
@@ -2090,11 +2080,7 @@ impl Ip {
 pub(crate) fn open_ip_h2(
     dial: &FoxyDial,
 ) -> Result<(Tls2, Option<ferrox_core::foxy::connectip::Assigned>), Failure> {
-    let edge = if dial.port == 443 {
-        dial.host.clone()
-    } else {
-        format!("{}:{}", dial.host, dial.port)
-    };
+    let edge = edge_authority(&dial.host, dial.port);
     let mut block = Vec::with_capacity(160 + dial.pass.token.len());
     connectip::connect_ip(&edge, "*", 0, &dial.pass.token, &mut block);
     let mut lane = open_h2_with(dial, &block)?;
