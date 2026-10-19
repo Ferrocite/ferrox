@@ -79,7 +79,7 @@ jobs:
         run: ./scripts/watch-test.sh --selftest
       - name: the gates that do not need a toolchain
         env:
-          GATES: check-leak-surface check-comments check-fixture-safety check-dependency-policy check-windows-binary-paths check-method-docs check-ci-scope
+          GATES: check-leak-surface check-comments check-merge-markers check-fixture-safety check-dependency-policy check-windows-binary-paths check-method-docs check-ci-scope
         run: |
           for gate in $GATES; do
             ( "./scripts/$gate.sh" > "/tmp/$gate.log" 2>&1; echo $? > "/tmp/$gate.rc" ) &
