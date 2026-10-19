@@ -21,6 +21,8 @@ const MAX_FRAME: usize = frames::MAX_FRAME as usize;
 const MAX_HEAD: usize = 8_192;
 /// The head walk's window, the size the byte walk pre-sized its buffer to: one read of it takes a status line and its empty line, and a wider window would only divert more of the tunnel's first bytes into the tail they are carried in.
 const HEAD_WINDOW: usize = 256;
+/// The widest answer a hop's head may be, and the window that proves it: a hop's head is peeked rather than read, so a window this wide diverts no tunnel bytes.
+const HOP_HEAD: usize = 4_096;
 /// Unparsed capsule-stream cap: fail the association rather than buffer a peer that never completes a capsule.
 const DATAGRAM_BUF_MAX: usize = 256 * 1024;
 const SEND_WAIT: Duration = Duration::from_secs(10);
@@ -279,37 +281,66 @@ fn tls_config(dial: &FoxyDial) -> ferrox_core::tls::TlsConfig {
     }
 }
 
+/// The CONNECT a plain HTTP hop is asked to tunnel and the answer it gives: the authority is gathered out of the name, the port's digits and the brackets a literal already spells, so no joined form is built to be copied again, and the head is proved by a `peek` that consumes only its own octets — whatever the hop sent after `\r\n\r\n` is the record the caller reads next.
+fn hop_connect(stream: &mut Connection, host: &str, port: u16) -> Result<(), Failure> {
+    // The digits land at the end of a stack array, as the masquerade answer puts its status there.
+    let mut digits = [0u8; 5];
+    let mut at = digits.len();
+    let mut rest = port;
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    let port = &digits[at..];
+    let bracketed = host.contains(':');
+    let open: &[u8] = if bracketed { b"[" } else { b"" };
+    let close: &[u8] = if bracketed { b"]" } else { b"" };
+    crate::proxy::write_all_parts::<13>(
+        stream,
+        &[
+            b"CONNECT ",
+            open,
+            host.as_bytes(),
+            close,
+            b":",
+            port,
+            b" HTTP/1.1\r\nHost: ",
+            open,
+            host.as_bytes(),
+            close,
+            b":",
+            port,
+            b"\r\n\r\n",
+        ],
+    )
+    .map_err(|_| Failure::Io)?;
+    let mut window = [0u8; HOP_HEAD];
+    loop {
+        let seen = stream.peek(&mut window).map_err(|_| Failure::Io)?;
+        if seen == 0 {
+            return Err(Failure::Io);
+        }
+        let Some(end) = foxy::head_end(&window[..seen]) else {
+            if seen == window.len() {
+                return Err(Failure::Io);
+            }
+            continue;
+        };
+        read_exact(stream, &mut window[..end + 4]).map_err(|_| Failure::Io)?;
+        let code = foxy::connect_status(&window[..end + 4]).map_err(|_| Failure::Io)?;
+        return opened(code);
+    }
+}
+
 /// TCP to the edge through one upstream hop: the TLS name stays the edge's, so the hop carries bytes it can neither read nor address.
 fn tcp_via(proxy: &UpstreamProxy, dial: &FoxyDial) -> Result<Connection, Failure> {
     let mut stream = tcp_to_proxy(proxy).ok_or(Failure::Io)?;
-    let edge = authority(&dial.host, dial.port);
     if proxy.http {
-        // Build CONNECT request without allocating String in most cases
-        let mut request = Vec::with_capacity(edge.len() + 32);
-        request.extend_from_slice(b"CONNECT ");
-        request.extend_from_slice(edge.as_bytes());
-        request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
-        request.extend_from_slice(edge.as_bytes());
-        request.extend_from_slice(b"\r\n\r\n");
-        stream.write_all(&request).map_err(|_| Failure::Io)?;
-        // The whole head, not just the status line
-        let mut head = Vec::with_capacity(64);
-        let mut byte = [0u8; 1];
-        while !head.ends_with(b"\r\n\r\n") {
-            read_exact(&mut stream, &mut byte).map_err(|_| Failure::Io)?;
-            head.push(byte[0]);
-            if head.len() > 4096 {
-                return Err(Failure::Io);
-            }
-        }
-        let code = head
-            .split(|b| *b == b'\n')
-            .next()
-            .and_then(|line| line.split(|b| *b == b' ').nth(1))
-            .and_then(|code| std::str::from_utf8(code).ok())
-            .and_then(|code| code.trim().parse::<u16>().ok())
-            .ok_or(Failure::Io)?;
-        opened(code)?;
+        hop_connect(&mut stream, &dial.host, dial.port)?;
     } else {
         socks_greeting(&mut stream)?;
         let host_len = u8::try_from(dial.host.len()).map_err(|_| Failure::Io)?;
@@ -353,7 +384,7 @@ fn tcp_to_peers<I: Iterator<Item = SocketAddr>>(peers: I) -> Option<Connection> 
     for addr in peers {
         if let Ok(stream) = crate::conn::dial_tcp(&addr, CONNECT_TIMEOUT) {
             let _ = stream.set_nodelay(true);
-            // The head is read a byte at a time and is small, so a few seconds is the honest bound; without it a missing byte holds the flow for the OS's minutes-long timeout.
+            // The hop's head is small and peeked, so a few seconds is the honest bound; without it a missing byte holds the flow for the OS's minutes-long timeout.
             let _ = stream.set_read_timeout(Some(HEADER_TIMEOUT));
             return Some(stream);
         }
@@ -3101,6 +3132,87 @@ pub(crate) mod loopback {
         assert_eq!(back, PAYLOAD);
         assert_eq!(
             seen.join().expect("joins"),
+            "CONNECT edge.test:2499 HTTP/1.1\r\nHost: edge.test:2499\r\n\r\n"
+        );
+    }
+
+    /// The v6 case the joined authority used to guarantee: gathered as name, brackets and digits, it still reaches the hop bracketed, because a bare `::1:2499` is an authority nothing can read.
+    #[test]
+    fn a_hop_connect_brackets_a_literal_edge() {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let seen = std::thread::spawn(move || {
+            let (mut hop, _) = front.accept().expect("accepts");
+            hop.set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let head = read_head(&mut hop);
+            hop.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .expect("answers");
+            head
+        });
+        let mut client = Connection::connect(addr).expect("connects");
+        hop_connect(&mut client, "::1", 2499).expect("opens the tunnel");
+        assert_eq!(
+            seen.join().expect("joins"),
+            "CONNECT [::1]:2499 HTTP/1.1\r\nHost: [::1]:2499\r\n\r\n"
+        );
+    }
+
+    /// The hop's CONNECT and the head it is answered with, counted in the window the app's tests share: the name never enters a buffer of its own and neither does the answer.
+    #[test]
+    fn a_hop_connect_allocates_nothing() {
+        const DIALS: usize = 64;
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let mut clients = Vec::with_capacity(DIALS);
+        let mut hops = Vec::with_capacity(DIALS);
+        for _ in 0..DIALS {
+            clients.push(Connection::connect(addr).expect("connects"));
+            let (hop, _) = front.accept().expect("accepts");
+            hops.push(hop);
+        }
+        // Queued before the window opens, so what the window holds is the gathered write, the peek and the head's own read.
+        for hop in &mut hops {
+            hop.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .expect("answers");
+        }
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            for client in &mut clients {
+                hop_connect(client, "edge.test", 2499).expect("opens the tunnel");
+            }
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "{DIALS} hops, and no byte of the CONNECT or its answer went through a buffer"
+        );
+    }
+
+    /// A hop that answers with the tunnel's first bytes already behind its head: the head is proved by a `peek`, so those bytes stay on the socket for the caller, where a window that read the answer would have taken them.
+    #[test]
+    fn a_hop_head_leaves_the_tunnel_s_first_bytes_on_the_socket() {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let (released_tx, released_rx) = std::sync::mpsc::channel::<()>();
+        let answering = std::thread::spawn(move || {
+            let (mut hop, _) = front.accept().expect("accepts");
+            hop.set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            hop.write_all(b"HTTP/1.1 200 Connection established\r\n\r\nfirst-bytes-of-the-tunnel")
+                .expect("answers");
+            let head = read_head(&mut hop);
+            // A close with the CONNECT still in the hop's buffer answers `RST`, and an `RST` costs the caller the bytes behind the head: the hop holds its socket until the read above has happened.
+            released_rx.recv().expect("the caller read");
+            head
+        });
+        let mut client = Connection::connect(addr).expect("connects");
+        hop_connect(&mut client, "edge.test", 2499).expect("opens the tunnel");
+        let mut tail = [0u8; 25];
+        read_exact(&mut client, &mut tail).expect("the tail is still on the socket");
+        assert_eq!(&tail, b"first-bytes-of-the-tunnel");
+        released_tx.send(()).expect("releases the hop");
+        assert_eq!(
+            answering.join().expect("joins"),
             "CONNECT edge.test:2499 HTTP/1.1\r\nHost: edge.test:2499\r\n\r\n"
         );
     }
