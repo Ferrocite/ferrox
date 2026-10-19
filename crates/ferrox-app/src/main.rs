@@ -36,6 +36,11 @@ mod xhttp;
 mod xhttp_h2;
 mod xray_pb;
 
+/// The process-wide allocator. glibc `malloc` keeps a per-thread arena and rarely hands freed pages back to the OS, so the foxy lane's burst of concurrent flows leaves resident pages the process no longer uses; mimalloc decommits eagerly and returns them, which is the resident set the arena retention was padding. Left off under Miri, which cannot drive a native allocator across FFI, so the safety harness keeps the `System` allocator.
+#[cfg(not(miri))]
+#[global_allocator]
+static ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use ferrox_core::policy::UnsafeOptIn;
 use ferrox_core::transport::Support;
 use std::io::Read as _;
