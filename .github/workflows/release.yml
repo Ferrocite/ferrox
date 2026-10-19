@@ -3,14 +3,16 @@ name: release
 # Ships the lanes. On a version tag (or on demand) this builds `ferrox-app`
 # for every platform a user can run it on and attaches one package per platform
 # to the GitHub Release: the binary, `ferrox-cli.sh` beside it, and the two
-# pages that make trying a lane three commands — `login`, `up --foxy --vpn`,
-# `down` — with no toolchain, no repository and no config by hand.
+# pages that make trying a lane three commands — `login`, `up --foxy --vpn`
+# (or `up --veepn --vpn` with no account), `down` — with no toolchain, no
+# repository and no config by hand.
 #
 # Nothing here dials a connection: the job compiles, smoke-runs the binary's
 # own version line, and packages. Whether a lane carries bytes is gated by
-# foxy-relay.yml and the parity matrix, never by a release build. Every leg
-# must go green for the release to be written; a platform that cannot build
-# holds the release rather than shipping a page that promises it.
+# foxy-relay.yml, veepn-relay.yml and the parity matrix, never by a release
+# build. Every leg must go green for the release to be written; a platform
+# that cannot build holds the release rather than shipping a page that
+# promises it.
 
 on:
   push:
@@ -156,7 +158,7 @@ jobs:
         env:
           VERSION: ${{ needs.plan.outputs.version }}
           BODY: |-
-            ## Try a lane in three commands
+            ## Ferrox VERSION_PLACEHOLDER — every working lane, one command
 
             Unpack your platform's package and run the CLI beside the binary — no cargo, no repository:
 
@@ -168,12 +170,44 @@ jobs:
             ./ferrox-cli.sh down
             ```
 
-            The Foxy lane needs an email and a password and **no server**: the first `up --foxy`
-            asks for them once, stores them 0600 outside the repository, and the edge is picked
-            from Mozilla's catalogue — `--country DE` moves the exit. The other lanes dial the
-            server their share link names: `up --vless 'vless://...'`, `--vmess`, `--trojan`,
-            `--ss`, or `--config` for anything the binary serves. `README.md` in each package is
-            the quickstart, `USAGE.md` the manual.
+            ### The lanes this build carries
+
+            | lane | what you supply | start it |
+            | --- | --- | --- |
+            | **Foxy** | a Firefox account, email + password; **no server** | `./ferrox-cli.sh up --foxy --vpn` |
+            | **VeePN** | **nothing**: anonymous, no account, no server | `./ferrox-cli.sh up --veepn --vpn` |
+            | **VLESS** | a `vless://` link: tcp, ws, grpc, httpupgrade or xhttp; TLS or REALITY | `./ferrox-cli.sh up --vless 'vless://...'` |
+            | **VMess** | `HOST:PORT` and the user id | `./ferrox-cli.sh up --vmess host:443 --uuid ID` |
+            | **Trojan** | `HOST:PORT` and the password | `./ferrox-cli.sh up --trojan host:443 --password PW` |
+            | **Shadowsocks** | `HOST:PORT`, method and password | `./ferrox-cli.sh up --ss host:8388 --method aes-256-gcm --password PW` |
+            | **Any served config** | a JSON config | `./ferrox-cli.sh up --config mine.json` |
+
+            **Foxy** is the account lane. The edge is picked from Mozilla's catalogue,
+            `--country DE` moves the exit, and a signed-in lane renews the edge pass on
+            its own clock, so a lane left running overnight keeps working. Accounts with
+            two-factor sign-in pass `--code 123456` once.
+
+            **VeePN** is the lane with nothing to type in. The plane launches this device
+            anonymously, names the fastest region — `--region us-va` pins one — and lists
+            the upstreams that answer for the pair it printed. Its live byte path is gated
+            in CI by `veepn-relay.yml`: exactly 1,000,000 B through the named SOCKS, HTTP
+            and mixed fronts on Ubuntu and macOS, and through `us-va`, `us-or`, `gb-lnd`,
+            `fr-prs`, `sg` and `ru-spb`.
+
+            **VLESS, VMess, Trojan and Shadowsocks** dial the server their link or
+            `HOST:PORT` names. The VLESS converter writes tcp, ws, grpc, httpupgrade and
+            xhttp with `security=none|tls|reality`; anything else the binary serves —
+            kcp, quic, hysteria, httpheader, masque, xdrive — rides `--config` verbatim.
+
+            All lanes serve the same loopback fronts: SOCKS5 `127.0.0.1:10808`, HTTP+HTTPS
+            `127.0.0.1:8080`, mixed `127.0.0.1:10809`. `--vpn` points the macOS system proxy
+            at them only after a real flow answers; `status` prints the exit IP and country;
+            `down` stops the lane and clears the proxy.
+
+            **Fixed in this release:** `up --vless` with no link — and every flag missing
+            its value — now names what is missing and the example instead of waiting
+            forever, and a rejected invocation no longer stops a lane that is already
+            carrying traffic.
 
             | package | platform |
             | --- | --- |
@@ -183,9 +217,7 @@ jobs:
             | `ferrox-VERSION_PLACEHOLDER-x86_64-linux-gnu.tar.gz` | Linux on x86_64, built on Ubuntu 26.04 |
             | `ferrox-VERSION_PLACEHOLDER-x86_64-pc-windows-msvc.zip` | Windows x86_64 (CLI runs in Git Bash) |
 
-            On the Foxy lane a signed-in account renews the edge pass on its own clock, so a lane
-            left running overnight keeps working; accounts with two-factor sign-in pass
-            `--code 123456` once.
+            `README.md` in each package is the quickstart, `USAGE.md` the manual.
         run: |
           printf '%s\n\nBuilt by `release.yml` from commit `%s`.\n' "$BODY" "${GITHUB_SHA::8}" \
             | sed "s/VERSION_PLACEHOLDER/${VERSION#v}/g" >RELEASE-BODY.md
@@ -210,9 +242,9 @@ jobs:
             # the commit that built these packages, so the assets and the tag
             # can never disagree about what this version is.
             gh release create "$VERSION" --target "$GITHUB_SHA" \
-              --title "Ferrox $VERSION" --notes-file RELEASE-BODY.md "${assets[@]}"
+              --title "Ferrox $VERSION: every working lane, one command" --notes-file RELEASE-BODY.md "${assets[@]}"
           else
-            gh release create "$VERSION" --title "Ferrox $VERSION" \
+            gh release create "$VERSION" --title "Ferrox $VERSION: every working lane, one command" \
               --notes-file RELEASE-BODY.md "${assets[@]}"
           fi
           gh release view "$VERSION" --json tagName,assets \
@@ -230,5 +262,5 @@ jobs:
               echo "- [$n](https://github.com/$GITHUB_REPOSITORY/releases/download/$VERSION/$n)"
             done
             echo
-            echo "Three commands from any of them: unpack, \`./ferrox-cli.sh up --foxy --vpn\`, done — the CLI asks for the account the first time."
+            echo "Three commands from any of them: unpack, \`./ferrox-cli.sh up --foxy --vpn\` (or \`--veepn\` for no account), done — the CLI asks for the account the first time."
           } >> "$GITHUB_STEP_SUMMARY"

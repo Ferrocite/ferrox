@@ -4,7 +4,7 @@ Three files, no installer: the binary, the one-command CLI (`ferrox-cli.sh`), an
 
 ```
 ferrox-app            the lane engine: serves SOCKS5/HTTP/mixed fronts, dials every implemented lane
-ferrox-cli.sh         login, up, down, status, ports — the only command you need
+ferrox-cli.sh         login, up, down, status, ports, version — the only command you need
 USAGE.md              the manual: every lane, every port, what to do when it does not work
 ```
 
@@ -30,6 +30,18 @@ The answer is stored once, in `~/.config/ferrox/credentials`, mode 0600, outside
 
 `up` prints the port map, then proves one real flow through a front before it routes anything: a lane that carries nothing never takes the machine's traffic with it. If it says NOT CONNECTED it also prints why, from the lane's own log, with the fix to run.
 
+## 30-second start — the VeePN lane
+
+VeePN needs nothing typed in: no account, no server. The plane launches this device anonymously, names a region, and lists the upstreams that answer for the pair it printed, so one command starts the lane:
+
+```bash
+./ferrox-cli.sh up --veepn --vpn    # anonymous: no account, no server
+./ferrox-cli.sh status
+./ferrox-cli.sh down
+```
+
+`--region us-va` pins the exit; the plane's free pool spells its regions in lowercase (`nl`, `us-va`, `us-or`, `gb-lnd`, `fr-prs`, `sg`, `ru-spb`), and anything typed is lowered for it. Without `--region` the plane picks the fastest region it has, which is the no-friction path. The device id it sees is kept in `~/.config/ferrox/veepn.udid` (0600), so a restart is the same device, and `--domains` replaces the seven API origins this build ships with.
+
 ## The other lanes
 
 Every share link this build dials goes through the same one command; anything beyond the link shapes rides `--config` (any config the binary serves is used verbatim — see USAGE.md §5 for the full inbound/outbound list):
@@ -42,7 +54,7 @@ Every share link this build dials goes through the same one command; anything be
 ./ferrox-cli.sh up --config mine.json
 ```
 
-Here the server is in the link or the `HOST:PORT` — unlike Foxy, these lanes dial the server you name.
+Here the server is in the link or the `HOST:PORT` — unlike Foxy, these lanes dial the server you name. An invocation that cannot start the lane it names is refused before anything runs: `up --vless` with no link prints the example, `up --vmess` without `--uuid` names the missing id, and a rejected `up` leaves a lane that is already carrying traffic untouched.
 
 ## Ports, on every platform
 
