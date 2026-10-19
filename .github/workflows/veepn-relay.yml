@@ -1,0 +1,353 @@
+name: VeePN relay (live download check)
+
+# Proves the `veepn` lane carries bytes, not just handshakes: on a clean runner
+# it starts `ferrox-app` with a socks/http config, lets the lane launch
+# anonymously, list a region's upstreams and dial one, downloads a real 1 MB
+# file through the tunnel and asserts the exact byte count. No account and no
+# secrets: the free pool is the whole setup, so a fork's pull request can run
+# it. The named region and the region the plane picks are gates; the rest of
+# the free pool is a measurement, not a red leg, because a region that has left
+# the pool is a fact about the plane and not about this lane. Every front the
+# app serves is exercised on the same warm lane. A red leg is read from the
+# lane log, which is kept as an artifact.
+on:
+  pull_request:
+    paths:
+      - .github/workflows/veepn-relay.yml
+      - crates/ferrox-app/src/veepn.rs
+      - crates/ferrox-core/src/veepn.rs
+      - crates/ferrox-app/src/foxy.rs
+      - crates/ferrox-app/src/proxy.rs
+  workflow_dispatch:
+    inputs:
+      region:
+        description: region id to name (lowercase, e.g. nl); blank asks the plane
+        required: false
+        default: nl
+
+concurrency:
+  group: veepn-relay-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  NO_PROXY: 127.0.0.1,localhost
+
+jobs:
+  plan:
+    name: does this change reach the lane
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      wide: ${{ steps.scope.outputs.wide }}
+      methods: ${{ steps.scope.outputs.methods }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: plan the scope
+        id: scope
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          if [[ "$EVENT" == pull_request ]]; then
+            python3 scripts/ci-scope.py scope --base "$BASE"
+          else
+            python3 scripts/ci-scope.py scope --wide
+          fi
+
+  veepn-relay:
+    name: VeePN relay live (${{ matrix.os }})
+    needs: plan
+    # The lane rides the record lane's H1 dial and relay, so a change in either
+    # is live material here. macOS is included because the lane's own client is
+    # read on a laptop; a red macos leg is named in the summary, not skipped.
+    if: >-
+      needs.plan.outputs.wide == 'true'
+      || contains(needs.plan.outputs.methods, 'veepn')
+      || contains(needs.plan.outputs.methods, 'foxy')
+    runs-on: ${{ matrix.os }}
+    # The backstop, not the clock: every curl carries its own budget and the
+    # step below bounds the whole set, so a stall fails in minutes.
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        shell: bash
+    env:
+      VEEPN_REGION: ${{ inputs.region || 'nl' }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: veepn-relay-${{ matrix.os }}
+      - name: Build ferrox-app
+        run: cargo build --locked -p ferrox-app
+      # What the runner itself can move with no lane in the path: a leg below
+      # cannot tell a refused tunnel from a runner that cannot carry a
+      # megabyte, and this line says which one it is.
+      - name: Egress control - 1 MB with no lane
+        run: |
+          : > veepn-legs.tsv
+          code=0
+          timing=$(curl -sS --noproxy '*' --max-time 300 \
+            -w '%{size_download} %{time_total} %{speed_download}' \
+            'https://speed.cloudflare.com/__down?bytes=1000000' -o control.bin) || code=$?
+          echo "control ${timing:-0 0 0}" >> veepn-legs.tsv
+          got=$(wc -c < control.bin 2>/dev/null | tr -d ' ')
+          echo "egress control: curl exit $code, ${got:-0} bytes of 1000000"
+          if test "$code" = 0 && test "${got:-0}" = 1000000; then
+            echo "egress control carried the whole megabyte"
+          else
+            echo "::warning::this runner cannot itself download 1 MB (curl exit $code, ${got:-0} bytes)"
+          fi
+      - name: Download 1 MB through the lane
+        run: |
+          BIN=target/debug/ferrox-app
+          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
+          # The plane's region ids are lowercase and its list ask is
+          # case-sensitive, so a typed code is lowered before it is named.
+          VEEPN_REGION="$(printf '%s' "$VEEPN_REGION" | tr '[:upper:]' '[:lower:]')"
+          : > veepn-relay.log
+          UDID="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+          LANE_PID=""
+          # kill on the pid this shell started, never a pid file: on windows $!
+          # is an msys pid and the lane would outlive its stop, holding the port
+          # its successor binds.
+          stop_lane() {
+            if [ -n "$LANE_PID" ]; then
+              kill -TERM "$LANE_PID" 2>/dev/null || true
+              tries=0
+              while [ "$tries" -lt 20 ] && kill -0 "$LANE_PID" 2>/dev/null; do
+                sleep 0.5
+                tries=$((tries + 1))
+              done
+              kill -KILL "$LANE_PID" 2>/dev/null || true
+            fi
+            LANE_PID=""
+          }
+          # A lane that died is named at once rather than polled for three
+          # minutes; the front binds before any upstream is dialled, so the
+          # first flow pays the launch and the list.
+          wait_port() {
+            local pid="$1" want="$2" stop_at=$((SECONDS + 30))
+            while ((SECONDS < stop_at)); do
+              kill -0 "$pid" 2>/dev/null || return 1
+              WANT="$want" python3 -c 'import os, socket; socket.create_connection(("127.0.0.1", int(os.environ["WANT"])), timeout=1).close()' 2>/dev/null && return 0
+              sleep 0.5
+            done
+            return 1
+          }
+          start_lane() {
+            local inbounds="$1" region="$2" first
+            INBOUNDS="$inbounds" REGION="$region" UDID="$UDID" python3 -c '
+          import json, os
+          settings = {"udid": os.environ["UDID"]}
+          if os.environ["REGION"]:
+              settings["region"] = os.environ["REGION"]
+          json.dump({"inbounds": json.loads(os.environ["INBOUNDS"]),
+                     "outbounds": [{"protocol": "veepn", "settings": settings}]},
+                    open("veepn-relay.json", "w"))
+          '
+            chmod 600 veepn-relay.json
+            FOXY_DEBUG=1 "$BIN" run -c veepn-relay.json >> veepn-relay.log 2>&1 &
+            LANE_PID=$!
+            first="$(printf '%s' "$inbounds" | python3 -c 'import json, sys; print(json.load(sys.stdin)[0]["port"])')"
+            wait_port "$LANE_PID" "$first"
+          }
+          # The front names the wire form the cursor speaks: an http or mixed
+          # front is an HTTP CONNECT hop, a socks front is SOCKS5.
+          via() {
+            local front="$1" port="$2"
+            shift 2
+            if [ "$front" = http ] || [ "$front" = mixed ]; then
+              curl -sS "$@" -x "http://127.0.0.1:$port"
+            else
+              curl -sS "$@" --socks5-hostname "127.0.0.1:$port"
+            fi
+          }
+          # One attempt, timed, its exit taken at face value: a retry here would
+          # hide a stalling lane behind a cached second answer. The exit the
+          # lane reports is printed, not asserted: the free pool may route
+          # outside the region it lists, so the byte count is the gate.
+          trace_front() {
+            local front="$1" port="$2" label="$3" code=0 timing
+            : > trace.txt
+            timing=$(via "$front" "$port" --max-time 90 \
+              -w '%{size_download} %{time_total} %{speed_download}' \
+              https://www.cloudflare.com/cdn-cgi/trace -o trace.txt) || code=$?
+            echo "$label trace ${timing:-0 0 0}" >> veepn-legs.tsv
+            if test "$code" = 0 && grep -q '^loc=' trace.txt; then
+              grep -E '^(loc|ip)=' trace.txt || true
+              return 0
+            fi
+            echo "$label FAILED: trace, curl exit $code" >&2
+            tail -n 20 veepn-relay.log
+            return 1
+          }
+          fetch_mb() {
+            local front="$1" port="$2" file="$3" label="$4" code=0 timing got
+            timing=$(via "$front" "$port" --max-time 180 \
+              -w '%{size_download} %{time_total} %{speed_download}' \
+              'https://speed.cloudflare.com/__down?bytes=1000000' -o "$file") || code=$?
+            echo "$label ${timing:-0 0 0}" >> veepn-legs.tsv
+            got=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
+            got="${got:-0}"
+            if test "$code" = 0 && test "$got" = 1000000; then
+              echo "$label: 1000000 B"
+              return 0
+            fi
+            echo "$label FAILED: curl exit $code after $got of 1000000 B" >&2
+            return 1
+          }
+          FAILED=""
+          # Gate 1: the named region on the three fronts the app serves, one
+          # warm lane. The socks flow pays the launch and the list; the http and
+          # mixed flows ride the same lane and prove their own request shapes.
+          echo "== named region $VEEPN_REGION, socks/http/mixed =="
+          start_lane '[{"protocol":"socks","listen":"127.0.0.1","port":10808},{"protocol":"http","listen":"127.0.0.1","port":10809},{"protocol":"mixed","listen":"127.0.0.1","port":10810}]' "$VEEPN_REGION" \
+            || { echo "the named-region lane never listened" >&2; FAILED="$FAILED named(listen)"; stop_lane; }
+          if [ -n "$LANE_PID" ]; then
+            trace_front socks 10808 "named socks" || FAILED="$FAILED named(trace)"
+            fetch_mb socks 10808 named-socks.bin "named socks" || FAILED="$FAILED named(socks)"
+            fetch_mb http 10809 named-http.bin "named http" || FAILED="$FAILED named(http)"
+            fetch_mb mixed 10810 named-mixed.bin "named mixed" || FAILED="$FAILED named(mixed)"
+            stop_lane
+          fi
+          # Gate 2: the lane the CLI starts with no `--region` at all, so the
+          # plane's own pick is covered. Its list may name a paid region, which
+          # is a fact this leg exists to surface.
+          echo "== plane-picked region =="
+          start_lane '[{"protocol":"socks","listen":"127.0.0.1","port":10811}]' "" \
+            || { echo "the plane-picked lane never listened" >&2; FAILED="$FAILED optimal(listen)"; stop_lane; }
+          if [ -n "$LANE_PID" ]; then
+            trace_front socks 10811 "optimal socks" || FAILED="$FAILED optimal(trace)"
+            fetch_mb socks 10811 optimal.bin "optimal socks" || FAILED="$FAILED optimal"
+            stop_lane
+          fi
+          # Measurement, not a gate: which free-pool ids still carry a megabyte
+          # from this runner. A dead id is the plane's pool, not this lane.
+          for region in us-va us-or gb-lnd fr-prs sg ru-spb; do
+            [ "$region" = "$VEEPN_REGION" ] && continue
+            port=$((10812 + $(printf '%s' "$region" | cksum | cut -d' ' -f1) % 40))
+            if start_lane "[{\"protocol\":\"socks\",\"listen\":\"127.0.0.1\",\"port\":$port}]" "$region"; then
+              fetch_mb socks "$port" "sweep-$region.bin" "sweep $region" \
+                || echo "sweep $region: no megabyte" >&2
+              stop_lane
+            else
+              echo "sweep $region: the lane never listened" >&2
+              stop_lane
+            fi
+          done
+          if [ -n "$FAILED" ]; then
+            echo "failed legs:$FAILED" >&2
+            tail -n 60 veepn-relay.log
+            exit 1
+          fi
+      # What the edge authority answers on this runner, with no lane in the
+      # path: the lane log names the address it lost on, and this says whether
+      # the runner reached it at all. Informational.
+      - name: Edge authority control - what this runner reaches
+        if: always()
+        continue-on-error: true
+        run: |
+          authority="$(grep -oE '[a-z0-9-]+(\.[a-z0-9-]+)+\.[a-z]{2,}:[0-9]{2,5}' veepn-relay.log 2>/dev/null | head -n 1 || true)"
+          if [ -z "$authority" ]; then
+            echo "edge control: the lane log named no authority"
+            exit 0
+          fi
+          host="${authority%:*}"
+          port="${authority##*:}"
+          echo "edge control: $host:$port"
+          HOST="$host" PORT="$port" python3 - <<'PY'
+          import os, socket, time
+          host, port = os.environ["HOST"], int(os.environ["PORT"])
+          for family, label in ((socket.AF_INET, "v4"), (socket.AF_INET6, "v6")):
+              try:
+                  infos = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM)
+              except socket.gaierror:
+                  print(f"{label}: no address", flush=True)
+                  continue
+              answered, count = False, 0
+              for info in infos:
+                  count += 1
+                  began = time.time()
+                  try:
+                      connection = socket.create_connection((info[4][0], port), timeout=10)
+                  except OSError as error:
+                      print(f"{label}: {info[4][0]} refused ({error.__class__.__name__})", flush=True)
+                      continue
+                  took = round((time.time() - began) * 1000)
+                  connection.close()
+                  answered = True
+                  print(f"{label}: {info[4][0]} took tcp in {took} ms", flush=True)
+                  break
+              if not answered:
+                  print(f"{label}: {count} address(es), none took tcp", flush=True)
+          PY
+      - name: Stop the lane and show its log
+        if: always()
+        run: |
+          pkill -TERM -f 'ferrox-app run -c veepn-relay.json' 2>/dev/null || true
+          echo "== lane log tail (edges, regions, relay totals; no secrets) =="
+          tail -n 80 veepn-relay.log 2>/dev/null || true
+      - name: Keep the whole lane log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: veepn-relay-log-${{ matrix.os }}
+          path: veepn-relay.log
+          if-no-files-found: ignore
+          retention-days: 3
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### VeePN relay, live (${{ matrix.os }})"
+            echo
+            echo "Two gates: a named free-pool region on the socks, http and"
+            echo "mixed fronts, and the region the plane picks when none is"
+            echo "named. Each gate asserts an exact 1000000-byte download; the"
+            echo "rest of the free pool is measured and never turns the run red."
+            echo "The lane log names the plane origin, the region, the edges and"
+            echo "the relay totals a red leg is read from."
+          } >> "$GITHUB_STEP_SUMMARY"
+          table=$(python3 - <<'PY'
+          rows = []
+          try:
+              with open("veepn-legs.tsv") as legs:
+                  lines = legs.read().splitlines()
+          except OSError:
+              lines = []
+          for line in lines:
+              parts = line.rsplit(None, 3)
+              if len(parts) != 4:
+                  continue
+              label, size, seconds, speed = parts
+              try:
+                  size, seconds, speed = float(size), float(seconds), float(speed)
+              except ValueError:
+                  continue
+              rows.append((label, size, seconds, speed))
+          for label, size, seconds, speed in rows:
+              print(f"| {label} | {int(size)} | {seconds:.2f} | {speed / 1048576:.2f} |")
+          if not rows:
+              print("| (no leg recorded a transfer) | 0 | 0.00 | 0.00 |")
+          PY
+          )
+          echo "$table"
+          {
+            echo
+            echo "### Lane legs, live (${{ matrix.os }})"
+            echo
+            echo "| leg | bytes | seconds | MiB/s |"
+            echo "| --- | --- | --- | --- |"
+            echo "$table"
+          } >> "$GITHUB_STEP_SUMMARY"
