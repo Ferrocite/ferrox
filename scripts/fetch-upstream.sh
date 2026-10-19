@@ -71,9 +71,16 @@ fetch_one() {
       return 1
     fi
 
-    local dir="upstream/$name" fetched_from
+    local dir="upstream/$name" fetched_from link=""
+    if [[ -L "$dir" ]]; then
+      link="$(readlink "$dir")"
+    fi
     fetched_from="cached (already at pin)"
-    if [[ -d "$dir/.git" && ! -L "$dir" ]] && [[ "$(git -C "$dir" rev-parse HEAD 2>/dev/null)" == "$rev" ]]; then
+    # A relative link is this script's own alias, which the name that owns a
+    # checkout may not read through; an absolute one is scripts/new-worktree.sh's
+    # pointer into another tree's copy, and re-cloning it is the waste to avoid.
+    if [[ -d "$dir/.git" && ( -z "$link" || "$link" = /* ) ]] &&
+      [[ "$(git -C "$dir" rev-parse HEAD 2>/dev/null)" == "$rev" ]]; then
       echo "ok: $name already at $rev"
     else
       rm -rf "$dir"
@@ -128,7 +135,10 @@ link_one() {
       return 1
     fi
 
-    if [[ -L "$dir" && "$(readlink "$dir")" == "$primary" ]]; then
+    # Same physical checkout on both sides of the pair, however many links a
+    # worktree adds on the way to it.
+    if [[ -L "$dir" ]] &&
+      [[ "$(cd "$dir" 2>/dev/null && pwd -P)" == "$(cd "$pdir" 2>/dev/null && pwd -P)" ]]; then
       echo "ok: $name shares $pdir"
     else
       if [[ -e "$dir" && ! -L "$dir" ]]; then
@@ -222,7 +232,7 @@ run_all() {
       continue
     fi
     [[ "$name" != "$primary" ]] || continue
-    if [[ ! -d "upstream/$primary/.git" ]] || [[ -L "upstream/$primary" ]] ||
+    if [[ ! -d "upstream/$primary/.git" ]] ||
       [[ "$(git -C "upstream/$primary" rev-parse HEAD 2>/dev/null)" != "$rev" ]]; then
       case " $selected " in
         *" $primary "*) ;;
@@ -328,6 +338,22 @@ EOF
   local stanzas
   stanzas="$(grep -c '^\[checkout\.' upstream/manifest.toml || true)"
   [[ "$stanzas" == "2" ]] || notes="$notes an alias-only run recorded $stanzas checkouts, not 2;"
+
+  # A worktree reads every shared copy through a link: those must not be re-cloned,
+  # which is the whole reason the links exist.
+  git init --quiet "$root/shared"
+  git -C "$root/shared" remote add origin "$src"
+  git -C "$root/shared" fetch --quiet --no-tags --depth 1 origin "$rev"
+  git -C "$root/shared" checkout --quiet FETCH_HEAD
+  mkdir -p "$root/wt/upstream"
+  ln -s "$root/shared" "$root/wt/upstream/alpha"
+  cp upstream/pins.toml "$root/wt/upstream/pins.toml"
+  cd "$root/wt"
+  run_all || notes="$notes a tree of linked copies exited red;"
+  [[ -L upstream/alpha && "$(readlink upstream/alpha)" == "$root/shared" ]] ||
+    notes="$notes a linked-in checkout was replaced by a fresh clone;"
+  [[ -L upstream/delta && "$(git -C upstream/delta rev-parse HEAD)" == "$rev" ]] ||
+    notes="$notes a link made over linked copies does not read its pin;"
 
   rm -rf "$root"
   if [[ -n "$notes" ]]; then
