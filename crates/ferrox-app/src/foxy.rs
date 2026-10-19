@@ -1394,7 +1394,7 @@ impl H3 {
 
     /// One pump of the request stream into the capsule buffer: whole DATA frames are staged where they lie, and the cursor is shared with the frame walk because a byte spent here cannot be spent again.
     fn fill_capsules(&mut self) -> Result<(), Failure> {
-        if H3_WINDOW - self.filled < 16 {
+        if self.head.len() - self.filled < 16 {
             self.head.copy_within(self.carried..self.filled, 0);
             self.filled -= self.carried;
             self.carried = 0;
