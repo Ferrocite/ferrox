@@ -946,6 +946,8 @@ pub fn run(
     }
 
     let mut ceilings: Vec<f64> = Vec::new();
+    // The measures of one cell share one wall clock, so the re-measuring of a storm is bounded by the cell and not by each measure: a job cut off at its CI timeout prints no verdict and uploads no bundle.
+    let cell = parity::Cell::new(parity::CELL_WINDOW);
 
     let mut by_engine: Vec<EngineRuns> = engines
         .iter()
@@ -958,7 +960,7 @@ pub fn run(
     let mut failures = Vec::new();
     let (names, skipped) = participant_names(engines, workload);
 
-    for repeat in 1..=repeats {
+    'measures: for repeat in 1..=repeats {
         if measure_ceiling {
             if let Ok(ceiling) = parity::harness_ceiling(
                 workload.connections,
@@ -972,20 +974,12 @@ pub fn run(
             let Some(engine) = engines.iter().find(|e| e.name == name) else {
                 continue;
             };
-            let output = out_dir.join(format!("{name}-run{repeat}"));
-            std::fs::create_dir_all(out_dir).map_err(|source| Error::Io {
-                action: format!("creating {}", out_dir.display()),
-                source,
-            })?;
-            let request_path = out_dir.join(format!("{name}-run{repeat}.json"));
-            std::fs::write(&request_path, workload.request(engine, &output)).map_err(|source| {
-                Error::Io {
-                    action: format!("writing {}", request_path.display()),
-                    source,
-                }
-            })?;
-            let request = Request::read(&request_path)?;
-            match parity::measure(&request, engine.config_arg, engine.dialect) {
+            let (output, request) = write_request(workload, engine, out_dir, name, repeat)?;
+            if !cell.fits() {
+                failures.push(window_ended(&by_engine, &names, repeats));
+                break 'measures;
+            }
+            match parity::measure(&request, engine.config_arg, engine.dialect, &cell) {
                 Ok(run) => {
                     let result_path = output.join("result.json");
                     let result_text = run
@@ -1028,6 +1022,46 @@ pub fn run(
         skipped,
         machine: machine_description(),
     })
+}
+
+/// The harness's request for one repeat, written to disk and read back so the file and the measure describe the workload identically.
+fn write_request(
+    workload: &Workload,
+    engine: &Engine,
+    out_dir: &Path,
+    name: &str,
+    repeat: usize,
+) -> Result<(PathBuf, Request), Error> {
+    let output = out_dir.join(format!("{name}-run{repeat}"));
+    std::fs::create_dir_all(out_dir).map_err(|source| Error::Io {
+        action: format!("creating {}", out_dir.display()),
+        source,
+    })?;
+    let request_path = out_dir.join(format!("{name}-run{repeat}.json"));
+    std::fs::write(&request_path, workload.request(engine, &output)).map_err(|source| {
+        Error::Io {
+            action: format!("writing {}", request_path.display()),
+            source,
+        }
+    })?;
+    Ok((output, Request::read(&request_path)?))
+}
+
+/// The cell ran out of its CI window before every measure landed. It names `cell`, not an engine, because it says nothing about any one engine: it counts what landed against what the cell asked for, so the report is honest about the repeats a cut-off cell never measured.
+fn window_ended(
+    by_engine: &[EngineRuns],
+    names: &[&'static str],
+    repeats: usize,
+) -> (String, String) {
+    let landed = by_engine.iter().map(|e| e.runs.len()).sum::<usize>();
+    (
+        "cell".to_owned(),
+        format!(
+            "the cell's {}s window ended before every measure ran: {landed} run(s) landed, and the cell asked for {} engine(s) x {repeats} repeats",
+            parity::CELL_WINDOW.as_secs(),
+            names.len()
+        ),
+    )
 }
 
 fn machine_description() -> String {
@@ -1357,6 +1391,7 @@ fn read_io(item: Option<&Json>) -> Option<crate::ps::Io> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn engine(name: &'static str, path: &str) -> Engine {
         Engine {
@@ -1734,6 +1769,39 @@ mod tests {
                  started and reported as a fault instead of sitting out"
             );
         }
+    }
+
+    /// The window a cell may spend measuring is bounded by the CI job that runs it: a job cut off at its timeout prints no verdict and uploads no bundle, which is exactly what a per-measure budget of 240s did to macos-15 `vless-raw-duplex-8` - the cell ran 04:47:09 to 05:16:55 of a 30-minute job and was cancelled mid-run.
+    #[test]
+    fn the_cell_window_leaves_room_for_the_job_timeout_the_matrix_declares() {
+        // What the job spends outside the harness. Measured on the macos-15 duplex-8 cell of run 39194705301: 27s from `Set up job` to the cell step, 4s from the step's end to `Complete job`, rounded up.
+        const CELL_JOB_STEPS: Duration = Duration::from_secs(60);
+        let workflow = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../.github/workflows/benchmark-matrix.yml");
+        let text = std::fs::read_to_string(&workflow)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", workflow.display()));
+        let cells = text
+            .split_once("\n  cells:")
+            .unwrap_or_else(|| panic!("{} has no `cells:` job", workflow.display()))
+            .1;
+        let declared = cells
+            .lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("timeout-minutes:")
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+            })
+            .unwrap_or_else(|| panic!("the cells job declares no timeout-minutes"));
+        // The last measure a cell starts can take its run cap and then the whole re-measure bound, and `fits` only admits it while the margin plus the cap are still left - so past the window the cell can cost the bound it kept back, once.
+        let worst = (parity::CELL_WINDOW + parity::REMEASURE_BUDGET)
+            .checked_sub(parity::CELL_MARGIN)
+            .expect("the window plus the re-measure bound outlasts the margin");
+        assert!(
+            worst + CELL_JOB_STEPS <= Duration::from_secs(declared * 60),
+            "a cell can cost {worst:?} at its worst and the job spends {CELL_JOB_STEPS:?} outside \
+             the harness, but the matrix declares only {declared} minutes: the cell would be cut \
+             off mid-run and report nothing"
+        );
     }
 
     #[test]

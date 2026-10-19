@@ -847,12 +847,54 @@ impl Drop for Engine {
     }
 }
 
-// Three runner disturbances are measured on macos-15 and belong to neither engine: a forged validated byte, seen on ferrox and the reference alike, a short bulk transfer whose every reason is a socket-layer transient, and a transfer that never finished inside the run cap because the flows stalled - a saturated runner cannot always move 8 GiB full duplex at all, and it does so to every engine in the cell. None says anything about the engine under test, so each is re-measured, up to this many attempts and inside this much wall time; a disturbance that survives every attempt still fails as a workload fault. The two bounds are what keep this from becoming a silent retry of a genuine regression, and from a stalled re-measure spending the cell's CI window.
+// Three runner disturbances are measured on macos-15 and belong to neither engine: a forged validated byte, seen on ferrox and the reference alike, a short bulk transfer whose every reason is a socket-layer transient, and a transfer that never finished inside the run cap because the flows stalled - a saturated runner cannot always move 8 GiB full duplex at all, and it does so to every engine in the cell. None says anything about the engine under test, so each is re-measured, up to this many attempts and inside the wall time the cell has left; a disturbance that survives every attempt still fails as a workload fault. The attempt bound keeps a retry from becoming a silent re-run of a genuine regression, and the cell bound keeps a storm from spending the window the CI job gave the cell - a job cut off at its timeout reports nothing at all, which is worse than the fault it never printed.
 const REMEASURE_ATTEMPTS: usize = 4;
-const REMEASURE_BUDGET: Duration = Duration::from_secs(240);
+/// The most wall time one measure may spend on attempts after its first. A cell cuts this to what it has left, and `the_cell_window_leaves_room_for_the_job_timeout_the_matrix_declares` bounds the worst case this allows against the CI window the matrix declares.
+pub const REMEASURE_BUDGET: Duration = Duration::from_secs(240);
 
-pub fn measure(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> Result<Run, Error> {
-    remeasure_disturbed(REMEASURE_ATTEMPTS, REMEASURE_BUDGET, || {
+/// What one cell's measures are handed: less than the CI window of the job that runs it, so a cell that storms still prints its verdict and uploads its bundle. `the_cell_window_leaves_room_for_the_job_timeout_the_matrix_declares` reads the window out of the workflow and fails when this constant no longer fits it.
+pub const CELL_WINDOW: Duration = Duration::from_mins(25);
+/// What a cell keeps back from its window: long enough for one stalled attempt to hit its cap, for the report to be written and for the bundle to upload.
+pub const CELL_MARGIN: Duration = Duration::from_secs(90);
+
+/// The wall clock one cell's measures share. Every measure draws on what is left, so the cell - not each measure - is what bounds the re-measuring, and a measure that could not finish inside the window is never started.
+#[derive(Debug)]
+pub struct Cell {
+    started: Instant,
+    window: Duration,
+}
+
+impl Cell {
+    pub fn new(window: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            window,
+        }
+    }
+
+    /// What the cell has left of its window.
+    pub fn left(&self) -> Duration {
+        self.window.saturating_sub(self.started.elapsed())
+    }
+
+    /// How long this measure may spend re-measuring: its own bound, cut by what the cell has left.
+    fn budget(&self) -> Duration {
+        self.left().min(REMEASURE_BUDGET)
+    }
+
+    /// Whether starting a measure still fits: its first attempt can take the whole run cap, and the cell still owes the margin to print.
+    pub fn fits(&self) -> bool {
+        self.left() > RUN_TIMEOUT + CELL_MARGIN
+    }
+}
+
+pub fn measure(
+    request: &Request,
+    config_arg: ConfigArg,
+    dialect: Dialect,
+    cell: &Cell,
+) -> Result<Run, Error> {
+    remeasure_disturbed(REMEASURE_ATTEMPTS, cell.budget(), || {
         measure_once(request, config_arg, dialect)
     })
 }
@@ -874,13 +916,22 @@ fn remeasure_disturbed<T>(
                     } else {
                         "A saturation fault that survives every retry is not the runner's"
                     };
+                    // Which bound fired is what the next cell is read by: an attempt bound says the runner disturbed the same measure over and over, the cell's window says the storm outlasted the time the CI job gave it.
+                    let stop = if attempt == attempts {
+                        format!("{attempts} attempts")
+                    } else {
+                        let total = budget.as_secs_f64();
+                        format!("the cell's {total:.1}s")
+                    };
                     return Err(Error::Workload(format!(
-                        "{err}; {label}, and a workload fault is reported as one, never as a number"
+                        "{err}; {label}, and a workload fault is reported as one, never as a number; {stop} is what stopped the re-measuring"
                     )));
                 }
                 attempt += 1;
+                let spent = started.elapsed().as_secs_f64();
+                let total = budget.as_secs_f64();
                 eprintln!(
-                    "gate 5 note: attempt {attempt} of {attempts} was disturbed, re-measuring: {err}"
+                    "gate 5 note: attempt {attempt} of {attempts} was disturbed at {spent:.1}s of the cell's {total:.1}s, re-measuring: {err}"
                 );
                 std::thread::sleep(Duration::from_millis(250));
             }
@@ -2554,6 +2605,56 @@ mod tests {
         assert_eq!(
             calls, 2,
             "one attempt fits the budget, the second converts on its elapsed check"
+        );
+    }
+
+    #[test]
+    fn a_cell_stops_taking_a_measure_it_cannot_finish() {
+        // A measure's first attempt can take the whole run cap, so a cell with less than that and the print margin left starts none.
+        assert!(
+            Cell::new(CELL_WINDOW).fits(),
+            "a fresh cell can always measure"
+        );
+        let spent = Cell {
+            started: Instant::now()
+                .checked_sub(CELL_WINDOW + Duration::from_secs(1))
+                .expect("a cell one window in the past"),
+            window: CELL_WINDOW,
+        };
+        assert!(!spent.fits(), "a cell past its window takes no measure");
+        assert_eq!(
+            spent.left(),
+            Duration::ZERO,
+            "and its clock saturates at zero rather than going negative"
+        );
+    }
+
+    #[test]
+    fn a_measure_may_re_run_only_inside_what_the_cell_has_left() {
+        assert_eq!(
+            Cell::new(CELL_WINDOW).budget(),
+            REMEASURE_BUDGET,
+            "while the cell has more to give, the bound is the measure's own"
+        );
+        let left = Duration::from_secs(30);
+        let nearly_gone = Cell {
+            started: Instant::now()
+                .checked_sub(
+                    CELL_WINDOW
+                        .checked_sub(left)
+                        .expect("what has passed leaves less than the window"),
+                )
+                .expect("a cell partway through its window"),
+            window: CELL_WINDOW,
+        };
+        let budget = nearly_gone.budget();
+        assert!(
+            budget <= left
+                && left
+                    .checked_sub(budget)
+                    .expect("the budget is cut from what is left")
+                    < Duration::from_secs(1),
+            "once the cell has less than the bound left, the cell is the bound: {budget:?} of the {left:?} the cell has left, not the {REMEASURE_BUDGET:?} the measure would spend"
         );
     }
 
