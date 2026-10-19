@@ -1269,7 +1269,7 @@ fn serve_vless_mux(stream: Connection) {
     let table: MuxTable = Arc::new(Mutex::new(HashMap::new()));
     let mut udp: UdpTable = HashMap::new();
     let mut global: UdpGlobal = HashMap::new();
-    let mut handles: Vec<std::sync::mpsc::Receiver<()>> = Vec::new();
+    let mut handles: Vec<RelayEnd> = Vec::new();
     let mut buf: Vec<u8> = Vec::with_capacity(READ_SLICE);
     let mut at = 0;
     let mut staging = Vec::with_capacity(8192);
@@ -1314,7 +1314,7 @@ fn serve_vless_mux(stream: Connection) {
     teardown_mux(&table, &udp, &handles);
 }
 
-fn teardown_mux(table: &MuxTable, udp: &UdpTable, handles: &[std::sync::mpsc::Receiver<()>]) {
+fn teardown_mux(table: &MuxTable, udp: &UdpTable, handles: &[RelayEnd]) {
     if let Ok(table) = table.lock() {
         for half in table.values() {
             if let Ok(half) = half.lock() {
@@ -1337,7 +1337,7 @@ fn handle_mux_frame(
     global: &mut UdpGlobal,
     shared: &Arc<Mutex<Connection>>,
     staging: &mut Vec<u8>,
-    handles: &mut Vec<std::sync::mpsc::Receiver<()>>,
+    handles: &mut Vec<RelayEnd>,
 ) {
     use ferrox_core::mux::{Network, Status};
     match frame.status {
@@ -1395,7 +1395,7 @@ fn handle_mux_tcp_new(
     table: &MuxTable,
     shared: &Arc<Mutex<Connection>>,
     staging: &mut Vec<u8>,
-    handles: &mut Vec<std::sync::mpsc::Receiver<()>>,
+    handles: &mut Vec<RelayEnd>,
 ) {
     let Some(target) = frame.target.and_then(|t| mux_target_addr(&t)) else {
         return send_mux_end(shared, staging, frame.id);
@@ -1459,7 +1459,7 @@ fn handle_mux_udp_new(
     global: &mut UdpGlobal,
     shared: &Arc<Mutex<Connection>>,
     staging: &mut Vec<u8>,
-    handles: &mut Vec<std::sync::mpsc::Receiver<()>>,
+    handles: &mut Vec<RelayEnd>,
 ) {
     let Some(dest) = frame.target.and_then(|t| mux_target_addr(&t)) else {
         return send_mux_end(shared, staging, frame.id);
@@ -1512,7 +1512,7 @@ fn spawn_mux_udp_reader(
     socket: &UdpSocket,
     shared: &Arc<Mutex<Connection>>,
     session: &Arc<UdpMux>,
-) -> Option<std::sync::mpsc::Receiver<()>> {
+) -> Option<RelayEnd> {
     let read = socket.try_clone().ok()?;
     read.set_read_timeout(Some(RELAY_POLL)).ok()?;
     let shared = Arc::clone(shared);
@@ -3644,7 +3644,7 @@ fn serve_tun_inbound(inbound: &Json, out: &Outbound, _address: &str) -> bool {
 struct UdpUplink {
     write: Connection,
     target: SocketAddr,
-    done: std::sync::mpsc::Receiver<()>,
+    done: RelayEnd,
 }
 
 fn dial_udp_uplink(
@@ -3685,7 +3685,7 @@ fn spawn_udp_uplink_reader(
     udp: UdpSocket,
     source: Arc<Mutex<Option<SocketAddr>>>,
     target: SocketAddr,
-) -> std::sync::mpsc::Receiver<()> {
+) -> RelayEnd {
     RelayPool::global().run(move || {
         let mut read = read;
         let mut buf = udp_buffer();
@@ -3712,7 +3712,7 @@ struct VmessUdpUplink {
     send: crate::vmess::Flow,
     pad: crate::vmess::PadSource,
     target: SocketAddr,
-    done: std::sync::mpsc::Receiver<()>,
+    done: RelayEnd,
 }
 
 fn dial_vmess_udp_uplink(
@@ -3753,7 +3753,7 @@ fn spawn_vmess_udp_reader(
     source: Arc<Mutex<Option<SocketAddr>>>,
     target: SocketAddr,
     recv: crate::vmess::Flow,
-) -> std::sync::mpsc::Receiver<()> {
+) -> RelayEnd {
     RelayPool::global().run(move || {
         let mut read = read;
         let mut recv = recv;
@@ -3781,7 +3781,7 @@ fn spawn_vmess_udp_reader(
 
 struct TrojanUdpUplink {
     write: Connection,
-    done: std::sync::mpsc::Receiver<()>,
+    done: RelayEnd,
 }
 
 fn dial_trojan_udp_uplink(
@@ -3815,7 +3815,7 @@ fn spawn_trojan_uplink_reader(
     read: Connection,
     udp: UdpSocket,
     source: Arc<Mutex<Option<SocketAddr>>>,
-) -> std::sync::mpsc::Receiver<()> {
+) -> RelayEnd {
     RelayPool::global().run(move || {
         let mut read = read;
         let mut buf = udp_buffer();
@@ -7189,7 +7189,7 @@ fn spawn_ss_udp_reader2022(
     method: ferrox_core::shadowsocks2022::Method,
     source: Arc<Mutex<Option<SocketAddr>>>,
     done: Arc<AtomicBool>,
-) -> Option<std::sync::mpsc::Receiver<()>> {
+) -> Option<RelayEnd> {
     let read = uplink.try_clone().ok()?;
     read.set_read_timeout(Some(RELAY_POLL)).ok()?;
     let send = relay.try_clone().ok()?;
@@ -7236,7 +7236,7 @@ fn spawn_ss_udp_reader(
     method: ferrox_core::shadowsocks::Method,
     source: Arc<Mutex<Option<SocketAddr>>>,
     done: Arc<AtomicBool>,
-) -> Option<std::sync::mpsc::Receiver<()>> {
+) -> Option<RelayEnd> {
     let read = uplink.try_clone().ok()?;
     read.set_read_timeout(Some(RELAY_POLL)).ok()?;
     let send = relay.try_clone().ok()?;
@@ -7422,7 +7422,7 @@ fn spawn_xudp_reader(
     read: Connection,
     relay: &UdpSocket,
     source: Arc<Mutex<Option<SocketAddr>>>,
-) -> Option<std::sync::mpsc::Receiver<()>> {
+) -> Option<RelayEnd> {
     let reply = relay.try_clone().ok()?;
     Some(RelayPool::global().run(move || {
         let mut read = read;
@@ -8092,6 +8092,9 @@ pub(crate) fn pump_vmess_udp(
 
 type RelayTask = Box<dyn FnOnce() + Send + 'static>;
 
+/// A direction's hand-back to its joiner: the unit says the direction ended, the error says it ended by panicking — which the join still counts as an end, so no shipped relay changes its answer.
+type RelayEnd = std::sync::mpsc::Receiver<Result<(), ()>>;
+
 /// A direction's thread is borrowed, not bought: a worker parks on its channel for the worker life after each task and hands the thread back when nothing has claimed it in that window, so a burst of concurrent flows costs threads for the length of the burst rather than for the life of the process.
 struct RelayPool {
     idle: Mutex<Vec<(u64, std::sync::mpsc::Sender<RelayTask>)>>,
@@ -8131,12 +8134,13 @@ impl RelayPool {
     fn run(
         self: &Arc<Self>,
         direction: impl FnOnce() + Send + 'static,
-    ) -> std::sync::mpsc::Receiver<()> {
+    ) -> RelayEnd {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let task: RelayTask = Box::new(move || {
             let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(direction));
-            let _ = done_tx.send(());
-            if ended.is_err() {
+            let clean = ended.is_ok();
+            let _ = done_tx.send(if clean { Ok(()) } else { Err(()) });
+            if !clean {
                 eprintln!("ferrox-app: a relay direction panicked");
             }
         });
@@ -8192,7 +8196,7 @@ impl RelayPool {
     }
 }
 
-fn join_within(direction: &std::sync::mpsc::Receiver<()>, budget: Duration) -> bool {
+fn join_within(direction: &RelayEnd, budget: Duration) -> bool {
     census!("relay-join", crate::census::NO_FD, Some(budget));
     match direction.recv_timeout(budget) {
         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
@@ -8202,12 +8206,12 @@ fn join_within(direction: &std::sync::mpsc::Receiver<()>, budget: Duration) -> b
             false
         }
         // A partner whose sender is gone can never hand back, which is what the unbounded wait already read as finished.
-        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
+        Ok(_) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
     }
 }
 
 /// One leg's wait for its partner, bounded by the join budget the config named. The verdict is returned because the give-up is a fact about the flow, and a bound nobody can observe is not a bound.
-fn join(direction: &std::sync::mpsc::Receiver<()>) -> bool {
+fn join(direction: &RelayEnd) -> bool {
     join_within(direction, budgets::relay_join())
 }
 
@@ -9134,7 +9138,7 @@ pub(crate) fn write_all_runs<const N: usize>(
 /// The app's payload pumped while the carrier still owes its answer, because a server may hold that answer until it sees payload — xray flushes its buffered response on the first downstream write and zeronet's `HeaderFirst::hold` waits for the first payload outright — so a client that stops sending to wait hangs both ways.
 pub(crate) struct Pump {
     stop: std::sync::mpsc::Sender<()>,
-    running: Option<std::sync::mpsc::Receiver<()>>,
+    running: Option<RelayEnd>,
 }
 
 impl Pump {
@@ -11644,7 +11648,8 @@ mod tests {
             wait.recv_timeout(RELAY_JOIN).expect(
                 "every direction must report that it ended, and a direction that never \
                          started means the pool serialised them instead of running them",
-            );
+            )
+            .expect("and none of them ended by panicking on an assert of its own");
         }
         assert_eq!(
             arrived.load(std::sync::atomic::Ordering::SeqCst),
@@ -11684,7 +11689,8 @@ mod tests {
         }
         for wait in waits {
             wait.recv_timeout(RELAY_JOIN)
-                .expect("every direction of the burst reported that it ended");
+                .expect("every direction of the burst reported that it ended")
+                .expect("and none of them ended by panicking on an assert of its own");
         }
         assert_eq!(
             pool.parked(),
@@ -11706,7 +11712,8 @@ mod tests {
             named.store(true, Ordering::SeqCst);
         });
         did.recv_timeout(RELAY_JOIN)
-            .expect("the direction of a claim that missed its worker still hands back");
+            .expect("the direction of a claim that missed its worker still hands back")
+            .expect("and the direction it carried ran to its end");
         assert!(
             ran.load(Ordering::SeqCst),
             "and it ran on the thread spawned for it"
@@ -11721,20 +11728,22 @@ mod tests {
             .expect(
                 "a panicking direction still has to report that it ended, or the relay \
              waits on it forever",
-            );
+            )
+            .expect_err("and the report says it panicked, so a joiner is not told the leg finished");
         let (tx, rx) = std::sync::mpsc::channel();
         pool.run(move || {
             let _ = tx.send(());
         })
         .recv_timeout(RELAY_JOIN)
-        .expect("the pool still works, so a hand-back arrived");
+        .expect("the pool still works, so a hand-back arrived")
+        .expect("and a direction that ran is reported as clean");
         assert!(rx.try_recv().is_ok(), "and the work after it actually ran");
     }
 
     /// A leg whose partner never reports has to be given up on inside the budget, not waited out: the parked arm is the one that used to hold a thread forever.
     #[test]
     fn a_leg_that_never_hands_back_is_given_up_on_instead_of_waited_out() {
-        let (_never, held) = std::sync::mpsc::channel::<()>();
+        let (_never, held) = std::sync::mpsc::channel::<Result<(), ()>>();
         let started = std::time::Instant::now();
         assert!(
             !join_within(&held, Duration::from_millis(50)),
@@ -11746,12 +11755,12 @@ mod tests {
         );
 
         let (ended_tx, ended_rx) = std::sync::mpsc::channel();
-        ended_tx.send(()).expect("the hand-back is sent");
+        ended_tx.send(Ok(())).expect("the hand-back is sent");
         assert!(
             join_within(&ended_rx, RELAY_JOIN),
             "a hand-back is a hand-back"
         );
-        let (gone_tx, gone_rx) = std::sync::mpsc::channel::<()>();
+        let (gone_tx, gone_rx) = std::sync::mpsc::channel::<Result<(), ()>>();
         drop(gone_tx);
         assert!(
             join_within(&gone_rx, RELAY_JOIN),
@@ -11766,10 +11775,10 @@ mod tests {
         let root = crate::json::parse(r#"{"budgets": {"relayJoin": "1ms"}}"#).expect("parses");
         budgets::apply(&crate::config::budgets(&root).expect("a budget the engine acts on"));
         let handed_back_later = || {
-            let (tx, rx) = std::sync::mpsc::channel::<()>();
+            let (tx, rx) = std::sync::mpsc::channel::<Result<(), ()>>();
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(40));
-                let _ = tx.send(());
+                let _ = tx.send(Ok(()));
             });
             rx
         };
@@ -23811,7 +23820,7 @@ mod census_tests {
 
     #[test]
     fn a_parked_join_reports_the_budget_it_armed() {
-        let (handed, receiver) = mpsc::channel::<()>();
+        let (handed, receiver) = mpsc::channel::<Result<(), ()>>();
         let budget = Duration::from_millis(500);
         let waiter = thread::spawn(move || join_within(&receiver, budget));
         let waiter_id = waiter.thread().id();
