@@ -104,9 +104,53 @@ pub fn connect_request<'a>(
 }
 
 /// Where the head ends: the offset of the empty line that closes an HTTP/1.1 answer, or `None` while it has not arrived. The lane walks a window at a time and asks this before it reads again, so the delimiter rule lives in one place.
+///
+/// One word at a time: a SWAR pass marks the `\n` lanes of each eight-byte block and only the byte after a marked `\n` is checked against the whole terminator. Bit-identical to `head.windows(4).position(|w| w == b"\r\n\r\n")` — which compares four bytes at every offset — but this reads eight bytes per load and skips the ~255/256 of offsets that hold no `\n`, doing the four-byte verify only at a real candidate. Portable integer code: no target feature, no unsafe. It is the tree's one terminator scan, and every reader that ends a head at `\r\n\r\n` — this lane's window walk, the `httpUpgrade` and xHTTP head readers — reaches it rather than reopening the byte loop.
 #[must_use]
 pub fn head_end(head: &[u8]) -> Option<usize> {
-    head.windows(4).position(|window| window == b"\r\n\r\n")
+    const CR: u8 = b'\r';
+    const LF: u8 = b'\n';
+    const SPREAD: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let n = head.len();
+    // A terminator needs four bytes, so the latest start that can still hold one.
+    if n < 4 {
+        return None;
+    }
+    let last = n - 4;
+    let want_lf = (LF as u64).wrapping_mul(SPREAD);
+    let mut word = 0usize;
+    while word + 8 <= n {
+        let block = u64::from_le_bytes(
+            head[word..word + 8]
+                .try_into()
+                .expect("one eight-byte block"),
+        );
+        let x = block ^ want_lf;
+        // A zero byte of `x` is a `\n` lane; isolate those lanes and walk them low to high.
+        let mut lf = x.wrapping_sub(SPREAD) & !x & HIGH;
+        while lf != 0 {
+            let a = word + lf.trailing_zeros() as usize / 8;
+            // The terminator's first `\n` sits one byte past its start (`a >= 1`), which must still hold four bytes (`a - 1 <= last`).
+            if a >= 1 && a - 1 <= last {
+                let s = a - 1;
+                if head[s] == CR && head[s + 2] == CR && head[s + 3] == LF {
+                    return Some(s);
+                }
+            }
+            lf &= lf - 1;
+        }
+        word += 8;
+    }
+    // Starts past the last whole block, and the one whose first `\n` fell on the block boundary, are too few for SWAR to pay: check them as four-byte windows.
+    let mut s = if word == 0 { 0 } else { word - 1 };
+    while s <= last {
+        if head[s..s + 4] == [CR, LF, CR, LF] {
+            return Some(s);
+        }
+        s += 1;
+    }
+    None
 }
 
 pub fn connect_status(head: &[u8]) -> Result<u16, Failure> {
@@ -710,5 +754,92 @@ mod tests {
         };
         assert_eq!(pass.renews_in(0).as_secs(), 500);
         assert_eq!(pass.quota_remaining, Some(12));
+    }
+
+    /// `head_end` is the tree's one terminator scan and the shared head readers reach it in place of `windows(4).position`; this sweep is its oracle. A forged `\r\n\r`, a length that is not a multiple of eight, a terminator whose first `\n` lands exactly on a block boundary, and an all-`\n` body that keeps the verify busy must all return the very same offset — or the same `None` — as the byte-by-byte form it replaced.
+    #[test]
+    fn the_swar_terminator_scan_is_the_windows_four_scan() {
+        // Nested so the sweep takes any start iterator without collecting one first.
+        fn sweep(len: usize, starts: impl Iterator<Item = usize>) {
+            const CR: u8 = b'\r';
+            const LF: u8 = b'\n';
+            const NEEDLE: [u8; 4] = [CR, LF, CR, LF];
+            let oracle = |buf: &[u8]| buf.windows(4).position(|w| w == b"\r\n\r\n");
+            for start in starts {
+                // A `\n`-and-`Z` body with no `\r`, so the only terminator is the one planted at `start`.
+                if start + 4 <= len {
+                    let mut v: Vec<u8> = (0..len)
+                        .map(|i| if i % 5 == 0 { LF } else { b'Z' })
+                        .collect();
+                    v[start..start + 4].copy_from_slice(&NEEDLE);
+                    assert_eq!(head_end(&v), oracle(&v), "len {len} at {start}");
+                }
+            }
+            let no_lf: Vec<u8> = vec![CR; len];
+            assert_eq!(head_end(&no_lf), oracle(&no_lf), "len {len} no LF");
+            let all_lf: Vec<u8> = vec![LF; len];
+            assert_eq!(head_end(&all_lf), oracle(&all_lf), "len {len} all LF");
+        }
+
+        // Exhaustive over {\r, \n, Z} up to eight bytes: every alignment and near-miss.
+        const ALPHABET: [u8; 3] = *b"\r\nZ";
+        let mut small = [0u8; 8];
+        let oracle = |buf: &[u8]| buf.windows(4).position(|w| w == b"\r\n\r\n");
+        for len in 0..=8usize {
+            for code in 0..ALPHABET.len().pow(len as u32) {
+                let mut rest = code;
+                for slot in &mut small[..len] {
+                    *slot = ALPHABET[rest % ALPHABET.len()];
+                    rest /= ALPHABET.len();
+                }
+                let view = &small[..len];
+                assert_eq!(head_end(view), oracle(view), "exhaustive {view:?}");
+            }
+        }
+
+        // Every start over the lengths that straddle a block boundary at both ends.
+        for len in 0..=130usize {
+            sweep(len, 0..len);
+        }
+        // At scale, the first two words, mid-buffer, and the final partial word.
+        for len in [511usize, 512, 513, 4096, 16 * 1024] {
+            sweep(
+                len,
+                (0..17)
+                    .chain([len / 2, len / 2 + 1])
+                    .chain(len.saturating_sub(9)..len),
+            );
+        }
+    }
+
+    /// The scan, and nothing else: 64 walks of one 87-byte `200` answer, each found offset folded into a running `u32` whose expected value is pinned, the head handed over opaquely so no round can be answered from the literal. The mirror below walks the same head a byte-window at a time under the identical fold, so one ops job reports both frames and only their difference is a claim about the scan.
+    #[test]
+    fn the_head_walk_costs_the_scan_and_nothing_else() {
+        const HEAD: &[u8] = b"HTTP/1.1 200 Connection established\r\nProxy-Agent: ferrox\r\nX-Trace: 0123456789abcdef\r\n\r\n";
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            let end =
+                head_end(std::hint::black_box(HEAD)).expect("the delimiter of a shipped head");
+            fold = fold.wrapping_mul(31).wrapping_add(end as u32 + 1);
+        }
+        assert_eq!(fold, 0x734b_5000, "64 walks of one head, folded after each");
+    }
+
+    /// The walk the scan replaced, kept as this run's other frame: the same 64 walks of the same head through `windows(4).position`, the same pinned fold, so the pair prices the scan without a second CI run being trusted to agree with the first.
+    #[test]
+    fn the_serial_terminator_walk_costs_the_same_answer() {
+        const HEAD: &[u8] = b"HTTP/1.1 200 Connection established\r\nProxy-Agent: ferrox\r\nX-Trace: 0123456789abcdef\r\n\r\n";
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            let end = std::hint::black_box(HEAD)
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .expect("the delimiter of a shipped head");
+            fold = fold.wrapping_mul(31).wrapping_add(end as u32 + 1);
+        }
+        assert_eq!(
+            fold, 0x734b_5000,
+            "the same 64 walks, byte-window at a time"
+        );
     }
 }
