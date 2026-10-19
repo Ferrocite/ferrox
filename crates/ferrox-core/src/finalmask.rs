@@ -19,6 +19,51 @@ use std::time::Duration;
 const HANDSHAKE: u8 = 22;
 const HEADER: usize = 5;
 
+/// Draws served from one `getrandom` until the cache runs dry: a hello cut at random widths
+/// needs a draw per bound, piece and delay, and a syscall each was the reference's, not a law.
+/// A smaller draw could not feed the same modulo, so the draws are the same shape either way.
+#[derive(Debug, Clone, Copy)]
+struct Entropy {
+    cache: [u64; 4],
+    at: usize,
+    #[cfg(test)]
+    refills: usize,
+}
+
+impl Entropy {
+    fn new() -> Self {
+        Self {
+            cache: [0; 4],
+            at: 4,
+            #[cfg(test)]
+            refills: 0,
+        }
+    }
+
+    /// The next draw, refilling the cache with one `getrandom` when dry.
+    fn draw(&mut self) -> Option<u64> {
+        if self.at == 4 {
+            let mut raw = [0u8; 32];
+            getrandom::getrandom(&mut raw).ok()?;
+            let array = raw.as_chunks::<8>().0;
+            self.cache = [
+                u64::from_le_bytes(array[0]),
+                u64::from_le_bytes(array[1]),
+                u64::from_le_bytes(array[2]),
+                u64::from_le_bytes(array[3]),
+            ];
+            self.at = 0;
+            #[cfg(test)]
+            {
+                self.refills += 1;
+            }
+        }
+        let draw = self.cache[self.at];
+        self.at += 1;
+        Some(draw)
+    }
+}
+
 /// One `Int32Range` from the config, its ends already ordered by [`Range::ordered`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Range {
@@ -40,13 +85,16 @@ impl Range {
     /// draws `min .. max` — the top of a range is never emitted, so `11-37` means thirty-six at
     /// most.
     pub fn pick(&self) -> Option<i64> {
+        self.pick_from(&mut Entropy::new())
+    }
+
+    /// The same draw off a cached supply; the span test and the modulo are `pick`'s unchanged.
+    fn pick_from(&self, ent: &mut Entropy) -> Option<i64> {
         let span = self.high - self.low;
         if span < 2 {
             return Some(self.low);
         }
-        let mut draw = [0u8; 8];
-        getrandom::getrandom(&mut draw).ok()?;
-        Some(self.low + i64::try_from(u64::from_le_bytes(draw) % span as u64).ok()?)
+        Some(self.low + i64::try_from(ent.draw()? % span as u64).ok()?)
     }
 }
 
@@ -60,6 +108,7 @@ pub struct Fragment {
     pub delays: Vec<Range>,
     pub max_split: Range,
     merged: Vec<u8>,
+    ent: Entropy,
     count: u64,
 }
 
@@ -88,6 +137,7 @@ impl Fragment {
             delays,
             max_split,
             merged: Vec::new(),
+            ent: Entropy::new(),
             count: 0,
         })
     }
@@ -108,8 +158,8 @@ impl Fragment {
 
     /// The segment's width, or the body's last octet once `max_split` has taken its bound: the run
     /// always ends on the whole, so a bounded hello is a short hello, never a lost one.
-    fn cut(&self, segment: usize, from: usize, end: usize, bound: i64) -> Option<usize> {
-        let width = self.lengths[segment.min(self.lengths.len() - 1)].pick()?;
+    fn cut(&mut self, segment: usize, from: usize, end: usize, bound: i64) -> Option<usize> {
+        let width = self.lengths[segment.min(self.lengths.len() - 1)].pick_from(&mut self.ent)?;
         let last = bound > 0 && i64::try_from(segment).ok()? + 1 >= bound;
         let to = from.saturating_add(width as usize);
         Some(if last || to > end { end } else { to })
@@ -117,9 +167,9 @@ impl Fragment {
 
     /// The reference parks between pieces when its delay range can answer above zero, and so does
     /// this: a mask that cut faster would look like a different schedule to anything watching the
-    /// wire. One draw decides both the test and the duration.
-    fn park(delay: Range) {
-        let Some(ms) = delay.pick().filter(|ms| *ms > 0) else {
+    /// wire. One draw of the cached supply decides both the test and the duration.
+    fn park(&mut self, delay: Range) {
+        let Some(ms) = delay.pick_from(&mut self.ent).filter(|ms| *ms > 0) else {
             return;
         };
         std::thread::sleep(Duration::from_millis(ms as u64));
@@ -143,12 +193,19 @@ impl Fragment {
         let Some(record_len) = self.hello_shape(p) else {
             return raw.write(p);
         };
-        let Some(bound) = self.max_split.pick() else {
+        let Some(bound) = self.max_split.pick_from(&mut self.ent) else {
             // No entropy for the bound: the hello goes out as the one record it was.
             return raw.write_all(p).map(|()| p.len());
         };
         let merged = self.delays.len() == 1 && self.delays[0].high == 0;
         self.merged.clear();
+        if merged {
+            // The bound is the only thing that can cut the run short, so the merge starts at its exact room.
+            let extra = (bound.unsigned_abs().saturating_sub(1) as usize)
+                .saturating_mul(HEADER)
+                .min(p.len());
+            self.merged.reserve(record_len + extra);
+        }
         let mut from = HEADER;
         let mut segment = 0usize;
         while from < record_len {
@@ -169,7 +226,8 @@ impl Fragment {
                 self.merged.extend_from_slice(&p[from..to]);
             } else {
                 write_record(raw, &head, &p[from..to])?;
-                Self::park(self.delay_at(segment));
+                let delay = self.delay_at(segment);
+                self.park(delay);
             }
             from = to;
             segment += 1;
@@ -192,7 +250,7 @@ impl Fragment {
     /// The `packets` modes that are not `tlshello`: the whole goes out as pieces of the drawn
     /// widths, each advance measured by what the socket actually took.
     fn write_pieces<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
-        let Some(bound) = self.max_split.pick() else {
+        let Some(bound) = self.max_split.pick_from(&mut self.ent) else {
             return raw.write_all(p).map(|()| p.len());
         };
         let mut from = 0usize;
@@ -203,7 +261,8 @@ impl Fragment {
             };
             let written = raw.write(&p[from..to])?;
             from += written;
-            Self::park(self.delay_at(segment));
+            let delay = self.delay_at(segment);
+            self.park(delay);
             segment += 1;
             if from >= p.len() {
                 return Ok(from);
@@ -435,6 +494,97 @@ mod tests {
         let (widths, message) = records(&wire.bytes);
         assert_eq!(widths, vec![11, 37]);
         assert_eq!(message, whole[HEADER..]);
+        assert_eq!(
+            mask.ent.refills, 0,
+            "a fixed config answers its low ends and never reaches the supply at all"
+        );
+    }
+
+    #[test]
+    fn a_random_piece_draws_once_from_the_cached_supply() {
+        // The one random draw here is the first width, 11..20; the bound, second width and delay all answer their fixed low ends.
+        let mut mask = Fragment::new(
+            0,
+            1,
+            vec![range(11, 20), range(37, 37)],
+            vec![range(0, 1)],
+            range(24, 24),
+        )
+        .expect("valid");
+        let whole = hello(48);
+        let mut wire = Wire::default();
+        mask.write(&mut wire, &whole).expect("writes");
+        assert_eq!(
+            mask.ent.refills, 1,
+            "the draw came from the supply, refilled once and never again"
+        );
+        let (widths, message) = records(&wire.bytes);
+        assert_eq!(widths.len(), 2, "a cut and the clamped rest");
+        assert!((11..20).contains(&widths[0]), "the drawn width");
+        assert_eq!(message, whole[HEADER..]);
+    }
+
+    #[test]
+    fn a_merged_first_hello_lands_in_room_it_drew_ahead_of() {
+        let mut mask = Fragment::new(0, 1, vec![range(100, 100)], vec![range(0, 0)], range(5, 5))
+            .expect("valid");
+        let whole = hello(400);
+        let mut wire = Wire::default();
+        mask.write(&mut wire, &whole).expect("first");
+        assert_eq!(
+            mask.merged.capacity(),
+            whole.len() + 4 * HEADER,
+            "the reserve covered the run the bound allows in full, so nothing regrew mid-hello"
+        );
+        assert_eq!(
+            mask.ent.refills, 0,
+            "a fixed config answers its low ends and never draws at all"
+        );
+        wire.bytes.clear();
+        mask.count = 0;
+        mask.write(&mut wire, &whole).expect("second");
+        assert_eq!(
+            mask.merged.capacity(),
+            whole.len() + 4 * HEADER,
+            "and the second hello neither grew nor shrank it"
+        );
+        let (widths, message) = records(&wire.bytes);
+        assert_eq!(widths, vec![100, 100, 100, 100]);
+        assert_eq!(message, whole[HEADER..], "the run is the mask's own bytes");
+    }
+
+    #[test]
+    fn a_random_merged_hello_draws_only_the_random_widths_from_the_supply() {
+        // Two random widths, then a fixed 100 governs every later segment and the bound closes the run at ten records: only the two random segments reach the supply, and one getrandom feeds both.
+        let mut mask = Fragment::new(
+            0,
+            1,
+            vec![range(50, 150), range(50, 150), range(100, 100)],
+            vec![range(0, 0)],
+            range(10, 10),
+        )
+        .expect("valid");
+        let whole = hello(1000);
+        let mut wire = Wire::default();
+        assert_eq!(mask.write(&mut wire, &whole).expect("writes"), whole.len());
+        let (widths, message) = records(&wire.bytes);
+        assert_eq!(
+            widths.len(),
+            10,
+            "the bound closed the run on exactly ten records"
+        );
+        assert!(
+            (50..150).contains(&widths[0]) && (50..150).contains(&widths[1]),
+            "the two random segments drew their width"
+        );
+        assert_eq!(
+            &widths[2..9],
+            &[100; 7],
+            "the fixed width governs every later segment and never draws"
+        );
+        assert!(widths[9] > 0, "the last record carries the clamped rest");
+        assert_eq!(message, whole[HEADER..], "and the hello arrives whole");
+        assert_eq!(mask.ent.refills, 1, "two draws ride one getrandom, not two");
     }
 
     #[test]
