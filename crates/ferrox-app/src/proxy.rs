@@ -18779,7 +18779,7 @@ mod tests {
     #[test]
     fn hysteria_udp_lane_carries_a_datagram() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_udp_lane_once, 3);
+        hysteria_udp_lane_once();
     }
 
     fn hysteria_udp_lane_once() {
@@ -19763,7 +19763,7 @@ mod tests {
     #[test]
     fn socks_dials_vless_quic_to_echo() {
         let _serial = quic_serial();
-        quic_retry_dial(socks_quic_once, 3);
+        socks_quic_once();
     }
 
     fn socks_quic_once() {
@@ -19919,19 +19919,10 @@ mod tests {
         }
     }
 
-    fn quic_retry_dial(once: fn(), attempts: u32) {
-        for _ in 0..attempts.saturating_sub(1) {
-            if std::panic::catch_unwind(std::panic::AssertUnwindSafe(once)).is_ok() {
-                return;
-            }
-        }
-        once();
-    }
-
     #[test]
     fn quic_dials_loopback_echo() {
         let _serial = quic_serial();
-        quic_retry_dial(quic_loopback_once, 3);
+        quic_loopback_once();
     }
 
     fn quic_loopback_once() {
@@ -19996,7 +19987,7 @@ mod tests {
     #[test]
     fn quic_pool_shares_one_connection_between_two_streams() {
         let _serial = quic_serial();
-        quic_retry_dial(quic_pool_once, 5);
+        quic_pool_once();
     }
 
     fn pool_read(client: &mut Connection, want: [u8; 4], who: &str, port: u16) {
@@ -20491,7 +20482,7 @@ mod tests {
     #[test]
     fn hysteria_client_passes_a_hand_rolled_server() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_client_once, 3);
+        hysteria_client_once();
     }
 
     fn hysteria_client_once() {
@@ -20579,7 +20570,7 @@ mod tests {
     #[test]
     fn hysteria_server_passes_a_hand_rolled_client() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_server_once, 3);
+        hysteria_server_once();
     }
 
     fn hysteria_server_once() {
@@ -20740,7 +20731,7 @@ mod tests {
     #[test]
     fn hysteria_answers_a_browser_get_with_the_masquerade_404() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_masq_404_once, 3);
+        hysteria_masq_404_once();
     }
 
     fn hysteria_masq_404_once() {
@@ -20760,7 +20751,7 @@ mod tests {
     #[test]
     fn hysteria_serves_a_canned_masquerade_response() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_masq_response_once, 3);
+        hysteria_masq_response_once();
     }
 
     fn hysteria_masq_response_once() {
@@ -20785,7 +20776,7 @@ mod tests {
     #[test]
     fn hysteria_serves_a_file_from_the_masquerade_directory() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_masq_file_once, 3);
+        hysteria_masq_file_once();
     }
 
     fn hysteria_masq_file_once() {
@@ -20817,7 +20808,7 @@ mod tests {
     #[test]
     fn hysteria_refuses_a_masquerade_path_that_escalates_the_directory() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_masq_traversal_once, 3);
+        hysteria_masq_traversal_once();
     }
 
     fn hysteria_masq_traversal_once() {
@@ -20850,7 +20841,7 @@ mod tests {
     #[test]
     fn hysteria_proxies_a_masquerade_request_to_an_origin() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_masq_proxy_once, 3);
+        hysteria_masq_proxy_once();
     }
 
     fn hysteria_masq_proxy_once() {
@@ -20909,7 +20900,7 @@ mod tests {
     #[test]
     fn hysteria_proxies_a_masquerade_request_to_a_unix_origin() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_masq_unix_once, 3);
+        hysteria_masq_unix_once();
     }
 
     fn hysteria_masq_unix_once() {
@@ -20967,7 +20958,7 @@ mod tests {
     #[test]
     fn hysteria_proxies_a_masquerade_request_to_an_https_origin() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_masq_https_insecure_once, 3);
+        hysteria_masq_https_insecure_once();
     }
 
     fn hysteria_masq_https_insecure_once() {
@@ -20995,7 +20986,7 @@ mod tests {
     #[test]
     fn hysteria_refuses_a_masquerade_https_origin_whose_chain_is_untrusted() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_masq_https_verified_once, 3);
+        hysteria_masq_https_verified_once();
     }
 
     fn hysteria_masq_https_verified_once() {
@@ -21022,7 +21013,7 @@ mod tests {
     #[test]
     fn hysteria_still_carries_proxy_flows_beside_a_masquerade_get() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_masq_beside_flow_once, 3);
+        hysteria_masq_beside_flow_once();
     }
 
     fn hysteria_masq_beside_flow_once() {
@@ -21106,7 +21097,7 @@ mod tests {
     #[test]
     fn hysteria_closes_a_wrong_hysteria_password_even_with_masquerade() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_masq_wrong_auth_once, 3);
+        hysteria_masq_wrong_auth_once();
     }
 
     fn hysteria_masq_wrong_auth_once() {
@@ -21177,7 +21168,7 @@ mod tests {
     #[test]
     fn hysteria_carries_udp_echo_over_loopback() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_udp_echo_once, 3);
+        hysteria_udp_echo_once();
     }
 
     fn hysteria_udp_echo_once() {
@@ -21277,7 +21268,7 @@ mod tests {
     #[test]
     fn hysteria_carries_a_udp_association_over_the_carrier() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_udp_association_once, 3);
+        hysteria_udp_association_once();
     }
 
     fn hysteria_udp_association_once() {
@@ -21353,7 +21344,7 @@ mod tests {
     #[test]
     fn hysteria_carries_vless_echo_over_loopback() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_echo_once, 3);
+        hysteria_echo_once();
     }
 
     fn hysteria_echo_once() {
@@ -21371,7 +21362,7 @@ mod tests {
     #[test]
     fn hysteria_carries_a_flow_through_salamander_over_loopback() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_salamander_once, 3);
+        hysteria_salamander_once();
     }
 
     fn hysteria_salamander_once() {
@@ -21391,7 +21382,7 @@ mod tests {
     #[test]
     fn hysteria_shares_one_connection_between_two_flows() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_share_once, 3);
+        hysteria_share_once();
     }
 
     fn hysteria_share_once() {
@@ -21419,7 +21410,7 @@ mod tests {
     #[test]
     fn hysteria_redials_when_a_pooled_connection_closes() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_redial_once, 3);
+        hysteria_redial_once();
     }
 
     fn hysteria_redial_once() {
@@ -21448,7 +21439,7 @@ mod tests {
     #[test]
     fn hysteria_refuses_a_wrong_password_without_relaying() {
         let _serial = quic_serial();
-        quic_retry_dial(hysteria_refuses_once, 3);
+        hysteria_refuses_once();
     }
 
     fn hysteria_refuses_once() {
