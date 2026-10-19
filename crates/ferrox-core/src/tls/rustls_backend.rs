@@ -161,17 +161,30 @@ struct Material {
 }
 
 /// The three config fields `build_material` reads. ALPN is not one of them because the anchors and the suite order do not depend on it, and the server name is not one either: it reaches the connection, not the config.
-#[derive(PartialEq, Eq)]
+#[derive(Eq)]
 struct MaterialKey {
-    roots: Vec<Vec<u8>>,
+    roots: crate::tls::Anchors,
     pins: crate::foxy::pin::Pins,
     cipher_suites: Vec<u16>,
+}
+
+/// Two anchor lists name the same trust when one allocation answers for both, which is what sharing them by reference makes the ordinary case; comparing their bytes is a walk of every certificate the platform trusts, and only a set read twice can reach it.
+fn same_roots(ours: &crate::tls::Anchors, theirs: &crate::tls::Anchors) -> bool {
+    Arc::ptr_eq(ours, theirs) || ours == theirs
+}
+
+impl PartialEq for MaterialKey {
+    fn eq(&self, other: &Self) -> bool {
+        same_roots(&self.roots, &other.roots)
+            && self.pins == other.pins
+            && self.cipher_suites == other.cipher_suites
+    }
 }
 
 impl MaterialKey {
     fn of(cfg: &TlsConfig) -> Self {
         Self {
-            roots: cfg.roots.clone(),
+            roots: Arc::clone(&cfg.roots),
             pins: cfg.pins.clone(),
             cipher_suites: cfg.cipher_suites.clone(),
         }
@@ -189,7 +202,7 @@ static MATERIALS: OnceLock<Mutex<Materials>> = OnceLock::new();
 /// Parses the anchors, orders the suites and builds the verifier a config named, once per set of inputs.
 fn build_material(cfg: &TlsConfig) -> Result<Material, TlsError> {
     let mut roots = RootStore::empty();
-    for der in &cfg.roots {
+    for der in cfg.roots.iter() {
         roots
             .add(rustls::pki_types::CertificateDer::from(der.as_slice()))
             .map_err(|e| TlsError::BadCertificate(format!("trust anchor: {e}")))?;
@@ -846,7 +859,7 @@ mod tests {
         TlsConfig {
             server_name: name.to_owned(),
             alpn: alpn.iter().map(|p| p.to_vec()).collect(),
-            roots: vec![ANCHOR.to_vec()],
+            roots: vec![ANCHOR.to_vec()].into(),
             pins: crate::foxy::pin::Pins::default(),
             cipher_suites: Vec::new(),
             insecure: false,
@@ -999,7 +1012,7 @@ mod tests {
         );
 
         let mut no_anchor = client("one.test", &[b"test-only"]);
-        no_anchor.roots.clear();
+        no_anchor.roots = Vec::new().into();
         let empty = RustlsProvider::<TcpStream>::material(&no_anchor).expect("builds");
         assert!(
             !Arc::ptr_eq(&built, &empty),

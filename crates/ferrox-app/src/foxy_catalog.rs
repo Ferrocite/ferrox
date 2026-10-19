@@ -51,7 +51,7 @@ fn settled(
 }
 
 /// Every dialable edge: a fresh list, a fetched one, or the last one known — no edges is a refusal with a reason, never a guess.
-pub(crate) fn edges(roots: Vec<Vec<u8>>) -> Vec<Candidate> {
+pub(crate) fn edges(roots: ferrox_core::tls::Anchors) -> Vec<Candidate> {
     let now = epoch();
     let cached = CACHE.lock().map_or((0, Vec::new()), |cache| cache.clone());
     let known = if cached.1.is_empty() {
@@ -161,7 +161,7 @@ fn write_at(path: &std::path::Path, listed: &[Candidate]) {
     }
 }
 
-fn fetch(roots: Vec<Vec<u8>>) -> Option<Vec<Candidate>> {
+fn fetch(roots: ferrox_core::tls::Anchors) -> Option<Vec<Candidate>> {
     let endpoint = Endpoint::parse(CATALOG_URL, roots)?;
     let reply = crate::foxy_account::send(
         &endpoint,
