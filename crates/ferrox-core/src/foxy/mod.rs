@@ -58,18 +58,18 @@ pub fn authority(host: &str, port: u16) -> String {
     }
 }
 
-/// HTTP/1.1 CONNECT, the one carrier the account's edge is certain to speak.
+/// HTTP/1.1 CONNECT, the one carrier the account's edge is certain to speak: the pieces in wire order, so the writer gathers them into one record instead of building a buffer to hold the request first.
 #[must_use]
-pub fn connect_request(target: &str, bearer: &str) -> Vec<u8> {
-    let mut out = Vec::with_capacity(59 + 2 * target.len() + bearer.len());
-    out.extend_from_slice(b"CONNECT ");
-    out.extend_from_slice(target.as_bytes());
-    out.extend_from_slice(b" HTTP/1.1\r\nHost: ");
-    out.extend_from_slice(target.as_bytes());
-    out.extend_from_slice(b"\r\nProxy-Authorization: Bearer ");
-    out.extend_from_slice(bearer.as_bytes());
-    out.extend_from_slice(b"\r\n\r\n");
-    out
+pub fn connect_request<'a>(target: &'a str, bearer: &'a str) -> [&'a [u8]; 7] {
+    [
+        b"CONNECT ",
+        target.as_bytes(),
+        b" HTTP/1.1\r\nHost: ",
+        target.as_bytes(),
+        b"\r\nProxy-Authorization: Bearer ",
+        bearer.as_bytes(),
+        b"\r\n\r\n",
+    ]
 }
 
 pub fn connect_status(head: &[u8]) -> Result<u16, Failure> {
@@ -366,7 +366,7 @@ mod tests {
 
     #[test]
     fn a_connect_request_carries_one_authorization_and_nothing_else() {
-        let block = connect_request("example.com:443", "pass.jwt.value");
+        let block = connect_request("example.com:443", "pass.jwt.value").concat();
         assert_eq!(
             String::from_utf8(block).expect("ascii"),
             "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Bearer pass.jwt.value\r\n\r\n"
