@@ -161,6 +161,9 @@ pub(crate) const MAX_STREAMS: u64 = 100;
 
 const PUMP_POLL: Duration = Duration::from_millis(500);
 
+/// The pump drain's read window: one lock is amortised over this many bytes on the downlink, and it is the uplink relay's read quantum on the same lane.
+const PUMP_WINDOW: usize = 32 * 1024;
+
 pub(crate) const SEND_WAIT: Duration = Duration::from_secs(10);
 
 static TRUST_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -1727,7 +1730,7 @@ fn pump(
 ) {
     let mut ready: Vec<(u64, Arc<Connection>)> = Vec::new();
     // One lock per 32 KiB rather than per 8: the drain is the connection's busiest shared path, and every pass pays the mutex twice.
-    let mut chunk = vec![0u8; 32768];
+    let mut chunk = crate::proxy::RelayBuf::with_len(PUMP_WINDOW).into_vec();
     let mut buf = [0u8; MAX_DATAGRAM];
     loop {
         // The lock covers quiche calls only: a stalled peer must not stall the sessions sharing the connection.
@@ -1879,7 +1882,7 @@ fn uplink_stream(pooled: &PooledConn, id: u64, client: &Connection) {
         leave_session(&pooled.table, id);
         return;
     };
-    let mut chunk = vec![0u8; 32768];
+    let mut chunk = crate::proxy::RelayBuf::with_len(PUMP_WINDOW).into_vec();
     loop {
         #[cfg(test)]
         let read_at = Instant::now();
