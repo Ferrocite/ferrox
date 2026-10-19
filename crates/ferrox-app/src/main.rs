@@ -4,6 +4,11 @@ macro_rules! census {
     ($name:literal, $fd:expr, $armed:expr) => {};
 }
 
+// The counting allocator is core's and the window is one thread's: installed only for the test binary, so a shipped flow keeps the system allocator.
+#[cfg(test)]
+#[global_allocator]
+static ALLOC_COUNT: ferrox_core::alloc_count::Counting = ferrox_core::alloc_count::Counting;
+
 mod budgets;
 #[cfg(test)]
 #[macro_use]
@@ -380,5 +385,19 @@ mod tests {
             assert_eq!(link, "vless://x");
             assert!(opt.unsafe_fingerprint() && opt.plaintext_to_public());
         }
+    }
+
+    /// The window reaches across the crate boundary: what an app test allocates is counted by core's allocator, so a count taken here measures the app.
+    #[test]
+    fn a_count_taken_here_sees_what_the_app_allocates() {
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            let buffer = vec![0u8; 64];
+            std::hint::black_box(&buffer);
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (1, 64, 1),
+            "this test binary is not running on the allocator whose window `measure` opens"
+        );
     }
 }

@@ -1,4 +1,4 @@
-//! Counting allocator for tests: the window is thread-local and one at a time process-wide, so an unmeasured thread adds nothing.
+//! Counting allocator for tests: the window is thread-local and one at a time process-wide, so an unmeasured thread adds nothing. The binary that wants it installs `Counting` as its `#[global_allocator]`, which is how a test in one crate counts what another crate allocates.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -14,6 +14,7 @@ static BYTES: AtomicUsize = AtomicUsize::new(0);
 static ZEROED: AtomicUsize = AtomicUsize::new(0);
 static BUSY: Mutex<()> = Mutex::new(());
 
+#[derive(Debug)]
 pub struct Counting;
 
 /// Closes the window even when the measured closure panics, so a set flag cannot charge a later test.
@@ -89,6 +90,7 @@ unsafe impl GlobalAlloc for Counting {
     }
 }
 
+#[cfg(test)]
 #[global_allocator]
 static ALLOC: Counting = Counting;
 
