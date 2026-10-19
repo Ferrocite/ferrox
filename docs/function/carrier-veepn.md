@@ -68,7 +68,7 @@ That is 4.8x–5.1x at the long pair, 9.8x–10.0x at the ordinary one and 15.2x
 
 What is **not** removed. A flow still allocates for its dial: the host `String` and the pair `String` cloned out of the one `Server` it picks (`FoxyDial` owns its edge name, as the `Foxy` lane's dial does), the `authority` `String` the front hands in, and the copy every plaintext pays into the TLS record. The rotation is cloned per ask — `Vec<Endpoint>` copied under the lock so no lock is held across the network — which is a few allocations per *ask*, at a 7-day and 12-hour cadence, and none per flow. The plane's two request bodies are built into a `Vec` in the app before they are sent, because `foxy_account::ask` takes `&[u8]` and the window has to outlive the call. Nothing here has a benchmark cell yet, so none of it is quoted as a duration; the coder is, and it is named as one.
 
-One byte of the launch diverges, and it is named rather than slipped past: `platformVersion` carries this tree's browser-UA shape — `Chrome/130.0`, the way `foxy_challenge` spells its `Chrome/126.0` — not the extension's `Chrome/130.0.0.0`. No reader at either end compares that tail, and a literal that reads as a routable address has no business in a fixture-checked tree.
+One byte of the launch diverges, and it is named rather than slipped past: `platformVersion` carries this tree's browser-UA shape — `Chrome/130.0`, the way `foxy_challenge` spells its `Chrome/126.0` — instead of the extension's four-field build tail, which no reader at either end compares and which this tree's own fixture gate reads as a routable address.
 
 ## References
 
