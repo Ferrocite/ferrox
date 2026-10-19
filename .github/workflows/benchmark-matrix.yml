@@ -220,6 +220,8 @@ jobs:
           key: matrix-engines-${{ matrix.os }}-${{ hashFiles('upstream/pins.toml') }}
       - name: build every engine without moving traffic
         shell: bash
+        env:
+          FERROX_UPSTREAM_HANDOFF: "1"
         run: >
           ./scripts/run-benchmark-matrix.sh
           --tier "${{ needs.setup.outputs.tier }}"
