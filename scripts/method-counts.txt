@@ -247,6 +247,8 @@ carrier-foxy h3-window-bytes-per-frame-ahead-of-the-answer 16 ferrox-app-foxy::l
 carrier-foxy h3-bytes-lost-at-a-frame-boundary 0 ferrox-app-foxy::loopback::a_quic_capsule_split_over_frames_arrives_as_one_datagram
 carrier-foxy h3-bytes-lost-behind-a-parked-frame 0 ferrox-app-foxy::loopback::a_quic_trailer_that_parks_mid_block_keeps_the_frames_behind_it
 carrier-foxy h3-empty-frames-called-the-end 0 ferrox-app-foxy::loopback::an_empty_data_frame_is_not_the_end_of_the_tunnel
+carrier-foxy h3-datagram-write-staging-bytes 19 ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_over_quic_and_echoes_a_datagram
+carrier-foxy h3-bytes-lost-in-a-block-arriving-in-pieces 0 ferrox-app-foxy::loopback::a_quic_block_that_arrives_in_pieces_keeps_the_pieces_it_already_holds
 carrier-foxy h2-bytes-lost-at-a-read-quantum 0 ferrox-app-foxy::loopback::a_frame_that_straddles_a_read_quantum_arrives_whole
 carrier-foxy h2-upload-bytes-blocked-by-an-unread-grant 0 ferrox-app-foxy::loopback::an_upload_is_paced_by_the_grants_the_edge_sends_rather_than_by_the_bytes_it_reads
 carrier-foxy window-update-frames-per-floor-crossing 2 ferrox-app-foxy::loopback::credit_crossing_the_floor_costs_one_pair_not_one_per_frame
