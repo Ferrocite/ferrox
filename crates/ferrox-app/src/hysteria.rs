@@ -37,7 +37,7 @@ pub(crate) struct Dial {
     pub(crate) address: String,
     pub(crate) port: u16,
     pub(crate) config: hysteria::Config,
-    pub(crate) roots: Option<Vec<Vec<u8>>>,
+    pub(crate) roots: Option<ferrox_core::tls::Anchors>,
 }
 
 #[derive(Clone)]
@@ -466,7 +466,7 @@ struct Server {
     /// A hop plan is its own connection: a hopped dial never reuses a plain one to the
     /// same address, nor the reverse, since the two move the server port differently.
     hop: Option<hysteria::Hop>,
-    roots: Option<Vec<Vec<u8>>>,
+    roots: Option<ferrox_core::tls::Anchors>,
 }
 
 /// How long an unused connection may sit before a dial pays a fresh handshake: half of quiche's idle timeout, so a reuse always lands before either side closes it.
@@ -1086,7 +1086,7 @@ fn origin_tls_config(host: &str, insecure: bool) -> ferrox_core::tls::TlsConfig 
     ferrox_core::tls::TlsConfig {
         server_name: host.to_owned(),
         roots: if insecure {
-            Vec::new()
+            ferrox_core::tls::Anchors::default()
         } else {
             crate::quic::system_roots()
         },

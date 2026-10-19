@@ -241,6 +241,7 @@ carrier-foxy quic-datagrams-out-of-one-frame 2 ferrox-app-foxy::loopback::a_quic
 carrier-foxy stream-write-staging-copies-per-byte 0 ferrox-app-foxy::loopback::the_quic_carrier_sends_the_block_reads_the_status_and_carries_the_bytes
 carrier-foxy datagram-write-staging-copies-per-byte 0 ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_and_echoes_a_datagram
 carrier-foxy ip-read-staging-copies-per-byte 0 ferrox-app-foxy::loopback::the_connect_ip_carrier_opens_one_tunnel_and_carries_a_datagram
+carrier-foxy platform-store-reads-per-flow 0 ferrox-app-quic::tests::the_platform_anchors_are_read_once
 carrier-foxy server-roles 0 ferrox-app-proxy::tests::quic_serve_closes_without_handshake
 carrier-foxy dialled-without-ca-cert-file 0 ferrox-app-proxy::tests::quic_outbound_reads_ca_cert_file
 carrier-foxy address-assign-capsule-bytes-per-grant 9 ferrox-core-foxy::connectip::tests::the_assign_a_proxy_writes_is_the_assign_the_lane_reads
@@ -297,6 +298,7 @@ reality-tls unsafe-fingerprint-header-bytes-added 0 ferrox-core-vless::tests::an
 reality-tls plaintext-to-public-header-bytes-added 0 ferrox-core-vless::tests::pattng_plaintext_to_public_needs_opt_in_and_adds_no_byte
 reality-tls certificate-refusals-folded-into-other 0 ferrox-core-tls::rustls_backend::tests::mismatched_certificate_name_fails
 reality-tls trust-anchors-parsed-per-dial-after-the-first 0 ferrox-core-tls::rustls_backend::tests::the_parts_a_config_is_built_from_are_built_once
+reality-tls trust-anchor-bytes-copied-per-dial 0 ferrox-app-foxy::loopback::every_dial_of_one_trust_names_the_same_anchors
 reality-tls handshakes-skipped-by-an-earlier-dials-ticket 0 ferrox-core-tls::rustls_backend::tests::a_second_dial_with_the_same_config_still_fetches_the_chain
 reality-tls untrusted-dials-counted-as-retryable 0 ferrox-app-proxy::tests::a_refused_chain_is_a_refusal_not_a_drop
 reality-tls session-writes-per-frame 1 ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call
