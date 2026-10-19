@@ -223,6 +223,12 @@ carrier-xhttp head-tail-allocations 0 ferrox-app-xhttp::tests::the_record_head_h
 carrier-xhttp received-data-frames-copied 0 ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into
 carrier-xhttp received-header-blocks-copied 0 ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into
 
+carrier-veepn ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-veepn credential-window-allocations-per-pair 0 ferrox-core-veepn::tests::the_credential_lands_in_the_callers_window_and_not_in_one_of_its_own
+carrier-veepn launch-body-window-allocations-per-ask 0 ferrox-core-veepn::tests::a_launch_body_is_the_document_the_api_reads
+carrier-veepn connect-request-allocations-per-open 0 ferrox-core-tls::rustls_backend::tests::the_connect_request_gathers_without_a_heap_buffer
+carrier-veepn write-calls-per-h1-open 1 ferrox-core-tls::rustls_backend::tests::the_connect_request_gathers_without_a_heap_buffer
+carrier-veepn region-list-copies-per-flow 0 ferrox-app-veepn::tests::a_cached_list_is_shared_not_copied_per_flow
 carrier-foxy ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-foxy payload-staging-copies-per-byte-written 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane
 carrier-foxy payload-staging-copies-per-byte-read 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane

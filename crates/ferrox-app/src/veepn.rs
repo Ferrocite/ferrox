@@ -1,0 +1,703 @@
+//! The `VeePN` lane: a launch that names a token, a region's list that names a pair, and the HTTPS upstream that answers `Basic` for it. The record, the head walk and the relay are the `Foxy` lane's, so an open here costs what an open costs there.
+
+use crate::foxy::{Carrier, FoxyDial, Tunnel};
+use crate::foxy_account::{self, Endpoint};
+use crate::json::Json;
+use ferrox_core::foxy::Pass;
+use ferrox_core::veepn::{self, BASIC_HEAD};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+/// One listed upstream, with its pair coded at the fetch: a region's list is read once per 12 hours, so no flow re-encodes a credential the lane already has.
+#[derive(Debug)]
+struct Server {
+    host: String,
+    port: u16,
+    /// The coded `user:pass`, without the scheme — the scheme rides the request's head literal.
+    credential: String,
+}
+
+/// The plane's cached state: the rotation, the token as the plane wants it, and one server list per region.
+#[derive(Debug, Default)]
+struct Plane {
+    domains: Vec<Endpoint>,
+    /// Where the next ask starts, so concurrent flows do not all knock on the first domain.
+    cursor: usize,
+    /// The `Authorization` value with its scheme already on it, so an ask writes the header without formatting one.
+    access: Option<(String, u64)>,
+    lists: HashMap<String, (Arc<Vec<Server>>, u64)>,
+    region: Option<(String, u64)>,
+}
+
+/// The outbound: the plane behind a lock, the identity in front of it.
+#[derive(Debug, Clone)]
+pub(crate) struct VeepnOut {
+    plane: Arc<Mutex<Plane>>,
+    region: String,
+    udid: String,
+    zone: String,
+    roots: ferrox_core::tls::Anchors,
+    /// A region lists a dozen upstreams; every flow does not go to the first of them.
+    picked: Arc<AtomicUsize>,
+}
+
+/// What one walk of the rotation came back with: an answer, or the plane's name for the token it carried.
+enum Walked {
+    Carried(foxy_account::Reply),
+    Token,
+}
+
+impl VeepnOut {
+    /// The lane from a region name and the origins it may ask. A domain that does not parse is a refusal, not a skip: a typo in the config should say so at boot.
+    pub(crate) fn new(
+        region: String,
+        domains: &[String],
+        udid: String,
+        roots: ferrox_core::tls::Anchors,
+    ) -> Result<Self, String> {
+        let mut plane = Plane::default();
+        for url in domains {
+            let (host, port) = veepn::api_domain(url)
+                .ok_or_else(|| format!("veepn: {url:?} is not an https origin with a real port"))?;
+            plane.domains.push(Endpoint {
+                host: host.to_owned(),
+                port,
+                base: String::new(),
+                address: None,
+                roots: Arc::clone(&roots),
+            });
+        }
+        if plane.domains.is_empty() {
+            return Err("veepn: the lane has no api domain to ask".to_owned());
+        }
+        Ok(Self {
+            plane: Arc::new(Mutex::new(plane)),
+            region,
+            udid,
+            zone: zone_name(),
+            roots,
+            picked: Arc::new(AtomicUsize::new(0)),
+        })
+    }
+
+    /// One flow's tunnel: a listed upstream of the region and the `Foxy` lane's HTTP/1.1 record dialed at the target. An upstream that has left the pool is tried for the rest of the list; one that refuses the pair takes the region's cache with it, so the next flow fetches fresh credentials.
+    pub(crate) fn open(&self, target: &str) -> Result<Tunnel, String> {
+        let region = self.region()?;
+        let servers = self.servers(&region)?;
+        let count = servers.len();
+        let start = self.picked.fetch_add(1, Ordering::Relaxed) % count;
+        let mut last = format!("region {region:?} lists no upstream");
+        for step in 0..count {
+            let server = &servers[(start + step) % count];
+            let dial = FoxyDial {
+                host: server.host.clone(),
+                port: server.port,
+                address: None,
+                carrier: Carrier::H1,
+                upstream: None,
+                roots: Arc::clone(&self.roots),
+                pins: ferrox_core::foxy::pin::Pins::default(),
+                pass: pass(&server.credential),
+            };
+            match crate::foxy::open_h1(&dial, target, BASIC_HEAD, &dial.pass.token) {
+                Ok(lane) => return Ok(Tunnel::H1(lane)),
+                Err(ferrox_core::foxy::Failure::Rejected(status))
+                    if ferrox_core::foxy::pass_is_rejected(status) =>
+                {
+                    self.forget(&region);
+                    return Err(format!(
+                        "{region} refuses its pairs ({status}): asked again"
+                    ));
+                }
+                Err(failure) => last = failure.to_string(),
+            }
+        }
+        Err(last)
+    }
+
+    /// The region the lane serves: the one configured, or the optimal one the plane names, kept for the same window as a list.
+    fn region(&self) -> Result<String, String> {
+        if !self.region.is_empty() {
+            return Ok(self.region.clone());
+        }
+        let now = foxy_account::epoch();
+        if let Some((named, _)) = self
+            .plane
+            .lock()
+            .ok()
+            .and_then(|plane| plane.region.clone().filter(|(_, until)| *until > now))
+        {
+            return Ok(named);
+        }
+        let reply = self.ask(veepn::OPTIMAL, &[])?;
+        let named = json(&reply)?
+            .get("region")
+            .and_then(Json::as_str)
+            .filter(|named| !named.is_empty())
+            .ok_or("the plane named no optimal region")?
+            .to_owned();
+        if let Ok(mut plane) = self.plane.lock() {
+            plane.region = Some((named.clone(), now.saturating_add(veepn::SERVERS_TTL)));
+        }
+        Ok(named)
+    }
+
+    /// A region's upstreams: one ask per 12 hours, the pair coded once here rather than once per flow, and the list handed out by `Arc` so a flow shares the cached text instead of copying the whole region.
+    fn servers(&self, region: &str) -> Result<Arc<Vec<Server>>, String> {
+        let now = foxy_account::epoch();
+        if let Some((list, _)) = self
+            .plane
+            .lock()
+            .ok()
+            .and_then(|plane| plane.lists.get(region).cloned())
+            .filter(|(_, until)| *until > now)
+        {
+            return Ok(list);
+        }
+        let mut body = vec![0u8; veepn::server_list_len(region)];
+        let text: Vec<u8> = veepn::server_list_into(region, &mut body)
+            .map_err(|why| format!("region {region:?} cannot be written: {why}"))?
+            .to_vec();
+        let found = servers_of(&self.ask(veepn::SERVER_LIST, &text)?)?;
+        if found.is_empty() {
+            return Err(format!("region {region:?} answers no usable upstream"));
+        }
+        let list = Arc::new(found);
+        if let Ok(mut plane) = self.plane.lock() {
+            plane.lists.insert(
+                region.to_owned(),
+                (Arc::clone(&list), now.saturating_add(veepn::SERVERS_TTL)),
+            );
+        }
+        Ok(list)
+    }
+
+    /// A refused pair retires the region's cache, so the flow after this one pays a fetch instead of the same refusal.
+    fn forget(&self, region: &str) {
+        if let Ok(mut plane) = self.plane.lock() {
+            plane.lists.remove(region);
+            plane.access = None;
+        }
+    }
+
+    /// The token the plane answers with, launched when the cache has run out: one ask per 7 days, and a plane that refuses what it issued gets exactly one relaunch.
+    fn access(&self, force: bool) -> Result<String, String> {
+        let now = foxy_account::epoch();
+        if !force {
+            if let Some((value, _)) = self
+                .plane
+                .lock()
+                .ok()
+                .and_then(|plane| plane.access.clone())
+                .filter(|(_, until)| *until > now)
+            {
+                return Ok(value);
+            }
+        }
+        let mut body = vec![0u8; veepn::launch_len(&self.udid, &self.zone)];
+        let text: Vec<u8> = veepn::launch_into(&self.udid, &self.zone, &mut body)
+            .map_err(|why| format!("launch body: {why}"))?
+            .to_vec();
+        let Walked::Carried(reply) = self.walk(veepn::LAUNCH, &text, None)? else {
+            return Err("launch carries no token".to_owned());
+        };
+        if let Some(denied) = reply.denied() {
+            return Err(format!("launch refused: {denied}"));
+        }
+        let document = json(&reply)?;
+        let token = document
+            .get("access")
+            .and_then(Json::as_str)
+            .filter(|token| !token.is_empty())
+            .ok_or("launch answers no access token")?;
+        let value = format!("Bearer {token}");
+        if let Ok(mut plane) = self.plane.lock() {
+            plane.access = Some((value.clone(), now.saturating_add(veepn::TOKEN_TTL)));
+        }
+        Ok(value)
+    }
+
+    /// One plane ask with the token in front of it: a plane that refuses the token is the cache's problem, so it is relaunched and the same ask repeats once.
+    fn ask(&self, path: &str, body: &[u8]) -> Result<foxy_account::Reply, String> {
+        let value = self.access(false)?;
+        if let Walked::Carried(reply) = self.walk(path, body, Some(&value))? {
+            return Ok(reply);
+        }
+        let fresh = self.access(true)?;
+        match self.walk(path, body, Some(&fresh))? {
+            Walked::Carried(reply) => Ok(reply),
+            Walked::Token => Err(format!("{path} refuses a fresh token")),
+        }
+    }
+
+    /// The rotation walked with the reference's backoff and its wall-clock budget: a domain that answers nothing rotates, the budget ends the walk, and a plane that refuses the token stops the walk to say so.
+    fn walk(&self, path: &str, body: &[u8], access: Option<&str>) -> Result<Walked, String> {
+        let started = Instant::now();
+        let (domains, start) = self.rotation();
+        let mut last = format!("{path} answered nothing");
+        // The plane's asks are a body POSTed or a location GET: one of the two, decided by the body.
+        let method = if body.is_empty() { "GET" } else { "POST" };
+        for attempt in 0..domains.len().min(veepn::MAX_ATTEMPTS) {
+            if attempt != 0 && started.elapsed().as_secs() >= veepn::REQUEST_BUDGET {
+                return Err(format!(
+                    "{path} ran out the {}s budget: {last}",
+                    veepn::REQUEST_BUDGET
+                ));
+            }
+            let endpoint = &domains[(start + attempt) % domains.len()];
+            let url = format!("{}{path}", endpoint.base);
+            let mut headers: Vec<(&str, &str)> = Vec::with_capacity(5);
+            headers.push(("User-Agent", veepn::USER_AGENT));
+            headers.push(("Accept", "application/json"));
+            if !body.is_empty() {
+                headers.push(("Content-Type", "application/json"));
+            }
+            headers.push(("Connection", "close"));
+            if let Some(value) = access {
+                headers.push(("Authorization", value));
+            }
+            match foxy_account::ask(endpoint, method, &url, &headers, body) {
+                Err(why) => last = why,
+                Ok(reply) => match reply.status {
+                    200..=299 => return Ok(Walked::Carried(reply)),
+                    401 | 403 | 407 if access.is_some() => return Ok(Walked::Token),
+                    429 | 500..=599 => last = format!("{} answers {}", endpoint.host, reply.status),
+                    other => {
+                        return Err(format!(
+                            "{path} answers {other}: {}",
+                            String::from_utf8_lossy(&reply.body)
+                        ))
+                    }
+                },
+            }
+            std::thread::sleep(Duration::from_secs(
+                veepn::BACKOFF[attempt.min(veepn::BACKOFF.len() - 1)],
+            ));
+        }
+        Err(last)
+    }
+
+    /// The rotation to walk and where this flow starts in it; the cursor moves so the next flow asks a different origin.
+    fn rotation(&self) -> (Vec<Endpoint>, usize) {
+        let Ok(mut plane) = self.plane.lock() else {
+            return (Vec::new(), 0);
+        };
+        let count = plane.domains.len().max(1);
+        let start = plane.cursor % count;
+        plane.cursor = (start + 1) % count;
+        (plane.domains.clone(), start)
+    }
+}
+
+/// The dial the `Foxy` lane already speaks, with the coded pair where its carrier keeps a credential.
+fn pass(credential: &str) -> Pass {
+    Pass {
+        token: credential.to_owned(),
+        expires_at: None,
+        quota_remaining: None,
+        quota_reset: None,
+    }
+}
+
+/// The body as one document: the plane answers JSON or an error page, and a broken one is named as itself.
+fn json(reply: &foxy_account::Reply) -> Result<Json, String> {
+    crate::json::parse(&String::from_utf8_lossy(&reply.body))
+}
+
+/// The entries a list answer carries: an address this lane can dial, a real port, and a pair to code. An entry missing any of them is not an upstream, and the count of what was dropped is what a live run reads.
+fn servers_of(reply: &foxy_account::Reply) -> Result<Vec<Server>, String> {
+    let Json::Arr(entries) = json(reply)? else {
+        return Err("the server list is not an array".to_owned());
+    };
+    let mut list = Vec::with_capacity(entries.len());
+    let mut unusable = 0usize;
+    for entry in entries {
+        let username = entry.get("username").and_then(Json::as_str);
+        let secret = entry.get("password").and_then(Json::as_str);
+        let port = entry
+            .get("port")
+            .and_then(Json::as_port)
+            .filter(|port| *port != 0);
+        let host = entry
+            .get("addresses")
+            .and_then(Json::as_arr)
+            .and_then(|addresses| {
+                addresses
+                    .iter()
+                    .filter_map(Json::as_str)
+                    .find(|address| !address.is_empty())
+            });
+        let (Some(username), Some(secret), Some(port), Some(host)) = (username, secret, port, host)
+        else {
+            unusable += 1;
+            continue;
+        };
+        let mut window = vec![0u8; veepn::credential_len(username, secret)];
+        match veepn::credential_into(username, secret, &mut window) {
+            Ok(coded) => list.push(Server {
+                host: host.to_owned(),
+                port,
+                credential: String::from_utf8_lossy(coded).into_owned(),
+            }),
+            Err(_) => unusable += 1,
+        }
+    }
+    if unusable != 0 {
+        eprintln!("veepn: {unusable} listed entries carry no dialable address and pair");
+    }
+    Ok(list)
+}
+
+/// The zone the launch publishes: the `TZ` the operator set, else the name the machine's own localtime points at, else the one name that is always right.
+fn zone_name() -> String {
+    if let Ok(named) = std::env::var("TZ") {
+        if !named.is_empty() {
+            return named;
+        }
+    }
+    #[cfg(unix)]
+    if let Ok(link) = std::fs::read_link("/etc/localtime") {
+        let text = link.to_string_lossy();
+        if let Some((_, named)) = text.rsplit_once("zoneinfo/") {
+            return named.to_owned();
+        }
+    }
+    "UTC".to_owned()
+}
+
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+/// The id the launch publishes as `udid`: the one configured, or a version-4 drawn for this process so the plane's free pool sees one device rather than one per flow. Written a byte at a time — no formatter runs.
+pub(crate) fn udid(named: &str) -> String {
+    if !named.is_empty() {
+        return named.to_owned();
+    }
+    let mut raw = [0u8; 16];
+    getrandom::getrandom(&mut raw).unwrap_or_default();
+    raw[6] = (raw[6] & 0x0f) | 0x40;
+    raw[8] = (raw[8] & 0x3f) | 0x80;
+    let mut text = String::with_capacity(36);
+    for (at, byte) in raw.iter().enumerate() {
+        if matches!(at, 4 | 6 | 8 | 11) {
+            text.push('-');
+        }
+        text.push(HEX[usize::from(byte >> 4)] as char);
+        text.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests {
+    use ferrox_core::tls::TlsProvider as _;
+
+    use super::*;
+
+    fn lane(domains: &[&str]) -> Result<VeepnOut, String> {
+        let named: Vec<String> = domains.iter().map(|url| (*url).to_owned()).collect();
+        VeepnOut::new(
+            "DE".to_owned(),
+            &named,
+            "00000000-0000-4000-8000-000000000000".to_owned(),
+            ferrox_core::tls::Anchors::from(Vec::new()),
+        )
+    }
+
+    /// A domain that does not parse refuses the lane at boot rather than leaving a rotation that dials nothing.
+    #[test]
+    fn a_domain_that_does_not_parse_refuses_the_lane() {
+        assert!(lane(&["https://antpeak.com", "https://hibchr.com:8443"]).is_ok());
+        for bad in [
+            "http://antpeak.com",
+            "https://a.com/path",
+            "antpeak.com",
+            "https://a..b.com",
+        ] {
+            assert!(lane(&[bad]).is_err(), "{bad} was accepted");
+        }
+        assert!(lane(&[]).is_err(), "a rotation of nothing serves nothing");
+    }
+
+    /// The rotation walks from a different origin each flow, and every origin is walked before the list wraps.
+    #[test]
+    fn the_rotation_starts_where_the_last_one_left_off() {
+        let out = lane(&[
+            "https://a.example",
+            "https://b.example",
+            "https://c.example",
+        ])
+        .unwrap();
+        let starts: Vec<String> = (0..7)
+            .map(|_| {
+                let (domains, start) = out.rotation();
+                domains[start].host.clone()
+            })
+            .collect();
+        assert_eq!(
+            starts,
+            [
+                "a.example",
+                "b.example",
+                "c.example",
+                "a.example",
+                "b.example",
+                "c.example",
+                "a.example"
+            ]
+        );
+    }
+
+    /// The cached region is shared, not copied: two flows read the *same* list allocation, so a dozen entries cost a refcount bump per flow instead of the whole region cloned out of the cache.
+    #[test]
+    fn a_cached_list_is_shared_not_copied_per_flow() {
+        let out = lane(&["https://antpeak.com"]).expect("lane");
+        let seeded = Arc::new(vec![Server {
+            host: "185.216.34.12".to_owned(),
+            port: 443,
+            credential: "MTAwMC1hYmM6czNjcjN0".to_owned(),
+        }]);
+        out.plane
+            .lock()
+            .expect("locks")
+            .lists
+            .insert("DE".to_owned(), (Arc::clone(&seeded), 4_000_000_000));
+        let first = out.servers("DE").expect("the cached region");
+        let second = out.servers("DE").expect("still the cached region");
+        assert!(
+            Arc::ptr_eq(&first, &second) && Arc::ptr_eq(&first, &seeded),
+            "a flow reads the list it was cached under, not a copy of it"
+        );
+    }
+
+    /// The list is read as the plane writes it: an entry without an address or a port is dropped with a count, and a pair reaches the wire coded once, not per flow.
+    #[test]
+    fn a_list_answer_keeps_the_entries_this_lane_can_dial() {
+        let body = r#"[{"username":"1000-abc","password":"s3cr3t","port":443,"addresses":["185.216.34.12"]},
+                       {"username":"x","password":"y","port":0,"addresses":["1.2.3.4"]},
+                       {"username":"x","password":"y","port":8080,"addresses":[]},
+                       {"username":"x","password":"y","port":80,"addresses":[""]}]"#;
+        let reply = foxy_account::Reply {
+            status: 200,
+            headers: Vec::new(),
+            body: body.as_bytes().to_vec(),
+        };
+        let list = servers_of(&reply).expect("a list");
+        assert_eq!(list.len(), 1, "only the entry with a port and an address");
+        assert_eq!(list[0].host, "185.216.34.12");
+        assert_eq!(list[0].port, 443);
+        let mut window = [0u8; 64];
+        assert_eq!(
+            list[0].credential,
+            std::str::from_utf8(
+                veepn::credential_into("1000-abc", "s3cr3t", &mut window).expect("window")
+            )
+            .unwrap(),
+            "the pair is the one the upstream reads back"
+        );
+        assert!(
+            servers_of(&foxy_account::Reply {
+                status: 200,
+                headers: Vec::new(),
+                body: b"{\"detail\": \"no json array here\"}".to_vec(),
+            })
+            .is_err(),
+            "an answer that is not a list is named, not served as an empty region"
+        );
+    }
+
+    #[test]
+    fn the_zone_the_launch_publishes_is_one_the_body_can_carry() {
+        let named = zone_name();
+        assert_ne!(named, "", "a launch always has a zone to publish");
+        let mut window = vec![0u8; veepn::launch_len("udid", &named)];
+        assert!(
+            veepn::launch_into("udid", &named, &mut window).is_ok(),
+            "{named}"
+        );
+    }
+
+    /// The id the plane keys its free pool on: one per process unless the config names one, and shaped the way a v4 has to be.
+    #[test]
+    fn the_launch_id_is_the_one_configured_or_a_version_four() {
+        assert_eq!(udid("given-id"), "given-id");
+        let drawn = udid("");
+        let bytes = drawn.as_bytes();
+        assert_eq!(bytes.len(), 36, "{drawn}");
+        assert_eq!(bytes[8], b'-', "and the hyphens sit where a uuid puts them");
+        assert!(matches!(&drawn[14..15], "4"), "version four: {drawn}");
+        assert!(
+            matches!(&drawn[19..20], "8" | "9" | "a" | "b"),
+            "variant ten: {drawn}"
+        );
+        assert_ne!(drawn, udid(""), "two lanes are two devices");
+    }
+
+    /// The lane's open, end to end: an upstream that reads the `Basic` pair the region's list coded, answers 200, and carries the tunnel's bytes back. This is the witness that the pair reaches the wire where a `Bearer` pass would.
+    #[test]
+    fn an_upstream_reads_the_pair_and_carries_the_tunnel() {
+        use std::io::{Read, Write};
+        let (roots, server) = crate::foxy::loopback::minted(b"http/1.1");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts tls");
+            tls.handshake().expect("handshakes");
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                tls.read_exact(&mut byte).expect("reads the request");
+                head.push(byte[0]);
+            }
+            assert_eq!(
+                String::from_utf8(head).expect("ascii"),
+                "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Basic MTAwMC1hYmM6czNjcjN0\r\n\r\n",
+                "the pair the list coded is the pair the upstream reads"
+            );
+            tls.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                .expect("answers");
+            let mut buf = [0u8; 64];
+            let read = tls.read(&mut buf).expect("reads the tunnel");
+            assert_eq!(&buf[..read], crate::foxy::loopback::PAYLOAD);
+            tls.write_all(&buf[..read]).expect("echoes");
+        });
+        let mut window = [0u8; 64];
+        let coded = veepn::credential_into("1000-abc", "s3cr3t", &mut window).expect("window");
+        let mut dial = crate::foxy::loopback::dial_for(
+            roots,
+            port,
+            Carrier::H1,
+            ferrox_core::foxy::pin::Pins::default(),
+        );
+        dial.pass = pass(std::str::from_utf8(coded).expect("ascii"));
+        let mut tunnel =
+            crate::foxy::open_h1(&dial, "example.com:443", BASIC_HEAD, &dial.pass.token)
+                .expect("opens");
+        tunnel
+            .write_all(crate::foxy::loopback::PAYLOAD)
+            .expect("writes");
+        tunnel.flush().expect("flushes");
+        let mut got = [0u8; 64];
+        let read = tunnel.read(&mut got).expect("reads back");
+        assert_eq!(
+            &got[..read],
+            crate::foxy::loopback::PAYLOAD,
+            "the tunnel carries the bytes unchanged"
+        );
+        edge.join().expect("joins");
+    }
+
+    /// One request head read to its delimiter: both branches of the fake plane walk it, and neither needs the octets past it.
+    fn head<S: std::io::Read>(io: &mut S) -> String {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            io.read_exact(&mut byte).expect("reads the head");
+            head.push(byte[0]);
+        }
+        String::from_utf8(head).expect("ascii")
+    }
+
+    /// The control plane end to end with no network in it: a launch that answers a token, a region list that answers a pair, and the upstream that reads that pair. This is the only gate that runs `access`, `ask` and `walk`, so the `Bearer` a plane ask carries, the anonymous launch that earns it and the `Basic` a tunnel carries are all witnessed by what actually went on the wire.
+    #[test]
+    fn the_plane_launches_lists_and_carries_a_flow() {
+        use std::io::{Read, Write};
+        let (roots, server) = crate::foxy::loopback::minted_at(b"http/1.1", "127.0.0.1");
+        let bound = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = bound.local_addr().expect("addr").port();
+        let listener = crate::conn::Listener::Tcp(bound);
+        let lists = format!(
+            "[{{\"username\": \"1000-abc\", \"password\": \"s3cr3t\", \"port\": {port}, \"addresses\": [\"127.0.0.1\"]}}, {{\"username\": \"\", \"password\": \"\", \"port\": 0, \"addresses\": []}}]"
+        );
+        let asked = Arc::new(Mutex::new(Vec::<String>::new()));
+        let log = Arc::clone(&asked);
+        let plane = std::thread::spawn(move || {
+            for _ in 0..3 {
+                let (stream, _) = listener.accept().expect("accepts");
+                let mut tls =
+                    ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                        .expect("accepts tls");
+                tls.handshake().expect("handshakes");
+                let text = head(&mut tls);
+                if text.starts_with("CONNECT ") {
+                    assert_eq!(
+                        text,
+                        "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Basic MTAwMC1hYmM6czNjcjN0\r\n\r\n",
+                        "the pair the list coded is the pair the upstream reads"
+                    );
+                    tls.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        .expect("answers");
+                    let mut buf = [0u8; 64];
+                    let read = tls.read(&mut buf).expect("reads the tunnel");
+                    assert_eq!(&buf[..read], crate::foxy::loopback::PAYLOAD);
+                    tls.write_all(&buf[..read]).expect("echoes");
+                    continue;
+                }
+                let mut fields = text.split("\r\n");
+                let line = fields.next().expect("a request line").to_owned();
+                let path = line.split(' ').nth(1).expect("a path");
+                let auth = fields
+                    .clone()
+                    .find_map(|field| field.strip_prefix("Authorization: "))
+                    .unwrap_or_default()
+                    .to_owned();
+                let want: usize = fields
+                    .find_map(|field| field.strip_prefix("Content-Length: "))
+                    .expect("a length")
+                    .parse()
+                    .expect("digits");
+                let mut body = vec![0u8; want];
+                tls.read_exact(&mut body).expect("reads the body");
+                let answer = if path == veepn::LAUNCH {
+                    r#"{"access": "t0ken"}"#
+                } else {
+                    lists.as_str()
+                };
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{answer}",
+                    answer.len()
+                );
+                tls.write_all(reply.as_bytes()).expect("answers");
+                log.lock().expect("locks").push(format!(
+                    "{line} auth:{auth} body:{}",
+                    String::from_utf8_lossy(&body)
+                ));
+            }
+        });
+        let lane = VeepnOut::new(
+            "DE".to_owned(),
+            &[format!("https://127.0.0.1:{port}")],
+            "udid-1".to_owned(),
+            ferrox_core::tls::Anchors::from(roots),
+        )
+        .expect("lane");
+        let mut tunnel = lane
+            .open("example.com:443")
+            .expect("opens through the plane");
+        tunnel
+            .write_all(crate::foxy::loopback::PAYLOAD)
+            .expect("writes");
+        tunnel.flush().expect("flushes");
+        let mut got = [0u8; 64];
+        let read = tunnel.read(&mut got).expect("reads back");
+        assert_eq!(&got[..read], crate::foxy::loopback::PAYLOAD);
+        plane.join().expect("joins");
+        let asked = asked.lock().expect("locks");
+        assert_eq!(asked.len(), 2, "{asked:?}");
+        assert!(
+            asked[0].starts_with("POST /v3/launch/") && asked[0].contains("auth: body:"),
+            "a launch is anonymous: {}",
+            asked[0]
+        );
+        assert!(asked[0].contains("\"udid\": \"udid-1\""), "{}", asked[0]);
+        assert!(
+            asked[1].starts_with("POST /v3/server/list/") && asked[1].contains("auth:Bearer t0ken"),
+            "the list is asked with the token the launch answered: {}",
+            asked[1]
+        );
+        assert!(asked[1].contains("\"region\": \"DE\""), "{}", asked[1]);
+    }
+}

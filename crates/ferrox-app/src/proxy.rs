@@ -568,6 +568,7 @@ enum Outbound {
     Vmess(VmessOut),
     Shadowsocks(ShadowsocksOut),
     Foxy(Box<FoxyOut>),
+    Veepn(crate::veepn::VeepnOut),
     Freedom,
     Http(HttpOut),
 }
@@ -581,7 +582,7 @@ impl Outbound {
             Self::Vmess(vmess) => resolve_outbound(&vmess.address, vmess.port),
             Self::Shadowsocks(ss) => resolve_outbound(&ss.address, ss.port),
             Self::Http(http) => resolve_outbound(&http.address, http.port),
-            Self::Foxy(_) | Self::Freedom => None,
+            Self::Foxy(_) | Self::Veepn(_) | Self::Freedom => None,
         }
     }
 }
@@ -5679,8 +5680,11 @@ fn serve_trojan_httpheader(stream: Connection, key: &[u8; 56], path: &str, freed
 }
 
 fn serve_socks(mut client: Connection, out: &Outbound) {
-    // Foxy grants only after its tunnel opens; a doubled grant reads as ten bytes of tunnel data.
-    let Some((cmd, asked)) = socks_target(&mut client, !matches!(out, Outbound::Foxy(_))) else {
+    // Foxy and VeePN grant only after their tunnel opens; a doubled grant reads as ten bytes of tunnel data.
+    let Some((cmd, asked)) = socks_target(
+        &mut client,
+        !matches!(out, Outbound::Foxy(_) | Outbound::Veepn(_)),
+    ) else {
         return;
     };
     if cmd == 3 {
@@ -5699,6 +5703,9 @@ fn serve_connect(
 ) {
     if let Outbound::Foxy(foxy) = out {
         return serve_foxy_front(client, foxy, asked, front, prefix);
+    }
+    if let Outbound::Veepn(lane) = out {
+        return serve_veepn_front(client, lane, asked, front, prefix);
     }
     if matches!(out, Outbound::Freedom) {
         // Nothing carries the destination onward, so this lane is the one that has to look it up.
@@ -5822,7 +5829,7 @@ fn dial_socks_outbound(
         Outbound::Http(http) => {
             dial_http_outbound(client, server, http, target, ladder);
         }
-        Outbound::Foxy(_) | Outbound::Freedom => {}
+        Outbound::Foxy(_) | Outbound::Veepn(_) | Outbound::Freedom => {}
     }
 }
 
@@ -6273,8 +6280,34 @@ fn serve_foxy_front(
     }
 }
 
-const HTTP_HEAD_LIMIT: usize = 8192;
+/// The `VeePN` half of either front: the plane names the upstream, the `Foxy` record lane opens it, and the grant waits for that open as it does for Foxy's.
+fn serve_veepn_front(
+    mut client: Connection,
+    lane: &crate::veepn::VeepnOut,
+    asked: &Destination,
+    front: Front,
+    prefix: &[u8],
+) {
+    let mut tunnel = match lane.open(&asked.authority()) {
+        Ok(tunnel) => tunnel,
+        Err(why) => {
+            eprintln!("veepn: {why}");
+            let _ = client.write_all(&front.refusal(0x01));
+            return;
+        }
+    };
+    if prefix.is_empty() && client.write_all(front.grant_line()).is_err() {
+        return;
+    }
+    if !prefix.is_empty() && tunnel.write_all(prefix).is_err() {
+        return;
+    }
+    // One lock serves both directions: a blocking read would hold the writer, hence the bounded quantum.
+    let _ = tunnel.set_read_quantum(budgets::relay_quantum());
+    relay_tunnel(&client, &std::sync::Arc::new(std::sync::Mutex::new(tunnel)));
+}
 
+const HTTP_HEAD_LIMIT: usize = 8192;
 /// An HTTP proxy request: a tunnel to open, or a head to forward to a raw uplink.
 enum ProxyRequest {
     Connect(Destination),
@@ -6394,7 +6427,7 @@ fn serve_http(mut client: Connection, out: &Outbound) {
     };
     match request {
         ProxyRequest::Connect(asked) => {
-            if !matches!(out, Outbound::Foxy(_))
+            if !matches!(out, Outbound::Foxy(_) | Outbound::Veepn(_))
                 && client.write_all(Front::Http.grant_line()).is_err()
             {
                 return;
@@ -9779,6 +9812,9 @@ fn find_outbound(root: &Json) -> Option<Outbound> {
     if let Some(foxy) = find_foxy_outbound(root) {
         return Some(Outbound::Foxy(Box::new(foxy)));
     }
+    if let Some(lane) = find_veepn_outbound(root) {
+        return Some(Outbound::Veepn(lane));
+    }
     if let Some(vless) = find_vless_outbound(root) {
         return Some(Outbound::Vless(vless));
     }
@@ -10243,6 +10279,46 @@ fn resolve(host: &str, port: u16) -> Option<SocketAddr> {
         .and_then(|mut addrs| addrs.next())
 }
 
+/// No CA file trusts the machine's anchors; an empty store is trust-nothing.
+fn ca_roots(settings: Option<&Json>) -> ferrox_core::tls::Anchors {
+    settings
+        .and_then(|s| s.get("caCertFile"))
+        .and_then(Json::as_str)
+        .and_then(|path| std::fs::read(path).ok())
+        .map(|pem| ferrox_core::tls::Anchors::from(crate::quic::parse_ca_pem(&pem)))
+        .filter(|roots: &ferrox_core::tls::Anchors| !roots.is_empty())
+        .unwrap_or_else(crate::quic::system_roots)
+}
+
+/// The `VeePN` lane: an anonymous launch over a rotation of origins, one region's list, and the upstream that answers `Basic` for the pair it names.
+fn find_veepn_outbound(root: &Json) -> Option<crate::veepn::VeepnOut> {
+    let empty = Vec::new();
+    for outbound in root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty)
+    {
+        if outbound.get("protocol").and_then(Json::as_str) != Some("veepn") {
+            continue;
+        }
+        let settings = outbound.get("settings");
+        let mut domains = foxy_strings(settings.and_then(|s| s.get("domains")));
+        if domains.is_empty() {
+            domains = ferrox_core::veepn::DEFAULT_DOMAINS
+                .iter()
+                .map(|url| (*url).to_owned())
+                .collect();
+        }
+        let udid = crate::veepn::udid(&foxy_text(settings, "udid"));
+        let region = foxy_text(settings, "region");
+        match crate::veepn::VeepnOut::new(region, &domains, udid, ca_roots(settings)) {
+            Ok(lane) => return Some(lane),
+            Err(why) => eprintln!("{why}: serves nothing"),
+        }
+    }
+    None
+}
+
 fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
     let empty = Vec::new();
     for outbound in root
@@ -10272,14 +10348,7 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
                 continue;
             }
         };
-        // No CA file trusts the machine's anchors; an empty store is trust-nothing.
-        let roots = settings
-            .and_then(|s| s.get("caCertFile"))
-            .and_then(Json::as_str)
-            .and_then(|path| std::fs::read(path).ok())
-            .map(|pem| ferrox_core::tls::Anchors::from(crate::quic::parse_ca_pem(&pem)))
-            .filter(|roots: &ferrox_core::tls::Anchors| !roots.is_empty())
-            .unwrap_or_else(crate::quic::system_roots);
+        let roots = ca_roots(settings);
         let pins = ferrox_core::foxy::pin::Pins::parse(foxy_list_or(&link, settings, "spkiPins"));
         let edge_address = foxy_edge_address(settings);
         let candidates = foxy_candidates(outbound, &link, &country, &city, roots.clone());
@@ -22016,6 +22085,31 @@ mod tests {
                 .is_some_and(|account| account.can_renew()),
             "a pasted pass has no grant to renew with"
         );
+    }
+
+    /// The `veepn` outbound starts on the rotation the code ships with when the config names none, and a configured origin that is not an https one is a refusal at boot rather than a rotation that dials nothing.
+    #[test]
+    fn a_veepn_outbound_starts_on_the_rotation_it_names_or_ships() {
+        for json in [
+            r#"{"outbounds":[{"protocol":"veepn","settings":{"region":"DE"}}]}"#,
+            r#"{"outbounds":[{"protocol":"veepn","settings":{"domains":["https://antpeak.com"]}}]}"#,
+            r#"{"outbounds":[{"protocol":"veepn","settings":{"domains":[]}}]}"#,
+            r#"{"outbounds":[{"protocol":"veepn"}]}"#,
+        ] {
+            let root = crate::json::parse(json).expect("parses");
+            assert!(find_veepn_outbound(&root).is_some(), "{json} serves");
+        }
+        for json in [
+            r#"{"outbounds":[{"protocol":"veepn","settings":{"domains":["http://antpeak.com"]}}]}"#,
+            r#"{"outbounds":[{"protocol":"veepn","settings":{"domains":["antpeak.com/path"]}}]}"#,
+            r#"{"outbounds":[{"protocol":"foxy","settings":{"email":"a@b.c"}}]}"#,
+        ] {
+            let root = crate::json::parse(json).expect("parses");
+            assert!(
+                find_veepn_outbound(&root).is_none(),
+                "{json} serves nothing"
+            );
+        }
     }
 
     /// The tag is the whole route: a loopback outbound without one names nowhere.

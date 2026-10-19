@@ -1368,7 +1368,11 @@ mod tests {
     /// stack into one `write_vectored`, so no buffer is built to hold it first.
     #[test]
     fn the_connect_request_gathers_without_a_heap_buffer() {
-        let parts = crate::foxy::connect_request("example.com:443", "pass.jwt.value");
+        let parts = crate::foxy::connect_request(
+            "example.com:443",
+            crate::foxy::BEARER_HEAD,
+            "pass.jwt.value",
+        );
         let want: usize = parts.iter().map(|part| part.len()).sum();
         let mut recorder = SegmentRecorder { calls: 0, bytes: 0 };
         // Three opens inside one window: a reclaim that stopped firing would show as a rising count.
