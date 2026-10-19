@@ -233,6 +233,8 @@ carrier-veepn dial-clones-per-flow 0 ferrox-app-veepn::tests::a_flow_dials_the_c
 carrier-veepn region-name-copies-per-flow 0 ferrox-app-veepn::tests::the_named_region_is_shared_not_copied_per_flow
 carrier-veepn origin-list-copies-per-ask 0 ferrox-app-veepn::tests::the_rotation_starts_where_the_last_one_left_off
 carrier-veepn edge-peer-read-allocations-per-entry 0 ferrox-core-foxy::tests::a_literal_edge_address_is_read_without_a_buffer_of_its_own
+carrier-veepn declined-edge-visits-per-two-flows 1 ferrox-app-veepn::tests::a_declined_edge_is_skipped_while_its_silence_lasts
+carrier-veepn silent-region-edges-probed-per-flow 1 ferrox-app-veepn::tests::a_silent_region_probes_one_edge_instead_of_its_whole_list
 carrier-foxy ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-foxy payload-staging-copies-per-byte-written 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane
 carrier-foxy payload-staging-copies-per-byte-read 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane

@@ -36,6 +36,9 @@ pub const RESERVE_TTL: u64 = 24 * 3600;
 pub const BACKOFF: [u64; 5] = [1, 2, 4, 8, 10];
 pub const REQUEST_BUDGET: u64 = 120;
 pub const MAX_ATTEMPTS: usize = 14;
+
+/// How long an upstream that declined a flow is left alone. One refused handshake says the edge is gone for now, and the flow after it has nothing to learn from paying the same discovery again.
+pub const EDGE_SILENCE: u64 = 60;
 pub const MAX_RESERVE_DOMAINS: usize = 10;
 
 /// The `user:pass` of one list entry, coded straight into the caller's window: the pair it encodes is never a buffer, because the coder reads the two runs and the colon between them as one stream.
