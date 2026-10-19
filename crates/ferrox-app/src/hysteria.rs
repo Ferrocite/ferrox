@@ -1447,12 +1447,14 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
             }
             let destination = association.destination;
             drop(held);
-            let Some((_address, payload)) = lane
-                .defrag
-                .lock()
-                .ok()
-                .and_then(|mut reassembly| reassembly.feed(&message).ok().flatten())
-            else {
+            let mut assembled = Vec::new();
+            let Some(payload) = lane.defrag.lock().ok().and_then(|mut reassembly| {
+                reassembly
+                    .feed(&message, &mut assembled)
+                    .ok()
+                    .flatten()
+                    .map(|(_address, payload)| payload)
+            }) else {
                 continue;
             };
             let Some(src) = lane.source.lock().ok().and_then(|slot| *slot) else {
@@ -1461,7 +1463,7 @@ fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpS
             reply.clear();
             reply.extend_from_slice(&[0, 0, 0]);
             crate::proxy::push_socks_addr(&mut reply, &destination);
-            reply.extend_from_slice(&payload);
+            reply.extend_from_slice(payload);
             let _ = relay.send_to(&reply, src);
         }
     }
@@ -1495,12 +1497,13 @@ fn relay_datagrams(
                 vacant.insert(opened)
             }
         };
-        let whole = flow.defrag.feed(&message);
+        let mut assembled = Vec::new();
+        let whole = flow.defrag.feed(&message, &mut assembled);
         flow.last = Instant::now();
         let forged = whole.is_err();
         match whole {
             Ok(Some((_address, payload))) => {
-                let _ = flow.target.send(&payload);
+                let _ = flow.target.send(payload);
             }
             Ok(None) => {}
             Err(_) => flow.stop.store(true, Ordering::Relaxed),
