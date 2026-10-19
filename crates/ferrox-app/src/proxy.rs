@@ -8352,21 +8352,34 @@ fn copy_all(from: &mut Connection, to: &mut Connection) {
 
 #[inline]
 fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
+    // Once per leg, outside the byte loop: a budget read per buffer would price the copy.
+    let stall = crate::budgets::relay_stall();
+    let _ = to.set_write_timeout(Some(stall));
+    // A read a caller already armed is that caller's to end: a poll quantum it set is how the leg stops, so this shape arms only a read nobody bounded.
+    let armed = from.read_timeout().ok().flatten();
+    let patient = armed.is_none();
+    let read_arm = armed.or(Some(stall));
+    let _ = from.set_read_timeout(read_arm);
     let mut buffer = RelayBuf::new();
     loop {
         let read = {
-            census!("relay-leg-read", crate::census::handle(from), None);
+            census!("relay-leg-read", crate::census::handle(from), read_arm);
             from.read(buffer.as_mut())
         };
         let n = match read {
-            Ok(0) | Err(_) => return,
+            Ok(0) => return,
             Ok(n) => n,
+            // An un-armed peer that has simply not spoken is idle, not ended: its read arm exists so this leg can still notice its partner gave up, which on Windows nothing else does.
+            Err(error) if patient && is_timeout(&error) => continue,
+            Err(_) => return,
         };
         let written = {
-            census!("relay-leg-write", crate::census::handle(to), None);
+            census!("relay-leg-write", crate::census::handle(to), Some(stall));
             to.write_all(buffer.filled(n))
         };
         if written.is_err() {
+            // Closing both halves is what ends the partner leg on a POSIX read parked inside its own socket; on Windows that park ends only at the read arm above, and a give-up that leaves a thread parked is not a give-up.
+            let _ = to.shutdown(Shutdown::Both);
             return;
         }
     }
@@ -23590,6 +23603,62 @@ mod relay_tests {
         parked.join().expect("joins");
     }
 
+    /// A peer that takes the downlink, reads none of the flow and never closes costs the stall
+    /// budget instead of the thread: the leg writing into it gives up at its arm and closes both
+    /// halves of that socket, which wakes the partner leg on a POSIX read parked in that socket —
+    /// on Windows nothing wakes it, so an un-armed read carries the same arm and ends at it. A half-close
+    /// wakes nothing anywhere, since the peer never reads the FIN. The buffered copy is what this
+    /// shape runs; the Linux pump keeps its own stalled-destination witness above. Loopback only.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_downlink_peer_that_reads_nothing_is_given_up_on_at_its_named_stall() {
+        const STALLED: Duration = Duration::from_millis(250);
+        const CEILING: Duration = Duration::from_secs(10);
+
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(STALLED),
+            ..Default::default()
+        });
+        let front = listener();
+        let front_port = port_of(&front);
+        let back = listener();
+        let back_port = port_of(&back);
+        let (release, hold) = mpsc::channel::<()>();
+        let silent = thread::spawn(move || {
+            let (_stream, _) = front.accept().expect("accepts");
+            let _ = hold.recv();
+        });
+        let pushing = thread::spawn(move || push_until_refused(&back, 512, CHUNK));
+        let client = Connection::connect(("127.0.0.1", front_port)).expect("dials");
+        let target = Connection::connect(("127.0.0.1", back_port)).expect("dials");
+
+        let began = std::time::Instant::now();
+        relay(&client, &target);
+        let took = began.elapsed();
+        // `relay` returns with its four duplicates gone, so these are the last handles: closing them stops the destination waiting out its own write timeout.
+        drop((client, target));
+        let _ = release.send(());
+        let pushed = pushing.join().expect("joins");
+        budgets::clear();
+
+        assert!(
+            pushed > 0,
+            "the destination wrote {pushed} bytes into a client that read none"
+        );
+        assert!(
+            took >= STALLED,
+            "the relay gave up after {took:?}, before its {STALLED:?} stall budget"
+        );
+        assert!(
+            took < CEILING,
+            "the relay took {took:?} to end a flow whose downlink peer reads nothing, so a leg \
+             is parked past its stall budget:\n{}",
+            crate::census::dump()
+        );
+        silent.join().expect("joins");
+    }
+
     /// A pipe ring's slots go before its bytes: 512-byte segments arriving one wake at a time
     /// stuff the ring at its slot ceiling while byte room remains, so an honest `POLLIN` still
     /// has nowhere to put what it sees. The destination has to be *moving* for that to spin —
@@ -23947,8 +24016,8 @@ mod census_tests {
         );
         let held = wait_for("relay-leg-read", leg_id);
         assert!(held.contains(&format!("fd={read_fd} ")), "{held}");
-        // A raw relay leg holds no deadline at its wait: its caller restores `None`, so the census says none.
-        assert!(held.contains("armed=none "), "{held}");
+        // The arm a caller gave the leg is the arm the census reports, so a stall shows its own bound instead of pretending to be unbounded.
+        assert!(held.contains("armed=2s "), "{held}");
         leg.join().expect("joins");
         assert!(
             census::held("relay-leg-read", leg_id).is_none(),

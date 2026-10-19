@@ -287,7 +287,7 @@ Today exactly one method dials per hop. The engine to build stacks them as an or
 | 121 | Tide down/up traffic-ratio shaping | planned | ZeroNet `tide/shape.rs`. Read as a superset rung beside row 103 |
 | 122 | Fountain-coded carrier rendezvous over DoH TXT | planned | ZeroNet `rendezvous.rs` |
 | 123 | Multi-file config layering (`-c` repeats, `-confdir`, tag-merge) | planned | ZeroNet `merge.rs`. Rows 119–122 land per-file layers once merging exists |
-| 124 | Nine wait budgets (`dial`, `handshake`, `headArrival`, `relayJoin`, `relayQuantum`, `udpIdle`, `payloadGrace`, `goawayGrace`, `carrierProbe`) | implemented | Each wait named once (`budgets.rs`), armed before the first inbound; unknown/missing-unit/zero refused by name. Loop cadences stay constants |
+| 124 | Ten wait budgets (`dial`, `handshake`, `headArrival`, `relayJoin`, `relayQuantum`, `relayStall`, `udpIdle`, `payloadGrace`, `goawayGrace`, `carrierProbe`) | implemented | Each wait named once (`budgets.rs`), armed before the first inbound; unknown/missing-unit/zero refused by name. Loop cadences stay constants |
 
 ### Conformance, per row
 
