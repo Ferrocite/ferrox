@@ -58,6 +58,12 @@ pub fn authority(host: &str, port: u16) -> String {
     }
 }
 
+/// The peer an edge name already is: a literal address and its port, read straight out of the text — no name built, no buffer taken, no resolver asked. A host that is not a literal answers `None`, so the names that need resolving still reach it.
+#[must_use]
+pub fn edge_peer(host: &str, port: u16) -> Option<std::net::SocketAddr> {
+    Some(std::net::SocketAddr::new(host.parse().ok()?, port))
+}
+
 /// The `Proxy-Authorization` line a pass is presented with: the scheme rides the literal because the record lane's gather stack holds seven runs, and a scheme coded into the value would need an eighth.
 pub const BEARER_HEAD: &[u8] = b"\r\nProxy-Authorization: Bearer ";
 
@@ -372,6 +378,47 @@ mod tests {
         assert_eq!(authority("example.com", 443), "example.com:443");
         assert_eq!(authority("::1", 443), "[::1]:443");
         assert_eq!(authority("2001:db8::1", 8080), "[2001:db8::1]:8080");
+    }
+
+    /// A literal edge address is read out of the text it is written in — no name built and no buffer taken, which the window below counts rather than infers — and a host that is not a literal is left for the resolver with a `None`, not a half-read address.
+    #[test]
+    fn a_literal_edge_address_is_read_without_a_buffer_of_its_own() {
+        assert_eq!(
+            edge_peer("192.0.2.12", 8443),
+            Some("192.0.2.12:8443".parse().expect("address")),
+            "the listed address and its port, as one peer"
+        );
+        assert_eq!(
+            edge_peer("2001:db8::1", 443),
+            Some("[2001:db8::1]:443".parse().expect("address")),
+            "a bare v6 literal is an address, not the ambiguous host:port the old name spelled"
+        );
+        assert_eq!(
+            edge_peer("edge.example", 443),
+            None,
+            "a name is the resolver's"
+        );
+        assert_eq!(
+            edge_peer("fe80::1%eth0", 443),
+            None,
+            "a scoped address keeps the answer the resolver gives"
+        );
+        assert_eq!(edge_peer("", 443), None, "no host is not an address");
+        // Both branches, through an input the optimizer cannot fold out of the loop.
+        let hosts = ["192.0.2.12", "edge.example"];
+        let (_, counts) = crate::alloc_count::measure(|| {
+            for at in 0..4096 {
+                std::hint::black_box(edge_peer(
+                    std::hint::black_box(hosts[at % hosts.len()]),
+                    std::hint::black_box(443),
+                ));
+            }
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "4096 reads of an edge address take no heap at all"
+        );
     }
 
     #[test]
