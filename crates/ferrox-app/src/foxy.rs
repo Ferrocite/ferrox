@@ -415,10 +415,20 @@ fn read_exact<S: Read>(io: &mut S, buf: &mut [u8]) -> std::io::Result<()> {
 }
 
 /// HTTP/1.1 CONNECT: the request, the status line, then the target's own bytes.
-pub(crate) fn open_h1(dial: &FoxyDial, target: &str) -> Result<Tls1, Failure> {
+/// The `Proxy-Authorization` head literal is a parameter so one seven-run builder serves every scheme a lane dials with.
+pub(crate) fn open_h1(
+    dial: &FoxyDial,
+    target: &str,
+    authorization_head: &'static [u8],
+    credential: &str,
+) -> Result<Tls1, Failure> {
     let mut tls = tls_to_edge(dial)?;
-    tls.write_all_slices(&foxy::connect_request(target, &dial.pass.token))
-        .map_err(|_| Failure::Io)?;
+    tls.write_all_slices(&foxy::connect_request(
+        target,
+        authorization_head,
+        credential,
+    ))
+    .map_err(|_| Failure::Io)?;
     let (status, carried) = head(&mut tls)?;
     opened(status)?;
     Ok(Tls1 {
@@ -2207,7 +2217,9 @@ pub(crate) enum Tunnel {
 impl Tunnel {
     pub(crate) fn open(dial: &FoxyDial, target: &str, quic: Option<Quic>) -> Result<Self, Failure> {
         match (dial.carrier, quic) {
-            (Carrier::H1, _) => open_h1(dial, target).map(Self::H1),
+            (Carrier::H1, _) => {
+                open_h1(dial, target, foxy::BEARER_HEAD, &dial.pass.token).map(Self::H1)
+            }
             (Carrier::H2, _) => open_h2(dial, target).map(Self::H2),
             (Carrier::H3, Some(quic)) => {
                 H3::open(dial, target, quic).map(|lane| Self::H3(Box::new(lane)))
@@ -2614,15 +2626,22 @@ mod tests {
 }
 
 #[cfg(test)]
-mod loopback {
+pub(crate) mod loopback {
     use super::*;
     use crate::conn::Listener;
 
-    const PAYLOAD: &[u8] = b"the tunnel carries the bytes unchanged";
+    pub(crate) const PAYLOAD: &[u8] = b"the tunnel carries the bytes unchanged";
 
-    fn minted(alpn: &[u8]) -> (Vec<Vec<u8>>, ferrox_core::tls::TlsServerConfig) {
-        let minted =
-            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
+    pub(crate) fn minted(alpn: &[u8]) -> (Vec<Vec<u8>>, ferrox_core::tls::TlsServerConfig) {
+        minted_at(alpn, "localhost")
+    }
+
+    /// The same edge under the name the dialer puts in its handshake: a lane dialled at an IP literal needs an `IpAddress` SAN, which is a different check in the verifier than a DNS one.
+    pub(crate) fn minted_at(
+        alpn: &[u8],
+        subject: &str,
+    ) -> (Vec<Vec<u8>>, ferrox_core::tls::TlsServerConfig) {
+        let minted = rcgen::generate_simple_self_signed(vec![subject.to_owned()]).expect("mints");
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
         let server = ferrox_core::tls::TlsServerConfig {
             cert_chain: vec![minted.cert.der().to_vec()],
@@ -2634,7 +2653,7 @@ mod loopback {
         (roots, server)
     }
 
-    fn dial_for(
+    pub(crate) fn dial_for(
         roots: Vec<Vec<u8>>,
         port: u16,
         carrier: Carrier,

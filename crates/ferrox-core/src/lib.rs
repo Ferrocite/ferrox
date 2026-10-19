@@ -23,6 +23,7 @@ pub mod shadowsocks;
 pub mod shadowsocks2022;
 pub mod tls;
 pub mod transport;
+pub mod veepn;
 pub mod vless;
 pub mod wireguard;
 

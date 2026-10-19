@@ -351,6 +351,21 @@ impl Endpoint {
 
 use std::net::ToSocketAddrs as _;
 
+/// One request and its answer over TLS, headers exactly as the caller wrote them: the exchange every plane of this app makes, cookie jar or none.
+pub(crate) fn ask(
+    endpoint: &Endpoint,
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<Reply, String> {
+    let mut tls = endpoint.connect()?;
+    tls.write_all(&request(method, &endpoint.origin(), url, headers, body))
+        .and_then(|()| tls.flush())
+        .map_err(|why| format!("writing {} {url}: {why}", endpoint.host))?;
+    read_reply(&mut tls).map_err(|why| format!("reading {} {url}: {why}", endpoint.host))
+}
+
 /// One request and answer through the jar; the agent and accept are the caller's because API and challenge differ.
 pub(crate) fn send(
     endpoint: &Endpoint,
@@ -375,12 +390,7 @@ pub(crate) fn send(
     if let Some(cookie) = cookie.as_deref() {
         headers.push(("Cookie", cookie));
     }
-    let mut tls = endpoint.connect().map_err(Denied::Unreachable)?;
-    tls.write_all(&request(method, &endpoint.origin(), &url, &headers, body))
-        .and_then(|()| tls.flush())
-        .map_err(|why| Denied::Unreachable(format!("writing {} {url}: {why}", endpoint.host)))?;
-    let reply = read_reply(&mut tls)
-        .map_err(|why| Denied::Unreachable(format!("reading {} {url}: {why}", endpoint.host)))?;
+    let reply = ask(endpoint, method, &url, &headers, body).map_err(Denied::Unreachable)?;
     if let Ok(mut jar) = jar.lock() {
         jar.absorb(&endpoint.host, &reply);
     }
@@ -846,7 +856,7 @@ pub(crate) struct Account {
     pub(crate) pass: std::sync::Arc<std::sync::Mutex<Pass>>,
 }
 
-fn epoch() -> u64 {
+pub(crate) fn epoch() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs())

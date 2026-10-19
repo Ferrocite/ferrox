@@ -1,8 +1,11 @@
 const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+/// The `String`-returning coder, walked a chunk at a time with no intermediate buffer to zero and no validation pass afterwards.
+///
+/// [`encode_parts_into`] is the other route to these bytes and the one that writes where the caller already has a window; `the_window_coder_matches_the_alphabet_at_every_length` holds the two byte-identical, which is why this shape survives instead of delegating and paying a fill plus a UTF-8 walk per call.
 #[must_use]
 pub fn encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut out = String::with_capacity(encoded_len(bytes.len()));
     for chunk in bytes.chunks(3) {
         let mut word = 0u32;
         for byte in chunk {
@@ -23,6 +26,93 @@ pub fn encode(bytes: &[u8]) -> String {
         });
     }
     out
+}
+
+#[must_use]
+pub const fn encoded_len(bytes: usize) -> usize {
+    bytes.div_ceil(3) * 4
+}
+
+/// The coded text of several runs put end to end, written straight into the caller's buffer: the concatenation is never a buffer of its own, so a credential costs one pass over its bytes instead of a staging copy and a coder pass.
+///
+/// # Errors
+/// [`std::io::ErrorKind::InvalidInput`] when `out` is shorter than the exact coded length.
+pub fn encode_parts_into(parts: &[&[u8]], out: &mut [u8]) -> std::io::Result<usize> {
+    let total: usize = parts.iter().map(|part| part.len()).sum();
+    let len = encoded_len(total);
+    let out = out
+        .get_mut(..len)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let mut source = Gather {
+        parts,
+        part: 0,
+        at: 0,
+    };
+    let groups = total / 3;
+    for group in 0..groups {
+        let word = source.triple();
+        let at = group * 4;
+        out[at..at + 4].copy_from_slice(&[
+            STD[(word >> 18 & 63) as usize],
+            STD[(word >> 12 & 63) as usize],
+            STD[(word >> 6 & 63) as usize],
+            STD[(word & 63) as usize],
+        ]);
+    }
+    // The 1..=2 bytes that did not fill a group take the padding their empty lanes would have coded.
+    let at = groups * 4;
+    match total - groups * 3 {
+        0 => {}
+        1 => {
+            let word = u32::from(source.byte().expect("the counted leftover")) << 16;
+            out[at..at + 4].copy_from_slice(&[
+                STD[(word >> 18 & 63) as usize],
+                STD[(word >> 12 & 63) as usize],
+                b'=',
+                b'=',
+            ]);
+        }
+        _ => {
+            let word = (u32::from(source.byte().expect("the first leftover")) << 16)
+                | (u32::from(source.byte().expect("the second leftover")) << 8);
+            out[at..at + 4].copy_from_slice(&[
+                STD[(word >> 18 & 63) as usize],
+                STD[(word >> 12 & 63) as usize],
+                STD[(word >> 6 & 63) as usize],
+                b'=',
+            ]);
+        }
+    }
+    Ok(len)
+}
+
+struct Gather<'a> {
+    parts: &'a [&'a [u8]],
+    part: usize,
+    at: usize,
+}
+
+impl Gather<'_> {
+    fn byte(&mut self) -> Option<u8> {
+        loop {
+            let part = *self.parts.get(self.part)?;
+            if let Some(byte) = part.get(self.at) {
+                self.at += 1;
+                return Some(*byte);
+            }
+            self.part += 1;
+            self.at = 0;
+        }
+    }
+
+    /// The next three bytes as one word; the group count comes from the total, so a caller only asks while the bytes are known to be there.
+    fn triple(&mut self) -> u32 {
+        let mut word = 0u32;
+        for lane in (0..3).rev() {
+            word |= u32::from(self.byte().expect("the counted group")) << (8 * lane);
+        }
+        word
+    }
 }
 
 pub fn value(byte: u8) -> Option<u8> {
@@ -96,6 +186,77 @@ mod tests {
             decode(url.trim_end_matches('=').as_bytes()),
             Some(raw.to_vec())
         );
+    }
+
+    /// Every length, both padding shapes included, and the write lands in the buffer the caller handed over: no allocation of its own.
+    #[test]
+    fn the_window_coder_matches_the_alphabet_at_every_length() {
+        let mut word = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            word ^= word << 13;
+            word ^= word >> 7;
+            word ^= word << 17;
+            word as u8
+        };
+        for len in 0..=80usize {
+            let bytes: Vec<u8> = (0..len).map(|_| next()).collect();
+            let mut staged = vec![0u8; encoded_len(len)];
+            let written = encode_parts_into(&[&bytes], &mut staged).expect("exact length");
+            assert_eq!(written, staged.len(), "coded length for {len} bytes");
+            assert_eq!(
+                std::str::from_utf8(&staged).expect("ascii"),
+                encode(&bytes),
+                "{len} bytes"
+            );
+        }
+        let mut too_short = [0u8; 4];
+        assert_eq!(
+            encode_parts_into(&[b"abcd"], &mut too_short)
+                .err()
+                .map(|e| e.kind()),
+            Some(std::io::ErrorKind::InvalidInput),
+            "a buffer under the coded length is refused rather than partially filled"
+        );
+        assert_eq!(too_short, [0; 4], "and it is left untouched");
+    }
+
+    /// The gathered coder is the concatenation's coder: every total length, with the split put at every position inside it, so a group straddling the boundary and a tail of either side are both covered.
+    #[test]
+    fn the_gathered_coder_puts_the_concatenation_in_the_callers_buffer() {
+        for len in 0..=40usize {
+            let bytes: Vec<u8> = (0..len).map(|i| (i * 7 + 11) as u8).collect();
+            for split in 0..=len {
+                let (head, tail) = bytes.split_at(split);
+                let want = encode(&[head, tail].concat());
+                let mut out = vec![0u8; encoded_len(len)];
+                let written = encode_parts_into(&[head, b"", tail], &mut out)
+                    .unwrap_or_else(|_| panic!("{len} bytes split at {split}"));
+                assert_eq!(written, want.len(), "{len} split at {split}");
+                assert_eq!(
+                    std::str::from_utf8(&out).expect("ascii"),
+                    want,
+                    "{len} split at {split}"
+                );
+            }
+        }
+        let empty: &[u8] = &[];
+        assert_eq!(encode_parts_into(&[empty, empty], &mut []).unwrap(), 0);
+        let mut wide = [0u8; 8];
+        assert_eq!(
+            encode_parts_into(&[b"abc", b"d"], &mut wide).unwrap(),
+            8,
+            "a split run codes the same text as a whole one"
+        );
+        assert_eq!(&wide, b"YWJjZA==");
+        let mut too_short = [0u8; 3];
+        assert_eq!(
+            encode_parts_into(&[b"abc"], &mut too_short)
+                .err()
+                .map(|e| e.kind()),
+            Some(std::io::ErrorKind::InvalidInput),
+            "a buffer under the coded length is refused"
+        );
+        assert_eq!(too_short, [0; 3], "and left untouched");
     }
 
     #[test]
