@@ -256,6 +256,7 @@ carrier-foxy h3-empty-frames-called-the-end 0 ferrox-app-foxy::loopback::an_empt
 carrier-foxy h3-datagram-write-staging-bytes 19 ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_over_quic_and_echoes_a_datagram
 carrier-foxy h3-bytes-lost-in-a-block-arriving-in-pieces 0 ferrox-app-foxy::loopback::a_quic_block_that_arrives_in_pieces_keeps_the_pieces_it_already_holds
 carrier-foxy h2-bytes-lost-at-a-read-quantum 0 ferrox-app-foxy::loopback::a_frame_that_straddles_a_read_quantum_arrives_whole
+carrier-foxy uplink-bytes-blocked-by-a-parked-leg 0 ferrox-app-foxy::loopback::a_parked_downlink_leg_does_not_hold_the_uplink_behind_its_wait
 carrier-foxy h2-upload-bytes-blocked-by-an-unread-grant 0 ferrox-app-foxy::loopback::an_upload_is_paced_by_the_grants_the_edge_sends_rather_than_by_the_bytes_it_reads
 carrier-foxy window-update-frames-per-floor-crossing 2 ferrox-app-foxy::loopback::credit_crossing_the_floor_costs_one_pair_not_one_per_frame
 carrier-foxy window-update-frames-below-the-floor 0 ferrox-app-foxy::loopback::credit_held_under_the_floor_never_reaches_the_wire
