@@ -22788,11 +22788,11 @@ mod poll_relay {
         ingest_stalled: bool,
         src_at_eof: bool,
         ended: bool,
-        done: Option<mpsc::Sender<()>>,
+        done: Option<mpsc::Sender<Result<(), ()>>>,
     }
 
     impl Direction {
-        fn new(src: Connection, dst: Connection, done: mpsc::Sender<()>) -> Self {
+        fn new(src: Connection, dst: Connection, done: mpsc::Sender<Result<(), ()>>) -> Self {
             Self {
                 src,
                 dst,
@@ -22889,7 +22889,7 @@ mod poll_relay {
             self.ended = true;
             let _ = self.dst.shutdown(Shutdown::Write);
             if let Some(done) = self.done.take() {
-                let _ = done.send(());
+                let _ = done.send(Ok(()));
             }
         }
     }
@@ -23061,16 +23061,16 @@ mod poll_relay {
         client_write: Connection,
     ) {
         let worker = next();
-        let (first_tx, first_rx) = mpsc::channel();
-        let (second_tx, second_rx) = mpsc::channel();
+        let (first_tx, first_rx) = mpsc::channel::<Result<(), ()>>();
+        let (second_tx, second_rx) = mpsc::channel::<Result<(), ()>>();
         let first = Direction::new(client_read, target_write, first_tx);
         let second = Direction::new(target_read, client_write, second_tx);
         let _guards = arm_flow(&first, &second);
         worker.push(Flow {
             directions: vec![first, second],
         });
-        let _ = first_rx.recv();
-        let _ = second_rx.recv();
+        super::join(&first_rx);
+        super::join(&second_rx);
     }
 
     /// The arm's truth table, in the two units it mixes: `pending` counts bytes and the
@@ -23432,6 +23432,56 @@ mod relay_tests {
              bytes) once its destination read again ({held} drained)"
         );
         stalled_relay.join().expect("joins");
+    }
+
+    /// A leg parked inside the kernel costs the flow its join budget, the same bound the
+    /// fallback joins on, instead of the thread that started it. Loopback only, dials nothing;
+    /// the Linux job owns the splice pump.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_parked_splice_leg_costs_the_join_budget_not_a_thread() {
+        const JOINED: Duration = Duration::from_millis(250);
+        const SLACK: Duration = Duration::from_secs(10);
+
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            relay_join: Some(JOINED),
+            ..Default::default()
+        });
+        let front = listener();
+        let front_port = port_of(&front);
+        let back = listener();
+        let back_port = port_of(&back);
+        let (release, hold) = mpsc::channel::<()>();
+        let feeding = thread::spawn(move || push_until_refused(&front, 512, CHUNK));
+        let parked = thread::spawn(move || {
+            let (_stream, _) = back.accept().expect("accepts");
+            let _ = hold.recv();
+        });
+        let client = Connection::connect(("127.0.0.1", front_port)).expect("dials");
+        let target = Connection::connect(("127.0.0.1", back_port)).expect("dials");
+        let began = std::time::Instant::now();
+        relay(&client, &target);
+        let took = began.elapsed();
+        let _ = release.send(());
+        let pushed = feeding.join().expect("joins");
+        // Restored before the verdicts, so a leg another test is joining never reads this table.
+        budgets::clear();
+
+        assert!(
+            pushed > 0,
+            "the front wrote {pushed} bytes into a destination that read none"
+        );
+        assert!(
+            took >= JOINED,
+            "the relay gave up after {took:?}, before its {JOINED:?} join budget"
+        );
+        assert!(
+            took < JOINED * 2 + SLACK,
+            "the parked leg cost {took:?}, not its {JOINED:?} join budget:\n{}",
+            crate::census::dump()
+        );
+        parked.join().expect("joins");
     }
 
     /// A pipe ring's slots go before its bytes: 512-byte segments arriving one wake at a time
