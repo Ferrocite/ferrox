@@ -8131,10 +8131,7 @@ impl RelayPool {
         self.idle.lock().map_or(0, |idle| idle.len())
     }
 
-    fn run(
-        self: &Arc<Self>,
-        direction: impl FnOnce() + Send + 'static,
-    ) -> RelayEnd {
+    fn run(self: &Arc<Self>, direction: impl FnOnce() + Send + 'static) -> RelayEnd {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let task: RelayTask = Box::new(move || {
             let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(direction));
@@ -11645,11 +11642,12 @@ mod tests {
             }));
         }
         for wait in &waits {
-            wait.recv_timeout(RELAY_JOIN).expect(
-                "every direction must report that it ended, and a direction that never \
+            wait.recv_timeout(RELAY_JOIN)
+                .expect(
+                    "every direction must report that it ended, and a direction that never \
                          started means the pool serialised them instead of running them",
-            )
-            .expect("and none of them ended by panicking on an assert of its own");
+                )
+                .expect("and none of them ended by panicking on an assert of its own");
         }
         assert_eq!(
             arrived.load(std::sync::atomic::Ordering::SeqCst),
@@ -11729,7 +11727,9 @@ mod tests {
                 "a panicking direction still has to report that it ended, or the relay \
              waits on it forever",
             )
-            .expect_err("and the report says it panicked, so a joiner is not told the leg finished");
+            .expect_err(
+                "and the report says it panicked, so a joiner is not told the leg finished",
+            );
         let (tx, rx) = std::sync::mpsc::channel();
         pool.run(move || {
             let _ = tx.send(());
