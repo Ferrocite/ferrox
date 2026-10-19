@@ -802,12 +802,30 @@ pub fn parse_h3_request(block: &[u8]) -> Option<H3Request> {
 
 /// An HTTP/3 response on a request stream: a `HEADERS` frame carrying `:status` ahead of the caller's fields, then a `DATA` frame only when the body is not empty, each length-prefixed the way the auth answer frames its headers. The caller sends the stream FIN.
 pub fn encode_h3_response(status: u16, headers: &[(&str, &str)], body: &[u8], out: &mut Vec<u8>) {
-    let code = status.to_string();
-    let mut block = Vec::with_capacity(32 + 16 * headers.len());
-    let mut fields = Vec::with_capacity(headers.len() + 1);
-    fields.push((":status", code.as_str()));
-    fields.extend_from_slice(headers);
-    hpack::qpack_literal_many(&fields, &mut block);
+    // The code's digits go into the end of a stack buffer: `to_string` is one allocation per answer, and a `fields` list to prepend them to is another.
+    let mut code = [0u8; 5];
+    let mut at = code.len();
+    let mut rest = status;
+    loop {
+        at -= 1;
+        code[at] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    let mut block = Vec::with_capacity(
+        2 + hpack::qpack_field_len(7, code.len() - at)
+            + headers
+                .iter()
+                .map(|(name, value)| hpack::qpack_field_len(name.len(), value.len()))
+                .sum::<usize>(),
+    );
+    hpack::qpack_open(&mut block);
+    hpack::qpack_field(&mut block, ":status", &code[at..]);
+    for (name, value) in headers {
+        hpack::qpack_field(&mut block, name, value.as_bytes());
+    }
     frames::quic_varint(out, frames::H3_HEADERS);
     frames::quic_varint(out, block.len() as u64);
     out.extend_from_slice(&block);
@@ -1476,6 +1494,41 @@ mod tests {
         assert_eq!(data.kind, frames::H3_DATA);
         assert_eq!(data.length, 2);
         assert_eq!(&out[at..at + 2], b"hi");
+    }
+
+    /// One block buffer per answer, sized to the bytes it holds: the code's digits go on the wire from a stack array, no field list is joined ahead of them, and the caller's buffer is never grown by the answer.
+    #[test]
+    fn an_h3_answer_allocates_only_its_field_block() {
+        let headers = [
+            ("content-type", "text/html; charset=utf-8"),
+            ("server", "nginx"),
+        ];
+        let need = 2
+            + hpack::qpack_field_len(":status".len(), 3)
+            + headers
+                .iter()
+                .map(|(name, value)| hpack::qpack_field_len(name.len(), value.len()))
+                .sum::<usize>();
+        let mut out = Vec::with_capacity(need + 16);
+        encode_h3_response(200, &headers, b"cover", &mut out);
+        let block = out.as_ptr();
+        let capacity = out.capacity();
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                out.clear();
+                encode_h3_response(200, &headers, b"cover", &mut out);
+            }
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (4096, 4096 * need, 0),
+            "one block of {need} bytes per answer, and nothing joined or grown on the way"
+        );
+        assert_eq!(
+            (out.as_ptr(), out.capacity()),
+            (block, capacity),
+            "the answer never moved or grew the caller's own buffer"
+        );
     }
 
     #[test]
