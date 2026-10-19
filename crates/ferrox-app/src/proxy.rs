@@ -8774,12 +8774,22 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
     };
     let mut peer_read = peer_read;
     let mut peer_write = peer_write;
+    // The stall the buffered copy already arms, once per leg outside the byte loop: a peer that reads none of the download would otherwise pin this leg's read, and the join behind it, for the life of the process.
+    let stall = budgets::relay_stall();
+    let read_arm = peer_read.read_timeout().ok().flatten().or(Some(stall));
+    let _ = peer_read.set_read_timeout(read_arm);
+    let ended = Arc::new(AtomicBool::new(false));
     let uplink = writer.clone();
-    let done = thread::spawn(move || {
+    let forward_ended = Arc::clone(&ended);
+    let done = RelayPool::global().run(move || {
         let mut buf = RelayBuf::new();
         let mut first = true;
         loop {
-            match peer_read.read(buf.as_mut()) {
+            let read = {
+                census!("carrier-read", crate::census::handle(&peer_read), read_arm);
+                peer_read.read(buf.as_mut())
+            };
+            match read {
                 Ok(n) if n > 0 => {
                     if first {
                         echo_trace("relay fwd first read");
@@ -8804,7 +8814,12 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
                         break;
                     }
                 }
-                Err(error) if is_timeout(&error) => {}
+                // The arm is the bound, not the end: a quiet peer that has simply not spoken keeps its flow, while a sibling that gave up ends this leg on Windows, where its half-close wakes nothing.
+                Err(error) if is_timeout(&error) => {
+                    if forward_ended.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
                 Err(error) => {
                     echo_trace(&format!("relay fwd read err {error:?}"));
                     break;
@@ -8815,11 +8830,37 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
                 }
             }
         }
+        forward_ended.store(true, Ordering::Relaxed);
         if CLOSE_FIRST {
             uplink.close();
             let _ = peer_read.shutdown(Shutdown::Both);
         }
     });
+    carry_upload(&mut reader, &mut peer_write, &ended, stall);
+    ended.store(true, Ordering::Relaxed);
+    if CLOSE_FIRST {
+        writer.close();
+        on_reader_done(&mut reader);
+        let _ = peer_write.shutdown(Shutdown::Both);
+        let _ = join(&done);
+    } else {
+        let _ = peer_write.shutdown(Shutdown::Write);
+        let _ = join(&done);
+        writer.close();
+        let _ = peer_write.shutdown(Shutdown::Both);
+    }
+}
+
+/// The upload leg of an ordered carried relay: the carrier's reader into the peer's write half,
+/// armed with the stall it reports, ending on that leg's own stream error or on the sibling's
+/// give-up, whichever the arm reports.
+fn carry_upload<R: Read>(
+    reader: &mut R,
+    peer_write: &mut Connection,
+    ended: &AtomicBool,
+    stall: Duration,
+) {
+    let _ = peer_write.set_write_timeout(Some(stall));
     let mut buf = RelayBuf::new();
     let mut first = true;
     loop {
@@ -8831,6 +8872,11 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
                 if first {
                     echo_trace("relay bwd forwarding");
                 }
+                census!(
+                    "carrier-write",
+                    crate::census::handle(peer_write),
+                    Some(stall)
+                );
                 if peer_write.write_all(&buf.as_mut()[..n]).is_err() {
                     echo_trace("relay bwd peer write failed");
                     break;
@@ -8840,7 +8886,11 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
                     first = false;
                 }
             }
-            Err(error) if is_timeout(&error) => {}
+            Err(error) if is_timeout(&error) => {
+                if ended.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
             Err(error) => {
                 echo_trace(&format!("relay bwd read err {error:?}"));
                 break;
@@ -8850,17 +8900,6 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
                 break;
             }
         }
-    }
-    if CLOSE_FIRST {
-        writer.close();
-        on_reader_done(&mut reader);
-        let _ = peer_write.shutdown(Shutdown::Both);
-        let _ = done.join();
-    } else {
-        let _ = peer_write.shutdown(Shutdown::Write);
-        let _ = done.join();
-        writer.close();
-        let _ = peer_write.shutdown(Shutdown::Both);
     }
 }
 
@@ -8884,36 +8923,63 @@ pub(crate) fn relay_carried<R: Read>(mut reader: R, write: &Connection, peer: &C
     let Ok(mut uplink) = write.try_clone() else {
         return;
     };
-    let done = thread::spawn(move || {
+    // Every wait of this shape carries the named stall, armed once outside the byte loop: the half-close below is a write half, which wakes a parked read on no platform.
+    let stall = budgets::relay_stall();
+    let _ = peer_write.set_write_timeout(Some(stall));
+    let _ = uplink.set_write_timeout(Some(stall));
+    let read_arm = peer_read.read_timeout().ok().flatten().or(Some(stall));
+    let _ = peer_read.set_read_timeout(read_arm);
+    let ended = Arc::new(AtomicBool::new(false));
+    let forward_ended = Arc::clone(&ended);
+    let done = RelayPool::global().run(move || {
         let mut buf = RelayBuf::new();
         loop {
-            match peer_read.read(buf.as_mut()) {
+            let read = {
+                census!("carrier-read", crate::census::handle(&peer_read), read_arm);
+                peer_read.read(buf.as_mut())
+            };
+            match read {
                 Ok(n) if n > 0 => {
                     if uplink.write_all(&buf.as_mut()[..n]).is_err() {
                         break;
                     }
                 }
-                Err(error) if is_timeout(&error) => {}
+                Err(error) if is_timeout(&error) => {
+                    if forward_ended.load(Ordering::Relaxed) {
+                        break;
+                    }
+                }
                 _ => break,
             }
         }
+        forward_ended.store(true, Ordering::Relaxed);
         let _ = uplink.shutdown(Shutdown::Write);
     });
     let mut buf = RelayBuf::new();
     loop {
         match reader.read(buf.as_mut()) {
             Ok(n) if n > 0 => {
+                census!(
+                    "carrier-write",
+                    crate::census::handle(&peer_write),
+                    Some(stall)
+                );
                 if peer_write.write_all(&buf.as_mut()[..n]).is_err() {
                     break;
                 }
             }
-            Err(error) if is_timeout(&error) => {}
+            Err(error) if is_timeout(&error) => {
+                if ended.load(Ordering::Relaxed) {
+                    break;
+                }
+            }
             _ => break,
         }
     }
+    ended.store(true, Ordering::Relaxed);
     // Half-close this direction's write only: `Both` would abort the sibling clone's still-open read and drop a pending download.
     let _ = peer_write.shutdown(Shutdown::Write);
-    let _ = done.join();
+    let _ = join(&done);
 }
 
 // A quiet socket is not a dead one: retry the relay's poll grain, fail only a closed stream.
@@ -23659,6 +23725,146 @@ mod relay_tests {
         silent.join().expect("joins");
     }
 
+    /// The two loopback ends a carried relay needs, each with a holder thread that takes the
+    /// upload, reads none of the download and never closes, so nothing but an armed wait can end
+    /// the leg parked behind it.
+    struct Carried {
+        write: Connection,
+        destination: Connection,
+        release: (mpsc::Sender<()>, mpsc::Sender<()>),
+        holders: Vec<thread::JoinHandle<()>>,
+    }
+
+    impl Carried {
+        fn open(patience: Duration) -> Carried {
+            let carrier = listener();
+            let carrier_port = port_of(&carrier);
+            let (carrier_go, carrier_hold) = mpsc::channel::<()>();
+            let peer = listener();
+            let peer_port = port_of(&peer);
+            let (peer_go, peer_hold) = mpsc::channel::<()>();
+            let holders = vec![
+                thread::spawn(move || {
+                    let (_stream, _) = carrier.accept().expect("accepts");
+                    let _ = carrier_hold.recv_timeout(patience);
+                }),
+                thread::spawn(move || {
+                    let (_stream, _) = peer.accept().expect("accepts");
+                    let _ = peer_hold.recv_timeout(patience);
+                }),
+            ];
+            let write = Connection::connect(("127.0.0.1", carrier_port)).expect("dials");
+            let destination = Connection::connect(("127.0.0.1", peer_port)).expect("dials");
+            Carried {
+                write,
+                destination,
+                release: (carrier_go, peer_go),
+                holders,
+            }
+        }
+
+        /// Sends each holder away, so its accepted stream goes with it and any leg parked behind
+        /// one wakes, then joins them.
+        fn close(self) {
+            let Carried {
+                write,
+                destination,
+                release,
+                holders,
+            } = self;
+            drop((write, destination));
+            let _ = release.0.send(());
+            let _ = release.1.send(());
+            for holder in holders {
+                let _ = holder.join();
+            }
+        }
+    }
+
+    /// A peer that takes the upload, reads none of the download and never closes ends the carried
+    /// relay's inline leg at its own end of stream, and what that leg hands its sibling is a
+    /// *write* half-close, which wakes a parked read on no platform: the leg blocked in that read
+    /// has to give up at its named stall, or the join behind it waits for a thread that never
+    /// returns. Loopback only, dials nothing.
+    #[test]
+    fn a_carried_relay_ends_the_leg_behind_a_peer_that_reads_nothing() {
+        const STALLED: Duration = Duration::from_millis(250);
+        const CEILING: Duration = Duration::from_secs(10);
+
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(STALLED),
+            ..Default::default()
+        });
+        let carried = Carried::open(CEILING * 4);
+        let write = carried.write.try_clone().expect("clones");
+        let destination = carried.destination.try_clone().expect("clones");
+        let (handed, joined) = mpsc::channel();
+        let began = std::time::Instant::now();
+        let relayed = thread::spawn(move || {
+            relay_carried(std::io::empty(), &write, &destination);
+            let _ = handed.send(began.elapsed());
+        });
+
+        let Ok(took) = joined.recv_timeout(CEILING) else {
+            let held = crate::census::dump();
+            carried.close();
+            budgets::clear();
+            panic!("the carried relay never handed back over a peer that reads nothing:\n{held}");
+        };
+        let held = crate::census::dump();
+        // Restored before the verdicts, so a leg another test is joining never reads this table.
+        budgets::clear();
+        let _ = relayed.join();
+        carried.close();
+
+        assert!(
+            took >= STALLED,
+            "the carried relay handed back after {took:?}, before its peer's {STALLED:?} read arm \
+             could expire"
+        );
+        assert!(
+            took < CEILING,
+            "the carried relay took {took:?} to end a flow behind a peer that reads nothing, so a \
+             leg is parked past its stall budget:\n{held}"
+        );
+    }
+
+    /// The leg's own arm is the deep bound; the join in front of it is what hands the flow back.
+    /// Arm a stall the join budget cannot reach and a peer that reads nothing still costs the
+    /// caller its `relayJoin` and no more, with the worker left to end at its own arm. Loopback
+    /// only, dials nothing.
+    #[test]
+    fn a_carried_relay_gives_up_on_a_parked_leg_at_its_join_budget() {
+        const JOINED: Duration = Duration::from_millis(250);
+        const ARMED: Duration = Duration::from_secs(30);
+        const CEILING: Duration = Duration::from_secs(10);
+
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            relay_join: Some(JOINED),
+            relay_stall: Some(ARMED),
+            ..Default::default()
+        });
+        let carried = Carried::open(ARMED);
+        let began = std::time::Instant::now();
+        relay_carried(std::io::empty(), &carried.write, &carried.destination);
+        let took = began.elapsed();
+        let held = crate::census::dump();
+        budgets::clear();
+        carried.close();
+
+        assert!(
+            took >= JOINED,
+            "the carried relay handed back after {took:?}, before its {JOINED:?} join budget"
+        );
+        assert!(
+            took < JOINED * 2 + CEILING,
+            "the leg parked behind a peer that reads nothing cost the flow {took:?}, not its \
+             {JOINED:?} join budget:\n{held}"
+        );
+    }
+
     /// A pipe ring's slots go before its bytes: 512-byte segments arriving one wake at a time
     /// stuff the ring at its slot ceiling while byte room remains, so an honest `POLLIN` still
     /// has nowhere to put what it sees. The destination has to be *moving* for that to spin —
@@ -24074,6 +24280,72 @@ mod census_tests {
             census::held("relay-join", waiter_id).is_none(),
             "a returned join is still in the census:\n{}",
             census::dump()
+        );
+    }
+
+    /// The carried relay's upload leg parks in a *write*, on the caller's own thread, once its
+    /// peer stops taking bytes, and a write half-close on the sibling wakes nothing: the census
+    /// line names that write with the stall it was armed with, and the flow hands back at that
+    /// bound instead of holding the carrier's thread. The leg writes through the peer socket's own
+    /// clone, whose descriptor is not the caller's, so the line has to name a descriptor rather
+    /// than match a number. Loopback only, dials nothing.
+    #[test]
+    fn a_parked_carrier_write_gives_up_at_the_stall_it_reports() {
+        const STALLED: Duration = Duration::from_millis(250);
+        const CEILING: Duration = Duration::from_secs(10);
+        const UPLOAD: usize = 16 << 20;
+
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(STALLED),
+            ..Default::default()
+        });
+        let carrier = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let carrier_port = carrier.local_addr().expect("addr").port();
+        let peer = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let peer_port = peer.local_addr().expect("addr").port();
+        let write = Connection::connect(("127.0.0.1", carrier_port)).expect("connects");
+        let destination = Connection::connect(("127.0.0.1", peer_port)).expect("connects");
+        // Both peers stay open and read nothing, so the only progress either leg can make is its own bound.
+        let _silent_carrier = carrier.accept().map(|(stream, _)| stream).expect("accepts");
+        let _silent_peer = peer.accept().map(|(stream, _)| stream).expect("accepts");
+        let (handed, joined) = mpsc::channel();
+        let began = Instant::now();
+        let leg = thread::spawn(move || {
+            relay_carried(
+                std::io::Cursor::new(vec![0u8; UPLOAD]),
+                &write,
+                &destination,
+            );
+            let _ = handed.send(began.elapsed());
+        });
+        let leg_id = leg.thread().id();
+
+        let held = wait_for("carrier-write", leg_id);
+        assert!(held.contains("armed=250ms "), "{held}");
+        assert!(!held.contains("fd=none "), "{held}");
+        budgets::clear();
+        let Ok(took) = joined.recv_timeout(CEILING) else {
+            panic!(
+                "the carried relay never handed back over an upload its peer stopped taking:\n{}",
+                census::dump()
+            );
+        };
+        leg.join().expect("joins");
+        assert!(
+            census::held("carrier-write", leg_id).is_none(),
+            "a returned write is still in the census:\n{}",
+            census::dump()
+        );
+        assert!(
+            took >= STALLED,
+            "the carried relay handed back after {took:?}, before its upload's {STALLED:?} write \
+             arm could expire"
+        );
+        assert!(
+            took < CEILING,
+            "the carried relay took {took:?} to end a flow whose peer stopped taking the upload, \
+             so a write is parked past its stall budget"
         );
     }
 }
