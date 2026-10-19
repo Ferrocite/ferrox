@@ -725,6 +725,10 @@ mod tests {
     }
 
     /// Spent payload buffers go back to `spare` for the socket thread to fill, so after the window has been full once no received segment allocates; held capacity is the witness, since a fill that allocated or a drain that stopped returning buffers could not hold it steady.
+    #[cfg_attr(
+        miri,
+        ignore = "the worker closes a link silent for 30 s of wall clock"
+    )]
     #[test]
     fn the_receive_pool_serves_every_segment_without_growing() {
         let conn = echoing_connection();
