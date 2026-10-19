@@ -177,10 +177,12 @@ pub fn head_field<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
     lines.next()?;
     for line in lines {
         let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let Some((field, value)) = line.split_once(|byte| *byte == b':') else {
+        // A slice has no `split_once` on this toolchain, and the separator is one byte to find.
+        let Some(at) = line.iter().position(|byte| *byte == b':') else {
             continue;
         };
-        if field.eq_ignore_ascii_case(name) {
+        if line[..at].eq_ignore_ascii_case(name) {
+            let value = &line[at + 1..];
             return Some(value.strip_prefix(b" ").unwrap_or(value));
         }
     }
