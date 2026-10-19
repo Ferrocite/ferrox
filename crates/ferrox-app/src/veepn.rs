@@ -374,15 +374,16 @@ impl VeepnOut {
         }
     }
 
-    /// The rotation walked with the reference's backoff and its wall-clock budget: a domain that answers nothing rotates, the budget ends the walk, and a plane that refuses the token stops the walk to say so.
+    /// The rotation walked with the plane's own patience and the walk's wall-clock budget: a domain that answers nothing rotates at once, a plane that answers `429` or `5xx` is waited on, the budget ends the walk, and a plane that refuses the token stops the walk to say so.
     fn walk(&self, path: &str, body: &[u8], access: Option<&str>) -> Result<Walked, String> {
         let started = Instant::now();
         let (domains, start) = self.rotation();
         let count = domains.len();
+        let attempts = count.min(veepn::MAX_ATTEMPTS);
         let mut last = format!("{path} answered nothing");
         // The plane's asks are a body POSTed or a location GET: one of the two, decided by the body.
         let method = if body.is_empty() { "GET" } else { "POST" };
-        for attempt in 0..count.min(veepn::MAX_ATTEMPTS) {
+        for attempt in 0..attempts {
             if attempt != 0 && started.elapsed().as_secs() >= veepn::REQUEST_BUDGET {
                 return Err(format!(
                     "{path} ran out the {}s budget: {last}",
@@ -401,12 +402,16 @@ impl VeepnOut {
                 headers.push(("Authorization", value));
             }
             // An origin of this lane names a host and a port and no prefix, so the path is the whole request target.
+            let mut patience = false;
             match foxy_account::ask(endpoint, method, path, &headers, body) {
                 Err(why) => last = why,
                 Ok(reply) => match reply.status {
                     200..=299 => return Ok(Walked::Carried(reply)),
                     401 | 403 | 407 if access.is_some() => return Ok(Walked::Token),
-                    429 | 500..=599 => last = format!("{} answers {}", endpoint.host, reply.status),
+                    429 | 500..=599 => {
+                        last = format!("{} answers {}", endpoint.host, reply.status);
+                        patience = true;
+                    }
                     other => {
                         return Err(format!(
                             "{path} answers {other}: {}",
@@ -415,9 +420,10 @@ impl VeepnOut {
                     }
                 },
             }
-            std::thread::sleep(Duration::from_secs(
-                veepn::BACKOFF[attempt.min(veepn::BACKOFF.len() - 1)],
-            ));
+            let wait = veepn::pause(attempt, attempts, patience);
+            if wait != 0 {
+                std::thread::sleep(Duration::from_secs(wait));
+            }
         }
         Err(last)
     }
@@ -1409,6 +1415,29 @@ mod tests {
             head.push(byte[0]);
         }
         String::from_utf8(head).expect("ascii")
+    }
+
+    /// A plane that answers nothing is a fact about the network, and a walk that earns nothing from a dead origin should say so without waiting for one: one refused port fails this flow with no pause in front of it, where the same rotation paced by the answer counter slept a whole second before its error. The bound is well under that first step of the table, so a walk that pauses an unanswered attempt fails here.
+    #[test]
+    fn an_unreachable_plane_answers_without_a_pause() {
+        let dead = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let origin = format!(
+            "https://127.0.0.1:{}",
+            dead.local_addr().expect("addr").port()
+        );
+        drop(dead);
+        let out = lane(&[origin.as_str()]).expect("lane");
+        let started = std::time::Instant::now();
+        let why = match out.open("example.com:443") {
+            Err(why) => why,
+            Ok(_) => panic!("a plane that answers nothing fails the flow"),
+        };
+        let took = started.elapsed();
+        assert!(
+            took < std::time::Duration::from_millis(700),
+            "the walk paused {took:?} in front of a plane that never answered: {}",
+            why.why
+        );
     }
 
     /// The control plane end to end with no network in it: a launch that answers a token, a region list that answers a pair, and the upstream that reads that pair. This is the only gate that runs `access`, `ask` and `walk` to an answer, so the `Bearer` a plane ask carries, the anonymous launch that earns it and the `Basic` a tunnel carries are all witnessed by what actually went on the wire.

@@ -241,6 +241,8 @@ carrier-veepn refusal-field-allocations-per-refusal 0 ferrox-core-foxy::tests::h
 carrier-veepn unreachable-plane-asks-per-two-flows 1 ferrox-app-veepn::tests::a_plane_that_answers_nothing_carries_the_list_it_gave
 carrier-veepn unreachable-plane-edge-dials-per-flow 1 ferrox-app-veepn::tests::a_plane_that_answers_nothing_carries_the_list_it_gave
 carrier-veepn unreachable-plane-region-asks-per-two-flows 1 ferrox-app-veepn::tests::the_region_the_plane_named_survives_its_own_outage
+carrier-veepn unanswered-plane-pause-seconds-per-ask 0 ferrox-core-veepn::tests::a_plane_that_answered_nothing_is_rotated_away_from_not_waited_on
+carrier-veepn answered-plane-pause-seconds-per-ask 35 ferrox-core-veepn::tests::a_plane_that_answered_nothing_is_rotated_away_from_not_waited_on
 carrier-foxy ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-foxy payload-staging-copies-per-byte-written 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane
 carrier-foxy payload-staging-copies-per-byte-read 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane
