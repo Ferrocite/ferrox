@@ -16633,37 +16633,18 @@ mod tests {
             crate::shadowsocks::seal_datagram(&master, method, &target, &mut wire, at, 4, &mut hop)
                 .expect("seals")
                 .to_vec();
-        let mut attempts = 0usize;
-        loop {
-            attempts += 1;
-            assert!(attempts <= 15, "no echo after {attempts} fresh sockets");
-            let dial = UdpSocket::bind("127.0.0.1:0").expect("binds");
-            dial.set_read_timeout(Some(Duration::from_secs(2)))
-                .expect("timeout");
-            let mut back = vec![0u8; UDP_BUF];
-            let mut echoed = None;
-            for _ in 0..3 {
-                if dial
-                    .send_to(&packet, format!("127.0.0.1:{front_port}"))
-                    .is_err()
-                {
-                    break;
-                }
-                if let Ok((n, _)) = dial.recv_from(&mut back) {
-                    echoed = Some(n);
-                    break;
-                }
-            }
-            let Some(n) = echoed else {
-                continue;
-            };
-            let (source, payload) =
-                crate::shadowsocks::open_datagram(&master, method, &mut back[..n], &mut hop)
-                    .expect("opens");
-            assert_eq!(source.port(), target.port());
-            assert_eq!(payload, b"ping");
-            return;
-        }
+        let dial = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        dial.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        dial.send_to(&packet, format!("127.0.0.1:{front_port}"))
+            .expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = dial.recv_from(&mut back).expect("echoes");
+        let (source, payload) =
+            crate::shadowsocks::open_datagram(&master, method, &mut back[..n], &mut hop)
+                .expect("opens");
+        assert_eq!(source.port(), target.port());
+        assert_eq!(payload, b"ping");
     }
 
     #[test]
