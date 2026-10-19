@@ -5,7 +5,6 @@ use crate::foxy_account::{self, Endpoint};
 use crate::json::Json;
 use ferrox_core::foxy::{edge_peer, Pass};
 use ferrox_core::veepn::{self, BASIC_HEAD};
-use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,7 +17,8 @@ struct Plane {
     access: Option<(String, u64)>,
     /// A region's upstreams, each already a `Foxy` dial shell: the list a flow reads is the list the fetch built.
     lists: HashMap<String, (Arc<Vec<FoxyDial>>, u64)>,
-    region: Option<(String, u64)>,
+    /// The optimal region the plane named, shared with every flow that reads it.
+    region: Option<(Arc<str>, u64)>,
 }
 
 /// The outbound: the plane behind a lock, the rotation in front of it, the identity ahead of both.
@@ -29,7 +29,8 @@ pub(crate) struct VeepnOut {
     domains: Arc<[Endpoint]>,
     /// Where the next ask starts, so concurrent flows do not all knock on the first domain.
     cursor: Arc<AtomicUsize>,
-    region: String,
+    /// The region this lane serves, or empty when the plane is the one that names it. One allocation, handed to every flow as a reference count.
+    region: Arc<str>,
     udid: String,
     zone: String,
     roots: ferrox_core::tls::Anchors,
@@ -70,7 +71,7 @@ impl VeepnOut {
             plane: Arc::new(Mutex::new(Plane::default())),
             domains: origins.into(),
             cursor: Arc::new(AtomicUsize::new(0)),
-            region,
+            region: Arc::from(region),
             udid,
             zone: zone_name(),
             roots,
@@ -103,31 +104,33 @@ impl VeepnOut {
         Err(declined.unwrap_or_else(|| format!("region {region:?} lists no upstream")))
     }
 
-    /// The region the lane serves: the one configured, or the optimal one the plane names, kept for the same window as a list. A configured region is read where it lives, so a flow that names one copies nothing.
-    fn region(&self) -> Result<Cow<'_, str>, String> {
+    /// The region the lane serves: the one configured, or the optimal one the plane names, kept for the same window as a list. Either way a flow takes a reference count, not a copy of the name, so an open builds no text of its own.
+    fn region(&self) -> Result<Arc<str>, String> {
         if !self.region.is_empty() {
-            return Ok(Cow::Borrowed(&self.region));
+            return Ok(Arc::clone(&self.region));
         }
         let now = foxy_account::epoch();
-        if let Some((named, _)) = self
-            .plane
-            .lock()
-            .ok()
-            .and_then(|plane| plane.region.clone().filter(|(_, until)| *until > now))
-        {
-            return Ok(Cow::Owned(named));
+        if let Some(named) = self.plane.lock().ok().and_then(|plane| {
+            plane
+                .region
+                .as_ref()
+                .filter(|(_, until)| *until > now)
+                .map(|(named, _)| Arc::clone(named))
+        }) {
+            return Ok(named);
         }
         let reply = self.ask(veepn::OPTIMAL, &[])?;
-        let named = json(&reply)?
-            .get("region")
-            .and_then(Json::as_str)
-            .filter(|named| !named.is_empty())
-            .ok_or("the plane named no optimal region")?
-            .to_owned();
+        let named: Arc<str> = Arc::from(
+            json(&reply)?
+                .get("region")
+                .and_then(Json::as_str)
+                .filter(|named| !named.is_empty())
+                .ok_or("the plane named no optimal region")?,
+        );
         if let Ok(mut plane) = self.plane.lock() {
-            plane.region = Some((named.clone(), now.saturating_add(veepn::SERVERS_TTL)));
+            plane.region = Some((Arc::clone(&named), now.saturating_add(veepn::SERVERS_TTL)));
         }
-        Ok(Cow::Owned(named))
+        Ok(named)
     }
 
     /// A region's upstreams: one ask per 12 hours, each entry's pair coded and its dial built here rather than once per flow, and the list handed out by `Arc` so a flow shares the cached text instead of copying the whole region.
@@ -471,7 +474,7 @@ mod tests {
         }
     }
 
-    /// The dial a flow uses is the one the list built: every pick, including the ones that wrap past the end, is the cached entry itself, the run the record gathers is the cached pair's own bytes, and a configured region is read where it lives.
+    /// The dial a flow uses is the one the list built: every pick, including the ones that wrap past the end, is the cached entry itself, the run the record gathers is the cached pair's own bytes.
     #[test]
     fn a_flow_dials_the_cached_entry_and_not_a_copy_of_it() {
         let out = lane(&["https://antpeak.com", "https://hibchr.com"]).expect("lane");
@@ -499,11 +502,31 @@ mod tests {
             first.pass.token.as_ptr(),
             "the pair the record writes is the pair the list coded, in the list's own text"
         );
-        let named = out.region().expect("the configured region");
-        assert_eq!(
-            named.as_ptr(),
-            out.region.as_ptr(),
-            "the flow reads the region name where the lane holds it"
+    }
+
+    /// The region name is one allocation for every flow on both paths: a configured lane hands out its own text, and a lane the plane names hands out the text its cache holds. Two opens each hold the same allocation, so an open pays a reference count where it used to copy the name.
+    #[test]
+    fn the_named_region_is_shared_not_copied_per_flow() {
+        let configured = lane(&["https://antpeak.com"]).expect("lane");
+        let named = configured.region().expect("the configured region");
+        assert!(
+            Arc::ptr_eq(&named, &configured.region),
+            "a configured lane reads its own text"
+        );
+
+        let mut out = lane(&["https://antpeak.com"]).expect("lane");
+        out.region = Arc::from("");
+        let cached: Arc<str> = Arc::from("IR");
+        out.plane.lock().expect("locks").region = Some((Arc::clone(&cached), 4_000_000_000));
+        let first = out.region().expect("the plane named one");
+        let second = out.region().expect("and still names it");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "two flows read one region name"
+        );
+        assert!(
+            Arc::ptr_eq(&first, &cached),
+            "and the name is the one the plane holds, not a copy of it"
         );
     }
 
