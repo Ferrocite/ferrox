@@ -105,13 +105,24 @@ impl Gather<'_> {
         }
     }
 
-    /// The next three bytes as one word; the group count comes from the total, so a caller only asks while the bytes are known to be there.
+    /// The next three bytes as one word; the group count comes from the total, so a caller only asks while the bytes are known to be there. A group the run under the cursor still holds is one read at that cursor; only a group that reaches a run's end walks the cursor a byte at a time.
     fn triple(&mut self) -> u32 {
+        if let Some(word) = self.whole() {
+            return word;
+        }
         let mut word = 0u32;
         for lane in (0..3).rev() {
             word |= u32::from(self.byte().expect("the counted group")) << (8 * lane);
         }
         word
+    }
+
+    fn whole(&mut self) -> Option<u32> {
+        let part = *self.parts.get(self.part)?;
+        let end = self.at + 3;
+        let bytes = part.get(self.at..end)?;
+        self.at = end;
+        Some((u32::from(bytes[0]) << 16) | (u32::from(bytes[1]) << 8) | u32::from(bytes[2]))
     }
 }
 
@@ -257,6 +268,24 @@ mod tests {
             "a buffer under the coded length is refused"
         );
         assert_eq!(too_short, [0; 3], "and left untouched");
+    }
+
+    /// The `String` coder, and nothing else: 64 passes over one 96-byte whole and one 95-byte padded coding, each output folded into a running `u32` whose expected value is pinned — so the loop cannot be folded away and a changed answer fails the row instead of measuring nothing. The fold, the loops and the frame entry ride inside this number, which is why the row is read as the difference between two runs of it and never as a cost per byte.
+    #[test]
+    fn the_alphabet_coder_costs_the_groups_and_nothing_else() {
+        let bytes: Vec<u8> = (0..96).map(|i| (i * 7 + 11) as u8).collect();
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            for len in [96, 95] {
+                for byte in encode(&bytes[..len]).into_bytes() {
+                    fold = fold.wrapping_mul(31).wrapping_add(u32::from(byte));
+                }
+            }
+        }
+        assert_eq!(
+            fold, 0x4291_eb80,
+            "64 passes over a whole coding and a padded one, folded after each"
+        );
     }
 
     #[test]
