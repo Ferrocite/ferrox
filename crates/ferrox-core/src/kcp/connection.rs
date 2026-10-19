@@ -88,23 +88,16 @@ impl Notifier {
         self.condvar.notify_all();
     }
 
-    fn wait_since(&self, snapshot: u64, timeout: Option<Duration>) -> bool {
+    fn wait_since(&self, snapshot: u64, timeout: Duration) -> bool {
         let mut g = self.generation.lock().unwrap();
         loop {
             if *g != snapshot {
                 return true;
             }
-            match timeout {
-                Some(d) => {
-                    let (guard, r) = self.condvar.wait_timeout(g, d).unwrap();
-                    g = guard;
-                    if r.timed_out() && *g == snapshot {
-                        return false;
-                    }
-                }
-                None => {
-                    g = self.condvar.wait(g).unwrap();
-                }
+            let (guard, r) = self.condvar.wait_timeout(g, timeout).unwrap();
+            g = guard;
+            if r.timed_out() && *g == snapshot {
+                return false;
             }
         }
     }
@@ -252,7 +245,7 @@ impl Connection {
                     Duration::from_millis(u64::from(tti))
                 };
                 if conn.update.gen() == seen {
-                    conn.update.wait_since(seen, Some(idle));
+                    conn.update.wait_since(seen, idle);
                 }
                 seen = conn.update.gen();
                 if conn.state() == State::Terminated {
@@ -508,7 +501,7 @@ impl Connection {
         let duration = deadline.map_or(Duration::from_secs(16), |t| {
             t.saturating_duration_since(Instant::now())
         });
-        if !self.data_input.wait_since(snap, Some(duration))
+        if !self.data_input.wait_since(snap, duration)
             && deadline.is_some_and(|t| t <= Instant::now())
         {
             return Err(ConnError::IoTimeout);
@@ -525,7 +518,7 @@ impl Connection {
         let duration = deadline.map_or(Duration::from_secs(16), |t| {
             t.saturating_duration_since(Instant::now())
         });
-        if !self.data_output.wait_since(snap, Some(duration))
+        if !self.data_output.wait_since(snap, duration)
             && deadline.is_some_and(|t| t <= Instant::now())
         {
             return Err(ConnError::IoTimeout);
