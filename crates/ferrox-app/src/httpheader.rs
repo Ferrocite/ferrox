@@ -17,6 +17,20 @@ impl HeadReader<Connection> {
     }
 }
 
+impl<R: Read> HeadReader<R> {
+    // A head that ended at the delimiter leaves no tail to deliver, so its buffer is dead at birth.
+    fn new(read: R, prefix: Vec<u8>, at: usize) -> Self {
+        if at == prefix.len() {
+            return Self {
+                read,
+                prefix: Vec::new(),
+                at: 0,
+            };
+        }
+        Self { read, prefix, at }
+    }
+}
+
 impl<R: Read> Read for HeadReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
@@ -53,14 +67,7 @@ pub(crate) fn accept(stream: Connection, path: &str) -> Option<(HeadReader, Conn
     write
         .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")
         .ok()?;
-    Some((
-        HeadReader {
-            read,
-            prefix: head,
-            at,
-        },
-        write,
-    ))
+    Some((HeadReader::new(read, head, at), write))
 }
 
 fn check_request(head: &[u8], path: &str) -> Option<()> {
@@ -82,14 +89,7 @@ pub(crate) fn accept_split<R: Read, W: Write>(
     write
         .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n")
         .ok()?;
-    Some((
-        HeadReader {
-            read,
-            prefix: head,
-            at,
-        },
-        write,
-    ))
+    Some((HeadReader::new(read, head, at), write))
 }
 
 const BEFORE_PATH: &[u8] = b"GET ";
@@ -121,14 +121,7 @@ pub(crate) fn connect(
     let Ok(write) = read.try_clone() else {
         return None;
     };
-    Some((
-        HeadReader {
-            read,
-            prefix: head,
-            at,
-        },
-        write,
-    ))
+    Some((HeadReader::new(read, head, at), write))
 }
 
 fn check_response(head: &[u8]) -> Option<()> {
@@ -151,14 +144,7 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite>(
     let (head, at) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
     check_response(&head[..at])?;
-    Some((
-        HeadReader {
-            read,
-            prefix: head,
-            at,
-        },
-        write,
-    ))
+    Some((HeadReader::new(read, head, at), write))
 }
 
 #[cfg(test)]
@@ -222,11 +208,7 @@ mod tests {
         }
         let mut prefix = Vec::from(HEAD);
         prefix.extend_from_slice(b"ping");
-        let mut reader = HeadReader {
-            read: Refused,
-            prefix,
-            at: HEAD.len(),
-        };
+        let mut reader = HeadReader::new(Refused, prefix, HEAD.len());
         let mut got = [0u8; 4];
         assert_eq!(reader.read(&mut got).expect("delivers"), 4);
         assert_eq!(&got, b"ping", "the bytes behind the head, not a re-read");
@@ -235,6 +217,23 @@ mod tests {
             0,
             "the read that finished the walk released the buffer that carried the head"
         );
+
+        // The ordinary shape: the head ends at the delimiter, so nothing is left to deliver and the buffer is dead at birth.
+        let mut reader = HeadReader::new(
+            std::io::Cursor::new(b"nextnext"),
+            Vec::from(HEAD),
+            HEAD.len(),
+        );
+        let mut got = [0u8; 4];
+        for _ in 0..2 {
+            assert_eq!(reader.read(&mut got).expect("reaches the socket"), 4);
+            assert_eq!(&got, b"next");
+            assert_eq!(
+                reader.prefix.capacity(),
+                0,
+                "a head with no tail holds no buffer across the reads that follow"
+            );
+        }
     }
 
     /// The camouflage request reaches the write as the runs it is made of: the path and host octets go over where they lie, so the handshake stages no copy of itself.
