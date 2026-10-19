@@ -13,6 +13,8 @@ pub mod pin;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Failure {
     Rejected(u16),
+    /// A refusal that named the target in its own head: the edge is healthy and the pair is valid, and no other edge or fresh token will carry this host.
+    BlockedHost(u16),
     Stream,
     Frame,
     Io,
@@ -24,6 +26,7 @@ impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Rejected(status) => write!(f, "edge answered {status}"),
+            Self::BlockedHost(status) => write!(f, "edge will not carry this target ({status})"),
             Self::Stream => f.write_str("the edge closed the stream"),
             Self::Frame => f.write_str("the edge sent a frame the carrier cannot read"),
             Self::Io => f.write_str("the carrier io failed"),
@@ -164,6 +167,26 @@ pub fn connect_status(head: &[u8]) -> Result<u16, Failure> {
     let status = parts.next().ok_or(Failure::Frame)?;
     let status = std::str::from_utf8(status).map_err(|_| Failure::Frame)?;
     status.parse::<u16>().map_err(|_| Failure::Frame)
+}
+
+/// One field of an answer's head, read where the octets landed: a name matches case-insensitively as `connect_status` reads the code above it, and the value comes back borrowed with the one space after the colon gone. A field the answer does not carry is `None`, and a line with no colon is not a field. Cold-path only — an answer that opened the tunnel never has its head walked twice.
+#[must_use]
+pub fn head_field<'a>(head: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    let end = head_end(head)?;
+    let mut lines = head[..end].split(|byte| *byte == b'\n');
+    lines.next()?;
+    for line in lines {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        // A slice has no `split_once` on this toolchain, and the separator is one byte to find.
+        let Some(at) = line.iter().position(|byte| *byte == b':') else {
+            continue;
+        };
+        if line[..at].eq_ignore_ascii_case(name) {
+            let value = &line[at + 1..];
+            return Some(value.strip_prefix(b" ").unwrap_or(value));
+        }
+    }
+    None
 }
 
 /// Half the remaining life, brought forward by a safety margin so a pass is replaced before the edge refuses it, and clamped so a long pass comes back on a clock.
@@ -542,6 +565,81 @@ mod tests {
         assert_eq!(connect_status(b"nonsense"), Err(Failure::Frame));
         assert_eq!(connect_status(b"HTTP/2 200\r\n\r\n"), Err(Failure::Frame));
         assert_eq!(connect_status(b"HTTP/1.1 abc\r\n\r\n"), Err(Failure::Frame));
+    }
+
+    /// The lookup a refusal is read with: a name matched whichever way the edge spelled it, the value as it arrived with or without its space, and a marker that only appears inside another field's value is not the field.
+    #[test]
+    fn head_field_reads_the_names_the_edge_sent() {
+        let head =
+            b"HTTP/1.1 403 Forbidden\r\nX-Hola-Error: Forbidden Host\r\nConnection: close\r\n\r\n";
+        let names: [&[u8]; 4] = [
+            b"X-Hola-Error",
+            b"x-hola-error",
+            b"X-HOLA-ERROR",
+            b"x-hoLa-ErRoR",
+        ];
+        for name in names {
+            assert_eq!(
+                head_field(head, name),
+                Some(&b"Forbidden Host"[..]),
+                "the name matches whichever way the edge spelled it: {name:?}"
+            );
+        }
+        assert_eq!(head_field(head, b"Connection"), Some(&b"close"[..]));
+        assert_eq!(head_field(head, b"Proxy-Connection"), None);
+        assert_eq!(
+            head_field(
+                b"HTTP/1.1 403 F\r\nX-Hola-Error:Forbidden Host\r\n\r\n",
+                b"X-Hola-Error"
+            ),
+            Some(&b"Forbidden Host"[..]),
+            "the space after the colon is the convention, not part of the value"
+        );
+        assert_eq!(
+            head_field(
+                b"HTTP/1.1 403 F\r\nNote: X-Hola-Error: Forbidden Host\r\n\r\n",
+                b"X-Hola-Error"
+            ),
+            None,
+            "the marker inside another field's value is not this field"
+        );
+        assert_eq!(
+            head_field(
+                b"HTTP/1.1 403 F\r\nnot a field\r\nX\r\n\r\n",
+                b"X-Hola-Error"
+            ),
+            None,
+            "a line with no colon is skipped, not a stop"
+        );
+        assert_eq!(
+            head_field(
+                b"HTTP/1.1 403 F\r\nX-Hola-Error: Forbidden Host\r\n",
+                b"X-Hola-Error"
+            ),
+            None,
+            "a head that never reached its blank line has no fields to read"
+        );
+        // Bytes alone cannot witness the borrow: the offset of the answer inside the caller's own head is what says nothing was staged.
+        let found = head_field(head, b"X-Hola-Error").expect("the edge named the host");
+        let offset = found.as_ptr() as usize - head.as_ptr() as usize;
+        let width = found.len();
+        assert!(
+            offset + width <= head.len(),
+            "the value lies inside the head it was read from: offset {offset}, {width} bytes"
+        );
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for at in 0..4096 {
+                std::hint::black_box(head_field(
+                    std::hint::black_box(head.as_slice()),
+                    std::hint::black_box(names[at % names.len()]),
+                ));
+            }
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "4096 field reads of an answer's head take no heap at all"
+        );
     }
 
     #[test]
