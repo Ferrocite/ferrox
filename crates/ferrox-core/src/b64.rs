@@ -1,33 +1,35 @@
 const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// The `String`-returning coder, walked a chunk at a time with no intermediate buffer to zero and no validation pass afterwards.
+/// The `String`-returning coder, one read a group with no intermediate buffer to zero and no validation pass afterwards.
 ///
 /// [`encode_parts_into`] is the other route to these bytes and the one that writes where the caller already has a window; `the_window_coder_matches_the_alphabet_at_every_length` holds the two byte-identical, which is why this shape survives instead of delegating and paying a fill plus a UTF-8 walk per call.
 #[must_use]
 pub fn encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(encoded_len(bytes.len()));
-    for chunk in bytes.chunks(3) {
+    // A whole group is three adjacent bytes, so the word is read as one and no per-byte walk or variable shift is paid for it.
+    let (whole, rest) = bytes.as_chunks::<3>();
+    for [a, b, c] in whole {
+        let word = u32::from_be_bytes([0, *a, *b, *c]);
+        out.push(STD[(word >> 18 & 63) as usize] as char);
+        out.push(STD[(word >> 12 & 63) as usize] as char);
+        out.push(STD[(word >> 6 & 63) as usize] as char);
+        out.push(STD[(word & 63) as usize] as char);
+    }
+    // The one or two bytes a whole group does not cover are the padded group they always were, with its last octets zero.
+    if !rest.is_empty() {
         let mut word = 0u32;
-        for byte in chunk {
+        for byte in rest {
             word = (word << 8) | u32::from(*byte);
         }
-        word <<= 8 * (3 - chunk.len());
-        let quad = [
-            STD[(word >> 18 & 63) as usize],
-            STD[(word >> 12 & 63) as usize],
-            if chunk.len() > 1 {
-                STD[(word >> 6 & 63) as usize]
-            } else {
-                b'='
-            },
-            if chunk.len() > 2 {
-                STD[(word & 63) as usize]
-            } else {
-                b'='
-            },
-        ];
-        // Four alphabet bytes are one write, so the capacity check, the length update and the widening branch are paid once a group rather than four times.
-        out.push_str(std::str::from_utf8(&quad).expect("the alphabet is ascii"));
+        word <<= 8 * (3 - rest.len());
+        out.push(STD[(word >> 18 & 63) as usize] as char);
+        out.push(STD[(word >> 12 & 63) as usize] as char);
+        out.push(if rest.len() > 1 {
+            STD[(word >> 6 & 63) as usize] as char
+        } else {
+            '='
+        });
+        out.push('=');
     }
     out
 }
