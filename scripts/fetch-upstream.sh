@@ -59,7 +59,7 @@ parse_pins() {
 tmp="$(mktemp -d)"
 root=""
 manifest_tmp=""
-trap 'rm -rf "$tmp" $root; rm -f "$manifest_tmp"' EXIT
+trap 'rm -rf "$tmp"; rm -f "$manifest_tmp"; [[ -z "$root" ]] || rm -rf "$root"' EXIT
 
 fetch_one() {
   local name="$1" repo="$2" rev="$3" fallback="$4"
