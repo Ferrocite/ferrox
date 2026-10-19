@@ -3649,6 +3649,20 @@ pub(crate) mod loopback {
         edge.join().expect("the edge finishes");
     }
 
+    /// The census line for a leg parked at a named wait, waited for: a moment spent is not evidence the leg parked, and a flow that never reached its wait hands its lane back for free.
+    fn wait_for_leg(name: &str, leg: std::thread::ThreadId, budget: Duration) {
+        let began = Instant::now();
+        while crate::census::held(name, leg).is_none() {
+            assert!(
+                began.elapsed() < budget,
+                "the leg never parked in `{name}` after {:?}:\n{}",
+                began.elapsed(),
+                crate::census::dump()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     /// A flow's forward leg is parked in a blocking read on the client, so the end of a flow has to wake that read: a leg that never wakes keeps its pool worker, its lane and the lane's buffers for the life of the process.
     #[test]
     fn a_lane_that_ends_releases_the_leg_parked_on_its_client() {
@@ -3706,17 +3720,19 @@ pub(crate) mod loopback {
         let _browser = Connection::connect(front.local_addr().expect("addr")).expect("connects");
         let (client, _) = front.accept().expect("accepts");
         let (ended_tx, ended_rx) = std::sync::mpsc::channel::<()>();
-        let started = Instant::now();
         let flow_lane = Arc::clone(&lane);
-        std::thread::spawn(move || {
+        let flow = std::thread::spawn(move || {
             crate::proxy::relay_tunnel(&client, &flow_lane);
             let _ = ended_tx.send(());
         });
         // The leg has to be parked before the lane ends, or the test measures a flow that never started.
-        std::thread::sleep(Duration::from_millis(200));
+        wait_for_leg("tunnel-leg-read", flow.thread().id(), PARK);
+        let started = Instant::now();
         close_tx.send(()).expect("ends the edge");
         edge.join().expect("the edge finishes");
-        let _ = ended_rx.recv_timeout(PARK);
+        ended_rx
+            .recv_timeout(PARK)
+            .expect("the flow ends when its lane is gone");
         assert!(
             started.elapsed() < WAKE,
             "the flow that lost its lane is still holding the leg parked on its client"
@@ -3779,39 +3795,27 @@ pub(crate) mod loopback {
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let browser = Connection::connect(front.local_addr().expect("addr")).expect("connects");
         let (client, _) = front.accept().expect("accepts");
-        let started = Instant::now();
         let (ended_tx, ended_rx) = std::sync::mpsc::channel::<()>();
         let flow_lane = Arc::clone(&lane);
-        std::thread::spawn(move || {
+        let flow = std::thread::spawn(move || {
             crate::proxy::relay_tunnel(&client, &flow_lane);
             let _ = ended_tx.send(());
         });
         // The leg has to be parked on the lane before the client goes, or the test measures a flow that never started.
-        std::thread::sleep(Duration::from_millis(200));
+        wait_for_leg("tunnel-leg-read", flow.thread().id(), PARK);
+        let started = Instant::now();
         browser
             .shutdown(std::net::Shutdown::Write)
             .expect("the client says goodbye");
-        let _ = ended_rx.recv_timeout(PARK);
+        ended_rx
+            .recv_timeout(PARK)
+            .expect("the flow ends when its client says goodbye");
         assert!(
             started.elapsed() < WAKE,
             "the flow that lost its client is still holding the leg parked on its lane"
         );
         hold_tx.send(()).expect("the edge is released");
         edge.join().expect("the edge finishes");
-    }
-
-    /// The census line for a leg parked writing its client, waited for: a moment spent is not evidence the leg parked, and a flow that never waited hands its lane back for free.
-    fn wait_for_leg_write(leg: std::thread::ThreadId, budget: Duration) {
-        let began = Instant::now();
-        while crate::census::held("tunnel-leg-write", leg).is_none() {
-            assert!(
-                began.elapsed() < budget,
-                "the leg never parked writing the client after {:?}:\n{}",
-                began.elapsed(),
-                crate::census::dump()
-            );
-            std::thread::sleep(Duration::from_millis(2));
-        }
     }
 
     /// The lane is the flow's shared resource: the leg that hands bytes to the client has to give the lane back before it waits on the socket, or a client that has stopped reading costs its own upload the road it came in on.
@@ -3897,7 +3901,7 @@ pub(crate) mod loopback {
         });
         // The leg has to be parked on the client's socket before the lane is asked for.
         let leg = leg_rx.recv().expect("the leg names itself");
-        wait_for_leg_write(leg, PARK);
+        wait_for_leg("tunnel-leg-write", leg, PARK);
         let started = Instant::now();
         let handed_back = loop {
             if lane.try_lock().is_ok() {
