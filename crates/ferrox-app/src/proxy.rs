@@ -11669,7 +11669,10 @@ mod tests {
             .collect();
         // All eight are in flight at once, so no direction was served by a worker another had already released.
         gate.wait();
-        std::thread::sleep(Duration::from_millis(50));
+        let settled = Instant::now() + Duration::from_secs(1);
+        while pool.parked() < BURST && Instant::now() < settled {
+            std::thread::sleep(Duration::from_millis(2));
+        }
         assert_eq!(
             pool.parked(),
             BURST,
