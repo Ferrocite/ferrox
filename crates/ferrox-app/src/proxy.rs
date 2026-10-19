@@ -8837,6 +8837,29 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
             let _ = peer_read.shutdown(Shutdown::Both);
         }
     });
+    carry_upload(&mut reader, &mut peer_write, &ended, stall);
+    ended.store(true, Ordering::Relaxed);
+    if CLOSE_FIRST {
+        writer.close();
+        on_reader_done(&mut reader);
+        let _ = peer_write.shutdown(Shutdown::Both);
+        let _ = join(&done);
+    } else {
+        let _ = peer_write.shutdown(Shutdown::Write);
+        let _ = join(&done);
+        writer.close();
+        let _ = peer_write.shutdown(Shutdown::Both);
+    }
+}
+
+/// The upload leg of an ordered carried relay: the carrier's reader into the peer's write half,
+/// ending on that leg's own stream error or on the sibling's give-up, whichever the arm reports.
+fn carry_upload<R: Read>(
+    reader: &mut R,
+    peer_write: &mut Connection,
+    ended: &AtomicBool,
+    stall: Duration,
+) {
     let mut buf = RelayBuf::new();
     let mut first = true;
     loop {
@@ -8850,7 +8873,7 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
                 }
                 census!(
                     "carrier-write",
-                    crate::census::handle(&peer_write),
+                    crate::census::handle(peer_write),
                     Some(stall)
                 );
                 if peer_write.write_all(&buf.as_mut()[..n]).is_err() {
@@ -8876,18 +8899,6 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
                 break;
             }
         }
-    }
-    ended.store(true, Ordering::Relaxed);
-    if CLOSE_FIRST {
-        writer.close();
-        on_reader_done(&mut reader);
-        let _ = peer_write.shutdown(Shutdown::Both);
-        let _ = join(&done);
-    } else {
-        let _ = peer_write.shutdown(Shutdown::Write);
-        let _ = join(&done);
-        writer.close();
-        let _ = peer_write.shutdown(Shutdown::Both);
     }
 }
 
@@ -23794,16 +23805,11 @@ mod relay_tests {
             let _ = handed.send(began.elapsed());
         });
 
-        let took = match joined.recv_timeout(CEILING) {
-            Ok(took) => took,
-            Err(_) => {
-                let held = crate::census::dump();
-                carried.close();
-                budgets::clear();
-                panic!(
-                    "the carried relay never handed back over a peer that reads nothing:\n{held}"
-                );
-            }
+        let Ok(took) = joined.recv_timeout(CEILING) else {
+            let held = crate::census::dump();
+            carried.close();
+            budgets::clear();
+            panic!("the carried relay never handed back over a peer that reads nothing:\n{held}");
         };
         let held = crate::census::dump();
         // Restored before the verdicts, so a leg another test is joining never reads this table.
@@ -24273,6 +24279,72 @@ mod census_tests {
             census::held("relay-join", waiter_id).is_none(),
             "a returned join is still in the census:\n{}",
             census::dump()
+        );
+    }
+
+    /// The carried relay's upload leg parks in a *write*, on the caller's own thread, once its
+    /// peer stops taking bytes, and a write half-close on the sibling wakes nothing: the census
+    /// line names that write with the stall it was armed with, and the flow hands back at that
+    /// bound instead of holding the carrier's thread. The leg writes through the peer socket's own
+    /// clone, whose descriptor is not the caller's, so the line has to name a descriptor rather
+    /// than match a number. Loopback only, dials nothing.
+    #[test]
+    fn a_parked_carrier_write_gives_up_at_the_stall_it_reports() {
+        const STALLED: Duration = Duration::from_millis(250);
+        const CEILING: Duration = Duration::from_secs(10);
+        const UPLOAD: usize = 16 << 20;
+
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(STALLED),
+            ..Default::default()
+        });
+        let carrier = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let carrier_port = carrier.local_addr().expect("addr").port();
+        let peer = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let peer_port = peer.local_addr().expect("addr").port();
+        let write = Connection::connect(("127.0.0.1", carrier_port)).expect("connects");
+        let destination = Connection::connect(("127.0.0.1", peer_port)).expect("connects");
+        // Both peers stay open and read nothing, so the only progress either leg can make is its own bound.
+        let _silent_carrier = carrier.accept().map(|(stream, _)| stream).expect("accepts");
+        let _silent_peer = peer.accept().map(|(stream, _)| stream).expect("accepts");
+        let (handed, joined) = mpsc::channel();
+        let began = Instant::now();
+        let leg = thread::spawn(move || {
+            relay_carried(
+                std::io::Cursor::new(vec![0u8; UPLOAD]),
+                &write,
+                &destination,
+            );
+            let _ = handed.send(began.elapsed());
+        });
+        let leg_id = leg.thread().id();
+
+        let held = wait_for("carrier-write", leg_id);
+        assert!(held.contains("armed=250ms "), "{held}");
+        assert!(!held.contains("fd=none "), "{held}");
+        budgets::clear();
+        let Ok(took) = joined.recv_timeout(CEILING) else {
+            panic!(
+                "the carried relay never handed back over an upload its peer stopped taking:\n{}",
+                census::dump()
+            );
+        };
+        leg.join().expect("joins");
+        assert!(
+            census::held("carrier-write", leg_id).is_none(),
+            "a returned write is still in the census:\n{}",
+            census::dump()
+        );
+        assert!(
+            took >= STALLED,
+            "the carried relay handed back after {took:?}, before its upload's {STALLED:?} write \
+             arm could expire"
+        );
+        assert!(
+            took < CEILING,
+            "the carried relay took {took:?} to end a flow whose peer stopped taking the upload, \
+             so a write is parked past its stall budget"
         );
     }
 }
