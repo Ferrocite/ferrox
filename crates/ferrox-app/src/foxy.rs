@@ -3631,13 +3631,13 @@ pub(crate) mod loopback {
         edge.join().expect("the edge finishes");
     }
 
-    /// The census line for a leg parked reading its lane, waited for: a moment spent is not evidence the leg parked, and a flow that never started releases its lane for free.
-    fn wait_for_leg_read(leg: std::thread::ThreadId, budget: Duration) {
+    /// The census line for a leg parked at a named wait, waited for: a moment spent is not evidence the leg parked, and a flow that never reached its wait hands its lane back for free.
+    fn wait_for_leg(name: &str, leg: std::thread::ThreadId, budget: Duration) {
         let began = Instant::now();
-        while crate::census::held("tunnel-leg-read", leg).is_none() {
+        while crate::census::held(name, leg).is_none() {
             assert!(
                 began.elapsed() < budget,
-                "the leg never parked reading its lane after {:?}:\n{}",
+                "the leg never parked in `{name}` after {:?}:\n{}",
                 began.elapsed(),
                 crate::census::dump()
             );
@@ -3708,7 +3708,7 @@ pub(crate) mod loopback {
             let _ = ended_tx.send(());
         });
         // The leg has to be parked before the lane ends, or the test measures a flow that never started.
-        wait_for_leg_read(flow.thread().id(), PARK);
+        wait_for_leg("tunnel-leg-read", flow.thread().id(), PARK);
         let started = Instant::now();
         close_tx.send(()).expect("ends the edge");
         edge.join().expect("the edge finishes");
@@ -3784,7 +3784,7 @@ pub(crate) mod loopback {
             let _ = ended_tx.send(());
         });
         // The leg has to be parked on the lane before the client goes, or the test measures a flow that never started.
-        wait_for_leg_read(flow.thread().id(), PARK);
+        wait_for_leg("tunnel-leg-read", flow.thread().id(), PARK);
         let started = Instant::now();
         browser
             .shutdown(std::net::Shutdown::Write)
@@ -3798,20 +3798,6 @@ pub(crate) mod loopback {
         );
         hold_tx.send(()).expect("the edge is released");
         edge.join().expect("the edge finishes");
-    }
-
-    /// The census line for a leg parked writing its client, waited for: a moment spent is not evidence the leg parked, and a flow that never waited hands its lane back for free.
-    fn wait_for_leg_write(leg: std::thread::ThreadId, budget: Duration) {
-        let began = Instant::now();
-        while crate::census::held("tunnel-leg-write", leg).is_none() {
-            assert!(
-                began.elapsed() < budget,
-                "the leg never parked writing the client after {:?}:\n{}",
-                began.elapsed(),
-                crate::census::dump()
-            );
-            std::thread::sleep(Duration::from_millis(2));
-        }
     }
 
     /// The lane is the flow's shared resource: the leg that hands bytes to the client has to give the lane back before it waits on the socket, or a client that has stopped reading costs its own upload the road it came in on.
@@ -3897,7 +3883,7 @@ pub(crate) mod loopback {
         });
         // The leg has to be parked on the client's socket before the lane is asked for.
         let leg = leg_rx.recv().expect("the leg names itself");
-        wait_for_leg_write(leg, PARK);
+        wait_for_leg("tunnel-leg-write", leg, PARK);
         let started = Instant::now();
         let handed_back = loop {
             if lane.try_lock().is_ok() {
