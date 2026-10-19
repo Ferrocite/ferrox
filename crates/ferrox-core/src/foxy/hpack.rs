@@ -647,6 +647,26 @@ mod tests {
         }
     }
 
+    /// The decode's own cost, with no socket, allocation or fixture in the frame: one coded host string, decoded 64 times into a buffer that is allocated once and cleared each turn, folded after every pass so the probe cannot pass by having stopped running. `scripts/method-ops.txt` points the `huffman_decode` row at it.
+    #[test]
+    fn the_huffman_probe_costs_the_decode_and_nothing_else() {
+        let coded = hex("f1e3c2e5f23a6ba0ab90f4ff");
+        let mut out = Vec::with_capacity(coded.len());
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            out.clear();
+            huffman_decode(&coded, &mut out).expect("decodes");
+            for &byte in &out {
+                fold = fold.wrapping_mul(31).wrapping_add(u32::from(byte));
+            }
+        }
+        assert_eq!(out, b"www.example.com".as_slice());
+        assert_eq!(
+            fold, 0xff9c_e800,
+            "64 decodes of one coded host string, folded after each"
+        );
+    }
+
     #[test]
     fn encoding_huffman_reproduces_the_rfc7541_appendix_c_bit_strings() {
         for (plain, encoded) in [
