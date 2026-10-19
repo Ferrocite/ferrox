@@ -242,6 +242,7 @@ pub enum Error {
         message: String,
     },
     Workload(String),
+    Transient(String),
     Desync {
         flow: usize,
         offset: u64,
@@ -255,6 +256,7 @@ impl std::fmt::Display for Error {
             Self::Io { action, source } => write!(f, "{action}: {source}"),
             Self::Engine { message } => write!(f, "engine: {message}"),
             Self::Workload(m) => write!(f, "workload: {m}"),
+            Self::Transient(m) => write!(f, "transient: {m}"),
             Self::Desync { flow, offset } => write!(
                 f,
                 "workload: flow {flow} relayed a byte that is not the validated pattern at byte {offset}"
@@ -276,6 +278,30 @@ fn note_desync(desync: &Desync, flow: usize, offset: u64) {
 
 fn is_desync(err: &Error) -> bool {
     matches!(err, Error::Desync { .. })
+}
+
+fn is_retryable(err: &Error) -> bool {
+    matches!(err, Error::Desync { .. } | Error::Transient(_))
+}
+
+// The socket-layer signatures of a saturated runner rather than a fault in the engine: EAGAIN (the macos write ride and the read timeout both end here), ENOBUFS, EPIPE and ECONNRESET — the last two usually the cascade of a sibling flow whose ride expired. A genuinely slow engine still completes the transfer and fails on its ratio, not here.
+fn is_transient_io(message: &str) -> bool {
+    [
+        "Resource temporarily unavailable",
+        "No buffer space available",
+        "Broken pipe",
+        "Connection reset by peer",
+        "os error 35",
+        "os error 55",
+        "os error 32",
+        "os error 54",
+        "os error 105",
+        "os error 10035",
+        "os error 10055",
+        "os error 11",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 // The absolute byte a validated download reported corrupt, lifted from read_validated's message so the client's desync carries the same (flow, offset) signature the sink's does.
@@ -821,36 +847,44 @@ impl Drop for Engine {
     }
 }
 
-// A macOS runner has forged a validated byte on both engines nondeterministically, so one desynced attempt says nothing about either engine: it is re-measured, up to this many attempts, and a desync that survives every attempt still fails as a workload fault. The bound is what keeps this from becoming a silent retry of a genuine regression.
-const DESYNC_ATTEMPTS: usize = 3;
+// Two runner disturbances are measured on macos-15 and belong to neither engine: a forged validated byte, seen on ferrox and the reference alike, and a short bulk transfer whose every reason is a socket-layer transient - a saturated runner cannot always move 8 GiB full duplex inside one per-op timeout, and it does so to every engine in the cell. Neither says anything about the engine under test, so each is re-measured, up to this many attempts; a disturbance that survives every attempt still fails as a workload fault. The bound is what keeps this from becoming a silent retry of a genuine regression.
+const REMEASURE_ATTEMPTS: usize = 3;
 
 pub fn measure(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> Result<Run, Error> {
-    desync_retry(DESYNC_ATTEMPTS, || {
+    remeasure_disturbed(REMEASURE_ATTEMPTS, || {
         measure_once(request, config_arg, dialect)
     })
 }
 
-// The retry policy split from the run it wraps, so the bound is gated without an engine: it stops at the first result that is not a desync, and a desync surviving every attempt is converted, never banked as a number.
-fn desync_retry<T>(attempts: usize, mut run: impl FnMut() -> Result<T, Error>) -> Result<T, Error> {
+// The retry policy split from the run it wraps, so the bound is gated without an engine: it stops at the first result that needs no re-measure, and a disturbance surviving every attempt is converted, never banked as a number.
+fn remeasure_disturbed<T>(
+    attempts: usize,
+    mut run: impl FnMut() -> Result<T, Error>,
+) -> Result<T, Error> {
     let mut attempt = 1;
     loop {
         match run() {
-            Err(err) if is_desync(&err) => {
+            Err(err) if is_retryable(&err) => {
                 if attempt == attempts {
+                    let label = if is_desync(&err) {
+                        "A forged byte that survives every retry is not the runner's"
+                    } else {
+                        "A socket fault that survives every retry is not the runner's"
+                    };
                     return Err(Error::Workload(format!(
-                        "{err}; a platform desync that survives every retry is not the runner's, and a workload fault is reported as one, never as a number"
+                        "{err}; {label}, and a workload fault is reported as one, never as a number"
                     )));
                 }
                 attempt += 1;
                 eprintln!(
-                    "gate 5 note: attempt {attempt} of {attempts} desynced, re-measuring: {err}"
+                    "gate 5 note: attempt {attempt} of {attempts} was disturbed, re-measuring: {err}"
                 );
                 std::thread::sleep(Duration::from_millis(250));
             }
             other => {
                 if attempt > 1 && other.is_ok() {
                     eprintln!(
-                        "gate 5 note: this run follows a desynced attempt; the desync was re-measured, the bar was not"
+                        "gate 5 note: this run follows a re-measured attempt; the disturbed run was re-measured, the bar was not"
                     );
                 }
                 return other;
@@ -934,11 +968,20 @@ fn measure_once(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> R
             moved.all_stopped.clone()
         };
         why.extend(sink_reasons);
+        let joined = why.join("; ");
+        // A short transfer explained by socket-layer transience - a saturated runner, every engine alike - is re-measured like a forged byte, never banked; one that carries no such signature is a real workload fault and stays one.
+        if is_transient_io(&joined) {
+            return Err(Error::Transient(format!(
+                "moved {} of {expected} bytes: {}",
+                moved.sent + moved.received,
+                joined
+            )));
+        }
         return Err(Error::Workload(format!(
             "moved {} of {expected} bytes: a short transfer is a fault in the \
              workload, not a number to report. {}",
             moved.sent + moved.received,
-            why.join("; ")
+            joined
         )));
     }
 
@@ -2395,11 +2438,11 @@ mod tests {
         );
     }
 
-    /// `measure` retries a desync, and the bound is the gate: it must stop at the first result that is not a desync, so a genuine desync still fails the cell and a genuine other fault is never retried.
+    /// `measure` re-measures a disturbed attempt, and the bound is the gate: it must stop at the first result that needs no re-measure, so a genuine disturbance still fails the cell and a genuine other fault is never retried.
     #[test]
     fn a_desync_is_retried_until_the_bound_and_a_final_error_never_loops() {
         let mut calls = 0usize;
-        let recovered = desync_retry(DESYNC_ATTEMPTS, || {
+        let recovered = remeasure_disturbed(REMEASURE_ATTEMPTS, || {
             calls += 1;
             if calls < 2 {
                 Err(Error::Desync {
@@ -2417,7 +2460,7 @@ mod tests {
         );
 
         calls = 0;
-        let stuck = desync_retry(DESYNC_ATTEMPTS, || {
+        let stuck = remeasure_disturbed(REMEASURE_ATTEMPTS, || {
             calls += 1;
             Err::<(), Error>(Error::Desync { flow: 0, offset: 7 })
         });
@@ -2425,10 +2468,13 @@ mod tests {
             matches!(&stuck, Err(Error::Workload(message)) if message.contains("survives every retry")),
             "a desync that survives every attempt fails as a workload fault, never a number: {stuck:?}"
         );
-        assert_eq!(calls, DESYNC_ATTEMPTS, "exactly the bound ran, no further");
+        assert_eq!(
+            calls, REMEASURE_ATTEMPTS,
+            "exactly the bound ran, no further"
+        );
 
         calls = 0;
-        let fatal = desync_retry(DESYNC_ATTEMPTS, || {
+        let fatal = remeasure_disturbed(REMEASURE_ATTEMPTS, || {
             calls += 1;
             Err::<(), Error>(Error::Engine {
                 message: "cannot spawn".into(),
@@ -2439,6 +2485,50 @@ mod tests {
             "a fault that is not a desync must surface untouched"
         );
         assert_eq!(calls, 1, "the retry loop never touches a final error");
+    }
+
+    /// The class that actually broke macos-15 `vless-raw-duplex-8`: every engine in the cell aborts short with socket-layer transients, so the cell re-measures; a short transfer with no such signature is a real workload fault and must fail on the first call, and the bound must still be the last word on a saturated runner.
+    #[test]
+    fn a_transient_socket_fault_is_remeasured_and_a_real_short_transfer_is_not() {
+        // The reasons one macos-15 duplex-8 attempt actually returned, kept verbatim.
+        let saturated = "moved 4999610368 of 8589934592 bytes: upload write failed after \
+         256901120 of 536870912 bytes: Resource temporarily unavailable (os error 35); the \
+         upload read failed after 139632640 bytes: Connection reset by peer (os error 54); \
+         upload write failed after 292552704 of 536870912 bytes: Broken pipe (os error 32)";
+        assert!(is_transient_io(saturated), "the CI cell's own reasons");
+        assert!(
+            is_transient_io("write failed: No buffer space available (os error 55)"),
+            "ENOBUFS, the other macOS face of the same thing"
+        );
+        assert!(
+            !is_transient_io("no flow reported why it stopped; could not connect to the engine"),
+            "a workload fault with no socket signature is never re-measured"
+        );
+
+        let mut calls = 0usize;
+        let real = remeasure_disturbed(REMEASURE_ATTEMPTS, || {
+            calls += 1;
+            Err::<(), Error>(Error::Workload(
+                "moved 0 of 100 bytes: no flow reported why it stopped".into(),
+            ))
+        });
+        assert!(
+            matches!(&real, Err(Error::Workload(m)) if m.contains("no flow reported")),
+            "a short transfer that is not transient stays fatal: {real:?}"
+        );
+        assert_eq!(calls, 1, "and is never retried");
+
+        calls = 0;
+        let storm = remeasure_disturbed(REMEASURE_ATTEMPTS, || {
+            calls += 1;
+            Err::<(), Error>(Error::Transient(saturated.into()))
+        });
+        assert!(
+            matches!(&storm, Err(Error::Workload(m))
+                if m.contains("survives every retry") && m.contains("os error 35")),
+            "the bound converts a persistent storm, reason and all, never a number: {storm:?}"
+        );
+        assert_eq!(calls, REMEASURE_ATTEMPTS, "exactly the bound ran");
     }
 
     #[test]
