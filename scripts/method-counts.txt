@@ -232,6 +232,7 @@ carrier-veepn region-list-copies-per-flow 0 ferrox-app-veepn::tests::a_cached_li
 carrier-veepn dial-clones-per-flow 0 ferrox-app-veepn::tests::a_flow_dials_the_cached_entry_and_not_a_copy_of_it
 carrier-veepn region-name-copies-per-flow 0 ferrox-app-veepn::tests::a_flow_dials_the_cached_entry_and_not_a_copy_of_it
 carrier-veepn origin-list-copies-per-ask 0 ferrox-app-veepn::tests::the_rotation_starts_where_the_last_one_left_off
+carrier-veepn edge-peer-read-allocations-per-entry 0 ferrox-core-foxy::tests::a_literal_edge_address_is_read_without_a_buffer_of_its_own
 carrier-foxy ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-foxy payload-staging-copies-per-byte-written 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane
 carrier-foxy payload-staging-copies-per-byte-read 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane
@@ -273,6 +274,7 @@ carrier-foxy pool-directions-lost-on-a-gone-worker 0 ferrox-app-proxy::tests::a_
 carrier-foxy rate-limits-that-stopped-a-renewal 0 ferrox-app-foxy_account::tests::a_refused_credential_is_the_only_answer_a_second_ask_cannot_change
 carrier-foxy named-waits-dropped-from-a-renewal-pause 0 ferrox-app-foxy_account::tests::a_rate_limit_carries_the_wait_its_head_names
 carrier-foxy renewal-pauses-past-their-own-ceiling 0 ferrox-app-foxy_account::tests::the_next_ask_waits_the_gap_the_plane_names_or_a_curve_that_caps
+carrier-foxy edge-peer-read-allocations-per-open 0 ferrox-core-foxy::tests::a_literal_edge_address_is_read_without_a_buffer_of_its_own
 
 carrier-quic ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-quic zero-filled-bytes-per-relayed-frame 3 ferrox-app-quic::tests::a_relayed_datagram_frames_its_target_ahead_of_its_payload

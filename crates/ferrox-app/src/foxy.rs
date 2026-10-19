@@ -2,7 +2,7 @@
 
 use crate::conn::Connection;
 use ferrox_core::foxy::connectip;
-use ferrox_core::foxy::{self, authority, frames, hpack, masque, Failure, Pass};
+use ferrox_core::foxy::{self, authority, edge_peer, frames, hpack, masque, Failure, Pass};
 use ferrox_core::tls::RecordAlignment;
 use ferrox_core::tls::TlsProvider;
 use std::io::{Read, Write};
@@ -122,6 +122,11 @@ pub(crate) fn upstream_proxy(text: &str) -> Option<UpstreamProxy> {
         return None;
     }
     let port = port.parse::<u16>().ok()?;
+    // A URL spells a v6 host in brackets and the lane's address reader wants the bare address; `authority` puts them back where a name is what the wire needs.
+    let host = host
+        .strip_prefix('[')
+        .and_then(|bare| bare.strip_suffix(']'))
+        .unwrap_or(host);
     Some(UpstreamProxy {
         http,
         host: host.to_owned(),
@@ -134,13 +139,23 @@ fn tls_to_edge(dial: &FoxyDial) -> Result<ferrox_core::tls::RustlsProvider<Conne
     if let Some(proxy) = dial.upstream.as_ref() {
         return edge_over_hop(proxy, dial);
     }
-    let peers = match dial.address {
-        Some(address) => vec![address],
-        None => format!("{}:{}", dial.host, dial.port)
-            .to_socket_addrs()
-            .map_err(|_| Failure::Io)?
-            .collect(),
-    };
+    // The address the lane holds, or the one the edge's name already is, reaches the socket as it stands: no name spelled, no list collected, no resolver asked.
+    match dial.address.or_else(|| edge_peer(&dial.host, dial.port)) {
+        Some(peer) => dial_peers(dial, std::iter::once(peer)),
+        None => dial_peers(
+            dial,
+            authority(&dial.host, dial.port)
+                .to_socket_addrs()
+                .map_err(|_| Failure::Io)?,
+        ),
+    }
+}
+
+/// The peers an edge is reached through, tried in the order they came: the handshake's half-second budget and `EDGE_ATTEMPTS` quick asks at each, then the next one.
+fn dial_peers<I: Iterator<Item = SocketAddr>>(
+    dial: &FoxyDial,
+    peers: I,
+) -> Result<ferrox_core::tls::RustlsProvider<Connection>, Failure> {
     let mut tried = 0usize;
     let mut last = Failure::Io;
     for peer in peers {
@@ -325,11 +340,15 @@ pub(crate) fn associate_udp(proxy: &UpstreamProxy) -> Option<(Arc<Connection>, S
 
 /// The one hop this tree speaks to, dialed: a proxy that does not answer at all is a failed dial, not a lane running direct.
 fn tcp_to_proxy(proxy: &UpstreamProxy) -> Option<Connection> {
-    // Same reason the edge dial tries each one: a hop answering on the second listed family is still the hop this lane uses.
-    for addr in format!("{}:{}", proxy.host, proxy.port)
-        .to_socket_addrs()
-        .ok()?
-    {
+    match edge_peer(&proxy.host, proxy.port) {
+        Some(peer) => tcp_to_peers(std::iter::once(peer)),
+        None => tcp_to_peers(authority(&proxy.host, proxy.port).to_socket_addrs().ok()?),
+    }
+}
+
+/// The hop's peers in the order they came: a hop answering on the second listed family is still the hop this lane uses.
+fn tcp_to_peers<I: Iterator<Item = SocketAddr>>(peers: I) -> Option<Connection> {
+    for addr in peers {
         if let Ok(stream) = crate::conn::dial_tcp(&addr, CONNECT_TIMEOUT) {
             let _ = stream.set_nodelay(true);
             // The head is read a byte at a time and is small, so a few seconds is the honest bound; without it a missing byte holds the flow for the OS's minutes-long timeout.
@@ -2595,6 +2614,12 @@ mod tests {
         assert_eq!((socks.host, socks.port), ("proxy.local".to_owned(), 1080));
         let h = upstream_proxy("socks5h://proxy.local:1080").expect("parses");
         assert!(!h.http);
+        let v6 = upstream_proxy("socks5://[2001:db8::1]:1080").expect("parses");
+        assert_eq!(
+            (v6.host, v6.port),
+            ("2001:db8::1".to_owned(), 1080),
+            "a v6 hop is read as the address it spells, brackets and all"
+        );
         for bad in [
             "",
             "proxy.local:8080",
