@@ -27,6 +27,11 @@ const SHORTEST: usize = 5;
 const MAX_BITS: usize = 30;
 const PEEK: usize = 12;
 
+/// The symbols a `len`-octet Huffman window can hold: `SHORTEST` is the code's shortest symbol, so this is the ceiling the decode can reach and a buffer of it never grows.
+const fn decoded_bound(len: usize) -> usize {
+    8 * len / SHORTEST
+}
+
 struct Huffman {
     /// One load per probed length: the first code of that length in the high half and how many codes share it in the low half. A length with no codes reads `(0, 0)`, so the range test below already rejects it and no separate empty-length check is needed.
     probe: [u64; MAX_BITS + 1],
@@ -270,7 +275,7 @@ fn string_literal<'a>(block: &'a [u8], at: &mut usize) -> Option<Literal<'a>> {
     if !coded {
         return Some(Literal::Borrowed(raw));
     }
-    let mut out = Vec::with_capacity(len);
+    let mut out = Vec::with_capacity(decoded_bound(len));
     huffman_decode(raw, &mut out)?;
     Some(Literal::Owned(out))
 }
@@ -491,7 +496,7 @@ fn qpack_name<'a>(block: &'a [u8], at: &mut usize) -> Option<Literal<'a>> {
     if !coded {
         return Some(Literal::Borrowed(raw));
     }
-    let mut out = Vec::with_capacity(len);
+    let mut out = Vec::with_capacity(decoded_bound(len));
     huffman_decode(raw, &mut out)?;
     Some(Literal::Owned(out))
 }
@@ -892,6 +897,54 @@ mod tests {
             "padding is allowed"
         );
         assert_eq!(out, b"dat");
+    }
+
+    /// A coded literal is a `len`-byte window holding at most `8 * len / SHORTEST` symbols, so a buffer sized to `len` overflows on any literal denser than eight bits a symbol and pays a reallocation plus a copy of what it already wrote.
+    #[test]
+    fn a_coded_literal_is_decoded_into_one_allocation() {
+        let decode = |value: &str| {
+            let mut coded = Vec::new();
+            huffman_encode(value.as_bytes(), &mut coded);
+            let mut block = vec![0x80 | coded.len() as u8];
+            block.extend_from_slice(&coded);
+            let mut at = 0usize;
+            let literal = string_literal(&block, &mut at).expect("a coded literal");
+            assert_eq!(literal.as_bytes(), value.as_bytes());
+            assert_eq!(at, block.len(), "the whole literal is spent");
+            match literal {
+                Literal::Owned(bytes) => (bytes.capacity(), coded.len()),
+                Literal::Borrowed(_) => unreachable!("the H bit named a coded literal"),
+            }
+        };
+        // The table's one-time build allocates, so the window opens only after a decode has already run.
+        decode("200");
+        for value in ["200", "12345678", "gzip", "a", "www.cloudflare.com"] {
+            let (capacity, coded) = decode(value);
+            assert_eq!(
+                capacity,
+                8 * coded / SHORTEST,
+                "{value}: the buffer is the symbol bound of its {coded} bytes"
+            );
+            assert!(
+                capacity >= value.len(),
+                "{value}: the bound still holds the string it decodes to"
+            );
+        }
+        let mut coded = Vec::new();
+        huffman_encode(b"200", &mut coded);
+        let mut block = vec![0x80 | coded.len() as u8];
+        block.extend_from_slice(&coded);
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                let mut at = 0usize;
+                std::hint::black_box(string_literal(std::hint::black_box(&block), &mut at));
+            }
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (4096, 4096 * 3, 0),
+            "4096 coded statuses take one buffer each and no growth"
+        );
     }
 
     #[test]
