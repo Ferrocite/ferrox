@@ -1,7 +1,6 @@
 #![deny(missing_debug_implementations)]
 
-#[cfg(test)]
-mod alloc_count;
+pub mod alloc_count;
 
 pub mod addr;
 pub mod aead;
