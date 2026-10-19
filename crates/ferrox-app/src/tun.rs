@@ -23,8 +23,8 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use crate::budgets;
 use crate::conn::Connection;
 use ferrox_core::foxy::connectip::{
-    checksum, ipv4_checksum, ipv4_head, udp_datagram, udp_head, Ipv4Head, UdpDatagram, IPV4_HEADER,
-    PROTOCOL_UDP, UDP_HEADER,
+    checksum, ipv4_checksum, ipv4_head, tcp_checksum, udp_datagram, udp_head, Ipv4Head,
+    UdpDatagram, IPV4_HEADER, PROTOCOL_UDP, UDP_HEADER,
 };
 
 const DEFAULT_MTU: usize = 1500;
@@ -299,7 +299,76 @@ impl Device {
     }
 }
 
-/// Build an IPv4 + TCP packet with valid IP and TCP checksums.
+/// Render one IPv4/TCP packet into `out` — the caller's reused buffer — so a steady stream of SYN-ACKs, pure ACKs and response packets allocates and zero-fills nothing per packet. The IPv4 and TCP headers are built on the stack and extended, the payload is extended once, and both checksums are computed in place, the twelve-byte pseudo-header summed as words and never written. The bytes are what a freshly zero-filled buffer would hold for the same arguments: every header byte is named explicitly and the checksum field is read as zero until it is computed.
+#[allow(clippy::too_many_arguments)] // the fields of one IPv4/TCP header, plus the caller's reused out buffer
+fn render_tcp_packet(
+    src: ([u8; 4], u16),
+    dst: ([u8; 4], u16),
+    seq: u32,
+    ack_num: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+    out: &mut Vec<u8>,
+) {
+    let (src, src_port) = src;
+    let (dst, dst_port) = dst;
+    let tcp_len = 20 + payload.len();
+    let ip_len = IPV4_HEADER + tcp_len;
+    out.clear();
+    out.reserve(ip_len);
+    let mut ip = [0u8; IPV4_HEADER];
+    ip[0] = 0x45;
+    ip[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
+    ip[6] = 0x40;
+    ip[8] = 64;
+    ip[9] = TCP_PROTO;
+    ip[12..16].copy_from_slice(&src);
+    ip[16..20].copy_from_slice(&dst);
+    let c = ipv4_checksum(&ip);
+    ip[10..12].copy_from_slice(&c.to_be_bytes());
+    let mut tcp = [0u8; 20];
+    tcp[0..2].copy_from_slice(&src_port.to_be_bytes());
+    tcp[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+    tcp[8..12].copy_from_slice(&ack_num.to_be_bytes());
+    tcp[12] = 0x50;
+    tcp[13] = flags;
+    tcp[14..16].copy_from_slice(&window.to_be_bytes());
+    out.extend_from_slice(&ip);
+    out.extend_from_slice(&tcp);
+    out.extend_from_slice(payload);
+    let tc = tcp_checksum(&src, &dst, &out[IPV4_HEADER..]);
+    out[IPV4_HEADER + 16..IPV4_HEADER + 18].copy_from_slice(&tc.to_be_bytes());
+}
+
+/// An ICMP echo request answered as the device's own destination would: the request's own message with the type flipped to an echo reply, the code and checksum zeroed and the checksum recomputed, wrapped in an IPv4 header whose source and destination are the request's swapped — rendered into the caller's reused `out`, so a ping storm allocates nothing per reply.
+fn render_icmp_reply(src: [u8; 4], dst: [u8; 4], request: &[u8], out: &mut Vec<u8>) {
+    let ip_len = IPV4_HEADER + request.len();
+    out.clear();
+    out.reserve(ip_len);
+    let mut ip = [0u8; IPV4_HEADER];
+    ip[0] = 0x45;
+    ip[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
+    ip[6] = 0x40;
+    ip[8] = 64;
+    ip[9] = ICMP_PROTO;
+    ip[12..16].copy_from_slice(&src);
+    ip[16..20].copy_from_slice(&dst);
+    let c = ipv4_checksum(&ip);
+    ip[10..12].copy_from_slice(&c.to_be_bytes());
+    out.extend_from_slice(&ip);
+    out.extend_from_slice(request);
+    let m = &mut out[IPV4_HEADER..];
+    m[0] = ICMP_ECHO_REPLY;
+    m[1] = 0;
+    m[2..4].copy_from_slice(&[0, 0]);
+    let ic = checksum(m);
+    m[2..4].copy_from_slice(&ic.to_be_bytes());
+}
+
+/// Test-only: the render pair behind a fresh vector, so a caller that only wants to inspect one packet need not thread a buffer. Production emits reach the device through `render_*_packet` into a reused buffer.
+#[cfg(test)]
 fn build_tcp_packet(
     src: ([u8; 4], u16),
     dst: ([u8; 4], u16),
@@ -309,68 +378,16 @@ fn build_tcp_packet(
     window: u16,
     payload: &[u8],
 ) -> Vec<u8> {
-    let (src, src_port) = src;
-    let (dst, dst_port) = dst;
-    let tcp_len = 20 + payload.len();
-    let ip_len = IPV4_HEADER + tcp_len;
-    let mut pkt = vec![0u8; ip_len];
-    pkt[0] = 0x45;
-    pkt[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
-    pkt[6] = 0x40;
-    pkt[8] = 64;
-    pkt[9] = TCP_PROTO;
-    pkt[12..16].copy_from_slice(&src);
-    pkt[16..20].copy_from_slice(&dst);
-    let c = ipv4_checksum(&pkt[..IPV4_HEADER]);
-    pkt[10..12].copy_from_slice(&c.to_be_bytes());
-    let t = &mut pkt[IPV4_HEADER..IPV4_HEADER + 20];
-    t[0..2].copy_from_slice(&src_port.to_be_bytes());
-    t[2..4].copy_from_slice(&dst_port.to_be_bytes());
-    t[4..8].copy_from_slice(&seq.to_be_bytes());
-    t[8..12].copy_from_slice(&ack_num.to_be_bytes());
-    t[12] = 0x50;
-    t[13] = flags;
-    t[14..16].copy_from_slice(&window.to_be_bytes());
-    if !payload.is_empty() {
-        pkt[IPV4_HEADER + 20..].copy_from_slice(payload);
-    }
-    let mut pseudo: Vec<u8> = Vec::with_capacity(12 + tcp_len);
-    pseudo.extend_from_slice(&src);
-    pseudo.extend_from_slice(&dst);
-    pseudo.push(0);
-    pseudo.push(TCP_PROTO);
-    pseudo.extend_from_slice(&(tcp_len as u16).to_be_bytes());
-    pseudo.extend_from_slice(&pkt[IPV4_HEADER..]);
-    let tc = checksum(&pseudo);
-    pkt[IPV4_HEADER + 16..IPV4_HEADER + 18].copy_from_slice(&tc.to_be_bytes());
-    pkt
+    let mut out = Vec::new();
+    render_tcp_packet(src, dst, seq, ack_num, flags, window, payload, &mut out);
+    out
 }
 
-/// An ICMP echo request answered as its destination would: the request's own message with
-/// the type flipped to an echo reply, the code and checksum zeroed and the checksum
-/// recomputed, wrapped in an IPv4 header whose source and destination are the request's
-/// swapped. The identifier, sequence and data ride back unchanged, and the message is read
-/// from the borrowed body — one render, one write, no header staging.
+#[cfg(test)]
 fn build_icmp_reply(src: [u8; 4], dst: [u8; 4], request: &[u8]) -> Vec<u8> {
-    let ip_len = IPV4_HEADER + request.len();
-    let mut pkt = vec![0u8; ip_len];
-    pkt[0] = 0x45;
-    pkt[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
-    pkt[6] = 0x40;
-    pkt[8] = 64;
-    pkt[9] = ICMP_PROTO;
-    pkt[12..16].copy_from_slice(&src);
-    pkt[16..20].copy_from_slice(&dst);
-    let c = ipv4_checksum(&pkt[..IPV4_HEADER]);
-    pkt[10..12].copy_from_slice(&c.to_be_bytes());
-    let m = &mut pkt[IPV4_HEADER..];
-    m.copy_from_slice(request);
-    m[0] = ICMP_ECHO_REPLY;
-    m[1] = 0;
-    m[2..4].copy_from_slice(&[0, 0]);
-    let ic = checksum(m);
-    m[2..4].copy_from_slice(&ic.to_be_bytes());
-    pkt
+    let mut out = Vec::new();
+    render_icmp_reply(src, dst, request, &mut out);
+    out
 }
 
 /// One active TCP flow's state. The two cursors are shared with the response
@@ -447,6 +464,8 @@ pub(crate) struct Handler {
     flows: HashMap<FlowKey, Flow>,
     legs: HashMap<UdpKey, UdpSocket>,
     frame: Vec<u8>,
+    /// Reused render buffer for every device-bound packet this thread emits (SYN-ACK, pure ACK, ICMP reply), so the emit path allocates nothing in steady state.
+    emit: Vec<u8>,
     association: Option<Association>,
     ended_tx: mpsc::Sender<Ended>,
     ended_rx: mpsc::Receiver<Ended>,
@@ -455,6 +474,7 @@ pub(crate) struct Handler {
 impl Handler {
     pub(crate) fn new(device: Device, relay: Relay, associate: Associate) -> Self {
         let (ended_tx, ended_rx) = mpsc::channel();
+        let emit = Vec::with_capacity(device.mtu + 64);
         Self {
             device,
             relay,
@@ -462,6 +482,7 @@ impl Handler {
             flows: HashMap::new(),
             legs: HashMap::new(),
             frame: Vec::with_capacity(FRAME_CAP),
+            emit,
             association: None,
             ended_tx,
             ended_rx,
@@ -583,17 +604,22 @@ impl Handler {
                 || (tcp.flags & FLAG_PSH != 0 && !payload.is_empty())
                 || unacked >= self.device.mtu as u32
             {
-                let ack = build_tcp_packet(
+                let snd = flow.snd_nxt.load(Relaxed);
+                let rcv = flow.rcv_nxt.load(Relaxed);
+                let mut emit = std::mem::take(&mut self.emit);
+                render_tcp_packet(
                     (ip.destination, tcp.destination_port),
                     (ip.source, tcp.source_port),
-                    flow.snd_nxt.load(Relaxed),
-                    flow.rcv_nxt.load(Relaxed),
+                    snd,
+                    rcv,
                     FLAG_ACK,
                     65535,
                     &[],
+                    &mut emit,
                 );
-                let _ = self.device.write_packet(&ack);
-                flow.last_acked = flow.rcv_nxt.load(Relaxed);
+                let _ = self.device.write_packet(&emit);
+                self.emit = emit;
+                flow.last_acked = rcv;
             }
         }
         // The proxy half is gone: an upload into a closed lane has no flow to finish, and keeping the entry would keep its socket and its cursors.
@@ -610,7 +636,8 @@ impl Handler {
         let remote_port = tcp.source_port;
         let syn_seq = tcp.seq;
 
-        let syn_ack = build_tcp_packet(
+        let mut emit = std::mem::take(&mut self.emit);
+        render_tcp_packet(
             (local_ip, local_port),
             (remote_ip, remote_port),
             syn_seq.wrapping_add(1),
@@ -618,8 +645,11 @@ impl Handler {
             FLAG_SYN | FLAG_ACK,
             65535,
             &[],
+            &mut emit,
         );
-        self.device.write_packet(&syn_ack)?;
+        let wrote = self.device.write_packet(&emit);
+        self.emit = emit;
+        wrote?;
 
         let target = SocketAddr::from((ip.destination, tcp.destination_port));
         let destination = crate::proxy::Destination::from(target);
@@ -659,12 +689,13 @@ impl Handler {
 
         std::thread::spawn(move || {
             let mut buf = vec![0u8; 4096];
+            let mut pkt = Vec::with_capacity(4096 + 40);
             loop {
                 match read_half.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
                         let seq = snd_nxt.fetch_add(n as u32, Relaxed);
-                        let pkt = build_tcp_packet(
+                        render_tcp_packet(
                             (local_ip, local_port),
                             (remote_ip, remote_port),
                             seq,
@@ -672,6 +703,7 @@ impl Handler {
                             FLAG_PSH | FLAG_ACK,
                             65535,
                             &buf[..n],
+                            &mut pkt,
                         );
                         if dev_writer.write_all(&pkt).is_err() {
                             break;
@@ -707,8 +739,11 @@ impl Handler {
         if !is_echo_request(body) {
             return Ok(());
         }
-        let reply = build_icmp_reply(ip.destination, ip.source, body);
-        self.device.write_packet(&reply)
+        let mut emit = std::mem::take(&mut self.emit);
+        render_icmp_reply(ip.destination, ip.source, body, &mut emit);
+        let wrote = self.device.write_packet(&emit);
+        self.emit = emit;
+        wrote
     }
 
     fn close_flow(&mut self, key: FlowKey) {
@@ -870,6 +905,62 @@ mod tests {
         assert_eq!(ip.destination, [10, 0, 0, 2]);
         let (_tcp, payload) = tcp_head(body).unwrap();
         assert_eq!(payload, b"x");
+    }
+
+    /// The emit path reallocates nothing under steady traffic: warm one render, then require the reused buffer's base pointer and capacity to survive every later TCP and ICMP render, and each render's bytes to equal a fresh build — the witness that buffer reuse leaks no stale byte a throwaway vector would not have carried.
+    #[test]
+    fn an_emitted_packet_reuses_its_render_buffer() {
+        let src = ([10, 0, 0, 1], 443);
+        let dst = ([10, 0, 0, 2], 55555);
+        let mut out = Vec::new();
+        render_tcp_packet(
+            src,
+            dst,
+            100,
+            200,
+            FLAG_PSH | FLAG_ACK,
+            65535,
+            b"0123456789",
+            &mut out,
+        );
+        let warm_ptr = out.as_ptr() as usize;
+        let warm_cap = out.capacity();
+        for payload in [&[][..], &b"hi"[..], &b"borrow me"[..], &b"0123456789"[..]] {
+            render_tcp_packet(
+                src,
+                dst,
+                100,
+                200,
+                FLAG_PSH | FLAG_ACK,
+                65535,
+                payload,
+                &mut out,
+            );
+            assert_eq!(
+                out.as_ptr() as usize,
+                warm_ptr,
+                "no reallocation across the emit cycle"
+            );
+            assert_eq!(out.capacity(), warm_cap, "capacity held steady");
+            assert_eq!(out.len(), IPV4_HEADER + 20 + payload.len());
+            assert_eq!(
+                out,
+                build_tcp_packet(src, dst, 100, 200, FLAG_PSH | FLAG_ACK, 65535, payload),
+                "a reused render is byte-identical to a fresh one"
+            );
+        }
+        let request = [8u8, 0, 0, 0, 0, 1, 0, 1, b'p', b'i', b'n', b'g'];
+        render_icmp_reply([10, 0, 0, 1], [10, 0, 0, 2], &request, &mut out);
+        assert_eq!(
+            out.as_ptr() as usize,
+            warm_ptr,
+            "the icmp reply rides the same buffer"
+        );
+        assert_eq!(
+            out,
+            build_icmp_reply([10, 0, 0, 1], [10, 0, 0, 2], &request),
+            "a reused icmp render is byte-identical to a fresh one"
+        );
     }
 
     /// One reply packet, built the way the lane builds it.

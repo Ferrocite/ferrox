@@ -545,6 +545,14 @@ pub fn ipv4_checksum(header: &[u8]) -> u16 {
     !fold(word_sum(header))
 }
 
+/// The TCP checksum of a segment this lane builds (RFC 793), summed without materialising the twelve-byte pseudo-header: the addresses contribute their word runs, the protocol (6) and the segment length their own words, and the segment — header with its checksum field read as zero plus payload — is summed where it already lies. The same one's-complement sum the materialised pseudo-header and a copy of the whole segment reached, so the bytes on the device are unchanged and the throwaway vector and its copy are gone.
+pub fn tcp_checksum(source: &[u8], destination: &[u8], segment: &[u8]) -> u16 {
+    const TCP_PROTOCOL: u32 = 6;
+    let sum = word_sum(source) + word_sum(destination) + (segment.len() as u32) + TCP_PROTOCOL;
+    let sum = (sum & 0xffff) + (sum >> 16);
+    !fold(sum + word_sum(segment))
+}
+
 /// The pseudo-header a UDP checksum covers (RFC 768, RFC 8200 §8.1) summed without writing it: a one's-complement sum is position-independent, so the addresses contribute their word runs, the length its value (sixteen bits by construction, IPv6's wider field adding an unchanged zero word) and the protocol a lone word whose high half is zero — the same words the materialised header held, so both versions agree with no branch.
 fn pseudo_sum(source: &[u8], destination: &[u8], payload: usize) -> u32 {
     let length = (UDP_HEADER + payload) as u32;
@@ -1233,6 +1241,45 @@ mod tests {
                 "v6 payload {payload}"
             );
         }
+    }
+
+    /// The streaming TCP checksum is the one's-complement sum of the materialised twelve-byte IPv4 pseudo-header followed by the whole segment — the exact byte run the TUN builder used to copy into a throwaway vector — at every segment length the builder can emit, including the odd tail, the empty header-only packet, and an all-ones segment that maximises the carry chain.
+    #[test]
+    fn the_tcp_checksum_is_the_materialised_pseudo_header_words() {
+        let materialised = |source: &[u8], destination: &[u8], segment: &[u8]| -> u16 {
+            let tcp_len = segment.len() as u16;
+            let mut pseudo: Vec<u8> = Vec::with_capacity(12 + segment.len());
+            pseudo.extend_from_slice(source);
+            pseudo.extend_from_slice(destination);
+            pseudo.push(0);
+            pseudo.push(6);
+            pseudo.extend_from_slice(&tcp_len.to_be_bytes());
+            pseudo.extend_from_slice(segment);
+            checksum(&pseudo)
+        };
+        let src = [198u8, 51, 100, 7];
+        let dst = [203u8, 0, 113, 9];
+        for len in [0usize, 1, 2, 3, 20, 21, 1332, 1333] {
+            // A segment that is 20 bytes of header plus `len` payload bytes, the checksum field left zero as the builder leaves it.
+            let mut segment = vec![0u8; 20 + len];
+            for (i, b) in segment.iter_mut().enumerate() {
+                *b = (i % 251) as u8;
+            }
+            segment[16] = 0;
+            segment[17] = 0;
+            assert_eq!(
+                tcp_checksum(&src, &dst, &segment),
+                materialised(&src, &dst, &segment),
+                "segment len {len}"
+            );
+        }
+        // The all-ones worst case: a maximum carry chain folded twice.
+        let ones = [0xffu8; 20 + 512];
+        assert_eq!(
+            tcp_checksum(&src, &dst, &ones),
+            materialised(&src, &dst, &ones),
+            "all-ones segment"
+        );
     }
 
     /// A receiver of a datagram this lane builds sums the pseudo-header, the UDP header with the checksum in it, and the payload, and gets all ones — and a zero answer never goes on the wire.
