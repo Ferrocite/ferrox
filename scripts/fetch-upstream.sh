@@ -4,15 +4,17 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 usage() {
-  echo "usage: fetch-upstream.sh [--only name[,name...]] [--selftest]" >&2
+  echo "usage: fetch-upstream.sh [--only name[,name...]] [--replace] [--selftest]" >&2
   exit 2
 }
 
 only_list=""
+replace=0
 selftest=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --only) [[ $# -ge 2 ]] || usage; only_list="$2"; shift 2 ;;
+    --replace) replace=1; shift ;;
     --selftest) selftest=1; shift ;;
     -h | --help) usage ;;
     *) echo "::error::unknown argument $1" >&2; usage ;;
@@ -85,7 +87,8 @@ fetch_one() {
     else
       # The alias path refuses a dirty clone; a primary that drifted off its pin is
       # the same loss waiting to happen, and only this branch reaches for rm.
-      if [[ ! -L "$dir" ]] && [[ -d "$dir/.git" ]] &&
+      # --replace is the artifact handoff saying its trees are disposable.
+      if [[ "$replace" == "0" && ! -L "$dir" ]] && [[ -d "$dir/.git" ]] &&
         [[ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]]; then
         echo "::error::$name holds uncommitted reading notes; moving it to $rev would discard them"
         echo BAD >"$verdict"
@@ -388,12 +391,31 @@ EOF
   [[ "$(git -C upstream/alpha rev-parse HEAD)" == "$rev3" ]] ||
     notes="$notes alpha did not reach its new pin once the notes were cleared;"
 
+  # --replace is the artifact handoff's opt-in: the tree it names is disposable.
+  echo four >"$src/file.txt"
+  git -C "$src" commit --quiet -am four
+  local rev4
+  rev4="$(git -C "$src" rev-parse HEAD)"
+  echo "handoff bytes" >upstream/alpha/notes.md
+  cat >upstream/pins.toml <<EOF
+[sources.alpha]
+repo = "$src"
+rev  = "$rev4"
+EOF
+  replace=1
+  run_all || notes="$notes a replace run over a dirty handoff exited red;"
+  replace=0
+  [[ "$(git -C upstream/alpha rev-parse HEAD)" == "$rev4" ]] ||
+    notes="$notes --replace left alpha off its new pin;"
+  [[ ! -f upstream/alpha/notes.md ]] ||
+    notes="$notes --replace kept the tree it was told to replace;"
+
   rm -rf "$root"
   if [[ -n "$notes" ]]; then
     echo "::error::self-test: $notes"
     return 1
   fi
-  echo "ok: self-test — one checkout per repo and rev, aliases link, a pin at another rev clones, notes refuse a move"
+  echo "ok: self-test — one checkout per repo and rev, aliases link, a pin at another rev clones, notes refuse a move, --replace moves a handoff's tree"
 }
 
 if [[ "$selftest" -eq 1 ]]; then

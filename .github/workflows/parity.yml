@@ -106,6 +106,7 @@ jobs:
       - name: identity, counts, timings, framing, then the process comparison
         shell: bash
         env:
+          FERROX_UPSTREAM_HANDOFF: "1"
           SPLICE_PIPE: ${{ inputs.splice_pipe_bytes }}
           REPEATS: ${{ inputs.repeats }}
           CONNECTIONS: ${{ inputs.connections }}

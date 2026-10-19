@@ -66,7 +66,9 @@ build() {
   # subshell keeps verify_checkout's exit from ending the whole matrix run.
   if ! (verify_checkout "$name" 2>/dev/null); then
     note "re-fetching $name at its pin; the handoff did not carry it"
-    ./scripts/fetch-upstream.sh --only "$name" >&2 || return 1
+    local -a refetch=(--only "$name")
+    [[ -z "${FERROX_UPSTREAM_HANDOFF:-}" ]] || refetch+=(--replace)
+    ./scripts/fetch-upstream.sh "${refetch[@]}" >&2 || return 1
     verify_checkout "$name" || return 1
   fi
   case "$name" in
