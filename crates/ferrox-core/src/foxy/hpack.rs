@@ -512,11 +512,42 @@ fn qpack_line(out: &mut Vec<u8>, name: &str, value: &[&[u8]]) {
     }
 }
 
+/// The bytes a prefixed integer costs: one for the octet holding what fits the prefix, then one per seven bits left over.
+fn integer_len(prefix: u8, value: usize) -> usize {
+    let max = (1usize << prefix) - 1;
+    if value < max {
+        return 1;
+    }
+    let mut rest = value - max;
+    let mut len = 2;
+    while rest >= 128 {
+        rest >>= 7;
+        len += 1;
+    }
+    len
+}
+
+/// The bytes a literal field line costs, so a block can be sized before it is written: the pattern octet shared with the name's length integer, the name, the value's length integer, the value.
+#[must_use]
+pub fn qpack_field_len(name: usize, value: usize) -> usize {
+    integer_len(3, name) + name + integer_len(7, value) + value
+}
+
+/// The two zero bytes that open a QPACK field block: no dynamic state, no indexed name.
+pub fn qpack_open(out: &mut Vec<u8>) {
+    out.extend_from_slice(&[0x00, 0x00]);
+}
+
+/// One field of an open block, its value taken as bytes: a code written into a stack buffer needs no `String`, and a value that already is bytes needs no join.
+pub fn qpack_field(out: &mut Vec<u8>, name: &str, value: &[u8]) {
+    qpack_line(out, name, &[value]);
+}
+
 /// Any request as literal field lines: two zero prefix bytes name no dynamic state, and each field is a `001` name length, name, value length and value run with no Huffman to compute.
 pub fn qpack_literal_many(fields: &[(&str, &str)], out: &mut Vec<u8>) {
-    out.extend_from_slice(&[0x00, 0x00]);
+    qpack_open(out);
     for (name, value) in fields {
-        qpack_line(out, name, &[value.as_bytes()]);
+        qpack_field(out, name, value.as_bytes());
     }
 }
 
