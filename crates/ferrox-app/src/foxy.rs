@@ -22,8 +22,10 @@ const DATAGRAM_BUF_MAX: usize = 256 * 1024;
 const SEND_WAIT: Duration = Duration::from_secs(10);
 /// The client's first unidirectional stream, carrying the SETTINGS that make the connection HTTP/3.
 const CONTROL_STREAM: u64 = 2;
-/// Request-stream buffer cap before the lane drops what it already read, and the max DATA frame size.
+/// The request-stream window's cap: the downlink never stages a frame here — only the head walk and the capsule stream land bytes in the window, and the max DATA frame the lane writes fits inside one read of this size.
 const H3_WINDOW: usize = 64 * 1024;
+/// A QUIC frame header is two varints of at most eight bytes each; the downlink reads no more than this into its window, because the payload it names lands in the caller.
+const H3_PEEK: usize = 16;
 const H3_FRAME: usize = 16 * 1024;
 
 /// The carriers the lane can carry, in `auto`'s preference order: QUIC (one handshake carries every flow), HTTP/2 (the edge speaks it), HTTP/1.1 (every edge does).
@@ -1150,13 +1152,12 @@ pub(crate) type Quic = crate::quic::PooledStream;
 pub(crate) struct H3 {
     /// The stream this lane rides, and the pool entry it owes back when the lane ends.
     quic: Quic,
-    /// The request stream's read window, filled straight from the stream — no scratch buffer, no second copy: `head[..filled]` has arrived, `head[carried..filled]` is unparsed.
+    /// The request stream's read window, filled a header's worth at a time — the DATA payload it frames lands in the caller, not here: `head[..filled]` has arrived, `head[carried..filled]` is unparsed.
     head: Vec<u8>,
     filled: usize,
     carried: usize,
-    /// The remainder of a DATA frame the caller had no room for, with a cursor: draining moves what is left on every call.
-    carry: Vec<u8>,
-    at: usize,
+    /// Bytes of the DATA frame being delivered that the caller has not asked for yet: a frame spans reads from here, straight from the stream into each call's own buffer.
+    body: usize,
     /// The frame this lane writes, reused so a relay allocates nothing per frame.
     out: Vec<u8>,
     /// Capsule-stream bytes no whole DATAGRAM capsule has consumed yet: one capsule may span DATA frames, so frames accumulate only here.
@@ -1189,8 +1190,7 @@ impl H3 {
             head: Self::open_window(),
             filled: 0,
             carried: 0,
-            carry: Vec::new(),
-            at: 0,
+            body: 0,
             out: Vec::new(),
             capsule_buf: Vec::new(),
             fin: false,
@@ -1244,8 +1244,7 @@ impl H3 {
             head: Self::open_window(),
             filled: 0,
             carried: 0,
-            carry: Vec::new(),
-            at: 0,
+            body: 0,
             out: Vec::new(),
             capsule_buf: Vec::new(),
             fin: false,
@@ -1265,8 +1264,7 @@ impl H3 {
             head: Self::open_window(),
             filled: 0,
             carried: 0,
-            carry: Vec::new(),
-            at: 0,
+            body: 0,
             out: Vec::new(),
             capsule_buf: Vec::new(),
             fin: false,
@@ -1452,6 +1450,8 @@ impl H3 {
     /// One UDP payload out of the capsule stream: DATA frames are parsed until a whole DATAGRAM capsule appears, capsules that span frames accumulate, and empty datagrams are skipped so `Ok(0)` stays the end of stream.
     pub(crate) fn read_datagram(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let started = Instant::now();
+        // One wait per call, armed from its start: re-armed inside the loop the check below could never see an expiry, so a peer that stopped answering cost this lane nothing but its own parking.
+        self.deadline = started + HEADER_TIMEOUT;
         loop {
             if let Some((used, payload)) = masque::datagram_split(&self.capsule_buf) {
                 let take = buf.len().min(payload.len());
@@ -1478,7 +1478,6 @@ impl H3 {
                     "foxy: a capsule stream that never parses",
                 ));
             }
-            self.deadline = Instant::now() + HEADER_TIMEOUT;
             self.fill().map_err(io)?;
             // A capsule is usually whole inside one DATA frame, so a frame's payload is parsed where it lies and only a split capsule staged: the same one copy the tunnel read makes.
             let mut at = self.carried;
@@ -1672,16 +1671,83 @@ impl H3 {
         }
     }
 
-    /// Hands the caller what is left of a frame the caller's buffer had no room for, and moves the cursor.
-    fn take(&mut self, buf: &mut [u8]) -> usize {
-        let take = buf.len().min(self.carry.len() - self.at);
-        buf[..take].copy_from_slice(&self.carry[self.at..self.at + take]);
-        self.at += take;
-        if self.at == self.carry.len() {
-            self.carry.clear();
-            self.at = 0;
+    /// The next frame's header, a peek's worth at most: the DATA payload the header names never passes through the window, so what sits unparsed here is always smaller than a header and its spill.
+    fn fill_peek(&mut self) -> Result<(), Failure> {
+        if self.head.len() - self.filled < H3_PEEK {
+            self.head.copy_within(self.carried..self.filled, 0);
+            self.filled -= self.carried;
+            self.carried = 0;
         }
-        take
+        // A window filled by the head walk's whole-frame read can still run out of tail; nothing is unparsed at a header boundary, so the window restarts empty rather than handing the stream a zero-length buffer.
+        if self.filled == self.head.len() {
+            self.filled = 0;
+        }
+        let id = self.quic.id;
+        let mut window = std::mem::take(&mut self.head);
+        let filled = self.filled;
+        let room = H3_PEEK.min(window.len() - filled);
+        let read = self.with_conn(|conn| conn.stream_recv(id, &mut window[filled..filled + room]));
+        self.head = window;
+        match read {
+            Some(Ok((0, true))) => Err(Failure::Stream),
+            Some(Ok((read, _))) => {
+                self.filled += read;
+                Ok(())
+            }
+            Some(Err(quiche::Error::Done)) => {
+                if Instant::now() >= self.deadline {
+                    return Err(Failure::Stream);
+                }
+                self.pump(Duration::from_millis(5));
+                Ok(())
+            }
+            _ => Err(Failure::Io),
+        }
+    }
+
+    /// Delivers the frame in flight: what already sits in the window moves first — those bytes crossed once before this lane knew their length — and the rest arrives from the stream straight into the caller's buffer. A quantum that expires mid-frame hands back what was delivered; the next read resumes at the cursor.
+    fn body_into(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let started = Instant::now();
+        self.deadline = started + self.head_wait;
+        let mut delivered = 0usize;
+        while self.body > 0 && delivered < buf.len() {
+            if self.carried < self.filled {
+                let n = (self.filled - self.carried)
+                    .min(self.body)
+                    .min(buf.len() - delivered);
+                buf[delivered..delivered + n]
+                    .copy_from_slice(&self.head[self.carried..self.carried + n]);
+                self.carried += n;
+                self.body -= n;
+                delivered += n;
+                continue;
+            }
+            if self
+                .quantum
+                .is_some_and(|quantum| started.elapsed() >= quantum)
+            {
+                break;
+            }
+            let want = self.body.min(buf.len() - delivered);
+            let id = self.quic.id;
+            let read =
+                self.with_conn(|conn| conn.stream_recv(id, &mut buf[delivered..delivered + want]));
+            match read {
+                Some(Ok((0, true))) => return Err(io(Failure::Stream)),
+                Some(Ok((read, _))) => {
+                    delivered += read;
+                    self.body -= read;
+                }
+                Some(Err(quiche::Error::Done)) => {
+                    if Instant::now() >= self.deadline {
+                        return Err(io(Failure::Stream));
+                    }
+                    self.pump(Duration::from_millis(5));
+                }
+                _ => return Err(io(Failure::Io)),
+            }
+        }
+        Ok(delivered)
     }
 }
 
@@ -1710,11 +1776,13 @@ impl Write for H3 {
 impl Read for H3 {
     /// The tunnel, not the stream: the caller gets the payload of DATA frames, because a frame header read as payload carries the tunnel's own framing into every byte after it.
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.body > 0 {
+            return self.body_into(buf);
+        }
         let started = Instant::now();
+        // One wait per read call, armed from its own start: re-arming inside the loop would let a peer that answers nothing park this lane forever, where the socket carriers' read timeout costs the caller `head_wait` and returns.
+        self.deadline = started + self.head_wait;
         loop {
-            if self.at < self.carry.len() {
-                return Ok(self.take(buf));
-            }
             if self.fin {
                 return Ok(0);
             }
@@ -1724,57 +1792,39 @@ impl Read for H3 {
             {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
-            self.deadline = Instant::now() + HEADER_TIMEOUT;
-            if H3_WINDOW - self.filled < 16 {
-                // Only the frames already parsed are worth moving, and they move to the start of the window rather than draining out of it.
-                self.head.copy_within(self.carried..self.filled, 0);
-                self.filled -= self.carried;
-                self.carried = 0;
-            }
-            self.fill().map_err(io)?;
-            if let Some(read) = self.take_frames(buf).map_err(io)? {
-                return Ok(read);
-            }
-        }
-    }
-}
-
-impl H3 {
-    /// Walks the buffered frames, handing a DATA payload straight to the caller and leaving anything that is not tunnel bytes where the next read starts; only what the caller has no room for is staged in `carry`.
-    fn take_frames(&mut self, buf: &mut [u8]) -> Result<Option<usize>, Failure> {
-        loop {
-            let at = self.carried;
-            if at >= self.filled {
-                return Ok(None);
-            }
             let mut head = 0usize;
-            let Some(frame) = frames::h3_frame(&self.head[at..self.filled], &mut head) else {
-                return Ok(None);
+            let Some(frame) = frames::h3_frame(&self.head[self.carried..self.filled], &mut head)
+            else {
+                self.fill_peek().map_err(io)?;
+                continue;
             };
-            let end = match at
-                .checked_add(head)
-                .and_then(|body| body.checked_add(frame.length as usize))
-            {
-                Some(end) if end <= self.filled => end,
-                _ => return Ok(None),
+            let Some(body_at) = self.carried.checked_add(head) else {
+                return Err(io(Failure::Frame));
             };
-            let body = at + head;
-            match frames::h3_event(frame, &self.head[body..end]) {
-                frames::H3Event::Data { payload, .. } => {
-                    let taken = buf.len().min(payload.len());
-                    buf[..taken].copy_from_slice(&payload[..taken]);
-                    if taken < payload.len() {
-                        self.carry.clear();
-                        self.carry.extend_from_slice(&payload[taken..]);
-                        self.at = 0;
-                    }
-                    self.carried = end;
-                    return Ok(Some(taken));
+            let Ok(length) = usize::try_from(frame.length) else {
+                return Err(io(Failure::Stream));
+            };
+            if frame.kind == frames::H3_DATA {
+                self.carried = body_at;
+                self.body = length;
+                return self.body_into(buf);
+            }
+            let Some(end) = body_at.checked_add(length) else {
+                return Err(io(Failure::Frame));
+            };
+            if end > self.filled {
+                // A frame bigger than the window would leave fill() indexing a full tail out of range; at a boundary with nothing unparsed the window restarts empty instead of growing.
+                if self.carried == self.filled {
+                    self.filled = 0;
+                    self.carried = 0;
                 }
+                self.fill().map_err(io)?;
+                continue;
+            }
+            match frames::h3_event(frame, &self.head[body_at..end]) {
                 frames::H3Event::Reset { .. } | frames::H3Event::GoAway { .. } => {
                     self.fin = true;
                     self.carried = self.filled;
-                    return Ok(None);
                 }
                 _ => self.carried = end,
             }
@@ -2910,7 +2960,7 @@ mod loopback {
         let key = crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY");
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
         let (uni_tx, uni_rx) = std::sync::mpsc::channel();
-        let edge = h3_edge(sock, cert, key, seen_tx, uni_tx);
+        let edge = h3_edge(sock, cert, key, seen_tx, uni_tx, PAYLOAD.to_vec());
         let proxy = socks_relay(edge_port);
         let (client, peer, local) = crate::quic::udp_to_server("127.0.0.1", edge_port)
             .expect("a socket the edge can be addressed from");
@@ -5366,13 +5416,14 @@ mod loopback {
         edge.join().expect("joins");
     }
 
-    /// The edge half of the QUIC carrier: a control stream, one HEADERS frame with a QPACK status, and DATA frames echoed both ways — the proof the QUIC lane lacked: the wire request compared byte for byte with the lane's block, the status read through the QPACK decoder, and the bytes after the head travelling through the tunnel; a codec test answers none of those three.
+    /// The edge half of the QUIC carrier: a control stream, one HEADERS frame with a QPACK status, and DATA frames echoing the uplink back then streaming `downlink` — the proof the QUIC lane lacked: the wire request compared byte for byte with the lane's block, the status read through the QPACK decoder, and the bytes after the head travelling through the tunnel; a codec test answers none of those three.
     fn h3_edge(
         sock: crate::quic::Datagram,
         cert_pem: Vec<u8>,
         key_pem: Vec<u8>,
         seen: std::sync::mpsc::Sender<Vec<u8>>,
         uni: std::sync::mpsc::Sender<Vec<(u64, Vec<u8>, bool)>>,
+        downlink: Vec<u8>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let stamp = std::time::SystemTime::now()
@@ -5456,11 +5507,13 @@ mod loopback {
             while let Ok((written, info)) = conn.send(&mut out) {
                 let _ = sock.send_to(&out[..written], info.to);
             }
-            echo_stream(&sock, local, &mut conn, &mut buf, &mut out, stream);
+            echo_stream(
+                &sock, local, &mut conn, &mut buf, &mut out, stream, &downlink,
+            );
         })
     }
 
-    /// Echoes one request stream's DATA payloads until the lane's whole payload has come back: the tunnel half of the loopback proof.
+    /// Streams `downlink` onto one request stream as DATA frames, held to the length of the lane's own payload until the uplink has come in: a lane that never wrote gets nothing back, and a downlink longer than the uplink still arrives. The tunnel half of the loopback proof, and the downlink half the byte-count witnesses stand on.
     fn echo_stream(
         sock: &crate::quic::Datagram,
         local: SocketAddr,
@@ -5468,46 +5521,74 @@ mod loopback {
         buf: &mut [u8; 1350],
         out: &mut [u8; 1350],
         stream: u64,
+        downlink: &[u8],
     ) {
         let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut received: Vec<u8> = Vec::new();
-        let mut sent = 0usize;
         let mut pending: Vec<u8> = Vec::new();
-        while sent < PAYLOAD.len() {
+        let mut frame: Vec<u8> = Vec::new();
+        let mut sent = 0usize;
+        // The head of what the edge sends is the echo's debt: no byte leaves before the uplink paid for it, so a lane that never wrote never reads. Past `PAYLOAD` the stream is the edge's own to give and it flows at the credit's pace, which is what lets a downlink longer than the uplink arrive at all.
+        let echo = PAYLOAD.len().min(downlink.len());
+        let mut quiet = std::time::Instant::now();
+        loop {
             assert!(std::time::Instant::now() < deadline, "the tunnel echoes");
-            if let Some((n, from)) = crate::quic::server_poll(sock, &mut buf[..]) {
-                let info = quiche::RecvInfo { from, to: local };
-                conn.recv(&mut buf[..n], info).expect("drives");
-                pending.extend_from_slice(&drain(&mut *conn, stream));
-                let mut at = 0usize;
-                let mut whole = 0usize;
-                while let Some(frame) = frames::h3_frame(&pending, &mut at) {
-                    let end = at + frame.length as usize;
-                    if end > pending.len() {
-                        break;
-                    }
-                    if let frames::H3Event::Data { payload, .. } =
-                        frames::h3_event(frame, &pending[at..end])
-                    {
-                        received.extend_from_slice(payload);
-                    }
-                    at = end;
-                    whole = end;
+            match crate::quic::server_poll(sock, &mut buf[..]) {
+                Some((n, from)) => {
+                    let info = quiche::RecvInfo { from, to: local };
+                    conn.recv(&mut buf[..n], info).expect("drives");
+                    pending.extend_from_slice(&drain(&mut *conn, stream));
                 }
-                // Only what whole frames cover is spent: a header that arrived without its payload has to wait for the rest of it.
-                pending.drain(..whole);
+                // A quiet turn still drives the connection: its timer is what turns a datagram the loopback dropped back into a retransmission.
+                None => conn.on_timeout(),
             }
-            if received.len() > sent {
-                let n = (received.len() - sent).min(16_384);
-                let mut frame = Vec::new();
-                frames::quic_varint(&mut frame, frames::H3_DATA);
-                frames::quic_varint(&mut frame, n as u64);
-                frame.extend_from_slice(&received[sent..sent + n]);
-                conn.stream_send(stream, &frame, false).expect("echoes");
-                sent += n;
+            let mut at = 0usize;
+            let mut whole = 0usize;
+            while let Some(head) = frames::h3_frame(&pending, &mut at) {
+                let end = at + head.length as usize;
+                if end > pending.len() {
+                    break;
+                }
+                if let frames::H3Event::Data { payload, .. } =
+                    frames::h3_event(head, &pending[at..end])
+                {
+                    received.extend_from_slice(payload);
+                }
+                at = end;
+                whole = end;
             }
-            while let Ok((written, info)) = conn.send(&mut out[..]) {
+            // Only what whole frames cover is spent: a header that arrived without its payload has to wait for the rest of it.
+            pending.drain(..whole);
+            if sent < downlink.len() {
+                let owed = if sent < echo {
+                    received.len().min(downlink.len())
+                } else {
+                    downlink.len()
+                };
+                let n = owed.saturating_sub(sent).min(16_384);
+                if n > 0 {
+                    frame.clear();
+                    frames::quic_varint(&mut frame, frames::H3_DATA);
+                    frames::quic_varint(&mut frame, n as u64);
+                    frame.extend_from_slice(&downlink[sent..sent + n]);
+                    // The credit-aware write: a send buffer the reader has not emptied takes only part of a frame, and the rest lives on solely because the writer waited for it.
+                    assert!(
+                        crate::quic::stream_send_all(conn, sock, stream, &frame, false, deadline),
+                        "the echo reaches the lane"
+                    );
+                    sent += n;
+                }
+            }
+            let mut wrote = false;
+            while let Ok((written, info)) = conn.send(out) {
+                wrote = true;
                 let _ = sock.send_to(&out[..written], info.to);
+            }
+            // Handing quiche the bytes is not delivering them: the tail of a burst survives a dropped datagram only while someone is left to retransmit it, so the edge stays until a whole quiet period has nothing to send.
+            if wrote || sent < downlink.len() {
+                quiet = std::time::Instant::now();
+            } else if sent == downlink.len() && quiet.elapsed() >= Duration::from_millis(200) {
+                return;
             }
         }
     }
@@ -5557,6 +5638,7 @@ mod loopback {
             key_pem,
             seen_tx,
             uni_tx,
+            PAYLOAD.to_vec(),
         );
 
         let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
@@ -5601,6 +5683,69 @@ mod loopback {
             panic!("an h3 lane");
         };
         assert_eq!(lane.out.capacity(), 0, "no buffer was staged to write one");
+        edge.join().expect("joins");
+    }
+
+    /// A downlink several times the old frame cap: bytes no window could have held whole, so a lane that stages a frame before handing it over would have to grow one.
+    const DOWNLINK: usize = 204_800;
+
+    #[test]
+    fn the_h3_downlink_hands_the_caller_the_frame_without_staging_it() {
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let port = sock.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (uni_tx, _uni_rx) = std::sync::mpsc::channel();
+        let downlink: Vec<u8> = (0..DOWNLINK as u64).map(|i| (i % 251) as u8).collect();
+        let edge = h3_edge(
+            sock,
+            crate::quic::der_to_pem(&server.cert_chain[0], "CERTIFICATE"),
+            crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY"),
+            seen_tx,
+            uni_tx,
+            downlink.clone(),
+        );
+
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", Some(quic)).expect("opens");
+        seen_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the edge read the block");
+        tunnel.write_all(PAYLOAD).expect("writes");
+        tunnel.flush().expect("flushes");
+
+        // Small caller buffers: every frame spans many reads, so a resumed-read bug cannot hide behind one big pull.
+        let mut chunk = vec![0u8; 4096];
+        let mut got: Vec<u8> = Vec::new();
+        while got.len() < downlink.len() {
+            let read = tunnel.read(&mut chunk).expect("reads");
+            assert!(
+                read > 0,
+                "a read that returns nothing is an EOF, and the stream has not ended"
+            );
+            assert!(
+                read <= chunk.len(),
+                "the lane never hands back more than the caller asked for"
+            );
+            got.extend_from_slice(&chunk[..read]);
+        }
+        assert_eq!(
+            got, downlink,
+            "every downlink byte arrives, in order, with no framing in it"
+        );
+        let Tunnel::H3(lane) = &tunnel else {
+            panic!("an h3 lane");
+        };
+        // The window holds at most a header and the spill of the frame it names: under the old lane this is where the whole 16 KiB frame sat before any of it reached the caller.
+        assert!(
+            lane.filled - lane.carried <= H3_PEEK,
+            "the window staged {} bytes of a frame the caller was reading",
+            lane.filled - lane.carried
+        );
+        assert_eq!(lane.body, 0, "the frame in flight was delivered, not kept");
         edge.join().expect("joins");
     }
 }
