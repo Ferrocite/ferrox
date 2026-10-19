@@ -2909,7 +2909,7 @@ mod tests {
                 stream
                     .read_exact(&mut got)
                     .map_err(|e| format!("the peer's upload stopped after {read}: {e}"))?;
-                if let Some(at) = pattern_mismatch(&pattern, read, &got) {
+                if let Some(at) = pattern_mismatch(&template, read, &got) {
                     return Err(format!("the upload desynced at byte {}", read + at));
                 }
                 read += got.len();
