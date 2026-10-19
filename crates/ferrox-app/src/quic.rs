@@ -487,13 +487,10 @@ pub(crate) fn send_h3_opening(conn: &mut quiche::Connection, sock: &Datagram) ->
     true
 }
 
-/// The most datagrams one pump takes before it hands the connection back: a peer's whole burst is
-/// absorbed in one visit, but a socket kept busy must not hold the lock from the other flows.
+/// The most datagrams one pump takes before it hands the connection back, so a busy socket cannot hold the lock from the other flows.
 const PUMP_BURST: usize = 64;
 
-/// How long a pump waits for the datagram after the one it came for, once the first read has landed:
-/// long enough to catch the packets already in flight behind it, short enough that a caller waiting on
-/// a packet that has not arrived is not held for the deadline it armed the visit with.
+/// How long a pump waits for a datagram once it has taken the one it came for: long enough to catch what is already in flight, far shorter than the caller's own deadline.
 const PUMP_TAIL: Duration = Duration::from_millis(1);
 
 pub(crate) fn pump_once(
@@ -511,10 +508,7 @@ pub(crate) fn pump_once(
     }
     let mut room = Unfilled::<MAX_DATAGRAM>::new();
     let buf = room.as_mut();
-    // The wait is armed once for the visit, then the queue already full behind it is drained: a 16 KiB
-    // DATA frame arrives as a dozen datagrams, and absorbing one per visit paid a timer set and an
-    // egress sweep for each. An expired read timeout answers EAGAIN like an empty queue, which is where
-    // the drain stops.
+    // One armed wait, then the queue already full behind it: a 16 KiB DATA frame is a dozen datagrams, and absorbing one per visit paid a timer set and an egress sweep for each.
     let mut taken = 0usize;
     loop {
         match sock.recv_from(buf) {
@@ -522,11 +516,7 @@ pub(crate) fn pump_once(
                 let info = quiche::RecvInfo { from, to: local };
                 let _ = conn.recv(&mut buf[..n], info);
                 taken += 1;
-                // Re-armed once, after the packet the visit waited for: what follows is either already
-                // queued, and costs no wait, or is not coming yet, and the caller's own deadline is the
-                // thing that should wait for it -- `wait` here can be that caller's whole remaining
-                // budget, so holding it for a packet that has not arrived wastes the budget instead.
-                // A failed re-arm leaves the first arm in place, which is the wait this call began with.
+                // Re-armed once the packet the visit waited for lands: what follows is queued and costs no wait, or is not coming yet and the caller's deadline should wait for it; a failed re-arm leaves the first arm in place.
                 if taken == 1 {
                     let _ = sock.set_read_timeout(Some(PUMP_TAIL));
                 }
@@ -2963,8 +2953,7 @@ mod tests {
         );
     }
 
-    /// A socket, its address and a connection that answers nothing: the pump's queue is what these
-    /// witnesses read, so no peer and no handshake is needed to fill it.
+    /// A socket, its address and a connection that answers nothing: the pump's queue is what these witnesses read, so no peer and no handshake is needed to fill it.
     fn deaf_lane() -> (Datagram, SocketAddr, quiche::Connection) {
         let sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
         let local = sock.local_addr().expect("addr");
@@ -2977,10 +2966,7 @@ mod tests {
         (sock, local, conn)
     }
 
-    /// One visit to the socket absorbs the whole burst waiting on it: a 16 KiB stream write arrives as
-    /// a dozen packets, and a pump that took one per visit paid a timer set and an egress sweep for each.
-    /// The witness is the queue itself — one armed wait and three reads say whether three datagrams were
-    /// taken in one visit or one at a time.
+    /// One visit to the socket absorbs the whole burst waiting on it, and the witness is the queue itself: one armed wait and a fourth read that must find nothing says whether three datagrams were taken in one visit or one at a time.
     #[test]
     fn one_pump_absorbs_the_whole_datagram_burst_on_the_socket() {
         let (sock, local, mut conn) = deaf_lane();
@@ -2988,9 +2974,7 @@ mod tests {
             sock.send_to(&[0xc0, 0x00, 0x00, 0x01, salt], local)
                 .expect("queues");
         }
-        // The wait is one millisecond and the floor keeps it there, so it expires once the queue is dry:
-        // the third read is the first nothing arrived on, which is only true if the two before it were
-        // taken in the same visit rather than one per visit.
+        // The one-millisecond wait is also the floor, so it expires once the queue is dry: the third read is the first nothing arrived on, which is only true if the two before it were taken in the same visit.
         assert!(pump_once(&mut conn, &sock, local, Duration::from_millis(1)));
         assert!(
             sock.recv_from(&mut [0u8; 64]).is_err(),
@@ -2998,10 +2982,7 @@ mod tests {
         );
     }
 
-    /// Absorbing the burst must not cost the caller the wait it armed: `stream_recv_exact` hands this
-    /// function its whole remaining budget, so a pump that kept reading on that arm after the packet it
-    /// came for held the flow for seconds on a queue that had gone quiet. One second armed, a few
-    /// milliseconds taken -- the drain is bounded by the queue, not by the budget.
+    /// Absorbing the burst must not cost the caller the wait it armed: `stream_recv_exact` hands this function its whole remaining budget, so the drain is bounded by the queue, not by the budget.
     #[test]
     fn a_pump_that_absorbs_its_burst_does_not_hold_the_wait_it_armed() {
         let (sock, local, mut conn) = deaf_lane();
