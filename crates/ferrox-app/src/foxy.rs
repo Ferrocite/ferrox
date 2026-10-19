@@ -415,7 +415,7 @@ fn read_exact<S: Read>(io: &mut S, buf: &mut [u8]) -> std::io::Result<()> {
 /// HTTP/1.1 CONNECT: the request, the status line, then the target's own bytes.
 pub(crate) fn open_h1(dial: &FoxyDial, target: &str) -> Result<Tls1, Failure> {
     let mut tls = tls_to_edge(dial)?;
-    tls.write_all(&foxy::connect_request(target, &dial.pass.token))
+    tls.write_all_slices(&foxy::connect_request(target, &dial.pass.token))
         .map_err(|_| Failure::Io)?;
     opened(foxy::connect_status(&head(&mut tls)?)?)?;
     Ok(Tls1(tls))
@@ -478,7 +478,7 @@ fn open_h2_with(dial: &FoxyDial, block: &[u8]) -> Result<Tls2, Failure> {
         frames::SETTINGS,
         0,
         0,
-        &frames::client_settings(),
+        &frames::CLIENT_SETTINGS,
         &mut opening,
     );
     h2_frame(
@@ -1000,7 +1000,7 @@ fn open_h2_with_raw(
         frames::SETTINGS,
         0,
         0,
-        &frames::client_settings(),
+        &frames::CLIENT_SETTINGS,
         &mut opening,
     );
     h2_frame(
