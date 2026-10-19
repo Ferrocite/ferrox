@@ -30,6 +30,7 @@ mod tun;
 mod vision;
 mod vmess;
 mod ws;
+mod xdrive;
 mod xhttp;
 mod xhttp_h2;
 mod xray_pb;

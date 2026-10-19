@@ -157,6 +157,16 @@ carrier-httpupgrade head-reads-per-window 1 ferrox-app-proxy::tests::a_kept_head
 carrier-httpupgrade head-tail-allocations 0 ferrox-app-httpupgrade::tests::the_record_head_hands_over_the_buffer_it_filled
 carrier-httpupgrade inner-reads-per-pipelined-prefix 0 ferrox-app-httpupgrade::tests::the_pipelined_prefix_reaches_the_reader_without_a_socket_read
 carrier-httpupgrade prefix-bytes-held-after-walk 0 ferrox-app-httpupgrade::tests::the_pipelined_prefix_reaches_the_reader_without_a_socket_read
+carrier-xdrive ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-xdrive connections-per-five-templated-asks 1 ferrox-app-xdrive::tests::the_templated_store_sends_the_reference_bytes
+carrier-xdrive connections-per-five-drive-asks 1 ferrox-app-xdrive::tests::the_drive_service_asks_in_the_reference_shape
+carrier-xdrive token-asks-per-two-oauth2-uploads 1 ferrox-app-xdrive::tests::an_oauth2_template_fetches_its_token_once_and_again_after_a_401
+carrier-xdrive asks-per-waited-out-refusal 2 ferrox-app-xdrive::tests::a_configured_answer_is_asked_again
+carrier-xdrive store-instances-per-two-identical-configs 1 ferrox-app-xdrive::tests::a_store_is_shared_by_the_settings_that_name_it
+carrier-xdrive held-ticks-per-growing-segment 8 ferrox-app-xdrive::tests::coalescing_holds_a_growing_buffer_for_a_bounded_run_of_ticks
+carrier-xdrive segment-buffer-reallocations-per-upload-cycle 0 ferrox-app-xdrive::tests::a_finished_upload_hands_its_buffer_back_empty_and_whole
+carrier-xdrive socket-reads-per-pipelined-answer 0 ferrox-app-xdrive::tests::a_lane_keeps_what_arrives_past_the_answer_it_read
+carrier-xdrive lane-buffer-reallocations-per-answer 0 ferrox-app-xdrive::tests::a_lane_keeps_what_arrives_past_the_answer_it_read
 
 carrier-httpheader ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-httpheader framing-bytes-added 0 ferrox-app-httpheader::tests::header_carries_an_echo_over_loopback
