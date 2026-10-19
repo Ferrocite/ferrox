@@ -1556,10 +1556,11 @@ fn read_validated(stream: &mut TcpStream, pattern: &[u8], bytes: u64) -> Result<
             ));
         }
         if let Some(at) = pattern_mismatch(pattern, read_total as usize, &chunk[..want]) {
-            let (want, saw) = mismatch_bytes(pattern, read_total as usize, &chunk[..want], at);
+            let (expect, saw) = mismatch_bytes(pattern, read_total as usize, &chunk[..want], at);
             return Err(format!(
-                "bytes at offset {read_total} are not the validated pattern, first at byte {} (expected 0x{want:02x}, saw 0x{saw:02x})",
-                read_total + at as u64
+                "bytes at offset {read_total} are not the validated pattern, first at byte {} (expected 0x{expect:02x}, saw 0x{saw:02x}; read {want}, local {at}; {})",
+                read_total + at as u64,
+                mismatch_window(pattern, read_total as usize, &chunk[..want], at)
             ));
         }
         read_total += want as u64;
@@ -1595,6 +1596,17 @@ fn pattern_mismatch(pattern: &[u8], offset: usize, chunk: &[u8]) -> Option<usize
 fn mismatch_bytes(pattern: &[u8], offset: usize, chunk: &[u8], at: usize) -> (u8, u8) {
     let want = pattern[(offset + at) % pattern.len()];
     (want, chunk[at])
+}
+
+/// Sixteen pattern bytes and sixteen stream bytes from the first mismatch: a buffer that restarted reads `pattern[0..]`, a shifted stream reads `pattern[k..]`.
+fn mismatch_window(pattern: &[u8], offset: usize, chunk: &[u8], at: usize) -> String {
+    let period = pattern.len();
+    let start = (offset + at) % period;
+    let want: Vec<u8> = (0..16.min(period))
+        .map(|i| pattern[(start + i) % period])
+        .collect();
+    let end = (at + 16).min(chunk.len());
+    format!("pattern {want:02x?} stream {:02x?}", &chunk[at..end])
 }
 
 // A blocking socket returns WouldBlock/EAGAIN (macOS 35), ENOBUFS (macOS 55, Linux 105, Windows 10055) and their EAGAIN kin transiently when a full-rate flow outruns the kernel's send buffers; on an 8-flow macos-15 cell that aborted the reference engine and collapsed the gate-5 comparison into a false PROCESS REGRESSION, so ride it out until the per-op timeout rather than treating backpressure as a fault.
@@ -1817,7 +1829,10 @@ fn validate(
         if let Some(local) = pattern_mismatch(pattern, offset, &buffer[..n]) {
             let at = seen + local as u64;
             let (want, saw) = mismatch_bytes(pattern, offset, &buffer[..n], local);
-            let detail = format!("expected 0x{want:02x}, saw 0x{saw:02x}");
+            let detail = format!(
+                "expected 0x{want:02x}, saw 0x{saw:02x}; read {n}, local {local}; {}",
+                mismatch_window(pattern, offset, &buffer[..n], local)
+            );
             note_desync(
                 desync,
                 Forged {
@@ -2173,14 +2188,20 @@ pub fn harness_ceiling(connections: usize, payload_size: usize, bytes: u64) -> R
     let mut flows = Vec::with_capacity(connections);
     for (index, addr) in targets.into_iter().enumerate() {
         let template = Arc::clone(&pattern);
-        flows.push(std::thread::spawn(move || {
-            ceiling_flow(addr, &template, index, connections, bytes)
-        }));
+        flows.push((
+            index,
+            std::thread::spawn(move || ceiling_flow(addr, &template, index, connections, bytes)),
+        ));
     }
 
     let mut best = 0.0f64;
-    for flow in flows {
-        let Ok(rate) = flow.join() else { continue };
+    for (index, flow) in flows {
+        let Ok((rate, why)) = flow.join() else {
+            continue;
+        };
+        if let Some(why) = why {
+            eprintln!("harness ceiling flow {index}: {why}");
+        }
         best = best.max(rate);
     }
     let _ = sink.join();
@@ -2200,21 +2221,27 @@ fn ceiling_flow(
     index: usize,
     flows: usize,
     bytes: u64,
-) -> f64 {
+) -> (f64, Option<String>) {
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(10)) else {
-        return 0.0;
+        return (0.0, Some("could not connect to the sink".to_owned()));
     };
     let _ = stream.set_nodelay(true);
     apply_flow_timeouts(&stream);
     let pattern = rotate(template, index, flows);
     let started = Instant::now();
-    let read_total = read_validated(&mut stream, &pattern, bytes).unwrap_or(0);
+    let (read_total, why) = match read_validated(&mut stream, &pattern, bytes) {
+        Ok(n) => (n, None),
+        Err(why) => (0, Some(why)),
+    };
     let elapsed = started.elapsed();
     let _ = stream.shutdown(Shutdown::Both);
     if elapsed.is_zero() || read_total == 0 {
-        return 0.0;
+        return (0.0, why);
     }
-    read_total as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0)
+    (
+        read_total as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0),
+        why,
+    )
 }
 
 #[cfg(test)]
