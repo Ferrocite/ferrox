@@ -24,10 +24,10 @@ const DATAGRAM_BUF_MAX: usize = 256 * 1024;
 const SEND_WAIT: Duration = Duration::from_secs(10);
 /// The client's first unidirectional stream, carrying the SETTINGS that make the connection HTTP/3.
 const CONTROL_STREAM: u64 = 2;
-/// The request-stream window's cap: the downlink never stages a frame here — only the head walk and the capsule stream land bytes in the window, and the max DATA frame the lane writes fits inside one read of this size.
-const H3_WINDOW: usize = 64 * 1024;
-/// A QUIC frame header is two varints of at most eight bytes each; the downlink reads no more than this into its window, because the payload it names lands in the caller.
+/// The ceiling of a QUIC frame header: two varints of at most eight bytes each. The request stream's window is this size and nothing larger, because a payload never passes through it — it lands in the buffer its reader uses.
 const H3_PEEK: usize = 16;
+/// The largest frame block the lane will consume without keeping it: a HEADERS answer's block and any frame the tunnel has no use for are bounded by one head, so a peer cannot make the lane wait on a block bigger than a header.
+const H3_SKIP: usize = MAX_HEAD;
 const H3_FRAME: usize = 16 * 1024;
 
 /// The carriers the lane can carry, in `auto`'s preference order: QUIC (one handshake carries every flow), HTTP/2 (the edge speaks it), HTTP/1.1 (every edge does).
@@ -1250,15 +1250,17 @@ pub(crate) type Quic = crate::quic::PooledStream;
 pub(crate) struct H3 {
     /// The stream this lane rides, and the pool entry it owes back when the lane ends.
     quic: Quic,
-    /// The request stream's read window, filled a header's worth at a time — the DATA payload it frames lands in the caller, not here: `head[..filled]` has arrived, `head[carried..filled]` is unparsed.
+    /// The request stream's frame window, sized to one header and nothing more: `head[..filled]` has arrived, `head[carried..filled]` is unparsed, and a payload the header names never lands here — the tunnel's goes to its caller's buffer, a capsule's to the capsule stream. Its capacity is the whole claim: a lane that stages a frame before reading it would need a wider window, and the bytes would be identical either way.
     head: Vec<u8>,
     filled: usize,
     carried: usize,
     /// Bytes of the DATA frame being delivered that the caller has not asked for yet: a frame spans reads from here, straight from the stream into each call's own buffer.
     body: usize,
+    /// The block the last header named that the lane has not finished consuming, if any: `Keep` appends it to the capsule stream and `Drop` appends it where the stream can forget it whole. The count has to survive a quantum park — the header is already spent, so a walk that re-read it would put the next frame out of order.
+    pending: Option<Pending>,
     /// The frame this lane writes, reused so a relay allocates nothing per frame.
     out: Vec<u8>,
-    /// Capsule-stream bytes no whole DATAGRAM capsule has consumed yet: one capsule may span DATA frames, so frames accumulate only here.
+    /// Capsule-stream bytes no whole DATAGRAM capsule has consumed yet: one capsule may span DATA frames, so frames accumulate only here. The answer's header block rides through it too, and it is cleared once the status is decoded.
     capsule_buf: Vec<u8>,
     fin: bool,
     deadline: Instant,
@@ -1266,6 +1268,13 @@ pub(crate) struct H3 {
     head_wait: Duration,
     /// Bounds one blocking `Read::read` the way the socket timeout bounds TCP carriers: set, it returns `WouldBlock` after the quantum so a one-lock relay can interleave.
     quantum: Option<Duration>,
+}
+
+/// A frame block the lane is still consuming: `rest` bytes to go, landing at the capsule buffer's tail from `mark`, and `keep` telling the reader's own capsules from a frame the lane only has to get past. It exists because a header is spent the moment it is parsed — a park that forgot the count would re-read the header and take the next frame's bytes as this one's.
+struct Pending {
+    rest: usize,
+    mark: usize,
+    keep: bool,
 }
 
 impl H3 {
@@ -1285,10 +1294,11 @@ impl H3 {
     ) -> Result<Self, Failure> {
         let mut lane = Self {
             quic,
-            head: Self::open_window(),
+            head: vec![0u8; H3_PEEK],
             filled: 0,
             carried: 0,
             body: 0,
+            pending: None,
             out: Vec::new(),
             capsule_buf: Vec::new(),
             fin: false,
@@ -1306,13 +1316,6 @@ impl H3 {
         let out = body(&mut guard);
         crate::quic::flush_egress(&mut guard, &self.quic.sock);
         Some(out)
-    }
-
-    /// Read window opened into its uninitialised tail rather than zero-filled: the stream fills what it reads and the walk never reads past what arrived.
-    fn open_window() -> Vec<u8> {
-        let mut window = Vec::with_capacity(H3_WINDOW);
-        crate::proxy::resize_scratch(&mut window, H3_WINDOW);
-        window
     }
 
     /// The HTTP/3 opening a fresh connection carries exactly once: a complete SETTINGS plus QPACK encoder/decoder hellos, literal-only with no dynamic table; a truncated SETTINGS waits forever and a second control stream is a connection error, and nothing is ever finished.
@@ -1339,10 +1342,11 @@ impl H3 {
     ) -> Result<Self, Failure> {
         let mut lane = Self {
             quic,
-            head: Self::open_window(),
+            head: vec![0u8; H3_PEEK],
             filled: 0,
             carried: 0,
             body: 0,
+            pending: None,
             out: Vec::new(),
             capsule_buf: Vec::new(),
             fin: false,
@@ -1359,10 +1363,11 @@ impl H3 {
     pub(crate) fn open_ip(dial: &FoxyDial, quic: Quic) -> Result<Self, Failure> {
         let mut lane = Self {
             quic,
-            head: Self::open_window(),
+            head: vec![0u8; H3_PEEK],
             filled: 0,
             carried: 0,
             body: 0,
+            pending: None,
             out: Vec::new(),
             capsule_buf: Vec::new(),
             fin: false,
@@ -1421,39 +1426,46 @@ impl H3 {
         self.read_head()
     }
 
-    /// One pump of the request stream into the capsule buffer: whole DATA frames are staged where they lie, and the cursor is shared with the frame walk because a byte spent here cannot be spent again.
+    /// One turn of the request stream for the capsule reader: the header is peeked, a DATA frame's block lands at the capsule buffer's tail where the association reads its capsules, and a block this lane has no use for is consumed without being kept. Nothing of a frame's payload crosses the frame window, so a capsule byte reaches its reader through one lane buffer instead of a window and then a buffer.
     fn fill_capsules(&mut self) -> Result<(), Failure> {
-        if self.head.len() - self.filled < 16 {
-            self.head.copy_within(self.carried..self.filled, 0);
-            self.filled -= self.carried;
-            self.carried = 0;
+        let started = Instant::now();
+        self.deadline = started + HEADER_TIMEOUT;
+        if self.pending.is_some() {
+            // A block that arrived in pieces resumes its own count; the caller's split test sees it as soon as it is whole.
+            return self.pending_block(started);
         }
-        self.deadline = Instant::now() + HEADER_TIMEOUT;
-        self.fill()?;
-        let mut at = self.carried;
-        while at < self.filled {
-            let mut head = 0usize;
-            let Some(frame) = frames::h3_frame(&self.head[at..self.filled], &mut head) else {
-                break;
-            };
-            let end = match at
-                .checked_add(head)
-                .and_then(|body| body.checked_add(frame.length as usize))
-            {
-                Some(end) if end <= self.filled => end,
-                _ => break,
-            };
-            let body = at + head;
-            if matches!(
-                frames::h3_event(frame, &self.head[body..end]),
-                frames::H3Event::Data { .. }
-            ) {
-                self.capsule_buf.extend_from_slice(&self.head[body..end]);
+        self.walk_capsules(started)
+    }
+
+    /// Consumes one frame per turn: a header that is not whole yet leaves the caller to retry, because the capsules already in the buffer are what its reader is waiting for.
+    fn walk_capsules(&mut self, started: Instant) -> Result<(), Failure> {
+        let Some((frame, head)) = self.peek()? else {
+            return Ok(());
+        };
+        let Some(body) = self.carried.checked_add(head) else {
+            return Err(Failure::Frame);
+        };
+        let Ok(length) = usize::try_from(frame.length) else {
+            return Err(Failure::Stream);
+        };
+        match frame.kind {
+            frames::H3_DATA => {
+                self.take_block(body, length, true, started)?;
+                Ok(())
             }
-            at = end;
+            frames::H3_RESET | frames::H3_GOAWAY => {
+                self.fin = true;
+                self.carried = self.filled;
+                Ok(())
+            }
+            _ => {
+                if length > H3_SKIP {
+                    return Err(Failure::Frame);
+                }
+                self.take_block(body, length, false, started)?;
+                Ok(())
+            }
         }
-        self.carried = at;
-        Ok(())
     }
 
     /// Sends the address request and reads the assignment: without one the lane has no source address to write into a packet, and a proxy that refuses is refused rather than guessed at.
@@ -1545,7 +1557,7 @@ impl H3 {
         Ok(())
     }
 
-    /// One UDP payload out of the capsule stream: DATA frames are parsed until a whole DATAGRAM capsule appears, capsules that span frames accumulate, and empty datagrams are skipped so `Ok(0)` stays the end of stream.
+    /// One UDP payload out of the capsule stream: DATA frames are consumed into the capsule stream until a whole DATAGRAM capsule appears, capsules that span frames accumulate, and empty datagrams are skipped so `Ok(0)` stays the end of stream.
     pub(crate) fn read_datagram(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let started = Instant::now();
         // One wait per call, armed from its start: re-armed inside the loop the check below could never see an expiry, so a peer that stopped answering cost this lane nothing but its own parking.
@@ -1576,55 +1588,7 @@ impl H3 {
                     "foxy: a capsule stream that never parses",
                 ));
             }
-            self.fill().map_err(io)?;
-            // A capsule is usually whole inside one DATA frame, so a frame's payload is parsed where it lies and only a split capsule staged: the same one copy the tunnel read makes.
-            let mut at = self.carried;
-            while at < self.filled {
-                let mut head = 0usize;
-                let Some(frame) = frames::h3_frame(&self.head[at..self.filled], &mut head) else {
-                    break;
-                };
-                let end = match at
-                    .checked_add(head)
-                    .and_then(|body| body.checked_add(frame.length as usize))
-                {
-                    Some(end) if end <= self.filled => end,
-                    _ => break,
-                };
-                let body = at + head;
-                match frames::h3_event(frame, &self.head[body..end]) {
-                    frames::H3Event::Data {
-                        payload,
-                        end: stream_end,
-                    } => {
-                        self.fin = stream_end;
-                        // A capsule is usually whole inside one DATA frame, so it is handed over where it lies and only the ones behind it staged; nothing is handed over while a split capsule waits, because stream order is datagram order.
-                        if self.capsule_buf.is_empty() {
-                            if let Some((used, datagram)) = masque::datagram_split(payload) {
-                                let take = buf.len().min(datagram.len());
-                                buf[..take].copy_from_slice(&datagram[..take]);
-                                let len = datagram.len();
-                                self.capsule_buf.extend_from_slice(&payload[used..]);
-                                self.carried = end;
-                                if len == 0 {
-                                    at = end;
-                                    break;
-                                }
-                                return Ok(len);
-                            }
-                        }
-                        self.capsule_buf.extend_from_slice(payload);
-                    }
-                    frames::H3Event::Reset { .. } | frames::H3Event::GoAway { .. } => {
-                        self.fin = true;
-                        self.carried = self.filled;
-                        return Ok(0);
-                    }
-                    _ => {}
-                }
-                at = end;
-            }
-            self.carried = at;
+            self.fill_capsules().map_err(io)?;
         }
     }
 
@@ -1705,99 +1669,176 @@ impl H3 {
         }
     }
 
-    /// Pulls the request stream until a whole HEADERS frame has arrived, then reads the status; bytes read past that frame stay buffered because the edge's first DATA frame is the tunnel, not a header.
+    /// Pulls the request stream until the answer's HEADERS frame is whole and reads the status out of it: a header is peeked, the block it names lands in the buffer the lane keeps arrived bytes in, and any frame ahead of the answer is consumed rather than waited on. Nothing past the answer's own header is read here, so the tunnel's first DATA frame is still on the stream when this returns.
     fn read_head(&mut self) -> Result<u16, Failure> {
-        self.deadline = Instant::now() + self.head_wait;
-        while Instant::now() < self.deadline {
-            if let Some(status) = Self::header_in(&self.head[self.carried..self.filled])? {
-                return Ok(status);
+        let started = Instant::now();
+        self.deadline = started + self.head_wait;
+        loop {
+            if self.pending.is_some() {
+                self.pending_block(started)?;
+                continue;
             }
-            self.fill()?;
+            let Some((frame, head)) = self.peek()? else {
+                continue;
+            };
+            let Some(body) = self.carried.checked_add(head) else {
+                return Err(Failure::Frame);
+            };
+            let Ok(length) = usize::try_from(frame.length) else {
+                return Err(Failure::Stream);
+            };
+            if length > H3_SKIP {
+                // A block bigger than a head is not an answer, a trailer or an application error; it is a peer that does not want this lane to reach its next frame.
+                return Err(Failure::Frame);
+            }
+            match frame.kind {
+                frames::H3_HEADERS => {
+                    let mark = self.take_block(body, length, true, started)?;
+                    if self.pending.is_some() {
+                        continue;
+                    }
+                    let block = &self.capsule_buf[mark..];
+                    let status = hpack::qpack_status(block).ok_or_else(|| {
+                        debug_block(block);
+                        Failure::Frame
+                    })?;
+                    self.capsule_buf.truncate(mark);
+                    return Ok(status);
+                }
+                frames::H3_RESET | frames::H3_GOAWAY => return Err(Failure::Stream),
+                _ => {
+                    self.take_block(body, length, false, started)?;
+                }
+            }
         }
-        Err(Failure::Stream)
     }
 
-    /// The status of the first complete HEADERS frame in `bytes`, and how much of it that frame was.
-    fn header_in(bytes: &[u8]) -> Result<Option<u16>, Failure> {
-        let mut at = 0usize;
-        let Some(frame) = frames::h3_frame(bytes, &mut at) else {
-            return Ok(None);
-        };
-        let Some(end) = at.checked_add(frame.length as usize) else {
+    /// The frame header at the cursor, or `None` when this turn read no whole one. A window that is full of bytes and still does not parse is not a header: the ceiling is the largest header a QUIC varint pair can be, so the lane ends there instead of growing a window to find out.
+    fn peek(&mut self) -> Result<Option<(frames::H3Frame, usize)>, Failure> {
+        let mut head = 0usize;
+        if let Some(frame) = frames::h3_frame(&self.head[self.carried..self.filled], &mut head) {
+            return Ok(Some((frame, head)));
+        }
+        if self.filled - self.carried >= self.head.len() {
             return Err(Failure::Frame);
-        };
-        let Some(body) = bytes.get(at..end) else {
-            return Ok(None);
-        };
-        match frames::h3_event(frame, body) {
-            frames::H3Event::Headers { block, .. } => {
-                hpack::qpack_status(block).map(Some).ok_or(Failure::Frame)
-            }
-            frames::H3Event::Reset { .. } | frames::H3Event::GoAway { .. } => Err(Failure::Stream),
-            _ => Ok(None),
         }
+        self.fill_peek()?;
+        Ok(None)
     }
 
-    /// One read from the request stream straight into the window's spare room, or a pump when nothing arrived — the same two answers a QUIC stream gives, minus the second copy.
-    fn fill(&mut self) -> Result<(), Failure> {
-        let id = self.quic.id;
-        let mut window = std::mem::take(&mut self.head);
-        let filled = self.filled;
-        let room = window.len() - filled;
-        let room = if room == 0 {
-            window.resize(filled + H3_WINDOW, 0);
-            H3_WINDOW
-        } else {
-            room
+    /// The block a header names, consumed into the capsule buffer's tail: the bytes the peek already pulled arrive first, `keep` says whether the rest is the stream's own or a frame this lane has no use for, and the lane's cursor moves past what the window held either way. Returns where the block began, which is what its reader cuts back to.
+    fn take_block(
+        &mut self,
+        body: usize,
+        length: usize,
+        keep: bool,
+        started: Instant,
+    ) -> Result<usize, Failure> {
+        let held = (self.filled - body).min(length);
+        let mark = self.capsule_buf.len();
+        if keep {
+            self.capsule_buf
+                .extend_from_slice(&self.head[body..body + held]);
+        }
+        self.carried = body + held;
+        self.pending = Some(Pending {
+            rest: length - held,
+            mark,
+            keep,
+        });
+        self.pending_block(started)?;
+        Ok(mark)
+    }
+
+    /// Finishes the block the last header named: its bytes arrive at the capsule buffer's tail, and one nobody reads is cut back out when it is whole. A quantum that expires mid-block leaves the count on the lane, so the next turn resumes at the tail — the header is already spent, and a walk that read it again would put every frame after it out of order.
+    fn pending_block(&mut self, started: Instant) -> Result<(), Failure> {
+        let Some(mut block) = self.pending.take() else {
+            return Ok(());
         };
-        let read = self.with_conn(|conn| conn.stream_recv(id, &mut window[filled..filled + room]));
-        self.head = window;
-        match read {
-            Some(Ok((0, true))) => Err(Failure::Stream),
-            Some(Ok((read, _))) => {
-                self.filled += read;
-                Ok(())
+        loop {
+            if block.rest == 0 {
+                if !block.keep {
+                    self.capsule_buf.truncate(block.mark);
+                }
+                return Ok(());
             }
-            Some(Err(quiche::Error::Done)) => {
-                if Instant::now() >= self.deadline {
+            if self
+                .quantum
+                .is_some_and(|quantum| started.elapsed() >= quantum)
+            {
+                self.pending = Some(block);
+                return Ok(());
+            }
+            if Instant::now() >= self.deadline {
+                return Err(Failure::Stream);
+            }
+            let room = DATAGRAM_BUF_MAX
+                .saturating_sub(self.capsule_buf.len())
+                .min(block.rest);
+            if room == 0 {
+                return Err(Failure::Frame);
+            }
+            let id = self.quic.id;
+            let mut buf = std::mem::take(&mut self.capsule_buf);
+            let base = buf.len();
+            buf.resize(base + room, 0);
+            let read = self.with_conn(|conn| conn.stream_recv(id, &mut buf[base..base + room]));
+            let read = match read {
+                Some(Ok((0, true))) => {
+                    // The stream ended with the block still short: a truncated frame, which is where the walk stops rather than waiting for bytes that will not come.
+                    buf.truncate(base);
+                    self.capsule_buf = buf;
                     return Err(Failure::Stream);
                 }
+                Some(Ok((read, _))) => read,
+                Some(Err(quiche::Error::Done)) => 0,
+                _ => {
+                    buf.truncate(base);
+                    self.capsule_buf = buf;
+                    return Err(Failure::Io);
+                }
+            };
+            buf.truncate(base + read);
+            self.capsule_buf = buf;
+            block.rest -= read;
+            if read == 0 {
+                // Nothing had arrived: the socket is what turns a dropped datagram into a retransmission, so a walk that only asks the stream never reads the packet that answers it.
                 self.pump(Duration::from_millis(5));
-                Ok(())
             }
-            _ => Err(Failure::Io),
         }
     }
 
-    /// The next frame's header, a peek's worth at most: the DATA payload the header names never passes through the window, so what sits unparsed here is always smaller than a header and its spill.
+    /// The window's spare room from the stream, with whatever is still unparsed moved to its front first: the window is a header wide and never larger, so a full one is a boundary rather than a reason to allocate.
     fn fill_peek(&mut self) -> Result<(), Failure> {
-        if self.head.len() - self.filled < H3_PEEK {
+        if self.carried == self.filled {
+            self.filled = 0;
+            self.carried = 0;
+        } else if self.carried > 0 {
             self.head.copy_within(self.carried..self.filled, 0);
             self.filled -= self.carried;
             self.carried = 0;
         }
-        // A window filled by the head walk's whole-frame read can still run out of tail; nothing is unparsed at a header boundary, so the window restarts empty rather than handing the stream a zero-length buffer.
-        if self.filled == self.head.len() {
-            self.filled = 0;
-        }
+        let at = self.filled;
+        let read = self.pull(at, self.head.len() - at)?;
+        self.filled += read;
+        Ok(())
+    }
+
+    /// Up to `want` bytes of the request stream into the window at `at`, or a pump when nothing has arrived — the same two answers a QUIC stream gives, minus the second copy.
+    fn pull(&mut self, at: usize, want: usize) -> Result<usize, Failure> {
         let id = self.quic.id;
         let mut window = std::mem::take(&mut self.head);
-        let filled = self.filled;
-        let room = H3_PEEK.min(window.len() - filled);
-        let read = self.with_conn(|conn| conn.stream_recv(id, &mut window[filled..filled + room]));
+        let read = self.with_conn(|conn| conn.stream_recv(id, &mut window[at..at + want]));
         self.head = window;
         match read {
             Some(Ok((0, true))) => Err(Failure::Stream),
-            Some(Ok((read, _))) => {
-                self.filled += read;
-                Ok(())
-            }
+            Some(Ok((read, _))) => Ok(read),
             Some(Err(quiche::Error::Done)) => {
                 if Instant::now() >= self.deadline {
                     return Err(Failure::Stream);
                 }
                 self.pump(Duration::from_millis(5));
-                Ok(())
+                Ok(0)
             }
             _ => Err(Failure::Io),
         }
@@ -1890,10 +1931,12 @@ impl Read for H3 {
             {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
-            let mut head = 0usize;
-            let Some(frame) = frames::h3_frame(&self.head[self.carried..self.filled], &mut head)
-            else {
-                self.fill_peek().map_err(io)?;
+            if self.pending.is_some() {
+                // The block of a frame the tunnel does not read: consumed here so the next header is the next frame's, and a quantum that expired inside it is resumed, not re-parsed.
+                self.pending_block(started).map_err(io)?;
+                continue;
+            }
+            let Some((frame, head)) = self.peek().map_err(io)? else {
                 continue;
             };
             let Some(body_at) = self.carried.checked_add(head) else {
@@ -1904,28 +1947,24 @@ impl Read for H3 {
             };
             if frame.kind == frames::H3_DATA {
                 self.carried = body_at;
+                // An empty DATA frame carries no bytes and is not the end of the stream: only a finished stream or a reset ends the tunnel, and handing back zero here is what a caller reads as EOF.
+                if length == 0 {
+                    continue;
+                }
                 self.body = length;
                 return self.body_into(buf);
             }
-            let Some(end) = body_at.checked_add(length) else {
-                return Err(io(Failure::Frame));
-            };
-            if end > self.filled {
-                // A frame bigger than the window would leave fill() indexing a full tail out of range; at a boundary with nothing unparsed the window restarts empty instead of growing.
-                if self.carried == self.filled {
-                    self.filled = 0;
-                    self.carried = 0;
-                }
-                self.fill().map_err(io)?;
+            if frame.kind == frames::H3_RESET || frame.kind == frames::H3_GOAWAY {
+                // The kind is in the header, so an ending needs no block of its own: the frame that follows it is never read.
+                self.fin = true;
+                self.carried = self.filled;
                 continue;
             }
-            match frames::h3_event(frame, &self.head[body_at..end]) {
-                frames::H3Event::Reset { .. } | frames::H3Event::GoAway { .. } => {
-                    self.fin = true;
-                    self.carried = self.filled;
-                }
-                _ => self.carried = end,
+            if length > H3_SKIP {
+                return Err(io(Failure::Frame));
             }
+            self.take_block(body_at, length, false, started)
+                .map_err(io)?;
         }
     }
 }
@@ -6019,6 +6058,12 @@ pub(crate) mod loopback {
         let Tunnel::H3(lane) = &tunnel else {
             panic!("an h3 lane");
         };
+        // The window's own size is the claim: a lane that read the first 64 KiB of the download at open, or staged a frame before handing it over, needed a wider one, and every byte the caller got was identical either way.
+        assert_eq!(
+            lane.head.capacity(),
+            H3_PEEK,
+            "the frame window is one header wide, not a frame wide"
+        );
         // The window holds at most a header and the spill of the frame it names: under the old lane this is where the whole 16 KiB frame sat before any of it reached the caller.
         assert!(
             lane.filled - lane.carried <= H3_PEEK,
@@ -6026,6 +6071,279 @@ pub(crate) mod loopback {
             lane.filled - lane.carried
         );
         assert_eq!(lane.body, 0, "the frame in flight was delivered, not kept");
+        assert_eq!(
+            lane.capsule_buf.len(),
+            0,
+            "nothing the tunnel does not read was left on the lane"
+        );
+        edge.join().expect("joins");
+    }
+
+    /// A QUIC edge that answers the request stream with exactly these pieces, each followed by a pause of its own: the frame shapes a plain echo cannot make — a capsule whose first half waits for its second, a header whose block arrives only after the lane has parked on it.
+    fn h3_scripted_edge(
+        sock: crate::quic::Datagram,
+        server: ferrox_core::tls::TlsServerConfig,
+        pieces: Vec<(Vec<u8>, Duration)>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let tag = format!("ferrox-foxy-script-{}-{stamp}", std::process::id());
+            let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
+            let key_path = std::env::temp_dir().join(format!("{tag}.key"));
+            std::fs::write(
+                &cert_path,
+                crate::quic::der_to_pem(&server.cert_chain[0], "CERTIFICATE"),
+            )
+            .expect("stages cert");
+            std::fs::write(
+                &key_path,
+                crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY"),
+            )
+            .expect("stages key");
+            let mut config = crate::quic::server_config(crate::quic::ALPN);
+            config
+                .load_cert_chain_from_pem_file(cert_path.to_str().expect("ascii"))
+                .expect("loads chain");
+            config
+                .load_priv_key_from_pem_file(key_path.to_str().expect("ascii"))
+                .expect("loads key");
+            let _ = std::fs::remove_file(&cert_path);
+            let _ = std::fs::remove_file(&key_path);
+            let local = sock.local_addr().expect("addr");
+            let mut conn = crate::quic::server_accept(&sock, local, &mut config);
+            let mut buf = [0u8; 1350];
+            let mut out = [0u8; 1350];
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let mut stream = None;
+            while stream.is_none() {
+                assert!(std::time::Instant::now() < deadline, "the request arrives");
+                let Some((n, from)) = crate::quic::server_poll(&sock, &mut buf) else {
+                    crate::quic::server_idle(&mut conn, &sock, &mut out);
+                    continue;
+                };
+                let info = quiche::RecvInfo { from, to: local };
+                conn.recv(&mut buf[..n], info).expect("drives");
+                let ids: Vec<u64> = conn.readable().collect();
+                for id in ids {
+                    if id % 4 != 0 {
+                        continue;
+                    }
+                    if !drain(&mut conn, id).is_empty() {
+                        stream = Some(id);
+                    }
+                }
+                crate::quic::server_idle(&mut conn, &sock, &mut out);
+            }
+            let stream = stream.expect("a request stream");
+            for (piece, pause) in pieces {
+                conn.stream_send(stream, &piece, false)
+                    .expect("sends a piece");
+                crate::quic::server_idle(&mut conn, &sock, &mut out);
+                let until = std::time::Instant::now() + pause;
+                while std::time::Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(5));
+                    crate::quic::server_idle(&mut conn, &sock, &mut out);
+                }
+            }
+            let until = std::time::Instant::now() + Duration::from_millis(400);
+            while std::time::Instant::now() < until {
+                if let Some((n, from)) = crate::quic::server_poll(&sock, &mut buf) {
+                    let info = quiche::RecvInfo { from, to: local };
+                    let _ = conn.recv(&mut buf[..n], info);
+                }
+                crate::quic::server_idle(&mut conn, &sock, &mut out);
+            }
+        })
+    }
+
+    /// The 200 every scripted edge answers with, as the frame the lane peeks rather than reads.
+    fn h3_answer() -> Vec<u8> {
+        let mut reply = Vec::new();
+        frames::quic_varint(&mut reply, frames::H3_HEADERS);
+        frames::quic_varint(&mut reply, 3);
+        reply.extend_from_slice(&[0x00, 0x00, 0xd9]);
+        reply
+    }
+
+    /// One DATA frame holding `payload`, the way an edge sends it: varint kind, varint length, bytes.
+    fn h3_data(payload: &[u8]) -> Vec<u8> {
+        let mut frame = Vec::new();
+        frames::quic_varint(&mut frame, frames::H3_DATA);
+        frames::quic_varint(&mut frame, payload.len() as u64);
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    /// The frame walk read out of a tunnel, with a quantum short enough to park on and a caller that treats a park as a retry rather than an end.
+    fn h3_tunnel_reads(tunnel: &mut Tunnel, want: usize) -> Vec<u8> {
+        let mut got = Vec::new();
+        let mut chunk = [0u8; 8];
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        while got.len() < want {
+            assert!(std::time::Instant::now() < until, "the tunnel delivers");
+            match tunnel.read(&mut chunk) {
+                Ok(0) => panic!("the lane called the end of the stream with {want} bytes owed"),
+                Ok(read) => got.extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("the tunnel failed: {error}"),
+            }
+        }
+        got
+    }
+
+    /// A DATAGRAM capsule that spans two DATA frames, the second of them 400 ms behind the first: the old lane marked the stream finished on the strength of a frame header, so the first half was the whole answer it reported and the association lost the rest of it.
+    #[test]
+    fn a_quic_capsule_split_over_frames_arrives_as_one_datagram() {
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let port = sock.local_addr().expect("addr").port();
+        let mut capsule = Vec::new();
+        masque::datagram_encode(b"a capsule over two frames", &mut capsule);
+        let half = capsule.len() / 2;
+        let edge = h3_scripted_edge(
+            sock,
+            server,
+            vec![
+                (h3_answer(), Duration::ZERO),
+                (h3_data(&capsule[..half]), Duration::from_millis(400)),
+                (h3_data(&capsule[half..]), Duration::ZERO),
+            ],
+        );
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let mut lane = H3::open_udp(&dial, "example.com", 443, quic).expect("opens");
+        lane.set_read_quantum(Duration::from_millis(100));
+        let mut back = [0u8; 64];
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        let read = loop {
+            assert!(std::time::Instant::now() < until, "the two halves arrive");
+            match lane.read_datagram(&mut back) {
+                Ok(0) => panic!("the capsule reader called the end of the stream with its second half still owed"),
+                Ok(read) => break read,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("the capsule failed: {error}"),
+            }
+        };
+        assert_eq!(&back[..read], b"a capsule over two frames");
+        assert!(!lane.fin, "a frame boundary is not the end of the stream");
+        edge.join().expect("joins");
+    }
+
+    /// A HEADERS trailer parked halfway through: its header is spent before its block lands, so the resumed walk must finish the block rather than read the next header out of the trailer's own bytes.
+    #[test]
+    fn a_quic_trailer_that_parks_mid_block_keeps_the_frames_behind_it() {
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let port = sock.local_addr().expect("addr").port();
+        let mut header_only = Vec::new();
+        frames::quic_varint(&mut header_only, frames::H3_HEADERS);
+        frames::quic_varint(&mut header_only, 3);
+        let edge = h3_scripted_edge(
+            sock,
+            server,
+            vec![
+                (h3_answer(), Duration::ZERO),
+                (h3_data(b"first"), Duration::ZERO),
+                (header_only, Duration::from_millis(400)),
+                (vec![0x00, 0x00, 0xd9], Duration::from_millis(200)),
+                (h3_data(b"second"), Duration::ZERO),
+            ],
+        );
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", Some(quic)).expect("opens");
+        tunnel
+            .set_read_quantum(Duration::from_millis(100))
+            .expect("arms");
+        assert_eq!(
+            h3_tunnel_reads(&mut tunnel, b"firstsecond".len()),
+            b"firstsecond",
+            "the trailer is consumed and the payload behind it arrives whole"
+        );
+        let Tunnel::H3(lane) = &tunnel else {
+            panic!("an h3 lane");
+        };
+        assert_eq!(lane.capsule_buf.len(), 0, "the trailer left nothing staged");
+        assert!(lane.pending.is_none(), "and no half-read block either");
+        edge.join().expect("joins");
+    }
+
+    /// An empty DATA frame ahead of the payload: it carries no bytes, which is not the same thing as carrying none left.
+    #[test]
+    fn an_empty_data_frame_is_not_the_end_of_the_tunnel() {
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let port = sock.local_addr().expect("addr").port();
+        let edge = h3_scripted_edge(
+            sock,
+            server,
+            vec![
+                (h3_answer(), Duration::from_millis(50)),
+                (h3_data(b""), Duration::from_millis(50)),
+                (h3_data(b"after the empty one"), Duration::ZERO),
+            ],
+        );
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", Some(quic)).expect("opens");
+        tunnel
+            .set_read_quantum(Duration::from_millis(100))
+            .expect("arms");
+        assert_eq!(
+            h3_tunnel_reads(&mut tunnel, b"after the empty one".len()),
+            b"after the empty one"
+        );
+        edge.join().expect("joins");
+    }
+
+    /// A DATA frame the edge puts ahead of its answer: the head walk could not parse it and asked for more window rather than spending it, so the same header was re-read every turn while the window grew and zeroed another 64 KiB at each floor, and the open failed at its deadline with the answer never reached.
+    #[test]
+    fn a_frame_ahead_of_the_answer_is_consumed_rather_than_waited_on() {
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let port = sock.local_addr().expect("addr").port();
+        let edge = h3_scripted_edge(
+            sock,
+            server,
+            vec![
+                (h3_data(&[0x7fu8; 300]), Duration::from_millis(50)),
+                (h3_answer(), Duration::from_millis(50)),
+                (h3_data(b"past the padding"), Duration::ZERO),
+            ],
+        );
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", Some(quic))
+            .expect("a padded answer still opens");
+        assert_eq!(
+            h3_tunnel_reads(&mut tunnel, b"past the padding".len()),
+            b"past the padding",
+            "the frame ahead of the answer costs the payload behind it nothing"
+        );
+        let Tunnel::H3(lane) = &tunnel else {
+            panic!("an h3 lane");
+        };
+        assert_eq!(
+            lane.head.capacity(),
+            H3_PEEK,
+            "a frame ahead of the answer grew no window"
+        );
+        assert_eq!(
+            lane.capsule_buf.len(),
+            0,
+            "and left nothing of itself behind"
+        );
         edge.join().expect("joins");
     }
 }
