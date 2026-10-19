@@ -1282,10 +1282,10 @@ impl Reader {
 }
 
 impl Drop for Reader {
-    /// The last handle dropping ends the pump and the discards, so a session never outlives the relay that read it.
+    /// The last handle dropping ends the pump and closes the discard queue, but the deletes already promised still land: a session outlives the relay that read it only in the sense that nothing new is handed over.
     fn drop(&mut self) {
         self.rd.wake.halt();
-        self.rd.discards.abort();
+        self.rd.discards.shut();
     }
 }
 
@@ -3818,6 +3818,105 @@ mod tests {
             emptied(&store, SESSIONS_DIR, Duration::from_secs(10)),
             0,
             "the announcement went to the listener that claimed it"
+        );
+        drop(server);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// What the reader promised to discard before its handle went away is still discarded: the queue closes, it does not forget.
+    #[test]
+    fn a_session_ends_with_every_uplink_object_deleted() {
+        struct Held {
+            inner: Arc<dyn Storage>,
+            hold: AtomicBool,
+            entered: AtomicBool,
+        }
+
+        impl Storage for Held {
+            fn put(&self, name: &str, data: &[u8]) -> io::Result<()> {
+                self.inner.put(name, data)
+            }
+
+            fn get(&self, name: &str) -> io::Result<Vec<u8>> {
+                self.inner.get(name)
+            }
+
+            // The hold is bounded, so a latch the test never drops fails the run instead of parking it.
+            fn delete(&self, name: &str) -> io::Result<()> {
+                self.entered.store(true, Ordering::Release);
+                let until = Instant::now() + Duration::from_secs(5);
+                while self.hold.load(Ordering::Acquire) && Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                self.inner.delete(name)
+            }
+
+            fn list(&self, prefix: &str) -> io::Result<Vec<Entry>> {
+                self.inner.list(prefix)
+            }
+        }
+
+        let (dir, inner) = local("discard");
+        let held = Arc::new(Held {
+            inner,
+            hold: AtomicBool::new(true),
+            entered: AtomicBool::new(false),
+        });
+        let store: Arc<dyn Storage> = Arc::clone(&held) as Arc<dyn Storage>;
+        // One worker for the whole queue: the first discard is what the gate holds, so every one after it is provably still queued when the session ends.
+        let params = Arc::new(Params {
+            concurrency: 1,
+            ..quick()
+        });
+        let closed = Arc::new(AtomicBool::new(false));
+        let gone = Arc::clone(&closed);
+        let accept: Accept = Arc::new(move |mut session: Conn| {
+            let mut buf = [0u8; 512];
+            loop {
+                match session.read(&mut buf) {
+                    Ok(n) => {
+                        if session.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                    Err(_) => break,
+                }
+            }
+            drop(session);
+            gone.store(true, Ordering::Release);
+        });
+        let server = Server::serve(Arc::clone(&store), Arc::clone(&params), Arc::clone(&accept))
+            .expect("serves");
+        let mut client = dial(Arc::clone(&store), &params).expect("dials");
+        let payload: Vec<u8> = (0..1_600usize).map(|at| (at % 251) as u8).collect();
+        client.write_all(&payload).expect("writes");
+        assert_eq!(
+            read_up_to(&mut client, payload.len(), Duration::from_secs(30)),
+            payload,
+            "the echo carries every byte before the uplink ends"
+        );
+        client.end_write().expect("ends the uplink");
+        let until = Instant::now() + Duration::from_secs(30);
+        while !closed.load(Ordering::Acquire) && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(
+            closed.load(Ordering::Acquire),
+            "the session's own handle is what ended it"
+        );
+        assert!(
+            held.entered.load(Ordering::Acquire),
+            "a discard reached the gate, so the rest of that queue never left it"
+        );
+        held.hold.store(false, Ordering::Release);
+        let sessions = store.list(STREAMS_DIR).expect("lists");
+        assert_eq!(sessions.len(), 1, "one announcement opened one session");
+        let session = &sessions[0].name;
+        assert_eq!(
+            emptied(&store, &uplink_prefix(session), Duration::from_secs(10)),
+            0,
+            "the uplink objects the reader read are gone once its handle dropped"
         );
         drop(server);
         let _ = std::fs::remove_dir_all(&dir);
