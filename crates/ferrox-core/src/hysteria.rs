@@ -342,15 +342,16 @@ impl Defrag {
         Self::default()
     }
 
-    /// Fold one message in; `Some((address, payload))` when a datagram is whole. A single fragment clears any partial and passes straight through, so an unfragmented datagram never waits on the state.
-    pub fn feed(
+    /// Fold one message in; `Some((address, payload))` when a datagram is whole. A single fragment clears any partial and passes straight through, so an unfragmented datagram never waits on the state — and never copies either: the answer is the caller's own datagram. Reassembly, the rare answer, writes into the buffer the caller lends.
+    pub fn feed<'a>(
         &mut self,
-        message: &UdpMessage<'_>,
-    ) -> Result<Option<(String, Vec<u8>)>, RequestError> {
+        message: &UdpMessage<'a>,
+        out: &'a mut Vec<u8>,
+    ) -> Result<Option<(&'a str, &'a [u8])>, RequestError> {
         message.validate()?;
         if message.frags == 1 {
             *self = Self::default();
-            return Ok(Some((message.address.to_owned(), message.payload.to_vec())));
+            return Ok(Some((message.address, message.payload)));
         }
         if self.slots.is_empty() || self.packet != message.packet {
             self.packet = message.packet;
@@ -373,14 +374,16 @@ impl Defrag {
         if self.have != self.slots.len() {
             return Ok(None);
         }
-        let address = std::mem::take(&mut self.address);
-        let mut payload = Vec::with_capacity(self.size);
+        let size = self.size;
+        self.address.clear();
+        out.clear();
+        out.reserve(size);
         for fragment in std::mem::take(&mut self.slots).into_iter().flatten() {
-            payload.extend_from_slice(&fragment);
+            out.extend_from_slice(&fragment);
         }
         self.have = 0;
         self.size = 0;
-        Ok(Some((address, payload)))
+        Ok(Some((message.address, out)))
     }
 }
 
@@ -1070,16 +1073,21 @@ mod tests {
         );
         // Feeding fragments out of order still reassembles in id order.
         let mut defrag = Defrag::new();
-        assert_eq!(defrag.feed(&frags[2]).expect("ok"), None);
-        assert_eq!(defrag.feed(&frags[0]).expect("ok"), None);
-        let whole = defrag.feed(&frags[1]).expect("ok").expect("complete");
-        assert_eq!(whole.0, "a:1");
-        assert_eq!(whole.1, b"0123456789");
+        let mut assembled = Vec::new();
+        assert_eq!(defrag.feed(&frags[2], &mut assembled).expect("ok"), None);
+        assert_eq!(defrag.feed(&frags[0], &mut assembled).expect("ok"), None);
+        let packet = defrag
+            .feed(&frags[1], &mut assembled)
+            .expect("ok")
+            .expect("complete");
+        assert_eq!(packet.0, "a:1");
+        assert_eq!(packet.1, b"0123456789");
     }
 
     #[test]
     fn a_new_packet_id_discards_the_partial_before_it() {
         let mut defrag = Defrag::new();
+        let mut assembled = Vec::new();
         let first = UdpMessage {
             session: 1,
             packet: 1,
@@ -1088,18 +1096,67 @@ mod tests {
             address: "a:1",
             payload: b"x",
         };
-        assert_eq!(defrag.feed(&first).expect("ok"), None);
+        assert_eq!(defrag.feed(&first, &mut assembled).expect("ok"), None);
         // A new packet id on the same session drops the half-filled packet.
         let next = UdpMessage { packet: 2, ..first };
-        assert_eq!(defrag.feed(&next).expect("ok"), None);
+        assert_eq!(defrag.feed(&next, &mut assembled).expect("ok"), None);
         let tail = UdpMessage {
             packet: 2,
             frag: 1,
             payload: b"y",
             ..first
         };
-        let whole = defrag.feed(&tail).expect("ok").expect("complete");
-        assert_eq!(whole.1, b"xy");
+        let packet = defrag
+            .feed(&tail, &mut assembled)
+            .expect("ok")
+            .expect("complete");
+        assert_eq!(packet.1, b"xy");
+    }
+
+    /// A whole datagram answers from the caller's own bytes: an unfragmented message needs no reassembly, so neither its address nor its payload is copied and no buffer is taken for it.
+    #[test]
+    fn an_unfragmented_datagram_is_handed_over_without_a_buffer() {
+        let payload: Vec<u8> = (0..64).map(|i| i as u8).collect();
+        let message = UdpMessage {
+            session: 1,
+            packet: 7,
+            frag: 0,
+            frags: 1,
+            address: "edge.example:443",
+            payload: &payload,
+        };
+        let mut defrag = Defrag::new();
+        let mut assembled = Vec::new();
+        let (address, got) = defrag
+            .feed(&message, &mut assembled)
+            .expect("ok")
+            .expect("whole");
+        assert_eq!(
+            address.as_ptr(),
+            message.address.as_ptr(),
+            "the address IS the datagram's own text, not a copy of it"
+        );
+        assert_eq!(
+            got.as_ptr(),
+            message.payload.as_ptr(),
+            "the payload IS the datagram's own bytes, not a copy of them"
+        );
+        assert_eq!(assembled.capacity(), 0, "nothing was staged");
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                let mut assembled = Vec::new();
+                std::hint::black_box(
+                    defrag
+                        .feed(std::hint::black_box(&message), &mut assembled)
+                        .expect("ok"),
+                );
+            }
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "4096 whole datagrams take no heap at all"
+        );
     }
 
     #[test]
@@ -1206,10 +1263,13 @@ mod tests {
             fragment_udp(&message, max, &mut frags).expect("fragments");
             assert_eq!(frags.len(), len.div_ceil(7));
             let mut defrag = Defrag::new();
+            let mut assembled = Vec::new();
             let mut whole = None;
             for frag in &frags {
-                if let Some(done) = defrag.feed(frag).expect("feeds") {
-                    assert!(whole.replace(done).is_none(), "assembles exactly once");
+                if let Some((address, payload)) = defrag.feed(frag, &mut assembled).expect("feeds")
+                {
+                    assert!(whole.is_none(), "assembles exactly once");
+                    whole = Some((address.to_owned(), payload.to_owned()));
                 }
             }
             let (got_address, got_payload) = whole.expect("reassembles");
