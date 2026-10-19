@@ -436,12 +436,13 @@ fn read_exact<S: Read>(io: &mut S, buf: &mut [u8]) -> std::io::Result<()> {
 }
 
 /// HTTP/1.1 CONNECT: the request, the status line, then the target's own bytes.
-/// The `Proxy-Authorization` head literal is a parameter so one seven-run builder serves every scheme a lane dials with.
+/// The `Proxy-Authorization` head literal is a parameter so one seven-run builder serves every scheme a lane dials with; `refused_target` is the lane's own field-and-value, and a lane that names none never has an answer's head walked twice.
 pub(crate) fn open_h1(
     dial: &FoxyDial,
     target: &str,
     authorization_head: &'static [u8],
     credential: &str,
+    refused_target: Option<(&[u8], &[u8])>,
 ) -> Result<Tls1, Failure> {
     let mut tls = tls_to_edge(dial)?;
     tls.write_all_slices(&foxy::connect_request(
@@ -450,7 +451,7 @@ pub(crate) fn open_h1(
         credential,
     ))
     .map_err(|_| Failure::Io)?;
-    let (status, carried) = head(&mut tls)?;
+    let (status, carried) = head(&mut tls, refused_target)?;
     opened(status)?;
     Ok(Tls1 {
         tls,
@@ -460,7 +461,10 @@ pub(crate) fn open_h1(
 }
 
 /// Walks the CONNECT answer a window at a time and parses it where the octets landed: the head never enters a buffer of its own. What the last read took past `\r\n\r\n` is the tunnel's own first byte stream, so it comes back as exactly-sized tail rather than being discarded and re-waited for on the socket.
-fn head<S: Read>(io: &mut S) -> Result<(u16, Vec<u8>), Failure> {
+fn head<S: Read>(
+    io: &mut S,
+    refused_target: Option<(&[u8], &[u8])>,
+) -> Result<(u16, Vec<u8>), Failure> {
     // The budget bounds the whole head, not one read of it: a drip that keeps every read inside the socket's arm still ends at the wall.
     let until = Instant::now() + crate::budgets::head_arrival();
     let mut window = [0u8; HEAD_WINDOW];
@@ -477,13 +481,15 @@ fn head<S: Read>(io: &mut S) -> Result<(u16, Vec<u8>), Failure> {
         }
         filled += read;
         if let Some(end) = foxy::head_end(&window[..filled]) {
-            return Ok((
-                foxy::connect_status(&window[..end + 4])?,
-                window[end + 4..filled].to_vec(),
-            ));
+            let head = &window[..end + 4];
+            let status = foxy::connect_status(head)?;
+            if is_refused_target(head, status, refused_target) {
+                return Err(Failure::BlockedHost(status));
+            }
+            return Ok((status, window[end + 4..filled].to_vec()));
         }
         if filled == window.len() {
-            return long_head(io, &window, until);
+            return long_head(io, &window, until, refused_target);
         }
     }
 }
@@ -493,16 +499,19 @@ fn long_head<S: Read>(
     io: &mut S,
     walked: &[u8; HEAD_WINDOW],
     until: Instant,
+    refused_target: Option<(&[u8], &[u8])>,
 ) -> Result<(u16, Vec<u8>), Failure> {
     let mut head = Vec::with_capacity(walked.len() * 2);
     head.extend_from_slice(walked);
     let mut window = [0u8; HEAD_WINDOW];
     loop {
         if let Some(end) = foxy::head_end(&head) {
-            return Ok((
-                foxy::connect_status(&head[..end + 4])?,
-                head[end + 4..].to_vec(),
-            ));
+            let block = &head[..end + 4];
+            let status = foxy::connect_status(block)?;
+            if is_refused_target(block, status, refused_target) {
+                return Err(Failure::BlockedHost(status));
+            }
+            return Ok((status, head[end + 4..].to_vec()));
         }
         if head.len() >= MAX_HEAD {
             return Err(Failure::Frame);
@@ -517,6 +526,12 @@ fn long_head<S: Read>(
         }
         head.extend_from_slice(&window[..read]);
     }
+}
+
+/// Whether this refusal is the edge naming the target: a lane that configured no field never asks, and an answer that opened the tunnel is not walked a second time.
+fn is_refused_target(head: &[u8], status: u16, refused_target: Option<(&[u8], &[u8])>) -> bool {
+    opened(status).is_err()
+        && refused_target.is_some_and(|(name, value)| foxy::head_field(head, name) == Some(value))
 }
 
 /// Hands the caller what it asked for out of the tail the head walk left behind, and moves the cursor: a copy of bytes, never a move of what is left. The read that delivers the last octet releases the buffer, so nothing of the walk is held idle for the life of the tunnel.
@@ -2280,7 +2295,7 @@ impl Tunnel {
     pub(crate) fn open(dial: &FoxyDial, target: &str, quic: Option<Quic>) -> Result<Self, Failure> {
         match (dial.carrier, quic) {
             (Carrier::H1, _) => {
-                open_h1(dial, target, foxy::BEARER_HEAD, &dial.pass.token).map(Self::H1)
+                open_h1(dial, target, foxy::BEARER_HEAD, &dial.pass.token, None).map(Self::H1)
             }
             (Carrier::H2, _) => open_h2(dial, target).map(Self::H2),
             (Carrier::H3, Some(quic)) => {
@@ -2370,6 +2385,8 @@ impl Read for Tunnel {
 pub(crate) fn refusal_reply(failure: Failure) -> u8 {
     match failure {
         Failure::Rejected(status) if foxy::target_is_unreachable(status) => 0x04,
+        // The edge named the host, so the client hears the same answer it would from an unreachable target.
+        Failure::BlockedHost(_) => 0x04,
         Failure::Stream => 0x06,
         Failure::Rejected(_) | Failure::Frame | Failure::Io | Failure::Untrusted => 0x01,
     }
@@ -2405,7 +2422,7 @@ mod tests {
             at: 0,
             reads: 0,
         };
-        let (status, carried) = head(&mut source).expect("walks the head");
+        let (status, carried) = head(&mut source, None).expect("walks the head");
         assert_eq!(status, 200);
         assert_eq!(
             carried, b"first tunnel bytes",
@@ -2451,7 +2468,7 @@ mod tests {
             at: 0,
             reads: 0,
         };
-        let (status, carried) = head(&mut source).expect("walks the long head");
+        let (status, carried) = head(&mut source, None).expect("walks the long head");
         assert_eq!(status, 200);
         assert_eq!(carried, b"piped");
         assert!(
@@ -2466,7 +2483,7 @@ mod tests {
             at: 0,
             reads: 0,
         };
-        assert_eq!(head(&mut source).err(), Some(Failure::Frame));
+        assert_eq!(head(&mut source, None).err(), Some(Failure::Frame));
 
         let mut at_bound = b"HTTP/1.1 200 ".to_vec();
         while at_bound.len() < MAX_HEAD - 4 {
@@ -2478,7 +2495,7 @@ mod tests {
             at: 0,
             reads: 0,
         };
-        let (status, carried) = head(&mut source).expect("walks to the bound");
+        let (status, carried) = head(&mut source, None).expect("walks to the bound");
         assert_eq!(status, 200);
         assert!(
             carried.is_empty(),
@@ -2605,6 +2622,7 @@ mod tests {
     #[test]
     fn a_refusal_becomes_the_socks_reply_that_says_so() {
         assert_eq!(refusal_reply(Failure::Rejected(502)), 0x04);
+        assert_eq!(refusal_reply(Failure::BlockedHost(403)), 0x04);
         assert_eq!(refusal_reply(Failure::Rejected(403)), 0x01);
         assert_eq!(refusal_reply(Failure::Stream), 0x06);
         assert_eq!(refusal_reply(Failure::Io), 0x01);

@@ -6291,8 +6291,8 @@ fn serve_veepn_front(
     let mut tunnel = match lane.open(&asked.authority()) {
         Ok(tunnel) => tunnel,
         Err(why) => {
-            eprintln!("veepn: {why}");
-            let _ = client.write_all(&front.refusal(0x01));
+            eprintln!("veepn: {}", why.why);
+            let _ = client.write_all(&front.refusal(why.code));
             return;
         }
     };

@@ -46,6 +46,19 @@ impl std::fmt::Debug for Servers {
     }
 }
 
+/// Why a flow did not open: what the log says, and the SOCKS reply the front owes the client for it. Everything the plane answers with a status is a general failure until it names the target, which is the client's own answer to carry.
+#[derive(Debug)]
+pub(crate) struct Refusal {
+    pub(crate) why: String,
+    pub(crate) code: u8,
+}
+
+impl From<String> for Refusal {
+    fn from(why: String) -> Self {
+        Self { why, code: 0x01 }
+    }
+}
+
 /// The outbound: the plane behind a lock, the rotation in front of it, the identity ahead of both.
 #[derive(Debug, Clone)]
 pub(crate) struct VeepnOut {
@@ -104,8 +117,8 @@ impl VeepnOut {
         })
     }
 
-    /// One flow's tunnel: a listed upstream of the region and the `Foxy` lane's HTTP/1.1 record dialed at the target. The upstream, its pair and the region name are read where the cache holds them, so a flow builds no dial of its own. An upstream that declined a flow keeps the edge's silence for [`veepn::EDGE_SILENCE`] seconds, so one flow pays for a gone edge instead of every one after it. When a whole region has gone quiet the walk lifts the silence of the entry whose window ends first — a tie split by the flow's own rotation, so equal windows are probed in turn — and dials that one: a gone region costs a flow one handshake rather than its list, a recovered edge rejoins as soon as it answers, and an edge probed and declined again goes behind the others. One that refuses the pair takes the region's cache with it, so the next flow fetches fresh credentials.
-    pub(crate) fn open(&self, target: &str) -> Result<Tunnel, String> {
+    /// One flow's tunnel: a listed upstream of the region and the `Foxy` lane's HTTP/1.1 record dialed at the target. The upstream, its pair and the region name are read where the cache holds them, so a flow builds no dial of its own. An upstream that declined a flow keeps the edge's silence for [`veepn::EDGE_SILENCE`] seconds, so one flow pays for a gone edge instead of every one after it. When a whole region has gone quiet the walk lifts the silence of the entry whose window ends first — a tie split by the flow's own rotation, so equal windows are probed in turn — and dials that one: a gone region costs a flow one handshake rather than its list, a recovered edge rejoins as soon as it answers, and an edge probed and declined again goes behind the others. One that refuses the pair takes the region's cache with it, so the next flow fetches fresh credentials. One that refuses the *target* takes nothing with it and stops the walk there: the answer is a fact about the host, every edge holds it, and the client is told so rather than about a general failure.
+    pub(crate) fn open(&self, target: &str) -> Result<Tunnel, Refusal> {
         let region = self.region()?;
         let servers = self.servers(&region)?;
         let count = servers.dials.len();
@@ -136,15 +149,27 @@ impl VeepnOut {
                 }
                 let dial = picked(&servers.dials[..], at);
                 tried += 1;
-                match crate::foxy::open_h1(dial, target, BASIC_HEAD, &dial.pass.token) {
+                match crate::foxy::open_h1(
+                    dial,
+                    target,
+                    BASIC_HEAD,
+                    &dial.pass.token,
+                    Some(veepn::FORBIDDEN_TARGET),
+                ) {
                     Ok(lane) => return Ok(Tunnel::H1(lane)),
+                    Err(ferrox_core::foxy::Failure::BlockedHost(status)) => {
+                        return Err(Refusal {
+                            why: format!("{target} is refused by the edge ({status})"),
+                            code: 0x04,
+                        })
+                    }
                     Err(ferrox_core::foxy::Failure::Rejected(status))
                         if ferrox_core::foxy::pass_is_rejected(status) =>
                     {
                         self.forget(&region);
-                        return Err(format!(
+                        return Err(Refusal::from(format!(
                             "{region} refuses its pairs ({status}): asked again"
-                        ));
+                        )));
                     }
                     Err(failure) => {
                         servers.silence[at]
@@ -157,10 +182,10 @@ impl VeepnOut {
                 break;
             }
         }
-        Err(declined.map_or_else(
+        Err(Refusal::from(declined.map_or_else(
             || format!("region {region:?} lists no upstream this lane can dial"),
             |last| format!("{region}: {tried} of {count} upstream(s) declined, last: {last}"),
-        ))
+        )))
     }
 
     /// The region the lane serves: the one configured, or the optimal one the plane names, kept for the same window as a list. Either way a flow takes a reference count, not a copy of the name, so an open builds no text of its own.
@@ -767,9 +792,14 @@ mod tests {
             ferrox_core::foxy::pin::Pins::default(),
         );
         dial.pass.token = std::str::from_utf8(coded).expect("ascii").to_owned();
-        let mut tunnel =
-            crate::foxy::open_h1(&dial, "example.com:443", BASIC_HEAD, &dial.pass.token)
-                .expect("opens");
+        let mut tunnel = crate::foxy::open_h1(
+            &dial,
+            "example.com:443",
+            BASIC_HEAD,
+            &dial.pass.token,
+            Some(veepn::FORBIDDEN_TARGET),
+        )
+        .expect("opens");
         tunnel
             .write_all(crate::foxy::loopback::PAYLOAD)
             .expect("writes");
@@ -932,7 +962,11 @@ mod tests {
             .lists
             .insert("DE".to_owned(), (Arc::clone(&seeded), 4_000_000_000));
 
-        let why = out.open("example.com:443").err().expect("no edge is there");
+        let why = out
+            .open("example.com:443")
+            .err()
+            .expect("no edge is there")
+            .why;
         assert!(
             why.contains("2 of 2 upstream(s) declined"),
             "the first flow walks the list: {why}"
@@ -956,7 +990,8 @@ mod tests {
         let why = out
             .open("example.com:443")
             .err()
-            .expect("the edges are still gone");
+            .expect("the edges are still gone")
+            .why;
         assert!(
             why.contains("1 of 2 upstream(s) declined"),
             "a silent region is probed, not swept: {why}"
@@ -971,7 +1006,8 @@ mod tests {
         let why = out
             .open("example.com:443")
             .err()
-            .expect("still nothing to dial");
+            .expect("still nothing to dial")
+            .why;
         assert!(why.contains("1 of 2 upstream(s) declined"), "{why}");
         let next = counts();
         assert_ne!(
@@ -982,6 +1018,143 @@ mod tests {
         assert!(
             next.0 > swept.0 && next.1 > swept.1,
             "over two probes the walk reached both entries rather than hammering one: {swept:?} then {next:?}"
+        );
+    }
+
+    /// An edge that refuses the *target* answers for the whole plane: the walk stops at the first such answer, the region's list and the token behind it stay where they are, and the edge is not put in the silence a gone one earns.
+    fn forbidden_edge(server: &ferrox_core::tls::TlsServerConfig) -> (u16, Arc<AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let answered = Arc::clone(&hits);
+        let server = server.clone();
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                answered.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut tls) =
+                    ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                else {
+                    continue;
+                };
+                if tls.handshake().is_err() {
+                    continue;
+                }
+                // The answer follows the request: an edge that writes before it reads resets the flow's write instead of teaching it about the target.
+                let request = head(&mut tls);
+                assert!(
+                    request.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"),
+                    "the refusal is a fact about the host the flow asked for: {request}"
+                );
+                let _ = tls
+                    .write_all(b"HTTP/1.1 403 Forbidden\r\nX-Hola-Error: Forbidden Host\r\n\r\n");
+                let mut sink = [0u8; 64];
+                // The flow ends the leg as soon as it has read the refusal, so an error closes the drain as surely as a zero read.
+                while tls.read(&mut sink).unwrap_or(0) > 0 {}
+            }
+        });
+        (port, hits)
+    }
+
+    /// A refusal that names the host is not a refusal of the pair: one answer ends the walk, the plane is asked nothing, and the client is told the host is unreachable rather than about a general failure.
+    #[test]
+    fn a_refused_target_stops_the_walk_and_keeps_the_region() {
+        let (roots, server) = crate::foxy::loopback::minted(b"http/1.1");
+        let api = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let api_port = api.local_addr().expect("addr").port();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&asked);
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = api.accept() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let out = VeepnOut::new(
+            "DE".to_owned(),
+            &[format!("https://127.0.0.1:{api_port}")],
+            "00000000-0000-4000-8000-000000000000".to_owned(),
+            ferrox_core::tls::Anchors::from(roots.clone()),
+        )
+        .expect("lane");
+        let (one_port, one_hits) = forbidden_edge(&server);
+        let (two_port, two_hits) = forbidden_edge(&server);
+        let dials = vec![
+            crate::foxy::loopback::dial_for(
+                roots.clone(),
+                one_port,
+                Carrier::H1,
+                ferrox_core::foxy::pin::Pins::default(),
+            ),
+            crate::foxy::loopback::dial_for(
+                roots,
+                two_port,
+                Carrier::H1,
+                ferrox_core::foxy::pin::Pins::default(),
+            ),
+        ];
+        let silence: Vec<AtomicU64> = (0..dials.len()).map(|_| AtomicU64::new(0)).collect();
+        let seeded = Arc::new(Servers { dials, silence });
+        out.plane
+            .lock()
+            .expect("locks")
+            .lists
+            .insert("DE".to_owned(), (Arc::clone(&seeded), 4_000_000_000));
+
+        let refusal = out
+            .open("example.com:443")
+            .err()
+            .expect("the edge refuses this host");
+        assert_eq!(
+            (refusal.code, refusal.why.as_str()),
+            (
+                0x04,
+                "example.com:443 is refused by the edge (403)"
+            ),
+            "the client hears a host that cannot be reached, not a proxy that failed: edges answered {}+{}, plane asked {}",
+            one_hits.load(Ordering::SeqCst),
+            two_hits.load(Ordering::SeqCst),
+            asked.load(Ordering::SeqCst)
+        );
+        assert_eq!(
+            one_hits.load(Ordering::SeqCst),
+            1,
+            "one handshake is enough to learn a fact about the target"
+        );
+        assert_eq!(
+            two_hits.load(Ordering::SeqCst),
+            0,
+            "and the walk does not pay for the edges behind it"
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            0,
+            "the plane is asked nothing for a refusal that is not about it"
+        );
+
+        let refusal = out.open("example.com:443").err().expect("still refused");
+        assert_eq!(refusal.code, 0x04);
+        assert_eq!(
+            two_hits.load(Ordering::SeqCst),
+            1,
+            "the next flow reads the same answer from the edge its own rotation picked"
+        );
+        assert_eq!(
+            one_hits.load(Ordering::SeqCst),
+            1,
+            "and reads it from one edge, not from both"
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            0,
+            "the region's list and the token behind it survived: a refusal that retired them would ask the plane here"
+        );
+        assert!(
+            seeded
+                .silence
+                .iter()
+                .all(|until| until.load(Ordering::Relaxed) <= foxy_account::epoch()),
+            "an edge that named the target is not remembered as a gone one"
         );
     }
 
