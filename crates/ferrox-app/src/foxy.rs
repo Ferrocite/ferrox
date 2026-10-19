@@ -3782,6 +3782,20 @@ pub(crate) mod loopback {
         edge.join().expect("the edge finishes");
     }
 
+    /// The census line for a leg parked writing its client, waited for: a moment spent is not evidence the leg parked, and a flow that never waited hands its lane back for free.
+    fn wait_for_leg_write(leg: std::thread::ThreadId, budget: Duration) {
+        let began = Instant::now();
+        while crate::census::held("tunnel-leg-write", leg).is_none() {
+            assert!(
+                began.elapsed() < budget,
+                "the leg never parked writing the client after {:?}:\n{}",
+                began.elapsed(),
+                crate::census::dump()
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
     /// The lane is the flow's shared resource: the leg that hands bytes to the client has to give the lane back before it waits on the socket, or a client that has stopped reading costs its own upload the road it came in on.
     #[test]
     fn a_client_that_has_stopped_reading_does_not_cost_the_flow_its_lane() {
@@ -3857,12 +3871,15 @@ pub(crate) mod loopback {
         let (client, _) = front.accept().expect("accepts");
         let (ended_tx, ended_rx) = std::sync::mpsc::channel::<()>();
         let flow_lane = Arc::clone(&lane);
+        let (leg_tx, leg_rx) = std::sync::mpsc::channel::<std::thread::ThreadId>();
         std::thread::spawn(move || {
+            let _ = leg_tx.send(std::thread::current().id());
             crate::proxy::relay_tunnel(&client, &flow_lane);
             let _ = ended_tx.send(());
         });
-        // The leg has to be parked on the client's socket before the lane is asked for, or the test measures a flow that never waited.
-        std::thread::sleep(Duration::from_millis(200));
+        // The leg has to be parked on the client's socket before the lane is asked for.
+        let leg = leg_rx.recv().expect("the leg names itself");
+        wait_for_leg_write(leg, PARK);
         let started = Instant::now();
         let handed_back = loop {
             if lane.try_lock().is_ok() {
