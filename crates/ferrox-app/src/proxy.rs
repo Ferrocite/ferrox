@@ -8779,7 +8779,11 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
         let mut buf = RelayBuf::new();
         let mut first = true;
         loop {
-            match peer_read.read(buf.as_mut()) {
+            let read = {
+                census!("carrier-read", crate::census::handle(&peer_read), None);
+                peer_read.read(buf.as_mut())
+            };
+            match read {
                 Ok(n) if n > 0 => {
                     if first {
                         echo_trace("relay fwd first read");
@@ -8831,6 +8835,7 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
                 if first {
                     echo_trace("relay bwd forwarding");
                 }
+                census!("carrier-write", crate::census::handle(&peer_write), None);
                 if peer_write.write_all(&buf.as_mut()[..n]).is_err() {
                     echo_trace("relay bwd peer write failed");
                     break;
@@ -8887,7 +8892,11 @@ pub(crate) fn relay_carried<R: Read>(mut reader: R, write: &Connection, peer: &C
     let done = thread::spawn(move || {
         let mut buf = RelayBuf::new();
         loop {
-            match peer_read.read(buf.as_mut()) {
+            let read = {
+                census!("carrier-read", crate::census::handle(&peer_read), None);
+                peer_read.read(buf.as_mut())
+            };
+            match read {
                 Ok(n) if n > 0 => {
                     if uplink.write_all(&buf.as_mut()[..n]).is_err() {
                         break;
@@ -8903,6 +8912,7 @@ pub(crate) fn relay_carried<R: Read>(mut reader: R, write: &Connection, peer: &C
     loop {
         match reader.read(buf.as_mut()) {
             Ok(n) if n > 0 => {
+                census!("carrier-write", crate::census::handle(&peer_write), None);
                 if peer_write.write_all(&buf.as_mut()[..n]).is_err() {
                     break;
                 }
@@ -23656,6 +23666,49 @@ mod relay_tests {
              is parked past its stall budget:\n{}",
             crate::census::dump()
         );
+        silent.join().expect("joins");
+    }
+
+    /// A peer that takes the upload, reads none of the download and never closes ends the carried
+    /// relay's inline leg at its own end of stream, and what that leg hands its sibling is a
+    /// *write* half-close, which wakes a parked read on no platform: the leg blocked in that read,
+    /// and the join behind it, wait for a thread that never returns. Loopback only, dials nothing.
+    #[test]
+    fn a_carried_relay_ends_the_leg_behind_a_peer_that_reads_nothing() {
+        const CEILING: Duration = Duration::from_secs(5);
+
+        let carrier = listener();
+        let carrier_port = port_of(&carrier);
+        let (carrier_go, carrier_hold) = mpsc::channel::<()>();
+        let open = thread::spawn(move || {
+            let (_stream, _) = carrier.accept().expect("accepts");
+            let _ = carrier_hold.recv_timeout(CEILING * 4);
+        });
+        let peer = listener();
+        let peer_port = port_of(&peer);
+        let (peer_go, peer_hold) = mpsc::channel::<()>();
+        let silent = thread::spawn(move || {
+            let (_stream, _) = peer.accept().expect("accepts");
+            let _ = peer_hold.recv_timeout(CEILING * 4);
+        });
+        let write = Connection::connect(("127.0.0.1", carrier_port)).expect("dials");
+        let destination = Connection::connect(("127.0.0.1", peer_port)).expect("dials");
+        let (handed, joined) = mpsc::channel();
+        let relayed = thread::spawn(move || {
+            relay_carried(std::io::empty(), &write, &destination);
+            let _ = handed.send(());
+        });
+
+        let handed_back = joined.recv_timeout(CEILING).is_ok();
+        let held = crate::census::dump();
+        let _ = carrier_go.send(());
+        let _ = peer_go.send(());
+        assert!(
+            handed_back,
+            "the carried relay never handed back over a peer that reads nothing:\n{held}"
+        );
+        drop(relayed);
+        open.join().expect("joins");
         silent.join().expect("joins");
     }
 
