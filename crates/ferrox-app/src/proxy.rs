@@ -19619,7 +19619,7 @@ mod tests {
         cert_pem: Vec<u8>,
         key_pem: Vec<u8>,
         expected_header: Vec<u8>,
-    ) -> thread::JoinHandle<(usize, usize)> {
+    ) -> thread::JoinHandle<(usize, usize, usize)> {
         thread::spawn(move || {
             let mut config = quic_test_config("multi", &cert_pem, &key_pem);
             let local = sock.local_addr().expect("addr");
@@ -19634,15 +19634,17 @@ mod tests {
             let mut conns = 1usize;
             let mut seen_scids = vec![peer_scid];
             let mut streams: Vec<u64> = Vec::new();
+            let mut finished: std::collections::HashSet<u64> = std::collections::HashSet::new();
             let mut opening: HashMap<u64, Vec<u8>> = HashMap::new();
             let echo_deadline = std::time::Instant::now() + QUIC_TEST_TIMEOUT;
             loop {
                 if conn.is_closed() {
                     crate::quic::qstage(format!(
-                        "{} t={} server-closed conns={conns} streams={}",
+                        "{} t={} server-closed conns={conns} streams={} finished={}",
                         local.port(),
                         crate::quic::qms(),
-                        streams.len()
+                        streams.len(),
+                        finished.len()
                     ));
                     break;
                 }
@@ -19650,10 +19652,11 @@ mod tests {
                     quic_server_idle(&mut conn, &sock, &mut out);
                     if std::time::Instant::now() >= echo_deadline {
                         crate::quic::qstage(format!(
-                            "{} t={} server-bound conns={conns} streams={}",
+                            "{} t={} server-bound conns={conns} streams={} finished={}",
                             local.port(),
                             crate::quic::qms(),
-                            streams.len()
+                            streams.len(),
+                            finished.len()
                         ));
                         break;
                     }
@@ -19734,6 +19737,7 @@ mod tests {
                             ));
                         }
                         if fin {
+                            finished.insert(id);
                             break;
                         }
                     }
@@ -19741,8 +19745,18 @@ mod tests {
                 while let Ok((written, info)) = conn.send(&mut out) {
                     sock.send_to(&out[..written], info.to).expect("answers");
                 }
+                // Every stream this edge accepted has read its FIN: the flows are over, so the edge has nothing left to answer and leaves rather than spinning to its bound.
+                if !streams.is_empty() && finished.len() == streams.len() {
+                    crate::quic::qstage(format!(
+                        "{} t={} server-done conns={conns} streams={}",
+                        local.port(),
+                        crate::quic::qms(),
+                        streams.len()
+                    ));
+                    break;
+                }
             }
-            (conns, streams.len())
+            (conns, streams.len(), finished.len())
         })
     }
 
@@ -20061,9 +20075,13 @@ mod tests {
         drop(client2);
         relay1.join().expect("joins");
         relay2.join().expect("joins");
-        let (conns, streams) = server.join().expect("joins");
+        let (conns, streams, fin) = server.join().expect("joins");
         assert_eq!(conns, 1, "one UDP association, not two handshakes");
         assert_eq!(streams, 2, "two VLESS sessions on it");
+        assert_eq!(
+            fin, 2,
+            "each lease ended the stream it gave back: an edge that never read a FIN waits its whole bound"
+        );
     }
 
     #[test]
