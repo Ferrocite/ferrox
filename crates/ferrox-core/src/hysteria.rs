@@ -1,6 +1,6 @@
 //! Hysteria version 2 framing: the bytes around the QUIC streams and datagrams — every TCP flow is one bidirectional stream opening with the `0x401` type as a QUIC varint, the connection authenticates by HTTP/3 `POST /auth` answered with status `233`, and the UDP lane rides QUIC datagrams each carrying a `BE32` session id ahead of a packet id, fragment metadata, a varint address and its payload.
 
-use crate::foxy::{frames, hpack};
+use crate::foxy::{frames, head_end, hpack};
 
 pub const TCP_FRAME: u64 = 0x401;
 
@@ -846,9 +846,9 @@ pub fn content_type(path: &str) -> &'static str {
 
 /// One origin HTTP/1.1 response reduced to what ferrox re-emits as HTTP/3: the status code, every header as it arrived (the caller drops the hop-by-hop ones), and the body with any chunked framing or content-length tail already removed. The whole response, read to the origin's close, is the input; a head that never reaches its blank line is not a response.
 pub fn parse_origin_response(raw: &[u8]) -> Option<OriginResponse> {
-    let head_end = raw.windows(4).position(|window| window == b"\r\n\r\n")?;
-    let mut body = &raw[head_end + 4..];
-    let mut lines = raw[..head_end].split(|&byte| byte == b'\n');
+    let end = head_end(raw)?;
+    let mut body = &raw[end + 4..];
+    let mut lines = raw[..end].split(|&byte| byte == b'\n');
     let status = lines
         .next()?
         .split(|&byte| byte == b' ')

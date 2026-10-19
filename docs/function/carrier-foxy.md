@@ -159,9 +159,19 @@ This lane does not need a bundled root. The pin replaces **who signed the leaf**
   foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane 'Tls2::write'
 ./scripts/count-ops.sh report \
   foxy::loopback::the_h3_downlink_hands_the_caller_the_frame_without_staging_it 'H3::read'
+./scripts/count-ops.sh report \
+  foxy::tests::the_head_walk_costs_the_scan_and_nothing_else 'ferrox_core::foxy::head_end'
+./scripts/count-ops.sh report \
+  foxy::tests::the_head_walk_costs_the_scan_and_nothing_else \
+  'ferrox_core::foxy::tests::the_head_walk_costs_the_scan_and_nothing_else'
+./scripts/count-ops.sh report \
+  foxy::tests::the_serial_terminator_walk_costs_the_same_answer \
+  'ferrox_core::foxy::tests::the_serial_terminator_walk_costs_the_same_answer'
 ```
 
 `ops-retired-instructions` is `UNBLESSED`. `ops.yml` reports every symbol in `scripts/method-ops.txt` on each run and never blocks, so the row is open, not a figure.
+
+The last two lines are one measurement in two frames: 64 walks of the same 87-byte `200` answer, the found offset folded the same way to the same pinned `u32` (`0x734b_5000`), one frame through the shipped scan and one through the `windows(4).position` byte walk it replaced. Both frames are in the same test binary and the same run, so their difference is the scan's price without a second CI run being trusted to agree with the first — the pattern `carrier-websocket`'s `the_head_was_validated_three_times_over` mirror established. Neither absolute is a cost per byte: each frame carries its own loop entry, its `expect` and its fold.
 
 ## Time
 
@@ -177,6 +187,8 @@ Against the two clients this lane is a port of, and named with their paths so th
 
 - **A name built, a resolver asked and a `Vec` collected to reach an address the lane already had.** Every direct dial — of the edge and of the configured hop — went through `to_socket_addrs`, including the edges the plane publishes as addresses and the ones a config hands over already parsed. `foxy::edge_peer` reads the literal out of the text where it lies and the dial walks `iter::once(peer)`; the resolver keeps only the names, which is the one thing it can answer. `foxy_account::Endpoint::parse` does the same for a numeric origin, so an ask whose server is an address dials it without spelling the name. `edge-peer-read-allocations-per-open 0` is the core window over both branches, and `a_literal_edge_address_is_read_without_a_buffer_of_its_own` holds the IPv6 case the old unbracketed `format!` refused. `upstream_proxy` reads a URL that spells its hop in brackets (`[2001:db8::1]:1080`) as the address inside them, which `authority` puts back where a name is what the wire needs; `an_upstream_proxy_names_its_scheme_host_and_port` is that one's gate, and `an_endpoint_names_itself_and_keeps_the_address_out_of_the_tls_name` the account lane's.
 - **Four hand-spelled copies of one authority rule.** `open_udp`, `H3::open_ip`, `H3::udp_request` and `open_ip_h2` each cloned or formatted the edge name for their own head, so a lane open cost a `String` whichever branch it took, and an edge written as an address would have put an authority no reader can parse on the wire — reachable now because `edge_peer` lets that edge dial. One core rule answers all four, borrows the caller's text when there is nothing to bracket and nothing to append, and is priced by `edge-authority-allocations-per-lane-open 0`.
+
+- **A second owner of the delimiter walk, and a four-byte weigh at every offset.** This lane's `head_end` answered "where does the head end" with `windows(4).position`, which compares four bytes at every offset it walks, while `proxy::find_double_crlf` already walked the same terminator eight bytes at a time — one XOR, one zero-lane isolate, a verify only at a real `\n` — and its page claimed it as the tree's one terminator scan while a second body stayed in use. The scan has one owner now, in core: this lane's window walk, the kept-head reader's cursor, `find_across`'s past-the-seam half, the xHTTP h2 head and `hysteria::parse_origin_response` all reach it, so the byte-window body is gone rather than sped up. What is **not** removed: the four-byte verify at each `\n` candidate, and the four-byte window loop over the starts past the last whole word — under eight bytes a SWAR pass does not pay, which is why the tail stays the shape it was. The gate is the sweep, not the claim: `the_swar_terminator_scan_is_the_windows_four_scan` runs exhaustive over `{\r, \n, Z}` to eight bytes, every start at lengths 0..=130, and the first two words, mid-buffer and the final partial word at 511, 512, 513, 4096 and 16 384, asserting the same offset or the same `None` as the byte walk at every one. Its price is the pair of frames above, read as their difference.
 
 - **A second TLS record per CONNECT-UDP frame.** Writing the frame header and its capsule as two writes made two TLS records, and a record boundary is on the wire. `write_parts` hands the header and the payload to the same fragmenter in one call, which is the record a concatenated write would have produced: the same plaintext in the same order, one record instead of two.
 
