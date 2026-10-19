@@ -56,7 +56,13 @@ note "building the harness driver"
 if ((no_build)); then
   note "skipping the build: binaries are handed over, not rebuilt"
 else
-  cargo build --locked --release -p ferrox-bench -p ferrox-app 2>&1 | tail -2 >&2
+  build_log="$(mktemp)"
+  if ! cargo build --locked --release -p ferrox-bench -p ferrox-app >"$build_log" 2>&1; then
+    tail -80 "$build_log" >&2
+    rm -f "$build_log"
+    fail "the harness driver did not build"
+  fi
+  rm -f "$build_log"
 fi
 bench_bin="$(built "$bench_bin")" || fail \
   "no executable at $bench_bin(.exe) after the build above"
