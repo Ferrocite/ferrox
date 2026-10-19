@@ -237,12 +237,20 @@ impl Comparison {
     }
 
     pub fn gate(&self) -> stats::Gate {
-        if self.reference().is_none() {
+        let Some(reference) = self.reference() else {
+            return stats::Gate::no_comparison();
+        };
+        if self.candidates().is_empty() {
             return stats::Gate::no_comparison();
         }
-        let candidates = self.candidates();
-        if candidates.is_empty() {
-            return stats::Gate::no_comparison();
+        // A comparison needs a baseline. When the reference itself landed no run, the runner never let any engine be measured, so there is nothing to gate and no regression to blame on the engine under test. It fires only on an empty reference: a candidate that lands nothing while the reference lands its runs still resolves against gate_rows.
+        if self.runs(reference).is_empty() {
+            let failed = self
+                .failures
+                .iter()
+                .filter(|(engine, _)| engine.as_str() == reference)
+                .count();
+            return stats::Gate::unmeasured_by_runner(reference, failed);
         }
         stats::gate_rows(&self.rows())
     }
@@ -759,7 +767,10 @@ impl Comparison {
              data must never silently pass. A run whose gating rows all land \
              within noise passes — measured parity is not a regression — while \
              a run with an unproven gating row fails, because the comparison \
-             never happened (`.../zbench/report.py:968`).\n\
+             never happened — unless the reference itself landed no run, when \
+             there is no baseline to gate and the cell is reported `unmeasured \
+             by the runner`, a fact about the machine and not the engine under \
+             test (`.../zbench/report.py:968`).\n\
              Only the rows for `{}` decide this gate. Every other engine here is a \
              pinned comparator: it is measured and published so a reader can see \
              where it sits, but a comparator measuring worse than the reference is \
@@ -1801,6 +1812,71 @@ mod tests {
             "a cell can cost {worst:?} at its worst and the job spends {CELL_JOB_STEPS:?} outside \
              the harness, but the matrix declares only {declared} minutes: the cell would be cut \
              off mid-run and report nothing"
+        );
+    }
+
+    /// A saturated macOS runner can disturb every engine, the reference included, so no baseline lands; a comparison with no reference is not a regression the engine under test caused.
+    #[test]
+    fn a_reference_that_landed_no_run_is_unmeasured_not_a_regression() {
+        let empty = |engine: &'static str| EngineRuns {
+            engine,
+            dialect: parity::Dialect::Xray,
+            runs: Vec::new(),
+        };
+        let comparison = Comparison {
+            workload: workload(),
+            repeats: 3,
+            by_engine: vec![empty("xray-core"), empty("ferrox")],
+            ceilings_mib_s: Vec::new(),
+            gated: Some("ferrox"),
+            failures: vec![
+                ("xray-core".to_owned(), "workload: forged byte".to_owned()),
+                ("ferrox".to_owned(), "workload: transient".to_owned()),
+            ],
+            skipped: Vec::new(),
+            machine: "test".into(),
+        };
+        let gate = comparison.gate();
+        assert!(
+            gate.passed,
+            "an empty reference is not a ferrox regression: {:?}",
+            gate.lines
+        );
+        assert!(
+            gate.lines
+                .iter()
+                .any(|line| line.contains("unmeasured by the runner")),
+            "the line says the machine, not the engine, left it unmeasured: {:?}",
+            gate.lines
+        );
+    }
+
+    /// The escape hatch is only for an unmeasurable reference: a candidate that lands nothing while the reference does is still an unproven regression.
+    #[test]
+    fn a_candidate_that_lands_nothing_while_the_reference_is_measured_still_fails() {
+        let comparison = Comparison {
+            workload: workload(),
+            repeats: 3,
+            by_engine: vec![
+                synth_engine(
+                    "xray-core",
+                    [(100, 6000, 20480), (110, 6200, 20500), (120, 6400, 20600)],
+                ),
+                EngineRuns {
+                    engine: "ferrox",
+                    dialect: parity::Dialect::Xray,
+                    runs: Vec::new(),
+                },
+            ],
+            ceilings_mib_s: vec![900.0, 950.0, 1000.0],
+            gated: Some("ferrox"),
+            failures: vec![("ferrox".to_owned(), "workload: transient".to_owned())],
+            skipped: Vec::new(),
+            machine: "test".into(),
+        };
+        assert!(
+            !comparison.gate().passed,
+            "a ferrox that lands nothing against a measured reference is still an unproven regression"
         );
     }
 

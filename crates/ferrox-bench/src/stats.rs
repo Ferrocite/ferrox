@@ -189,6 +189,19 @@ impl Gate {
             )],
         }
     }
+
+    /// The runner never let a baseline land: the reference engine measured nothing, so there is no pair to gate and no regression to claim. It passes only in the sense that an unmeasured comparison cannot be blamed on the engine under test - the reason and the missing reference are named in the line so the report says it was not measured, never that it was fine.
+    pub fn unmeasured_by_runner(reference_engine: &str, failed_measures: usize) -> Self {
+        Self {
+            passed: true,
+            lines: vec![format!(
+                "unmeasured by the runner: `{reference_engine}` (the reference) landed no run \
+                 across {failed_measures} failed measure(s), so the gated comparison has no \
+                 baseline; reported inconclusive because of the machine, not a regression in the \
+                 engine under test"
+            )],
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
