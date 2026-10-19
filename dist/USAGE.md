@@ -4,7 +4,7 @@ Two things were built here, from the same release binary — a release package f
 
 | what | where |
 | --- | --- |
-| the binary | `target/release/ferrox-app` (arm64, `ferrox-app 0.0.1`) |
+| the binary | `target/release/ferrox-app` (arm64, `ferrox-app 0.0.2`) |
 | the CLI | `dist/ferrox-cli.sh` — every lane, every front, ports, system proxy |
 | the app | `dist/Ferrox.app` — the same CLI behind a double-click |
 
@@ -42,6 +42,8 @@ The lane is handed the account, not a saved token: the pass the edge accepts liv
 ```
 
 `up` prints the port map, then proves one flow through the first front. With `--vpn` it arms the macOS system proxy only after that flow answers, so a lane that carries nothing never takes the machine's traffic with it. If the fronts are open but no flow gets through, it says so and shows the lane log: that is a refused sign-in, an expired pass, or an edge that cannot be reached.
+
+An `up` that cannot start the lane it names fails before anything starts: `--vless` with no link prints the example, `--vmess` without `--uuid` names the id, every flag missing its value says which flag — and none of them stops a lane that is already carrying traffic. `ferrox-cli version` prints the binary's release.
 
 ## 3. Ports, and what each one serves
 
@@ -89,15 +91,18 @@ The binary serves and dials far more than Foxy; `ferrox-cli` writes the config f
 
 ```bash
 ferrox-cli up --vless 'vless://uuid@host:443?type=ws&security=tls&sni=host&path=/ws'
+ferrox-cli up --veepn --region us-va      # anonymous: no account, no server
 ferrox-cli up --vmess host:443 --uuid ID --network tcp
 ferrox-cli up --trojan host:443 --password PW
 ferrox-cli up --ss host:8388 --method aes-256-gcm --password PW
 ferrox-cli up --config mine.json          # served verbatim, any inbound/outbound
 ```
 
-The vless converter writes `tcp`, `ws`, `grpc`, `httpupgrade` and `xhttp`, with `security=none|tls|reality`. Anything else (kcp, quic, hysteria, httpheader, masque, xdrive) goes through `--config`: those are config shapes this binary already serves, and the converter does not guess at them.
+The vless converter writes `tcp`, `ws`, `grpc`, `httpupgrade` and `xhttp`, with `security=none|tls|reality`. Anything else (kcp, quic, hysteria, httpheader, masque, xdrive) goes through `--config`: those are config shapes this binary already serves, and the converter does not guess at them. A share-link lane with no link, a missing `--uuid`, or a missing password is refused before the lane starts, with the example to run.
 
-A config file can carry any inbound the binary serves — `vless`, `vmess`, `trojan`, `shadowsocks`, `hysteria`, `socks`, `http`, `mixed` — and any outbound — those plus `foxy`, `http` and `freedom`.
+`--veepn` is the one lane that needs nothing typed in. The plane launches this device anonymously, names the fastest region (or the one `--region` pins, with `--country` as its alias), and lists the upstreams that answer `Basic` for the pair it printed. The region ids are the plane's own, lowercase and from its free pool (`nl`, `us-va`, `us-or`, `gb-lnd`, `fr-prs`, `sg`, `ru-spb` at the time of writing); a typed id is lowered for the ask, and a name the plane does not list is answered `422` and diagnosed as such. The device id the plane sees is kept in `~/.config/ferrox/veepn.udid` (mode 0600), so a restart is the same device; `--domains` replaces the seven API origins this build ships with, and `--udid` names the identity outright.
+
+A config file can carry any inbound the binary serves — `vless`, `vmess`, `trojan`, `shadowsocks`, `hysteria`, `socks`, `http`, `mixed` — and any outbound — those plus `foxy`, `veepn`, `http` and `freedom`.
 
 ## 6. The app
 
@@ -105,7 +110,7 @@ A config file can carry any inbound the binary serves — `vless`, `vmess`, `tro
 open dist/Ferrox.app
 ```
 
-Double-clicking it opens a Terminal window with a menu: connect with the system proxy, connect ports-only, change the ports, another lane, status, the port map, the TUN explanation, stop. Closing the window stops the lane.
+Double-clicking it opens a Terminal window with a menu: connect the Foxy or VeePN lane with the system proxy or ports-only, change the ports, another lane, status, the port map, the TUN explanation, stop. Closing the window stops the lane.
 
 Drag `dist/Ferrox.app` to `/Applications` to keep it. It is ad-hoc signed, so the first launch may need right-click > Open.
 
@@ -125,6 +130,10 @@ Drag `dist/Ferrox.app` to `/Applications` to keep it. It is ad-hoc signed, so th
 | same, with "the TLS handshake with the edge failed" | this network blocks TLS to `*.fastly-masque.net:2499`; see below |
 | `the lane did not open its fronts` | the port is taken (`lsof -nP -iTCP:8080`), the config names an inbound this binary refuses, or its `settings.pass` is past its `exp` and nothing can replace it |
 | a browser works, `curl` does not | `curl` ignores the system proxy: pass `-x` or `--socks5-hostname` |
+| VeePN says "every upstream … declined" | the plane's edges are unreachable from this network: try `--region`, or `--domains` with an origin that answers |
+| VeePN says "does not list the region" (`422`) | the id is not in the plane's free pool, or was spelled differently: its ids are lowercase (`nl`, `us-va`), and leaving `--region` off lets the plane pick |
+| VeePN says "refuses its pairs" | the plane retired the pair it listed; `up` again fetches a fresh list, and `--region` moves the exit |
+| VeePN says "granted the CONNECT and then closed" | the edge accepted the pair but this network's path dropped the tunnel: the lane is healthy, the egress is not; use a hop that carries the edge's high port, or a network that reaches it |
 | `git`/`ssh` still go direct | they do not read the system proxy: set `HTTPS_PROXY`, or `ssh -o ProxyCommand='nc -X 5 -x 127.0.0.1:10808 %h %p'` |
 | DNS looks local | the SOCKS front resolves at the exit; the HTTP front receives a hostname in `CONNECT`. A browser's own DNS-over-HTTPS setting bypasses both |
 
