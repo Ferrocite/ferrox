@@ -25,8 +25,14 @@ struct Entry {
     thread: ThreadId,
 }
 
+/// A wait this old has outlasted every test that means to finish, so the census says so without being asked.
+const ALARM: Duration = Duration::from_secs(20);
+/// How often the alarm looks, which is how late a line can land past `ALARM`.
+const ALARM_TICK: Duration = Duration::from_secs(5);
+
 static LIVE: Mutex<Vec<Entry>> = Mutex::new(Vec::new());
 static NEXT: AtomicU64 = AtomicU64::new(0);
+static ALARMED: std::sync::Once = std::sync::Once::new();
 
 fn live() -> MutexGuard<'static, Vec<Entry>> {
     LIVE.lock()
@@ -58,6 +64,7 @@ pub(crate) fn enter(name: &'static str, fd: i64, armed: Option<Duration>) -> Wai
         started: Instant::now(),
         thread: std::thread::current().id(),
     });
+    ALARMED.call_once(start_alarm);
     Waited(id)
 }
 
@@ -74,29 +81,71 @@ pub(crate) fn handle<T: std::os::windows::io::AsRawSocket>(socket: &T) -> i64 {
     socket.as_raw_socket() as i64
 }
 
-/// One line per live wait, in the `key=value` shape `watch-test.sh`'s procfs lines take.
+/// One wait, in the `key=value` shape `watch-test.sh`'s procfs lines take.
+fn line(entry: &Entry) -> String {
+    let fd = match entry.fd {
+        NO_FD => "none".to_owned(),
+        descriptor => descriptor.to_string(),
+    };
+    let armed = match entry.armed {
+        Some(budget) => format!("{budget:?}"),
+        None => "none".to_owned(),
+    };
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "census thread {:?} name={} fd={fd} armed={armed} waited={}ms",
+        entry.thread,
+        entry.name,
+        entry.started.elapsed().as_millis()
+    );
+    out.trim_end().to_owned()
+}
+
+/// One line per live wait.
 #[must_use]
 pub(crate) fn dump() -> String {
     let live = live();
     let mut out = String::new();
     for entry in live.iter() {
-        let fd = match entry.fd {
-            NO_FD => "none".to_owned(),
-            descriptor => descriptor.to_string(),
-        };
-        let armed = match entry.armed {
-            Some(budget) => format!("{budget:?}"),
-            None => "none".to_owned(),
-        };
-        let _ = writeln!(
-            out,
-            "census thread {:?} name={} fd={fd} armed={armed} waited={}ms",
-            entry.thread,
-            entry.name,
-            entry.started.elapsed().as_millis()
-        );
+        let _ = writeln!(out, "{}", line(entry));
     }
     out
+}
+
+/// The ids of the waits still held: a stall is told once, because a line the alarm repeated would keep `watch-test.sh` from ever reading the silence as a stall.
+fn forget(told: &mut Vec<u64>, live: &[Entry]) {
+    told.retain(|id| live.iter().any(|entry| entry.id == *id));
+}
+
+/// The lines for waits held at least `age`, each told once and each dropped from `told` the moment its wait returns.
+fn alarm(told: &mut Vec<u64>, age: Duration) -> Vec<String> {
+    let live = live();
+    let mut lines = Vec::new();
+    for entry in live.iter() {
+        if entry.started.elapsed() >= age && !told.contains(&entry.id) {
+            told.push(entry.id);
+            lines.push(line(entry));
+        }
+    }
+    forget(told, &live);
+    lines
+}
+
+/// The thread that asks, because a suite `watch-test.sh` kills never reaches the assert that would have printed the census, and procfs names no thread on macOS or Windows.
+fn start_alarm() {
+    std::thread::Builder::new()
+        .name("ferrox-census-alarm".to_owned())
+        .spawn(|| {
+            let mut told = Vec::new();
+            loop {
+                std::thread::sleep(ALARM_TICK);
+                for stalled in alarm(&mut told, ALARM) {
+                    eprintln!("ferrox-app: still waiting: {stalled}");
+                }
+            }
+        })
+        .expect("the census alarm starts");
 }
 
 /// The census line one thread's named wait holds, or none when the census carries no such line. The thread is what tells this wait from another test's running beside it.
@@ -170,5 +219,55 @@ mod tests {
         drop(third);
         drop(first);
         assert!(held("census-order-first", this).is_none(), "{}", dump());
+    }
+
+    #[test]
+    fn a_wait_held_past_its_age_is_told_once_and_a_returned_one_never() {
+        let this = std::thread::current().id();
+        let waited = enter("census-alarm", 4, None);
+        std::thread::sleep(Duration::from_millis(40));
+        let named = |lines: &[String]| -> Option<String> {
+            lines
+                .iter()
+                .find(|line| {
+                    line.contains("name=census-alarm ")
+                        && line.contains(&format!("thread {this:?} "))
+                })
+                .cloned()
+        };
+        let mut told = Vec::new();
+        let stalled = named(&alarm(&mut told, Duration::from_millis(30)))
+            .expect("a wait held past its age is told");
+        assert!(stalled.contains("fd=4 "), "{stalled}");
+        assert!(number(&stalled, "waited") >= 30, "{stalled}");
+        assert!(
+            named(&alarm(&mut told, Duration::from_millis(30))).is_none(),
+            "the same stall was told twice, and a repeated line keeps `watch-test.sh` from reading the silence as a stall"
+        );
+        drop(waited);
+        assert!(
+            named(&alarm(&mut Vec::new(), Duration::from_millis(30))).is_none(),
+            "a returned wait is still being told:\n{}",
+            dump()
+        );
+    }
+
+    #[test]
+    fn the_alarm_drops_the_id_of_a_wait_that_returned() {
+        let held = Entry {
+            id: 7,
+            name: "census-forget",
+            fd: NO_FD,
+            armed: None,
+            started: Instant::now(),
+            thread: std::thread::current().id(),
+        };
+        let mut told = vec![7, 8];
+        forget(&mut told, std::slice::from_ref(&held));
+        assert_eq!(
+            told,
+            [7],
+            "a wait that left the census left the told-list too"
+        );
     }
 }
