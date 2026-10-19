@@ -397,6 +397,58 @@ impl Connection {
             Connection::Unix(_) => Ok(()),
         }
     }
+
+    /// Wait for this socket to have something to read, without taking a byte or blocking the
+    /// caller's own reads: a relay leg parks here so it can hold nothing while it waits. `Ok(true)`
+    /// is readiness, the peer's end included, which the next read then reports; `Ok(false)` is the
+    /// wait expiring. `#[cfg(unix)]` spelling: one `poll` row.
+    #[cfg(unix)]
+    pub(crate) fn wait_readable(&self, timeout: Duration) -> io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        let mut row = libc::pollfd {
+            fd: self.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            // SAFETY: one descriptor this leg holds, one element in the array, and the call writes only `revents`.
+            let ready = unsafe { libc::poll(&raw mut row, 1, millis) };
+            if ready > 0 {
+                return Ok(row.revents != 0);
+            }
+            if ready == 0 {
+                return Ok(false);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    /// The Windows spelling of the same wait: one `WSAPoll` row, whose error code comes from
+    /// `WSAGetLastError` rather than the process error slot.
+    #[cfg(windows)]
+    pub(crate) fn wait_readable(&self, timeout: Duration) -> io::Result<bool> {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::{
+            WSAGetLastError, WSAPoll, POLLERR, POLLHUP, POLLIN, POLLRDNORM, SOCKET, WSAPOLLFD,
+        };
+        let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        let mut row = WSAPOLLFD {
+            fd: self.as_raw_socket() as SOCKET,
+            events: POLLIN | POLLRDNORM,
+            revents: 0,
+        };
+        // SAFETY: one handle this leg holds and one element the call writes `revents` into.
+        let ready = unsafe { WSAPoll(&raw mut row, 1, millis) };
+        if ready < 0 {
+            return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+        }
+        let readable = POLLIN | POLLRDNORM | POLLHUP | POLLERR;
+        Ok(ready > 0 && row.revents & readable != 0)
+    }
 }
 
 /// Set `SO_RCVTIMEO`/`SO_SNDTIMEO` the way `std` does for TCP but not Unix: one `timeval`
