@@ -241,6 +241,11 @@ carrier-foxy write-calls-per-h1-open 1 ferrox-core-tls::rustls_backend::tests::t
 carrier-foxy head-read-calls-per-open 1 ferrox-app-foxy::tests::the_head_walk_reads_the_answer_in_one_call
 carrier-foxy head-tail-bytes-held-after-they-reach-the-caller 0 ferrox-app-foxy::tests::the_pipelined_tail_is_released_by_the_read_that_spends_it
 carrier-foxy h3-window-peek-bytes-per-delivered-frame 16 ferrox-app-foxy::loopback::the_h3_downlink_hands_the_caller_the_frame_without_staging_it
+carrier-foxy h3-frame-window-bytes 16 ferrox-app-foxy::loopback::the_h3_downlink_hands_the_caller_the_frame_without_staging_it
+carrier-foxy h3-window-bytes-per-frame-ahead-of-the-answer 16 ferrox-app-foxy::loopback::a_frame_ahead_of_the_answer_is_consumed_rather_than_waited_on
+carrier-foxy h3-bytes-lost-at-a-frame-boundary 0 ferrox-app-foxy::loopback::a_quic_capsule_split_over_frames_arrives_as_one_datagram
+carrier-foxy h3-bytes-lost-behind-a-parked-frame 0 ferrox-app-foxy::loopback::a_quic_trailer_that_parks_mid_block_keeps_the_frames_behind_it
+carrier-foxy h3-empty-frames-called-the-end 0 ferrox-app-foxy::loopback::an_empty_data_frame_is_not_the_end_of_the_tunnel
 carrier-foxy h2-bytes-lost-at-a-read-quantum 0 ferrox-app-foxy::loopback::a_frame_that_straddles_a_read_quantum_arrives_whole
 carrier-foxy h2-upload-bytes-blocked-by-an-unread-grant 0 ferrox-app-foxy::loopback::an_upload_is_paced_by_the_grants_the_edge_sends_rather_than_by_the_bytes_it_reads
 carrier-foxy window-update-frames-per-floor-crossing 2 ferrox-app-foxy::loopback::credit_crossing_the_floor_costs_one_pair_not_one_per_frame
