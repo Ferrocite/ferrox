@@ -1417,21 +1417,31 @@ mod tests {
         String::from_utf8(head).expect("ascii")
     }
 
-    /// A plane that answers nothing is a fact about the network, and a walk that earns nothing from a dead origin should say so without waiting for one: one refused port fails this flow with no pause in front of it, where the same rotation paced by the answer counter slept a whole second before its error. The bound is well under that first step of the table, so a walk that pauses an unanswered attempt fails here.
+    /// A plane that answers nothing is a fact about the network, and a walk that earns nothing from it should say so without waiting: the rotation reaches all seven shipped origins and hands back the error with no pause in front of it, where the same walk paced by the attempt counter slept a whole second after the first. The plane hangs up rather than refusing, because a refused loopback connect costs two seconds of its own on Windows and the gate would then measure the operating system instead of the walk.
     #[test]
     fn an_unreachable_plane_answers_without_a_pause() {
-        let dead = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let gone = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let origin = format!(
             "https://127.0.0.1:{}",
-            dead.local_addr().expect("addr").port()
+            gone.local_addr().expect("addr").port()
         );
-        drop(dead);
-        let out = lane(&[origin.as_str()]).expect("lane");
+        let reached = Arc::new(AtomicUsize::new(0));
+        gone_edge(gone, Arc::clone(&reached));
+        let names: Vec<&str> = (0..veepn::DEFAULT_DOMAINS.len())
+            .map(|_| origin.as_str())
+            .collect();
+        let out = lane(&names).expect("lane");
         let started = std::time::Instant::now();
         let Err(why) = out.open("example.com:443") else {
             panic!("a plane that answers nothing fails the flow");
         };
         let took = started.elapsed();
+        assert_eq!(
+            reached.load(Ordering::SeqCst),
+            veepn::DEFAULT_DOMAINS.len(),
+            "the walk rotated away from every origin it was given: {}",
+            why.why
+        );
         assert!(
             took < std::time::Duration::from_millis(700),
             "the walk paused {took:?} in front of a plane that never answered: {}",
