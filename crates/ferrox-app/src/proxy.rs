@@ -2795,7 +2795,7 @@ fn kcp_relay(tcp: &Connection, conn: &Arc<ferrox_core::kcp::Connection>) {
     let up = Arc::clone(conn);
     let done = RelayPool::global().run(move || {
         let mut tcp_read = tcp_read;
-        let mut buf = vec![0u8; 16384];
+        let mut buf = RelayBuf::new().into_vec();
         loop {
             match tcp_read.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -2812,7 +2812,7 @@ fn kcp_relay(tcp: &Connection, conn: &Arc<ferrox_core::kcp::Connection>) {
     let mut download = KcpIo {
         conn: Arc::clone(conn),
     };
-    let mut buf = vec![0u8; 16384];
+    let mut buf = RelayBuf::new().into_vec();
     loop {
         match download.read(&mut buf) {
             Ok(n) if n > 0 => {
@@ -3164,7 +3164,7 @@ fn xdrive_relay(app: &Connection, mut down: crate::xdrive::Conn) {
     let mut up = down.clone();
     let done = RelayPool::global().run(move || {
         let mut app_read = app_read;
-        let mut buf = vec![0u8; 16384];
+        let mut buf = RelayBuf::new().into_vec();
         loop {
             match app_read.read(&mut buf) {
                 Ok(0) | Err(_) => break,
@@ -3177,7 +3177,7 @@ fn xdrive_relay(app: &Connection, mut down: crate::xdrive::Conn) {
         }
         let _ = up.end_write();
     });
-    let mut buf = vec![0u8; 16384];
+    let mut buf = RelayBuf::new().into_vec();
     loop {
         match down.read(&mut buf) {
             Ok(n) if n > 0 => {
@@ -12044,6 +12044,38 @@ mod tests {
                 buffer.size(),
                 RELAY_SMALL_BUFFER,
                 "round {round}: and did not grow it"
+            );
+        }
+    }
+
+    /// The relay legs hand `read` a window that has left the type uninitialised (`RelayBuf::with_len(n).into_vec()`): the claim this witnesses is that leaving did not shrink the quantum — the same `len` and headroom the zero-filled `vec![0u8; n]` carried — so the read still covers the whole window and never reallocs, and only the prefix a read reports escapes. The zeroing is the only thing that changed.
+    #[test]
+    fn a_relay_leg_window_keeps_its_quantum_after_leaving_the_buffer() {
+        for window in [RELAY_SMALL_BUFFER, 32 * 1024] {
+            let mut buf = RelayBuf::with_len(window).into_vec();
+            assert_eq!(buf.len(), window, "the read window keeps its full quantum");
+            let base = buf.as_ptr();
+            let headroom = buf.capacity();
+            assert!(
+                headroom >= window,
+                "the window was shrunk below its quantum"
+            );
+            // A sub-window read overwrites from index 0; nothing past the reported prefix is ever read back.
+            let source: Vec<u8> = (0..1024u32).map(|i| (i % 251) as u8).collect();
+            let n = std::io::Cursor::new(source.clone())
+                .read(&mut buf)
+                .expect("the cursor fills what it holds");
+            assert_eq!(n, source.len(), "a short read reports its own length");
+            assert_eq!(
+                &buf[..n],
+                &source[..],
+                "every byte below the prefix was read"
+            );
+            assert_eq!(buf.as_ptr(), base, "a read did not move the window");
+            assert_eq!(
+                buf.capacity(),
+                headroom,
+                "a read did not realloc the window"
             );
         }
     }
