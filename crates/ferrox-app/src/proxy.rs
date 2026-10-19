@@ -8305,14 +8305,12 @@ fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
     // A read a caller already armed is that caller's to end: a poll quantum it set is how the leg stops, so this shape arms only a read nobody bounded.
     let armed = from.read_timeout().ok().flatten();
     let patient = armed.is_none();
-    let bound = armed.unwrap_or(stall);
-    if patient {
-        let _ = from.set_read_timeout(Some(stall));
-    }
+    let read_arm = armed.or(Some(stall));
+    let _ = from.set_read_timeout(read_arm);
     let mut buffer = RelayBuf::new();
     loop {
         let read = {
-            census!("relay-leg-read", crate::census::handle(from), Some(bound));
+            census!("relay-leg-read", crate::census::handle(from), read_arm);
             from.read(buffer.as_mut())
         };
         let n = match read {
