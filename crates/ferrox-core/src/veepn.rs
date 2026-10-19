@@ -38,10 +38,23 @@ pub const RESERVE_TTL: u64 = 24 * 3600;
 /// How soon a plane that could not be reached at all is asked again while the answer it already gave keeps the lane running: an outage costs the flows in this window nothing, and a recovered plane is back inside it.
 pub const PLANE_RETRY: u64 = 30;
 
-/// The pause before the next domain attempt, and the wall the whole request runs out against: a dead network has to surface as an error, not as a lane that hangs.
+/// The pause the walk earns before a retry of a plane that asked for patience, and the wall the whole request runs out against: a dead network has to surface as an error, not as a lane that hangs.
 pub const BACKOFF: [u64; 5] = [1, 2, 4, 8, 10];
 pub const REQUEST_BUDGET: u64 = 120;
 pub const MAX_ATTEMPTS: usize = 14;
+
+/// The seconds owed before the walk's next attempt. A `429` or a `5xx` is the plane asking for patience, so it gets the table; a domain that gave no answer back asked for nothing and the rotation away from it is the retry, so a seized API or a dead network costs the flow its transports and no pause at all. The attempt that closes the walk earns nothing either, because there is no next attempt to pace.
+#[must_use]
+pub const fn pause(attempt: usize, attempts: usize, answered: bool) -> u64 {
+    if !answered || attempt + 1 >= attempts {
+        return 0;
+    }
+    if attempt < BACKOFF.len() {
+        BACKOFF[attempt]
+    } else {
+        BACKOFF[BACKOFF.len() - 1]
+    }
+}
 
 /// How long an upstream that declined a flow is left alone. One refused handshake says the edge is gone for now, and the flow after it has nothing to learn from paying the same discovery again.
 pub const EDGE_SILENCE: u64 = 60;
@@ -395,6 +408,49 @@ mod tests {
                 .map(|error| error.kind()),
             Some(std::io::ErrorKind::InvalidInput),
             "a window under the body is refused rather than partially filled"
+        );
+    }
+
+    /// The walk's pause belongs to the answer, not to the attempt counter: a domain that gave nothing back is rotated away from rather than waited on, and the attempt that closes the walk earns no pause because there is no next attempt to pace. The two sums are what the page's rows read.
+    #[test]
+    fn a_plane_that_answered_nothing_is_rotated_away_from_not_waited_on() {
+        for attempt in 0..MAX_ATTEMPTS * 2 {
+            assert_eq!(
+                pause(attempt, DEFAULT_DOMAINS.len(), false),
+                0,
+                "no answer asks for nothing at attempt {attempt}"
+            );
+        }
+        for (attempt, want) in BACKOFF.iter().enumerate() {
+            assert_eq!(
+                pause(attempt, DEFAULT_DOMAINS.len(), true),
+                *want,
+                "a plane that said slow down is paced by the table at attempt {attempt}"
+            );
+        }
+        assert_eq!(
+            pause(6, DEFAULT_DOMAINS.len(), true),
+            0,
+            "the walk's closing attempt earns no pause"
+        );
+        assert_eq!(
+            pause(0, 1, true),
+            0,
+            "a one-origin rotation has no next attempt to wait for"
+        );
+        let waited: u64 = (0..DEFAULT_DOMAINS.len())
+            .map(|attempt| pause(attempt, DEFAULT_DOMAINS.len(), true))
+            .sum();
+        assert_eq!(
+            waited, 35,
+            "the shipped rotation, a plane that answered `429` throughout"
+        );
+        let rotated: u64 = (0..DEFAULT_DOMAINS.len())
+            .map(|attempt| pause(attempt, DEFAULT_DOMAINS.len(), false))
+            .sum();
+        assert_eq!(
+            rotated, 0,
+            "the same rotation, a plane that answered nothing"
         );
     }
 
