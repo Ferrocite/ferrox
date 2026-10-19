@@ -220,6 +220,8 @@ jobs:
           key: matrix-engines-${{ matrix.os }}-${{ hashFiles('upstream/pins.toml') }}
       - name: build every engine without moving traffic
         shell: bash
+        env:
+          FERROX_UPSTREAM_HANDOFF: "1"
         run: >
           ./scripts/run-benchmark-matrix.sh
           --tier "${{ needs.setup.outputs.tier }}"
@@ -253,20 +255,23 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - uses: actions/cache@v4
-        with:
-          path: target/parity-engines
-          key: matrix-engines-${{ matrix.os }}-${{ hashFiles('upstream/pins.toml') }}
       - uses: actions/download-artifact@v4
         with:
           name: matrix-ferrox-${{ matrix.os }}
           path: target/release
+      # Hash the handed-over pins file as the build job did: a Windows checkout's line endings would key a cache the build never wrote.
       - uses: actions/download-artifact@v4
         with:
           name: upstream-trees
           path: upstream
+      - uses: actions/cache@v4
+        with:
+          path: target/parity-engines
+          key: matrix-engines-${{ matrix.os }}-${{ hashFiles('upstream/pins.toml') }}
       - name: run one cell with handed-over binaries
         shell: bash
+        env:
+          FERROX_UPSTREAM_HANDOFF: "1"
         run: >
           ./scripts/run-benchmark-matrix.sh
           --tier "${{ needs.setup.outputs.tier }}"
