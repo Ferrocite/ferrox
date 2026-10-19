@@ -2476,21 +2476,6 @@ pub(crate) fn read_into_tail(read: &mut impl Read, buf: &mut Vec<u8>) -> std::io
     }
 }
 
-pub(crate) fn refresh_read_timeout(
-    sock: &crate::quic::Datagram,
-    want: Duration,
-    applied: &mut Option<Duration>,
-) -> bool {
-    if *applied == Some(want) {
-        return true;
-    }
-    if sock.set_read_timeout(Some(want)).is_err() {
-        return false;
-    }
-    *applied = Some(want);
-    true
-}
-
 pub(crate) fn is_timeout(error: &std::io::Error) -> bool {
     use std::io::ErrorKind::{TimedOut, WouldBlock};
     matches!(error.kind(), TimedOut | WouldBlock)
