@@ -82,6 +82,10 @@ carrier-foxy  foxy::loopback::the_masque_carrier_opens_connect_udp_and_echoes_a_
 carrier-foxy  foxy::hpack::tests::the_huffman_probe_costs_the_decode_and_nothing_else  ferrox_core::foxy::hpack::huffman_decode
 carrier-foxy  foxy::hpack::tests::the_huffman_probe_costs_the_decode_and_nothing_else  ferrox_core::foxy::hpack::tests::the_huffman_probe_costs_the_decode_and_nothing_else
 carrier-grpc  grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else  grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else
+carrier-veepn  veepn::tests::the_domain_walk_costs_the_labels_and_nothing_else  ferrox_core::veepn::api_domain
+carrier-veepn  veepn::tests::the_domain_walk_costs_the_labels_and_nothing_else  ferrox_core::veepn::tests::the_domain_walk_costs_the_labels_and_nothing_else
+carrier-veepn  veepn::tests::the_pair_coder_costs_the_coder_and_nothing_else  ferrox_core::veepn::credential_into
+carrier-veepn  veepn::tests::the_pair_coder_costs_the_coder_and_nothing_else  ferrox_core::veepn::tests::the_pair_coder_costs_the_coder_and_nothing_else
 carrier-websocket  ws::tests::a_read_covers_a_window_not_one_frame_header  ws::WsReader::pull
 carrier-websocket  ws::tests::frames_round_trip_masked_and_plain  ws::write_frame
 carrier-websocket  ws::tests::mask_chunks_match_the_byte_loop  ws::apply_mask

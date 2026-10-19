@@ -45,11 +45,11 @@ What the rows cannot see stays in prose. The pair is coded when a region's list 
 ## Ops
 
 ```bash
-./scripts/count-ops.sh report \
-  veepn::tests::the_credential_lands_in_the_callers_window_and_not_in_one_of_its_own 'veepn::credential_into'
+./scripts/count-ops.sh report veepn::tests::the_domain_walk_costs_the_labels_and_nothing_else 'ferrox_core::veepn::api_domain'
+./scripts/count-ops.sh report veepn::tests::the_pair_coder_costs_the_coder_and_nothing_else 'ferrox_core::veepn::credential_into'
 ```
 
-`UNBLESSED`, as every page here says of it. `scripts/count-ops.sh` needs valgrind, which does not exist on macOS/aarch64, so this count is CI-only (`ops.yml`); nothing quotes it until the artefact has been read.
+`UNBLESSED`, as every page here says of it: `scripts/count-ops.sh` needs valgrind, which does not exist on macOS/aarch64, so these counts are CI-only (`ops.yml`) and nothing quotes them until the artefact has been read. Both are probes rather than fixtures — 64 walks of the seven origins this crate ships, 512 codings of one `user:pass` into one stack window, each pass folded into a running `u32` whose expected value is pinned (`0xe2ea_d240`, `0xe88e_0600`) so the loop cannot be optimized out and a changed answer fails the row instead of measuring nothing. A probe's number is its frame: the fold, the loop and the frame entry ride inside it, so a row is read as the difference between two runs of the same row and never as the cost of the method alone. `the_domain_walk_costs_the_labels_and_nothing_else` is what puts a count behind the walk that replaced `_API_DOMAIN_RE` (`api.py:72`, applied per candidate origin at `api.py:91`); the regex's own cost is a code read of CPython's engine, not a number this harness measures. `the_pair_coder_costs_the_coder_and_nothing_else` is the instruction-side half of the coder claim priced in durations above.
 
 ## Time
 

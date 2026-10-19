@@ -388,4 +388,40 @@ mod tests {
             "a window under the body is refused rather than partially filled"
         );
     }
+
+    /// The origin walk, and nothing else: the seven domains this crate ships, walked 64 times over with the answer folded after each, so the frame is the walk and no socket, buffer or fixture rides in it. Read as the difference between two runs of this row, never as the cost of the method alone.
+    #[test]
+    fn the_domain_walk_costs_the_labels_and_nothing_else() {
+        assert_eq!(api_domain(DEFAULT_DOMAINS[0]), Some(("antpeak.com", 443)));
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            for url in DEFAULT_DOMAINS {
+                let (host, port) = api_domain(url).expect("a shipped origin");
+                for &byte in host.as_bytes() {
+                    fold = fold.wrapping_mul(31).wrapping_add(u32::from(byte));
+                }
+                fold = fold.wrapping_add(u32::from(port));
+            }
+        }
+        assert_eq!(
+            fold, 0xe2ea_d240,
+            "64 walks of the seven shipped origins, folded after each"
+        );
+    }
+
+    /// The pair coder, and nothing else: one list entry's `user:pass` coded 512 times into one stack window and folded after each pass, so the frame is the coder — fifteen plain bytes to twenty coded ones, no padding.
+    #[test]
+    fn the_pair_coder_costs_the_coder_and_nothing_else() {
+        let mut window = [0u8; 32];
+        let mut fold: u32 = 0;
+        for _ in 0..512 {
+            for &byte in credential_into("1000-abc", "s3cr3t", &mut window).expect("window") {
+                fold = fold.wrapping_mul(31).wrapping_add(u32::from(byte));
+            }
+        }
+        assert_eq!(
+            fold, 0xe88e_0600,
+            "512 codings of one pair, folded after each"
+        );
+    }
 }
