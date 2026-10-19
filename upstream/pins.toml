@@ -33,7 +33,7 @@ note          = "hand-rolled ChaCha20 in the WireGuard data path"
 
 [sources.amnezia-client]
 repo          = "https://github.com/amnezia-vpn/amnezia-client"
-rev           = "ffba1cb2a4286c2cd15c8f16d20a780d857a027e"
+rev           = "ddde43635e957ebf042d92787489da72d3394019"
 topics        = "amnezia, junk packet, header protection"
 default_branch = "dev"
 path          = "common/crypto"
@@ -43,7 +43,7 @@ note          = "the C++ Amnezia core; the second implementation of the same wir
 
 [sources.xray-rust]
 repo          = "https://github.com/aimalygin/xray-rust"
-rev           = "2255fdf919efcbbda4ea5a13f0fd949a8c61f835"
+rev           = "5834b86d8063bd27788c04b7c7364a7fdb1cecd1"
 topics        = "interop, balancer, round robin, proxy chain"
 default_branch = "main"
 path          = "crates"
@@ -55,7 +55,7 @@ note          = "Rust VLESS core; 24 of local_xray_interop_tests.rs's 29 interop
 
 [sources.xray-rust-hysteria]
 repo          = "https://github.com/aimalygin/xray-rust"
-rev           = "2255fdf919efcbbda4ea5a13f0fd949a8c61f835"
+rev           = "5834b86d8063bd27788c04b7c7364a7fdb1cecd1"
 topics        = "hysteria"
 default_branch = "main"
 path          = "crates"
@@ -67,7 +67,7 @@ note          = "the same core's Hysteria v2 client against ferrox-app's `protoc
 
 [sources.xray-core-rust]
 repo          = "https://github.com/Be90nia/xray-core-rust"
-rev           = "d657a80c213801b23459092f5eb876be42496b5f"
+rev           = "323fab576f5ec5cfc8581dd83f3c663753ddcb9d"
 always        = true
 default_branch = "master"
 path          = "crates"
@@ -77,7 +77,7 @@ note          = "a Rust rewrite of xray-core, read as a third same-language impl
 
 [sources.pattng]
 repo          = "https://github.com/patterniha/PattNG"
-rev           = "351ec050fb9587756d7c5fc6430a7df71a3dd9b7"
+rev           = "4e94c4c1e287adcfd73c0492f7db5aa08dcf8b8e"
 topics        = "ciphersuites, unsafe fingerprint, plaintext to public"
 default_branch = "my-releases"
 path          = "V2rayNG"
@@ -100,7 +100,7 @@ note          = "MIT Zray core; 9 oracle tests run against ferrox-app via ZRAY_X
 
 [sources.mqvpn]
 repo          = "https://github.com/mp0rta/mqvpn"
-rev           = "03a3749c3c1f33187a09eced22b4a0b6093e054d"
+rev           = "14e98987b3d5cbdc25c114923db1114996f7aa1a"
 topics        = "masque, connect-ip, multipath, scheduler, wlb, minrtt, reinjection, backup_fec, hybrid tcp"
 default_branch = "main"
 path          = "src"
@@ -150,7 +150,7 @@ note          = "Cloudflare QUIC + HTTP/3 stack (BSD-2.0); the default QUIC for 
 
 [sources.lxbox]
 repo          = "https://github.com/Leadaxe/LxBox"
-rev           = "73b7efeaef3d7c015f6354438be49e13a2bdc887"
+rev           = "0137f1f624889c6d08bfae6a7ab4aca336b16449"
 default_branch = "main"
 path          = "app"
 test_enabled  = false
