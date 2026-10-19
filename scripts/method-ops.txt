@@ -102,6 +102,7 @@ carrier-quic  foxy::loopback::the_quic_carrier_rides_a_socks5_upstream_and_carri
 carrier-quic  foxy::loopback::a_lane_outlives_its_leases_and_the_next_flow_rides_it  quic::pump
 carrier-quic  foxy::loopback::a_lane_outlives_its_leases_and_the_next_flow_rides_it  quic::pooled_stream_within
 carrier-quic  quic::tests::a_quic_socket_arms_its_receive_buffer  quic::bind_datagram
+carrier-quic  foxy::loopback::the_h3_downlink_hands_the_caller_the_frame_without_staging_it  quic::flush_burst
 carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hysteria::serve_loop
 carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hysteria::drive_once
 carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hysteria::serve_stream

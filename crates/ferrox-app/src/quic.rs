@@ -464,11 +464,92 @@ pub(crate) fn quiche_config(roots: &[Vec<u8>], cc: Option<&str>) -> Option<quich
     config
 }
 
+/// The datagrams one egress sweep hands the socket in one call: a 32 KiB write queues about ten behind each other, so a batch of eight sends most of a frame where the loop paid one syscall per packet.
+#[cfg(target_os = "linux")]
+const SEND_SLOTS: usize = 8;
+
 pub(crate) fn flush_egress(conn: &mut quiche::Connection, sock: &Datagram) {
+    #[cfg(target_os = "linux")]
+    if sock.batchable() {
+        flush_burst(conn, sock);
+        return;
+    }
     let mut room = Unfilled::<MAX_DATAGRAM>::new();
     let out = room.as_mut();
     while let Ok((written, info)) = conn.send(out) {
         let _ = sock.send_to(&out[..written], info.to);
+    }
+}
+
+/// Every datagram quiche has ready, in batches of `SEND_SLOTS`. Each packet is written straight into its own slot and addressed by the peer quiche named for it, and only the slots a sweep fills pay a header, so the batch costs neither a copy nor any wiring the per-packet loop did not already make.
+#[cfg(target_os = "linux")]
+fn flush_burst(conn: &mut quiche::Connection, sock: &Datagram) {
+    let mut slots: [Unfilled<MAX_DATAGRAM>; SEND_SLOTS] =
+        std::array::from_fn(|_| Unfilled::<MAX_DATAGRAM>::new());
+    let mut peers: [std::mem::MaybeUninit<libc::sockaddr_storage>; SEND_SLOTS] =
+        std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
+    let mut parts: [std::mem::MaybeUninit<libc::iovec>; SEND_SLOTS] =
+        std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
+    let mut batch: [std::mem::MaybeUninit<libc::mmsghdr>; SEND_SLOTS] =
+        std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
+    // The sweep is over when quiche has nothing more to hand, so a frame wider than the slots leaves in batch after batch, exactly as the per-packet loop drained it.
+    let mut at = 0usize;
+    let mut drained = false;
+    while !drained {
+        match conn.send(slots[at].as_mut()) {
+            Ok((written, info)) if written > 0 => {
+                let (storage, len) = crate::proxy::sockaddr_of(info.to);
+                peers[at].write(storage);
+                parts[at].write(libc::iovec {
+                    iov_base: slots[at].as_mut().as_mut_ptr().cast(),
+                    iov_len: written,
+                });
+                batch[at].write(libc::mmsghdr {
+                    msg_hdr: libc::msghdr {
+                        msg_name: peers[at].as_mut_ptr().cast(),
+                        msg_namelen: len,
+                        msg_iov: parts[at].as_mut_ptr(),
+                        msg_iovlen: 1,
+                        msg_control: std::ptr::null_mut(),
+                        msg_controllen: 0,
+                        msg_flags: 0,
+                    },
+                    msg_len: 0,
+                });
+                at += 1;
+            }
+            Ok(_) | Err(_) => drained = true,
+        }
+        if at == SEND_SLOTS {
+            send_batch(sock, &mut batch, at);
+            at = 0;
+        }
+    }
+    if at > 0 {
+        send_batch(sock, &mut batch, at);
+    }
+}
+
+/// One `sendmmsg` over the slots the sweep filled, retried from the first message the kernel did not take. A refusal is what the per-packet loop's ignored `send_to` already gave: those datagrams are dropped, quiche retransmits them, and the sweep moves on to whatever it offers next.
+#[cfg(target_os = "linux")]
+fn send_batch(sock: &Datagram, batch: &mut [std::mem::MaybeUninit<libc::mmsghdr>], want: usize) {
+    use std::os::fd::AsRawFd as _;
+    let mut done = 0usize;
+    while done < want {
+        let rest = &mut batch[done..want];
+        // SAFETY: every header below `want` was written by the caller this iteration, `MaybeUninit` is transparent over the header the call reads, and the buffers each names outlive the caller's frame.
+        let sent = unsafe {
+            libc::sendmmsg(
+                sock.sock.as_raw_fd(),
+                rest.as_mut_ptr().cast::<libc::mmsghdr>(),
+                rest.len() as libc::c_uint,
+                0,
+            )
+        };
+        match sent {
+            n if n <= 0 => return,
+            n => done += usize::try_from(n).unwrap_or(0),
+        }
     }
 }
 
@@ -1407,6 +1488,12 @@ impl Datagram {
             gecko: None,
             armed: Arc::default(),
         })
+    }
+
+    /// A lane the kernel can speak to in batches: no gecko fragment, no hop, no obfuscation and no relay frame, so the datagram quiche wrote is the datagram on the wire, and Linux is where the batched call exists.
+    #[cfg(target_os = "linux")]
+    fn batchable(&self) -> bool {
+        self.gecko.is_none() && self.hop.is_none() && self.obfs.is_none() && self.relay.is_none()
     }
 
     pub(crate) fn send_to(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
@@ -2987,6 +3074,145 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:53099".parse().expect("addr");
         let conn = quiche::accept(&cid, None, local, peer, &mut config).expect("accepts");
         (sock, local, conn)
+    }
+
+    /// One side's sweep, then everything its peer's socket holds delivered into that peer: the handshake and the gate both ride the batched path rather than a ferry of their own.
+    fn pass(
+        from: &mut quiche::Connection,
+        from_sock: &Datagram,
+        to: &mut quiche::Connection,
+        to_lane: &Datagram,
+        to_addr: SocketAddr,
+    ) {
+        flush_egress(from, from_sock);
+        let _ = to_lane.set_read_timeout(Some(Duration::from_millis(20)));
+        let mut room = [0u8; MAX_DATAGRAM];
+        while let Ok((n, peer)) = to_lane.recv_from(&mut room) {
+            let info = quiche::RecvInfo {
+                from: peer,
+                to: to_addr,
+            };
+            let _ = to.recv(&mut room[..n], info);
+        }
+    }
+
+    /// A lane: its socket, the address it holds, and the connection riding it.
+    struct Lane {
+        sock: Datagram,
+        addr: SocketAddr,
+        conn: quiche::Connection,
+    }
+
+    /// Client and server handshaked over two real loopback sockets, because a batched sweep is only readable from the peer's side of the wire.
+    fn lane_pair() -> (Lane, Lane) {
+        let identity = minted_identity();
+        let mut server_config = serve_config(&identity).expect("serves");
+        let mut client_config = quiche_config(&identity.cert_chain, None).expect("trusts");
+        let server_sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
+        let server_addr = server_sock.local_addr().expect("addr");
+        let client_sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
+        let client_addr = client_sock.local_addr().expect("addr");
+        let mut bytes = [0u8; 16];
+        getrandom::getrandom(&mut bytes).expect("random");
+        let server_id = quiche::ConnectionId::from_ref(&bytes);
+        let server = quiche::accept(
+            &server_id,
+            None,
+            server_addr,
+            client_addr,
+            &mut server_config,
+        )
+        .expect("accepts");
+        getrandom::getrandom(&mut bytes).expect("random");
+        let client_id = quiche::ConnectionId::from_ref(&bytes);
+        let client = quiche::connect(
+            Some("quic.test"),
+            &client_id,
+            client_addr,
+            server_addr,
+            &mut client_config,
+        )
+        .expect("connects");
+        let mut client = Lane {
+            sock: client_sock,
+            addr: client_addr,
+            conn: client,
+        };
+        let mut server = Lane {
+            sock: server_sock,
+            addr: server_addr,
+            conn: server,
+        };
+        for _ in 0..64 {
+            pass(
+                &mut client.conn,
+                &client.sock,
+                &mut server.conn,
+                &server.sock,
+                server.addr,
+            );
+            pass(
+                &mut server.conn,
+                &server.sock,
+                &mut client.conn,
+                &client.sock,
+                client.addr,
+            );
+            if client.conn.is_established() && server.conn.is_established() {
+                break;
+            }
+        }
+        assert!(
+            client.conn.is_established() && server.conn.is_established(),
+            "the lane handshook over the very sweep under test"
+        );
+        (client, server)
+    }
+
+    /// A sweep hands the socket every datagram quiche offered rather than one batch of slots, and the peer reads the same bytes in the same order: the connection is asked, right after the call, whether it still has a packet ready.
+    #[test]
+    fn an_egress_sweep_drains_its_whole_queue() {
+        let (mut client, mut server) = lane_pair();
+        let pattern: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        let wrote = server.conn.stream_send(1, &pattern, false).expect("writes");
+        assert!(
+            wrote >= 4 * MAX_DATAGRAM,
+            "the write queued a frame several batches wide, saw {wrote}"
+        );
+        flush_egress(&mut server.conn, &server.sock);
+        let mut left = [0u8; MAX_DATAGRAM];
+        assert!(
+            server.conn.send(&mut left).is_err(),
+            "the sweep took every datagram quiche was ready to hand over"
+        );
+        let mut room = [0u8; MAX_DATAGRAM];
+        let _ = client
+            .sock
+            .set_read_timeout(Some(Duration::from_millis(20)));
+        let mut got = 0usize;
+        while let Ok((n, peer)) = client.sock.recv_from(&mut room) {
+            got += 1;
+            let info = quiche::RecvInfo {
+                from: peer,
+                to: client.addr,
+            };
+            let _ = client.conn.recv(&mut room[..n], info);
+        }
+        assert!(
+            got >= 2,
+            "one sweep moved a burst rather than a single datagram, saw {got}"
+        );
+        let mut buf = vec![0u8; wrote + 1];
+        let (read, _) = client.conn.stream_recv(1, &mut buf).expect("reads");
+        assert!(
+            read > 0,
+            "the burst carried stream bytes the peer could read"
+        );
+        assert_eq!(
+            buf[..read],
+            pattern[..read],
+            "the batch delivered the frame in order, whole"
+        );
     }
 
     /// One visit to the socket absorbs the whole burst waiting on it, and the witness is the queue itself: one armed wait and a fourth read that must find nothing says whether three datagrams were taken in one visit or one at a time.
