@@ -229,6 +229,9 @@ carrier-veepn launch-body-window-allocations-per-ask 0 ferrox-core-veepn::tests:
 carrier-veepn connect-request-allocations-per-open 0 ferrox-core-tls::rustls_backend::tests::the_connect_request_gathers_without_a_heap_buffer
 carrier-veepn write-calls-per-h1-open 1 ferrox-core-tls::rustls_backend::tests::the_connect_request_gathers_without_a_heap_buffer
 carrier-veepn region-list-copies-per-flow 0 ferrox-app-veepn::tests::a_cached_list_is_shared_not_copied_per_flow
+carrier-veepn dial-clones-per-flow 0 ferrox-app-veepn::tests::a_flow_dials_the_cached_entry_and_not_a_copy_of_it
+carrier-veepn region-name-copies-per-flow 0 ferrox-app-veepn::tests::a_flow_dials_the_cached_entry_and_not_a_copy_of_it
+carrier-veepn origin-list-copies-per-ask 0 ferrox-app-veepn::tests::the_rotation_starts_where_the_last_one_left_off
 carrier-foxy ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-foxy payload-staging-copies-per-byte-written 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane
 carrier-foxy payload-staging-copies-per-byte-read 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane
