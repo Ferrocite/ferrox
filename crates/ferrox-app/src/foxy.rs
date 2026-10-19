@@ -1531,17 +1531,20 @@ impl H3 {
         }
     }
 
-    /// One UDP payload as one DATAGRAM capsule inside one DATA frame: the capsule's length is its own, so the frame's length is issued first and the capsule follows — one buffer, one stream write.
+    /// One UDP payload as one DATAGRAM capsule inside one DATA frame. The two headers ride the lane's own scratch and the payload keeps the caller's buffer: quiche copies every slice it is handed, so joining the datagram ahead of that copy crossed each of its bytes in userspace twice.
     pub(crate) fn write_datagram(&mut self, payload: &[u8]) -> std::io::Result<()> {
         if self.fin {
             return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
         }
+        let mut prefix = [0u8; 10];
+        let plen = masque::datagram_prefix_into(&mut prefix, payload.len());
+        let mut head = [0u8; 9];
+        let hl = frames::h3_data_header(&mut head, (plen + payload.len()) as u64);
         let mut out = std::mem::take(&mut self.out);
         out.clear();
-        masque::datagram_encode(payload, &mut out);
-        let mut head = [0u8; 9];
-        let hl = frames::h3_data_header(&mut head, out.len() as u64);
-        let sent = self.send_pair(self.quic.id, &head[..hl], &out);
+        out.extend_from_slice(&head[..hl]);
+        out.extend_from_slice(&prefix[..plen]);
+        let sent = self.send_pair(self.quic.id, &out, payload);
         self.out = out;
         sent.map_err(io)?;
         Ok(())
@@ -1740,62 +1743,77 @@ impl H3 {
         Ok(mark)
     }
 
-    /// Finishes the block the last header named: its bytes arrive at the capsule buffer's tail, and one nobody reads is cut back out when it is whole. A quantum that expires mid-block leaves the count on the lane, so the next turn resumes at the tail — the header is already spent, and a walk that read it again would put every frame after it out of order.
+    /// Finishes the block the last header named: its bytes arrive at the capsule buffer's tail, and one nobody reads is cut back out when it is whole. The tail the block needs is asked for once, because a poll that re-grew it per arrival zeroed every byte the peer had not sent yet — once per datagram, for a block it would fill in the end anyway. Every exit hands back only what quiche actually wrote. A quantum that expires mid-block leaves the count on the lane, so the next turn resumes at the tail — the header is already spent, and a walk that read it again would put every frame after it out of order.
     fn pending_block(&mut self, started: Instant) -> Result<(), Failure> {
         let Some(mut block) = self.pending.take() else {
             return Ok(());
         };
-        loop {
-            if block.rest == 0 {
-                if !block.keep {
-                    self.capsule_buf.truncate(block.mark);
-                }
-                return Ok(());
-            }
-            if self
-                .quantum
-                .is_some_and(|quantum| started.elapsed() >= quantum)
-            {
-                self.pending = Some(block);
-                return Ok(());
-            }
-            if Instant::now() >= self.deadline {
-                return Err(Failure::Stream);
-            }
-            let room = DATAGRAM_BUF_MAX
-                .saturating_sub(self.capsule_buf.len())
-                .min(block.rest);
+        let id = self.quic.id;
+        let mut buf = std::mem::take(&mut self.capsule_buf);
+        let base = buf.len();
+        if block.rest > 0 {
+            let room = DATAGRAM_BUF_MAX.saturating_sub(base).min(block.rest);
             if room == 0 {
+                self.capsule_buf = buf;
                 return Err(Failure::Frame);
             }
-            let id = self.quic.id;
-            let mut buf = std::mem::take(&mut self.capsule_buf);
-            let base = buf.len();
             buf.resize(base + room, 0);
-            let read = self.with_conn(|conn| conn.stream_recv(id, &mut buf[base..base + room]));
-            let read = match read {
-                Some(Ok((0, true))) => {
-                    // The stream ended with the block still short: a truncated frame, which is where the walk stops rather than waiting for bytes that will not come.
-                    buf.truncate(base);
+            let mut used = base;
+            loop {
+                if Instant::now() >= self.deadline {
+                    buf.truncate(used);
                     self.capsule_buf = buf;
                     return Err(Failure::Stream);
                 }
-                Some(Ok((read, _))) => read,
-                Some(Err(quiche::Error::Done)) => 0,
-                _ => {
-                    buf.truncate(base);
+                let read = match self.with_conn(|conn| conn.stream_recv(id, &mut buf[used..])) {
+                    Some(Ok((0, true))) => {
+                        // The stream ended with the block still short: a truncated frame, which is where the walk stops rather than waiting for bytes that will not come.
+                        buf.truncate(used);
+                        self.capsule_buf = buf;
+                        return Err(Failure::Stream);
+                    }
+                    Some(Ok((read, _))) => read,
+                    Some(Err(quiche::Error::Done)) => 0,
+                    _ => {
+                        buf.truncate(used);
+                        self.capsule_buf = buf;
+                        return Err(Failure::Io);
+                    }
+                };
+                used += read;
+                block.rest -= read;
+                if block.rest == 0 {
+                    if !block.keep {
+                        buf.truncate(block.mark);
+                    }
                     self.capsule_buf = buf;
-                    return Err(Failure::Io);
+                    return Ok(());
                 }
-            };
-            buf.truncate(base + read);
-            self.capsule_buf = buf;
-            block.rest -= read;
-            if read == 0 {
-                // Nothing had arrived: the socket is what turns a dropped datagram into a retransmission, so a walk that only asks the stream never reads the packet that answers it.
-                self.pump(Duration::from_millis(5));
+                if used == buf.len() {
+                    // The room a capsule stream may hold ran out with the block still owed: a stream that never parses.
+                    self.capsule_buf = buf;
+                    return Err(Failure::Frame);
+                }
+                if self
+                    .quantum
+                    .is_some_and(|quantum| started.elapsed() >= quantum)
+                {
+                    buf.truncate(used);
+                    self.capsule_buf = buf;
+                    self.pending = Some(block);
+                    return Ok(());
+                }
+                if read == 0 {
+                    // Nothing had arrived: the socket is what turns a dropped datagram into a retransmission, so a walk that only asks the stream never reads the packet that answers it.
+                    self.pump(Duration::from_millis(5));
+                }
             }
         }
+        if !block.keep {
+            buf.truncate(block.mark);
+        }
+        self.capsule_buf = buf;
+        Ok(())
     }
 
     /// The window's spare room from the stream, with whatever is still unparsed moved to its front first: the window is a header wide and never larger, so a full one is a boundary rather than a reason to allocate.
@@ -5533,17 +5551,27 @@ pub(crate) mod loopback {
             &mut want,
         );
         assert_eq!(block, want, "the edge reads the block the lane wrote");
-        lane.write_datagram(b"hello udp").expect("writes");
-        let mut back = [0u8; 64];
+        let big: Vec<u8> = (0..1350u64).map(|i| (i % 251) as u8).collect();
+        // A stage would grow the lane's write scratch to the datagram's own length, so capacity is the witness: the bytes the edge reads are identical either way.
+        lane.out = Vec::new();
+        lane.write_datagram(&big).expect("writes a datagram");
+        assert!(
+            lane.out.capacity() <= 19,
+            "the lane staged {} bytes to write a {}-byte datagram",
+            lane.out.capacity(),
+            big.len()
+        );
+        // The same datagram coming back is a capsule wider than one QUIC packet: one block the stream hands over, every one of its bytes owed.
+        let mut back = vec![0u8; big.len()];
         let mut at = 0usize;
-        while at < b"hello udp".len() {
+        while at < big.len() {
             match lane.read_datagram(&mut back[at..]) {
                 Ok(0) => panic!("the echo ended early"),
                 Ok(read) => at += read,
                 Err(error) => panic!("the echo failed: {error}"),
             }
         }
-        assert_eq!(&back[..at], b"hello udp");
+        assert_eq!(back, big, "a capsule over several reads arrives whole");
         edge.join().expect("joins");
     }
 
@@ -6234,6 +6262,55 @@ pub(crate) mod loopback {
         };
         assert_eq!(&back[..read], b"a capsule over two frames");
         assert!(!lane.fin, "a frame boundary is not the end of the stream");
+        edge.join().expect("joins");
+    }
+
+    /// One DATA frame whose block crosses a packet boundary: the header is spent, the first half of the block lands, and the peer goes quiet before the rest of it arrives. The resumed walk owes those bytes to the block it already named, so the tail must land after the head rather than over it.
+    #[test]
+    fn a_quic_block_that_arrives_in_pieces_keeps_the_pieces_it_already_holds() {
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let port = sock.local_addr().expect("addr").port();
+        let mut capsule = Vec::new();
+        masque::datagram_encode(
+            b"the head of this block lands first, the tail a packet later",
+            &mut capsule,
+        );
+        let frame = h3_data(&capsule);
+        let head = frame.len() - capsule.len();
+        let cut = head + capsule.len() / 2;
+        let edge = h3_scripted_edge(
+            sock,
+            server,
+            vec![
+                (h3_answer(), Duration::ZERO),
+                (frame[..cut].to_vec(), Duration::from_millis(400)),
+                (frame[cut..].to_vec(), Duration::ZERO),
+            ],
+        );
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let mut lane = H3::open_udp(&dial, "example.com", 443, quic).expect("opens");
+        lane.set_read_quantum(Duration::from_secs(5));
+        let mut back = [0u8; 96];
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        let read = loop {
+            assert!(std::time::Instant::now() < until, "the two pieces arrive");
+            match lane.read_datagram(&mut back) {
+                Ok(0) => panic!("the block's tail was called the end of the stream"),
+                Ok(read) => break read,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("the capsule failed: {error}"),
+            }
+        };
+        assert_eq!(
+            &back[..read],
+            b"the head of this block lands first, the tail a packet later",
+            "the piece that arrived first is still there when the rest lands"
+        );
+        assert_eq!(lane.capsule_buf.len(), 0, "the spent capsule is not held");
         edge.join().expect("joins");
     }
 
