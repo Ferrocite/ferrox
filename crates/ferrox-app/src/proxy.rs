@@ -13743,16 +13743,30 @@ mod tests {
 
         let session = dial_tls_session(&server, &client_config, None).expect("dialled");
         let (reader, writer, raw) = tls_halves(session).expect("halves");
+        let polling = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let pump_polling = Arc::clone(&polling);
         let reading = thread::spawn(move || {
             let mut peer = reader;
             let began = Instant::now();
             let mut buf = [0u8; 512];
             while began.elapsed() < Duration::from_secs(4) {
+                pump_polling.store(true, std::sync::atomic::Ordering::Release);
                 let _ = peer.read(&mut buf);
+                pump_polling.store(false, std::sync::atomic::Ordering::Release);
             }
         });
-        // Let the read pump settle into its wait before the write pump comes by.
-        thread::sleep(Duration::from_millis(250));
+        // The write pump has to arrive on a session the read pump is polling, so the test waits for a read in flight rather than for a moment to pass: an uncontended session answers any write.
+        let waited = Instant::now();
+        while !polling.load(std::sync::atomic::Ordering::Acquire)
+            && waited.elapsed() < Duration::from_secs(5)
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            polling.load(std::sync::atomic::Ordering::Acquire),
+            "the read pump was not polling after {:?}",
+            waited.elapsed()
+        );
 
         let mut sink = SessionSink { half: writer, raw };
         for _ in 0..3 {
