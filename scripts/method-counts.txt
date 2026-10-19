@@ -367,6 +367,7 @@ carrier-hysteria non-v2-configs-carried 0 ferrox-app-proxy::tests::hysteria_sett
 carrier-hysteria datagram-lane-client-round-trips 1 ferrox-app-proxy::tests::hysteria_carries_a_udp_association_over_the_carrier
 carrier-hysteria udp-datagram-decode-copies 0 ferrox-core-hysteria::tests::a_decoded_datagram_leaves_its_payload_where_it_landed
 carrier-hysteria udp-fragments-witnessed 200 ferrox-core-hysteria::tests::every_length_survives_fragment_then_defrag_intact
+carrier-hysteria udp-datagram-reassembly-allocations-per-whole-packet 0 ferrox-core-hysteria::tests::an_unfragmented_datagram_is_handed_over_without_a_buffer
 carrier-hysteria obfuscated-datagram-heap-copies 0 ferrox-core-hysteria::tests::a_sealed_datagram_never_touches_the_heap
 carrier-hysteria pinned-hysteria-client-verdicts 1 scripts/run-upstream-suite.sh
 carrier-hysteria masquerade-answers-browser-on-same-port 1 ferrox-app-proxy::tests::hysteria_serves_a_canned_masquerade_response
