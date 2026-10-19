@@ -63,7 +63,7 @@ test_enabled  = true
 suite         = "cargo test -p xray-transport --test hysteria_interop_tests -- --ignored --exact pinned_reference_rejects_wrong_auth_and_closes_failed_tcp_destination"
 ferrox_binary = "ferrox-app"
 seam          = "XRAY_HYSTERIA_BINARY"
-note          = "the same core's Hysteria v2 client against ferrox-app's `protocol: hysteria` inbound: a wrong password is refused and a failed destination closes after the acknowledgement. UDP stays out — ferrox carries no UDP flows, and the two tests that need them name that refusal. The harness's readiness token is the pinned Xray banner; ferrox-app emits it labeled as the harness's string"
+note          = "the same core's Hysteria v2 client against ferrox-app's `protocol: hysteria` inbound: a wrong password is refused and a failed destination closes after the acknowledgement. UDP stays out — ferrox carries no UDP flows, and the two tests that need them name that refusal. The harness's readiness token is the pinned Xray banner; ferrox-app emits it labeled as the harness's string. Read from `upstream/xray-rust`: one checkout for the commit both pins name, this name links to it"
 
 [sources.xray-core-rust]
 repo          = "https://github.com/Be90nia/xray-core-rust"

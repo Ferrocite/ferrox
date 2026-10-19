@@ -26,6 +26,9 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: the fetcher holds one checkout per repo and rev
+        shell: bash
+        run: ./scripts/fetch-upstream.sh --selftest
       - name: check the upstream pins resolve
         shell: bash
         run: ./scripts/check-upstream-pins.sh
