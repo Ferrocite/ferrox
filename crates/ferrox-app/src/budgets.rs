@@ -21,6 +21,9 @@ pub(crate) const RELAY_HANDOFF_SPINS: u32 = 64;
 /// One leg's wait for its partner after the flow has ended: a partner still missing past the relay's own idle bound is starved rather than draining, and a thread that waits forever turns one stalled peer into a pile-up of held sessions.
 pub(crate) const RELAY_JOIN: Duration = Duration::from_secs(120);
 
+/// One relay leg's patience: how long a copy may sit against a socket that moves neither way before the flow is given up. A peer that stops reading and never closes otherwise parks a worker, its duplicated descriptors and a copy buffer for the life of the process.
+pub(crate) const RELAY_STALL: Duration = Duration::from_secs(120);
+
 pub(crate) const RELAY_LOCK_TRIES: u32 = 64;
 
 /// How long a relay worker may sit unclaimed before it hands its thread back: long enough for the next flow to reuse it, short enough that a burst of finished flows leaves no residue.
@@ -62,6 +65,7 @@ static HANDSHAKE_MS: AtomicU64 = AtomicU64::new(0);
 static HEAD_ARRIVAL_MS: AtomicU64 = AtomicU64::new(0);
 static RELAY_JOIN_MS: AtomicU64 = AtomicU64::new(0);
 static RELAY_QUANTUM_MS: AtomicU64 = AtomicU64::new(0);
+static RELAY_STALL_MS: AtomicU64 = AtomicU64::new(0);
 static UDP_IDLE_MS: AtomicU64 = AtomicU64::new(0);
 static PAYLOAD_GRACE_MS: AtomicU64 = AtomicU64::new(0);
 static GOAWAY_GRACE_MS: AtomicU64 = AtomicU64::new(0);
@@ -92,6 +96,10 @@ pub(crate) fn relay_join() -> Duration {
 
 pub(crate) fn relay_quantum() -> Duration {
     named(&RELAY_QUANTUM_MS, RELAY_QUANTUM)
+}
+
+pub(crate) fn relay_stall() -> Duration {
+    named(&RELAY_STALL_MS, RELAY_STALL)
 }
 
 pub(crate) fn udp_idle() -> Duration {
@@ -125,6 +133,7 @@ pub(crate) fn apply(overrides: &crate::config::Budgets) {
     one(&HEAD_ARRIVAL_MS, overrides.head_arrival);
     one(&RELAY_JOIN_MS, overrides.relay_join);
     one(&RELAY_QUANTUM_MS, overrides.relay_quantum);
+    one(&RELAY_STALL_MS, overrides.relay_stall);
     one(&UDP_IDLE_MS, overrides.udp_idle);
     one(&PAYLOAD_GRACE_MS, overrides.payload_grace);
     one(&GOAWAY_GRACE_MS, overrides.goaway_grace);
@@ -140,6 +149,7 @@ pub(crate) fn clear() {
         &HEAD_ARRIVAL_MS,
         &RELAY_JOIN_MS,
         &RELAY_QUANTUM_MS,
+        &RELAY_STALL_MS,
         &UDP_IDLE_MS,
         &PAYLOAD_GRACE_MS,
         &GOAWAY_GRACE_MS,
@@ -174,6 +184,7 @@ mod tests {
         assert_eq!(head_arrival(), HEAD_DEADLINE);
         assert_eq!(relay_join(), RELAY_JOIN);
         assert_eq!(relay_quantum(), RELAY_QUANTUM);
+        assert_eq!(relay_stall(), RELAY_STALL);
         assert_eq!(udp_idle(), UDP_IDLE);
         assert_eq!(payload_grace(), PAYLOAD_GRACE);
         assert_eq!(goaway_grace(), GOAWAY_GRACE);
@@ -181,7 +192,8 @@ mod tests {
 
         let root = crate::json::parse(
             r#"{"budgets": {"dial": "20s", "handshake": "30s", "headArrival": "40s",
-                            "relayJoin": "5mn", "relayQuantum": "250ms", "udpIdle": "300s",
+                            "relayJoin": "5mn", "relayQuantum": "250ms", "relayStall": "180s",
+                            "udpIdle": "300s",
                             "payloadGrace": "400ms", "goawayGrace": "200ms", "carrierProbe": "3s"}}"#,
         )
         .expect("parses");
@@ -191,7 +203,8 @@ mod tests {
 
         let root = crate::json::parse(
             r#"{"budgets": {"dial": "20s", "handshake": "30s", "headArrival": "40s",
-                            "relayJoin": "300s", "relayQuantum": "250ms", "udpIdle": "300s",
+                            "relayJoin": "300s", "relayQuantum": "250ms", "relayStall": "180s",
+                            "udpIdle": "300s",
                             "payloadGrace": "400ms", "goawayGrace": "200ms", "carrierProbe": "3s"}}"#,
         )
         .expect("parses");
@@ -201,6 +214,7 @@ mod tests {
         assert_eq!(head_arrival(), Duration::from_secs(40));
         assert_eq!(relay_join(), Duration::from_secs(300));
         assert_eq!(relay_quantum(), Duration::from_millis(250));
+        assert_eq!(relay_stall(), Duration::from_secs(180));
         assert_eq!(udp_idle(), Duration::from_secs(300));
         assert_eq!(payload_grace(), Duration::from_millis(400));
         assert_eq!(goaway_grace(), Duration::from_millis(200));
