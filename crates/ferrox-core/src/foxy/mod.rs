@@ -406,7 +406,7 @@ mod tests {
         assert_eq!(edge_peer("", 443), None, "no host is not an address");
         // Both branches, through an input the optimizer cannot fold out of the loop.
         let hosts = ["192.0.2.12", "edge.example"];
-        let (_, counts) = crate::alloc_count::measure(|| {
+        let ((), counts) = crate::alloc_count::measure(|| {
             for at in 0..4096 {
                 std::hint::black_box(edge_peer(
                     std::hint::black_box(hosts[at % hosts.len()]),

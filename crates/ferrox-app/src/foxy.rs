@@ -140,7 +140,7 @@ fn tls_to_edge(dial: &FoxyDial) -> Result<ferrox_core::tls::RustlsProvider<Conne
         return edge_over_hop(proxy, dial);
     }
     // The address the lane holds, or the one the edge's name already is, reaches the socket as it stands: no name spelled, no list collected, no resolver asked.
-    match dial.address.or(edge_peer(&dial.host, dial.port)) {
+    match dial.address.or_else(|| edge_peer(&dial.host, dial.port)) {
         Some(peer) => dial_peers(dial, std::iter::once(peer)),
         None => dial_peers(
             dial,
