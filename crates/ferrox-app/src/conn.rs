@@ -746,11 +746,13 @@ mod winunix {
     use std::sync::{Arc, Once};
     use std::time::Duration;
     use windows_sys::Win32::Networking::WinSock::{
-        accept, bind, closesocket, connect, getsockopt, ioctlsocket, listen, recv, send,
-        setsockopt, shutdown, socket, WSAGetLastError, WSARecv, WSASend, WSAStartup, AF_UNIX,
-        FIONBIO, INVALID_SOCKET, MSG_PEEK, SD_BOTH, SD_RECEIVE, SD_SEND, SOCKADDR, SOCKADDR_UN,
-        SOCKET, SOCKET_ERROR, SOCK_STREAM, SOL_SOCKET, WSABUF, WSADATA, WSAESHUTDOWN,
+        accept, bind, closesocket, connect, getsockopt, listen, recv, send, setsockopt, shutdown,
+        socket, WSAGetLastError, WSARecv, WSASend, WSAStartup, AF_UNIX, INVALID_SOCKET, MSG_PEEK,
+        SD_BOTH, SD_RECEIVE, SD_SEND, SOCKADDR, SOCKADDR_UN, SOCKET, SOCKET_ERROR, SOCK_STREAM,
+        SOL_SOCKET, WSABUF, WSADATA, WSAESHUTDOWN,
     };
+    #[cfg(test)]
+    use windows_sys::Win32::Networking::WinSock::{ioctlsocket, FIONBIO};
 
     pub(crate) use windows_sys::Win32::Networking::WinSock::{SO_RCVTIMEO, SO_SNDTIMEO};
 
@@ -1136,6 +1138,7 @@ mod winunix {
             Incoming { listener: self }
         }
 
+        #[cfg(test)]
         pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
             // SAFETY: `mode` is the one `u32` flag `FIONBIO` reads, on this socket.
             let mut mode = u32::from(nonblocking);
