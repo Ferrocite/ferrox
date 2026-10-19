@@ -6250,8 +6250,8 @@ fn serve_foxy_front(
             if !prefix.is_empty() && tunnel.write_all(prefix).is_err() {
                 return;
             }
-            // One lock serves both directions: a blocking read would hold the writer, hence the bounded quantum.
-            let _ = tunnel.set_read_quantum(budgets::relay_quantum());
+            // One lock serves both directions: the lane's read takes a grain so a writer never waits out the wait, and the idle leg parks on the edge socket outside the lock.
+            let _ = tunnel.set_relay_quantum(budgets::relay_quantum());
             let tunnel = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
             let started = Instant::now();
             relay_tunnel(&client, &tunnel);
@@ -6302,8 +6302,8 @@ fn serve_veepn_front(
     if !prefix.is_empty() && tunnel.write_all(prefix).is_err() {
         return;
     }
-    // One lock serves both directions: a blocking read would hold the writer, hence the bounded quantum.
-    let _ = tunnel.set_read_quantum(budgets::relay_quantum());
+    // The same one lock serves both directions as a Foxy flow's, so it gets the same arm: a grain for the read, the wait outside the lock.
+    let _ = tunnel.set_relay_quantum(budgets::relay_quantum());
     relay_tunnel(&client, &std::sync::Arc::new(std::sync::Mutex::new(tunnel)));
 }
 
@@ -7670,8 +7670,15 @@ fn copy_locked(
                             debug_relay(direction, total, None);
                             break;
                         }
-                        drop(lane);
-                        std::thread::sleep(RELAY_IDLE);
+                        // The wait belongs outside the lock, on the edge socket rather than on a clock: a leg parked on a quiet edge would otherwise cost the first uplink byte after a pause the whole of its wait, and a leg that sleeps instead of watching the socket pays that pause in the other direction too.
+                        if let Some((edge, park)) = lane.read_wait() {
+                            drop(lane);
+                            census!("downlink-park", crate::census::handle(&edge), Some(park));
+                            let _ = edge.wait_readable(park);
+                        } else {
+                            drop(lane);
+                            std::thread::sleep(RELAY_IDLE);
+                        }
                         continue;
                     }
                     Err(error) => {

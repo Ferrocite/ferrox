@@ -365,6 +365,12 @@ impl<S: Stream> RustlsProvider<S> {
         &self.io
     }
 
+    /// Whether this session's only way to make progress is a socket read: `false` while a record's
+    /// plaintext still sits in the layer, which a read takes without touching the socket.
+    pub fn wants_read(&self) -> bool {
+        self.conn.wants_read()
+    }
+
     /// Writes two slices as one TLS record: the fragmenter sees `head` and `tail`
     /// in that order in one call, which is the record a concatenated write would
     /// have produced, so the payload's staging copy is spent rather than the

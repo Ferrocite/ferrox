@@ -457,6 +457,7 @@ pub(crate) fn open_h1(
         tls,
         carried,
         at: 0,
+        park: None,
     })
 }
 
@@ -609,6 +610,7 @@ fn open_h2_with(dial: &FoxyDial, block: &[u8]) -> Result<Tls2, Failure> {
         pending_credit: 0,
         frame: FrameState::default(),
         fin: false,
+        park: None,
     };
     let status = lane.await_status()?;
     opened(status)?;
@@ -664,6 +666,8 @@ pub(crate) struct Tls2 {
     pending_credit: u32,
     frame: FrameState,
     fin: bool,
+    /// How long a leg that has handed its lock back may wait on this lane's socket for the next byte: the quantum a relay armed, less the grain its blocking read takes. `None` until one arms it, because a caller that reads this lane alone has no lock to release.
+    park: Option<Duration>,
 }
 
 /// How much of the frame in flight has arrived: a read quantum expires between two socket reads, not between two frames.
@@ -815,6 +819,20 @@ fn read_frame<S: Read>(
 impl Tls2 {
     pub(crate) fn set_read_quantum(&self, quantum: Duration) -> std::io::Result<()> {
         self.tls.get_ref().set_read_timeout(Some(quantum))
+    }
+
+    /// The arm for a lane whose lock both relay directions share: the blocking read takes one grain — `SESSION_POLL`, the cadence a shared lock is armed with elsewhere in the app — and the rest of the quantum is spent outside the lock, parked on the socket `read_wait` hands back. A writer then waits out a grain, not a wait.
+    pub(crate) fn set_relay_quantum(&mut self, quantum: Duration) -> std::io::Result<()> {
+        self.park = Some(quantum);
+        self.set_read_quantum(quantum.min(crate::budgets::SESSION_POLL))
+    }
+
+    /// The socket to park on, when a socket read is the only thing that can move this lane: a staged frame's bytes and a TLS record's plaintext are both one read away from the caller, and waiting on the wire for them would park a leg that has work to hand over.
+    pub(crate) fn read_wait(&self) -> Option<(Connection, Duration)> {
+        let park = self
+            .park
+            .filter(|_| self.at >= self.carry.len() && self.tls.wants_read())?;
+        Some((self.tls.get_ref().try_clone().ok()?, park))
     }
 
     /// Reads one frame, hands it to `body` with the payload borrowed, and puts the buffer back.
@@ -1206,6 +1224,8 @@ pub(crate) struct Tls1 {
     /// What the head walk took past the delimiter, with a cursor: draining would move what is left on every call.
     carried: Vec<u8>,
     at: usize,
+    /// How long a leg that has handed its lock back may wait on this lane's socket for the next byte: the quantum a relay armed, less the grain its blocking read takes. `None` until one arms it, because a caller that reads this lane alone has no lock to release.
+    park: Option<Duration>,
 }
 
 /// Undecodable-block dump behind `FOXY_DEBUG`: the hex of a header block no codec here reads, so a red live run names the encoding.
@@ -1231,10 +1251,24 @@ fn header_status(
     })
 }
 
-/// Bounds one blocking read so a relay holding one lock for both directions can interleave: the backward read returns `WouldBlock` within the quantum instead of holding the lock.
 impl Tls1 {
+    /// Bounds one blocking read so a caller that holds this lane alone can still be interrupted by its own timeout.
     pub(crate) fn set_read_quantum(&self, quantum: Duration) -> std::io::Result<()> {
         self.tls.get_ref().set_read_timeout(Some(quantum))
+    }
+
+    /// The arm for a lane whose lock both relay directions share: the blocking read takes one grain — `SESSION_POLL`, the cadence a shared lock is armed with elsewhere in the app — and the rest of the quantum is spent outside the lock, parked on the socket `read_wait` hands back. A writer then waits out a grain, not a wait.
+    pub(crate) fn set_relay_quantum(&mut self, quantum: Duration) -> std::io::Result<()> {
+        self.park = Some(quantum);
+        self.set_read_quantum(quantum.min(crate::budgets::SESSION_POLL))
+    }
+
+    /// The socket to park on, when a socket read is the only thing that can move this lane: bytes the head walk took past the delimiter are the tunnel's own and come from the buffer, and a record whose plaintext the TLS layer still holds is one read away, not one wait.
+    pub(crate) fn read_wait(&self) -> Option<(Connection, Duration)> {
+        let park = self
+            .park
+            .filter(|_| self.at >= self.carried.len() && self.tls.wants_read())?;
+        Some((self.tls.get_ref().try_clone().ok()?, park))
     }
 }
 
@@ -2326,6 +2360,28 @@ impl Tunnel {
                 lane.set_read_quantum(quantum);
                 Ok(())
             }
+        }
+    }
+
+    /// The relay's arm: a TCP carrier reads one grain and waits the rest of the quantum outside the lock, on the socket `read_wait` hands it.
+    pub(crate) fn set_relay_quantum(&mut self, quantum: Duration) -> std::io::Result<()> {
+        match self {
+            Self::H1(lane) => lane.set_relay_quantum(quantum),
+            Self::H2(lane) => lane.set_relay_quantum(quantum),
+            // h3 has no socket of its own to park on: its stream rides a pooled QUIC connection whose pump thread owns the only descriptor, so a readiness wait there would wake every flow on the connection for one datagram.
+            Self::H3(lane) => {
+                lane.set_read_quantum(quantum);
+                Ok(())
+            }
+        }
+    }
+
+    /// The edge socket a parked downlink leg waits on, with how long it may wait: `Some` only once the lane can hand over nothing without the wire — no staged frame, no plaintext the TLS layer still holds — and never for h3, which has no socket of its own.
+    pub(crate) fn read_wait(&self) -> Option<(Connection, Duration)> {
+        match self {
+            Self::H1(lane) => lane.read_wait(),
+            Self::H2(lane) => lane.read_wait(),
+            Self::H3(_) => None,
         }
     }
 }
@@ -3834,6 +3890,124 @@ pub(crate) mod loopback {
         );
         hold_tx.send(()).expect("the edge is released");
         edge.join().expect("the edge finishes");
+    }
+
+    /// The edge of a parked lane: it answers the open in its carrier's own shape, then says nothing — the quiet keep-alive target — and counts every unit that comes up.
+    fn quiet_edge(
+        carrier: Carrier,
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+        arrived_tx: std::sync::mpsc::Sender<u8>,
+    ) -> std::thread::JoinHandle<()> {
+        let framed = matches!(carrier, Carrier::H2);
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut opening = Vec::new();
+            if framed {
+                let mut preface = vec![0u8; frames::PREFACE.len()];
+                if !read_exact_poll(&mut tls, &mut preface) {
+                    return;
+                }
+                h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut opening);
+                h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut opening);
+            } else {
+                let mut request = Vec::new();
+                let mut byte = [0u8; 1];
+                while !request.ends_with(b"\r\n\r\n") {
+                    if !read_exact_poll(&mut tls, &mut byte) {
+                        return;
+                    }
+                    request.push(byte[0]);
+                }
+                opening.extend_from_slice(b"HTTP/1.1 200 Connection established\r\n\r\n");
+            }
+            tls.write_all(&opening).expect("answers 200");
+            tls.flush().expect("flushes");
+            let mut seen = 0u8;
+            loop {
+                if framed {
+                    let mut header = [0u8; frames::H2_HEADER];
+                    if !read_exact_poll(&mut tls, &mut header) {
+                        return;
+                    }
+                    let frame = frames::H2Frame::parse(&header).expect("parses");
+                    let mut payload = vec![0u8; frame.length as usize];
+                    if !read_exact_poll(&mut tls, &mut payload) {
+                        return;
+                    }
+                    if frame.kind != frames::DATA {
+                        continue;
+                    }
+                } else {
+                    let mut byte = [0u8; 1];
+                    if !read_exact_poll(&mut tls, &mut byte) {
+                        return;
+                    }
+                }
+                seen += 1;
+                if arrived_tx.send(seen).is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// The wait a parked downlink leg takes is not the uplink's: the lane's lock comes back before the leg waits, so a browser's first byte after a quiet edge does not pay for that quiet. Both TCP carriers arm the same way, so the same flow runs on each. The wait is armed far wider than production's 100 ms quantum on purpose — a stall this test looks for is the wait itself, and a 500 ms hold with a 100 ms budget would leave it room to hide.
+    #[test]
+    fn a_parked_downlink_leg_does_not_hold_the_uplink_behind_its_wait() {
+        const WAIT: Duration = Duration::from_millis(500);
+        const REACH: Duration = Duration::from_millis(100);
+        const BYTES: u8 = 4;
+        for (carrier, alpn) in [(Carrier::H2, &b"h2"[..]), (Carrier::H1, &b"http/1.1"[..])] {
+            let (roots, server) = minted(alpn);
+            let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let port = listener.local_addr().expect("addr").port();
+            let (arrived_tx, arrived_rx) = std::sync::mpsc::channel::<u8>();
+            let edge = quiet_edge(carrier, listener, server, arrived_tx);
+            let dial = dial_for(roots, port, carrier, foxy::pin::Pins::default());
+            let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+            tunnel.set_relay_quantum(WAIT).expect("bounds one wait");
+            let lane = Arc::new(std::sync::Mutex::new(tunnel));
+            let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let mut browser =
+                Connection::connect(front.local_addr().expect("addr")).expect("connects");
+            let (client, _) = front.accept().expect("accepts");
+            let flow_lane = Arc::clone(&lane);
+            let relay = std::thread::spawn(move || {
+                crate::proxy::relay_tunnel(&client, &flow_lane);
+            });
+            // The downlink leg has to be parked before the first byte goes up, or the test measures a flow that never waited.
+            wait_for_leg("downlink-park", relay.thread().id(), WAIT * 4);
+            let started = Instant::now();
+            for byte in 1..=BYTES {
+                browser
+                    .write_all(&[b'a' + byte])
+                    .expect("the browser speaks");
+                assert_eq!(
+                    arrived_rx
+                        .recv_timeout(WAIT * 4)
+                        .expect("the byte reaches the edge"),
+                    byte,
+                    "the {carrier:?} uplink lost a byte, so the edge counted a different one"
+                );
+            }
+            let reached = started.elapsed();
+            assert!(
+                reached < REACH,
+                "{BYTES} {carrier:?} uplink bytes waited {reached:?} for a lane its parked downlink leg was holding"
+            );
+            drop(browser);
+            let _ = relay.join();
+            // The relay's own handle is only one of two: the lane closes when the test lets go of it too, and the edge is waiting on that.
+            drop(lane);
+            let _ = edge.join();
+        }
     }
 
     /// The lane is the flow's shared resource: the leg that hands bytes to the client has to give the lane back before it waits on the socket, or a client that has stopped reading costs its own upload the road it came in on.
