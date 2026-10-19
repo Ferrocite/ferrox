@@ -578,10 +578,6 @@ const PUMP_BURST: usize = 64;
 /// How long a pump waits for a datagram once it has taken the one it came for: long enough to catch what is already in flight, far shorter than the caller's own deadline.
 const PUMP_TAIL: Duration = Duration::from_millis(1);
 
-/// The datagrams one batched read takes off a lane: a 16 KiB DATA frame is a dozen datagrams, so two of these drain a frame where a packet at a time paid a syscall for each, and the slots are a page of the pump thread's own stack.
-#[cfg(target_os = "linux")]
-const PUMP_SLOTS: usize = 8;
-
 pub(crate) fn pump_once(
     conn: &mut quiche::Connection,
     sock: &Datagram,
@@ -596,32 +592,14 @@ pub(crate) fn pump_once(
     let buf = room.as_mut();
     // One armed wait, then the queue already full behind it: a 16 KiB DATA frame is a dozen datagrams, and absorbing one per visit paid a timer set and an egress sweep for each.
     let mut taken = 0usize;
-    let mut dry = false;
     loop {
-        #[cfg(target_os = "linux")]
-        if taken > 0 && sock.batchable() {
-            match drain_burst(sock, conn, local, PUMP_TAIL, PUMP_BURST - taken) {
-                Burst::Dead => return false,
-                Burst::Full(n) => {
-                    taken += n;
-                    if taken >= PUMP_BURST {
-                        break;
-                    }
-                    continue;
-                }
-                Burst::Drained => {
-                    dry = true;
-                    break;
-                }
-            }
-        }
         match sock.recv_from(buf) {
             Ok((n, from)) => {
                 let info = quiche::RecvInfo { from, to: local };
                 let _ = conn.recv(&mut buf[..n], info);
                 taken += 1;
-                // The tail rides the batch call's own timeout where a batch can run; elsewhere it is the socket's arm, re-armed once the packet the visit waited for lands. What follows is queued and costs no wait, or is not coming yet and the caller's deadline should wait for it; a failed re-arm leaves the first arm in place.
-                if taken == 1 && !sock.batchable() {
+                // Re-armed once the packet the visit waited for lands: what follows is queued and costs no wait, or is not coming yet and the caller's deadline should wait for it; a failed re-arm leaves the first arm in place.
+                if taken == 1 {
                     let _ = sock.refresh_read_timeout(PUMP_TAIL);
                 }
                 if taken == PUMP_BURST {
@@ -634,128 +612,15 @@ pub(crate) fn pump_once(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                dry = true;
-                break;
+                conn.on_timeout();
+                flush_egress(conn, sock);
+                return true;
             }
             Err(_) => return false,
         }
     }
-    // The timer tick is what an empty queue owes the connection, and nothing else: a visit that left on its burst cap never paid it.
-    if dry {
-        conn.on_timeout();
-    }
     flush_egress(conn, sock);
     true
-}
-
-/// How one batched read of the queue ended: `Full` filled its slots and carries how many it moved, so more may be behind them; `Drained` left the socket dry, at any count; `Dead` is a read the pump cannot ride out.
-#[cfg(target_os = "linux")]
-enum Burst {
-    Full(usize),
-    Drained,
-    Dead,
-}
-
-/// Every datagram already waiting on a plain lane, in one `recvmmsg` per batch: here the kernel's copy *is* the datagram, so nothing sits between the socket and quiche. A salamander's salt, a relay header, a gecko fragment or a hopping port is a read of its own shape and stays with the datagram-at-a-time loop.
-///
-/// `tail` bounds the wait for the first of the batch as the call's own timeout, so draining a burst never leaves the lane carrying a shorter wait than the one its other handles asked for, and `MSG_WAITFORONE` stops a batch at the queue rather than at the slots, so a partial drain costs no wait at all. `limit` is the caller's remaining burst, so a batch cannot take the visit past the cap that keeps one busy flow off the connection lock.
-#[cfg(target_os = "linux")]
-fn drain_burst(
-    sock: &Datagram,
-    conn: &mut quiche::Connection,
-    local: SocketAddr,
-    tail: Duration,
-    limit: usize,
-) -> Burst {
-    use std::os::fd::AsRawFd as _;
-    let want = PUMP_SLOTS.min(limit);
-    let mut slots: [Unfilled<MAX_DATAGRAM>; PUMP_SLOTS] =
-        std::array::from_fn(|_| Unfilled::<MAX_DATAGRAM>::new());
-    let mut parts: [libc::iovec; PUMP_SLOTS] = std::array::from_fn(|_| libc::iovec {
-        iov_base: std::ptr::null_mut(),
-        iov_len: MAX_DATAGRAM,
-    });
-    let mut peers: [libc::sockaddr_storage; PUMP_SLOTS] =
-        std::array::from_fn(|_| unsafe { std::mem::zeroed() });
-    let mut batch: [libc::mmsghdr; PUMP_SLOTS] =
-        std::array::from_fn(|_| unsafe { std::mem::zeroed() });
-    let room = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
-    for (at, (slot, part)) in slots.iter_mut().zip(&mut parts).enumerate() {
-        part.iov_base = slot.as_mut().as_mut_ptr().cast();
-        // SAFETY: `peers` and `parts` outlive the call, each holds one entry per slot, and a `sockaddr_storage` is wide enough for the family the kernel writes.
-        unsafe {
-            let header = &raw mut batch[at].msg_hdr;
-            (*header).msg_name = std::ptr::from_mut(&mut peers[at]).cast();
-            (*header).msg_namelen = room;
-            (*header).msg_iov = std::ptr::from_mut(part);
-            (*header).msg_iovlen = 1;
-        }
-    }
-    let mut budget = libc::timespec {
-        tv_sec: i64::try_from(tail.as_secs()).unwrap_or(i64::MAX),
-        tv_nsec: i64::from(tail.subsec_nanos()),
-    };
-    // SAFETY: every pointer in the batch names storage owned by this frame, sized as the call reads it, and `budget` outlives it.
-    let got = unsafe {
-        libc::recvmmsg(
-            sock.sock.as_raw_fd(),
-            batch.as_mut_ptr(),
-            want as libc::c_uint,
-            libc::MSG_WAITFORONE,
-            &raw mut budget,
-        )
-    };
-    let taken = match got {
-        n if n < 0 => {
-            let error = std::io::Error::last_os_error();
-            return match error.kind() {
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => Burst::Drained,
-                _ => Burst::Dead,
-            };
-        }
-        n => usize::try_from(n).unwrap_or(0),
-    };
-    for (at, slot) in slots.iter_mut().take(taken).enumerate() {
-        let Some(peer) = peer_of(&peers[at]) else {
-            return Burst::Dead;
-        };
-        let width = usize::try_from(batch[at].msg_len).unwrap_or(MAX_DATAGRAM);
-        let info = quiche::RecvInfo {
-            from: peer,
-            to: local,
-        };
-        let _ = conn.recv(&mut slot.as_mut()[..width], info);
-    }
-    // A batch that filled its slots says nothing about the queue — the caller's own cap may have been the width; a short one means the kernel had no more to hand over.
-    if taken == want {
-        Burst::Full(taken)
-    } else {
-        Burst::Drained
-    }
-}
-
-/// The peer a batched read names: the two families a datagram lane is bound to, and nothing else.
-#[cfg(target_os = "linux")]
-fn peer_of(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
-    match i32::from(storage.ss_family) {
-        libc::AF_INET => {
-            // SAFETY: the family says the storage holds a `sockaddr_in`, which is no wider and no more aligned than it.
-            let v4 = unsafe { &*std::ptr::from_ref(storage).cast::<libc::sockaddr_in>() };
-            Some(SocketAddr::new(
-                std::net::Ipv4Addr::from(v4.sin_addr.s_addr.to_ne_bytes()).into(),
-                u16::from_be(v4.sin_port),
-            ))
-        }
-        libc::AF_INET6 => {
-            // SAFETY: as above, for the v6 spelling.
-            let v6 = unsafe { &*std::ptr::from_ref(storage).cast::<libc::sockaddr_in6>() };
-            Some(SocketAddr::new(
-                std::net::Ipv6Addr::from(v6.sin6_addr.s6_addr).into(),
-                u16::from_be(v6.sin6_port),
-            ))
-        }
-        _ => None,
-    }
 }
 
 pub(crate) fn drive_handshake(
@@ -1629,6 +1494,12 @@ impl Datagram {
         })
     }
 
+    /// A lane the kernel can speak to in batches: no gecko fragment, no hop, no obfuscation and no relay frame, so the datagram quiche wrote is the datagram on the wire, and Linux is where the batched call exists.
+    #[cfg(target_os = "linux")]
+    fn batchable(&self) -> bool {
+        self.gecko.is_none() && self.hop.is_none() && self.obfs.is_none() && self.relay.is_none()
+    }
+
     pub(crate) fn send_to(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
         if let Some(gecko) = self.gecko.as_ref() {
             return gecko.send(buf, to);
@@ -1657,15 +1528,6 @@ impl Datagram {
             .seal_into(plain, wire.as_mut())
             .ok_or(std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
         self.sock.send_to(&wire.as_mut()[..sealed], target)
-    }
-
-    /// Whether one batched read can carry this lane's queue: the plain lane's socket read *is* the datagram, while a salt, a relay header, a gecko fragment or a hopping port makes each read a shape of its own. Off Linux nothing batches, and the pump drains one datagram at a time.
-    fn batchable(&self) -> bool {
-        cfg!(target_os = "linux")
-            && self.gecko.is_none()
-            && self.hop.is_none()
-            && self.obfs.is_none()
-            && self.relay.is_none()
     }
 
     pub(crate) fn recv_from(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
@@ -3382,81 +3244,6 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_millis(250),
             "the visit ended with the queue, not with the arm"
-        );
-    }
-
-    /// However the queue is read, one visit costs the other flows at most its burst: a burst wider than the cap leaves exactly the surplus behind, which is the witness that a batch did not run past it.
-    #[test]
-    fn a_visit_still_stops_at_its_burst_cap() {
-        const SURPLUS: usize = 15;
-        let (sock, local, mut conn) = deaf_lane();
-        for salt in 0..(PUMP_BURST + SURPLUS) as u8 {
-            sock.send_to(&[0xc0, 0x00, 0x00, 0x01, salt], local)
-                .expect("queues");
-        }
-        assert!(pump_once(&mut conn, &sock, local, Duration::from_millis(1)));
-        let mut left = 0usize;
-        while let Ok((_, _)) = sock.recv_from(&mut [0u8; 64]) {
-            left += 1;
-        }
-        assert_eq!(left, SURPLUS, "the visit took its burst off a wider queue");
-    }
-
-    /// A lane that batches pays the tail as the call's own timeout, so draining a burst leaves the socket carrying the wait the caller armed instead of the tail the last read wanted.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_batched_drain_leaves_the_lane_armed_at_the_wait_it_was_asked() {
-        let (sock, local, mut conn) = deaf_lane();
-        sock.send_to(&[0xc0, 0x00, 0x00, 0x01, 0], local)
-            .expect("queues");
-        assert!(pump_once(
-            &mut conn,
-            &sock,
-            local,
-            Duration::from_millis(400)
-        ));
-        let started = Instant::now();
-        assert!(
-            sock.recv_from(&mut [0u8; MAX_DATAGRAM]).is_err(),
-            "the queue was drained"
-        );
-        let waited = started.elapsed();
-        assert!(
-            waited >= Duration::from_millis(100),
-            "the drain left the lane armed at its tail: the read returned after {waited:?}"
-        );
-    }
-
-    /// The port and the octets of a batched read's peer come back in host order from the network order the storage holds. That the kernel wrote these bytes the way `recv_from` reads them is what the loopback carriers prove: a wrong peer is a packet quiche drops, and a lane that carries no bytes fails the carrier's own test.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_batched_read_names_the_peer_in_host_order() {
-        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-        // SAFETY: a `sockaddr_in` is no wider and no more aligned than the storage it is read out of.
-        let v4 = unsafe { &mut *(&raw mut storage).cast::<libc::sockaddr_in>() };
-        v4.sin_family = libc::AF_INET as libc::sa_family_t;
-        v4.sin_port = 8443u16.to_be();
-        v4.sin_addr = libc::in_addr {
-            s_addr: u32::from_ne_bytes([127, 0, 0, 1]),
-        };
-        assert_eq!(
-            peer_of(&storage),
-            Some("127.0.0.1:8443".parse().expect("addr"))
-        );
-
-        let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-        // SAFETY: as above, for the v6 spelling.
-        let v6 = unsafe { &mut *(&raw mut storage).cast::<libc::sockaddr_in6>() };
-        v6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-        v6.sin6_port = 443u16.to_be();
-        v6.sin6_addr = libc::in6_addr {
-            s6_addr: [
-                0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01,
-            ],
-        };
-        assert_eq!(
-            peer_of(&storage),
-            Some("[2001:db8::1]:443".parse().expect("addr"))
         );
     }
 
