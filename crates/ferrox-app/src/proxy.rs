@@ -9075,7 +9075,7 @@ fn send_to_two(
 
 /// The `sockaddr` a datagram goes to, and its length, in the storage the kernel reads it from.
 #[cfg(unix)]
-fn sockaddr_of(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+pub(crate) fn sockaddr_of(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
     match addr {
         SocketAddr::V4(v4) => {
