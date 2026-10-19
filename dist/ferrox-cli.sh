@@ -21,17 +21,18 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Three homes for the binary, first hit wins: $FERROX_BIN names one outright; a
 # release package puts it next to this script; in the repository cargo writes
 # where build.target-dir says, not under $ROOT/target, so resolving the name is
-# the only way `up` runs the binary `cargo build --release` just built.
+# the only way `up` runs the binary `cargo build --release` just built. It is
+# deferred: --help, down or a missing flag answers without waiting for cargo.
 BIN="${FERROX_BIN:-}"
-if [ -z "$BIN" ]; then
-  for _cand in "$SCRIPT_DIR/ferrox-app" "$SCRIPT_DIR/ferrox-app.exe"; do
-    [ -x "$_cand" ] && { BIN="$_cand"; break; }
+resolve_bin() {
+  [ -n "$BIN" ] && return 0
+  local cand cargo_target
+  for cand in "$SCRIPT_DIR/ferrox-app" "$SCRIPT_DIR/ferrox-app.exe"; do
+    [ -x "$cand" ] && { BIN="$cand"; return 0; }
   done
-fi
-if [ -z "$BIN" ]; then
-  CARGO_TARGET="$(cd "$ROOT" && cargo metadata --format-version 1 --no-deps 2>/dev/null | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | head -1)"
-  BIN="${CARGO_TARGET:-$ROOT/target}/release/ferrox-app"
-fi
+  cargo_target="$(cd "$ROOT" && cargo metadata --format-version 1 --no-deps 2>/dev/null | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | head -1)"
+  BIN="${cargo_target:-$ROOT/target}/release/ferrox-app"
+}
 CONF_DIR="${FERROX_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ferrox}"
 CREDS="${FOXY_CREDENTIALS:-$CONF_DIR/credentials}"
 CFG="$CONF_DIR/lane.json"
@@ -916,9 +917,10 @@ done
 # waits longer than a lane that configures the server it dials.
 [ "$OUTBOUND" = veepn ] && PROBE_TIMEOUT=45
 
-# up and serve are the only actions that need the binary: down, status and
-# login must still work when it was never fetched.
+# Only up, serve and version need the binary: down, status and login must
+# still work when it was never fetched.
 require_bin() {
+  resolve_bin
   [ -x "$BIN" ] && return 0
   # In a checkout the binary is a build, not a download: build it once rather
   # than send the reader to a release page for a lane this tree already has.

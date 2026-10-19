@@ -28,6 +28,9 @@ step "comment trace"
 step "merge markers"
 ./scripts/check-merge-markers.sh
 
+step "cli arguments"
+python3 scripts/check-cli-args.py
+
 step "fixture safety"
 ./scripts/check-fixture-safety.sh
 
