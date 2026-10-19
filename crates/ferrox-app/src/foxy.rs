@@ -17,6 +17,8 @@ const EDGE_BACKOFF_MS: u64 = 250;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(20);
 const MAX_FRAME: usize = frames::MAX_FRAME as usize;
 const MAX_HEAD: usize = 8_192;
+/// The head walk's window, the size the byte walk pre-sized its buffer to: one read of it takes a status line and its empty line, and a wider window would only divert more of the tunnel's first bytes into the tail they are carried in.
+const HEAD_WINDOW: usize = 256;
 /// Unparsed capsule-stream cap: fail the association rather than buffer a peer that never completes a capsule.
 const DATAGRAM_BUF_MAX: usize = 256 * 1024;
 const SEND_WAIT: Duration = Duration::from_secs(10);
@@ -417,26 +419,85 @@ pub(crate) fn open_h1(dial: &FoxyDial, target: &str) -> Result<Tls1, Failure> {
     let mut tls = tls_to_edge(dial)?;
     tls.write_all_slices(&foxy::connect_request(target, &dial.pass.token))
         .map_err(|_| Failure::Io)?;
-    opened(foxy::connect_status(&head(&mut tls)?)?)?;
-    Ok(Tls1(tls))
+    let (status, carried) = head(&mut tls)?;
+    opened(status)?;
+    Ok(Tls1 {
+        tls,
+        carried,
+        at: 0,
+    })
 }
 
-fn head<S: Read>(io: &mut S) -> Result<Vec<u8>, Failure> {
-    let mut head = Vec::with_capacity(256);
-    let mut byte = [0u8; 1];
-    // The budget bounds the whole head, not one byte of it: a drip that keeps every read inside the socket's arm still ends at the wall.
+/// Walks the CONNECT answer a window at a time and parses it where the octets landed: the head never enters a buffer of its own. What the last read took past `\r\n\r\n` is the tunnel's own first byte stream, so it comes back as exactly-sized tail rather than being discarded and re-waited for on the socket.
+fn head<S: Read>(io: &mut S) -> Result<(u16, Vec<u8>), Failure> {
+    // The budget bounds the whole head, not one read of it: a drip that keeps every read inside the socket's arm still ends at the wall.
     let until = Instant::now() + crate::budgets::head_arrival();
-    while !head.ends_with(b"\r\n\r\n") {
+    let mut window = [0u8; HEAD_WINDOW];
+    let mut filled = 0usize;
+    loop {
+        if Instant::now() >= until {
+            return Err(Failure::Stream);
+        }
+        let read = io
+            .read(&mut window[filled..])
+            .map_err(|_| Failure::Stream)?;
+        if read == 0 {
+            return Err(Failure::Stream);
+        }
+        filled += read;
+        if let Some(end) = foxy::head_end(&window[..filled]) {
+            return Ok((
+                foxy::connect_status(&window[..end + 4])?,
+                window[end + 4..filled].to_vec(),
+            ));
+        }
+        if filled == window.len() {
+            return long_head(io, &window, until);
+        }
+    }
+}
+
+/// The cold answer to an edge that sends more than a status line: the octets already walked move into a buffer that grows to what the edge sends, the window keeps serving the reads, and `MAX_HEAD` still bounds the whole head.
+fn long_head<S: Read>(
+    io: &mut S,
+    walked: &[u8; HEAD_WINDOW],
+    until: Instant,
+) -> Result<(u16, Vec<u8>), Failure> {
+    let mut head = Vec::with_capacity(walked.len() * 2);
+    head.extend_from_slice(walked);
+    let mut window = [0u8; HEAD_WINDOW];
+    loop {
+        if let Some(end) = foxy::head_end(&head) {
+            return Ok((
+                foxy::connect_status(&head[..end + 4])?,
+                head[end + 4..].to_vec(),
+            ));
+        }
         if head.len() >= MAX_HEAD {
             return Err(Failure::Frame);
         }
         if Instant::now() >= until {
             return Err(Failure::Stream);
         }
-        read_exact(io, &mut byte).map_err(|_| Failure::Stream)?;
-        head.push(byte[0]);
+        let room = window.len().min(MAX_HEAD - head.len());
+        let read = io.read(&mut window[..room]).map_err(|_| Failure::Stream)?;
+        if read == 0 {
+            return Err(Failure::Stream);
+        }
+        head.extend_from_slice(&window[..read]);
     }
-    Ok(head)
+}
+
+/// Hands the caller what it asked for out of the tail the head walk left behind, and moves the cursor: a copy of bytes, never a move of what is left. The read that delivers the last octet releases the buffer, so nothing of the walk is held idle for the life of the tunnel.
+fn hand_back(carried: &mut Vec<u8>, at: &mut usize, buf: &mut [u8]) -> usize {
+    let take = buf.len().min(carried.len() - *at);
+    buf[..take].copy_from_slice(&carried[*at..*at + take]);
+    *at += take;
+    if *at == carried.len() {
+        *carried = Vec::new();
+        *at = 0;
+    }
+    take
 }
 
 /// HTTP/2 CONNECT: preface, settings, stream 1 and the status in its first header block. Stream 1 is the lane's only stream, so the codec needs no stream-id bookkeeping.
@@ -1097,8 +1158,13 @@ impl Read for Tls2 {
     }
 }
 
-/// The HTTP/1.1 relay: bytes in, bytes out, once the status has been read.
-pub(crate) struct Tls1(pub(crate) ferrox_core::tls::RustlsProvider<Connection>);
+/// The HTTP/1.1 relay: bytes in, bytes out, once the status has been read. The head walk reads a whole window at a time, so the octets that arrived past `\r\n\r\n` in the answer's own record are the tunnel's first bytes and are handed over from here before the socket is touched again.
+pub(crate) struct Tls1 {
+    tls: ferrox_core::tls::RustlsProvider<Connection>,
+    /// What the head walk took past the delimiter, with a cursor: draining would move what is left on every call.
+    carried: Vec<u8>,
+    at: usize,
+}
 
 /// Undecodable-block dump behind `FOXY_DEBUG`: the hex of a header block no codec here reads, so a red live run names the encoding.
 fn debug_block(block: &[u8]) {
@@ -1126,23 +1192,26 @@ fn header_status(
 /// Bounds one blocking read so a relay holding one lock for both directions can interleave: the backward read returns `WouldBlock` within the quantum instead of holding the lock.
 impl Tls1 {
     pub(crate) fn set_read_quantum(&self, quantum: Duration) -> std::io::Result<()> {
-        self.0.get_ref().set_read_timeout(Some(quantum))
+        self.tls.get_ref().set_read_timeout(Some(quantum))
     }
 }
 
 impl Write for Tls1 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
+        self.tls.write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
+        self.tls.flush()
     }
 }
 
 impl Read for Tls1 {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.0.read(buf)
+        if self.at < self.carried.len() {
+            return Ok(hand_back(&mut self.carried, &mut self.at, buf));
+        }
+        self.tls.read(buf)
     }
 }
 
@@ -2236,6 +2305,113 @@ pub(crate) fn refusal_reply(failure: Failure) -> u8 {
 mod tests {
     use super::*;
 
+    /// A `Read` source that answers a whole buffer in one call and counts the calls it got: the read count is exact here, which is what a loopback socket cannot promise.
+    struct HeadSource<'a> {
+        bytes: &'a [u8],
+        at: usize,
+        reads: usize,
+    }
+
+    impl Read for HeadSource<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            let take = buf.len().min(self.bytes.len() - self.at);
+            buf[..take].copy_from_slice(&self.bytes[self.at..self.at + take]);
+            self.at += take;
+            Ok(take)
+        }
+    }
+
+    /// An edge that answers in its own record costs one read: the walk used to pay one `Read::read`, and one pass through the record deframer, per octet of the status line.
+    #[test]
+    fn the_head_walk_reads_the_answer_in_one_call() {
+        let bytes = b"HTTP/1.1 200 Connection established\r\n\r\nfirst tunnel bytes";
+        let mut source = HeadSource {
+            bytes,
+            at: 0,
+            reads: 0,
+        };
+        let (status, carried) = head(&mut source).expect("walks the head");
+        assert_eq!(status, 200);
+        assert_eq!(
+            carried, b"first tunnel bytes",
+            "the octets that arrived past the empty line in the same record come with the status"
+        );
+        assert_eq!(
+            source.reads, 1,
+            "one window read for an answer that came in one record"
+        );
+        assert_eq!(
+            carried.capacity(),
+            carried.len(),
+            "the tail is sized to its own bytes, not to the window that found it"
+        );
+    }
+
+    /// The tail is handed over from where it landed and released by the read that delivers its last octet: a relay that has taken the tunnel's first bytes holds nothing of the walk.
+    #[test]
+    fn the_pipelined_tail_is_released_by_the_read_that_spends_it() {
+        let mut carried = b"tunnel-first".to_vec();
+        let mut at = 0usize;
+        let mut buf = [0u8; 4];
+        assert_eq!(hand_back(&mut carried, &mut at, &mut buf), 4);
+        assert_eq!(&buf, b"tunn");
+        assert_eq!(carried.capacity(), 12, "held, because octets still wait");
+        let mut rest = [0u8; 8];
+        assert_eq!(hand_back(&mut carried, &mut at, &mut rest), 8);
+        assert_eq!(&rest, b"el-first");
+        assert_eq!(carried.capacity(), 0, "the last byte releases the window");
+        assert_eq!(at, 0, "and the cursor is ready for the socket");
+    }
+
+    /// A head longer than the window is the cold answer of an edge that sends more than a status line: the walk still finds the delimiter, still hands on what follows it, and still refuses a head that runs past `MAX_HEAD` without one.
+    #[test]
+    fn a_head_longer_than_the_window_is_walked_without_losing_its_tail() {
+        let mut bytes = b"HTTP/1.1 200 OK\r\n".to_vec();
+        for at in 0..40 {
+            bytes.extend_from_slice(format!("X-Pad-{at}: pad-pad-pad-pad\r\n").as_bytes());
+        }
+        bytes.extend_from_slice(b"\r\npiped");
+        let mut source = HeadSource {
+            bytes: &bytes,
+            at: 0,
+            reads: 0,
+        };
+        let (status, carried) = head(&mut source).expect("walks the long head");
+        assert_eq!(status, 200);
+        assert_eq!(carried, b"piped");
+        assert!(
+            source.reads < 12,
+            "a window at a time, not a byte at a time: {} reads",
+            source.reads
+        );
+
+        let long = vec![b'x'; MAX_HEAD + 8];
+        let mut source = HeadSource {
+            bytes: &long,
+            at: 0,
+            reads: 0,
+        };
+        assert_eq!(head(&mut source).err(), Some(Failure::Frame));
+
+        let mut at_bound = b"HTTP/1.1 200 ".to_vec();
+        while at_bound.len() < MAX_HEAD - 4 {
+            at_bound.push(b'x');
+        }
+        at_bound.extend_from_slice(b"\r\n\r\n");
+        let mut source = HeadSource {
+            bytes: &at_bound,
+            at: 0,
+            reads: 0,
+        };
+        let (status, carried) = head(&mut source).expect("walks to the bound");
+        assert_eq!(status, 200);
+        assert!(
+            carried.is_empty(),
+            "the empty line was the last thing the edge sent"
+        );
+    }
+
     /// The constant credit buffer is the two frames the per-call loop built: a window update for stream 1 and one for the connection, each with the increment slot left for the caller to fill.
     #[test]
     fn the_credit_template_is_the_two_window_update_frames() {
@@ -3067,6 +3243,44 @@ mod loopback {
         });
         let dial = dial_for(roots, port, Carrier::H1, foxy::pin::Pins::default());
         let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        round_trip(&mut tunnel);
+        edge.join().expect("joins");
+    }
+
+    /// The no-loss gate for the bulk head walk: an edge that puts the answer and the target's first bytes in one record has to have both reach the relay, in order. A walk that read one byte at a time could not overshoot the delimiter, so nothing in the suite saw this shape before.
+    #[test]
+    fn the_head_walk_hands_on_the_bytes_the_edge_pipelined_behind_it() {
+        let (roots, server) = minted(b"http/1.1");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("times out");
+            let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") {
+                read_exact(&mut tls, &mut byte).expect("reads the request");
+                request.push(byte[0]);
+            }
+            let mut reply = b"HTTP/1.1 200 Connection established\r\n\r\n".to_vec();
+            reply.extend_from_slice(b"the target speaks first");
+            tls.write_all(&reply).expect("answers in one record");
+            let mut echoed = [0u8; PAYLOAD.len()];
+            assert!(read_exact_poll(&mut tls, &mut echoed), "reads the tunnel");
+            tls.write_all(&echoed).expect("echoes");
+        });
+        let dial = dial_for(roots, port, Carrier::H1, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let mut spoken = [0u8; 23];
+        tunnel
+            .read_exact(&mut spoken)
+            .expect("the pipelined octets come before the socket");
+        assert_eq!(&spoken, b"the target speaks first");
         round_trip(&mut tunnel);
         edge.join().expect("joins");
     }

@@ -72,11 +72,14 @@ pub fn connect_request<'a>(target: &'a str, bearer: &'a str) -> [&'a [u8]; 7] {
     ]
 }
 
+/// Where the head ends: the offset of the empty line that closes an HTTP/1.1 answer, or `None` while it has not arrived. The lane walks a window at a time and asks this before it reads again, so the delimiter rule lives in one place.
+#[must_use]
+pub fn head_end(head: &[u8]) -> Option<usize> {
+    head.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
 pub fn connect_status(head: &[u8]) -> Result<u16, Failure> {
-    let line_end = head
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .ok_or(Failure::Frame)?;
+    let line_end = head_end(head).ok_or(Failure::Frame)?;
     let line = &head[..line_end];
     let mut parts = line.split(|byte| *byte == b' ');
     let version = parts.next().ok_or(Failure::Frame)?;
