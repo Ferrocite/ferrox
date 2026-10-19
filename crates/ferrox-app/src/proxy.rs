@@ -8301,19 +8301,25 @@ fn copy_all(from: &mut Connection, to: &mut Connection) {
 fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
     // Once per leg, outside the byte loop: a budget read per buffer would price the copy.
     let stall = crate::budgets::relay_stall();
-    let _ = from.set_read_timeout(Some(stall));
     let _ = to.set_write_timeout(Some(stall));
+    // A read a caller already armed is that caller's to end: a poll quantum it set is how the leg stops, so this shape arms only a read nobody bounded.
+    let armed = from.read_timeout().ok().flatten();
+    let patient = armed.is_none();
+    let read_bound = armed.unwrap_or(stall);
+    if patient {
+        let _ = from.set_read_timeout(Some(stall));
+    }
     let mut buffer = RelayBuf::new();
     loop {
         let read = {
-            census!("relay-leg-read", crate::census::handle(from), Some(stall));
+            census!("relay-leg-read", crate::census::handle(from), Some(read_bound));
             from.read(buffer.as_mut())
         };
         let n = match read {
             Ok(0) => return,
             Ok(n) => n,
-            // A peer that has simply not spoken is idle, not ended: the read arm exists so this leg can still notice its partner gave up, which on Windows nothing else does.
-            Err(error) if is_timeout(&error) => continue,
+            // An un-armed peer that has simply not spoken is idle, not ended: its read arm exists so this leg can still notice its partner gave up, which on Windows nothing else does.
+            Err(error) if patient && is_timeout(&error) => continue,
             Err(_) => return,
         };
         let written = {
@@ -23496,7 +23502,7 @@ mod relay_tests {
     /// A peer that takes the downlink, reads none of the flow and never closes costs the stall
     /// budget instead of the thread: the leg writing into it gives up at its arm and closes both
     /// halves of that socket, which wakes the partner leg on a POSIX read parked in that socket —
-    /// on Windows nothing wakes it, so the read carries the same arm and ends at it. A half-close
+    /// on Windows nothing wakes it, so an un-armed read carries the same arm and ends at it. A half-close
     /// wakes nothing anywhere, since the peer never reads the FIN. The buffered copy is what this
     /// shape runs; the Linux pump keeps its own stalled-destination witness above. Loopback only.
     #[cfg(not(target_os = "linux"))]
@@ -23906,8 +23912,8 @@ mod census_tests {
         );
         let held = wait_for("relay-leg-read", leg_id);
         assert!(held.contains(&format!("fd={read_fd} ")), "{held}");
-        // A raw relay leg holds no deadline at its wait: its caller restores `None`, so the census says none.
-        assert!(held.contains("armed=none "), "{held}");
+        // The arm a caller gave the leg is the arm the census reports, so a stall shows its own bound instead of pretending to be unbounded.
+        assert!(held.contains("armed=2s "), "{held}");
         leg.join().expect("joins");
         assert!(
             census::held("relay-leg-read", leg_id).is_none(),
