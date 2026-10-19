@@ -91,9 +91,7 @@ carrier-veepn  veepn::tests::the_pair_coder_costs_the_coder_and_nothing_else  fe
 carrier-veepn  veepn::tests::the_pair_coder_costs_the_coder_and_nothing_else  ferrox_core::veepn::tests::the_pair_coder_costs_the_coder_and_nothing_else
 carrier-veepn  veepn::tests::the_pair_coder_costs_the_coder_and_nothing_else  ferrox_core::b64::encode_parts_into
 carrier-websocket  b64::tests::the_alphabet_coder_costs_the_groups_and_nothing_else  ferrox_core::b64::encode
-carrier-websocket  b64::tests::the_alphabet_coder_costs_the_groups_and_nothing_else  ferrox_core::b64::encode_parts_into
 carrier-websocket  b64::tests::the_alphabet_coder_costs_the_groups_and_nothing_else  ferrox_core::b64::tests::the_alphabet_coder_costs_the_groups_and_nothing_else
-carrier-websocket  b64::tests::the_push_form_coder_costs_the_same_fold  ferrox_core::b64::tests::the_push_form_coder_costs_the_same_fold
 carrier-websocket  ws::tests::a_read_covers_a_window_not_one_frame_header  ws::WsReader::pull
 carrier-websocket  ws::tests::frames_round_trip_masked_and_plain  ws::write_frame
 carrier-websocket  ws::tests::mask_chunks_match_the_byte_loop  ws::apply_mask
