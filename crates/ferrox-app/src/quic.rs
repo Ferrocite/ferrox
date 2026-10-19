@@ -43,7 +43,8 @@ impl QuicServer {
 pub(crate) const MAX_FLOWS_ON_LANE: u64 = 64;
 
 struct PooledState {
-    sessions: HashMap<u64, Connection>,
+    /// One handle per flow, shared by every burst it arrives in: a hand-off takes a refcount, not a `dup`.
+    sessions: HashMap<u64, Arc<Connection>>,
     opening: HashSet<u64>,
     next_id: u64,
     /// When the lane's pump parked with no lease on it, or none while a pump thread owns it: the thread follows the leases, so an idle edge pins no thread and the next flow rides the same handshake.
@@ -1696,7 +1697,7 @@ fn hand_off(
     conn: &mut quiche::Connection,
     table: &Arc<Mutex<PooledState>>,
     chunk: &mut [u8],
-    ready: &mut Vec<(u64, Connection)>,
+    ready: &mut Vec<(u64, Arc<Connection>)>,
 ) {
     for id in conn.readable() {
         let Ok(leases) = table.lock() else {
@@ -1705,11 +1706,7 @@ fn hand_off(
         if leases.opening.contains(&id) {
             continue;
         }
-        let Some(half) = leases
-            .sessions
-            .get(&id)
-            .and_then(|half| half.try_clone().ok())
-        else {
+        let Some(half) = leases.sessions.get(&id).cloned() else {
             drop(leases);
             while let Ok((n, _)) = conn.stream_recv(id, chunk) {
                 if n == 0 {
@@ -1728,7 +1725,7 @@ fn pump(
     sock: &Datagram,
     local: SocketAddr,
 ) {
-    let mut ready: Vec<(u64, Connection)> = Vec::new();
+    let mut ready: Vec<(u64, Arc<Connection>)> = Vec::new();
     // One lock per 32 KiB rather than per 8: the drain is the connection's busiest shared path, and every pass pays the mutex twice.
     let mut chunk = vec![0u8; 32768];
     let mut buf = [0u8; MAX_DATAGRAM];
@@ -1789,7 +1786,7 @@ fn pump(
                 return;
             }
         }
-        for (id, mut up) in ready.drain(..) {
+        for (id, up) in ready.drain(..) {
             loop {
                 let (n, fin) = {
                     let Ok(mut conn) = shared.lock() else {
@@ -1800,7 +1797,7 @@ fn pump(
                         Ok(found) => found,
                     }
                 };
-                if up.write_all(&chunk[..n]).is_err() {
+                if (&*up).write_all(&chunk[..n]).is_err() {
                     break;
                 }
                 if fin {
@@ -1846,7 +1843,7 @@ fn lend(pooled: &PooledConn, up: Option<Connection>) -> Option<u64> {
     let id = table.next_id;
     table.next_id += 4;
     if let Some(up) = up {
-        table.sessions.insert(id, up);
+        table.sessions.insert(id, Arc::new(up));
     }
     table.opening.insert(id);
     Some(id)
