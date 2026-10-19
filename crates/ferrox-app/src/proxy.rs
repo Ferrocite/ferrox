@@ -22781,11 +22781,11 @@ mod poll_relay {
         ingest_stalled: bool,
         src_at_eof: bool,
         ended: bool,
-        done: Option<mpsc::Sender<()>>,
+        done: Option<mpsc::Sender<Result<(), ()>>>,
     }
 
     impl Direction {
-        fn new(src: Connection, dst: Connection, done: mpsc::Sender<()>) -> Self {
+        fn new(src: Connection, dst: Connection, done: mpsc::Sender<Result<(), ()>>) -> Self {
             Self {
                 src,
                 dst,
@@ -22882,7 +22882,7 @@ mod poll_relay {
             self.ended = true;
             let _ = self.dst.shutdown(Shutdown::Write);
             if let Some(done) = self.done.take() {
-                let _ = done.send(());
+                let _ = done.send(Ok(()));
             }
         }
     }
@@ -23054,16 +23054,16 @@ mod poll_relay {
         client_write: Connection,
     ) {
         let worker = next();
-        let (first_tx, first_rx) = mpsc::channel();
-        let (second_tx, second_rx) = mpsc::channel();
+        let (first_tx, first_rx) = mpsc::channel::<Result<(), ()>>();
+        let (second_tx, second_rx) = mpsc::channel::<Result<(), ()>>();
         let first = Direction::new(client_read, target_write, first_tx);
         let second = Direction::new(target_read, client_write, second_tx);
         let _guards = arm_flow(&first, &second);
         worker.push(Flow {
             directions: vec![first, second],
         });
-        let _ = first_rx.recv();
-        let _ = second_rx.recv();
+        super::join(&first_rx);
+        super::join(&second_rx);
     }
 
     /// The arm's truth table, in the two units it mixes: `pending` counts bytes and the
