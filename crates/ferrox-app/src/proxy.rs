@@ -7649,6 +7649,7 @@ fn copy_locked(
                 let Ok(mut lane) = tunnel.lock() else {
                     break;
                 };
+                census!("tunnel-leg-read", crate::census::NO_FD, None);
                 match lane.read(&mut buf) {
                     Ok(0) => {
                         debug_relay(direction, total, None);
