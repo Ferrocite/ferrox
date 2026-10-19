@@ -638,6 +638,7 @@ fn open_h2_with(dial: &FoxyDial, block: &[u8]) -> Result<Tls2, Failure> {
         at: 0,
         out: Vec::new(),
         capsule_buf: Vec::new(),
+        handed: 0,
         pending_credit: 0,
         frame: FrameState::default(),
         fin: false,
@@ -693,6 +694,8 @@ pub(crate) struct Tls2 {
     out: Vec<u8>,
     /// Capsule-stream bytes not parsed yet: one capsule may span DATA frames, so frames accumulate here.
     capsule_buf: Vec<u8>,
+    /// Octets of the head DATAGRAM capsule already handed to a caller whose buffer was shorter than the datagram: the capsule stays staged until this reaches its length, so a short read costs the tail nothing.
+    handed: usize,
     /// Bytes the edge has sent into its granted window that this lane has taken but not yet granted back: the update goes out when the held credit reaches `CREDIT_FLOOR`, never per frame.
     pending_credit: u32,
     frame: FrameState,
@@ -1067,24 +1070,32 @@ impl Tls2 {
         Ok(())
     }
 
-    /// One UDP payload out of the capsule stream: frames accumulate until a whole DATAGRAM capsule parses; empty datagrams are skipped so `Ok(0)` stays the end of stream.
+    /// One UDP payload out of the capsule stream: frames accumulate until a whole DATAGRAM capsule parses, a payload wider than the caller's buffer arrives over several reads, and empty datagrams are skipped so `Ok(0)` stays the end of stream.
     pub(crate) fn read_datagram(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
             if let Some((used, payload)) = masque::datagram_split(&self.capsule_buf) {
                 let len = payload.len();
-                let take = buf.len().min(len);
-                buf[..take].copy_from_slice(&payload[..take]);
-                self.capsule_buf.drain(..used);
+                let at = self.handed;
+                let take = buf.len().min(len - at);
+                buf[..take].copy_from_slice(&payload[at..at + take]);
+                // A capsule is released only when its last octet has been copied, and the count is what the caller got rather than what the capsule holds.
+                if at + take == len {
+                    self.capsule_buf.drain(..used);
+                    self.handed = 0;
+                } else {
+                    self.handed = at + take;
+                }
                 if len == 0 {
                     continue;
                 }
-                return Ok(len);
+                return Ok(take);
             }
             if self.fin {
                 return Ok(0);
             }
             if self.capsule_buf.len() > DATAGRAM_BUF_MAX {
                 self.capsule_buf.clear();
+                self.handed = 0;
                 return Err(std::io::Error::other(
                     "foxy: a capsule stream that never parses",
                 ));
@@ -1100,10 +1111,12 @@ impl Tls2 {
                         // A capsule is usually whole inside one DATA frame, so it is handed over where it lies and only the ones behind it staged; nothing is handed over while a split capsule waits, because stream order is datagram order.
                         if lane.capsule_buf.is_empty() {
                             if let Some((used, datagram)) = masque::datagram_split(payload) {
-                                let take = buf.len().min(datagram.len());
-                                buf[..take].copy_from_slice(&datagram[..take]);
-                                lane.capsule_buf.extend_from_slice(&payload[used..]);
-                                return Ok(datagram.len());
+                                // A buffer shorter than the datagram stages it instead, so the walk above can finish it one read at a time.
+                                if buf.len() >= datagram.len() {
+                                    buf[..datagram.len()].copy_from_slice(datagram);
+                                    lane.capsule_buf.extend_from_slice(&payload[used..]);
+                                    return Ok(datagram.len());
+                                }
                             }
                         }
                         lane.capsule_buf.extend_from_slice(payload);
@@ -1340,6 +1353,8 @@ pub(crate) struct H3 {
     out: Vec<u8>,
     /// Capsule-stream bytes no whole DATAGRAM capsule has consumed yet: one capsule may span DATA frames, so frames accumulate only here. The answer's header block rides through it too, and it is cleared once the status is decoded.
     capsule_buf: Vec<u8>,
+    /// Octets of the head DATAGRAM capsule already handed to a caller whose buffer was shorter than the datagram: the capsule stays staged until this reaches its length, so a short read costs the tail nothing.
+    handed: usize,
     fin: bool,
     deadline: Instant,
     /// How long this lane waits for a CONNECT answer: a carrier's own open gets the head timeout, a disposable probe gets the budget its caller names.
@@ -1379,6 +1394,7 @@ impl H3 {
             pending: None,
             out: Vec::new(),
             capsule_buf: Vec::new(),
+            handed: 0,
             fin: false,
             deadline: Instant::now(),
             head_wait,
@@ -1427,6 +1443,7 @@ impl H3 {
             pending: None,
             out: Vec::new(),
             capsule_buf: Vec::new(),
+            handed: 0,
             fin: false,
             deadline: Instant::now(),
             head_wait: HEADER_TIMEOUT,
@@ -1448,6 +1465,7 @@ impl H3 {
             pending: None,
             out: Vec::new(),
             capsule_buf: Vec::new(),
+            handed: 0,
             fin: false,
             deadline: Instant::now(),
             head_wait: HEADER_TIMEOUT,
@@ -1630,21 +1648,28 @@ impl H3 {
         Ok(())
     }
 
-    /// One UDP payload out of the capsule stream: DATA frames are consumed into the capsule stream until a whole DATAGRAM capsule appears, capsules that span frames accumulate, and empty datagrams are skipped so `Ok(0)` stays the end of stream.
+    /// One UDP payload out of the capsule stream: DATA frames are consumed into the capsule stream until a whole DATAGRAM capsule appears, capsules that span frames accumulate, a payload wider than the caller's buffer arrives over several reads, and empty datagrams are skipped so `Ok(0)` stays the end of stream.
     pub(crate) fn read_datagram(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let started = Instant::now();
         // One wait per call, armed from its start: re-armed inside the loop the check below could never see an expiry, so a peer that stopped answering cost this lane nothing but its own parking.
         self.deadline = started + HEADER_TIMEOUT;
         loop {
             if let Some((used, payload)) = masque::datagram_split(&self.capsule_buf) {
-                let take = buf.len().min(payload.len());
-                buf[..take].copy_from_slice(&payload[..take]);
                 let len = payload.len();
-                self.capsule_buf.drain(..used);
+                let at = self.handed;
+                let take = buf.len().min(len - at);
+                buf[..take].copy_from_slice(&payload[at..at + take]);
+                // A capsule is released only when its last octet has been copied, and the count is what the caller got rather than what the capsule holds.
+                if at + take == len {
+                    self.capsule_buf.drain(..used);
+                    self.handed = 0;
+                } else {
+                    self.handed = at + take;
+                }
                 if len == 0 {
                     continue;
                 }
-                return Ok(len);
+                return Ok(take);
             }
             if self.fin {
                 return Ok(0);
@@ -1657,6 +1682,7 @@ impl H3 {
             }
             if self.capsule_buf.len() > DATAGRAM_BUF_MAX {
                 self.capsule_buf.clear();
+                self.handed = 0;
                 return Err(std::io::Error::other(
                     "foxy: a capsule stream that never parses",
                 ));
@@ -5224,6 +5250,44 @@ pub(crate) mod loopback {
         read_datagram(&mut lane, b"second");
     }
 
+    /// A capsule wider than the caller's buffer: the count one read reports is the octets its buffer got, the octets behind them are owed by the next read, and the capsule after them keeps its place in the stream.
+    #[test]
+    fn a_datagram_wider_than_the_caller_s_buffer_keeps_its_tail() {
+        const BODY: usize = 1_350;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let wide: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
+        let mut capsules = Vec::new();
+        masque::datagram_encode(&wide, &mut capsules);
+        masque::datagram_encode(b"behind it", &mut capsules);
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let _edge = downlink_edge(listener, server, vec![(data_frame(&capsules), None)], tx);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut lane = open_udp(&dial, "example.com", 443).expect("opens");
+        lane.set_read_quantum(Duration::from_secs(5))
+            .expect("bounds a read");
+        let mut piece = [0u8; 64];
+        let mut got = Vec::new();
+        while got.len() < BODY {
+            let read = lane
+                .read_datagram(&mut piece)
+                .expect("a piece of the staged capsule");
+            assert!(
+                read > 0 && read <= piece.len(),
+                "a read reports what its buffer got, not what the capsule holds"
+            );
+            got.extend_from_slice(&piece[..read]);
+        }
+        assert_eq!(got, wide, "every octet once, in the order it was sent");
+        read_datagram(&mut lane, b"behind it");
+        assert!(
+            lane.capsule_buf.is_empty(),
+            "the two spent capsules left nothing staged"
+        );
+        assert_eq!(lane.handed, 0, "and no cursor either");
+    }
+
     /// One datagram through the lane, asserted whole; a buffer that has grown is the only thing a staged capsule leaves behind.
     fn read_datagram(lane: &mut Tls2, want: &[u8]) {
         let mut back = [0u8; 64];
@@ -6570,6 +6634,74 @@ pub(crate) mod loopback {
         };
         assert_eq!(&back[..read], b"a capsule over two frames");
         assert!(!lane.fin, "a frame boundary is not the end of the stream");
+        edge.join().expect("joins");
+    }
+
+    /// The same debt on the QUIC carrier: a capsule wider than the caller's buffer is paid one buffer at a time, and the capsule behind it is still there to read.
+    #[test]
+    fn a_quic_datagram_wider_than_the_caller_s_buffer_keeps_its_tail() {
+        const BODY: usize = 1_350;
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let port = sock.local_addr().expect("addr").port();
+        let wide: Vec<u8> = (0..BODY).map(|i| (i % 251) as u8).collect();
+        let mut capsules = Vec::new();
+        masque::datagram_encode(&wide, &mut capsules);
+        masque::datagram_encode(b"behind it", &mut capsules);
+        let edge = h3_scripted_edge(
+            sock,
+            server,
+            vec![
+                (h3_answer(), Duration::ZERO),
+                (h3_data(&capsules), Duration::ZERO),
+            ],
+        );
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let mut lane = H3::open_udp(&dial, "example.com", 443, quic).expect("opens");
+        lane.set_read_quantum(Duration::from_millis(100));
+        let mut piece = [0u8; 64];
+        let mut got = Vec::new();
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        while got.len() < BODY {
+            assert!(std::time::Instant::now() < until, "the pieces arrive");
+            match lane.read_datagram(&mut piece) {
+                Ok(0) => panic!(
+                    "a short read called the end of the stream with its capsule still staged"
+                ),
+                Ok(read) => {
+                    assert!(
+                        read > 0 && read <= piece.len(),
+                        "a read reports what its buffer got, not what the capsule holds"
+                    );
+                    got.extend_from_slice(&piece[..read]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("the capsule failed: {error}"),
+            }
+        }
+        assert_eq!(got, wide, "every octet once, in the order it was sent");
+        let mut back = [0u8; 64];
+        let read = loop {
+            assert!(
+                std::time::Instant::now() < until,
+                "the next capsule arrives"
+            );
+            match lane.read_datagram(&mut back) {
+                Ok(0) => panic!("the capsule behind it was called the end of the stream"),
+                Ok(read) => break read,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("the capsule failed: {error}"),
+            }
+        };
+        assert_eq!(&back[..read], b"behind it");
+        assert!(
+            lane.capsule_buf.is_empty(),
+            "the two spent capsules left nothing staged"
+        );
+        assert_eq!(lane.handed, 0, "and no cursor either");
         edge.join().expect("joins");
     }
 
