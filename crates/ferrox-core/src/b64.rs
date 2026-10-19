@@ -227,11 +227,7 @@ mod tests {
                 want,
                 "{len} bytes through the window coder"
             );
-            assert_eq!(
-                encode(&bytes),
-                want,
-                "{len} bytes through the String coder"
-            );
+            assert_eq!(encode(&bytes), want, "{len} bytes through the String coder");
         }
         let mut too_short = [0u8; 4];
         assert_eq!(
@@ -313,10 +309,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(
-            fold, 0x4291_eb80,
-            "the same 64 passes, four pushes a group"
-        );
+        assert_eq!(fold, 0x4291_eb80, "the same 64 passes, four pushes a group");
     }
 
     #[test]
