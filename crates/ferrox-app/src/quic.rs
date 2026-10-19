@@ -609,8 +609,7 @@ pub(crate) fn pump_once(
                     }
                     continue;
                 }
-                Burst::Drained(n) => {
-                    taken += n;
+                Burst::Drained => {
                     dry = true;
                     break;
                 }
@@ -649,11 +648,11 @@ pub(crate) fn pump_once(
     true
 }
 
-/// How one batched read of the queue ended: `Full` filled its slots, so more may be behind them; `Drained` left the socket dry, at any count; `Dead` is a read the pump cannot ride out.
+/// How one batched read of the queue ended: `Full` filled its slots and carries how many it moved, so more may be behind them; `Drained` left the socket dry, at any count; `Dead` is a read the pump cannot ride out.
 #[cfg(target_os = "linux")]
 enum Burst {
     Full(usize),
-    Drained(usize),
+    Drained,
     Dead,
 }
 
@@ -703,14 +702,14 @@ fn drain_burst(
             batch.as_mut_ptr(),
             want as libc::c_uint,
             0,
-            &mut budget,
+            &raw mut budget,
         )
     };
     let taken = match got {
         n if n < 0 => {
             let error = std::io::Error::last_os_error();
             return match error.kind() {
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => Burst::Drained(0),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => Burst::Drained,
                 _ => Burst::Dead,
             };
         }
@@ -731,7 +730,7 @@ fn drain_burst(
     if taken == want {
         Burst::Full(taken)
     } else {
-        Burst::Drained(taken)
+        Burst::Drained
     }
 }
 
@@ -741,7 +740,7 @@ fn peer_of(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
     match i32::from(storage.ss_family) {
         libc::AF_INET => {
             // SAFETY: the family says the storage holds a `sockaddr_in`, which is no wider and no more aligned than it.
-            let v4 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
+            let v4 = unsafe { &*std::ptr::from_ref(storage).cast::<libc::sockaddr_in>() };
             Some(SocketAddr::new(
                 std::net::Ipv4Addr::from(v4.sin_addr.s_addr.to_ne_bytes()).into(),
                 u16::from_be(v4.sin_port),
@@ -749,7 +748,7 @@ fn peer_of(storage: &libc::sockaddr_storage) -> Option<SocketAddr> {
         }
         libc::AF_INET6 => {
             // SAFETY: as above, for the v6 spelling.
-            let v6 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
+            let v6 = unsafe { &*std::ptr::from_ref(storage).cast::<libc::sockaddr_in6>() };
             Some(SocketAddr::new(
                 std::net::Ipv6Addr::from(v6.sin6_addr.s6_addr).into(),
                 u16::from_be(v6.sin6_port),
