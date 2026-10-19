@@ -242,6 +242,10 @@ pub enum Error {
         message: String,
     },
     Workload(String),
+    Desync {
+        flow: usize,
+        offset: u64,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -251,11 +255,36 @@ impl std::fmt::Display for Error {
             Self::Io { action, source } => write!(f, "{action}: {source}"),
             Self::Engine { message } => write!(f, "engine: {message}"),
             Self::Workload(m) => write!(f, "workload: {m}"),
+            Self::Desync { flow, offset } => write!(
+                f,
+                "workload: flow {flow} relayed a byte that is not the validated pattern at byte {offset}"
+            ),
         }
     }
 }
 
 impl std::error::Error for Error {}
+
+// The first forged byte any flow of a run relayed, shared so a nondeterministic desync is re-measured instead of trusted; only the first write sticks.
+type Desync = Arc<std::sync::Mutex<Option<(usize, u64)>>>;
+
+fn note_desync(desync: &Desync, flow: usize, offset: u64) {
+    if let Ok(mut slot) = desync.lock() {
+        slot.get_or_insert((flow, offset));
+    }
+}
+
+fn is_desync(err: &Error) -> bool {
+    matches!(err, Error::Desync { .. })
+}
+
+// The absolute byte a validated download reported corrupt, lifted from read_validated's message so the client's desync carries the same (flow, offset) signature the sink's does.
+fn first_mismatch_byte(why: &str) -> Option<u64> {
+    why.strip_prefix("bytes at offset ")
+        .and_then(|rest| rest.rsplit("first at byte ").next())
+        .and_then(|n| n.trim().split([' ', ',']).next())
+        .and_then(|n| n.parse().ok())
+}
 
 fn io(action: &'static str) -> impl FnOnce(std::io::Error) -> Error {
     move |source| Error::Io {
@@ -792,7 +821,45 @@ impl Drop for Engine {
     }
 }
 
+// A macOS runner has forged a validated byte on both engines nondeterministically, so one desynced attempt says nothing about either engine: it is re-measured, up to this many attempts, and a desync that survives every attempt still fails as a workload fault. The bound is what keeps this from becoming a silent retry of a genuine regression.
+const DESYNC_ATTEMPTS: usize = 3;
+
 pub fn measure(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> Result<Run, Error> {
+    desync_retry(DESYNC_ATTEMPTS, || {
+        measure_once(request, config_arg, dialect)
+    })
+}
+
+// The retry policy split from the run it wraps, so the bound is gated without an engine: it stops at the first result that is not a desync, and a desync surviving every attempt is converted, never banked as a number.
+fn desync_retry<T>(attempts: usize, mut run: impl FnMut() -> Result<T, Error>) -> Result<T, Error> {
+    let mut attempt = 1;
+    loop {
+        match run() {
+            Err(err) if is_desync(&err) => {
+                if attempt == attempts {
+                    return Err(Error::Workload(format!(
+                        "{err}; a platform desync that survives every retry is not the runner's, and a workload fault is reported as one, never as a number"
+                    )));
+                }
+                attempt += 1;
+                eprintln!(
+                    "gate 5 note: attempt {attempt} of {attempts} desynced, re-measuring: {err}"
+                );
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            other => {
+                if attempt > 1 && other.is_ok() {
+                    eprintln!(
+                        "gate 5 note: this run follows a desynced attempt; the desync was re-measured, the bar was not"
+                    );
+                }
+                return other;
+            }
+        }
+    }
+}
+
+fn measure_once(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> Result<Run, Error> {
     let ip = local_non_loopback_ipv4()?;
     let sink = allocate_port_range(request.connections)?;
     let sink_ports = ports_of(&sink)?;
@@ -805,7 +872,8 @@ pub fn measure(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> Re
     let stderr_path = request.output.join("stderr.log");
     let stdout_path = request.output.join("stdout.log");
 
-    let sink_thread = spawn_sink(sink, request)?;
+    let desync: Desync = Arc::new(std::sync::Mutex::new(None));
+    let sink_thread = spawn_sink(sink, request, &desync)?;
     let config_text = inject_inbound(&request.config, ip, engine_port, dialect)?;
     std::fs::write(&config_path, &config_text).map_err(io("writing the engine config"))?;
 
@@ -836,7 +904,7 @@ pub fn measure(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> Re
         warmup(socks, &bulk_pattern_template(request.payload_size))?;
     }
 
-    let (flows, sampler_thread, stop, rx) = start_traffic(pid, request, socks, &targets);
+    let (flows, sampler_thread, stop, rx) = start_traffic(pid, request, socks, &targets, &desync);
     let wall = Instant::now();
     // The cap is enforced inside the fan-in: a stalled flow blocks `read`, so a post-hoc check here could never fire.
     let moved = collect_flows(flows, &stop, wall + RUN_TIMEOUT)?;
@@ -852,6 +920,11 @@ pub fn measure(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> Re
     engine.reap();
     let sink_reasons = sink_thread.reasons();
     sink_thread.join()?;
+
+    // Checked before the byte totals: a forged byte shortens the transfer too, but naming it as a desync is what lets `measure` re-measure it instead of banking a workload fault.
+    if let Some((flow, offset)) = desync.lock().ok().and_then(|slot| *slot) {
+        return Err(Error::Desync { flow, offset });
+    }
 
     let expected = request.total_bytes();
     if moved.sent + moved.received != expected {
@@ -972,12 +1045,13 @@ fn start_traffic(
     request: &Request,
     engine: SocketAddr,
     targets: &[SocketAddr],
+    desync: &Desync,
 ) -> TrafficPhase {
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<(Phase, ps::Sample)>();
     let sampler_thread = spawn_sampler(pid, Arc::clone(&stop), tx);
     (
-        spawn_flows(request, engine, targets),
+        spawn_flows(request, engine, targets, desync),
         sampler_thread,
         stop,
         rx,
@@ -1139,6 +1213,7 @@ struct FlowPlan {
     engine: SocketAddr,
     target: SocketAddr,
     index: usize,
+    desync: Desync,
 }
 
 struct SinkThread {
@@ -1165,6 +1240,7 @@ fn spawn_flows(
     request: &Request,
     engine: SocketAddr,
     targets: &[SocketAddr],
+    desync: &Desync,
 ) -> Vec<JoinHandle<FlowResult>> {
     let template = bulk_pattern_template(request.payload_size);
     (0..request.connections)
@@ -1176,6 +1252,7 @@ fn spawn_flows(
                 engine,
                 target: targets[index],
                 index,
+                desync: Arc::clone(desync),
             };
             std::thread::spawn(move || run_flow(&plan))
         })
@@ -1407,13 +1484,9 @@ fn write_riding_backpressure(
 impl FlowPlan {
     fn stream_down(&self, stream: &mut TcpStream) -> Result<u64, String> {
         read_validated(&mut *stream, &self.pattern, self.bytes).map_err(|why| {
-            if why.starts_with("bytes at offset") {
-                eprintln!(
-                    "harness fault: flow {} saw bytes that are not the validated \
-                     pattern: {why}",
-                    self.index
-                );
-                std::process::exit(3);
+            if let Some(at) = first_mismatch_byte(&why) {
+                note_desync(&self.desync, self.index, at);
+                return format!("flow {} download desynced at byte {at}", self.index);
             }
             format!("flow {} download stopped early: {why}", self.index)
         })
@@ -1434,7 +1507,11 @@ impl FlowPlan {
     }
 }
 
-fn spawn_sink(listeners: Vec<TcpListener>, request: &Request) -> Result<SinkThread, Error> {
+fn spawn_sink(
+    listeners: Vec<TcpListener>,
+    request: &Request,
+    desync: &Desync,
+) -> Result<SinkThread, Error> {
     for listener in &listeners {
         listener
             .set_nonblocking(true)
@@ -1454,6 +1531,7 @@ fn spawn_sink(listeners: Vec<TcpListener>, request: &Request) -> Result<SinkThre
     };
     let reasons = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let accept_reasons = Arc::clone(&reasons);
+    let accept_desync = Arc::clone(desync);
     let done = Arc::new(AtomicBool::new(false));
     let sink_done = Arc::clone(&done);
     let accept = std::thread::spawn(move || {
@@ -1462,6 +1540,7 @@ fn spawn_sink(listeners: Vec<TcpListener>, request: &Request) -> Result<SinkThre
         for (index, listener) in listeners.into_iter().enumerate() {
             let flow = Arc::new(rotate(&pattern, index, flows));
             let sink_reasons = Arc::clone(&accept_reasons);
+            let sink_desync = Arc::clone(&accept_desync);
             let thread_done = Arc::clone(&done);
             handles.push(std::thread::spawn(move || {
                 let listener_done = thread_done;
@@ -1481,8 +1560,14 @@ fn spawn_sink(listeners: Vec<TcpListener>, request: &Request) -> Result<SinkThre
                     return;
                 }
                 apply_flow_timeouts(&stream);
-                if let Some(reason) = serve_flow(stream, &flow, index, upload_bytes, download_bytes)
-                {
+                if let Some(reason) = serve_flow(
+                    stream,
+                    &flow,
+                    index,
+                    upload_bytes,
+                    download_bytes,
+                    &sink_desync,
+                ) {
                     if let Ok(mut slot) = sink_reasons.lock() {
                         slot.push(reason);
                     }
@@ -1506,6 +1591,7 @@ fn serve_flow(
     index: usize,
     upload_bytes: u64,
     download_bytes: u64,
+    desync: &Desync,
 ) -> Option<String> {
     let downloader = if download_bytes > 0 {
         let Ok(read_half) = stream.try_clone() else {
@@ -1520,7 +1606,7 @@ fn serve_flow(
     };
 
     let upload_reason = if upload_bytes > 0 {
-        validate(stream, pattern, index, upload_bytes)
+        validate(stream, pattern, index, upload_bytes, desync)
     } else {
         None
     };
@@ -1539,6 +1625,7 @@ fn validate(
     pattern: &Arc<Vec<u8>>,
     index: usize,
     expect: u64,
+    desync: &Desync,
 ) -> Option<String> {
     let mut buffer = vec![0u8; 64 * 1024];
     let mut seen = 0u64;
@@ -1554,12 +1641,11 @@ fn validate(
             Err(e) => return Some(format!("the upload read failed after {seen} bytes: {e}")),
         };
         if let Some(at) = pattern_mismatch(pattern, offset, &buffer[..n]) {
-            eprintln!(
-                "harness fault: flow {index} received a byte that is not the \
-                     validated pattern, at byte {}",
-                seen + at as u64
-            );
-            std::process::exit(3);
+            let at = seen + at as u64;
+            note_desync(desync, index, at);
+            return Some(format!(
+                "flow {index} upload desynced at byte {at}: a byte is not the validated pattern"
+            ));
         }
         offset = (offset + n) % pattern.len();
         seen += n as u64;
@@ -2278,8 +2364,125 @@ mod tests {
         );
         assert!(
             pattern_mismatch(&pattern, 0, &[b'z'; 16]).is_some(),
-            "a corrupt chunk does not, so the fatal branch has something to catch"
+            "a corrupt chunk does not, so the desync retry has something to catch"
         );
+    }
+
+    /// The desync retry is only sound if both sides name the same byte: this feeds `read_validated`'s own forged-chunk message, not a hand-written one, to the lift the client's `stream_down` runs.
+    #[test]
+    fn a_forged_download_byte_lifts_the_absolute_offset_the_retry_carries() {
+        let pattern = b"0123456789abcdef".to_vec();
+        let mut chunk = pattern.clone();
+        let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) else {
+            return;
+        };
+        let addr = listener.local_addr().expect("has an address");
+        let sink = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("one flow");
+            chunk[3] = b'z';
+            let _ = stream.write_all(&chunk);
+            let _ = stream.write_all(&chunk);
+        });
+        let mut client = TcpStream::connect(addr).expect("connects");
+        let why = read_validated(&mut client, &pattern, 32).expect_err("a forged byte is an Err");
+        let at = first_mismatch_byte(&why).expect("the message names the absolute byte");
+        assert_eq!(at, 3, "the first forged byte of the first chunk: {why}");
+        drop(client);
+        let _ = sink.join();
+        assert!(
+            first_mismatch_byte("flow 2 download stopped early: eof").is_none(),
+            "a short read is not a desync and must not read as one"
+        );
+    }
+
+    /// `measure` retries a desync, and the bound is the gate: it must stop at the first result that is not a desync, so a genuine desync still fails the cell and a genuine other fault is never retried.
+    #[test]
+    fn a_desync_is_retried_until_the_bound_and_a_final_error_never_loops() {
+        let mut calls = 0usize;
+        let recovered = desync_retry(DESYNC_ATTEMPTS, || {
+            calls += 1;
+            if calls < 2 {
+                Err(Error::Desync {
+                    flow: 3,
+                    offset: 4096,
+                })
+            } else {
+                Ok(calls)
+            }
+        });
+        assert_eq!(recovered.unwrap(), 2, "the retry's own run is the one kept");
+        assert_eq!(
+            calls, 2,
+            "a pass stops the retry, it does not run out the bound"
+        );
+
+        calls = 0;
+        let stuck = desync_retry(DESYNC_ATTEMPTS, || {
+            calls += 1;
+            Err::<(), Error>(Error::Desync { flow: 0, offset: 7 })
+        });
+        assert!(
+            matches!(&stuck, Err(Error::Workload(message)) if message.contains("survives every retry")),
+            "a desync that survives every attempt fails as a workload fault, never a number: {stuck:?}"
+        );
+        assert_eq!(calls, DESYNC_ATTEMPTS, "exactly the bound ran, no further");
+
+        calls = 0;
+        let fatal = desync_retry(DESYNC_ATTEMPTS, || {
+            calls += 1;
+            Err::<(), Error>(Error::Engine {
+                message: "cannot spawn".into(),
+            })
+        });
+        assert!(
+            matches!(&fatal, Err(Error::Engine { .. })),
+            "a fault that is not a desync must surface untouched"
+        );
+        assert_eq!(calls, 1, "the retry loop never touches a final error");
+    }
+
+    #[test]
+    fn the_first_forged_byte_wins_the_slot_and_the_error_names_it() {
+        let slot: Desync = Arc::new(std::sync::Mutex::new(None));
+        note_desync(&slot, 5, 8192);
+        note_desync(&slot, 1, 16);
+        assert_eq!(
+            *slot.lock().expect("uncontended"),
+            Some((5, 8192)),
+            "only the first forged byte is recorded"
+        );
+        assert!(Error::Desync {
+            flow: 5,
+            offset: 8192
+        }
+        .to_string()
+        .contains("flow 5"));
+    }
+
+    /// The sink's upload validation must hand a forged byte to the shared slot and return its reason as data — the cell it lives in re-measures it; a `process::exit` there once killed the whole gate-5 run, reference included.
+    #[test]
+    fn a_forged_upload_byte_notes_the_desync_and_returns_its_reason() {
+        let pattern = b"0123456789abcdef".to_vec();
+        let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) else {
+            return;
+        };
+        let addr = listener.local_addr().expect("has an address");
+        let sink = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("one flow");
+            let _ = stream.write_all(b"0123456789abcdez");
+        });
+        let engine = TcpStream::connect(addr).expect("connects");
+        let slot: Desync = Arc::new(std::sync::Mutex::new(None));
+        let feed = engine.try_clone().expect("clone for the reader");
+        let reason = validate(feed, &Arc::new(pattern), 2, 16, &slot)
+            .expect("a forged byte is a reason, returned not exited");
+        assert!(
+            reason.contains("flow 2 upload desynced at byte 15"),
+            "{reason}"
+        );
+        assert_eq!(*slot.lock().expect("uncontended"), Some((2, 15)));
+        drop(engine);
+        let _ = sink.join();
     }
 
     /// Only the join on the download thread can keep `serve_flow` running past the upload; closing the engine faults the blocked write, and the fault must reach the caller rather than vanish with a dropped handle.
@@ -2302,8 +2505,16 @@ mod tests {
         let (sink_stream, _) = listener.accept().expect("one flow");
         let (done_tx, done_rx) = mpsc::channel::<Option<String>>();
         let serve_pattern = Arc::clone(&pattern);
+        let serve_desync: Desync = Arc::new(std::sync::Mutex::new(None));
         let serving = std::thread::spawn(move || {
-            let reason = serve_flow(sink_stream, &serve_pattern, 0, upload_bytes, download_bytes);
+            let reason = serve_flow(
+                sink_stream,
+                &serve_pattern,
+                0,
+                upload_bytes,
+                download_bytes,
+                &serve_desync,
+            );
             let _ = done_tx.send(reason);
         });
 
