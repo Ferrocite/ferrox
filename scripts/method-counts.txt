@@ -272,6 +272,8 @@ carrier-foxy datagram-frames-per-capsule 1 ferrox-app-foxy::loopback::the_masque
 carrier-foxy capsules-reassembled-across-frames 1 ferrox-app-foxy::loopback::a_capsule_split_over_frames_reassembles_as_one_datagram
 carrier-foxy datagrams-out-of-one-frame 2 ferrox-app-foxy::loopback::a_frame_of_two_datagrams_arrives_as_two_datagrams
 carrier-foxy quic-datagrams-out-of-one-frame 2 ferrox-app-foxy::loopback::a_quic_frame_of_two_datagrams_arrives_as_two_datagrams
+carrier-foxy h2-bytes-lost-at-a-short-datagram-read 0 ferrox-app-foxy::loopback::a_datagram_wider_than_the_caller_s_buffer_keeps_its_tail
+carrier-foxy h3-bytes-lost-at-a-short-datagram-read 0 ferrox-app-foxy::loopback::a_quic_datagram_wider_than_the_caller_s_buffer_keeps_its_tail
 carrier-foxy stream-write-staging-copies-per-byte 0 ferrox-app-foxy::loopback::the_quic_carrier_sends_the_block_reads_the_status_and_carries_the_bytes
 carrier-foxy datagram-write-staging-copies-per-byte 0 ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_and_echoes_a_datagram
 carrier-foxy ip-read-staging-copies-per-byte 0 ferrox-app-foxy::loopback::the_connect_ip_carrier_opens_one_tunnel_and_carries_a_datagram

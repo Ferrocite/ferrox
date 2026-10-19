@@ -6668,7 +6668,9 @@ pub(crate) mod loopback {
         while got.len() < BODY {
             assert!(std::time::Instant::now() < until, "the pieces arrive");
             match lane.read_datagram(&mut piece) {
-                Ok(0) => panic!("a short read called the end of the stream with its capsule still staged"),
+                Ok(0) => panic!(
+                    "a short read called the end of the stream with its capsule still staged"
+                ),
                 Ok(read) => {
                     assert!(
                         read > 0 && read <= piece.len(),
@@ -6683,7 +6685,10 @@ pub(crate) mod loopback {
         assert_eq!(got, wide, "every octet once, in the order it was sent");
         let mut back = [0u8; 64];
         let read = loop {
-            assert!(std::time::Instant::now() < until, "the next capsule arrives");
+            assert!(
+                std::time::Instant::now() < until,
+                "the next capsule arrives"
+            );
             match lane.read_datagram(&mut back) {
                 Ok(0) => panic!("the capsule behind it was called the end of the stream"),
                 Ok(read) => break read,
