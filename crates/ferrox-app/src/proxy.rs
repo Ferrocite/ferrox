@@ -4268,16 +4268,69 @@ fn dial_vmess_rung(
     }
 }
 
-fn trojan_header(key: &[u8; 56], cmd: u8, target: &Destination) -> Vec<u8> {
+/// A Trojan request header: an IP destination fits the protocol's bound (68 bytes
+/// IPv4, 80 IPv6) and rides stack storage, while a name is unbounded and keeps the
+/// precise heap `Vec`. Both paths emit the same bytes; a `Deref` to `&[u8]` hands
+/// callers the header slice so the dial site never learns which one it holds.
+enum TrojanHeader {
+    Address { bytes: [u8; 80], len: u8 },
+    Name(Vec<u8>),
+}
+
+impl std::ops::Deref for TrojanHeader {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Address { bytes, len } => &bytes[..*len as usize],
+            Self::Name(header) => header,
+        }
+    }
+}
+
+fn trojan_header(key: &[u8; 56], cmd: u8, target: &Destination) -> TrojanHeader {
     // key + CRLF + command, then the address and its port, closed by a CRLF.
-    let mut header = Vec::with_capacity(63 + target.addr_len());
-    header.extend_from_slice(key);
-    header.extend_from_slice(b"\r\n");
-    header.push(cmd);
-    target.push_addr(&mut header, 4, 3);
-    header.extend_from_slice(&target.port().to_be_bytes());
-    header.extend_from_slice(b"\r\n");
-    header
+    let address = match target {
+        Destination::Name(..) => {
+            let mut header = Vec::with_capacity(63 + target.addr_len());
+            header.extend_from_slice(key);
+            header.extend_from_slice(b"\r\n");
+            header.push(cmd);
+            target.push_addr(&mut header, 4, 3);
+            header.extend_from_slice(&target.port().to_be_bytes());
+            header.extend_from_slice(b"\r\n");
+            return TrojanHeader::Name(header);
+        }
+        Destination::Address(address) => *address,
+    };
+    let mut bytes = [0u8; 80];
+    bytes[..56].copy_from_slice(key);
+    let mut len = 56;
+    bytes[len..len + 2].copy_from_slice(b"\r\n");
+    len += 2;
+    bytes[len] = cmd;
+    len += 1;
+    match address.ip() {
+        std::net::IpAddr::V4(ip) => {
+            bytes[len] = 1;
+            len += 1;
+            bytes[len..len + 4].copy_from_slice(&ip.octets());
+            len += 4;
+        }
+        std::net::IpAddr::V6(ip) => {
+            bytes[len] = 4;
+            len += 1;
+            bytes[len..len + 16].copy_from_slice(&ip.octets());
+            len += 16;
+        }
+    }
+    bytes[len..len + 2].copy_from_slice(&address.port().to_be_bytes());
+    len += 2;
+    bytes[len..len + 2].copy_from_slice(b"\r\n");
+    TrojanHeader::Address {
+        bytes,
+        len: (len + 2) as u8,
+    }
 }
 
 fn dial_trojan(
@@ -14453,6 +14506,27 @@ mod tests {
         want.extend_from_slice(&8443u16.to_be_bytes());
         want.extend_from_slice(b"\r\n");
         assert_eq!(&head[tail + 2..], want, "and the port after the address");
+    }
+
+    /// The header's stack path must not move a byte: for IPv4 (68) and IPv6 (80) the
+    /// fixed buffer spells the exact same wire the heap path would, and for a name it
+    /// still falls back to the Vec, so every destination dials identical bytes.
+    #[test]
+    fn trojan_header_builds_identical_bytes_for_every_destination() {
+        let key = [0x5au8; 56];
+        for target in [
+            Destination::from("192.0.2.53:8080".parse::<SocketAddr>().expect("IPv4")),
+            Destination::from("[2001:db8::1]:443".parse::<SocketAddr>().expect("IPv6")),
+            Destination::Name("www.example.com".to_owned(), 8443),
+        ] {
+            let mut want = key.to_vec();
+            want.extend_from_slice(b"\r\n\x01");
+            target.push_addr(&mut want, 4, 3);
+            want.extend_from_slice(&target.port().to_be_bytes());
+            want.extend_from_slice(b"\r\n");
+            let header = trojan_header(&key, 1, &target);
+            assert_eq!(&*header, want.as_slice(), "{}", target.authority());
+        }
     }
 
     /// The pump belongs to the carrier, not to the socket: a WebSocket server that holds its `[0, 0]` until the first frame arrives must not deadlock either.
