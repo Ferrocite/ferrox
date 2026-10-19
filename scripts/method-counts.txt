@@ -229,6 +229,8 @@ carrier-foxy payload-staging-copies-per-byte-read 0 ferrox-app-foxy::loopback::a
 carrier-foxy read-buffer-bytes-per-staged-remainder 0 ferrox-app-foxy::loopback::half_a_frame_reaches_the_caller_with_the_rest_left_on_the_wire
 carrier-foxy connect-request-allocations-per-open 0 ferrox-core-tls::rustls_backend::tests::the_connect_request_gathers_without_a_heap_buffer
 carrier-foxy write-calls-per-h1-open 1 ferrox-core-tls::rustls_backend::tests::the_connect_request_gathers_without_a_heap_buffer
+carrier-foxy head-read-calls-per-open 1 ferrox-app-foxy::tests::the_head_walk_reads_the_answer_in_one_call
+carrier-foxy head-tail-bytes-held-after-they-reach-the-caller 0 ferrox-app-foxy::tests::the_pipelined_tail_is_released_by_the_read_that_spends_it
 carrier-foxy h3-window-peek-bytes-per-delivered-frame 16 ferrox-app-foxy::loopback::the_h3_downlink_hands_the_caller_the_frame_without_staging_it
 carrier-foxy h2-bytes-lost-at-a-read-quantum 0 ferrox-app-foxy::loopback::a_frame_that_straddles_a_read_quantum_arrives_whole
 carrier-foxy h2-upload-bytes-blocked-by-an-unread-grant 0 ferrox-app-foxy::loopback::an_upload_is_paced_by_the_grants_the_edge_sends_rather_than_by_the_bytes_it_reads
