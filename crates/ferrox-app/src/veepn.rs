@@ -298,16 +298,20 @@ fn servers_of(
             .get("port")
             .and_then(Json::as_port)
             .filter(|port| *port != 0);
-        let host = entry
+        // Every address the entry lists becomes a dial of its own: the list is read once per region per 12 hours, so a walk of the region gets one edge per address rather than one per entry, and an edge that has gone quiet silences only itself.
+        let addresses = entry
             .get("addresses")
             .and_then(Json::as_arr)
-            .and_then(|addresses| {
+            .map(|addresses| {
                 addresses
                     .iter()
                     .filter_map(Json::as_str)
-                    .find(|address| !address.is_empty())
-            });
-        let (Some(username), Some(secret), Some(port), Some(host)) = (username, secret, port, host)
+                    .filter(|address| !address.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|addresses| !addresses.is_empty());
+        let (Some(username), Some(secret), Some(port), Some(addresses)) =
+            (username, secret, port, addresses)
         else {
             unusable += 1;
             continue;
@@ -322,22 +326,25 @@ fn servers_of(
             unusable += 1;
             continue;
         };
-        list.push(FoxyDial {
-            host: host.to_owned(),
-            port,
-            // The plane lists an address, so the fetch reads it once and every flow after it dials that without parsing or asking the resolver; a listed name keeps `None` and is resolved when the flow opens.
-            address: edge_peer(host, port),
-            carrier: Carrier::H1,
-            upstream: None,
-            roots: Arc::clone(roots),
-            pins: ferrox_core::foxy::pin::Pins::default(),
-            pass: Pass {
-                token,
-                expires_at: None,
-                quota_remaining: None,
-                quota_reset: None,
-            },
-        });
+        for host in &addresses {
+            list.push(FoxyDial {
+                host: (*host).to_owned(),
+                port,
+                // The plane lists an address, so the fetch reads it once and every flow after it dials that without parsing or asking the resolver; a listed name keeps `None` and is resolved when the flow opens.
+                address: edge_peer(host, port),
+                carrier: Carrier::H1,
+                upstream: None,
+                roots: Arc::clone(roots),
+                pins: ferrox_core::foxy::pin::Pins::default(),
+                pass: Pass {
+                    // The pair is coded once per entry and its text is what each of the entry's addresses carries.
+                    token: token.clone(),
+                    expires_at: None,
+                    quota_remaining: None,
+                    quota_reset: None,
+                },
+            });
+        }
     }
     if unusable != 0 {
         eprintln!("veepn: {unusable} listed entries carry no dialable address and pair");
@@ -548,13 +555,14 @@ mod tests {
         );
     }
 
-    /// The list is read as the plane writes it: an entry without an address or a port is dropped with a count, a pair reaches the wire coded once rather than per flow, and a listed address is read into the dial at the fetch so no flow parses or resolves it.
+    /// The list is read as the plane writes it: an entry without an address or a port is dropped with a count, a pair reaches the wire coded once rather than per flow, every address an entry lists becomes a dial of its own, and a listed address is read into the dial at the fetch so no flow parses or resolves it.
     #[test]
     fn a_list_answer_keeps_the_entries_this_lane_can_dial() {
-        let body = r#"[{"username":"1000-abc","password":"s3cr3t","port":443,"addresses":["192.0.2.12"]},
+        let body = r#"[{"username":"1000-abc","password":"s3cr3t","port":443,"addresses":["192.0.2.12","192.0.2.13"]},
                        {"username":"x","password":"y","port":0,"addresses":["192.0.2.4"]},
                        {"username":"x","password":"y","port":8080,"addresses":[]},
                        {"username":"x","password":"y","port":80,"addresses":[""]},
+                       {"username":"x","password":"y","port":8443,"addresses":["","192.0.2.9"]},
                        {"username":"x","password":"y","port":443,"addresses":["edge.example"]}]"#;
         let reply = foxy_account::Reply {
             status: 200,
@@ -564,19 +572,33 @@ mod tests {
         let roots = ferrox_core::tls::Anchors::from(Vec::new());
         let list = servers_of(&reply, &roots).expect("a list");
         assert_eq!(
-            list.len(),
-            2,
-            "every entry with a port and a non-empty address is kept, literal or name"
+            list.iter()
+                .map(|dial| (dial.host.as_str(), dial.port))
+                .collect::<Vec<_>>(),
+            [
+                ("192.0.2.12", 443),
+                ("192.0.2.13", 443),
+                ("192.0.2.9", 8443),
+                ("edge.example", 443),
+            ],
+            "every address of an entry with a port is kept, blank ones are not, and one entry with two addresses is two dials"
         );
-        assert_eq!(list[0].host, "192.0.2.12");
-        assert_eq!(list[0].port, 443);
+        assert_eq!(
+            list[0].pass.token, list[1].pass.token,
+            "one entry codes its pair once and both of its addresses carry that text"
+        );
         assert_eq!(
             list[0].address,
             Some("192.0.2.12:443".parse().expect("address")),
             "the fetch read the listed address, so the flow dials it as it stands"
         );
         assert_eq!(
-            list[1].address, None,
+            list[1].address,
+            Some("192.0.2.13:443".parse().expect("address")),
+            "and read the entry's second address as its own edge, not as the first's alias"
+        );
+        assert_eq!(
+            list[3].address, None,
             "a listed name is left for the resolver rather than half-read here"
         );
         assert_eq!(
