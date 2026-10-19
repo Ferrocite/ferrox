@@ -1023,7 +1023,7 @@ mod tests {
 
     /// An edge that refuses the *target* answers for the whole plane: the walk stops at the first such answer, the region's list and the token behind it stay where they are, and the edge is not put in the silence a gone one earns.
     fn forbidden_edge(server: &ferrox_core::tls::TlsServerConfig) -> (u16, Arc<AtomicUsize>) {
-        use std::io::Write;
+        use std::io::{Read, Write};
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let hits = Arc::new(AtomicUsize::new(0));
@@ -1037,11 +1037,20 @@ mod tests {
                 else {
                     continue;
                 };
-                if tls.handshake().is_ok() {
-                    let _ = tls.write_all(
-                        b"HTTP/1.1 403 Forbidden\r\nX-Hola-Error: Forbidden Host\r\n\r\n",
-                    );
+                if tls.handshake().is_err() {
+                    continue;
                 }
+                // The answer follows the request: an edge that writes before it reads resets the flow's write instead of teaching it about the target.
+                let request = head(&mut tls);
+                assert!(
+                    request.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"),
+                    "the refusal is a fact about the host the flow asked for: {request}"
+                );
+                let _ = tls
+                    .write_all(b"HTTP/1.1 403 Forbidden\r\nX-Hola-Error: Forbidden Host\r\n\r\n");
+                let mut sink = [0u8; 64];
+                // The flow ends the leg as soon as it has read the refusal, so an error closes the drain as surely as a zero read.
+                while tls.read(&mut sink).unwrap_or(0) > 0 {}
             }
         });
         (port, hits)
@@ -1097,12 +1106,15 @@ mod tests {
             .err()
             .expect("the edge refuses this host");
         assert_eq!(
-            refusal.code, 0x04,
-            "the client hears a host that cannot be reached, not a proxy that failed"
-        );
-        assert_eq!(
-            refusal.why, "example.com:443 is refused by the edge (403)",
-            "the answer says which host the edge named, and is not a credential story"
+            (refusal.code, refusal.why.as_str()),
+            (
+                0x04,
+                "example.com:443 is refused by the edge (403)"
+            ),
+            "the client hears a host that cannot be reached, not a proxy that failed: edges answered {}+{}, plane asked {}",
+            one_hits.load(Ordering::SeqCst),
+            two_hits.load(Ordering::SeqCst),
+            asked.load(Ordering::SeqCst)
         );
         assert_eq!(
             one_hits.load(Ordering::SeqCst),
