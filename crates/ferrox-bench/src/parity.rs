@@ -1360,6 +1360,50 @@ fn pattern_mismatch(pattern: &[u8], offset: usize, chunk: &[u8]) -> Option<usize
     None
 }
 
+// A blocking socket returns WouldBlock/EAGAIN (macOS 35), ENOBUFS (macOS 55, Linux 105, Windows 10055) and their EAGAIN kin transiently when a full-rate flow outruns the kernel's send buffers; on an 8-flow macos-15 cell that aborted the reference engine and collapsed the gate-5 comparison into a false PROCESS REGRESSION, so ride it out until the per-op timeout rather than treating backpressure as a fault.
+fn is_send_backpressure(e: &std::io::Error) -> bool {
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        return true;
+    }
+    match e.raw_os_error() {
+        #[cfg(target_vendor = "apple")]
+        Some(55 | 35) => true,
+        #[cfg(target_os = "linux")]
+        Some(105 | 11) => true,
+        #[cfg(windows)]
+        Some(10055) => true,
+        _ => false,
+    }
+}
+
+// Write `buf` in full, retrying only transient send-buffer backpressure and resetting `idle` on every byte of progress so a slow-but-live flow is never cut off while a truly wedged one still fails.
+fn write_riding_backpressure(
+    stream: &mut TcpStream,
+    buf: &[u8],
+    idle: Duration,
+) -> std::io::Result<()> {
+    let mut at = 0usize;
+    let mut budget = Instant::now() + idle;
+    while at < buf.len() {
+        match stream.write(&buf[at..]) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::WriteZero)),
+            Ok(n) => {
+                at += n;
+                budget = Instant::now() + idle;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) if is_send_backpressure(&e) => {
+                if Instant::now() >= budget {
+                    return Err(e);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 impl FlowPlan {
     fn stream_down(&self, stream: &mut TcpStream) -> Result<u64, String> {
         read_validated(&mut *stream, &self.pattern, self.bytes).map_err(|why| {
@@ -1383,7 +1427,7 @@ impl FlowPlan {
         while *sent < self.bytes {
             let take = usize::try_from((self.bytes - *sent).min(chunk.len() as u64))
                 .unwrap_or(chunk.len());
-            stream.write_all(&chunk[..take])?;
+            write_riding_backpressure(stream, &chunk[..take], FLOW_IO_TIMEOUT)?;
             *sent += take as u64;
         }
         Ok(())
@@ -1538,7 +1582,7 @@ fn emit(
     while sent < expect {
         let take =
             usize::try_from((expect - sent).min(buffer.len() as u64)).unwrap_or(buffer.len());
-        if let Err(e) = stream.write_all(&buffer[..take]) {
+        if let Err(e) = write_riding_backpressure(&mut stream, &buffer[..take], FLOW_IO_TIMEOUT) {
             return Some(format!(
                 "the sink could not write after {sent} of {expect} bytes: {e}"
             ));
