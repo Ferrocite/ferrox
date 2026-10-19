@@ -1,31 +1,13 @@
 const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-/// The `String`-returning coder, walked a chunk at a time with no intermediate buffer to zero and no validation pass afterwards.
+/// The `String`-returning coder: the gathered coder's bytes, in a buffer opened to the exact coded length, so one body owns the alphabet, the padding and the group read.
 ///
-/// [`encode_parts_into`] is the other route to these bytes and the one that writes where the caller already has a window; `the_window_coder_matches_the_alphabet_at_every_length` holds the two byte-identical, which is why this shape survives instead of delegating and paying a fill plus a UTF-8 walk per call.
+/// Delegating costs one zero fill and one UTF-8 walk over the output; the four `String::push` it replaces cost a `len_utf8` branch and a capacity check per character. `the_alphabet_coder_costs_the_groups_and_nothing_else` and `the_push_form_coder_costs_the_same_fold` are the two shapes under one probe, and their difference is which side of that trade the numbers sit on.
 #[must_use]
 pub fn encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(encoded_len(bytes.len()));
-    for chunk in bytes.chunks(3) {
-        let mut word = 0u32;
-        for byte in chunk {
-            word = (word << 8) | u32::from(*byte);
-        }
-        word <<= 8 * (3 - chunk.len());
-        out.push(STD[(word >> 18 & 63) as usize] as char);
-        out.push(STD[(word >> 12 & 63) as usize] as char);
-        out.push(if chunk.len() > 1 {
-            STD[(word >> 6 & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push(if chunk.len() > 2 {
-            STD[(word & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    out
+    let mut coded = vec![0u8; encoded_len(bytes.len())];
+    encode_parts_into(&[bytes], &mut coded).expect("a buffer opened to the exact coded length");
+    String::from_utf8(coded).expect("the alphabet is ascii")
 }
 
 #[must_use]
@@ -199,6 +181,31 @@ mod tests {
         );
     }
 
+    /// The shape the shipped `String` coder replaced: a `chunks(3)` walk that puts its four characters through four `String::push`. It stays as the independent oracle the two sweeps below compare against — with `encode` delegating, an `encode`-shaped oracle would only prove a body equals itself — and as this run's second ops frame.
+    fn push_form(bytes: &[u8]) -> String {
+        let mut out = String::with_capacity(encoded_len(bytes.len()));
+        for chunk in bytes.chunks(3) {
+            let mut word = 0u32;
+            for byte in chunk {
+                word = (word << 8) | u32::from(*byte);
+            }
+            word <<= 8 * (3 - chunk.len());
+            out.push(STD[(word >> 18 & 63) as usize] as char);
+            out.push(STD[(word >> 12 & 63) as usize] as char);
+            out.push(if chunk.len() > 1 {
+                STD[(word >> 6 & 63) as usize] as char
+            } else {
+                '='
+            });
+            out.push(if chunk.len() > 2 {
+                STD[(word & 63) as usize] as char
+            } else {
+                '='
+            });
+        }
+        out
+    }
+
     /// Every length, both padding shapes included, and the write lands in the buffer the caller handed over: no allocation of its own.
     #[test]
     fn the_window_coder_matches_the_alphabet_at_every_length() {
@@ -211,13 +218,19 @@ mod tests {
         };
         for len in 0..=80usize {
             let bytes: Vec<u8> = (0..len).map(|_| next()).collect();
+            let want = push_form(&bytes);
             let mut staged = vec![0u8; encoded_len(len)];
             let written = encode_parts_into(&[&bytes], &mut staged).expect("exact length");
             assert_eq!(written, staged.len(), "coded length for {len} bytes");
             assert_eq!(
                 std::str::from_utf8(&staged).expect("ascii"),
+                want,
+                "{len} bytes through the window coder"
+            );
+            assert_eq!(
                 encode(&bytes),
-                "{len} bytes"
+                want,
+                "{len} bytes through the String coder"
             );
         }
         let mut too_short = [0u8; 4];
@@ -285,6 +298,24 @@ mod tests {
         assert_eq!(
             fold, 0x4291_eb80,
             "64 passes over a whole coding and a padded one, folded after each"
+        );
+    }
+
+    /// The coder that was: the same 64 passes of the same two inputs the probe above folds, through [`push_form`], into the same pinned answer. One ops job reports both frames, so the fill and the UTF-8 walk the delegation buys are read against the four `String::push` they replaced without a second run being trusted to agree with the first.
+    #[test]
+    fn the_push_form_coder_costs_the_same_fold() {
+        let bytes: Vec<u8> = (0..96).map(|i| (i * 7 + 11) as u8).collect();
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            for len in [96, 95] {
+                for byte in push_form(&bytes[..len]).into_bytes() {
+                    fold = fold.wrapping_mul(31).wrapping_add(u32::from(byte));
+                }
+            }
+        }
+        assert_eq!(
+            fold, 0x4291_eb80,
+            "the same 64 passes, four pushes a group"
         );
     }
 
