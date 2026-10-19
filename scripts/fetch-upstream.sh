@@ -83,6 +83,14 @@ fetch_one() {
       [[ "$(git -C "$dir" rev-parse HEAD 2>/dev/null)" == "$rev" ]]; then
       echo "ok: $name already at $rev"
     else
+      # The alias path refuses a dirty clone; a primary that drifted off its pin is
+      # the same loss waiting to happen, and only this branch reaches for rm.
+      if [[ ! -L "$dir" ]] && [[ -d "$dir/.git" ]] &&
+        [[ -n "$(git -C "$dir" status --porcelain 2>/dev/null)" ]]; then
+        echo "::error::$name holds uncommitted reading notes; moving it to $rev would discard them"
+        echo BAD >"$verdict"
+        return 1
+      fi
       rm -rf "$dir"
       git init --quiet "$dir"
       fetched_from=""
@@ -355,12 +363,37 @@ EOF
   [[ -L upstream/delta && "$(git -C upstream/delta rev-parse HEAD)" == "$rev" ]] ||
     notes="$notes a link made over linked copies does not read its pin;"
 
+  # A pin that moves off a checkout holding notes is refused, and clearing the
+  # notes is what lets it run: nothing here may silently discard a reader's work.
+  cd "$root"
+  echo three >"$src/file.txt"
+  git -C "$src" commit --quiet -am three
+  local rev3
+  rev3="$(git -C "$src" rev-parse HEAD)"
+  echo "reading notes" >upstream/alpha/notes.md
+  cat >upstream/pins.toml <<EOF
+[sources.alpha]
+repo = "$src"
+rev  = "$rev3"
+EOF
+  local dirty_status=0
+  run_all || dirty_status=1
+  [[ "$dirty_status" == 1 ]] || notes="$notes a move over uncommitted notes exited green;"
+  [[ -f upstream/alpha/notes.md ]] ||
+    notes="$notes the refusal deleted the notes it promised to keep;"
+  [[ "$(git -C upstream/alpha rev-parse HEAD)" == "$rev" ]] ||
+    notes="$notes the refusal still moved alpha off its commit;"
+  rm -f upstream/alpha/notes.md
+  run_all || notes="$notes clearing the notes did not let the move run;"
+  [[ "$(git -C upstream/alpha rev-parse HEAD)" == "$rev3" ]] ||
+    notes="$notes alpha did not reach its new pin once the notes were cleared;"
+
   rm -rf "$root"
   if [[ -n "$notes" ]]; then
     echo "::error::self-test: $notes"
     return 1
   fi
-  echo "ok: self-test — one checkout per repo and rev, aliases link, a pin at another rev clones"
+  echo "ok: self-test — one checkout per repo and rev, aliases link, a pin at another rev clones, notes refuse a move"
 }
 
 if [[ "$selftest" -eq 1 ]]; then
