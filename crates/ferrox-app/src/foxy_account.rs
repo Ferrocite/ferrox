@@ -3,7 +3,7 @@
 use crate::conn::Connection;
 use crate::foxy_challenge::{self, Jar};
 use ferrox_core::foxy::account::{self, Signed};
-use ferrox_core::foxy::{Failure, Pass};
+use ferrox_core::foxy::{edge_peer, Failure, Pass};
 use ferrox_core::tls::{RustlsProvider, TlsConfig, TlsProvider as _};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::SocketAddr;
@@ -300,7 +300,8 @@ impl Endpoint {
             host: host.to_owned(),
             port,
             base: path.to_owned(),
-            address: None,
+            // An origin that already is an address is read here, once, so an ask does not build the name and ask the resolver what it means.
+            address: edge_peer(host, port),
             roots,
         })
     }
@@ -758,6 +759,13 @@ mod tests {
         );
         assert!(Endpoint::parse("http://vpn.mozilla.org", Vec::new().into()).is_none());
         assert!(Endpoint::parse("vpn.mozilla.org", Vec::new().into()).is_none());
+        assert_eq!(
+            Endpoint::parse("https://127.0.0.1:8443", Vec::new().into())
+                .expect("parses")
+                .address,
+            Some("127.0.0.1:8443".parse().expect("addr")),
+            "a numeric origin is read at the parse, so an ask dials it without asking the resolver"
+        );
         assert_eq!(
             Endpoint::parse("https://host:8443", Vec::new().into())
                 .expect("parses")

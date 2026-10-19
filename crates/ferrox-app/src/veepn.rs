@@ -3,7 +3,7 @@
 use crate::foxy::{Carrier, FoxyDial, Tunnel};
 use crate::foxy_account::{self, Endpoint};
 use crate::json::Json;
-use ferrox_core::foxy::Pass;
+use ferrox_core::foxy::{edge_peer, Pass};
 use ferrox_core::veepn::{self, BASIC_HEAD};
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -322,7 +322,8 @@ fn servers_of(
         list.push(FoxyDial {
             host: host.to_owned(),
             port,
-            address: None,
+            // The plane lists an address, so the fetch reads it once and every flow after it dials that without parsing or asking the resolver; a listed name keeps `None` and is resolved when the flow opens.
+            address: edge_peer(host, port),
             carrier: Carrier::H1,
             upstream: None,
             roots: Arc::clone(roots),
@@ -524,13 +525,14 @@ mod tests {
         );
     }
 
-    /// The list is read as the plane writes it: an entry without an address or a port is dropped with a count, and a pair reaches the wire coded once, not per flow.
+    /// The list is read as the plane writes it: an entry without an address or a port is dropped with a count, a pair reaches the wire coded once rather than per flow, and a listed address is read into the dial at the fetch so no flow parses or resolves it.
     #[test]
     fn a_list_answer_keeps_the_entries_this_lane_can_dial() {
         let body = r#"[{"username":"1000-abc","password":"s3cr3t","port":443,"addresses":["192.0.2.12"]},
                        {"username":"x","password":"y","port":0,"addresses":["192.0.2.4"]},
                        {"username":"x","password":"y","port":8080,"addresses":[]},
-                       {"username":"x","password":"y","port":80,"addresses":[""]}]"#;
+                       {"username":"x","password":"y","port":80,"addresses":[""]},
+                       {"username":"x","password":"y","port":443,"addresses":["edge.example"]}]"#;
         let reply = foxy_account::Reply {
             status: 200,
             headers: Vec::new(),
@@ -538,9 +540,22 @@ mod tests {
         };
         let roots = ferrox_core::tls::Anchors::from(Vec::new());
         let list = servers_of(&reply, &roots).expect("a list");
-        assert_eq!(list.len(), 1, "only the entry with a port and an address");
+        assert_eq!(
+            list.len(),
+            2,
+            "every entry with a port and a non-empty address is kept, literal or name"
+        );
         assert_eq!(list[0].host, "192.0.2.12");
         assert_eq!(list[0].port, 443);
+        assert_eq!(
+            list[0].address,
+            Some("192.0.2.12:443".parse().expect("address")),
+            "the fetch read the listed address, so the flow dials it as it stands"
+        );
+        assert_eq!(
+            list[1].address, None,
+            "a listed name is left for the resolver rather than half-read here"
+        );
         assert_eq!(
             list[0].carrier,
             Carrier::H1,
