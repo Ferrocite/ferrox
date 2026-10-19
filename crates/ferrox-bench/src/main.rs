@@ -905,12 +905,30 @@ fn main() {
 fn assert_gate5(gate5: &Gate5, shapes: usize) {
     if let Some(comparison) = &gate5.comparison {
         let gate = comparison.gate();
+        // A lost repeat is not a measured regression: when rows are unproven because runs never landed, the panic names that, beside the rows, so the claim matches what ran.
+        let mut report = gate.lines.join("\n");
+        if !comparison.failures.is_empty() {
+            let lost = comparison
+                .failures
+                .iter()
+                .map(|(engine, reason)| {
+                    format!("{engine}: {}", reason.chars().take(200).collect::<String>())
+                })
+                .collect::<Vec<_>>()
+                .join("\n  ");
+            let _ = std::fmt::Write::write_fmt(
+                &mut report,
+                format_args!(
+                    "\n{} repeat(s) never landed a number and sit in the report's failures:\n  {lost}",
+                    comparison.failures.len()
+                ),
+            );
+        }
         assert!(
             gate.passed,
-            "PROCESS REGRESSION: the process-level comparison did not pass.\n{}\n\
+            "PROCESS REGRESSION: the process-level comparison did not pass.\n{report}\n\
              The table it failed on is in target/bench-report.md and every run's \
              result.json is under target/parity/.",
-            gate.lines.join("\n")
         );
         for line in &gate.lines {
             println!("gate 5: {line}");

@@ -847,29 +847,32 @@ impl Drop for Engine {
     }
 }
 
-// Two runner disturbances are measured on macos-15 and belong to neither engine: a forged validated byte, seen on ferrox and the reference alike, and a short bulk transfer whose every reason is a socket-layer transient - a saturated runner cannot always move 8 GiB full duplex inside one per-op timeout, and it does so to every engine in the cell. Neither says anything about the engine under test, so each is re-measured, up to this many attempts; a disturbance that survives every attempt still fails as a workload fault. The bound is what keeps this from becoming a silent retry of a genuine regression.
-const REMEASURE_ATTEMPTS: usize = 3;
+// Three runner disturbances are measured on macos-15 and belong to neither engine: a forged validated byte, seen on ferrox and the reference alike, a short bulk transfer whose every reason is a socket-layer transient, and a transfer that never finished inside the run cap because the flows stalled - a saturated runner cannot always move 8 GiB full duplex at all, and it does so to every engine in the cell. None says anything about the engine under test, so each is re-measured, up to this many attempts and inside this much wall time; a disturbance that survives every attempt still fails as a workload fault. The two bounds are what keep this from becoming a silent retry of a genuine regression, and from a stalled re-measure spending the cell's CI window.
+const REMEASURE_ATTEMPTS: usize = 4;
+const REMEASURE_BUDGET: Duration = Duration::from_secs(240);
 
 pub fn measure(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> Result<Run, Error> {
-    remeasure_disturbed(REMEASURE_ATTEMPTS, || {
+    remeasure_disturbed(REMEASURE_ATTEMPTS, REMEASURE_BUDGET, || {
         measure_once(request, config_arg, dialect)
     })
 }
 
-// The retry policy split from the run it wraps, so the bound is gated without an engine: it stops at the first result that needs no re-measure, and a disturbance surviving every attempt is converted, never banked as a number.
+// The retry policy split from the run it wraps, so both bounds are gated without an engine: it stops at the first result that needs no re-measure, and a disturbance surviving every attempt is converted, never banked as a number.
 fn remeasure_disturbed<T>(
     attempts: usize,
+    budget: Duration,
     mut run: impl FnMut() -> Result<T, Error>,
 ) -> Result<T, Error> {
     let mut attempt = 1;
+    let started = Instant::now();
     loop {
         match run() {
             Err(err) if is_retryable(&err) => {
-                if attempt == attempts {
+                if attempt == attempts || started.elapsed() >= budget {
                     let label = if is_desync(&err) {
                         "A forged byte that survives every retry is not the runner's"
                     } else {
-                        "A socket fault that survives every retry is not the runner's"
+                        "A saturation fault that survives every retry is not the runner's"
                     };
                     return Err(Error::Workload(format!(
                         "{err}; {label}, and a workload fault is reported as one, never as a number"
@@ -940,7 +943,7 @@ fn measure_once(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> R
 
     let (flows, sampler_thread, stop, rx) = start_traffic(pid, request, socks, &targets, &desync);
     let wall = Instant::now();
-    // The cap is enforced inside the fan-in: a stalled flow blocks `read`, so a post-hoc check here could never fire.
+    // The cap is enforced inside the fan-in: a stalled flow blocks `read`, so a post-hoc check here could never fire. A stall past the cap produced no number to bank, so `measure` re-measures it inside the budget rather than banking a workload fault.
     let moved = collect_flows(flows, &stop, wall + RUN_TIMEOUT)?;
     let wall_elapsed = wall.elapsed();
 
@@ -1127,7 +1130,7 @@ fn collect_flows(
     while !flows.iter().all(JoinHandle::is_finished) {
         if Instant::now() >= deadline {
             stop.store(true, Ordering::Relaxed);
-            return Err(Error::Workload(format!(
+            return Err(Error::Transient(format!(
                 "workload exceeded the {}s cap",
                 RUN_TIMEOUT.as_secs()
             )));
@@ -2145,10 +2148,13 @@ mod tests {
             &stop,
             started + Duration::from_millis(200),
         );
-        assert!(matches!(
-            &result,
-            Err(Error::Workload(message)) if message.contains("exceeded")
-        ));
+        assert!(
+            matches!(
+                &result,
+                Err(Error::Transient(message)) if message.contains("exceeded")
+            ),
+            "a cap overrun is a disturbance to re-measure, not a number to bank"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(5),
             "the fan-in returns at the deadline, not at the CI job ceiling"
@@ -2442,7 +2448,7 @@ mod tests {
     #[test]
     fn a_desync_is_retried_until_the_bound_and_a_final_error_never_loops() {
         let mut calls = 0usize;
-        let recovered = remeasure_disturbed(REMEASURE_ATTEMPTS, || {
+        let recovered = remeasure_disturbed(REMEASURE_ATTEMPTS, REMEASURE_BUDGET, || {
             calls += 1;
             if calls < 2 {
                 Err(Error::Desync {
@@ -2460,7 +2466,7 @@ mod tests {
         );
 
         calls = 0;
-        let stuck = remeasure_disturbed(REMEASURE_ATTEMPTS, || {
+        let stuck = remeasure_disturbed(REMEASURE_ATTEMPTS, REMEASURE_BUDGET, || {
             calls += 1;
             Err::<(), Error>(Error::Desync { flow: 0, offset: 7 })
         });
@@ -2474,7 +2480,7 @@ mod tests {
         );
 
         calls = 0;
-        let fatal = remeasure_disturbed(REMEASURE_ATTEMPTS, || {
+        let fatal = remeasure_disturbed(REMEASURE_ATTEMPTS, REMEASURE_BUDGET, || {
             calls += 1;
             Err::<(), Error>(Error::Engine {
                 message: "cannot spawn".into(),
@@ -2506,7 +2512,7 @@ mod tests {
         );
 
         let mut calls = 0usize;
-        let real = remeasure_disturbed(REMEASURE_ATTEMPTS, || {
+        let real = remeasure_disturbed(REMEASURE_ATTEMPTS, REMEASURE_BUDGET, || {
             calls += 1;
             Err::<(), Error>(Error::Workload(
                 "moved 0 of 100 bytes: no flow reported why it stopped".into(),
@@ -2519,7 +2525,7 @@ mod tests {
         assert_eq!(calls, 1, "and is never retried");
 
         calls = 0;
-        let storm = remeasure_disturbed(REMEASURE_ATTEMPTS, || {
+        let storm = remeasure_disturbed(REMEASURE_ATTEMPTS, REMEASURE_BUDGET, || {
             calls += 1;
             Err::<(), Error>(Error::Transient(saturated.into()))
         });
@@ -2529,6 +2535,26 @@ mod tests {
             "the bound converts a persistent storm, reason and all, never a number: {storm:?}"
         );
         assert_eq!(calls, REMEASURE_ATTEMPTS, "exactly the bound ran");
+    }
+
+    /// The second bound: a stalled attempt costs the full run cap, so a repeat whose wall time runs past the budget converts even while attempts remain - the re-measure cannot spend the cell's CI window. A slow-disturbed closure with a 100 ms budget converts after the first retry sleep swallows it.
+    #[test]
+    fn the_time_budget_stops_re_measuring_before_the_attempt_bound() {
+        let mut calls = 0usize;
+        let stuck = remeasure_disturbed(10, Duration::from_millis(100), || {
+            calls += 1;
+            std::thread::sleep(Duration::from_millis(10));
+            Err::<(), Error>(Error::Transient("workload exceeded the 120s cap".into()))
+        });
+        assert!(
+            matches!(&stuck, Err(Error::Workload(m))
+                if m.contains("survives every retry") && m.contains("exceeded the 120s cap")),
+            "the budget converts the stall, never banks it: {stuck:?}"
+        );
+        assert_eq!(
+            calls, 2,
+            "one attempt fits the budget, the second converts on its elapsed check"
+        );
     }
 
     #[test]
