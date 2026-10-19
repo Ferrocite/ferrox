@@ -501,15 +501,22 @@ fn qpack_name<'a>(block: &'a [u8], at: &mut usize) -> Option<Literal<'a>> {
     Some(Literal::Owned(out))
 }
 
+/// One QPACK literal field line: the `001` pattern, the name's three-bit length, the value's seven-bit length and nothing Huffman-coded. A value handed over in runs goes on the wire as one field with nothing joined first.
+fn qpack_line(out: &mut Vec<u8>, name: &str, value: &[&[u8]]) {
+    out.push(0x20);
+    integer_into(out, 3, name.len());
+    out.extend_from_slice(name.as_bytes());
+    integer(out, 7, 0x00, value.iter().map(|run| run.len()).sum());
+    for run in value {
+        out.extend_from_slice(run);
+    }
+}
+
 /// Any request as literal field lines: two zero prefix bytes name no dynamic state, and each field is a `001` name length, name, value length and value run with no Huffman to compute.
 pub fn qpack_literal_many(fields: &[(&str, &str)], out: &mut Vec<u8>) {
     out.extend_from_slice(&[0x00, 0x00]);
     for (name, value) in fields {
-        out.push(0x20);
-        integer_into(out, 3, name.len());
-        out.extend_from_slice(name.as_bytes());
-        integer(out, 7, 0x00, value.len());
-        out.extend_from_slice(value.as_bytes());
+        qpack_line(out, name, &[value.as_bytes()]);
     }
 }
 
@@ -564,17 +571,12 @@ pub fn hpack_connect(target: &str, bearer: &str, out: &mut Vec<u8>) {
     out.extend_from_slice(bearer.as_bytes());
 }
 
-/// The same three fields under QPACK: a required insert count of zero, fields named with the `001` literal pattern, and one allocation joining the scheme the edge answers to the token, since a bare token is a 400.
+/// The same three fields under QPACK: a required insert count of zero, fields named with the `001` literal pattern, and the scheme the edge answers written ahead of the token rather than joined onto it, since a bare token is a 400.
 pub fn qpack_connect(target: &str, bearer: &str, out: &mut Vec<u8>) {
-    let bearer = format!("Bearer {bearer}");
-    qpack_literal_many(
-        &[
-            (":method", "CONNECT"),
-            (":authority", target),
-            ("proxy-authorization", bearer.as_str()),
-        ],
-        out,
-    );
+    out.extend_from_slice(&[0x00, 0x00]);
+    qpack_line(out, ":method", &[b"CONNECT"]);
+    qpack_line(out, ":authority", &[target.as_bytes()]);
+    qpack_line(out, "proxy-authorization", &[b"Bearer ", bearer.as_bytes()]);
 }
 
 #[cfg(test)]
@@ -1223,6 +1225,47 @@ mod tests {
         assert_eq!(h2, hex("00073a6d 6574686f 6407434f 4e4e4543 54000a3a 61757468 6f726974 790f6578 616d706c 652e636f 6d3a3434 33001370 726f7879 2d617574 686f7269 7a617469 6f6e0842 65617265 722070"));
         assert_eq!(q3, hex("00002700 3a6d6574 686f6407 434f4e4e 45435427 033a6175 74686f72 6974790f 6578616d 706c652e 636f6d3a 34343327 0c70726f 78792d61 7574686f 72697a61 74696f6e 08426561 72657220 70"));
         assert_eq!((h2.len(), q3.len()), (75, 77));
+    }
+
+    /// A CONNECT block used to `format!` the bearer scheme onto the token before writing it, so every h3 lane open paid a `String` and a copy of the token to write one field the encoder can put on the wire in two runs.
+    #[test]
+    fn a_connect_block_is_written_without_touching_the_heap() {
+        let mid = "t".repeat(120);
+        let over = "t".repeat(121);
+        let long = "t".repeat(300);
+        for token in ["", "p", mid.as_str(), over.as_str(), long.as_str()] {
+            let joined_value = format!("Bearer {token}");
+            let mut joined = Vec::new();
+            qpack_literal_many(
+                &[
+                    (":method", "CONNECT"),
+                    (":authority", "example.com:443"),
+                    ("proxy-authorization", joined_value.as_str()),
+                ],
+                &mut joined,
+            );
+            let mut split = Vec::new();
+            qpack_connect("example.com:443", token, &mut split);
+            assert_eq!(joined, split, "two runs write what one joined value wrote");
+        }
+        let mut out = Vec::with_capacity(192);
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                out.clear();
+                qpack_connect(
+                    std::hint::black_box("example.com:443"),
+                    std::hint::black_box("the-pass-which-is-long-enough"),
+                    &mut out,
+                );
+                std::hint::black_box(&out);
+            }
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "4096 CONNECT blocks take no heap: the caller's buffer holds the block and nothing is joined first"
+        );
+        assert_eq!(out.capacity(), 192, "the caller's buffer never grew");
     }
 
     #[test]
