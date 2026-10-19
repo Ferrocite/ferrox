@@ -35,6 +35,9 @@ pub const TOKEN_TTL: u64 = 7 * 24 * 3600;
 pub const SERVERS_TTL: u64 = 12 * 3600;
 pub const RESERVE_TTL: u64 = 24 * 3600;
 
+/// How soon a plane that could not be reached at all is asked again while the answer it already gave keeps the lane running: an outage costs the flows in this window nothing, and a recovered plane is back inside it.
+pub const PLANE_RETRY: u64 = 30;
+
 /// The pause before the next domain attempt, and the wall the whole request runs out against: a dead network has to surface as an error, not as a lane that hangs.
 pub const BACKOFF: [u64; 5] = [1, 2, 4, 8, 10];
 pub const REQUEST_BUDGET: u64 = 120;
