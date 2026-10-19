@@ -519,7 +519,9 @@ pub(crate) enum Carrier {
     Kcp(ferrox_core::kcp::Config),
     Hysteria(ferrox_core::hysteria::Config),
     Masque,
-    Xdrive,
+    Xdrive {
+        settings: Box<crate::xdrive::Settings>,
+    },
     Http,
     Unknown {
         network: String,
@@ -704,8 +706,16 @@ fn resolve_masque(_: Option<&Json>, _: &str) -> Carrier {
     Carrier::Masque
 }
 
-fn resolve_xdrive(_: Option<&Json>, _: &str) -> Carrier {
-    Carrier::Xdrive
+/// A folder the tree can reach, or no folder at all: an xdrive carrier that cannot name its store is refused rather than dialled at a default.
+fn resolve_xdrive(settings: Option<&Json>, network: &str) -> Carrier {
+    crate::xdrive::Settings::from_json(settings).map_or(
+        Carrier::Unknown {
+            network: network.to_owned(),
+        },
+        |settings| Carrier::Xdrive {
+            settings: Box::new(settings),
+        },
+    )
 }
 
 fn resolve_http(_: Option<&Json>, _: &str) -> Carrier {
@@ -1106,7 +1116,7 @@ pub(crate) fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, Stri
         Carrier::Kcp(_) => "kcpSettings",
         Carrier::Hysteria(_) => "hysteriaSettings",
         Carrier::Masque => "masqueSettings",
-        Carrier::Xdrive => "xdriveSettings",
+        Carrier::Xdrive { .. } => "xdriveSettings",
         Carrier::Unknown { .. } | Carrier::Raw(_) | Carrier::Http => "",
     };
     let host = settings
