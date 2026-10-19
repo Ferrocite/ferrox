@@ -83,7 +83,7 @@ fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
 }
 
 /// One turn of the quiche wheel with the lock held for quiche calls only, never for the socket wait between them — the shape the pool's pump takes, so a writer's one `send_all` is never starved by a reader's polling.
-fn drive_once(session: &Session, wait: Duration, applied: &mut Option<Duration>) -> bool {
+fn drive_once(session: &Session, wait: Duration) -> bool {
     let timeout = {
         let Ok(conn) = session.shared.lock() else {
             return false;
@@ -95,7 +95,7 @@ fn drive_once(session: &Session, wait: Duration, applied: &mut Option<Duration>)
             .map_or(wait, |left| left.min(wait))
             .max(Duration::from_millis(1))
     };
-    if !crate::proxy::refresh_read_timeout(&session.sock, timeout, applied) {
+    if !session.sock.refresh_read_timeout(timeout) {
         return false;
     }
     let mut room = Unfilled::<MAX_DATAGRAM>::new();
@@ -138,7 +138,6 @@ fn drive_once(session: &Session, wait: Duration, applied: &mut Option<Duration>)
 fn recv_reply(session: &Session, stream: u64, deadline: Instant) -> Option<[u8; 2]> {
     let mut room = Unfilled::<2>::new();
     let mut got = 0usize;
-    let mut applied = None;
     while got < 2 {
         let read = {
             let Ok(mut conn) = session.shared.lock() else {
@@ -156,7 +155,7 @@ fn recv_reply(session: &Session, stream: u64, deadline: Instant) -> Option<[u8; 
             if Instant::now() >= deadline {
                 return None;
             }
-            let _ = drive_once(session, STREAM_POLL, &mut applied);
+            let _ = drive_once(session, STREAM_POLL);
         }
     }
     let reply = room.as_mut();
@@ -166,7 +165,6 @@ fn recv_reply(session: &Session, stream: u64, deadline: Instant) -> Option<[u8; 
 fn read_headers_block(session: &Session, stream: u64, deadline: Instant) -> Option<Vec<u8>> {
     let mut head = Vec::with_capacity(128);
     let mut room = Unfilled::<4096>::new();
-    let mut applied = None;
     loop {
         if head.len() >= HEAD_CAP || Instant::now() >= deadline {
             return None;
@@ -196,7 +194,7 @@ fn read_headers_block(session: &Session, stream: u64, deadline: Instant) -> Opti
         if let Some(n) = read {
             head.extend_from_slice(&room.as_mut()[..n]);
         } else {
-            let _ = drive_once(session, STREAM_POLL, &mut applied);
+            let _ = drive_once(session, STREAM_POLL);
         }
     }
 }
@@ -347,7 +345,6 @@ impl Read for Flow {
             self.at += n;
             return Ok(n);
         }
-        let mut applied = None;
         loop {
             let read = {
                 let Ok(mut conn) = self.session.shared.lock() else {
@@ -366,7 +363,7 @@ impl Read for Flow {
                 return Ok(n);
             }
             if self.drive {
-                let _ = drive_once(&self.session, STREAM_POLL, &mut applied);
+                let _ = drive_once(&self.session, STREAM_POLL);
                 continue;
             }
             {
@@ -1427,10 +1424,9 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
 
 /// Drive the connection and hand every whole datagram of the flow being relayed back to the relay socket, re-wrapped in the socks5 UDP frame the client sent its first packet in. The drive stays `drive_once`'s, shared with the TCP pump, so writer and reader take the connection lock in the same one-turn shape and neither holds it across a socket wait; the `UDP_POLL` bound is how long a stop flag outlives the reader, since a UDP socket has no shutdown to wake a blocked read.
 fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpSocket) {
-    let mut applied = None;
     let mut reply = Vec::with_capacity(3 + 25 + UDP_TARGET_BUF);
     loop {
-        if stop.load(Ordering::Relaxed) || !drive_once(session, UDP_POLL, &mut applied) {
+        if stop.load(Ordering::Relaxed) || !drive_once(session, UDP_POLL) {
             break;
         }
         let Ok(mut conn) = session.shared.lock() else {

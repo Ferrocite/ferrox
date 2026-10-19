@@ -500,10 +500,7 @@ pub(crate) fn pump_once(
     wait: Duration,
 ) -> bool {
     let timer = conn.timeout().map_or(wait, |left| left.min(wait));
-    if sock
-        .set_read_timeout(Some(timer.max(Duration::from_millis(1))))
-        .is_err()
-    {
+    if !sock.refresh_read_timeout(timer.max(Duration::from_millis(1))) {
         return false;
     }
     let mut room = Unfilled::<MAX_DATAGRAM>::new();
@@ -518,7 +515,7 @@ pub(crate) fn pump_once(
                 taken += 1;
                 // Re-armed once the packet the visit waited for lands: what follows is queued and costs no wait, or is not coming yet and the caller's deadline should wait for it; a failed re-arm leaves the first arm in place.
                 if taken == 1 {
-                    let _ = sock.set_read_timeout(Some(PUMP_TAIL));
+                    let _ = sock.refresh_read_timeout(PUMP_TAIL);
                 }
                 if taken == PUMP_BURST {
                     break;
@@ -833,6 +830,9 @@ fn receive_buffer(sock: &UdpSocket) -> i32 {
     }
 }
 
+/// What a datagram socket is armed to wait for: `Some(None)` blocks forever, `Some(Some(d))` waits `d`, and `None` records no arm yet.
+type Arm = Option<Option<Duration>>;
+
 /// One datagram socket: a relay or an obfuscation below changes no handshake, frame or stream above, so the hops live here.
 pub(crate) struct Datagram {
     sock: UdpSocket,
@@ -846,6 +846,10 @@ pub(crate) struct Datagram {
     /// the way out and reassembled on the way in, masking still salamander's. Shared
     /// behind an `Arc` so the reassembly table and message counter are one owner.
     gecko: Option<Arc<Gecko>>,
+    /// The read wait this file description carries, shared behind an `Arc` because
+    /// `SO_RCVTIMEO` belongs to the socket and not the handle: a wait remembered per
+    /// holder lets the next read by another holder skip an arm the first one undid.
+    armed: Arc<Mutex<Arm>>,
 }
 
 /// Where datagrams go. The association's control connection is held, never read: dropping it ends it.
@@ -1333,6 +1337,7 @@ impl Datagram {
             obfs: None,
             hop: None,
             gecko: None,
+            armed: Arc::default(),
         }
     }
 
@@ -1344,6 +1349,7 @@ impl Datagram {
             obfs: Some(obfs),
             hop: None,
             gecko: None,
+            armed: Arc::default(),
         }
     }
 
@@ -1357,6 +1363,7 @@ impl Datagram {
             obfs: None,
             hop: None,
             gecko: None,
+            armed: Arc::default(),
         }
     }
 
@@ -1375,6 +1382,7 @@ impl Datagram {
             obfs: None,
             hop: None,
             gecko: Some(Arc::new(Gecko::new(handle, obfs, window))),
+            armed: Arc::default(),
         })
     }
 
@@ -1397,6 +1405,7 @@ impl Datagram {
             obfs,
             hop: Some(Arc::new(hopper)),
             gecko: None,
+            armed: Arc::default(),
         })
     }
 
@@ -1484,14 +1493,33 @@ impl Datagram {
             obfs: self.obfs.clone(),
             hop: self.hop.clone(),
             gecko: self.gecko.clone(),
+            armed: Arc::clone(&self.armed),
         })
     }
 
     pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) -> std::io::Result<()> {
-        if let Some(hop) = self.hop.as_ref() {
-            return hop.set_read_timeout(timeout);
+        // The arm and its record are one step under the shared cell, so a concurrent holder cannot leave the cell naming a wait the socket does not carry.
+        let guard = self.armed.lock();
+        let result = match self.hop.as_ref() {
+            Some(hop) => hop.set_read_timeout(timeout),
+            None => self.sock.set_read_timeout(timeout),
+        };
+        if let Ok(mut armed) = guard {
+            *armed = Some(timeout);
         }
-        self.sock.set_read_timeout(timeout)
+        result
+    }
+
+    /// Arm the read wait only when this file description does not already carry it: the record is shared by every handle of the socket, so an arm made through one cannot be skipped past by a read through another.
+    pub(crate) fn refresh_read_timeout(&self, want: Duration) -> bool {
+        if self
+            .armed
+            .lock()
+            .is_ok_and(|armed| *armed == Some(Some(want)))
+        {
+            return true;
+        }
+        self.set_read_timeout(Some(want)).is_ok()
     }
 }
 
@@ -1617,7 +1645,6 @@ fn pump(
     // One lock per 32 KiB rather than per 8: the drain is the connection's busiest shared path, and every pass pays the mutex twice.
     let mut chunk = vec![0u8; 32768];
     let mut buf = [0u8; MAX_DATAGRAM];
-    let mut applied: Option<Duration> = None;
     loop {
         // The lock covers quiche calls only: a stalled peer must not stall the sessions sharing the connection.
         let timeout = {
@@ -1631,7 +1658,7 @@ fn pump(
                 .map_or(PUMP_POLL, |left| left.min(PUMP_POLL))
                 .max(Duration::from_millis(1))
         };
-        if !crate::proxy::refresh_read_timeout(sock, timeout, &mut applied) {
+        if !sock.refresh_read_timeout(timeout) {
             return;
         }
         let incoming = match sock.recv_from(&mut buf) {
@@ -2200,7 +2227,6 @@ pub(crate) fn serve_loop(
         buf: [0u8; MAX_DATAGRAM],
         out: [0u8; MAX_DATAGRAM],
     };
-    let mut applied: Option<Duration> = None;
     while !stop.load(Ordering::Relaxed) {
         let start = Instant::now();
         let mut wait = Duration::from_millis(100);
@@ -2213,11 +2239,8 @@ pub(crate) fn serve_loop(
             }
         }
         wait = wait.max(Duration::from_millis(1));
-        if applied != Some(wait) {
-            if sock.set_read_timeout(Some(wait)).is_err() {
-                return;
-            }
-            applied = Some(wait);
+        if !sock.refresh_read_timeout(wait) {
+            return;
         }
         match sock.recv_from(&mut scratch.buf) {
             Ok((n, from)) => route(&sock, local, config, &mut conns, &mut scratch, n, from),
@@ -2995,6 +3018,35 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_millis(250),
             "the visit ended with the queue, not with the arm"
+        );
+    }
+
+    /// The record of the armed wait belongs to the file description, not the handle: `SO_RCVTIMEO` is shared by a socket and every clone of it, so a clone that kept its own record would arm nothing.
+    #[test]
+    fn a_clone_carries_the_socket_it_was_cloned_from_one_arm_record() {
+        let sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
+        let clone = sock.try_clone().expect("clones");
+        assert!(
+            Arc::ptr_eq(&sock.armed, &clone.armed),
+            "the second handle kept a record of a wait the socket does not carry"
+        );
+    }
+
+    /// Two handles over one lane socket, each polling on its own budget — the shape of a pooled `pump` beside a flow's `pump_once`, or a hysteria reader beside its TCP pump. The read that asks for the long wait has to get it even though the other handle armed the socket short in between; a per-handle record skips that arm and the reader returns in the other's milliseconds.
+    #[test]
+    fn a_wait_undone_by_another_handle_is_armed_again_before_the_read() {
+        let sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
+        assert!(sock.refresh_read_timeout(Duration::from_millis(400)));
+        let other = sock.try_clone().expect("clones");
+        assert!(other.refresh_read_timeout(Duration::from_millis(4)));
+        assert!(sock.refresh_read_timeout(Duration::from_millis(400)));
+        let started = Instant::now();
+        let quiet = sock.recv_from(&mut [0u8; MAX_DATAGRAM]);
+        let waited = started.elapsed();
+        assert!(quiet.is_err(), "an empty socket does not answer");
+        assert!(
+            waited >= Duration::from_millis(100),
+            "the read waited {waited:?}, not the arm it asked for"
         );
     }
 }
