@@ -8776,7 +8776,6 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
     let mut peer_write = peer_write;
     // The stall the buffered copy already arms, once per leg outside the byte loop: a peer that reads none of the download would otherwise pin this leg's read, and the join behind it, for the life of the process.
     let stall = budgets::relay_stall();
-    let _ = peer_write.set_write_timeout(Some(stall));
     let read_arm = peer_read.read_timeout().ok().flatten().or(Some(stall));
     let _ = peer_read.set_read_timeout(read_arm);
     let ended = Arc::new(AtomicBool::new(false));
@@ -8853,13 +8852,15 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
 }
 
 /// The upload leg of an ordered carried relay: the carrier's reader into the peer's write half,
-/// ending on that leg's own stream error or on the sibling's give-up, whichever the arm reports.
+/// armed with the stall it reports, ending on that leg's own stream error or on the sibling's
+/// give-up, whichever the arm reports.
 fn carry_upload<R: Read>(
     reader: &mut R,
     peer_write: &mut Connection,
     ended: &AtomicBool,
     stall: Duration,
 ) {
+    let _ = peer_write.set_write_timeout(Some(stall));
     let mut buf = RelayBuf::new();
     let mut first = true;
     loop {
