@@ -3,9 +3,10 @@
 #
 #   ferrox-cli login                           save the foxy account once (0600)
 #   ferrox-cli up --foxy --vpn                 the Foxy lane, whole-device proxy
+#   ferrox-cli up --veepn --vpn                the VeePN lane, no account needed
 #   ferrox-cli up --vless 'vless://...'        any vless share link
 #   ferrox-cli up --config mine.json           any config the binary serves
-#   ferrox-cli down | status | ports | tun
+#   ferrox-cli down | status | ports | tun | version
 #
 # In a release package this script sits beside the binary and runs it; in the
 # repository it runs what `cargo build --release` last produced.
@@ -52,9 +53,16 @@ EMAIL=""
 PASSWORD=""
 CODE=""
 COUNTRY="US"
+COUNTRY_SET=0
 CITY=""
 CARRIER="auto"
 UPSTREAM=""
+# VeePN has no account and no server: an empty region lets the plane pick, and
+# the device id is kept under $CONF_DIR so a restart is the same device.
+REGION=""
+VEEPN_DOMAINS=""
+VEEPN_UDID=""
+PROBE_TIMEOUT=20
 FRONTS="socks,http,mixed"
 SOCKS_PORT="${FOXY_SOCKS_PORT:-10808}"
 HTTP_PORT="${FOXY_HTTP_PORT:-8080}"
@@ -65,6 +73,21 @@ DEBUG=0
 die() { echo "ferrox-cli: $*" >&2; exit 1; }
 say() { printf '%s\n' "$*"; }
 rule() { printf '%s\n' "----------------------------------------------------------------"; }
+
+# A flag that takes a value must have one. `shift 2` on a lone flag fails
+# without consuming it, and the parse loop would ask the same question forever.
+# Say what is missing and stop before a running lane is touched.
+need_value() {
+  local flag="$1" hint="$2" have="$3" value="${4:-}"
+  [ "$have" -ge 2 ] && [ -n "$value" ] && return 0
+  if [ "$flag" = --vless ]; then
+    die "--vless needs a vless:// share link; nothing was started.
+  example: ferrox-cli up --vless 'vless://uuid@host:443?type=ws&security=tls&sni=host&path=/ws'
+  a config instead: ferrox-cli up --config mine.json
+  no server to name: ferrox-cli up --foxy   or   ferrox-cli up --veepn"
+  fi
+  die "$flag needs $hint; nothing was started (see --help)."
+}
 
 usage() {
   cat <<EOF
@@ -78,6 +101,7 @@ commands
   status     show the lane, then the exit IP through the SOCKS front
   ports      print the port map and the macOS settings to type
   tun        what TUN mode would need, and why this binary refuses it
+  version    print the release binary's version
 
 three commands from a fresh package (the foxy lane needs no server: the edge
 comes from Mozilla's catalogue, and --country moves the exit; with no account
@@ -86,8 +110,12 @@ stored yet, the first up --foxy simply asks for the email and password):
   ferrox-cli status                             # exit IP and country
   ferrox-cli down                               # stop, clear the system proxy
 
+and from the same fresh package, with nothing to type in at all:
+  ferrox-cli up --veepn --vpn                   # anonymous, no account, no server
+
 outbound (choose one)
   --foxy                 Foxy lane; account from \$FOXY_CREDENTIALS
+  --veepn                VeePN lane; anonymous, no account and no server
   --vless LINK           a vless:// share link (tcp, ws, grpc, httpupgrade, xhttp)
   --vmess HOST:PORT --uuid ID
   --trojan HOST:PORT --password PW
@@ -103,6 +131,12 @@ foxy options (email + password is the whole setup; there is no server to name)
   --carrier NAME         auto|h1|h2|h3, default auto (h3 first)
   --upstream URL         http:// or socks5(h):// hop to reach the edge through
 
+veepn options (nothing is required: the plane names the region and its edges)
+  --region CC            exit region id (lowercase, e.g. nl, us-va), else the plane picks
+  --country CC           an alias for --region on this lane
+  --domains URLS         comma-separated https origins to ask, else the shipped seven
+  --udid ID              the device identity the plane sees, else one kept per machine
+
 fronts
   --fronts LIST          socks,http,mixed (default all three)
   --socks PORT           default $SOCKS_PORT
@@ -112,6 +146,7 @@ fronts
   --debug                keep the lane's dial trace in the log (FOXY_DEBUG=1)
   --tun                  refused: this binary has no utun device
   -h, --help             this text
+  -V, --version          print the release binary's version
 
 ports (defaults)
   SOCKS5         127.0.0.1:$SOCKS_PORT    curl --socks5-hostname, UDP-aware
@@ -202,6 +237,50 @@ if upstream:
 if code:
     settings["code"] = code
 print(json.dumps({"protocol": "foxy", "settings": settings}))
+PY
+}
+
+# --region wins, --country is the alias, and an empty answer means the plane picks.
+# The plane's own codes are lowercase region ids (`nl`, `us-va`) and its list ask
+# is case-sensitive, so what was typed is lowered rather than passed as typed.
+effective_region() {
+  local region="$REGION"
+  if [ -z "$region" ] && [ "$COUNTRY_SET" = 1 ]; then region="$COUNTRY"; fi
+  printf '%s' "$region" | tr '[:upper:]' '[:lower:]'
+}
+
+# The plane counts devices by the id the launch carries, so it is kept: a fresh
+# one per launch reads as a new device every time.
+stable_udid() {
+  [ -n "$VEEPN_UDID" ] && { printf '%s' "$VEEPN_UDID"; return 0; }
+  local file="$CONF_DIR/veepn.udid" value=""
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
+  if [ -f "$file" ]; then value="$(tr -d '[:space:]' < "$file" 2>/dev/null)"; fi
+  if [ -z "$value" ]; then
+    value="$(python3 -c 'import uuid; print(uuid.uuid4())')" || die "cannot mint a device id"
+    ( umask 077; printf '%s\n' "$value" > "$file" )
+  fi
+  printf '%s' "$value"
+}
+
+# The VeePN outbound: no account, no server, and only the fields that were asked for.
+veepn_outbound() {
+  local region udid
+  region="$(effective_region)"
+  udid="$(stable_udid)" || return 1
+  python3 - "$region" "$VEEPN_DOMAINS" "$udid" <<'PY'
+import json, sys
+
+region, domains, udid = sys.argv[1:4]
+settings = {}
+if region:
+    settings["region"] = region
+listed = [url.strip() for url in domains.split(",") if url.strip()]
+if listed:
+    settings["domains"] = listed
+if udid:
+    settings["udid"] = udid
+print(json.dumps({"protocol": "veepn", "settings": settings}))
 PY
 }
 
@@ -303,6 +382,8 @@ hostport, uuid, network = sys.argv[1:4]
 host, _, port = hostport.rpartition(":")
 if not host or not port.isdigit():
     sys.exit("--vmess wants HOST:PORT and --uuid ID")
+if not uuid:
+    sys.exit("--vmess needs --uuid ID as well, e.g. ferrox-cli up --vmess host:443 --uuid UUID")
 stream = {"network": network or "tcp"}
 print(json.dumps({
     "protocol": "vmess",
@@ -320,6 +401,8 @@ hostport, password = sys.argv[1:3]
 host, _, port = hostport.rpartition(":")
 if not host or not port.isdigit():
     sys.exit("--trojan wants HOST:PORT and --password PW")
+if not password:
+    sys.exit("--trojan needs --password PW as well, e.g. ferrox-cli up --trojan host:443 --password PW")
 print(json.dumps({
     "protocol": "trojan",
     "settings": {"servers": [{"address": host, "port": int(port), "password": password}]},
@@ -334,6 +417,8 @@ hostport, method, password = sys.argv[1:4]
 host, _, port = hostport.rpartition(":")
 if not host or not port.isdigit():
     sys.exit("--ss wants HOST:PORT, --method and --password")
+if not password:
+    sys.exit("--ss needs --password PW as well, e.g. ferrox-cli up --ss host:8388 --password PW")
 print(json.dumps({
     "protocol": "shadowsocks",
     "settings": {"servers": [{"address": host, "port": int(port),
@@ -430,6 +515,14 @@ port_map() {
   done
 }
 
+# One converter, one sentence: a refusal says what is missing and prints no
+# second line restating it.
+build_outbound() {
+  local lane="$1" json
+  json="$("${lane}_outbound" 2>&1)" || die "$json"
+  printf '%s' "$json"
+}
+
 build_config() {
   local outbound
   case "$OUTBOUND" in
@@ -446,27 +539,51 @@ build_config() {
       fi
       outbound="$(foxy_outbound)" || die "cannot build the foxy outbound"
       ;;
-    vless) outbound="$(vless_outbound)" || die "cannot read the vless link" ;;
-    vmess) outbound="$(vmess_outbound)" || die "cannot build the vmess outbound" ;;
-    trojan) outbound="$(trojan_outbound)" || die "cannot build the trojan outbound" ;;
-    ss) outbound="$(ss_outbound)" || die "cannot build the shadowsocks outbound" ;;
+    vless)
+      case "$VLESS" in
+        vless://*) ;;
+        *) die "--vless wants a vless:// share link, got '$VLESS'; nothing was started.
+  example: ferrox-cli up --vless 'vless://uuid@host:443?type=ws&security=tls&sni=host&path=/ws'" ;;
+      esac
+      outbound="$(build_outbound vless)" || exit 1
+      ;;
+    veepn) outbound="$(build_outbound veepn)" || exit 1 ;;
+    vmess) outbound="$(build_outbound vmess)" || exit 1 ;;
+    trojan) outbound="$(build_outbound trojan)" || exit 1 ;;
+    ss) outbound="$(build_outbound ss)" || exit 1 ;;
     config)
       [ -f "$CONFIG_FILE" ] || die "no such config: $CONFIG_FILE"
       CFG="$CONFIG_FILE"
       return 0
       ;;
-    *) die "choose an outbound: --foxy, --vless, --vmess, --trojan, --ss or --config" ;;
+    *)
+      cat >&2 <<EOF
+ferrox-cli: no outbound chosen; nothing was started.
+  --foxy                 account only, no server to name (asks once)
+  --veepn                anonymous: no account and no server
+  --vless 'vless://...'  a share link
+  --vmess HOST:PORT --uuid ID
+  --trojan HOST:PORT --password PW
+  --ss HOST:PORT --method METHOD --password PW
+  --config FILE          any JSON config this binary serves
+Run 'ferrox-cli up --foxy --vpn' for the shortest path, or --help for the menu.
+EOF
+      exit 2
+      ;;
   esac
   write_config "$outbound" || die "cannot write $CFG"
 }
 
 start_lane() {
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
+  # Validate first: an invocation that cannot start must not stop a healthy lane,
+  # and a bad link must not send the user to a build before saying what is wrong.
+  build_config
+  require_bin
   if lane_running; then
     say "a lane is already running (pid $(lane_pid)); stopping it first."
     stop_lane 0
   fi
-  build_config
   if [ "$DEBUG" = 1 ]; then
     FOXY_DEBUG=1 "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
   else
@@ -494,9 +611,20 @@ stop_lane() {
 probe_front() {
   local front="$1" port="$2"
   if [ "$front" = socks ]; then
-    curl -s --noproxy '' --max-time 20 --socks5-hostname "127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null
+    curl -s --noproxy '' --max-time "$PROBE_TIMEOUT" --socks5-hostname "127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null
   else
-    curl -s --noproxy '' --max-time 20 -x "http://127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null
+    curl -s --noproxy '' --max-time "$PROBE_TIMEOUT" -x "http://127.0.0.1:$port" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null
+  fi
+}
+
+# A VeePN edge is a free pool with its own blocklist, so a refused trace host is
+# not proof about the lane: a plain 200 is what says the flow got through.
+probe_plain() {
+  local front="$1" port="$2"
+  if [ "$front" = socks ]; then
+    curl -s --noproxy '' --max-time "$PROBE_TIMEOUT" --socks5-hostname "127.0.0.1:$port" http://example.com/ 2>/dev/null
+  else
+    curl -s --noproxy '' --max-time "$PROBE_TIMEOUT" -x "http://127.0.0.1:$port" http://example.com/ 2>/dev/null
   fi
 }
 
@@ -519,6 +647,33 @@ diagnose() {
   else
     say "the lane log stayed empty even with the trace on: nothing was dialled,"
     say "so the front refused the request before any carrier was tried."
+    return 0
+  fi
+  # The VeePN lane has no account and no edge it configures: every refusal it
+  # writes is about the plane or the region, so its three shapes are its own.
+  if [ "$OUTBOUND" = veepn ]; then
+    if grep -q "answers 422" "$LOG"; then
+      say "diagnosis: the plane does not list the region that was named. Its free pool"
+      say "uses lowercase ids (nl, us-va, gb-lnd); leaving --region off lets the plane"
+      say "name the fastest one it serves."
+    elif grep -q "refuses its pairs" "$LOG"; then
+      say "diagnosis: an edge refused the pair the plane listed, so the lane dropped"
+      say "the region's list; run up again, or move the exit with --region CC."
+    elif grep -q "refused by the edge" "$LOG"; then
+      say "diagnosis: the edge answered that it will not carry this target. The pair"
+      say "and the region are healthy; the host is what was refused."
+    elif grep -q "relay forward ended after" "$LOG" && ! grep -qE "relay backward ended after [1-9]" "$LOG"; then
+      say "diagnosis: an edge granted the CONNECT and then closed the tunnel without"
+      say "returning a byte, so the plane, the region and the pair are healthy: this"
+      say "network's path to the edge's relay is what drops the flow."
+    elif grep -q "declined" "$LOG"; then
+      say "diagnosis: every upstream the region listed declined. That is this network"
+      say "failing to reach the plane's edges, not an account: try another region, or"
+      say "--domains with an origin this network reaches."
+    else
+      say "diagnosis: the plane answered no list this lane can dial; the lines above"
+      say "name the region and the reason."
+    fi
     return 0
   fi
   if grep -q "handshake with the edge failed" "$LOG"; then
@@ -561,6 +716,10 @@ verify_flow() {
   port="$(front_port_of "$front")"
   answer="$(probe_front "$front" "$port")"
   if ! printf '%s\n' "$answer" | grep -qE '^(ip|loc)='; then
+    if [ "$OUTBOUND" = veepn ] && probe_plain "$front" "$port" | grep -q 'Example Domain'; then
+      say "exit through $front: a plain HTTP flow answered."
+      return 0
+    fi
     say "NOT CONNECTED: the fronts are up, but no flow got through them."
     diagnose
     return 1
@@ -569,6 +728,16 @@ verify_flow() {
   # Any answer at all is not proof: this machine's own exit answers the same trace.
   want="$(printf '%s' "$COUNTRY" | tr '[:lower:]' '[:upper:]')"
   got="$(printf '%s\n' "$answer" | sed -n 's/^loc=//p' | tr '[:lower:]' '[:upper:]')"
+  # The plane's free pool may route outside the region it lists, so a pinned
+  # region that reads otherwise is named and the flow still counts as carried.
+  if [ "$OUTBOUND" = veepn ]; then
+    want="$(effective_region)"
+    got="$(printf '%s' "$got" | tr '[:upper:]' '[:lower:]')"
+    if [ -n "$want" ] && [ "$got" != "$want" ]; then
+      say "note: the exit reads ${got:-unreadable}, not the pinned $want; the plane's"
+      say "pool can route elsewhere, so the front is carrying the flow either way."
+    fi
+  fi
   if [ "$OUTBOUND" = foxy ] && [ "$got" != "$want" ]; then
     say "the exit reads ${got:-unreadable}, not the pinned $want: that is either another"
     say "country's edge or this machine's own address, so the lane is not carrying it."
@@ -679,6 +848,12 @@ One app instead of the whole system:
 EOF
 }
 
+action_version() {
+  require_bin
+  say "ferrox-cli at $SCRIPT_DIR"
+  "$BIN" version
+}
+
 action_tun() {
   cat <<EOF
 TUN mode is refused by this binary, by name, not by silence.
@@ -703,47 +878,66 @@ EOF
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    up|serve|down|status|ports|tun|login) ACTION="$1"; shift ;;
+    up|serve|down|status|ports|tun|login|version) ACTION="$1"; shift ;;
     --foxy) OUTBOUND=foxy; shift ;;
-    --vless) OUTBOUND=vless; VLESS="${2:-}"; shift 2 ;;
-    --vmess) OUTBOUND=vmess; VMESS="${2:-}"; shift 2 ;;
-    --uuid) VMESS_ID="${2:-}"; shift 2 ;;
-    --network) VMESS_NETWORK="${2:-}"; shift 2 ;;
-    --trojan) OUTBOUND=trojan; TROJAN="${2:-}"; shift 2 ;;
-    --ss) OUTBOUND=ss; SS="${2:-}"; shift 2 ;;
-    --method) SS_METHOD="${2:-}"; shift 2 ;;
-    --config) OUTBOUND=config; CONFIG_FILE="${2:-}"; shift 2 ;;
-    --email) EMAIL="${2:-}"; shift 2 ;;
-    --password) PASSWORD="${2:-}"; shift 2 ;;
-    --code) CODE="${2:-}"; shift 2 ;;
-    --country) COUNTRY="${2:-}"; shift 2 ;;
-    --city) CITY="${2:-}"; shift 2 ;;
-    --carrier) CARRIER="${2:-}"; shift 2 ;;
-    --upstream) UPSTREAM="${2:-}"; shift 2 ;;
-    --fronts) FRONTS="${2:-}"; shift 2 ;;
-    --socks) SOCKS_PORT="${2:-}"; shift 2 ;;
-    --http) HTTP_PORT="${2:-}"; shift 2 ;;
-    --mixed) MIXED_PORT="${2:-}"; shift 2 ;;
+    --veepn) OUTBOUND=veepn; shift ;;
+    --vless) need_value --vless "a vless:// share link" "$#" "${2:-}"; OUTBOUND=vless; VLESS="$2"; shift 2 ;;
+    --vmess) need_value --vmess "HOST:PORT" "$#" "${2:-}"; OUTBOUND=vmess; VMESS="$2"; shift 2 ;;
+    --uuid) need_value --uuid "the VMess user id" "$#" "${2:-}"; VMESS_ID="$2"; shift 2 ;;
+    --network) need_value --network "tcp or ws" "$#" "${2:-}"; VMESS_NETWORK="$2"; shift 2 ;;
+    --trojan) need_value --trojan "HOST:PORT" "$#" "${2:-}"; OUTBOUND=trojan; TROJAN="$2"; shift 2 ;;
+    --ss) need_value --ss "HOST:PORT" "$#" "${2:-}"; OUTBOUND=ss; SS="$2"; shift 2 ;;
+    --method) need_value --method "a shadowsocks method" "$#" "${2:-}"; SS_METHOD="$2"; shift 2 ;;
+    --config) need_value --config "a JSON config path" "$#" "${2:-}"; OUTBOUND=config; CONFIG_FILE="$2"; shift 2 ;;
+    --email) need_value --email "an email address" "$#" "${2:-}"; EMAIL="$2"; shift 2 ;;
+    --password) need_value --password "a password" "$#" "${2:-}"; PASSWORD="$2"; shift 2 ;;
+    --code) need_value --code "a two-factor code" "$#" "${2:-}"; CODE="$2"; shift 2 ;;
+    --country) need_value --country "a country code" "$#" "${2:-}"; COUNTRY="$2"; COUNTRY_SET=1; shift 2 ;;
+    --region) need_value --region "a region id" "$#" "${2:-}"; REGION="$2"; shift 2 ;;
+    --domains) need_value --domains "comma-separated origins" "$#" "${2:-}"; VEEPN_DOMAINS="$2"; shift 2 ;;
+    --udid) need_value --udid "a device id" "$#" "${2:-}"; VEEPN_UDID="$2"; shift 2 ;;
+    --city) need_value --city "a city code" "$#" "${2:-}"; CITY="$2"; shift 2 ;;
+    --carrier) need_value --carrier "auto, h1, h2 or h3" "$#" "${2:-}"; CARRIER="$2"; shift 2 ;;
+    --upstream) need_value --upstream "an http:// or socks5:// URL" "$#" "${2:-}"; UPSTREAM="$2"; shift 2 ;;
+    --fronts) need_value --fronts "a comma-separated front list" "$#" "${2:-}"; FRONTS="$2"; shift 2 ;;
+    --socks) need_value --socks "a port" "$#" "${2:-}"; SOCKS_PORT="$2"; shift 2 ;;
+    --http) need_value --http "a port" "$#" "${2:-}"; HTTP_PORT="$2"; shift 2 ;;
+    --mixed) need_value --mixed "a port" "$#" "${2:-}"; MIXED_PORT="$2"; shift 2 ;;
     --vpn) WANT_VPN=1; shift ;;
     --debug) DEBUG=1; shift ;;
     --tun) ACTION=tun; shift ;;
     -h|--help) usage; exit 0 ;;
+    -V|--version) ACTION=version; shift ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
 done
 
+# A VeePN flow pays a launch and a list before bytes move, so its first probe
+# waits longer than a lane that configures the server it dials.
+[ "$OUTBOUND" = veepn ] && PROBE_TIMEOUT=45
+
 # up and serve are the only actions that need the binary: down, status and
 # login must still work when it was never fetched.
 require_bin() {
-  [ -x "$BIN" ] || die "no binary at $BIN: unpack a release package beside this script (https://github.com/FerroxCo/ferrox/releases), or build one: cargo build --release -p ferrox-app"
+  [ -x "$BIN" ] && return 0
+  # In a checkout the binary is a build, not a download: build it once rather
+  # than send the reader to a release page for a lane this tree already has.
+  if [ -f "$ROOT/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
+    say "building ferrox-app (release, one time)..."
+    ( cd "$ROOT" && cargo build --locked --release -p ferrox-app ) >&2 || die "the build failed"
+    [ -x "$BIN" ] || die "the build finished but $BIN is still missing"
+    return 0
+  fi
+  die "no binary at $BIN: unpack a release package beside this script (https://github.com/FerroxCo/ferrox/releases), or build one: cargo build --release -p ferrox-app"
 }
 
 case "$ACTION" in
-  up) require_bin; action_up ;;
-  serve) require_bin; action_serve ;;
+  up) action_up ;;
+  serve) action_serve ;;
   login) action_login ;;
-  down) stop_lane 1; rm -f "$CFG"; say "lane stopped; the lane config (which carries the account) is removed." ;;
+  down) stop_lane 1; rm -f "$CFG"; say "lane stopped; the lane config is removed." ;;
   status) action_status ;;
   ports) action_ports ;;
   tun) action_tun ;;
+  version) action_version ;;
 esac
