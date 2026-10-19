@@ -25,6 +25,9 @@ step "dependency policy"
 step "comment trace"
 ./scripts/check-comments.sh
 
+step "merge markers"
+./scripts/check-merge-markers.sh
+
 step "fixture safety"
 ./scripts/check-fixture-safety.sh
 
