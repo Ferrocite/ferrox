@@ -545,12 +545,14 @@ impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RustlsServer
 
 /// Hand `parts` to a rustls writer in one `write_vectored` so the fragmenter sees one payload and emits one record; iterating `write_all` per part would emit one record per part.
 ///
-/// The framer hands at most `uuid | head | payload | padding` — four segments — and the
-/// camouflage head gather hands five, so they are laid out on the stack like
-/// [`RustlsProvider::write_parts`] does its two, rather than spending one heap `Vec<IoSlice>`
-/// on every framed write.
+/// The framer hands at most `uuid | head | payload | padding` — four segments — the
+/// camouflage head gather hands five, and a CONNECT request is seven runs of literal and
+/// caller text, so they are laid out on the stack like [`RustlsProvider::write_parts`] does
+/// its two, rather than spending one heap `Vec<IoSlice>` on every framed write.
 fn coalesce<W: Write + ?Sized>(writer: &mut W, parts: &[&[u8]]) -> std::io::Result<()> {
     let mut stack = [
+        std::io::IoSlice::new(&[]),
+        std::io::IoSlice::new(&[]),
         std::io::IoSlice::new(&[]),
         std::io::IoSlice::new(&[]),
         std::io::IoSlice::new(&[]),
@@ -1361,6 +1363,38 @@ mod tests {
         );
     }
 
+    /// A CONNECT request is seven runs of literal and caller text — wider than the camouflage
+    /// gather — and a repeated open still enters the allocator zero times: the request rides the
+    /// stack into one `write_vectored`, so no buffer is built to hold it first.
+    #[test]
+    fn the_connect_request_gathers_without_a_heap_buffer() {
+        let parts = crate::foxy::connect_request("example.com:443", "pass.jwt.value");
+        let want: usize = parts.iter().map(|part| part.len()).sum();
+        let mut recorder = SegmentRecorder { calls: 0, bytes: 0 };
+        // Three opens inside one window: a reclaim that stopped firing would show as a rising count.
+        let (result, counts) = crate::alloc_count::measure(|| {
+            let mut last = Ok(());
+            for _ in 0..3 {
+                last = coalesce(&mut recorder, &parts);
+            }
+            last
+        });
+        result.expect("coalesces");
+        assert_eq!(
+            counts.allocs, 0,
+            "seven segments ride the stack over every open, counted {counts:?}"
+        );
+        assert_eq!(
+            recorder.calls, 3,
+            "one `write_vectored` per request, so one record each"
+        );
+        assert_eq!(
+            recorder.bytes,
+            3 * want,
+            "the bytes the concatenated request carried, unchanged"
+        );
+    }
+
     /// Past the stack bound the same segments still go out in one call, and empty runs never
     /// reach the writer where a zero-length slice would stall `advance_slices`.
     #[test]
@@ -1368,10 +1402,19 @@ mod tests {
         let a = [1u8; 3];
         let b = [2u8; 4];
         let empty: [u8; 0] = [];
-        let parts: [&[u8]; 6] = [&a[..], &empty[..], &b[..], &empty[..], &a[..], &b[..]];
+        let parts: [&[u8]; 8] = [
+            &a[..],
+            &empty[..],
+            &b[..],
+            &empty[..],
+            &a[..],
+            &b[..],
+            &a[..],
+            &empty[..],
+        ];
         let mut recorder = SegmentRecorder { calls: 0, bytes: 0 };
         coalesce(&mut recorder, &parts).expect("coalesces");
-        assert_eq!(recorder.bytes, 3 + 4 + 3 + 4, "empty runs are dropped");
+        assert_eq!(recorder.bytes, 3 + 4 + 3 + 4 + 3, "empty runs are dropped");
         assert_eq!(recorder.calls, 1, "one record even past the stack bound");
     }
 }

@@ -157,13 +157,25 @@ pub const DEFAULT_WINDOW: u32 = 65_535;
 /// The frame size the reference asks the edge to use.
 pub const MAX_FRAME: u32 = 256 * 1024;
 
-/// What a CONNECT lane asks for at the start: a window big enough that a tunnel is not paced by a round trip, the largest frame the edge may send, and no push.
+/// What a CONNECT lane asks for at the start: a window big enough that a tunnel is not paced by a round trip, the largest frame the edge may send, and no push. Every dial asks for the same eighteen octets, so they are written down once instead of built per open.
+pub const CLIENT_SETTINGS: [u8; 18] = client_settings();
+
 #[must_use]
-pub fn client_settings() -> Vec<u8> {
-    let mut out = Vec::with_capacity(18);
-    for (id, value) in [(4u16, WINDOW), (5, MAX_FRAME), (2, 0)] {
-        out.extend_from_slice(&id.to_be_bytes());
-        out.extend_from_slice(&value.to_be_bytes());
+pub const fn client_settings() -> [u8; 18] {
+    let asks = [(4u16, WINDOW), (5u16, MAX_FRAME), (2u16, 0u32)];
+    let mut out = [0u8; 18];
+    let mut at = 0;
+    while at < asks.len() {
+        let (id, value) = asks[at];
+        let (id, value) = (id.to_be_bytes(), value.to_be_bytes());
+        out[at * 6] = id[0];
+        out[at * 6 + 1] = id[1];
+        let written = at * 6 + 2;
+        out[written] = value[0];
+        out[written + 1] = value[1];
+        out[written + 2] = value[2];
+        out[written + 3] = value[3];
+        at += 1;
     }
     out
 }
@@ -519,7 +531,7 @@ mod tests {
 
     #[test]
     fn the_client_settings_ask_for_a_window_a_frame_and_no_push() {
-        let settings = client_settings();
+        let settings = CLIENT_SETTINGS;
         assert_eq!(settings.len(), 18);
         let found: Vec<(u16, u32)> = (0..settings.len() / 6)
             .filter_map(|at| setting(&settings, at * 6))
