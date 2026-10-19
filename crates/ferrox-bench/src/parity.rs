@@ -2776,9 +2776,11 @@ mod tests {
             Some(first.clone()),
             "only the first forged byte is recorded"
         );
-        assert!(Error::Desync(first)
-            .to_string()
-            .contains("flow 5 on the upload"));
+        let text = Error::Desync(first).to_string();
+        assert!(
+            text.contains("flow 5") && text.contains("byte 8192") && text.contains("on the upload"),
+            "{text}"
+        );
     }
 
     /// The sink's upload validation must hand a forged byte to the shared slot and return its reason as data — the cell it lives in re-measures it; a `process::exit` there once killed the whole gate-5 run, reference included.
