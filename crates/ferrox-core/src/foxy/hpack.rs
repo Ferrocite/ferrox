@@ -82,81 +82,70 @@ fn huffman() -> &'static Huffman {
     })
 }
 
-/// The `PEEK` bits starting at bit `p`, whole when the three bytes at `p >> 3` are in the string and bit by bit for its final positions.
-fn peek(code: &[u8], p: usize) -> usize {
-    let byte = p >> 3;
-    let off = p & 7;
-    if byte + 3 <= code.len() {
-        let v = (u32::from(code[byte]) << 16)
-            | (u32::from(code[byte + 1]) << 8)
-            | u32::from(code[byte + 2]);
-        (v >> (PEEK - off)) as usize & ((1 << PEEK) - 1)
-    } else {
-        let mut window = 0usize;
-        for k in 0..PEEK {
-            let q = p + k;
-            window = (window << 1) | usize::from(code[q >> 3] >> (7 - (q & 7)) & 1);
-        }
-        window
-    }
-}
-
-/// Decodes one Huffman-coded string: the 257th entry is the EOS code rather than a symbol, so a block decoding one is malformed, and only the all-ones prefix under eight bits may follow the last symbol. A twelve-bit window answers every symbol of that length or shorter in one table load, and the window's twelve bits seed the serial probe for the longer codes that hold their high bits — the same probe the pre-table decoder ran from bit one, starting at twelve, so its verdicts are its own.
+/// Decodes one Huffman-coded string: the 257th entry is the EOS code rather than a symbol, so a block decoding one is malformed, and only the all-ones prefix under eight bits may follow the last symbol. The unread bits sit in one register, refilled a byte at a time, so a symbol costs a shift and a load of the 4096-entry table `huffman()` builds once beside the probe rows — it answers every code of length `PEEK` or shorter, which is the whole ASCII range — and a miss hands the register's high bits to the same serial probe the pre-table decoder ran, for the 13..30-bit codes, without reading a byte for it.
 pub fn huffman_decode(code: &[u8], out: &mut Vec<u8>) -> Option<()> {
     let table = huffman();
-    let end = code.len() * 8;
-    let mut p = 0usize;
-    'symbol: while p + PEEK <= end {
-        let window = peek(code, p);
-        let entry = table.primary[window];
+    // The register is left-justified at the next unread bit, so consuming a symbol is one shift, and `held + 8 * (code.len() - cursor)` is the string's remaining bit count at every point of the walk.
+    let mut held = 0u64;
+    let mut bits = 0usize;
+    let mut cursor = 0usize;
+    'symbol: loop {
+        while bits <= 56 && cursor < code.len() {
+            held |= u64::from(code[cursor]) << (56 - bits);
+            bits += 8;
+            cursor += 1;
+        }
+        if bits < PEEK {
+            break;
+        }
+        let entry = table.primary[(held >> (64 - PEEK)) as usize];
         if entry != 0 {
             out.push((entry >> 5) as u8);
-            p += usize::from(entry & 31);
+            let used = usize::from(entry & 31);
+            held <<= used;
+            bits -= used;
             continue;
         }
-        let mut bits = PEEK;
-        let mut acc = window as u32;
-        while p + bits < end {
-            let q = p + bits;
-            acc = (acc << 1) | u32::from(code[q >> 3] >> (7 - (q & 7)) & 1);
-            bits += 1;
-            if bits > MAX_BITS {
-                return None;
-            }
-            let probe = table.probe[bits];
+        let mut length = PEEK;
+        while length < bits && length < MAX_BITS {
+            length += 1;
+            let probe = table.probe[length];
+            let acc = (held >> (64 - length)) as u32;
             let offset = acc.wrapping_sub((probe >> 32) as u32);
             if offset >= probe as u32 {
                 continue;
             }
-            let symbol = table.symbols[table.base[bits] as usize + offset as usize];
+            let symbol = table.symbols[table.base[length] as usize + offset as usize];
             if symbol == 256 {
                 return None;
             }
             out.push(symbol as u8);
-            p += bits;
+            held <<= length;
+            bits -= length;
             continue 'symbol;
         }
         return None;
     }
     let mut acc = 0u32;
-    let mut bits = 0usize;
-    while p < end {
-        acc = (acc << 1) | u32::from(code[p >> 3] >> (7 - (p & 7)) & 1);
-        bits += 1;
-        let probe = table.probe[bits];
+    let mut length = 0usize;
+    while bits > 0 {
+        acc = (acc << 1) | (held >> 63) as u32;
+        held <<= 1;
+        bits -= 1;
+        length += 1;
+        let probe = table.probe[length];
         let offset = acc.wrapping_sub((probe >> 32) as u32);
         if offset < probe as u32 {
-            let symbol = table.symbols[table.base[bits] as usize + offset as usize];
+            let symbol = table.symbols[table.base[length] as usize + offset as usize];
             if symbol == 256 {
                 return None;
             }
             out.push(symbol as u8);
             acc = 0;
-            bits = 0;
+            length = 0;
         }
-        p += 1;
     }
-    if bits != 0 && (bits >= 8 || acc != (1 << bits) - 1) {
+    if length != 0 && (length >= 8 || acc != (1 << length) - 1) {
         return None;
     }
     Some(())
