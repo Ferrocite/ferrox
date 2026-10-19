@@ -232,14 +232,14 @@ pub(crate) fn trojan_key(password: &str) -> [u8; 56] {
     out
 }
 
-pub(crate) fn tls_ca_roots(outbound: &Json) -> Option<Vec<Vec<u8>>> {
+pub(crate) fn tls_ca_roots(outbound: &Json) -> Option<ferrox_core::tls::Anchors> {
     outbound
         .get("streamSettings")
         .and_then(|s| s.get("tlsSettings"))
         .and_then(|s| s.get("caCertFile"))
         .and_then(Json::as_str)
         .and_then(|path| std::fs::read(path).ok())
-        .map(|pem| crate::quic::parse_ca_pem(&pem))
+        .map(|pem| ferrox_core::tls::Anchors::from(crate::quic::parse_ca_pem(&pem)))
         .filter(|roots| !roots.is_empty())
 }
 

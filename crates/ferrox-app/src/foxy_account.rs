@@ -278,12 +278,12 @@ pub(crate) struct Endpoint {
     /// The path prefix the origin publishes (`Guardian` serves none); a path, never part of the TLS name.
     pub(crate) base: String,
     pub(crate) address: Option<SocketAddr>,
-    pub(crate) roots: Vec<Vec<u8>>,
+    pub(crate) roots: ferrox_core::tls::Anchors,
 }
 
 impl Endpoint {
     #[must_use]
-    pub(crate) fn parse(url: &str, roots: Vec<Vec<u8>>) -> Option<Self> {
+    pub(crate) fn parse(url: &str, roots: ferrox_core::tls::Anchors) -> Option<Self> {
         let rest = url.strip_prefix("https://")?;
         let (hostport, path) = match rest.find('/') {
             Some(at) => (&rest[..at], rest[at..].trim_end_matches('/')),
@@ -320,7 +320,7 @@ impl Endpoint {
         TlsConfig {
             server_name: self.host.clone(),
             alpn: Vec::new(),
-            roots: self.roots.clone(),
+            roots: std::sync::Arc::clone(&self.roots),
             pins: ferrox_core::foxy::pin::Pins::default(),
             cipher_suites: Vec::new(),
             insecure: false,
@@ -732,7 +732,8 @@ mod tests {
 
     #[test]
     fn an_endpoint_names_itself_and_keeps_the_address_out_of_the_tls_name() {
-        let endpoint = Endpoint::parse("https://vpn.mozilla.org", Vec::new()).expect("parses");
+        let endpoint =
+            Endpoint::parse("https://vpn.mozilla.org", Vec::new().into()).expect("parses");
         assert_eq!(endpoint.host, "vpn.mozilla.org");
         assert_eq!(endpoint.port, 443);
         assert_eq!(endpoint.address, None);
@@ -745,10 +746,10 @@ mod tests {
             pinned.host, "vpn.mozilla.org",
             "the pin dial keeps the name"
         );
-        assert!(Endpoint::parse("http://vpn.mozilla.org", Vec::new()).is_none());
-        assert!(Endpoint::parse("vpn.mozilla.org", Vec::new()).is_none());
+        assert!(Endpoint::parse("http://vpn.mozilla.org", Vec::new().into()).is_none());
+        assert!(Endpoint::parse("vpn.mozilla.org", Vec::new().into()).is_none());
         assert_eq!(
-            Endpoint::parse("https://host:8443", Vec::new())
+            Endpoint::parse("https://host:8443", Vec::new().into())
                 .expect("parses")
                 .port,
             8443
@@ -1023,9 +1024,10 @@ mod renewal {
 
     fn account_with(pass: Pass) -> Account {
         Account {
-            fxa: Endpoint::parse("https://api.accounts.firefox.com/v1", Vec::new())
+            fxa: Endpoint::parse("https://api.accounts.firefox.com/v1", Vec::new().into())
                 .expect("parses"),
-            guardian: Endpoint::parse("https://vpn.mozilla.org", Vec::new()).expect("parses"),
+            guardian: Endpoint::parse("https://vpn.mozilla.org", Vec::new().into())
+                .expect("parses"),
             jar: std::sync::Arc::new(Mutex::new(Jar::default())),
             pending: std::sync::Arc::new(std::sync::Mutex::new(None)),
             auth: std::sync::Arc::new(std::sync::Mutex::new(Auth {
@@ -1300,7 +1302,10 @@ mod loopback {
         }
     }
 
-    pub(crate) fn account(address: std::net::SocketAddr, roots: Vec<Vec<u8>>) -> Account {
+    pub(crate) fn account(
+        address: std::net::SocketAddr,
+        roots: ferrox_core::tls::Anchors,
+    ) -> Account {
         Account {
             fxa: Endpoint {
                 address: Some(address),
@@ -1329,7 +1334,7 @@ mod loopback {
     }
 
     /// The edge loopback two tests share: a certificate, a port and a listener with the whole plane behind it.
-    pub(crate) fn edge() -> (std::net::SocketAddr, Vec<Vec<u8>>) {
+    pub(crate) fn edge() -> (std::net::SocketAddr, ferrox_core::tls::Anchors) {
         let minted = rcgen::generate_simple_self_signed(
             HOSTS
                 .iter()
@@ -1345,7 +1350,10 @@ mod loopback {
         let port = listener.local_addr().expect("addr").port();
         let (tx, _rx) = mpsc::channel();
         std::thread::spawn(move || serve(&listener, &root, &tx));
-        (format!("127.0.0.1:{port}").parse().expect("addr"), roots)
+        (
+            format!("127.0.0.1:{port}").parse().expect("addr"),
+            roots.into(),
+        )
     }
 
     #[test]
@@ -1372,7 +1380,7 @@ mod loopback {
         std::thread::spawn(move || serve(&listener, &root, &tx));
 
         let address = format!("127.0.0.1:{port}").parse().expect("addr");
-        let account = account(address, roots);
+        let account = account(address, roots.into());
         account
             .sign_in("person@example.com", "hunter2")
             .expect("signs in");
@@ -1438,7 +1446,7 @@ mod two_factor {
         std::thread::spawn(move || super::loopback::serve(&listener, &root, &tx));
 
         let address = format!("127.0.0.1:{port}").parse().expect("addr");
-        let account = super::loopback::account(address, roots);
+        let account = super::loopback::account(address, roots.into());
         account
             .sign_in("person@example.com", "hunter2")
             .expect("signs in");

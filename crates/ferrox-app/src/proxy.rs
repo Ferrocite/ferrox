@@ -606,7 +606,7 @@ struct FoxyOut {
     carrier_dead: std::sync::Arc<std::sync::Mutex<ferrox_core::foxy::Refusals>>,
     /// Edges whose TCP tunnels kept ending soon and the ones rested for a while: an edge that answers the probe yet drops the traffic is otherwise dialed by every flow.
     edge_strikes: std::sync::Arc<std::sync::Mutex<ferrox_core::foxy::EdgeStrikes>>,
-    roots: Vec<Vec<u8>>,
+    roots: ferrox_core::tls::Anchors,
     pins: ferrox_core::foxy::pin::Pins,
     pass: ferrox_core::foxy::Pass,
     edge_address: Option<SocketAddr>,
@@ -719,8 +719,8 @@ struct VlessOut {
     carrier: Carrier,
     host: String,
     mux: bool,
-    quic_roots: Option<Vec<Vec<u8>>>,
-    hysteria_roots: Option<Vec<Vec<u8>>>,
+    quic_roots: Option<ferrox_core::tls::Anchors>,
+    hysteria_roots: Option<ferrox_core::tls::Anchors>,
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
     flow: String,
     reality: Option<Arc<ferrox_core::tls::RealityClientConfig>>,
@@ -10003,7 +10003,7 @@ fn foxy_candidates(
     link: &ferrox_core::foxy::link::FoxyLink,
     country: &str,
     city: &str,
-    roots: Vec<Vec<u8>>,
+    roots: ferrox_core::tls::Anchors,
 ) -> Vec<ferrox_core::foxy::Candidate> {
     let named = link.host();
     let named_edge = (!named.is_empty()).then(|| ferrox_core::foxy::Candidate {
@@ -10132,7 +10132,7 @@ fn foxy_account(
     code: &str,
     pasted: &ferrox_core::foxy::Pass,
     guardian: &str,
-    roots: &[Vec<u8>],
+    roots: &ferrox_core::tls::Anchors,
 ) -> Option<std::sync::Arc<crate::foxy_account::Account>> {
     let pass = pasted.clone();
     if email.is_empty() && pass.token.is_empty() {
@@ -10141,9 +10141,9 @@ fn foxy_account(
     let account = std::sync::Arc::new(crate::foxy_account::Account {
         fxa: crate::foxy_account::Endpoint::parse(
             ferrox_core::foxy::account::FXA_SERVER,
-            roots.to_vec(),
+            std::sync::Arc::clone(roots),
         )?,
-        guardian: crate::foxy_account::Endpoint::parse(guardian, roots.to_vec())?,
+        guardian: crate::foxy_account::Endpoint::parse(guardian, std::sync::Arc::clone(roots))?,
         jar: std::sync::Arc::new(std::sync::Mutex::new(crate::foxy_challenge::Jar::default())),
         pending: std::sync::Arc::new(std::sync::Mutex::new(None)),
         auth: std::sync::Arc::new(std::sync::Mutex::new(crate::foxy_account::Auth {
@@ -10292,8 +10292,8 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             .and_then(|s| s.get("caCertFile"))
             .and_then(Json::as_str)
             .and_then(|path| std::fs::read(path).ok())
-            .map(|pem| crate::quic::parse_ca_pem(&pem))
-            .filter(|roots: &Vec<Vec<u8>>| !roots.is_empty())
+            .map(|pem| ferrox_core::tls::Anchors::from(crate::quic::parse_ca_pem(&pem)))
+            .filter(|roots: &ferrox_core::tls::Anchors| !roots.is_empty())
             .unwrap_or_else(crate::quic::system_roots);
         let pins = ferrox_core::foxy::pin::Pins::parse(foxy_list_or(&link, settings, "spkiPins"));
         let edge_address = foxy_edge_address(settings);
@@ -13779,7 +13779,7 @@ mod tests {
         let client = ferrox_core::tls::TlsConfig {
             server_name: "carrier.test".to_owned(),
             alpn: Vec::new(),
-            roots: vec![CARRIER_CERT.to_vec()],
+            roots: vec![CARRIER_CERT.to_vec()].into(),
             pins: ferrox_core::foxy::pin::Pins::default(),
             cipher_suites: Vec::new(),
             insecure: false,
@@ -16092,7 +16092,7 @@ mod tests {
             edge_strikes: std::sync::Arc::new(std::sync::Mutex::new(
                 ferrox_core::foxy::EdgeStrikes::new(32),
             )),
-            roots: Vec::new(),
+            roots: Vec::new().into(),
             pins: ferrox_core::foxy::pin::Pins::default(),
             pass: ferrox_core::foxy::Pass {
                 token: "the-pass".to_owned(),
@@ -18750,7 +18750,7 @@ mod tests {
                 hop: None,
                 gecko: None,
             },
-            roots: Some(roots),
+            roots: Some(roots.into()),
         };
         thread::spawn(move || crate::hysteria::serve_udp(&relay, &dial));
         let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
@@ -19725,7 +19725,7 @@ mod tests {
             carrier: Carrier::Quic,
             host: "localhost".to_owned(),
             mux: false,
-            quic_roots: Some(roots),
+            quic_roots: Some(roots.into()),
             hysteria_roots: None,
             tls: None,
             flow: String::new(),
@@ -19830,7 +19830,7 @@ mod tests {
         let out = find_vless_outbound(&root).expect("finds quic+tls");
         assert!(matches!(out.carrier, Carrier::Quic));
         let roots = out.quic_roots.expect("carries anchors");
-        assert_ne!(roots, Vec::<Vec<u8>>::new());
+        assert!(!roots.is_empty(), "carries anchors");
         let _ = std::fs::remove_file(&path);
         let bare = crate::json::parse(
             r#"{"outbounds": [{"protocol": "vless",
@@ -19906,7 +19906,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port: quic_port,
             upstream: None,
-            roots: Some(roots),
+            roots: Some(roots.into()),
         };
         let relay = thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -19977,7 +19977,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port: quic_port,
             upstream: None,
-            roots: Some(roots),
+            roots: Some(roots.into()),
         };
         let front = Arc::new(crate::conn::test_bind("127.0.0.1:0").expect("binds"));
         let front_port = front.local_addr().expect("addr").port();
@@ -20312,7 +20312,7 @@ mod tests {
                 hop: None,
                 gecko: None,
             },
-            roots: Some(roots),
+            roots: Some(roots.into()),
         };
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -20489,7 +20489,7 @@ mod tests {
                 hop: None,
                 gecko: None,
             },
-            roots: Some(roots),
+            roots: Some(roots.into()),
         };
         let Some(session) = crate::hysteria::connect(&dial) else {
             panic!("client connects");
@@ -21229,7 +21229,7 @@ mod tests {
             host: "localhost".to_owned(),
             mux: false,
             quic_roots: None,
-            hysteria_roots: Some(roots),
+            hysteria_roots: Some(roots.into()),
             tls: None,
             flow: String::new(),
             reality: None,
@@ -22393,7 +22393,7 @@ mod tests {
             edge_strikes: std::sync::Arc::new(std::sync::Mutex::new(
                 ferrox_core::foxy::EdgeStrikes::new(32),
             )),
-            roots: vec![CARRIER_CERT.to_vec()],
+            roots: vec![CARRIER_CERT.to_vec()].into(),
             pins: ferrox_core::foxy::pin::Pins::default(),
             pass: ferrox_core::foxy::Pass {
                 token: "the-pass".to_owned(),
@@ -22490,7 +22490,7 @@ mod tests {
             edge_strikes: std::sync::Arc::new(std::sync::Mutex::new(
                 ferrox_core::foxy::EdgeStrikes::new(32),
             )),
-            roots: Vec::new(),
+            roots: Vec::new().into(),
             pins: ferrox_core::foxy::pin::Pins::default(),
             pass: ferrox_core::foxy::Pass {
                 token: "the-pass".to_owned(),

@@ -14,7 +14,7 @@ pub(crate) struct QuicDial {
     pub(crate) port: u16,
     /// A pooled connection through a hop is its own connection, never reused for a direct dial.
     pub(crate) upstream: Option<crate::foxy::UpstreamProxy>,
-    pub(crate) roots: Option<Vec<Vec<u8>>>,
+    pub(crate) roots: Option<ferrox_core::tls::Anchors>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -23,7 +23,7 @@ struct QuicServer {
     port: u16,
     host: String,
     upstream: Option<crate::foxy::UpstreamProxy>,
-    roots: Option<Vec<Vec<u8>>>,
+    roots: Option<ferrox_core::tls::Anchors>,
 }
 
 impl QuicServer {
@@ -645,7 +645,13 @@ const BUNDLES: [&str; 10] = [
     "C:/msys64/usr/ssl/certs/ca-bundle.crt",
 ];
 
-pub(crate) fn system_roots() -> Vec<Vec<u8>> {
+pub(crate) fn system_roots() -> ferrox_core::tls::Anchors {
+    // Read once for the process: the platform store is not a per-flow input, and every dial that asked for it was paying a walk of the filesystem and a copy of every certificate in it.
+    static READ_ONCE: OnceLock<ferrox_core::tls::Anchors> = OnceLock::new();
+    Arc::clone(READ_ONCE.get_or_init(|| Arc::from(platform_roots())))
+}
+
+fn platform_roots() -> Vec<Vec<u8>> {
     // Platform store first: macOS bundle files hold a handful of roots, so bundle-first answers unknown issuer.
     let native = rustls_native_certs::load_native_certs();
     let roots: Vec<Vec<u8>> = native
@@ -2447,6 +2453,15 @@ pub(crate) fn server_config(alpn: &[u8]) -> quiche::Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The store is read once, not once per dial: two calls name the same allocation rather than the same bytes.
+    #[test]
+    fn the_platform_anchors_are_read_once() {
+        assert!(
+            Arc::ptr_eq(&system_roots(), &system_roots()),
+            "one allocation answers for every caller"
+        );
+    }
 
     /// Trust anchors come from the platform bundle, so a publicly trusted host is not trusted by nothing.
     #[test]

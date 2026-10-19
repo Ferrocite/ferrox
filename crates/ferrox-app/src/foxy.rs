@@ -88,7 +88,7 @@ pub(crate) struct FoxyDial {
     pub(crate) carrier: Carrier,
     /// The upstream hop the dial chains through (TCP over CONNECT or SOCKS5; QUIC over a SOCKS5 UDP association).
     pub(crate) upstream: Option<UpstreamProxy>,
-    pub(crate) roots: Vec<Vec<u8>>,
+    pub(crate) roots: ferrox_core::tls::Anchors,
     pub(crate) pins: foxy::pin::Pins,
     pub(crate) pass: Pass,
 }
@@ -253,7 +253,7 @@ fn tls_config(dial: &FoxyDial) -> ferrox_core::tls::TlsConfig {
     ferrox_core::tls::TlsConfig {
         server_name: dial.host.clone(),
         alpn: vec![dial.carrier.alpn().to_vec()],
-        roots: dial.roots.clone(),
+        roots: Arc::clone(&dial.roots),
         pins: dial.pins.clone(),
         cipher_suites: Vec::new(),
         insecure: false,
@@ -2271,7 +2271,7 @@ mod tests {
             address: Some(SocketAddr::from(([127, 0, 0, 1], 1))),
             carrier,
             upstream: None,
-            roots: Vec::new(),
+            roots: Vec::new().into(),
             pins: foxy::pin::Pins::default(),
             pass: Pass {
                 token: "the-pass".to_owned(),
@@ -2299,13 +2299,16 @@ mod tests {
     #[test]
     fn the_tls_config_names_the_edge_and_carries_its_pins() {
         let mut d = dial("edge.example", Carrier::H2);
-        d.roots = vec![vec![1, 2, 3]];
+        d.roots = vec![vec![1, 2, 3]].into();
         d.pins = foxy::pin::Pins::parse([
             "sha256/AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned()
         ]);
         let config = tls_config(&d);
         assert_eq!(config.server_name, "edge.example");
-        assert_eq!(config.roots, vec![vec![1, 2, 3]]);
+        assert_eq!(
+            config.roots,
+            ferrox_core::tls::Anchors::from(vec![vec![1, 2, 3]])
+        );
         assert_eq!(config.pins.len(), 1);
     }
 
@@ -2467,7 +2470,7 @@ mod loopback {
             address: Some(SocketAddr::from(([127, 0, 0, 1], port))),
             carrier,
             upstream: None,
-            roots,
+            roots: roots.into(),
             pins,
             pass: Pass {
                 token: "the-pass".to_owned(),
@@ -2476,6 +2479,25 @@ mod loopback {
                 quota_reset: None,
             },
         }
+    }
+
+    /// A dial names the trust store, it does not own a copy of it: two dials of one edge, and the configs built from them, answer with the same allocation.
+    #[test]
+    fn every_dial_of_one_trust_names_the_same_anchors() {
+        let anchors = crate::quic::system_roots();
+        let no_pins = foxy::pin::Pins::default();
+        let first = FoxyDial {
+            roots: Arc::clone(&anchors),
+            ..dial_for(Vec::new(), 443, Carrier::H2, no_pins.clone())
+        };
+        let second = FoxyDial {
+            roots: anchors,
+            ..dial_for(Vec::new(), 443, Carrier::H3, no_pins)
+        };
+        assert!(
+            Arc::ptr_eq(&tls_config(&first).roots, &tls_config(&second).roots),
+            "the platform store is read once for the process, not once per dial"
+        );
     }
 
     /// An address that accepts TCP is not an address that carries the lane: `localhost` answers v6 first on both runners that matter, so a silent v6 listener must not cost the lane the v4 edge behind it.
@@ -2508,7 +2530,7 @@ mod loopback {
             address: None,
             carrier: Carrier::H2,
             upstream: None,
-            roots,
+            roots: roots.into(),
             pins: foxy::pin::Pins::default(),
             pass: Pass {
                 token: "the-pass".to_owned(),
@@ -2533,7 +2555,7 @@ mod loopback {
             address: Some(SocketAddr::from(([127, 0, 0, 1], 1))),
             carrier: Carrier::H2,
             upstream: None,
-            roots,
+            roots: roots.into(),
             pins: foxy::pin::Pins::default(),
             pass: Pass {
                 token: "the-pass".to_owned(),
@@ -2695,7 +2717,7 @@ mod loopback {
             address: edge,
             carrier: Carrier::H1,
             upstream: Some(proxy),
-            roots: Vec::new(),
+            roots: Vec::new().into(),
             pins: foxy::pin::Pins::default(),
             pass: Pass {
                 token: "the-pass".to_owned(),
@@ -5061,7 +5083,7 @@ mod loopback {
             address: "127.0.0.1".to_owned(),
             port,
             upstream: None,
-            roots: Some(roots.clone()),
+            roots: Some(roots.clone().into()),
         };
         let first = crate::quic::pooled_stream_within(&dial, crate::quic::HANDSHAKE_TIMEOUT)
             .expect("a pooled stream");
@@ -5136,7 +5158,7 @@ mod loopback {
             address: "127.0.0.1".to_owned(),
             port,
             upstream: None,
-            roots: Some(roots.clone()),
+            roots: Some(roots.clone().into()),
         };
         let mut last = None;
         for flow in 1..=crate::quic::MAX_FLOWS_ON_LANE {
