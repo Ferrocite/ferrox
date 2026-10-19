@@ -30,6 +30,7 @@ graph TD
 | write-calls-per-dial | 1 | ferrox-app-httpheader::tests::the_request_reaches_the_write_as_the_runs_it_is_made_of |
 | request-staging-copies-per-dial | 0 | ferrox-app-httpheader::tests::the_request_reaches_the_write_as_the_runs_it_is_made_of |
 | request-buffer-allocations-per-dial | 0 | ferrox-app-httpheader::tests::the_request_reaches_the_write_as_the_runs_it_is_made_of |
+| record-lane-segment-allocations-per-dial | 0 | ferrox-core-tls::rustls_backend::tests::the_camouflage_gather_coalesces_without_a_heap_buffer |
 | user-space-copies-per-byte-relayed | 1 | ferrox-app-proxy::tests::carried_streams_round_trip_behind_the_http_camouflage |
 <!-- counts:end -->
 
@@ -52,9 +53,11 @@ The dial's own request. It was formatted into a `String` — one allocation per 
 
 The Rust reference still stages it: `render_request` renders into `String::with_capacity(256)` and returns `into_bytes()` (`xray-transport/src/headers/http.rs:201-225`), so a dial there pays a 256-byte heap buffer and a copy of every octet into it; this carrier pays neither.
 
-The price is named: the segment list is the shared `VECTOR_PARTS`-wide stack array every other carrier's frame write already fills, and the kernel copies five runs where it copied one. The user-space count is what `ops.yml` reads for this row, and a measured rise goes back.
+The price is named: the segment list is the shared `VECTOR_PARTS`-wide stack array every other carrier's frame write already fills, and the kernel copies five runs where it copied one. The user-space count is what `ops.yml` reads for this row, and a measured rise goes back. On the record lane the same five runs crossed the framer's four-slot stack bound and paid a heap `Vec<IoSlice>` every dial until this slice; the fix widened the bound, and the named price of that is one more discarded empty-slot initialisation on every coalesced write narrower than five — the Vision framer's four-run writes now throw away one init they did not before.
 
-The head buffer after its walk. `HeadReader` keeps the read's own `Vec` so the octets pipelined behind the delimiter are delivered from where they landed, but once the last of them has been handed over nothing reads that buffer again, and a `clear` left its whole capacity — every byte of an 8 KiB-capped head — held idle for the life of the tunnel it was built on. The reader now drops it back to an empty `Vec` on the read that finishes the walk (the same shape `carrier-httpupgrade` already uses), so `prefix-bytes-held-after-walk` is `0`, witnessed by `the_bytes_behind_the_head_reach_the_relay_without_a_syscall`: the gate delivers the tail from the buffer it arrived in, asserts a zero-capacity prefix once it is spent, and then reaches the handle it had not touched for the tail. The handoff itself is unchanged — the release moves the single `dealloc` that used to wait for the connection to close up to the last delivered byte, so the syscall count, the copies, and the bytes on the wire are all exactly what they were.
+The head buffer after its walk. `HeadReader` keeps the read's own `Vec` so the octets pipelined behind the delimiter are delivered from where they landed, but once the last of them has been handed over nothing reads that buffer again, and a `clear` left its whole capacity — every byte of an 8 KiB-capped head — held idle for the life of the tunnel it was built on. The reader now drops it back to an empty `Vec` on the read that finishes the walk (the same shape `carrier-httpupgrade` already uses), so `prefix-bytes-held-after-walk` is `0`, witnessed by `the_bytes_behind_the_head_reach_the_relay_without_a_syscall`: the gate delivers the tail from the buffer it arrived in, asserts a zero-capacity prefix once it is spent, and then reaches the handle it had not touched for the tail. The ordinary head ends exactly at the delimiter, so there is no tail to deliver at all: the constructor drops the buffer at birth instead of holding it across every relay read that follows, and the same gate asserts a zero-capacity prefix for that shape over two reads that reach the handle straight away. The handoff itself is unchanged — the release moves the single `dealloc` that used to wait for the connection to close up to the last delivered byte, so the syscall count, the copies, and the bytes on the wire are all exactly what they were.
+
+The fifth run's heap trip. The dial hands the carrier five runs, one piece wider than the segment stack `coalesce` laid out for the Vision framer's four, so every TLS dial of this carrier entered the allocator for a `Vec<IoSlice>` it threw away one record later. The stack now carries five and the gather rides it like the framer does: same segments, same single `write_vectored`, same record count, same bytes. `record-lane-segment-allocations-per-dial` is `0`, witnessed by `the_camouflage_gather_coalesces_without_a_heap_buffer`, which counts allocations across three gathers in one window — the shape the allocation rule demands, flat over a push/drain cycle, and it reads six when the stack is cut back to four, so the number sees the removal. The in-memory `request-buffer-allocations-per-dial` gate could never see this: its `Runs` sink is not the rustls framer, which is why the record lane needed a checker of its own.
 
 Three things on the read side are named because they are easy to get wrong rather than because they were fixed:
 
@@ -74,6 +77,10 @@ Three things on the read side are named because they are easy to get wrong rathe
 ## CI scope
 
 What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
+
+The record-lane gate sits in `ferrox-core`'s TLS framer, which `xtls-vision` also gates
+(`coalesce-segment-allocations`): `coalesce` stays shared infrastructure rather than joining this
+page's `paths`, so a change to it takes both rows' runs.
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/httpheader.rs

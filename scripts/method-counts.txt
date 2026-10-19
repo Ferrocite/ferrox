@@ -176,6 +176,7 @@ carrier-httpheader prefix-bytes-held-after-walk 0 ferrox-app-httpheader::tests::
 carrier-httpheader write-calls-per-dial 1 ferrox-app-httpheader::tests::the_request_reaches_the_write_as_the_runs_it_is_made_of
 carrier-httpheader request-staging-copies-per-dial 0 ferrox-app-httpheader::tests::the_request_reaches_the_write_as_the_runs_it_is_made_of
 carrier-httpheader request-buffer-allocations-per-dial 0 ferrox-app-httpheader::tests::the_request_reaches_the_write_as_the_runs_it_is_made_of
+carrier-httpheader record-lane-segment-allocations-per-dial 0 ferrox-core-tls::rustls_backend::tests::the_camouflage_gather_coalesces_without_a_heap_buffer
 carrier-httpheader user-space-copies-per-byte-relayed 1 ferrox-app-proxy::tests::carried_streams_round_trip_behind_the_http_camouflage
 
 carrier-grpc ops-retired-instructions UNBLESSED scripts/count-ops.sh
