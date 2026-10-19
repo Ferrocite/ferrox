@@ -288,6 +288,10 @@ rev  = "$rev"
 [sources.gamma]
 repo = "$src"
 rev  = "$rev2"
+
+[sources.delta]
+repo = "$src"
+rev  = "$rev"
 EOF
 
   cd "$root"
@@ -299,13 +303,15 @@ EOF
     notes="$notes alpha does not hold the real checkout;"
   [[ -L upstream/beta && "$(readlink upstream/beta)" == alpha ]] ||
     notes="$notes beta is its own clone of a commit alpha already holds;"
+  [[ -L upstream/delta && "$(readlink upstream/delta)" == alpha ]] ||
+    notes="$notes delta is its own clone of a commit alpha already holds;"
   [[ "$(git -C upstream/beta rev-parse HEAD)" == "$rev" ]] ||
     notes="$notes beta does not read alpha's checkout at its pin;"
   [[ "$(git -C upstream/gamma rev-parse HEAD)" == "$rev2" ]] ||
     notes="$notes gamma shares a checkout of a commit it is not pinned to;"
   local shares
   shares="$(grep -c '^shares' upstream/manifest.toml || true)"
-  [[ "$shares" == "1" ]] || notes="$notes the manifest accounts for $shares shared checkout(s), not 1;"
+  [[ "$shares" == "2" ]] || notes="$notes the manifest accounts for $shares shared checkout(s), not 2;"
 
   # Rerunning over the tree it just made must not re-clone or re-link.
   run_all || notes="$notes the rerun exited red;"
@@ -313,7 +319,7 @@ EOF
     notes="$notes the rerun undid the sharing;"
 
   # A run naming only the alias owes both stanzas: the link has to have something to read.
-  rm -rf upstream/alpha upstream/beta upstream/gamma upstream/manifest.toml
+  rm -rf upstream/alpha upstream/beta upstream/gamma upstream/delta upstream/manifest.toml
   only_list=beta
   run_all || notes="$notes an alias-only run exited red;"
   only_list=""
