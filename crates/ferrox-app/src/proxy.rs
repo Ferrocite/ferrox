@@ -7682,7 +7682,11 @@ fn copy_locked(
             if total == 0 {
                 debug_bytes(direction, &buf[..taken]);
             }
-            match socket.write_all(&buf[..taken]) {
+            let written = {
+                census!("tunnel-leg-write", crate::census::handle(socket), None);
+                socket.write_all(&buf[..taken])
+            };
+            match written {
                 Ok(()) => taken,
                 Err(error) => {
                     debug_relay(direction, total, Some(error.kind()));
