@@ -235,6 +235,9 @@ carrier-veepn origin-list-copies-per-ask 0 ferrox-app-veepn::tests::the_rotation
 carrier-veepn edge-peer-read-allocations-per-entry 0 ferrox-core-foxy::tests::a_literal_edge_address_is_read_without_a_buffer_of_its_own
 carrier-veepn declined-edge-visits-per-two-flows 1 ferrox-app-veepn::tests::a_declined_edge_is_skipped_while_its_silence_lasts
 carrier-veepn silent-region-edges-probed-per-flow 1 ferrox-app-veepn::tests::a_silent_region_probes_one_edge_instead_of_its_whole_list
+carrier-veepn refused-target-edge-dials-per-flow 1 ferrox-app-veepn::tests::a_refused_target_stops_the_walk_and_keeps_the_region
+carrier-veepn refused-target-plane-asks-per-flow 0 ferrox-app-veepn::tests::a_refused_target_stops_the_walk_and_keeps_the_region
+carrier-veepn refusal-field-allocations-per-refusal 0 ferrox-core-foxy::tests::head_field_reads_the_names_the_edge_sent
 carrier-foxy ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-foxy payload-staging-copies-per-byte-written 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane
 carrier-foxy payload-staging-copies-per-byte-read 0 ferrox-app-foxy::loopback::a_relayed_byte_is_copied_once_on_its_way_through_the_lane

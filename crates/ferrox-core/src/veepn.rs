@@ -5,6 +5,9 @@ use crate::b64;
 /// The `Proxy-Authorization` head for the pair that server's own list entry handed out, not a `Bearer` pass. It rides the literal rather than the value so the request stays seven runs — the width of the record lane's gather stack.
 pub const BASIC_HEAD: &[u8] = b"\r\nProxy-Authorization: Basic ";
 
+/// The answer that names the target rather than the pair: the plane's edge sends this field and value when the host itself is one it will not carry, so the pair is valid, the edge is healthy, and no other edge or fresh token changes the answer.
+pub const FORBIDDEN_TARGET: (&[u8], &[u8]) = (b"X-Hola-Error", b"Forbidden Host");
+
 /// What the launch body publishes. The API keys its free pool on these, so they are sent verbatim.
 pub const APP_VERSION: &str = "5.0.2";
 pub const DEVICE_NAME: &str = "Chrome 130";
