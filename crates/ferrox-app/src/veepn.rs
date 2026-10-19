@@ -59,6 +59,32 @@ impl From<String> for Refusal {
     }
 }
 
+/// Why an ask did not carry, and which of the two very different answers that is. A plane that answered is speaking about this lane's own state — a pair even a fresh token cannot make good — and nothing cached will change it. A plane that never answered, because its domain was seized or the network went quiet, says nothing about the pair at all, and the list it handed out while it was reachable still carries flows.
+#[derive(Debug)]
+struct Miss {
+    answered: bool,
+    why: String,
+}
+
+impl Miss {
+    /// The plane reached and answered about this device — a launch that refuses it or carries no token: a fact no held list changes, so the flows hear it.
+    fn spoken(why: impl Into<String>) -> Self {
+        Self {
+            answered: true,
+            why: why.into(),
+        }
+    }
+}
+
+impl From<String> for Miss {
+    fn from(why: String) -> Self {
+        Self {
+            answered: false,
+            why,
+        }
+    }
+}
+
 /// The outbound: the plane behind a lock, the rotation in front of it, the identity ahead of both.
 #[derive(Debug, Clone)]
 pub(crate) struct VeepnOut {
@@ -188,22 +214,39 @@ impl VeepnOut {
         )))
     }
 
-    /// The region the lane serves: the one configured, or the optimal one the plane names, kept for the same window as a list. Either way a flow takes a reference count, not a copy of the name, so an open builds no text of its own.
+    /// The region the lane serves: the one configured, or the optimal one the plane names, kept for the same window as a list. Either way a flow takes a reference count, not a copy of the name, so an open builds no text of its own. A plane that cannot be reached is asked again after [`veepn::PLANE_RETRY`] seconds and the name it already gave is served meanwhile, because a seized API domain says nothing about which region carries this device.
     fn region(&self) -> Result<Arc<str>, String> {
         if !self.region.is_empty() {
             return Ok(Arc::clone(&self.region));
         }
         let now = foxy_account::epoch();
-        if let Some(named) = self.plane.lock().ok().and_then(|plane| {
-            plane
-                .region
-                .as_ref()
-                .filter(|(_, until)| *until > now)
-                .map(|(named, _)| Arc::clone(named))
-        }) {
-            return Ok(named);
+        let mut held: Option<Arc<str>> = None;
+        if let Some((named, until)) = self
+            .plane
+            .lock()
+            .ok()
+            .and_then(|plane| plane.region.clone())
+        {
+            if until > now {
+                return Ok(named);
+            }
+            held = Some(named);
         }
-        let reply = self.ask(veepn::OPTIMAL, &[])?;
+        let reply = match self.ask(veepn::OPTIMAL, &[]) {
+            Ok(reply) => reply,
+            Err(miss) => {
+                if let (false, Some(named)) = (miss.answered, held) {
+                    if let Ok(mut plane) = self.plane.lock() {
+                        plane.region = Some((
+                            Arc::clone(&named),
+                            foxy_account::epoch().saturating_add(veepn::PLANE_RETRY),
+                        ));
+                    }
+                    return Ok(named);
+                }
+                return Err(miss.why);
+            }
+        };
         let named: Arc<str> = Arc::from(
             json(&reply)?
                 .get("region")
@@ -217,22 +260,42 @@ impl VeepnOut {
         Ok(named)
     }
 
-    /// A region's upstreams: one ask per 12 hours, each entry's pair coded and its dial built here rather than once per flow, and the list handed out by `Arc` so a flow shares the cached text instead of copying the whole region.
+    /// A region's upstreams: one ask per 12 hours, each entry's pair coded and its dial built here rather than once per flow, and the list handed out by `Arc` so a flow shares the cached text instead of copying the whole region. A plane that cannot be reached keeps carrying the flows its own earlier answer can, and is asked again no sooner than [`veepn::PLANE_RETRY`] seconds later, so an outage costs the lane one ask per window instead of one per flow. A plane that *answers* is answered with its own words: a list of nothing usable is a fact about the region, not about the network, and never falls back on the old one.
     fn servers(&self, region: &str) -> Result<Arc<Servers>, String> {
         let now = foxy_account::epoch();
-        if let Some((list, _)) = self
+        let mut held: Option<Arc<Servers>> = None;
+        if let Some((list, until)) = self
             .plane
             .lock()
             .ok()
             .and_then(|plane| plane.lists.get(region).cloned())
-            .filter(|(_, until)| *until > now)
         {
-            return Ok(list);
+            if until > now {
+                return Ok(list);
+            }
+            held = Some(list);
         }
         let mut body = vec![0u8; veepn::server_list_len(region)];
         let text = veepn::server_list_into(region, &mut body)
             .map_err(|why| format!("region {region:?} cannot be written: {why}"))?;
-        let found = self.ask(veepn::SERVER_LIST, text)?;
+        let found = match self.ask(veepn::SERVER_LIST, text) {
+            Ok(found) => found,
+            Err(miss) => {
+                if let (false, Some(list)) = (miss.answered, held) {
+                    if let Ok(mut plane) = self.plane.lock() {
+                        plane.lists.insert(
+                            region.to_owned(),
+                            (
+                                Arc::clone(&list),
+                                foxy_account::epoch().saturating_add(veepn::PLANE_RETRY),
+                            ),
+                        );
+                    }
+                    return Ok(list);
+                }
+                return Err(miss.why);
+            }
+        };
         let list = servers_of(&found, &self.roots)?;
         if list.is_empty() {
             return Err(format!("region {region:?} answers no usable upstream"));
@@ -259,8 +322,8 @@ impl VeepnOut {
         }
     }
 
-    /// The token the plane answers with, launched when the cache has run out: one ask per 7 days, and a plane that refuses what it issued gets exactly one relaunch.
-    fn access(&self, force: bool) -> Result<String, String> {
+    /// The token the plane answers with, launched when the cache has run out: one ask per 7 days, and a plane that refuses what it issued gets exactly one relaunch. A launch that reaches the plane but answers about this device is a refusal the cache cannot fix, so it is marked as one; a launch that reaches nothing is a miss a held list survives.
+    fn access(&self, force: bool) -> Result<String, Miss> {
         let now = foxy_account::epoch();
         if !force {
             if let Some((value, _)) = self
@@ -277,17 +340,17 @@ impl VeepnOut {
         let text = veepn::launch_into(&self.udid, &self.zone, &mut body)
             .map_err(|why| format!("launch body: {why}"))?;
         let Walked::Carried(reply) = self.walk(veepn::LAUNCH, text, None)? else {
-            return Err("launch carries no token".to_owned());
+            return Err(Miss::spoken("launch carries no token"));
         };
         if let Some(denied) = reply.denied() {
-            return Err(format!("launch refused: {denied}"));
+            return Err(Miss::spoken(format!("launch refused: {denied}")));
         }
         let document = json(&reply)?;
         let token = document
             .get("access")
             .and_then(Json::as_str)
             .filter(|token| !token.is_empty())
-            .ok_or("launch answers no access token")?;
+            .ok_or_else(|| Miss::spoken("launch answers no access token"))?;
         let value = format!("Bearer {token}");
         if let Ok(mut plane) = self.plane.lock() {
             plane.access = Some((value.clone(), now.saturating_add(veepn::TOKEN_TTL)));
@@ -295,8 +358,8 @@ impl VeepnOut {
         Ok(value)
     }
 
-    /// One plane ask with the token in front of it: a plane that refuses the token is the cache's problem, so it is relaunched and the same ask repeats once.
-    fn ask(&self, path: &str, body: &[u8]) -> Result<foxy_account::Reply, String> {
+    /// One plane ask with the token in front of it: a plane that refuses the token is the cache's problem, so it is relaunched and the same ask repeats once. Only a plane that answers again about the *pair* after that is a fact the cache cannot fix; every other miss leaves the held answer alone.
+    fn ask(&self, path: &str, body: &[u8]) -> Result<foxy_account::Reply, Miss> {
         let value = self.access(false)?;
         if let Walked::Carried(reply) = self.walk(path, body, Some(&value))? {
             return Ok(reply);
@@ -304,7 +367,10 @@ impl VeepnOut {
         let fresh = self.access(true)?;
         match self.walk(path, body, Some(&fresh))? {
             Walked::Carried(reply) => Ok(reply),
-            Walked::Token => Err(format!("{path} refuses a fresh token")),
+            Walked::Token => Err(Miss {
+                answered: true,
+                why: format!("{path} refuses a fresh token"),
+            }),
         }
     }
 
@@ -1155,6 +1221,182 @@ mod tests {
                 .iter()
                 .all(|until| until.load(Ordering::Relaxed) <= foxy_account::epoch()),
             "an edge that named the target is not remembered as a gone one"
+        );
+    }
+
+    /// An edge that carries a flow out of a held list: it reads the pair the entry coded, answers `200`, then drains until the flow ends the leg. Every accept is counted, so a gate can name which edge a flow reached and how often.
+    fn carrying_edge(server: &ferrox_core::tls::TlsServerConfig) -> (u16, Arc<AtomicUsize>) {
+        use std::io::{Read, Write};
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let answered = Arc::clone(&hits);
+        let server = server.clone();
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                answered.fetch_add(1, Ordering::SeqCst);
+                let Ok(mut tls) =
+                    ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+                else {
+                    continue;
+                };
+                if tls.handshake().is_err() {
+                    continue;
+                }
+                assert_eq!(
+                    head(&mut tls),
+                    "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\nProxy-Authorization: Basic the-pass\r\n\r\n",
+                    "the flow that came through a held list carries the pair that list coded"
+                );
+                let _ = tls.write_all(b"HTTP/1.1 200 Connection established\r\n\r\n");
+                let mut sink = [0u8; 64];
+                while tls.read(&mut sink).unwrap_or(0) > 0 {}
+            }
+        });
+        (port, hits)
+    }
+
+    /// A plane that cannot be reached at all is no reason to stop a flow: the region's held list still carries it with the pair that list handed out, and the ask is retried once per window rather than once per flow.
+    #[test]
+    fn a_plane_that_answers_nothing_carries_the_list_it_gave() {
+        let (roots, server) = crate::foxy::loopback::minted(b"http/1.1");
+        let api = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let api_port = api.local_addr().expect("addr").port();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&asked);
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = api.accept() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let out = VeepnOut::new(
+            "DE".to_owned(),
+            &[format!("https://127.0.0.1:{api_port}")],
+            "00000000-0000-4000-8000-000000000000".to_owned(),
+            ferrox_core::tls::Anchors::from(roots.clone()),
+        )
+        .expect("lane");
+        let (one_port, one_hits) = carrying_edge(&server);
+        let (two_port, two_hits) = carrying_edge(&server);
+        let dials = vec![
+            crate::foxy::loopback::dial_for(
+                roots.clone(),
+                one_port,
+                Carrier::H1,
+                ferrox_core::foxy::pin::Pins::default(),
+            ),
+            crate::foxy::loopback::dial_for(
+                roots,
+                two_port,
+                Carrier::H1,
+                ferrox_core::foxy::pin::Pins::default(),
+            ),
+        ];
+        let silence: Vec<AtomicU64> = (0..dials.len()).map(|_| AtomicU64::new(0)).collect();
+        let seeded = Arc::new(Servers { dials, silence });
+        // An answer the plane gave long ago, kept on past its own window.
+        out.plane
+            .lock()
+            .expect("locks")
+            .lists
+            .insert("DE".to_owned(), (Arc::clone(&seeded), 1));
+
+        let first = out
+            .open("example.com:443")
+            .expect("a held list carries the flow while the plane is gone");
+        drop(first);
+        assert_eq!(
+            one_hits.load(Ordering::SeqCst),
+            1,
+            "the flow went out through one edge of the held list"
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "and the outage was walked once, not once per edge"
+        );
+
+        let second = out.open("example.com:443").expect("and the flow after it");
+        drop(second);
+        assert_eq!(
+            two_hits.load(Ordering::SeqCst),
+            1,
+            "the next flow carries on the same held list"
+        );
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "the retry window holds: a plane that cannot be reached is asked once per window, not once per flow"
+        );
+        assert!(
+            seeded
+                .silence
+                .iter()
+                .all(|until| until.load(Ordering::Relaxed) <= foxy_account::epoch()),
+            "an edge that carried a flow out of a held list leaves no silence behind"
+        );
+    }
+
+    /// The region an auto lane was *told* about outlives the plane that told it: an optimal ask that reaches nothing serves the held name, and is retried once per window rather than once per flow.
+    #[test]
+    fn the_region_the_plane_named_survives_its_own_outage() {
+        let (roots, server) = crate::foxy::loopback::minted(b"http/1.1");
+        let api = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let api_port = api.local_addr().expect("addr").port();
+        let asked = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&asked);
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = api.accept() {
+                counted.fetch_add(1, Ordering::SeqCst);
+                drop(stream);
+            }
+        });
+        let out = VeepnOut::new(
+            String::new(),
+            &[format!("https://127.0.0.1:{api_port}")],
+            "00000000-0000-4000-8000-000000000000".to_owned(),
+            ferrox_core::tls::Anchors::from(roots.clone()),
+        )
+        .expect("lane");
+        let (edge_port, hits) = carrying_edge(&server);
+        let dials = vec![crate::foxy::loopback::dial_for(
+            roots,
+            edge_port,
+            Carrier::H1,
+            ferrox_core::foxy::pin::Pins::default(),
+        )];
+        let silence: Vec<AtomicU64> = (0..dials.len()).map(|_| AtomicU64::new(0)).collect();
+        {
+            let mut plane = out.plane.lock().expect("locks");
+            plane.region = Some((Arc::from("US"), 1));
+            plane.lists.insert(
+                "US".to_owned(),
+                (
+                    Arc::new(Servers { dials, silence }),
+                    foxy_account::epoch().saturating_add(veepn::SERVERS_TTL),
+                ),
+            );
+        }
+
+        let first = out
+            .open("example.com:443")
+            .expect("the held name still names a region");
+        drop(first);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "and the flow went out");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "the optimal ask walked the rotation once"
+        );
+
+        let second = out.open("example.com:443").expect("and the flow after it");
+        drop(second);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "on the same held name");
+        assert_eq!(
+            asked.load(Ordering::SeqCst),
+            1,
+            "with the plane asked once for both flows"
         );
     }
 
