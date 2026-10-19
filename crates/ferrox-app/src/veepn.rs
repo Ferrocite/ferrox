@@ -417,7 +417,7 @@ mod tests {
         assert!(lane(&[]).is_err(), "a rotation of nothing serves nothing");
     }
 
-    /// The rotation walks from a different origin each flow, every origin is walked before the list wraps, and the walk is handed the lane's own origins: the slice it reads starts where the field's bytes do.
+    /// The rotation walks from a different origin each flow, every origin is walked before the list wraps, and the walk is handed the lane's own origins: the slice each flow reads starts where the field's bytes do.
     #[test]
     fn the_rotation_starts_where_the_last_one_left_off() {
         let out = lane(&[
@@ -426,16 +426,15 @@ mod tests {
             "https://c.example",
         ])
         .unwrap();
-        let (walked, _) = out.rotation();
-        assert_eq!(
-            walked.as_ptr(),
-            out.domains[..].as_ptr(),
-            "the walk reads the origins where the lane holds them, not a copy of them"
-        );
         let starts: Vec<String> = (0..7)
             .map(|_| {
-                let (domains, start) = out.rotation();
-                domains[start].host.clone()
+                let (walked, start) = out.rotation();
+                assert_eq!(
+                    walked.as_ptr(),
+                    out.domains[..].as_ptr(),
+                    "the walk reads the origins where the lane holds them, not a copy of them"
+                );
+                walked[start].host.clone()
             })
             .collect();
         assert_eq!(
@@ -487,7 +486,7 @@ mod tests {
         let dials = out.servers("DE").expect("the cached region");
         for at in [0usize, 1, 2, 5, 9] {
             assert!(
-                std::ptr::eq(picked(&dials[..], at), &seeded[at % dials.len()]),
+                std::ptr::eq(picked(&dials[..], at), &raw const seeded[at % dials.len()]),
                 "the {at}th pick is the cached entry, not a copy of it"
             );
         }
