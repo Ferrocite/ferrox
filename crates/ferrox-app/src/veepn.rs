@@ -454,7 +454,7 @@ mod tests {
     fn a_cached_list_is_shared_not_copied_per_flow() {
         let out = lane(&["https://antpeak.com"]).expect("lane");
         let seeded = Arc::new(vec![Server {
-            host: "185.216.34.12".to_owned(),
+            host: "192.0.2.12".to_owned(),
             port: 443,
             credential: "MTAwMC1hYmM6czNjcjN0".to_owned(),
         }]);
@@ -474,8 +474,8 @@ mod tests {
     /// The list is read as the plane writes it: an entry without an address or a port is dropped with a count, and a pair reaches the wire coded once, not per flow.
     #[test]
     fn a_list_answer_keeps_the_entries_this_lane_can_dial() {
-        let body = r#"[{"username":"1000-abc","password":"s3cr3t","port":443,"addresses":["185.216.34.12"]},
-                       {"username":"x","password":"y","port":0,"addresses":["1.2.3.4"]},
+        let body = r#"[{"username":"1000-abc","password":"s3cr3t","port":443,"addresses":["192.0.2.12"]},
+                       {"username":"x","password":"y","port":0,"addresses":["192.0.2.4"]},
                        {"username":"x","password":"y","port":8080,"addresses":[]},
                        {"username":"x","password":"y","port":80,"addresses":[""]}]"#;
         let reply = foxy_account::Reply {
@@ -485,7 +485,7 @@ mod tests {
         };
         let list = servers_of(&reply).expect("a list");
         assert_eq!(list.len(), 1, "only the entry with a port and an address");
-        assert_eq!(list[0].host, "185.216.34.12");
+        assert_eq!(list[0].host, "192.0.2.12");
         assert_eq!(list[0].port, 443);
         let mut window = [0u8; 64];
         assert_eq!(

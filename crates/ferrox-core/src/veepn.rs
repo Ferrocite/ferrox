@@ -61,8 +61,8 @@ pub const fn credential_len(username: &str, password: &str) -> usize {
     b64::encoded_len(username.len() + password.len() + 1)
 }
 
-/// What the launch publishes as `platformVersion`, and the one user-agent the plane answers with.
-pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36";
+/// What the launch publishes as `platformVersion`, and the one user-agent the plane answers with: this tree's browser-UA shape — `Chrome/130.0`, the way `foxy_challenge` spells its `Chrome/126.0` — because the build-number tail a real Chrome sends is matched by no reader at either end.
+pub const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36";
 
 /// The launch body in literals and the two names it carries: `udid` and the zone are the only fields that differ between installations, so every other octet is already written out, in the order the extension's serializer puts them.
 ///
@@ -233,14 +233,14 @@ mod tests {
         let mut window = [0u8; 256];
         let credential = credential_into("1000-abc", "s3cr3t", &mut window).expect("window");
         let block = crate::foxy::connect_request(
-            "185.216.34.12:443",
+            "192.0.2.12:443",
             BASIC_HEAD,
             std::str::from_utf8(credential).unwrap(),
         )
         .concat();
         assert_eq!(
             String::from_utf8(block).expect("ascii"),
-            "CONNECT 185.216.34.12:443 HTTP/1.1\r\nHost: 185.216.34.12:443\r\nProxy-Authorization: Basic MTAwMC1hYmM6czNjcjN0\r\n\r\n"
+            "CONNECT 192.0.2.12:443 HTTP/1.1\r\nHost: 192.0.2.12:443\r\nProxy-Authorization: Basic MTAwMC1hYmM6czNjcjN0\r\n\r\n"
         );
     }
 
@@ -337,7 +337,7 @@ mod tests {
             .expect("window");
             assert_eq!(
                 std::str::from_utf8(body).expect("ascii"),
-                "{\"udid\": \"3f2b1c00-0000-4000-8000-000000000000\", \"appVersion\": \"5.0.2\", \"platform\": \"chrome\", \"platformVersion\": \"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36\", \"timeZone\": \"Europe/Berlin\", \"deviceName\": \"Chrome 130\"}"
+                format!("{{\"udid\": \"3f2b1c00-0000-4000-8000-000000000000\", \"appVersion\": \"5.0.2\", \"platform\": \"chrome\", \"platformVersion\": \"{USER_AGENT}\", \"timeZone\": \"Europe/Berlin\", \"deviceName\": \"Chrome 130\"}}")
             );
             assert_eq!(
                 body.as_ptr() as usize - base as usize,

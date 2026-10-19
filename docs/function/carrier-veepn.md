@@ -52,7 +52,7 @@ What the rows cannot see stays in prose. The pair is coded when a region's list 
 | 1 + 1 bytes | 155.2 – 177.6 ms | 9.9 – 10.6 ms |
 | 32 + 24 bytes | 428.2 – 458.6 ms | 88.7 – 90.2 ms |
 
-That is 4.8x–5.1x at the long pair, 9.8x–10.0x at the ordinary one and 15.2x–17.9x at the smallest. A third shape was measured and lost: stage the pair in a stack buffer and code the whole of it with the group loader costs 1.06x to 1.28x *more* than the gather at the same three cells, so the wider load does not pay for keeping the concatenation, and the gather ships alone. Durations, not counts: the same cells read up to 2.9x higher in absolute time while a `cargo` build shared the cores — the ratios moved far less than the durations — nothing here reproduces either, and no `bench.yml` cell blesses them, so they suggest and prove nothing.
+That is 4.8x–5.1x at the long pair, 9.8x–10.0x at the ordinary one and 15.2x–17.9x at the smallest. A third shape was measured and lost: stage the pair in a stack buffer and code the whole of it one group at a time costs 1.06x to 1.28x *more* than the gather at the same three cells — the wider load never pays for the concatenation it has to keep — so that route is not in the tree and the gather ships as the only window coder. Durations, not counts: the same cells read up to 2.9x higher in absolute time while a `cargo` build shared the cores — the ratios moved far less than the durations — nothing here reproduces either, and no `bench.yml` cell blesses them, so they suggest and prove nothing.
 
 ## What we removed
 
@@ -67,6 +67,8 @@ That is 4.8x–5.1x at the long pair, 9.8x–10.0x at the ordinary one and 15.2x
 **The whole region copied to reach one upstream.** `servers()` handed back a `Vec<Server>` cloned from the cache, so a flow rebuilt a host `String` and a pair `String` for *every* entry of the region — a dozen entries, two dozen allocations — to dial one of them. The cache holds an `Arc<Vec<Server>>` and a flow bumps it, which is what `a_cached_list_is_shared_not_copied_per_flow` witnesses by pointer equality rather than by bytes.
 
 What is **not** removed. A flow still allocates for its dial: the host `String` and the pair `String` cloned out of the one `Server` it picks (`FoxyDial` owns its edge name, as the `Foxy` lane's dial does), the `authority` `String` the front hands in, and the copy every plaintext pays into the TLS record. The rotation is cloned per ask — `Vec<Endpoint>` copied under the lock so no lock is held across the network — which is a few allocations per *ask*, at a 7-day and 12-hour cadence, and none per flow. The plane's two request bodies are built into a `Vec` in the app before they are sent, because `foxy_account::ask` takes `&[u8]` and the window has to outlive the call. Nothing here has a benchmark cell yet, so none of it is quoted as a duration; the coder is, and it is named as one.
+
+One byte of the launch diverges, and it is named rather than slipped past: `platformVersion` carries this tree's browser-UA shape — `Chrome/130.0`, the way `foxy_challenge` spells its `Chrome/126.0` — not the extension's `Chrome/130.0.0.0`. No reader at either end compares that tail, and a literal that reads as a routable address has no business in a fixture-checked tree.
 
 ## References
 

@@ -2,7 +2,7 @@ const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 
 /// The `String`-returning coder, walked a chunk at a time with no intermediate buffer to zero and no validation pass afterwards.
 ///
-/// Two coders reach these bytes, this one and [`encode_into`]; `the_staged_encoder_matches_the_alphabet_at_every_length` holds them byte-identical, which is why the older route keeps its own shape instead of paying a fill and a check per call.
+/// [`encode_parts_into`] is the other route to these bytes and the one that writes where the caller already has a window; `the_window_coder_matches_the_alphabet_at_every_length` holds the two byte-identical, which is why this shape survives instead of delegating and paying a fill plus a UTF-8 walk per call.
 #[must_use]
 pub fn encode(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(encoded_len(bytes.len()));
@@ -26,56 +26,6 @@ pub fn encode(bytes: &[u8]) -> String {
         });
     }
     out
-}
-
-/// Every whole group of three bytes is one load and four table stores, and a short last group carries its own `=` padding: the coded text lands where the caller already allocated it, so a credential costs no buffer of its own.
-///
-/// # Errors
-/// [`std::io::ErrorKind::InvalidInput`] when `out` is shorter than the exact coded length.
-pub fn encode_into(bytes: &[u8], out: &mut [u8]) -> std::io::Result<usize> {
-    let len = encoded_len(bytes.len());
-    let out = out
-        .get_mut(..len)
-        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let groups = bytes.len() / 3;
-    let whole = groups * 3;
-    for (slot, group) in out[..groups * 4]
-        .as_chunks_mut::<4>()
-        .0
-        .iter_mut()
-        .zip(bytes[..whole].as_chunks::<3>().0)
-    {
-        let word = u32::from_be_bytes([0, group[0], group[1], group[2]]);
-        *slot = [
-            STD[(word >> 18 & 63) as usize],
-            STD[(word >> 12 & 63) as usize],
-            STD[(word >> 6 & 63) as usize],
-            STD[(word & 63) as usize],
-        ];
-    }
-    // One load of the 1..=2 leftover bytes, shifted so the unused lanes fall on padding.
-    let rest = &bytes[whole..];
-    let word = match rest {
-        [] => return Ok(len),
-        [a] => u32::from(*a) << 16,
-        [a, b] => (u32::from(*a) << 16) | (u32::from(*b) << 8),
-        _ => unreachable!("the leftover is under a group"),
-    };
-    out[groups * 4..].copy_from_slice(&[
-        STD[(word >> 18 & 63) as usize],
-        STD[(word >> 12 & 63) as usize],
-        if rest.len() > 1 {
-            STD[(word >> 6 & 63) as usize]
-        } else {
-            b'='
-        },
-        if rest.len() > 2 {
-            STD[(word & 63) as usize]
-        } else {
-            b'='
-        },
-    ]);
-    Ok(len)
 }
 
 #[must_use]
@@ -240,7 +190,7 @@ mod tests {
 
     /// Every length, both padding shapes included, and the write lands in the buffer the caller handed over: no allocation of its own.
     #[test]
-    fn the_staged_encoder_matches_the_alphabet_at_every_length() {
+    fn the_window_coder_matches_the_alphabet_at_every_length() {
         let mut word = 0x9e37_79b9_7f4a_7c15_u64;
         let mut next = move || {
             word ^= word << 13;
@@ -251,7 +201,7 @@ mod tests {
         for len in 0..=80usize {
             let bytes: Vec<u8> = (0..len).map(|_| next()).collect();
             let mut staged = vec![0u8; encoded_len(len)];
-            let written = encode_into(&bytes, &mut staged).expect("exact length");
+            let written = encode_parts_into(&[&bytes], &mut staged).expect("exact length");
             assert_eq!(written, staged.len(), "coded length for {len} bytes");
             assert_eq!(
                 std::str::from_utf8(&staged).expect("ascii"),
@@ -261,7 +211,9 @@ mod tests {
         }
         let mut too_short = [0u8; 4];
         assert_eq!(
-            encode_into(b"abcd", &mut too_short).err().map(|e| e.kind()),
+            encode_parts_into(&[b"abcd"], &mut too_short)
+                .err()
+                .map(|e| e.kind()),
             Some(std::io::ErrorKind::InvalidInput),
             "a buffer under the coded length is refused rather than partially filled"
         );
