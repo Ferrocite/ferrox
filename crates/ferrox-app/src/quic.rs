@@ -658,7 +658,7 @@ enum Burst {
 
 /// Every datagram already waiting on a plain lane, in one `recvmmsg` per batch: here the kernel's copy *is* the datagram, so nothing sits between the socket and quiche. A salamander's salt, a relay header, a gecko fragment or a hopping port is a read of its own shape and stays with the datagram-at-a-time loop.
 ///
-/// `tail` bounds the wait for the first of the batch as the call's own timeout, so draining a burst never leaves the lane carrying a shorter wait than the one its other handles asked for. `limit` is the caller's remaining burst, so a batch cannot take the visit past the cap that keeps one busy flow off the connection lock.
+/// `tail` bounds the wait for the first of the batch as the call's own timeout, so draining a burst never leaves the lane carrying a shorter wait than the one its other handles asked for, and `MSG_WAITFORONE` stops a batch at the queue rather than at the slots, so a partial drain costs no wait at all. `limit` is the caller's remaining burst, so a batch cannot take the visit past the cap that keeps one busy flow off the connection lock.
 #[cfg(target_os = "linux")]
 fn drain_burst(
     sock: &Datagram,
@@ -701,7 +701,7 @@ fn drain_burst(
             sock.sock.as_raw_fd(),
             batch.as_mut_ptr(),
             want as libc::c_uint,
-            0,
+            libc::MSG_WAITFORONE,
             &raw mut budget,
         )
     };
