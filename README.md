@@ -42,6 +42,7 @@ A from-scratch proxy core, **bit-identical to the implementations it replaces** 
 | dependency licence and provenance | `deny.toml` + `scripts/check-dependency-policy.sh`; GPL/AGPL refused as dependencies |
 | roadmap coherence | `ferrox-prompt check`: no duplicate id, no gate-less slice, no cycle |
 | method pages match one manifest | `scripts/check-method-docs.sh` against `scripts/method-counts.txt` |
+| no conflict left half-resolved | `scripts/check-merge-markers.sh` over every tracked file |
 | change measured against what it touches | `scripts/check-ci-scope.sh` against each page's scope block — see [`docs/ci-scope.md`](docs/ci-scope.md) |
 
 Not claimed: that this is the fastest implementation. What is built is the machinery that notices when it is not.
