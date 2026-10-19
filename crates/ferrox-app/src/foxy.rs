@@ -318,20 +318,25 @@ fn hop_connect(stream: &mut Connection, host: &str, port: u16) -> Result<(), Fai
         ],
     )
     .map_err(|_| Failure::Io)?;
-    let mut window = [0u8; HOP_HEAD];
+    let mut head = [0u8; HOP_HEAD];
+    let mut have = 0usize;
     loop {
-        let seen = stream.peek(&mut window).map_err(|_| Failure::Io)?;
+        let seen = stream.peek(&mut head[have..]).map_err(|_| Failure::Io)?;
         if seen == 0 {
             return Err(Failure::Io);
         }
-        let Some(end) = foxy::head_end(&window[..seen]) else {
-            if seen == window.len() {
+        let filled = have + seen;
+        let Some(end) = foxy::head_end(&head[..filled]) else {
+            if filled == head.len() {
                 return Err(Failure::Io);
             }
+            // No terminator yet, so every octet seen so far is head: take them, and let the next peek block on the wire instead of rereading the ones already here.
+            read_exact(stream, &mut head[have..filled]).map_err(|_| Failure::Io)?;
+            have = filled;
             continue;
         };
-        read_exact(stream, &mut window[..end + 4]).map_err(|_| Failure::Io)?;
-        let code = foxy::connect_status(&window[..end + 4]).map_err(|_| Failure::Io)?;
+        read_exact(stream, &mut head[have..end + 4]).map_err(|_| Failure::Io)?;
+        let code = foxy::connect_status(&head[..end + 4]).map_err(|_| Failure::Io)?;
         return opened(code);
     }
 }
@@ -3241,6 +3246,39 @@ pub(crate) mod loopback {
             answering.join().expect("joins"),
             "CONNECT edge.test:2499 HTTP/1.1\r\nHost: edge.test:2499\r\n\r\n"
         );
+    }
+
+    /// A hop that sends the first line of its head and then withholds the rest must cost the read arm, not the core: a peek that leaves its octets in the socket would see them again forever, so the walk takes what it has seen before it waits for more.
+    #[test]
+    fn a_hop_that_withholds_its_terminator_waits_on_the_wire_not_on_its_own_octets() {
+        const ARM: Duration = Duration::from_secs(1);
+        const GIVE_UP: Duration = Duration::from_secs(5);
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let (partial_tx, partial_rx) = std::sync::mpsc::channel::<()>();
+        let (released_tx, released_rx) = std::sync::mpsc::channel::<()>();
+        let answering = std::thread::spawn(move || {
+            let (mut hop, _) = front.accept().expect("accepts");
+            hop.write_all(b"HTTP/1.1 200 Connection established")
+                .expect("a head with no empty line");
+            partial_tx.send(()).expect("signals");
+            let _ = released_rx.recv();
+        });
+        let mut client = Connection::connect(addr).expect("connects");
+        client.set_read_timeout(Some(ARM)).expect("arms a read");
+        partial_rx
+            .recv_timeout(GIVE_UP)
+            .expect("the hop answered before the walk started");
+        let (verdict_tx, verdict_rx) = std::sync::mpsc::channel();
+        let _walked = std::thread::spawn(move || {
+            let _ = verdict_tx.send(hop_connect(&mut client, "edge.test", 2499));
+        });
+        let verdict = verdict_rx.recv_timeout(GIVE_UP).expect(
+            "a withheld terminator cost the walk its read arm, not a spin over the octets it had already seen",
+        );
+        assert!(verdict.is_err(), "a head with no empty line opens nothing");
+        released_tx.send(()).expect("releases the hop");
+        answering.join().expect("joins");
     }
 
     #[test]
