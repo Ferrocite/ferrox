@@ -1428,9 +1428,8 @@ mod tests {
         drop(dead);
         let out = lane(&[origin.as_str()]).expect("lane");
         let started = std::time::Instant::now();
-        let why = match out.open("example.com:443") {
-            Err(why) => why,
-            Ok(_) => panic!("a plane that answers nothing fails the flow"),
+        let Err(why) = out.open("example.com:443") else {
+            panic!("a plane that answers nothing fails the flow");
         };
         let took = started.elapsed();
         assert!(
