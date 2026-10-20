@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::sync::{mpsc, Arc};
 
@@ -417,42 +417,22 @@ struct Association {
 }
 
 impl Association {
-    /// Associate over a loopback pair and read the relay address off the reply: the greeting, the request and the reply are the same bytes a SOCKS5 client writes, so the outbound's UDP arms cannot tell a device from a proxy client.
+    /// Associate over a loopback pair and read the relay address off the reply: the
+    /// reply is the ten bytes a SOCKS5 server writes for a `UDP ASSOCIATE`, so the
+    /// outbound's UDP arms cannot tell a device from a proxy client.
     fn open(associate: &Associate) -> io::Result<Self> {
-        let listener = TcpListener::bind("127.0.0.1:0")?;
-        let pair_addr = listener.local_addr()?;
-        let client = TcpStream::connect(pair_addr)?;
-        let (server, _) = listener.accept()?;
-        drop(listener);
         let associate = Arc::clone(associate);
-        std::thread::spawn(move || associate(Connection::from(server)));
-
-        let budget = budgets::handshake();
-        let mut control = Connection::from(client);
-        control.set_read_timeout(Some(budget))?;
-        control.write_all(&[5, 1, 0])?;
-        let mut method = [0u8; 2];
-        control.read_exact(&mut method)?;
-        if method != [5, 0] {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "the association refused no authentication",
-            ));
-        }
-        control.write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])?;
-        let mut reply = [0u8; 10];
-        control.read_exact(&mut reply)?;
-        if reply[..4] != [5, 0, 0, 1] {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "the association refused its address type",
-            ));
-        }
-        let relay = SocketAddr::new(
-            IpAddr::V4([reply[4], reply[5], reply[6], reply[7]].into()),
-            u16::from_be_bytes([reply[8], reply[9]]),
-        );
-        Ok(Self { control, relay })
+        let association =
+            crate::proxy::udp_association(move |conn| associate(conn)).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "the association refused its address type",
+                )
+            })?;
+        Ok(Self {
+            control: association.control,
+            relay: association.relay,
+        })
     }
 }
 
@@ -771,9 +751,7 @@ fn open_leg(
     key: UdpKey,
     ended: &mpsc::Sender<Ended>,
 ) -> io::Result<UdpSocket> {
-    let leg = UdpSocket::bind(SocketAddr::new(relay.ip(), 0))?;
-    leg.connect(relay)?;
-    leg.set_read_timeout(Some(budgets::udp_idle()))?;
+    let leg = crate::proxy::relay_leg(relay)?;
     let target = SocketAddr::from(endpoint);
     let reader = leg.try_clone()?;
     let mut dev_writer = device.clone_writer()?;

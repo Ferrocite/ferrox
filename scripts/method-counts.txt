@@ -516,3 +516,10 @@ socks socks4-client-request-buffers 1 ferrox-app-socks::tests::a_socks4_session_
 socks socks4a-client-request-buffers 1 ferrox-app-socks::tests::a_socks4a_session_names_its_destination
 socks socks4-requests-a-credential-front-refuses 1 ferrox-app-proxy::tests::a_front_that_asks_for_a_credential_refuses_a_socks4_request
 socks socks4-xray-scenario-tests-passing 1 scripts/run-upstream-suite.sh
+
+# --- dokodemo-door transparent inbound -----------------------------------------
+front-dokodemo ops-retired-instructions UNBLESSED scripts/count-ops.sh
+front-dokodemo datagrams-carrying-to-the-target 1 ferrox-app-proxy::tests::a_dokodemo_door_carries_a_datagram_to_its_target
+front-dokodemo associations-answering-with-the-relay 1 ferrox-app-proxy::tests::the_udp_association_carries_a_datagram_to_the_target
+front-dokodemo transparent-settings-refused 2 ferrox-app-proxy::tests::a_dokodemo_front_refuses_the_transparent_settings
+front-dokodemo xray-scenario-tests-passing 2 scripts/run-upstream-suite.sh
