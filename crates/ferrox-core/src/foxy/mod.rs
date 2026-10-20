@@ -216,6 +216,53 @@ impl Pass {
     pub fn renews_in(&self, now: u64) -> std::time::Duration {
         renewal_delay(self.expires_at, now)
     }
+
+    /// The traffic allowance the plane named, in the one shape a caller prints: the bytes left in the
+    /// largest unit that keeps a digit, and when they come back. `None` when the plane said nothing,
+    /// which is not zero — an account whose headers name no allowance is not an account with nothing left.
+    #[must_use]
+    pub fn allowance_line(&self) -> Option<String> {
+        let left = self.quota_remaining?;
+        let mut line = allowance_bytes(left);
+        if let Some(reset) = self.quota_reset {
+            line.push_str(", resets in ");
+            line.push_str(&allowance_clock(reset));
+        }
+        Some(line)
+    }
+}
+
+/// Bytes in the largest unit that keeps a digit: integer arithmetic throughout, because a quota is a
+/// count of bytes and a float here is a rounding bug waiting for an account at 1023 MiB.
+fn allowance_bytes(bytes: u64) -> String {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    const KIB: u64 = 1 << 10;
+    if bytes < KIB {
+        return format!("{bytes} B");
+    }
+    if bytes < MIB {
+        return format!("{} KiB", bytes / KIB);
+    }
+    if bytes < GIB {
+        return format!("{} MiB", bytes / MIB);
+    }
+    let tenths = bytes / (GIB / 10);
+    format!("{}.{} GiB", tenths / 10, tenths % 10)
+}
+
+/// A wait in the two units a person reads it in, and never a decimal: an hour and a minute is what a
+/// reset clock means, and the seconds under it are noise a caller cannot act on.
+fn allowance_clock(seconds: u64) -> String {
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{seconds}s")
+    }
 }
 
 /// The pass itself is the problem, so a different edge answers the same way.
@@ -455,6 +502,46 @@ mod tests {
         assert_eq!(
             Failure::Untrusted.to_string(),
             "this device does not trust the edge's certificate"
+        );
+    }
+
+    /// The allowance a person reads: the bytes in the largest unit that keeps a digit, and the reset
+    /// clock in two units. Integer arithmetic, so a quota that lands on a boundary is not rounded into
+    /// the wrong unit, and no headers is no line rather than a zero.
+    #[test]
+    fn the_allowance_is_the_bytes_left_and_when_they_return() {
+        let pass = |left: Option<u64>, reset: Option<u64>| Pass {
+            token: String::new(),
+            expires_at: None,
+            quota_remaining: left,
+            quota_reset: reset,
+        };
+        assert_eq!(
+            pass(Some(4_294_967_296), Some(3_600)).allowance_line(),
+            Some("4.0 GiB, resets in 1h 0m".to_owned())
+        );
+        assert_eq!(
+            pass(Some(1_610_612_736), None).allowance_line(),
+            Some("1.5 GiB".to_owned()),
+            "a half gibibyte is a tenth, not a truncation"
+        );
+        assert_eq!(
+            pass(Some((1 << 30) - 1), Some(90)).allowance_line(),
+            Some("1023 MiB, resets in 1m".to_owned()),
+            "one byte under a gibibyte is still mebibytes"
+        );
+        assert_eq!(
+            pass(Some(1_048_575), Some(45)).allowance_line(),
+            Some("1023 KiB, resets in 45s".to_owned())
+        );
+        assert_eq!(
+            pass(Some(512), Some(0)).allowance_line(),
+            Some("512 B, resets in 0s".to_owned())
+        );
+        assert_eq!(
+            pass(None, Some(3_600)).allowance_line(),
+            None,
+            "an account the plane said nothing about is not an empty one"
         );
     }
 

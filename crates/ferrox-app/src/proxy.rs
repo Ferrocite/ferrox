@@ -11064,7 +11064,12 @@ pub(crate) fn mint_foxy_pass(config: &str, out: &str) -> ! {
         use std::os::unix::fs::PermissionsExt as _;
         let _ = std::fs::set_permissions(out, std::fs::Permissions::from_mode(0o600));
     }
-    println!("minted=1 expires_at={:?}", pass.expires_at);
+    // The allowance on the pass's own line, so an account knows how much is left before a flow is refused for having none.
+    let allowance = pass
+        .allowance_line()
+        .map(|line| format!(" quota=\"{line}\""))
+        .unwrap_or_default();
+    println!("minted=1 expires_at={:?}{allowance}", pass.expires_at);
     std::process::exit(0);
 }
 

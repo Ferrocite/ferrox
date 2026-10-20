@@ -11,6 +11,8 @@ The Foxy lane is an account-authenticated CONNECT tunnel to a CDN edge: a Firefo
 
 UDP rides the same lane as **CONNECT-UDP** (RFC 9298), over `h2` and over `h3`, `h3` first: one capsule stream per destination. HTTP/1.1 has no extended CONNECT, so it is never asked to carry a datagram, which `the_carriers_are_ordered_by_what_the_edge_can_answer` gates.
 
+**How much is left, before a flow is refused for it.** The account plane names the traffic allowance in two headers on the mint (`X-Quota-Remaining`, `X-Quota-Reset`), and `mint-foxy-pass` prints them on the line it already prints for the pass it stores — `quota="4.0 GiB, resets in 1h 0m"` — so an account three flows from empty says so instead of failing a dial. The formatter is integer arithmetic throughout (`Pass::allowance_line`: bytes in the largest unit that keeps a digit, the reset clock in hours and minutes), gated by `the_allowance_is_the_bytes_left_and_when_they_return`, which pins the two boundaries that round the wrong way — one byte under a gibibyte, and a half-gibibyte tenth — and holds the plane's silence to `None` rather than to a zero that would read as an exhausted account.
+
 One shape for all of them, and it is the whole design: open a stream, send seven header fields, read one status, relay. The parts that decide rather than move bytes live in `ferrox_core::foxy` (the codecs, the window arithmetic, the UDP path and template), and the app crate owns the socket, the pool and the TLS session. A caller that relays bytes does not know which carrier produced its `Read + Write`. The tunnel a dial returns owns the pooled stream it rides (`FoxyOpen::Tunnel`), so the flow that ends is what hands that stream back.
 
 ## Data path

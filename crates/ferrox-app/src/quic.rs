@@ -154,10 +154,22 @@ pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) const IDLE_TIMEOUT_MS: u64 = 300_000;
 
-/// The receive credit an edge may hold against this process: quiche parks every delivered byte here until the app reads it, so the advertised window is the memory the edge gets to spend, and the auto-tuning ceiling is the same number — a window that only ever grows is a window that was never capped.
+/// The receive credit an edge may hold against this process at the first byte: quiche parks every delivered byte here until the app reads it, so the advertised window is the memory the edge gets to spend before the first `MAX_STREAM_DATA` update.
 pub(crate) const MAX_DATA: u64 = 2_097_152;
 pub(crate) const MAX_STREAM_DATA: u64 = 1_048_576;
 pub(crate) const MAX_STREAMS: u64 = 100;
+
+/// The rate every window in this file is sized for, in bytes per second: 1 Gbit/s, the fastest link a lane's own socket is expected to feed.
+const WINDOW_RATE: u64 = 125_000_000;
+
+/// The bytes a link of `rate` holds in flight over one round trip — the window a flow must be allowed before the window, and not the link, is what limits it. A window narrower than this caps a flow at `window / rtt`; a wider one buys nothing. Integer arithmetic throughout, because the product is a count of bytes and rounding it is the whole answer.
+const fn in_flight(rate: u64, rtt_ms: u64) -> u64 {
+    rate * rtt_ms / 1000
+}
+
+/// The ceilings quiche's own receiver autotuner may double up to, one round trip at a time. They are strictly wider than the initial credit above, which is the point: quiche doubles a window when it is drained twice inside two round trips, and a ceiling equal to the initial window turns every one of those doublings into a no-op, leaving the flow paced by `window / rtt` on every path where the product is larger than a megabyte.
+pub(crate) const MAX_CONNECTION_WINDOW: u64 = in_flight(WINDOW_RATE, 256);
+pub(crate) const MAX_STREAM_WINDOW: u64 = in_flight(WINDOW_RATE, 64);
 
 const PUMP_POLL: Duration = Duration::from_millis(500);
 
@@ -380,11 +392,10 @@ fn stage_at(path: &std::path::Path, bundle: &[u8]) -> Option<(std::path::PathBuf
     Some((path.to_path_buf(), text))
 }
 
-/// One ALPN and one flow-control shape for the lane: a weaker peer negotiates down, never up.
-pub(crate) fn tune(config: &mut quiche::Config, alpn: &[u8]) -> bool {
-    if config.set_application_protos(&[alpn]).is_err() {
-        return false;
-    }
+/// The transport shape every lane in this file shares, in one place: the initial credit, the ceiling its autotuner may grow to, and the datagram both ends are bounded to.
+///
+/// The datagram is the whole arithmetic of a QUIC lane's syscall count. A packet carries 1350 bytes of UDP payload instead of the 1200 quiche defaults to, so a megabyte leaves in 776 datagrams rather than 874 — 11.2 percent fewer sends, fewer ACKs, and fewer receive interrupts for the same bytes, and the lane's own receive buffer is already exactly this wide, so what it advertises is what it can hold.
+fn tune_transport(config: &mut quiche::Config) {
     config.set_max_idle_timeout(IDLE_TIMEOUT_MS);
     config.set_initial_max_data(MAX_DATA);
     config.set_initial_max_stream_data_bidi_local(MAX_STREAM_DATA);
@@ -392,8 +403,19 @@ pub(crate) fn tune(config: &mut quiche::Config, alpn: &[u8]) -> bool {
     config.set_initial_max_stream_data_uni(MAX_STREAM_DATA);
     config.set_initial_max_streams_bidi(MAX_STREAMS);
     config.set_initial_max_streams_uni(MAX_STREAMS);
-    config.set_max_connection_window(MAX_DATA);
-    config.set_max_stream_window(MAX_STREAM_DATA);
+    config.set_max_connection_window(MAX_CONNECTION_WINDOW);
+    config.set_max_stream_window(MAX_STREAM_WINDOW);
+    config.set_max_send_udp_payload_size(MAX_DATAGRAM);
+    // What the lane may be handed is what its own receive buffer holds: advertising quiche's 65527 while reading into `MAX_DATAGRAM` truncates any wider datagram a peer takes the advertisement at its word on.
+    config.set_max_recv_udp_payload_size(MAX_DATAGRAM);
+}
+
+/// One ALPN and one flow-control shape for the lane: a weaker peer negotiates down, never up.
+pub(crate) fn tune(config: &mut quiche::Config, alpn: &[u8]) -> bool {
+    if config.set_application_protos(&[alpn]).is_err() {
+        return false;
+    }
+    tune_transport(config);
     true
 }
 
@@ -452,15 +474,7 @@ pub(crate) fn quiche_config(roots: &[Vec<u8>], cc: Option<&str>) -> Option<quich
             if let Some(name) = cc {
                 config.set_cc_algorithm_name(name).ok()?;
             }
-            config.set_max_idle_timeout(IDLE_TIMEOUT_MS);
-            config.set_initial_max_data(MAX_DATA);
-            config.set_initial_max_stream_data_bidi_local(MAX_STREAM_DATA);
-            config.set_initial_max_stream_data_bidi_remote(MAX_STREAM_DATA);
-            config.set_initial_max_stream_data_uni(MAX_STREAM_DATA);
-            config.set_initial_max_streams_bidi(MAX_STREAMS);
-            config.set_initial_max_streams_uni(MAX_STREAMS);
-            config.set_max_connection_window(MAX_DATA);
-            config.set_max_stream_window(MAX_STREAM_DATA);
+            tune_transport(&mut config);
             config.load_verify_locations_from_file(&path_text).ok()?;
             Some(config)
         });
@@ -820,29 +834,32 @@ pub(crate) fn bind_datagram(address: &str) -> std::io::Result<UdpSocket> {
             );
         }
     }
-    set_receive_buffer(&sock, DATAGRAM_RECV_BUF);
+    set_receive_buffer(&sock, DATAGRAM_BUFFER);
+    set_send_buffer(&sock, DATAGRAM_BUFFER);
     Ok(sock)
 }
 
-/// The receive buffer a lane's socket asks for: the edge is granted a whole stream window of datagrams
-/// at once (`MAX_STREAM_DATA`), so a socket holding a few of them turns every pause in the pump into
-/// loss the lane pays for in retransmit timers rather than in packets.
-const DATAGRAM_RECV_BUF: i32 = 1 << 20;
+/// The buffer a lane's socket asks for, in each direction: the edge is granted a whole stream window of
+/// datagrams at once (`MAX_STREAM_DATA`), so a socket holding a few of them turns every pause in the pump into
+/// loss the lane pays for in retransmit timers rather than in packets. The send side is the same number for the
+/// mirror reason: quiche hands the socket a burst of a window's worth of datagrams and a `send_to` the kernel
+/// cannot queue is a datagram quiche has already counted as sent.
+const DATAGRAM_BUFFER: i32 = 1 << 20;
 
 /// The least the ask has to land as for the lane to be worth reading back: a Linux default already clears it, a macOS and a Windows default do not, which is where the arm is observable.
 #[cfg(test)]
 const DATAGRAM_RECV_BUF_FLOOR: i32 = 1 << 18;
 
-/// Ask the socket for `bytes` of receive buffer; a platform that caps the ask hands back what it granted.
+/// Ask the socket for `bytes` of a buffer; a platform that caps the ask hands back what it granted.
 #[cfg(unix)]
-fn set_receive_buffer(sock: &UdpSocket, bytes: i32) {
+fn set_buffer(sock: &UdpSocket, option: libc::c_int, bytes: i32) {
     use std::os::fd::AsRawFd as _;
     // SAFETY: `bytes` outlives the call, and the size is its own.
     unsafe {
         libc::setsockopt(
             sock.as_raw_fd(),
             libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
+            option,
             std::ptr::addr_of!(bytes).cast(),
             libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
                 .unwrap_or(libc::socklen_t::MAX),
@@ -850,9 +867,21 @@ fn set_receive_buffer(sock: &UdpSocket, bytes: i32) {
     }
 }
 
+#[cfg(unix)]
+fn set_receive_buffer(sock: &UdpSocket, bytes: i32) {
+    set_buffer(sock, libc::SO_RCVBUF, bytes);
+}
+
+/// A macOS socket's send buffer defaults to a few kilobytes, so a burst quiche has already declared sent is refused
+/// by the kernel and lost: the lane asks for the same buffer in both directions and lets the kernel cap it.
+#[cfg(unix)]
+fn set_send_buffer(sock: &UdpSocket, bytes: i32) {
+    set_buffer(sock, libc::SO_SNDBUF, bytes);
+}
+
 /// What the socket actually holds, as the kernel reports it.
 #[cfg(all(test, unix))]
-fn receive_buffer(sock: &UdpSocket) -> i32 {
+fn get_buffer(sock: &UdpSocket, option: libc::c_int) -> i32 {
     use std::os::fd::AsRawFd as _;
     let mut got: libc::c_int = 0;
     let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
@@ -862,7 +891,7 @@ fn receive_buffer(sock: &UdpSocket) -> i32 {
         libc::getsockopt(
             sock.as_raw_fd(),
             libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
+            option,
             std::ptr::addr_of_mut!(got).cast(),
             std::ptr::addr_of_mut!(len),
         )
@@ -874,28 +903,66 @@ fn receive_buffer(sock: &UdpSocket) -> i32 {
     }
 }
 
-/// Ask the socket for `bytes` of receive buffer; a platform that caps the ask hands back what it granted.
+#[cfg(all(test, unix))]
+fn receive_buffer(sock: &UdpSocket) -> i32 {
+    get_buffer(sock, libc::SO_RCVBUF)
+}
+
+#[cfg(all(test, unix))]
+fn send_buffer(sock: &UdpSocket) -> i32 {
+    get_buffer(sock, libc::SO_SNDBUF)
+}
+
+/// Ask the socket for `bytes` of a buffer; a platform that caps the ask hands back what it granted.
 #[cfg(windows)]
-fn set_receive_buffer(sock: &UdpSocket, bytes: i32) {
+fn set_buffer(sock: &UdpSocket, option: i32, bytes: i32) {
     use std::os::windows::io::AsRawSocket as _;
-    use windows_sys::Win32::Networking::WinSock::{setsockopt, SOL_SOCKET, SO_RCVBUF};
+    use windows_sys::Win32::Networking::WinSock::setsockopt;
     // SAFETY: `bytes` outlives the call, the handle is the socket's own, and the length is that of the value pointed at.
     unsafe {
         setsockopt(
             sock.as_raw_socket() as usize,
-            SOL_SOCKET,
-            SO_RCVBUF,
+            windows_sys::Win32::Networking::WinSock::SOL_SOCKET,
+            option,
             std::ptr::addr_of!(bytes).cast(),
             i32::try_from(std::mem::size_of::<i32>()).unwrap_or(i32::MAX),
         );
     }
 }
 
-/// What the socket actually holds, as the kernel reports it.
+#[cfg(windows)]
+fn set_receive_buffer(sock: &UdpSocket, bytes: i32) {
+    set_buffer(
+        sock,
+        windows_sys::Win32::Networking::WinSock::SO_RCVBUF,
+        bytes,
+    );
+}
+
 #[cfg(all(test, windows))]
 fn receive_buffer(sock: &UdpSocket) -> i32 {
+    get_buffer(sock, windows_sys::Win32::Networking::WinSock::SO_RCVBUF)
+}
+
+#[cfg(all(test, windows))]
+fn send_buffer(sock: &UdpSocket) -> i32 {
+    get_buffer(sock, windows_sys::Win32::Networking::WinSock::SO_SNDBUF)
+}
+
+#[cfg(windows)]
+fn set_send_buffer(sock: &UdpSocket, bytes: i32) {
+    set_buffer(
+        sock,
+        windows_sys::Win32::Networking::WinSock::SO_SNDBUF,
+        bytes,
+    );
+}
+
+/// What the socket actually holds, as the kernel reports it.
+#[cfg(all(test, windows))]
+fn get_buffer(sock: &UdpSocket, option: i32) -> i32 {
     use std::os::windows::io::AsRawSocket as _;
-    use windows_sys::Win32::Networking::WinSock::{getsockopt, SOL_SOCKET, SO_RCVBUF};
+    use windows_sys::Win32::Networking::WinSock::{getsockopt, SOL_SOCKET};
     let mut got: i32 = 0;
     let mut len = i32::try_from(std::mem::size_of::<i32>()).unwrap_or(i32::MAX);
     // SAFETY: `got` and `len` are the buffer and the length the kernel writes through, on the socket's own handle.
@@ -903,7 +970,7 @@ fn receive_buffer(sock: &UdpSocket) -> i32 {
         getsockopt(
             sock.as_raw_socket() as usize,
             SOL_SOCKET,
-            SO_RCVBUF,
+            option,
             std::ptr::addr_of_mut!(got).cast(),
             std::ptr::addr_of_mut!(len),
         )
@@ -2626,15 +2693,74 @@ mod tests {
         assert!(udp_to_server("127.0.0.1", 443).is_some(), "still dials");
     }
 
-    /// The lane asks for a receive buffer before a first datagram can land on it, and the ask is read back rather than assumed: a parked lane holds whatever the edge sent while no pump owned the socket, and a default buffer would drop it.
+    /// The lane asks for a receive buffer before a first datagram can land on it, and the ask is read back rather than assumed: a parked lane holds whatever the edge sent while no pump owned the socket, and a default buffer would drop it. The send side is the same ask: a burst quiche has already accounted for is lost if the kernel's queue is a macOS default.
     #[test]
-    fn a_quic_socket_arms_its_receive_buffer() {
+    fn a_quic_socket_arms_both_of_its_buffers() {
         let sock = bind_datagram("127.0.0.1:0").expect("binds");
         assert!(
             receive_buffer(&sock) >= DATAGRAM_RECV_BUF_FLOOR,
             "the lane asked for {} and holds {}",
-            DATAGRAM_RECV_BUF,
+            DATAGRAM_BUFFER,
             receive_buffer(&sock)
+        );
+        assert!(
+            send_buffer(&sock) >= DATAGRAM_RECV_BUF_FLOOR,
+            "the lane asked for {} and holds {}",
+            DATAGRAM_BUFFER,
+            send_buffer(&sock)
+        );
+    }
+
+    /// The datagram the lane builds is the datagram its own receive buffer holds: quiche's 1200-byte default
+    /// leaves a 1350-byte packet unbuilt and costs a datagram for every 1200 bytes, and a real connection is
+    /// where that is read — the size quiche's packet builder takes is the one the peer's transport parameters
+    /// and this config agree on, and the lane's own advertisement is the buffer it can actually read into.
+    #[test]
+    fn the_lane_sends_the_datagram_its_buffer_holds() {
+        let (client, mut server) = lane_pair();
+        assert_eq!(
+            client.conn.max_send_udp_payload_size(),
+            MAX_DATAGRAM,
+            "the size quiche's packet builder is handed"
+        );
+        let pattern: Vec<u8> = (0..16 * 1024).map(|i| (i % 251) as u8).collect();
+        let wrote = server.conn.stream_send(1, &pattern, false).expect("writes");
+        flush_egress(&mut server.conn, &server.sock);
+        let mut room = [0u8; 2048];
+        let _ = client
+            .sock
+            .set_read_timeout(Some(Duration::from_millis(20)));
+        let mut widest = 0usize;
+        let mut datagrams = 0usize;
+        while let Ok((n, _)) = client.sock.recv_from(&mut room) {
+            datagrams += 1;
+            widest = widest.max(n);
+        }
+        assert!(
+            datagrams > 1,
+            "the frame leaves as a burst, saw {datagrams}"
+        );
+        assert_eq!(
+            widest, MAX_DATAGRAM,
+            "every full packet carries {MAX_DATAGRAM} bytes of the {wrote} written"
+        );
+    }
+
+    /// The ceiling leaves the receiver's autotuner room to double: quiche grows a window by two each time it is
+    /// drained twice inside two round trips, up to `max_window`. A ceiling equal to the initial window turns
+    /// every one of those doublings into a no-op, and the flow is then paced by `window / rtt` for its whole life.
+    /// The product is the arithmetic: 1 Gbit/s holds 64 ms of bytes in flight in 8 MB and 256 ms in 32 MB.
+    #[test]
+    fn the_window_ceiling_leaves_the_autotuner_room() {
+        let stream = std::hint::black_box(MAX_STREAM_WINDOW);
+        let connect = std::hint::black_box(MAX_CONNECTION_WINDOW);
+        assert!(stream > MAX_STREAM_DATA, "a stream ceiling above its floor");
+        assert!(connect > MAX_DATA, "a connection ceiling above its floor");
+        assert_eq!(stream, in_flight(std::hint::black_box(WINDOW_RATE), 64));
+        assert_eq!(connect, in_flight(std::hint::black_box(WINDOW_RATE), 256));
+        assert!(
+            connect >= stream,
+            "one stream cannot outgrow the connection that carries it"
         );
     }
 
