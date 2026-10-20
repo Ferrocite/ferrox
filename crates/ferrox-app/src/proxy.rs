@@ -3868,10 +3868,14 @@ fn serve_dokodemo(address: &str, inbound: &Json, out: &Outbound, label: &str) ->
         armed += 1;
     }
     if networks.contains(&"udp") {
+        // The door's own socket is bound before the inbound is armed: a port nobody holds answers a datagram with a refusal.
+        let Ok(socket) = UdpSocket::bind(address) else {
+            eprintln!("dokodemo-door udp: cannot bind {address} in {label}");
+            return armed;
+        };
         let door = out.clone();
         let target = dest.clone();
-        let address = address.to_owned();
-        thread::spawn(move || serve_dokodemo_udp(&address, &target, &door));
+        thread::spawn(move || dokodemo_udp_door(&socket, &target, &door));
         armed += 1;
     }
     armed
@@ -7057,16 +7061,10 @@ pub(crate) fn relay_leg(relay: SocketAddr) -> std::io::Result<UdpSocket> {
 /// The door rides the outbound's own UDP lane over a loopback SOCKS5 association, the
 /// same relay the `tun` front rides: the lane sees a datagram with a destination and
 /// never learns that a door sent it.
-fn serve_dokodemo_udp(address: &str, dest: &Destination, out: &Outbound) {
-    let Ok(socket) = UdpSocket::bind(address) else {
-        eprintln!("dokodemo-door udp: cannot bind {address}");
-        return;
-    };
-    dokodemo_udp_door(&socket, dest, out);
-}
-
-/// The door itself: the socket it reads, the target every datagram goes to, and the
-/// outbound it rides.
+///
+/// The socket is the one the front bound, so the port is held from the moment the
+/// inbound is armed, and a datagram that arrives before the door reads it waits in the
+/// kernel rather than in a refusal.
 fn dokodemo_udp_door(socket: &UdpSocket, dest: &Destination, out: &Outbound) {
     let Some(target) = dest.socket() else {
         eprintln!("dokodemo-door udp: rewrite target unusable, refused");
@@ -22736,6 +22734,7 @@ mod tests {
     /// names, and the answer comes back to the client that sent it.
     #[test]
     fn a_dokodemo_door_carries_a_datagram_to_its_target() {
+        const PATIENCE: Duration = Duration::from_secs(10);
         let target = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let target_addr = target.local_addr().expect("addr");
         thread::spawn(move || {
@@ -22744,29 +22743,20 @@ mod tests {
                 let _ = target.send_to(&buf[..n], src);
             }
         });
-        let port = {
-            let socket = UdpSocket::bind("127.0.0.1:0").expect("binds");
-            socket.local_addr().expect("addr").port()
-        };
-        let address = format!("127.0.0.1:{port}");
+        // The door's own socket is bound here, so the port is held before the client can send into it.
+        let door = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = door.local_addr().expect("addr").port();
         let dest = Destination::Address(target_addr);
-        thread::spawn(move || serve_dokodemo_udp(&address, &dest, &Outbound::Freedom));
+        thread::spawn(move || dokodemo_udp_door(&door, &dest, &Outbound::Freedom));
         let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
         client
             .connect(SocketAddr::from(([127, 0, 0, 1], port)))
             .expect("connects");
-        client
-            .set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("timeout");
+        client.set_read_timeout(Some(PATIENCE)).expect("timeout");
         let mut back = [0u8; 2048];
-        for _ in 0..100 {
-            client.send(b"who-is").expect("sends");
-            if let Ok((n, _)) = client.recv_from(&mut back) {
-                assert_eq!(&back[..n], b"who-is", "the answer comes back to the client");
-                return;
-            }
-        }
-        panic!("the door did not answer");
+        client.send(b"who-is").expect("sends");
+        let (n, _) = client.recv_from(&mut back).expect("the door answers");
+        assert_eq!(&back[..n], b"who-is", "the answer comes back to the client");
     }
 
     /// The transparent redirect is refused by name: the original destination lives in a
@@ -24941,9 +24931,18 @@ mod relay_tests {
 
     /// The client of the stalled flow: `rounds` chunks of `chunk_len` as fast as the socket
     /// takes them, then a half-close, reporting how much got out.
-    fn push_until_refused(listener: &Listener, rounds: usize, chunk_len: usize) -> usize {
+    ///
+    /// `patience` is how long one write waits for room in a socket whose reader has stopped:
+    /// a destination that reads nothing parks the writer, and the arm that ends the wait is
+    /// the test's own, so a fixture never sits out the suite's default.
+    fn push_until_refused(
+        listener: &Listener,
+        rounds: usize,
+        chunk_len: usize,
+        patience: Duration,
+    ) -> usize {
         let (mut stream, _) = listener.accept().expect("accepts");
-        stream.set_write_timeout(Some(PATIENCE)).expect("timeout");
+        stream.set_write_timeout(Some(patience)).expect("timeout");
         let body: Vec<u8> = (0..chunk_len).map(|i| (i % 251) as u8).collect();
         let mut written = 0usize;
         for _ in 0..rounds {
@@ -25032,7 +25031,8 @@ mod relay_tests {
         let stalled_back = listener();
         let stalled_back_port = port_of(&stalled_back);
         let (release, drain_now) = mpsc::channel::<()>();
-        let feeding = thread::spawn(move || push_until_refused(&stalled_front, ROUNDS, CHUNK));
+        let feeding =
+            thread::spawn(move || push_until_refused(&stalled_front, ROUNDS, CHUNK, PATIENCE));
         let draining = thread::spawn(move || hold_then_read(&stalled_back, &drain_now));
         let stalled_client = Connection::connect(("127.0.0.1", stalled_front_port)).expect("dials");
         let stalled_target = Connection::connect(("127.0.0.1", stalled_back_port)).expect("dials");
@@ -25127,6 +25127,8 @@ mod relay_tests {
     fn a_parked_splice_leg_costs_the_join_budget_not_a_thread() {
         const JOINED: Duration = Duration::from_millis(250);
         const SLACK: Duration = Duration::from_secs(10);
+        // The front's own write arm: the destination reads nothing, so the write parks, and the arm is this test's.
+        const ARMED: Duration = Duration::from_millis(250);
 
         let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
@@ -25138,7 +25140,7 @@ mod relay_tests {
         let back = listener();
         let back_port = port_of(&back);
         let (release, hold) = mpsc::channel::<()>();
-        let feeding = thread::spawn(move || push_until_refused(&front, 512, CHUNK));
+        let feeding = thread::spawn(move || push_until_refused(&front, 512, CHUNK, ARMED));
         let parked = thread::spawn(move || {
             let (_stream, _) = back.accept().expect("accepts");
             let _ = hold.recv();
@@ -25148,10 +25150,10 @@ mod relay_tests {
         let began = std::time::Instant::now();
         relay(&client, &target);
         let took = began.elapsed();
+        // Restored before the fixture's own teardown, so a leg another test is joining never reads this table.
+        budgets::clear();
         let _ = release.send(());
         let pushed = feeding.join().expect("joins");
-        // Restored before the verdicts, so a leg another test is joining never reads this table.
-        budgets::clear();
 
         assert!(
             pushed > 0,
@@ -25195,7 +25197,7 @@ mod relay_tests {
             let (_stream, _) = front.accept().expect("accepts");
             let _ = hold.recv();
         });
-        let pushing = thread::spawn(move || push_until_refused(&back, 512, CHUNK));
+        let pushing = thread::spawn(move || push_until_refused(&back, 512, CHUNK, PATIENCE));
         let client = Connection::connect(("127.0.0.1", front_port)).expect("dials");
         let target = Connection::connect(("127.0.0.1", back_port)).expect("dials");
 
@@ -25387,7 +25389,8 @@ mod relay_tests {
         let stalled_back = listener();
         let stalled_back_port = port_of(&stalled_back);
         let (release, drain_now) = mpsc::channel::<()>();
-        let feeding = thread::spawn(move || push_until_refused(&stalled_front, ROUNDS, SEGMENT));
+        let feeding =
+            thread::spawn(move || push_until_refused(&stalled_front, ROUNDS, SEGMENT, PATIENCE));
         let draining = thread::spawn(move || trickle_then_read(&stalled_back, &drain_now, SEGMENT));
         let stalled_client = Connection::connect(("127.0.0.1", stalled_front_port)).expect("dials");
         let stalled_target = Connection::connect(("127.0.0.1", stalled_back_port)).expect("dials");
