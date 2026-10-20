@@ -571,6 +571,153 @@ fn send_batch(sock: &Datagram, batch: &mut [std::mem::MaybeUninit<libc::mmsghdr>
     }
 }
 
+/// The datagrams one receive takes at a time, the mirror of the send side's `SEND_SLOTS`: a 16 KiB DATA frame is a dozen QUIC packets, and one `recvfrom` each paid a syscall and a timer set per packet.
+#[cfg(target_os = "linux")]
+const RECV_SLOTS: usize = 8;
+
+/// A batch of datagrams read off a lane's socket: the bytes of each, the peer it came from and the length of that peer's name. The batch owns its slots, so a read costs no allocation and a caller takes each datagram by its place in the batch.
+#[cfg(target_os = "linux")]
+pub(crate) struct Batch {
+    slots: [Unfilled<MAX_DATAGRAM>; RECV_SLOTS],
+    peers: [libc::sockaddr_storage; RECV_SLOTS],
+    names: [libc::socklen_t; RECV_SLOTS],
+    lens: [libc::c_uint; RECV_SLOTS],
+    len: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl Batch {
+    pub(crate) fn new() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| Unfilled::<MAX_DATAGRAM>::new()),
+            peers: [unsafe { std::mem::zeroed() }; RECV_SLOTS],
+            names: [0; RECV_SLOTS],
+            lens: [0; RECV_SLOTS],
+            len: 0,
+        }
+    }
+
+    /// How many datagrams the last read filled.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    /// One datagram of the batch, with the peer it came from: the bytes are read out of the slot the kernel wrote, and the address out of the storage it filled.
+    fn at(&mut self, at: usize) -> Option<(&mut [u8], SocketAddr)> {
+        let len = usize::try_from(self.lens[at]).ok()?;
+        let from = crate::proxy::socket_addr_of(&self.peers[at], self.names[at])?;
+        let bytes = self.slots[at].as_mut().get_mut(..len)?;
+        Some((bytes, from))
+    }
+}
+
+/// A platform with no batched call has no batch to own, and the lane says so before it reads.
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct Batch;
+
+#[cfg(not(target_os = "linux"))]
+impl Batch {
+    pub(crate) fn new() -> Self {
+        Self
+    }
+
+    /// How many datagrams the last read filled: a platform with no batched call never fills one.
+    #[allow(
+        clippy::unused_self,
+        reason = "the batched read is Linux's, and this is where the other platforms say so"
+    )]
+    pub(crate) fn len(&self) -> usize {
+        0
+    }
+
+    /// One datagram of the batch: a platform with no batched call has none to give.
+    fn at(&mut self, _at: usize) -> Option<(&mut [u8], SocketAddr)> {
+        let _ = self;
+        None
+    }
+}
+
+/// How one batched read ended: `Read` is a batch the kernel filled, `Empty` is a queue with nothing in it, and `Unbatchable` is a lane whose read is a shape of its own.
+#[derive(PartialEq, Eq, Clone, Copy)]
+#[allow(
+    dead_code,
+    reason = "a platform with no batched call never reads a batch, so it never builds one either"
+)]
+pub(crate) enum Drain {
+    Read,
+    Empty,
+    Unbatchable,
+}
+
+/// Every datagram the socket has queued, in at most `RECV_SLOTS` per call, read straight into the batch's own slots. A lane that reads one datagram per syscall is paced by the syscall, not by the wire: a QUIC packet is 1350 bytes, and a fast link delivers one every ten microseconds, which a syscall per packet cannot keep up with.
+#[cfg(target_os = "linux")]
+pub(crate) fn recv_batch(sock: &Datagram, batch: &mut Batch) -> Drain {
+    use std::os::fd::AsRawFd as _;
+    if !sock.batchable() {
+        return Drain::Unbatchable;
+    }
+    let mut parts: [libc::iovec; RECV_SLOTS] = std::array::from_fn(|_| libc::iovec {
+        iov_base: std::ptr::null_mut(),
+        iov_len: MAX_DATAGRAM,
+    });
+    let mut headers: [libc::mmsghdr; RECV_SLOTS] =
+        std::array::from_fn(|_| unsafe { std::mem::zeroed() });
+    let room = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    for at in 0..RECV_SLOTS {
+        parts[at].iov_base = batch.slots[at].as_mut().as_mut_ptr().cast();
+        headers[at].msg_hdr.msg_name = (&raw mut batch.peers[at]).cast();
+        headers[at].msg_hdr.msg_namelen = room;
+        headers[at].msg_hdr.msg_iov = (&raw mut parts[at]).cast();
+        headers[at].msg_hdr.msg_iovlen = 1;
+    }
+    // `MSG_WAITFORONE` returns on the first datagram that is there rather than waiting for the whole batch: the caller's deadline is the socket's own arm, and a batch that waited for eight would turn one slow packet into eight slow packets.
+    //
+    // The timeout is the socket's own arm and not the call's. The first receive of a batch runs without `MSG_DONTWAIT`, so it waits exactly as long as a `recvfrom` on this socket waits — which is the `SO_RCVTIMEO` the lane armed — and the reads behind it carry `MSG_DONTWAIT`, so they take what is already queued and answer at once. A call's own deadline would have been checked only between the reads, never against the first one.
+    //
+    // SAFETY: every header names a slot of `batch`, a peer of `batch` and a part of `parts`, all of which outlive the call, and the kernel writes each slot only as far as the datagram it read.
+    let got = unsafe {
+        libc::recvmmsg(
+            sock.sock.as_raw_fd(),
+            headers.as_mut_ptr(),
+            RECV_SLOTS as libc::c_uint,
+            libc::MSG_WAITFORONE as _,
+            std::ptr::null_mut(),
+        )
+    };
+    if got < 0 {
+        // A queue with nothing in it is the socket's own arm expiring, and the per-datagram read below would wait for it again: the batch is the answer, so the empty queue is its answer too.
+        let error = std::io::Error::last_os_error();
+        batch.len = 0;
+        return if error.kind() == std::io::ErrorKind::WouldBlock {
+            Drain::Empty
+        } else {
+            Drain::Unbatchable
+        };
+    }
+    if got == 0 {
+        batch.len = 0;
+        return Drain::Empty;
+    }
+    // A read that ran dry after some datagrams is the count, not the error: the kernel answers with what it took.
+    let got = usize::try_from(got).unwrap_or(0).min(RECV_SLOTS);
+    for (at, header) in headers.iter().enumerate().take(got) {
+        batch.lens[at] = header.msg_len;
+        batch.names[at] = header.msg_hdr.msg_namelen;
+    }
+    batch.len = got;
+    Drain::Read
+}
+
+/// A platform with no batched call has no batch: the read is one datagram at a time, and the lane says so.
+#[cfg(not(target_os = "linux"))]
+#[allow(
+    dead_code,
+    reason = "the batched read is Linux's, and the drain is the answer on the platforms that have one"
+)]
+pub(crate) fn recv_batch(_sock: &Datagram, _batch: &mut Batch) -> Drain {
+    Drain::Unbatchable
+}
+
 /// The HTTP/3 opening, carried exactly once per connection: a second control stream is a connection error.
 pub(crate) fn send_h3_opening(conn: &mut quiche::Connection, sock: &Datagram) -> bool {
     for (stream, payload) in crate::foxy::H3::h3_opening() {
@@ -606,7 +753,39 @@ pub(crate) fn pump_once(
     let buf = room.as_mut();
     // One armed wait, then the queue already full behind it: a 16 KiB DATA frame is a dozen datagrams, and absorbing one per visit paid a timer set and an egress sweep for each.
     let mut taken = 0usize;
+    // The batched read is Linux's, and only where the datagram is the datagram on the wire: a gecko fragment, a hop, an obfuscation or a relay frame all rewrite the bytes, so those lanes keep the one-datagram read.
+    #[cfg(target_os = "linux")]
+    let mut batch = Batch::new();
     loop {
+        // The batch first: a socket with datagrams queued hands over all of them in one call, and the per-datagram read below then finds the queue empty.
+        #[cfg(target_os = "linux")]
+        match recv_batch(sock, &mut batch) {
+            Drain::Read => {
+                for at in 0..batch.len() {
+                    let Some((bytes, from)) = batch.at(at) else {
+                        continue;
+                    };
+                    let info = quiche::RecvInfo { from, to: local };
+                    let _ = conn.recv(bytes, info);
+                    taken += 1;
+                }
+                // Re-armed once the packets the visit waited for land: what follows is queued and costs no wait, or is not coming yet and the caller's deadline should wait for it; a failed re-arm leaves the first arm in place.
+                if taken > 0 {
+                    let _ = sock.refresh_read_timeout(PUMP_TAIL);
+                }
+                if taken >= PUMP_BURST {
+                    break;
+                }
+                continue;
+            }
+            // An empty queue is the socket's own arm expiring, and the tick is what it owes the connection.
+            Drain::Empty => {
+                conn.on_timeout();
+                flush_egress(conn, sock);
+                return true;
+            }
+            Drain::Unbatchable => {}
+        }
         match sock.recv_from(buf) {
             Ok((n, from)) => {
                 let info = quiche::RecvInfo { from, to: local };
@@ -1799,6 +1978,8 @@ fn pump(
     // One lock per 32 KiB rather than per 8: the drain is the connection's busiest shared path, and every pass pays the mutex twice.
     let mut chunk = crate::proxy::RelayBuf::with_len(PUMP_WINDOW).into_vec();
     let mut buf = [0u8; MAX_DATAGRAM];
+    // The batch lives across the turns, so a turn does not build the slots again.
+    let mut batch = Batch::new();
     loop {
         // The lock covers quiche calls only: a stalled peer must not stall the sessions sharing the connection.
         let timeout = {
@@ -1815,17 +1996,29 @@ fn pump(
         if !sock.refresh_read_timeout(timeout) {
             return;
         }
-        let incoming = match sock.recv_from(&mut buf) {
-            Ok(found) => Some(found),
-            Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
+        // The batched read is Linux's, and only where the datagram is the datagram on the wire: a gecko fragment, a hop, an obfuscation or a relay frame all rewrite the bytes, so those lanes keep the one-datagram read.
+        let drain = recv_batch(sock, &mut batch);
+        // An empty batch is the socket's own arm expiring, and the tick is what it owes the connection: a read that timed out is the same answer the batch gives, so the two are one case.
+        let mut timed_out = false;
+        let incoming = match drain {
+            Drain::Read => None,
+            Drain::Empty => {
+                timed_out = true;
                 None
             }
-            Err(_) => return,
+            Drain::Unbatchable => match sock.recv_from(&mut buf) {
+                Ok(found) => Some(found),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    timed_out = true;
+                    None
+                }
+                Err(_) => return,
+            },
         };
         ready.clear();
         {
@@ -1839,12 +2032,22 @@ fn pump(
             if conn.is_closed() {
                 return;
             }
+            // Every datagram the batch holds is one packet, and they are handed to quiche in the order the kernel wrote them.
+            for at in 0..batch.len() {
+                let Some((bytes, from)) = batch.at(at) else {
+                    continue;
+                };
+                let info = quiche::RecvInfo { from, to: local };
+                let _ = conn.recv(bytes, info);
+            }
+
             match incoming {
                 Some((n, from)) => {
                     let info = quiche::RecvInfo { from, to: local };
                     let _ = conn.recv(&mut buf[..n], info);
                 }
-                None => conn.on_timeout(),
+                None if timed_out => conn.on_timeout(),
+                None => {}
             }
             flush_egress(&mut conn, sock);
             hand_off(&mut conn, table, &mut chunk, &mut ready);
@@ -1852,7 +2055,7 @@ fn pump(
                 return;
             }
             // A quiet socket and an empty lane ends the thread; the lease that follows it starts the next one on the same connection.
-            if incoming.is_none() && park_if_idle(table) {
+            if timed_out && park_if_idle(table) {
                 return;
             }
         }

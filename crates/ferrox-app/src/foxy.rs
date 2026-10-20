@@ -169,7 +169,7 @@ fn dial_peers<I: Iterator<Item = SocketAddr>>(
             let stream = match crate::conn::dial_tcp(&peer, CONNECT_TIMEOUT) {
                 Ok(stream) => stream,
                 Err(error) => {
-                    debug_address(peer, &format!("tcp {error}"));
+                    debug_address(peer, || format!("tcp {error}"));
                     break;
                 }
             };
@@ -192,7 +192,7 @@ fn dial_peers<I: Iterator<Item = SocketAddr>>(
                         std::thread::sleep(after_attempt(attempt));
                         continue;
                     }
-                    debug_address(peer, &failure.to_string());
+                    debug_address(peer, || failure.to_string());
                     break;
                 }
             }
@@ -224,10 +224,9 @@ fn edge_over_hop(
             }
         }
     }
-    debug_loss(
-        "the hop refused the edge",
-        &format!("after {tried} attempts"),
-    );
+    debug_loss("the hop refused the edge", || {
+        format!("after {tried} attempts")
+    });
     Err(failure)
 }
 
@@ -236,16 +235,22 @@ fn after_attempt(_attempt: usize) -> std::time::Duration {
     Duration::from_millis(EDGE_BACKOFF_MS)
 }
 
-/// Diagnostics behind `FOXY_DEBUG`: a red leg is only actionable when it names the address, the stage and the platform error — a refusal and a hang share a message otherwise.
-fn debug_loss(stage: &str, error: &dyn std::fmt::Display) {
-    if std::env::var("FOXY_DEBUG").is_ok() {
-        eprintln!("foxy-debug: {stage}: {error}");
+/// Whether the lane's diagnostics are wanted, read once: the flag cannot change under a running process, and asking the environment for it on every flow paid a lookup and a lock in the dial path.
+pub(crate) fn debug_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FOXY_DEBUG").is_ok())
+}
+
+/// Diagnostics behind `FOXY_DEBUG`: a red leg is only actionable when it names the address, the stage and the platform error — a refusal and a hang share a message otherwise. The error is a closure because the trace is off by default, and a rendered error was built for every failed attempt on a lane whose trace nobody reads.
+fn debug_loss(stage: &str, error: impl FnOnce() -> String) {
+    if debug_on() {
+        eprintln!("foxy-debug: {stage}: {}", error());
     }
 }
 
-fn debug_address(peer: SocketAddr, why: &str) {
-    if std::env::var("FOXY_DEBUG").is_ok() {
-        eprintln!("foxy-debug: address {peer} lost: {why}");
+fn debug_address(peer: SocketAddr, why: impl FnOnce() -> String) {
+    if debug_on() {
+        eprintln!("foxy-debug: address {peer} lost: {}", why());
     }
 }
 
@@ -257,12 +262,14 @@ fn finish_tls(
     let mut tls = match ferrox_core::tls::RustlsProvider::connect(&tls_config(dial), stream) {
         Ok(tls) => tls,
         Err(error) => {
-            debug_loss("the TLS client failed to start", &error.to_string());
+            debug_loss("the TLS client failed to start", || error.to_string());
             return Err(error.into());
         }
     };
     if let Err(error) = tls.handshake() {
-        debug_loss("the TLS handshake with the edge failed", &error.to_string());
+        debug_loss("the TLS handshake with the edge failed", || {
+            error.to_string()
+        });
         return Err(error.into());
     }
     negotiated(&tls, dial)
@@ -642,6 +649,7 @@ fn open_h2_with(dial: &FoxyDial, block: &[u8]) -> Result<Tls2, Failure> {
         carry: Vec::new(),
         at: 0,
         out: Vec::new(),
+        packet: Vec::new(),
         capsule_buf: Vec::new(),
         handed: 0,
         pending_credit: 0,
@@ -656,7 +664,7 @@ fn open_h2_with(dial: &FoxyDial, block: &[u8]) -> Result<Tls2, Failure> {
 
 /// The stage the lane's edge dial lost, behind `FOXY_DEBUG`: a red leg is only actionable when it says where.
 fn debug_stage(stage: &str) {
-    if std::env::var("FOXY_DEBUG").is_ok() {
+    if debug_on() {
         eprintln!("foxy-debug: {stage}");
     }
 }
@@ -697,6 +705,8 @@ pub(crate) struct Tls2 {
     at: usize,
     /// The frame this lane writes, reused so a relay allocates nothing per frame.
     out: Vec<u8>,
+    /// The IP packet under construction, reused so a datagram allocates nothing: an IP header, a UDP header and the payload, written once and handed to the frame. A packet per datagram took a buffer that grew three times on its way to the wire.
+    packet: Vec<u8>,
     /// Capsule-stream bytes not parsed yet: one capsule may span DATA frames, so frames accumulate here.
     capsule_buf: Vec<u8>,
     /// Octets of the head DATAGRAM capsule already handed to a caller whose buffer was shorter than the datagram: the capsule stays staged until this reaches its length, so a short read costs the tail nothing.
@@ -1279,7 +1289,7 @@ pub(crate) struct Tls1 {
 
 /// Undecodable-block dump behind `FOXY_DEBUG`: the hex of a header block no codec here reads, so a red live run names the encoding.
 fn debug_block(block: &[u8]) {
-    if std::env::var("FOXY_DEBUG").is_ok() {
+    if debug_on() {
         eprintln!("foxy-debug: undecodable header block {block:02x?}");
     }
 }
@@ -1356,6 +1366,8 @@ pub(crate) struct H3 {
     pending: Option<Pending>,
     /// The frame this lane writes, reused so a relay allocates nothing per frame.
     out: Vec<u8>,
+    /// The IP packet under construction, reused so a datagram allocates nothing: an IP header, a UDP header and the payload, written once and handed to the frame. A packet per datagram took a buffer that grew three times on its way to the wire.
+    packet: Vec<u8>,
     /// Capsule-stream bytes no whole DATAGRAM capsule has consumed yet: one capsule may span DATA frames, so frames accumulate only here. The answer's header block rides through it too, and it is cleared once the status is decoded.
     capsule_buf: Vec<u8>,
     /// Octets of the head DATAGRAM capsule already handed to a caller whose buffer was shorter than the datagram: the capsule stays staged until this reaches its length, so a short read costs the tail nothing.
@@ -1398,6 +1410,7 @@ impl H3 {
             body: 0,
             pending: None,
             out: Vec::new(),
+            packet: Vec::new(),
             capsule_buf: Vec::new(),
             handed: 0,
             fin: false,
@@ -1447,6 +1460,7 @@ impl H3 {
             body: 0,
             pending: None,
             out: Vec::new(),
+            packet: Vec::new(),
             capsule_buf: Vec::new(),
             handed: 0,
             fin: false,
@@ -1469,6 +1483,7 @@ impl H3 {
             body: 0,
             pending: None,
             out: Vec::new(),
+            packet: Vec::new(),
             capsule_buf: Vec::new(),
             handed: 0,
             fin: false,
@@ -1605,24 +1620,25 @@ impl H3 {
         Ok(assigned)
     }
 
-    /// One IP packet, as a frame's payload the caller takes whole.
-    pub(crate) fn read_ip(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+    /// One IP packet, as a frame's payload the caller takes whole: the packet is written into the caller's buffer, so a datagram costs a copy and no allocation of its own.
+    pub(crate) fn read_ip(&mut self, into: &mut Vec<u8>) -> std::io::Result<bool> {
         let started = Instant::now();
         loop {
             if let Some((used, capsule)) = connectip::capsule_split(&self.capsule_buf) {
-                let packet = if let connectip::Capsule::Datagram(packet) = capsule {
-                    packet.to_vec()
-                } else {
-                    Vec::new()
+                let connectip::Capsule::Datagram(packet) = capsule else {
+                    self.capsule_buf.drain(..used);
+                    continue;
                 };
+                into.clear();
+                into.extend_from_slice(packet);
                 self.capsule_buf.drain(..used);
-                if !packet.is_empty() {
-                    return Ok(Some(packet));
+                if !into.is_empty() {
+                    return Ok(true);
                 }
                 continue;
             }
             if self.fin {
-                return Ok(None);
+                return Ok(false);
             }
             if self
                 .quantum
@@ -1868,7 +1884,8 @@ impl H3 {
                 self.capsule_buf = buf;
                 return Err(Failure::Frame);
             }
-            buf.resize(base + room, 0);
+            // The room is claimed without a zero pass: the block's bytes are what the peer sends into it, and the zeroing was a memset of a region the walk was about to overwrite — once per datagram, for a block it fills in the end anyway. The length is set past the written bytes and rolled back on every path that leaves it short.
+            crate::proxy::grow_scratch(&mut buf, base + room);
             let mut used = base;
             loop {
                 if Instant::now() >= self.deadline {
@@ -2113,6 +2130,38 @@ fn io(failure: Failure) -> std::io::Error {
     std::io::Error::other(failure.to_string())
 }
 
+/// One IP packet built into the lane's own scratch: the codec's build, into a buffer that already holds the room. The scratch is cleared rather than dropped, so the datagram after this one writes over the last one's bytes and takes no allocation of its own.
+fn build_packet(
+    into: &mut Vec<u8>,
+    source: &[u8],
+    destination: &[u8],
+    source_port: u16,
+    destination_port: u16,
+    payload: &[u8],
+) -> bool {
+    into.clear();
+    // The room is claimed before the build, so the appends below never reallocate: the packet is the header and the payload, and the payload's size is known before the first byte is written. The delta is against the length, not the capacity, because a reservation is measured from the length — a delta against the capacity would leave the room short and the first append would grow the buffer anyway.
+    let header = if source.len() == 4 {
+        ferrox_core::foxy::connectip::IPV4_HEADER
+    } else {
+        ferrox_core::foxy::connectip::IPV6_HEADER
+    };
+    let want = header + ferrox_core::foxy::connectip::UDP_HEADER + payload.len();
+    if into.capacity() < want {
+        into.reserve_exact(want - into.len());
+    }
+    ferrox_core::foxy::connectip::udp_datagram(
+        &ferrox_core::foxy::connectip::UdpDatagram {
+            source,
+            destination,
+            source_port,
+            destination_port,
+            payload,
+        },
+        into,
+    )
+}
+
 /// One CONNECT-UDP lane on whichever carrier the edge answers: a UDP flow is a capsule stream either way, and which carrier carries it is the dial's question.
 pub(crate) enum Datagram {
     H2(Box<Tls2>),
@@ -2164,32 +2213,49 @@ impl Ip {
         destination_port: u16,
         payload: &[u8],
     ) -> std::io::Result<bool> {
-        let mut packet = Vec::new();
-        let built = ferrox_core::foxy::connectip::udp_datagram(
-            &ferrox_core::foxy::connectip::UdpDatagram {
-                source,
-                destination,
-                source_port,
-                destination_port,
-                payload,
-            },
-            &mut packet,
-        );
+        // The packet is built into the lane's own scratch, which the datagram after it reuses: a packet per datagram took a buffer that grew from nothing to the payload's size in three steps, and every datagram of a flow paid for it. The scratch is lent out for the write and taken back after, because the lane's own borrow of it is what keeps it alive.
+        let (built, sent) = match self {
+            Self::H2(lane) => {
+                let built = build_packet(
+                    &mut lane.packet,
+                    source,
+                    destination,
+                    source_port,
+                    destination_port,
+                    payload,
+                );
+                let packet = std::mem::take(&mut lane.packet);
+                let sent = lane.write_datagram(&packet);
+                lane.packet = packet;
+                (built, sent)
+            }
+            Self::H3(lane) => {
+                let built = build_packet(
+                    &mut lane.packet,
+                    source,
+                    destination,
+                    source_port,
+                    destination_port,
+                    payload,
+                );
+                let packet = std::mem::take(&mut lane.packet);
+                let sent = lane.write_datagram(&packet);
+                lane.packet = packet;
+                (built, sent)
+            }
+        };
         if !built {
             return Ok(false);
         }
         // The packet leaves on the flush rather than waiting for the next write: these are datagrams, and one that waits is one the peer never sees.
-        match self {
-            Self::H2(lane) => lane.write_datagram(&packet).map(|()| true),
-            Self::H3(lane) => lane.write_datagram(&packet).map(|()| true),
-        }
+        sent.map(|()| true)
     }
 
-    /// One UDP payload in, as one IP packet: the destination is what a reply is addressed to, and `None` is a frame that is not a datagram yet.
-    pub(crate) fn read(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+    /// One UDP payload in, as one IP packet: the destination is what a reply is addressed to, and the packet is written into the caller's buffer, so a reply costs a copy and no allocation.
+    pub(crate) fn read(&mut self, into: &mut Vec<u8>) -> std::io::Result<bool> {
         match self {
-            Self::H2(lane) => lane.read_ip(),
-            Self::H3(lane) => lane.read_ip(),
+            Self::H2(lane) => lane.read_ip(into),
+            Self::H3(lane) => lane.read_ip(into),
         }
     }
 
@@ -2318,64 +2384,60 @@ impl Tls2 {
     }
 
     /// One IP packet, as a datagram this lane can read both ends of. A capsule whole inside one DATA frame is handed out where it lies, so the packet crosses userspace once instead of through the capsule buffer.
-    pub(crate) fn read_ip(&mut self) -> std::io::Result<Option<Vec<u8>>> {
+    pub(crate) fn read_ip(&mut self, into: &mut Vec<u8>) -> std::io::Result<bool> {
         loop {
             if let Some((used, capsule)) = connectip::capsule_split(&self.capsule_buf) {
-                // A datagram is handed whole — the caller takes the buffer and the lane keeps it — so this reads a packet out rather than a slice of one.
-                let packet = if let connectip::Capsule::Datagram(packet) = capsule {
-                    packet.to_vec()
-                } else {
-                    Vec::new()
+                let connectip::Capsule::Datagram(packet) = capsule else {
+                    self.capsule_buf.drain(..used);
+                    continue;
                 };
+                into.clear();
+                into.extend_from_slice(packet);
                 self.capsule_buf.drain(..used);
-                if !packet.is_empty() {
-                    return Ok(Some(packet));
+                if !into.is_empty() {
+                    return Ok(true);
                 }
                 continue;
             }
             if self.fin {
-                return Ok(None);
+                return Ok(false);
             }
-            let read = self.with_frame(
-                &mut [],
-                |lane, frame, payload| -> std::io::Result<Option<Vec<u8>>> {
-                    match frames::h2_event(frame, payload, 1) {
-                        frames::H2Event::Data { payload, end } => {
-                            lane.fin = end;
-                            if !payload.is_empty() {
-                                lane.credit(payload.len()).map_err(io)?;
+            let read = self.with_frame(&mut [], |lane, frame, payload| -> std::io::Result<bool> {
+                match frames::h2_event(frame, payload, 1) {
+                    frames::H2Event::Data { payload, end } => {
+                        lane.fin = end;
+                        if !payload.is_empty() {
+                            lane.credit(payload.len()).map_err(io)?;
+                        }
+                        // The capsule is usually whole inside one DATA frame, so it is handed out where it lies and only the bytes behind it staged; nothing is handed out while a split capsule waits, because stream order is packet order.
+                        if lane.capsule_buf.is_empty() {
+                            if let Some((used, connectip::Capsule::Datagram(packet))) =
+                                connectip::capsule_split(payload)
+                            {
+                                into.clear();
+                                into.extend_from_slice(packet);
+                                lane.capsule_buf.extend_from_slice(&payload[used..]);
+                                return Ok(true);
                             }
-                            // The capsule is usually whole inside one DATA frame, so it is handed out where it lies and only the bytes behind it staged; nothing is handed out while a split capsule waits, because stream order is packet order.
-                            if lane.capsule_buf.is_empty() {
-                                if let Some((used, connectip::Capsule::Datagram(packet))) =
-                                    connectip::capsule_split(payload)
-                                {
-                                    let packet = packet.to_vec();
-                                    lane.capsule_buf.extend_from_slice(&payload[used..]);
-                                    return Ok(Some(packet));
-                                }
-                            }
-                            lane.capsule_buf.extend_from_slice(payload);
-                            Ok(None)
                         }
-                        frames::H2Event::Window { stream, increment } => {
-                            lane.grant(stream, increment);
-                            Ok(None)
-                        }
-                        frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
-                            lane.fin = true;
-                            Ok(None)
-                        }
-                        _ => Ok(None),
+                        lane.capsule_buf.extend_from_slice(payload);
+                        Ok(false)
                     }
-                },
-            );
-            if let Some(packet) = read?? {
-                if !packet.is_empty() {
-                    return Ok(Some(packet));
+                    frames::H2Event::Window { stream, increment } => {
+                        lane.grant(stream, increment);
+                        Ok(false)
+                    }
+                    frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
+                        lane.fin = true;
+                        Ok(false)
+                    }
+                    _ => Ok(false),
                 }
-                // An empty datagram is skipped, exactly as the staged path skips one, so `Ok(None)` stays the end of stream.
+            });
+            if read?? && !into.is_empty() {
+                return Ok(true);
             }
+            // An empty datagram is skipped, exactly as the staged path skips one, so a false answer stays the end of stream.
         }
     }
 }
@@ -5013,7 +5075,8 @@ pub(crate) mod loopback {
             );
             inner.capsule_buf = Vec::new();
         }
-        let packet = lane.read().expect("reads").expect("a reply");
+        let mut packet = Vec::new();
+        assert!(lane.read(&mut packet).expect("reads"), "a reply");
         let Ip::H2(inner) = &mut lane else {
             unreachable!("an h2 dial opens an h2 lane");
         };
@@ -5031,6 +5094,113 @@ pub(crate) mod loopback {
         );
         assert_eq!(read.destination, &[198, 51, 100, 9]);
         assert_eq!(read.payload, b"hello ip");
+        edge.join().expect("joins");
+    }
+
+    /// The packet a datagram is built in is the lane's own buffer, and it stays that buffer: across a push and a drain the base pointer does not move and the capacity does not grow. A byte-level test passes with the copy and without it, so only the pointer can witness that the packet was not built in a buffer of its own.
+    #[test]
+    fn the_packet_scratch_is_the_lanes_own_buffer_and_it_stays_there() {
+        let (roots, server) = minted(b"\x68\x32");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (udp_tx, udp_rx) = std::sync::mpsc::channel();
+        let edge = ip_h2_edge(listener, server, seen_tx, udp_tx, 3);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let (mut lane, _) = Ip::open(&dial, None).expect("opens");
+        let _ = seen_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the edge read the block");
+
+        let mut base = 0usize;
+        let mut room = 0usize;
+        let mut packet = Vec::new();
+        for round in 0..3usize {
+            let written = lane
+                .write(
+                    &[198, 51, 100, 9],
+                    &[203, 0, 113, 9],
+                    40_000,
+                    443,
+                    &[b'x'; 400],
+                )
+                .expect("writes");
+            assert!(written, "the packet was built");
+            lane.flush().expect("flushes");
+            let (_destination, _port, payload) = udp_rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the edge read it");
+            assert_eq!(payload.len(), 400, "the payload arrived whole");
+            // The reply is drained too, so the cycle is a push and a drain and not a push alone.
+            assert!(lane.read(&mut packet).expect("reads"), "a reply");
+            assert_eq!(packet.len(), 428, "the reply is the packet whole");
+
+            let Ip::H2(inner) = &mut lane else {
+                unreachable!("an h2 dial opens an h2 lane");
+            };
+            let at = inner.packet.as_ptr() as usize;
+            let claimed = inner.packet.capacity();
+            if round == 0 {
+                base = at;
+                room = claimed;
+                assert!(
+                    claimed >= 428,
+                    "the room for the packet was claimed before the build, got {claimed}"
+                );
+            } else {
+                assert_eq!(at, base, "the packet buffer did not move");
+                assert_eq!(claimed, room, "the packet buffer did not grow");
+            }
+        }
+        edge.join().expect("joins");
+    }
+
+    /// The packet a reply is read into is the caller's own buffer, and it stays that buffer: across a push and a drain the base pointer does not move and the capacity does not grow. A byte-level test passes with the copy and without it, so only the pointer can witness that the reply was not read into a buffer of its own.
+    #[test]
+    fn the_read_packet_is_the_callers_own_buffer_and_it_stays_there() {
+        let (roots, server) = minted(b"\x68\x32");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let (udp_tx, udp_rx) = std::sync::mpsc::channel();
+        let edge = ip_h2_edge(listener, server, seen_tx, udp_tx, 3);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let (mut lane, _) = Ip::open(&dial, None).expect("opens");
+        let _ = seen_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the edge read the block");
+
+        let mut packet = Vec::with_capacity(1024);
+        let mut base = packet.as_ptr() as usize;
+        let mut room = packet.capacity();
+        for round in 0..3usize {
+            let written = lane
+                .write(
+                    &[198, 51, 100, 9],
+                    &[203, 0, 113, 9],
+                    40_000,
+                    443,
+                    &[b'x'; 400],
+                )
+                .expect("writes");
+            assert!(written, "the packet was built");
+            lane.flush().expect("flushes");
+            let _ = udp_rx
+                .recv_timeout(Duration::from_secs(20))
+                .expect("the edge read it");
+            assert!(lane.read(&mut packet).expect("reads"), "a reply");
+            assert_eq!(packet.len(), 428, "the reply is the packet whole");
+
+            let at = packet.as_ptr() as usize;
+            let claimed = packet.capacity();
+            if round == 0 {
+                base = at;
+                room = claimed;
+            } else {
+                assert_eq!(at, base, "the read buffer did not move");
+                assert_eq!(claimed, room, "the read buffer did not grow");
+            }
+        }
         edge.join().expect("joins");
     }
 
@@ -5789,7 +5959,8 @@ pub(crate) mod loopback {
         assert_eq!(port, 443);
         assert_eq!(payload, b"hello ip");
         // The reply comes back from the destination, and the lane reads it as a packet whose source is where the datagram went.
-        let packet = lane.read().expect("reads").expect("a reply");
+        let mut packet = Vec::new();
+        assert!(lane.read(&mut packet).expect("reads"), "a reply");
         let read = connectip::udp_from_packet(&packet).expect("parses");
         assert!(read.verified);
         assert_eq!(
@@ -5849,7 +6020,7 @@ pub(crate) mod loopback {
             udp_rx
                 .recv_timeout(Duration::from_secs(60))
                 .expect("the edge read it");
-            lane.read().expect("reads").expect("a reply");
+            lane.read(&mut Vec::new()).expect("reads");
         }
         // The park is the pump's own report and it lands inside one poll of a quiet socket, so waiting for the flag is the witness that an idle edge keeps its connection and drops its thread.
         for _ in 0..60 {
@@ -5939,7 +6110,10 @@ pub(crate) mod loopback {
         udp_rx
             .recv_timeout(Duration::from_secs(60))
             .expect("the edge read it");
-        tunnel.read().expect("reads").expect("a reply");
+        assert!(
+            tunnel.read(&mut Vec::new()).expect("reads"),
+            "the lane lent its last flow a reply"
+        );
         edge.join().expect("joins");
     }
 

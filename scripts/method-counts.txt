@@ -319,6 +319,8 @@ carrier-foxy renewal-pauses-past-their-own-ceiling 0 ferrox-app-foxy_account::te
 carrier-foxy edge-peer-read-allocations-per-open 0 ferrox-core-foxy::tests::a_literal_edge_address_is_read_without_a_buffer_of_its_own
 carrier-foxy edge-authority-allocations-per-lane-open 0 ferrox-core-foxy::tests::an_edge_authority_brackets_an_address_and_borrows_a_plain_default_port_name
 carrier-foxy huffman-literal-allocations-per-decode 1 ferrox-core-foxy::hpack::tests::a_coded_literal_is_decoded_into_one_allocation
+carrier-foxy ip-packet-allocations-per-datagram 0 ferrox-app-foxy::loopback::the_packet_scratch_is_the_lanes_own_buffer_and_it_stays_there
+carrier-foxy ip-read-packet-allocations-per-datagram 0 ferrox-app-foxy::loopback::the_read_packet_is_the_callers_own_buffer_and_it_stays_there
 
 carrier-quic ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-quic zero-filled-bytes-per-relayed-frame 3 ferrox-app-quic::tests::a_relayed_datagram_frames_its_target_ahead_of_its_payload
