@@ -163,6 +163,8 @@ pub(crate) fn clear() {
 static ARMED: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// The table is process-global and read by every thread, so a test that arms one takes this lock: two arming tests never overlap, and the values they arm are held for no assertion of their own.
+///
+/// The lock is held until the guard is dropped, so a test hands it back as soon as the code under test is done: a fixture that waits on its own teardown waits outside the window, or every other arming test waits behind it.
 #[cfg(test)]
 pub(crate) fn lock() -> std::sync::MutexGuard<'static, ()> {
     ARMED
