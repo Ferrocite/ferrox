@@ -1,0 +1,15 @@
+# The script the SOCKS5 oracle replays.
+#
+# Each `handshake` line names what the server answers and what destination the
+# request carries; each `udp` line names a datagram frame to write.
+#
+#   handshake <none|user> <ipv4|ipv6|name> <addr> <port> [<user> <pass>]
+#   udp <ipv4|ipv6|name> <addr> <port> <hex payload>
+handshake none ipv4 192.0.2.1 443
+handshake user ipv4 198.51.100.7 80 user1 pass1
+handshake none name example.com 443
+handshake none ipv6 2001:db8::1 443
+handshake user name example.com 443 user1 pass1
+udp ipv4 198.51.100.7 53 77686f2d
+udp name example.com 53 77686f2d
+udp ipv6 2001:db8::1 53 00

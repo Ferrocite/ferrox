@@ -7,6 +7,11 @@
 scripts/kcp-oracle/expected.txt -text
 scripts/kcp-oracle/script.txt -text
 
+# The same reason, for the socks client's golden and its script: the client
+# replays the script line by line and compares the golden byte for byte.
+scripts/socks5-oracle/expected.txt -text
+scripts/socks5-oracle/script.txt -text
+
 # Same reason, for every other checked-in expectation in this tree.
 **/fixtures/** -text
 **/*.golden -text
