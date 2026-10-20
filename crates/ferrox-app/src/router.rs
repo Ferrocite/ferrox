@@ -6,10 +6,12 @@
 
 use crate::json::Json;
 use crate::xray_pb::Reader;
+use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -222,8 +224,9 @@ impl Routing {
         names: Option<Names<'_>>,
         resolve: &dyn Fn(&str, u16) -> Vec<IpAddr>,
     ) -> Option<&'a str> {
-        let mut pending = false;
-        for rule in &self.rules {
+        let mut pending = [0u64; 4];
+        let mut spilled = false;
+        for (at, rule) in self.rules.iter().enumerate() {
             if !rule.matches_without_ip(flow, names) {
                 continue;
             }
@@ -233,25 +236,35 @@ impl Routing {
                 }
             } else if rule.ips.is_none() {
                 return Some(rule.target.as_str());
+            } else if at < pending.len() * 64 {
+                pending[at / 64] |= 1 << (at % 64);
             } else {
-                pending = true;
+                spilled = true;
             }
         }
-        if !pending {
+        if !spilled && pending.iter().all(|word| *word == 0) {
             return None;
         }
         let addrs = resolve(flow.domain?, flow.port.unwrap_or(0));
         if addrs.is_empty() {
             return None;
         }
-        self.rules
-            .iter()
-            .find(|rule| {
-                rule.ips.is_some()
-                    && rule.matches_without_ip(flow, names)
-                    && rule.ip_matches_any(&addrs)
-            })
-            .map(|rule| rule.target.as_str())
+        for at in 0..self.rules.len().min(pending.len() * 64) {
+            if pending[at / 64] & (1 << (at % 64)) != 0 && self.rules[at].ip_matches_any(&addrs) {
+                return Some(self.rules[at].target.as_str());
+            }
+        }
+        if spilled {
+            return self.rules[pending.len() * 64..]
+                .iter()
+                .find(|rule| {
+                    rule.ips.is_some()
+                        && rule.matches_without_ip(flow, names)
+                        && rule.ip_matches_any(&addrs)
+                })
+                .map(|rule| rule.target.as_str());
+        }
+        None
     }
 
     /// The one tag a SOCKS association may use when every datagram reaches it; `None` when a
@@ -620,18 +633,104 @@ impl Rule {
 
 #[derive(Debug)]
 struct DomainMatcher {
-    full: HashSet<Arc<str>>,
-    suffix: HashSet<Arc<str>>,
+    full: DomainSet,
+    suffix: DomainSet,
     substr: Vec<Arc<str>>,
     ac: Option<aho_corasick::AhoCorasick>,
     regex: Vec<regex::Regex>,
 }
 
+/// Full and suffix names as an open-addressed table keyed by a suffix hash. Hashing one byte at a
+/// time from the right means the hash of every parent domain falls out of a single pass over the
+/// name, so a match never allocates a label or hashes the same bytes twice. The string is compared
+/// on a hash hit, never trusting the hash alone.
+#[derive(Debug, Default)]
+struct DomainSet {
+    entries: Vec<(u64, Arc<str>)>,
+    slots: Vec<u32>,
+    mask: usize,
+}
+
+/// The hash of a name, folded from its last byte to its first. Two names that share a suffix share
+/// a prefix of these states, which is what makes the parent lookups fall out of one pass.
+fn suffix_hash(bytes: &[u8]) -> u64 {
+    let mut hash = 0u64;
+    for &byte in bytes.iter().rev() {
+        hash = hash
+            .wrapping_mul(0x9e37_79b1_85eb_ca87)
+            .wrapping_add(u64::from(byte));
+    }
+    hash
+}
+
+fn hash_slot(hash: u64) -> u64 {
+    let mut mixed = hash ^ (hash >> 33);
+    mixed = mixed.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    mixed ^ (mixed >> 33)
+}
+
+impl DomainSet {
+    fn insert(&mut self, value: Arc<str>) {
+        self.entries.push((suffix_hash(value.as_bytes()), value));
+    }
+
+    fn finish(&mut self) {
+        self.entries.sort_unstable_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| left.1.as_ref().cmp(right.1.as_ref()))
+        });
+        self.entries
+            .dedup_by(|left, right| left.0 == right.0 && left.1 == right.1);
+        let mut capacity = 8;
+        while capacity < self.entries.len().saturating_mul(2) {
+            capacity <<= 1;
+        }
+        self.mask = capacity - 1;
+        self.slots = vec![0; capacity];
+        for (at, &(hash, _)) in self.entries.iter().enumerate() {
+            let mut slot = hash_slot(hash) as usize & self.mask;
+            while self.slots[slot] != 0 {
+                slot = (slot + 1) & self.mask;
+            }
+            self.slots[slot] = at as u32 + 1;
+        }
+    }
+
+    fn contains(&self, hash: u64, value: &str) -> bool {
+        if self.entries.is_empty() {
+            return false;
+        }
+        let mut slot = hash_slot(hash) as usize & self.mask;
+        loop {
+            let at = self.slots[slot];
+            if at == 0 {
+                return false;
+            }
+            let (entry_hash, entry) = &self.entries[at as usize - 1];
+            if *entry_hash == hash && entry.as_ref() == value {
+                return true;
+            }
+            slot = (slot + 1) & self.mask;
+        }
+    }
+
+    #[cfg(test)]
+    fn first(&self) -> Option<&Arc<str>> {
+        self.entries.first().map(|(_, value)| value)
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static DOMAIN_TABLE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl DomainMatcher {
     fn new() -> Self {
         Self {
-            full: HashSet::new(),
-            suffix: HashSet::new(),
+            full: DomainSet::default(),
+            suffix: DomainSet::default(),
             substr: Vec::new(),
             ac: None,
             regex: Vec::new(),
@@ -639,6 +738,8 @@ impl DomainMatcher {
     }
 
     fn finish(&mut self) -> Result<(), String> {
+        self.full.finish();
+        self.suffix.finish();
         if !self.substr.is_empty() {
             self.ac = Some(
                 aho_corasick::AhoCorasick::new(self.substr.iter().map(|value| value.as_bytes()))
@@ -651,12 +752,8 @@ impl DomainMatcher {
     fn add(&mut self, kind: DomainKind, value: Arc<str>) {
         match kind {
             DomainKind::Substr => self.substr.push(value),
-            DomainKind::Domain => {
-                self.suffix.insert(value);
-            }
-            DomainKind::Full => {
-                self.full.insert(value);
-            }
+            DomainKind::Domain => self.suffix.insert(value),
+            DomainKind::Full => self.full.insert(value),
             DomainKind::Regex => {
                 if let Ok(regex) = regex::Regex::new(value.as_ref()) {
                     self.regex.push(regex);
@@ -668,17 +765,20 @@ impl DomainMatcher {
     }
 
     fn matches(&self, host: &str, lower: &str) -> bool {
-        if !self.full.is_empty() && self.full.contains(lower) {
-            return true;
-        }
-        if !self.suffix.is_empty() {
-            let mut rest = Some(lower);
-            while let Some(part) = rest {
-                if self.suffix.contains(part) {
-                    return true;
-                }
-                rest = part.find('.').map(|at| &part[at + 1..]);
+        #[cfg(test)]
+        DOMAIN_TABLE_READS.with(|reads| reads.set(reads.get() + 1));
+        let bytes = lower.as_bytes();
+        let mut hash = 0u64;
+        for at in (0..bytes.len()).rev() {
+            if bytes[at] == b'.' && self.suffix.contains(hash, &lower[at + 1..]) {
+                return true;
             }
+            hash = hash
+                .wrapping_mul(0x9e37_79b1_85eb_ca87)
+                .wrapping_add(u64::from(bytes[at]));
+        }
+        if self.suffix.contains(hash, lower) || self.full.contains(hash, lower) {
+            return true;
         }
         if self.ac.as_ref().is_some_and(|ac| ac.is_match(lower)) {
             return true;
@@ -1143,9 +1243,110 @@ struct DomainEntry {
 type SiteCache = HashMap<(String, String, String), Arc<Vec<DomainEntry>>>;
 type IpCache = HashMap<(String, String), Arc<Vec<(IpAddr, u32)>>>;
 
+/// A container read into an anonymous mapping rather than the allocator's large zone. `geoip.dat`
+/// is many megabytes on a real install, and a freed `Vec` that size can stay resident in the
+/// process; unmapping returns the pages to the kernel as soon as startup is done.
+#[cfg(unix)]
+struct AssetBytes {
+    ptr: *mut u8,
+    len: usize,
+}
+
+#[cfg(all(unix, any(target_os = "linux", target_os = "android")))]
+const MAP_ANON: libc::c_int = libc::MAP_ANONYMOUS;
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+const MAP_ANON: libc::c_int = libc::MAP_ANON;
+
+#[cfg(unix)]
+impl AssetBytes {
+    fn read(path: &Path) -> Result<Self, String> {
+        use std::io::Read as _;
+
+        let mut file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+        let len = usize::try_from(file.metadata().map_err(|error| error.to_string())?.len())
+            .map_err(|_| "asset is larger than this address space".to_owned())?;
+        if len == 0 {
+            return Ok(Self {
+                ptr: std::ptr::null_mut(),
+                len,
+            });
+        }
+        // SAFETY: an anonymous private mapping is writable and private to this process; its descriptor is ignored.
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | MAP_ANON,
+                -1,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        let buffer = Self {
+            ptr: ptr.cast(),
+            len,
+        };
+        // SAFETY: the mapping is `len` writable bytes that nothing else aliases.
+        let target = unsafe { std::slice::from_raw_parts_mut(buffer.ptr, len) };
+        file.read_exact(target).map_err(|error| error.to_string())?;
+        Ok(buffer)
+    }
+}
+
+#[cfg(unix)]
+impl std::ops::Deref for AssetBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        if self.len == 0 {
+            return &[];
+        }
+        // SAFETY: the mapping is `len` readable bytes for the life of `self`.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for AssetBytes {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() {
+            // SAFETY: the pointer and length are the ones `mmap` returned.
+            unsafe {
+                libc::munmap(self.ptr.cast(), self.len);
+            }
+        }
+    }
+}
+
+#[cfg(not(unix))]
+struct AssetBytes {
+    bytes: Vec<u8>,
+}
+
+#[cfg(not(unix))]
+impl AssetBytes {
+    fn read(path: &Path) -> Result<Self, String> {
+        Ok(Self {
+            bytes: std::fs::read(path).map_err(|error| error.to_string())?,
+        })
+    }
+}
+
+#[cfg(not(unix))]
+impl std::ops::Deref for AssetBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 struct Assets {
     dirs: Vec<PathBuf>,
-    files: HashMap<PathBuf, Arc<Vec<u8>>>,
+    files: HashMap<PathBuf, Rc<AssetBytes>>,
     sites: SiteCache,
     ips: IpCache,
 }
@@ -1160,7 +1361,7 @@ impl Assets {
         }
     }
 
-    fn file(&mut self, file: &str) -> Result<Arc<Vec<u8>>, String> {
+    fn file(&mut self, file: &str) -> Result<Rc<AssetBytes>, String> {
         if !is_local_asset(file) {
             return Err(format!("asset `{file}` is not a local path"));
         }
@@ -1171,11 +1372,11 @@ impl Assets {
             .find(|path| path.is_file())
             .ok_or_else(|| format!("asset `{file}` was not found under the asset directories"))?;
         if let Some(bytes) = self.files.get(&path) {
-            return Ok(Arc::clone(bytes));
+            return Ok(Rc::clone(bytes));
         }
-        let bytes = std::fs::read(&path).map_err(|error| format!("asset `{file}`: {error}"))?;
-        let bytes = Arc::new(bytes);
-        self.files.insert(path, Arc::clone(&bytes));
+        let bytes = AssetBytes::read(&path).map_err(|error| format!("asset `{file}`: {error}"))?;
+        let bytes = Rc::new(bytes);
+        self.files.insert(path, Rc::clone(&bytes));
         Ok(bytes)
     }
 
@@ -1198,10 +1399,8 @@ impl Assets {
             match (field, wire) {
                 (1, 2) => {
                     let entry = reader.bytes()?;
-                    let (entry_code, domains) = geosite_entry(entry, &wanted)?;
-                    if entry_code.eq_ignore_ascii_case(code) {
+                    if geosite_entry(entry, code, &wanted, &mut entries)? {
                         found = true;
-                        entries.extend(domains);
                     }
                 }
                 _ => reader.skip(wire)?,
@@ -1228,10 +1427,8 @@ impl Assets {
             match (field, wire) {
                 (1, 2) => {
                     let entry = reader.bytes()?;
-                    let (entry_code, ranges) = geoip_entry(entry)?;
-                    if entry_code.eq_ignore_ascii_case(code) {
+                    if geoip_entry(entry, code, &mut cidrs)? {
                         found = true;
-                        cidrs.extend(ranges);
                     }
                 }
                 _ => reader.skip(wire)?,
@@ -1280,25 +1477,46 @@ fn asset_dirs() -> Vec<PathBuf> {
     dirs
 }
 
-fn geosite_entry(bytes: &[u8], wanted: &[&str]) -> Result<(String, Vec<DomainEntry>), String> {
+fn geosite_entry(
+    bytes: &[u8],
+    code: &str,
+    wanted: &[&str],
+    entries: &mut Vec<DomainEntry>,
+) -> Result<bool, String> {
     let mut reader = Reader::new(bytes, "geodata.GeoSite");
-    let mut code = String::new();
-    let mut entries = Vec::new();
+    let start = entries.len();
+    let mut known = false;
+    let mut matched = false;
+    let mut deferred = Vec::new();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => {
-                code = String::from_utf8_lossy(reader.bytes()?).into_owned();
+                matched = String::from_utf8_lossy(reader.bytes()?).eq_ignore_ascii_case(code);
+                known = true;
             }
             (2, 2) => {
-                let domain = reader.bytes()?;
-                if let Some(entry) = domain_entry(domain, wanted)? {
-                    entries.push(entry);
+                let raw = reader.bytes()?;
+                if !known {
+                    deferred.push(raw);
+                } else if matched {
+                    if let Some(entry) = domain_entry(raw, wanted)? {
+                        entries.push(entry);
+                    }
                 }
             }
             _ => reader.skip(wire)?,
         }
     }
-    Ok((code, entries))
+    if matched {
+        for raw in deferred {
+            if let Some(entry) = domain_entry(raw, wanted)? {
+                entries.push(entry);
+            }
+        }
+    } else {
+        entries.truncate(start);
+    }
+    Ok(matched)
 }
 
 fn domain_entry(bytes: &[u8], wanted: &[&str]) -> Result<Option<DomainEntry>, String> {
@@ -1323,7 +1541,13 @@ fn domain_entry(bytes: &[u8], wanted: &[&str]) -> Result<Option<DomainEntry>, St
                 };
                 value = Some(text);
             }
-            (3, 2) => attrs.push(domain_attribute(reader.bytes()?)?),
+            (3, 2) => {
+                if wanted.is_empty() {
+                    reader.skip(wire)?;
+                } else if let Some(attr) = domain_attribute(reader.bytes()?)? {
+                    attrs.push(attr);
+                }
+            }
             _ => reader.skip(wire)?,
         }
     }
@@ -1335,7 +1559,7 @@ fn domain_entry(bytes: &[u8], wanted: &[&str]) -> Result<Option<DomainEntry>, St
     }
     if !wanted
         .iter()
-        .all(|want| attrs.iter().any(|have| have == want))
+        .all(|want| attrs.iter().any(|have| have.as_ref() == *want))
     {
         return Ok(None);
     }
@@ -1347,12 +1571,15 @@ fn domain_entry(bytes: &[u8], wanted: &[&str]) -> Result<Option<DomainEntry>, St
     Ok(Some(DomainEntry { kind, value }))
 }
 
-fn domain_attribute(bytes: &[u8]) -> Result<String, String> {
+fn domain_attribute(bytes: &[u8]) -> Result<Option<Cow<'_, str>>, String> {
     let mut reader = Reader::new(bytes, "geodata.Domain.Attribute");
-    let mut key = String::new();
+    let mut key = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
-            (1, 2) => key = String::from_utf8_lossy(reader.bytes()?).into_owned(),
+            (1, 2) => {
+                let bytes = reader.bytes()?;
+                key = Some(String::from_utf8_lossy(bytes));
+            }
             (2 | 3, 0) => {
                 reader.varint()?;
             }
@@ -1362,25 +1589,41 @@ fn domain_attribute(bytes: &[u8]) -> Result<String, String> {
     Ok(key)
 }
 
-fn geoip_entry(bytes: &[u8]) -> Result<(String, Vec<(IpAddr, u32)>), String> {
+fn geoip_entry(bytes: &[u8], code: &str, cidrs: &mut Vec<(IpAddr, u32)>) -> Result<bool, String> {
     let mut reader = Reader::new(bytes, "geodata.GeoIP");
-    let mut code = String::new();
-    let mut cidrs = Vec::new();
+    let start = cidrs.len();
+    let mut known = false;
+    let mut matched = false;
+    let mut deferred = Vec::new();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
-            (1, 2) => code = String::from_utf8_lossy(reader.bytes()?).into_owned(),
-            (2, 2) => {
-                if let Some(cidr) = geoip_cidr(reader.bytes()?)? {
-                    cidrs.push(cidr);
-                }
+            (1, 2) => {
+                matched = String::from_utf8_lossy(reader.bytes()?).eq_ignore_ascii_case(code);
+                known = true;
             }
-            (3, 0) => {
-                reader.varint()?;
+            (2, 2) => {
+                let raw = reader.bytes()?;
+                if !known {
+                    deferred.push(raw);
+                } else if matched {
+                    if let Some(cidr) = geoip_cidr(raw)? {
+                        cidrs.push(cidr);
+                    }
+                }
             }
             _ => reader.skip(wire)?,
         }
     }
-    Ok((code, cidrs))
+    if matched {
+        for raw in deferred {
+            if let Some(cidr) = geoip_cidr(raw)? {
+                cidrs.push(cidr);
+            }
+        }
+    } else {
+        cidrs.truncate(start);
+    }
+    Ok(matched)
 }
 
 fn geoip_cidr(bytes: &[u8]) -> Result<Option<(IpAddr, u32)>, String> {
@@ -1511,6 +1754,73 @@ mod tests {
 
     fn geoip_code(path: &Path, code: &str, cidrs: &[(IpAddr, u32)]) {
         std::fs::write(path, geoip(code, cidrs)).expect("writes geoip");
+    }
+
+    #[test]
+    fn a_rejected_entry_does_not_leave_its_domains_behind() {
+        let entry = [
+            bytes_field(1, b"TEST"),
+            bytes_field(2, &domain(2, "leaked.test", &[])),
+            bytes_field(1, b"OTHER"),
+        ]
+        .concat();
+        let mut entries = Vec::new();
+        assert!(!geosite_entry(&entry, "TEST", &[], &mut entries).expect("parses"));
+        assert!(entries.is_empty(), "{entries:?}");
+    }
+
+    #[test]
+    fn a_rejected_entry_does_not_leave_its_ranges_behind() {
+        let cidr = [bytes_field(1, &[192, 0, 2, 0]), varint_field(2, 24)].concat();
+        let entry = [
+            bytes_field(1, b"TEST"),
+            bytes_field(2, &cidr),
+            bytes_field(1, b"OTHER"),
+        ]
+        .concat();
+        let mut cidrs = Vec::new();
+        assert!(!geoip_entry(&entry, "TEST", &mut cidrs).expect("parses"));
+        assert!(cidrs.is_empty(), "{cidrs:?}");
+    }
+
+    #[test]
+    fn an_asset_container_reads_whole_including_its_last_byte() {
+        let dir = dir();
+        let path = dir.join("container.dat");
+        let payload = [0u8, 1, 2, 255, 0, 42];
+        std::fs::write(&path, payload).expect("writes");
+        let bytes = AssetBytes::read(&path).expect("reads");
+        assert_eq!(&*bytes, &payload);
+        let empty = dir.join("empty.dat");
+        std::fs::write(&empty, []).expect("writes");
+        let bytes = AssetBytes::read(&empty).expect("reads");
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn a_suffix_matches_the_name_itself_and_its_subdomains() {
+        let root = object(vec![(
+            "routing",
+            routing(vec![rule(
+                "direct",
+                vec![("domain", array(vec![text("domain:example.test")]))],
+            )]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let flow = |domain| Flow {
+            network: Network::Tcp,
+            domain: Some(domain),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: None,
+        };
+        assert_eq!(routing.route(&flow("example.test")), Some("direct"));
+        assert_eq!(routing.route(&flow("www.example.test")), Some("direct"));
+        assert_eq!(routing.route(&flow("notexample.test")), None);
     }
 
     #[test]
@@ -1646,21 +1956,125 @@ mod tests {
             .as_ref()
             .expect("first matcher")
             .full
-            .iter()
-            .next()
+            .first()
             .expect("first entry");
         let second = rules[1]
             .domains
             .as_ref()
             .expect("second matcher")
             .full
-            .iter()
-            .next()
+            .first()
             .expect("second entry");
         assert_eq!(&**first, "shared.test");
         assert!(
             Arc::ptr_eq(first, second),
             "the second rule copies the entry"
+        );
+    }
+
+    #[test]
+    fn an_unwanted_geosite_code_is_not_decoded() {
+        let dir = dir();
+        let root = object(vec![(
+            "routing",
+            routing(vec![rule(
+                "direct",
+                vec![("domain", array(vec![text("geosite:test")]))],
+            )]),
+        )]);
+        let wanted = || geosite("TEST", vec![domain(3, "wanted.test", &[])]);
+        std::fs::write(dir.join("geosite.dat"), wanted()).expect("writes");
+        let (_, small) = ferrox_core::alloc_count::measure(|| {
+            Routing::parse_in(&root, vec![dir.clone()])
+                .expect("parses")
+                .expect("routing")
+        });
+        let mut file = geosite(
+            "HUGE",
+            (0..256)
+                .map(|at| domain(3, &format!("huge{at}.test"), &[]))
+                .collect(),
+        );
+        file.extend(wanted());
+        std::fs::write(dir.join("geosite.dat"), file).expect("writes");
+        let (_, big) = ferrox_core::alloc_count::measure(|| {
+            Routing::parse_in(&root, vec![dir.clone()])
+                .expect("parses")
+                .expect("routing")
+        });
+        assert_eq!(
+            big.allocs, small.allocs,
+            "an unwanted code was decoded: {big:?} against {small:?}"
+        );
+    }
+
+    #[test]
+    fn an_unwanted_geoip_code_is_not_decoded() {
+        let dir = dir();
+        let root = object(vec![(
+            "routing",
+            routing(vec![rule(
+                "direct",
+                vec![("ip", array(vec![text("geoip:test")]))],
+            )]),
+        )]);
+        let wanted = || geoip("TEST", &[("192.0.2.0".parse().expect("ip"), 24)]);
+        std::fs::write(dir.join("geoip.dat"), wanted()).expect("writes");
+        let (_, small) = ferrox_core::alloc_count::measure(|| {
+            Routing::parse_in(&root, vec![dir.clone()])
+                .expect("parses")
+                .expect("routing")
+        });
+        let huge: Vec<(IpAddr, u32)> = (0..256)
+            .map(|at| (IpAddr::from([10, 0, (at / 256) as u8, at as u8]), 32))
+            .collect();
+        let mut file = geoip("HUGE", &huge);
+        file.extend(wanted());
+        std::fs::write(dir.join("geoip.dat"), file).expect("writes");
+        let (_, big) = ferrox_core::alloc_count::measure(|| {
+            Routing::parse_in(&root, vec![dir.clone()])
+                .expect("parses")
+                .expect("routing")
+        });
+        assert_eq!(
+            big.allocs, small.allocs,
+            "an unwanted code was decoded: {big:?} against {small:?}"
+        );
+    }
+
+    #[test]
+    fn attributes_are_not_decoded_unless_requested() {
+        let dir = dir();
+        let root = object(vec![(
+            "routing",
+            routing(vec![rule(
+                "direct",
+                vec![("domain", array(vec![text("geosite:test")]))],
+            )]),
+        )]);
+        std::fs::write(
+            dir.join("geosite.dat"),
+            geosite("TEST", vec![domain(3, "wanted.test", &[])]),
+        )
+        .expect("writes");
+        let (_, plain) = ferrox_core::alloc_count::measure(|| {
+            Routing::parse_in(&root, vec![dir.clone()])
+                .expect("parses")
+                .expect("routing")
+        });
+        std::fs::write(
+            dir.join("geosite.dat"),
+            geosite("TEST", vec![domain(3, "wanted.test", &["ads"])]),
+        )
+        .expect("writes");
+        let (_, attributed) = ferrox_core::alloc_count::measure(|| {
+            Routing::parse_in(&root, vec![dir.clone()])
+                .expect("parses")
+                .expect("routing")
+        });
+        assert_eq!(
+            attributed.allocs, plain.allocs,
+            "an unrequested attribute was decoded: {attributed:?} against {plain:?}"
         );
     }
 
@@ -1778,6 +2192,46 @@ mod tests {
         });
         assert_eq!(tag, Some("domain"));
         assert_eq!(lookups.get(), 0);
+    }
+
+    #[test]
+    fn a_candidate_is_not_re_evaluated_under_ip_if_non_match() {
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                ("domainStrategy", text("IPIfNonMatch")),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "direct",
+                        vec![
+                            ("domain", array(vec![text("full:once.test")])),
+                            ("ip", array(vec![text("192.0.2.0/24")])),
+                        ],
+                    )]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("once.test"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: None,
+        };
+        let before = DOMAIN_TABLE_READS.with(std::cell::Cell::get);
+        let tag = routing.route_with(&flow, &|_, _| vec!["192.0.2.1".parse().expect("ip")]);
+        assert_eq!(tag, Some("direct"));
+        assert_eq!(
+            DOMAIN_TABLE_READS.with(std::cell::Cell::get) - before,
+            1,
+            "the second pass re-read the domain table"
+        );
     }
 
     #[test]
