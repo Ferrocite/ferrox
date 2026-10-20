@@ -205,7 +205,9 @@ pub fn renewal_delay(expires_at: Option<u64>, now: u64) -> std::time::Duration {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Pass {
-    pub token: String,
+    /// The bearer the plane minted, shared rather than copied: a flow's dial clones the pass into every
+    /// carrier it tries, and the token is the same bytes each time.
+    pub token: std::sync::Arc<str>,
     pub expires_at: Option<u64>,
     pub quota_remaining: Option<u64>,
     pub quota_reset: Option<u64>,
@@ -520,7 +522,7 @@ mod tests {
     #[test]
     fn the_allowance_is_the_bytes_left_and_when_they_return() {
         let pass = |left: Option<u64>, reset: Option<u64>| Pass {
-            token: String::new(),
+            token: std::sync::Arc::from(""),
             expires_at: None,
             quota_remaining: left,
             quota_reset: reset,
@@ -561,7 +563,7 @@ mod tests {
     #[test]
     fn the_allowance_names_the_ceiling_it_is_left_of() {
         let pass = |left: Option<u64>, limit: Option<u64>| Pass {
-            token: String::new(),
+            token: std::sync::Arc::from(""),
             expires_at: None,
             quota_remaining: left,
             quota_reset: None,
@@ -970,7 +972,7 @@ mod tests {
     #[test]
     fn a_pass_reports_when_it_wants_to_come_back() {
         let pass = Pass {
-            token: "t".to_owned(),
+            token: std::sync::Arc::from("t"),
             expires_at: Some(1_000),
             quota_remaining: Some(12),
             quota_reset: Some(9),
@@ -978,6 +980,25 @@ mod tests {
         };
         assert_eq!(pass.renews_in(0).as_secs(), 500);
         assert_eq!(pass.quota_remaining, Some(12));
+    }
+
+    /// A flow's dial clones the pass into every carrier it tries, and the token is the same bytes each time: the clone shares the token rather than copying it. A byte-level test passes with the copy and without it, so only the pointer can witness that the token was not copied.
+    #[test]
+    fn a_cloned_pass_shares_its_token_rather_than_copying_it() {
+        let pass = Pass {
+            token: std::sync::Arc::from("a-token-long-enough-to-stand-alone"),
+            expires_at: None,
+            quota_remaining: None,
+            quota_reset: None,
+            quota_limit: None,
+        };
+        let copied = pass.clone();
+        assert_eq!(
+            copied.token.as_ptr(),
+            pass.token.as_ptr(),
+            "the clone shares the token's bytes"
+        );
+        assert_eq!(copied.token.as_ref(), pass.token.as_ref());
     }
 
     /// `head_end` is the tree's one terminator scan and the shared head readers reach it in place of `windows(4).position`; this sweep is its oracle. A forged `\r\n\r`, a length that is not a multiple of eight, a terminator whose first `\n` lands exactly on a block boundary, and an all-`\n` body that keeps the verify busy must all return the very same offset — or the same `None` — as the byte-by-byte form it replaced.

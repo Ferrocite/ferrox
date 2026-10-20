@@ -498,7 +498,7 @@ fn servers_of(
                 pins: ferrox_core::foxy::pin::Pins::default(),
                 pass: Pass {
                     // The pair is coded once per entry and its text is what each of the entry's addresses carries.
-                    token: token.clone(),
+                    token: std::sync::Arc::from(token.clone()),
                     expires_at: None,
                     quota_remaining: None,
                     quota_reset: None,
@@ -634,7 +634,7 @@ mod tests {
             roots: ferrox_core::tls::Anchors::from(Vec::new()),
             pins: ferrox_core::foxy::pin::Pins::default(),
             pass: Pass {
-                token: token.to_owned(),
+                token: std::sync::Arc::from(token),
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
@@ -779,7 +779,7 @@ mod tests {
         );
         let mut window = [0u8; 64];
         assert_eq!(
-            list[0].pass.token,
+            list[0].pass.token.as_ref(),
             std::str::from_utf8(
                 veepn::credential_into("1000-abc", "s3cr3t", &mut window).expect("window")
             )
@@ -865,7 +865,7 @@ mod tests {
             Carrier::H1,
             ferrox_core::foxy::pin::Pins::default(),
         );
-        dial.pass.token = std::str::from_utf8(coded).expect("ascii").to_owned();
+        dial.pass.token = std::sync::Arc::from(std::str::from_utf8(coded).expect("ascii"));
         let mut tunnel = crate::foxy::open_h1(
             &dial,
             "example.com:443",

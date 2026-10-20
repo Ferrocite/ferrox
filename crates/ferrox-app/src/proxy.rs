@@ -11293,7 +11293,7 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             continue;
         }
         let pasted = ferrox_core::foxy::Pass {
-            token: configured.clone(),
+            token: std::sync::Arc::from(configured.clone()),
             expires_at: ferrox_core::foxy::account::jwt_expiry(&configured),
             quota_remaining: None,
             quota_reset: None,
@@ -17161,7 +17161,7 @@ mod tests {
             roots: Vec::new().into(),
             pins: ferrox_core::foxy::pin::Pins::default(),
             pass: ferrox_core::foxy::Pass {
-                token: "the-pass".to_owned(),
+                token: std::sync::Arc::from("the-pass"),
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
@@ -23920,7 +23920,7 @@ mod tests {
             roots: vec![CARRIER_CERT.to_vec()].into(),
             pins: ferrox_core::foxy::pin::Pins::default(),
             pass: ferrox_core::foxy::Pass {
-                token: "the-pass".to_owned(),
+                token: std::sync::Arc::from("the-pass"),
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
@@ -24018,7 +24018,7 @@ mod tests {
             roots: Vec::new().into(),
             pins: ferrox_core::foxy::pin::Pins::default(),
             pass: ferrox_core::foxy::Pass {
-                token: "the-pass".to_owned(),
+                token: std::sync::Arc::from("the-pass"),
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,

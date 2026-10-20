@@ -2721,7 +2721,7 @@ mod tests {
             roots: Vec::new().into(),
             pins: foxy::pin::Pins::default(),
             pass: Pass {
-                token: "the-pass".to_owned(),
+                token: std::sync::Arc::from("the-pass"),
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
@@ -2935,7 +2935,7 @@ pub(crate) mod loopback {
             roots: roots.into(),
             pins,
             pass: Pass {
-                token: "the-pass".to_owned(),
+                token: std::sync::Arc::from("the-pass"),
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
@@ -2996,7 +2996,7 @@ pub(crate) mod loopback {
             roots: roots.into(),
             pins: foxy::pin::Pins::default(),
             pass: Pass {
-                token: "the-pass".to_owned(),
+                token: std::sync::Arc::from("the-pass"),
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
@@ -3022,7 +3022,7 @@ pub(crate) mod loopback {
             roots: roots.into(),
             pins: foxy::pin::Pins::default(),
             pass: Pass {
-                token: "the-pass".to_owned(),
+                token: std::sync::Arc::from("the-pass"),
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
@@ -3187,7 +3187,7 @@ pub(crate) mod loopback {
             roots: Vec::new().into(),
             pins: foxy::pin::Pins::default(),
             pass: Pass {
-                token: "the-pass".to_owned(),
+                token: std::sync::Arc::from("the-pass"),
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,

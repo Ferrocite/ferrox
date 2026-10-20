@@ -35,7 +35,7 @@ fn account() -> Option<Account> {
             expires_at: 0,
         })),
         pass: std::sync::Arc::new(Mutex::new(Pass {
-            token: String::new(),
+            token: std::sync::Arc::from(""),
             expires_at: None,
             quota_remaining: None,
             quota_reset: None,
