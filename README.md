@@ -221,7 +221,7 @@ Today exactly one method dials per hop. The engine to build stacks them as an or
 
 | # | method | state | supported today by |
 | --- | --- | --- | --- |
-| 78 | Routing rules + geosite/geoip | planned | Xray `app/router` + `app/geodata`; sing-box `route/`; ZeroNet `zero-router` |
+| 78 | Routing rules + geosite/geoip | partial — rules with AND selectors and first match, domain/geoip/geosite assets, `blackhole`, per-inbound tags, `AsIs`/`IpOnDemand`/`IpIfNonMatch`; balancers, scripts, sniffing selectors and per-destination UDP routing refuse by name; [page](docs/function/engine-router.md) | Xray `app/router` + `app/geodata`; sing-box `route/`; ZeroNet `zero-router` |
 | 79 | Balancers leastPing/leastLoad/roundRobin/random + urltest/selector | planned | Xray `router/balancing.go`; sing-box `protocol/group/`; ZeroNet `zero-observatory` |
 | 80 | Built-in DNS app (UDP/TCP/DoT/DoH/DoQ/FakeDNS/cache) | planned | Xray `app/dns`; sing-box `dns/`; ZeroNet `zero-dns`. Row 26 is the outbound |
 | 81 | Reverse tunnel bridge/portal | planned | Xray `app/reverse`; ZeroNet `reverse.rs` over Mux.cool; xray-core-rust `xray-app-reverse` |
