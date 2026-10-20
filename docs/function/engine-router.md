@@ -82,16 +82,20 @@ agree with the fallback the association rides it. Per-destination datagram routi
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | flow-decision-allocations | 0 | ferrox-app-router::tests::a_flow_without_a_domain_matcher_allocates_nothing |
-| host-lowercase-buffers-per-domain-match | 1 | ferrox-app-router::tests::a_domain_match_takes_one_lowercase_buffer |
+| host-lowercase-buffers-lowercase | 0 | ferrox-app-router::tests::a_lowercase_host_matches_without_a_buffer |
+| host-lowercase-buffers-mixed-case | 1 | ferrox-app-router::tests::a_mixed_case_host_takes_one_lowercase_buffer |
 | literal-route-allocations | 0 | ferrox-app-proxy::tests::a_route_decision_on_a_literal_address_allocates_nothing |
 | dns-lookups-per-rule-matched-name | 0 | ferrox-app-router::tests::ip_if_non_match_resolves_only_after_no_rule_matched |
 | dns-lookups-per-unmatched-name | 1 | ferrox-app-router::tests::ip_if_non_match_resolves_only_after_no_rule_matched |
 <!-- counts:end -->
 
 `flow-decision-allocations 0` is a rule table with no domain matcher: the scan reads ports and
-networks and allocates nothing. `host-lowercase-buffers-per-domain-match 1` is the one buffer a
-domain match needs, because the suffix and substring tables are stored lowercased and the flow's
-name is not; the test asserts the count, so a second copy on the per-flow path fails it.
+networks and allocates nothing. `host-lowercase-buffers-lowercase 0` is a domain match on the host
+as it arrived: the suffix and substring tables are stored lowercased, and a name that is already
+lowercase is borrowed rather than copied, which is the shape almost every client sends.
+`host-lowercase-buffers-mixed-case 1` is the same match on an uppercase name, where one buffer is
+the price of the comparison; the test asserts both counts, so a copy on the common path or a second
+copy on the mixed path fails them.
 `literal-route-allocations 0` is the same claim for a routed flow on an address: the plan borrows the
 chosen outbound and the decision touches no heap. `dns-lookups-per-rule-matched-name 0` and
 `dns-lookups-per-unmatched-name 1` are the two halves of `IpIfNonMatch` — a name a rule already
