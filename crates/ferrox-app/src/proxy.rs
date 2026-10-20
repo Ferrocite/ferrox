@@ -11128,6 +11128,7 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             expires_at: ferrox_core::foxy::account::jwt_expiry(&configured),
             quota_remaining: None,
             quota_reset: None,
+            quota_limit: None,
         };
         let account = foxy_account(&email, &password, &code, &pasted, link.guardian(), &roots);
         let pass = account
@@ -11205,7 +11206,12 @@ pub(crate) fn mint_foxy_pass(config: &str, out: &str) -> ! {
         use std::os::unix::fs::PermissionsExt as _;
         let _ = std::fs::set_permissions(out, std::fs::Permissions::from_mode(0o600));
     }
-    println!("minted=1 expires_at={:?}", pass.expires_at);
+    // The allowance on the pass's own line, so an account knows how much is left before a flow is refused for having none.
+    let allowance = pass
+        .allowance_line()
+        .map(|line| format!(" quota=\"{line}\""))
+        .unwrap_or_default();
+    println!("minted=1 expires_at={:?}{allowance}", pass.expires_at);
     std::process::exit(0);
 }
 
@@ -16990,6 +16996,7 @@ mod tests {
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
+                quota_limit: None,
             },
             edge_address: None,
             direct_ports: Vec::new(),
@@ -23669,6 +23676,7 @@ mod tests {
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
+                quota_limit: None,
             },
             edge_address: Some(edge),
             direct_ports: Vec::new(),
@@ -23766,6 +23774,7 @@ mod tests {
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
+                quota_limit: None,
             },
             edge_address: Some(edge),
             direct_ports: Vec::new(),

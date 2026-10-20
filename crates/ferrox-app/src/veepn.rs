@@ -502,6 +502,7 @@ fn servers_of(
                     expires_at: None,
                     quota_remaining: None,
                     quota_reset: None,
+                    quota_limit: None,
                 },
             });
         }
@@ -637,6 +638,7 @@ mod tests {
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
+                quota_limit: None,
             },
         }
     }

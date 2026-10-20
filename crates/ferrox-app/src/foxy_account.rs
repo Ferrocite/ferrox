@@ -559,6 +559,7 @@ pub(crate) fn pass(
         expires_at,
         quota_remaining: reply.header_number("X-Quota-Remaining"),
         quota_reset: reply.header_number("X-Quota-Reset"),
+        quota_limit: reply.header_number("X-Quota-Limit"),
     })
 }
 
@@ -1013,6 +1014,7 @@ impl Account {
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
+                quota_limit: None,
             },
             |pass| pass.clone(),
         )
@@ -1064,6 +1066,7 @@ mod renewal {
             expires_at: Some(epoch() + 600),
             quota_remaining: None,
             quota_reset: None,
+            quota_limit: None,
         });
         let want = account.current().renews_in(epoch());
         assert_eq!(account.renews_in(), want);
@@ -1077,6 +1080,7 @@ mod renewal {
             expires_at: None,
             quota_remaining: None,
             quota_reset: None,
+            quota_limit: None,
         });
         assert!(
             account.can_renew(),
@@ -1097,6 +1101,7 @@ mod renewal {
             expires_at: None,
             quota_remaining: None,
             quota_reset: None,
+            quota_limit: None,
         });
         assert_eq!(account.renews_in(), std::time::Duration::from_secs(240));
         assert_eq!(account.current().token, "t");
@@ -1347,6 +1352,7 @@ mod loopback {
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
+                quota_limit: None,
             })),
         }
     }
@@ -1406,6 +1412,11 @@ mod loopback {
         assert!(pass.token.starts_with("eyJ"), "{}", pass.token);
         assert_eq!(pass.expires_at, Some(1_735_689_600));
         assert_eq!(pass.quota_remaining, Some(4_294_967_296));
+        assert_eq!(
+            pass.quota_limit,
+            Some(5_368_709_120),
+            "the ceiling the plane named rides with the remainder"
+        );
         assert!(!account.needs_code());
 
         let seen: Vec<String> = rx
