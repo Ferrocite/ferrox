@@ -209,12 +209,68 @@ pub struct Pass {
     pub expires_at: Option<u64>,
     pub quota_remaining: Option<u64>,
     pub quota_reset: Option<u64>,
+    /// The allowance the plane grants, when it names one: the ceiling the remaining bytes are counted
+    /// against, and the only way to tell a metered account from an unmetered one. `None` is not zero —
+    /// a plane that names no ceiling has named no ceiling, not an empty one.
+    pub quota_limit: Option<u64>,
 }
 
 impl Pass {
     #[must_use]
     pub fn renews_in(&self, now: u64) -> std::time::Duration {
         renewal_delay(self.expires_at, now)
+    }
+
+    /// The traffic allowance the plane named, in the one shape a caller prints: the bytes left in the
+    /// largest unit that keeps a digit, what it is left of when the plane named a ceiling, and when the
+    /// bytes come back. `None` when the plane said nothing, which is not zero — an account whose headers
+    /// name no allowance is not an account with nothing left.
+    #[must_use]
+    pub fn allowance_line(&self) -> Option<String> {
+        let left = self.quota_remaining?;
+        let mut line = allowance_bytes(left);
+        if let Some(limit) = self.quota_limit {
+            line.push_str(" of ");
+            line.push_str(&allowance_bytes(limit));
+        }
+        if let Some(reset) = self.quota_reset {
+            line.push_str(", resets in ");
+            line.push_str(&allowance_clock(reset));
+        }
+        Some(line)
+    }
+}
+
+/// Bytes in the largest unit that keeps a digit: integer arithmetic throughout, because a quota is a
+/// count of bytes and a float here is a rounding bug waiting for an account at 1023 MiB.
+fn allowance_bytes(bytes: u64) -> String {
+    const MIB: u64 = 1 << 20;
+    const GIB: u64 = 1 << 30;
+    const KIB: u64 = 1 << 10;
+    if bytes < KIB {
+        return format!("{bytes} B");
+    }
+    if bytes < MIB {
+        return format!("{} KiB", bytes / KIB);
+    }
+    if bytes < GIB {
+        return format!("{} MiB", bytes / MIB);
+    }
+    let tenths = bytes / (GIB / 10);
+    format!("{}.{} GiB", tenths / 10, tenths % 10)
+}
+
+/// A wait in the two units a person reads it in, and never a decimal: an hour and a minute is what a
+/// reset clock means, and the seconds under it are noise a caller cannot act on.
+fn allowance_clock(seconds: u64) -> String {
+    let hours = seconds / 3_600;
+    let minutes = (seconds % 3_600) / 60;
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m")
+    } else {
+        format!("{seconds}s")
     }
 }
 
@@ -455,6 +511,75 @@ mod tests {
         assert_eq!(
             Failure::Untrusted.to_string(),
             "this device does not trust the edge's certificate"
+        );
+    }
+
+    /// The allowance a person reads: the bytes in the largest unit that keeps a digit, and the reset
+    /// clock in two units. Integer arithmetic, so a quota that lands on a boundary is not rounded into
+    /// the wrong unit, and no headers is no line rather than a zero.
+    #[test]
+    fn the_allowance_is_the_bytes_left_and_when_they_return() {
+        let pass = |left: Option<u64>, reset: Option<u64>| Pass {
+            token: String::new(),
+            expires_at: None,
+            quota_remaining: left,
+            quota_reset: reset,
+            quota_limit: None,
+        };
+        assert_eq!(
+            pass(Some(4_294_967_296), Some(3_600)).allowance_line(),
+            Some("4.0 GiB, resets in 1h 0m".to_owned())
+        );
+        assert_eq!(
+            pass(Some(1_610_612_736), None).allowance_line(),
+            Some("1.5 GiB".to_owned()),
+            "a half gibibyte is a tenth, not a truncation"
+        );
+        assert_eq!(
+            pass(Some((1 << 30) - 1), Some(90)).allowance_line(),
+            Some("1023 MiB, resets in 1m".to_owned()),
+            "one byte under a gibibyte is still mebibytes"
+        );
+        assert_eq!(
+            pass(Some(1_048_575), Some(45)).allowance_line(),
+            Some("1023 KiB, resets in 45s".to_owned())
+        );
+        assert_eq!(
+            pass(Some(512), Some(0)).allowance_line(),
+            Some("512 B, resets in 0s".to_owned())
+        );
+        assert_eq!(
+            pass(None, Some(3_600)).allowance_line(),
+            None,
+            "an account the plane said nothing about is not an empty one"
+        );
+    }
+
+    /// The ceiling the plane named rides with the remainder: what is left, and what it is left of. A
+    /// remainder on its own cannot be told from a spent one, and the plane that names a ceiling is
+    /// the only one that can say what the remainder is counted against.
+    #[test]
+    fn the_allowance_names_the_ceiling_it_is_left_of() {
+        let pass = |left: Option<u64>, limit: Option<u64>| Pass {
+            token: String::new(),
+            expires_at: None,
+            quota_remaining: left,
+            quota_reset: None,
+            quota_limit: limit,
+        };
+        assert_eq!(
+            pass(Some(4_294_967_296), Some(5_368_709_120)).allowance_line(),
+            Some("4.0 GiB of 5.0 GiB".to_owned())
+        );
+        assert_eq!(
+            pass(Some(0), Some(5_368_709_120)).allowance_line(),
+            Some("0 B of 5.0 GiB".to_owned()),
+            "a spent account says so next to the ceiling it spent"
+        );
+        assert_eq!(
+            pass(Some(4_294_967_296), None).allowance_line(),
+            Some("4.0 GiB".to_owned()),
+            "a plane that named no ceiling gets no ceiling claimed for it"
         );
     }
 
@@ -849,6 +974,7 @@ mod tests {
             expires_at: Some(1_000),
             quota_remaining: Some(12),
             quota_reset: Some(9),
+            quota_limit: None,
         };
         assert_eq!(pass.renews_in(0).as_secs(), 500);
         assert_eq!(pass.quota_remaining, Some(12));

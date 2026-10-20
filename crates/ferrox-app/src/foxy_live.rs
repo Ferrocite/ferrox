@@ -39,6 +39,7 @@ fn account() -> Option<Account> {
             expires_at: None,
             quota_remaining: None,
             quota_reset: None,
+            quota_limit: None,
         })),
     })
 }
