@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io::Read;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::addr::Addr;
 use crate::policy::UnsafeOptIn;
@@ -11,7 +13,10 @@ pub struct VlessLink {
     uuid_bytes: [u8; 16],
     pub host: String,
     pub port: u16,
-    pub params: BTreeMap<String, String>,
+    params: BTreeMap<String, String>,
+    /// The flow the link was parsed with, decided once: the header encoder asks this
+    /// every time it writes, and a map lookup per header is a tree walk per header.
+    vision: bool,
     pub name: String,
 }
 
@@ -52,14 +57,27 @@ impl VlessLink {
         }
         let uuid_lower = uuid.to_ascii_lowercase();
         let uuid_bytes_val = uuid_bytes(&uuid_lower);
+        let vision = params
+            .get("flow")
+            .is_some_and(|flow| is_vision_name(flow.as_str()));
         Ok(Self {
             uuid: uuid_lower,
             uuid_bytes: uuid_bytes_val,
             host: host.to_string(),
             port,
             params,
+            vision,
             name: percent_decode(name_enc),
         })
+    }
+
+    /// Sets one query parameter. The flow decides what the header writes, so a link
+    /// that changes its flow changes that too.
+    pub fn set_param(&mut self, key: &str, value: &str) {
+        self.params.insert(key.to_owned(), value.to_owned());
+        if key == "flow" {
+            self.vision = is_vision_name(value);
+        }
     }
 
     #[must_use]
@@ -252,8 +270,7 @@ impl VlessLink {
 
     #[must_use]
     pub fn is_vision_flow(&self) -> bool {
-        let f = self.flow().as_bytes();
-        matches!(f.len(), 16 | 23) && (f == b"xtls-rprx-vision" || f == b"xtls-rprx-vision-udp443")
+        self.vision
     }
 
     fn is_vision(&self) -> bool {
@@ -337,6 +354,173 @@ impl VlessLink {
 }
 
 const VISION_ADDONS: [u8; 18] = *b"\x0A\x10xtls-rprx-vision";
+
+/// The flow the Vision framing speaks.
+pub const VISION_FLOW: &str = "xtls-rprx-vision";
+
+/// The flow names the Vision framing answers to, and the one UDP variant that rides it.
+#[must_use]
+pub fn is_vision_name(flow: &str) -> bool {
+    matches!(flow.len(), 16 | 23) && (flow == VISION_FLOW || flow == "xtls-rprx-vision-udp443")
+}
+
+/// The longest request header the wire can carry: the head, the add-ons, the command.
+/// The port, the family byte and the address follow the command and are read after it.
+pub const REQUEST_MAX: usize = 18 + 255 + 1;
+
+/// The flow a request header's add-ons named.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Flow {
+    /// No flow, or an add-on this tree does not read.
+    None,
+    /// The flow the Vision framing speaks.
+    Vision,
+    /// A flow that is not the Vision one.
+    Other,
+}
+
+/// The target a request names: an address on the wire, or a name to look up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Target<'a> {
+    Ip(IpAddr),
+    Name(&'a str),
+}
+
+/// A decoded VLESS request header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Request<'a> {
+    pub id: [u8; 16],
+    pub flow: Flow,
+    pub command: u8,
+    pub port: u16,
+    /// The target the command names; a mux request carries none.
+    pub target: Option<Target<'a>>,
+}
+
+/// Reads a request header off the wire into the caller's buffer and names what it says.
+///
+/// The header is read in four reads — the head, the add-ons with the command, the port
+/// with the family byte, and the address — and every byte the header holds is left where
+/// it landed: a name is borrowed from `scratch`, so the parse allocates nothing and copies
+/// nothing but the id.
+pub fn decode_request<'a>(
+    stream: &mut dyn Read,
+    scratch: &'a mut [u8; REQUEST_MAX],
+) -> Option<Request<'a>> {
+    crate::tls::read_exact(stream, &mut scratch[..18]).ok()?;
+    if scratch[0] != 0 {
+        return None;
+    }
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&scratch[1..17]);
+    let addons = usize::from(scratch[17]);
+    crate::tls::read_exact(stream, &mut scratch[18..19 + addons]).ok()?;
+    let command = scratch[18 + addons];
+    let flow = flow_of(&scratch[18..18 + addons]);
+    if command == Command::Mux.byte() {
+        return Some(Request {
+            id,
+            flow,
+            command,
+            port: 0,
+            target: None,
+        });
+    }
+    // The port, the family and the body's first byte are the same four bytes for every family.
+    crate::tls::read_exact(stream, &mut scratch[..4]).ok()?;
+    let port = u16::from_be_bytes([scratch[0], scratch[1]]);
+    let family = scratch[2];
+    let first = scratch[3];
+    let body = match family {
+        crate::addr::IPV4 => {
+            crate::tls::read_exact(stream, &mut scratch[4..7]).ok()?;
+            Body::V4
+        }
+        crate::addr::DOMAIN => {
+            let n = usize::from(first);
+            crate::tls::read_exact(stream, &mut scratch[4..4 + n]).ok()?;
+            Body::Name(n)
+        }
+        crate::addr::IPV6 => {
+            crate::tls::read_exact(stream, &mut scratch[4..19]).ok()?;
+            Body::V6
+        }
+        _ => return None,
+    };
+    // The bytes are in place; the name borrows them where they landed.
+    let bytes: &'a [u8; REQUEST_MAX] = &*scratch;
+    let target = match body {
+        Body::V4 => {
+            let mut octets = [0u8; 4];
+            octets.copy_from_slice(&bytes[3..7]);
+            Target::Ip(IpAddr::V4(Ipv4Addr::from(octets)))
+        }
+        Body::V6 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&bytes[3..19]);
+            Target::Ip(IpAddr::V6(Ipv6Addr::from(octets)))
+        }
+        Body::Name(n) => Target::Name(std::str::from_utf8(&bytes[4..4 + n]).ok()?),
+    };
+    Some(Request {
+        id,
+        flow,
+        command,
+        port,
+        target: Some(target),
+    })
+}
+
+/// Which body the family byte asked for, so the address is read before it is named.
+enum Body {
+    V4,
+    V6,
+    Name(usize),
+}
+
+/// The flow the add-ons named, read out of the protobuf without building a string for it.
+fn flow_of(body: &[u8]) -> Flow {
+    let mut at = 0;
+    while at < body.len() {
+        let tag = body[at];
+        at += 1;
+        let (field, wire) = (tag >> 3, tag & 0x07);
+        let Some(len) = read_varint(body, &mut at) else {
+            return Flow::None;
+        };
+        let len = len as usize;
+        match (field, wire) {
+            (1, 2) => {
+                let Some(bytes) = body.get(at..at.saturating_add(len)) else {
+                    return Flow::None;
+                };
+                return match std::str::from_utf8(bytes) {
+                    Ok("") | Err(_) => Flow::None,
+                    Ok(flow) if flow == VISION_FLOW => Flow::Vision,
+                    Ok(_) => Flow::Other,
+                };
+            }
+            (0, _) | (1, 0) | (_, 2) => at += len,
+            (_, 5) => at += 4,
+            (_, 1) => at += 8,
+            _ => return Flow::None,
+        }
+    }
+    Flow::None
+}
+
+fn read_varint(body: &[u8], at: &mut usize) -> Option<u32> {
+    let mut word = 0u32;
+    for shift in (0..32).step_by(7) {
+        let byte = *body.get(*at)?;
+        *at += 1;
+        word |= u32::from(byte & 0x7f) << shift;
+        if byte & 0x80 == 0 {
+            return Some(word);
+        }
+    }
+    None
+}
 
 const RECORD_CAP: usize = 8192;
 const RECORD_OVERHEAD: usize = 21;
@@ -1270,6 +1454,229 @@ mod tests {
     const SEAL_KEY: [u8; 32] = [0x5au8; 32];
     const SEAL_NONCE: [u8; 12] = [0xa7u8; 12];
     const SEAL_UUID: [u8; 16] = [0xabu8; 16];
+
+    /// The request header as the wire carries it, so the parse is read against the bytes
+    /// and not against a description of them.
+    fn request_wire(id: &[u8; 16], addons: &[u8], cmd: u8, tail: &[u8]) -> Vec<u8> {
+        let mut wire = vec![0u8];
+        wire.extend_from_slice(id);
+        wire.push(addons.len() as u8);
+        wire.extend_from_slice(addons);
+        wire.push(cmd);
+        wire.extend_from_slice(tail);
+        wire
+    }
+
+    /// A reader that answers exactly what it is asked, so the read count is exact.
+    struct Counting<'a> {
+        at: usize,
+        wire: &'a [u8],
+        reads: usize,
+    }
+
+    impl Read for Counting<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.reads += 1;
+            let n = (self.wire.len() - self.at).min(buf.len());
+            buf[..n].copy_from_slice(&self.wire[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    const REQUEST_ID: [u8; 16] = [0x11u8; 16];
+
+    /// The header is read in four reads for every address family, and two for a mux one.
+    #[test]
+    fn the_request_header_costs_four_reads_for_every_family() {
+        let port = 80u16.to_be_bytes();
+        let cases = [
+            (
+                "ipv4",
+                request_wire(
+                    &REQUEST_ID,
+                    &[],
+                    1,
+                    &[port.as_slice(), &[1, 192, 0, 2, 53]].concat(),
+                ),
+                4,
+            ),
+            (
+                "ipv6",
+                request_wire(
+                    &REQUEST_ID,
+                    &[],
+                    1,
+                    &[
+                        port.as_slice(),
+                        &[3, 0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x01],
+                    ]
+                    .concat(),
+                ),
+                4,
+            ),
+            (
+                "domain",
+                request_wire(
+                    &REQUEST_ID,
+                    &[],
+                    1,
+                    &[port.as_slice(), b"\x02\x09localhost"].concat(),
+                ),
+                4,
+            ),
+            (
+                "addons",
+                request_wire(
+                    &REQUEST_ID,
+                    b"\x0a\x00",
+                    1,
+                    &[port.as_slice(), &[1, 192, 0, 2, 53]].concat(),
+                ),
+                4,
+            ),
+        ];
+        for (label, wire, want) in cases {
+            let mut reader = Counting {
+                at: 0,
+                wire: &wire,
+                reads: 0,
+            };
+            let mut scratch = [0u8; REQUEST_MAX];
+            let request = decode_request(&mut reader, &mut scratch).expect("decodes");
+            assert_eq!(request.id, REQUEST_ID, "{label}");
+            assert_eq!(request.command, 1, "{label}");
+            assert_eq!(request.port, 80, "{label}");
+            assert_eq!(reader.reads, want, "{label}");
+        }
+
+        let mux = request_wire(&REQUEST_ID, &[], 3, &[]);
+        let mut reader = Counting {
+            at: 0,
+            wire: &mux,
+            reads: 0,
+        };
+        let mut scratch = [0u8; REQUEST_MAX];
+        let request = decode_request(&mut reader, &mut scratch).expect("decodes a mux request");
+        assert_eq!(request.command, 3);
+        assert_eq!(request.target, None, "a mux request names no target");
+        assert_eq!(reader.reads, 2, "a mux request stops at the command byte");
+    }
+
+    /// The parse reads the header and names it; it builds no buffer of its own and copies
+    /// no byte but the id, so the name it hands over is the name that arrived.
+    #[test]
+    fn the_request_parse_allocates_nothing_and_borrows_the_name() {
+        let wire = request_wire(
+            &REQUEST_ID,
+            &[],
+            1,
+            &[80u16.to_be_bytes().as_slice(), b"\x02\x09localhost"].concat(),
+        );
+        let mut scratch = [0u8; REQUEST_MAX];
+        let base = scratch.as_ptr();
+        let ((), counts) = crate::alloc_count::measure(|| {
+            let mut reader = Counting {
+                at: 0,
+                wire: &wire,
+                reads: 0,
+            };
+            let request = decode_request(&mut reader, &mut scratch).expect("decodes");
+            let Some(Target::Name(name)) = request.target else {
+                panic!("a domain target is a name");
+            };
+            assert_eq!(name, "localhost");
+            let at = name.as_ptr() as usize;
+            let lo = base as usize;
+            assert!(
+                at >= lo && at < lo + REQUEST_MAX,
+                "the name is the name that arrived, not a copy of it"
+            );
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "the request parse builds no buffer of its own"
+        );
+        assert_eq!(scratch.as_ptr(), base, "the caller's buffer did not move");
+    }
+
+    /// The request parser alone: one header, read again and again from a fixed buffer,
+    /// with the fold outside the read so the frame holds the parse and nothing else.
+    #[test]
+    fn the_request_parse_probe_costs_the_read_and_nothing_else() {
+        let wire = request_wire(
+            &REQUEST_ID,
+            b"\x0a\x10xtls-rprx-vision",
+            1,
+            &[80u16.to_be_bytes().as_slice(), &[1, 192, 0, 2, 53]].concat(),
+        );
+        let mut scratch = [0u8; REQUEST_MAX];
+        let mut ids = 0usize;
+        for _ in 0..64 {
+            let mut reader = std::io::Cursor::new(&wire[..]);
+            let request = decode_request(&mut reader, &mut scratch).expect("decodes");
+            ids += usize::from(request.id == REQUEST_ID);
+        }
+        assert_eq!(ids, 64, "every parse named the id");
+    }
+
+    /// The flow decision alone: the add-ons, read again and again, with the fold outside
+    /// the walk so the frame holds the decision and nothing else.
+    #[test]
+    fn the_flow_decision_probe_costs_the_walk_and_nothing_else() {
+        let addons = b"\x0a\x10xtls-rprx-vision";
+        let mut vision = 0usize;
+        for _ in 0..64 {
+            vision += usize::from(flow_of(addons) == Flow::Vision);
+        }
+        assert_eq!(vision, 64, "every walk named the vision flow");
+    }
+
+    /// The command validator accepts exactly the three commands the reference knows and
+    /// refuses every other byte: checking costs one match, and it is paid on every frame.
+    #[test]
+    fn the_command_validator_accepts_three_commands() {
+        let accepted: Vec<u8> = (0..=u8::MAX)
+            .filter(|byte| VisionCommand::from_byte(*byte).is_some())
+            .collect();
+        assert_eq!(
+            accepted,
+            vec![0, 1, 2],
+            "the three commands the reference knows"
+        );
+        for byte in 3..=u8::MAX {
+            assert_eq!(VisionCommand::from_byte(byte), None, "byte {byte}");
+        }
+    }
+
+    /// The validator alone: the 256 command bytes, read again and again, with the fold
+    /// outside the call so the frame holds the match and nothing else.
+    #[test]
+    fn the_command_validator_probe_costs_the_match_and_nothing_else() {
+        let mut accepted = 0usize;
+        for _ in 0..64 {
+            for byte in 0..=u8::MAX {
+                accepted += usize::from(VisionCommand::from_byte(byte).is_some());
+            }
+        }
+        assert_eq!(accepted, 64 * 3, "the validator accepts three commands");
+    }
+
+    /// The add-ons name a flow; the parse says which without building a string for it.
+    #[test]
+    fn the_flow_is_named_without_building_a_string() {
+        let cases: [(&[u8], Flow); 5] = [
+            (&[], Flow::None),
+            (&b"\x0a\x00"[..], Flow::None),
+            (&b"\x0a\x10xtls-rprx-vision"[..], Flow::Vision),
+            (&b"\x0a\x17xtls-rprx-vision-udp443"[..], Flow::Other),
+            (&b"\x0a\x04none"[..], Flow::Other),
+        ];
+        for (addons, want) in cases {
+            assert_eq!(flow_of(addons), want, "{addons:?}");
+        }
+    }
 
     fn is_fresh(open: &VisionOpen) -> bool {
         open.command == -1 && open.content == -1 && open.padding == -1

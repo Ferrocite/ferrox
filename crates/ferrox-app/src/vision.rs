@@ -3,6 +3,7 @@ use std::cell::RefCell;
 use crate::conn::Connection;
 use crate::proxy::RELAY_SMALL_BUFFER;
 use ferrox_core::tls::RecordAlignment;
+use ferrox_core::vless::VisionCommand;
 use std::io::{Read, Write};
 
 const BUFFER: usize = 2048;
@@ -10,8 +11,7 @@ const BUFFER: usize = 2048;
 const WINDOW: usize = RELAY_SMALL_BUFFER;
 const SEED: [u32; 4] = [900, 500, 900, 256];
 const FILTER_PACKETS: i32 = 8;
-const CMD_DIRECT: u8 = 2;
-pub(crate) const FLOW: &str = "xtls-rprx-vision";
+pub(crate) const FLOW: &str = ferrox_core::vless::VISION_FLOW;
 
 const TLS_SERVER_HELLO: [u8; 3] = [0x16, 0x03, 0x03];
 const TLS_HANDSHAKE_START: [u8; 2] = [0x16, 0x03];
@@ -34,6 +34,10 @@ pub(crate) struct Link<S: Read + Write + RecordAlignment> {
     oat: usize,
     #[cfg(test)]
     staged: usize,
+    /// The command bytes the reader validated: one per frame, and the count the
+    /// validator's row is read from.
+    #[cfg(test)]
+    validated: usize,
     read: Reading,
     write: Writing,
     tls: Tls,
@@ -46,7 +50,7 @@ struct Reading {
     want_header: i32,
     want_content: usize,
     want_padding: usize,
-    command: u8,
+    command: Option<VisionCommand>,
 }
 
 struct Writing {
@@ -76,6 +80,8 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             oat: 0,
             #[cfg(test)]
             staged: 0,
+            #[cfg(test)]
+            validated: 0,
             read: Reading {
                 padding: true,
                 mid_frame: false,
@@ -83,7 +89,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 want_header: 0,
                 want_content: 0,
                 want_padding: 0,
-                command: 0,
+                command: None,
             },
             write: Writing {
                 padding: true,
@@ -111,8 +117,13 @@ impl<S: Read + Write + RecordAlignment> RecordAlignment for Link<S> {
 impl<S: Read + Write + RecordAlignment> Read for Link<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.oat >= self.out.len() {
-            self.out.clear();
             self.oat = 0;
+            if self.read.padding {
+                self.out.clear();
+            } else {
+                // The framing is over and its staging is empty: the connection is done with it.
+                self.out = Vec::new();
+            }
         }
         if !self.read.padding {
             if self.oat < self.out.len() {
@@ -169,6 +180,17 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         self.staged += n;
     }
 
+    /// One command byte validated. The count is the validator's row, and the production
+    /// arm folds away: the validator's own cost is in the match it makes.
+    #[cfg(test)]
+    fn validate(&mut self) {
+        self.validated += 1;
+    }
+
+    #[cfg(not(test))]
+    #[allow(clippy::unused_self)]
+    fn validate(&mut self) {}
+
     #[cfg(not(test))]
     #[allow(clippy::unused_self)]
     fn stage(&mut self, _n: usize) {}
@@ -219,9 +241,13 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 continue;
             }
             if self.oat < self.out.len() {
-                return Ok(true);
+                break;
             }
         }
+        // The framing is over: the window is dead with it, and a connection past the switch does not carry it.
+        self.have = Vec::new();
+        self.hat = 0;
+        Ok(true)
     }
 
     fn unpad(&mut self) -> bool {
@@ -242,60 +268,75 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             self.read.mid_frame = true;
             self.read.want_header = 5;
         }
-        while self.read.want_header > 0 || self.read.want_content > 0 || self.read.want_padding > 0
-        {
-            if self.pending() == 0 {
-                return false;
-            }
-            if self.read.want_header == 5 && self.pending() >= 5 {
-                // Five header iterations with no observable in between read as one load.
-                let head = &self.have[self.hat..self.hat + 5];
-                self.read.command = head[0];
-                self.read.want_content = (usize::from(head[1]) << 8) | usize::from(head[2]);
-                self.read.want_padding = (usize::from(head[3]) << 8) | usize::from(head[4]);
-                self.hat += 5;
-                self.read.want_header = 0;
-                continue;
-            }
-            if self.read.want_header > 0 {
-                let byte = self.have[self.hat];
-                match self.read.want_header {
-                    5 => self.read.command = byte,
-                    4 => self.read.want_content = usize::from(byte) << 8,
-                    3 => self.read.want_content |= usize::from(byte),
-                    2 => self.read.want_padding = usize::from(byte) << 8,
-                    _ => self.read.want_padding |= usize::from(byte),
+        // The frames in the window are walked in a loop: a thousand frames cost a thousand steps.
+        loop {
+            while self.read.want_header > 0
+                || self.read.want_content > 0
+                || self.read.want_padding > 0
+            {
+                if self.pending() == 0 {
+                    return false;
                 }
-                self.hat += 1;
-                self.read.want_header -= 1;
-                continue;
-            }
-            if self.read.want_content > 0 {
-                let take = self.read.want_content.min(self.pending());
-                self.out
-                    .extend_from_slice(&self.have[self.hat..self.hat + take]);
-                self.stage(take);
+                if self.read.want_header == 5 && self.pending() >= 5 {
+                    // Five header iterations with no observable in between read as one load.
+                    let head = &self.have[self.hat..self.hat + 5];
+                    let (command, content, padding) = (
+                        VisionCommand::from_byte(head[0]),
+                        (usize::from(head[1]) << 8) | usize::from(head[2]),
+                        (usize::from(head[3]) << 8) | usize::from(head[4]),
+                    );
+                    self.read.command = command;
+                    self.validate();
+                    self.read.want_content = content;
+                    self.read.want_padding = padding;
+                    self.hat += 5;
+                    self.read.want_header = 0;
+                    continue;
+                }
+                if self.read.want_header > 0 {
+                    let byte = self.have[self.hat];
+                    match self.read.want_header {
+                        5 => {
+                            self.read.command = VisionCommand::from_byte(byte);
+                            self.validate();
+                        }
+                        4 => self.read.want_content = usize::from(byte) << 8,
+                        3 => self.read.want_content |= usize::from(byte),
+                        2 => self.read.want_padding = usize::from(byte) << 8,
+                        _ => self.read.want_padding |= usize::from(byte),
+                    }
+                    self.hat += 1;
+                    self.read.want_header -= 1;
+                    continue;
+                }
+                if self.read.want_content > 0 {
+                    let take = self.read.want_content.min(self.pending());
+                    self.out
+                        .extend_from_slice(&self.have[self.hat..self.hat + take]);
+                    self.stage(take);
+                    self.hat += take;
+                    self.read.want_content -= take;
+                    continue;
+                }
+                let take = self.read.want_padding.min(self.pending());
                 self.hat += take;
-                self.read.want_content -= take;
+                self.read.want_padding -= take;
+            }
+            // The frame is complete: a continue means another frame follows it.
+            if self.read.command == Some(VisionCommand::Continue) {
+                self.read.want_header = 5;
                 continue;
             }
-            let take = self.read.want_padding.min(self.pending());
-            self.hat += take;
-            self.read.want_padding -= take;
+            self.read.mid_frame = false;
+            self.read.padding = false;
+            self.read.raw = self.read.command == Some(VisionCommand::Direct) && self.raw.is_some();
+            let tail = self.have.len();
+            let taken = tail - self.hat;
+            self.out.extend_from_slice(&self.have[self.hat..tail]);
+            self.stage(taken);
+            self.hat = tail;
+            return true;
         }
-        if self.read.command == 0 {
-            self.read.want_header = 5;
-            return self.unpad();
-        }
-        self.read.mid_frame = false;
-        self.read.padding = false;
-        self.read.raw = self.read.command == CMD_DIRECT && self.raw.is_some();
-        let tail = self.have.len();
-        let taken = tail - self.hat;
-        self.out.extend_from_slice(&self.have[self.hat..tail]);
-        self.stage(taken);
-        self.hat = tail;
-        true
     }
 
     fn flush_truncated(&mut self) {
@@ -372,7 +413,7 @@ impl<S: Read + Write + RecordAlignment> Write for Link<S> {
             let padding = padding_len(content, self.tls.present);
             let switches = last && complete;
             let command = match (switches && self.tls.enable_xtls, ends_early || switches) {
-                (true, _) => CMD_DIRECT,
+                (true, _) => VisionCommand::Direct.byte(),
                 (_, true) => 1,
                 _ => 0,
             };
@@ -390,8 +431,9 @@ impl<S: Read + Write + RecordAlignment> Write for Link<S> {
             at += content;
             if command != 0 {
                 self.write.padding = false;
-                self.write.raw =
-                    self.raw.is_some() && self.tls.enable_xtls && command == CMD_DIRECT;
+                self.write.raw = self.raw.is_some()
+                    && self.tls.enable_xtls
+                    && command == VisionCommand::Direct.byte();
                 self.write_out(&buf[at..])?;
                 return Ok(buf.len());
             }
@@ -629,7 +671,59 @@ mod tests {
         );
     }
 
-    /// The framed staging never reaches for a full relay buffer: it is capped at one record and holds steady across a whole handshake's worth of fills.
+    /// The frame parser alone: a fixed window of empty frames, walked again and again,
+    /// with the fold outside the walk so the frame holds the parse and nothing else.
+    #[test]
+    fn the_frame_parser_probe_costs_the_walk_and_nothing_else() {
+        let mut input = Vec::new();
+        for _ in 0..7 {
+            input.extend(frame(false, 0, &[], 0));
+        }
+        input.extend(frame(false, 1, &[], 0));
+        let mut link = link(&[]);
+        let mut frames = 0usize;
+        for _ in 0..64 {
+            link.have.clear();
+            link.have.extend_from_slice(&input);
+            link.hat = 0;
+            link.read.mid_frame = true;
+            link.read.want_header = 5;
+            assert!(link.unpad(), "the last frame ends the framing");
+            frames += 8;
+        }
+        assert_eq!(frames, 512, "the walk saw every frame");
+    }
+
+    /// The command byte is validated once per frame, and a command the reference does
+    /// not know ends the framing the way `end` does: the bytes after it are not framed.
+    #[test]
+    fn a_frame_validates_its_command_once() {
+        let mut input = frame(true, 0, b"first", 3);
+        input.extend(frame(false, 0, b"second", 4));
+        input.extend(frame(false, 1, b"third", 0));
+        input.extend_from_slice(b"raw tail");
+        let mut framed = link(&input);
+        let mut out = Vec::new();
+        framed.read_to_end(&mut out).expect("reads");
+        assert_eq!(out, b"firstsecondthirdraw tail");
+        assert_eq!(
+            framed.validated, 3,
+            "one command byte per frame, and the tail carries none"
+        );
+        drop(framed);
+
+        // A command outside the three the reference knows ends the framing like `end`.
+        let mut unknown = frame(true, 0x07, b"kept", 0);
+        unknown.extend_from_slice(b"after");
+        let mut other = link(&unknown);
+        let mut out = Vec::new();
+        other.read_to_end(&mut out).expect("reads");
+        assert_eq!(out, b"keptafter", "an unknown command ends the framing");
+        assert_eq!(other.validated, 1, "the unknown command was validated too");
+    }
+
+    /// The framed staging never reaches for a full relay buffer: it is capped at one
+    /// record while the framing lives, and the switch hands both buffers back.
     #[test]
     fn the_framed_staging_buffers_stay_at_one_record() {
         let mut input = Vec::new();
@@ -643,6 +737,16 @@ mod tests {
 
         let mut link = link(&input);
         let mut got = Vec::new();
+        // The first read lands inside the framing, where the window is one record wide.
+        let mut head = [0u8; 64];
+        let n = link.read(&mut head).expect("reads");
+        assert!(n > 0, "the first read carries content");
+        assert_eq!(
+            link.have.capacity(),
+            WINDOW,
+            "the read buffer holds exactly the window, never a relay's 256 KiB"
+        );
+        got.extend_from_slice(&head[..n]);
         link.read_to_end(&mut got).expect("reads");
         let mut want: Vec<u8> = (0..24u32)
             .flat_map(|i| (0..700u32).map(move |k| (k as u8) ^ (i as u8)))
@@ -653,14 +757,10 @@ mod tests {
 
         assert_eq!(
             link.have.capacity(),
-            WINDOW,
-            "the read buffer holds exactly the window, never a relay's 256 KiB"
+            0,
+            "the switch hands the window back: a connection that lives on does not carry it"
         );
-        assert!(
-            link.out.capacity() < crate::proxy::RELAY_BUFFER,
-            "the staging buffer stays under a full relay buffer, at {}",
-            link.out.capacity()
-        );
+        assert_eq!(link.out.capacity(), 0, "and the staging with it");
     }
 
     /// A reader that answers in seeded chunks, so a red run replays anywhere.

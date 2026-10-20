@@ -376,6 +376,7 @@ fn gate_deterministic(key: &[u8; 32], nonce: &[u8; 12]) -> usize {
     }
 
     gate_vision_allocs(key, nonce, &mut alloc_failures);
+    gate_request_allocs(&mut alloc_failures);
 
     assert!(
         block_failures.is_empty(),
@@ -418,6 +419,54 @@ fn gate_vision_allocs(key: &[u8; 32], nonce: &[u8; 12], alloc_failures: &mut Vec
         if counts.allocs != 0 || counts.bytes != 0 || counts.zeroed != 0 {
             alloc_failures.push(format!(
                 "vision {len}B: {} allocs, {} bytes, {} zero-fills per 64 seals",
+                counts.allocs, counts.bytes, counts.zeroed
+            ));
+        }
+    }
+}
+
+/// The request header the server reads, in the shape row 1's client writes it: the
+/// Vision add-ons, the command, and a target in each of the three families.
+fn gate_request_allocs(alloc_failures: &mut Vec<String>) {
+    let addons = b"\x0a\x10xtls-rprx-vision";
+    let families: [(&str, Vec<u8>); 3] = [
+        ("ipv4", {
+            let mut body = 443u16.to_be_bytes().to_vec();
+            body.extend_from_slice(&[1, 192, 0, 2, 53]);
+            body
+        }),
+        ("ipv6", {
+            let mut body = 443u16.to_be_bytes().to_vec();
+            body.extend_from_slice(&[3, 0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]);
+            body
+        }),
+        ("domain", {
+            let mut body = 443u16.to_be_bytes().to_vec();
+            body.extend_from_slice(&[2, 11]);
+            body.extend_from_slice(b"example.com");
+            body
+        }),
+    ];
+    for (label, body) in families {
+        let mut wire = vec![0u8];
+        wire.extend_from_slice(&[0xabu8; 16]);
+        wire.push(addons.len() as u8);
+        wire.extend_from_slice(addons);
+        wire.push(1);
+        wire.extend_from_slice(&body);
+        let iters = 64u64;
+        let ((), counts) = count::measure(|| {
+            for _ in 0..iters {
+                let mut scratch = [0u8; ferrox_core::vless::REQUEST_MAX];
+                let mut reader = std::io::Cursor::new(&wire[..]);
+                let request = ferrox_core::vless::decode_request(&mut reader, &mut scratch)
+                    .expect("the request parses");
+                std::hint::black_box(request.id);
+            }
+        });
+        if counts.allocs != 0 || counts.bytes != 0 || counts.zeroed != 0 {
+            alloc_failures.push(format!(
+                "request {label}: {} allocs, {} bytes, {} zero-fills per 64 parses",
                 counts.allocs, counts.bytes, counts.zeroed
             ));
         }
