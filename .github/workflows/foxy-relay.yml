@@ -7,7 +7,7 @@ name: Foxy relay (live download check)
 # exit country off the Cloudflare trace. Each carrier then rides two further
 # 200 KB flows on the still-open lane: the first flow pays for dial, handshake
 # and slow start, and the warm rows are the number a one-session competitor is
-# read against. Ubuntu additionally carries a 16 MB bulk leg over h3 and h2,
+# read against. Ubuntu additionally carries a 10 MB bulk leg over h3 and h2,
 # which is the only row big enough to cross the lane's opening receive credit:
 # a window that cannot grow past it paces the flow at `credit / rtt`, and that
 # is a duration no 1 MB leg can show. Every leg also records its
@@ -306,24 +306,27 @@ jobs:
                   FAILED="$FAILED $carrier(warm$flow)"
                 fi
               done
-              # The receive window, measured rather than argued: 16 MB is sixteen times the lane's
+              # The receive window, measured rather than argued: ten mebibytes is ten times the lane's
               # opening credit, so a lane whose window cannot grow past that credit is paced
               # by `window / rtt` and answers in tens of seconds, where one that grows answers in
               # seconds. One megabyte cannot see this at all - it fits inside the opening credit - and
               # that is why every other row here is blind to it. Ubuntu only: this is the one leg whose
               # cost is quota rather than a byte count, and the edge is the same from every runner.
+              # Ten mebibytes, not sixteen: the edge serves a `__down` request of at most ten mebibytes
+              # and answers a larger one with a 403 and one byte, so a sixteen-mebibyte leg would have
+              # measured cloudflare's cap rather than the lane's window.
               if [ "${{ matrix.os }}" = "ubuntu-latest" ] && { [ "$carrier" = h3 ] || [ "$carrier" = h2 ]; }; then
                 code=0
                 timing=$(curl -sS --max-time 120 --socks5-hostname "127.0.0.1:$PORT" \
                   -w '%{size_download} %{time_total} %{speed_download}' \
-                  'https://speed.cloudflare.com/__down?bytes=16777216' -o "bulk-$carrier.bin") || code=$?
+                  'https://speed.cloudflare.com/__down?bytes=10485760' -o "bulk-$carrier.bin") || code=$?
                 echo "carrier $carrier bulk ${timing:-0 0 0}" >> foxy-legs.tsv
                 got=$(wc -c < "bulk-$carrier.bin" 2>/dev/null | tr -d ' ')
                 got="${got:-0}"
-                if test "$code" = 0 && test "$got" = 16777216; then
-                  echo "carrier $carrier bulk: 16777216 B on one lane"
+                if test "$code" = 0 && test "$got" = 10485760; then
+                  echo "carrier $carrier bulk: 10485760 B on one lane"
                 else
-                  echo "carrier $carrier bulk FAILED: curl_exit=$code bytes=$got of 16777216" >&2
+                  echo "carrier $carrier bulk FAILED: curl_exit=$code bytes=$got of 10485760" >&2
                   FAILED="$FAILED $carrier(bulk)"
                 fi
               fi
