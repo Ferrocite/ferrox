@@ -596,18 +596,25 @@ impl DomainMatcher {
     }
 
     fn matches(&self, host: &str) -> bool {
-        let domain = host.to_ascii_lowercase();
-        if self.full.contains(&domain) {
+        // Names arrive lowercase almost always, so the borrowed host is the table key until it is not.
+        let lower;
+        let domain = if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            lower = host.to_ascii_lowercase();
+            lower.as_str()
+        } else {
+            host
+        };
+        if self.full.contains(domain) {
             return true;
         }
-        let mut rest = Some(domain.as_str());
+        let mut rest = Some(domain);
         while let Some(part) = rest {
             if self.suffix.contains(part) {
                 return true;
             }
             rest = part.find('.').map(|at| &part[at + 1..]);
         }
-        if self.ac.as_ref().is_some_and(|ac| ac.is_match(&domain)) {
+        if self.ac.as_ref().is_some_and(|ac| ac.is_match(domain)) {
             return true;
         }
         self.regex.iter().any(|regex| regex.is_match(host))
@@ -1879,7 +1886,33 @@ mod tests {
     }
 
     #[test]
-    fn a_domain_match_takes_one_lowercase_buffer() {
+    fn a_lowercase_host_matches_without_a_buffer() {
+        let root = object(vec![(
+            "routing",
+            routing(vec![rule(
+                "direct",
+                vec![("domain", array(vec![text("domain:example.test")]))],
+            )]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("www.example.test"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: None,
+        };
+        let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
+        assert_eq!(tag, Some("direct"));
+        assert_eq!(counts.allocs, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn a_mixed_case_host_takes_one_lowercase_buffer() {
         let root = object(vec![(
             "routing",
             routing(vec![rule(
