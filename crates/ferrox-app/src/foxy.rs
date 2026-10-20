@@ -1373,6 +1373,8 @@ pub(crate) struct H3 {
     /// Octets of the head DATAGRAM capsule already handed to a caller whose buffer was shorter than the datagram: the capsule stays staged until this reaches its length, so a short read costs the tail nothing.
     handed: usize,
     fin: bool,
+    /// The peer sent its fin: nothing more will arrive on the request stream, so a reader that has the bytes it was given is at the end of the tunnel and a reader that has none is at the end of a stream that carried none.
+    closed: bool,
     deadline: Instant,
     /// How long this lane waits for a CONNECT answer: a carrier's own open gets the head timeout, a disposable probe gets the budget its caller names.
     head_wait: Duration,
@@ -1414,6 +1416,7 @@ impl H3 {
             capsule_buf: Vec::new(),
             handed: 0,
             fin: false,
+            closed: false,
             deadline: Instant::now(),
             head_wait,
             quantum: None,
@@ -1428,6 +1431,22 @@ impl H3 {
         let out = body(&mut guard);
         crate::quic::flush_egress(&mut guard, &self.quic.sock);
         Some(out)
+    }
+
+    /// Whether the request stream has nothing left in it: the peer sent its fin and every byte it sent has been read. A fin alone says no more will arrive, so bytes already in the stream's own buffer are still the caller's.
+    fn drained(&self) -> bool {
+        if !self.closed {
+            return false;
+        }
+        let id = self.quic.id;
+        self.with_conn_read(|conn| conn.stream_finished(id))
+            .unwrap_or(false)
+    }
+
+    /// The connection under its lock, read-only: a reader that asks what is left has nothing to send, and the egress sweep is a syscall the read did not ask for.
+    fn with_conn_read<T>(&self, body: impl FnOnce(&quiche::Connection) -> T) -> Option<T> {
+        let guard = self.quic.conn.lock().ok()?;
+        Some(body(&guard))
     }
 
     /// The HTTP/3 opening a fresh connection carries exactly once: a complete SETTINGS plus QPACK encoder/decoder hellos, literal-only with no dynamic table; a truncated SETTINGS waits forever and a second control stream is a connection error, and nothing is ever finished.
@@ -1464,6 +1483,7 @@ impl H3 {
             capsule_buf: Vec::new(),
             handed: 0,
             fin: false,
+            closed: false,
             deadline: Instant::now(),
             head_wait: HEADER_TIMEOUT,
             quantum: None,
@@ -1487,6 +1507,7 @@ impl H3 {
             capsule_buf: Vec::new(),
             handed: 0,
             fin: false,
+            closed: false,
             deadline: Instant::now(),
             head_wait: HEADER_TIMEOUT,
             quantum: None,
@@ -1548,6 +1569,10 @@ impl H3 {
     /// Consumes one frame per turn: a header that is not whole yet leaves the caller to retry, because the capsules already in the buffer are what its reader is waiting for.
     fn walk_capsules(&mut self, started: Instant) -> Result<(), Failure> {
         let Some((frame, head)) = self.peek()? else {
+            if self.closed {
+                // The peer finished the stream: a capsule that never came is a capsule the peer never sent, and a reader that waits for it waits for the whole head timeout.
+                return Err(Failure::Stream);
+            }
             return Ok(());
         };
         let Some(body) = self.carried.checked_add(head) else {
@@ -1640,6 +1665,10 @@ impl H3 {
             if self.fin {
                 return Ok(false);
             }
+            if self.closed {
+                // The peer finished the stream: the packet that never came is a packet the peer never sent.
+                return Ok(false);
+            }
             if self
                 .quantum
                 .is_some_and(|quantum| started.elapsed() >= quantum)
@@ -1693,6 +1722,10 @@ impl H3 {
                 return Ok(take);
             }
             if self.fin {
+                return Ok(0);
+            }
+            if self.closed {
+                // The peer finished the stream: the datagram that never came is a datagram the peer never sent, and `Ok(0)` is the end of the stream.
                 return Ok(0);
             }
             if self
@@ -1799,6 +1832,10 @@ impl H3 {
                 continue;
             }
             let Some((frame, head)) = self.peek()? else {
+                if self.closed {
+                    // The peer finished the stream without an answer: the head wait would otherwise spin until its deadline for bytes that will not come.
+                    return Err(Failure::Stream);
+                }
                 continue;
             };
             let Some(body) = self.carried.checked_add(head) else {
@@ -1833,17 +1870,65 @@ impl H3 {
         }
     }
 
-    /// The frame header at the cursor, or `None` when this turn read no whole one. A window that is full of bytes and still does not parse is not a header: the ceiling is the largest header a QUIC varint pair can be, so the lane ends there instead of growing a window to find out.
+    /// The frame header at the cursor, if a whole one is there: a window that is full of bytes and still does not parse is not a header — the ceiling is the largest header a QUIC varint pair can be, so the lane ends there instead of growing a window to find out.
     fn peek(&mut self) -> Result<Option<(frames::H3Frame, usize)>, Failure> {
-        let mut head = 0usize;
-        if let Some(frame) = frames::h3_frame(&self.head[self.carried..self.filled], &mut head) {
-            return Ok(Some((frame, head)));
+        if let Some(frame) = self.parse_head() {
+            return Ok(Some(frame));
         }
         if self.filled - self.carried >= self.head.len() {
             return Err(Failure::Frame);
         }
         self.fill_peek()?;
+        if let Some(frame) = self.parse_head() {
+            return Ok(Some(frame));
+        }
+        if self.closed && self.filled > self.carried {
+            // The peer finished the stream with a frame header half in the window: a truncated frame, and the lane ends there rather than waiting for bytes that will not come.
+            return Err(Failure::Stream);
+        }
         Ok(None)
+    }
+
+    /// The frame header the window holds, if it is a whole one: the kind and the length, and how many bytes the header itself took.
+    fn parse_head(&self) -> Option<(frames::H3Frame, usize)> {
+        let mut head = 0usize;
+        frames::h3_frame(&self.head[self.carried..self.filled], &mut head)
+            .map(|frame| (frame, head))
+    }
+
+    /// What one frame's header says the reader should do: a DATA frame's body becomes the caller's to read, a frame the tunnel does not read is consumed, and a reset or a goaway ends the tunnel without a block of its own.
+    fn dispatch(
+        &mut self,
+        frame: frames::H3Frame,
+        head: usize,
+        started: Instant,
+    ) -> Result<Dispatch, Failure> {
+        let Some(body_at) = self.carried.checked_add(head) else {
+            return Err(Failure::Frame);
+        };
+        let Ok(length) = usize::try_from(frame.length) else {
+            return Err(Failure::Stream);
+        };
+        if frame.kind == frames::H3_DATA {
+            self.carried = body_at;
+            // An empty DATA frame carries no bytes and is not the end of the stream: only a finished stream or a reset ends the tunnel, and handing back zero here is what a caller reads as EOF.
+            if length == 0 {
+                return Ok(Dispatch::Again);
+            }
+            self.body = length;
+            return Ok(Dispatch::Again);
+        }
+        if frame.kind == frames::H3_RESET || frame.kind == frames::H3_GOAWAY {
+            // The kind is in the header, so an ending needs no block of its own: the frame that follows it is never read.
+            self.fin = true;
+            self.carried = self.filled;
+            return Ok(Dispatch::Ended);
+        }
+        if length > H3_SKIP {
+            return Err(Failure::Frame);
+        }
+        self.take_block(body_at, length, false, started)?;
+        Ok(Dispatch::Again)
     }
 
     /// The block a header names, consumed into the capsule buffer's tail: the bytes the peek already pulled arrive first, `keep` says whether the rest is the stream's own or a frame this lane has no use for, and the lane's cursor moves past what the window held either way. Returns where the block began, which is what its reader cuts back to.
@@ -1900,7 +1985,18 @@ impl H3 {
                         self.capsule_buf = buf;
                         return Err(Failure::Stream);
                     }
-                    Some(Ok((read, _))) => read,
+                    Some(Ok((read, fin))) => {
+                        if fin {
+                            // The fin came with these bytes: the block is whole or the peer never finished it.
+                            if block.rest > read {
+                                buf.truncate(used + read);
+                                self.capsule_buf = buf;
+                                return Err(Failure::Stream);
+                            }
+                            self.closed = true;
+                        }
+                        read
+                    }
                     Some(Err(quiche::Error::Done)) => 0,
                     _ => {
                         buf.truncate(used);
@@ -1921,6 +2017,12 @@ impl H3 {
                     // The room a capsule stream may hold ran out with the block still owed: a stream that never parses.
                     self.capsule_buf = buf;
                     return Err(Failure::Frame);
+                }
+                if self.closed {
+                    // The peer finished the stream with the block still owed: a frame the peer never finished, and a walk that waits for the rest of it waits for the whole head timeout.
+                    buf.truncate(used);
+                    self.capsule_buf = buf;
+                    return Err(Failure::Stream);
                 }
                 if self
                     .quantum
@@ -1967,8 +2069,17 @@ impl H3 {
         let read = self.with_conn(|conn| conn.stream_recv(id, &mut window[at..at + want]));
         self.head = window;
         match read {
-            Some(Ok((0, true))) => Err(Failure::Stream),
-            Some(Ok((read, _))) => Ok(read),
+            Some(Ok((0, true))) => {
+                // The stream ended with nothing in it: a reader that has bytes is at the end of the tunnel.
+                self.closed = true;
+                Ok(0)
+            }
+            Some(Ok((read, fin))) => {
+                if fin {
+                    self.closed = true;
+                }
+                Ok(read)
+            }
             Some(Err(quiche::Error::Done)) => {
                 if Instant::now() >= self.deadline {
                     return Err(Failure::Stream);
@@ -1981,9 +2092,7 @@ impl H3 {
     }
 
     /// Delivers the frame in flight: what already sits in the window moves first — those bytes crossed once before this lane knew their length — and the rest arrives from the stream straight into the caller's buffer. A quantum that expires mid-frame hands back what was delivered; the next read resumes at the cursor.
-    fn body_into(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let started = Instant::now();
-        self.deadline = started + self.head_wait;
+    fn body_into(&mut self, buf: &mut [u8], started: Instant) -> std::io::Result<usize> {
         let mut delivered = 0usize;
         while self.body > 0 && delivered < buf.len() {
             if self.carried < self.filled {
@@ -2003,15 +2112,26 @@ impl H3 {
             {
                 break;
             }
+            if self.closed {
+                // The peer finished the stream with the body still owed: a frame the peer never finished, and a lane that waits for the rest of it waits for the whole head timeout.
+                return Err(io(Failure::Stream));
+            }
             let want = self.body.min(buf.len() - delivered);
             let id = self.quic.id;
             let read =
                 self.with_conn(|conn| conn.stream_recv(id, &mut buf[delivered..delivered + want]));
             match read {
                 Some(Ok((0, true))) => return Err(io(Failure::Stream)),
-                Some(Ok((read, _))) => {
+                Some(Ok((read, fin))) => {
                     delivered += read;
                     self.body -= read;
+                    if fin {
+                        // The fin came with these bytes, so the stream is over: a body still owed is a frame the peer never finished.
+                        if self.body > 0 {
+                            return Err(io(Failure::Stream));
+                        }
+                        self.closed = true;
+                    }
                 }
                 Some(Err(quiche::Error::Done)) => {
                     if Instant::now() >= self.deadline {
@@ -2049,23 +2169,68 @@ impl Write for H3 {
 }
 
 impl Read for H3 {
-    /// The tunnel, not the stream: the caller gets the payload of DATA frames, because a frame header read as payload carries the tunnel's own framing into every byte after it.
+    /// The tunnel, not the stream: the caller gets the payload of DATA frames, because a frame header read as payload carries the tunnel's own framing into every byte after it. The caller's buffer is filled across frames: a lane that hands back one frame per read makes the caller's read syscall per frame, and the acknowledgement quiche sends when the app drains the stream is what the edge's congestion window grows on.
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.body > 0 {
-            return self.body_into(buf);
+        if buf.is_empty() {
+            return Ok(0);
         }
         let started = Instant::now();
         // One wait per read call, armed from its own start: re-arming inside the loop would let a peer that answers nothing park this lane forever, where the socket carriers' read timeout costs the caller `head_wait` and returns.
         self.deadline = started + self.head_wait;
+        let mut delivered = 0usize;
         loop {
+            if self.body > 0 {
+                // The frame in flight: its body goes into the caller's buffer, and a body the caller's buffer cannot hold all of is finished by the next call.
+                let took = self.body_into(&mut buf[delivered..], started)?;
+                delivered += took;
+                if self.body > 0 {
+                    // The quantum ended the body short: what arrived is the caller's, and the rest waits for the next call. Handing back nothing here would read as the end of the stream.
+                    return if delivered > 0 {
+                        Ok(delivered)
+                    } else {
+                        Err(blocked())
+                    };
+                }
+                continue;
+            }
             if self.fin {
-                return Ok(0);
+                // The tunnel is over: the bytes already delivered are the caller's, and the next read is the end of the stream.
+                return Ok(delivered);
+            }
+            if self.closed {
+                // The peer finished the stream. The bytes it sent are in the caller's hands, and what the stream still holds behind them is the caller's too: a fin says no more will arrive, not that none arrived.
+                if self.body > 0 {
+                    // A frame the peer never finished: a tunnel that ends mid-frame is a broken tunnel, not a short one.
+                    return Err(io(Failure::Stream));
+                }
+                if self.carried < self.filled {
+                    // The window holds bytes the peer sent: they are the last of the tunnel, and a frame header among them is read before the tunnel ends.
+                    let Some((frame, head)) = self.parse_head() else {
+                        // A remainder that is not a frame header: the peer sent bytes no frame names, and a tunnel that ends on them is a broken tunnel.
+                        return Err(io(Failure::Stream));
+                    };
+                    match self.dispatch(frame, head, started).map_err(io)? {
+                        Dispatch::Again => continue,
+                        Dispatch::Ended => return Ok(delivered),
+                    }
+                }
+                if self.drained() {
+                    return Ok(delivered);
+                }
+                return Err(io(Failure::Stream));
+            }
+            if delivered == buf.len() {
+                return Ok(delivered);
             }
             if self
                 .quantum
                 .is_some_and(|quantum| started.elapsed() >= quantum)
             {
-                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                return if delivered > 0 {
+                    Ok(delivered)
+                } else {
+                    Err(blocked())
+                };
             }
             if self.pending.is_some() {
                 // The block of a frame the tunnel does not read: consumed here so the next header is the next frame's, and a quantum that expired inside it is resumed, not re-parsed.
@@ -2073,36 +2238,26 @@ impl Read for H3 {
                 continue;
             }
             let Some((frame, head)) = self.peek().map_err(io)? else {
-                continue;
-            };
-            let Some(body_at) = self.carried.checked_add(head) else {
-                return Err(io(Failure::Frame));
-            };
-            let Ok(length) = usize::try_from(frame.length) else {
-                return Err(io(Failure::Stream));
-            };
-            if frame.kind == frames::H3_DATA {
-                self.carried = body_at;
-                // An empty DATA frame carries no bytes and is not the end of the stream: only a finished stream or a reset ends the tunnel, and handing back zero here is what a caller reads as EOF.
-                if length == 0 {
-                    continue;
+                // No whole frame yet: a header the peer has not finished sending, or a stream that owes nothing right now. What already arrived is the caller's.
+                if delivered > 0 {
+                    return Ok(delivered);
                 }
-                self.body = length;
-                return self.body_into(buf);
-            }
-            if frame.kind == frames::H3_RESET || frame.kind == frames::H3_GOAWAY {
-                // The kind is in the header, so an ending needs no block of its own: the frame that follows it is never read.
-                self.fin = true;
-                self.carried = self.filled;
                 continue;
+            };
+            match self.dispatch(frame, head, started).map_err(io)? {
+                Dispatch::Again => {}
+                Dispatch::Ended => return Ok(delivered),
             }
-            if length > H3_SKIP {
-                return Err(io(Failure::Frame));
-            }
-            self.take_block(body_at, length, false, started)
-                .map_err(io)?;
         }
     }
+}
+
+/// What one frame's header says the reader should do next: the frame is a payload to deliver, or the tunnel is over.
+enum Dispatch {
+    /// The frame was taken in: a DATA frame's body is now the caller's to read, and a frame the tunnel does not read has been consumed.
+    Again,
+    /// The frame was a reset or a goaway: the tunnel is over and the frame that follows it is never read.
+    Ended,
 }
 
 /// Reads the two-letter country out of whatever the probe answered: a `loc=XX` line, a `"countryCode":"XX"` field, or nothing — a probe that cannot be read is not evidence.
@@ -2128,6 +2283,11 @@ pub(crate) fn exit_country(head: &[u8]) -> Option<String> {
 
 fn io(failure: Failure) -> std::io::Error {
     std::io::Error::other(failure.to_string())
+}
+
+/// The answer a lane gives when its quantum ran out with nothing to show: not the end of the stream, which is zero bytes and no error, but a turn handed back so the caller may come again.
+fn blocked() -> std::io::Error {
+    std::io::Error::from(std::io::ErrorKind::WouldBlock)
 }
 
 /// One IP packet built into the lane's own scratch: the codec's build, into a buffer that already holds the room. The scratch is cleared rather than dropped, so the datagram after this one writes over the last one's bytes and takes no allocation of its own.
@@ -6701,6 +6861,105 @@ pub(crate) mod loopback {
         edge.join().expect("joins");
     }
 
+    /// A read that crosses a frame boundary hands the caller one buffer's worth of bytes and no more: the old lane stopped at every frame, so a caller reading 4096 bytes asked the edge for 16 KiB and was answered in pieces.
+    #[test]
+    fn an_h3_read_crosses_the_frames_under_it() {
+        const FRAME: usize = 512;
+        const FRAMES: usize = 32;
+        const BUFFER: usize = 4096;
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let port = sock.local_addr().expect("addr").port();
+        // Frames smaller than the caller's buffer: a lane that answers one frame per read stops at every frame's edge, and a lane that fills the buffer takes eight frames at a time.
+        let downlink: Vec<u8> = (0..(FRAME * FRAMES) as u64)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut pieces = vec![(h3_answer(), Duration::ZERO)];
+        for at in (0..downlink.len()).step_by(FRAME) {
+            pieces.push((h3_data(&downlink[at..at + FRAME]), Duration::ZERO));
+        }
+        let edge = h3_scripted_edge(sock, server, pieces);
+
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", Some(quic)).expect("opens");
+        tunnel
+            .set_read_quantum(Duration::from_millis(100))
+            .expect("arms");
+
+        let mut chunk = vec![0u8; BUFFER];
+        let mut got: Vec<u8> = Vec::new();
+        let mut reads = 0usize;
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        while got.len() < downlink.len() {
+            assert!(std::time::Instant::now() < until, "the download arrives");
+            match tunnel.read(&mut chunk) {
+                Ok(0) => panic!("the lane called the end of the stream with bytes owed"),
+                Ok(read) => {
+                    assert!(read <= BUFFER, "the lane hands back no more than asked");
+                    reads += 1;
+                    got.extend_from_slice(&chunk[..read]);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("the tunnel failed: {error}"),
+            }
+        }
+        assert_eq!(got, downlink, "every downlink byte arrives, in order");
+        // The old lane answered one frame per read and stopped at the frame's edge, so a 4096-byte caller over thirty-two 512-byte frames paid thirty-two reads; the lane that fills the caller's buffer pays the frames the download is cut into.
+        assert!(
+            reads <= FRAMES / 8 + 1,
+            "the lane took {reads} reads for {} bytes, one per frame rather than one per buffer",
+            FRAME * FRAMES
+        );
+        edge.join().expect("joins");
+    }
+
+    /// A peer that finishes its stream ends the tunnel: the bytes it sent are the caller's, and the read after them is the end of the stream rather than a wait for a frame that will never come.
+    #[test]
+    fn an_h3_stream_the_peer_finished_ends_the_tunnel() {
+        let (roots, server) = minted(b"h3");
+        let sock =
+            crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
+        let port = sock.local_addr().expect("addr").port();
+        let edge = h3_fin_edge(
+            sock,
+            server,
+            vec![
+                (h3_answer(), Duration::ZERO),
+                (h3_data(b"the last of the tunnel"), Duration::ZERO),
+            ],
+        );
+
+        let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+        let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+            .expect("a connection");
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", Some(quic)).expect("opens");
+        tunnel
+            .set_read_quantum(Duration::from_millis(100))
+            .expect("arms");
+
+        let mut chunk = [0u8; 64];
+        let mut got: Vec<u8> = Vec::new();
+        let until = std::time::Instant::now() + Duration::from_secs(30);
+        // The read that returns nothing is the end of the stream, and it comes after the bytes: a lane that reported the end first would lose them.
+        loop {
+            assert!(std::time::Instant::now() < until, "the tunnel ends");
+            match tunnel.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(read) => got.extend_from_slice(&chunk[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) => panic!("the tunnel failed: {error}"),
+            }
+        }
+        assert_eq!(
+            got, b"the last of the tunnel",
+            "the bytes the peer sent arrive before the end of the stream"
+        );
+        edge.join().expect("joins");
+    }
+
     /// A QUIC edge that answers the request stream with exactly these pieces, each followed by a pause of its own: the frame shapes a plain echo cannot make — a capsule whose first half waits for its second, a header whose block arrives only after the lane has parked on it.
     fn h3_scripted_edge(
         sock: crate::quic::Datagram,
@@ -6761,8 +7020,11 @@ pub(crate) mod loopback {
             }
             let stream = stream.expect("a request stream");
             for (piece, pause) in pieces {
-                conn.stream_send(stream, &piece, false)
-                    .expect("sends a piece");
+                // The credit-aware send: a piece the congestion window cannot take is a piece the edge waits for rather than drops, and a script that sends thirty-two frames pays the window's pace.
+                assert!(
+                    crate::quic::stream_send_all(&mut conn, &sock, stream, &piece, false, deadline,),
+                    "the piece reaches the lane"
+                );
                 crate::quic::server_idle(&mut conn, &sock, &mut out);
                 let until = std::time::Instant::now() + pause;
                 while std::time::Instant::now() < until {
@@ -6788,6 +7050,93 @@ pub(crate) mod loopback {
         frames::quic_varint(&mut reply, 3);
         reply.extend_from_slice(&[0x00, 0x00, 0xd9]);
         reply
+    }
+
+    /// A scripted edge that finishes its request stream: the pieces land as they are, and then the stream is closed, so the lane sees the peer's fin rather than a frame header it mistook for one.
+    fn h3_fin_edge(
+        sock: crate::quic::Datagram,
+        server: ferrox_core::tls::TlsServerConfig,
+        pieces: Vec<(Vec<u8>, Duration)>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos();
+            let tag = format!("ferrox-foxy-fin-{}-{stamp}", std::process::id());
+            let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
+            let key_path = std::env::temp_dir().join(format!("{tag}.key"));
+            std::fs::write(
+                &cert_path,
+                crate::quic::der_to_pem(&server.cert_chain[0], "CERTIFICATE"),
+            )
+            .expect("stages cert");
+            std::fs::write(
+                &key_path,
+                crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY"),
+            )
+            .expect("stages key");
+            let mut config = crate::quic::server_config(crate::quic::ALPN);
+            config
+                .load_cert_chain_from_pem_file(cert_path.to_str().expect("ascii"))
+                .expect("loads chain");
+            config
+                .load_priv_key_from_pem_file(key_path.to_str().expect("ascii"))
+                .expect("loads key");
+            let _ = std::fs::remove_file(&cert_path);
+            let _ = std::fs::remove_file(&key_path);
+            let local = sock.local_addr().expect("addr");
+            let mut conn = crate::quic::server_accept(&sock, local, &mut config);
+            let mut buf = [0u8; 1350];
+            let mut out = [0u8; 1350];
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            let mut stream = None;
+            while stream.is_none() {
+                assert!(std::time::Instant::now() < deadline, "the request arrives");
+                let Some((n, from)) = crate::quic::server_poll(&sock, &mut buf) else {
+                    crate::quic::server_idle(&mut conn, &sock, &mut out);
+                    continue;
+                };
+                let info = quiche::RecvInfo { from, to: local };
+                conn.recv(&mut buf[..n], info).expect("drives");
+                let ids: Vec<u64> = conn.readable().collect();
+                for id in ids {
+                    if id % 4 != 0 {
+                        continue;
+                    }
+                    if !drain(&mut conn, id).is_empty() {
+                        stream = Some(id);
+                    }
+                }
+                crate::quic::server_idle(&mut conn, &sock, &mut out);
+            }
+            let stream = stream.expect("a request stream");
+            for (piece, pause) in pieces {
+                assert!(
+                    crate::quic::stream_send_all(&mut conn, &sock, stream, &piece, false, deadline,),
+                    "the piece reaches the lane"
+                );
+                crate::quic::server_idle(&mut conn, &sock, &mut out);
+                let until = std::time::Instant::now() + pause;
+                while std::time::Instant::now() < until {
+                    std::thread::sleep(Duration::from_millis(5));
+                    crate::quic::server_idle(&mut conn, &sock, &mut out);
+                }
+            }
+            // The fin: the peer is done, and the lane must learn that from the stream rather than from a frame header it read as one. An empty send with the fin flag is how a QUIC stream says "no more", as opposed to the reset a shutdown would send.
+            assert!(
+                crate::quic::stream_send_all(&mut conn, &sock, stream, &[], true, deadline,),
+                "the fin reaches the lane"
+            );
+            let until = std::time::Instant::now() + Duration::from_millis(400);
+            while std::time::Instant::now() < until {
+                if let Some((n, from)) = crate::quic::server_poll(&sock, &mut buf) {
+                    let info = quiche::RecvInfo { from, to: local };
+                    let _ = conn.recv(&mut buf[..n], info);
+                }
+                crate::quic::server_idle(&mut conn, &sock, &mut out);
+            }
+        })
     }
 
     /// One DATA frame holding `payload`, the way an edge sends it: varint kind, varint length, bytes.

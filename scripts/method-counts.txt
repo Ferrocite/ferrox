@@ -526,3 +526,5 @@ front-dokodemo datagrams-carrying-to-the-target 1 ferrox-app-proxy::tests::a_dok
 front-dokodemo associations-answering-with-the-relay 1 ferrox-app-proxy::tests::the_udp_association_carries_a_datagram_to_the_target
 front-dokodemo transparent-settings-refused 2 ferrox-app-proxy::tests::a_dokodemo_front_refuses_the_transparent_settings
 front-dokodemo xray-scenario-tests-passing 2 scripts/run-upstream-suite.sh
+carrier-foxy h3-read-calls-per-16k-download 5 ferrox-app-foxy::loopback::an_h3_read_crosses_the_frames_under_it
+carrier-foxy h3-bytes-lost-when-the-peer-finishes 0 ferrox-app-foxy::loopback::an_h3_stream_the_peer_finished_ends_the_tunnel
