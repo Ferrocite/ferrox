@@ -586,7 +586,6 @@ impl SocksAccounts {
 }
 
 /// The no-authentication front: the account list a config that names none carries.
-#[cfg(test)]
 fn no_accounts() -> SocksAccounts {
     SocksAccounts::default()
 }
@@ -3827,15 +3826,18 @@ fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
 }
 
 /// Bind a dokodemo-door flow and rewrite it to the target its config names, and say how many
-/// inbounds it armed. Only the tcp flow is served; a udp-only inbound is refused by name so it
-/// never reads as a silent no-op.
+/// inbounds it armed. The tcp flow and the udp flow are served when the config names them.
 fn serve_dokodemo(address: &str, inbound: &Json, out: &Outbound, label: &str) -> usize {
     let Some(dest) = dokodemo_target(inbound) else {
         eprintln!("dokodemo-door rewrite target unusable in {label}: refused, not served");
         return 0;
     };
-    if !dokodemo_networks(inbound).contains(&"tcp") {
-        eprintln!("dokodemo-door without tcp in {label}: only the tcp flow is served");
+    let networks = dokodemo_networks(inbound);
+    if !networks
+        .iter()
+        .any(|network| *network == "tcp" || *network == "udp")
+    {
+        eprintln!("dokodemo-door without tcp or udp in {label}: no flow to serve");
         return 0;
     }
     // A raw front has no tcp carrier to arm a chain on, so a masked inbound is refused rather than served unmasked.
@@ -3843,14 +3845,36 @@ fn serve_dokodemo(address: &str, inbound: &Json, out: &Outbound, label: &str) ->
         eprintln!("dokodemo-door in {label} asks for a finalmask tcp chain it cannot arm");
         return 0;
     }
-    spawn_role(
-        address,
-        Role::Dokodemo {
-            out: out.clone(),
-            dest,
-        },
-    );
-    1
+    // The transparent redirect is the kernel's to give: the original destination lives in a socket option this tree asks for nothing. The device front is the tree's transparent path, and a config naming either setting is refused rather than served as if the rewrite had been asked for.
+    for setting in ["followRedirect", "portMap"] {
+        if inbound
+            .get("settings")
+            .and_then(|settings| settings.get(setting))
+            .is_some()
+        {
+            eprintln!("dokodemo-door in {label} asks for `{setting}`, which this tree cannot carry: refused, not served");
+            return 0;
+        }
+    }
+    let mut armed = 0;
+    if networks.contains(&"tcp") {
+        spawn_role(
+            address,
+            Role::Dokodemo {
+                out: out.clone(),
+                dest: dest.clone(),
+            },
+        );
+        armed += 1;
+    }
+    if networks.contains(&"udp") {
+        let door = out.clone();
+        let target = dest.clone();
+        let address = address.to_owned();
+        thread::spawn(move || serve_dokodemo_udp(&address, &target, &door));
+        armed += 1;
+    }
+    armed
 }
 
 fn inbound_ss_destinations(inbound: &Json, method: &str) -> Vec<(Vec<u8>, SocketAddr)> {
@@ -4010,8 +4034,9 @@ fn serve_tun_inbound(inbound: &Json, out: &Outbound, _address: &str) -> bool {
         serve_device_flow(conn, &outbound, &dest);
     });
     let datagram = out.clone();
+    // The device's association is the protocol's own: the front reads the greeting and the `UDP ASSOCIATE` request and answers with the relay's address.
     let associate: crate::tun::Associate =
-        std::sync::Arc::new(move |conn| serve_socks_udp(conn, &datagram));
+        std::sync::Arc::new(move |conn| serve_socks(conn, &datagram, &no_accounts()));
     let mut handler = crate::tun::Handler::new(device, relay, associate);
     thread::spawn(move || {
         if let Err(e) = handler.serve() {
@@ -6991,6 +7016,110 @@ fn foxy_exit_country<T: Read + Write>(tunnel: &mut T, foxy: &FoxyOut) -> Option<
         }
     }
     crate::foxy::exit_country(&head)
+}
+
+/// The relay a datagram flow rides: a loopback SOCKS5 association whose server half
+/// runs `serve` and whose client half is the tree's own SOCKS5 UDP client.
+///
+/// The association is the protocol's own: the greeting, the method, the `UDP
+/// ASSOCIATE` request and the reply that names the relay. The control leg comes back
+/// with it and is held for the flow's life: dropping it ends the association, and the
+/// lane stops relaying.
+pub(crate) fn udp_association(
+    serve: impl FnOnce(Connection) + Send + 'static,
+) -> Option<crate::socks::Association> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
+    let pair = listener.local_addr().ok()?;
+    let client = std::net::TcpStream::connect(pair).ok()?;
+    let (server, _) = listener.accept().ok()?;
+    drop(listener);
+    thread::spawn(move || serve(Connection::from(server)));
+    crate::socks::associate(
+        Connection::from(client),
+        &crate::socks::Credential::default(),
+    )
+}
+
+/// A leg on a SOCKS5 UDP relay: the socket the frames go through.
+///
+/// The leg's own source address is what routes the reply — the relay answers the
+/// address the request came from — so one leg per client keeps the answers apart.
+pub(crate) fn relay_leg(relay: SocketAddr) -> std::io::Result<UdpSocket> {
+    let leg = UdpSocket::bind(SocketAddr::new(relay.ip(), 0))?;
+    leg.connect(relay)?;
+    leg.set_read_timeout(Some(budgets::udp_idle()))?;
+    Ok(leg)
+}
+
+/// The dokodemo UDP door: a datagram a client sends goes to the target the config
+/// names, and the answer comes back to the client that sent it.
+///
+/// The door rides the outbound's own UDP lane over a loopback SOCKS5 association, the
+/// same relay the `tun` front rides: the lane sees a datagram with a destination and
+/// never learns that a door sent it.
+fn serve_dokodemo_udp(address: &str, dest: &Destination, out: &Outbound) {
+    let Ok(socket) = UdpSocket::bind(address) else {
+        eprintln!("dokodemo-door udp: cannot bind {address}");
+        return;
+    };
+    dokodemo_udp_door(&socket, dest, out);
+}
+
+/// The door itself: the socket it reads, the target every datagram goes to, and the
+/// outbound it rides.
+fn dokodemo_udp_door(socket: &UdpSocket, dest: &Destination, out: &Outbound) {
+    let Some(target) = dest.socket() else {
+        eprintln!("dokodemo-door udp: rewrite target unusable, refused");
+        return;
+    };
+    let outbound = out.clone();
+    let Some(association) =
+        udp_association(move |conn| serve_socks(conn, &outbound, &no_accounts()))
+    else {
+        eprintln!("dokodemo-door udp: the outbound refused the association");
+        return;
+    };
+    let relay = association.relay;
+    // The control leg stays open for the association's life: dropping it ends it.
+    let _control = association.control;
+    let mut legs: HashMap<SocketAddr, UdpSocket> = HashMap::new();
+    let mut buf = udp_buffer();
+    while let Ok((n, src)) = socket.recv_from(&mut buf) {
+        if n == 0 {
+            continue;
+        }
+        let leg = match legs.entry(src) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let Ok(leg) = relay_leg(relay) else {
+                    continue;
+                };
+                let Ok(writer) = socket.try_clone() else {
+                    continue;
+                };
+                let Ok(reader) = leg.try_clone() else {
+                    continue;
+                };
+                thread::spawn(move || {
+                    let mut back = udp_buffer();
+                    while let Ok(read) = reader.recv(&mut back) {
+                        let Some((_source, payload)) = parse_socks_udp(&back[..read]) else {
+                            continue;
+                        };
+                        if writer.send_to(payload, src).is_err() {
+                            break;
+                        }
+                    }
+                });
+                vacant.insert(leg)
+            }
+        };
+        let mut frame = Vec::with_capacity(HEAD + n);
+        frame.extend_from_slice(&[0, 0, 0]);
+        push_socks_addr(&mut frame, &target);
+        frame.extend_from_slice(&buf[..n]);
+        let _ = leg.send(&frame);
+    }
 }
 
 fn socks_udp_relay(client: &mut Connection) -> Option<UdpSocket> {
@@ -22573,6 +22702,93 @@ mod tests {
             "the name is the destination, so it is owned once"
         );
         drop(client);
+    }
+
+    /// The association the device front and the door both ride: the server half is the
+    /// tree's own SOCKS5 UDP path, and the reply names the relay its lane reads from.
+    #[test]
+    fn the_udp_association_carries_a_datagram_to_the_target() {
+        let target = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let target_addr = target.local_addr().expect("addr");
+        thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, src)) = target.recv_from(&mut buf) {
+                let _ = target.send_to(&buf[..n], src);
+            }
+        });
+        let association =
+            udp_association(|conn| serve_socks(conn, &Outbound::Freedom, &no_accounts()))
+                .expect("the association answers with the relay");
+        let relay = association.relay;
+        let mut frame = vec![0, 0, 0];
+        push_socks_addr(&mut frame, &target_addr);
+        frame.extend_from_slice(b"who-is");
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        socket.connect(relay).expect("connects");
+        socket.send(&frame).expect("sends");
+        let mut back = vec![0u8; 2048];
+        let (n, _) = socket.recv_from(&mut back).expect("the echo");
+        let (_, payload) = parse_socks_udp(&back[..n]).expect("the frame");
+        assert_eq!(payload, b"who-is");
+    }
+
+    /// The dokodemo UDP door: a datagram a client sends goes to the target the config
+    /// names, and the answer comes back to the client that sent it.
+    #[test]
+    fn a_dokodemo_door_carries_a_datagram_to_its_target() {
+        let target = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let target_addr = target.local_addr().expect("addr");
+        thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, src)) = target.recv_from(&mut buf) {
+                let _ = target.send_to(&buf[..n], src);
+            }
+        });
+        let port = {
+            let socket = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            socket.local_addr().expect("addr").port()
+        };
+        let address = format!("127.0.0.1:{port}");
+        let dest = Destination::Address(target_addr);
+        thread::spawn(move || serve_dokodemo_udp(&address, &dest, &Outbound::Freedom));
+        let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        client
+            .connect(SocketAddr::from(([127, 0, 0, 1], port)))
+            .expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut back = [0u8; 2048];
+        for _ in 0..100 {
+            client.send(b"who-is").expect("sends");
+            if let Ok((n, _)) = client.recv_from(&mut back) {
+                assert_eq!(&back[..n], b"who-is", "the answer comes back to the client");
+                return;
+            }
+        }
+        panic!("the door did not answer");
+    }
+
+    /// The transparent redirect is refused by name: the original destination lives in a
+    /// socket option this tree asks for nothing, and a config naming either setting
+    /// must not read as served.
+    #[test]
+    fn a_dokodemo_front_refuses_the_transparent_settings() {
+        for (setting, value) in [("followRedirect", "true"), ("portMap", "{}")] {
+            let text = format!(
+                r#"{{"inbounds":[{{"protocol":"dokodemo-door","settings":{{"address":"127.0.0.1","port":80,"network":"tcp","{setting}":{value}}}}}]}}"#
+            );
+            let root = crate::json::parse(&text).expect("parses");
+            let inbound = &root
+                .get("inbounds")
+                .and_then(Json::as_arr)
+                .expect("inbounds")[0];
+            assert_eq!(
+                serve_dokodemo("127.0.0.1:0", inbound, &Outbound::Freedom, "test"),
+                0,
+                "`{setting}` is refused, not served as if the rewrite had been asked for"
+            );
+        }
     }
 
     /// The SOCKS5 client lane: the greeting, the request, and the tunnel that follows.
