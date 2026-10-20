@@ -458,6 +458,11 @@ engine-router ops-retired-instructions UNBLESSED scripts/count-ops.sh
 engine-router flow-decision-allocations 0 ferrox-app-router::tests::a_flow_without_a_domain_matcher_allocates_nothing
 engine-router host-lowercase-buffers-lowercase 0 ferrox-app-router::tests::a_lowercase_host_matches_without_a_buffer
 engine-router host-lowercase-buffers-mixed-case 1 ferrox-app-router::tests::a_mixed_case_host_takes_one_lowercase_buffer
+engine-router host-lowercase-buffers-mixed-case-two-rules 1 ferrox-app-router::tests::a_mixed_case_host_is_lowercased_once_for_the_table
+engine-router host-lowercase-buffers-before-a-domain-rule 0 ferrox-app-router::tests::a_mixed_case_host_matched_before_a_domain_rule_is_not_lowered
+engine-router geosite-shared-entry-copies 0 ferrox-app-router::tests::a_code_named_by_two_rules_shares_its_entries
 engine-router literal-route-allocations 0 ferrox-app-proxy::tests::a_route_decision_on_a_literal_address_allocates_nothing
 engine-router dns-lookups-per-rule-matched-name 0 ferrox-app-router::tests::ip_if_non_match_resolves_only_after_no_rule_matched
 engine-router dns-lookups-per-unmatched-name 1 ferrox-app-router::tests::ip_if_non_match_resolves_only_after_no_rule_matched
+engine-router dns-lookups-ip-if-non-match-no-ip-rule 0 ferrox-app-router::tests::ip_if_non_match_does_not_resolve_without_an_ip_rule
+engine-router dns-lookups-ip-on-demand-source-failed 0 ferrox-app-router::tests::ip_on_demand_does_not_resolve_when_a_later_selector_fails

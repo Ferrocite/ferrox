@@ -6,6 +6,7 @@
 
 use crate::json::Json;
 use crate::xray_pb::Reader;
+use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
@@ -51,6 +52,25 @@ enum DomainStrategy {
 pub(crate) struct Routing {
     strategy: DomainStrategy,
     rules: Vec<Rule>,
+    has_domains: bool,
+}
+
+/// The name a flow carries, in the form the tables store and the form a regex must see. Lowering
+/// happens on the first table that needs it, once per decision, not once per rule.
+#[derive(Debug, Clone, Copy)]
+struct Names<'a> {
+    raw: &'a str,
+    needs_lower: bool,
+    lower: &'a OnceCell<String>,
+}
+
+impl Names<'_> {
+    fn lower(&self) -> &str {
+        if !self.needs_lower {
+            return self.raw;
+        }
+        self.lower.get_or_init(|| self.raw.to_ascii_lowercase())
+    }
 }
 
 #[derive(Debug)]
@@ -143,7 +163,12 @@ impl Routing {
                 }
             }
         }
-        Ok(Some(Self { strategy, rules }))
+        let has_domains = rules.iter().any(|rule| rule.domains.is_some());
+        Ok(Some(Self {
+            strategy,
+            rules,
+            has_domains,
+        }))
     }
 
     /// The tags rules name, for the registry that has to build every one of them.
@@ -157,34 +182,75 @@ impl Routing {
     }
 
     fn route_with(&self, flow: &Flow, resolve: &dyn Fn(&str, u16) -> Vec<IpAddr>) -> Option<&str> {
+        let lower = OnceCell::new();
+        let names = flow.domain.map(|raw| Names {
+            raw,
+            needs_lower: self.has_domains && raw.bytes().any(|byte| byte.is_ascii_uppercase()),
+            lower: &lower,
+        });
         match self.strategy {
             DomainStrategy::AsIs => {
                 let mut ips = Ips::never();
-                self.first_match(flow, &mut ips)
+                self.first_match(flow, names, &mut ips)
             }
             DomainStrategy::IpOnDemand => {
                 let mut ips = Ips::lazy(resolve);
-                self.first_match(flow, &mut ips)
+                self.first_match(flow, names, &mut ips)
             }
-            DomainStrategy::IpIfNonMatch => {
-                let mut ips = Ips::never();
-                if let Some(tag) = self.first_match(flow, &mut ips) {
-                    return Some(tag);
-                }
-                if flow.ip.is_some() || flow.domain.is_none() {
-                    return None;
-                }
-                let addrs = resolve(flow.domain.unwrap_or_default(), flow.port.unwrap_or(0));
-                let mut ips = Ips::ready(addrs);
-                self.first_match(flow, &mut ips)
-            }
+            DomainStrategy::IpIfNonMatch => self.first_match_if_non_match(flow, names, resolve),
         }
     }
 
-    fn first_match<'a>(&'a self, flow: &Flow, ips: &mut Ips<'_>) -> Option<&'a str> {
+    fn first_match<'a>(
+        &'a self,
+        flow: &Flow,
+        names: Option<Names<'_>>,
+        ips: &mut Ips<'_>,
+    ) -> Option<&'a str> {
         self.rules
             .iter()
-            .find(|rule| rule.matches(flow, ips))
+            .find(|rule| rule.matches(flow, names, ips))
+            .map(|rule| rule.target.as_str())
+    }
+
+    /// `IpIfNonMatch` only resolves when a rule whose other selectors already hold still has an
+    /// address set to test, and the second pass visits only those rules: a rule that failed on a
+    /// port, a name or a source cannot be turned by an address it never names.
+    fn first_match_if_non_match<'a>(
+        &'a self,
+        flow: &Flow,
+        names: Option<Names<'_>>,
+        resolve: &dyn Fn(&str, u16) -> Vec<IpAddr>,
+    ) -> Option<&'a str> {
+        let mut pending = false;
+        for rule in &self.rules {
+            if !rule.matches_without_ip(flow, names) {
+                continue;
+            }
+            if let Some(ip) = flow.ip {
+                if rule.ip_matches_addr(ip) {
+                    return Some(rule.target.as_str());
+                }
+            } else if rule.ips.is_none() {
+                return Some(rule.target.as_str());
+            } else {
+                pending = true;
+            }
+        }
+        if !pending {
+            return None;
+        }
+        let addrs = resolve(flow.domain?, flow.port.unwrap_or(0));
+        if addrs.is_empty() {
+            return None;
+        }
+        self.rules
+            .iter()
+            .find(|rule| {
+                rule.ips.is_some()
+                    && rule.matches_without_ip(flow, names)
+                    && rule.ip_matches_any(&addrs)
+            })
             .map(|rule| rule.target.as_str())
     }
 
@@ -304,14 +370,6 @@ impl<'a> Ips<'a> {
             allowed: true,
             resolve: Some(resolve),
             addrs: None,
-        }
-    }
-
-    fn ready(addrs: Vec<IpAddr>) -> Self {
-        Self {
-            allowed: false,
-            resolve: None,
-            addrs: Some(addrs),
         }
     }
 
@@ -474,7 +532,13 @@ impl Rule {
             .is_none_or(|list| list.contains(&network))
     }
 
-    fn matches(&self, flow: &Flow, ips: &mut Ips<'_>) -> bool {
+    fn matches(&self, flow: &Flow, names: Option<Names<'_>>, ips: &mut Ips<'_>) -> bool {
+        self.matches_without_ip(flow, names) && self.ip_matches(flow, ips)
+    }
+
+    /// Every selector but the destination address, in the order a decision reads them. The address
+    /// is last so a selector that already failed does not spend a resolver call under `IPOnDemand`.
+    fn matches_without_ip(&self, flow: &Flow, names: Option<Names<'_>>) -> bool {
         if let Some(networks) = &self.networks {
             if !networks.contains(&flow.network) {
                 return false;
@@ -510,15 +574,10 @@ impl Rule {
             }
         }
         if let Some(domains) = &self.domains {
-            let Some(domain) = flow.domain else {
+            let Some(names) = names else {
                 return false;
             };
-            if !domains.matches(domain) {
-                return false;
-            }
-        }
-        if let Some(matcher) = &self.ips {
-            if !ip_any(flow, matcher, ips) {
+            if !domains.matches(names.raw, names.lower()) {
                 return false;
             }
         }
@@ -537,20 +596,33 @@ impl Rule {
         }
         true
     }
-}
 
-fn ip_any(flow: &Flow, matcher: &IpMatcher, ips: &mut Ips<'_>) -> bool {
-    if let Some(ip) = flow.ip {
-        return matcher.matches(ip);
+    fn ip_matches(&self, flow: &Flow, ips: &mut Ips<'_>) -> bool {
+        let Some(matcher) = &self.ips else {
+            return true;
+        };
+        match flow.ip {
+            Some(ip) => matcher.matches(ip),
+            None => ips.get(flow).iter().any(|ip| matcher.matches(*ip)),
+        }
     }
-    ips.get(flow).iter().any(|ip| matcher.matches(*ip))
+
+    fn ip_matches_addr(&self, ip: IpAddr) -> bool {
+        self.ips.as_ref().is_none_or(|matcher| matcher.matches(ip))
+    }
+
+    fn ip_matches_any(&self, addrs: &[IpAddr]) -> bool {
+        self.ips
+            .as_ref()
+            .is_none_or(|matcher| addrs.iter().any(|ip| matcher.matches(*ip)))
+    }
 }
 
 #[derive(Debug)]
 struct DomainMatcher {
-    full: HashSet<String>,
-    suffix: HashSet<String>,
-    substr: Vec<String>,
+    full: HashSet<Arc<str>>,
+    suffix: HashSet<Arc<str>>,
+    substr: Vec<Arc<str>>,
     ac: Option<aho_corasick::AhoCorasick>,
     regex: Vec<regex::Regex>,
 }
@@ -569,24 +641,24 @@ impl DomainMatcher {
     fn finish(&mut self) -> Result<(), String> {
         if !self.substr.is_empty() {
             self.ac = Some(
-                aho_corasick::AhoCorasick::new(&self.substr)
+                aho_corasick::AhoCorasick::new(self.substr.iter().map(|value| value.as_bytes()))
                     .map_err(|error| format!("domain keyword matcher: {error}"))?,
             );
         }
         Ok(())
     }
 
-    fn add(&mut self, kind: DomainKind, value: &str) {
+    fn add(&mut self, kind: DomainKind, value: Arc<str>) {
         match kind {
-            DomainKind::Substr => self.substr.push(value.to_ascii_lowercase()),
+            DomainKind::Substr => self.substr.push(value),
             DomainKind::Domain => {
-                self.suffix.insert(value.to_ascii_lowercase());
+                self.suffix.insert(value);
             }
             DomainKind::Full => {
-                self.full.insert(value.to_ascii_lowercase());
+                self.full.insert(value);
             }
             DomainKind::Regex => {
-                if let Ok(regex) = regex::Regex::new(value) {
+                if let Ok(regex) = regex::Regex::new(value.as_ref()) {
                     self.regex.push(regex);
                 } else {
                     eprintln!("routing: ignoring an invalid geosite regex");
@@ -595,26 +667,20 @@ impl DomainMatcher {
         }
     }
 
-    fn matches(&self, host: &str) -> bool {
-        // Names arrive lowercase almost always, so the borrowed host is the table key until it is not.
-        let lower;
-        let domain = if host.bytes().any(|byte| byte.is_ascii_uppercase()) {
-            lower = host.to_ascii_lowercase();
-            lower.as_str()
-        } else {
-            host
-        };
-        if self.full.contains(domain) {
+    fn matches(&self, host: &str, lower: &str) -> bool {
+        if !self.full.is_empty() && self.full.contains(lower) {
             return true;
         }
-        let mut rest = Some(domain);
-        while let Some(part) = rest {
-            if self.suffix.contains(part) {
-                return true;
+        if !self.suffix.is_empty() {
+            let mut rest = Some(lower);
+            while let Some(part) = rest {
+                if self.suffix.contains(part) {
+                    return true;
+                }
+                rest = part.find('.').map(|at| &part[at + 1..]);
             }
-            rest = part.find('.').map(|at| &part[at + 1..]);
         }
-        if self.ac.as_ref().is_some_and(|ac| ac.is_match(domain)) {
+        if self.ac.as_ref().is_some_and(|ac| ac.is_match(lower)) {
             return true;
         }
         self.regex.iter().any(|regex| regex.is_match(host))
@@ -858,6 +924,15 @@ fn domain_matcher(value: &Json, assets: &mut Assets) -> Result<DomainMatcher, St
     Ok(matcher)
 }
 
+/// A lowercased name, allocated once when it carries uppercase and borrowed into an `Arc` otherwise.
+fn lower_arc(text: &str) -> Arc<str> {
+    if text.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Arc::from(text.to_ascii_lowercase())
+    } else {
+        Arc::from(text)
+    }
+}
+
 fn add_domain(matcher: &mut DomainMatcher, value: &str, assets: &mut Assets) -> Result<(), String> {
     if value.starts_with('!') {
         return Err(format!(
@@ -888,21 +963,21 @@ fn add_domain(matcher: &mut DomainMatcher, value: &str, assets: &mut Assets) -> 
         if rest.is_empty() {
             return Err(format!("domain rule `{value}` is empty"));
         }
-        matcher.suffix.insert(rest.to_ascii_lowercase());
+        matcher.suffix.insert(lower_arc(rest));
         return Ok(());
     }
     if let Some(rest) = value.strip_prefix("full:") {
         if rest.is_empty() {
             return Err(format!("domain rule `{value}` is empty"));
         }
-        matcher.full.insert(rest.to_ascii_lowercase());
+        matcher.full.insert(lower_arc(rest));
         return Ok(());
     }
     if let Some(rest) = value.strip_prefix("keyword:") {
         if rest.is_empty() {
             return Err(format!("domain rule `{value}` is empty"));
         }
-        matcher.substr.push(rest.to_ascii_lowercase());
+        matcher.substr.push(lower_arc(rest));
         return Ok(());
     }
     if let Some(rest) = value.strip_prefix("dotless:") {
@@ -923,7 +998,7 @@ fn add_domain(matcher: &mut DomainMatcher, value: &str, assets: &mut Assets) -> 
     if value.is_empty() {
         return Err("domain rule is empty".into());
     }
-    matcher.substr.push(value.to_ascii_lowercase());
+    matcher.substr.push(lower_arc(value));
     Ok(())
 }
 
@@ -948,10 +1023,9 @@ fn add_geosite(
     if code.is_empty() {
         return Err(format!("domain rule `{file}:` names an empty code"));
     }
-    let code = code.to_ascii_uppercase();
     let attrs = attrs.to_ascii_lowercase();
-    for entry in assets.site(file, &code, &attrs)?.iter() {
-        matcher.add(entry.kind, &entry.value);
+    for entry in assets.site(file, code, &attrs)?.iter() {
+        matcher.add(entry.kind, Arc::clone(&entry.value));
     }
     Ok(())
 }
@@ -1032,9 +1106,8 @@ fn add_geoip(
     if code.is_empty() {
         return Err(format!("ip rule `{file}:` names an empty code"));
     }
-    let code = code.to_ascii_uppercase();
     let target = if reverse { negative } else { positive };
-    for (ip, prefix) in assets.ip(file, &code)?.iter() {
+    for (ip, prefix) in assets.ip(file, code)?.iter() {
         target.add(*ip, *prefix)?;
     }
     Ok(())
@@ -1064,7 +1137,7 @@ fn parse_cidr(value: &str) -> Result<(IpAddr, u32), String> {
 #[derive(Debug)]
 struct DomainEntry {
     kind: DomainKind,
-    value: String,
+    value: Arc<str>,
 }
 
 type SiteCache = HashMap<(String, String, String), Arc<Vec<DomainEntry>>>;
@@ -1231,7 +1304,7 @@ fn geosite_entry(bytes: &[u8], wanted: &[&str]) -> Result<(String, Vec<DomainEnt
 fn domain_entry(bytes: &[u8], wanted: &[&str]) -> Result<Option<DomainEntry>, String> {
     let mut reader = Reader::new(bytes, "geodata.Domain");
     let mut kind = DomainKind::Substr;
-    let mut value = String::new();
+    let mut value = None;
     let mut attrs = Vec::new();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
@@ -1245,16 +1318,18 @@ fn domain_entry(bytes: &[u8], wanted: &[&str]) -> Result<Option<DomainEntry>, St
                 };
             }
             (2, 2) => {
-                let raw = reader.bytes()?;
-                let Ok(text) = std::str::from_utf8(raw) else {
+                let Ok(text) = std::str::from_utf8(reader.bytes()?) else {
                     return Ok(None);
                 };
-                text.clone_into(&mut value);
+                value = Some(text);
             }
             (3, 2) => attrs.push(domain_attribute(reader.bytes()?)?),
             _ => reader.skip(wire)?,
         }
     }
+    let Some(value) = value else {
+        return Ok(None);
+    };
     if value.is_empty() {
         return Ok(None);
     }
@@ -1264,6 +1339,11 @@ fn domain_entry(bytes: &[u8], wanted: &[&str]) -> Result<Option<DomainEntry>, St
     {
         return Ok(None);
     }
+    let value = if matches!(kind, DomainKind::Regex) {
+        Arc::from(value)
+    } else {
+        lower_arc(value)
+    };
     Ok(Some(DomainEntry { kind, value }))
 }
 
@@ -1537,6 +1617,51 @@ mod tests {
         assert_eq!(routing.route(&flow("x.both.test")), Some("direct"));
         assert_eq!(routing.route(&flow("one.test")), None);
         assert_eq!(routing.route(&flow("full.test")), Some("direct"));
+    }
+
+    #[test]
+    fn a_code_named_by_two_rules_shares_its_entries() {
+        let dir = dir();
+        std::fs::write(
+            dir.join("geosite.dat"),
+            geosite("TEST", vec![domain(3, "Shared.Test", &[])]),
+        )
+        .expect("writes");
+        let root = object(vec![(
+            "routing",
+            routing(vec![
+                rule("first", vec![("domain", array(vec![text("geosite:test")]))]),
+                rule(
+                    "second",
+                    vec![("domain", array(vec![text("geosite:test")]))],
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir])
+            .expect("parses")
+            .expect("routing");
+        let rules = routing.rules();
+        let first = rules[0]
+            .domains
+            .as_ref()
+            .expect("first matcher")
+            .full
+            .iter()
+            .next()
+            .expect("first entry");
+        let second = rules[1]
+            .domains
+            .as_ref()
+            .expect("second matcher")
+            .full
+            .iter()
+            .next()
+            .expect("second entry");
+        assert_eq!(&**first, "shared.test");
+        assert!(
+            Arc::ptr_eq(first, second),
+            "the second rule copies the entry"
+        );
     }
 
     #[test]
@@ -1935,6 +2060,150 @@ mod tests {
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, Some("direct"));
         assert_eq!(counts.allocs, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_mixed_case_host_is_lowercased_once_for_the_table() {
+        let root = object(vec![(
+            "routing",
+            routing(vec![
+                rule(
+                    "first",
+                    vec![("domain", array(vec![text("keyword:blocked")]))],
+                ),
+                rule(
+                    "second",
+                    vec![("domain", array(vec![text("domain:example.test")]))],
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("WWW.EXAMPLE.TEST"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: None,
+        };
+        let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
+        assert_eq!(tag, Some("second"));
+        assert_eq!(counts.allocs, 1, "{counts:?}");
+    }
+
+    #[test]
+    fn a_mixed_case_host_matched_before_a_domain_rule_is_not_lowered() {
+        let root = object(vec![(
+            "routing",
+            routing(vec![
+                rule("first", vec![("port", number(443))]),
+                rule(
+                    "second",
+                    vec![("domain", array(vec![text("keyword:blocked")]))],
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("WWW.EXAMPLE.TEST"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: None,
+        };
+        let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
+        assert_eq!(tag, Some("first"));
+        assert_eq!(counts.allocs, 0, "{counts:?}");
+    }
+
+    #[test]
+    fn ip_if_non_match_does_not_resolve_without_an_ip_rule() {
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                ("domainStrategy", text("IPIfNonMatch")),
+                (
+                    "rules",
+                    array(vec![rule("udp", vec![("network", text("udp"))])]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("echo.test"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: None,
+        };
+        let lookups = std::cell::Cell::new(0);
+        let tag = routing.route_with(&flow, &|_, _| {
+            lookups.set(lookups.get() + 1);
+            Vec::new()
+        });
+        assert_eq!(tag, None);
+        assert_eq!(lookups.get(), 0);
+    }
+
+    #[test]
+    fn ip_on_demand_does_not_resolve_when_a_later_selector_fails() {
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                ("domainStrategy", text("IPOnDemand")),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "address",
+                        vec![
+                            ("ip", array(vec![text("192.0.2.0/24")])),
+                            ("sourceIP", array(vec![text("10.0.0.0/8")])),
+                        ],
+                    )]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("echo.test"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: None,
+        };
+        let lookups = std::cell::Cell::new(0);
+        let tag = routing.route_with(&flow, &|_, _| {
+            lookups.set(lookups.get() + 1);
+            vec!["192.0.2.1".parse().expect("ip")]
+        });
+        assert_eq!(tag, None);
+        assert_eq!(lookups.get(), 0);
+        let from_source = Flow {
+            source: Some("10.1.2.3:4242".parse().expect("source")),
+            ..flow
+        };
+        let lookups = std::cell::Cell::new(0);
+        let tag = routing.route_with(&from_source, &|_, _| {
+            lookups.set(lookups.get() + 1);
+            vec!["192.0.2.1".parse().expect("ip")]
+        });
+        assert_eq!(tag, Some("address"));
+        assert_eq!(lookups.get(), 1);
     }
 
     #[test]
