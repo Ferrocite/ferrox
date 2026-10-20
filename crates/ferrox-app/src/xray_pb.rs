@@ -64,6 +64,7 @@ fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
         "xray.proxy.vmess.inbound.Config" => ("vmess", vmess_inbound_settings(value)?),
         "xray.proxy.vless.inbound.Config" => ("vless", vless_inbound_settings(value)?),
         "xray.proxy.shadowsocks.ServerConfig" => ("shadowsocks", ss_inbound_settings(value)?),
+        "xray.proxy.socks.ServerConfig" => ("socks", socks_inbound_settings(value)?),
         _ => return Err(format!("inbound protocol `{name}` is not carried")),
     };
     Ok(ports
@@ -115,6 +116,10 @@ fn outbound(bytes: &[u8]) -> Result<Json, String> {
         "xray.proxy.shadowsocks.ClientConfig" => Ok(object(vec![
             ("protocol", Json::Str("shadowsocks".to_owned())),
             ("settings", ss_outbound_settings(value)?),
+        ])),
+        "xray.proxy.socks.ClientConfig" => Ok(object(vec![
+            ("protocol", Json::Str("socks".to_owned())),
+            ("settings", socks_outbound_settings(value)?),
         ])),
         _ => Err(format!("outbound protocol `{name}` is not carried")),
     }
@@ -727,6 +732,170 @@ fn ss_outbound_settings(bytes: &[u8]) -> Result<Json, String> {
             ("password", Json::Str(password)),
         ])]),
     )]))
+}
+
+/// A socks server: the authentication it asks for and the accounts it accepts.
+///
+/// The accounts arrive as a protobuf map — one entry per account, the name in the
+/// first field and the password in the second. The address the server names and its
+/// datagram switch are read and dropped: this front answers the relay address it
+/// bound itself and always carries datagrams.
+fn socks_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.socks.ServerConfig");
+    let mut auth_type = 0u64;
+    let mut accounts: Vec<Json> = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => auth_type = reader.varint()?,
+            (2, 2) => {
+                let (user, pass) = socks_account_entry(reader.bytes()?)?;
+                accounts.push(object(vec![
+                    ("user", Json::Str(user)),
+                    ("pass", Json::Str(pass)),
+                ]));
+            }
+            (3, 2) => {
+                ip_or_domain(reader.bytes()?)?;
+            }
+            (4, 0) => {
+                reader.varint()?;
+            }
+            (6, 0) => return Err(reader.uncarried("user_level")),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let auth = match auth_type {
+        0 => "noauth",
+        1 => "password",
+        other => {
+            return Err(format!(
+                "xray.proxy.socks.ServerConfig: auth type {other} is not carried"
+            ))
+        }
+    };
+    let mut pairs = vec![("auth", Json::Str(auth.to_owned()))];
+    if !accounts.is_empty() {
+        pairs.push(("accounts", Json::Arr(accounts)));
+    }
+    Ok(object(pairs))
+}
+
+/// One entry of the account map: the name in the first field, the password in the second.
+fn socks_account_entry(bytes: &[u8]) -> Result<(String, String), String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.socks.ServerConfig.accounts");
+    let mut user = None;
+    let mut pass = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => user = Some(account_text(&mut reader)?),
+            (2, 2) => pass = Some(account_text(&mut reader)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok((
+        user.ok_or("xray.proxy.socks.ServerConfig: an account with no name")?,
+        pass.ok_or("xray.proxy.socks.ServerConfig: an account with no password")?,
+    ))
+}
+
+/// A socks client dials the one endpoint its config names, with the credential it names.
+fn socks_outbound_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.socks.ClientConfig");
+    let mut server = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => server = Some(socks_server_endpoint(reader.bytes()?)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let (address, port, credential) = server.ok_or("xray.proxy.socks.ClientConfig: no server")?;
+    let mut users = Vec::new();
+    if let Some((user, pass)) = credential {
+        users.push(object(vec![
+            ("user", Json::Str(user)),
+            ("pass", Json::Str(pass)),
+        ]));
+    }
+    Ok(object(vec![(
+        "servers",
+        Json::Arr(vec![object(vec![
+            ("address", Json::Str(address)),
+            ("port", Json::Num(f64::from(port))),
+            ("users", Json::Arr(users)),
+        ])]),
+    )]))
+}
+
+/// The endpoint a socks client dials: the address, the port, and the credential when
+/// the config names one.
+type SocksEndpoint = (String, u16, Option<(String, String)>);
+
+/// `common.protocol.ServerEndpoint` for the socks client: the address, the port, and
+/// the credential when the config names one. A socks client may name no credential —
+/// the greeting then offers no authentication.
+fn socks_server_endpoint(bytes: &[u8]) -> Result<SocksEndpoint, String> {
+    let mut reader = Reader::new(bytes, "xray.common.protocol.ServerEndpoint");
+    let mut address = None;
+    let mut port = None;
+    let mut credential = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => address = Some(ip_or_domain(reader.bytes()?)?),
+            (2, 0) => {
+                let value = reader.varint()?;
+                port = Some(u16::try_from(value).map_err(|_| {
+                    format!("xray.common.protocol.ServerEndpoint: port {value} is above 65535")
+                })?);
+            }
+            (3, 2) => credential = Some(socks_user(reader.bytes()?)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok((
+        address.ok_or("xray.common.protocol.ServerEndpoint: no address")?,
+        port.ok_or("xray.common.protocol.ServerEndpoint: no port")?,
+        credential,
+    ))
+}
+
+/// A `common.protocol.User` whose account is a socks one; level and email feed the
+/// policy and the stats nothing here reads.
+fn socks_user(bytes: &[u8]) -> Result<(String, String), String> {
+    let mut reader = Reader::new(bytes, "xray.common.protocol.User");
+    let mut account = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => return Err(reader.uncarried("user level")),
+            (2, 2) => return Err(reader.uncarried("user email")),
+            (3, 2) => {
+                let (name, value) = typed_message(reader.bytes()?)?;
+                if name != "xray.proxy.socks.Account" {
+                    return Err(format!("socks account `{name}` is not carried"));
+                }
+                account = Some(socks_account(value)?);
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    account.ok_or("xray.common.protocol.User: no account".to_owned())
+}
+
+/// The socks account: the name and the password the RFC 1929 exchange carries.
+fn socks_account(bytes: &[u8]) -> Result<(String, String), String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.socks.Account");
+    let mut user = None;
+    let mut pass = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => user = Some(account_text(&mut reader)?),
+            (2, 2) => pass = Some(account_text(&mut reader)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok((
+        user.ok_or("xray.proxy.socks.Account: no username")?,
+        pass.ok_or("xray.proxy.socks.Account: no password")?,
+    ))
 }
 
 fn freedom_settings(bytes: &[u8]) -> Result<(), String> {
@@ -1527,6 +1696,188 @@ mod tests {
             client.get("method").and_then(Json::as_str),
             Some("chacha20-ietf-poly1305")
         );
+    }
+
+    fn socks_account(user: &[u8], pass: &[u8]) -> Vec<u8> {
+        typed(
+            "xray.proxy.socks.Account",
+            &message(&[bytes_field(1, user), bytes_field(2, pass)]),
+        )
+    }
+
+    fn socks_user(account: &[u8]) -> Vec<u8> {
+        bytes_field(3, account)
+    }
+
+    fn socks_inbound(port: u64, auth_type: u64, accounts: &[(&[u8], &[u8])]) -> Vec<u8> {
+        let mut settings = vec![varint_field(1, auth_type)];
+        for (user, pass) in accounts {
+            let entry = message(&[bytes_field(1, user), bytes_field(2, pass)]);
+            settings.push(bytes_field(2, &entry));
+        }
+        message(&[
+            bytes_field(
+                2,
+                &typed(
+                    "xray.app.proxyman.ReceiverConfig",
+                    &receiver(port, Some(&[127, 0, 0, 1])),
+                ),
+            ),
+            bytes_field(
+                3,
+                &typed("xray.proxy.socks.ServerConfig", &message(&settings)),
+            ),
+        ])
+    }
+
+    /// The shape `TestSocksBridgeTCP` names: a socks server that asks for a password,
+    /// and a socks client that offers one.
+    #[test]
+    fn a_socks_scenario_decodes_both_sides() {
+        let outbound = message(&[bytes_field(
+            3,
+            &typed(
+                "xray.proxy.socks.ClientConfig",
+                &bytes_field(
+                    1,
+                    &message(&[
+                        bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
+                        varint_field(2, 5001),
+                        bytes_field(
+                            3,
+                            &socks_user(&socks_account(b"Test Account", b"Test Password")),
+                        ),
+                    ]),
+                ),
+            ),
+        )]);
+        let json = to_json(&config(
+            &socks_inbound(5000, 1, &[(b"Test Account", b"Test Password")]),
+            &outbound,
+        ))
+        .expect("socks decodes both sides");
+        let server = &json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0];
+        assert_eq!(server.get("protocol").and_then(Json::as_str), Some("socks"));
+        let settings = server.get("settings").expect("settings");
+        assert_eq!(
+            settings.get("auth").and_then(Json::as_str),
+            Some("password")
+        );
+        let account = &settings
+            .get("accounts")
+            .and_then(Json::as_arr)
+            .expect("accounts")[0];
+        assert_eq!(
+            account.get("user").and_then(Json::as_str),
+            Some("Test Account")
+        );
+        assert_eq!(
+            account.get("pass").and_then(Json::as_str),
+            Some("Test Password")
+        );
+        let client = &json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0]
+            .get("settings")
+            .expect("settings")
+            .get("servers")
+            .and_then(Json::as_arr)
+            .expect("servers")[0];
+        assert_eq!(
+            client.get("address").and_then(Json::as_str),
+            Some("127.0.0.1")
+        );
+        assert_eq!(client.get("port").and_then(Json::as_port), Some(5001));
+        let user = &client.get("users").and_then(Json::as_arr).expect("users")[0];
+        assert_eq!(
+            user.get("user").and_then(Json::as_str),
+            Some("Test Account")
+        );
+        assert_eq!(
+            user.get("pass").and_then(Json::as_str),
+            Some("Test Password")
+        );
+    }
+
+    /// A socks server with no accounts asks for no authentication, the way the pinned
+    /// `AuthType_NO_AUTH` server does.
+    #[test]
+    fn a_socks_server_without_a_password_decodes_to_no_auth() {
+        let json = to_json(&config(&socks_inbound(5000, 0, &[]), &freedom_outbound()))
+            .expect("socks decodes");
+        let settings = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("settings")
+            .expect("settings");
+        assert_eq!(settings.get("auth").and_then(Json::as_str), Some("noauth"));
+        assert!(
+            settings.get("accounts").is_none(),
+            "a server with no account names none"
+        );
+    }
+
+    /// A socks client may name no credential: the greeting then offers no
+    /// authentication, the way the pinned `ClientConfig` without a user does.
+    #[test]
+    fn a_socks_client_without_a_credential_decodes_to_no_users() {
+        let outbound = message(&[bytes_field(
+            3,
+            &typed(
+                "xray.proxy.socks.ClientConfig",
+                &bytes_field(
+                    1,
+                    &message(&[
+                        bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
+                        varint_field(2, 5001),
+                    ]),
+                ),
+            ),
+        )]);
+        let json =
+            to_json(&config(&socks_inbound(5000, 0, &[]), &outbound)).expect("socks decodes");
+        let client = &json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0]
+            .get("settings")
+            .expect("settings")
+            .get("servers")
+            .and_then(Json::as_arr)
+            .expect("servers")[0];
+        assert!(
+            client
+                .get("users")
+                .and_then(Json::as_arr)
+                .expect("users")
+                .is_empty(),
+            "a client with no credential names no user"
+        );
+    }
+
+    #[test]
+    fn a_socks_server_user_level_is_refused() {
+        let settings = message(&[varint_field(1, 1), varint_field(6, 3)]);
+        let error = to_json(&config(
+            &message(&[
+                bytes_field(
+                    2,
+                    &typed(
+                        "xray.app.proxyman.ReceiverConfig",
+                        &receiver(5000, Some(&[127, 0, 0, 1])),
+                    ),
+                ),
+                bytes_field(3, &typed("xray.proxy.socks.ServerConfig", &settings)),
+            ]),
+            &freedom_outbound(),
+        ))
+        .expect_err("refused");
+        assert!(error.contains("user_level"), "{error}");
     }
 
     #[test]

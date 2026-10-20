@@ -476,3 +476,19 @@ engine-router dns-lookups-per-rule-matched-name 0 ferrox-app-router::tests::ip_i
 engine-router dns-lookups-per-unmatched-name 1 ferrox-app-router::tests::ip_if_non_match_resolves_only_after_no_rule_matched
 engine-router dns-lookups-ip-if-non-match-no-ip-rule 0 ferrox-app-router::tests::ip_if_non_match_does_not_resolve_without_an_ip_rule
 engine-router dns-lookups-ip-on-demand-source-failed 0 ferrox-app-router::tests::ip_on_demand_does_not_resolve_when_a_later_selector_fails
+
+# --- SOCKS5, both roles ------------------------------------------------------
+socks ops-retired-instructions UNBLESSED scripts/count-ops.sh
+socks oracle-lines-matching-the-pinned-go 8 ferrox-core-socks::tests::the_client_writes_the_bytes_the_pinned_go_writes
+socks methods-offered-in-the-greeting 1 ferrox-core-socks::tests::the_greeting_is_the_bytes_the_pinned_writer_writes
+socks request-bytes-per-tcp-dial 10 ferrox-core-socks::tests::the_request_is_the_bytes_the_pinned_writer_writes
+socks credential-bytes-per-authenticated-dial 5 ferrox-core-socks::tests::the_user_pass_block_is_rfc_1929
+socks datagram-frame-bytes-overhead 10 ferrox-core-socks::tests::the_datagram_frame_is_rfc_1928
+socks servers-answering-another-method-refused 1 ferrox-app-socks::tests::a_credentialed_session_refuses_a_server_that_answers_no_auth
+socks device-flows-leaving-through-the-client-lane 1 ferrox-app-tun::tests::a_device_flow_leaves_through_the_socks_client_lane
+socks tcp-tunnels-through-the-front 1 ferrox-app-proxy::tests::a_socks_client_dials_the_front_and_carries_an_echo
+socks datagrams-through-the-front 1 ferrox-app-proxy::tests::a_socks_client_carries_a_datagram_through_the_front
+socks credentialed-tunnels-through-the-front 1 ferrox-app-proxy::tests::a_socks_client_offers_the_credential_the_front_asks_for
+socks credentials-the-front-refuses 1 ferrox-app-proxy::tests::a_front_refuses_a_credential_it_does_not_know
+socks config-lanes-named 1 ferrox-app-proxy::tests::a_socks_outbound_names_its_server_and_credential
+socks pb-scenario-sides-decoded 2 ferrox-app-xray_pb::tests::a_socks_scenario_decodes_both_sides

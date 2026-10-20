@@ -256,10 +256,11 @@ fn serve_inbounds(
                         eprintln!("inbound `{protocol}` in {label} asks for a finalmask tcp chain it cannot arm");
                         continue;
                     }
+                    let accounts = Arc::new(socks_accounts(inbound));
                     let role = match protocol {
-                        "socks" => Role::Socks { out },
+                        "socks" => Role::Socks { out, accounts },
                         "http" => Role::Http { out },
-                        _ => Role::Mixed { out },
+                        _ => Role::Mixed { out, accounts },
                     };
                     thread::spawn(move || accept_loop(&address, &role));
                     inbounds += 1;
@@ -554,6 +555,76 @@ fn exit(message: &str) -> ! {
     std::process::exit(1);
 }
 
+/// The RFC 1929 accounts a SOCKS5 front accepts: the name and the password the
+/// credential exchange carries.
+///
+/// A front with no accounts asks for no authentication, the one this tree has always
+/// served. A front that asks for the exchange and names no account refuses every
+/// credential, which is what a config that asks for password authentication without
+/// saying who may use it means.
+#[derive(Debug, Clone, Default)]
+struct SocksAccounts {
+    /// Whether the front asks for the credential exchange at all.
+    password: bool,
+    /// The name and the password of each account the front accepts.
+    pairs: Vec<(String, String)>,
+}
+
+impl SocksAccounts {
+    /// Whether the front wants the credential exchange, which is what decides the
+    /// method the greeting must offer.
+    fn wants_credential(&self) -> bool {
+        self.password
+    }
+
+    /// Whether the credential the client sent is one this front knows.
+    fn accepts(&self, user: &[u8], pass: &[u8]) -> bool {
+        self.pairs
+            .iter()
+            .any(|(name, password)| name.as_bytes() == user && password.as_bytes() == pass)
+    }
+}
+
+/// The no-authentication front: the account list a config that names none carries.
+#[cfg(test)]
+fn no_accounts() -> SocksAccounts {
+    SocksAccounts::default()
+}
+
+/// The accounts a SOCKS front accepts, read from the inbound's own settings.
+///
+/// The shape is xray's: an `auth` of `password` and a list of `accounts`, each a
+/// `user` and a `pass`. A front that names no `auth` asks for no authentication.
+fn socks_accounts(inbound: &Json) -> SocksAccounts {
+    let settings = inbound.get("settings");
+    let auth = settings
+        .and_then(|s| s.get("auth"))
+        .and_then(Json::as_str)
+        .unwrap_or("");
+    if !auth.eq_ignore_ascii_case("password") {
+        return SocksAccounts::default();
+    }
+    let empty = Vec::new();
+    let accounts = settings
+        .and_then(|s| s.get("accounts"))
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty);
+    let mut pairs = Vec::new();
+    for account in accounts {
+        let Some(user) = account.get("user").and_then(Json::as_str) else {
+            continue;
+        };
+        let Some(pass) = account.get("pass").and_then(Json::as_str) else {
+            continue;
+        };
+        pairs.push((user.to_owned(), pass.to_owned()));
+    }
+    SocksAccounts {
+        password: true,
+        pairs,
+    }
+}
+
 #[derive(Debug, Clone)]
 enum Role {
     Vless {
@@ -591,12 +662,14 @@ enum Role {
     },
     Socks {
         out: Outbound,
+        accounts: Arc<SocksAccounts>,
     },
     Http {
         out: Outbound,
     },
     Mixed {
         out: Outbound,
+        accounts: Arc<SocksAccounts>,
     },
     /// dokodemo-door: a raw stream to the address its config rewrites every flow to.
     Dokodemo {
@@ -624,11 +697,12 @@ impl Role {
 }
 
 #[derive(Debug, Clone)]
-enum Outbound {
+pub(crate) enum Outbound {
     Vless(VlessOut),
     Trojan(TrojanOut),
     Vmess(VmessOut),
     Shadowsocks(ShadowsocksOut),
+    Socks(SocksOut),
     Foxy(Box<FoxyOut>),
     Veepn(crate::veepn::VeepnOut),
     Freedom,
@@ -647,6 +721,7 @@ impl Outbound {
             Self::Trojan(trojan) => resolve_outbound(&trojan.address, trojan.port),
             Self::Vmess(vmess) => resolve_outbound(&vmess.address, vmess.port),
             Self::Shadowsocks(ss) => resolve_outbound(&ss.address, ss.port),
+            Self::Socks(socks) => resolve_outbound(&socks.address, socks.port),
             Self::Http(http) => resolve_outbound(&http.address, http.port),
             Self::Foxy(_) | Self::Veepn(_) | Self::Freedom | Self::Route(_) | Self::Block => None,
         }
@@ -679,7 +754,7 @@ struct RouteShared {
 /// One inbound's view of the routes: its tag decides which rules may see a flow, and whether the
 /// transport can answer the selectors that name source and local addresses.
 #[derive(Debug, Clone)]
-struct RoutePlan {
+pub(crate) struct RoutePlan {
     shared: Arc<RouteShared>,
     inbound_tag: Option<String>,
     source_known: bool,
@@ -688,7 +763,7 @@ struct RoutePlan {
 
 /// The one decision a SOCKS association can carry: a datagram has no per-destination route here.
 #[derive(Debug, Clone)]
-enum Association {
+pub(crate) enum Association {
     Default,
     Tag(String),
     Split,
@@ -860,7 +935,7 @@ fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
 
 /// The Foxy lane: an account's pass over an edge in one pinned country, plus the split-tunnel list.
 #[derive(Debug, Clone)]
-struct FoxyOut {
+pub(crate) struct FoxyOut {
     account: Option<std::sync::Arc<crate::foxy_account::Account>>,
     country: String,
     city: String,
@@ -984,7 +1059,7 @@ fn carrier_key(edge: &ferrox_core::foxy::Candidate, carrier: crate::foxy::Carrie
 }
 
 #[derive(Debug, Clone)]
-struct VlessOut {
+pub(crate) struct VlessOut {
     address: String,
     port: u16,
     id: [u8; 16],
@@ -999,13 +1074,39 @@ struct VlessOut {
 }
 
 #[derive(Debug, Clone)]
-struct HttpOut {
+pub(crate) struct HttpOut {
     address: String,
     port: u16,
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
     headers: Vec<(String, String)>,
     user: Option<String>,
     pass: Option<String>,
+}
+
+/// The SOCKS5 client lane: the server this outbound dials, and the credential it offers.
+///
+/// The credential is the RFC 1929 one, and it is offered only when it is spelled whole:
+/// a half-written credential refuses the lane rather than downgrading it to no
+/// authentication.
+#[derive(Debug, Clone)]
+pub(crate) struct SocksOut {
+    address: String,
+    port: u16,
+    credential: crate::socks::Credential,
+}
+
+impl SocksOut {
+    /// The lane a config names: the server's address and the credential it offers.
+    pub(crate) fn new(address: &str, port: u16, user: &str, pass: &str) -> Self {
+        Self {
+            address: address.to_owned(),
+            port,
+            credential: crate::socks::Credential {
+                user: user.to_owned(),
+                pass: pass.to_owned(),
+            },
+        }
+    }
 }
 
 macro_rules! refused_carriers {
@@ -1021,7 +1122,7 @@ macro_rules! refused_carriers {
 }
 
 #[derive(Debug, Clone)]
-struct VmessOut {
+pub(crate) struct VmessOut {
     address: String,
     port: u16,
     id: [u8; 16],
@@ -1032,7 +1133,7 @@ struct VmessOut {
 }
 
 #[derive(Debug, Clone)]
-struct TrojanOut {
+pub(crate) struct TrojanOut {
     address: String,
     port: u16,
     key: [u8; 56],
@@ -1042,7 +1143,7 @@ struct TrojanOut {
 }
 
 #[derive(Debug, Clone)]
-struct ShadowsocksOut {
+pub(crate) struct ShadowsocksOut {
     address: String,
     port: u16,
     method: String,
@@ -1133,9 +1234,9 @@ fn accept_loop(address: &str, role: &Role) {
                     carrier,
                     freedom,
                 } => serve_shadowsocks(stream, &password, &method, &carrier, freedom),
-                Role::Socks { out } => serve_socks(stream, &out),
+                Role::Socks { out, accounts } => serve_socks(stream, &out, &accounts),
                 Role::Http { out } => serve_http(stream, &out),
-                Role::Mixed { out } => serve_mixed(stream, &out),
+                Role::Mixed { out, accounts } => serve_mixed(stream, &out, &accounts),
                 Role::Dokodemo { out, dest } => {
                     let target = out.resolved(&dest, crate::router::Network::Tcp, Some(&stream));
                     serve_connect(stream, target, &dest, Front::Socks, &[]);
@@ -3897,8 +3998,7 @@ fn serve_tun_inbound(inbound: &Json, out: &Outbound, _address: &str) -> bool {
     };
     let outbound = out.clone();
     let relay: crate::tun::Relay = std::sync::Arc::new(move |conn, dest| {
-        let target = outbound.resolved(&dest, crate::router::Network::Tcp, Some(&conn));
-        serve_connect(conn, target, &dest, Front::Socks, &[]);
+        serve_device_flow(conn, &outbound, &dest);
     });
     let datagram = out.clone();
     let associate: crate::tun::Associate =
@@ -6003,8 +6103,8 @@ fn serve_trojan_httpheader(stream: Connection, key: &[u8; 56], path: &str, freed
     crate::proxy::relay_carried(reader, &write, &uplink);
 }
 
-fn serve_socks(mut client: Connection, out: &Outbound) {
-    let Some((cmd, asked)) = socks_target(&mut client, false) else {
+fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) {
+    let Some((cmd, asked)) = socks_target(&mut client, false, accounts) else {
         return;
     };
     if cmd == 3 {
@@ -6018,6 +6118,17 @@ fn serve_socks(mut client: Connection, out: &Outbound) {
         return;
     }
     serve_connect(client, out, &asked, Front::Socks, &[]);
+}
+
+/// The device front's relay: the front layer's own dial, with the destination the
+/// device's packet named.
+///
+/// The device does not know what an outbound is, so it asks for the dial every other
+/// front reaches — the same `serve_connect` the socks and http fronts call, with the
+/// same rules and the same grant.
+pub(crate) fn serve_device_flow(client: Connection, out: &Outbound, dest: &Destination) {
+    let lane = out.resolved(dest, crate::router::Network::Tcp, Some(&client));
+    serve_connect(client, lane, dest, Front::Socks, &[]);
 }
 
 /// Nothing carries the destination onward, so this lane is the one that has to look it up.
@@ -6164,12 +6275,46 @@ fn dial_socks_outbound(
         Outbound::Http(http) => {
             dial_http_outbound(client, server, http, target, ladder);
         }
+        Outbound::Socks(socks) => {
+            dial_socks_client(client, server, socks, target);
+        }
         Outbound::Foxy(_)
         | Outbound::Veepn(_)
         | Outbound::Freedom
         | Outbound::Route(_)
         | Outbound::Block => {}
     }
+}
+
+/// The SOCKS5 client: the greeting, the credential exchange, the `CONNECT` request, and
+/// then the tunnel.
+///
+/// The destination keeps its shape on the wire: a name the caller asked for is a name in
+/// the request, so the server resolves it and this tree's resolver never sees it.
+fn dial_socks_client(
+    client: &Connection,
+    server: &SocketAddr,
+    socks: &SocksOut,
+    target: &Destination,
+) {
+    let Some(upstream) = dial_or_report(server) else {
+        return;
+    };
+    let destination = match target {
+        Destination::Address(address) => match address.ip() {
+            std::net::IpAddr::V4(octets) => {
+                crate::socks::Destination::V4(octets.octets(), address.port())
+            }
+            std::net::IpAddr::V6(octets) => {
+                crate::socks::Destination::V6(octets.octets(), address.port())
+            }
+        },
+        Destination::Name(host, port) => crate::socks::Destination::Name(host.as_bytes(), *port),
+    };
+    let Some(tunnel) = crate::socks::connect(upstream, &socks.credential, &destination) else {
+        return;
+    };
+    relay(client, &tunnel);
 }
 
 /// The split-tunnel list: targets this lane does not carry, which leave by the plain dial.
@@ -6782,7 +6927,7 @@ fn serve_http(mut client: Connection, out: &Outbound) {
 }
 
 /// The `mixed` front sniffs one byte: 0x05 is SOCKS5, a method token is HTTP, and a peek consumes nothing.
-fn serve_mixed(client: Connection, out: &Outbound) {
+fn serve_mixed(client: Connection, out: &Outbound, accounts: &SocksAccounts) {
     // Bound only the sniff to the greeting's budget, then restore the untimed reads the fronts behind it expect.
     let _ = client.set_read_timeout(Some(budgets::handshake()));
     let mut first = [0u8; 1];
@@ -6795,7 +6940,7 @@ fn serve_mixed(client: Connection, out: &Outbound) {
         return;
     }
     if first[0] == 5 {
-        serve_socks(client, out);
+        serve_socks(client, out, accounts);
     } else {
         serve_http(client, out);
     }
@@ -6901,8 +7046,91 @@ fn serve_socks_udp(mut client: Connection, out: &Outbound) {
             _ => serve_socks_udp_foxy(&relay, foxy, &client),
         },
         Outbound::Freedom => serve_socks_udp_freedom(&relay),
+        Outbound::Socks(socks) => serve_socks_udp_socks(&relay, socks),
         _ => {}
     }
+}
+
+/// The SOCKS5 client lane for datagrams: one association to the upstream server, and
+/// every datagram rides it framed the way RFC 1928 frames them.
+///
+/// The control leg stays open for the association's life: dropping it ends the
+/// association, and the server stops relaying.
+fn serve_socks_udp_socks(relay: &UdpSocket, socks: &SocksOut) {
+    let Some(server) = resolve_outbound(&socks.address, socks.port) else {
+        return;
+    };
+    let Some(stream) = dial_or_report(&server) else {
+        return;
+    };
+    let Some(association) = crate::socks::associate(stream, &socks.credential) else {
+        return;
+    };
+    let _control = association.control;
+    let Ok(upstream) = UdpSocket::bind(SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        0,
+    )) else {
+        return;
+    };
+    if upstream.connect(association.relay).is_err() {
+        return;
+    }
+    // The same idle budget the relay socket carries, so the two legs of the lane end together instead of one waiting on the other for the life of the process.
+    let _ = upstream.set_read_timeout(Some(budgets::udp_idle()));
+    let Ok(sender) = upstream.try_clone() else {
+        return;
+    };
+    let Ok(receiver) = upstream.try_clone() else {
+        return;
+    };
+    let Ok(client) = relay.try_clone() else {
+        return;
+    };
+    let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let reader_source = source.clone();
+    // The answer leg: the upstream's frames go back to the client that sent them.
+    let answer = thread::spawn(move || {
+        let mut buf = udp_buffer();
+        let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
+        while let Ok((n, _)) = receiver.recv_from(&mut buf) {
+            let Some((from, payload)) = parse_socks_udp(&buf[..n]) else {
+                continue;
+            };
+            let Some(dest) = reader_source.lock().ok().and_then(|slot| *slot) else {
+                continue;
+            };
+            frame.clear();
+            frame.extend_from_slice(&[0, 0, 0]);
+            push_socks_addr(&mut frame, &from);
+            frame.extend_from_slice(payload);
+            if client.send_to(&frame, dest).is_err() {
+                break;
+            }
+        }
+    });
+    // The request leg: the client's frames go to the relay address the server named.
+    let mut buf = udp_buffer();
+    let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
+    while let Ok((n, src)) = relay.recv_from(&mut buf) {
+        let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+            continue;
+        };
+        if payload.is_empty() {
+            continue;
+        }
+        if let Ok(mut slot) = source.lock() {
+            *slot = Some(src);
+        }
+        frame.clear();
+        frame.extend_from_slice(&[0, 0, 0]);
+        push_socks_addr(&mut frame, &dest);
+        frame.extend_from_slice(payload);
+        if sender.send(&frame).is_err() {
+            break;
+        }
+    }
+    let _ = answer.join();
 }
 
 /// Freedom UDP: the machine's own socket per destination, since a datagram here has no carrier to ride.
@@ -9820,11 +10048,15 @@ pub(crate) fn parse_socks_udp(packet: &[u8]) -> Option<(SocketAddr, &[u8])> {
 }
 
 /// The handshake that keeps the client's name: resolving here hands the edge an address it cannot route.
-fn socks_target(client: &mut Connection, grant: bool) -> Option<(u8, Destination)> {
+fn socks_target(
+    client: &mut Connection,
+    grant: bool,
+    accounts: &SocksAccounts,
+) -> Option<(u8, Destination)> {
     // Bound only the greeting to a wall-clock budget, then restore the untimed relay reads behind it.
     let budget = budgets::handshake();
     let _ = client.set_read_timeout(Some(budget));
-    let asked = socks_request(client, grant, Instant::now() + budget);
+    let asked = socks_request(client, grant, Instant::now() + budget, accounts);
     let _ = client.set_read_timeout(None);
     asked
 }
@@ -9834,6 +10066,7 @@ fn socks_request(
     client: &mut Connection,
     grant: bool,
     until: Instant,
+    accounts: &SocksAccounts,
 ) -> Option<(u8, Destination)> {
     let mut head = [0u8; 2];
     read_exact(
@@ -9857,7 +10090,20 @@ fn socks_request(
         &mut methods[..usize::from(head[1])],
     )
     .ok()?;
-    if client.write_all(&[5, 0]).is_err() {
+    // The one method this front wants: the credential exchange when the front has accounts, no authentication when it has none — a front that asks for the credential exchange refuses a client that does not offer it, the way the pinned Go server does (`authNoMatchingMethod`), and the no-authentication front answers whatever the client offered, as it always has.
+    let wanted = if accounts.wants_credential() {
+        ferrox_core::socks::METHOD_USER
+    } else {
+        ferrox_core::socks::METHOD_NONE
+    };
+    if accounts.wants_credential() && !methods[..usize::from(head[1])].contains(&wanted) {
+        client.write_all(&[5, 0xff]).ok()?;
+        return None;
+    }
+    if client.write_all(&[5, wanted]).is_err() {
+        return None;
+    }
+    if wanted == ferrox_core::socks::METHOD_USER && !socks_authenticate(client, until, accounts) {
         return None;
     }
     let mut req = [0u8; 4];
@@ -9883,6 +10129,67 @@ fn socks_request(
         return None;
     }
     Some((req[1], target))
+}
+
+/// The RFC 1929 exchange: the version, the name's length, the name, the password's
+/// length, and the password. The answer is the version and a status byte — zero when
+/// the account is one the front knows.
+fn socks_authenticate(client: &mut Connection, until: Instant, accounts: &SocksAccounts) -> bool {
+    let mut head = [0u8; 2];
+    if read_exact(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        &mut head,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    if head[0] != ferrox_core::socks::AUTH_VERSION {
+        let _ = client.write_all(&[ferrox_core::socks::AUTH_VERSION, 1]);
+        return false;
+    }
+    let mut user = vec![0u8; usize::from(head[1])];
+    if read_exact(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        &mut user,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let mut len = [0u8; 1];
+    if read_exact(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        &mut len,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let mut pass = vec![0u8; usize::from(len[0])];
+    if read_exact(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        &mut pass,
+    )
+    .is_err()
+    {
+        return false;
+    }
+    let accepted = accounts.accepts(&user, &pass);
+    let _ = client.write_all(&[ferrox_core::socks::AUTH_VERSION, u8::from(!accepted)]);
+    accepted
 }
 
 fn read_socks_named(stream: &mut dyn Read, atyp: u8) -> Option<Destination> {
@@ -10136,6 +10443,9 @@ fn find_outbound(root: &Json) -> Option<Outbound> {
     }
     if let Some(http) = find_http_outbound(root) {
         return Some(Outbound::Http(http));
+    }
+    if let Some(socks) = find_socks_outbound(root) {
+        return Some(Outbound::Socks(socks));
     }
     find_shadowsocks_outbound(root)
         .map(Outbound::Shadowsocks)
@@ -10800,6 +11110,55 @@ fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
             host,
             tls: None,
         });
+    }
+    None
+}
+
+/// The SOCKS5 client lane's server: the address the outbound dials, and the credential
+/// it offers.
+///
+/// The shape is xray's own outbound form — a `servers` list whose one entry names an
+/// address, a port and the user that signs the dial — so a config that served xray's
+/// SOCKS client serves this one.
+fn find_socks_outbound(root: &Json) -> Option<SocksOut> {
+    let empty = Vec::new();
+    let outbounds = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty);
+    for outbound in outbounds {
+        if outbound.get("protocol").and_then(Json::as_str) != Some("socks") {
+            continue;
+        }
+        let server = outbound
+            .get("settings")
+            .and_then(|s| s.get("servers"))
+            .and_then(Json::as_arr)
+            .and_then(|servers| servers.first());
+        let Some(server) = server else { continue };
+        let address = server.get("address").and_then(Json::as_str)?.to_owned();
+        let port = server.get("port").and_then(Json::as_port)?;
+        let user = server
+            .get("users")
+            .and_then(Json::as_arr)
+            .and_then(|users| users.first())
+            .and_then(|user| {
+                user.get("user")
+                    .and_then(Json::as_str)
+                    .or_else(|| user.get("username").and_then(Json::as_str))
+            })
+            .unwrap_or_default();
+        let pass = server
+            .get("users")
+            .and_then(Json::as_arr)
+            .and_then(|users| users.first())
+            .and_then(|user| {
+                user.get("pass")
+                    .and_then(Json::as_str)
+                    .or_else(|| user.get("password").and_then(Json::as_str))
+            })
+            .unwrap_or_default();
+        return Some(SocksOut::new(&address, port, user, pass));
     }
     None
 }
@@ -11512,7 +11871,8 @@ mod tests {
             client.write_all(b"example.com").expect("names");
             client.write_all(&[0, 80]).expect("ports");
             let mut server = accepted.join().expect("accepts");
-            let (cmd, target) = socks_target(&mut server, grant).expect("handshakes");
+            let (cmd, target) =
+                socks_target(&mut server, grant, &no_accounts()).expect("handshakes");
             assert_eq!(cmd, 1);
             assert_eq!(target.authority(), "example.com:80");
             let mut reply = [0u8; 2];
@@ -11547,7 +11907,7 @@ mod tests {
         greeting.extend([0, 80]);
         client.write_all(&greeting).expect("greets");
         let mut server = accepted.join().expect("accepts");
-        let (cmd, target) = socks_target(&mut server, true).expect("handshakes");
+        let (cmd, target) = socks_target(&mut server, true, &no_accounts()).expect("handshakes");
         assert_eq!(cmd, 1);
         assert_eq!(target.authority(), "example.com:80");
         let mut reply = [0u8; 2];
@@ -14365,7 +14725,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_socks(stream, &Outbound::Freedom);
+            serve_socks(stream, &Outbound::Freedom, &no_accounts());
             let _ = done_tx.send(());
         });
         let _peer = Connection::connect(addr).expect("connects");
@@ -14388,7 +14748,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_socks(stream, &Outbound::Freedom);
+            serve_socks(stream, &Outbound::Freedom, &no_accounts());
             let _ = done_tx.send(());
         });
         // The peer stays open and says nothing more, so the request read expires rather than seeing a close.
@@ -16037,7 +16397,7 @@ mod tests {
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -16169,7 +16529,7 @@ mod tests {
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -16623,7 +16983,7 @@ mod tests {
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -16678,7 +17038,7 @@ mod tests {
         let front_port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &Outbound::Freedom);
+            serve_socks(stream, &Outbound::Freedom, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -16867,7 +17227,7 @@ mod tests {
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -17007,7 +17367,7 @@ mod tests {
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -17129,7 +17489,7 @@ mod tests {
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -17414,7 +17774,7 @@ mod tests {
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -18013,7 +18373,7 @@ mod tests {
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -18105,7 +18465,7 @@ mod tests {
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -18171,7 +18531,7 @@ mod tests {
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -18236,7 +18596,7 @@ mod tests {
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -18300,7 +18660,7 @@ mod tests {
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -18364,7 +18724,7 @@ mod tests {
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -18427,7 +18787,7 @@ mod tests {
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -18490,7 +18850,7 @@ mod tests {
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -18553,7 +18913,7 @@ mod tests {
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -18730,7 +19090,8 @@ mod tests {
         );
         assert!(
             Role::Socks {
-                out: Outbound::Freedom
+                out: Outbound::Freedom,
+                accounts: Arc::new(SocksAccounts::default()),
             }
             .tcp_mask()
             .is_none(),
@@ -20106,7 +20467,7 @@ mod tests {
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -20155,7 +20516,7 @@ mod tests {
         let (handed_back, done) = std::sync::mpsc::channel();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
             let _ = handed_back.send(());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
@@ -21604,7 +21965,7 @@ mod tests {
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -21825,13 +22186,226 @@ mod tests {
     }
 
     fn socks_front_with(out: Outbound) -> u16 {
+        socks_front_with_accounts(out, no_accounts())
+    }
+
+    /// The SOCKS front with the accounts it asks for: an empty list is the
+    /// no-authentication front.
+    fn socks_front_with_accounts(out: Outbound, accounts: SocksAccounts) -> u16 {
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &accounts);
         });
         port
+    }
+
+    /// A socks client that asks the front for one destination: the greeting, the
+    /// request, and the reply.
+    fn socks_ask(port: u16, destination: SocketAddr) -> Connection {
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("the method");
+        assert_eq!(method, [5, 0]);
+        socks_request_destination(&mut client, destination);
+        client
+    }
+
+    /// A socks client that offers the credential the front asks for.
+    fn socks_ask_with_credential(
+        port: u16,
+        destination: SocketAddr,
+        user: &str,
+        pass: &str,
+    ) -> Connection {
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 2]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("the method");
+        assert_eq!(method, [5, 2]);
+        let mut block = vec![1, user.len() as u8];
+        block.extend_from_slice(user.as_bytes());
+        block.push(pass.len() as u8);
+        block.extend_from_slice(pass.as_bytes());
+        client.write_all(&block).expect("the credential");
+        let mut status = [0u8; 2];
+        client
+            .read_exact(&mut status)
+            .expect("the credential reply");
+        assert_eq!(status, [1, 0]);
+        socks_request_destination(&mut client, destination);
+        client
+    }
+
+    /// The request a socks client sends for one destination, and the reply it reads.
+    fn socks_request_destination(client: &mut Connection, destination: SocketAddr) {
+        let mut request = vec![5, 1, 0, 1];
+        match destination.ip() {
+            std::net::IpAddr::V4(octets) => request.extend_from_slice(&octets.octets()),
+            std::net::IpAddr::V6(octets) => {
+                request[3] = 4;
+                request.extend_from_slice(&octets.octets());
+            }
+        }
+        request.extend_from_slice(&destination.port().to_be_bytes());
+        client.write_all(&request).expect("asks");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("the reply");
+        assert_eq!(reply[1], 0, "the front granted the request");
+    }
+
+    /// The config surface names the lane: an outbound with the `socks` protocol, one
+    /// server and the credential that server wants.
+    #[test]
+    fn a_socks_outbound_names_its_server_and_credential() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":1080,"users":[{"user":"Test Account","pass":"Test Password"}]}]}}]}"#,
+        )
+        .expect("parses");
+        let Some(Outbound::Socks(lane)) = find_outbound(&root) else {
+            panic!("the socks outbound is the one the config names");
+        };
+        assert_eq!(lane.address, "127.0.0.1");
+        assert_eq!(lane.port, 1080);
+        assert_eq!(lane.credential.user, "Test Account");
+        assert_eq!(lane.credential.pass, "Test Password");
+    }
+
+    /// The SOCKS5 client lane: the greeting, the request, and the tunnel that follows.
+    #[test]
+    fn a_socks_client_dials_the_front_and_carries_an_echo() {
+        let echo = echo_loop();
+        let upstream = socks_front_with(Outbound::Freedom);
+        let lane = Outbound::Socks(SocksOut::new("127.0.0.1", upstream, "", ""));
+        let front = socks_front_with(lane);
+        let mut client = socks_ask(
+            front,
+            format!("127.0.0.1:{echo}").parse().expect("an address"),
+        );
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// The credential path: the lane offers the user method and the RFC 1929 block,
+    /// and the front that asks for one lets the tunnel through.
+    #[test]
+    fn a_socks_client_offers_the_credential_the_front_asks_for() {
+        let echo = echo_loop();
+        let accounts = SocksAccounts {
+            password: true,
+            pairs: vec![("Test Account".to_owned(), "Test Password".to_owned())],
+        };
+        let upstream = socks_front_with_accounts(Outbound::Freedom, accounts.clone());
+        let lane = Outbound::Socks(SocksOut::new(
+            "127.0.0.1",
+            upstream,
+            "Test Account",
+            "Test Password",
+        ));
+        let front = socks_front_with_accounts(lane, accounts);
+        let mut client = socks_ask_with_credential(
+            front,
+            format!("127.0.0.1:{echo}").parse().expect("an address"),
+            "Test Account",
+            "Test Password",
+        );
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// The datagram lane of the SOCKS5 client: one association to the upstream, and
+    /// every datagram rides it framed the way RFC 1928 frames them.
+    #[test]
+    fn a_socks_client_carries_a_datagram_through_the_front() {
+        // The target: a datagram echo.
+        let target = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let target_addr = target.local_addr().expect("addr");
+        thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, src)) = target.recv_from(&mut buf) {
+                let _ = target.send_to(&buf[..n], src);
+            }
+        });
+        // The upstream: the socks front, whose own datagram lane carries the echo.
+        let upstream = socks_front_with(Outbound::Freedom);
+        let lane = Outbound::Socks(SocksOut::new("127.0.0.1", upstream, "", ""));
+        let front = socks_front_with(lane);
+        // The client: the association, then a datagram.
+        let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("the method");
+        assert_eq!(method, [5, 0]);
+        client
+            .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("the relay address");
+        assert_eq!(reply[..2], [5, 0]);
+        let relay = SocketAddr::from((
+            [reply[4], reply[5], reply[6], reply[7]],
+            u16::from_be_bytes([reply[8], reply[9]]),
+        ));
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        socket.connect(relay).expect("connects");
+        let mut frame = vec![0, 0, 0, 1];
+        match target_addr.ip() {
+            std::net::IpAddr::V4(octets) => frame.extend_from_slice(&octets.octets()),
+            std::net::IpAddr::V6(octets) => {
+                frame[3] = 4;
+                frame.extend_from_slice(&octets.octets());
+            }
+        }
+        frame.extend_from_slice(&target_addr.port().to_be_bytes());
+        frame.extend_from_slice(b"who-is");
+        socket.send(&frame).expect("sends");
+        let mut back = vec![0u8; 2048];
+        let (n, _) = socket.recv_from(&mut back).expect("the echo");
+        let (source, payload) = parse_socks_udp(&back[..n]).expect("the frame");
+        assert_eq!(payload, b"who-is");
+        assert_eq!(source.port(), target_addr.port());
+    }
+
+    /// A front that asks for a credential refuses one it does not know, and says so
+    /// in the status byte rather than closing without an answer.
+    #[test]
+    fn a_front_refuses_a_credential_it_does_not_know() {
+        let accounts = SocksAccounts {
+            password: true,
+            pairs: vec![("Test Account".to_owned(), "Test Password".to_owned())],
+        };
+        let front = socks_front_with_accounts(Outbound::Freedom, accounts);
+        let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 2]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("the method");
+        assert_eq!(method, [5, 2]);
+        client
+            .write_all(&[1, 1, b'x', 1, b'y'])
+            .expect("the credential");
+        let mut status = [0u8; 2];
+        client
+            .read_exact(&mut status)
+            .expect("the credential reply");
+        assert_eq!(status, [1, 1], "the credential is refused");
     }
 
     fn http_front_with(out: Outbound) -> u16 {
@@ -22010,7 +22584,7 @@ mod tests {
         thread::spawn(move || {
             for stream in front.incoming().take(2) {
                 let Ok(stream) = stream else { continue };
-                thread::spawn(|| serve_mixed(stream, &Outbound::Freedom));
+                thread::spawn(|| serve_mixed(stream, &Outbound::Freedom, &no_accounts()));
             }
         });
         let mut socks = socks_tcp_client(port, echo_socks);
@@ -22036,7 +22610,7 @@ mod tests {
         let quiet = Connection::connect(addr).expect("connects");
         let (stream, _) = front.accept().expect("accepts");
         let at = Instant::now();
-        serve_mixed(stream, &Outbound::Freedom);
+        serve_mixed(stream, &Outbound::Freedom, &no_accounts());
         budgets::clear();
         drop(quiet);
         assert!(
@@ -22648,7 +23222,7 @@ mod tests {
         let front_port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -22704,7 +23278,7 @@ mod tests {
         let front_port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &out);
+            serve_socks(stream, &out, &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
