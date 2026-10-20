@@ -845,4 +845,702 @@ mod tests {
         server.join().expect("joins");
         drop(stream);
     }
+
+    /// The differential sweep against the pinned reference.
+    ///
+    /// `scripts/httpupgrade-oracle` writes the script and the golden from the pinned
+    /// xray-core, and this replays the tree's own paths against what the reference
+    /// did: every head length the script names, every offset a head can be split at,
+    /// the verdicts on both roles, the bytes of the answer, the fate of the octets
+    /// that came with the head, the order the early data rides in, and the request.
+    /// The script names the fields on which the two sides are known to differ, so a
+    /// difference the script does not name fails here.
+    mod sweep {
+        use super::*;
+        use std::collections::BTreeMap;
+        use std::io::Read;
+
+        const SCRIPT: &str = include_str!("../../../scripts/httpupgrade-oracle/script.txt");
+        const GOLDEN: &str = include_str!("../../../scripts/httpupgrade-oracle/expected.txt");
+        const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+        /// The tree's read round, the seam its scan looks three octets back from.
+        const ROUND: usize = 512;
+
+        /// A field on which the two sides are known to differ, as the script names it.
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum Divergence {
+            /// The two sides' verdicts differ.
+            Verdict,
+            /// The answer carries the accept header, which the tree does not write.
+            AcceptHeader,
+            /// The octets that came with the head reached the tree and not the
+            /// reference's handler.
+            Tail,
+            /// The request carries the key and the version, which the tree does not
+            /// send.
+            Request,
+            /// The payload's order differs.
+            Order,
+        }
+
+        /// The divergences a case's `expect` field names. `v+` and `v-` are the same
+        /// divergence seen from either side; `same` names none.
+        fn divergences(text: &str) -> Vec<Divergence> {
+            let mut out = Vec::new();
+            let mut at = 0;
+            while at < text.len() {
+                let rest = &text[at..];
+                if rest.starts_with("v+") || rest.starts_with("v-") {
+                    out.push(Divergence::Verdict);
+                    at += 2;
+                    continue;
+                }
+                if rest.starts_with("same") {
+                    at += 4;
+                    continue;
+                }
+                let flag = match rest.as_bytes()[0] {
+                    b'a' => Divergence::AcceptHeader,
+                    b't' => Divergence::Tail,
+                    b'r' => Divergence::Request,
+                    b'o' => Divergence::Order,
+                    other => panic!("unknown divergence {}", other as char),
+                };
+                out.push(flag);
+                at += 1;
+                if at < text.len() {
+                    assert_eq!(text.as_bytes()[at], b'+', "the flags are joined by a plus");
+                    at += 1;
+                }
+            }
+            out
+        }
+
+        /// One case of the script, in the fields its family gives it.
+        struct Case {
+            label: String,
+            path: String,
+            host: String,
+            key: String,
+            budget: u32,
+            size: usize,
+            pad: usize,
+            tail: String,
+            end: String,
+            expect: Vec<Divergence>,
+            text: String,
+        }
+
+        impl Case {
+            /// `frame <label> <pad> <tail> <expect> <end> <head>`
+            fn frame(rest: &str) -> Self {
+                let mut parts = rest.splitn(6, ' ');
+                Case {
+                    label: parts.next().expect("a label").to_owned(),
+                    pad: parts.next().expect("a pad").parse().expect("a pad"),
+                    tail: parts.next().expect("a tail").to_owned(),
+                    expect: divergences(parts.next().expect("an expect")),
+                    end: parts.next().expect("an end").to_owned(),
+                    text: parts.next().expect("a head").to_owned(),
+                    path: String::new(),
+                    host: String::new(),
+                    key: String::new(),
+                    budget: 0,
+                    size: 0,
+                }
+            }
+
+            /// `serve <label> <path> <host> <tail> <expect> <head>`
+            fn serve(rest: &str) -> Self {
+                let mut parts = rest.splitn(6, ' ');
+                Case {
+                    label: parts.next().expect("a label").to_owned(),
+                    path: parts.next().expect("a path").to_owned(),
+                    host: parts.next().expect("a host").to_owned(),
+                    tail: parts.next().expect("a tail").to_owned(),
+                    expect: divergences(parts.next().expect("an expect")),
+                    text: parts.next().expect("a head").to_owned(),
+                    pad: 0,
+                    end: String::new(),
+                    key: String::new(),
+                    budget: 0,
+                    size: 0,
+                }
+            }
+
+            /// `client <label> <ed> <path> <host> <key> <payload> <expect> <answer>`
+            fn client(rest: &str) -> Self {
+                let mut parts = rest.splitn(8, ' ');
+                Case {
+                    label: parts.next().expect("a label").to_owned(),
+                    budget: parts.next().expect("a budget").parse().expect("a budget"),
+                    path: parts.next().expect("a path").to_owned(),
+                    host: parts.next().expect("a host").to_owned(),
+                    key: parts.next().expect("a key").to_owned(),
+                    size: parts.next().expect("a size").parse().expect("a size"),
+                    expect: divergences(parts.next().expect("an expect")),
+                    text: parts.next().expect("an answer").to_owned(),
+                    pad: 0,
+                    tail: String::new(),
+                    end: String::new(),
+                }
+            }
+        }
+
+        /// The script's escapes, the set the oracle writes.
+        fn unescape(text: &str) -> Vec<u8> {
+            let bytes = text.as_bytes();
+            let mut out = Vec::with_capacity(bytes.len());
+            let mut at = 0;
+            while at < bytes.len() {
+                if bytes[at] != b'\\' {
+                    out.push(bytes[at]);
+                    at += 1;
+                    continue;
+                }
+                at += 1;
+                assert!(at < bytes.len(), "a trailing backslash");
+                match bytes[at] {
+                    b'r' => out.push(b'\r'),
+                    b'n' => out.push(b'\n'),
+                    b't' => out.push(b'\t'),
+                    b's' => out.push(b' '),
+                    b'\\' => out.push(b'\\'),
+                    b'x' => {
+                        let digits = bytes
+                            .get(at + 1..at + 3)
+                            .expect("two hex digits")
+                            .to_owned();
+                        out.push(
+                            u8::from_str_radix(std::str::from_utf8(&digits).expect("ascii"), 16)
+                                .expect("two hex digits"),
+                        );
+                        at += 2;
+                    }
+                    other => panic!("unknown escape \\{}", other as char),
+                }
+                at += 1;
+            }
+            out
+        }
+
+        fn hex(bytes: &[u8]) -> String {
+            let mut out = String::with_capacity(bytes.len() * 2);
+            for byte in bytes {
+                out.push(char::from_digit(u32::from(byte >> 4), 16).expect("hex"));
+                out.push(char::from_digit(u32::from(byte & 0xf), 16).expect("hex"));
+            }
+            out
+        }
+
+        fn unhex(text: &str) -> Vec<u8> {
+            assert!(text.len().is_multiple_of(2), "hex is whole octets");
+            (0..text.len() / 2)
+                .map(|at| u8::from_str_radix(&text[2 * at..2 * at + 2], 16).expect("hex"))
+                .collect()
+        }
+
+        /// The golden's lines, keyed by family and label.
+        fn golden() -> BTreeMap<String, Vec<String>> {
+            let mut map = BTreeMap::new();
+            for line in GOLDEN.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let mut parts = line.split(' ');
+                let family = parts.next().expect("a family");
+                let label = parts.next().expect("a label");
+                map.insert(
+                    format!("{family} {label}"),
+                    parts.map(str::to_owned).collect::<Vec<String>>(),
+                );
+            }
+            map
+        }
+
+        /// A reader that hands the head over in two pieces, so the tree's head end can
+        /// be shown not to move with the split.
+        struct TwoPieces<'a> {
+            data: &'a [u8],
+            at: usize,
+            split: usize,
+        }
+
+        impl Read for TwoPieces<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let want = if self.at < self.split {
+                    (self.split - self.at).min(buf.len())
+                } else {
+                    buf.len().min(self.data.len() - self.at)
+                };
+                buf[..want].copy_from_slice(&self.data[self.at..self.at + want]);
+                self.at += want;
+                Ok(want)
+            }
+        }
+
+        /// Where the tree's own head read ends, in octets.
+        fn tree_head_end(head: &[u8], split: usize) -> Option<usize> {
+            let mut reader = TwoPieces {
+                data: head,
+                at: 0,
+                split,
+            };
+            crate::proxy::read_exact_head(&mut reader, HEAD_LIMIT, crate::budgets::head_arrival())
+                .map(|(_, at)| at)
+        }
+
+        /// Every offset a short head can be split at, and the offsets that matter for a
+        /// long one: either side of every round the tree reads in, and the last octets.
+        fn split_offsets(len: usize) -> Vec<usize> {
+            if len <= 4096 {
+                return (0..=len).collect();
+            }
+            let mut out = Vec::new();
+            let mut at = ROUND;
+            while at < len {
+                for near in [at - 1, at, at + 1] {
+                    if near <= len {
+                        out.push(near);
+                    }
+                }
+                at += ROUND;
+            }
+            out.extend(len.saturating_sub(8)..=len);
+            out.sort_unstable();
+            out.dedup();
+            out
+        }
+
+        /// The head the oracle built: the text, the pad, the terminator, the tail.
+        fn frame_head(case: &Case) -> Vec<u8> {
+            let mut head = unescape(&case.text);
+            head.extend(std::iter::repeat_n(b'A', case.pad));
+            if case.end == "crlf" {
+                head.extend_from_slice(b"\r\n\r\n");
+            }
+            let tail: usize = case.tail.parse().expect("a tail");
+            head.extend(std::iter::repeat_n(b'B', tail));
+            head
+        }
+
+        /// The value of a header in a head, as the references read it.
+        fn header_value(head: &[u8], name: &str) -> Option<String> {
+            let text = std::str::from_utf8(head).ok()?;
+            for line in text.split("\r\n").skip(1) {
+                let Some((key, value)) = line.split_once(':') else {
+                    continue;
+                };
+                if key.trim().eq_ignore_ascii_case(name) {
+                    return Some(value.trim().to_owned());
+                }
+            }
+            None
+        }
+
+        /// The accept header the reference derives from the key, as it derives it.
+        fn accept_key(key: &str) -> String {
+            use sha1::Digest as _;
+            let mut hash = sha1::Sha1::new();
+            hash.update(key.trim().as_bytes());
+            hash.update(GUID.as_bytes());
+            ferrox_core::b64::encode(&hash.finalize())
+        }
+
+        /// A writer that keeps what it was given after the call that took it: a dial
+        /// that refuses the answer still wrote the request, and the sweep has to see it.
+        #[derive(Clone, Default)]
+        struct Shared(std::sync::Arc<std::sync::Mutex<Recorder>>);
+
+        impl Write for Shared {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .expect("the recorder is not poisoned")
+                    .plain
+                    .push(buf.to_vec());
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl crate::proxy::FrameWrite for Shared {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                self.0
+                    .lock()
+                    .expect("the recorder is not poisoned")
+                    .calls
+                    .push(
+                        parts
+                            .iter()
+                            .map(|part| (part.as_ptr() as usize, part.to_vec()))
+                            .collect(),
+                    );
+                true
+            }
+        }
+
+        /// The request's protocol headers, in the order they were written. The browser
+        /// masquerade the reference adds carries a Chrome version that moves with the
+        /// date, so a golden that held it would differ every day.
+        fn project(request: &[u8]) -> Vec<&str> {
+            let text = std::str::from_utf8(request).expect("ascii");
+            let mut kept = Vec::new();
+            for (index, line) in text.split("\r\n").enumerate() {
+                if index == 0 {
+                    kept.push(line);
+                    continue;
+                }
+                let Some((name, _)) = line.split_once(':') else {
+                    continue;
+                };
+                match name.trim().to_ascii_lowercase().as_str() {
+                    "host"
+                    | "connection"
+                    | "upgrade"
+                    | "sec-websocket-key"
+                    | "sec-websocket-version" => kept.push(line),
+                    _ => {}
+                }
+            }
+            kept
+        }
+
+        /// What one served case measured, in counts.
+        struct Served {
+            verdict_differs: usize,
+            answer_differs: usize,
+            dropped: usize,
+        }
+
+        /// One served case: the verdict against the reference's, the answer's bytes,
+        /// and the fate of the octets that came with the head.
+        fn serve_case(case: &Case, fields: &[String]) -> Served {
+            let label = &case.label;
+            let head = unescape(&case.text);
+            let tail = if case.tail == "-" {
+                Vec::new()
+            } else {
+                unescape(&case.tail)
+            };
+            let mut wire = head.clone();
+            wire.extend_from_slice(&tail);
+            let outcome = accept_split(std::io::Cursor::new(wire), Vec::new(), &case.path);
+            let answer = outcome
+                .as_ref()
+                .map(|(_, write)| write.clone())
+                .unwrap_or_default();
+            let reference_took = fields[0] == "accept";
+            let mut measured = Served {
+                verdict_differs: 0,
+                answer_differs: 0,
+                dropped: 0,
+            };
+            if reference_took != outcome.is_some() {
+                assert!(
+                    case.expect.contains(&Divergence::Verdict),
+                    "SERVE {label}: the verdicts differ and the script does not say so"
+                );
+                measured.verdict_differs = 1;
+            }
+            let reference = if fields[1] == "-" {
+                Vec::new()
+            } else {
+                unhex(&fields[1])
+            };
+            if case.expect.contains(&Divergence::AcceptHeader) {
+                // The reference derives the accept header from the key it was given.
+                let key = header_value(&head, "Sec-WebSocket-Key").expect("the head carries a key");
+                let accept = format!("Sec-Websocket-Accept: {}\r\n", accept_key(&key));
+                let want = String::from_utf8(SWITCH.to_vec()).expect("ascii").replacen(
+                    "Connection: Upgrade\r\n",
+                    &format!("Connection: Upgrade\r\n{accept}"),
+                    1,
+                );
+                assert_eq!(
+                    reference,
+                    want.as_bytes(),
+                    "SERVE {label}: the accept header"
+                );
+            } else if reference_took {
+                assert_eq!(reference, SWITCH, "SERVE {label}: the answer differs");
+            } else {
+                assert!(
+                    reference.is_empty(),
+                    "SERVE {label}: the reference answered a head it refused"
+                );
+            }
+            if answer != reference {
+                measured.answer_differs = 1;
+            }
+            let tree_tail = match &outcome {
+                Some((reader, _)) if !tail.is_empty() => {
+                    assert_eq!(
+                        &reader.prefix[reader.at..],
+                        tail.as_slice(),
+                        "SERVE {label}: the tail changed"
+                    );
+                    "kept"
+                }
+                _ => "-",
+            };
+            if case.expect.contains(&Divergence::Tail) {
+                assert_eq!(fields[2], "dropped", "SERVE {label}: the reference kept it");
+                assert_eq!(tree_tail, "kept", "SERVE {label}: the tree dropped it");
+                measured.dropped = 1;
+            } else {
+                assert_eq!(
+                    fields[2], tree_tail,
+                    "SERVE {label}: the tail's fate differs"
+                );
+            }
+            measured
+        }
+
+        /// What one dialled case measured, in counts.
+        struct Dialled {
+            verdict_differs: usize,
+            order_differs: usize,
+            payload_differs: usize,
+            request_lines: usize,
+        }
+
+        /// One dialled case: the verdict on the answer, the order the early data
+        /// rides in, the bytes of that payload, and the request the reference wrote.
+        fn client_case(case: &Case, fields: &[String]) -> Dialled {
+            let label = &case.label;
+            let answer = unescape(&case.text);
+            let payload: Vec<u8> = (0..case.size).map(|at| 0xa0 + at as u8).collect();
+            let recorder = Shared::default();
+            let outcome = connect_split(
+                std::io::Cursor::new(answer),
+                recorder.clone(),
+                &case.host,
+                &case.path,
+                case.budget,
+                &payload,
+            );
+            let write = recorder.0.lock().expect("the recorder is not poisoned");
+            let reference_took = fields[0] == "accept";
+            let mut measured = Dialled {
+                verdict_differs: 0,
+                order_differs: 0,
+                payload_differs: 0,
+                request_lines: 0,
+            };
+            if reference_took != outcome.is_some() {
+                assert!(
+                    case.expect.contains(&Divergence::Verdict),
+                    "CLIENT {label}: the verdicts differ and the script does not say so"
+                );
+                measured.verdict_differs = 1;
+            }
+            // The order: a payload that rides went out with the request, one held back after the answer.
+            let tree_order = if write.calls.is_empty() { "A" } else { "P" };
+            if fields[1] != tree_order {
+                assert!(
+                    case.expect.contains(&Divergence::Order),
+                    "CLIENT {label}: the order differs and the script does not say so"
+                );
+                measured.order_differs = 1;
+            }
+            let tree_payload = if write.calls.is_empty() {
+                write.plain.get(1).cloned().unwrap_or_default()
+            } else {
+                write.calls[0]
+                    .get(1)
+                    .map(|(_, part)| part.clone())
+                    .unwrap_or_default()
+            };
+            if hex(&tree_payload) != fields[2] {
+                measured.payload_differs = 1;
+            }
+            let request = if write.calls.is_empty() {
+                write.plain.first().cloned().unwrap_or_default()
+            } else {
+                write.calls[0][0].1.clone()
+            };
+            let reference = unhex(&fields[3]);
+            if case.expect.contains(&Divergence::Request) {
+                let mut rest = Vec::new();
+                let mut keys = Vec::new();
+                let mut versions = Vec::new();
+                for line in project(&reference) {
+                    let name = line
+                        .split(':')
+                        .next()
+                        .unwrap_or_default()
+                        .trim()
+                        .to_ascii_lowercase();
+                    match name.as_str() {
+                        "sec-websocket-key" => keys.push(line),
+                        "sec-websocket-version" => versions.push(line),
+                        _ => rest.push(line),
+                    }
+                }
+                assert_eq!(
+                    rest,
+                    project(&request),
+                    "CLIENT {label}: the request differs"
+                );
+                assert_eq!(keys.len(), 2, "CLIENT {label}: the keys the reference sent");
+                assert!(
+                    keys.iter().any(|line| line.ends_with(&case.key)),
+                    "CLIENT {label}: the caller's key"
+                );
+                assert_eq!(versions.len(), 1, "CLIENT {label}: the version");
+                assert!(versions[0].ends_with(" 13"), "CLIENT {label}: the version");
+                measured.request_lines = keys.len() + versions.len();
+                assert_eq!(
+                    measured.request_lines, 3,
+                    "CLIENT {label}: the request lines the reference adds"
+                );
+            } else {
+                assert_eq!(
+                    project(&reference),
+                    project(&request),
+                    "CLIENT {label}: the request differs"
+                );
+            }
+            measured
+        }
+
+        /// The head sweep: every length the script names, and every offset a head can
+        /// be split at, must end where the reference's own parser ended.
+        #[test]
+        fn the_head_sweep_agrees_with_the_reference_on_every_length_and_split() {
+            let golden = golden();
+            let mut lengths = 0usize;
+            let mut cases = 0usize;
+            let mut verdicts_differing = 0usize;
+            let mut offsets_differing = 0usize;
+            for line in SCRIPT.lines() {
+                let line = line.trim();
+                let Some(rest) = line.strip_prefix("frame ") else {
+                    continue;
+                };
+                let case = Case::frame(rest);
+                let head = frame_head(&case);
+                cases += 1;
+                if case.label.starts_with("len-") {
+                    lengths += 1;
+                }
+                let fields = golden
+                    .get(&format!("FRAME {}", case.label))
+                    .unwrap_or_else(|| panic!("the golden has no line for FRAME {}", case.label));
+                let tree = tree_head_end(&head, head.len());
+                let reference_took = fields[0] == "accept";
+                if reference_took != tree.is_some() {
+                    // The script names the heads the two sides read differently.
+                    assert!(
+                        case.expect.contains(&Divergence::Verdict),
+                        "FRAME {}: the verdicts differ and the script does not say so",
+                        case.label
+                    );
+                    if let Some(at) = tree {
+                        assert_eq!(
+                            at,
+                            head.len() - case.tail.parse::<usize>().expect("a tail"),
+                            "FRAME {}: the tree's head end",
+                            case.label
+                        );
+                    }
+                    verdicts_differing += 1;
+                } else if reference_took {
+                    let want: usize = fields[1].parse().expect("an offset");
+                    if tree != Some(want) {
+                        offsets_differing += 1;
+                    }
+                }
+                for split in split_offsets(head.len()) {
+                    assert_eq!(
+                        tree_head_end(&head, split),
+                        tree,
+                        "FRAME {}: the head end moved at the split {split}",
+                        case.label
+                    );
+                }
+            }
+            assert_eq!(lengths, 93, "the head lengths the script names");
+            assert_eq!(cases, 108, "the head cases the script names");
+            assert_eq!(
+                verdicts_differing, 22,
+                "the heads the two sides read differently"
+            );
+            assert_eq!(offsets_differing, 0, "the head ends that differ");
+        }
+
+        /// The served sweep: the verdict, the bytes of the answer, and the fate of the
+        /// octets that came with the head.
+        #[test]
+        fn the_served_sweep_agrees_with_the_reference_on_every_head() {
+            let golden = golden();
+            let mut cases = 0usize;
+            let mut verdicts_differing = 0usize;
+            let mut answers_differing = 0usize;
+            let mut dropped = 0usize;
+            for line in SCRIPT.lines() {
+                let line = line.trim();
+                let Some(rest) = line.strip_prefix("serve ") else {
+                    continue;
+                };
+                let case = Case::serve(rest);
+                let fields = golden
+                    .get(&format!("SERVE {}", case.label))
+                    .unwrap_or_else(|| panic!("the golden has no line for SERVE {}", case.label));
+                cases += 1;
+                let measured = serve_case(&case, fields);
+                verdicts_differing += measured.verdict_differs;
+                answers_differing += measured.answer_differs;
+                dropped += measured.dropped;
+            }
+            assert_eq!(cases, 13, "the served cases the script names");
+            assert_eq!(
+                verdicts_differing, 4,
+                "the verdicts the two sides give differently"
+            );
+            assert_eq!(answers_differing, 6, "the answers that differ");
+            assert_eq!(dropped, 2, "the tails the reference dropped");
+        }
+
+        /// The dialled sweep: the verdict on the answer, the order the early data rides
+        /// in, the bytes of that payload, and the request the reference wrote.
+        #[test]
+        fn the_dialled_sweep_agrees_with_the_reference_on_every_answer() {
+            let golden = golden();
+            let mut cases = 0usize;
+            let mut verdicts_differing = 0usize;
+            let mut orders_differing = 0usize;
+            let mut payloads_differing = 0usize;
+            let mut request_lines = 0usize;
+            for line in SCRIPT.lines() {
+                let line = line.trim();
+                let Some(rest) = line.strip_prefix("client ") else {
+                    continue;
+                };
+                let case = Case::client(rest);
+                let fields = golden
+                    .get(&format!("CLIENT {}", case.label))
+                    .unwrap_or_else(|| panic!("the golden has no line for CLIENT {}", case.label));
+                cases += 1;
+                let measured = client_case(&case, fields);
+                verdicts_differing += measured.verdict_differs;
+                orders_differing += measured.order_differs;
+                payloads_differing += measured.payload_differs;
+                request_lines = measured.request_lines;
+            }
+            assert_eq!(cases, 9, "the dialled cases the script names");
+            assert_eq!(
+                verdicts_differing, 2,
+                "the verdicts the two sides give differently"
+            );
+            assert_eq!(orders_differing, 0, "the orders that differ");
+            assert_eq!(payloads_differing, 0, "the payloads that differ");
+            assert_eq!(request_lines, 3, "the request lines the reference adds");
+        }
+    }
 }

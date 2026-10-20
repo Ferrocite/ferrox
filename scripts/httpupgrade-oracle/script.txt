@@ -1,0 +1,130 @@
+frame len-55 0 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-56 1 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-57 2 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-58 3 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-59 4 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-60 5 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-61 6 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-62 7 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-63 8 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-64 9 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-65 10 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-66 11 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-67 12 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-68 13 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-69 14 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-70 15 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-125 70 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-126 71 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-127 72 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-128 73 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-129 74 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-130 75 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-131 76 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-253 198 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-254 199 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-255 200 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-256 201 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-257 202 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-258 203 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-259 204 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-509 454 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-510 455 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-511 456 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-512 457 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-513 458 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-514 459 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-515 460 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-1021 966 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-1022 967 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-1023 968 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-1024 969 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-1025 970 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-1026 971 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-1027 972 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-2045 1990 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-2046 1991 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-2047 1992 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-2048 1993 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-2049 1994 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-2050 1995 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-2051 1996 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-4093 4038 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-4094 4039 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-4095 4040 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-4096 4041 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-4097 4042 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-4098 4043 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-4099 4044 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-8189 8134 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-8190 8135 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-8191 8136 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-8192 8137 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-8193 8138 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-8194 8139 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-8195 8140 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-12285 12230 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-12286 12231 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-12287 12232 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-12288 12233 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-12289 12234 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-12290 12235 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-12291 12236 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-16381 16326 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-16382 16327 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-16383 16328 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-16384 16329 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-16385 16330 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-16386 16331 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-16387 16332 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-32765 32710 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-32766 32711 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-32767 32712 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-32768 32713 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-32769 32714 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-32770 32715 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-32771 32716 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-65533 65478 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-65534 65479 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-65535 65480 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-65536 65481 0 v+ crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-65537 65482 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-65538 65483 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame len-65539 65484 0 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame tail-1 0 1 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame tail-2 0 2 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame tail-3 0 3 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame tail-7 0 7 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame tail-8 0 8 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame tail-15 0 15 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame tail-16 0 16 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame tail-63 0 63 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame tail-64 0 64 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame tail-255 0 255 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame tail-256 0 256 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame tail-4095 0 4095 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame tail-4096 0 4096 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame tail-4097 0 4097 same crlf GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nX-Pad:\s
+frame lf-1 0 0 v- none GET /tunnel HTTP/1.1\nHost: oracle.example\nX-Pad:\s\n\n
+serve post-1 /tunnel oracle.example - v- POST /tunnel HTTP/1.1\r\nHost: oracle.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
+serve pct-1 /tunnel oracle.example - v- GET /tun%6Eel HTTP/1.1\r\nHost: oracle.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
+serve dup-1 /tunnel oracle.example - v- GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nConnection: Upgrade\r\nConnection: close\r\nUpgrade: websocket\r\n\r\n
+serve ok-1 /tunnel oracle.example - same GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
+serve key-1 /tunnel oracle.example - a GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nSec-WebSocket-Key: AQIDBAUGBwgJCgsMDQ4PEC==\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
+serve tail-1 /tunnel oracle.example early t GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
+serve tail-key-1 /tunnel oracle.example early a+t GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nSec-WebSocket-Key: AQIDBAUGBwgJCgsMDQ4PEC==\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
+serve path-1 /other oracle.example - same GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
+serve host-1 /tunnel other.example - v+ GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
+serve query-1 /tunnel oracle.example - same GET /tunnel?ed=2048 HTTP/1.1\r\nHost: oracle.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
+serve case-1 /tunnel oracle.example - same GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nconnection: upgrade\r\nupgrade: WebSocket\r\n\r\n
+serve noupgrade-1 /tunnel oracle.example - same GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nConnection: Upgrade\r\n\r\n
+serve noconn-1 /tunnel oracle.example - same GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nUpgrade: websocket\r\n\r\n
+client ok-1 0 /tunnel oracle.example AQIDBAUGBwgJCgsMDQ4PEC== 0 r HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
+client ok-ride-1 2048 /tunnel oracle.example AQIDBAUGBwgJCgsMDQ4PEC== 8 r HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
+client hold-1 0 /tunnel oracle.example AQIDBAUGBwgJCgsMDQ4PEC== 8 r HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
+client reason-1 0 /tunnel oracle.example AQIDBAUGBwgJCgsMDQ4PEC== 0 v+r HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
+client bare-1 0 /tunnel oracle.example AQIDBAUGBwgJCgsMDQ4PEC== 0 v+r HTTP/1.1 101\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
+client code-1 0 /tunnel oracle.example AQIDBAUGBwgJCgsMDQ4PEC== 0 r HTTP/1.1 200 OK\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
+client noconn-1 0 /tunnel oracle.example AQIDBAUGBwgJCgsMDQ4PEC== 0 r HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n\r\n
+client noupgrade-1 0 /tunnel oracle.example AQIDBAUGBwgJCgsMDQ4PEC== 0 r HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\n
+client case-1 0 /tunnel oracle.example AQIDBAUGBwgJCgsMDQ4PEC== 0 r HTTP/1.1 101 Switching Protocols\r\nconnection: upgrade\r\nupgrade: WebSocket\r\n\r\n
