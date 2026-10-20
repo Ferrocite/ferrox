@@ -2663,6 +2663,7 @@ mod tests {
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
+                quota_limit: None,
             },
         }
     }
@@ -2876,6 +2877,7 @@ pub(crate) mod loopback {
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
+                quota_limit: None,
             },
         }
     }
@@ -2936,6 +2938,7 @@ pub(crate) mod loopback {
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
+                quota_limit: None,
             },
         };
         // The v4 edge's port, which is the one that speaks.
@@ -2961,6 +2964,7 @@ pub(crate) mod loopback {
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
+                quota_limit: None,
             },
         };
         assert!(
@@ -3123,6 +3127,7 @@ pub(crate) mod loopback {
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
+                quota_limit: None,
             },
         }
     }

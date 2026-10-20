@@ -10987,6 +10987,7 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             expires_at: ferrox_core::foxy::account::jwt_expiry(&configured),
             quota_remaining: None,
             quota_reset: None,
+            quota_limit: None,
         };
         let account = foxy_account(&email, &password, &code, &pasted, link.guardian(), &roots);
         let pass = account
@@ -16842,6 +16843,7 @@ mod tests {
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
+                quota_limit: None,
             },
             edge_address: None,
             direct_ports: Vec::new(),
@@ -23372,6 +23374,7 @@ mod tests {
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
+                quota_limit: None,
             },
             edge_address: Some(edge),
             direct_ports: Vec::new(),
@@ -23469,6 +23472,7 @@ mod tests {
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
+                quota_limit: None,
             },
             edge_address: Some(edge),
             direct_ports: Vec::new(),

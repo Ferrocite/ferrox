@@ -209,6 +209,10 @@ pub struct Pass {
     pub expires_at: Option<u64>,
     pub quota_remaining: Option<u64>,
     pub quota_reset: Option<u64>,
+    /// The allowance the plane grants, when it names one: the ceiling the remaining bytes are counted
+    /// against, and the only way to tell a metered account from an unmetered one. `None` is not zero —
+    /// a plane that names no ceiling has named no ceiling, not an empty one.
+    pub quota_limit: Option<u64>,
 }
 
 impl Pass {
@@ -218,12 +222,17 @@ impl Pass {
     }
 
     /// The traffic allowance the plane named, in the one shape a caller prints: the bytes left in the
-    /// largest unit that keeps a digit, and when they come back. `None` when the plane said nothing,
-    /// which is not zero — an account whose headers name no allowance is not an account with nothing left.
+    /// largest unit that keeps a digit, what it is left of when the plane named a ceiling, and when the
+    /// bytes come back. `None` when the plane said nothing, which is not zero — an account whose headers
+    /// name no allowance is not an account with nothing left.
     #[must_use]
     pub fn allowance_line(&self) -> Option<String> {
         let left = self.quota_remaining?;
         let mut line = allowance_bytes(left);
+        if let Some(limit) = self.quota_limit {
+            line.push_str(" of ");
+            line.push_str(&allowance_bytes(limit));
+        }
         if let Some(reset) = self.quota_reset {
             line.push_str(", resets in ");
             line.push_str(&allowance_clock(reset));
@@ -515,6 +524,7 @@ mod tests {
             expires_at: None,
             quota_remaining: left,
             quota_reset: reset,
+            quota_limit: None,
         };
         assert_eq!(
             pass(Some(4_294_967_296), Some(3_600)).allowance_line(),
@@ -542,6 +552,34 @@ mod tests {
             pass(None, Some(3_600)).allowance_line(),
             None,
             "an account the plane said nothing about is not an empty one"
+        );
+    }
+
+    /// The ceiling the plane named rides with the remainder: what is left, and what it is left of. A
+    /// remainder on its own cannot be told from a spent one, and the plane that names a ceiling is
+    /// the only one that can say what the remainder is counted against.
+    #[test]
+    fn the_allowance_names_the_ceiling_it_is_left_of() {
+        let pass = |left: Option<u64>, limit: Option<u64>| Pass {
+            token: String::new(),
+            expires_at: None,
+            quota_remaining: left,
+            quota_reset: None,
+            quota_limit: limit,
+        };
+        assert_eq!(
+            pass(Some(4_294_967_296), Some(5_368_709_120)).allowance_line(),
+            Some("4.0 GiB of 5.0 GiB".to_owned())
+        );
+        assert_eq!(
+            pass(Some(0), Some(5_368_709_120)).allowance_line(),
+            Some("0 B of 5.0 GiB".to_owned()),
+            "a spent account says so next to the ceiling it spent"
+        );
+        assert_eq!(
+            pass(Some(4_294_967_296), None).allowance_line(),
+            Some("4.0 GiB".to_owned()),
+            "a plane that named no ceiling gets no ceiling claimed for it"
         );
     }
 
@@ -936,6 +974,7 @@ mod tests {
             expires_at: Some(1_000),
             quota_remaining: Some(12),
             quota_reset: Some(9),
+            quota_limit: None,
         };
         assert_eq!(pass.renews_in(0).as_secs(), 500);
         assert_eq!(pass.quota_remaining, Some(12));
