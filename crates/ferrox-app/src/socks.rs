@@ -37,6 +37,15 @@ pub(crate) struct Credential {
     pub(crate) pass: String,
 }
 
+/// The SOCKS version a session speaks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Version {
+    /// RFC 1928, with RFC 1929's credential exchange.
+    V5,
+    /// SOCKS4 and `SOCKS4a`: one request, no negotiation, a user id and no password.
+    V4,
+}
+
 impl Credential {
     /// The method this credential makes the session offer, or nothing when the
     /// credential cannot be spelled on the wire.
@@ -197,6 +206,38 @@ impl Session {
     pub(crate) fn into_stream(self) -> Connection {
         self.stream
     }
+
+    /// Open a SOCKS4 session: there is no greeting and no method to negotiate, so the
+    /// request is the first thing on the wire.
+    pub(crate) fn open4(stream: Connection) -> Self {
+        Self { stream }
+    }
+
+    /// The SOCKS4 request: the version, the command, the port, the address, the user
+    /// id, and — for a name — the name itself.
+    ///
+    /// A name rides the `SOCKS4a` form, with the `0.0.0.1` marker in the address
+    /// field, so the server resolves it and this tree's resolver never sees it. An
+    /// IPv6 address has no SOCKS4 form and is refused.
+    fn connect4(&mut self, destination: &Destination<'_>, credential: &Credential) -> Option<()> {
+        let (port, address, name) = match destination {
+            Destination::V4(octets, port) => (*port, *octets, None),
+            Destination::V6(..) => return None,
+            Destination::Name(name, port) => (*port, [0, 0, 0, 1], Some(*name)),
+        };
+        let user = credential.user.as_bytes();
+        if user.len() > socks::NAME4_MAX || name.is_some_and(|name| name.len() > socks::NAME4_MAX) {
+            return None;
+        }
+        let request = socks::request4(socks::CMD4_CONNECT, port, address, user, name);
+        self.stream.write_all(&request).ok()?;
+        let mut reply = [0u8; 8];
+        self.stream.read_exact(&mut reply).ok()?;
+        if reply[1] != socks::REPLY4_GRANTED {
+            return None;
+        }
+        Some(())
+    }
 }
 
 /// The relay a UDP association names: the address datagrams go to, and the control
@@ -224,10 +265,20 @@ pub(crate) fn connect(
     stream: Connection,
     credential: &Credential,
     destination: &Destination<'_>,
+    version: Version,
 ) -> Option<Connection> {
-    let mut session = Session::open(stream, credential)?;
-    session.connect(destination)?;
-    Some(session.into_stream())
+    match version {
+        Version::V5 => {
+            let mut session = Session::open(stream, credential)?;
+            session.connect(destination)?;
+            Some(session.into_stream())
+        }
+        Version::V4 => {
+            let mut session = Session::open4(stream);
+            session.connect4(destination, credential)?;
+            Some(session.into_stream())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -333,6 +384,88 @@ mod tests {
         session
             .connect(&Destination::V4([10, 0, 0, 1], 80))
             .expect("a granted request");
+    }
+
+    #[test]
+    fn a_socks4_session_writes_the_request_and_reads_the_reply() {
+        let credential = Credential {
+            user: "u".to_owned(),
+            pass: "p".to_owned(),
+        };
+        let (client, written) = pair(|server, seen| {
+            let mut request = [0u8; 10];
+            server.read_exact(&mut request).expect("the request");
+            seen.lock().expect("the slot").extend_from_slice(&request);
+            server
+                .write_all(&[0, 90, 0, 0, 0, 0, 0, 0])
+                .expect("the reply");
+        });
+        let mut session = Session::open4(client);
+        session
+            .connect4(&Destination::V4([10, 0, 0, 1], 80), &credential)
+            .expect("a granted request");
+        // The request is one buffer: the version, the command, the port, the address, the user id and its NUL. SOCKS4 has no password.
+        assert_eq!(
+            octets(&written, 10),
+            vec![4, 1, 0, 80, 10, 0, 0, 1, b'u', 0],
+            "the user id is the credential's name and the password is not sent"
+        );
+    }
+
+    #[test]
+    fn a_socks4a_session_names_its_destination() {
+        let (client, written) = pair(|server, seen| {
+            let mut request = [0u8; 21];
+            server.read_exact(&mut request).expect("the request");
+            seen.lock().expect("the slot").extend_from_slice(&request);
+            server
+                .write_all(&[0, 90, 0, 0, 0, 0, 0, 0])
+                .expect("the reply");
+        });
+        let mut session = Session::open4(client);
+        session
+            .connect4(
+                &Destination::Name(b"example.com", 443),
+                &Credential::default(),
+            )
+            .expect("a granted request");
+        // The address is the 0.0.0.1 marker and the name follows the user id.
+        assert_eq!(
+            octets(&written, 21),
+            vec![
+                4, 1, 1, 187, 0, 0, 0, 1, 0, b'e', b'x', b'a', b'm', b'p', b'l', b'e', b'.', b'c',
+                b'o', b'm', 0
+            ],
+            "the name rides the request instead of being resolved here"
+        );
+    }
+
+    #[test]
+    fn a_socks4_session_refuses_a_refused_request() {
+        let (client, _written) = pair(|server, _seen| {
+            let mut request = [0u8; 9];
+            server.read_exact(&mut request).expect("the request");
+            server
+                .write_all(&[0, 91, 0, 0, 0, 0, 0, 0])
+                .expect("the refusal");
+        });
+        let mut session = Session::open4(client);
+        assert!(session
+            .connect4(&Destination::V4([10, 0, 0, 1], 80), &Credential::default())
+            .is_none());
+    }
+
+    #[test]
+    fn a_socks4_session_refuses_an_address_it_cannot_carry() {
+        let (client, _written) = pair(|server, _seen| {
+            // The client refuses an IPv6 address before it writes, so the server has nothing to read.
+            let mut sink = [0u8; 1];
+            let _ = server.read(&mut sink);
+        });
+        let mut session = Session::open4(client);
+        assert!(session
+            .connect4(&Destination::V6([0; 16], 80), &Credential::default())
+            .is_none());
     }
 
     #[test]

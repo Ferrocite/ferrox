@@ -1093,11 +1093,19 @@ pub(crate) struct SocksOut {
     address: String,
     port: u16,
     credential: crate::socks::Credential,
+    version: crate::socks::Version,
 }
 
 impl SocksOut {
-    /// The lane a config names: the server's address and the credential it offers.
-    pub(crate) fn new(address: &str, port: u16, user: &str, pass: &str) -> Self {
+    /// The lane a config names: the server's address, the credential it offers, and the
+    /// version it speaks.
+    pub(crate) fn new(
+        address: &str,
+        port: u16,
+        user: &str,
+        pass: &str,
+        version: crate::socks::Version,
+    ) -> Self {
         Self {
             address: address.to_owned(),
             port,
@@ -1105,6 +1113,7 @@ impl SocksOut {
                 user: user.to_owned(),
                 pass: pass.to_owned(),
             },
+            version,
         }
     }
 }
@@ -6104,20 +6113,24 @@ fn serve_trojan_httpheader(stream: Connection, key: &[u8; 56], path: &str, freed
 }
 
 fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) {
-    let Some((cmd, asked)) = socks_target(&mut client, false, accounts) else {
+    let Some(handshake) = socks_target(&mut client, false, accounts) else {
         return;
     };
-    if cmd == 3 {
+    if handshake.cmd == 3 {
         return serve_socks_udp(client, out);
     }
     // The rules decide the lane first; a blocked flow is granted before it closes, so the front's reply is read.
-    let out = out.resolved(&asked, crate::router::Network::Tcp, Some(&client));
-    if !matches!(out, Outbound::Foxy(_) | Outbound::Veepn(_))
-        && client.write_all(Front::Socks.grant_line()).is_err()
-    {
-        return;
+    let out = out.resolved(&handshake.asked, crate::router::Network::Tcp, Some(&client));
+    if !matches!(out, Outbound::Foxy(_) | Outbound::Veepn(_)) {
+        let grant = match handshake.version {
+            crate::socks::Version::V5 => Front::Socks.grant_line(),
+            crate::socks::Version::V4 => ferrox_core::socks::grant4(),
+        };
+        if client.write_all(grant).is_err() {
+            return;
+        }
     }
-    serve_connect(client, out, &asked, Front::Socks, &[]);
+    serve_connect(client, out, &handshake.asked, Front::Socks, &[]);
 }
 
 /// The device front's relay: the front layer's own dial, with the destination the
@@ -6311,7 +6324,9 @@ fn dial_socks_client(
         },
         Destination::Name(host, port) => crate::socks::Destination::Name(host.as_bytes(), *port),
     };
-    let Some(tunnel) = crate::socks::connect(upstream, &socks.credential, &destination) else {
+    let Some(tunnel) =
+        crate::socks::connect(upstream, &socks.credential, &destination, socks.version)
+    else {
         return;
     };
     relay(client, &tunnel);
@@ -6939,7 +6954,7 @@ fn serve_mixed(client: Connection, out: &Outbound, accounts: &SocksAccounts) {
     if n == 0 {
         return;
     }
-    if first[0] == 5 {
+    if first[0] == 5 || first[0] == ferrox_core::socks::VERSION4 {
         serve_socks(client, out, accounts);
     } else {
         serve_http(client, out);
@@ -7057,6 +7072,10 @@ fn serve_socks_udp(mut client: Connection, out: &Outbound) {
 /// The control leg stays open for the association's life: dropping it ends the
 /// association, and the server stops relaying.
 fn serve_socks_udp_socks(relay: &UdpSocket, socks: &SocksOut) {
+    if socks.version == crate::socks::Version::V4 {
+        // SOCKS4 has no datagram half: the association is a SOCKS5 request.
+        return;
+    }
     let Some(server) = resolve_outbound(&socks.address, socks.port) else {
         return;
     };
@@ -10047,12 +10066,23 @@ pub(crate) fn parse_socks_udp(packet: &[u8]) -> Option<(SocketAddr, &[u8])> {
     Some((addr, &packet[4 + used..]))
 }
 
+/// The handshake a front's client made: the command, the destination, and the version
+/// the reply is written in.
+struct Handshake {
+    /// 1 for CONNECT, 3 for UDP ASSOCIATE.
+    cmd: u8,
+    /// The destination the request named.
+    asked: Destination,
+    /// The version the client spoke.
+    version: crate::socks::Version,
+}
+
 /// The handshake that keeps the client's name: resolving here hands the edge an address it cannot route.
 fn socks_target(
     client: &mut Connection,
     grant: bool,
     accounts: &SocksAccounts,
-) -> Option<(u8, Destination)> {
+) -> Option<Handshake> {
     // Bound only the greeting to a wall-clock budget, then restore the untimed relay reads behind it.
     let budget = budgets::handshake();
     let _ = client.set_read_timeout(Some(budget));
@@ -10067,7 +10097,7 @@ fn socks_request(
     grant: bool,
     until: Instant,
     accounts: &SocksAccounts,
-) -> Option<(u8, Destination)> {
+) -> Option<Handshake> {
     let mut head = [0u8; 2];
     read_exact(
         &mut HandshakeDeadline {
@@ -10077,6 +10107,15 @@ fn socks_request(
         &mut head,
     )
     .ok()?;
+    if head[0] == ferrox_core::socks::VERSION4 {
+        // SOCKS4 has no greeting: the second byte is the command.
+        let (cmd, asked) = socks4_request(client, head[1], until, accounts)?;
+        return Some(Handshake {
+            cmd,
+            asked,
+            version: crate::socks::Version::V4,
+        });
+    }
     if head[0] != 5 {
         return None;
     }
@@ -10128,7 +10167,109 @@ fn socks_request(
     if grant && req[1] == 1 && client.write_all(&foxy_socks_reply(0)).is_err() {
         return None;
     }
-    Some((req[1], target))
+    Some(Handshake {
+        cmd: req[1],
+        asked: target,
+        version: crate::socks::Version::V5,
+    })
+}
+
+/// The SOCKS4 request: the port, the address, the user id, and — for `SOCKS4a` — the
+/// name.
+///
+/// A front that asks for a credential refuses the request: SOCKS4 carries a user id
+/// and no password, so there is nothing to check a credential against. The pinned Go
+/// server refuses it the same way, and its reply is the one this writes.
+fn socks4_request(
+    client: &mut Connection,
+    cmd: u8,
+    until: Instant,
+    accounts: &SocksAccounts,
+) -> Option<(u8, Destination)> {
+    if accounts.wants_credential() || cmd != ferrox_core::socks::CMD4_CONNECT {
+        client.write_all(ferrox_core::socks::refuse4()).ok()?;
+        return None;
+    }
+    let mut head = [0u8; 6];
+    read_exact(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        &mut head,
+    )
+    .ok()?;
+    let port = u16::from_be_bytes([head[0], head[1]]);
+    let address = [head[2], head[3], head[4], head[5]];
+    let mut name = [0u8; ferrox_core::socks::NAME4_MAX];
+    // The user id: a NUL-terminated name no front here reads, so it is stepped over.
+    read_socks4_name(client, until, &mut name)?;
+    let asked = if address[0] == 0 {
+        // SOCKS4a: the name follows the user id.
+        let len = read_socks4_name(client, until, &mut name)?;
+        let text = std::str::from_utf8(&name[..len]).ok()?;
+        Destination::Name(text.to_owned(), port)
+    } else {
+        Destination::Address(SocketAddr::from((
+            std::net::IpAddr::V4(address.into()),
+            port,
+        )))
+    };
+    Some((cmd, asked))
+}
+
+/// Read a NUL-terminated name into `buf`, and return how many bytes it held.
+///
+/// The first byte is read on its own, because an empty name is one byte and a proxy
+/// client sends one; the rest is found with a peek and taken with one read, so the
+/// bytes after the name stay on the socket for the tunnel. The pinned Go reader takes
+/// a byte per call, so a name of n bytes costs it n reads.
+fn read_socks4_name(client: &mut Connection, until: Instant, buf: &mut [u8]) -> Option<usize> {
+    read_exact(
+        &mut HandshakeDeadline {
+            inner: &mut *client,
+            until,
+        },
+        &mut buf[..1],
+    )
+    .ok()?;
+    if buf[0] == 0 {
+        return Some(0);
+    }
+    let mut held = 1;
+    while held < buf.len() {
+        if Instant::now() >= until {
+            return None;
+        }
+        let peeked = client.peek(&mut buf[held..]).ok()?;
+        if peeked == 0 {
+            return None;
+        }
+        let chunk = &buf[held..held + peeked];
+        if let Some(at) = chunk.iter().position(|byte| *byte == 0) {
+            // The name ends inside the chunk: take the bytes from here to the NUL.
+            let end = held + at + 1;
+            read_exact(
+                &mut HandshakeDeadline {
+                    inner: &mut *client,
+                    until,
+                },
+                &mut buf[held..end],
+            )
+            .ok()?;
+            return Some(end - 1);
+        }
+        read_exact(
+            &mut HandshakeDeadline {
+                inner: &mut *client,
+                until,
+            },
+            &mut buf[held..held + peeked],
+        )
+        .ok()?;
+        held += peeked;
+    }
+    None
 }
 
 /// The RFC 1929 exchange: the version, the name's length, the name, the password's
@@ -11138,6 +11279,19 @@ fn find_socks_outbound(root: &Json) -> Option<SocksOut> {
         let Some(server) = server else { continue };
         let address = server.get("address").and_then(Json::as_str)?.to_owned();
         let port = server.get("port").and_then(Json::as_port)?;
+        // The version the lane speaks: `4` and `4a` are SOCKS4, `5` is SOCKS5. An unknown one is refused by name rather than spoken as the wrong protocol.
+        let version = match outbound
+            .get("settings")
+            .and_then(|settings| settings.get("version"))
+            .and_then(Json::as_str)
+        {
+            None | Some("5") => crate::socks::Version::V5,
+            Some("4" | "4a") => crate::socks::Version::V4,
+            Some(other) => {
+                eprintln!("socks outbound: version `{other}` is not carried, refused");
+                return None;
+            }
+        };
         let user = server
             .get("users")
             .and_then(Json::as_arr)
@@ -11158,7 +11312,7 @@ fn find_socks_outbound(root: &Json) -> Option<SocksOut> {
                     .or_else(|| user.get("password").and_then(Json::as_str))
             })
             .unwrap_or_default();
-        return Some(SocksOut::new(&address, port, user, pass));
+        return Some(SocksOut::new(&address, port, user, pass, version));
     }
     None
 }
@@ -11871,10 +12025,9 @@ mod tests {
             client.write_all(b"example.com").expect("names");
             client.write_all(&[0, 80]).expect("ports");
             let mut server = accepted.join().expect("accepts");
-            let (cmd, target) =
-                socks_target(&mut server, grant, &no_accounts()).expect("handshakes");
-            assert_eq!(cmd, 1);
-            assert_eq!(target.authority(), "example.com:80");
+            let handshake = socks_target(&mut server, grant, &no_accounts()).expect("handshakes");
+            assert_eq!(handshake.cmd, 1);
+            assert_eq!(handshake.asked.authority(), "example.com:80");
             let mut reply = [0u8; 2];
             client.read_exact(&mut reply).expect("selects a method");
             assert_eq!(reply, [5, 0]);
@@ -11907,9 +12060,9 @@ mod tests {
         greeting.extend([0, 80]);
         client.write_all(&greeting).expect("greets");
         let mut server = accepted.join().expect("accepts");
-        let (cmd, target) = socks_target(&mut server, true, &no_accounts()).expect("handshakes");
-        assert_eq!(cmd, 1);
-        assert_eq!(target.authority(), "example.com:80");
+        let handshake = socks_target(&mut server, true, &no_accounts()).expect("handshakes");
+        assert_eq!(handshake.cmd, 1);
+        assert_eq!(handshake.asked.authority(), "example.com:80");
         let mut reply = [0u8; 2];
         client.read_exact(&mut reply).expect("selects a method");
         assert_eq!(reply, [5, 0]);
@@ -22279,12 +22432,154 @@ mod tests {
         assert_eq!(lane.credential.pass, "Test Password");
     }
 
+    /// A SOCKS4 client that asks the front for one destination: the version, the
+    /// command, the port, the address, the user id, and — for `SOCKS4a` — the name.
+    fn socks4_ask(port: u16, destination: SocketAddr, name: Option<&str>) -> Connection {
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let mut request = vec![4, 1];
+        request.extend_from_slice(&destination.port().to_be_bytes());
+        if let Some(name) = name {
+            request.extend_from_slice(&[0, 0, 0, 1]);
+            request.push(0);
+            request.extend_from_slice(name.as_bytes());
+            request.push(0);
+        } else {
+            let std::net::IpAddr::V4(octets) = destination.ip() else {
+                panic!("SOCKS4 carries an IPv4 address");
+            };
+            request.extend_from_slice(&octets.octets());
+            request.push(0);
+        }
+        client.write_all(&request).expect("asks");
+        client
+    }
+
+    /// A socket pair with a SOCKS4 request already on the wire, so the handshake runs
+    /// on this thread and the allocation window sees it.
+    fn socks4_pair(request: &[u8]) -> (Connection, Connection) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("addr");
+        let client = std::net::TcpStream::connect(address).expect("connects");
+        let (server, _) = listener.accept().expect("accepts");
+        let mut client = Connection::from(client);
+        client.write_all(request).expect("asks");
+        (client, Connection::from(server))
+    }
+
+    /// The SOCKS4 request reaches the destination it names, and the front's answer is
+    /// the pinned Go server's own eight bytes.
+    #[test]
+    fn a_socks4_request_reaches_the_destination_it_names() {
+        let echo = echo_loop();
+        let front = socks_front_with(Outbound::Freedom);
+        let mut client = socks4_ask(
+            front,
+            format!("127.0.0.1:{echo}").parse().expect("an address"),
+            None,
+        );
+        let mut reply = [0u8; 8];
+        client.read_exact(&mut reply).expect("the reply");
+        assert_eq!(
+            reply,
+            [0, 90, 0, 0, 0, 0, 0, 0],
+            "the grant is the pinned Go server's own bytes"
+        );
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// The `SOCKS4a` request carries its name, and the front resolves it.
+    #[test]
+    fn a_socks4a_request_carries_its_name_to_the_front() {
+        let echo = echo_loop();
+        let front = socks_front_with(Outbound::Freedom);
+        let mut client = socks4_ask(
+            front,
+            format!("127.0.0.1:{echo}").parse().expect("an address"),
+            Some("127.0.0.1"),
+        );
+        let mut reply = [0u8; 8];
+        client.read_exact(&mut reply).expect("the reply");
+        assert_eq!(reply, [0, 90, 0, 0, 0, 0, 0, 0]);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// A front that asks for a credential refuses a SOCKS4 request: the protocol
+    /// carries a user id and no password, so there is nothing to check against. The
+    /// pinned Go server refuses it the same way, with the same reply.
+    #[test]
+    fn a_front_that_asks_for_a_credential_refuses_a_socks4_request() {
+        let accounts = SocksAccounts {
+            password: true,
+            pairs: vec![("Test Account".to_owned(), "Test Password".to_owned())],
+        };
+        let front = socks_front_with_accounts(Outbound::Freedom, accounts);
+        let mut client = socks4_ask(front, "127.0.0.1:80".parse().expect("an address"), None);
+        let mut reply = [0u8; 8];
+        client.read_exact(&mut reply).expect("the refusal");
+        assert_eq!(reply, [0, 91, 0, 0, 0, 0, 0, 0]);
+    }
+
+    /// The SOCKS4 handshake costs no heap buffer: the user id is stepped over and the
+    /// reply is a static array. The pinned Go server allocates a string for the user
+    /// id, one for the request header and a buffer for the reply.
+    #[test]
+    fn a_socks4_handshake_costs_no_heap_buffer() {
+        let (client, mut server) = socks4_pair(&[4, 1, 0, 80, 127, 0, 0, 1, 0]);
+        let (asked, counts) = ferrox_core::alloc_count::measure(|| {
+            socks_target(&mut server, false, &no_accounts())
+                .expect("handshakes")
+                .asked
+        });
+        assert_eq!(asked.authority(), "127.0.0.1:80");
+        assert_eq!(
+            counts.allocs, 0,
+            "the user id is stepped over, not materialised"
+        );
+        drop(client);
+    }
+
+    /// The `SOCKS4a` handshake costs one heap buffer: the name is the destination, so it
+    /// is owned once. The pinned Go server allocates it twice — once for the name it
+    /// read and once for the address it parsed.
+    #[test]
+    fn a_socks4a_handshake_costs_one_heap_buffer() {
+        let mut request = vec![4, 1, 0, 80, 0, 0, 0, 1, 0];
+        request.extend_from_slice(b"example.com\0");
+        let (client, mut server) = socks4_pair(&request);
+        let (asked, counts) = ferrox_core::alloc_count::measure(|| {
+            socks_target(&mut server, false, &no_accounts())
+                .expect("handshakes")
+                .asked
+        });
+        assert_eq!(asked.authority(), "example.com:80");
+        assert_eq!(
+            counts.allocs, 1,
+            "the name is the destination, so it is owned once"
+        );
+        drop(client);
+    }
+
     /// The SOCKS5 client lane: the greeting, the request, and the tunnel that follows.
     #[test]
     fn a_socks_client_dials_the_front_and_carries_an_echo() {
         let echo = echo_loop();
         let upstream = socks_front_with(Outbound::Freedom);
-        let lane = Outbound::Socks(SocksOut::new("127.0.0.1", upstream, "", ""));
+        let lane = Outbound::Socks(SocksOut::new(
+            "127.0.0.1",
+            upstream,
+            "",
+            "",
+            crate::socks::Version::V5,
+        ));
         let front = socks_front_with(lane);
         let mut client = socks_ask(
             front,
@@ -22311,6 +22606,7 @@ mod tests {
             upstream,
             "Test Account",
             "Test Password",
+            crate::socks::Version::V5,
         ));
         let front = socks_front_with_accounts(lane, accounts);
         let mut client = socks_ask_with_credential(
@@ -22340,7 +22636,13 @@ mod tests {
         });
         // The upstream: the socks front, whose own datagram lane carries the echo.
         let upstream = socks_front_with(Outbound::Freedom);
-        let lane = Outbound::Socks(SocksOut::new("127.0.0.1", upstream, "", ""));
+        let lane = Outbound::Socks(SocksOut::new(
+            "127.0.0.1",
+            upstream,
+            "",
+            "",
+            crate::socks::Version::V5,
+        ));
         let front = socks_front_with(lane);
         // The client: the association, then a datagram.
         let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
