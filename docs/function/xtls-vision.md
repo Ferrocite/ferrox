@@ -2,7 +2,7 @@
 
 Vision is the one framing in this tree that *stops existing*. Once the inner TLS handshake is over, the padding frames stop and the stream becomes the raw socket, so the framing's cost should be zero from that point on — not amortised, not small. Zero.
 
-The framing is: the first frame is prefixed with the 16-byte user UUID; every frame is then `command(1) | length(2) | padLength(2) | content | padding`. Commands are `0` continue, `1` end, `2` direct. Padding is zero-filled and its length comes from the same seed table Xray uses (`{900, 500, 900, 256}`), so the byte counts a DPI sees are the byte counts the reference produces. One frame carries at most 8171 content bytes — Xray's `buf.Size` of 8192 less the uuid and the header — so a longer write leaves as several frames, never as one frame the reference's reader refuses.
+The framing is: the first frame is prefixed with the 16-byte user UUID; every frame is then `command(1) | length(2) | padLength(2) | content | padding`. Commands are `0` continue, `1` end, `2` direct. Padding is zero-filled and its length comes from the same seed table Xray uses (`{900, 500, 900, 256}`); the cap that follows the seed is this tree's and not the reference's, and the difference is named below. One frame carries at most 8171 content bytes — Xray's `buf.Size` of 8192 less the uuid and the header — so a longer write leaves as several frames, never as one frame the reference's reader refuses.
 
 For eight buffers in each direction the writer and the reader run a TLS filter: `0x16 0x03` means a handshake record, `0x17 0x03 0x03` means application data, and a `0x00 0x2b 0x00 0x02 0x03 0x04` window inside a 1.3 ServerHello means the inner TLS negotiated a cipher worth switching for. Until that window closes, every buffer is framed; after it, nothing is.
 
@@ -38,6 +38,9 @@ graph TD
 | user-space-copies-per-byte-written-while-framed | 0 | ferrox-app-vision::tests::the_writer_hands_the_callers_payload_by_pointer |
 | uuid-bytes-copied-per-link | 0 | ferrox-app-vision::tests::the_writer_hands_the_uuid_by_pointer_on_the_first_frame |
 | framed-staging-buffer-bytes | 16384 | ferrox-app-vision::tests::the_framed_staging_buffers_stay_at_one_record |
+| framed-staging-bytes-held-after-the-switch | 0 | ferrox-app-vision::tests::the_framed_staging_buffers_stay_at_one_record |
+| command-bytes-validated-per-frame | 1 | ferrox-app-vision::tests::a_frame_validates_its_command_once |
+| commands-the-validator-accepts | 3 | ferrox-core-vless::tests::the_command_validator_accepts_three_commands |
 | seal-open-staging-allocations | 0 | ferrox-bench-gate-2 |
 | coalesce-segment-allocations | 0 | ferrox-core-tls::rustls_backend::tests::the_framer_path_coalesces_without_a_heap_buffer |
 <!-- counts:end -->
@@ -68,6 +71,12 @@ The two rows beside the renamed one are properly gated: both `user-space-copies-
 
 ## What we removed
 
+- **A command byte that nothing checked.** The reader took the frame's command byte as a number and compared it twice — once against zero to ask "is another frame coming", once against two to ask "does the socket go raw". The byte is now validated by `VisionCommand::from_byte`, the same validator the core's `VisionSeal`/`VisionOpen` pair uses, so the check is one named match and the reader holds a command rather than a number. It runs on every frame, so it is counted like the parser is: `a_frame_validates_its_command_once` holds the reader at one validated command byte per frame — the frames it walks, and no more — and the acceptance set is fixed by `the_command_validator_accepts_three_commands`, which holds the validator at the three commands the reference knows (`0` continue, `1` end, `2` direct) and refuses the other 253 byte values. A command the reference does not know ends the framing the way `end` does, exactly as Xray does with one it only logs.
+
+- **A recursion per frame.** The reader walked the frames in a window by calling itself for the next one, so a window that held a thousand frames cost a thousand stack frames. The walk is a loop now: a thousand frames cost a thousand steps.
+
+- **32 KiB held for the life of the connection.** The framing's window and its staging are dead the moment the switch lands — the reader reads straight into the caller's buffer and the writer writes straight to the socket — but both buffers stayed allocated until the connection closed. The switch hands them back: `the_framed_staging_buffers_stay_at_one_record` holds the window at one record while the framing lives, and at zero capacity once the switch is past, so a connection that outlives its handshake does not carry 32 KiB of staging it will never touch again.
+
 Vision was the worst-shaped carrier in this tree before the change, and the reason is worth writing down: it had **three** user-space copies per byte throughout the whole session, not only during the handshake.
 
 - **After the switch, two of the three copies are gone.** `read` used to read into a `chunk` buffer, extend `out` from it, and then copy out of `out` into the caller's buffer, on every call, forever. `read_direct` now hands the caller's buffer to the session when the framing is over, so the post-handshake steady state — which is every byte of every real connection — costs zero user-space copies. `the_framing_switch_ends_the_staging` counts staged bytes and asserts that not one byte after the switch went through a staging buffer.
@@ -93,6 +102,12 @@ Vision was the worst-shaped carrier in this tree before the change, and the reas
   What got worse is the framed pass's record count: while the framing is live, a bulk caller buffer now issues `ceil(len / 8171)` records where it used to issue one. That single record was one the pinned reader refuses, so the old cost was not a working cost; the pass runs only until the switch, and every byte after it still leaves through `write_out` unframed.
 
 What was deliberately **not** removed: the seed table and the padding itself. Padding bytes are wire bytes; making them random instead of zero would change the output, and the point of this repository is that it does not.
+
+Two more things were left, and both are named here rather than claimed as wins.
+
+- **The trailer is capped lower than the reference caps it.** The seed table is the reference's `{900, 500, 900, 256}` and the long case is the reference's `rand(0, 500) + 900 - contentLen`, but the cap that follows is not the reference's: the reference clamps the trailer to `buf.Size - 21 - contentLen` (`upstream/xray-core/proxy/proxy.go:520`, so 8171 less the content) while this tree clamps it to `BUFFER - SHORTEST_FRAME - content` (2048 less 21 less the content), because the static zero run it hands the socket is 2 KiB. The two agree while the content is under 1772 bytes, and above that the reference pads a frame by `rand(0, 256)` where this tree pads it by at most `2027 - content` — and by nothing at all past 2027. So the first paragraph's claim that the byte counts a DPI sees are the byte counts the reference produces does not hold for a frame over 1772 bytes, and the fix is a bigger zero run and the reference's cap. That fix changes the bytes on the wire, which is the one thing this repository does not trade, so it is named here and left for the slice that can weigh it.
+
+- **The framed bytes are still copied twice.** The reader stages each frame's content in a buffer of its own and then copies it into the caller's buffer, so a framed byte is written into user space twice, where the reference writes it once and Zray hands the content window over without a second copy. The staging is not a free choice: the TLS filter watches the *unframed* content of one read, which is the reference's own shape (`XtlsFilterTls` runs on the unpadded `MultiBuffer`, `upstream/xray-core/proxy/proxy.go:257`), and the content of one read is only contiguous while a buffer holds it. Removing the staging would move the filter's observation from one read's content to one frame's content, which changes when the switch lands, so the copy stays and the count `user-space-copies-per-byte-while-framed 2` stands. What the staging bought is now released at the switch rather than held for the connection's life.
 
 ## Pins
 

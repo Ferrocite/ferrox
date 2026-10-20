@@ -21,6 +21,7 @@ use crate::config::{
 use crate::json::Json;
 use ferrox_core::failure::{Failure, Kind, Ladder, Rung, Stage};
 use ferrox_core::tls::{Edges, RecordAlignment as _, Stream, TlsProvider as _};
+use ferrox_core::vless::{Flow, Target};
 
 pub(crate) fn print_version() {
     println!("ferrox-app {}", env!("CARGO_PKG_VERSION"));
@@ -1335,7 +1336,7 @@ impl std::io::Read for HandshakeDeadline<'_> {
 }
 
 /// The opening request decoded under a wall-clock budget: a peer that upgrades, connects or handshakes and then stays silent costs a thread briefly, not forever.
-fn decode_request_bounded(stream: &mut dyn Read) -> Option<([u8; 16], String, u8, SocketAddr)> {
+fn decode_request_bounded(stream: &mut dyn Read) -> Option<([u8; 16], Flow, u8, SocketAddr)> {
     let mut bounded = HandshakeDeadline {
         inner: stream,
         until: Instant::now() + budgets::handshake(),
@@ -1396,7 +1397,7 @@ fn serve_vless_raw(mut stream: Connection, id: &[u8; 16], freedom: bool) {
         return;
     }
     if cmd == 2 {
-        if !flow.is_empty() {
+        if flow != Flow::None {
             return;
         }
         return serve_vless_udp(stream, &target);
@@ -1869,7 +1870,7 @@ fn serve_vless_quic(mut stream: crate::quic::QuicStream, id: &[u8; 16], freedom:
         return;
     };
     // Streams carry TCP sessions only, never Vision framing, UDP or mux: a foreign shape closes here.
-    if got != *id || cmd != 1 || !flow.is_empty() || !freedom {
+    if got != *id || cmd != 1 || flow != Flow::None || !freedom {
         stream.close();
         return;
     }
@@ -2590,7 +2591,7 @@ fn relay_vless<S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'sta
             let _ = raw.shutdown(Shutdown::Both);
         }
     });
-    if flow == crate::vision::FLOW {
+    if flow == Flow::Vision {
         relay_stream(crate::vision::Link::new(session, raw, id), uplink, &close);
     } else {
         // No direct switch coming: the limiter stops bounding and tracking reads.
@@ -2749,12 +2750,7 @@ pub(crate) fn read_into_tail(read: &mut impl Read, buf: &mut Vec<u8>) -> std::io
 }
 
 pub(crate) fn is_timeout(error: &std::io::Error) -> bool {
-    use std::io::ErrorKind::{TimedOut, WouldBlock};
-    matches!(error.kind(), TimedOut | WouldBlock)
-        || error
-            .get_ref()
-            .and_then(|source| source.downcast_ref::<ferrox_core::tls::TlsError>())
-            .is_some_and(|mapped| matches!(mapped, ferrox_core::tls::TlsError::Timeout))
+    ferrox_core::tls::TlsError::is_timeout(error)
 }
 
 pub(crate) fn vless_header(id: &[u8; 16], cmd: u8, target: &Destination) -> Vec<u8> {
@@ -9292,16 +9288,8 @@ pub(crate) fn relay_carried<R: Read>(mut reader: R, write: &Connection, peer: &C
 }
 
 // A quiet socket is not a dead one: retry the relay's poll grain, fail only a closed stream.
-pub(crate) fn read_exact(stream: &mut dyn Read, mut buf: &mut [u8]) -> std::io::Result<()> {
-    while !buf.is_empty() {
-        match stream.read(buf) {
-            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
-            Ok(n) => buf = &mut buf[n..],
-            Err(error) if is_timeout(&error) => {}
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
+pub(crate) fn read_exact(stream: &mut dyn Read, buf: &mut [u8]) -> std::io::Result<()> {
+    ferrox_core::tls::read_exact(stream, buf)
 }
 
 pub(crate) fn header_value<'a>(head: &'a [u8], name: &str) -> Option<&'a str> {
@@ -9675,92 +9663,16 @@ pub(crate) fn read_vless_response(stream: &mut dyn Read) -> Option<()> {
 const MUX_TARGET: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 666);
 
-pub(crate) fn decode_request(stream: &mut dyn Read) -> Option<([u8; 16], String, u8, SocketAddr)> {
-    let mut head = [0u8; 18];
-    read_exact(stream, &mut head).ok()?;
-    if head[0] != 0 {
-        return None;
-    }
-    let mut id = [0u8; 16];
-    id.copy_from_slice(&head[1..17]);
-    let addons = usize::from(head[17]);
-    // The add-ons and the command byte are contiguous, and every request — a mux one included — puts its next field after the command, so this one read is always header. The addons length is a single byte, so the buffer lives on the stack.
-    let mut rest = [0u8; 256];
-    read_exact(stream, &mut rest[..=addons]).ok()?;
-    let cmd = rest[addons];
-    let flow = if addons == 0 {
-        String::new()
-    } else {
-        addons_flow(&rest[..addons])
+pub(crate) fn decode_request(stream: &mut dyn Read) -> Option<([u8; 16], Flow, u8, SocketAddr)> {
+    // One buffer holds the whole header: the parse borrows the name out of it.
+    let mut scratch = [0u8; ferrox_core::vless::REQUEST_MAX];
+    let request = ferrox_core::vless::decode_request(stream, &mut scratch)?;
+    let target = match request.target {
+        Some(Target::Ip(ip)) => SocketAddr::new(ip, request.port),
+        Some(Target::Name(host)) => resolve_endpoint(host, request.port)?,
+        None => MUX_TARGET,
     };
-    if cmd == 3 {
-        return Some((id, flow, cmd, MUX_TARGET));
-    }
-    // Port, family, and the body's first byte are the same four bytes for every family — an IPv4 or IPv6 octet, or a domain's length — so the whole address header is served by this read and one more.
-    let mut tail = [0u8; 4];
-    read_exact(stream, &mut tail).ok()?;
-    let port = u16::from_be_bytes([tail[0], tail[1]]);
-    let first = tail[3];
-    let target = match tail[2] {
-        1 => {
-            let mut octets = [first; 4];
-            read_exact(stream, &mut octets[1..]).ok()?;
-            SocketAddr::new(std::net::IpAddr::V4(octets.into()), port)
-        }
-        2 => {
-            let mut name = vec![0u8; usize::from(first)];
-            read_exact(stream, &mut name).ok()?;
-            let host = String::from_utf8(name).ok()?;
-            resolve_endpoint(&host, port)?
-        }
-        3 => {
-            let mut octets = [first; 16];
-            read_exact(stream, &mut octets[1..]).ok()?;
-            SocketAddr::new(std::net::IpAddr::V6(octets.into()), port)
-        }
-        _ => return None,
-    };
-    Some((id, flow, cmd, target))
-}
-
-fn addons_flow(body: &[u8]) -> String {
-    let mut at = 0;
-    while at < body.len() {
-        let tag = body[at];
-        at += 1;
-        let (field, wire) = (tag >> 3, tag & 0x07);
-        let Some(len) = read_varint(body, &mut at) else {
-            return String::new();
-        };
-        let len = len as usize;
-        match (field, wire) {
-            (1, 2) => {
-                return body
-                    .get(at..at.saturating_add(len))
-                    .and_then(|bytes| std::str::from_utf8(bytes).ok())
-                    .unwrap_or_default()
-                    .to_owned();
-            }
-            (0, _) | (1, 0) | (_, 2) => at += len,
-            (_, 5) => at += 4,
-            (_, 1) => at += 8,
-            _ => return String::new(),
-        }
-    }
-    String::new()
-}
-
-fn read_varint(body: &[u8], at: &mut usize) -> Option<u32> {
-    let mut word = 0u32;
-    for shift in (0..32).step_by(7) {
-        let byte = *body.get(*at)?;
-        *at += 1;
-        word |= u32::from(byte & 0x7f) << shift;
-        if byte & 0x80 == 0 {
-            return Some(word);
-        }
-    }
-    None
+    Some((request.id, request.flow, request.command, target))
 }
 
 /// The longest trojan header: key, CRLF, command, a 255-byte domain with its port, and CRLF.
@@ -13068,7 +12980,7 @@ mod tests {
             reader.write_all(&proxy).expect("writes");
             let (got, flow, cmd, decoded) = writer.join().expect("joins");
             assert_eq!(got, id);
-            assert_eq!(flow, "xtls-rprx-vision");
+            assert_eq!(flow, Flow::Vision);
             assert_eq!(cmd, 1);
             assert_eq!(decoded, target);
         }

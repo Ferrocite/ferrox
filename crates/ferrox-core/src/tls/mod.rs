@@ -94,6 +94,35 @@ impl fmt::Display for TlsError {
 
 impl std::error::Error for TlsError {}
 
+impl TlsError {
+    /// Whether an I/O error is a timeout: the socket said so, or the stack behind it did.
+    /// A `TlsError::Timeout` reaches a caller wrapped in an `io::Error` of another kind,
+    /// so the kind alone does not answer it.
+    #[must_use]
+    pub fn is_timeout(error: &std::io::Error) -> bool {
+        use std::io::ErrorKind::{TimedOut, WouldBlock};
+        matches!(error.kind(), TimedOut | WouldBlock)
+            || error
+                .get_ref()
+                .and_then(|source| source.downcast_ref::<TlsError>())
+                .is_some_and(|mapped| matches!(mapped, TlsError::Timeout))
+    }
+}
+
+/// Fills `buf` from `stream`: a `dyn Read` may answer short, and a poll quantum the
+/// socket reports as a timeout is not an answer, so the loop asks again.
+pub fn read_exact(stream: &mut dyn std::io::Read, mut buf: &mut [u8]) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match stream.read(buf) {
+            Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
+            Ok(n) => buf = &mut buf[n..],
+            Err(error) if TlsError::is_timeout(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 impl From<TlsError> for std::io::Error {
     fn from(e: TlsError) -> Self {
         std::io::Error::other(e)
