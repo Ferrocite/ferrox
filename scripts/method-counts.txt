@@ -492,3 +492,10 @@ socks credentialed-tunnels-through-the-front 1 ferrox-app-proxy::tests::a_socks_
 socks credentials-the-front-refuses 1 ferrox-app-proxy::tests::a_front_refuses_a_credential_it_does_not_know
 socks config-lanes-named 1 ferrox-app-proxy::tests::a_socks_outbound_names_its_server_and_credential
 socks pb-scenario-sides-decoded 2 ferrox-app-xray_pb::tests::a_socks_scenario_decodes_both_sides
+socks socks4-handshake-allocations 0 ferrox-app-proxy::tests::a_socks4_handshake_costs_no_heap_buffer
+socks socks4a-handshake-allocations 1 ferrox-app-proxy::tests::a_socks4a_handshake_costs_one_heap_buffer
+socks socks4-reply-bytes 8 ferrox-core-socks::tests::the_socks4_reply_is_the_bytes_the_pinned_server_writes
+socks socks4-client-request-buffers 1 ferrox-app-socks::tests::a_socks4_session_writes_the_request_and_reads_the_reply
+socks socks4a-client-request-buffers 1 ferrox-app-socks::tests::a_socks4a_session_names_its_destination
+socks socks4-requests-a-credential-front-refuses 1 ferrox-app-proxy::tests::a_front_that_asks_for_a_credential_refuses_a_socks4_request
+socks socks4-xray-scenario-tests-passing 1 scripts/run-upstream-suite.sh

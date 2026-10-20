@@ -1721,8 +1721,13 @@ mod tests {
     fn a_device_flow_leaves_through_the_socks_client_lane() {
         let echo = echo_server();
         let (asked, port) = socks_server();
-        let out =
-            crate::proxy::Outbound::Socks(crate::proxy::SocksOut::new("127.0.0.1", port, "", ""));
+        let out = crate::proxy::Outbound::Socks(crate::proxy::SocksOut::new(
+            "127.0.0.1",
+            port,
+            "",
+            "",
+            crate::socks::Version::V5,
+        ));
         let relay: Relay = Arc::new(move |conn, dest| {
             crate::proxy::serve_device_flow(conn, &out, &dest);
         });
