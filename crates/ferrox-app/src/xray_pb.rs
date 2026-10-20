@@ -776,14 +776,14 @@ fn object(pairs: Vec<(&str, Json)>) -> Json {
 }
 
 /// One protobuf message reader, walked field by field to the message's end.
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     buf: &'a [u8],
     pos: usize,
     message: &'static str,
 }
 
 impl<'a> Reader<'a> {
-    fn new(buf: &'a [u8], message: &'static str) -> Self {
+    pub(crate) fn new(buf: &'a [u8], message: &'static str) -> Self {
         Self {
             buf,
             pos: 0,
@@ -792,12 +792,12 @@ impl<'a> Reader<'a> {
     }
 
     /// Whether any bytes of the message are left, which is how a packed field's values end.
-    fn more(&self) -> bool {
+    pub(crate) fn more(&self) -> bool {
         self.pos < self.buf.len()
     }
 
     /// The next field number and wire type, or `None` at the message's end.
-    fn field(&mut self) -> Result<Option<(u64, u8)>, String> {
+    pub(crate) fn field(&mut self) -> Result<Option<(u64, u8)>, String> {
         if self.pos == self.buf.len() {
             return Ok(None);
         }
@@ -815,7 +815,7 @@ impl<'a> Reader<'a> {
         Ok(Some((field, wire)))
     }
 
-    fn varint(&mut self) -> Result<u64, String> {
+    pub(crate) fn varint(&mut self) -> Result<u64, String> {
         let mut value = 0u64;
         let mut shift = 0u32;
         loop {
@@ -838,7 +838,7 @@ impl<'a> Reader<'a> {
         }
     }
 
-    fn bytes(&mut self) -> Result<&'a [u8], String> {
+    pub(crate) fn bytes(&mut self) -> Result<&'a [u8], String> {
         let length = self.varint()?;
         let end = self
             .pos
@@ -856,6 +856,30 @@ impl<'a> Reader<'a> {
         let field = &self.buf[self.pos..end];
         self.pos = end;
         Ok(field)
+    }
+
+    /// Consumes one field this reader does not read, so a newer writer's field is skipped rather than refused.
+    pub(crate) fn skip(&mut self, wire: u8) -> Result<(), String> {
+        match wire {
+            0 => {
+                self.varint()?;
+            }
+            1 | 5 => {
+                let width = if wire == 1 { 8 } else { 4 };
+                self.pos = self
+                    .pos
+                    .checked_add(width)
+                    .filter(|end| *end <= self.buf.len())
+                    .ok_or_else(|| {
+                        format!("{}: a fixed field runs past the message", self.message)
+                    })?;
+            }
+            2 => {
+                self.bytes()?;
+            }
+            _ => return Err(format!("{}: wire type {wire} is not carried", self.message)),
+        }
+        Ok(())
     }
 
     fn refuse(&self, field: u64, wire: u8) -> String {
