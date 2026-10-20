@@ -9,8 +9,8 @@ thing that is missing, never inert rules.
 
 The asset containers are xray's protobuf `GeoSiteList` and `GeoIPList`, decoded here with the same
 field walk the rest of the tree uses for xray's wire form. `geosite:CODE@attr@attr` keeps only the
-domains that carry **all** listed attributes; codes are uppercased and attributes lowercased as the
-reference does. For addresses, a leading `!` on a rule toggles that rule's own reverse flag, twice
+domains that carry **all** listed attributes; codes are compared case-insensitively and attributes
+are lowercased as the reference does. For addresses, a leading `!` on a rule toggles that rule's own reverse flag, twice
 toggles it back, and the positive and negative subsets OR together. A family that the negative set
 never names is not matched by its reverse — the reference's `max4`/`max6` sentinel — so a v4-only
 `!geoip:test` does not match a v6 address.
@@ -52,10 +52,13 @@ the local address the inbound accepted on. An absent field matches no rule, whic
 selector from turning into an unconditional match. A rule with no effective selector is refused at
 parse time, so no rule can match every flow by accident.
 
-`AsIs` never looks a name up. `IpOnDemand` resolves on the first IP matcher the scan reaches.
-`IpIfNonMatch` runs the match once, and only if nothing matched and the destination is a name does it
-resolve and run the scan again. The literal address of an unchanged destination still short-circuits
-the lookup: a test drives both passes and counts the resolver calls.
+`AsIs` never looks a name up. `IpOnDemand` resolves on the first IP matcher the scan reaches, and the
+address test is last in a rule: a rule that already failed a source or local selector resolves
+nothing. `IpIfNonMatch` runs the match once, and only if nothing matched, the destination is a name,
+and a rule whose other selectors held still names an address set does it resolve and revisit just
+those rules. A literal destination and a table with no address rule both short-circuit the lookup:
+tests drive each path and count the resolver calls. A table that is empty is not hashed either — the
+full set is probed only when it has a member, and the suffix walk runs only over a non-empty set.
 
 ## Lanes the transport cannot route
 
@@ -84,9 +87,14 @@ agree with the fallback the association rides it. Per-destination datagram routi
 | flow-decision-allocations | 0 | ferrox-app-router::tests::a_flow_without_a_domain_matcher_allocates_nothing |
 | host-lowercase-buffers-lowercase | 0 | ferrox-app-router::tests::a_lowercase_host_matches_without_a_buffer |
 | host-lowercase-buffers-mixed-case | 1 | ferrox-app-router::tests::a_mixed_case_host_takes_one_lowercase_buffer |
+| host-lowercase-buffers-mixed-case-two-rules | 1 | ferrox-app-router::tests::a_mixed_case_host_is_lowercased_once_for_the_table |
+| host-lowercase-buffers-before-a-domain-rule | 0 | ferrox-app-router::tests::a_mixed_case_host_matched_before_a_domain_rule_is_not_lowered |
+| geosite-shared-entry-copies | 0 | ferrox-app-router::tests::a_code_named_by_two_rules_shares_its_entries |
 | literal-route-allocations | 0 | ferrox-app-proxy::tests::a_route_decision_on_a_literal_address_allocates_nothing |
 | dns-lookups-per-rule-matched-name | 0 | ferrox-app-router::tests::ip_if_non_match_resolves_only_after_no_rule_matched |
 | dns-lookups-per-unmatched-name | 1 | ferrox-app-router::tests::ip_if_non_match_resolves_only_after_no_rule_matched |
+| dns-lookups-ip-if-non-match-no-ip-rule | 0 | ferrox-app-router::tests::ip_if_non_match_does_not_resolve_without_an_ip_rule |
+| dns-lookups-ip-on-demand-source-failed | 0 | ferrox-app-router::tests::ip_on_demand_does_not_resolve_when_a_later_selector_fails |
 <!-- counts:end -->
 
 `flow-decision-allocations 0` is a rule table with no domain matcher: the scan reads ports and
@@ -95,18 +103,27 @@ as it arrived: the suffix and substring tables are stored lowercased, and a name
 lowercase is borrowed rather than copied, which is the shape almost every client sends.
 `host-lowercase-buffers-mixed-case 1` is the same match on an uppercase name, where one buffer is
 the price of the comparison; the test asserts both counts, so a copy on the common path or a second
-copy on the mixed path fails them.
+copy on the mixed path fails them. That buffer belongs to the decision, not to a rule:
+`host-lowercase-buffers-mixed-case-two-rules 1` scans two domain rules and still pays one, where a
+per-rule copy would pay two. `geosite-shared-entry-copies 0` is pointer identity between the two
+rules' entries: a code named twice stores the same `Arc<str>` twice, not two decoded strings.
+`host-lowercase-buffers-before-a-domain-rule 0` is a rule that matches on its port before any table is
+consulted: the buffer is deferred until a table needs it, not bought at the top of the decision.
 `literal-route-allocations 0` is the same claim for a routed flow on an address: the plan borrows the
 chosen outbound and the decision touches no heap. `dns-lookups-per-rule-matched-name 0` and
 `dns-lookups-per-unmatched-name 1` are the two halves of `IpIfNonMatch` — a name a rule already
 matched is never resolved, and a name no rule matched is resolved exactly once before the second
-pass.
+pass. `dns-lookups-ip-if-non-match-no-ip-rule 0` is the case the first half does not cover: no rule
+names an address set, so no address can turn the decision and the resolver is never called.
+`dns-lookups-ip-on-demand-source-failed 0` is the address test ordered last: a rule whose source
+selector already failed resolves nothing under `IPOnDemand`.
 
 What was not removed: a geosite code is expanded into the rule's sets at startup, so a rule naming a
-large code pays that memory for the life of the process; keywords build one Aho-Corasick automaton
-per rule that names them; and the rule scan is linear in the number of rules, as the reference's
-first-match pass is. The registry keeps one outbound instance per named tag and clones the default
-for its own tag, so a lane's shared state is not duplicated.
+large code pays that memory for the life of the process (the entries themselves are shared between
+rules that name the same code, but each rule keeps its own hash tables); keywords build one
+Aho-Corasick automaton per rule that names them; and the rule scan is linear in the number of rules,
+as the reference's first-match pass is. The registry keeps one outbound instance per named tag and
+clones the default for its own tag, so a lane's shared state is not duplicated.
 
 ## Time
 
