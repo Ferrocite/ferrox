@@ -1417,6 +1417,11 @@ fn run_flow(plan: &FlowPlan) -> FlowResult {
     };
     let _ = stream.set_nodelay(true);
     apply_flow_timeouts(&stream);
+    #[cfg(target_vendor = "apple")]
+    if let Err(e) = bound_flow_send(&stream) {
+        result.stopped = Some(format!("could not bound the flow's send window: {e}"));
+        return result;
+    }
     result.setup.tcp_connect_us = t0.elapsed().as_micros();
 
     let t1 = Instant::now();
@@ -1539,9 +1544,39 @@ fn exchange(plan: &FlowPlan, stream: &mut TcpStream) -> (u64, u64, Option<String
     }
 }
 
+/// A send of at most this many bytes reaches sosend's pru_send as one mbuf
+/// chain, so an ENOBUFS there appended none of the slice and a retry is exact.
+#[cfg(target_vendor = "apple")]
+const SEND_LOWAT: usize = 64 * 1024;
+
+#[cfg(target_vendor = "apple")]
+const UPLOAD_CHUNK: usize = SEND_LOWAT;
+
+#[cfg(not(target_vendor = "apple"))]
 const UPLOAD_CHUNK: usize = 1024 * 1024;
 
 const DOWNLOAD_CHUNK: usize = 64 * 1024;
+
+#[cfg(target_vendor = "apple")]
+fn bound_flow_send(stream: &TcpStream) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let lowat: libc::c_int = SEND_LOWAT.try_into().unwrap_or(libc::c_int::MAX);
+    // SAFETY: `lowat` is a live `c_int`, sized as the kernel reads the option, on the stream's own descriptor.
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDLOWAT,
+            (&raw const lowat).cast::<libc::c_void>(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
 
 fn read_validated(stream: &mut TcpStream, pattern: &[u8], bytes: u64) -> Result<u64, String> {
     let mut chunk = vec![0u8; pattern.len().clamp(1, DOWNLOAD_CHUNK)];
@@ -1625,7 +1660,7 @@ fn is_send_backpressure(e: &std::io::Error) -> bool {
     }
 }
 
-// Write `buf` in full, retrying only transient send-buffer backpressure and resetting `idle` on every byte of progress so a slow-but-live flow is never cut off while a truly wedged one still fails.
+// Write `buf` in full, retrying only transient send-buffer backpressure and resetting `idle` on every byte of progress so a slow-but-live flow is never cut off while a truly wedged one still fails. On apple `bound_flow_send` holds every slice within SO_SNDLOWAT, so a retry can only re-send bytes the kernel appended none of.
 fn write_riding_backpressure(
     stream: &mut TcpStream,
     buf: &[u8],
@@ -1678,6 +1713,7 @@ impl FlowPlan {
         while chunk.len() < UPLOAD_CHUNK {
             chunk.extend_from_slice(&self.pattern);
         }
+        chunk.truncate(UPLOAD_CHUNK);
         while *sent < self.bytes {
             if self.abort.load(Ordering::Relaxed) {
                 return Err(std::io::Error::other("the download leg ended the flow"));
@@ -1744,6 +1780,10 @@ fn spawn_sink(
                     return;
                 }
                 apply_flow_timeouts(&stream);
+                #[cfg(target_vendor = "apple")]
+                if bound_flow_send(&stream).is_err() {
+                    return;
+                }
                 if let Some(reason) = serve_flow(
                     stream,
                     &flow,
@@ -1859,10 +1899,11 @@ fn emit(
     expect: u64,
 ) -> Option<String> {
     let _ = index;
-    let mut buffer = Vec::with_capacity(64 * 1024);
-    while buffer.len() < 64 * 1024 {
+    let mut buffer = Vec::with_capacity(DOWNLOAD_CHUNK);
+    while buffer.len() < DOWNLOAD_CHUNK {
         buffer.extend_from_slice(pattern);
     }
+    buffer.truncate(DOWNLOAD_CHUNK);
     let mut sent = 0u64;
     while sent < expect {
         let take =
@@ -2152,6 +2193,8 @@ fn accept_until(listener: &TcpListener, deadline: Instant) -> Option<TcpStream> 
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).ok()?;
                 apply_flow_timeouts(&stream);
+                #[cfg(target_vendor = "apple")]
+                bound_flow_send(&stream).ok()?;
                 return Some(stream);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -2261,6 +2304,36 @@ mod tests {
         assert_eq!(
             stream.write_timeout().expect("readable"),
             Some(FLOW_IO_TIMEOUT)
+        );
+    }
+
+    /// The macos duplex desync was a retried slice the kernel had already appended
+    /// in part; a slice within `sb_lowat` is taken whole or not at all, so the armed
+    /// value is read back rather than trusting that `setsockopt` accepted it.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn an_apple_flow_arms_the_send_lowat() {
+        use std::os::fd::AsRawFd;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let stream = TcpStream::connect(addr).expect("connects");
+        bound_flow_send(&stream).expect("arms the lowat");
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `value` and `len` are live and the latter names `value`'s size, as the kernel writes them.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDLOWAT,
+                (&raw mut value).cast::<libc::c_void>(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt: {}", std::io::Error::last_os_error());
+        assert_eq!(
+            usize::try_from(value).expect("a non-negative lowat"),
+            SEND_LOWAT
         );
     }
 
@@ -2831,15 +2904,18 @@ mod tests {
             reason.contains("flow 2 upload desynced at byte 15"),
             "{reason}"
         );
-        assert_eq!(
-            *slot.lock().expect("uncontended"),
-            Some(Forged {
-                flow: 2,
-                offset: 15,
-                side: "upload",
-                detail: "expected 0x66, saw 0x7a".to_owned(),
-            }),
-            "the slot names the side and both bytes"
+        let forged = slot
+            .lock()
+            .expect("uncontended")
+            .clone()
+            .expect("a forged byte reached the slot");
+        assert_eq!(forged.flow, 2);
+        assert_eq!(forged.offset, 15);
+        assert_eq!(forged.side, "upload");
+        assert!(
+            forged.detail.starts_with("expected 0x66, saw 0x7a;"),
+            "the slot names both bytes: {}",
+            forged.detail
         );
         drop(engine);
         let _ = sink.join();
