@@ -1710,6 +1710,166 @@ mod tests {
         );
     }
 
+    /// The tun2socks shape: a device's TCP flow leaves through the SOCKS5 client
+    /// lane, and the echo comes back as IP packets on the same descriptor.
+    ///
+    /// The SOCKS5 server here answers the greeting, the `CONNECT` request and the
+    /// reply the way a SOCKS5 client writes them, and relays to the destination the
+    /// request named — so the lane cannot tell a device from a proxy client.
+    #[cfg(unix)]
+    #[test]
+    fn a_device_flow_leaves_through_the_socks_client_lane() {
+        let echo = echo_server();
+        let (asked, port) = socks_server();
+        let out =
+            crate::proxy::Outbound::Socks(crate::proxy::SocksOut::new("127.0.0.1", port, "", ""));
+        let relay: Relay = Arc::new(move |conn, dest| {
+            crate::proxy::serve_device_flow(conn, &out, &dest);
+        });
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
+        let flow = FlowSpec {
+            destination: format!("127.0.0.1:{echo}").parse().unwrap(),
+            source_port: 51002,
+            syn_seq: 8000,
+            chunks: vec![b"ping".to_vec()],
+        };
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        run_flow(&mut handler, &mut peer, &flow, &mut buf);
+
+        // The SOCKS5 server received the CONNECT for the destination the device named; the dial runs on the flow's own thread, so the record is waited for.
+        let record = Arc::clone(&asked);
+        let mut seen = Vec::new();
+        for _ in 0..2_500 {
+            seen = record
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if !seen.is_empty() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(
+            seen.as_slice(),
+            &[format!("127.0.0.1:{echo}").parse().expect("an address")],
+            "the device's destination is the one the request names"
+        );
+
+        // And the echo rides back as IP packets on the device's own descriptor.
+        let mut reply = vec![0u8; DEFAULT_MTU + 64];
+        let mut payload = Vec::new();
+        for _ in 0..500 {
+            match peer.read(&mut reply) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if let Some((_ip, body)) = ipv4_head(&reply[..n]) {
+                        if let Some((_, pl)) = tcp_head(body) {
+                            payload.extend_from_slice(pl);
+                        }
+                    }
+                    if payload.windows(4).any(|w| w == b"ping") {
+                        break;
+                    }
+                }
+                Err(ref e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::Interrupted =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            payload.windows(4).any(|w| w == b"ping"),
+            "the echo rides back as a payload"
+        );
+    }
+
+    /// A TCP echo server on loopback: the destination the device's flow names.
+    #[cfg(unix)]
+    fn echo_server() -> u16 {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            while let Ok((mut stream, _)) = listener.accept() {
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = stream.read(&mut buf) {
+                        if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        port
+    }
+
+    /// A SOCKS5 server on loopback: the greeting, the `CONNECT` request and the reply,
+    /// and then a relay to the destination the request named. The destination is kept
+    /// so a test can see what the client asked for.
+    #[cfg(unix)]
+    fn socks_server() -> (Arc<std::sync::Mutex<Vec<SocketAddr>>>, u16) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let asked: Arc<std::sync::Mutex<Vec<SocketAddr>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&asked);
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut greeting = [0u8; 3];
+            if stream.read_exact(&mut greeting).is_err() || stream.write_all(&[5, 0]).is_err() {
+                return;
+            }
+            let mut head = [0u8; 4];
+            if stream.read_exact(&mut head).is_err() {
+                return;
+            }
+            let mut body = [0u8; 6];
+            if stream.read_exact(&mut body).is_err() {
+                return;
+            }
+            let target = SocketAddr::from((
+                [body[0], body[1], body[2], body[3]],
+                u16::from_be_bytes([body[4], body[5]]),
+            ));
+            record.lock().expect("the record").push(target);
+            if stream.write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0]).is_err() {
+                return;
+            }
+            let Ok(mut upstream) = TcpStream::connect(target) else {
+                return;
+            };
+            let Ok(mut down) = stream.try_clone() else {
+                return;
+            };
+            let Ok(mut up) = upstream.try_clone() else {
+                return;
+            };
+            let mut back = stream;
+            let forward = std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while let Ok(n) = up.read(&mut buf) {
+                    if n == 0 || back.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                }
+            });
+            let mut buf = [0u8; 4096];
+            while let Ok(n) = down.read(&mut buf) {
+                if n == 0 || upstream.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+            }
+            let _ = forward.join();
+        });
+        (asked, port)
+    }
+
     /// One flow opened and then silent: SYN, the ACK read off this stack's own SYN-ACK, and nothing after.
     #[cfg(unix)]
     fn open_flow(

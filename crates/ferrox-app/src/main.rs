@@ -32,6 +32,7 @@ mod quic;
 mod router;
 mod shadowsocks;
 mod shadowsocks2022;
+mod socks;
 mod tun;
 mod veepn;
 mod vision;

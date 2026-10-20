@@ -20,6 +20,7 @@ pub mod poly1305;
 pub mod record;
 pub mod shadowsocks;
 pub mod shadowsocks2022;
+pub mod socks;
 pub mod tls;
 pub mod transport;
 pub mod veepn;
