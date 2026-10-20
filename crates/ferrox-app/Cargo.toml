@@ -13,6 +13,7 @@ workspace = true
 [dependencies]
 aes = "0.8"
 aes-gcm = "0.10"
+aho-corasick = "1"
 ferrox-core = { workspace = true }
 getrandom = "0.2"
 quiche = "0.30"

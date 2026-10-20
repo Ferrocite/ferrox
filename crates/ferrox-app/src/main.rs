@@ -29,6 +29,7 @@ mod hysteria;
 mod json;
 mod proxy;
 mod quic;
+mod router;
 mod shadowsocks;
 mod shadowsocks2022;
 mod tun;

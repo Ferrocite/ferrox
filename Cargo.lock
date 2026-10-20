@@ -430,6 +430,7 @@ version = "0.0.2"
 dependencies = [
  "aes",
  "aes-gcm",
+ "aho-corasick",
  "base64",
  "chacha20poly1305",
  "ferrox-core",

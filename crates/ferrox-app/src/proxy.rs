@@ -147,8 +147,56 @@ fn serve_root(label: &str, root: &Json) -> ! {
         }
         selected => selected,
     };
+    let routing = crate::router::Routing::parse(root)
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    let route = routing.map(|routing| {
+        route_shared(root, routing)
+            .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")))
+    });
+    let (inbounds, hysteria_served) =
+        serve_inbounds(label, root, outbound.as_ref(), route.as_ref(), freedom);
+    if inbounds == 0 {
+        exit(&format!("no servable inbound in {label}"));
+    }
+    if hysteria_served {
+        // The readiness token the pinned interop harness scans the server log for; not this binary's name.
+        println!("ferrox-app serving; harness readiness token: core: Xray 26.7.28 started");
+    }
+    loop {
+        thread::park();
+        report_dial_failures();
+    }
+}
+
+/// One inbound's lane: a route plan when the config carries rules, else the single configured outbound.
+fn routed_out(
+    outbound: Option<&Outbound>,
+    route: Option<&Arc<RouteShared>>,
+    inbound: &Json,
+    source_known: bool,
+) -> Option<Outbound> {
+    match route {
+        Some(shared) => Some(Outbound::Route(Arc::new(RoutePlan::new(
+            Arc::clone(shared),
+            inbound_tag(inbound),
+            source_known,
+        )))),
+        None => outbound.cloned(),
+    }
+}
+
+/// Opens every inbound the config names, proving each server inbound's rules at startup, and reports
+/// how many opened and whether a hysteria inbound wants the readiness token.
+fn serve_inbounds(
+    label: &str,
+    root: &Json,
+    outbound: Option<&Outbound>,
+    route: Option<&Arc<RouteShared>>,
+    freedom: bool,
+) -> (usize, bool) {
+    let routed =
+        |inbound: &Json, source_known: bool| routed_out(outbound, route, inbound, source_known);
     let mut inbounds = 0;
-    let dial = outbound.as_ref();
     let mut hysteria_served = false;
     if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
         for inbound in list {
@@ -164,6 +212,15 @@ fn serve_root(label: &str, root: &Json) -> ! {
             if !inbound_served(protocol) {
                 refuse_inbound(protocol, label, inbound);
                 continue;
+            }
+            // A server inbound dials direct, so every rule that can reach it must agree with that at startup.
+            if matches!(
+                protocol,
+                "vless" | "trojan" | "vmess" | "shadowsocks" | "hysteria"
+            ) {
+                if let Some(shared) = route {
+                    prove_server_route(shared, inbound, label);
+                }
             }
             match protocol {
                 "vless" => {
@@ -190,7 +247,7 @@ fn serve_root(label: &str, root: &Json) -> ! {
                     }
                 }
                 "socks" | "http" | "mixed" => {
-                    let Some(out) = outbound.clone() else {
+                    let Some(out) = routed(inbound, true) else {
                         continue;
                     };
                     // A front with no tcp carrier has no chain to arm, so the inbound is refused rather than served unmasked.
@@ -206,9 +263,23 @@ fn serve_root(label: &str, root: &Json) -> ! {
                     thread::spawn(move || accept_loop(&address, &role));
                     inbounds += 1;
                 }
-                "dokodemo-door" => inbounds += serve_dokodemo(&address, inbound, dial, label),
+                "dokodemo-door" => {
+                    if let Some(out) = routed(inbound, true) {
+                        inbounds += serve_dokodemo(&address, inbound, &out, label);
+                    }
+                }
                 "tun" => {
-                    let Some(out) = outbound.clone() else {
+                    // A tun flow has no source or local address, so a reaching rule that names one is refused here.
+                    if let Some(shared) = route {
+                        let tag = inbound_tag(inbound);
+                        if let Some(selector) = shared.routing.source_refusal(tag.as_deref()) {
+                            exit(&format!(
+                                "bad config {label}: tun inbound {} names `{selector}`, which a tun flow cannot answer",
+                                tag.as_deref().unwrap_or("<untagged>")
+                            ));
+                        }
+                    }
+                    let Some(out) = routed(inbound, false) else {
                         continue;
                     };
                     if serve_tun_inbound(inbound, &out, &address) {
@@ -219,17 +290,7 @@ fn serve_root(label: &str, root: &Json) -> ! {
             }
         }
     }
-    if inbounds == 0 {
-        exit(&format!("no servable inbound in {label}"));
-    }
-    if hysteria_served {
-        // The readiness token the pinned interop harness scans the server log for; not this binary's name.
-        println!("ferrox-app serving; harness readiness token: core: Xray 26.7.28 started");
-    }
-    loop {
-        thread::park();
-        report_dial_failures();
-    }
+    (inbounds, hysteria_served)
 }
 
 /// A device inbound is refused with the reason the device layer computes from the config; any other unserved inbound is refused by name.
@@ -571,6 +632,10 @@ enum Outbound {
     Veepn(crate::veepn::VeepnOut),
     Freedom,
     Http(HttpOut),
+    /// The rules choose the outbound per flow; the plan holds the registry and the fallback.
+    Route(Arc<RoutePlan>),
+    /// The rules drop the flow after the front has granted it.
+    Block,
 }
 
 impl Outbound {
@@ -582,8 +647,213 @@ impl Outbound {
             Self::Vmess(vmess) => resolve_outbound(&vmess.address, vmess.port),
             Self::Shadowsocks(ss) => resolve_outbound(&ss.address, ss.port),
             Self::Http(http) => resolve_outbound(&http.address, http.port),
-            Self::Foxy(_) | Self::Veepn(_) | Self::Freedom => None,
+            Self::Foxy(_) | Self::Veepn(_) | Self::Freedom | Self::Route(_) | Self::Block => None,
         }
+    }
+
+    /// The outbound a flow resolves to; every outbound but a route is its own answer.
+    fn resolved(
+        &self,
+        asked: &Destination,
+        network: crate::router::Network,
+        client: Option<&Connection>,
+    ) -> &Self {
+        match self {
+            Self::Route(plan) => plan.pick(asked, network, client),
+            other => other,
+        }
+    }
+}
+
+/// Routing once its assets are read: the rules, every outbound a rule names, and the first
+/// configured outbound as the fallback the reference calls its default handler.
+#[derive(Debug)]
+struct RouteShared {
+    routing: crate::router::Routing,
+    tagged: HashMap<String, Outbound>,
+    default: Outbound,
+    default_tag: Option<String>,
+}
+
+/// One inbound's view of the routes: its tag decides which rules may see a flow, and whether the
+/// transport can answer the selectors that name source and local addresses.
+#[derive(Debug, Clone)]
+struct RoutePlan {
+    shared: Arc<RouteShared>,
+    inbound_tag: Option<String>,
+    source_known: bool,
+    udp: Association,
+}
+
+/// The one decision a SOCKS association can carry: a datagram has no per-destination route here.
+#[derive(Debug, Clone)]
+enum Association {
+    Default,
+    Tag(String),
+    Split,
+}
+
+impl RoutePlan {
+    fn new(shared: Arc<RouteShared>, inbound_tag: Option<String>, source_known: bool) -> Self {
+        let udp = match shared
+            .routing
+            .udp_tag(inbound_tag.as_deref(), shared.default_tag.as_deref())
+        {
+            Ok(None) => Association::Default,
+            Ok(Some(tag)) => Association::Tag(tag.to_owned()),
+            Err(()) => Association::Split,
+        };
+        Self {
+            shared,
+            inbound_tag,
+            source_known,
+            udp,
+        }
+    }
+
+    fn target(&self, tag: &str) -> &Outbound {
+        self.shared
+            .tagged
+            .get(tag)
+            .expect("startup built every tag a rule names")
+    }
+
+    fn pick(
+        &self,
+        asked: &Destination,
+        network: crate::router::Network,
+        client: Option<&Connection>,
+    ) -> &Outbound {
+        let (domain, ip) = match asked {
+            Destination::Name(host, _) => (Some(host.as_str()), None),
+            Destination::Address(address) => (None, Some(address.ip())),
+        };
+        let (source, local) = match (self.source_known, client) {
+            (true, Some(client)) => (client.peer_addr().ok(), client.local_addr().ok()),
+            _ => (None, None),
+        };
+        let flow = crate::router::Flow {
+            network,
+            domain,
+            ip,
+            port: Some(asked.port()),
+            source,
+            local,
+            inbound_tag: self.inbound_tag.as_deref(),
+        };
+        match self.shared.routing.route(&flow) {
+            Some(tag) => self.target(tag),
+            None => &self.shared.default,
+        }
+    }
+
+    fn udp_out(&self) -> Result<&Outbound, ()> {
+        match &self.udp {
+            Association::Default => Ok(&self.shared.default),
+            Association::Tag(tag) => Ok(self.target(tag)),
+            Association::Split => Err(()),
+        }
+    }
+}
+
+/// The tag an inbound answers to, or nothing when the config leaves it unnamed.
+fn inbound_tag(inbound: &Json) -> Option<String> {
+    inbound
+        .get("tag")
+        .and_then(Json::as_str)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_owned)
+}
+
+/// The outbound one configured entry names, with the reason when this tree cannot dial it: a tag a
+/// rule can reach is built at startup, so a missing or unbuildable one stops the process, not a flow.
+fn build_outbound(config: &Json, tag: &str) -> Result<Outbound, String> {
+    let protocol = config.get("protocol").and_then(Json::as_str).unwrap_or("");
+    if protocol == "loopback" {
+        return Err(format!(
+            "outbound `{tag}` is loopback, which routing over a re-inject does not carry"
+        ));
+    }
+    if protocol == "blackhole" {
+        let response = config
+            .get("settings")
+            .and_then(|settings| settings.get("response"))
+            .and_then(Json::as_str)
+            .unwrap_or("none");
+        if !response.is_empty() && !response.eq_ignore_ascii_case("none") {
+            return Err(format!(
+                "outbound `{tag}` blackhole response `{response}` is not carried"
+            ));
+        }
+        return Ok(Outbound::Block);
+    }
+    let single = Json::Obj(vec![(
+        "outbounds".to_owned(),
+        Json::Arr(vec![config.clone()]),
+    )]);
+    find_outbound(&single)
+        .ok_or_else(|| format!("outbound `{tag}` protocol `{protocol}` is not carried"))
+}
+
+/// The routing table the inbounds share: the default is the first configured outbound, and every tag
+/// a rule names is built once here rather than per flow.
+fn route_shared(root: &Json, routing: crate::router::Routing) -> Result<Arc<RouteShared>, String> {
+    let list = root.get("outbounds").and_then(Json::as_arr).unwrap_or(&[]);
+    let Some(first) = list.first() else {
+        return Err("routing has no outbound to fall back to".into());
+    };
+    let default_tag = first
+        .get("tag")
+        .and_then(Json::as_str)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_owned);
+    let default = build_outbound(first, default_tag.as_deref().unwrap_or("<default>"))?;
+    let mut configs: HashMap<&str, &Json> = HashMap::new();
+    for outbound in list {
+        let tag = outbound.get("tag").and_then(Json::as_str).unwrap_or("");
+        if tag.is_empty() {
+            continue;
+        }
+        if configs.insert(tag, outbound).is_some() {
+            return Err(format!("outbound tag `{tag}` is named twice"));
+        }
+    }
+    let mut tagged = HashMap::new();
+    for target in routing.targets() {
+        if tagged.contains_key(target) {
+            continue;
+        }
+        if Some(target) == default_tag.as_deref() {
+            tagged.insert(target.to_owned(), default.clone());
+            continue;
+        }
+        let Some(config) = configs.get(target) else {
+            return Err(format!(
+                "routing targets `{target}`, which no outbound names"
+            ));
+        };
+        let out = build_outbound(config, target)?;
+        tagged.insert(target.to_owned(), out);
+    }
+    Ok(Arc::new(RouteShared {
+        routing,
+        tagged,
+        default,
+        default_tag,
+    }))
+}
+
+/// A server inbound dials direct, so every rule that can reach it must name a freedom outbound and
+/// the fallback must be one too; anything else refuses the start rather than serving the wrong lane.
+fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
+    let tag = inbound_tag(inbound);
+    let direct = |named: &str| matches!(shared.tagged.get(named), Some(Outbound::Freedom));
+    if let Err(error) = shared.routing.server_routes(
+        tag.as_deref(),
+        matches!(&shared.default, Outbound::Freedom),
+        direct,
+    ) {
+        exit(&format!("bad config {label}: {error}"));
     }
 }
 
@@ -866,7 +1136,8 @@ fn accept_loop(address: &str, role: &Role) {
                 Role::Http { out } => serve_http(stream, &out),
                 Role::Mixed { out } => serve_mixed(stream, &out),
                 Role::Dokodemo { out, dest } => {
-                    serve_connect(stream, &out, &dest, Front::Socks, &[]);
+                    let target = out.resolved(&dest, crate::router::Network::Tcp, Some(&stream));
+                    serve_connect(stream, target, &dest, Front::Socks, &[]);
                 }
             }
         });
@@ -3452,10 +3723,7 @@ fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
 /// Bind a dokodemo-door flow and rewrite it to the target its config names, and say how many
 /// inbounds it armed. Only the tcp flow is served; a udp-only inbound is refused by name so it
 /// never reads as a silent no-op.
-fn serve_dokodemo(address: &str, inbound: &Json, out: Option<&Outbound>, label: &str) -> usize {
-    let Some(out) = out.cloned() else {
-        return 0;
-    };
+fn serve_dokodemo(address: &str, inbound: &Json, out: &Outbound, label: &str) -> usize {
     let Some(dest) = dokodemo_target(inbound) else {
         eprintln!("dokodemo-door rewrite target unusable in {label}: refused, not served");
         return 0;
@@ -3469,7 +3737,13 @@ fn serve_dokodemo(address: &str, inbound: &Json, out: Option<&Outbound>, label: 
         eprintln!("dokodemo-door in {label} asks for a finalmask tcp chain it cannot arm");
         return 0;
     }
-    spawn_role(address, Role::Dokodemo { out, dest });
+    spawn_role(
+        address,
+        Role::Dokodemo {
+            out: out.clone(),
+            dest,
+        },
+    );
     1
 }
 
@@ -3627,7 +3901,8 @@ fn serve_tun_inbound(inbound: &Json, out: &Outbound, _address: &str) -> bool {
     };
     let outbound = out.clone();
     let relay: crate::tun::Relay = std::sync::Arc::new(move |conn, dest| {
-        serve_connect(conn, &outbound, &dest, Front::Socks, &[]);
+        let target = outbound.resolved(&dest, crate::router::Network::Tcp, Some(&conn));
+        serve_connect(conn, target, &dest, Front::Socks, &[]);
     });
     let datagram = out.clone();
     let associate: crate::tun::Associate =
@@ -5733,20 +6008,37 @@ fn serve_trojan_httpheader(stream: Connection, key: &[u8; 56], path: &str, freed
 }
 
 fn serve_socks(mut client: Connection, out: &Outbound) {
-    // Foxy and VeePN grant only after their tunnel opens; a doubled grant reads as ten bytes of tunnel data.
-    let Some((cmd, asked)) = socks_target(
-        &mut client,
-        !matches!(out, Outbound::Foxy(_) | Outbound::Veepn(_)),
-    ) else {
+    let Some((cmd, asked)) = socks_target(&mut client, false) else {
         return;
     };
     if cmd == 3 {
         return serve_socks_udp(client, out);
     }
+    // The rules decide the lane first; a blocked flow is granted before it closes, so the front's reply is read.
+    let out = out.resolved(&asked, crate::router::Network::Tcp, Some(&client));
+    if !matches!(out, Outbound::Foxy(_) | Outbound::Veepn(_))
+        && client.write_all(Front::Socks.grant_line()).is_err()
+    {
+        return;
+    }
     serve_connect(client, out, &asked, Front::Socks, &[]);
 }
 
-/// One tunnel request from either front: SOCKS or HTTP CONNECT; the Foxy lane grants after its tunnel opens.
+/// Nothing carries the destination onward, so this lane is the one that has to look it up.
+fn serve_connect_freedom(client: &Connection, asked: &Destination, prefix: &[u8]) {
+    let Some(target) = asked.socket() else {
+        return;
+    };
+    let Some(mut upstream) = dial_or_report(&target) else {
+        return;
+    };
+    if !prefix.is_empty() && upstream.write_all(prefix).is_err() {
+        return;
+    }
+    relay(client, &upstream);
+}
+
+/// One tunnel request from either front, already resolved to its lane: the Foxy lane grants after its tunnel opens.
 fn serve_connect(
     mut client: Connection,
     out: &Outbound,
@@ -5754,6 +6046,10 @@ fn serve_connect(
     front: Front,
     prefix: &[u8],
 ) {
+    // The rules dropped this flow: the front has granted it, so closing is the whole answer.
+    if matches!(out, Outbound::Block) {
+        return;
+    }
     if let Outbound::Foxy(foxy) = out {
         return serve_foxy_front(client, foxy, asked, front, prefix);
     }
@@ -5761,17 +6057,7 @@ fn serve_connect(
         return serve_veepn_front(client, lane, asked, front, prefix);
     }
     if matches!(out, Outbound::Freedom) {
-        // Nothing carries the destination onward, so this lane is the one that has to look it up.
-        let Some(target) = asked.socket() else {
-            return;
-        };
-        let Some(mut upstream) = dial_or_report(&target) else {
-            return;
-        };
-        if !prefix.is_empty() && upstream.write_all(prefix).is_err() {
-            return;
-        }
-        relay(&client, &upstream);
+        serve_connect_freedom(&client, asked, prefix);
         return;
     }
     if !prefix.is_empty() {
@@ -5882,7 +6168,11 @@ fn dial_socks_outbound(
         Outbound::Http(http) => {
             dial_http_outbound(client, server, http, target, ladder);
         }
-        Outbound::Foxy(_) | Outbound::Veepn(_) | Outbound::Freedom => {}
+        Outbound::Foxy(_)
+        | Outbound::Veepn(_)
+        | Outbound::Freedom
+        | Outbound::Route(_)
+        | Outbound::Block => {}
     }
 }
 
@@ -6480,6 +6770,7 @@ fn serve_http(mut client: Connection, out: &Outbound) {
     };
     match request {
         ProxyRequest::Connect(asked) => {
+            let out = out.resolved(&asked, crate::router::Network::Tcp, Some(&client));
             if !matches!(out, Outbound::Foxy(_) | Outbound::Veepn(_))
                 && client.write_all(Front::Http.grant_line()).is_err()
             {
@@ -6488,6 +6779,7 @@ fn serve_http(mut client: Connection, out: &Outbound) {
             serve_connect(client, out, &asked, Front::Http, &[]);
         }
         ProxyRequest::Forward(asked, origin) => {
+            let out = out.resolved(&asked, crate::router::Network::Tcp, Some(&client));
             serve_connect(client, out, &asked, Front::Http, &origin);
         }
     }
@@ -6561,6 +6853,23 @@ fn socks_udp_relay(client: &mut Connection) -> Option<UdpSocket> {
 }
 
 fn serve_socks_udp(mut client: Connection, out: &Outbound) {
+    // A datagram names its own destination, so rules that could split the association refuse it here.
+    let out = if let Outbound::Route(plan) = out {
+        if let Ok(target) = plan.udp_out() {
+            target
+        } else {
+            eprintln!("socks udp: routing rules could split this association; refused, not routed");
+            let _ = client.write_all(&foxy_socks_reply(0x07));
+            return;
+        }
+    } else {
+        out
+    };
+    // A blackhole association is the same refusal: a relay that drops every datagram reads as working.
+    if matches!(out, Outbound::Block) {
+        let _ = client.write_all(&foxy_socks_reply(0x07));
+        return;
+    }
     let Some(relay) = socks_udp_relay(&mut client) else {
         return;
     };
@@ -22840,6 +23149,184 @@ mod tests {
         let mut back = [0u8; 4];
         client.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"ping");
+    }
+
+    /// A route plan built the way `serve_root` builds it, so the tests exercise the registry and the
+    /// rule evaluation a served config uses rather than a hand-made table.
+    fn route_outbound(json: &str, tag: Option<&str>, source_known: bool) -> Outbound {
+        let root = crate::json::parse(json).expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing).expect("builds");
+        Outbound::Route(Arc::new(RoutePlan::new(
+            shared,
+            tag.map(str::to_owned),
+            source_known,
+        )))
+    }
+
+    /// One SOCKS CONNECT by name, granted; the caller writes the payload or reads the close.
+    fn socks_name_client(front_port: u16, name: &str, port: u16) -> Connection {
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        let mut request = vec![5, 1, 0, 3, name.len() as u8];
+        request.extend_from_slice(name.as_bytes());
+        request.extend_from_slice(&port.to_be_bytes());
+        client.write_all(&request).expect("connects");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0, "granted before the lane is chosen");
+        client
+    }
+
+    /// The first configured outbound is xray's default handler, and the rule's tag is the only one
+    /// that decides before it: a name rule blocks without ever resolving the name.
+    #[test]
+    fn a_domain_rule_chooses_the_lane_before_the_front_dials() {
+        let echo_port = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[{"type":"field","domain":["full:blocked.test"],"outboundTag":"block"}]}}"#;
+        let front = socks_front_with(route_outbound(config, Some("in"), true));
+        let mut blocked = socks_name_client(front, "blocked.test", echo_port);
+        let mut rest = Vec::new();
+        blocked.read_to_end(&mut rest).expect("closes");
+        assert!(rest.is_empty(), "a blocked flow carried {rest:?}");
+
+        let front = socks_front_with(route_outbound(config, Some("in"), true));
+        let mut allowed = socks_tcp_client(front, echo_port);
+        allowed.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        allowed.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// The inbound's tag is part of the flow, so two fronts on one table take different lanes.
+    #[test]
+    fn an_inbound_tag_rule_reaches_only_the_inbound_it_names() {
+        let echo_port = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[{"type":"field","inboundTag":["pinned"],"outboundTag":"block"}]}}"#;
+        let pinned = socks_front_with(route_outbound(config, Some("pinned"), true));
+        let mut blocked = socks_tcp_client(pinned, echo_port);
+        let mut buf = [0u8; 1];
+        assert_eq!(blocked.read(&mut buf).expect("closes"), 0);
+
+        let other = socks_front_with(route_outbound(config, Some("other"), true));
+        let mut allowed = socks_tcp_client(other, echo_port);
+        allowed.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        allowed.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// A datagram names its own destination, so rules that could split one association refuse it
+    /// with a reply the client can read, rather than bind a relay that would route half of it.
+    #[test]
+    fn an_association_the_rules_could_split_is_refused_before_the_relay_binds() {
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[
+                {"type":"field","domain":["full:blocked.test"],"outboundTag":"block"},
+                {"type":"field","inboundTag":["in"],"outboundTag":"direct"}]}}"#;
+        let front = socks_front_with(route_outbound(config, Some("in"), true));
+        let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0x07, "command not supported: {reply:?}");
+    }
+
+    /// A tag a rule names but no outbound carries, a tag named twice, and a blackhole mode this tree
+    /// does not write are all startup refusals: none of them becomes an inert rule or a silent drop.
+    #[test]
+    fn the_route_registry_refuses_what_it_cannot_build() {
+        let missing = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"}],
+                "routing":{"rules":[{"outboundTag":"nope","domain":["full:blocked.test"]}]}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&missing, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let error = route_shared(&missing, routing).expect_err("refused");
+        assert!(error.contains("nope"), "{error}");
+
+        let twice = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"direct","protocol":"blackhole"}],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&twice, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let error = route_shared(&twice, routing).expect_err("refused");
+        assert!(
+            error.contains("twice") || error.contains("named twice"),
+            "{error}"
+        );
+
+        let response = crate::json::parse(
+            r#"{"outbounds":[{"tag":"drop","protocol":"blackhole","settings":{"response":"http"}}],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&response, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let error = route_shared(&response, routing).expect_err("refused");
+        assert!(error.contains("http"), "{error}");
+    }
+
+    /// A decision on a literal address reads the tables and returns a borrowed lane: no buffer, no
+    /// name, no lookup. The count is a gate on the per-flow path, not on a test that re-derives it.
+    #[test]
+    fn a_route_decision_on_a_literal_address_allocates_nothing() {
+        let out = route_outbound(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+                "routing":{"rules":[{"type":"field","port":443,"ip":["198.51.100.0/24"],"outboundTag":"block"}]}}"#,
+            Some("in"),
+            true,
+        );
+        let Outbound::Route(plan) = &out else {
+            panic!("a route plan");
+        };
+        let asked = Destination::Address("198.51.100.7:443".parse().expect("addr"));
+        let (picked, counts) = ferrox_core::alloc_count::measure(|| {
+            plan.pick(&asked, crate::router::Network::Tcp, None)
+        });
+        assert!(matches!(picked, Outbound::Block), "the rule decides");
+        assert_eq!(counts.allocs, 0, "{counts:?}");
+    }
+
+    /// The fallback is the first configured outbound even when no rule names it, as the reference's
+    /// default handler is.
+    #[test]
+    fn the_first_configured_outbound_answers_unmatched_flows() {
+        let out = route_outbound(
+            r#"{"outbounds":[{"tag":"drop","protocol":"blackhole"},{"tag":"direct","protocol":"freedom"}],"routing":{}}"#,
+            None,
+            false,
+        );
+        let Outbound::Route(plan) = &out else {
+            panic!("a route plan");
+        };
+        let asked = Destination::Name("example.test".to_owned(), 80);
+        assert!(matches!(
+            plan.pick(&asked, crate::router::Network::Tcp, None),
+            Outbound::Block
+        ));
     }
 
     #[test]

@@ -452,3 +452,11 @@ http-proxy ops-retired-instructions UNBLESSED scripts/count-ops.sh
 http-proxy connect-grant-allocations 0 ferrox-app-proxy::tests::a_connect_grant_costs_no_heap_buffer
 http-proxy connect-request-allocations 0 ferrox-app-proxy::tests::the_connect_request_builds_in_one_buffer
 http-proxy forwarded-head-allocations 0 ferrox-app-proxy::tests::an_origin_form_head_reaches_the_uplink_where_it_landed
+
+# --- Routing rules and geosite/geoip -----------------------------------------
+engine-router ops-retired-instructions UNBLESSED scripts/count-ops.sh
+engine-router flow-decision-allocations 0 ferrox-app-router::tests::a_flow_without_a_domain_matcher_allocates_nothing
+engine-router host-lowercase-buffers-per-domain-match 1 ferrox-app-router::tests::a_domain_match_takes_one_lowercase_buffer
+engine-router literal-route-allocations 0 ferrox-app-proxy::tests::a_route_decision_on_a_literal_address_allocates_nothing
+engine-router dns-lookups-per-rule-matched-name 0 ferrox-app-router::tests::ip_if_non_match_resolves_only_after_no_rule_matched
+engine-router dns-lookups-per-unmatched-name 1 ferrox-app-router::tests::ip_if_non_match_resolves_only_after_no_rule_matched
