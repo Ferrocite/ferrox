@@ -10,6 +10,8 @@ The udp flow is the same rewrite with a relay in the middle. A datagram arrives 
 
 The relay's address is not enough on its own: the lane answers *the address the request came from*, so one leg per client keeps the answers apart. Each client's leg is a socket connected to the relay; the door writes the framed datagram into the leg, and a reader on the leg sends the answer back to that client.
 
+The door's own socket is bound by the front, before the inbound is armed, and the door's thread only reads from it. A datagram into a port nobody holds is answered with a refusal rather than with the door, so the port is held from the moment the config is served and a datagram that arrives before the door reads it waits in the kernel. A bind that fails leaves the udp half unarmed rather than armed and silent.
+
 ## Byte-identity
 
 The association is the protocol's own handshake, not a private one: the greeting `[5, 1, 0]`, the method reply `[5, 0]`, the `UDP ASSOCIATE` request `[5, 3, 0, 1, 0, 0, 0, 0, 0, 0]` and the ten-byte reply that names the relay. Those bytes are the pinned Go client's own — `xray-core/proxy/socks/protocol.go`'s `ClientHandshake` — and the `socks` page's byte-identity check (`ferrox-core-socks::tests::the_client_writes_the_bytes_the_pinned_go_writes`) is the checker for them.
@@ -89,6 +91,6 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 
 <!-- scope:begin -->
 - paths: -
-- symbols: serve_dokodemo_udp, dokodemo_udp_door, dokodemo_target, dokodemo_networks, udp_association, relay_leg
+- symbols: dokodemo_udp_door, dokodemo_target, dokodemo_networks, udp_association, relay_leg
 - go: ./proxy/dokodemo/...
 <!-- scope:end -->
