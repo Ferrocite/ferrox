@@ -88,3 +88,11 @@ jobs:
             cat target/bench-report.md 2>/dev/null || echo "no report"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      - name: upload the report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-report-${{ matrix.name }}-${{ github.run_id }}
+          path: target/bench-report.md
+          retention-days: 30
+          if-no-files-found: warn

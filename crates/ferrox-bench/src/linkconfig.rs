@@ -479,7 +479,7 @@ mod tests {
             .expect_err("quic is refused")
             .contains("tcp or ws"));
         let mut unsafe_fp = reality_link();
-        unsafe_fp.params.insert("fp".into(), "unsafe-chrome".into());
+        unsafe_fp.set_param("fp", "unsafe-chrome");
         assert!(engine_config(&unsafe_fp, EngineFamily::XrayCore, 10801)
             .expect_err("unsafe fp is refused")
             .contains("unsafe"));
