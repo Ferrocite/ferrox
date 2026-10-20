@@ -44,6 +44,19 @@ graph TD
 | head-tail-allocations | 0 | ferrox-app-httpupgrade::tests::the_record_head_hands_over_the_buffer_it_filled |
 | inner-reads-per-pipelined-prefix | 0 | ferrox-app-httpupgrade::tests::the_pipelined_prefix_reaches_the_reader_without_a_socket_read |
 | prefix-bytes-held-after-walk | 0 | ferrox-app-httpupgrade::tests::the_pipelined_prefix_reaches_the_reader_without_a_socket_read |
+| sweep-head-cases | 108 | ferrox-app-httpupgrade::tests::sweep::the_head_sweep_agrees_with_the_reference_on_every_length_and_split |
+| sweep-head-lengths | 93 | ferrox-app-httpupgrade::tests::sweep::the_head_sweep_agrees_with_the_reference_on_every_length_and_split |
+| sweep-head-end-offsets-that-differ | 0 | ferrox-app-httpupgrade::tests::sweep::the_head_sweep_agrees_with_the_reference_on_every_length_and_split |
+| sweep-head-verdicts-that-differ | 22 | ferrox-app-httpupgrade::tests::sweep::the_head_sweep_agrees_with_the_reference_on_every_length_and_split |
+| sweep-served-cases | 13 | ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head |
+| sweep-served-verdicts-that-differ | 4 | ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head |
+| sweep-served-answers-that-differ | 6 | ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head |
+| sweep-tails-the-reference-dropped | 2 | ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head |
+| sweep-dialled-cases | 9 | ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer |
+| sweep-dialled-verdicts-that-differ | 2 | ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer |
+| sweep-dialled-payload-orders-that-differ | 0 | ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer |
+| sweep-dialled-payload-bytes-that-differ | 0 | ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer |
+| sweep-request-header-lines-the-reference-adds-per-dial | 3 | ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer |
 <!-- counts:end -->
 
 `round-trips-per-early-dial` is witnessed on a socket against a server that answers only *after* it has read the payload: a dial that held the payload back would sit in the head read until `budgets::head_arrival()` and return no upgrade, which is exactly what it does under the length rule (red at 20.03 s). An echo test cannot see the difference — a held-back payload arrives eventually either way — and `the_early_data_rides_in_one_write_with_the_request` cannot either, because it counts writes, not the round trip between them.
@@ -51,6 +64,33 @@ graph TD
 `round-trips-per-shadowsocks-dial` is the same witness moved up to the dial: the Shadowsocks request packet is produced by the protocol, not by the carrier, so its ladder rung used to hold it back whatever the config asked for. The server is `serve_httpupgrade_answering_after_the_request`, which reads the head, blocks in a `peek` until the first byte of the request packet is there, and only then writes the `101`; with `attempt.ed` put back to `0` the test is red at **20.08 s**, and green in 0.03 s as it stands.
 
 `head-reads-per-window` is counted on `Counted` over an in-memory stream, because a loopback socket sees bytes and not the calls that carried them: the same wire through the `peek` reader costs two calls per window (`peek` to prove, `read_exact` to take), and one here. `inner-reads-per-pipelined-prefix` is the reason the read is worth making — the payload that rode in with the head reaches its caller from the buffer it already landed in, so the reader does not touch the handle behind it — and `prefix-bytes-held-after-walk` is the same test's `capacity()` assertion, that the buffer carrying the head and the tail is gone once the walk passes it. What no count here can see is the arithmetic on a head of `H` octets with `P` octets riding behind it and both arriving in one round: `peek` copied `H + P` into a stack probe and `H` again into the head buffer, then the payload was read once more, so the first bulk read cost **2H+2P** byte-copies and **three** read-family calls. The kept read costs **H+2P** copies and **one** call, and the `P` bytes of that read cost the socket nothing.
+
+## The sweep against the pinned reference
+
+The handshake is where this carrier can be wrong, and everything above it is an argument. So the argument is replaced with a differential sweep. `scripts/httpupgrade-oracle` asks the pinned xray-core — the code under `upstream/xray-core/transport/internet/httpupgrade` at the rev named in `upstream/pins.toml` — what it does with a given head, request and answer, and writes two files: the script of cases and the golden of what the reference did. `httpupgrade::tests::sweep` then replays the tree's own paths against that golden, so every number below is a comparison that runs rather than a reading of the reference's source.
+
+The script names, per case, the fields on which the two sides are known to differ, so the golden holds only what the reference did and the Rust side is told where a difference is expected; a difference in a field the script does not name fails the sweep.
+
+The golden is what the reference did at one pin, so it is re-derived when the pin moves: `./scripts/fetch-upstream.sh --only xray-core` and then, in `scripts/httpupgrade-oracle`, `go run . --cases > script.txt` and `go run . < script.txt > expected.txt`. Both files are the reference's own output at the rev in `upstream/pins.toml`, so a pin bump that changed the handshake shows up as a diff in them rather than as a sweep that quietly passes against a stale golden.
+
+The head sweep runs every length the script names — 93 of them, from 55 octets to 65 539, either side of every group boundary of both scanners (8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 12 288, 16 384, 32 768, 65 536) — and, for every head, every offset the head can be split at: every offset for a head of 4 096 octets or fewer, and either side of every 512-octet read round plus the last eight octets for a longer one. The tree's head end must not move with the split, and where both sides read the head, it must land on the octet the reference's own parser consumed. The 14 tail cases (1, 2, 3, 7, 8, 15, 16, 63, 64, 255, 256, 4095, 4096 and 4097 octets behind the terminator) and the bare-line-feed head make 108 head cases.
+
+| what | ferrox: `foxy::head_end`, a portable SWAR pass over 8-byte words — scalar on every build, no target feature and no intrinsic | xray-core at the pin: `bufio` over `net/http`'s `textproto` line reader — `bytes.IndexByte`, SIMD assembly on amd64 and arm64 | the difference the sweep measured |
+| --- | --- | --- | --- |
+| the head's end, over 93 lengths and every split offset | the octet the tree's scan returns | the octet the reference's parser consumed | 0 offsets differ (`sweep-head-end-offsets-that-differ 0`) |
+| the head a connection may send | 65 536 octets (`HEAD_LIMIT`) | 12 288 octets (`io.LimitReader`), and its parser takes a bare line feed where the tree wants CRLF | 22 of the 108 heads read differently (`sweep-head-verdicts-that-differ 22`) |
+| the served verdict, over 13 heads | `check_request`: GET, the path, and both upgrade headers | `http.ReadRequest` plus `internet.IsValidHTTPHost`: any method, the decoded path, the host, the first value of a repeated header | 4 verdicts differ (`sweep-served-verdicts-that-differ 4`) |
+| the answer the server writes | `SWITCH`: 101 and the two upgrade headers | the same, plus `Sec-Websocket-Accept` derived from the key it was given | 6 answers differ (`sweep-served-answers-that-differ 6`) |
+| the octets that arrived with the head | kept: they are the reader's own prefix | dropped: the `bufio` read-ahead is discarded | 2 tails the reference dropped (`sweep-tails-the-reference-dropped 2`) |
+| the dialled verdict, over 9 answers | `check_response`: a 12-octet status prefix and both upgrade headers | `http.ReadResponse`, which wants the whole `101 Switching Protocols` | 2 verdicts differ (`sweep-dialled-verdicts-that-differ 2`) |
+| the early payload's order and its bytes | rides in the request's write, or goes after the answer | the same two orders | 0 orders and 0 payload bytes differ |
+| the request the dial writes | five pieces, no key and no version | `req.Write`, with the key twice and the version once | 3 request lines the reference adds (`sweep-request-header-lines-the-reference-adds-per-dial 3`) |
+
+The tree dispatches to scalar against the reference's vector path on every build: `foxy::head_end` is portable integer code, so it tests eight octets per word wherever it runs, while the reference's `bytes.IndexByte` is SIMD assembly on amd64 and arm64 and a byte loop elsewhere. The sweep compares what the two decide, not how fast they decide it, so that difference is named here and is not a claim about duration — this row has no matrix scenario (**Time** below), so no duration is claimed for it at all.
+
+The material that would let a permuted implementation pass is held to the octet: the golden keeps the octet at which the reference's parser ended each head, the caller's own key verbatim in the request it wrote, the accept header the reference derived from that key (the Rust side recomputes `base64(sha1(key + GUID))` and compares the bytes), the early payload as distinct octets (`a0`…`a7`) in the order they arrived, and the request's own line order. A scan that moved, a key that was permuted, a payload that was reordered or a request whose pieces were swapped all fail the sweep: moving the head end by one octet fails the head sweep, and permuting the request's pieces fails the dialled one.
+
+What the sweep does **not** claim: that the two sides are interchangeable. They are not, and the divergences above are the list. The tree's stricter rules (GET only, the raw path, the last value of a repeated header) and the reference's (any method, the decoded path, the first value, the host check) are both live, and a peer that satisfies one need not satisfy the other. The reference's own limit is the one that bites in production: a head above 12 288 octets is read by this tree and refused by the reference, and the reference's `bufio` discards the octets that came in with the head, where this tree hands them to its reader as the prefix it already holds.
 
 ## Ops
 
@@ -109,13 +149,15 @@ Each of the four kinds this row was hunted for is resolved, and the residue is n
 | 19-line pass-through, `bufio` handshake | `upstream/xray-core/transport/internet/httpupgrade/` |
 | `buf.NewSize(Buffered())` to preserve coalesced bytes | `upstream/sing-box` → `transport/v2rayhttpupgrade/server.go` |
 | `scanned` cursor, `PrefixedStream` | `upstream/zeronet/crates/zero-transport/src/httpupgrade.rs` |
+| the oracle that produced the script and the golden | `scripts/httpupgrade-oracle/main.go` |
+| the pin the golden was recorded at | `upstream/pins.toml`, `[sources.xray-core]` |
 
 ## CI scope
 
 What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
 
 <!-- scope:begin -->
-- paths: crates/ferrox-app/src/httpupgrade.rs
+- paths: crates/ferrox-app/src/httpupgrade.rs, scripts/httpupgrade-oracle/*
 - symbols: httpupgrade
 - oracle: http_upgrade, httpupgrade
 - go: ./transport/internet/httpupgrade/...
