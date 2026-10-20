@@ -13,6 +13,11 @@
 //!
 //! The datagram frame is RFC 1928's: two reserved bytes, a fragment byte, then the
 //! destination address and port, then the payload.
+//!
+//! The SOCKS4 half is here too: the reply a front writes (`[0, 90, 0, 0, 0, 0, 0, 0]`
+//! granted, `[0, 91, ...]` refused — the pinned Go server's own bytes) and the request a
+//! client sends (the version, the command, the port, the address, the user id and, for
+//! `SOCKS4a`, the name).
 
 /// The protocol version every byte of this module carries.
 pub const VERSION: u8 = 5;
@@ -36,6 +41,25 @@ pub const METHOD_USER: u8 = 0x02;
 
 /// The RFC 1929 sub-negotiation version byte.
 pub const AUTH_VERSION: u8 = 0x01;
+
+/// The SOCKS4 version byte.
+pub const VERSION4: u8 = 4;
+
+/// The SOCKS4 command byte: connect a TCP stream to the named destination.
+pub const CMD4_CONNECT: u8 = 0x01;
+
+/// The SOCKS4 reply code: the request was granted.
+pub const REPLY4_GRANTED: u8 = 90;
+
+/// The SOCKS4 reply code: the request was rejected.
+pub const REPLY4_REJECTED: u8 = 91;
+
+/// The longest name a SOCKS4 request may carry: the user id, or the domain of a
+/// `SOCKS4a` request.
+///
+/// The bound is the pinned Go reader's: a name that does not end inside it is a
+/// refused request, not a longer one.
+pub const NAME4_MAX: usize = 255;
 
 /// The address a request names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,7 +218,42 @@ impl Bound<'_> {
     }
 }
 
-/// The reply a server answers a request with: the status byte and the bound address.
+/// The reply a SOCKS4 front writes when it grants the request: the version byte is
+/// zero, the code, then the port and the address — both zero, the way the pinned Go
+/// server writes them (`net.AnyIP` and port 0).
+#[must_use]
+pub fn grant4() -> &'static [u8] {
+    &[0, REPLY4_GRANTED, 0, 0, 0, 0, 0, 0]
+}
+
+/// The reply a SOCKS4 front writes when it refuses the request.
+#[must_use]
+pub fn refuse4() -> &'static [u8] {
+    &[0, REPLY4_REJECTED, 0, 0, 0, 0, 0, 0]
+}
+
+/// The request a SOCKS4 client sends: the version, the command, the port, the address,
+/// the user id and its NUL — and, for `SOCKS4a`, the name and its NUL.
+///
+/// The address of a `SOCKS4a` request is the marker `0.0.0.1`: the first byte zero is
+/// what tells the server a name follows. One buffer carries the whole request.
+#[must_use]
+pub fn request4(cmd: u8, port: u16, address: [u8; 4], user: &[u8], name: Option<&[u8]>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(9 + user.len() + name.map_or(0, <[u8]>::len));
+    out.push(VERSION4);
+    out.push(cmd);
+    out.extend_from_slice(&port.to_be_bytes());
+    out.extend_from_slice(&address);
+    out.extend_from_slice(user);
+    out.push(0);
+    if let Some(name) = name {
+        out.extend_from_slice(name);
+        out.push(0);
+    }
+    out
+}
+
+/// The RFC 1928 reply: the version, the status, the reserved byte, and the bound address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Reply<'a> {
     /// The status byte. Zero is success.
@@ -388,6 +447,37 @@ mod tests {
             }
         }
         assert_eq!(lines.join("\n") + "\n", expected);
+    }
+
+    #[test]
+    fn the_socks4_request_is_the_bytes_the_pinned_writer_writes() {
+        // `xray-core`'s SOCKS4 server reads the version, the command, the port, the address and the user id; `SOCKS4a` adds the name after the user id.
+        let request = request4(CMD4_CONNECT, 80, [127, 0, 0, 1], b"", None);
+        assert_eq!(
+            request,
+            vec![4, 1, 0, 80, 127, 0, 0, 1, 0],
+            "the version, the command, the port, the address and the user id's NUL"
+        );
+        let with_name = request4(
+            CMD4_CONNECT,
+            80,
+            [0, 0, 0, 1],
+            b"user",
+            Some(b"example.com"),
+        );
+        assert_eq!(
+            &with_name[..8],
+            &[4, 1, 0, 80, 0, 0, 0, 1],
+            "the address of a SOCKS4a request is the 0.0.0.1 marker"
+        );
+        assert_eq!(&with_name[8..], b"user\0example.com\0");
+    }
+
+    #[test]
+    fn the_socks4_reply_is_the_bytes_the_pinned_server_writes() {
+        // `writeSocks4Response` writes the version byte zero, the code, the port and the address — `net.AnyIP` and port 0, both zero.
+        assert_eq!(grant4(), &[0, 90, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(refuse4(), &[0, 91, 0, 0, 0, 0, 0, 0]);
     }
 
     #[test]

@@ -81,7 +81,7 @@ printf '%s %s %s %s\n' '<doc>' '<key>' '<value>' '<checker>' >> scripts/method-c
 | Hysteria v2 | [carrier-hysteria](docs/function/carrier-hysteria.md) | 1 handshake per pooled outbound | 0 extra on datagram lane | `UNBLESSED` | not measured |
 | REALITY / TLS | [reality-tls](docs/function/reality-tls.md) | per handshake | per handshake | `UNBLESSED` | not measured |
 | KCP | [kcp](docs/function/kcp.md) | 1 sendto per segment | in place, pooled | `UNBLESSED` | not measured |
-| SOCKS5, both roles | [socks](docs/function/socks.md) | 3 writes + 4 reads per dial | 1 (the relay's own) | `UNBLESSED` | not measured |
+| SOCKS5 + SOCKS4, both roles | [socks](docs/function/socks.md) | 3 writes + 4 reads per dial | 1 (the relay's own) | `UNBLESSED` | not measured |
 
 `ops` and `time` are `UNBLESSED`/not measured on every row — the honest state. `scripts/expected-ops.txt` blesses exactly one symbol (`der_to_pem 2653`, a PEM helper); `scripts/method-ops.txt` is the open list that `ops.yml` measures into the `method-ops` artefact. Every duration comes from a named CI runner (`bench.yml`, `parity.yml`, `compare.yml`, `speedtest.yml`, `benchmark-matrix.yml`); no page quotes one off a laptop behind a VPN.
 

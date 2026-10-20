@@ -13,7 +13,9 @@ files = subprocess.run(
     capture_output=True, text=True, check=True).stdout.split()
 ip = re.compile(r"([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})")
 def allowed(a, b, c, d):
-    if (a, b, c, d) == (0, 0, 0, 0) or (a, b, c, d) == (255, 255, 255, 255):
+    if (a, b, c, d) == (0, 0, 0, 0) or (a, b, c, d) == (0, 0, 0, 1) or (a, b, c, d) == (255, 255, 255, 255):
+        # 0.0.0.0 is "this network" and 0.0.0.1 is the SOCKS4a marker a client
+        # puts in the address field to say a name follows; neither is routable.
         return True
     if a == 127 or a == 10:
         return True
