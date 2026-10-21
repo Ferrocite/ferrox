@@ -31,6 +31,8 @@ A body is the single fenced `text` block in the section — a second fenced bloc
 
 `next` picks the first row of the template's target class the ledger (`.ferrox/slices.log`) has not served to *this* template, records it, and renders the body. Calling `next` again moves on. For `open` templates the candidates are ordered nearness-to-done: a row that already links a method page goes before a `planned` greenfield one, because finishing the missing half of something already on the wire is the cheapest parity win. `implemented` and `all` templates are offered in plain matrix order.
 
+A row can also be named by hand — `--row A13` for its key, `--row 13` for its number, `--row quic` for part of its method name — and `rows` lists the matrix. A template draws only a row of its own class, so an open template refuses a shipped row and names the templates that take it.
+
 A row's verdict is read from its state cell alone: `implemented`, `in tree`, or `both roles` with no `planned`/`not carried`/`not parsed`/`refused` negation beside it. Everything else is open, including a half-role. Neighbouring columns never flip a verdict.
 
 Add-ons are one line each: `**Add-on — <slug>:** <extra instruction>`. Paths under `upstream/<name>/` are pinned reading copies fetched by `scripts/fetch-upstream.sh`; they never appear in `**Touches:**` and are never committed. `{references}` is drawn per row from that pin file — every `always` pin, plus every pin the row's own line names or hits one of its `topics` keywords, so a QUIC row asks for quiche and an unrelated row does not, with the whole list as the fallback when nothing matches — which keeps "compare against the best implementation" reading the pins rather than a hand-kept sentence.

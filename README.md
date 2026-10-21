@@ -317,9 +317,10 @@ The roadmap is `crates/ferrox-prompt/prompts.md`: reusable templates, each fille
 cargo run -p ferrox-prompt -- next        # the slice, the reason, prompt → clipboard
 cargo run -p ferrox-prompt -- list        # roadmap progress and what is ready now
 cargo run -p ferrox-prompt -- check       # is the library still coherent?
+cargo run -p ferrox-prompt -- rows        # the matrix rows a slice can be about
 ```
 
-`next` records each (template, matrix row) pair in `.ferrox/slices.log` and points the same template at the next outstanding row, walking the matrix toward completeness. Each handout names the worktree the slice runs in; create it with `scripts/new-worktree.sh`. Pinned checkouts under `upstream/` are for reading only; a duration is evidence only from a named runner.
+`next` records each (template, matrix row) pair in `.ferrox/slices.log` and points the same template at the next outstanding row, walking the matrix toward completeness. A row can also be picked by hand: `render 1 --row A13` renders one template for one row, and `next --row A13` lets the advisor choose the template that draws it. Each handout names the worktree the slice runs in; create it with `scripts/new-worktree.sh`. Pinned checkouts under `upstream/` are for reading only; a duration is evidence only from a named runner.
 
 ## Contributing
 

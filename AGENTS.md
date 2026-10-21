@@ -65,7 +65,10 @@ The roadmap is `crates/ferrox-prompt/prompts.md`: reusable templates, not one ha
 cargo run -p ferrox-prompt -- next        # the slice, the reason, prompt → clipboard
 cargo run -p ferrox-prompt -- list        # roadmap progress and what is ready now
 cargo run -p ferrox-prompt -- check       # is the library still coherent?
+cargo run -p ferrox-prompt -- rows        # the matrix rows a slice can be about
 ```
+
+A row can also be picked by hand: `render <id> --row A13` renders one template for one row, `next --row A13` lets the advisor choose the template that draws it, and a template refuses a row outside its own `**Targets:**` class rather than doing the wrong work.
 
 Status is the only field to edit, and a slice is `done` when its gates are green, not when its diff looks finished.
 
