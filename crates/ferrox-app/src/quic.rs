@@ -2536,6 +2536,14 @@ impl Write for QuicStream {
     }
 }
 
+impl crate::proxy::Duplicate for QuicStream {
+    /// Two handles of one stream: the clone shares the connection and the id and costs no
+    /// syscall, and neither half holds a lock across the wait the other direction wants.
+    fn duplicate(&self) -> Option<Self> {
+        Some(self.clone())
+    }
+}
+
 impl QuicStream {
     /// One send flight without holding the lock across the wait behind it.
     fn send_once(&mut self, buf: &[u8]) -> std::io::Result<usize> {
