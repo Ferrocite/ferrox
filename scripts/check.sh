@@ -31,6 +31,9 @@ step "merge markers"
 step "cli arguments"
 python3 scripts/check-cli-args.py
 
+step "cli lane report"
+python3 scripts/check-cli-lane.py
+
 step "fixture safety"
 ./scripts/check-fixture-safety.sh
 
