@@ -16,18 +16,40 @@ const OP_PING: u8 = 0x09;
 const OP_PONG: u8 = 0x0A;
 const CLOSE_BODY: [u8; 2] = [0x03, 0xE8];
 
-fn accept_key(key: &str) -> String {
+/// The accept key the server answers with: twenty-eight bytes of base64, on the stack.
+fn accept_key(key: &str) -> [u8; ACCEPT_LEN] {
     use sha1::Digest as _;
     let mut hash = sha1::Sha1::new();
     hash.update(key.trim().as_bytes());
     hash.update(GUID.as_bytes());
-    ferrox_core::b64::encode(&hash.finalize())
+    let digest = hash.finalize();
+    let mut out = [0u8; ACCEPT_LEN];
+    let written = ferrox_core::b64::encode_parts_into(&[&digest], &mut out)
+        .expect("the digest's window is long enough");
+    debug_assert_eq!(written, ACCEPT_LEN);
+    out
 }
 
-fn fresh_key() -> Option<String> {
+/// The key the client asks with: twenty-four bytes of base64, on the stack.
+fn fresh_key() -> Option<[u8; KEY_LEN]> {
     let mut raw = [0u8; 16];
     getrandom::getrandom(&mut raw).ok()?;
-    Some(ferrox_core::b64::encode(&raw))
+    let mut out = [0u8; KEY_LEN];
+    let written = ferrox_core::b64::encode_parts_into(&[&raw], &mut out)
+        .expect("the key's window is long enough");
+    debug_assert_eq!(written, KEY_LEN);
+    Some(out)
+}
+
+/// The base64 of a twenty-byte digest.
+const ACCEPT_LEN: usize = 28;
+/// The base64 of sixteen random bytes.
+const KEY_LEN: usize = 24;
+
+/// The base64 alphabet is ASCII, so a coded key is text: the head that carries it is a
+/// `String` and this is the one conversion that says so.
+fn base64_text(key: &[u8]) -> &str {
+    std::str::from_utf8(key).expect("the base64 alphabet is ASCII")
 }
 
 /// The pass width the `avx2` rung takes: four bytes of mask times eight, so the narrow ladder it hands the remainder to starts a payload phase at zero.
@@ -519,7 +541,7 @@ pub(crate) fn accept(stream: Connection, path: &str) -> Option<(WsReader, WsWrit
         early,
     } = check_request(&head[..at], path)?;
     let response = accept_response(key, offered, !early.is_empty());
-    read.write_all(response.as_bytes()).ok()?;
+    read.write_all(&response).ok()?;
     split(read, early, head, at, false)
 }
 
@@ -552,7 +574,7 @@ fn check_request<'a>(head: &'a [u8], path: &str) -> Option<Upgrade<'a>> {
 }
 
 /// The `101` in its exact length: the accept key, and the offered subprotocol echoed back when the head carried early data.
-fn accept_response(key: &str, offered: &str, echo: bool) -> String {
+fn accept_response(key: &str, offered: &str, echo: bool) -> Vec<u8> {
     const HEAD: &str = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ";
     const PROTOCOL: &str = "Sec-WebSocket-Protocol: ";
     let accept = accept_key(key);
@@ -561,16 +583,16 @@ fn accept_response(key: &str, offered: &str, echo: bool) -> String {
     } else {
         0
     };
-    let mut response = String::with_capacity(HEAD.len() + accept.len() + echoed + 4);
-    response.push_str(HEAD);
-    response.push_str(&accept);
-    response.push_str("\r\n");
+    let mut response = Vec::with_capacity(HEAD.len() + accept.len() + echoed + 4);
+    response.extend_from_slice(HEAD.as_bytes());
+    response.extend_from_slice(&accept);
+    response.extend_from_slice(b"\r\n");
     if echo {
-        response.push_str(PROTOCOL);
-        response.push_str(offered);
-        response.push_str("\r\n");
+        response.extend_from_slice(PROTOCOL.as_bytes());
+        response.extend_from_slice(offered.as_bytes());
+        response.extend_from_slice(b"\r\n");
     }
-    response.push_str("\r\n");
+    response.extend_from_slice(b"\r\n");
     response
 }
 
@@ -588,7 +610,7 @@ pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
         early,
     } = check_request(&head[..at], path)?;
     let response = accept_response(key, offered, !early.is_empty());
-    write.write_all(response.as_bytes()).ok()?;
+    write.write_all(&response).ok()?;
     Some(split_halves(read, write, early, head, at, false))
 }
 
@@ -613,12 +635,13 @@ pub(crate) fn connect(
     Some((reader, writer))
 }
 
-fn check_response(head: &[u8], key: &str) -> Option<()> {
+fn check_response(head: &[u8], key: &[u8]) -> Option<()> {
     let text = std::str::from_utf8(head).ok()?;
     if text.split("\r\n").next()?.split(' ').nth(1)? != "101" {
         return None;
     }
-    if crate::proxy::header_value_in(text, "sec-websocket-accept")? != accept_key(key) {
+    let accept = accept_key(base64_text(key));
+    if crate::proxy::header_value_in(text, "sec-websocket-accept")?.as_bytes() != accept {
         return None;
     }
     Some(())
@@ -646,7 +669,7 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     Some((reader, writer))
 }
 
-fn request(host: &str, path: &str, key: &str, budget: u32, first: &[u8]) -> (String, bool) {
+fn request(host: &str, path: &str, key: &[u8], budget: u32, first: &[u8]) -> (String, bool) {
     const OPEN: &str = "GET ";
     const MIDDLE: &str = " HTTP/1.1\r\nHost: ";
     const KEYS: &str = "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ";
@@ -667,7 +690,7 @@ fn request(host: &str, path: &str, key: &str, budget: u32, first: &[u8]) -> (Str
     request.push_str(MIDDLE);
     request.push_str(host);
     request.push_str(KEYS);
-    request.push_str(key);
+    request.push_str(base64_text(key));
     request.push_str(VERSION);
     if early {
         request.push_str("\r\n");
@@ -736,10 +759,23 @@ mod tests {
     use ferrox_core::transport::EarlyData;
     use std::thread;
 
+    /// The two keys are the base64 of a digest and of sixteen random bytes, and neither
+    /// leaves the heap: the counting allocator is the witness.
+    #[test]
+    fn the_keys_are_not_allocated() {
+        let (accept, counts) =
+            ferrox_core::alloc_count::measure(|| accept_key("dGhlIHNhbXBsZSBub25jZQ=="));
+        assert_eq!(counts.allocs, 0, "the accept key is on the stack");
+        assert_eq!(base64_text(&accept), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+        let (key, counts) = ferrox_core::alloc_count::measure(|| fresh_key().expect("a key"));
+        assert_eq!(counts.allocs, 0, "the fresh key is on the stack");
+        assert_eq!(key.len(), KEY_LEN, "and it is a whole key");
+    }
+
     #[test]
     fn accept_matches_the_rfc_example() {
         assert_eq!(
-            accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            base64_text(&accept_key("dGhlIHNhbXBsZSBub25jZQ==")),
             "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
         );
     }
@@ -1028,13 +1064,17 @@ mod tests {
 
     #[test]
     fn early_data_adds_one_line_and_truncates_nothing() {
-        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let key = fresh_key().expect("a key");
         let prefix = format!(
             "GET /tunnel HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n\
-             Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
+             Connection: Upgrade\r\nSec-WebSocket-Key: {}\r\nSec-WebSocket-Version: 13\r\n",
+            base64_text(&key)
         );
         let plain = format!("{prefix}\r\n");
-        assert_eq!(request("example.com", "/tunnel", key, 0, b"hello").0, plain);
+        assert_eq!(
+            request("example.com", "/tunnel", &key, 0, b"hello").0,
+            plain
+        );
         for (payload, budget, rides) in [
             (&b"hello"[..], 5u32, true),
             (&b"hello"[..], 4, false),
@@ -1043,7 +1083,7 @@ mod tests {
             (&b"hi"[..], 2, true),
             (&b"hi"[..], 1, false),
         ] {
-            let (got, early) = request("example.com", "/tunnel", key, budget, payload);
+            let (got, early) = request("example.com", "/tunnel", &key, budget, payload);
             assert_eq!(early, rides, "{payload:?} at {budget}");
             if !rides {
                 assert_eq!(got, plain, "{payload:?} at {budget}: no line at all");
@@ -1063,11 +1103,11 @@ mod tests {
     /// The request is filled into a buffer opened to its own length, so no head is copied into a grown one — over the lengths that are not a multiple of three and over both sides of the budget.
     #[test]
     fn the_request_is_sized_for_its_bytes() {
-        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let key = fresh_key().expect("a key");
         for len in [0usize, 1, 2, 3, 191, 192, 193, 2047, 2048] {
             let payload: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(61)).collect();
             for budget in [0u32, 1, len as u32, len as u32 + 1] {
-                let (got, _) = request("example.com", "/tunnel", key, budget, &payload);
+                let (got, _) = request("example.com", "/tunnel", &key, budget, &payload);
                 assert_eq!(
                     got.capacity(),
                     got.len(),
@@ -1079,19 +1119,19 @@ mod tests {
 
     #[test]
     fn the_101_is_the_key_and_the_echoed_subprotocol() {
-        let key = "dGhlIHNhbXBsZSBub25jZQ==";
+        let key = *b"dGhlIHNhbXBsZSBub25jZQ==";
         let head = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n";
-        let plain = accept_response(key, "", false);
+        let plain = accept_response(base64_text(&key), "", false);
         assert_eq!(
             plain,
-            format!("{head}\r\n"),
+            format!("{head}\r\n").into_bytes(),
             "no early data, no subprotocol line"
         );
         assert_eq!(plain.capacity(), plain.len(), "one allocation, no growth");
-        let echoed = accept_response(key, "cGluZw", true);
+        let echoed = accept_response(base64_text(&key), "cGluZw", true);
         assert_eq!(
             echoed,
-            format!("{head}Sec-WebSocket-Protocol: cGluZw\r\n\r\n"),
+            format!("{head}Sec-WebSocket-Protocol: cGluZw\r\n\r\n").into_bytes(),
             "the offered subprotocol rides back in the 101"
         );
         assert_eq!(echoed.capacity(), echoed.len(), "one allocation, no growth");
