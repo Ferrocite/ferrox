@@ -10,7 +10,8 @@ pub type Anchors = std::sync::Arc<[Vec<u8>]>;
 #[derive(Debug, Clone, Default)]
 pub struct TlsConfig {
     pub server_name: String,
-    pub alpn: Vec<Vec<u8>>,
+    /// The `ALPN` list a client offers, behind one allocation: a config names it once, and the client's own cache keys on it, so a per-dial copy was a vector of vectors paid on every handshake.
+    pub alpn: std::sync::Arc<[Vec<u8>]>,
     pub roots: Anchors,
     /// Leaf keys to accept: a chain that verified must still hold one, and a
     /// chain this device cannot build is verified against the pinned leaf as its

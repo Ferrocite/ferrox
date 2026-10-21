@@ -9,8 +9,9 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone)]
 pub(crate) struct QuicDial {
     pub(crate) id: [u8; 16],
-    pub(crate) host: String,
-    pub(crate) address: String,
+    /// The edge's name and the address it is dialled at, shared rather than copied: a dial names the same bytes twice, and the flow's dial copies the pair again per carrier.
+    pub(crate) host: std::sync::Arc<str>,
+    pub(crate) address: std::sync::Arc<str>,
     pub(crate) port: u16,
     /// A pooled connection through a hop is its own connection, never reused for a direct dial.
     pub(crate) upstream: Option<crate::foxy::UpstreamProxy>,
@@ -19,9 +20,9 @@ pub(crate) struct QuicDial {
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct QuicServer {
-    address: String,
+    address: std::sync::Arc<str>,
     port: u16,
-    host: String,
+    host: std::sync::Arc<str>,
     upstream: Option<crate::foxy::UpstreamProxy>,
     roots: Option<ferrox_core::tls::Anchors>,
 }

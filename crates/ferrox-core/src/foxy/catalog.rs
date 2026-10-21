@@ -56,7 +56,7 @@ mod tests {
 
     fn edge(host: &str, country: &str, city: &str) -> Candidate {
         Candidate {
-            host: host.to_owned(),
+            host: std::sync::Arc::from(host),
             port: 443,
             country: country.to_owned(),
             city: city.to_owned(),
@@ -75,7 +75,7 @@ mod tests {
     }
 
     fn hosts(edges: &[Candidate]) -> Vec<&str> {
-        edges.iter().map(|edge| edge.host.as_str()).collect()
+        edges.iter().map(|edge| edge.host.as_ref()).collect()
     }
 
     #[test]

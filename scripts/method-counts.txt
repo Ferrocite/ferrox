@@ -190,6 +190,7 @@ carrier-xdrive held-ticks-per-growing-segment 8 ferrox-app-xdrive::tests::coales
 carrier-xdrive segment-buffer-reallocations-per-upload-cycle 0 ferrox-app-xdrive::tests::a_finished_upload_hands_its_buffer_back_empty_and_whole
 carrier-xdrive socket-reads-per-pipelined-answer 0 ferrox-app-xdrive::tests::a_lane_keeps_what_arrives_past_the_answer_it_read
 carrier-xdrive lane-buffer-reallocations-per-answer 0 ferrox-app-xdrive::tests::a_lane_keeps_what_arrives_past_the_answer_it_read
+carrier-xdrive head-header-allocations-per-reply 0 ferrox-app-xdrive::tests::a_reply_head_costs_no_buffer_for_its_headers
 
 carrier-httpheader ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-httpheader framing-bytes-added 0 ferrox-app-httpheader::tests::header_carries_an_echo_over_loopback
@@ -384,6 +385,7 @@ reality-tls session-writes-per-frame 1 ferrox-app-proxy::tests::a_frame_reaches_
 reality-tls relay-write-waits-for-a-parked-read 0 ferrox-app-proxy::tests::a_relay_write_goes_out_while_the_reader_is_parked
 reality-tls relay-reads-on-an-unarmed-handle 0 ferrox-app-proxy::tests::the_socket_half_reads_on_the_armed_handle
 reality-tls tls-arm-cells 2 scripts/run-benchmark-matrix.sh
+reality-tls census-waits-per-relay-read 0 ferrox-app-proxy::tests::a_release_build_registers_no_census_wait
 reality-tls user-space-copies-per-framed-write 0 ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call
 
 kcp ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -567,3 +569,8 @@ blackhole drain-allocations-per-flow 0 ferrox-app-blackhole::tests::the_peers_by
 blackhole upstream-connections-per-flow 0 ferrox-app-proxy::tests::a_blackhole_front_answers_the_client_and_dials_nothing
 blackhole scenario-map-tests-passing 1 scripts/run-xray-scenario-map.sh
 carrier-foxy h2-connections-per-two-flows 1 ferrox-app-foxy::loopback::a_warm_flow_reuses_the_session_its_predecessor_left
+carrier-foxy dial-order-allocations-per-flow 0 ferrox-core-foxy::tests::a_dial_order_walks_without_touching_the_heap
+carrier-foxy ladder-walk-allocations-per-flow 0 ferrox-app-proxy::tests::a_flow_walks_the_ladder_without_touching_the_heap
+carrier-foxy edge-name-copies-per-flow 0 ferrox-core-foxy::tests::an_edge_name_is_shared_rather_than_copied
+carrier-foxy edge-strike-lookup-allocations 0 ferrox-core-foxy::tests::an_edge_strike_lookup_allocates_nothing
+carrier-foxy carrier-alpn-allocations-per-dial 0 ferrox-app-foxy::tests::a_carriers_alpn_list_is_shared_rather_than_built_per_dial

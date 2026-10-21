@@ -332,7 +332,7 @@ pub(crate) fn outbound_tls(
     }
     Some(Arc::new(ferrox_core::tls::TlsConfig {
         server_name,
-        alpn,
+        alpn: alpn.into(),
         roots,
         pins: ferrox_core::foxy::pin::Pins::default(),
         cipher_suites: tls_cipher_suites(tls),
