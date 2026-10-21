@@ -543,3 +543,4 @@ blackhole peer-reads-per-window 1 ferrox-app-blackhole::tests::the_peers_bytes_a
 blackhole peer-reads-for-the-end 1 ferrox-app-blackhole::tests::the_peers_bytes_are_read_in_windows
 blackhole drain-allocations-per-flow 0 ferrox-app-blackhole::tests::the_peers_bytes_are_read_in_windows
 blackhole upstream-connections-per-flow 0 ferrox-app-proxy::tests::a_blackhole_front_answers_the_client_and_dials_nothing
+blackhole scenario-map-tests-passing 1 scripts/run-xray-scenario-map.sh
