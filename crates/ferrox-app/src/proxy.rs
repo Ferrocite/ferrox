@@ -1998,7 +1998,7 @@ fn serve_vless_quic(mut stream: crate::quic::QuicStream, id: &[u8; 16], freedom:
         let _ = stop.shutdown(Shutdown::Both);
         peer.close();
     });
-    relay_stream(stream, uplink, &close);
+    relay_stream(Half::shared(stream), Half::socket(uplink), &close);
     let _ = fin.fin();
 }
 
@@ -2569,8 +2569,8 @@ fn relay_fallback<S: Stream + Send + 'static>(proxied: ferrox_core::tls::Proxied
     if target.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
     }
-    let one = Arc::new(Half::new(client));
-    let two = Arc::new(Half::new(target));
+    let one = Arc::new(Half::shared(client));
+    let two = Arc::new(Half::socket(target));
     let mut up = upload.map(Gauge::start);
     let mut down = download.map(Gauge::start);
     // A finished leg ends the splice; the sibling notices on its next poll grain.
@@ -2694,11 +2694,15 @@ fn relay_vless<S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'sta
         }
     });
     if flow == Flow::Vision {
-        relay_stream(crate::vision::Link::new(session, raw, id), uplink, &close);
+        relay_stream(
+            Half::shared(crate::vision::Link::new(session, raw, id)),
+            Half::socket(uplink),
+            &close,
+        );
     } else {
         // No direct switch coming: the limiter stops bounding and tracking reads.
         session.disarm_record_alignment();
-        relay_stream(session, uplink, &close);
+        relay_stream(Half::shared(session), Half::socket(uplink), &close);
     }
 }
 
@@ -2710,25 +2714,77 @@ fn unix_millis() -> u64 {
         })
 }
 
+/// One side of a relay: the bytes this direction reads and the bytes the other direction
+/// writes. A socket's two directions never touch each other, so its side is two handles
+/// and no lock stands between them — a read parked in the kernel never makes the write
+/// wait for it. A session's read and its write are one object, so its side is one handle
+/// behind one lock, and the lock is held for the length of the wait.
 #[derive(Debug)]
-struct Half<T> {
-    inner: Mutex<T>,
-    wanted: AtomicBool,
+enum Half<T> {
+    /// Two handles of one socket, each behind its own lock: the two directions of a
+    /// socket are independent, so a writer never waits for the reader's parked wait.
+    Split { read: Mutex<T>, write: Mutex<T> },
+    /// One object behind one lock: a session's read and its write are the same bytes, so
+    /// the lock is the only thing that can stand between them.
+    Shared { inner: Mutex<T>, wanted: AtomicBool },
 }
 
 impl<T> Half<T> {
-    fn new(value: T) -> Self {
-        Self {
+    /// Two handles of one direction pair: the read and the write never touch each other,
+    /// so a read parked in the kernel never makes the write wait for it.
+    fn split(read: T, write: T) -> Self {
+        Self::Split {
+            read: Mutex::new(read),
+            write: Mutex::new(write),
+        }
+    }
+
+    fn shared(value: T) -> Self {
+        Self::Shared {
             inner: Mutex::new(value),
             wanted: AtomicBool::new(false),
         }
     }
 
+    /// The reader hands the lock to a writer that is waiting for it, so the writer takes
+    /// the lock the moment the read is done rather than after the reader's next wait.
     fn hand_off(&self) {
-        let mut spins = 0;
-        while self.wanted.load(Ordering::Relaxed) && spins < RELAY_HANDOFF_SPINS {
-            thread::yield_now();
-            spins += 1;
+        if let Self::Shared { wanted, .. } = self {
+            let mut spins = 0;
+            while wanted.load(Ordering::Relaxed) && spins < RELAY_HANDOFF_SPINS {
+                thread::yield_now();
+                spins += 1;
+            }
+        }
+    }
+}
+
+/// A handle the relay can duplicate: the two directions of one socket are two handles of
+/// it, and a socket's read and its write never touch each other.
+trait Duplicate: Sized {
+    fn duplicate(&self) -> Option<Self>;
+}
+
+impl Duplicate for Connection {
+    fn duplicate(&self) -> Option<Self> {
+        self.try_clone().ok()
+    }
+}
+
+impl Duplicate for std::net::TcpStream {
+    fn duplicate(&self) -> Option<Self> {
+        self.try_clone().ok()
+    }
+}
+
+impl<T: Duplicate> Half<T> {
+    /// A socket's two directions, as two handles of it: the read and the write of a
+    /// socket never touch each other, so the relay's writer never waits for the reader's
+    /// parked wait. A socket that cannot be duplicated keeps one handle behind one lock.
+    fn socket(value: T) -> Self {
+        match value.duplicate() {
+            Some(read) => Self::split(read, value),
+            None => Self::shared(value),
         }
     }
 }
@@ -2736,9 +2792,15 @@ impl<T> Half<T> {
 impl<T: Read> Half<T> {
     fn read_once(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         census!("tunnel-leg-read", crate::census::NO_FD, None);
-        let result = match self.inner.lock() {
-            Ok(mut guard) => guard.read(buf),
-            Err(_) => Err(std::io::Error::other("relay half poisoned")),
+        let result = match self {
+            Self::Split { read, .. } => match read.lock() {
+                Ok(mut guard) => guard.read(buf),
+                Err(_) => Err(std::io::Error::other("relay half poisoned")),
+            },
+            Self::Shared { inner, .. } => match inner.lock() {
+                Ok(mut guard) => guard.read(buf),
+                Err(_) => Err(std::io::Error::other("relay half poisoned")),
+            },
         };
         self.hand_off();
         result
@@ -2747,10 +2809,7 @@ impl<T: Read> Half<T> {
 
 impl<T: Write> Half<T> {
     fn write_once(&self, buf: &[u8]) -> std::io::Result<()> {
-        self.wanted.store(true, Ordering::Relaxed);
-        let taken = self.writer_lock();
-        self.wanted.store(false, Ordering::Relaxed);
-        let Ok(mut guard) = taken else {
+        let Ok(mut guard) = self.writer_lock() else {
             return Err(std::io::Error::other("relay half poisoned"));
         };
         // Buffered writers only send on flush; raw sockets treat it as a no-op.
@@ -2759,16 +2818,30 @@ impl<T: Write> Half<T> {
     }
 
     fn writer_lock(&self) -> Result<MutexGuard<'_, T>, ()> {
+        match self {
+            Self::Split { write, .. } => write.lock().map_err(|_| ()),
+            Self::Shared { inner, wanted } => {
+                wanted.store(true, Ordering::Relaxed);
+                let taken = Self::spin_lock(inner);
+                wanted.store(false, Ordering::Relaxed);
+                taken
+            }
+        }
+    }
+
+    /// The shared lock: a writer that cannot take it waits for the reader's wait to end,
+    /// so it asks for the lock a few times first and then blocks on it.
+    fn spin_lock(inner: &Mutex<T>) -> Result<MutexGuard<'_, T>, ()> {
         let mut spins = 0u32;
         loop {
-            match self.inner.try_lock() {
+            match inner.try_lock() {
                 Ok(guard) => return Ok(guard),
                 Err(std::sync::TryLockError::Poisoned(_)) => return Err(()),
                 Err(std::sync::TryLockError::WouldBlock) => {}
             }
             spins += 1;
             if spins > RELAY_LOCK_TRIES {
-                return self.inner.lock().map_err(|_| ());
+                return inner.lock().map_err(|_| ());
             }
             thread::yield_now();
         }
@@ -2776,12 +2849,12 @@ impl<T: Write> Half<T> {
 }
 
 fn relay_stream<A: Read + Write + Send + 'static, B: Read + Write + Send + 'static>(
-    a: A,
-    b: B,
+    a: Half<A>,
+    b: Half<B>,
     close: &Arc<dyn Fn() + Send + Sync>,
 ) {
-    let a = Arc::new(Half::new(a));
-    let b = Arc::new(Half::new(b));
+    let a = Arc::new(a);
+    let b = Arc::new(b);
     // A leg polling its way through a finished relay must see that its sibling ended: shutdown delivery alone hangs when it does not arrive, as on Windows.
     let ended = Arc::new(AtomicBool::new(false));
     let (up_a, up_b, up_ended) = (Arc::clone(&a), Arc::clone(&b), Arc::clone(&ended));
@@ -2824,6 +2897,19 @@ pub(crate) fn resize_scratch(buf: &mut Vec<u8>, len: usize) {
         buf.reserve(len);
     }
     unsafe { buf.set_len(len) }
+}
+
+/// Room for a read to write into without a zero pass first: every byte is written before any
+/// code observes it, so the fill was work generated and thrown away.
+#[allow(
+    clippy::uninit_vec,
+    reason = "the buffer is a read target: the read that owns every byte writes before any code reads one"
+)]
+pub(crate) fn unfilled(len: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(len);
+    // SAFETY: every path hands the buffer to a read that initialises the bytes it reports, and no path reads a byte that was not written.
+    unsafe { buf.set_len(len) };
+    buf
 }
 
 /// Grows a buffer to `len` without a zero pass and without losing what it already holds: the bytes past the old length are claimed, not written, and the caller fills them. A buffer that grew by `resize(len, 0)` paid a memset of the whole new region for bytes the caller was about to overwrite.
@@ -5236,10 +5322,10 @@ fn dial_vless_tls(
     let Some(mut session) = dial_tls_session(server, cfg, vless.carrier.tcp_mask()) else {
         return;
     };
-    // The session's leg reads the uplink handle it took; un-timed, a parked read outlives the relay that should end it.
+    // The session is this relay's one shared half, so its read holds the lock the other direction's write wants: the shared grain is the one that keeps a writer from waiting out a wait.
     if session
         .get_ref()
-        .set_read_timeout(Some(RELAY_POLL))
+        .set_read_timeout(Some(SESSION_POLL))
         .is_err()
     {
         return;
@@ -5264,7 +5350,7 @@ fn dial_vless_tls(
                     let _ = downstream.shutdown(Shutdown::Both);
                 }
             });
-            relay_stream(downstream, session, &close);
+            relay_stream(Half::socket(downstream), Half::shared(session), &close);
         }
         _ => ride_carrier(server, session, vless, &header, client),
     }
@@ -5365,13 +5451,13 @@ fn dial_vless_reality(
             });
             if vless.flow == crate::vision::FLOW {
                 relay_stream(
-                    downstream,
-                    crate::vision::Link::new(session, Some(raw), &vless.id),
+                    Half::socket(downstream),
+                    Half::shared(crate::vision::Link::new(session, Some(raw), &vless.id)),
                     &close,
                 );
             } else {
                 session.disarm_record_alignment();
-                relay_stream(downstream, session, &close);
+                relay_stream(Half::socket(downstream), Half::shared(session), &close);
             }
         }
         _ => ride_carrier(server, session, vless, &header, client),
@@ -5385,10 +5471,10 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
     let Some(mut session) = dial_tls_session(server, cfg, trojan.carrier.tcp_mask()) else {
         return;
     };
-    // The session's leg reads the uplink handle it took; un-timed, a parked read outlives the relay that should end it.
+    // The session is this relay's one shared half, so its read holds the lock the other direction's write wants: the shared grain is the one that keeps a writer from waiting out a wait.
     if session
         .get_ref()
-        .set_read_timeout(Some(RELAY_POLL))
+        .set_read_timeout(Some(SESSION_POLL))
         .is_err()
     {
         return;
@@ -5410,7 +5496,7 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
                     let _ = downstream.shutdown(Shutdown::Both);
                 }
             });
-            relay_stream(downstream, session, &close);
+            relay_stream(Half::socket(downstream), Half::shared(session), &close);
         }
         Carrier::Ws { path, ed } => {
             let Some((reader, writer)) = tls_ws(server, session, &trojan.host, path, *ed, header)
@@ -8611,7 +8697,7 @@ fn dial_http_outbound(
                 let _ = d.shutdown(std::net::Shutdown::Both);
             }
         });
-        crate::proxy::relay_stream(stream, downstream, &close);
+        crate::proxy::relay_stream(Half::shared(stream), Half::socket(downstream), &close);
     }
 
     if let Some(cfg) = http.tls.as_deref() {
@@ -11851,6 +11937,87 @@ mod tests {
     use crate::config::{grpc_path, stream_carrier};
     use ferrox_core::finalmask::Chain;
 
+    /// A relay half that is read by one thread and written by another: the reader parks
+    /// where the kernel would park, and the writer must not wait for it.
+    struct Parked {
+        entered: std::sync::mpsc::Sender<()>,
+        written: std::sync::mpsc::Sender<()>,
+        released: std::sync::mpsc::Sender<()>,
+        open: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl Read for Parked {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            let _ = self.entered.send(());
+            // A parked read ends when it is released, or when its own wait is over.
+            let (lock, cvar) = &*self.open;
+            let mut open = lock.lock().expect("locks");
+            while !*open {
+                let (guard, timeout) = cvar
+                    .wait_timeout(open, std::time::Duration::from_secs(5))
+                    .expect("waits");
+                open = guard;
+                if timeout.timed_out() {
+                    break;
+                }
+            }
+            let _ = self.released.send(());
+            Ok(0)
+        }
+    }
+
+    impl Write for Parked {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let _ = self.written.send(());
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A relay's writer carries the bytes the reader is not going to bring, so it must not
+    /// wait for the reader's parked read: a read that holds the lock across its wait makes
+    /// the write wait for that whole wait, and the flow's throughput falls to one buffer
+    /// per wait.
+    #[test]
+    fn a_relay_write_goes_out_while_the_reader_is_parked() {
+        use std::sync::mpsc;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (written_tx, written_rx) = mpsc::channel();
+        let (released_tx, released_rx) = mpsc::channel();
+        let open = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let side = || Parked {
+            entered: entered_tx.clone(),
+            written: written_tx.clone(),
+            released: released_tx.clone(),
+            open: Arc::clone(&open),
+        };
+        // The two directions of a socket are two handles, so the write goes out while the read is parked.
+        let half = Arc::new(Half::split(side(), side()));
+        let parked = Arc::clone(&half);
+        let leg = std::thread::spawn(move || {
+            let mut buf = [0u8; 16];
+            parked.read_once(&mut buf)
+        });
+        entered_rx.recv().expect("the reader is parked in its read");
+        half.write_once(b"ping").expect("writes");
+        assert!(
+            written_rx.try_recv().is_ok(),
+            "the write went out while the reader was parked"
+        );
+        assert!(
+            released_rx.try_recv().is_err(),
+            "the reader's read ended before the write went out: the write waited for it"
+        );
+        {
+            let (lock, cvar) = &*open;
+            *lock.lock().expect("locks") = true;
+            cvar.notify_all();
+        }
+        let _ = leg.join().expect("joins");
+    }
+
     #[test]
     fn dokodemo_rewrites_to_the_named_address_and_port() {
         let inbound = crate::json::parse(
@@ -11956,12 +12123,15 @@ mod tests {
 
     #[test]
     fn a_relay_write_is_sent_without_waiting_for_close() {
-        let half = Half::new(Gated {
+        let half = Half::shared(Gated {
             sent: Vec::new(),
             held: Vec::new(),
         });
         half.write_once(b"ping").expect("writes");
-        let gated = half.inner.lock().expect("reads back");
+        let Half::Shared { inner, .. } = &half else {
+            panic!("a gated writer is one object behind one lock");
+        };
+        let gated = inner.lock().expect("reads back");
         assert_eq!(gated.sent, b"ping", "flush-gated bytes are sent, not held");
     }
 
@@ -11972,14 +12142,17 @@ mod tests {
         let flag = Arc::clone(&fired);
         let close: Arc<dyn Fn() + Send + Sync> =
             Arc::new(move || flag.store(true, Ordering::SeqCst));
-        let from = Arc::new(Half::new(std::io::Cursor::new(b"ping".to_vec())));
-        let to = Arc::new(Half::new(Gated {
+        let from = Arc::new(Half::shared(std::io::Cursor::new(b"ping".to_vec())));
+        let to = Arc::new(Half::shared(Gated {
             sent: Vec::new(),
             held: Vec::new(),
         }));
         copy_stream(&from, &to, &close, &AtomicBool::new(false));
         assert!(fired.load(Ordering::SeqCst), "EOF fires the close");
-        let gated = to.inner.lock().expect("reads back");
+        let Half::Shared { inner, .. } = to.as_ref() else {
+            panic!("a gated writer is one object behind one lock");
+        };
+        let gated = inner.lock().expect("reads back");
         assert_eq!(gated.sent, b"ping");
     }
 
@@ -12027,7 +12200,7 @@ mod tests {
         // The stall the Windows CI caught: a busy `continue` at the timeout outlives the relay that ended, and the join on it never returns.
         let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
         let joined = thread::spawn(move || {
-            relay_stream(Poller, EofReader, &close);
+            relay_stream(Half::shared(Poller), Half::shared(EofReader), &close);
         });
         joined
             .join()
@@ -25963,7 +26136,7 @@ mod census_tests {
         // Dropping the sender is what lifts the park, so the leg returns on its own.
         let (lift, until_lifted) = mpsc::channel::<()>();
         let leg = thread::spawn(move || {
-            let half = Half::new(Silent { until_lifted });
+            let half = Half::shared(Silent { until_lifted });
             half.read_once(&mut [0u8; 16])
         });
         let leg_id = leg.thread().id();
