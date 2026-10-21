@@ -6792,6 +6792,12 @@ fn serve_foxy_front(
             let tunnel = std::sync::Arc::new(std::sync::Mutex::new(tunnel));
             let started = Instant::now();
             relay_tunnel(&client, &tunnel);
+            // Both legs are joined, so the lane is no longer shared: a clean h2 session goes back to the pool instead of paying a handshake on the next flow.
+            if let Ok(lane) = std::sync::Arc::try_unwrap(tunnel) {
+                if let Ok(lane) = lane.into_inner() {
+                    lane.settle();
+                }
+            }
             foxy.note_edge_end(&edge, started.elapsed());
         }
         FoxyOpen::Direct(target) => {
@@ -8330,6 +8336,10 @@ pub(crate) fn relay_tunnel(
         // The park's grain, armed on the read handle: a stack that leaves a blocking read asleep through a shutdown still ends it on its own timeout, and the read after that sees the closed socket.
         let _ = client_read.set_read_timeout(Some(budgets::relay_quantum()));
         copy_locked(&mut client_read, &forward_tunnel, true, &learn_backward);
+        // The client's half ended, so the tunnel's ends too: h2 keeps the session for the next flow only when both halves of the stream are closed.
+        if let Ok(mut lane) = forward_tunnel.lock() {
+            let _ = lane.finish();
+        }
         report_forward.store(true, std::sync::atomic::Ordering::Release);
     };
     let done = RelayPool::global().run(forward);
