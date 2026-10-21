@@ -2565,7 +2565,7 @@ fn relay_fallback<S: Stream + Send + 'static>(proxied: ferrox_core::tls::Proxied
         upload,
         download,
     } = proxied;
-    // A silent cover origin must not hold the read across the mutex its upload writes on.
+    // A read with no bound never notices that the other leg ended, so the splice's peer is armed.
     if target.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
     }
@@ -8686,7 +8686,7 @@ fn dial_http_outbound(
         let Ok(mut downstream) = client.try_clone() else {
             return;
         };
-        // Each half shares a lock, so an unbounded read would block the other direction's write.
+        // A read with no bound never notices that its sibling ended, so this leg is armed before it is relayed.
         if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
             return;
         }
