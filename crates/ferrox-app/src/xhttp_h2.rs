@@ -580,7 +580,7 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
             conn.refuse(E_FRAME_SIZE);
             break;
         }
-        let mut body = vec![0u8; len];
+        let mut body = crate::proxy::unfilled(len);
         if crate::proxy::read_exact(&mut read, &mut body).is_err() {
             break;
         }
@@ -807,7 +807,7 @@ mod tests {
             };
             for _ in 0..3 {
                 let (len, kind, flags, _) = read_head(&mut conn.stream).expect("frame");
-                let mut body = vec![0u8; len];
+                let mut body = crate::proxy::unfilled(len);
                 crate::proxy::read_exact(&mut conn.stream, &mut body).expect("body");
                 if kind == T_SETTINGS && flags & F_ACK == 0 {
                     write_frame(&mut conn.stream, T_SETTINGS, F_ACK, 0, &[]);
@@ -900,7 +900,7 @@ mod tests {
                     return self.held.remove(at).expect("the position just found");
                 }
                 let (len, kind, flags, got) = read_head(&mut self.stream).expect("frame");
-                let mut body = vec![0u8; len];
+                let mut body = crate::proxy::unfilled(len);
                 crate::proxy::read_exact(&mut self.stream, &mut body).expect("body");
                 if kind == T_PING && flags & F_ACK == 0 && body.len() == 8 {
                     write_frame(&mut self.stream, T_PING, F_ACK, 0, &body);
@@ -975,7 +975,7 @@ mod tests {
                 let kind = head[3];
                 let flags = head[4];
                 let sid = u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7FFF_FFFF;
-                let mut body = vec![0u8; len];
+                let mut body = crate::proxy::unfilled(len);
                 if len > 0 && fill(&mut self.stream, &mut body).is_none() {
                     return false;
                 }
@@ -1092,6 +1092,31 @@ mod tests {
     }
 
     /// The received frame is queued as itself. The DATA chunk and the unterminated header block keep the buffer the loop read the body into, so nothing copies between the frame and the queue: a `to_vec` on that path moves the base pointer and grows or shrinks the allocation, and the assertions carry both.
+    /// The frame's body is not zeroed: the read fills every byte of it, so the zero pass
+    /// in front of the read was work generated and thrown away, once a frame, over the
+    /// whole frame's length. The counting allocator's `zeroed` counter is the witness.
+    #[test]
+    fn a_received_frames_body_is_not_zero_filled() {
+        let mut bytes = crate::h2::MAGIC.to_vec();
+        let body = vec![7u8; 4096];
+        bytes.extend_from_slice(&crate::h2::frame_head(body.len(), T_DATA, 0, 1));
+        bytes.extend_from_slice(&body);
+        let reader = std::io::Cursor::new(bytes);
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let slices = Arc::new(AtomicUsize::new(0));
+        let writer = Counted { written, slices };
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            serve_h2(
+                reader,
+                writer,
+                &XhttpSettings::stream_one(),
+                [0u8; 16],
+                true,
+            );
+        });
+        assert_eq!(counts.zeroed, 0, "no frame body is zeroed");
+    }
+
     #[test]
     fn a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into() {
         let (conn, _, _) = bare_conn();
@@ -1320,7 +1345,7 @@ mod tests {
         );
         assert_eq!(got[3], T_GOAWAY, "expected a GOAWAY");
         let len = usize::from(got[0]) << 16 | usize::from(got[1]) << 8 | usize::from(got[2]);
-        let mut body = vec![0u8; len];
+        let mut body = crate::proxy::unfilled(len);
         assert!(fill(&mut client.stream, &mut body).is_some(), "goaway body");
         assert_eq!(
             u32::from_be_bytes(body[4..8].try_into().unwrap()),
@@ -1356,7 +1381,7 @@ mod tests {
             );
             assert_eq!(got[3], T_GOAWAY, "round {round}: expected a GOAWAY");
             let len = usize::from(got[0]) << 16 | usize::from(got[1]) << 8 | usize::from(got[2]);
-            let mut body = vec![0u8; len];
+            let mut body = crate::proxy::unfilled(len);
             assert!(
                 fill(&mut client.stream, &mut body).is_some(),
                 "round {round}: goaway body"
