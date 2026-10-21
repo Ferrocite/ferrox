@@ -537,11 +537,8 @@ impl Handler {
             )?),
         };
         let mut frame = std::mem::take(&mut self.frame);
-        frame.clear();
-        frame.extend_from_slice(&[0u8, 0, 0]);
-        crate::proxy::push_socks_addr(&mut frame, &target);
-        frame.extend_from_slice(payload);
-        let sent = leg.send(&frame);
+        let out = crate::proxy::socks_udp_frame(&mut frame, None, &target, payload);
+        let sent = leg.send(out);
         self.frame = frame;
         if sent.is_err() {
             self.legs.remove(&key);

@@ -4113,11 +4113,8 @@ fn spawn_udp_uplink_reader(
             let Some(dest) = dest else {
                 continue;
             };
-            reply.clear();
-            reply.extend_from_slice(&[0, 0, 0]);
-            push_socks_addr(&mut reply, &target);
-            reply.extend_from_slice(&buf[..n]);
-            let _ = udp.send_to(&reply, dest);
+            let out = socks_udp_frame(&mut reply, None, &target, &buf[..n]);
+            let _ = udp.send_to(out, dest);
         }
     })
 }
@@ -4185,11 +4182,8 @@ fn spawn_vmess_udp_reader(
             let Some(dest) = dest else {
                 continue;
             };
-            reply.clear();
-            reply.extend_from_slice(&[0, 0, 0]);
-            push_socks_addr(&mut reply, &target);
-            reply.extend_from_slice(chunk);
-            let _ = udp.send_to(&reply, dest);
+            let out = socks_udp_frame(&mut reply, None, &target, chunk);
+            let _ = udp.send_to(out, dest);
         }
     })
 }
@@ -4243,11 +4237,8 @@ fn spawn_trojan_uplink_reader(
             let Some(dest) = dest else {
                 continue;
             };
-            reply.clear();
-            reply.extend_from_slice(&[0, 0, 0]);
-            push_socks_addr(&mut reply, &src_addr);
-            reply.extend_from_slice(&buf[..n]);
-            let _ = udp.send_to(&reply, dest);
+            let out = socks_udp_frame(&mut reply, None, &src_addr, &buf[..n]);
+            let _ = udp.send_to(out, dest);
         }
     })
 }
@@ -7097,6 +7088,8 @@ fn dokodemo_udp_door(socket: &UdpSocket, dest: &Destination, out: &Outbound) {
     let _control = association.control;
     let mut legs: HashMap<SocketAddr, UdpSocket> = HashMap::new();
     let mut buf = udp_buffer();
+    // The door's frame is the door's: the address it rewrites to is the same for every datagram.
+    let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
     while let Ok((n, src)) = socket.recv_from(&mut buf) {
         if n == 0 {
             continue;
@@ -7127,11 +7120,8 @@ fn dokodemo_udp_door(socket: &UdpSocket, dest: &Destination, out: &Outbound) {
                 vacant.insert(leg)
             }
         };
-        let mut frame = Vec::with_capacity(HEAD + n);
-        frame.extend_from_slice(&[0, 0, 0]);
-        push_socks_addr(&mut frame, &target);
-        frame.extend_from_slice(&buf[..n]);
-        let _ = leg.send(&frame);
+        let out = socks_udp_frame(&mut frame, None, &target, &buf[..n]);
+        let _ = leg.send(out);
     }
 }
 
@@ -7261,11 +7251,8 @@ fn serve_socks_udp_socks(relay: &UdpSocket, socks: &SocksOut) {
             let Some(dest) = reader_source.lock().ok().and_then(|slot| *slot) else {
                 continue;
             };
-            frame.clear();
-            frame.extend_from_slice(&[0, 0, 0]);
-            push_socks_addr(&mut frame, &from);
-            frame.extend_from_slice(payload);
-            if client.send_to(&frame, dest).is_err() {
+            let out = socks_udp_frame(&mut frame, Some(&buf[..n]), &from, payload);
+            if client.send_to(out, dest).is_err() {
                 break;
             }
         }
@@ -7283,11 +7270,8 @@ fn serve_socks_udp_socks(relay: &UdpSocket, socks: &SocksOut) {
         if let Ok(mut slot) = source.lock() {
             *slot = Some(src);
         }
-        frame.clear();
-        frame.extend_from_slice(&[0, 0, 0]);
-        push_socks_addr(&mut frame, &dest);
-        frame.extend_from_slice(payload);
-        if sender.send(&frame).is_err() {
+        let out = socks_udp_frame(&mut frame, Some(&buf[..n]), &dest, payload);
+        if sender.send(out).is_err() {
             break;
         }
     }
@@ -7333,15 +7317,13 @@ fn serve_socks_udp_freedom(relay: &UdpSocket) {
         let done = thread::spawn(move || {
             let mut back = udp_buffer();
             let writer = up;
+            let mut framed = Vec::with_capacity(HEAD + UDP_BUF);
             while let Ok(read) = writer.recv(&mut back) {
                 let Some(source) = peer.lock().ok().and_then(|slot| *slot) else {
                     continue;
                 };
-                let mut framed = Vec::with_capacity(HEAD + read);
-                framed.extend_from_slice(&[0, 0, 0]);
-                push_socks_addr(&mut framed, &dest);
-                framed.extend_from_slice(&back[..read]);
-                if relay_write.send_to(&framed, source).is_err() {
+                let out = socks_udp_frame(&mut framed, None, &dest, &back[..read]);
+                if relay_write.send_to(out, source).is_err() {
                     break;
                 }
             }
@@ -7436,11 +7418,8 @@ fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connectio
                     Ok(n) => {
                         quiet = Instant::now();
                         if let Some(src) = client {
-                            reply.clear();
-                            reply.extend_from_slice(&[0, 0, 0]);
-                            push_socks_addr(&mut reply, dest);
-                            reply.extend_from_slice(&datagram[..n]);
-                            let _ = relay.send_to(&reply, src);
+                            let out = socks_udp_frame(&mut reply, None, dest, &datagram[..n]);
+                            let _ = relay.send_to(out, src);
                         }
                     }
                     Err(error) if is_timeout(&error) => break,
@@ -7578,11 +7557,8 @@ fn drain_foxy_ip_tunnel(
                 }
                 let peer = socket_from_bytes(read.source, read.destination);
                 if let Some(src) = client {
-                    reply.clear();
-                    reply.extend_from_slice(&[0, 0, 0]);
-                    push_socks_addr(reply, &peer);
-                    reply.extend_from_slice(read.payload);
-                    let _ = relay.send_to(reply, src);
+                    let out = socks_udp_frame(reply, None, &peer, read.payload);
+                    let _ = relay.send_to(out, src);
                 }
             }
             Err(error) if is_timeout(&error) => break,
@@ -7959,11 +7935,8 @@ fn spawn_ss_udp_reader2022(
                     let Some(dest) = dest else {
                         continue;
                     };
-                    reply.clear();
-                    reply.extend_from_slice(&[0, 0, 0]);
-                    push_socks_addr(&mut reply, &target);
-                    reply.extend_from_slice(payload);
-                    let _ = send.send_to(&reply, dest);
+                    let out = socks_udp_frame(&mut reply, None, &target, payload);
+                    let _ = send.send_to(out, dest);
                 }
                 Err(error) if is_timeout(&error) => {
                     if done.load(Ordering::Relaxed) {
@@ -10197,6 +10170,34 @@ pub(crate) fn push_socks_addr(out: &mut Vec<u8>, addr: &SocketAddr) {
     out.extend_from_slice(&addr.port().to_be_bytes());
 }
 
+/// The SOCKS5 UDP frame to send for a datagram: the reserved bytes, the fragment byte,
+/// the address and the payload.
+///
+/// `client` is the frame the datagram arrived in, where there is one. When the frame
+/// this tree would build is byte for byte that frame, the datagram is sent as it
+/// arrived and its payload is not copied at all: the frame is handed back by pointer.
+/// Otherwise the frame is rebuilt around the payload, which is the only copy there is.
+///
+/// The caller's buffer is the only buffer: the frame never allocates.
+pub(crate) fn socks_udp_frame<'a>(
+    out: &'a mut Vec<u8>,
+    client: Option<&'a [u8]>,
+    dest: &SocketAddr,
+    payload: &'a [u8],
+) -> &'a [u8] {
+    out.clear();
+    out.extend_from_slice(&[0, 0, 0]);
+    push_socks_addr(out, dest);
+    let head = out.len();
+    if let Some(client) = client {
+        if client.len() == head + payload.len() && client[..head] == out[..head] {
+            return client;
+        }
+    }
+    out.extend_from_slice(payload);
+    out
+}
+
 /// Read a SOCKS address body straight off a slice: the same field order `read_socks_addr_rest` draws from a stream, read where the bytes already lie, so a relayed datagram pays no cursor, no `dyn Read` call per field and no copy into scratch.
 fn parse_socks_addr_rest(buf: &[u8], atyp: u8) -> Option<(SocketAddr, usize)> {
     match atyp {
@@ -10213,7 +10214,8 @@ fn parse_socks_addr_rest(buf: &[u8], atyp: u8) -> Option<(SocketAddr, usize)> {
             let name = buf.get(1..1 + len)?;
             let port: [u8; 2] = buf.get(1 + len..3 + len)?.try_into().ok()?;
             let host = std::str::from_utf8(name).ok()?;
-            let addr = format!("{host}:{}", u16::from_be_bytes(port))
+            // The name and the port go to the resolver as they are: the authority the datagram named is never spelled out.
+            let addr = (host, u16::from_be_bytes(port))
                 .to_socket_addrs()
                 .ok()?
                 .next()?;
@@ -22971,6 +22973,91 @@ mod tests {
         let (source, payload) = parse_socks_udp(&back[..n]).expect("the frame");
         assert_eq!(payload, b"who-is");
         assert_eq!(source.port(), target_addr.port());
+    }
+
+    /// A datagram the client framed with a literal address is the frame this tree
+    /// would build, so it goes on as it arrived: the payload is not copied, and the
+    /// bytes on the wire are the same either way.
+    #[test]
+    fn a_forwarded_datagram_is_the_frame_the_client_framed() {
+        let dest: SocketAddr = "198.51.100.7:443".parse().expect("addr");
+        let payload = b"the payload the client sent";
+        let mut client = vec![0, 0, 0];
+        push_socks_addr(&mut client, &dest);
+        client.extend_from_slice(payload);
+
+        let mut out = Vec::with_capacity(HEAD + UDP_BUF);
+        let base = out.as_ptr() as usize;
+        let capacity = out.capacity();
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            let sent = socks_udp_frame(&mut out, Some(&client), &dest, payload);
+            assert_eq!(
+                sent.as_ptr() as usize,
+                client.as_ptr() as usize,
+                "the datagram is sent as the client framed it"
+            );
+        });
+        assert_eq!(counts.allocs, 0, "the frame costs no buffer of its own");
+        assert_eq!(out.as_ptr() as usize, base, "the buffer does not move");
+        assert_eq!(out.capacity(), capacity, "the buffer does not grow");
+
+        // The frame the tree would have built is byte for byte the client's own, so the fast path cannot change a byte on the wire.
+        let mut rebuilt = vec![0, 0, 0];
+        push_socks_addr(&mut rebuilt, &dest);
+        rebuilt.extend_from_slice(payload);
+        let mut out = Vec::with_capacity(HEAD + UDP_BUF);
+        let sent = socks_udp_frame(&mut out, Some(&client), &dest, payload);
+        assert_eq!(
+            sent,
+            &rebuilt[..],
+            "the bytes on the wire are the tree's own"
+        );
+    }
+
+    /// A datagram the client framed with a name is not the frame this tree builds —
+    /// the tree resolved the name into an address — so the frame is rebuilt around
+    /// the payload, and the bytes are the tree's own.
+    #[test]
+    fn a_datagram_naming_a_host_is_reframed_around_its_payload() {
+        let dest: SocketAddr = "198.51.100.7:443".parse().expect("addr");
+        let payload = b"payload";
+        let mut client = vec![0, 0, 0, 3, 9];
+        client.extend_from_slice(b"host.test");
+        client.extend_from_slice(&443u16.to_be_bytes());
+        client.extend_from_slice(payload);
+
+        let mut out = Vec::with_capacity(HEAD + UDP_BUF);
+        let sent = socks_udp_frame(&mut out, Some(&client), &dest, payload);
+        assert_ne!(
+            sent.as_ptr() as usize,
+            client.as_ptr() as usize,
+            "the frame was rebuilt"
+        );
+        assert_eq!(
+            &sent[..4],
+            &[0, 0, 0, 1],
+            "the reserved bytes and the family"
+        );
+        assert_eq!(&sent[4..8], &[198, 51, 100, 7], "the address it resolved");
+        assert_eq!(&sent[8..10], &443u16.to_be_bytes(), "the port");
+        assert_eq!(&sent[10..], payload, "the payload");
+    }
+
+    /// A destination that is an IPv6 literal in the name field is the address and
+    /// the port the datagram named, and not the tail of an authority spelled out.
+    #[test]
+    fn a_destination_naming_an_ipv6_literal_is_the_address_it_named() {
+        let mut frame = vec![0, 0, 0, 3, 3];
+        frame.extend_from_slice(b"::1");
+        frame.extend_from_slice(&8080u16.to_be_bytes());
+        frame.extend_from_slice(b"payload");
+        let (dest, payload) = parse_socks_udp(&frame).expect("the frame parses");
+        assert_eq!(
+            dest,
+            SocketAddr::new("::1".parse::<std::net::IpAddr>().expect("addr"), 8080),
+            "the literal is the address and the port the datagram named"
+        );
+        assert_eq!(payload, b"payload");
     }
 
     /// A front that asks for a credential refuses one it does not know, and says so

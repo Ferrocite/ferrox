@@ -148,7 +148,7 @@ Rows 1–22 are the share-link world; rows 23–39 are the xray-core config surf
 | 41 | `POLICYGROUP` / routing groups | planned | PattNG |
 | 42 | Psiphon as its own program (`AETHER_PSIPHON_BIN`) | planned | PattNG, mlmvpn |
 | 43 | Pluggable transports via lyrebird (`obfs4`/`snowflake`/`webtunnel`/`meek`) | planned | PattNG, Aether |
-| 44 | hev-socks5-tunnel TUN (`libhev-socks5-tunnel.so`) | implemented | PattNG — the SOCKS5 **client** role (CONNECT + UDP ASSOCIATE, RFC 1929 credential) as a lane of the tree's own front layer, driven by the native `tun` device front: [socks](docs/function/socks.md) |
+| 44 | hev-socks5-tunnel TUN (`libhev-socks5-tunnel.so`) | implemented | PattNG — the SOCKS5 **client** role (CONNECT + UDP ASSOCIATE, RFC 1929 credential) as a lane of the tree's own front layer, driven by the native `tun` device front: [socks](docs/function/socks.md). The datagram lane's frame is the frame the client framed: a datagram whose address is a literal is sent as it arrived, with no copy of its payload and no buffer of its own. |
 
 ### C — VPN / tunnel carriers
 
