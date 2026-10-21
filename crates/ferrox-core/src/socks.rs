@@ -150,16 +150,21 @@ pub fn user_pass(user: &[u8], pass: &[u8]) -> Vec<u8> {
 
 /// The request a client sends after the greeting: the version, the command, the reserved
 /// byte, and the destination.
+#[allow(
+    clippy::uninit_vec,
+    reason = "the address is written into the room below before the vector is read"
+)]
 #[must_use]
 pub fn request(cmd: u8, target: &Target<'_>) -> Vec<u8> {
     let mut out = Vec::with_capacity(3 + target.wire_len());
     out.push(VERSION);
     out.push(cmd);
     out.push(0);
-    let mut addr = [0u8; 1 + 1 + 256 + 2];
     let len = target.wire_len();
-    target.encode_into(&mut addr[..len]);
-    out.extend_from_slice(&addr[..len]);
+    out.reserve_exact(len);
+    // SAFETY: the address is written into the room below before the vector is read, and `encode_into` fills every byte of it.
+    unsafe { out.set_len(3 + len) };
+    target.encode_into(&mut out[3..]);
     out
 }
 
