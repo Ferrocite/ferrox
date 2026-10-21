@@ -1980,7 +1980,7 @@ fn serve_vless_quic(mut stream: crate::quic::QuicStream, id: &[u8; 16], freedom:
         stream.close();
         return;
     };
-    // Both relay halves share one lock each: an untimed blocking read would pin its half forever.
+    // An untimed read would pin its half forever: both directions keep a bounded wait.
     if uplink.set_read_timeout(Some(RELAY_POLL)).is_err() {
         stream.close();
         return;
@@ -1998,7 +1998,7 @@ fn serve_vless_quic(mut stream: crate::quic::QuicStream, id: &[u8; 16], freedom:
         let _ = stop.shutdown(Shutdown::Both);
         peer.close();
     });
-    relay_stream(Half::shared(stream), Half::socket(uplink), &close);
+    relay_stream(Half::socket(stream), Half::socket(uplink), &close);
     let _ = fin.fin();
 }
 
@@ -2565,7 +2565,7 @@ fn relay_fallback<S: Stream + Send + 'static>(proxied: ferrox_core::tls::Proxied
         upload,
         download,
     } = proxied;
-    // A silent cover origin must not hold the read across the mutex its upload writes on.
+    // A read with no bound never notices that the other leg ended, so the splice's peer is armed.
     if target.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
     }
@@ -2761,7 +2761,7 @@ impl<T> Half<T> {
 
 /// A handle the relay can duplicate: the two directions of one socket are two handles of
 /// it, and a socket's read and its write never touch each other.
-trait Duplicate: Sized {
+pub(crate) trait Duplicate: Sized {
     fn duplicate(&self) -> Option<Self>;
 }
 
@@ -2780,10 +2780,12 @@ impl Duplicate for std::net::TcpStream {
 impl<T: Duplicate> Half<T> {
     /// A socket's two directions, as two handles of it: the read and the write of a
     /// socket never touch each other, so the relay's writer never waits for the reader's
-    /// parked wait. A socket that cannot be duplicated keeps one handle behind one lock.
+    /// parked wait. The handle the caller armed is the one that waits — a duplicate
+    /// inherits no read timeout on Windows, and an unbounded read cannot notice that its
+    /// sibling ended. A socket that cannot be duplicated keeps one handle behind one lock.
     fn socket(value: T) -> Self {
         match value.duplicate() {
-            Some(read) => Self::split(read, value),
+            Some(write) => Self::split(value, write),
             None => Self::shared(value),
         }
     }
@@ -8684,7 +8686,7 @@ fn dial_http_outbound(
         let Ok(mut downstream) = client.try_clone() else {
             return;
         };
-        // Each half shares a lock, so an unbounded read would block the other direction's write.
+        // A read with no bound never notices that its sibling ended, so this leg is armed before it is relayed.
         if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
             return;
         }
@@ -12005,6 +12007,65 @@ mod tests {
             cvar.notify_all();
         }
         let _ = leg.join().expect("joins");
+    }
+
+    /// One handle of a relay half that records which handle served a call: `armed` is the
+    /// handle its caller sets a read timeout on, `duplicate` the one `Half::socket` clones.
+    struct Marked {
+        calls: Arc<Mutex<Vec<String>>>,
+        handle: &'static str,
+    }
+
+    impl Read for Marked {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push(format!("read {}", self.handle));
+            Ok(0)
+        }
+    }
+
+    impl Write for Marked {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.calls
+                .lock()
+                .expect("calls")
+                .push(format!("write {}", self.handle));
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Duplicate for Marked {
+        fn duplicate(&self) -> Option<Self> {
+            Some(Self {
+                calls: Arc::clone(&self.calls),
+                handle: "duplicate",
+            })
+        }
+    }
+
+    /// The wait a caller arms belongs on the handle that waits: a duplicated socket is an
+    /// independent handle on Windows, so a read served there has no bound and can never
+    /// notice that its sibling ended.
+    #[test]
+    fn the_socket_half_reads_on_the_armed_handle() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let half = Half::socket(Marked {
+            calls: Arc::clone(&calls),
+            handle: "armed",
+        });
+        let mut buf = [0u8; 4];
+        half.read_once(&mut buf).expect("reads");
+        half.write_once(b"ping").expect("writes");
+        assert_eq!(
+            *calls.lock().expect("calls"),
+            ["read armed", "write duplicate"],
+            "the read was served by the unarmed duplicate"
+        );
     }
 
     #[test]
