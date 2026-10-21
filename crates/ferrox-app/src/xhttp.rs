@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::io::{Read, Write};
@@ -1668,12 +1669,55 @@ pub(crate) fn accept_core<
     }
 }
 
-// The stream-one dial: one POST, chunked framing both ways.
-fn dial_head(host: &str, path: &str) -> String {
+thread_local! {
+    /// The dial's head, staged once per dialling thread and refilled in place by every later dial on it.
+    static DIAL_HEAD: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+}
+
+// The stream-one dial: one POST, chunked framing both ways, staged in the thread's own room.
+fn send_dial_head<W: crate::proxy::FrameWrite>(
+    write: &mut W,
+    host: &str,
+    path: &str,
+) -> Option<()> {
+    const BEFORE_PATH: &str = "POST ";
+    const BEFORE_HOST: &str = " HTTP/1.1\r\nHost: ";
+    const BEFORE_REFERER: &str = "\r\nReferer: http://";
+    const BEFORE_PADDING: &str = "?x_padding=";
+    const TAIL: &str = "\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n";
+    const PADDING_MAX: usize = 1000;
     let mut raw = [0u8; 4];
     getrandom::getrandom(&mut raw).unwrap_or_default();
     let len = 100 + u32::from_le_bytes(raw) as usize % 901;
-    format!("POST {path} HTTP/1.1\r\nHost: {host}\r\nReferer: http://{host}{path}?x_padding={}\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n", "X".repeat(len))
+    DIAL_HEAD.with(|cell| {
+        let mut head = cell.borrow_mut();
+        head.clear();
+        // The room is the head's longest shape, so the allocator is entered once and the padding's length never grows it.
+        head.reserve(
+            BEFORE_PATH.len()
+                + path.len()
+                + BEFORE_HOST.len()
+                + host.len()
+                + BEFORE_REFERER.len()
+                + host.len()
+                + path.len()
+                + BEFORE_PADDING.len()
+                + PADDING_MAX
+                + TAIL.len(),
+        );
+        head.extend_from_slice(BEFORE_PATH.as_bytes());
+        head.extend_from_slice(path.as_bytes());
+        head.extend_from_slice(BEFORE_HOST.as_bytes());
+        head.extend_from_slice(host.as_bytes());
+        head.extend_from_slice(BEFORE_REFERER.as_bytes());
+        head.extend_from_slice(host.as_bytes());
+        head.extend_from_slice(path.as_bytes());
+        head.extend_from_slice(BEFORE_PADDING.as_bytes());
+        let at = head.len();
+        head.resize(at + len, b'X');
+        head.extend_from_slice(TAIL.as_bytes());
+        write.write_all(&head).ok()
+    })
 }
 
 pub(crate) fn connect(
@@ -1682,7 +1726,7 @@ pub(crate) fn connect(
     path: &str,
 ) -> Option<(XhttpReader, XhttpWriter)> {
     let mut read = stream;
-    read.write_all(dial_head(host, path).as_bytes()).ok()?;
+    send_dial_head(&mut read, host, path)?;
     let (head, at) = read_head(&mut read)?;
     check_response(&head[..at])?;
     split(read, head, at)
@@ -1695,7 +1739,7 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     host: &str,
     path: &str,
 ) -> Option<(Reader<R>, XhttpWriter)> {
-    write.write_all(dial_head(host, path).as_bytes()).ok()?;
+    send_dial_head(&mut write, host, path)?;
     let (head, at) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
     check_response(&head[..at])?;
@@ -2367,6 +2411,65 @@ mod tests {
             status_through_core(&head, &settings),
             200,
             "an auto hub refused the head its own dialer writes"
+        );
+    }
+
+    /// The dial's head is the thread's own room: the allocator is entered on the first
+    /// dial and never again, and the head's bytes are the ones the reference writes.
+    #[test]
+    fn the_dial_head_is_staged_once_per_thread() {
+        struct Sink {
+            bytes: [u8; 4096],
+            at: usize,
+        }
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.bytes[self.at..self.at + buf.len()].copy_from_slice(buf);
+                self.at += buf.len();
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl crate::proxy::FrameWrite for Sink {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                parts.iter().all(|part| self.write_all(part).is_ok())
+            }
+        }
+        let (sink, counts) = ferrox_core::alloc_count::measure(|| {
+            let mut sink = Sink {
+                bytes: [0u8; 4096],
+                at: 0,
+            };
+            for _ in 0..12 {
+                sink.at = 0;
+                send_dial_head(&mut sink, "example.com", "/share").expect("writes");
+            }
+            sink
+        });
+        assert_eq!(counts.allocs, 1, "one buffer for the thread, twelve dials");
+        let head = String::from_utf8_lossy(&sink.bytes[..sink.at]);
+        assert!(
+            head.starts_with(
+                "POST /share HTTP/1.1\r\nHost: example.com\r\nReferer: http://example.com/share?x_padding="
+            ),
+            "{head}"
+        );
+        let run = head
+            .split("?x_padding=")
+            .nth(1)
+            .and_then(|rest| rest.split("\r\n").next())
+            .expect("the padding run");
+        assert!(
+            !run.is_empty() && run.chars().all(|byte| byte == 'X'),
+            "the padding is a run of X: {head}"
+        );
+        assert!(
+            head.ends_with(
+                "\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n"
+            ),
+            "{head}"
         );
     }
 
