@@ -455,6 +455,7 @@ dependencies = [
  "aes-gcm",
  "chacha20",
  "ferrox-core",
+ "libc",
  "windows-sys 0.52.0",
 ]
 
