@@ -159,9 +159,9 @@ jobs:
         run: |
           code=0
           timing=$(curl -sS --noproxy '*' --max-time 300 \
-            -w '%{size_download} %{time_total} %{speed_download}' \
+            -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
             'https://speed.cloudflare.com/__down?bytes=1000000' -o control.bin) || code=$?
-          echo "control, no lane ${timing:-0 0 0}" >> foxy-legs.tsv
+          echo "control, no lane ${timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
           got=$(wc -c < control.bin 2>/dev/null | tr -d ' ')
           echo "egress control: curl exit $code, ${got:-0} bytes of 1000000"
           {
@@ -264,9 +264,9 @@ jobs:
             # leg by name instead of scrolling past in a green job.
             code=0
             trace_timing=$(curl -sS --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
-              -w '%{size_download} %{time_total} %{speed_download}' \
+              -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
               https://www.cloudflare.com/cdn-cgi/trace -o trace.txt) || code=$?
-            echo "trace $carrier ${trace_timing:-0 0 0}" >> foxy-legs.tsv
+            echo "trace $carrier ${trace_timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
             if test "$code" != 0 || ! grep -qx "loc=$FOXY_COUNTRY" trace.txt; then
               echo "carrier $carrier FAILED: first trace, curl exit $code" >&2
               tail -n 30 ferrox-relay.log
@@ -277,9 +277,9 @@ jobs:
             grep -E '^(loc|ip)=' trace.txt || true
             code=0
             timing=$(curl -sS --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
-              -w '%{size_download} %{time_total} %{speed_download}' \
+              -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
               'https://speed.cloudflare.com/__down?bytes=1000000' -o "file-$carrier.bin") || code=$?
-            echo "carrier $carrier ${timing:-0 0 0}" >> foxy-legs.tsv
+            echo "carrier $carrier ${timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
             got=$(wc -c < "file-$carrier.bin" 2>/dev/null | tr -d ' ')
             got="${got:-0}"
             if test "$code" = 0 && test "$got" = 1000000; then
@@ -294,9 +294,9 @@ jobs:
               for flow in 2 3; do
                 code=0
                 timing=$(curl -sS --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
-                  -w '%{size_download} %{time_total} %{speed_download}' \
+                  -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                   'https://speed.cloudflare.com/__down?bytes=200000' -o "file-$carrier-w$flow.bin") || code=$?
-                echo "carrier $carrier warm$flow ${timing:-0 0 0}" >> foxy-legs.tsv
+                echo "carrier $carrier warm$flow ${timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
                 got=$(wc -c < "file-$carrier-w$flow.bin" 2>/dev/null | tr -d ' ')
                 got="${got:-0}"
                 if test "$code" = 0 && test "$got" = 200000; then
@@ -318,9 +318,9 @@ jobs:
               if [ "${{ matrix.os }}" = "ubuntu-latest" ] && { [ "$carrier" = h3 ] || [ "$carrier" = h2 ]; }; then
                 code=0
                 timing=$(curl -sS --max-time 120 --socks5-hostname "127.0.0.1:$PORT" \
-                  -w '%{size_download} %{time_total} %{speed_download}' \
+                  -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                   'https://speed.cloudflare.com/__down?bytes=10485760' -o "bulk-$carrier.bin") || code=$?
-                echo "carrier $carrier bulk ${timing:-0 0 0}" >> foxy-legs.tsv
+                echo "carrier $carrier bulk ${timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
                 got=$(wc -c < "bulk-$carrier.bin" 2>/dev/null | tr -d ' ')
                 got="${got:-0}"
                 if test "$code" = 0 && test "$got" = 10485760; then
@@ -443,14 +443,14 @@ jobs:
             code=0
             if [ "$FRONT" = http ]; then
               timing=$(curl -sS --max-time 15 -x "http://127.0.0.1:$PORT" \
-                -w '%{size_download} %{time_total} %{speed_download}' \
+                -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                 https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt) || code=$?
             else
               timing=$(curl -sS --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
-                -w '%{size_download} %{time_total} %{speed_download}' \
+                -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                 https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt) || code=$?
             fi
-            echo "$LABEL trace ${timing:-0 0 0}" >> foxy-legs.tsv
+            echo "$LABEL trace ${timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
             test "$code" = 0 && grep -qx "loc=$WANT" trace-lane.txt
           }
           # `-w` gives the duration: bytes moved, seconds taken, the rate held.
@@ -462,14 +462,14 @@ jobs:
             code=0
             if [ "$FRONT" = http ]; then
               timing=$(curl -sS --max-time 60 -x "http://127.0.0.1:$PORT" \
-                -w '%{size_download} %{time_total} %{speed_download}' \
+                -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                 'https://speed.cloudflare.com/__down?bytes=1000000' -o "$FILE") || code=$?
             else
               timing=$(curl -sS --max-time 60 --socks5-hostname "127.0.0.1:$PORT" \
-                -w '%{size_download} %{time_total} %{speed_download}' \
+                -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
                 'https://speed.cloudflare.com/__down?bytes=1000000' -o "$FILE") || code=$?
             fi
-            echo "$LABEL ${timing:-0 0 0}" >> foxy-legs.tsv
+            echo "$LABEL ${timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
             got=$(wc -c < "$FILE" 2>/dev/null | tr -d ' ')
             got="${got:-0}"
             test "$code" = 0 && test "$got" = 1000000 || {
@@ -633,9 +633,9 @@ jobs:
             : > trace-lane.txt
             code=0
             timing=$(curl -sS --max-time 15 --socks5-hostname "127.0.0.1:$PORT" \
-              -w '%{size_download} %{time_total} %{speed_download}' \
+              -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
               https://www.cloudflare.com/cdn-cgi/trace -o trace-lane.txt) || code=$?
-            echo "$LABEL trace ${timing:-0 0 0}" >> foxy-legs.tsv
+            echo "$LABEL trace ${timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
             test "$code" = 0 && grep -qx "loc=$WANT" trace-lane.txt
           }
 
@@ -651,9 +651,9 @@ jobs:
           trace_socks "$PORT" DE "second country DE" || FAILED="$FAILED de(trace)"
           de_code=0
           de_timing=$(curl -sS --max-time 120 --socks5-hostname "127.0.0.1:$PORT" \
-            -w '%{size_download} %{time_total} %{speed_download}' \
+            -w '%{size_download} %{time_total} %{speed_download} %{time_namelookup} %{time_connect} %{time_appconnect} %{time_starttransfer}' \
             'https://speed.cloudflare.com/__down?bytes=1000000' -o file-de.bin) || de_code=$?
-          echo "second country DE ${de_timing:-0 0 0}" >> foxy-legs.tsv
+          echo "second country DE ${de_timing:-0 0 0 0 0 0 0}" >> foxy-legs.tsv
           de_got=$(wc -c < file-de.bin 2>/dev/null | tr -d ' ')
           test "$de_code" = 0 && test "${de_got:-0}" = 1000000 || {
             echo "second country DE FAILED: curl exit $de_code after ${de_got:-0} of 1000000 B" >&2
@@ -849,6 +849,14 @@ jobs:
           # seconds burned for fewer bytes rather than as a silent skip. It goes
           # to the log as well as the summary, because a number that lives only
           # in a job summary cannot be read from outside the web UI.
+          # The four stamps after the rate split one leg into what it paid before
+          # a byte moved and what the bytes cost: `proxy open` is the SOCKS
+          # handshake to this listener, `tls through the lane` is the end-to-end
+          # TLS carried over that tunnel, `first byte` is when the edge's answer
+          # started, and `transfer tail` is the body alone. A leg whose seconds
+          # are all `first byte` is a flow-open cost and no rate claim survives
+          # it; a leg whose seconds are all `transfer tail` is the lane's own
+          # pacing.
           table=$(python3 - <<'PY'
           rows = []
           try:
@@ -857,21 +865,23 @@ jobs:
           except OSError:
               lines = []
           for line in lines:
-              parts = line.rsplit(None, 3)
-              if len(parts) != 4:
+              parts = line.rsplit(None, 7)
+              if len(parts) != 8:
                   continue
-              label, size, seconds, speed = parts
+              label, size, seconds, speed, dns, conn, tls, ttfb = parts
               try:
-                  size, seconds, speed = float(size), float(seconds), float(speed)
+                  nums = [float(field) for field in (size, seconds, speed, dns, conn, tls, ttfb)]
               except ValueError:
                   continue
-              rows.append((label, size, seconds, speed))
-          control = next((rate for label, _, _, rate in rows if label.startswith("control")), 0)
-          for label, size, seconds, speed in rows:
+              rows.append((label, *nums))
+          control = next((rate for label, _, _, rate, *_ in rows if label.startswith("control")), 0)
+          for label, size, seconds, speed, dns, conn, tls, ttfb in rows:
               ratio = f"{speed / control:.2f}" if control > 0 and not label.startswith("control") else "-"
-              print(f"| {label} | {int(size)} | {seconds:.2f} | {speed / 1048576:.2f} | {ratio} |")
+              tail = seconds - ttfb
+              print(f"| {label} | {int(size)} | {seconds:.2f} | {speed / 1048576:.2f} | {ratio} "
+                    f"| {conn:.2f} | {tls:.2f} | {ttfb:.2f} | {tail:.2f} |")
           if not rows:
-              print("| (no leg recorded a transfer) | 0 | 0.00 | 0.00 | - |")
+              print("| (no leg recorded a transfer) | 0 | 0.00 | 0.00 | - | 0.00 | 0.00 | 0.00 | 0.00 |")
           PY
           )
           echo "$table"
@@ -879,7 +889,7 @@ jobs:
             echo
             echo "### Lane durations, live (${{ matrix.os }})"
             echo
-            echo "| leg | bytes | seconds | MiB/s | vs this runner's own egress |"
-            echo "| --- | --- | --- | --- | --- |"
+            echo "| leg | bytes | seconds | MiB/s | vs this runner's own egress | proxy open | tls through the lane | first byte | transfer tail |"
+            echo "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
             echo "$table"
           } >> "$GITHUB_STEP_SUMMARY"
