@@ -45,6 +45,17 @@ pub(crate) enum Carrier {
 }
 
 impl Carrier {
+    /// The byte a carrier is remembered under: a cache key that names a carrier needs one byte of it, and a joined name was a `String` per lookup.
+    #[must_use]
+    pub(crate) const fn key(self) -> u8 {
+        match self {
+            Self::H1 => 0,
+            Self::H2 => 1,
+            Self::H3 => 2,
+            Self::Auto => 3,
+        }
+    }
+
     #[must_use]
     pub(crate) const fn alpn(self) -> &'static [u8] {
         match self {

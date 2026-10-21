@@ -295,10 +295,14 @@ pub fn refusal_backoff(strikes: u32) -> std::time::Duration {
     std::time::Duration::from_secs((BASE << strikes.saturating_sub(1).min(16)).min(CAP))
 }
 
-/// Remembers the targets an edge has declined, so the next flow to one is answered locally instead of paying a round trip for the same status.
+/// Remembers the carriers an edge went silent on, so the next flow to one is answered locally instead of paying a round trip for the same silence.
+///
+/// The entries are a list rather than a map, because the list is short — one entry per edge per carrier, a handful — and a lookup walks it without hashing anything. The joined `String` key this replaced cost one allocation per lookup, and the lookup is on the dial path: once per carrier per edge per flow.
+///
+/// The lookup takes the three parts rather than a key, so a caller that already holds the edge's name asks without copying it: the copy is paid once, when the silence is remembered.
 #[derive(Debug)]
 pub struct Refusals {
-    entries: std::collections::HashMap<String, u64>,
+    entries: Vec<(CarrierKey, u64)>,
     cap: usize,
 }
 
@@ -306,32 +310,71 @@ impl Refusals {
     #[must_use]
     pub fn new(cap: usize) -> Self {
         Self {
-            entries: std::collections::HashMap::new(),
+            entries: Vec::new(),
             cap: cap.max(1),
         }
     }
 
-    pub fn remember(&mut self, key: &str, until: u64) {
-        if self.entries.len() >= self.cap && !self.entries.contains_key(key) {
-            let oldest = self
+    /// Whether this edge went silent on this carrier, inside the window.
+    #[must_use]
+    pub fn blocked(&self, carrier: u8, host: &str, port: u16, now: u64) -> bool {
+        self.entries.iter().any(|(known, until)| {
+            known.carrier == carrier && known.host == host && known.port == port && *until > now
+        })
+    }
+
+    pub fn remember(&mut self, carrier: u8, host: &str, port: u16, until: u64) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|(known, _)| known.carrier == carrier && known.host == host && known.port == port)
+        {
+            entry.1 = until;
+            return;
+        }
+        if self.entries.len() >= self.cap {
+            // The entry that expires first is the one to drop: the window is the whole of what an entry says, so the earliest expiry is the oldest news.
+            if let Some(at) = self
                 .entries
                 .iter()
-                .min_by_key(|(_, until)| **until)
-                .map(|(key, _)| key.clone());
-            if let Some(oldest) = oldest {
-                self.entries.remove(&oldest);
+                .enumerate()
+                .min_by_key(|(_, (_, until))| *until)
+                .map(|(at, _)| at)
+            {
+                self.entries.remove(at);
             }
         }
-        self.entries.insert(key.to_owned(), until);
+        self.entries
+            .push((CarrierKey::new(carrier, host, port), until));
     }
 
-    #[must_use]
-    pub fn blocked(&self, key: &str, now: u64) -> bool {
-        self.entries.get(key).is_some_and(|until| *until > now)
+    pub fn clear(&mut self, carrier: u8, host: &str, port: u16) {
+        self.entries.retain(|(known, _)| {
+            known.carrier != carrier || known.host != host || known.port != port
+        });
     }
+}
 
-    pub fn clear(&mut self, key: &str) {
-        self.entries.remove(key);
+/// The key a carrier's silence is remembered under: the carrier, the edge's name and the port it was reached on, as three fields rather than a joined string.
+///
+/// The joined form was a `String` per lookup, and the lookup happens on the dial path — once per carrier per edge per flow — so a flow paid three allocations to ask a cache whether it had already been told. The three fields are what the entry was anyway: the name and the port are the edge's own, and the carrier is a byte.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CarrierKey {
+    /// The carrier the edge went silent on.
+    carrier: u8,
+    /// The edge's name.
+    host: String,
+    /// The port the edge was reached on.
+    port: u16,
+}
+
+impl CarrierKey {
+    fn new(carrier: u8, host: &str, port: u16) -> Self {
+        Self {
+            carrier,
+            host: host.to_owned(),
+            port,
+        }
     }
 }
 
@@ -806,36 +849,53 @@ mod tests {
     #[test]
     fn a_carrier_this_edge_did_not_answer_waits_out_its_window() {
         let mut probe = Refusals::new(8);
-        probe.remember("H3 edge.example:2499", 1_000);
-        assert!(probe.blocked("H3 edge.example:2499", 10));
+        probe.remember(2, "edge.example", 2499, 1_000);
+        assert!(probe.blocked(2, "edge.example", 2499, 10));
         assert!(
-            !probe.blocked("H2 edge.example:2499", 10),
+            !probe.blocked(1, "edge.example", 2499, 10),
             "the other carrier is not what was asked"
         );
         assert!(
-            !probe.blocked("H3 edge.example:2499", 1_000),
+            !probe.blocked(2, "edge.example", 2499, 1_000),
             "the window ends, and the edge is asked again"
         );
-        probe.remember("H3 edge.example:2499", 2_000);
-        probe.clear("H3 edge.example:2499");
+        probe.remember(2, "edge.example", 2499, 2_000);
+        probe.clear(2, "edge.example", 2499);
         assert!(
-            !probe.blocked("H3 edge.example:2499", 10),
+            !probe.blocked(2, "edge.example", 2499, 10),
             "a cleared carrier is asked"
         );
-        assert!(probe.entries.is_empty(), "and the map is left empty");
+        assert!(probe.entries.is_empty(), "and the list is left empty");
+    }
+
+    /// The lookup takes the edge's own name, so a caller that already holds it asks without copying it: the joined key this replaced cost one allocation per lookup, and the lookup is on the dial path.
+    #[test]
+    fn a_carrier_cache_lookup_allocates_nothing() {
+        let mut probe = Refusals::new(8);
+        probe.remember(2, "edge.example", 2499, 1_000);
+        let host = String::from("edge.example");
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                assert!(probe.blocked(2, &host, 2499, 10));
+            }
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "the lookup copies nothing: the name is the caller's own"
+        );
     }
 
     #[test]
     fn a_refusal_expires_and_the_cache_stays_capped() {
         let mut refusals = Refusals::new(2);
-        refusals.remember("a:80", 30);
-        refusals.remember("b:80", 40);
-        assert!(refusals.blocked("a:80", 10) && refusals.blocked("b:80", 10));
-        assert!(!refusals.blocked("a:80", 40));
-        refusals.remember("c:80", 90);
+        refusals.remember(0, "a", 80, 30);
+        refusals.remember(0, "b", 80, 40);
+        assert!(refusals.blocked(0, "a", 80, 10) && refusals.blocked(0, "b", 80, 10));
+        assert!(!refusals.blocked(0, "a", 80, 40));
+        refusals.remember(0, "c", 80, 90);
         assert_eq!(refusals.entries.len(), 2);
-        refusals.clear("c:80");
-        assert!(!refusals.blocked("c:80", 10));
+        refusals.clear(0, "c", 80);
+        assert!(!refusals.blocked(0, "c", 80, 10));
     }
 
     /// One tunnel that stayed up clears the streak a short one built; only ends sooner than the mark, one after another, extend it.

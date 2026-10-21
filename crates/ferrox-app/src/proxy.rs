@@ -976,10 +976,9 @@ impl FoxyOut {
         edge: &ferrox_core::foxy::Candidate,
         carrier: crate::foxy::Carrier,
     ) -> bool {
-        let key = carrier_key(edge, carrier);
         self.carrier_dead
             .lock()
-            .is_ok_and(|cache| cache.blocked(&key, now_secs()))
+            .is_ok_and(|cache| cache.blocked(carrier.key(), &edge.host, edge.port, now_secs()))
     }
 
     /// Only silence is cached: a status means the edge answered, so it never marks a carrier dead.
@@ -997,17 +996,20 @@ impl FoxyOut {
         ) {
             return;
         }
-        let key = carrier_key(edge, carrier);
         if let Ok(mut cache) = self.carrier_dead.lock() {
-            cache.remember(&key, now_secs() + CARRIER_DEAD_SECS);
+            cache.remember(
+                carrier.key(),
+                &edge.host,
+                edge.port,
+                now_secs() + CARRIER_DEAD_SECS,
+            );
         }
     }
 
     /// The edge answered this carrier: the remembered silence was wrong, so it is found again at once.
     fn carrier_answered(&self, edge: &ferrox_core::foxy::Candidate, carrier: crate::foxy::Carrier) {
-        let key = carrier_key(edge, carrier);
         if let Ok(mut cache) = self.carrier_dead.lock() {
-            cache.clear(&key);
+            cache.clear(carrier.key(), &edge.host, edge.port);
         }
     }
 
@@ -1050,11 +1052,6 @@ impl FoxyOut {
             cache.note_end(&edge.authority(), lasted, now_secs());
         }
     }
-}
-
-/// The key a carrier's silence is remembered under: carrier, edge, and the port it was reached on.
-fn carrier_key(edge: &ferrox_core::foxy::Candidate, carrier: crate::foxy::Carrier) -> String {
-    format!("{carrier:?} {}:{}", edge.host, edge.port)
 }
 
 #[derive(Debug, Clone)]
@@ -23961,7 +23958,9 @@ mod tests {
         let edge = &foxy.candidates[0];
         if let Ok(mut cache) = foxy.carrier_dead.lock() {
             cache.remember(
-                &carrier_key(edge, edge_carrier),
+                edge_carrier.key(),
+                &edge.host,
+                edge.port,
                 now_secs().saturating_sub(1),
             );
         }
@@ -24037,7 +24036,9 @@ mod tests {
         for carrier in crate::foxy::Carrier::udp_order() {
             if let Ok(mut cache) = foxy.carrier_dead.lock() {
                 cache.remember(
-                    &carrier_key(&foxy.candidates[0], carrier),
+                    carrier.key(),
+                    &foxy.candidates[0].host,
+                    foxy.candidates[0].port,
                     now_secs() + CARRIER_DEAD_SECS,
                 );
             }
@@ -24056,7 +24057,11 @@ mod tests {
         );
         // The window, not the verdict: a carrier left alone for its quarantine is asked again when it ends.
         if let Ok(mut cache) = foxy.carrier_dead.lock() {
-            cache.clear(&carrier_key(&foxy.candidates[0], edge_carrier));
+            cache.clear(
+                edge_carrier.key(),
+                &foxy.candidates[0].host,
+                foxy.candidates[0].port,
+            );
         }
         assert!(
             !open_foxy_ip_tunnel(&foxy, &mut tunnel, &mut source, &mut width),

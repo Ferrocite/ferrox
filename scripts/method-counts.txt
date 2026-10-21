@@ -528,3 +528,4 @@ front-dokodemo transparent-settings-refused 2 ferrox-app-proxy::tests::a_dokodem
 front-dokodemo xray-scenario-tests-passing 2 scripts/run-upstream-suite.sh
 carrier-foxy h3-read-calls-per-16k-download 5 ferrox-app-foxy::loopback::an_h3_read_crosses_the_frames_under_it
 carrier-foxy h3-bytes-lost-when-the-peer-finishes 0 ferrox-app-foxy::loopback::an_h3_stream_the_peer_finished_ends_the_tunnel
+carrier-foxy carrier-cache-lookup-allocations 0 ferrox-core-foxy::tests::a_carrier_cache_lookup_allocates_nothing
