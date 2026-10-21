@@ -44,6 +44,9 @@ pub(crate) struct Waited(u64);
 
 impl Drop for Waited {
     fn drop(&mut self) {
+        if !cfg!(debug_assertions) {
+            return;
+        }
         let mut live = live();
         // The id, not an index: another wait leaving first moves whatever sat after it.
         if let Some(at) = live.iter().position(|entry| entry.id == self.0) {
@@ -55,6 +58,10 @@ impl Drop for Waited {
 /// Register a wait as this thread holding it, and return the guard that unregisters it.
 #[must_use = "a wait that registers nothing cannot be dumped"]
 pub(crate) fn enter(name: &'static str, fd: i64, armed: Option<Duration>) -> Waited {
+    // The census is a stall hunt's instrument: a shipped relay pays neither the map, the lock, the clock nor the scan, so a release build returns before any of them.
+    if !cfg!(debug_assertions) {
+        return Waited(0);
+    }
     let id = NEXT.fetch_add(1, Ordering::Relaxed);
     live().push(Entry {
         id,
@@ -66,6 +73,12 @@ pub(crate) fn enter(name: &'static str, fd: i64, armed: Option<Duration>) -> Wai
     });
     ALARMED.call_once(start_alarm);
     Waited(id)
+}
+
+/// How many waits this build has registered: a release build registers none.
+#[cfg(test)]
+pub(crate) fn registrations() -> u64 {
+    NEXT.load(Ordering::Relaxed)
 }
 
 /// The descriptor a stream's blocking calls wait on, in the number the census prints.
