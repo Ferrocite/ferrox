@@ -1144,6 +1144,7 @@ pub(crate) struct Budgets {
     pub(crate) udp_idle: Option<Duration>,
     pub(crate) payload_grace: Option<Duration>,
     pub(crate) goaway_grace: Option<Duration>,
+    pub(crate) sink_grace: Option<Duration>,
     pub(crate) carrier_probe: Option<Duration>,
 }
 
@@ -1167,6 +1168,7 @@ pub(crate) fn budgets(root: &Json) -> Result<Budgets, String> {
             "udpIdle" => &mut out.udp_idle,
             "payloadGrace" => &mut out.payload_grace,
             "goawayGrace" => &mut out.goaway_grace,
+            "sinkGrace" => &mut out.sink_grace,
             "carrierProbe" => &mut out.carrier_probe,
             other => return Err(format!("unknown budget `{other}`")),
         };

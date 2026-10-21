@@ -13,21 +13,36 @@ pub(crate) fn to_json(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.core.Config");
     let mut inbounds = Vec::new();
     let mut outbounds = Vec::new();
+    let mut routing = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => inbounds.extend(inbound(reader.bytes()?)?),
             (2, 2) => outbounds.push(outbound(reader.bytes()?)?),
-            // Apps (dispatcher, proxyman, log) and extensions wire xray's own object graph; nothing below reads them.
-            (4 | 6, 2) => {
+            // The router's rules say which tagged outbound a flow goes to; every other app is xray's own object graph.
+            (4, 2) => {
+                let (name, value) = typed_message(reader.bytes()?)?;
+                if name == "xray.app.router.Config" {
+                    if routing.is_some() {
+                        return Err("xray.core.Config: two router apps".to_owned());
+                    }
+                    routing = Some(router_settings(value)?);
+                }
+            }
+            // Extensions wire xray's own object graph; nothing below reads them.
+            (6, 2) => {
                 reader.bytes()?;
             }
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    Ok(object(vec![
+    let mut pairs = vec![
         ("inbounds", Json::Arr(inbounds)),
         ("outbounds", Json::Arr(outbounds)),
-    ]))
+    ];
+    if let Some(routing) = routing {
+        pairs.push(("routing", routing));
+    }
+    Ok(object(pairs))
 }
 
 /// One inbound handler decodes to one JSON inbound per port it names: xray carries a whole
@@ -36,11 +51,18 @@ fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
     let mut reader = Reader::new(bytes, "xray.core.InboundHandlerConfig");
     let mut receiver = None;
     let mut settings = None;
+    let mut tag = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
-            // A tag names the handler for xray's router; nothing here routes.
+            // A tag names the handler for the router's rules.
             (1, 2) => {
-                reader.bytes()?;
+                tag = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| {
+                            "xray.core.InboundHandlerConfig: the tag is not utf-8".to_owned()
+                        })?
+                        .to_owned(),
+                );
             }
             (2, 2) => {
                 let (name, value) = typed_message(reader.bytes()?)?;
@@ -75,6 +97,9 @@ fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
                 ("port", Json::Num(f64::from(port))),
                 ("listen", Json::Str(listen.clone())),
             ];
+            if let Some(tag) = &tag {
+                pairs.push(("tag", Json::Str(tag.clone())));
+            }
             if inbound_settings != Json::Null {
                 pairs.push(("settings", inbound_settings.clone()));
             }
@@ -86,10 +111,21 @@ fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
 fn outbound(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.core.OutboundHandlerConfig");
     let mut settings = None;
+    let mut tag = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
-            // A tag names the handler and a comment describes it; nothing here reads them.
-            (1 | 5, 2) => {
+            // A tag names the handler for the router's rules.
+            (1, 2) => {
+                tag = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| {
+                            "xray.core.OutboundHandlerConfig: the tag is not utf-8".to_owned()
+                        })?
+                        .to_owned(),
+                );
+            }
+            // A comment describes the handler; nothing here reads it.
+            (5, 2) => {
                 reader.bytes()?;
             }
             // Sender settings carry the client-side stream and multiplex policy; a scenario that sets them means more than a direct dial.
@@ -100,29 +136,41 @@ fn outbound(bytes: &[u8]) -> Result<Json, String> {
         }
     }
     let (name, value) = settings.ok_or("xray.core.OutboundHandlerConfig: no proxy settings")?;
-    match name.as_str() {
+    let mut pairs = match name.as_str() {
         "xray.proxy.freedom.Config" => {
             freedom_settings(value)?;
-            Ok(object(vec![("protocol", Json::Str("freedom".to_owned()))]))
+            vec![("protocol", Json::Str("freedom".to_owned()))]
         }
-        "xray.proxy.vmess.outbound.Config" => Ok(object(vec![
+        "xray.proxy.vmess.outbound.Config" => vec![
             ("protocol", Json::Str("vmess".to_owned())),
             ("settings", vmess_outbound_settings(value)?),
-        ])),
-        "xray.proxy.vless.outbound.Config" => Ok(object(vec![
+        ],
+        "xray.proxy.vless.outbound.Config" => vec![
             ("protocol", Json::Str("vless".to_owned())),
             ("settings", vless_outbound_settings(value)?),
-        ])),
-        "xray.proxy.shadowsocks.ClientConfig" => Ok(object(vec![
+        ],
+        "xray.proxy.shadowsocks.ClientConfig" => vec![
             ("protocol", Json::Str("shadowsocks".to_owned())),
             ("settings", ss_outbound_settings(value)?),
-        ])),
-        "xray.proxy.socks.ClientConfig" => Ok(object(vec![
+        ],
+        "xray.proxy.socks.ClientConfig" => vec![
             ("protocol", Json::Str("socks".to_owned())),
             ("settings", socks_outbound_settings(value)?),
-        ])),
-        _ => Err(format!("outbound protocol `{name}` is not carried")),
+        ],
+        "xray.proxy.blackhole.Config" => {
+            let settings = blackhole_settings(value)?;
+            let mut pairs = vec![("protocol", Json::Str("blackhole".to_owned()))];
+            if settings != Json::Null {
+                pairs.push(("settings", settings));
+            }
+            pairs
+        }
+        _ => return Err(format!("outbound protocol `{name}` is not carried")),
+    };
+    if let Some(tag) = tag {
+        pairs.push(("tag", Json::Str(tag)));
     }
+    Ok(object(pairs))
 }
 
 fn receiver_config(bytes: &[u8]) -> Result<(String, Vec<u16>), String> {
@@ -382,6 +430,154 @@ fn vmess_outbound_settings(bytes: &[u8]) -> Result<Json, String> {
             ("users", Json::Arr(vec![vmess_client(id, security)])),
         ])]),
     )]))
+}
+
+/// A blackhole outbound swallows the flow and answers the client with the
+/// reference's own answer: nothing, the 403, or the bytes the config carries.
+fn blackhole_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.blackhole.Config");
+    let mut response = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => response = Some(blackhole_response(reader.bytes()?)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let Some(response) = response else {
+        return Ok(Json::Null);
+    };
+    Ok(object(vec![("response", response)]))
+}
+
+/// `xray.proxy.blackhole.Response`: the answer's kind and the bytes a custom
+/// answer carries. The bytes travel as base64, the shape this tree's own JSON
+/// dialect reads them in.
+fn blackhole_response(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.blackhole.Response");
+    let mut kind = String::new();
+    let mut data = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => {
+                kind.clear();
+                kind.push_str(std::str::from_utf8(reader.bytes()?).map_err(|_| {
+                    "xray.proxy.blackhole.Response: the type is not utf-8".to_owned()
+                })?);
+            }
+            (2, 2) => data = reader.bytes()?.to_vec(),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = vec![("type", Json::Str(kind))];
+    if !data.is_empty() {
+        pairs.push((
+            "customResponseData",
+            Json::Str(ferrox_core::b64::encode(&data)),
+        ));
+    }
+    Ok(object(pairs))
+}
+
+/// The router app: the rules that send a flow to a tagged outbound, in the
+/// shape this tree's own router reads.
+fn router_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.app.router.Config");
+    let mut rules = Vec::new();
+    let mut strategy = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => {
+                let value = reader.varint()?;
+                strategy = Some(match value {
+                    0 => "AsIs",
+                    2 => "IpIfNonMatch",
+                    3 => "IpOnDemand",
+                    other => return Err(reader.uncarried(&format!("the domain strategy {other}"))),
+                });
+            }
+            (2, 2) => rules.push(router_rule(reader.bytes()?)?),
+            (3, 2) => return Err(reader.uncarried("balancers")),
+            (4, 2) => return Err(reader.uncarried("the routing script")),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = Vec::new();
+    if let Some(strategy) = strategy {
+        pairs.push(("domainStrategy", Json::Str(strategy.to_owned())));
+    }
+    pairs.push(("rules", Json::Arr(rules)));
+    Ok(object(pairs))
+}
+
+/// `xray.app.router.RoutingRule`: the outbound a flow goes to and the port it
+/// goes on. Every other selector is refused by name: this tree's router reads
+/// more of them, but the bridge carries what the pinned scenarios write.
+fn router_rule(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.app.router.RoutingRule");
+    let mut tag = None;
+    let mut ports = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => {
+                tag = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| {
+                            "xray.app.router.RoutingRule: the tag is not utf-8".to_owned()
+                        })?
+                        .to_owned(),
+                );
+            }
+            (14, 2) => ports = Some(port_selector(reader.bytes()?)?),
+            (2, 2) => return Err(reader.uncarried("a domain rule")),
+            (7, 2) => return Err(reader.uncarried("a user rule")),
+            (8, 2) => return Err(reader.uncarried("an inbound tag")),
+            (9, 2) => return Err(reader.uncarried("a protocol rule")),
+            (10, 2) => return Err(reader.uncarried("an ip rule")),
+            (11, 2) => return Err(reader.uncarried("a source ip rule")),
+            (12, 2) => return Err(reader.uncarried("a balancer tag")),
+            (13, 2) => return Err(reader.uncarried("a network rule")),
+            (15, 2) => return Err(reader.uncarried("an attribute rule")),
+            (16, 2) => return Err(reader.uncarried("a source port rule")),
+            (17, 2) => return Err(reader.uncarried("a local ip rule")),
+            (18, 2) => return Err(reader.uncarried("a local port rule")),
+            (19, 2) => return Err(reader.uncarried("a rule tag")),
+            (20, 2) => return Err(reader.uncarried("a vless route list")),
+            (21, 2) => return Err(reader.uncarried("a process rule")),
+            (22, 2) => return Err(reader.uncarried("a webhook")),
+            (23, 2) => return Err(reader.uncarried("a local os rule")),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let tag = tag.ok_or("xray.app.router.RoutingRule: no outbound tag")?;
+    let mut pairs = vec![("outboundTag", Json::Str(tag))];
+    if let Some(ports) = ports {
+        pairs.push(("port", Json::Str(ports)));
+    }
+    Ok(object(pairs))
+}
+
+/// `xray.common.net.PortList` in the shape this tree's router reads: a range is
+/// `from-to` and several are comma-separated.
+fn port_selector(bytes: &[u8]) -> Result<String, String> {
+    let mut reader = Reader::new(bytes, "xray.common.net.PortList");
+    let mut parts = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => {
+                let (from, to) = port_range(reader.bytes()?)?;
+                parts.push(if from == to {
+                    from.to_string()
+                } else {
+                    format!("{from}-{to}")
+                });
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    if parts.is_empty() {
+        return Err("xray.common.net.PortList: no range".to_owned());
+    }
+    Ok(parts.join(","))
 }
 
 /// `common.protocol.ServerEndpoint`: an address, a port and the user that signs the dial.
@@ -1801,6 +1997,138 @@ mod tests {
             user.get("pass").and_then(Json::as_str),
             Some("Test Password")
         );
+    }
+
+    /// The blackhole outbound the pinned scenario suite names: a config with no
+    /// response, and one with each answer the reference knows.
+    #[test]
+    fn a_blackhole_scenario_decodes_its_answers() {
+        let silent = message(&[bytes_field(3, &typed("xray.proxy.blackhole.Config", &[]))]);
+        let json = to_json(&config(&socks_inbound(5000, 0, &[]), &silent)).expect("decodes");
+        let outbound = &json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0];
+        assert_eq!(
+            outbound.get("protocol").and_then(Json::as_str),
+            Some("blackhole")
+        );
+        assert!(
+            outbound.get("settings").is_none(),
+            "a config with no response names no answer"
+        );
+
+        let http = message(&[bytes_field(
+            3,
+            &typed(
+                "xray.proxy.blackhole.Config",
+                &bytes_field(1, &message(&[bytes_field(1, b"http")])),
+            ),
+        )]);
+        let json = to_json(&config(&socks_inbound(5000, 0, &[]), &http)).expect("decodes");
+        let response = json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0]
+            .get("settings")
+            .expect("settings")
+            .get("response")
+            .expect("response");
+        assert_eq!(response.get("type").and_then(Json::as_str), Some("http"));
+
+        let custom = message(&[bytes_field(
+            3,
+            &typed(
+                "xray.proxy.blackhole.Config",
+                &bytes_field(
+                    1,
+                    &message(&[bytes_field(1, b"custom"), bytes_field(2, &[0, 1, 2])]),
+                ),
+            ),
+        )]);
+        let json = to_json(&config(&socks_inbound(5000, 0, &[]), &custom)).expect("decodes");
+        let response = json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0]
+            .get("settings")
+            .expect("settings")
+            .get("response")
+            .expect("response");
+        assert_eq!(response.get("type").and_then(Json::as_str), Some("custom"));
+        assert_eq!(
+            response.get("customResponseData").and_then(Json::as_str),
+            Some("AAEC"),
+            "the answer's bytes travel as base64"
+        );
+    }
+
+    /// The router app the pinned blackhole scenario writes: a rule that sends
+    /// the flow on one port to a tagged outbound, and the tags the rule names.
+    #[test]
+    fn a_router_rule_names_the_outbound_a_flow_goes_to() {
+        let range = message(&[varint_field(1, 5001), varint_field(2, 5001)]);
+        let ports = message(&[bytes_field(1, &range)]);
+        let rule = message(&[bytes_field(1, b"blocked"), bytes_field(14, &ports)]);
+        let router = message(&[bytes_field(2, &rule)]);
+        let outbound = message(&[
+            bytes_field(1, b"blocked"),
+            bytes_field(3, &typed("xray.proxy.blackhole.Config", &[])),
+        ]);
+        let config = message(&[
+            bytes_field(1, &socks_inbound(5000, 0, &[])),
+            bytes_field(2, &outbound),
+            bytes_field(4, &typed("xray.app.router.Config", &router)),
+        ]);
+        let json = to_json(&config).expect("decodes");
+        let rules = json
+            .get("routing")
+            .expect("routing")
+            .get("rules")
+            .and_then(Json::as_arr)
+            .expect("rules");
+        assert_eq!(rules.len(), 1);
+        assert_eq!(
+            rules[0].get("outboundTag").and_then(Json::as_str),
+            Some("blocked")
+        );
+        assert_eq!(rules[0].get("port").and_then(Json::as_str), Some("5001"));
+        let outbound = &json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0];
+        assert_eq!(outbound.get("tag").and_then(Json::as_str), Some("blocked"));
+        assert_eq!(
+            outbound.get("protocol").and_then(Json::as_str),
+            Some("blackhole")
+        );
+        // The rule reaches this tree's own router: the flow on that port goes to the outbound the rule names.
+        let routing = crate::router::Routing::parse(&json)
+            .expect("parses")
+            .expect("routing");
+        let flow = crate::router::Flow {
+            network: crate::router::Network::Tcp,
+            domain: None,
+            ip: Some("127.0.0.1".parse().expect("addr")),
+            port: Some(5001),
+            source: None,
+            local: None,
+            inbound_tag: None,
+        };
+        assert_eq!(routing.route(&flow), Some("blocked"));
+    }
+
+    /// An app this tree does not read is xray's own object graph and is
+    /// skipped, the way the bridge has always skipped it; the router is the one
+    /// app that decides where a flow goes, so it is read.
+    #[test]
+    fn an_app_this_tree_does_not_read_is_skipped() {
+        let config = message(&[
+            bytes_field(1, &socks_inbound(5000, 0, &[])),
+            bytes_field(2, &freedom_outbound()),
+            bytes_field(4, &typed("xray.app.dns.Config", &[])),
+        ]);
+        to_json(&config).expect("the app is xray's own");
     }
 
     /// A socks server with no accounts asks for no authentication, the way the pinned

@@ -6,6 +6,7 @@ pub mod addr;
 pub mod aead;
 pub mod aesgcm;
 pub mod b64;
+pub mod blackhole;
 pub mod blake2s;
 pub(crate) mod chacha;
 pub mod core;

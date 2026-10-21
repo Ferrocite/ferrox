@@ -530,3 +530,17 @@ front-dokodemo xray-scenario-tests-passing 2 scripts/run-upstream-suite.sh
 carrier-foxy h3-read-calls-per-16k-download 5 ferrox-app-foxy::loopback::an_h3_read_crosses_the_frames_under_it
 carrier-foxy h3-bytes-lost-when-the-peer-finishes 0 ferrox-app-foxy::loopback::an_h3_stream_the_peer_finished_ends_the_tunnel
 carrier-foxy carrier-cache-lookup-allocations 0 ferrox-core-foxy::tests::a_carrier_cache_lookup_allocates_nothing
+
+# --- blackhole sink outbound --------------------------------------------------
+blackhole ops-retired-instructions UNBLESSED scripts/count-ops.sh
+blackhole answer-bytes-the-reference-writes 101 ferrox-core-blackhole::tests::the_answer_is_the_bytes_the_pinned_go_writes
+blackhole answer-writes-per-flow 1 ferrox-core-blackhole::tests::the_answer_is_one_write
+blackhole answer-copies-per-byte-written 0 ferrox-core-blackhole::tests::the_answer_reaches_the_writer_uncopied
+blackhole answer-allocations-per-flow 0 ferrox-core-blackhole::tests::the_answer_reaches_the_writer_uncopied
+blackhole answer-buffer-moves-per-clone 0 ferrox-core-blackhole::tests::the_answer_reaches_the_writer_uncopied
+blackhole custom-answer-bytes-written-verbatim 3 ferrox-core-blackhole::tests::the_answer_is_the_bytes_the_pinned_go_writes
+blackhole peer-reads-per-window 1 ferrox-app-blackhole::tests::the_peers_bytes_are_read_in_windows
+blackhole peer-reads-for-the-end 1 ferrox-app-blackhole::tests::the_peers_bytes_are_read_in_windows
+blackhole drain-allocations-per-flow 0 ferrox-app-blackhole::tests::the_peers_bytes_are_read_in_windows
+blackhole upstream-connections-per-flow 0 ferrox-app-proxy::tests::a_blackhole_front_answers_the_client_and_dials_nothing
+blackhole scenario-map-tests-passing 1 scripts/run-xray-scenario-map.sh

@@ -12,6 +12,11 @@ scripts/kcp-oracle/script.txt -text
 scripts/socks5-oracle/expected.txt -text
 scripts/socks5-oracle/script.txt -text
 
+# Same reason, for the blackhole sink's golden and its script: the answer the
+# sink writes is compared against the recorder's output byte for byte.
+scripts/blackhole-oracle/expected.txt -text
+scripts/blackhole-oracle/script.txt -text
+
 # Same reason, for every other checked-in expectation in this tree.
 **/fixtures/** -text
 **/*.golden -text
