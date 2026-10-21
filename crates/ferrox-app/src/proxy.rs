@@ -21247,9 +21247,12 @@ mod tests {
             upstream: None,
             roots: Some(roots.into()),
         };
-        let relay = thread::spawn(move || {
-            let (stream, _) = front.accept().expect("accepts");
-            crate::quic::dial_pooled(&stream, &dial, &Destination::from(target));
+        let relay = thread::spawn({
+            let dial = dial.clone();
+            move || {
+                let (stream, _) = front.accept().expect("accepts");
+                crate::quic::dial_pooled(&stream, &dial, &Destination::from(target));
+            }
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -21259,8 +21262,27 @@ mod tests {
         let mut back = [0u8; 4];
         client.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"ping");
+        // A session lease is the one a pump can hand bytes to, so this is where the thread belongs: the flag is cleared by the lease that started it and set again only by a thread that ended itself.
+        assert!(
+            !crate::quic::lane_parked(&dial),
+            "the lease the pump could serve put a thread behind the lane"
+        );
         drop(client);
         relay.join().expect("joins");
+        for _ in 0..60 {
+            if crate::quic::lane_parked(&dial) {
+                break;
+            }
+            std::thread::sleep(QUIC_TEST_POLL);
+        }
+        assert!(
+            crate::quic::pool_holds(&dial),
+            "the lane outlived the last lease its pump served"
+        );
+        assert!(
+            crate::quic::lane_parked(&dial),
+            "the pump parked with its thread gone"
+        );
         server.join().expect("joins");
     }
 
