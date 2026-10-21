@@ -8,6 +8,9 @@ use std::time::Duration;
 
 use super::config::Config;
 
+/// The room a datagram is received into: the largest a KCP datagram can be.
+const DATAGRAM_MAX: usize = 65_536;
+
 use super::connection::{ConnMetadata, Connection, State};
 use super::mask::{Encoder, Mask};
 use super::segment::{read_segment, Command, Segment};
@@ -38,8 +41,21 @@ fn peek_conversation(buf: &[u8]) -> Option<(u16, bool)> {
     Some((conv, buf[2] == Command::Terminate.to_byte()))
 }
 
+/// The room a datagram is received into: the receive writes the bytes it got and the
+/// rest of the room is never read, so the room is not zeroed first.
+#[allow(
+    clippy::uninit_vec,
+    reason = "the room is a receive target: the receive writes the bytes it reports and no path reads a byte that was not written"
+)]
+fn datagram_room() -> Vec<u8> {
+    let mut buf = Vec::with_capacity(DATAGRAM_MAX);
+    // SAFETY: every path hands the room to a receive that initialises the bytes it reports, and no path reads a byte that was not written.
+    unsafe { buf.set_len(DATAGRAM_MAX) };
+    buf
+}
+
 fn feed(sock: &UdpSocket, conn: &Connection, mask: &Mask) {
-    let mut buf = vec![0u8; 65536];
+    let mut buf = datagram_room();
     let mut segs: Vec<Segment> = Vec::new();
     loop {
         match sock.recv_from(&mut buf) {
@@ -142,7 +158,7 @@ impl Listener {
         sock_r.set_read_timeout(Some(Duration::from_millis(50)))?;
         let weak = Arc::downgrade(&inner);
         thread::spawn(move || {
-            let mut buf = vec![0u8; 65536];
+            let mut buf = datagram_room();
             let mut segs: Vec<Segment> = Vec::new();
             loop {
                 {
@@ -269,6 +285,17 @@ mod tests {
     use crate::kcp::mask::{HeaderKind, Spec};
 
     #[cfg_attr(miri, ignore = "binds a loopback UDP socket")]
+    /// The room a datagram is received into is not zeroed: the receive writes the bytes
+    /// it got and the rest of the room is never read. The counting allocator's `zeroed`
+    /// counter is the witness.
+    #[test]
+    fn the_datagram_room_is_not_zeroed() {
+        let (room, counts) = crate::alloc_count::measure(datagram_room);
+        assert_eq!(counts.zeroed, 0, "the room is not zeroed");
+        assert_eq!(counts.allocs, 1, "the room is one buffer");
+        assert_eq!(room.len(), DATAGRAM_MAX, "and it is the whole datagram");
+    }
+
     #[test]
     fn close_returns_while_a_session_is_registered() {
         let listener = Listener::bind(([127, 0, 0, 1], 0).into(), Config::default()).expect("bind");
@@ -447,7 +474,7 @@ mod tests {
             relay_sock
                 .set_read_timeout(Some(Duration::from_millis(50)))
                 .expect("timeout");
-            let mut buf = vec![0u8; 65536];
+            let mut buf = datagram_room();
             let mut client: Option<SocketAddr> = None;
             while !relay_stop.load(Ordering::Relaxed) {
                 let Ok((n, src)) = relay_sock.recv_from(&mut buf) else {
