@@ -1880,6 +1880,77 @@ impl Datagram {
         }
         self.set_read_timeout(Some(want)).is_ok()
     }
+
+    /// This socket, when a readiness wait on it answers for `recv_from`: a hopped dial reads a descriptor that moves and a gecko reader reassembles inside its own table, so on those two a packet can be ready here and still not be one the reader will hand over.
+    pub(crate) fn waits_here(&self) -> Option<&Self> {
+        (self.hop.is_none() && self.gecko.is_none()).then_some(self)
+    }
+
+    /// Wait for a datagram to land without taking it: `Ok(true)` is readiness, and the next `recv_from` through this socket is what delivers the packet. A lane's own reader is never displaced by a wait.
+    #[cfg(unix)]
+    pub(crate) fn wait_readable(&self, timeout: Duration) -> std::io::Result<bool> {
+        use std::os::fd::AsRawFd as _;
+        let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        let mut row = libc::pollfd {
+            fd: self.sock.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            // SAFETY: one descriptor this socket holds, one element in the array, and the call writes only `revents`.
+            let ready = unsafe { libc::poll(&raw mut row, 1, millis) };
+            if ready > 0 {
+                return Ok(row.revents != 0);
+            }
+            if ready == 0 {
+                return Ok(false);
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    /// The Windows spelling of the same wait: one `WSAPoll` row, whose error code comes from `WSAGetLastError`.
+    #[cfg(windows)]
+    pub(crate) fn wait_readable(&self, timeout: Duration) -> std::io::Result<bool> {
+        use std::os::windows::io::AsRawSocket as _;
+        use windows_sys::Win32::Networking::WinSock::{
+            WSAGetLastError, WSAPoll, POLLERR, POLLHUP, POLLIN, POLLRDNORM, SOCKET, WSAPOLLFD,
+        };
+        let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+        let mut row = WSAPOLLFD {
+            fd: self.sock.as_raw_socket() as SOCKET,
+            events: POLLIN | POLLRDNORM,
+            revents: 0,
+        };
+        // SAFETY: one handle this socket holds and one element the call writes `revents` into.
+        let ready = unsafe { WSAPoll(&raw mut row, 1, millis) };
+        if ready < 0 {
+            return Err(std::io::Error::from_raw_os_error(unsafe {
+                WSAGetLastError()
+            }));
+        }
+        let readable = POLLIN | POLLRDNORM | POLLHUP | POLLERR;
+        Ok(ready > 0 && row.revents & readable != 0)
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for Datagram {
+    /// The descriptor `recv_from` reads, which is not one for a hopped dial — see [`Datagram::waits_here`].
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.sock.as_raw_fd()
+    }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsRawSocket for Datagram {
+    /// The handle `recv_from` reads, which is not one for a hopped dial — see [`Datagram::waits_here`].
+    fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        self.sock.as_raw_socket()
+    }
 }
 
 /// Frame one datagram behind the relay header that carries its real target, returning the bytes for the hop; `None` when `into` has no room. The socket itself is addressed to the hop, not `to`.
