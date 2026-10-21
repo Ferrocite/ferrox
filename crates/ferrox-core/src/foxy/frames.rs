@@ -158,12 +158,18 @@ pub const DEFAULT_WINDOW: u32 = 65_535;
 pub const MAX_FRAME: u32 = 256 * 1024;
 
 /// What a CONNECT lane asks for at the start: a window big enough that a tunnel is not paced by a round trip, the largest frame the edge may send, and no push. Every dial asks for the same eighteen octets, so they are written down once instead of built per open.
-pub const CLIENT_SETTINGS: [u8; 18] = client_settings();
+pub const CLIENT_SETTINGS: [u8; 24] = client_settings();
 
 #[must_use]
-pub const fn client_settings() -> [u8; 18] {
-    let asks = [(4u16, WINDOW), (5u16, MAX_FRAME), (2u16, 0u32)];
-    let mut out = [0u8; 18];
+pub const fn client_settings() -> [u8; 24] {
+    // The fourth ask is a zero header table: this lane's HPACK reader keeps no dynamic table, so an edge that indexed a status into one would make the next response on a pooled session name an entry the lane never stored.
+    let asks = [
+        (4u16, WINDOW),
+        (5u16, MAX_FRAME),
+        (2u16, 0u32),
+        (1u16, 0u32),
+    ];
+    let mut out = [0u8; 24];
     let mut at = 0;
     while at < asks.len() {
         let (id, value) = asks[at];
@@ -530,14 +536,18 @@ mod tests {
     }
 
     #[test]
-    fn the_client_settings_ask_for_a_window_a_frame_and_no_push() {
+    fn the_client_settings_ask_for_a_window_a_frame_no_push_and_no_header_table() {
         let settings = CLIENT_SETTINGS;
-        assert_eq!(settings.len(), 18);
+        assert_eq!(settings.len(), 24);
         let found: Vec<(u16, u32)> = (0..settings.len() / 6)
             .filter_map(|at| setting(&settings, at * 6))
             .collect();
-        assert_eq!(found, [(4, WINDOW), (5, MAX_FRAME), (2, 0)]);
-        assert!(setting(&settings, 18).is_none());
+        assert_eq!(
+            found,
+            [(4, WINDOW), (5, MAX_FRAME), (2, 0), (1, 0)],
+            "a zero header table is what keeps the lane's stateless reader safe on a reused session"
+        );
+        assert!(setting(&settings, 24).is_none());
     }
 
     #[test]

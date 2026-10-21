@@ -603,11 +603,94 @@ fn hand_back(carried: &mut Vec<u8>, at: &mut usize, buf: &mut [u8]) -> usize {
     take
 }
 
-/// HTTP/2 CONNECT: preface, settings, stream 1 and the status in its first header block. Stream 1 is the lane's only stream, so the codec needs no stream-id bookkeeping.
+/// HTTP/2 CONNECT: preface, settings, one stream and the status in its first header block. A session that carried a flow to its end is kept and lent to the next flow as a new stream, so a warm flow pays one round trip instead of a TCP and a TLS handshake.
 pub(crate) fn open_h2(dial: &FoxyDial, target: &str) -> Result<Tls2, Failure> {
+    if let Some((key, mut lane)) = pool_take(dial) {
+        match lane.reopen(dial, target) {
+            Ok(()) => {
+                // The session is leased again, so it is also returnable again: a lane lent twice and settled without its key would be the one reuse the pool ever gave.
+                lane.pool_key = Some(Box::new(key));
+                return Ok(lane);
+            }
+            // A session the edge closed while it was idle is the one handshake this reuse may cost; every other refusal is the edge's answer and is not retried on a new session.
+            Err(Failure::Stream | Failure::Io) => {}
+            Err(failure) => return Err(failure),
+        }
+    }
     let mut block = Vec::with_capacity(96 + dial.pass.token.len());
     hpack::hpack_connect(target, &dial.pass.token, &mut block);
-    open_h2_with(dial, &block)
+    let mut lane = open_h2_with(dial, &block)?;
+    lane.pool_key = Some(Box::new(SessionKey::of(dial)));
+    Ok(lane)
+}
+
+/// The identity one pooled session is lent under: a CONNECT stream names any target, so only the edge, the hop, the anchors, the pins and the account have to match.
+struct SessionKey {
+    host: String,
+    port: u16,
+    address: Option<SocketAddr>,
+    upstream: Option<UpstreamProxy>,
+    /// The trust store itself, not a pointer to it: the key holds the anchors alive for as long as the session it belongs to, so pointer identity cannot be recycled by a store that was dropped.
+    anchors: ferrox_core::tls::Anchors,
+    pins: foxy::pin::Pins,
+    token: Arc<str>,
+}
+
+impl SessionKey {
+    fn of(dial: &FoxyDial) -> Self {
+        Self {
+            host: dial.host.clone(),
+            port: dial.port,
+            address: dial.address,
+            upstream: dial.upstream.clone(),
+            anchors: Arc::clone(&dial.roots),
+            pins: dial.pins.clone(),
+            token: Arc::clone(&dial.pass.token),
+        }
+    }
+
+    /// Whether a stored key names the same edge this dial is about: the lookup borrows the dial, so a warm flow costs no name of its own.
+    fn names(&self, dial: &FoxyDial) -> bool {
+        self.host == dial.host
+            && self.port == dial.port
+            && self.address == dial.address
+            && self.upstream == dial.upstream
+            && Arc::ptr_eq(&self.anchors, &dial.roots)
+            && self.pins == dial.pins
+            && self.token == dial.pass.token
+    }
+}
+
+/// The idle sessions kept for the next flows: enough for a browser's parallel connections, and no more.
+const POOL_IDLE: usize = 8;
+/// How long a session is lent again: the edge's own idle timeout is longer, and a session older than this is a handshake the lane would rather pay than trust.
+const POOL_TTL: Duration = Duration::from_secs(20);
+/// The largest odd stream id the protocol names; a session that spent it is not lent again.
+const LAST_STREAM: u32 = 0x7fff_ffff;
+
+fn pool() -> &'static std::sync::Mutex<Vec<(SessionKey, Instant, Tls2)>> {
+    static POOL: std::sync::OnceLock<std::sync::Mutex<Vec<(SessionKey, Instant, Tls2)>>> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn pool_take(dial: &FoxyDial) -> Option<(SessionKey, Tls2)> {
+    let mut pool = pool().lock().ok()?;
+    let now = Instant::now();
+    pool.retain(|(_, at, _)| now.duration_since(*at) < POOL_TTL);
+    let at = pool.iter().rposition(|(held, _, _)| held.names(dial))?;
+    let (key, _, lane) = pool.swap_remove(at);
+    Some((key, lane))
+}
+
+fn pool_put(key: SessionKey, lane: Tls2) {
+    let Ok(mut pool) = pool().lock() else {
+        return;
+    };
+    if pool.len() >= POOL_IDLE {
+        pool.remove(0);
+    }
+    pool.push((key, Instant::now(), lane));
 }
 
 /// One UDP target as its own H2 connection carrying CONNECT-UDP: a lane stays one stream on one connection, so a second target is a second connection.
@@ -653,6 +736,7 @@ fn open_h2_with(dial: &FoxyDial, block: &[u8]) -> Result<Tls2, Failure> {
 
     let mut lane = Tls2 {
         tls,
+        stream: 1,
         // What this lane may put on the wire is only what the edge grants: the stream window arrives in its settings and the connection window only moves by a `WINDOW_UPDATE` on stream 0, so both start at the protocol default rather than at the window this lane asks the edge to keep open for it.
         window: foxy::flow::Window::new(i64::from(frames::DEFAULT_WINDOW)),
         conn: foxy::flow::Window::new(i64::from(frames::DEFAULT_WINDOW)),
@@ -667,6 +751,9 @@ fn open_h2_with(dial: &FoxyDial, block: &[u8]) -> Result<Tls2, Failure> {
         pending_credit: 0,
         frame: FrameState::default(),
         fin: false,
+        gone: false,
+        sent_end: false,
+        pool_key: None,
         park: None,
     };
     let status = lane.await_status()?;
@@ -692,17 +779,22 @@ fn h2_frame(kind: u8, flags: u8, stream: u32, payload: &[u8], out: &mut Vec<u8>)
     out.extend_from_slice(payload);
 }
 
-/// The two `WINDOW_UPDATE` frames a credit grants differ only by stream id, so their eighteen header bytes are constant and each call writes the increment into the two slots left zero here.
+/// The two `WINDOW_UPDATE` frames a credit grants differ only by stream id, so their eighteen header bytes are constant and each call writes the increment into the two slots left zero here; the stream slot is patched per lane.
 const CREDIT_TEMPLATE: [u8; 26] = {
     let mut out = [0u8; 26];
-    // length 4, WINDOW_UPDATE, no flags, stream 1 at [0..9], stream 0 at [13..22].
+    // length 4, WINDOW_UPDATE, no flags, the stream at [5..9] and stream 0 at [13..22].
     out[2] = 4;
     out[3] = frames::WINDOW_UPDATE;
-    out[8] = 1;
     out[15] = 4;
     out[16] = frames::WINDOW_UPDATE;
     out
 };
+
+fn credit_template(stream: u32) -> [u8; 26] {
+    let mut out = CREDIT_TEMPLATE;
+    out[5..9].copy_from_slice(&stream.to_be_bytes());
+    out
+}
 
 /// The credit a lane holds before it grants it back: the edge is granted a 16 MiB window to fill, so a held update cannot stall it, while a write per frame spends a record and a segment on 26 bytes the edge already owes us.
 const CREDIT_FLOOR: u32 = 1 << 16;
@@ -710,6 +802,8 @@ const CREDIT_FLOOR: u32 = 1 << 16;
 /// A relay over a TLS stream that speaks HTTP/2: a caller writing bytes sees a DATA frame, a caller reading bytes sees one's payload.
 pub(crate) struct Tls2 {
     tls: ferrox_core::tls::RustlsProvider<Connection>,
+    /// The CONNECT stream this lane currently owns: `1` on a fresh session, then the next odd id each time the session is lent again.
+    stream: u32,
     /// The credit this stream may spend: the edge grants it on this stream and the connection's credit bounds it too, so the tighter of the two is what a frame may carry.
     window: foxy::flow::Window,
     /// The credit the whole connection may spend: every stream's bytes are spent against it at once, so it is a connection's window and not a stream's.
@@ -732,6 +826,12 @@ pub(crate) struct Tls2 {
     pending_credit: u32,
     frame: FrameState,
     fin: bool,
+    /// The session answered with a reset, a `GOAWAY`, or a broken frame: it can carry this flow no further and is never lent again.
+    gone: bool,
+    /// This lane has closed its half of the current stream: a session is only pooled once both halves ended.
+    sent_end: bool,
+    /// The key this session is returned under when the flow ends, set only for a TCP lane opened through the pool; boxed because the lane is sized for bytes, not for the identity it is lent under.
+    pool_key: Option<Box<SessionKey>>,
     /// How long a leg that has handed its lock back may wait on this lane's socket for the next byte: the quantum a relay armed, less the grain its blocking read takes. `None` until one arms it, because a caller that reads this lane alone has no lock to release.
     park: Option<Duration>,
 }
@@ -816,6 +916,7 @@ fn read_frame<S: Read>(
     out: &mut Vec<u8>,
     max_frame: usize,
     dst: &mut [u8],
+    stream: u32,
 ) -> std::io::Result<frames::H2Frame> {
     if state.data_len > 0 {
         // A caller that cannot receive the rest of the frame into its buffer cannot receive it at all: the bytes already handed over are not replayable, and staging them again would be the loss this path exists to avoid.
@@ -846,7 +947,7 @@ fn read_frame<S: Read>(
     fill_from(io, &mut state.head, &mut state.head_at)?;
     let frame = frames::H2Frame::parse(&state.head)
         .ok_or_else(|| std::io::Error::other("foxy: a header that is not a frame"))?;
-    if frame.kind == frames::DATA && frame.stream == 1 && frame.length > 0 && !dst.is_empty() {
+    if frame.kind == frames::DATA && frame.stream == stream && frame.length > 0 && !dst.is_empty() {
         out.clear();
         state.data_len = frame.length;
         state.data_at = 0;
@@ -901,6 +1002,88 @@ impl Tls2 {
         Some((self.tls.get_ref().try_clone().ok()?, park))
     }
 
+    /// Ends this lane's half of its stream: an empty DATA with `END_STREAM`, so the edge closes the tunnel while the session stays open for the next stream.
+    pub(crate) fn finish(&mut self) -> Result<(), Failure> {
+        if self.sent_end || self.gone {
+            return Ok(());
+        }
+        self.out.clear();
+        h2_frame(
+            frames::DATA,
+            frames::END_STREAM,
+            self.stream,
+            &[],
+            &mut self.out,
+        );
+        self.tls.write_all(&self.out).map_err(|_| Failure::Io)?;
+        self.tls.flush().map_err(|_| Failure::Io)?;
+        self.sent_end = true;
+        Ok(())
+    }
+
+    /// The next CONNECT on a session whose last stream ended: a new odd stream carries it, the connection's window survives, and the stream window starts at the size the edge now announces.
+    fn reopen(&mut self, dial: &FoxyDial, target: &str) -> Result<(), Failure> {
+        if self.gone || !self.fin || self.stream >= LAST_STREAM - 1 {
+            return Err(Failure::Stream);
+        }
+        // The last flow's unflushed credit belongs to the connection; grant it before the new stream reuses the id slot.
+        if self.pending_credit > 0 {
+            self.flush_credit()?;
+        }
+        self.stream += 2;
+        self.window = foxy::flow::Window::new(i64::from(self.peer_initial));
+        self.carry.clear();
+        self.at = 0;
+        self.frame = FrameState::default();
+        self.fin = false;
+        self.sent_end = false;
+        self.handed = 0;
+        self.capsule_buf.clear();
+        self.park = None;
+        let _ = self
+            .tls
+            .get_ref()
+            .set_read_timeout(Some(crate::budgets::head_arrival()));
+        if !self.alive() {
+            return Err(Failure::Stream);
+        }
+        let mut block = Vec::with_capacity(96 + dial.pass.token.len());
+        hpack::hpack_connect(target, &dial.pass.token, &mut block);
+        self.out.clear();
+        h2_frame(frames::HEADERS, 0x4, self.stream, &block, &mut self.out);
+        self.tls.write_all(&self.out).map_err(|_| Failure::Io)?;
+        self.tls.flush().map_err(|_| Failure::Io)?;
+        let status = self.await_status()?;
+        opened(status)
+    }
+
+    /// Whether the session still has a transport: an edge that closed an idle session answers EOF here, before a stream is spent on it.
+    fn alive(&mut self) -> bool {
+        use std::io::ErrorKind;
+        let socket = self.tls.get_ref();
+        let _ = socket.set_read_timeout(Some(Duration::from_millis(1)));
+        let mut one = [0u8; 1];
+        let live = match socket.peek(&mut one) {
+            Ok(0) => false,
+            Ok(_) => true,
+            Err(error) => !matches!(
+                error.kind(),
+                ErrorKind::ConnectionReset | ErrorKind::BrokenPipe | ErrorKind::UnexpectedEof
+            ),
+        };
+        let _ = socket.set_read_timeout(Some(crate::budgets::head_arrival()));
+        live
+    }
+
+    /// A session is lent again only when both halves of its stream ended and nothing broke it: a half-closed or reset stream is not a session the next flow may ride.
+    fn reusable(&self) -> bool {
+        self.pool_key.is_some()
+            && self.fin
+            && self.sent_end
+            && !self.gone
+            && self.stream < LAST_STREAM - 1
+    }
+
     /// Reads one frame, hands it to `body` with the payload borrowed, and puts the buffer back.
     /// A `dst` with room takes a DATA frame's payload directly, and `body` then sees that payload already in the caller's buffer through `frame`'s length and end flag, with `payload` empty; the bytes this call delivered are counted in `frame_state.delivered`.
     fn with_frame<R>(
@@ -916,6 +1099,7 @@ impl Tls2 {
             &mut payload,
             self.max_frame,
             dst,
+            self.stream,
         );
         let out = match frame {
             Ok(frame) => body(self, frame, &payload),
@@ -943,7 +1127,7 @@ impl Tls2 {
     /// Grants back everything the lane has taken: the held total is cleared whether or not the write lands, because a lane that cannot write has lost the flow the credit would have paced.
     fn flush_credit(&mut self) -> Result<(), Failure> {
         let increment = std::mem::take(&mut self.pending_credit).to_be_bytes();
-        let mut out = CREDIT_TEMPLATE;
+        let mut out = credit_template(self.stream);
         out[9..13].copy_from_slice(&increment);
         out[22..26].copy_from_slice(&increment);
         self.tls.write_all(&out).map_err(|_| Failure::Io)
@@ -958,7 +1142,7 @@ impl Tls2 {
     fn grant(&mut self, stream: u32, increment: u32) {
         if stream == 0 {
             self.conn.add(increment);
-        } else if stream == 1 {
+        } else if stream == self.stream {
             self.window.add(increment);
         }
     }
@@ -985,7 +1169,13 @@ impl Tls2 {
     /// A push promise is refused by name — the only stream the lane answers that is not the one it opened.
     fn refuse_push(&mut self) -> Result<(), Failure> {
         self.out.clear();
-        h2_frame(frames::RST_STREAM, 0, 1, &8u32.to_be_bytes(), &mut self.out);
+        h2_frame(
+            frames::RST_STREAM,
+            0,
+            self.stream,
+            &8u32.to_be_bytes(),
+            &mut self.out,
+        );
         self.tls.write_all(&self.out).map_err(|_| Failure::Io)
     }
 
@@ -996,7 +1186,7 @@ impl Tls2 {
         while Instant::now() < deadline {
             let status = self
                 .with_frame(&mut [], |lane, frame, payload| {
-                    match frames::h2_event(frame, payload, 1) {
+                    match frames::h2_event(frame, payload, lane.stream) {
                         frames::H2Event::Headers { block: more, .. } => {
                             header_status(&mut block, more, frame.flags & frames::END_HEADERS != 0)
                         }
@@ -1029,6 +1219,7 @@ impl Tls2 {
                             Ok(None)
                         }
                         frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
+                            lane.gone = true;
                             Err(Failure::Stream)
                         }
                         // A status larger than one frame arrives in pieces: each fragment is appended and the block read once `END_HEADERS` says it is whole.
@@ -1091,7 +1282,7 @@ impl Tls2 {
             let header = frames::H2Frame {
                 kind: frames::DATA,
                 flags: 0,
-                stream: 1,
+                stream: self.stream,
                 length: frame as u32,
             }
             .header();
@@ -1146,7 +1337,7 @@ impl Tls2 {
                 ));
             }
             let read = self.with_frame(&mut [], |lane, frame, payload| -> std::io::Result<usize> {
-                match frames::h2_event(frame, payload, 1) {
+                match frames::h2_event(frame, payload, lane.stream) {
                     frames::H2Event::Data { payload, end } => {
                         let len = payload.len();
                         lane.fin = end;
@@ -1240,7 +1431,7 @@ impl Write for Tls2 {
         let header = frames::H2Frame {
             kind: frames::DATA,
             flags: 0,
-            stream: 1,
+            stream: self.stream,
             length: frame as u32,
         }
         .header();
@@ -1273,7 +1464,7 @@ impl Read for Tls2 {
                     }
                     return Ok(got);
                 }
-                match frames::h2_event(frame, payload, 1) {
+                match frames::h2_event(frame, payload, lane.stream) {
                     frames::H2Event::Data { payload, end } => {
                         // Only reachable for a caller that asked for nothing: the frame stages whole, and a later read with room is fed from the stage.
                         let len = payload.len();
@@ -1294,6 +1485,7 @@ impl Read for Tls2 {
                     }
                     frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
                         lane.fin = true;
+                        lane.gone = true;
                         Ok(0)
                     }
                     _ => Ok(0),
@@ -2501,7 +2693,7 @@ impl Tls2 {
             let header = frames::H2Frame {
                 kind: frames::DATA,
                 flags: 0,
-                stream: 1,
+                stream: self.stream,
                 length: frame as u32,
             }
             .header();
@@ -2548,7 +2740,7 @@ impl Tls2 {
                 return Err(Failure::Stream);
             }
             let read = self.with_frame(&mut [], |lane, frame, payload| -> std::io::Result<()> {
-                match frames::h2_event(frame, payload, 1) {
+                match frames::h2_event(frame, payload, lane.stream) {
                     frames::H2Event::Data { payload, end } => {
                         lane.capsule_buf.extend_from_slice(payload);
                         lane.fin = end;
@@ -2593,7 +2785,7 @@ impl Tls2 {
                 return Ok(false);
             }
             let read = self.with_frame(&mut [], |lane, frame, payload| -> std::io::Result<bool> {
-                match frames::h2_event(frame, payload, 1) {
+                match frames::h2_event(frame, payload, lane.stream) {
                     frames::H2Event::Data { payload, end } => {
                         lane.fin = end;
                         if !payload.is_empty() {
@@ -2663,6 +2855,31 @@ impl Tunnel {
         head_wait: Duration,
     ) -> Result<Self, Failure> {
         H3::open_within(dial, target, quic, head_wait).map(|lane| Self::H3(Box::new(lane)))
+    }
+
+    /// Ends the flow's half of the stream where the carrier has one: an h2 session whose request half stays open is not a session the next flow may ride.
+    pub(crate) fn finish(&mut self) -> Result<(), Failure> {
+        match self {
+            Self::H2(lane) => lane.finish(),
+            Self::H1(_) | Self::H3(_) => Ok(()),
+        }
+    }
+
+    /// Returns a clean HTTP/2 session to the pool and lets every other lane close: a flow whose stream did not end both ways is not a session to lend.
+    pub(crate) fn settle(self) {
+        let Self::H2(mut lane) = self else {
+            return;
+        };
+        if !lane.reusable() {
+            return;
+        }
+        let Some(key) = lane.pool_key.take() else {
+            return;
+        };
+        if lane.pending_credit > 0 && lane.flush_credit().is_err() {
+            return;
+        }
+        pool_put(*key, lane);
     }
 
     /// Bounds one blocking read on every carrier so a relay sharing one lane between its two directions stops holding its lock while idle: reads past the quantum answer `WouldBlock` and the relay retries instead of wedging.
@@ -2873,32 +3090,31 @@ mod tests {
         );
     }
 
-    /// The constant credit buffer is the two frames the per-call loop built: a window update for stream 1 and one for the connection, each with the increment slot left for the caller to fill.
+    /// The credit buffer is the two frames the per-call loop built: a window update for the lane's stream and one for the connection, each with the increment slot left for the caller to fill.
     #[test]
     fn the_credit_template_is_the_two_window_update_frames() {
-        for (slot, stream) in [(0usize, 1u32), (13, 0)] {
-            let frame = frames::H2Frame {
-                kind: frames::WINDOW_UPDATE,
-                flags: 0,
-                stream,
-                length: 4,
-            };
+        for stream in [1u32, 3] {
+            let template = credit_template(stream);
+            for (slot, id) in [(0usize, stream), (13, 0)] {
+                let frame = frames::H2Frame {
+                    kind: frames::WINDOW_UPDATE,
+                    flags: 0,
+                    stream: id,
+                    length: 4,
+                };
+                assert_eq!(
+                    &template[slot..slot + 9],
+                    &frame.header()[..],
+                    "header at {slot}"
+                );
+            }
+            assert_eq!(&template[9..13], &[0u8; 4], "increment is patched per call");
             assert_eq!(
-                &CREDIT_TEMPLATE[slot..slot + 9],
-                &frame.header()[..],
-                "header at {slot}"
+                &template[22..26],
+                &[0u8; 4],
+                "increment is patched per call"
             );
         }
-        assert_eq!(
-            &CREDIT_TEMPLATE[9..13],
-            &[0u8; 4],
-            "increment is patched per call"
-        );
-        assert_eq!(
-            &CREDIT_TEMPLATE[22..26],
-            &[0u8; 4],
-            "increment is patched per call"
-        );
     }
 
     fn dial(host: &str, carrier: Carrier) -> FoxyDial {
@@ -4079,6 +4295,105 @@ pub(crate) mod loopback {
             .recv_timeout(Duration::from_secs(30))
             .expect("both directions flow at once");
         assert_eq!(back, sent);
+    }
+
+    /// The edge side of a session that outlives its streams: a status on every CONNECT, an echo on the stream it arrived on, and an end for a stream the lane ends.
+    fn h2_session_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+        accepts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || loop {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            accepts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
+            let Ok(mut tls) =
+                ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
+            else {
+                continue;
+            };
+            if tls.handshake().is_err() {
+                continue;
+            }
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) || preface != frames::PREFACE {
+                continue;
+            }
+            let mut ack = Vec::new();
+            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut ack);
+            tls.write_all(&ack).ok();
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    break;
+                }
+                let Some(frame) = frames::H2Frame::parse(&header) else {
+                    break;
+                };
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    break;
+                }
+                let mut out = Vec::new();
+                match frame.kind {
+                    frames::SETTINGS if frame.flags & 0x1 == 0 => {
+                        h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut out);
+                    }
+                    frames::HEADERS => {
+                        h2_frame(frames::HEADERS, 0x4, frame.stream, &[0x88], &mut out);
+                    }
+                    frames::DATA => {
+                        h2_frame(
+                            frames::DATA,
+                            frame.flags & frames::END_STREAM,
+                            frame.stream,
+                            &payload,
+                            &mut out,
+                        );
+                    }
+                    _ => {}
+                }
+                if !out.is_empty() && tls.write_all(&out).is_err() {
+                    break;
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn a_warm_flow_reuses_the_session_its_predecessor_left() {
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let accepts = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let _edge = h2_session_edge(listener, server, std::sync::Arc::clone(&accepts));
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut first = Tunnel::open(&dial, "one.test:80", None).expect("opens");
+        round_trip(&mut first);
+        first
+            .set_read_quantum(Duration::from_secs(2))
+            .expect("bounds one read");
+        first.finish().expect("ends the request half");
+        let mut end = [0u8; 1];
+        assert_eq!(first.read(&mut end).expect("reads the end"), 0);
+        first.settle();
+        let mut second = Tunnel::open(&dial, "two.test:80", None).expect("reopens");
+        round_trip(&mut second);
+        second
+            .set_read_quantum(Duration::from_secs(2))
+            .expect("bounds one read");
+        second.finish().expect("ends the request half");
+        assert_eq!(second.read(&mut end).expect("reads the end"), 0);
+        second.settle();
+        let mut third = Tunnel::open(&dial, "three.test:80", None).expect("reopens again");
+        round_trip(&mut third);
+        assert_eq!(
+            accepts.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "every flow after the first rides the session the first opened"
+        );
     }
 
     /// The read quantum is what lets the writer behind the same mutex have a turn, so it must not cost the frame: a pause inside one DATA frame has to resume where it stopped, not abandon the bytes already promised to the header.
