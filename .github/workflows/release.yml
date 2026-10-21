@@ -215,16 +215,24 @@ jobs:
             ### Leaner where it counts
 
             Since the last release the Foxy lane lost a handshake per
-            flow — an ended flow lends its HTTP/2 session to the next — and an
-            allocation per CONNECT, per datagram and per relay leg; concurrent
-            flows hand their worker threads back when they finish instead of
-            parking for the life of the process, and the shared lane's idle poll
-            gives its lock back before it sleeps. The same grind reached the
-            other lanes: xhttp and Shadowsocks allocate twice less per frame
-            and per datagram, the buffers a flow fills are no longer zeroed
-            first (VLESS, SOCKS, KCP), an HTTP/2 header block is opened once at
-            its own length instead of grown four times, and a relay socket's two
-            directions no longer share a lock.
+            flow — an ended flow lends its HTTP/2 session to the next — a
+            buffer per datagram and a `recvfrom` per packet, and the lock its
+            shared lane's idle poll held while it slept. The same grind reached
+            the other lanes: xhttp and Shadowsocks allocate twice less per frame
+            and per datagram and xhttp stages its dial head once per thread, the
+            WebSocket keys are stack arrays and a VLESS request header is parsed
+            without a byte of its own, the buffers a flow fills are no longer
+            zeroed first (VLESS, SOCKS, KCP), an HTTP/2 header block is opened
+            once at its own length instead of grown four times, a datagram
+            leaves in the frame its client framed, and a relay socket's two
+            directions no longer share a lock. On x86_64 a ChaCha20 record's
+            remainder is finished inside the vector pass — eight blocks per pass
+            where the scalar ladder managed six, sixteen where the machine has
+            avx512f — so a chacha stream pays less work per kept block; the
+            `aarch64` pass keeps the shape it had. The trade is named on the
+            page: the pass computes blocks the buffer does not hold, so
+            discarded blocks rise, and the last one or two blocks are still the
+            ladder's.
 
             ### Also new under the hood
 
