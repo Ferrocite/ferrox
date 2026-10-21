@@ -330,9 +330,17 @@ impl VlessLink {
         o
     }
 
+    #[allow(
+        clippy::uninit_vec,
+        reason = "the header is written into the room below before the vector is read"
+    )]
     #[must_use]
     pub fn encode_request_header(&self, target_host: &str, target_port: u16) -> Vec<u8> {
-        let mut out = vec![0u8; self.request_header_len(target_host)];
+        let len = self.request_header_len(target_host);
+        let mut out = Vec::with_capacity(len);
+        out.reserve_exact(len);
+        // SAFETY: `encode_into` writes every byte of the header, and the vector is not read before it does.
+        unsafe { out.set_len(len) };
         let n = self.encode_into(target_host, target_port, &mut out);
         debug_assert_eq!(n, out.len());
         out
@@ -957,6 +965,22 @@ mod tests {
     use super::*;
 
     const BRIEF_LINK: &str = "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?security=reality&encryption=none&pbk=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA&host=%2Ftest-path&headerType=none&fp=firefox&type=tcp&flow=xtls-rprx-vision&sni=example.com&sid=a8#reality-vision-test";
+
+    /// The header the dial carries is not zeroed: `encode_into` writes every byte of it,
+    /// so the zero pass in front of it was work generated and thrown away. The counting
+    /// allocator's `zeroed` counter is the witness.
+    #[test]
+    fn the_request_header_is_not_zero_filled() {
+        let link = VlessLink::parse(
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?security=none&encryption=none&type=tcp#x",
+        )
+        .expect("a link");
+        let (header, counts) =
+            crate::alloc_count::measure(|| link.encode_request_header("example.com", 443));
+        assert_eq!(counts.zeroed, 0, "the header is not zeroed");
+        assert_eq!(counts.allocs, 1, "the header is one buffer");
+        assert_eq!(header.len(), link.request_header_len("example.com"));
+    }
 
     #[test]
     fn parses_the_brief_link() {
