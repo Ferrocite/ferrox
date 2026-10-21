@@ -4032,10 +4032,18 @@ pub(crate) mod loopback {
             let mut at = 0usize;
             while at < chunk.len() {
                 let end = (at + STEP).min(chunk.len());
-                match forward.lock().expect("locks").write(&chunk[at..end]) {
-                    Ok(0) => std::thread::sleep(Duration::from_millis(5)),
-                    Ok(wrote) => at += wrote,
+                // The guard is bound and dropped before the idle sleep: a guard that lived to the end of the `match` would hold the lane through the sleep, and the writer behind the same mutex would wait it out.
+                let mut guard = forward.lock().expect("locks");
+                let wrote = match guard.write(&chunk[at..end]) {
+                    Ok(0) => 0,
+                    Ok(wrote) => wrote,
                     Err(error) => panic!("the write failed: {error}"),
+                };
+                drop(guard);
+                if wrote == 0 {
+                    std::thread::sleep(Duration::from_millis(5));
+                } else {
+                    at += wrote;
                 }
             }
             done_tx.send(()).expect("reports");
@@ -4043,9 +4051,11 @@ pub(crate) mod loopback {
         let mut back = vec![0u8; BIG];
         let mut at = 0usize;
         while at < BIG {
-            match lane.lock().expect("locks").read(&mut back[at..]) {
+            // The lane is shared with the writer, so the guard is handed back before the idle sleep: a tight poll that keeps the lane starves the writer behind the same mutex, and the writer is the half that has the bytes to send.
+            let mut guard = lane.lock().expect("locks");
+            let read = match guard.read(&mut back[at..]) {
                 Ok(0) => panic!("the echo ended early"),
-                Ok(read) => at += read,
+                Ok(read) => read,
                 Err(error)
                     if matches!(
                         error.kind(),
@@ -4054,10 +4064,15 @@ pub(crate) mod loopback {
                             | std::io::ErrorKind::Interrupted
                     ) =>
                 {
-                    // The lane is shared with the writer, so an idle poll sleeps instead of re-locking: a tight poll loop starves the writer behind the same mutex under load.
-                    std::thread::sleep(Duration::from_millis(1));
+                    0
                 }
                 Err(error) => panic!("the echo failed: {error}"),
+            };
+            drop(guard);
+            if read == 0 {
+                std::thread::sleep(Duration::from_millis(1));
+            } else {
+                at += read;
             }
         }
         done_rx
