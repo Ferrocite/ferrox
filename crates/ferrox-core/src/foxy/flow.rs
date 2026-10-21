@@ -22,9 +22,10 @@ impl Window {
         self.bytes = if delta >= 0 {
             self.bytes.saturating_add(delta)
         } else {
-            // The magnitude is clamped before it is subtracted: a delta of `i64::MIN` cast to `i64` is still negative, and subtracting it would grow the window instead of emptying it.
-            self.bytes
-                .saturating_sub(delta.unsigned_abs().min(i64::MAX as u64) as i64)
+            // The magnitude is clamped to the window's own ceiling before it is subtracted: a delta of `i64::MIN` has a magnitude of `2^63`, one past `i64::MAX`, and casting that back would wrap it negative and grow the window instead of emptying it.
+            let drop = i64::try_from(delta.unsigned_abs().min(i64::MAX.unsigned_abs()))
+                .unwrap_or(i64::MAX);
+            self.bytes.saturating_sub(drop)
         };
     }
 

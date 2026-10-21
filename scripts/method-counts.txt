@@ -287,8 +287,9 @@ carrier-foxy h2-upload-bytes-blocked-by-an-unread-grant 0 ferrox-app-foxy::loopb
 carrier-foxy window-update-frames-per-floor-crossing 2 ferrox-app-foxy::loopback::credit_crossing_the_floor_costs_one_pair_not_one_per_frame
 carrier-foxy window-update-frames-below-the-floor 0 ferrox-app-foxy::loopback::credit_held_under_the_floor_never_reaches_the_wire
 carrier-foxy dead-carrier-dials-per-connect-ip-packet 0 ferrox-app-proxy::tests::the_connect_ip_lane_leaves_a_dead_carrier_dead
-carrier-foxy carriers-dialled 3 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer
-carrier-foxy udp-carriers-dialled 2 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer
+carrier-foxy carriers-dialled 3 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_answers_best
+carrier-foxy udp-carriers-dialled 2 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_answers_best
+carrier-foxy auto-carrier-opened-on H2 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_answers_best
 carrier-foxy datagram-frames-per-capsule 1 ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_over_quic_and_echoes_a_datagram
 carrier-foxy capsules-reassembled-across-frames 1 ferrox-app-foxy::loopback::a_capsule_split_over_frames_reassembles_as_one_datagram
 carrier-foxy datagrams-out-of-one-frame 2 ferrox-app-foxy::loopback::a_frame_of_two_datagrams_arrives_as_two_datagrams

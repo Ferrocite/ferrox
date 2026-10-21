@@ -129,9 +129,9 @@ foxy options (email + password is the whole setup; there is no server to name)
   --code CODE            two-factor code
   --country CC           exit country, default US
   --city CODE            city tier inside the country
-  --carrier NAME         auto|h1|h2|h3, default auto (h3, then h2, then h1);
-                         h1 and h2 measured 6-7 MB/s on CI against h3's 2.3, so
-                         name h2 for the fastest TCP tunnel and h3 for UDP
+  --carrier NAME         auto|h1|h2|h3, default auto (h2, then h1, then h3);
+                         h2 outran h3 on CI in every run and on every runner, so
+                         auto opens on h2; name h3 for UDP
   --upstream URL         http:// or socks5(h):// hop to reach the edge through
 
 veepn options (nothing is required: the plane names the region and its edges)

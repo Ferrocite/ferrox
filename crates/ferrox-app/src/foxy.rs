@@ -34,13 +34,13 @@ const H3_PEEK: usize = 16;
 const H3_SKIP: usize = MAX_HEAD;
 const H3_FRAME: usize = 16 * 1024;
 
-/// The carriers the lane can carry, in `auto`'s preference order: QUIC (one handshake carries every flow), HTTP/2 (the edge speaks it), HTTP/1.1 (every edge does).
+/// The carriers the lane can carry, in `auto`'s preference order: HTTP/2 (the edge speaks it and a resumed TCP session carries the bytes), HTTP/1.1 (every edge does), QUIC (one handshake carries every flow, and it is the only carrier that carries a datagram).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Carrier {
     H1,
     H2,
     H3,
-    /// Try each carrier in turn: an edge that will not answer QUIC is a slower tunnel, not a refused one.
+    /// Try each carrier in turn: an edge that will not answer HTTP/2 is a slower tunnel, not a refused one.
     Auto,
 }
 
@@ -68,10 +68,12 @@ impl Carrier {
     }
 
     /// The carriers to try, most preferred first, one entry when not `auto`.
+    ///
+    /// `auto` opens on `h2` and not on `h3`: the edge answers HTTP/3, but it answers it on a QUIC session whose congestion window starts empty on a path the edge has never seen, while HTTP/2 rides a resumed TCP session whose window the edge has already grown. On CI's own egress, against the real edge, `h2` outran `h3` and `auto` in every run and on every runner, so the rung that answered first was the rung that cost the most.
     #[must_use]
     pub(crate) const fn order(self) -> [Self; 3] {
         match self {
-            Self::Auto => [Self::H3, Self::H2, Self::H1],
+            Self::Auto => [Self::H2, Self::H1, Self::H3],
             Self::H3 => [Self::H3, Self::H3, Self::H3],
             Self::H2 => [Self::H2, Self::H2, Self::H2],
             Self::H1 => [Self::H1, Self::H1, Self::H1],
@@ -963,7 +965,8 @@ impl Tls2 {
 
     /// The edge's `INITIAL_WINDOW_SIZE` moved: the setting applies to every stream, open or not, so this lane's own stream gains or loses the difference rather than being set to the new size.
     fn set_initial_window(&mut self, size: u32) {
-        self.window.shift(i64::from(size) - i64::from(self.peer_initial));
+        self.window
+            .shift(i64::from(size) - i64::from(self.peer_initial));
         self.peer_initial = size;
     }
 
@@ -2949,10 +2952,11 @@ mod tests {
 
     /// The order the lane trusts to find a tunnel, and the order a datagram trusts: `auto` walks all three, UDP walks the two that can carry a capsule at all.
     #[test]
-    fn the_carriers_are_ordered_by_what_the_edge_can_answer() {
+    fn the_carriers_are_ordered_by_what_the_edge_answers_best() {
+        // `auto` opens on `h2`: against the real edge on CI's own egress, `h2` outran `h3` and the old `auto` order in every run and on every runner, because a QUIC session's congestion window starts empty where a resumed TCP session's does not. The exact order is the gate, so the ladder cannot lose a carrier to a reorder: all three are named here.
         assert_eq!(
             Carrier::Auto.order(),
-            [Carrier::H3, Carrier::H2, Carrier::H1]
+            [Carrier::H2, Carrier::H1, Carrier::H3]
         );
         assert_eq!(Carrier::H2.order(), [Carrier::H2, Carrier::H2, Carrier::H2]);
         assert_eq!(Carrier::udp_order(), [Carrier::H3, Carrier::H2]);

@@ -661,10 +661,10 @@ jobs:
           }
           stop_lane
 
-          # DNS through the tunnel over UDP. UDP rides CONNECT-UDP and the lane
-          # prefers the HTTP/3 edge, so the probe below is run over the auto
-          # order — HTTP/3 first, then the HTTP/2 form — each through a fresh
-          # socks lane, because the UDP associate speaks SOCKS5.
+          # DNS through the tunnel over UDP. UDP rides CONNECT-UDP and the lane's
+          # datagram order is the HTTP/3 edge first, so the probe below is run
+          # over the auto order — the HTTP/3 form, then the HTTP/2 one — each
+          # through a fresh socks lane, because the UDP associate speaks SOCKS5.
           # The probe is written once and run per carrier: a datagram to the
           # edge's relay and whatever comes back, NTP and DNS (both refused at
           # this edge, kept as the policy record) plus a QUIC
@@ -781,7 +781,7 @@ jobs:
           print('udp through the tunnel:', answers)
           PROBE
           leg_share
-          echo "== udp path over the auto carrier: h3, then h2 =="
+          echo "== udp path over the auto carrier: h3, then h2 (the datagram order) =="
           PORT=10818
           start_lane socks "$PORT" auto "$COUNTRY"
           trace_socks "$PORT" "$COUNTRY" "udp auto" || FAILED="$FAILED udp-auto(trace)"
