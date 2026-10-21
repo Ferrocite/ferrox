@@ -230,6 +230,7 @@ carrier-grpc header-field-copies-per-head 0 ferrox-app-h2::tests::a_plain_field_
 carrier-grpc table-entry-copies-per-indexed-field 0 ferrox-app-h2::tests::an_indexed_field_borrows_the_table
 carrier-grpc decoder-buffer-writes-per-borrowed-field 0 ferrox-app-h2::tests::a_borrowed_block_leaves_the_scratch_alone
 carrier-grpc header-field-allocations-per-inserted-field 2 ferrox-app-h2::tests::an_indexed_field_borrows_the_table
+carrier-grpc header-block-allocations-per-frame 1 ferrox-app-h2::tests::a_header_block_is_opened_once
 
 carrier-xhttp ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-xhttp framing-size-lines-without-an-allocation 0 ferrox-app-xhttp::tests::size_lines_match_format_without_allocating
