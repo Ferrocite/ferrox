@@ -1911,21 +1911,16 @@ impl Lane {
             let Some(colon) = line.iter().position(|byte| *byte == b':') else {
                 continue;
             };
-            let name = String::from_utf8_lossy(&line[..colon]).to_ascii_lowercase();
-            let value = String::from_utf8_lossy(&line[colon + 1..])
-                .trim()
-                .to_owned();
-            match name.as_str() {
-                "content-length" if !transfer => {
-                    length = value.parse::<usize>().ok().or(length);
-                }
-                "transfer-encoding" => {
-                    transfer |= value.to_ascii_lowercase().contains("chunked");
-                }
-                "connection" => {
-                    closing |= value.to_ascii_lowercase().contains("close");
-                }
-                _ => {}
+            // The name and the value are read where they lie: a head the service does not read costs no buffer, and the three names it does read are compared in place rather than built.
+            let name = &line[..colon];
+            let value = String::from_utf8_lossy(&line[colon + 1..]);
+            let value = value.trim();
+            if name.eq_ignore_ascii_case(b"content-length") && !transfer {
+                length = value.parse::<usize>().ok().or(length);
+            } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+                transfer |= contains_ascii_case(value, "chunked");
+            } else if name.eq_ignore_ascii_case(b"connection") {
+                closing |= contains_ascii_case(value, "close");
             }
         }
         if header_only || matches!(status, 204 | 304) {
@@ -1976,6 +1971,14 @@ fn guard(want: usize, limit: Option<usize>) -> io::Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Whether a header value holds a word, compared without a copy of the value.
+fn contains_ascii_case(haystack: &str, needle: &str) -> bool {
+    let hay = haystack.as_bytes();
+    let pin = needle.as_bytes();
+    hay.windows(pin.len())
+        .any(|window| window.eq_ignore_ascii_case(pin))
 }
 
 /// The status out of `HTTP/1.1 200 OK`.
@@ -3384,6 +3387,35 @@ mod tests {
             }
         }
         got
+    }
+
+    /// The head's names and values are read where they lie: a reply with headers the
+    /// service does not read costs no buffer for them.
+    #[test]
+    fn a_reply_head_costs_no_buffer_for_its_headers() {
+        let origin = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = origin.local_addr().expect("addr").port();
+        let (done, wait) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = origin.accept().expect("accepts");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\nX-Extra-One: a\r\nX-Extra-Two: b\r\nX-Extra-Three: c\r\n\r\n")
+                .expect("answers");
+            stream.flush().expect("flushes");
+            let _ = wait.recv();
+        });
+        let mut lane = Lane::new(Kind::Plain(
+            Connection::connect(("127.0.0.1", port)).expect("connects"),
+        ));
+        let (answer, counts) =
+            ferrox_core::alloc_count::measure(|| lane.reply(false, None).expect("the answer"));
+        assert_eq!(answer.status, 200, "the head was read");
+        assert_eq!(
+            counts.allocs, 0,
+            "the head's names and values are read where they lie, so none of them costs a buffer"
+        );
+        drop(done);
+        server.join().expect("the service finishes");
     }
 
     #[test]

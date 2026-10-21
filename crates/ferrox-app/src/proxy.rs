@@ -12040,6 +12040,27 @@ mod tests {
         );
     }
 
+    /// The census is a stall hunt's instrument: a release build's relay registers no wait
+    /// with it, so the hot path pays neither the map, the lock, the clock nor the scan.
+    /// The ops job builds its binary in release, so this row is the release shape's.
+    #[test]
+    fn a_release_build_registers_no_census_wait() {
+        let before = crate::census::registrations();
+        let half = Half::split(
+            std::io::Cursor::new(b"hello".to_vec()),
+            std::io::Cursor::new(Vec::new()),
+        );
+        let mut buf = [0u8; 8];
+        let read = half.read_once(&mut buf).expect("reads");
+        assert_eq!(read, 5, "the reader saw the bytes");
+        let after = crate::census::registrations();
+        if cfg!(debug_assertions) {
+            assert!(after > before, "a debug build registers the wait");
+        } else {
+            assert_eq!(after, before, "a release build registers no wait");
+        }
+    }
+
     #[test]
     fn a_relay_write_goes_out_while_the_reader_is_parked() {
         use std::sync::mpsc;
