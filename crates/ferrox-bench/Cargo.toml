@@ -13,6 +13,9 @@ workspace = true
 ferrox-core = { workspace = true, features = ["bench-reference"] }
 chacha20 = "0.9"
 aes-gcm = "0.10"
+# Only the `TLS` arm's fixture: a key and certificate minted at run time so no private key
+# is ever checked in. The harness is `publish = false`, so nothing shipped carries it.
+rcgen = "0.13"
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 libc = "0.2"
