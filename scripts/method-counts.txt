@@ -246,6 +246,7 @@ carrier-xhttp head-tail-allocations 0 ferrox-app-xhttp::tests::the_record_head_h
 carrier-xhttp received-data-frames-copied 0 ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into
 carrier-xhttp received-header-blocks-copied 0 ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into
 carrier-xhttp zero-filled-bytes-per-received-frame 0 ferrox-app-xhttp_h2::tests::a_received_frames_body_is_not_zero_filled
+carrier-xhttp dial-head-allocations-per-thread 1 ferrox-app-xhttp::tests::the_dial_head_is_staged_once_per_thread
 
 carrier-veepn ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-veepn credential-window-allocations-per-pair 0 ferrox-core-veepn::tests::the_credential_lands_in_the_callers_window_and_not_in_one_of_its_own
