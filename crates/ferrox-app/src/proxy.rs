@@ -10559,7 +10559,7 @@ fn socks_authenticate(client: &mut Connection, until: Instant, accounts: &SocksA
         let _ = client.write_all(&[ferrox_core::socks::AUTH_VERSION, 1]);
         return false;
     }
-    let mut user = vec![0u8; usize::from(head[1])];
+    let mut user = crate::proxy::unfilled(usize::from(head[1]));
     if read_exact(
         &mut HandshakeDeadline {
             inner: &mut *client,
@@ -10583,7 +10583,7 @@ fn socks_authenticate(client: &mut Connection, until: Instant, accounts: &SocksA
     {
         return false;
     }
-    let mut pass = vec![0u8; usize::from(len[0])];
+    let mut pass = crate::proxy::unfilled(usize::from(len[0]));
     if read_exact(
         &mut HandshakeDeadline {
             inner: &mut *client,
@@ -10605,7 +10605,7 @@ fn read_socks_named(stream: &mut dyn Read, atyp: u8) -> Option<Destination> {
         3 => {
             let mut len = [0u8; 1];
             read_exact(stream, &mut len).ok()?;
-            let mut name = vec![0u8; usize::from(len[0])];
+            let mut name = crate::proxy::unfilled(usize::from(len[0]));
             read_exact(stream, &mut name).ok()?;
             let mut port = [0u8; 2];
             read_exact(stream, &mut port).ok()?;
@@ -10756,7 +10756,7 @@ fn read_socks_addr_rest(stream: &mut dyn Read, atyp: u8) -> Option<SocketAddr> {
         3 => {
             let mut len = [0u8; 1];
             read_exact(stream, &mut len).ok()?;
-            let mut name = vec![0u8; usize::from(len[0])];
+            let mut name = crate::proxy::unfilled(usize::from(len[0]));
             read_exact(stream, &mut name).ok()?;
             let mut port = [0u8; 2];
             read_exact(stream, &mut port).ok()?;
@@ -11971,6 +11971,24 @@ mod tests {
     /// wait for the reader's parked read: a read that holds the lock across its wait makes
     /// the write wait for that whole wait, and the flow's throughput falls to one buffer
     /// per wait.
+    /// The buffers a SOCKS front reads a name and a credential into are not zeroed: the
+    /// reads fill them in full, so the zero pass in front of them was work generated and
+    /// thrown away. The counting allocator's `zeroed` counter is the witness.
+    #[test]
+    fn a_socks_front_reads_no_buffer_it_zeroed() {
+        let mut request = vec![12u8];
+        request.extend_from_slice(b"example.test");
+        request.extend_from_slice(&443u16.to_be_bytes());
+        let mut reader = std::io::Cursor::new(request);
+        let (target, counts) =
+            ferrox_core::alloc_count::measure(|| read_socks_named(&mut reader, 3));
+        assert_eq!(counts.zeroed, 0, "the name is not zeroed");
+        assert_eq!(
+            target,
+            Some(Destination::Name("example.test".to_owned(), 443))
+        );
+    }
+
     #[test]
     fn a_relay_write_goes_out_while_the_reader_is_parked() {
         use std::sync::mpsc;
