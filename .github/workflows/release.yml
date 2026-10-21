@@ -232,15 +232,35 @@ jobs:
             without a byte of its own, the buffers a flow fills are no longer
             zeroed first (VLESS, SOCKS, KCP), an HTTP/2 header block is opened
             once at its own length instead of grown four times, a datagram
-            leaves in the frame its client framed, and a relay socket's two
-            directions no longer share a lock. On x86_64 a ChaCha20 record's
-            remainder is finished inside the vector pass — eight blocks per pass
-            where the scalar ladder managed six, sixteen where the machine has
-            avx512f — so a chacha stream pays less work per kept block; the
-            `aarch64` pass keeps the shape it had. The trade is named on the
-            page: the pass computes blocks the buffer does not hold, so
-            discarded blocks rise, and the last one or two blocks are still the
-            ladder's.
+            leaves in the frame its client framed, a relay socket's two
+            directions no longer share a lock, and a forwarded HTTP head is
+            rewritten inside the buffer it was read into — the absolute-form
+            rewrite used to build a second buffer and copy every header byte
+            before the uplink saw it, and the gate that replaced it holds the
+            head the caller gets to the head that was read, which a copy cannot
+            do. What did **not** change: a ChaCha20 record's remainder. The
+            vector pass was tried on the tail — eight blocks a pass where the
+            ladder managed six, sixteen with `avx512f` — and this tree's own
+            bench gate said no: `0.754x`, `0.879x` and `0.854x` of the
+            reference at 256, 257 and 319 bytes, because the pass's setup is
+            only amortised over a whole pass and a tail is by definition
+            shorter than one. The pass stands where it was and the ladder still
+            closes a record; both readings are on the record-layer page.
+
+            ### Fixed: a padded frame now credits its whole wire length
+
+            RFC 7540 §6.9 puts a DATA frame's whole payload into the flow-control
+            window, the `Pad Length` octet and the padding included. Both HTTP/2
+            lanes — gRPC and Foxy — credited what the parser's trim left, so a
+            padded frame handed the peer back `1 + pad` octets fewer than it had
+            sent: a peer that keeps a strict window lost that much every frame,
+            and a long flow lost its window and stalled. The credit is the
+            frame's wire length now, and `a_padded_frame_credits_its_whole_wire_payload`
+            holds the granted increment at the frames' wire length on each lane.
+            The bytes on the wire did not move. One defect the same slice found
+            is still open and is named rather than claimed away: the Foxy lane's
+            direct delivery hands a padded frame's payload back with its pad
+            still on it, so what a caller gets depends on how much room it had.
 
             ### Also new under the hood
 
@@ -252,7 +272,11 @@ jobs:
             reference's. **SOCKS serves and dials** in both roles — SOCKS5,
             SOCKS4 and SOCKS4a — so an upstream hop can be a SOCKS front.
             **QUIC** carries a whole datagram per packet with a receive window
-            that grows, and **dokodemo-door** has its UDP door.
+            that grows, and **dokodemo-door** has its UDP door. The CI relay
+            gate now splits each leg's seconds four ways — proxy open, TLS
+            through the lane, first byte, transfer tail — and carries each
+            leg's real curl exit and byte count, so a stalled leg names itself
+            instead of passing green.
 
             **VeePN** is the lane with nothing to type in. The plane launches this device
             anonymously, names the fastest region — `--region us-va` pins one — and lists
