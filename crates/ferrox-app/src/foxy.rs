@@ -78,14 +78,16 @@ impl Carrier {
         }
     }
 
-    /// The carriers to try, most preferred first, one entry when not `auto`.
+    /// The carriers to try, most preferred first, three entries for every carrier.
     ///
     /// `auto` opens on `h2` and not on `h3`: the edge answers HTTP/3, but it answers it on a QUIC session whose congestion window starts empty on a path the edge has never seen, while HTTP/2 rides a resumed TCP session whose window the edge has already grown. On CI's own egress, against the real edge, `h2` outran `h3` and `auto` in every run and on every runner, so the rung that answered first was the rung that cost the most.
+    ///
+    /// A named carrier leads its ladder, but `h3` is a preference and not a pin: a path can drop QUIC outright, and silence is not a refusal the edge can fall through on its own, so the TCP rungs follow it.
     #[must_use]
     pub(crate) const fn order(self) -> [Self; 3] {
         match self {
             Self::Auto => [Self::H2, Self::H1, Self::H3],
-            Self::H3 => [Self::H3, Self::H3, Self::H3],
+            Self::H3 => [Self::H3, Self::H2, Self::H1],
             Self::H2 => [Self::H2, Self::H2, Self::H2],
             Self::H1 => [Self::H1, Self::H1, Self::H1],
         }
@@ -2852,7 +2854,8 @@ impl Tunnel {
             (Carrier::H3, Some(quic)) => {
                 H3::open(dial, target, quic).map(|lane| Self::H3(Box::new(lane)))
             }
-            (Carrier::H3, None) => Err(Failure::Stream),
+            // No QUIC connection means the path never answered: silence is an I/O failure, not the edge closing a stream.
+            (Carrier::H3, None) => Err(Failure::Io),
             // `auto` is expanded by the caller into the carriers it prefers; an unexpanded one here is a bug, and the answer is not a downgrade.
             (Carrier::Auto, _) => Err(Failure::Frame),
         }
@@ -3186,6 +3189,7 @@ mod tests {
             [Carrier::H2, Carrier::H1, Carrier::H3]
         );
         assert_eq!(Carrier::H2.order(), [Carrier::H2, Carrier::H2, Carrier::H2]);
+        assert_eq!(Carrier::H3.order(), [Carrier::H3, Carrier::H2, Carrier::H1]);
         assert_eq!(Carrier::udp_order(), [Carrier::H3, Carrier::H2]);
         assert!(
             !Carrier::udp_order().contains(&Carrier::H1),
@@ -3256,11 +3260,12 @@ mod tests {
         assert!(order.iter().all(|edge| edge.country == "DE"));
     }
 
+    /// No QUIC connection is the path's silence, so the failure names I/O and not a stream the edge never closed.
     #[test]
     fn a_quic_lane_without_a_connection_is_a_refusal_not_a_panic() {
         assert_eq!(
             Tunnel::open(&dial("edge.example", Carrier::H3), "e:443", None).err(),
-            Some(Failure::Stream)
+            Some(Failure::Io)
         );
     }
 

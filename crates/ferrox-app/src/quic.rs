@@ -152,6 +152,9 @@ impl<const N: usize> Unfilled<N> {
 
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A handshake that has processed no packet at all for this long is on a path that drops datagrams: quiche retransmits the Initial several times inside it, and a peer that answers at all answers before.
+const SILENT_HANDSHAKE: Duration = Duration::from_secs(5);
+
 pub(crate) const IDLE_TIMEOUT_MS: u64 = 300_000;
 
 /// The receive credit an edge may hold against this process at the first byte: quiche parks every delivered byte here until the app reads it, so the advertised window is the memory the edge gets to spend before the first `MAX_STREAM_DATA` update.
@@ -831,14 +834,33 @@ pub(crate) fn drive_handshake_by(
     local: SocketAddr,
     budget: Duration,
 ) -> Option<()> {
-    let deadline = Instant::now() + budget;
+    drive_handshake_watching(conn, sock, local, budget, SILENT_HANDSHAKE)
+}
+
+/// The handshake loop with the silence floor named, so a test can watch a dead path be abandoned without waiting five seconds.
+fn drive_handshake_watching(
+    conn: &mut quiche::Connection,
+    sock: &Datagram,
+    local: SocketAddr,
+    budget: Duration,
+    silence: Duration,
+) -> Option<()> {
+    let start = Instant::now();
+    let deadline = start + budget;
     while !conn.is_established() {
-        if conn.is_closed() || Instant::now() >= deadline {
+        let now = Instant::now();
+        if conn.is_closed() || now >= deadline {
+            return None;
+        }
+        let quiet = now.saturating_duration_since(start);
+        // A path that drops QUIC answers no packet at all, so silence past the floor is the path rather than a slow handshake.
+        if quiet >= silence && conn.stats().recv == 0 {
             return None;
         }
         flush_egress(conn, sock);
         let left = deadline.saturating_duration_since(Instant::now());
-        if !pump_once(conn, sock, local, left) {
+        // Cut the wait to the silence floor, so a dead path is abandoned on time rather than at the next backoff.
+        if !pump_once(conn, sock, local, left.min(silence.saturating_sub(quiet))) {
             return None;
         }
     }
@@ -2870,6 +2892,44 @@ mod tests {
             assert!(roots.len() > 50, "a bundle with {} anchors", roots.len());
         }
         assert_eq!(parse_ca_pem(b"not a pem at all"), Vec::<Vec<u8>>::new());
+    }
+
+    /// A path that drops QUIC is silence, not a budget: the handshake is abandoned at its silence floor rather than waited out.
+    #[test]
+    fn a_silent_quic_path_is_abandoned_before_the_handshake_budget() {
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let sock = bind_datagram("127.0.0.1:0").expect("binds");
+        let local = sock.local_addr().expect("local");
+        let sock = Datagram::plain(sock);
+        let mut scid = [0u8; SCID_LEN];
+        getrandom::getrandom(&mut scid).expect("random");
+        let cid = quiche::ConnectionId::from_ref(&scid);
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("config");
+        config.set_application_protos(&[ALPN]).expect("alpn");
+        let mut conn = quiche::connect(
+            Some("silent.test"),
+            &cid,
+            local,
+            peer.local_addr().expect("peer"),
+            &mut config,
+        )
+        .expect("connects");
+        let started = Instant::now();
+        let answer = drive_handshake_watching(
+            &mut conn,
+            &sock,
+            local,
+            HANDSHAKE_TIMEOUT,
+            Duration::from_millis(50),
+        );
+        assert!(answer.is_none(), "a silent path never establishes");
+        assert_eq!(conn.stats().recv, 0, "nothing answered");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "abandoned in {:?}, not at the {} s budget",
+            started.elapsed(),
+            HANDSHAKE_TIMEOUT.as_secs()
+        );
     }
 
     /// The read option is why the edge stops losing packets, so it is read back rather than assumed.
