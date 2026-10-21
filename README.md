@@ -291,6 +291,19 @@ Today exactly one method dials per hop. The engine to build stacks them as an or
 | 123 | Multi-file config layering (`-c` repeats, `-confdir`, tag-merge) | planned | ZeroNet `merge.rs`. Rows 119–122 land per-file layers once merging exists |
 | 124 | Ten wait budgets (`dial`, `handshake`, `headArrival`, `relayJoin`, `relayQuantum`, `relayStall`, `udpIdle`, `payloadGrace`, `goawayGrace`, `carrierProbe`) | implemented | Each wait named once (`budgets.rs`), armed before the first inbound; unknown/missing-unit/zero refused by name. Loop cadences stay constants |
 
+### O — client shaping, mobile service and the TUN edge
+
+Rows 125–130 are the client-side gaps the FoxyVPN v1.0.7 release surfaces, read against the pinned trees. Row 31 keeps the generic ClientHello mask and row 29 the native TUN; these rows are the parts neither reaches.
+
+| # | method | state | supported today by |
+| --- | --- | --- | --- |
+| 125 | ClientHello fragmentation on the Foxy lane (first-byte and SNI-aware cut) | planned | FoxyVPN v1.0.7 `TlsClientHelloSplitter.kt`; ZeroNet `zero-evasion/src/fragment.rs` (`tlssni`). Generic `tlshello` re-framing ships row 31, but the Foxy lane's TCP carriers (rustls) arm neither cut and the h3 handshake is quiche's own |
+| 126 | Custom tunnel MTU (576–9000) | planned | FoxyVPN v1.0.7 `SettingsStore.kt`/`HevSocks5TunnelConfig.kt`; sing-box `option/tun.go`; mqvpn `src/config.h` (`tun_mtu`). The native TUN honours `settings.mtu` (row 29); Foxy, tun2socks (row 58) and MASQUE (row 20) carry no MTU knob |
+| 127 | Cellular keepalive and handover rebind | planned | FoxyVPN v1.0.7 h2 PING (3 s check, 15 s idle, 25 s timeout) and `NetworkCallback`; ZeroNet `zero-evasion/src/keepalive.rs`. The Foxy h2 lane acks a peer PING and sends none; no lane rebinds after a network change |
+| 128 | QUIC congestion controller and pacing (CUBIC/BBR/BBR2) | planned | quiche `quiche/src/recovery/mod.rs`; ZeroNet `zero-transport/src/quic_shape.rs`; SlipStream `docs/protocol.md` (DCUBIC). Hysteria picks BBR; the Foxy h3 lane leaves quiche's CUBIC default and paces nothing |
+| 129 | TUN stack and offloads (`userspace`/`system`/`hybrid`, GSO/GRO, multi-queue) | planned | zeptun `docs/wiki/Stacks.md`; sing-box `option/tun.go`; mqvpn `src/mqvpn_internal.h`; aether `aether/src/netstack.rs`; ZeroNet `zero-tun`. The tree opens one userspace device on one handler loop, without GSO/GRO |
+| 130 | Split tunneling (per-app/per-UID and per-domain) | planned | sing-box `option/tun.go` (`include_package`/`exclude_package`); LxBox 011-SPLIT_TUNNELING; xray-rust `platform/android/README.md`. Router field rules (row 100) carry no app identity |
+
 ### Conformance, per row
 
 The oracle names live in `upstream/pins.toml`; `scripts/run-upstream-suite.sh` is the checker. Four pins are enabled — `zeronet` (9 `xray_oracle` tests), `xray-rust` (23 interop tests), `xray-rust-hysteria` (1 client test), `xray-core` (4 `http_test.go` tests, launched via `go -overlay`); the other eleven print `SKIPPED` with the enabling rung. `conformance.yml` also maps the rest of xray-core's 72 scenario tests family by family without gating, so an unserved family is a map row not a red job. Suites run in CI only; each remaining oracle row becomes a rung exactly when the feature it names ships.
