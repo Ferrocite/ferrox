@@ -133,7 +133,9 @@ foxy options (email + password is the whole setup; there is no server to name)
   --carrier NAME         auto|h1|h2|h3, default auto (h2, then h1, then h3);
                          asked once on a terminal when the flag is left off, and
                          auto on a pipe; h2 outran h3 on CI in every run and on
-                         every runner, so auto opens on h2; name h3 for UDP
+                         every runner, so auto opens on h2; h3 is still the
+                         carrier UDP asks first, and a named h3 falls back to
+                         h2 and h1 when the path drops QUIC
   --upstream URL         http:// or socks5(h):// hop to reach the edge through
 
 veepn options (nothing is required: the plane names the region and its edges)
@@ -590,7 +592,7 @@ choose_carrier() {
   say "  1) auto  h2, then h1, then h3 — the fastest that answers (default)"
   say "  2) h2    HTTPS/2 on a session reused across flows"
   say "  3) h1    one TLS connection per flow"
-  say "  4) h3    QUIC, the only carrier that also carries UDP"
+  say "  4) h3    QUIC; also carries UDP. Falls back to h2, then h1"
   printf 'carrier [auto]: '
   local answer=""
   IFS= read -r answer || true
@@ -714,6 +716,10 @@ diagnose() {
       say "UDP reaches the edge while TCP is dropped: force --carrier h3 to see"
       say "whether the pass itself is refused, or keep --upstream for TCP."
     fi
+  elif grep -q "the carrier io failed" "$LOG"; then
+    say "diagnosis: a carrier's path answered no datagram. Many networks drop UDP"
+    say "and QUIC while TCP works, so a named h3 has already walked h2 and h1; if"
+    say "every rung is in the lines above, the edge or the hop drops both."
   elif grep -q "the edge closed the stream" "$LOG"; then
     say "diagnosis: the QUIC carrier reached the edge and HTTP/2 answered the same"
     say "pass with 401, so the edge refuses the pass this lane signed in for. The"
