@@ -486,6 +486,32 @@ pub(crate) fn quiche_config(roots: &[Vec<u8>], cc: Option<&str>) -> Option<quich
     config
 }
 
+/// The built configs, keyed by the trust bundle they were staged from.
+type BuiltConfigs = Mutex<HashMap<Vec<Vec<u8>>, Arc<Mutex<quiche::Config>>>>;
+
+/// One built config per trust bundle: quiche documents a `Config` as shared between connections, and building one writes every anchor out as PEM, parses it back off the filesystem and deletes the file.
+static CONFIGS: OnceLock<BuiltConfigs> = OnceLock::new();
+
+/// Dial through the config this trust bundle was built into: the first dial of a bundle pays the staged file, a later one is handed the built config with no copy of the anchors. A bundle that will not build is not cached, so it names itself per dial as it always did.
+pub(crate) fn with_config<T>(
+    roots: &[Vec<u8>],
+    dial: impl FnOnce(&mut quiche::Config) -> Option<T>,
+) -> Option<T> {
+    let cell = {
+        let mut configs = CONFIGS.get_or_init(Default::default).lock().ok()?;
+        if let Some(cell) = configs.get(roots) {
+            Arc::clone(cell)
+        } else {
+            let config = quiche_config(roots, None)?;
+            let cell = Arc::new(Mutex::new(config));
+            configs.insert(roots.to_vec(), Arc::clone(&cell));
+            cell
+        }
+    };
+    let mut config = cell.lock().ok()?;
+    dial(&mut config)
+}
+
 /// The datagrams one egress sweep hands the socket in one call: a 32 KiB write queues about ten behind each other, so a batch of eight sends most of a frame where the loop paid one syscall per packet.
 #[cfg(target_os = "linux")]
 const SEND_SLOTS: usize = 8;
@@ -2071,8 +2097,9 @@ pub(crate) fn handshake_within(
     let mut scid = [0u8; SCID_LEN];
     getrandom::getrandom(&mut scid).ok()?;
     let cid = quiche::ConnectionId::from_ref(&scid);
-    let mut config = quiche_config(roots, None)?;
-    let mut conn = quiche::connect(Some(server_name), &cid, local, peer, &mut config).ok()?;
+    let mut conn = with_config(roots, |config| {
+        quiche::connect(Some(server_name), &cid, local, peer, config).ok()
+    })?;
     drive_handshake_by(&mut conn, sock, local, budget)?;
     Some(conn)
 }
@@ -3356,6 +3383,46 @@ mod tests {
         assert_eq!(std::fs::read(&path).expect("reads"), b"bundle");
         std::fs::remove_file(&path).expect("removes");
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn one_trust_bundle_shares_its_built_config() {
+        let minted = rcgen::generate_simple_self_signed(vec!["shared-config.test".to_owned()])
+            .expect("mints");
+        let roots = parse_ca_pem(minted.cert.pem().as_bytes());
+        let other = rcgen::generate_simple_self_signed(vec!["other-config.test".to_owned()])
+            .expect("mints");
+        let built = |roots: &[Vec<u8>]| {
+            with_config(roots, |config| Some(std::ptr::from_ref(config))).expect("builds")
+        };
+        let (first, again) = (built(&roots), built(&roots));
+        assert!(
+            std::ptr::eq(first, again),
+            "a second dial staged a second bundle"
+        );
+        assert!(
+            !std::ptr::eq(first, built(&parse_ca_pem(other.cert.pem().as_bytes()))),
+            "a second bundle rode the first one's config"
+        );
+        assert!(
+            with_config(&[], |_| Some(())).is_none(),
+            "a bundle that would not build was cached as one that did"
+        );
+    }
+
+    #[test]
+    fn a_warm_config_lookup_allocates_nothing() {
+        let roots = system_roots();
+        with_config(&roots, |_| Some(())).expect("builds");
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                with_config(&roots, |_| Some(())).expect("warms");
+            }
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "a warm dial asks the cache with the caller's own anchors"
+        );
     }
 
     #[test]
