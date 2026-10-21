@@ -11,6 +11,7 @@ mod earlydata;
 mod framing;
 mod json;
 mod linkconfig;
+mod make_tls;
 mod methods;
 mod muxframe;
 mod parity;
@@ -816,13 +817,15 @@ fn gate_eight(report: &mut String) -> Vec<framing::Row> {
     rows
 }
 
-fn linkconfig_exit() -> Option<i32> {
-    if std::env::args().nth(1).as_deref() == Some("linkconfig") {
-        Some(linkconfig::run(
-            &std::env::args().skip(2).collect::<Vec<_>>(),
-        ))
-    } else {
-        None
+/// A subcommand that ends the process: the harness's side modes never run a measurement.
+fn side_exit() -> Option<i32> {
+    let mut argv = std::env::args().skip(1);
+    let kind = argv.next()?;
+    let rest = argv.collect::<Vec<_>>();
+    match kind.as_str() {
+        "linkconfig" => Some(linkconfig::run(&rest)),
+        "make-tls" => Some(make_tls::run(&rest)),
+        _ => None,
     }
 }
 
@@ -849,7 +852,7 @@ fn gate_ten(report: &mut String) -> Vec<framing::Row> {
 }
 
 fn main() {
-    if let Some(code) = linkconfig_exit() {
+    if let Some(code) = side_exit() {
         std::process::exit(code);
     }
     let args = parse_args();
