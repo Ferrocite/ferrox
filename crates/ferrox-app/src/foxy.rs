@@ -652,10 +652,9 @@ fn open_h2_with(dial: &FoxyDial, block: &[u8]) -> Result<Tls2, Failure> {
     let mut lane = Tls2 {
         tls,
         // What this lane may put on the wire is only what the edge grants: the stream window arrives in its settings and the connection window only moves by a `WINDOW_UPDATE` on stream 0, so both start at the protocol default rather than at the window this lane asks the edge to keep open for it.
-        window: foxy::flow::Window::new(
-            i64::from(frames::DEFAULT_WINDOW),
-            i64::from(frames::DEFAULT_WINDOW),
-        ),
+        window: foxy::flow::Window::new(i64::from(frames::DEFAULT_WINDOW)),
+        conn: foxy::flow::Window::new(i64::from(frames::DEFAULT_WINDOW)),
+        peer_initial: frames::DEFAULT_WINDOW,
         max_frame: MAX_FRAME,
         carry: Vec::new(),
         at: 0,
@@ -709,7 +708,12 @@ const CREDIT_FLOOR: u32 = 1 << 16;
 /// A relay over a TLS stream that speaks HTTP/2: a caller writing bytes sees a DATA frame, a caller reading bytes sees one's payload.
 pub(crate) struct Tls2 {
     tls: ferrox_core::tls::RustlsProvider<Connection>,
+    /// The credit this stream may spend: the edge grants it on this stream and the connection's credit bounds it too, so the tighter of the two is what a frame may carry.
     window: foxy::flow::Window,
+    /// The credit the whole connection may spend: every stream's bytes are spent against it at once, so it is a connection's window and not a stream's.
+    conn: foxy::flow::Window,
+    /// The `INITIAL_WINDOW_SIZE` the edge last announced: a change moves every stream by the difference, and the one this lane opened is already running.
+    peer_initial: u32,
     max_frame: usize,
     /// Bytes read from a DATA frame the caller has not taken, with a cursor: draining would move what is left on every call.
     carry: Vec<u8>,
@@ -945,16 +949,28 @@ impl Tls2 {
 
     /// The credit this lane may spend on one frame: the edge grants the stream and the connection windows independently, so the tighter of the two is the limit.
     fn spend(&self) -> u32 {
-        self.window.stream().min(self.window.connection())
+        self.window.left().min(self.conn.left())
     }
 
     /// Applies one `WINDOW_UPDATE` from the edge: stream 0 moves the connection credit and our own stream moves the stream credit; nothing else gets spent by receiving DATA.
     fn grant(&mut self, stream: u32, increment: u32) {
         if stream == 0 {
-            self.window.add_connection(increment);
+            self.conn.add(increment);
         } else if stream == 1 {
-            self.window.add_stream(increment);
+            self.window.add(increment);
         }
+    }
+
+    /// The edge's `INITIAL_WINDOW_SIZE` moved: the setting applies to every stream, open or not, so this lane's own stream gains or loses the difference rather than being set to the new size.
+    fn set_initial_window(&mut self, size: u32) {
+        self.window.shift(i64::from(size) - i64::from(self.peer_initial));
+        self.peer_initial = size;
+    }
+
+    /// Spends the credit of one frame on both windows it is spent against: the stream's own and the connection's, whose bytes every stream pays at once.
+    fn charge(&mut self, len: u32) {
+        self.window.take(len);
+        self.conn.take(len);
     }
 
     fn ack(&mut self, kind: u8, payload: &[u8]) -> Result<(), Failure> {
@@ -985,7 +1001,7 @@ impl Tls2 {
                             let mut at = 0usize;
                             while let Some((id, value)) = frames::setting(payload, at) {
                                 match id {
-                                    4 => lane.window.reset_stream(value),
+                                    4 => lane.set_initial_window(value),
                                     5 => lane.max_frame = (value as usize).clamp(16_384, MAX_FRAME),
                                     _ => {}
                                 }
@@ -1067,7 +1083,7 @@ impl Tls2 {
         let mut at = 0usize;
         while at < total {
             let frame = foxy::flow::frame_size(total - at, self.max_frame).min(self.spend());
-            self.window.take(frame);
+            self.charge(frame);
             let frame = frame as usize;
             let header = frames::H2Frame {
                 kind: frames::DATA,
@@ -1215,7 +1231,7 @@ impl Write for Tls2 {
         if frame == 0 {
             return Ok(0);
         }
-        self.window.take(frame);
+        self.charge(frame);
         let frame = frame as usize;
         // Header and payload in one write: two writes would be two TLS records, and the record boundary is on the wire.
         let header = frames::H2Frame {
@@ -2477,7 +2493,7 @@ impl Tls2 {
                 std::thread::sleep(Duration::from_millis(5));
                 continue;
             }
-            self.window.take(frame);
+            self.charge(frame);
             let frame = frame as usize;
             let header = frames::H2Frame {
                 kind: frames::DATA,

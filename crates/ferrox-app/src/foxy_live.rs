@@ -264,8 +264,9 @@ fn a_second_connect_stream_on_one_session_names_what_the_edge_does() {
     );
     assert!(
         second.is_some(),
-        "the edge takes one CONNECT per H2 session: a pool would carry flows on streams it \
-         never answers, so P48 stays reverted and P50 keeps recording this"
+        "the edge answers a second CONNECT on the same session, so one session can carry \
+         many flows: a pool that opens one session per edge is what the fixed cost per \
+         flow is paid for"
     );
     println!("the edge answers a second CONNECT on the same session, so the session can be pooled");
 }

@@ -68,8 +68,11 @@ actions
 options
   --country CC       exit country, default US (env FOXY_COUNTRY)
   --city CODE        city tier inside the country, default any (env FOXY_CITY)
-  --carrier NAME     auto|h1|h2|h3, default auto (env FOXY_CARRIER); HTTP/3 is
-                     in the lane and is what auto tries first
+  --carrier NAME     auto|h1|h2|h3, default auto (env FOXY_CARRIER); auto tries
+                     h3, then h2, then h1 and keeps the first that answers. On the
+                     CI runner's own egress h1 and h2 ran at 6-7 MB/s and h3 at
+                     2.3 MB/s, so name h2 for the fastest TCP tunnel and h3 only
+                     when UDP is needed or the edge's TCP is filtered
   --mode MODE        socks|http|mixed|vpn|all, default all: which local fronts
                      to serve; vpn = all fronts plus the system proxy
   --socks PORT       SOCKS5 front port, default 10808
