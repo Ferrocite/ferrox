@@ -100,6 +100,7 @@ Both H1 handshakes — the `POST` a server reads and the `200` a dialer reads �
 | head-tail-allocations | 0 | ferrox-app-xhttp::tests::the_record_head_hands_over_the_buffer_it_filled |
 | received-data-frames-copied | 0 | ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into |
 | received-header-blocks-copied | 0 | ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into |
+| zero-filled-bytes-per-received-frame | 0 | ferrox-app-xhttp_h2::tests::a_received_frames_body_is_not_zero_filled |
 <!-- counts:end -->
 
 ## Ops
@@ -130,6 +131,7 @@ What that cell does *not* witness is named, because it is not a small thing: its
 
 ## What we removed
 
+- **A zero pass over every received frame.** The `h2` lane's frame loop allocated its body with `vec![0u8; len]`, so a frame paid a zero pass over its whole length before the read that fills it in full — a copy of the whole transfer's bytes, written and thrown away. The body is the read's own target now, and the counting allocator's `zeroed` counter is the witness: `a_received_frames_body_is_not_zero_filled` fails if a frame body is zeroed again. What did not move: the frame's own buffer. The body is still the caller's allocation and the queue still holds that same pointer, which `a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into` holds, so the frame is queued as itself and not as a copy of it.
 - **A TCP connection per uplink packet.** The hub used to serve one request per connection and drop the socket, so a `packet-up` uplink paid a connect, a TLS handshake and a fresh slow start for every `scMaxEachPostBytes` of payload. The reuse is counted in memory, where the number is exact: `one_connection_carries_the_packet_up_uplink` asks one `accept_split_with_settings` call to serve two pipelined POSTs and gets **2 answers and both packets in the session**, where the single-shot shape served 1; `a_request_that_says_close_takes_the_connection_with_it` holds the other half — **1 answer**, the pipelined tail left unread. What that buys on throughput, CPU and RSS is CI's `h1-none-packet-up` interop cell and `vless-xhttp-down-8`, read after the run rather than predicted here. A loopback socket is not the checker for either number: it sees the bytes, not how many connections carried them.
 
 - **A pass over the size line.** `chunk_size` used to scan for the first terminator once and then parse the digits it had kept as a second pass; both branches re-read the same two-to-seven bytes. The rewrite walks the line once, and the nibble, terminator and invalid tests collapse into one 256-byte LUT that is hot in the I-cache after the first chunk. `size * 16 + digit` becomes `(size << 4) | nibble` — same arithmetic, same wrap. Bit-identity is gated by `chunk_size_fused_matches_two_pass_on_every_probe`, which sweeps every length 0..=20 with a probe byte at every position against the old two-pass form kept as the oracle. Nothing on the wire moves, and a bad line is still `None`.

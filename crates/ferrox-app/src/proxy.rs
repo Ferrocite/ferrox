@@ -1538,7 +1538,7 @@ fn mux_target_addr(target: &ferrox_core::mux::Target<'_>) -> Option<SocketAddr> 
     }
 }
 
-fn resolve_endpoint(host: &str, port: u16) -> Option<SocketAddr> {
+pub(crate) fn resolve_endpoint(host: &str, port: u16) -> Option<SocketAddr> {
     // The tuple asks the resolver for host and port directly: no `host:port` re-serialisation, no String, no port re-scan.
     (host, port).to_socket_addrs().ok()?.next()
 }
@@ -10674,10 +10674,7 @@ impl Destination {
     fn socket(&self) -> Option<SocketAddr> {
         match self {
             Self::Address(address) => Some(*address),
-            Self::Name(host, port) => format!("{host}:{port}")
-                .to_socket_addrs()
-                .ok()
-                .and_then(|mut addrs| addrs.next()),
+            Self::Name(host, port) => resolve_endpoint(host, *port),
         }
     }
 
@@ -11100,7 +11097,7 @@ fn foxy_edge_address(settings: Option<&Json>) -> Option<SocketAddr> {
     if named.is_empty() {
         return None;
     }
-    resolve(&named, 443)
+    resolve_endpoint(&named, 443)
 }
 
 /// Upstream: config first, link second. A value that does not parse is refused, since going direct would leak.
@@ -11323,14 +11320,6 @@ fn foxy_country(link: &ferrox_core::foxy::link::FoxyLink, settings: Option<&Json
         named
     };
     named.to_ascii_uppercase()
-}
-
-/// One host as an address, which pins a dial to a host while the TLS name stays the name.
-fn resolve(host: &str, port: u16) -> Option<SocketAddr> {
-    format!("{host}:{port}")
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut addrs| addrs.next())
 }
 
 /// No CA file trusts the machine's anchors; an empty store is trust-nothing.

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1453,9 +1453,7 @@ fn parse_addr_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {
     let target = match body {
         crate::proxy::AddrBody::V4(ip) => SocketAddr::new(std::net::IpAddr::V4(ip.into()), port),
         crate::proxy::AddrBody::V6(ip) => SocketAddr::new(std::net::IpAddr::V6(ip.into()), port),
-        crate::proxy::AddrBody::Domain(host) => {
-            format!("{host}:{port}").to_socket_addrs().ok()?.next()?
-        }
+        crate::proxy::AddrBody::Domain(host) => crate::proxy::resolve_endpoint(host, port)?,
     };
     Some((target, used))
 }

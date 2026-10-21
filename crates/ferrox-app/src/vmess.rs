@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{Shutdown, SocketAddr, UdpSocket};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -624,9 +624,7 @@ fn decode_target(header: &[u8], cursor: &mut usize) -> Option<SocketAddr> {
     Some(match body {
         crate::proxy::AddrBody::V4(ip) => SocketAddr::new(std::net::IpAddr::V4(ip.into()), port),
         crate::proxy::AddrBody::V6(ip) => SocketAddr::new(std::net::IpAddr::V6(ip.into()), port),
-        crate::proxy::AddrBody::Domain(host) => {
-            format!("{host}:{port}").to_socket_addrs().ok()?.next()?
-        }
+        crate::proxy::AddrBody::Domain(host) => crate::proxy::resolve_endpoint(host, port)?,
     })
 }
 
