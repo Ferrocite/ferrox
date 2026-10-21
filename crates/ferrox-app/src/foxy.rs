@@ -26,6 +26,8 @@ const HOP_HEAD: usize = 4_096;
 /// Unparsed capsule-stream cap: fail the association rather than buffer a peer that never completes a capsule.
 const DATAGRAM_BUF_MAX: usize = 256 * 1024;
 const SEND_WAIT: Duration = Duration::from_secs(10);
+/// What an empty turn on the lane's socket waits for a datagram, when nothing narrower is armed.
+const PUMP_WAIT: Duration = Duration::from_millis(5);
 /// The client's first unidirectional stream, carrying the SETTINGS that make the connection HTTP/3.
 const CONTROL_STREAM: u64 = 2;
 /// The ceiling of a QUIC frame header: two varints of at most eight bytes each. The request stream's window is this size and nothing larger, because a payload never passes through it — it lands in the buffer its reader uses.
@@ -1008,11 +1010,11 @@ impl Tls2 {
     }
 
     /// The socket to park on, when a socket read is the only thing that can move this lane: a staged frame's bytes and a TLS record's plaintext are both one read away from the caller, and waiting on the wire for them would park a leg that has work to hand over.
-    pub(crate) fn read_wait(&self) -> Option<(Connection, Duration)> {
+    pub(crate) fn read_wait(&self) -> Option<(EdgeWait, Duration)> {
         let park = self
             .park
             .filter(|_| self.at >= self.carry.len() && self.tls.wants_read())?;
-        Some((self.tls.get_ref().try_clone().ok()?, park))
+        Some((EdgeWait::Tcp(self.tls.get_ref().try_clone().ok()?), park))
     }
 
     /// Ends this lane's half of its stream: an empty DATA with `END_STREAM`, so the edge closes the tunnel while the session stays open for the next stream.
@@ -1558,11 +1560,11 @@ impl Tls1 {
     }
 
     /// The socket to park on, when a socket read is the only thing that can move this lane: bytes the head walk took past the delimiter are the tunnel's own and come from the buffer, and a record whose plaintext the TLS layer still holds is one read away, not one wait.
-    pub(crate) fn read_wait(&self) -> Option<(Connection, Duration)> {
+    pub(crate) fn read_wait(&self) -> Option<(EdgeWait, Duration)> {
         let park = self
             .park
             .filter(|_| self.at >= self.carried.len() && self.tls.wants_read())?;
-        Some((self.tls.get_ref().try_clone().ok()?, park))
+        Some((EdgeWait::Tcp(self.tls.get_ref().try_clone().ok()?), park))
     }
 }
 
@@ -1615,6 +1617,8 @@ pub(crate) struct H3 {
     head_wait: Duration,
     /// Bounds one blocking `Read::read` the way the socket timeout bounds TCP carriers: set, it returns `WouldBlock` after the quantum so a one-lock relay can interleave.
     quantum: Option<Duration>,
+    /// How long a leg that has handed its lock back may wait on this lane's datagram socket for the next one: the quantum a relay armed. `None` until one arms it, because a caller that reads this lane alone has no lock to release.
+    park: Option<Duration>,
 }
 
 /// A frame block the lane is still consuming: `rest` bytes to go, landing at the capsule buffer's tail from `mark`, and `keep` telling the reader's own capsules from a frame the lane only has to get past. It exists because a header is spent the moment it is parsed — a park that forgot the count would re-read the header and take the next frame's bytes as this one's.
@@ -1627,6 +1631,27 @@ struct Pending {
 impl H3 {
     pub(crate) fn set_read_quantum(&mut self, quantum: Duration) {
         self.quantum = Some(quantum);
+    }
+
+    /// The arm for a lane whose lock both relay directions share: the blocking read takes one grain — `SESSION_POLL`, the cadence a shared lock is armed with elsewhere in the app — and the rest of the quantum is spent outside the lock, parked on the lane's datagram socket. A poll takes no packet, so the packet that wakes the leg is still the lane's to read.
+    pub(crate) fn set_relay_quantum(&mut self, quantum: Duration) {
+        self.park = Some(quantum);
+        self.set_read_quantum(quantum.min(crate::budgets::SESSION_POLL));
+    }
+
+    /// The socket to park on, when the wire is the only thing that can move this lane. Bytes already in the window are the state to refuse on: a header the window can hold is parsed by the read that has it, so a read that handed back `WouldBlock` with the window spent did so after looking at the stream — a frame body or a block still in flight is then waiting on a packet, and a blind sleep costs it the whole of `RELAY_IDLE`. The wait is cut to the connection's own next tick, because this lane's read is what services its loss timer and no other thread pumps it.
+    pub(crate) fn read_wait(&self) -> Option<(EdgeWait, Duration)> {
+        let park = self
+            .park
+            .filter(|_| self.carried >= self.filled && self.quic.sock.waits_here().is_some())?;
+        let tick = self
+            .with_conn_read(quiche::Connection::timeout)
+            .flatten()
+            .unwrap_or(park);
+        Some((
+            EdgeWait::Udp(std::sync::Arc::clone(&self.quic.sock)),
+            park.min(tick),
+        ))
     }
 
     pub(crate) fn open(dial: &FoxyDial, target: &str, quic: Quic) -> Result<Self, Failure> {
@@ -1655,6 +1680,7 @@ impl H3 {
             deadline: Instant::now(),
             head_wait,
             quantum: None,
+            park: None,
         };
         let status = lane.request(target, &dial.pass.token)?;
         opened(status)?;
@@ -1722,6 +1748,7 @@ impl H3 {
             deadline: Instant::now(),
             head_wait: HEADER_TIMEOUT,
             quantum: None,
+            park: None,
         };
         let status = lane.udp_request(dial, target_host, target_port)?;
         opened(status)?;
@@ -1746,6 +1773,7 @@ impl H3 {
             deadline: Instant::now(),
             head_wait: HEADER_TIMEOUT,
             quantum: None,
+            park: None,
         };
         let edge = edge_authority(&dial.host, dial.port);
         let mut block = Vec::with_capacity(160 + dial.pass.token.len());
@@ -2004,7 +2032,7 @@ impl H3 {
                 if Instant::now() >= deadline {
                     return Err(Failure::Io);
                 }
-                self.pump(Duration::from_millis(5));
+                self.pump(self.pump_wait());
             }
         }
         if fin {
@@ -2038,7 +2066,7 @@ impl H3 {
                 if Instant::now() >= deadline {
                     return Err(Failure::Io);
                 }
-                self.pump(Duration::from_millis(5));
+                self.pump(self.pump_wait());
             }
         }
     }
@@ -2048,6 +2076,12 @@ impl H3 {
             .with_conn(|conn| conn.stream_send(stream, &[], true))
             .ok_or(Failure::Io)?;
         sent.map(|_| ()).map_err(|_| Failure::Io)
+    }
+
+    /// How long one empty turn waits for a datagram: the read's own grain where a relay armed one, because the lane's lock is what the other direction of the flow is standing behind, and the idle tick everywhere else.
+    fn pump_wait(&self) -> Duration {
+        self.quantum
+            .map_or(PUMP_WAIT, |quantum| quantum.min(PUMP_WAIT))
     }
 
     fn pump(&mut self, wait: Duration) {
@@ -2270,7 +2304,7 @@ impl H3 {
                 }
                 if read == 0 {
                     // Nothing had arrived: the socket is what turns a dropped datagram into a retransmission, so a walk that only asks the stream never reads the packet that answers it.
-                    self.pump(Duration::from_millis(5));
+                    self.pump(self.pump_wait());
                 }
             }
         }
@@ -2301,7 +2335,12 @@ impl H3 {
     fn pull(&mut self, at: usize, want: usize) -> Result<usize, Failure> {
         let id = self.quic.id;
         let mut window = std::mem::take(&mut self.head);
-        let read = self.with_conn(|conn| conn.stream_recv(id, &mut window[at..at + want]));
+        let mut read = self.with_conn(|conn| conn.stream_recv(id, &mut window[at..at + want]));
+        // The pump is what puts a datagram's bytes into the stream, so the read that ran one looks at the stream again: a hand-back that skips that look leaves the byte inside the connection until the caller comes round, which costs a quantum for one octet.
+        if matches!(read, Some(Err(quiche::Error::Done))) && Instant::now() < self.deadline {
+            self.pump(self.pump_wait());
+            read = self.with_conn(|conn| conn.stream_recv(id, &mut window[at..at + want]));
+        }
         self.head = window;
         match read {
             Some(Ok((0, true))) => {
@@ -2319,7 +2358,6 @@ impl H3 {
                 if Instant::now() >= self.deadline {
                     return Err(Failure::Stream);
                 }
-                self.pump(Duration::from_millis(5));
                 Ok(0)
             }
             _ => Err(Failure::Io),
@@ -2372,7 +2410,7 @@ impl H3 {
                     if Instant::now() >= self.deadline {
                         return Err(io(Failure::Stream));
                     }
-                    self.pump(Duration::from_millis(5));
+                    self.pump(self.pump_wait());
                 }
                 _ => return Err(io(Failure::Io)),
             }
@@ -2844,6 +2882,43 @@ pub(crate) enum Tunnel {
     H3(Box<H3>),
 }
 
+/// The socket a relay leg parks on after it has handed the lane back: a TCP carrier's edge connection, or an h3 lane's datagram socket. Both answers are readiness only — neither takes a byte, so what wakes the wait is still there for the lane's own reader.
+pub(crate) enum EdgeWait {
+    Tcp(Connection),
+    Udp(std::sync::Arc<crate::quic::Datagram>),
+}
+
+impl EdgeWait {
+    pub(crate) fn wait_readable(&self, timeout: Duration) -> std::io::Result<bool> {
+        match self {
+            Self::Tcp(edge) => edge.wait_readable(timeout),
+            Self::Udp(sock) => sock.wait_readable(timeout),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsRawFd for EdgeWait {
+    /// The descriptor this wait blocks on, which is the one its own socket's `recv` reads.
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        match self {
+            Self::Tcp(edge) => edge.as_raw_fd(),
+            Self::Udp(sock) => sock.as_raw_fd(),
+        }
+    }
+}
+
+#[cfg(windows)]
+impl std::os::windows::io::AsRawSocket for EdgeWait {
+    /// The handle this wait blocks on, which is the one its own socket's `recv` reads.
+    fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        match self {
+            Self::Tcp(edge) => edge.as_raw_socket(),
+            Self::Udp(sock) => sock.as_raw_socket(),
+        }
+    }
+}
+
 impl Tunnel {
     pub(crate) fn open(dial: &FoxyDial, target: &str, quic: Option<Quic>) -> Result<Self, Failure> {
         match (dial.carrier, quic) {
@@ -2908,25 +2983,24 @@ impl Tunnel {
         }
     }
 
-    /// The relay's arm: a TCP carrier reads one grain and waits the rest of the quantum outside the lock, on the socket `read_wait` hands it.
+    /// The relay's arm: every carrier reads one grain and waits the rest of the quantum outside the lock, on the socket `read_wait` hands it — which a lane fronted by a hop or a gecko does not have.
     pub(crate) fn set_relay_quantum(&mut self, quantum: Duration) -> std::io::Result<()> {
         match self {
             Self::H1(lane) => lane.set_relay_quantum(quantum),
             Self::H2(lane) => lane.set_relay_quantum(quantum),
-            // h3 has no socket a parked leg can wait on alone: a datagram reaches this stream only through the lane's own connection lock, so a readiness wait would take the packet and leave it undelivered.
             Self::H3(lane) => {
-                lane.set_read_quantum(quantum);
+                lane.set_relay_quantum(quantum);
                 Ok(())
             }
         }
     }
 
-    /// The edge socket a parked downlink leg waits on, with how long it may wait: `Some` only once the lane can hand over nothing without the wire — no staged frame, no plaintext the TLS layer still holds — and never for h3, which has no socket of its own.
-    pub(crate) fn read_wait(&self) -> Option<(Connection, Duration)> {
+    /// The edge socket a parked downlink leg waits on, with how long it may wait: `Some` only once the lane can hand over nothing without the wire — no staged frame, no plaintext the TLS layer still holds, no packet the lane's own reader would displace.
+    pub(crate) fn read_wait(&self) -> Option<(EdgeWait, Duration)> {
         match self {
             Self::H1(lane) => lane.read_wait(),
             Self::H2(lane) => lane.read_wait(),
-            Self::H3(_) => None,
+            Self::H3(lane) => lane.read_wait(),
         }
     }
 }
@@ -4801,6 +4875,60 @@ pub(crate) mod loopback {
             drop(browser);
             let _ = relay.join();
             // The relay's own handle is only one of two: the lane closes when the test lets go of it too, and the edge is waiting on that.
+            drop(lane);
+            let _ = edge.join();
+        }
+
+        // The QUIC carrier parks the same way, on its lane's datagram socket: the edge owes the downlink only after the uplink has paid for it, so the leg that reads the answer is parked before a byte goes up.
+        {
+            let (roots, server) = minted(b"h3");
+            let sock = crate::quic::Datagram::plain(
+                crate::quic::bind_datagram("127.0.0.1:0").expect("binds"),
+            );
+            let port = sock.local_addr().expect("addr").port();
+            let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+            let (uni_tx, _uni_rx) = std::sync::mpsc::channel();
+            let edge = h3_edge(
+                sock,
+                crate::quic::der_to_pem(&server.cert_chain[0], "CERTIFICATE"),
+                crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY"),
+                seen_tx,
+                uni_tx,
+                PAYLOAD.to_vec(),
+            );
+            let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
+            let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
+                .expect("a connection");
+            let mut tunnel = Tunnel::open(&dial, "example.com:443", Some(quic)).expect("opens");
+            tunnel.set_relay_quantum(WAIT).expect("bounds one wait");
+            seen_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the edge read the block");
+            let lane = Arc::new(std::sync::Mutex::new(tunnel));
+            let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let mut browser =
+                Connection::connect(front.local_addr().expect("addr")).expect("connects");
+            let (client, _) = front.accept().expect("accepts");
+            let flow_lane = Arc::clone(&lane);
+            let relay = std::thread::spawn(move || {
+                crate::proxy::relay_tunnel(&client, &flow_lane);
+            });
+            wait_for_leg("downlink-park", relay.thread().id(), WAIT * 4);
+            let started = Instant::now();
+            browser.write_all(PAYLOAD).expect("the browser speaks");
+            browser
+                .set_read_timeout(Some(WAIT * 4))
+                .expect("bounds the read");
+            let mut got = [0u8; PAYLOAD.len()];
+            browser.read_exact(&mut got).expect("the echo returns");
+            let reached = started.elapsed();
+            assert_eq!(got, PAYLOAD, "the QUIC round trip moved other bytes");
+            assert!(
+                reached < REACH,
+                "a QUIC downlink waited {reached:?} behind its own parked leg"
+            );
+            drop(browser);
+            let _ = relay.join();
             drop(lane);
             let _ = edge.join();
         }
