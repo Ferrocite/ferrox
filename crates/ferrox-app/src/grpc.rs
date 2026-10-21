@@ -381,7 +381,8 @@ impl<R: Read> GrpcReader<R> {
         } else {
             (0usize, 0usize)
         };
-        self.replenish(id, len - first - pad);
+        // RFC 7540 6.9: the whole DATA payload is subject to flow control, so the credit is the wire length and not what the cut left.
+        self.replenish(id, len);
         if first != 0 || pad != 0 {
             // A pad byte and pad tail sit inside the body the parser reads: when they open a message region a cursor step skips the byte and the frame's length drops the tail, and only a message that already crossed into this frame moves.
             if self.msg_at == from && self.pay_end == from && self.msg_end == from {
@@ -1766,6 +1767,59 @@ mod tests {
         reader.read_exact(&mut got).expect("reads");
         assert_eq!(&got, b"ping");
         assert_eq!(reader.staged, 0, "the pad byte and tail cost no move");
+    }
+
+    /// The witness for `carrier-grpc padded-frame-credit-octets`: RFC 7540 6.9 puts the
+    /// whole DATA payload — the Pad Length octet and the Padding included — into the
+    /// flow-control window, so a padded frame gives the peer its wire length back and a
+    /// peer with a strict window does not lose an octet per frame.
+    #[test]
+    fn a_padded_frame_credits_its_whole_wire_payload() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let hunk = [b'x'; HUNK];
+        // A padded frame: the pad byte, the message, the pad tail.
+        let mut padded = vec![3u8];
+        padded.extend_from_slice(&message(&hunk));
+        padded.extend_from_slice(&[0xA5; 3]);
+        let wire_len = padded.len();
+        let per_credit = (CREDIT_AT as usize - 1) / wire_len + 1;
+        let mut wire = frame(
+            T_HEADERS,
+            F_END_HEADERS,
+            1,
+            &block_encode(&[(":status", "200"), ("content-type", "application/grpc")]),
+        );
+        for _ in 0..per_credit {
+            wire.extend_from_slice(&frame(T_DATA, F_PADDED, 1, &padded));
+        }
+        let (mut reader, writer) = connect_split(
+            std::io::Cursor::new(wire),
+            Calls(Arc::clone(&calls)),
+            "127.0.0.1",
+            "/x",
+        )
+        .expect("dials");
+        drop(writer);
+        calls.lock().unwrap().clear();
+        let mut got = [0u8; HUNK];
+        for _ in 0..per_credit {
+            reader.read_exact(&mut got).expect("reads a hunk");
+            assert_eq!(got, hunk);
+        }
+        // The grant: one write carrying the connection's and the stream's update.
+        let inc = (per_credit * wire_len) as u32;
+        let mut want = frame(T_WINDOW, 0, 0, &inc.to_be_bytes());
+        want.extend_from_slice(&frame(T_WINDOW, 0, 1, &inc.to_be_bytes()));
+        let sent = calls.lock().unwrap().clone();
+        assert_eq!(sent.len(), 1, "one credit, one write");
+        assert_eq!(
+            sent[0], want,
+            "the increment is every frame's wire length, the pad byte and the pad tail included"
+        );
+        assert!(
+            inc > (per_credit * (wire_len - 4)) as u32,
+            "and not what the cut left"
+        );
     }
 
     /// The move a padded frame still pays, and the witness that the staging counter counts: here the pad byte cuts into a message the frame before had started, so only what follows it moves down.

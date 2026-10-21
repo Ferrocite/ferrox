@@ -1218,10 +1218,10 @@ impl Tls2 {
                             lane.ack(frames::SETTINGS, &[]).map(|()| None)
                         }
                         // A DATA frame that arrives while the status is still out is payload the edge sent early: hold its credit like any other, and let the walk ignore the bytes until `END_STREAM` says the status itself is gone.
-                        frames::H2Event::Data { payload, end } => {
+                        frames::H2Event::Data { payload, end, wire } => {
                             lane.fin = end;
                             if !payload.is_empty() {
-                                lane.credit(payload.len())?;
+                                lane.credit(wire)?;
                             }
                             Ok(None)
                         }
@@ -1353,11 +1353,11 @@ impl Tls2 {
             }
             let read = self.with_frame(&mut [], |lane, frame, payload| -> std::io::Result<usize> {
                 match frames::h2_event(frame, payload, lane.stream) {
-                    frames::H2Event::Data { payload, end } => {
+                    frames::H2Event::Data { payload, end, wire } => {
                         let len = payload.len();
                         lane.fin = end;
                         if len > 0 {
-                            lane.credit(len).map_err(io)?;
+                            lane.credit(wire).map_err(io)?;
                         }
                         // A capsule is usually whole inside one DATA frame, so it is handed over where it lies and only the ones behind it staged; nothing is handed over while a split capsule waits, because stream order is datagram order.
                         if lane.capsule_buf.is_empty() {
@@ -1475,18 +1475,19 @@ impl Read for Tls2 {
                     lane.fin = frame.flags & frames::END_STREAM != 0;
                     let got = lane.frame.delivered as usize;
                     if got > 0 {
-                        lane.credit(got).map_err(io)?;
+                        // The frame's own length: the whole DATA payload is what the window counts.
+                        lane.credit(frame.length as usize).map_err(io)?;
                     }
                     return Ok(got);
                 }
                 match frames::h2_event(frame, payload, lane.stream) {
-                    frames::H2Event::Data { payload, end } => {
+                    frames::H2Event::Data { payload, end, wire } => {
                         // Only reachable for a caller that asked for nothing: the frame stages whole, and a later read with room is fed from the stage.
                         let len = payload.len();
                         lane.stage(payload, 0);
                         lane.fin = end;
                         if len > 0 {
-                            lane.credit(len).map_err(io)?;
+                            lane.credit(wire).map_err(io)?;
                         }
                         Ok(0)
                     }
@@ -2792,11 +2793,11 @@ impl Tls2 {
             }
             let read = self.with_frame(&mut [], |lane, frame, payload| -> std::io::Result<()> {
                 match frames::h2_event(frame, payload, lane.stream) {
-                    frames::H2Event::Data { payload, end } => {
+                    frames::H2Event::Data { payload, end, wire } => {
                         lane.capsule_buf.extend_from_slice(payload);
                         lane.fin = end;
                         if !payload.is_empty() {
-                            lane.credit(payload.len()).map_err(io)?;
+                            lane.credit(wire).map_err(io)?;
                         }
                         Ok(())
                     }
@@ -2837,10 +2838,10 @@ impl Tls2 {
             }
             let read = self.with_frame(&mut [], |lane, frame, payload| -> std::io::Result<bool> {
                 match frames::h2_event(frame, payload, lane.stream) {
-                    frames::H2Event::Data { payload, end } => {
+                    frames::H2Event::Data { payload, end, wire } => {
                         lane.fin = end;
                         if !payload.is_empty() {
-                            lane.credit(payload.len()).map_err(io)?;
+                            lane.credit(wire).map_err(io)?;
                         }
                         // The capsule is usually whole inside one DATA frame, so it is handed out where it lies and only the bytes behind it staged; nothing is handed out while a split capsule waits, because stream order is packet order.
                         if lane.capsule_buf.is_empty() {
@@ -5353,6 +5354,24 @@ pub(crate) mod loopback {
     }
 
     /// One DATA frame, whole: the header names the payload it carries.
+    /// A DATA frame with padding: the pad byte, the payload, the pad tail.
+    fn padded_data_frame(payload: &[u8], pad: usize) -> Vec<u8> {
+        let mut body = Vec::with_capacity(1 + payload.len() + pad);
+        body.push(pad as u8);
+        body.extend_from_slice(payload);
+        body.extend(std::iter::repeat_n(pad as u8, pad));
+        let mut out = frames::H2Frame {
+            kind: frames::DATA,
+            flags: 0x8,
+            stream: 1,
+            length: body.len() as u32,
+        }
+        .header()
+        .to_vec();
+        out.extend_from_slice(&body);
+        out
+    }
+
     fn data_frame(payload: &[u8]) -> Vec<u8> {
         let mut out = frames::H2Frame {
             kind: frames::DATA,
@@ -5598,6 +5617,63 @@ pub(crate) mod loopback {
             tally.len(),
             3,
             "no other window update left the lane: {tally:?}"
+        );
+    }
+
+    /// The witness for `carrier-foxy padded-frame-credit-octets`: RFC 7540 6.9 puts the
+    /// whole DATA payload into the flow-control window, the Pad Length octet and the
+    /// Padding included, so a padded frame gives the peer its wire length back and a peer
+    /// with a strict window does not lose an octet a frame.
+    #[test]
+    fn a_padded_frame_credits_its_whole_wire_payload() {
+        const FRAME: usize = 16 * 1024;
+        const FRAMES: usize = 4;
+        const PAD: usize = 7;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let payload: Vec<u8> = (0..FRAME * FRAMES).map(|i| (i % 251) as u8).collect();
+        let pieces = (0..FRAMES)
+            .map(|i| {
+                (
+                    padded_data_frame(&payload[i * FRAME..(i + 1) * FRAME], PAD),
+                    None,
+                )
+            })
+            .collect();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let edge = downlink_edge(listener, server, pieces, tx);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        // The room takes every frame whole, so every frame's credit is owed when read.
+        let wire = (FRAME + 1 + PAD) as u32;
+        let mut back = vec![0u8; (FRAME + 1 + PAD) * FRAMES];
+        let mut at = 0usize;
+        while at < back.len() {
+            at += lane.read(&mut back[at..]).expect("reads");
+        }
+        assert_eq!(
+            lane.pending_credit, 0,
+            "the frames crossed the floor and the grant took every octet of them"
+        );
+        drop(tunnel);
+        let mut tally = Vec::new();
+        while let Ok(update) = rx.recv_timeout(Duration::from_secs(20)) {
+            tally.push(update);
+        }
+        edge.join().expect("the edge finishes");
+        let granted: Vec<_> = tally
+            .iter()
+            .filter(|(_, increment)| *increment == FRAMES as u32 * wire)
+            .copied()
+            .collect();
+        assert_eq!(
+            granted,
+            vec![(1, FRAMES as u32 * wire), (0, FRAMES as u32 * wire)],
+            "the grant is every frame's wire length, the pad byte and the pad tail included"
         );
     }
 
