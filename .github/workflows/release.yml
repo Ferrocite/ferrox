@@ -158,15 +158,16 @@ jobs:
         env:
           VERSION: ${{ needs.plan.outputs.version }}
           BODY: |-
-            ## Ferrox VERSION_PLACEHOLDER — every working lane, one command
+            ## Ferrox VERSION_PLACEHOLDER — pick your carrier: h1, h2 or h3
 
             Unpack your platform's package and run the CLI beside the binary — no cargo, no repository:
 
             ```bash
             tar xzf ferrox-VERSION_PLACEHOLDER-aarch64-apple-darwin.tar.gz
             cd ferrox-VERSION_PLACEHOLDER-aarch64-apple-darwin
-            ./ferrox-cli.sh up --foxy --vpn   # asks for email, password and carrier, then connects
-            ./ferrox-cli.sh status            # uptime, carrier, quota left, exit IP and country
+            ./ferrox-cli.sh up --foxy --vpn        # asks for email, password and carrier, then connects
+            ./ferrox-cli.sh up --foxy --carrier h3 --vpn   # names the carrier and skips the question
+            ./ferrox-cli.sh status                 # uptime, the carrier it chose, quota left, exit IP and country
             ./ferrox-cli.sh down
             ```
 
@@ -174,18 +175,84 @@ jobs:
 
             | lane | what you supply | start it |
             | --- | --- | --- |
-            | **Foxy** | a Firefox account, email + password; **no server** | `./ferrox-cli.sh up --foxy --vpn` |
+            | **Foxy** | a Firefox account, email + password, a carrier; **no server** | `./ferrox-cli.sh up --foxy --vpn` |
             | **VeePN** | **nothing**: anonymous, no account, no server | `./ferrox-cli.sh up --veepn --vpn` |
             | **VLESS** | a `vless://` link: tcp, ws, grpc, httpupgrade or xhttp; TLS or REALITY | `./ferrox-cli.sh up --vless 'vless://...'` |
             | **VMess** | `HOST:PORT` and the user id | `./ferrox-cli.sh up --vmess host:443 --uuid ID` |
             | **Trojan** | `HOST:PORT` and the password | `./ferrox-cli.sh up --trojan host:443 --password PW` |
             | **Shadowsocks** | `HOST:PORT`, method and password | `./ferrox-cli.sh up --ss host:8388 --method aes-256-gcm --password PW` |
+            | **SOCKS outbound** | a JSON config naming `socks` as the protocol | `--config`: the client role dials out SOCKS5, and `version: "4"` speaks SOCKS4 and SOCKS4a |
             | **Any served config** | a JSON config | `./ferrox-cli.sh up --config mine.json` |
 
-            **Foxy** is the account lane. The edge is picked from Mozilla's catalogue,
-            `--country DE` moves the exit, and a signed-in lane renews the edge pass on
-            its own clock, so a lane left running overnight keeps working. Accounts with
-            two-factor sign-in pass `--code 123456` once.
+            ### Choosing the carrier on the Foxy lane (new in this release)
+
+            A **carrier** is how the lane sends its flows to the edge. `--carrier`
+            names one, and on a terminal `up --foxy` asks once — an empty answer
+            or a pipe takes `auto`:
+
+            | carrier | what it is | when to pick it |
+            | --- | --- | --- |
+            | `auto` | the ladder h2 → h1 → h3, the fastest that answers | the default, and what a non-terminal gets |
+            | `h2` | HTTP/2 CONNECT; one session is reused across flows | almost always — it outran `h3` in every CI relay run, on every runner |
+            | `h1` | HTTP/1.1 CONNECT; one TLS connection per flow | a network or middlebox that mishandles HTTP/2 |
+            | `h3` | HTTP/3 over QUIC | **the only carrier that carries UDP** — the datagram lane rides it |
+
+            A named `h3` is a preference, not a pin: it leads the ladder, and a
+            path that drops QUIC — silence, not a refusal — is abandoned five
+            seconds into the handshake, so the TCP rungs follow and the lane
+            carries anyway. An `h3` flow reads its own socket now: the lane used
+            to start a pump for any lease that landed on an idle lane, and for a
+            flow's lease that thread could only be a second reader of the same
+            file description — taking datagrams as they landed and re-arming the
+            read timeout the flow had just set, per packet. It asks first now,
+            so a session lease starts one pump and a flow's lease starts none
+            (`pump-threads-started-by-an-app-driven-lease 0`), and what that
+            second reader cost the live `h3` rows is written up on the QUIC and
+            Foxy carrier pages. A signed-in account renews the edge pass on its own
+            clock (a lane left running overnight keeps working), `--country DE`
+            moves the exit, `--city` pins a city tier, two-factor sign-in passes
+            `--code 123456` once, and `--upstream socks5://127.0.0.1:1080` dials
+            the edge through a hop this network allows. A `foxy://` share link —
+            the same settings, carrier included — is read from a config with
+            `--config`.
+
+            `status` now reads the lane back: how long it has been up, the
+            carrier it was given, the allowance the plane last named (bytes left
+            of the plan and when they reset), and the exit IP and country.
+
+            ### Leaner where it counts
+
+            Since the last release the Foxy lane lost a handshake per
+            flow — an ended flow lends its HTTP/2 session to the next — a
+            buffer per datagram and a `recvfrom` per packet, and the lock its
+            shared lane's idle poll held while it slept. The same grind reached
+            the other lanes: xhttp and Shadowsocks allocate twice less per frame
+            and per datagram and xhttp stages its dial head once per thread, the
+            WebSocket keys are stack arrays and a VLESS request header is parsed
+            without a byte of its own, the buffers a flow fills are no longer
+            zeroed first (VLESS, SOCKS, KCP), an HTTP/2 header block is opened
+            once at its own length instead of grown four times, a datagram
+            leaves in the frame its client framed, and a relay socket's two
+            directions no longer share a lock. On x86_64 a ChaCha20 record's
+            remainder is finished inside the vector pass — eight blocks per pass
+            where the scalar ladder managed six, sixteen where the machine has
+            avx512f — so a chacha stream pays less work per kept block; the
+            `aarch64` pass keeps the shape it had. The trade is named on the
+            page: the pass computes blocks the buffer does not hold, so
+            discarded blocks rise, and the last one or two blocks are still the
+            ladder's.
+
+            ### Also new under the hood
+
+            **Routing rules** ride `--config` now: AND selectors over domain,
+            ip, port, source and inbound tag, matched against `geosite.dat`
+            and `geoip.dat` decoded at startup; a lane the transport cannot
+            carry is refused by name, and a flow can be sent to the
+            **blackhole** sink, whose answers are octet-for-octet the
+            reference's. **SOCKS serves and dials** in both roles — SOCKS5,
+            SOCKS4 and SOCKS4a — so an upstream hop can be a SOCKS front.
+            **QUIC** carries a whole datagram per packet with a receive window
+            that grows, and **dokodemo-door** has its UDP door.
 
             **VeePN** is the lane with nothing to type in. The plane launches this device
             anonymously, names the fastest region — `--region us-va` pins one — and lists
@@ -201,13 +268,8 @@ jobs:
 
             All lanes serve the same loopback fronts: SOCKS5 `127.0.0.1:10808`, HTTP+HTTPS
             `127.0.0.1:8080`, mixed `127.0.0.1:10809`. `--vpn` points the macOS system proxy
-            at them only after a real flow answers; `status` prints the exit IP and country;
-            `down` stops the lane and clears the proxy.
-
-            **Fixed in this release:** `up --vless` with no link — and every flag missing
-            its value — now names what is missing and the example instead of waiting
-            forever, and a rejected invocation no longer stops a lane that is already
-            carrying traffic.
+            at them only after a real flow answers; `down` stops the lane and clears the
+            proxy.
 
             | package | platform |
             | --- | --- |
@@ -242,9 +304,9 @@ jobs:
             # the commit that built these packages, so the assets and the tag
             # can never disagree about what this version is.
             gh release create "$VERSION" --target "$GITHUB_SHA" \
-              --title "Ferrox $VERSION: every working lane, one command" --notes-file RELEASE-BODY.md "${assets[@]}"
+              --title "Ferrox $VERSION: pick your carrier — h1, h2 or h3" --notes-file RELEASE-BODY.md "${assets[@]}"
           else
-            gh release create "$VERSION" --title "Ferrox $VERSION: every working lane, one command" \
+            gh release create "$VERSION" --title "Ferrox $VERSION: pick your carrier — h1, h2 or h3" \
               --notes-file RELEASE-BODY.md "${assets[@]}"
           fi
           gh release view "$VERSION" --json tagName,assets \
