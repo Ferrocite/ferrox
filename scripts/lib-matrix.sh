@@ -27,6 +27,36 @@ vless_server() {
 vless_client() {
   echo "\"tag\": \"proxy\", \"protocol\": \"vless\", \"settings\": {\"vnext\": [{\"address\": \"127.0.0.1\", \"port\": $2, \"users\": [{\"id\": \"$UUID\", \"encryption\": \"none\"}]}]}$1"
 }
+# The TLS arm's fixture: a self-signed certificate and its key, so a TLS session can be
+# measured without a CA in the runner's store. The pin the reference's client checks is
+# the certificate's own SHA-256, read off the file so the two cannot drift.
+matrix_tls_dir() {
+  echo "$PWD/scripts/matrix-tls"
+}
+
+matrix_tls_pin() {
+  python3 -c 'import base64, hashlib, sys
+pem = open(sys.argv[1]).read()
+body = "".join(line for line in pem.splitlines() if line and not line.startswith("-----"))
+print(hashlib.sha256(base64.b64decode(body)).hexdigest())' "$1"
+}
+
+# The server's TLS: the identity the client is asked to trust.
+tls_server_settings() {
+  local dir
+  dir="$(matrix_tls_dir)"
+  echo "\"streamSettings\": {\"network\": \"tcp\", \"security\": \"tls\", \"tlsSettings\": {\"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"keyFile\": \"$dir/key.pem\"}]}}"
+}
+
+# The client's TLS: the roots this tree reads, the pin the reference reads, and the
+# verify certificate the third reference reads. Each takes the one it knows.
+tls_client_settings() {
+  local dir pin
+  dir="$(matrix_tls_dir)"
+  pin="$(matrix_tls_pin "$dir/cert.pem")"
+  echo "\"streamSettings\": {\"network\": \"tcp\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}}"
+}
+
 stream_json() {
   case "$1" in
     tcp) echo '"streamSettings": {"network": "tcp"}' ;;
@@ -40,6 +70,7 @@ scenario_config() {
   local port="$2"
   case "$1" in
     vless-raw-*) server_config "$(vless_server ', "streamSettings": {"network": "tcp"}')" "$(vless_client ', "streamSettings": {"network": "tcp"}' "$port")" "$port" ;;
+    vless-tls-raw-*) server_config "$(vless_server ", $(tls_server_settings)")" "$(vless_client ", $(tls_client_settings)" "$port")" "$port" ;;
     vless-ws-*) server_config "$(vless_server ", $(stream_json ws)")" "$(vless_client ", $(stream_json ws)" "$port")" "$port" ;;
     vless-grpc-*) server_config "$(vless_server ", $(stream_json grpc)")" "$(vless_client ", $(stream_json grpc)" "$port")" "$port" ;;
     vless-xhttp-*) server_config "$(vless_server ", $(stream_json xhttp)")" "$(vless_client ", $(stream_json xhttp)" "$port")" "$port" ;;
@@ -66,6 +97,8 @@ standard_scenarios() {
   echo "trojan-raw-down-8 download 8 16384 65536"
   echo "shadowsocks-raw-down-8 download 8 16384 65536"
   echo "vless-raw-setup-1k download 1 1000 8"
+  echo "vless-tls-raw-down-8 download 8 16384 65536"
+  echo "vless-tls-raw-up-1 upload 1 131072 65536"
 }
 
 scenarios() {
