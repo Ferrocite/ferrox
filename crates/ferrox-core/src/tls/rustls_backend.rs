@@ -249,7 +249,8 @@ fn build_material(cfg: &TlsConfig) -> Result<Material, TlsError> {
 #[derive(PartialEq, Eq)]
 struct ConfigKey {
     material: MaterialKey,
-    alpn: Vec<Vec<u8>>,
+    /// The `ALPN` list, shared rather than copied: the key is built on every dial, and copying the list into it allocated a vector of vectors per lookup for a list that never changes.
+    alpn: std::sync::Arc<[Vec<u8>]>,
     insecure: bool,
 }
 
@@ -264,7 +265,8 @@ fn build_config(cfg: &TlsConfig, built: &Material) -> Result<rustls::ClientConfi
         .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?
         .with_root_certificates(Arc::clone(&built.roots))
         .with_no_client_auth();
-    config.alpn_protocols.clone_from(&cfg.alpn);
+    config.alpn_protocols.clear();
+    config.alpn_protocols.extend(cfg.alpn.iter().cloned());
     if cfg.insecure {
         config
             .dangerous()
@@ -304,7 +306,7 @@ impl<S: Stream> RustlsProvider<S> {
     fn config(cfg: &TlsConfig) -> Result<Arc<rustls::ClientConfig>, TlsError> {
         let key = ConfigKey {
             material: MaterialKey::of(cfg),
-            alpn: cfg.alpn.clone(),
+            alpn: std::sync::Arc::clone(&cfg.alpn),
             insecure: cfg.insecure,
         };
         let all = CONFIGS.get_or_init(Default::default);
@@ -624,7 +626,8 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?;
-    config.alpn_protocols.clone_from(&cfg.alpn);
+    config.alpn_protocols.clear();
+    config.alpn_protocols.extend(cfg.alpn.iter().cloned());
     // rustls sends two tickets by default; REALITY arrivals carry none.
     config.send_tls13_tickets = if cfg.send_tickets { 2 } else { 0 };
     Ok(config)
@@ -689,7 +692,8 @@ pub(crate) fn reality_server_config(
         .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(key)));
-    config.alpn_protocols.clone_from(&cfg.alpn);
+    config.alpn_protocols.clear();
+    config.alpn_protocols.extend(cfg.alpn.iter().cloned());
     // rustls sends two tickets by default; REALITY arrivals carry none.
     config.send_tls13_tickets = if cfg.send_tickets { 2 } else { 0 };
     Ok(config)
@@ -866,7 +870,7 @@ mod tests {
     fn client(name: &str, alpn: &[&[u8]]) -> TlsConfig {
         TlsConfig {
             server_name: name.to_owned(),
-            alpn: alpn.iter().map(|p| p.to_vec()).collect(),
+            alpn: std::sync::Arc::from(alpn.iter().map(|p| p.to_vec()).collect::<Vec<_>>()),
             roots: vec![ANCHOR.to_vec()].into(),
             pins: crate::foxy::pin::Pins::default(),
             cipher_suites: Vec::new(),

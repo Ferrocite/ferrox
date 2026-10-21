@@ -110,7 +110,7 @@ fn decode(text: &str) -> Vec<Candidate> {
             continue;
         }
         out.push(Candidate {
-            host: (*host).to_owned(),
+            host: std::sync::Arc::from(*host),
             port,
             country: (*country).to_owned(),
             city: (*city).to_owned(),
@@ -211,7 +211,7 @@ pub(crate) fn edges_of(body: &Json) -> Vec<Candidate> {
                     continue;
                 };
                 out.push(Candidate {
-                    host,
+                    host: std::sync::Arc::from(host),
                     port,
                     country: code.to_owned(),
                     city: city_code.clone(),
@@ -374,7 +374,7 @@ mod tests {
         let mut listed = edges_of(&parsed());
         // A published city code can be blank, so the field separator has to keep an empty one.
         listed.push(Candidate {
-            host: "no.city".to_owned(),
+            host: std::sync::Arc::from("no.city"),
             port: 2499,
             country: "NL".to_owned(),
             city: String::new(),

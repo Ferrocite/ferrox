@@ -488,7 +488,7 @@ fn servers_of(
         };
         for host in &addresses {
             list.push(FoxyDial {
-                host: (*host).to_owned(),
+                host: std::sync::Arc::from(*host),
                 port,
                 // The plane lists an address, so the fetch reads it once and every flow after it dials that without parsing or asking the resolver; a listed name keeps `None` and is resolved when the flow opens.
                 address: edge_peer(host, port),
@@ -626,7 +626,7 @@ mod tests {
     /// One listed upstream exactly as the fetch builds it: the edge name, the port, and the coded pair sitting in the dial's own pass.
     fn listed(host: &str, port: u16, token: &str) -> FoxyDial {
         FoxyDial {
-            host: host.to_owned(),
+            host: std::sync::Arc::from(host),
             port,
             address: None,
             carrier: Carrier::H1,
@@ -744,7 +744,7 @@ mod tests {
         let list = servers_of(&reply, &roots).expect("a list");
         assert_eq!(
             list.iter()
-                .map(|dial| (dial.host.as_str(), dial.port))
+                .map(|dial| (dial.host.as_ref(), dial.port))
                 .collect::<Vec<_>>(),
             [
                 ("192.0.2.12", 443),
