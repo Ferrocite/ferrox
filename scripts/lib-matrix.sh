@@ -27,11 +27,17 @@ vless_server() {
 vless_client() {
   echo "\"tag\": \"proxy\", \"protocol\": \"vless\", \"settings\": {\"vnext\": [{\"address\": \"127.0.0.1\", \"port\": $2, \"users\": [{\"id\": \"$UUID\", \"encryption\": \"none\"}]}]}$1"
 }
-# The TLS arm's fixture: a self-signed certificate and its key, so a TLS session can be
-# measured without a CA in the runner's store. The pin the reference's client checks is
-# the certificate's own SHA-256, read off the file so the two cannot drift.
+# The TLS arm's fixture: a self-signed certificate and its key, minted into the ignored target
+# tree by the harness at run time, so no private key is ever in the tree and no CA is needed in
+# the runner's store. The path is relative to the repository root, where every engine is
+# spawned, because a Git-Bash absolute path is not one a native Windows engine can open; the
+# pin is hashed off the minted file, so the two cannot drift.
 matrix_tls_dir() {
-  echo "$PWD/scripts/matrix-tls"
+  local dir="target/matrix-tls"
+  if [[ ! -s "$dir/cert.pem" ]]; then
+    "${bench_bin:?no harness binary to mint the fixture}" make-tls "$dir" || return 1
+  fi
+  echo "$dir"
 }
 
 matrix_tls_pin() {
