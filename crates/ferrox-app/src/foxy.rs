@@ -45,6 +45,17 @@ pub(crate) enum Carrier {
 }
 
 impl Carrier {
+    /// The word `--carrier` takes and a status line prints, so a lane reports the rung it was given under the name it was given.
+    #[must_use]
+    pub(crate) const fn name(self) -> &'static str {
+        match self {
+            Self::H1 => "h1",
+            Self::H2 => "h2",
+            Self::H3 => "h3",
+            Self::Auto => "auto",
+        }
+    }
+
     /// The byte a carrier is remembered under: a cache key that names a carrier needs one byte of it, and a joined name was a `String` per lookup.
     #[must_use]
     pub(crate) const fn key(self) -> u8 {
@@ -3348,6 +3359,20 @@ pub(crate) mod loopback {
                 quota_reset: None,
                 quota_limit: None,
             },
+        }
+    }
+
+    /// The name a status line prints is the name `--carrier` takes, so a lane reports the rung it was given under the word it was given.
+    #[test]
+    fn a_carrier_names_itself_with_the_word_the_cli_takes() {
+        for (word, named) in [
+            ("auto", Carrier::Auto),
+            ("h1", Carrier::H1),
+            ("h2", Carrier::H2),
+            ("h3", Carrier::H3),
+        ] {
+            assert_eq!(named.name(), word);
+            assert_eq!(carrier(word), named, "the parse and the name agree");
         }
     }
 
