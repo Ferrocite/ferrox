@@ -887,7 +887,7 @@ impl<R: Read> Wire<R> {
     fn new(carrier: R) -> Self {
         Self {
             carrier,
-            held: vec![0u8; WIRE_LEN],
+            held: crate::proxy::unfilled(WIRE_LEN),
             start: 0,
             end: 0,
             plain: 0,
@@ -933,10 +933,16 @@ impl<R: Read> Wire<R> {
 
     /// Read until `want` bytes are buffered. False when the carrier is not to be asked, or
     /// when it has said it has no more.
+    #[allow(
+        clippy::uninit_vec,
+        reason = "the room past the old length is claimed, not written, and the read below writes every byte it reports"
+    )]
     fn fill(&mut self, want: usize, block: bool) -> bool {
         if want > self.held.len() - self.start {
             // A peer that seals a wider chunk than we do gets one bigger buffer, not a refusal.
-            self.held.resize(self.start + want, 0);
+            self.held.reserve(self.start + want - self.held.len());
+            // SAFETY: the room past the old length is claimed, not written, and the read below writes every byte it reports.
+            unsafe { self.held.set_len(self.start + want) };
         }
         while self.buffered() < want {
             if !block {
@@ -1059,7 +1065,7 @@ pub(crate) fn read_response(
     if body_len > 64 {
         return false;
     }
-    let mut sealed_body = vec![0u8; body_len + TAG_LEN];
+    let mut sealed_body = crate::proxy::unfilled(body_len + TAG_LEN);
     if read_exact(stream, &mut sealed_body).is_err() {
         return false;
     }
@@ -1101,7 +1107,7 @@ fn read_open_header(
     if !(38..=4096).contains(&head_len) {
         return None;
     }
-    let mut sealed_head = vec![0u8; head_len + TAG_LEN];
+    let mut sealed_head = crate::proxy::unfilled(head_len + TAG_LEN);
     read_exact(stream, &mut sealed_head).ok()?;
     let head_key = kdf16(instruction, &[b"VMess Header AEAD Key", auth_id, &nonce]);
     let head_full = kdf(instruction, &[b"VMess Header AEAD Nonce", auth_id, &nonce]);
@@ -1187,6 +1193,12 @@ impl std::io::Write for WsSink {
     }
 }
 
+/// The relay leg's read window: a read fills every byte the leg reads, so the zero pass
+/// in front of it was work generated and thrown away.
+fn relay_window() -> Vec<u8> {
+    crate::proxy::unfilled(READ_PLAIN)
+}
+
 pub(crate) fn pump_relay_carried<R, W>(
     plain: &Connection,
     reader: R,
@@ -1210,8 +1222,8 @@ pub(crate) fn pump_relay_carried<R, W>(
 
     let mut send = send;
     let thread_close = std::sync::Arc::clone(close);
+    let mut buf = relay_window();
     let done = thread::spawn(move || {
-        let mut buf = vec![0u8; READ_PLAIN];
         let mut staging = Vec::with_capacity(FRAMES_PER_WRITE * (MAX_WIRE + HEADER_LEN));
         let Some(mut pad) = PadSource::fresh() else {
             return;
@@ -1524,8 +1536,8 @@ pub(crate) fn pump_relay(
     let mut sealed_write = sealed_write;
     let mut plain_write = plain_write;
     let mut send = send;
+    let mut buf = relay_window();
     let done = thread::spawn(move || {
-        let mut buf = vec![0u8; READ_PLAIN];
         let mut staging = Vec::with_capacity(FRAMES_PER_WRITE * (MAX_WIRE + HEADER_LEN));
         let Some(mut pad) = PadSource::fresh() else {
             return;
@@ -2918,6 +2930,39 @@ mod tests {
             got.extend_from_slice(batch);
         }
         (writes, got)
+    }
+
+    /// The flow's windows are not zeroed: the wire's receive window and the relay leg's
+    /// read window are both read targets, so the zero pass in front of them was work
+    /// generated and thrown away. The counting allocator's `zeroed` counter is the witness.
+    #[test]
+    fn the_flows_windows_are_not_zero_filled() {
+        let (sealed, _plain, _recv) = frames(&[1000; 3]);
+        let carrier = Sealed {
+            held: sealed,
+            at: 0,
+            grain: usize::MAX,
+            reads: 0,
+        };
+        let (wire, counts) = ferrox_core::alloc_count::measure(|| Wire::new(carrier));
+        assert_eq!(counts.zeroed, 0, "the wire's window is not zeroed");
+        assert_eq!(counts.allocs, 1, "the wire's window is the only allocation");
+        assert_eq!(
+            counts.bytes, WIRE_LEN,
+            "and it is the window the wire reads into"
+        );
+        drop(wire);
+        let (window, counts) = ferrox_core::alloc_count::measure(relay_window);
+        assert_eq!(counts.zeroed, 0, "the relay leg's window is not zeroed");
+        assert_eq!(
+            counts.allocs, 1,
+            "the relay leg's window is the only allocation"
+        );
+        assert_eq!(
+            counts.bytes, READ_PLAIN,
+            "and it is the window the leg reads into"
+        );
+        drop(window);
     }
 
     #[test]

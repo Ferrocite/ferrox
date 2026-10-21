@@ -424,7 +424,7 @@ pub(crate) fn client_send_handshake(
     target.push_addr(&mut addr, 4, 3);
     addr.extend_from_slice(&target.port().to_be_bytes());
     let n = addr.len();
-    let mut buf = unfilled(SEAL_HEAD + n + TAG_LEN);
+    let mut buf = crate::proxy::unfilled(SEAL_HEAD + n + TAG_LEN);
     buf[SEAL_HEAD..SEAL_HEAD + n].copy_from_slice(&addr);
     seal_all(&mut send, &mut buf, n, uplink).ok()?;
     Some((send, Recv::Waiting(method, master)))
@@ -479,7 +479,7 @@ pub(crate) fn pump_relay_carried<R, W>(
     let mut send = send;
     let thread_close = std::sync::Arc::clone(close);
     let done = thread::spawn(move || {
-        let mut buf = unfilled(uplink_buffer_len(&send));
+        let mut buf = crate::proxy::unfilled(uplink_buffer_len(&send));
         loop {
             let read = match &send {
                 Uplink::Aead(_) => read_slots(&mut plain_read, &mut buf),
@@ -543,7 +543,7 @@ fn relay_downlink<R: Read>(mut reader: R, recv: Recv, out: &mut dyn Write) -> bo
         let mut window = ChunkReader::new(reader);
         let _ = drain_window(&mut window, &mut cipher, out);
     } else if let Some(mut rc4) = stream {
-        let mut buf = unfilled(READ_CHUNK);
+        let mut buf = crate::proxy::unfilled(READ_CHUNK);
         while let Some(payload) = open_stream(&mut reader, &mut rc4, &mut buf) {
             if out.write_all(payload).is_err() {
                 break;
@@ -578,8 +578,8 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
         }
     }
     let mut table: HashMap<SocketAddr, SocketAddr> = HashMap::new();
-    let mut buf = unfilled(DATAGRAM_MAX);
-    let mut reply = unfilled(DATAGRAM_MAX);
+    let mut buf = crate::proxy::unfilled(DATAGRAM_MAX);
+    let mut reply = crate::proxy::unfilled(DATAGRAM_MAX);
     let mut hop: Option<Cipher> = None;
     loop {
         match clients.recv_from(&mut buf[SEAL_ROOM..SEAL_ROOM + UDP_BUF]) {
@@ -643,19 +643,7 @@ fn uplink_buffer_len(send: &Uplink) -> usize {
 
 /// A chunk buffer sized once: `open_chunk` writes into a prefix of it, so no read ever grows or re-zeroes it.
 pub(crate) fn wire_buffer() -> Vec<u8> {
-    unfilled(WIRE_MAX)
-}
-
-/// Room for a read to write into without a zero pass first: every byte is written before any code observes it, so the fill was work generated and thrown away.
-#[allow(
-    clippy::uninit_vec,
-    reason = "the buffer is a read target: the read that owns every byte writes before any code reads one"
-)]
-fn unfilled(len: usize) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(len);
-    // SAFETY: every path hands the buffer to a read that initialises the bytes it reports, and no path reads a byte that was not written.
-    unsafe { buf.set_len(len) };
-    buf
+    crate::proxy::unfilled(WIRE_MAX)
 }
 
 /// Seal what one relay read filled: every chunk of it seals inside its own slot — length into that slot's headroom, tag into its tailroom — and the batch leaves as one vectored write whose slices are exactly the wire bytes a chunk at a time used to be, so a carrier with no `writev` still sees one write per chunk. A payload byte is never copied in user space, and more chunks than the buffer has slots is refused loudly rather than corrupted quietly.
@@ -763,7 +751,7 @@ impl<R: Read> ChunkReader<R> {
     fn new(read: R) -> Self {
         Self {
             read,
-            buf: unfilled(BATCH),
+            buf: crate::proxy::unfilled(BATCH),
             at: 0,
             end: 0,
             held: None,
