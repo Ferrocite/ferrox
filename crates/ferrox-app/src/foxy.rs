@@ -2913,7 +2913,7 @@ impl Tunnel {
         match self {
             Self::H1(lane) => lane.set_relay_quantum(quantum),
             Self::H2(lane) => lane.set_relay_quantum(quantum),
-            // h3 has no socket of its own to park on: its stream rides a pooled QUIC connection whose pump thread owns the only descriptor, so a readiness wait there would wake every flow on the connection for one datagram.
+            // h3 has no socket a parked leg can wait on alone: a datagram reaches this stream only through the lane's own connection lock, so a readiness wait would take the packet and leave it undelivered.
             Self::H3(lane) => {
                 lane.set_read_quantum(quantum);
                 Ok(())
@@ -6524,7 +6524,7 @@ pub(crate) mod loopback {
         edge.join().expect("joins");
     }
 
-    /// A QUIC lane belongs to the pool, not to the lease that opened it: one lease ending leaves the connection the other still rides, the last ending parks the lane with its thread gone, and the next flow rides the same handshake instead of paying for a new one.
+    /// A QUIC lane belongs to the pool, not to the lease that opened it: one lease ending leaves the connection the other still rides, a lease the flow reads itself starts no pump, and the next flow rides the same handshake.
     #[test]
     fn a_lane_outlives_its_leases_and_the_next_flow_rides_it() {
         let (roots, server) = minted(b"h3");
@@ -6573,27 +6573,20 @@ pub(crate) mod loopback {
                 .expect("the edge read it");
             lane.read(&mut Vec::new()).expect("reads");
         }
-        // The park is the pump's own report and it lands inside one poll of a quiet socket, so waiting for the flag is the witness that an idle edge keeps its connection and drops its thread.
-        for _ in 0..60 {
-            if crate::quic::lane_parked(&dial) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
         assert!(
             crate::quic::pool_holds(&dial),
             "the lane outlived the last lease that rode it"
         );
-        assert!(crate::quic::lane_parked(&dial), "the pump said it left");
         let third = crate::quic::pooled_stream_within(&dial, crate::quic::HANDSHAKE_TIMEOUT)
             .expect("the next flow rides the parked lane");
         assert!(
             std::sync::Arc::ptr_eq(&lane, &third.conn),
             "one handshake serves three flows, not three handshakes"
         );
+        // The flag a pump clears to run is still set, so no second reader of this socket exists: `lend` starts a thread only for a lease whose bytes it can hand over.
         assert!(
-            !crate::quic::lane_parked(&dial),
-            "the lease put a pump back behind the lane"
+            crate::quic::lane_parked(&dial),
+            "a lease the flow reads itself starts no pump"
         );
         drop(third);
         edge.join().expect("joins");

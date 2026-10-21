@@ -47,7 +47,7 @@ struct PooledState {
     sessions: HashMap<u64, Arc<Connection>>,
     opening: HashSet<u64>,
     next_id: u64,
-    /// When the lane's pump parked with no lease on it, or none while a pump thread owns it: the thread follows the leases, so an idle edge pins no thread and the next flow rides the same handshake.
+    /// When the lane's pump parked with no lease on it, or none while a pump thread owns it: the thread follows only the leases it can serve, so an idle edge and a flow that reads its own socket pin no thread and the next flow rides the same handshake.
     parked: Option<Instant>,
 }
 
@@ -2121,13 +2121,14 @@ fn lane_is_live(entry: &PooledConn) -> bool {
     !conn.is_closed()
 }
 
-/// Take a stream on the lane, and put a pump behind a parked one in the same table lock: a thread leaving an empty lane and a lease landing on it cannot both win the flag, so no flow waits on a thread that already ended.
+/// Take a stream on the lane, and put a pump behind a parked one that this lease can use in the same table lock: a thread leaving an empty lane and a lease landing on it cannot both win the flag, so no flow waits on a thread that already ended.
 fn lend(pooled: &PooledConn, up: Option<Connection>) -> Option<u64> {
     let mut table = pooled.table.lock().ok()?;
     if table.sessions.len() + table.opening.len() >= MAX_STREAMS as usize {
         return None;
     }
-    if table.parked.take().is_some() {
+    // Only a lease the pump can serve starts one: `hand_off` skips an id still opening, so for a lease that reads itself the thread is a second reader of one file description — it takes datagrams as they land and re-arms the read wait the flow just set, so the flow wakes on the pump's poll instead of its own.
+    if up.is_some() && table.parked.take().is_some() {
         let (Ok(pump_sock), Ok(local)) = (pooled.sock.try_clone(), pooled.sock.local_addr()) else {
             table.parked = Some(Instant::now());
             return None;
@@ -2437,7 +2438,7 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
             sessions: HashMap::new(),
             opening: HashSet::new(),
             next_id: 0,
-            // No thread yet: the first lease on the lane starts the pump, so a connection nobody rode costs none.
+            // No thread yet: only a lease whose bytes the pump can hand over starts one, so a connection nobody rode and a flow that reads its own socket cost none.
             parked: Some(Instant::now()),
         }));
         return Some(PooledConn {
