@@ -200,7 +200,15 @@ jobs:
             A named `h3` is a preference, not a pin: it leads the ladder, and a
             path that drops QUIC — silence, not a refusal — is abandoned five
             seconds into the handshake, so the TCP rungs follow and the lane
-            carries anyway. A signed-in account renews the edge pass on its own
+            carries anyway. An `h3` flow reads its own socket now: the lane used
+            to start a pump for any lease that landed on an idle lane, and for a
+            flow's lease that thread could only be a second reader of the same
+            file description — taking datagrams as they landed and re-arming the
+            read timeout the flow had just set, per packet. It asks first now,
+            so a session lease starts one pump and a flow's lease starts none
+            (`pump-threads-started-by-an-app-driven-lease 0`), and what that
+            second reader cost the live `h3` rows is written up on the QUIC and
+            Foxy carrier pages. A signed-in account renews the edge pass on its own
             clock (a lane left running overnight keeps working), `--country DE`
             moves the exit, `--city` pins a city tier, two-factor sign-in passes
             `--code 123456` once, and `--upstream socks5://127.0.0.1:1080` dials
