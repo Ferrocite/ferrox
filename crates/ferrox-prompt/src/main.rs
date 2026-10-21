@@ -13,6 +13,7 @@ use ferrox_prompt::markdown::{
     Addon, Diagnostic, Effort, Library, Prompt, Severity, Status, Targets, Touch,
 };
 use ferrox_prompt::render::{self, Options, Rendered};
+use ferrox_prompt::state::MethodRow;
 use ferrox_prompt::worktree::Worktree;
 use ferrox_prompt::{clipboard, load_library, workspace_root};
 
@@ -28,14 +29,16 @@ COMMANDS
     next                   the slice to work on, its blanks filled from the matrix
     render <id>            that slice's prompt, with add-ons and gates
     show <id>              that slice's metadata, then its full prompt
+    rows                   the matrix rows a slice can be about
     set-status <id> <status>  record progress: todo, doing, done or blocked
 
 OPTIONS
     --library <path>       read this Markdown instead of prompts.md
     --set KEY=VALUE        fill a placeholder; repeatable, wins over a default
+    --row <key|index|name> the matrix row this slice is about: A13, 13, or part of a name
     --addon <slug|all>     append an add-on; repeatable or comma-separated
     --print                print instead of copying to the clipboard
-    --json                 machine-readable output (list, next, render, show)
+    --json                 machine-readable output (list, next, render, show, rows)
     --status <status>      list only these: todo, doing, done, blocked
     --effort <effort>      restrict to small, medium or large
     --id <id>              ask for a specific slice from `next`
@@ -51,6 +54,9 @@ EXAMPLES
     ferrox-prompt next
     ferrox-prompt next --rotate --seed 4
     ferrox-prompt render 5 --addon isa-matrix
+    ferrox-prompt render 1 --row A13
+    ferrox-prompt next --row quic
+    ferrox-prompt rows --row quic
     ferrox-prompt set-status 5 doing
     ferrox-prompt list --status todo
     ferrox-prompt check --library /tmp/draft-prompts.md
@@ -61,6 +67,12 @@ prints the command that would fill it instead. Every handout is recorded in
 Every handout also names the worktree the slice runs in and what to do about it:
 created with `scripts/new-worktree.sh` when there is none, used and brought onto
 `main` when that script has made one for this task already.
+
+`--row` names the matrix row a slice is about, so a template and a row can be
+picked by hand: `render 1 --row A13` renders P1 for that row, and
+`next --row A13` picks the template that draws it. A row is named by its key
+(`A13`), its number (`13`) or part of its method name (`quic`); `rows` lists the
+matrix so a key can be found.
 ";
 
 /// What to do.
@@ -76,6 +88,8 @@ enum Command {
     Render,
     /// One prompt's metadata.
     Show,
+    /// The matrix rows a slice can be about.
+    Rows,
     /// Record a prompt's status: the only field progress edits.
     SetStatus,
     /// Usage.
@@ -130,6 +144,8 @@ struct Args {
     effort: Option<Effort>,
     /// `--id <id>` on `next`: a deliberate choice instead of a ranked one.
     forced: Option<u32>,
+    /// `--row <key|index|name>`: the matrix row a slice is about.
+    row: Option<String>,
     /// The value `set-status` writes.
     set_to: Option<Status>,
     seed: u64,
@@ -152,6 +168,7 @@ impl Default for Args {
             status: None,
             effort: None,
             forced: None,
+            row: None,
             set_to: None,
             seed: 1,
             memory: 3,
@@ -216,6 +233,7 @@ fn main() -> ExitCode {
                 Command::Next => run_next(&args, &library, &root),
                 Command::Render => run_render(&args, &library, &root),
                 Command::Show => run_show(&args, &library, &root),
+                Command::Rows => run_rows(&args, &library, &root),
                 Command::SetStatus => run_set_status(&args, &library),
                 Command::Check | Command::Help | Command::Version => ExitCode::SUCCESS,
             }
@@ -241,7 +259,8 @@ fn parse(arguments: &[String]) -> Result<Args, String> {
         let borrowed = inline.as_deref();
         let text = |at: &mut usize| take_value(arguments, at, borrowed, &flag);
         match flag.as_str() {
-            verb @ ("check" | "list" | "ls" | "next" | "render" | "show" | "set-status") => {
+            verb @ ("check" | "list" | "ls" | "next" | "render" | "show" | "rows"
+            | "set-status") => {
                 parsed.command = verb_of(verb);
             }
             "help" | "-h" | "--help" => parsed.command = Command::Help,
@@ -254,6 +273,7 @@ fn parse(arguments: &[String]) -> Result<Args, String> {
                 parsed.id = Some(parse_id(&text(&mut index)?)?);
             }
             "--id" => parsed.forced = Some(parse_id(&text(&mut index)?)?),
+            "--row" | "-r" => parsed.row = Some(text(&mut index)?),
             "--set" => assign(&mut parsed.values, &text(&mut index)?)?,
             "--addon" => parsed.addons.push(text(&mut index)?),
             "--print" => parsed.output = Output::Print,
@@ -299,8 +319,8 @@ fn parse(arguments: &[String]) -> Result<Args, String> {
         }
         if !matches!(parsed.command, Command::Render | Command::Show) {
             return Err(format!(
-                "`{id}` is not a command this tool has; try `list`, `next`, `render <id>`, `show <id>` \
-                 or `check`"
+                "`{id}` is not a command this tool has; try `list`, `next`, `render <id>`, `show <id>`, \
+                 `rows` or `check`"
             ));
         }
         parsed.id = Some(parse_id(&id)?);
@@ -348,6 +368,7 @@ fn verb_of(word: &str) -> Command {
         "next" => Command::Next,
         "render" => Command::Render,
         "show" => Command::Show,
+        "rows" => Command::Rows,
         "set-status" => Command::SetStatus,
         _ => Command::Help,
     }
@@ -497,11 +518,12 @@ fn run_list(args: &Args, library: &Library, root: &Path) -> ExitCode {
     if args.status.is_some() || args.effort.is_some() {
         for prompt in &selected {
             println!(
-                "P{} · {:<7} · lev {} · {:<6} · {}",
+                "P{} · {:<7} · lev {} · {:<6} · {:<11} · {}",
                 prompt.id,
                 prompt.status.as_str(),
                 prompt.leverage,
                 prompt.effort.as_str(),
+                prompt.targets.as_str(),
                 prompt.title,
             );
         }
@@ -510,23 +532,100 @@ fn run_list(args: &Args, library: &Library, root: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `rows`: the matrix a slice can be about, so a row can be picked by its key.
+fn run_rows(args: &Args, library: &Library, root: &Path) -> ExitCode {
+    let state = ProjectState::load(root);
+    if !state.has_matrix() {
+        eprintln!(
+            "no matrix in {} — there is no row to pick",
+            root.join(ferrox_prompt::README_RELATIVE).display()
+        );
+        return ExitCode::from(1);
+    }
+    let rows: Vec<&MethodRow> = match &args.row {
+        Some(selector) => expand::matching_rows(&state, selector),
+        None => state.methods.iter().collect(),
+    };
+    if rows.is_empty() {
+        eprintln!(
+            "no matrix row matches `{}`; the matrix has {} rows",
+            args.row.as_deref().unwrap_or_default().trim(),
+            state.methods.len()
+        );
+        return ExitCode::from(2);
+    }
+    if args.output == Output::Json {
+        println!(
+            "{}",
+            Value::object([
+                ("library", Value::text(library.path.display().to_string())),
+                (
+                    "rows",
+                    Value::List(rows.iter().map(|row| row_json(Some(row))).collect())
+                ),
+            ])
+            .to_pretty()
+        );
+        return ExitCode::SUCCESS;
+    }
+    for row in &rows {
+        println!(
+            "{} · {} · {} · {}",
+            row.key(),
+            row.method,
+            row.state,
+            if row.implemented { "shipped" } else { "open" }
+        );
+    }
+    println!();
+    println!(
+        "{} row(s) · {} open · {} shipped",
+        rows.len(),
+        rows.iter().filter(|row| !row.implemented).count(),
+        rows.iter().filter(|row| row.implemented).count()
+    );
+    ExitCode::SUCCESS
+}
+
 /// The state-filled placeholder values a template renders with.
 type Values = BTreeMap<String, String>;
 
-/// A slice the advisor may hand over: the prompt plus, for a matrix template, the row key and its values.
-type Offer<'p> = (&'p Prompt, Option<(String, Values)>);
+/// The values a handout may count as supplied: `--set`, plus every matrix blank when the matrix was readable.
+fn supplied_values(args: &Args, state: &ProjectState) -> Values {
+    let mut supplied = args.values.clone();
+    if state.has_matrix() {
+        for name in expand::FILLABLE {
+            supplied.entry((*name).to_owned()).or_default();
+        }
+    }
+    supplied
+}
+
+/// A slice the advisor may hand over: the prompt plus, for a matrix template, the row it draws and that row's values.
+type Offer<'p> = (&'p Prompt, Option<(&'p MethodRow, Values)>);
+
+/// A refusal: what to say, and the exit code that names it — 1 for the roadmap, 2 for the keyboard.
+type Refusal = (String, u8);
 
 /// A matrix template stays offered only while its class has an unserved row, so `next` moves on when it empties.
 fn build_offers<'p>(
     handable: &[&'p Prompt],
-    state: &ProjectState,
+    state: &'p ProjectState,
     ledger: &Ledger,
+    named: Option<&'p MethodRow>,
 ) -> Vec<Offer<'p>> {
     handable
         .iter()
         .filter_map(|prompt| {
+            if let Some(row) = named {
+                // A named row is the work, so only a template that draws that class may take it.
+                if !prompt.targets.is_matrix() || !expand::row_fits(row, prompt.targets) {
+                    return None;
+                }
+                return Some((*prompt, Some((row, expand::fill(prompt, row, &state.pins)))));
+            }
             if prompt.targets.is_matrix() {
-                target_for(prompt, state, ledger).map(|pair| (*prompt, Some(pair)))
+                target_for(prompt, state, ledger, None).map(|pair| (*prompt, Some(pair)))
             } else {
                 Some((*prompt, None))
             }
@@ -557,7 +656,7 @@ fn choose_offer<'p>(offers: &[Offer<'p>], rotate: bool, seed: u64) -> Offer<'p> 
 /// Fold `--set` over the state-filled row; `{references}` falls back to the core pins even for a `none` class.
 fn merge_values(
     requested: &Values,
-    target: Option<&(String, Values)>,
+    target: Option<&(&MethodRow, Values)>,
     state: &ProjectState,
 ) -> Values {
     let mut values = requested.clone();
@@ -576,10 +675,17 @@ fn merge_values(
 }
 
 /// The worktree this slice runs in: named from the matrix row it draws, or from its title when it draws none, so one task keeps one worktree.
-fn slice_worktree(prompt: &Prompt, values: &Values, root: &Path) -> Worktree {
+fn slice_worktree(
+    prompt: &Prompt,
+    target: Option<&(&MethodRow, Values)>,
+    values: &Values,
+    root: &Path,
+) -> Worktree {
     let label = values
         .get("method")
-        .map_or_else(|| prompt.title.as_str(), String::as_str);
+        .map(String::as_str)
+        .or_else(|| target.map(|(row, _)| row.method.as_str()))
+        .unwrap_or(prompt.title.as_str());
     Worktree::plan(prompt.id, label, root)
 }
 
@@ -589,7 +695,7 @@ fn next_json(
     prompt: &Prompt,
     args: &Args,
     suppressed: &[u32],
-    target_key: Option<&String>,
+    target: Option<&(&MethodRow, Values)>,
     ledger: &Ledger,
     rendered: &render::Rendered,
 ) -> String {
@@ -602,13 +708,28 @@ fn next_json(
         ),
         (
             "target",
-            target_key.map_or(Value::Null, |key| Value::text(key.to_owned())),
+            target.map_or(Value::Null, |(row, _)| Value::text(row.key())),
         ),
+        ("row", row_json(target.map(|(row, _)| *row))),
         ("slice", prompt_json(prompt, ledger)),
         ("worktree", worktree_json(rendered.worktree.as_ref())),
         ("prompt", Value::text(rendered.text.clone())),
     ])
     .to_pretty()
+}
+
+/// The matrix row a slice is about, for `--json`; a slice that draws no row says so.
+fn row_json(row: Option<&MethodRow>) -> Value {
+    let Some(row) = row else {
+        return Value::Null;
+    };
+    Value::object([
+        ("key", Value::text(row.key())),
+        ("method", Value::text(row.method.clone())),
+        ("state", Value::text(row.state.clone())),
+        ("page", Value::text(row.page.clone())),
+        ("implemented", Value::Bool(row.implemented)),
+    ])
 }
 
 /// The worktree a handout names, so an agent creates it or reuses it without parsing prose.
@@ -626,46 +747,44 @@ fn worktree_json(worktree: Option<&Worktree>) -> Value {
 /// `next`: fills a matrix template from its first unserved row, so repeat runs walk the matrix; `--set` still wins.
 fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
     let ledger = Ledger::load(Ledger::path_for(root));
-    let suppressed = ledger.recent_ids(args.memory);
     let state = ProjectState::load(root);
 
+    // A named row is the work; the template that draws it is then the advisor's choice.
+    let named = match &args.row {
+        Some(selector) => match expand::select_row(&state, selector) {
+            Ok(row) => Some(row),
+            Err(reason) => {
+                eprintln!("{reason}");
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+    // The ledger remembers templates, not rows, so a named row is asked for on purpose and is not withheld.
+    let suppressed = if named.is_some() {
+        Vec::new()
+    } else {
+        ledger.recent_ids(args.memory)
+    };
+
     // Matrix-filled names are not holes: FILLABLE counts as supplied when the matrix was readable.
-    let mut supplied = args.values.clone();
-    if state.has_matrix() {
-        for name in expand::FILLABLE {
-            supplied.entry((*name).to_owned()).or_default();
-        }
-    }
+    let supplied = supplied_values(args, &state);
 
     // Resolve the (template, row) pair: `forced` names one on purpose, else walk the handable set for a live target.
-    let offer: Option<Offer> = if let Some(id) = args.forced {
-        let Some(prompt) = library.prompt(id) else {
-            eprintln!("{}", unknown_prompt(library, id));
-            return ExitCode::from(2);
-        };
-        Some((prompt, target_for(prompt, &state, &ledger)))
-    } else {
-        let (handable, skipped) = advisor::handable(
-            library,
-            args.effort,
-            &suppressed,
-            &supplied,
-            args.allow_unfilled,
-        );
-        let offers = build_offers(&handable, &state, &ledger);
-        if offers.is_empty() {
-            eprintln!(
-                "{}",
-                nothing_to_hand_over(library, args.effort, &suppressed, &skipped)
-            );
-            return ExitCode::from(1);
+    let (prompt, target) = match choose_slice(
+        args,
+        library,
+        &state,
+        &ledger,
+        &suppressed,
+        &supplied,
+        named,
+    ) {
+        Ok(offer) => offer,
+        Err((message, code)) => {
+            eprintln!("{message}");
+            return ExitCode::from(code);
         }
-        let chosen = choose_offer(&offers, args.draw == Draw::Rotate, args.seed);
-        Some(chosen)
-    };
-    let Some((prompt, target)) = offer else {
-        // Unreachable — both branches return early; the let-else only satisfies the borrow checker.
-        return ExitCode::from(1);
     };
 
     let addons = match render::resolve_addons(prompt, &args.addons) {
@@ -677,49 +796,36 @@ fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
     };
     // `--set` wins over the state-filled value, so an explicit row beats the first unserved candidate.
     let values = merge_values(&args.values, target.as_ref(), &state);
-    let worktree = slice_worktree(prompt, &values, root);
+    let worktree = slice_worktree(prompt, target.as_ref(), &values, root);
     let options = Options {
         allow_unfilled: args.allow_unfilled,
         ..Options::default()
     };
     let rendered = render::render(library, prompt, &values, &addons, Some(&worktree), options);
 
-    let target_key = target.as_ref().map(|(key, _)| key.clone());
+    let target_key = target.as_ref().map(|(row, _)| row.key());
     if args.output == Output::Json {
-        let json = next_json(
-            library,
-            prompt,
-            args,
-            &suppressed,
-            target_key.as_ref(),
-            &ledger,
-            &rendered,
+        println!(
+            "{}",
+            next_json(
+                library,
+                prompt,
+                args,
+                &suppressed,
+                target.as_ref(),
+                &ledger,
+                &rendered
+            )
         );
-        // A `--json` handout is recorded too, so a JSON-driven agent still walks the matrix.
-        record(
-            ledger,
-            prompt.id,
-            &how_asked(args),
-            target_key.as_deref(),
-            args.record,
-        );
-        println!("{json}");
-        return ExitCode::SUCCESS;
-    }
-
-    report_next(library, prompt, &ledger, &suppressed, &[], args, &addons);
-    if let Some((key, _)) = &target {
-        if let Some(row) = state.methods.iter().find(|row| row.key() == *key) {
-            println!(
-                "targeting row {key} — {} (state: {})",
-                row.method, row.state
-            );
+    } else {
+        report_next(library, prompt, &ledger, &suppressed, &[], args, &addons);
+        report_target(target.as_ref(), &ledger, prompt);
+        if let Some(worktree) = &rendered.worktree {
+            println!("worktree    {}", worktree.brief());
         }
+        deliver(&rendered, library, prompt.id, args.output.is_stdout());
     }
-    if let Some(worktree) = &rendered.worktree {
-        println!("worktree    {}", worktree.brief());
-    }
-    deliver(&rendered, library, prompt.id, args.output.is_stdout());
+    // A `--json` handout is recorded too, so a JSON-driven agent still walks the matrix.
     record(
         ledger,
         prompt.id,
@@ -730,16 +836,135 @@ fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The first matrix row this template may draw that `served` has not, or `None` when its class is exhausted.
-fn target_for(
-    prompt: &Prompt,
-    state: &ProjectState,
+/// The (template, row) pair this handout is about: the one asked for by id, or the best the advisor has.
+fn choose_slice<'p>(
+    args: &Args,
+    library: &'p Library,
+    state: &'p ProjectState,
     ledger: &Ledger,
-) -> Option<(String, BTreeMap<String, String>)> {
+    suppressed: &[u32],
+    supplied: &Values,
+    named: Option<&'p MethodRow>,
+) -> Result<Offer<'p>, Refusal> {
+    if let Some(id) = args.forced {
+        let Some(prompt) = library.prompt(id) else {
+            return Err((unknown_prompt(library, id), 2));
+        };
+        if let Some(row) = named {
+            if let Err(reason) = row_fits_template(prompt, row, library) {
+                return Err((reason, 2));
+            }
+        }
+        return Ok((prompt, target_for(prompt, state, ledger, named)));
+    }
+    let (handable, skipped) = advisor::handable(
+        library,
+        args.effort,
+        suppressed,
+        supplied,
+        args.allow_unfilled,
+    );
+    let offers = build_offers(&handable, state, ledger, named);
+    if offers.is_empty() {
+        return Err((
+            nothing_to_hand_over(
+                library,
+                args.effort,
+                suppressed,
+                &skipped,
+                state,
+                ledger,
+                named,
+            ),
+            1,
+        ));
+    }
+    Ok(choose_offer(&offers, args.draw == Draw::Rotate, args.seed))
+}
+
+/// The row this slice draws, and whether this template was handed it before.
+fn report_target(target: Option<&(&MethodRow, Values)>, ledger: &Ledger, prompt: &Prompt) {
+    let Some((row, _)) = target else {
+        return;
+    };
+    let again = if ledger.targets_for(prompt.id).contains(&row.key()) {
+        "; already served to this template"
+    } else {
+        ""
+    };
+    println!(
+        "targeting row {} — {} (state: {}{})",
+        row.key(),
+        row.method,
+        row.state,
+        again
+    );
+}
+
+/// The row this slice is about: the one the user named, or the first unserved row of the template's class.
+fn target_for<'p>(
+    prompt: &Prompt,
+    state: &'p ProjectState,
+    ledger: &Ledger,
+    named: Option<&'p MethodRow>,
+) -> Option<(&'p MethodRow, Values)> {
+    if let Some(row) = named {
+        return Some((row, expand::fill(prompt, row, &state.pins)));
+    }
     if !expand::is_fillable(prompt, state) {
         return None;
     }
     expand::next_target(prompt, state, &ledger.targets_for(prompt.id))
+}
+
+/// The row the user named, when this template may draw it.
+fn named_row<'p>(
+    prompt: &Prompt,
+    state: &'p ProjectState,
+    library: &Library,
+    selector: &str,
+) -> Result<Option<&'p MethodRow>, String> {
+    let row = expand::select_row(state, selector)?;
+    row_fits_template(prompt, row, library)?;
+    Ok(Some(row))
+}
+
+/// Whether a template may draw a row, and the reason it may not.
+fn row_fits_template(prompt: &Prompt, row: &MethodRow, library: &Library) -> Result<(), String> {
+    if !prompt.targets.is_matrix() {
+        return Err(format!(
+            "P{} does not draw from the matrix — it is a fixed slice, so `--row` has nothing to fill",
+            prompt.id
+        ));
+    }
+    if expand::row_fits(row, prompt.targets) {
+        return Ok(());
+    }
+    let drawers: Vec<String> = library
+        .prompts
+        .iter()
+        .filter(|other| other.targets.is_matrix() && expand::row_fits(row, other.targets))
+        .map(|other| format!("P{}", other.id))
+        .collect();
+    Err(format!(
+        "row {} ({}) is {}, and P{} draws {} rows; these draw it: {}",
+        row.key(),
+        row.method,
+        if row.implemented { "shipped" } else { "open" },
+        prompt.id,
+        prompt.targets.as_str(),
+        join_capped(&drawers)
+    ))
+}
+
+/// A list of ids, capped: the first few name the way out, the count says how many more there are.
+fn join_capped(ids: &[String]) -> String {
+    const LIMIT: usize = 8;
+    if ids.len() <= LIMIT {
+        join_or(ids.iter().cloned())
+    } else {
+        format!("{} (+{} more)", ids[..LIMIT].join(", "), ids.len() - LIMIT)
+    }
 }
 
 /// `render <id>`: a matrix template filled from its first unserved row, like `next`, not a page of holes.
@@ -751,7 +976,25 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
     };
     let ledger = Ledger::load(Ledger::path_for(root));
     let state = ProjectState::load(root);
-    let target = target_for(prompt, &state, &ledger);
+    let named = match &args.row {
+        Some(selector) => match named_row(prompt, &state, library, selector) {
+            Ok(row) => row,
+            Err(reason) => {
+                eprintln!("{reason}");
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+    let target = target_for(prompt, &state, &ledger, named);
+    // A matrix template whose class is spent has no row to fill, and a hole is worse than the reason.
+    if target.is_none()
+        && expand::is_fillable(prompt, &state)
+        && !state.candidates(prompt.targets).is_empty()
+    {
+        eprintln!("{}", class_spent(library, prompt, &state, &ledger));
+        return ExitCode::from(2);
+    }
     let addons = match render::resolve_addons(prompt, &args.addons) {
         Ok(addons) => addons,
         Err(reason) => {
@@ -760,7 +1003,7 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
         }
     };
     let values = merge_values(&args.values, target.as_ref(), &state);
-    let worktree = slice_worktree(prompt, &values, root);
+    let worktree = slice_worktree(prompt, target.as_ref(), &values, root);
     let options = Options {
         allow_unfilled: args.allow_unfilled,
         ..Options::default()
@@ -782,7 +1025,7 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
         );
         return ExitCode::from(2);
     }
-    let target_key = target.as_ref().map(|(key, _)| key.clone());
+    let target_key = target.as_ref().map(|(row, _)| row.key());
     if args.output == Output::Json {
         let json = Value::object([
             ("tag", Value::text(library.tag())),
@@ -792,6 +1035,7 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
                     .as_deref()
                     .map_or(Value::Null, |key| Value::text(key.to_owned())),
             ),
+            ("row", row_json(target.map(|(row, _)| row))),
             ("slice", prompt_json(prompt, &ledger)),
             ("worktree", worktree_json(rendered.worktree.as_ref())),
             ("prompt", Value::text(rendered.text.clone())),
@@ -831,7 +1075,17 @@ fn run_show(args: &Args, library: &Library, root: &Path) -> ExitCode {
     };
     let ledger = Ledger::load(Ledger::path_for(root));
     let state = ProjectState::load(root);
-    let target = target_for(prompt, &state, &ledger);
+    let named = match &args.row {
+        Some(selector) => match named_row(prompt, &state, library, selector) {
+            Ok(row) => row,
+            Err(reason) => {
+                eprintln!("{reason}");
+                return ExitCode::from(2);
+            }
+        },
+        None => None,
+    };
+    let target = target_for(prompt, &state, &ledger, named);
     let addons = match render::resolve_addons(prompt, &args.addons) {
         Ok(addons) => addons,
         Err(reason) => {
@@ -840,7 +1094,7 @@ fn run_show(args: &Args, library: &Library, root: &Path) -> ExitCode {
         }
     };
     let values = merge_values(&args.values, target.as_ref(), &state);
-    let worktree = slice_worktree(prompt, &values, root);
+    let worktree = slice_worktree(prompt, target.as_ref(), &values, root);
     let rendered = render::render(
         library,
         prompt,
@@ -852,7 +1106,7 @@ fn run_show(args: &Args, library: &Library, root: &Path) -> ExitCode {
             ..Options::default()
         },
     );
-    let target_key = target.as_ref().map(|(key, _)| key.clone());
+    let target_key = target.as_ref().map(|(row, _)| row.key());
     if args.output == Output::Json {
         println!(
             "{}",
@@ -866,6 +1120,7 @@ fn run_show(args: &Args, library: &Library, root: &Path) -> ExitCode {
                         .as_deref()
                         .map_or(Value::Null, |key| Value::text(key.to_owned())),
                 ),
+                ("row", row_json(target.map(|(row, _)| row))),
                 ("prompt", Value::text(rendered.text.clone())),
             ])
             .to_pretty()
@@ -873,6 +1128,23 @@ fn run_show(args: &Args, library: &Library, root: &Path) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     println!("P{} · {}", prompt.id, prompt.title);
+    report_metadata(prompt, library, root, &ledger, target.as_ref(), &rendered);
+    println!();
+    println!("--- prompt ---");
+    println!();
+    println!("{}", rendered.text);
+    ExitCode::SUCCESS
+}
+
+/// The metadata above the prompt: what this slice is, what it waits on, and which row it draws.
+fn report_metadata(
+    prompt: &Prompt,
+    library: &Library,
+    root: &Path,
+    ledger: &Ledger,
+    target: Option<&(&MethodRow, Values)>,
+    rendered: &Rendered,
+) {
     println!("  status        {}", prompt.status.as_str());
     println!("  readiness     {}", describe_readiness(library, prompt));
     println!("  leverage      {}", prompt.leverage);
@@ -899,28 +1171,24 @@ fn run_show(args: &Args, library: &Library, root: &Path) -> ExitCode {
         println!("  overlaps      {}", overlaps.join(", "));
     }
     println!("  random weight {}", prompt.random_weight);
-    println!("  last drawn    {}", describe_history(&ledger, prompt.id));
+    println!("  last drawn    {}", describe_history(ledger, prompt.id));
     println!("  gates         {}", prompt.gates.join("; "));
     println!(
         "  add-ons       {}",
         join_or(prompt.addons.iter().map(|addon| addon.slug.clone()))
     );
-    if let Some(key) = &target_key {
-        if let Some(row) = state.methods.iter().find(|row| row.key() == *key) {
-            println!(
-                "  targeting     {key} — {} (state: {})",
-                row.method, row.state
-            );
-        }
+    println!("  targets       {}", prompt.targets.as_str());
+    if let Some((row, _)) = target {
+        println!(
+            "  targeting     {} — {} (state: {})",
+            row.key(),
+            row.method,
+            row.state
+        );
     }
     if let Some(worktree) = &rendered.worktree {
         println!("  worktree      {} — {}", worktree.name, worktree.brief());
     }
-    println!();
-    println!("--- prompt ---");
-    println!();
-    println!("{}", rendered.text);
-    ExitCode::SUCCESS
 }
 
 /// Record progress by rewriting exactly the prompt's `**Status:**` line: reflowing Markdown would fight the contributor's edits.
@@ -1038,19 +1306,42 @@ fn describe_history(ledger: &Ledger, id: u32) -> String {
     }
 }
 
-/// Three empty-ready causes with three fixes — ledger withholding, unfilled inputs, nothing open — reported separately, and two can hold at once.
+/// The empty-ready causes with their fixes — ledger withholding, unfilled inputs, a spent class, nothing open — reported separately, and two can hold at once.
 fn nothing_to_hand_over(
     library: &Library,
     effort: Option<Effort>,
     suppressed: &[u32],
     skipped: &[advisor::Skipped],
+    state: &ProjectState,
+    ledger: &Ledger,
+    named: Option<&MethodRow>,
 ) -> String {
     let withheld: Vec<u32> = advisor::ranked(library, effort)
         .iter()
         .map(|&index| library.prompts[index].id)
         .filter(|id| suppressed.contains(id))
         .collect();
-    let mut message = String::from("nothing to hand over:");
+    let mut message = match named {
+        Some(row) => format!(
+            "nothing to hand over for row {} ({}):",
+            row.key(),
+            row.method
+        ),
+        None => String::from("nothing to hand over:"),
+    };
+    if let Some(row) = named {
+        let drawers: Vec<String> = library
+            .prompts
+            .iter()
+            .filter(|other| other.targets.is_matrix() && expand::row_fits(row, other.targets))
+            .map(|other| format!("P{}", other.id))
+            .collect();
+        let _ = writeln!(
+            message,
+            "\n  no ready template draws it; these do: {}",
+            join_capped(&drawers)
+        );
+    }
     if !withheld.is_empty() {
         let _ = writeln!(
             message,
@@ -1076,10 +1367,63 @@ fn nothing_to_hand_over(
             );
         }
     }
-    if withheld.is_empty() && skipped.is_empty() {
+    let spent = spent_classes(library, state, ledger);
+    if !spent.is_empty() {
+        let _ = writeln!(
+            message,
+            "\n  its class is spent: {} — every row of it has been served to that template",
+            join_or(spent.iter().map(|id| format!("P{id}")))
+        );
+    }
+    if withheld.is_empty() && skipped.is_empty() && spent.is_empty() {
         return advisor::next_index(library, effort, &[]).unwrap_err();
     }
     message
+}
+
+/// The templates whose class has no row left, so the advisor walks past them.
+fn spent_classes(library: &Library, state: &ProjectState, ledger: &Ledger) -> Vec<u32> {
+    library
+        .prompts
+        .iter()
+        .filter(|prompt| prompt.targets.is_matrix() && expand::is_fillable(prompt, state))
+        .filter(|prompt| {
+            // A class with no row at all is empty, not spent; only a class whose every row was served is spent.
+            !state.candidates(prompt.targets).is_empty()
+                && expand::next_target(prompt, state, &ledger.targets_for(prompt.id)).is_none()
+        })
+        .map(|prompt| prompt.id)
+        .collect()
+}
+
+/// Every row of a template's class has been served to it; the way on is a row named by hand.
+fn class_spent(
+    library: &Library,
+    prompt: &Prompt,
+    state: &ProjectState,
+    ledger: &Ledger,
+) -> String {
+    let served = ledger.targets_for(prompt.id).len();
+    let first = state
+        .candidates(prompt.targets)
+        .first()
+        .map(|row| row.key())
+        .unwrap_or_default();
+    let others: Vec<String> = library
+        .prompts
+        .iter()
+        .filter(|other| other.id != prompt.id && other.targets.is_matrix())
+        .map(|other| format!("P{}", other.id))
+        .collect();
+    format!(
+        "P{} has no {} row left: the ledger served {} to it; name one with `--row {}` to render it \
+         again, or use a template that draws another class: {}",
+        prompt.id,
+        prompt.targets.as_str(),
+        served,
+        first,
+        join_or(others.into_iter())
+    )
 }
 
 /// The reasoning, printed above the prompt so it is read before it is obeyed.
@@ -1137,14 +1481,16 @@ fn report_next(
     }
     println!(
         "SUPPRESSED  {}",
-        if suppressed.is_empty() {
-            "nothing; the ledger is empty or --memory is 0".to_owned()
-        } else {
+        if !suppressed.is_empty() {
             suppressed
                 .iter()
                 .map(|id| format!("P{id}"))
                 .collect::<Vec<_>>()
                 .join(", ")
+        } else if args.row.is_some() {
+            "nothing; a named row is asked for on purpose".to_owned()
+        } else {
+            "nothing; the ledger is empty or --memory is 0".to_owned()
         }
     );
     if !skipped.is_empty() {
@@ -1239,19 +1585,19 @@ fn summarise(library: &Library, effort: Option<Effort>) {
 /// Print the fill-in guide so a clipboard handoff still explains what was chosen and how to change it.
 fn report_render_guide(
     prompt: &Prompt,
-    target: Option<&(String, BTreeMap<String, String>)>,
+    target: Option<&(&MethodRow, Values)>,
     values: &Values,
     state: &ProjectState,
     addons: &[Addon],
 ) {
     println!("P{} · {}", prompt.id, prompt.title);
-    if let Some((key, _)) = &target {
-        if let Some(row) = state.methods.iter().find(|row| row.key() == *key) {
-            println!(
-                "  targeting   row {key} — {} (state: {})",
-                row.method, row.state
-            );
-        }
+    if let Some((row, _)) = target {
+        println!(
+            "  targeting   row {} — {} (state: {})",
+            row.key(),
+            row.method,
+            row.state
+        );
     }
     if !values.is_empty() {
         println!(
@@ -1284,17 +1630,19 @@ fn report_render_guide(
     if state.has_matrix() && prompt.targets.is_matrix() {
         let candidates = state.candidates(prompt.targets);
         if candidates.len() > 1 {
+            let keys: Vec<String> = candidates.iter().take(5).map(|row| row.key()).collect();
             println!(
-                "  alternatives {} rows in class {}; pick one with --set method=<name> --set index=<n> --set section=<letter>",
+                "  alternatives {} rows in class {}; pick one with --row <key> — {}",
                 candidates.len(),
                 prompt.targets.as_str(),
+                keys.join(", "),
             );
         }
     }
     println!("  override    re-run with --set KEY=VALUE to replace any filled value");
     if !prompt.addons.is_empty() {
         println!(
-            "  example     cargo run -p ferrox-prompt -- render {} --addon {} --set method=<name>",
+            "  example     cargo run -p ferrox-prompt -- render {} --addon {} --row <key>",
             prompt.id, prompt.addons[0].slug
         );
     }
@@ -1343,8 +1691,10 @@ fn record(mut ledger: Ledger, id: u32, how: &str, target: Option<&str>, enabled:
 /// How this handout was asked for, for the ledger.
 fn how_asked(args: &Args) -> String {
     match args.command {
+        Command::Next if args.row.is_some() => "next --row".to_owned(),
         Command::Next if args.draw == Draw::Rotate => "next --rotate".to_owned(),
         Command::Next => "next".to_owned(),
+        Command::Render if args.row.is_some() => "render --row".to_owned(),
         Command::Render => "render".to_owned(),
         _ => "show".to_owned(),
     }
@@ -1452,6 +1802,7 @@ fn prompt_json(prompt: &Prompt, ledger: &Ledger) -> Value {
             "random_weight",
             Value::Number(i64::from(prompt.random_weight)),
         ),
+        ("targets", Value::text(prompt.targets.as_str())),
         (
             "placeholders",
             Value::List(
@@ -1590,6 +1941,76 @@ fn selection_json(
 mod tests {
     use super::*;
 
+    /// A library with one template per target class, so the class rules can be read off a row.
+    const LIBRARY: &str = "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · Land an open row
+
+**When to use:** an open row
+**Status:** todo
+**Leverage:** 5
+**Effort:** medium
+**Targets:** open
+**Gates:** `cargo test`
+
+```text
+implement {method}
+```
+
+## P2 · Tune a shipped row
+
+**When to use:** a shipped row
+**Status:** todo
+**Leverage:** 4
+**Effort:** medium
+**Targets:** implemented
+**Gates:** `cargo test`
+
+```text
+tune {method}
+```
+
+## P3 · A fixed slice
+
+**When to use:** no row at all
+**Status:** todo
+**Leverage:** 3
+**Effort:** small
+**Targets:** none
+**Gates:** `cargo test`
+
+```text
+do the fixed thing
+```
+";
+
+    fn library() -> Library {
+        Library::parse(Path::new("prompts.md"), LIBRARY)
+    }
+
+    fn row(section: char, index: u32, method: &str, implemented: bool) -> MethodRow {
+        MethodRow {
+            section,
+            index,
+            method: method.to_owned(),
+            state: if implemented {
+                "implemented"
+            } else {
+                "planned"
+            }
+            .to_owned(),
+            implemented,
+            page: "docs/function/method.md".to_owned(),
+            real_page: false,
+            text: format!("| {index} | {method} | planned |"),
+        }
+    }
+
     fn parse_args(arguments: &[&str]) -> Args {
         let owned: Vec<String> = arguments
             .iter()
@@ -1611,6 +2032,78 @@ mod tests {
         assert_eq!(parse_args(&["render", "--prompt", "p9"]).id, Some(9));
         assert_eq!(parse_args(&["show", "3"]).command, Command::Show);
         assert_eq!(parse_args(&["ls"]).command, Command::List);
+        assert_eq!(parse_args(&["rows"]).command, Command::Rows);
+    }
+
+    #[test]
+    fn a_row_is_named_by_whatever_the_user_knows() {
+        assert_eq!(
+            parse_args(&["render", "P1", "--row", "A13"]).row.as_deref(),
+            Some("A13")
+        );
+        assert_eq!(
+            parse_args(&["render", "P1", "--row=13"]).row.as_deref(),
+            Some("13")
+        );
+        assert_eq!(
+            parse_args(&["next", "--row", "quic"]).row.as_deref(),
+            Some("quic")
+        );
+        assert_eq!(parse_args(&["rows"]).row, None);
+    }
+
+    #[test]
+    fn a_row_outside_the_template_class_is_refused_by_name() {
+        let library = library();
+        let open = library.prompt(1).unwrap();
+        let shipped = library.prompt(2).unwrap();
+        let fixed = library.prompt(3).unwrap();
+        let shipped_row = row('A', 3, "VLESS TCP none", true);
+        let open_row = row('A', 13, "VLESS over QUIC", false);
+
+        // The template that wants the row takes it.
+        assert!(row_fits_template(shipped, &shipped_row, &library).is_ok());
+        assert!(row_fits_template(open, &open_row, &library).is_ok());
+        // The one that does not is refused, and the refusal names the templates that do.
+        let refusal = row_fits_template(open, &shipped_row, &library).unwrap_err();
+        assert!(refusal.contains("A3"), "{refusal}");
+        assert!(refusal.contains("is shipped"), "{refusal}");
+        assert!(refusal.contains("P2"), "{refusal}");
+        // A fixed slice draws no row at all, so `--row` has nothing to fill.
+        let fixed_refusal = row_fits_template(fixed, &open_row, &library).unwrap_err();
+        assert!(
+            fixed_refusal.contains("does not draw from the matrix"),
+            "{fixed_refusal}"
+        );
+    }
+
+    #[test]
+    fn a_long_list_of_drawers_is_capped_but_counted() {
+        let ids: Vec<String> = (1..=10).map(|id| format!("P{id}")).collect();
+        let capped = join_capped(&ids);
+        assert!(capped.contains("P8"), "{capped}");
+        assert!(capped.contains("+2 more"), "{capped}");
+        assert_eq!(join_capped(&ids[..3]), "P1, P2, P3");
+    }
+
+    #[test]
+    fn a_spent_class_says_so_and_names_a_row_to_render() {
+        let library = library();
+        let state = ferrox_prompt::expand::ProjectState {
+            methods: vec![row('A', 13, "VLESS over QUIC", false)],
+            pins: Vec::new(),
+        };
+        let mut path = std::env::temp_dir();
+        path.push(format!("ferrox-prompt-spent-{}.log", std::process::id()));
+        std::fs::write(&path, "2026-10-02T00:00:00Z P1 next t=A13\n").expect("write the ledger");
+        let ledger = Ledger::load(path.clone());
+        let prompt = library.prompt(1).expect("P1");
+        let message = class_spent(&library, prompt, &state, &ledger);
+        assert!(message.contains("no open row left"), "{message}");
+        assert!(message.contains("--row A13"), "{message}");
+        // And the class is reported as spent, so the advisor's silence is explained.
+        assert_eq!(spent_classes(&library, &state, &ledger), vec![1]);
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -1630,7 +2123,16 @@ mod tests {
                 let mut words = line.split_whitespace();
                 words.next() == Some("ferrox-prompt")
                     && words.next().is_some_and(|word| {
-                        ["check", "list", "next", "render", "show", "set-status"].contains(&word)
+                        [
+                            "check",
+                            "list",
+                            "next",
+                            "render",
+                            "show",
+                            "rows",
+                            "set-status",
+                        ]
+                        .contains(&word)
                     })
             })
             .map(|line| line.split_whitespace().skip(1).map(str::to_owned).collect())

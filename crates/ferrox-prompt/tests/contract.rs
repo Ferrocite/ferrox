@@ -5,7 +5,8 @@ use std::path::Path;
 
 use ferrox_prompt::advisor::{self, Ledger};
 use ferrox_prompt::check;
-use ferrox_prompt::markdown::{Severity, Status};
+use ferrox_prompt::expand::{self, ProjectState};
+use ferrox_prompt::markdown::{Severity, Status, Targets};
 use ferrox_prompt::render::{self, Options};
 use ferrox_prompt::{load_library, manifest_root};
 
@@ -325,6 +326,83 @@ fn every_body_says_something_the_project_can_act_on() {
         assert!(
             line.ends_with(['.', ':', '`']) || line.is_empty(),
             "unexpected line in the shared protocol: {line}"
+        );
+    }
+}
+
+#[test]
+fn a_row_is_picked_by_key_by_number_or_by_name_and_fills_the_template() {
+    let library = library();
+    let state = ProjectState::load(&manifest_root());
+    assert!(state.has_matrix(), "the live matrix must be readable");
+
+    // Every row is reachable by its own key, and the key is what the ledger and the JSON name it by.
+    for row in &state.methods {
+        let picked = expand::select_row(&state, &row.key())
+            .unwrap_or_else(|reason| panic!("row {} is not reachable: {reason}", row.key()));
+        assert_eq!(picked.key(), row.key());
+        assert_eq!(picked.method, row.method);
+    }
+
+    // A whole method name names one row, and a part of one names what it can.
+    let open = state
+        .methods
+        .iter()
+        .find(|row| !row.implemented)
+        .expect("the matrix has an open row");
+    let by_name = expand::select_row(&state, &open.method)
+        .unwrap_or_else(|reason| panic!("row {} is not reachable by name: {reason}", open.key()));
+    assert_eq!(by_name.key(), open.key());
+
+    // A template that draws the row's class renders it with every blank filled from that row.
+    let template = library
+        .prompts
+        .iter()
+        .find(|prompt| prompt.targets == Targets::Open)
+        .expect("a template draws open rows");
+    let values = expand::fill(template, open, &state.pins);
+    let rendered = render::render(&library, template, &values, &[], None, Options::default());
+    assert!(rendered.missing.is_empty(), "P{} left a hole", template.id);
+    assert!(
+        rendered.text.contains(&open.method),
+        "P{} did not name the row's method",
+        template.id
+    );
+    assert!(
+        rendered.text.contains(&open.index.to_string()),
+        "P{} did not name the row's number",
+        template.id
+    );
+}
+
+#[test]
+fn every_matrix_template_draws_a_row_of_its_own_class() {
+    let library = library();
+    let state = ProjectState::load(&manifest_root());
+    assert!(state.has_matrix());
+    for prompt in &library.prompts {
+        if !prompt.targets.is_matrix() {
+            continue;
+        }
+        for row in &state.methods {
+            assert_eq!(
+                expand::row_fits(row, prompt.targets),
+                match prompt.targets {
+                    Targets::Open => !row.implemented,
+                    Targets::Implemented => row.implemented,
+                    _ => true,
+                },
+                "P{} and row {} disagree about the class",
+                prompt.id,
+                row.key()
+            );
+        }
+        // And the template has a row to draw at all, from the live matrix.
+        let candidates = state.candidates(prompt.targets);
+        assert!(
+            !candidates.is_empty(),
+            "P{} draws a class the matrix has no row for",
+            prompt.id
         );
     }
 }

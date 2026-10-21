@@ -80,11 +80,11 @@ pub fn fill(prompt: &Prompt, row: &MethodRow, pins: &[Pin]) -> BTreeMap<String, 
 }
 
 /// The first candidate row the ledger has not served to this template, with its values; `None` is the advisor's cue to offer the next template.
-pub fn next_target(
+pub fn next_target<'a>(
     prompt: &Prompt,
-    state: &ProjectState,
+    state: &'a ProjectState,
     served: &[String],
-) -> Option<(String, BTreeMap<String, String>)> {
+) -> Option<(&'a MethodRow, BTreeMap<String, String>)> {
     if prompt.targets == Targets::None {
         return None;
     }
@@ -92,7 +92,107 @@ pub fn next_target(
         .candidates(prompt.targets)
         .into_iter()
         .find(|row| !served.contains(&row.key()))?;
-    Some((row.key(), fill(prompt, row, &state.pins)))
+    Some((row, fill(prompt, row, &state.pins)))
+}
+
+/// The rows a selector names: its key (`A13`), its index (`13`), or part of a method name.
+pub fn matching_rows<'a>(state: &'a ProjectState, selector: &str) -> Vec<&'a MethodRow> {
+    let text = selector.trim();
+    if text.is_empty() {
+        return Vec::new();
+    }
+    // A key first: `A13`.
+    if let Some((section, index)) = key_parts(text) {
+        let keyed: Vec<&MethodRow> = state
+            .methods
+            .iter()
+            .filter(|row| row.section.eq_ignore_ascii_case(&section) && row.index == index)
+            .collect();
+        if !keyed.is_empty() {
+            return keyed;
+        }
+    }
+    // Then the number on its own: `13`.
+    if let Ok(index) = text.parse::<u32>() {
+        let numbered: Vec<&MethodRow> = state
+            .methods
+            .iter()
+            .filter(|row| row.index == index)
+            .collect();
+        if !numbered.is_empty() {
+            return numbered;
+        }
+    }
+    // Then the method name, whole before part: `VLESS TCP none` is one row, not every row that starts with it.
+    let lower = text.to_ascii_lowercase();
+    let exact: Vec<&MethodRow> = state
+        .methods
+        .iter()
+        .filter(|row| row.method.to_ascii_lowercase() == lower)
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+    state
+        .methods
+        .iter()
+        .filter(|row| row.method.to_ascii_lowercase().contains(&lower))
+        .collect()
+}
+
+/// The one row a selector names, or why it names none or several.
+pub fn select_row<'a>(state: &'a ProjectState, selector: &str) -> Result<&'a MethodRow, String> {
+    let matches = matching_rows(state, selector);
+    match matches.as_slice() {
+        [only] => Ok(only),
+        [] => Err(format!(
+            "no matrix row matches `{}`; the matrix has {} rows — `ferrox-prompt rows` lists them",
+            selector.trim(),
+            state.methods.len()
+        )),
+        many => Err(format!(
+            "`{}` matches {} rows: {}; name one by its key, as in `--row {}`",
+            selector.trim(),
+            many.len(),
+            describe_rows(many),
+            many[0].key()
+        )),
+    }
+}
+
+/// Whether a template drawing `targets` may draw this row: an open row is not work for a shipped-row template.
+pub fn row_fits(row: &MethodRow, targets: Targets) -> bool {
+    match targets {
+        Targets::Open => !row.implemented,
+        Targets::Implemented => row.implemented,
+        Targets::All => true,
+        Targets::None => false,
+    }
+}
+
+/// `A13` — a table letter and a row number.
+fn key_parts(text: &str) -> Option<(char, u32)> {
+    let mut chars = text.chars();
+    let section = chars.next()?.to_ascii_uppercase();
+    if !section.is_ascii_alphabetic() {
+        return None;
+    }
+    Some((section, chars.as_str().parse().ok()?))
+}
+
+/// The candidates on one line, so an ambiguous selector is answerable without a second command.
+fn describe_rows(rows: &[&MethodRow]) -> String {
+    const LIMIT: usize = 6;
+    let named: Vec<String> = rows
+        .iter()
+        .take(LIMIT)
+        .map(|row| format!("{} {}", row.key(), row.method))
+        .collect();
+    if rows.len() <= LIMIT {
+        named.join(", ")
+    } else {
+        format!("{} (+{} more)", named.join(", "), rows.len() - LIMIT)
+    }
 }
 
 /// Whether `prompt` fills from this state untold: it draws from the matrix and still has an unserved target.
@@ -230,8 +330,9 @@ update the pins, nothing per-method here
     fn an_open_template_fills_the_first_open_row() {
         let library = library();
         let prompt = library.prompt(1).unwrap();
-        let (key, values) = next_target(prompt, &state(), &[]).expect("an open row exists");
-        assert_eq!(key, "A13");
+        let made = state();
+        let (row, values) = next_target(prompt, &made, &[]).expect("an open row exists");
+        assert_eq!(row.key(), "A13");
         assert_eq!(values["method"], "VLESS over QUIC");
         assert_eq!(values["section"], "A");
         assert_eq!(values["references"], "xray-core, sing-box, quiche");
@@ -272,18 +373,20 @@ update the pins, nothing per-method here
     fn a_served_target_advances_to_the_next_row_of_the_same_class() {
         let library = library();
         let prompt = library.prompt(1).unwrap();
-        let (key, _) = next_target(prompt, &state(), &["A13".to_owned()]).expect("still open rows");
-        assert_eq!(key, "C45");
+        let made = state();
+        let (row, _) = next_target(prompt, &made, &["A13".to_owned()]).expect("still open rows");
+        assert_eq!(row.key(), "C45");
         // And once both open rows are served there is nothing left for this class.
-        assert!(next_target(prompt, &state(), &["A13".to_owned(), "C45".to_owned()]).is_none());
+        assert!(next_target(prompt, &made, &["A13".to_owned(), "C45".to_owned()]).is_none());
     }
 
     #[test]
     fn a_target_class_only_draws_its_own_rows() {
         let library = library();
         let optimise = library.prompt(2).unwrap();
-        let (key, _) = next_target(optimise, &state(), &[]).expect("an implemented row exists");
-        assert_eq!(key, "A3");
+        let made = state();
+        let (row, _) = next_target(optimise, &made, &[]).expect("an implemented row exists");
+        assert_eq!(row.key(), "A3");
     }
 
     #[test]
@@ -311,5 +414,65 @@ update the pins, nothing per-method here
         let empty = ProjectState::default();
         let library = library();
         assert!(!is_fillable(library.prompt(1).unwrap(), &empty));
+    }
+
+    #[test]
+    fn a_row_is_picked_by_key_by_index_or_by_name() {
+        let state = state();
+        assert_eq!(select_row(&state, "A13").unwrap().key(), "A13");
+        // The letter is case-insensitive, and the index alone names the row too.
+        assert_eq!(select_row(&state, "a13").unwrap().key(), "A13");
+        assert_eq!(select_row(&state, "13").unwrap().key(), "A13");
+        assert_eq!(select_row(&state, "45").unwrap().key(), "C45");
+        // A name is matched on the method, whole or in part.
+        assert_eq!(select_row(&state, "vless over quic").unwrap().key(), "A13");
+        assert_eq!(select_row(&state, "wireguard").unwrap().key(), "C45");
+    }
+
+    #[test]
+    fn a_selector_that_names_nothing_says_how_many_rows_there_are() {
+        let error = select_row(&state(), "no-such-method").unwrap_err();
+        assert!(error.contains("no matrix row matches"), "{error}");
+        assert!(error.contains("3 rows"), "{error}");
+        assert!(error.contains("rows"), "{error}");
+    }
+
+    #[test]
+    fn a_whole_method_name_beats_a_row_that_starts_with_it() {
+        let mut made = state();
+        made.methods.push(MethodRow {
+            section: 'B',
+            index: 7,
+            method: "VLESS over QUIC, second spelling".to_owned(),
+            state: "planned".to_owned(),
+            implemented: false,
+            page: "docs/function/vless-over-quic.md".to_owned(),
+            real_page: false,
+            text: "| 7 | VLESS over QUIC, second spelling | planned |".to_owned(),
+        });
+        // The whole name is one row, even though the other row starts with it.
+        assert_eq!(select_row(&made, "VLESS over QUIC").unwrap().key(), "A13");
+        assert_eq!(select_row(&made, "vless over quic").unwrap().key(), "A13");
+        // A part of a name matches what it can, and says so when it matches more than one.
+        let error = select_row(&made, "over quic").unwrap_err();
+        assert!(error.contains("matches 2 rows"), "{error}");
+        assert!(error.contains("A13"), "{error}");
+        assert!(error.contains("B7"), "{error}");
+        // The key is the way out, so the message names one.
+        assert!(error.contains("--row A13"), "{error}");
+    }
+
+    #[test]
+    fn a_row_fits_only_the_class_that_wants_it() {
+        let state = state();
+        let open = select_row(&state, "A13").unwrap();
+        let shipped = select_row(&state, "A3").unwrap();
+        assert!(row_fits(open, Targets::Open));
+        assert!(!row_fits(open, Targets::Implemented));
+        assert!(row_fits(open, Targets::All));
+        assert!(row_fits(shipped, Targets::Implemented));
+        assert!(!row_fits(shipped, Targets::Open));
+        // A fixed slice draws no row at all.
+        assert!(!row_fits(open, Targets::None));
     }
 }
