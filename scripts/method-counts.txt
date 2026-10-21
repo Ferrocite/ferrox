@@ -86,6 +86,7 @@ vmess pump-buffer-allocations-per-batch 0 ferrox-app-vmess::tests::the_pump_gath
 vmess counters-per-frame 1 ferrox-app-vmess::tests::counters_advance_one_per_frame_at_any_offset
 vmess replay-keys-held-at-most 131072 ferrox-app-vmess::tests::the_window_holds_two_rotations_at_most
 vmess zero-filled-bytes-per-flow 0 ferrox-app-vmess::tests::the_flows_windows_are_not_zero_filled
+shadowsocks host-port-strings-per-datagram 0 ferrox-app-shadowsocks::tests::a_datagram_target_is_resolved_without_a_host_port_string
 
 # --- VLESS ------------------------------------------------------------------
 vless ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -242,6 +243,7 @@ carrier-xhttp head-tail-read-syscalls 0 ferrox-app-xhttp::tests::a_chunk_that_ro
 carrier-xhttp head-tail-allocations 0 ferrox-app-xhttp::tests::the_record_head_hands_over_the_buffer_it_filled
 carrier-xhttp received-data-frames-copied 0 ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into
 carrier-xhttp received-header-blocks-copied 0 ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into
+carrier-xhttp zero-filled-bytes-per-received-frame 0 ferrox-app-xhttp_h2::tests::a_received_frames_body_is_not_zero_filled
 
 carrier-veepn ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-veepn credential-window-allocations-per-pair 0 ferrox-core-veepn::tests::the_credential_lands_in_the_callers_window_and_not_in_one_of_its_own

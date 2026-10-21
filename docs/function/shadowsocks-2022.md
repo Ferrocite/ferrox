@@ -80,6 +80,7 @@ The row above is `UNBLESSED`: nobody has read a measured number for this symbol 
 
 ## What we removed
 
+- **A `host:port` string per datagram.** The datagram lane's target was re-serialised into a `host:port` string for the resolver, so every datagram that named a host paid a string the resolver then had to take apart again. The resolver is asked for a host and a port now, the way this tree already asks on the flow's own dial, and the `host:port` spelling is gone from the tree.
 Read against the pinned implementations, all of which are in `upstream/` for reading and never copied:
 
 - **A second chunk per 16 KiB read.** The AEAD rung caps at 16383, so a relay read is two chunks and four AEAD calls. The 2022 cap is 65535, so the same read is one chunk and two calls. The wire bytes are the same stream in the same order, only fewer length headers.

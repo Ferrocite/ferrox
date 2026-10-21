@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{IoSliceMut, Read, Write};
-use std::net::{Shutdown, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{Shutdown, SocketAddr, UdpSocket};
 use std::thread;
 use std::time::Duration;
 
@@ -996,9 +996,7 @@ fn parse_addr_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {
     let target = match body {
         crate::proxy::AddrBody::V4(ip) => SocketAddr::new(std::net::IpAddr::V4(ip.into()), port),
         crate::proxy::AddrBody::V6(ip) => SocketAddr::new(std::net::IpAddr::V6(ip.into()), port),
-        crate::proxy::AddrBody::Domain(host) => {
-            format!("{host}:{port}").to_socket_addrs().ok()?.next()?
-        }
+        crate::proxy::AddrBody::Domain(host) => crate::proxy::resolve_endpoint(host, port)?,
     };
     Some((target, used))
 }
@@ -1009,6 +1007,33 @@ mod tests {
     use std::io::IoSlice;
 
     /// Silence past the budget is death, not scheduling: a peer that opens the connection and never sends must not pin the raw Shadowsocks handshake thread forever.
+    use std::net::ToSocketAddrs as _;
+
+    /// A datagram's target is asked of the resolver as a host and a port, with no
+    /// `host:port` string in between: the counting allocator is the witness, and the name
+    /// is an address literal so the resolver is asked nothing of the network.
+    #[test]
+    fn a_datagram_target_is_resolved_without_a_host_port_string() {
+        let mut header = vec![3u8, 3];
+        header.extend_from_slice(b"::1");
+        header.extend_from_slice(&443u16.to_be_bytes());
+        let (_, baseline) = ferrox_core::alloc_count::measure(|| {
+            ("::1", 443u16)
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut addrs| addrs.next())
+        });
+        let baseline = baseline.allocs;
+        let ((target, used), counts) =
+            ferrox_core::alloc_count::measure(|| parse_addr_header(&header).expect("resolves"));
+        assert_eq!(used, header.len(), "the whole header was read");
+        assert_eq!(target, SocketAddr::new("::1".parse().expect("ip"), 443));
+        assert_eq!(
+            counts.allocs, baseline,
+            "the engine builds no string of its own for the resolver"
+        );
+    }
+
     #[test]
     fn a_silent_peer_cannot_pin_a_raw_shadowsocks_handshake() {
         let _guard = crate::budgets::lock();
