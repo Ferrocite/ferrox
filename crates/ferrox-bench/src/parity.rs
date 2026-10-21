@@ -1544,7 +1544,7 @@ fn exchange(plan: &FlowPlan, stream: &mut TcpStream) -> (u64, u64, Option<String
     }
 }
 
-/// A send of at most this many bytes reaches sosend's pru_send as one mbuf
+/// A send of at most this many bytes reaches sosend's `pru_send` as one mbuf
 /// chain, so an ENOBUFS there appended none of the slice and a retry is exact.
 #[cfg(target_vendor = "apple")]
 const SEND_LOWAT: usize = 64 * 1024;
@@ -2327,7 +2327,7 @@ mod tests {
                 libc::SOL_SOCKET,
                 libc::SO_SNDLOWAT,
                 (&raw mut value).cast::<libc::c_void>(),
-                &mut len,
+                &raw mut len,
             )
         };
         assert_eq!(rc, 0, "getsockopt: {}", std::io::Error::last_os_error());
