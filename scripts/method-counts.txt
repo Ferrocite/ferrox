@@ -509,6 +509,11 @@ socks servers-answering-another-method-refused 1 ferrox-app-socks::tests::a_cred
 socks device-flows-leaving-through-the-client-lane 1 ferrox-app-tun::tests::a_device_flow_leaves_through_the_socks_client_lane
 socks tcp-tunnels-through-the-front 1 ferrox-app-proxy::tests::a_socks_client_dials_the_front_and_carries_an_echo
 socks datagrams-through-the-front 1 ferrox-app-proxy::tests::a_socks_client_carries_a_datagram_through_the_front
+socks datagram-payload-copies-per-forwarded-datagram 0 ferrox-app-proxy::tests::a_forwarded_datagram_is_the_frame_the_client_framed
+socks datagram-frame-allocations-per-frame 0 ferrox-app-proxy::tests::a_forwarded_datagram_is_the_frame_the_client_framed
+socks datagram-rebuild-copies-per-reframed-datagram 1 ferrox-app-proxy::tests::a_datagram_naming_a_host_is_reframed_around_its_payload
+socks datagram-frames-the-client-framed 1 ferrox-app-proxy::tests::a_forwarded_datagram_is_the_frame_the_client_framed
+socks datagram-ipv6-literal-destinations-answered 1 ferrox-app-proxy::tests::a_destination_naming_an_ipv6_literal_is_the_address_it_named
 socks credentialed-tunnels-through-the-front 1 ferrox-app-proxy::tests::a_socks_client_offers_the_credential_the_front_asks_for
 socks credentials-the-front-refuses 1 ferrox-app-proxy::tests::a_front_refuses_a_credential_it_does_not_know
 socks config-lanes-named 1 ferrox-app-proxy::tests::a_socks_outbound_names_its_server_and_credential
@@ -524,6 +529,7 @@ socks socks4-xray-scenario-tests-passing 1 scripts/run-upstream-suite.sh
 # --- dokodemo-door transparent inbound -----------------------------------------
 front-dokodemo ops-retired-instructions UNBLESSED scripts/count-ops.sh
 front-dokodemo datagrams-carrying-to-the-target 1 ferrox-app-proxy::tests::a_dokodemo_door_carries_a_datagram_to_its_target
+front-dokodemo datagram-frame-allocations-per-frame 0 ferrox-app-proxy::tests::a_forwarded_datagram_is_the_frame_the_client_framed
 front-dokodemo associations-answering-with-the-relay 1 ferrox-app-proxy::tests::the_udp_association_carries_a_datagram_to_the_target
 front-dokodemo transparent-settings-refused 2 ferrox-app-proxy::tests::a_dokodemo_front_refuses_the_transparent_settings
 front-dokodemo xray-scenario-tests-passing 2 scripts/run-upstream-suite.sh
