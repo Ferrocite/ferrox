@@ -63,15 +63,40 @@ impl H2Frame {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum H2Event<'a> {
-    Data { payload: &'a [u8], end: bool },
-    Headers { block: &'a [u8], end: bool },
-    Reset { code: u32 },
-    Window { stream: u32, increment: u32 },
-    Settings { ack: bool, payload: &'a [u8] },
-    Ping { ack: bool, payload: &'a [u8] },
-    GoAway { code: u32 },
+    /// A DATA frame's payload, trimmed of its padding, and the frame's wire length: RFC
+    /// 7540 6.9 puts the whole payload into the flow-control window, the Pad Length octet
+    /// and the Padding included, so a credit is the wire length and not what the trim left.
+    Data {
+        payload: &'a [u8],
+        end: bool,
+        wire: usize,
+    },
+    Headers {
+        block: &'a [u8],
+        end: bool,
+    },
+    Reset {
+        code: u32,
+    },
+    Window {
+        stream: u32,
+        increment: u32,
+    },
+    Settings {
+        ack: bool,
+        payload: &'a [u8],
+    },
+    Ping {
+        ack: bool,
+        payload: &'a [u8],
+    },
+    GoAway {
+        code: u32,
+    },
     Push,
-    Other { kind: u8 },
+    Other {
+        kind: u8,
+    },
 }
 
 /// Reads a four-byte big-endian body, treating a short frame as zeroes.
@@ -115,6 +140,7 @@ pub fn h2_event(frame: H2Frame, payload: &[u8], ours: u32) -> H2Event<'_> {
             Some(body) => H2Event::Data {
                 payload: body,
                 end: frame.flags & END_STREAM != 0,
+                wire: payload.len(),
             },
             None => H2Event::Other { kind: frame.kind },
         },
@@ -424,7 +450,7 @@ mod tests {
     #[test]
     fn data_for_this_stream_is_data_and_data_for_another_is_not() {
         let (frame, raw) = frame_of(DATA, 0, 1, b"hello");
-        let H2Event::Data { payload, end } = h2_event(frame, &raw[H2_HEADER..], 1) else {
+        let H2Event::Data { payload, end, .. } = h2_event(frame, &raw[H2_HEADER..], 1) else {
             panic!("not data");
         };
         assert_eq!(payload, b"hello");
