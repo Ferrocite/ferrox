@@ -108,7 +108,7 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 <!-- scope:begin -->
 - paths: crates/ferrox-core/src/vless.rs
 - symbols: vless
-- scenarios: vless-raw
+- scenarios: vless-raw, vless-tls-raw
 - oracle: vless
 - go: ./proxy/vless/...
 <!-- scope:end -->

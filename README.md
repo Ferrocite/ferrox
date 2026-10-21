@@ -79,7 +79,7 @@ printf '%s %s %s %s\n' '<doc>' '<key>' '<value>' '<checker>' >> scripts/method-c
 | Foxy lane (h1/h2/h3 + CONNECT-UDP) | [carrier-foxy](docs/function/carrier-foxy.md) | 1 write per DATA frame | 0 staged | `UNBLESSED` | not measured |
 | VeePN lane (`Basic` CONNECT) | [carrier-veepn](docs/function/carrier-veepn.md) | 1 write per open | 0 staged: pair, request, region list | `UNBLESSED` | not measured (two local coder runs, no cell to reproduce them) |
 | Hysteria v2 | [carrier-hysteria](docs/function/carrier-hysteria.md) | 1 handshake per pooled outbound | 0 extra on datagram lane | `UNBLESSED` | not measured |
-| REALITY / TLS | [reality-tls](docs/function/reality-tls.md) | per handshake | per handshake | `UNBLESSED` | not measured |
+| REALITY / TLS | [reality-tls](docs/function/reality-tls.md) | per handshake | per handshake | `UNBLESSED` | `vless-tls-raw-*` arm (CI) |
 | KCP | [kcp](docs/function/kcp.md) | 1 sendto per segment | in place, pooled | `UNBLESSED` | not measured |
 | dokodemo-door inbound | [front-dokodemo](docs/function/front-dokodemo.md) | 1 send + 1 recv per datagram | 1 (the relay's own) | `UNBLESSED` | not measured |
 | SOCKS5 + SOCKS4, both roles | [socks](docs/function/socks.md) | 3 writes + 4 reads per dial | 1 (the relay's own) | `UNBLESSED` | not measured |
