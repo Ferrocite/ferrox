@@ -402,6 +402,7 @@ kcp mask-families-implemented 8 ferrox-core-kcp::listener::tests::every_mask_fam
 kcp mask-chain-wire-overhead-bytes 32 ferrox-core-kcp::listener::tests::the_wire_under_a_masked_session_carries_the_mask
 kcp mask-read-side-payload-copies-per-datagram 0 ferrox-core-kcp::mask::tests::the_original_frame_round_trips_and_the_checks_fire
 kcp mask-encode-buffer-allocations-per-frame 0 ferrox-core-kcp::mask::tests::the_scratch_holds_its_capacity_across_frames
+kcp datagram-room-zero-filled-bytes 0 ferrox-core-kcp::listener::tests::the_datagram_room_is_not_zeroed
 kcp oracle-mask-lines-against-the-pinned-go 86 ferrox-core-kcp::oracle::the_scripted_core_matches_the_pinned_go
 trojan header-reads-numeric-address 2 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven
 trojan header-reads-domain-address 3 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven
