@@ -6492,15 +6492,21 @@ fn start_renewal(account: std::sync::Arc<crate::foxy_account::Account>) {
     });
 }
 
-/// First bytes of each direction behind `FOXY_DEBUG`, so a tunnel that answers TLS with plaintext names itself.
-fn debug_bytes(direction: &str, buf: &[u8]) {
+/// First bytes of each direction behind `FOXY_DEBUG`, so a tunnel that answers TLS with plaintext names itself, and with the moment they landed so a slow answer names the half it waited on.
+fn debug_bytes(direction: &str, buf: &[u8], after: Option<Instant>) {
     if crate::foxy::debug_on() {
         let end = buf.len().min(32);
         eprintln!(
-            "foxy-debug: {direction} first {end} B: {:02x?}",
+            "foxy-debug: {direction} first {end} B in {}ms: {:02x?}",
+            trace_ms(after),
             &buf[..end]
         );
     }
+}
+
+/// How long a phase took, for a trace line: an untraced open hands this `None`, so a shipped lane makes no clock call for a number nobody reads.
+fn trace_ms(at: Option<Instant>) -> u128 {
+    at.map_or(0, |started| started.elapsed().as_millis())
 }
 
 /// Lane trace behind `FOXY_DEBUG`: edge, carrier and outcome per dial, so a stall names where it stopped. The outcome is a closure because the lane's own trace is off by default, and the text it carries was built per flow: an authority joined per dial and a message formatted per attempt, both for a line nobody reads.
@@ -6514,10 +6520,29 @@ fn debug_lane(
     }
 }
 
-/// Relay totals behind `FOXY_DEBUG`: which direction ended, after how many bytes, on what error kind.
-fn debug_relay(direction: &str, moved: u64, error: Option<std::io::ErrorKind>) {
+/// The stamps of one granted open behind `FOXY_DEBUG`: the lane's own dial and the CONNECT that rode it, in the milliseconds each took.
+fn debug_open(
+    edge: &ferrox_core::foxy::Candidate,
+    carrier: crate::foxy::Carrier,
+    target: &str,
+    lane: Option<Instant>,
+    open: Option<Instant>,
+) {
+    debug_lane(edge, carrier, || {
+        format!(
+            "opened for {target} lane={}ms open={}ms",
+            trace_ms(lane),
+            trace_ms(open)
+        )
+    });
+}
+
+/// Relay totals behind `FOXY_DEBUG`: which direction ended, after how many bytes, after how many turns the lane could not park through, and on what error kind.
+fn debug_relay(direction: &str, moved: u64, sleeps: u32, error: Option<std::io::ErrorKind>) {
     if crate::foxy::debug_on() {
-        eprintln!("foxy-debug: relay {direction} ended after {moved} B on {error:?}");
+        eprintln!(
+            "foxy-debug: relay {direction} ended after {moved} B with {sleeps} unparked sleeps on {error:?}"
+        );
     }
 }
 
@@ -6804,6 +6829,7 @@ fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
                 pass: pass.clone(),
             };
             // A named carrier gets the full budget; an `auto` walk is a probe and gets the probe's.
+            let lane_at = crate::foxy::debug_on().then(Instant::now);
             let quic = match carrier {
                 crate::foxy::Carrier::H3 => crate::quic::pooled_stream_within(
                     &foxy_quic_dial(foxy, &edge),
@@ -6815,9 +6841,10 @@ fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
                 ),
                 _ => None,
             };
+            let open_at = lane_at.map(|_| Instant::now());
             match crate::foxy::Tunnel::open(&dial, &target, quic) {
                 Ok(tunnel) => {
-                    debug_lane(&edge, carrier, || format!("opened for {target}"));
+                    debug_open(&edge, carrier, &target, lane_at, open_at);
                     foxy.unauthenticated
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                     clear_limited(&foxy.limited_strikes, &foxy.limited_until);
@@ -6825,7 +6852,9 @@ fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
                     return FoxyOpen::Tunnel(Box::new(tunnel), edge.clone());
                 }
                 Err(failure) => {
-                    debug_lane(&edge, carrier, || failure.to_string());
+                    debug_lane(&edge, carrier, || {
+                        format!("{} lane={}ms", failure, trace_ms(lane_at))
+                    });
                     // A refused pass is the pass, not the edge: all carriers answer it the same.
                     if let ferrox_core::foxy::Failure::Rejected(status) = failure {
                         if ferrox_core::foxy::pass_is_rejected(status) {
@@ -8474,13 +8503,15 @@ fn copy_locked(
 ) {
     const CHUNK: usize = 16 * 1024;
     let direction = if forward { "forward" } else { "backward" };
+    let started = crate::foxy::debug_on().then(Instant::now);
     let mut buf = [0u8; CHUNK];
     let mut total = 0u64;
+    let mut sleeps = 0u32;
     loop {
         let moved = if forward {
             match socket.read(&mut buf) {
                 Ok(0) => {
-                    debug_relay(direction, total, None);
+                    debug_relay(direction, total, sleeps, None);
                     break;
                 }
                 Err(error)
@@ -8493,19 +8524,19 @@ fn copy_locked(
                 {
                     // The quantum expired on a client that has not spoken: idle, unless the lane's own leg has already ended.
                     if peer_ended.load(std::sync::atomic::Ordering::Acquire) {
-                        debug_relay(direction, total, None);
+                        debug_relay(direction, total, sleeps, None);
                         break;
                     }
                     continue;
                 }
                 Err(error) => {
-                    debug_relay(direction, total, Some(error.kind()));
+                    debug_relay(direction, total, sleeps, Some(error.kind()));
                     break;
                 }
                 // A short write is credit, not completion: the rest retries once the window reopens.
                 Ok(read) => {
                     if total == 0 {
-                        debug_bytes(direction, &buf[..read]);
+                        debug_bytes(direction, &buf[..read], started);
                     }
                     write_full(tunnel, peer_ended, &buf[..read])
                 }
@@ -8519,7 +8550,7 @@ fn copy_locked(
                 census!("tunnel-leg-read", crate::census::NO_FD, None);
                 match lane.read(&mut buf) {
                     Ok(0) => {
-                        debug_relay(direction, total, None);
+                        debug_relay(direction, total, sleeps, None);
                         break;
                     }
                     Ok(read) => read,
@@ -8534,7 +8565,7 @@ fn copy_locked(
                     {
                         // The lane has not answered inside its quantum: idle, unless the client's own leg has ended and nothing is left to deliver.
                         if peer_ended.load(std::sync::atomic::Ordering::Acquire) {
-                            debug_relay(direction, total, None);
+                            debug_relay(direction, total, sleeps, None);
                             break;
                         }
                         // The wait belongs outside the lock, on the edge socket rather than on a clock: a leg parked on a quiet edge would otherwise cost the first uplink byte after a pause the whole of its wait, and a leg that sleeps instead of watching the socket pays that pause in the other direction too.
@@ -8544,18 +8575,19 @@ fn copy_locked(
                             let _ = edge.wait_readable(park);
                         } else {
                             drop(lane);
+                            sleeps += 1;
                             std::thread::sleep(RELAY_IDLE);
                         }
                         continue;
                     }
                     Err(error) => {
-                        debug_relay(direction, total, Some(error.kind()));
+                        debug_relay(direction, total, sleeps, Some(error.kind()));
                         break;
                     }
                 }
             };
             if total == 0 {
-                debug_bytes(direction, &buf[..taken]);
+                debug_bytes(direction, &buf[..taken], started);
             }
             let written = {
                 census!("tunnel-leg-write", crate::census::handle(socket), None);
@@ -8564,14 +8596,14 @@ fn copy_locked(
             match written {
                 Ok(()) => taken,
                 Err(error) => {
-                    debug_relay(direction, total, Some(error.kind()));
+                    debug_relay(direction, total, sleeps, Some(error.kind()));
                     break;
                 }
             }
         };
         total += moved as u64;
         if moved == 0 {
-            debug_relay(direction, total, None);
+            debug_relay(direction, total, sleeps, None);
             break;
         }
     }

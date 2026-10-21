@@ -846,25 +846,44 @@ fn drive_handshake_watching(
     silence: Duration,
 ) -> Option<()> {
     let start = Instant::now();
+    let trace = crate::foxy::debug_on().then_some(start);
     let deadline = start + budget;
+    let mut turns = 0u32;
     while !conn.is_established() {
+        turns += 1;
         let now = Instant::now();
         if conn.is_closed() || now >= deadline {
+            debug_handshake(trace, "died", turns, conn);
             return None;
         }
         let quiet = now.saturating_duration_since(start);
         // A path that drops QUIC answers no packet at all, so silence past the floor is the path rather than a slow handshake.
         if quiet >= silence && conn.stats().recv == 0 {
+            debug_handshake(trace, "silent", turns, conn);
             return None;
         }
         flush_egress(conn, sock);
         let left = deadline.saturating_duration_since(Instant::now());
         // Cut the wait to the silence floor, so a dead path is abandoned on time rather than at the next backoff.
         if !pump_once(conn, sock, local, left.min(silence.saturating_sub(quiet))) {
+            debug_handshake(trace, "socket", turns, conn);
             return None;
         }
     }
+    debug_handshake(trace, "ok", turns, conn);
     Some(())
+}
+
+/// One handshake's shape behind `FOXY_DEBUG`: the seconds it took, the turns it waited in and the packets each way — the three numbers that tell a slow edge from a slow pump.
+fn debug_handshake(trace: Option<Instant>, how: &str, turns: u32, conn: &quiche::Connection) {
+    let Some(started) = trace else { return };
+    let stats = conn.stats();
+    eprintln!(
+        "foxy-debug: quic hand {how} {}ms turns={turns} recv={} sent={}",
+        started.elapsed().as_millis(),
+        stats.recv,
+        stats.sent,
+    );
 }
 
 pub(crate) fn stream_send_all(
