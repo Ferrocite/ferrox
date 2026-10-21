@@ -1935,7 +1935,8 @@ pub(crate) fn handshake_within(
     let mut scid = [0u8; SCID_LEN];
     getrandom::getrandom(&mut scid).ok()?;
     let cid = quiche::ConnectionId::from_ref(&scid);
-    let mut config = quiche_config(roots, None)?;
+    // BBR rather than quiche's CUBIC default: the carrier's bulk row is what this default is measured by.
+    let mut config = quiche_config(roots, Some("bbr"))?;
     let mut conn = quiche::connect(Some(server_name), &cid, local, peer, &mut config).ok()?;
     drive_handshake_by(&mut conn, sock, local, budget)?;
     Some(conn)
