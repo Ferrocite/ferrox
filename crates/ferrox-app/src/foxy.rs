@@ -114,8 +114,8 @@ pub(crate) fn carrier(name: &str) -> Carrier {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FoxyDial {
-    /// The edge name: the TLS server name, the ALPN subject, and the country the hostname pins.
-    pub(crate) host: String,
+    /// The edge name: the TLS server name, the ALPN subject, and the country the hostname pins. Shared rather than copied, because a flow dials the same edge through several carriers and every one of them read this name.
+    pub(crate) host: std::sync::Arc<str>,
     pub(crate) port: u16,
     /// The address to connect to, when it is not the name's own resolution.
     pub(crate) address: Option<SocketAddr>,
@@ -131,7 +131,7 @@ pub(crate) struct FoxyDial {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct UpstreamProxy {
     http: bool,
-    host: String,
+    host: std::sync::Arc<str>,
     port: u16,
 }
 
@@ -161,7 +161,7 @@ pub(crate) fn upstream_proxy(text: &str) -> Option<UpstreamProxy> {
         .unwrap_or(host);
     Some(UpstreamProxy {
         http,
-        host: host.to_owned(),
+        host: std::sync::Arc::from(host),
         port,
     })
 }
@@ -305,10 +305,24 @@ fn finish_tls(
         .map(|()| tls)
 }
 
+/// The `ALPN` list each carrier offers, built once: the list is a function of the carrier alone, and a dial that built its own paid a vector and an arc for a list of one.
+fn carrier_alpn(carrier: Carrier) -> std::sync::Arc<[Vec<u8>]> {
+    static LISTS: std::sync::OnceLock<[std::sync::Arc<[Vec<u8>]>; 4]> = std::sync::OnceLock::new();
+    let lists = LISTS.get_or_init(|| {
+        [
+            std::sync::Arc::from([Carrier::H1.alpn().to_vec()]),
+            std::sync::Arc::from([Carrier::H2.alpn().to_vec()]),
+            std::sync::Arc::from([Carrier::H3.alpn().to_vec()]),
+            std::sync::Arc::from([Carrier::Auto.alpn().to_vec()]),
+        ]
+    });
+    std::sync::Arc::clone(&lists[carrier.key() as usize])
+}
+
 fn tls_config(dial: &FoxyDial) -> ferrox_core::tls::TlsConfig {
     ferrox_core::tls::TlsConfig {
-        server_name: dial.host.clone(),
-        alpn: vec![dial.carrier.alpn().to_vec()],
+        server_name: dial.host.to_string(),
+        alpn: carrier_alpn(dial.carrier),
         roots: Arc::clone(&dial.roots),
         pins: dial.pins.clone(),
         cipher_suites: Vec::new(),
@@ -641,7 +655,7 @@ pub(crate) fn open_h2(dial: &FoxyDial, target: &str) -> Result<Tls2, Failure> {
 
 /// The identity one pooled session is lent under: a CONNECT stream names any target, so only the edge, the hop, the anchors, the pins and the account have to match.
 struct SessionKey {
-    host: String,
+    host: std::sync::Arc<str>,
     port: u16,
     address: Option<SocketAddr>,
     upstream: Option<UpstreamProxy>,
@@ -3208,7 +3222,7 @@ mod tests {
 
     fn dial(host: &str, carrier: Carrier) -> FoxyDial {
         FoxyDial {
-            host: host.to_owned(),
+            host: std::sync::Arc::from(host),
             port: 443,
             address: Some(SocketAddr::from(([127, 0, 0, 1], 1))),
             carrier,
@@ -3233,8 +3247,8 @@ mod tests {
             (Carrier::H3, &b"h3"[..]),
         ] {
             assert_eq!(
-                tls_config(&dial("edge.example", carrier)).alpn,
-                vec![want.to_vec()]
+                &*tls_config(&dial("edge.example", carrier)).alpn,
+                &[want.to_vec()]
             );
         }
     }
@@ -3253,6 +3267,34 @@ mod tests {
             ferrox_core::tls::Anchors::from(vec![vec![1, 2, 3]])
         );
         assert_eq!(config.pins.len(), 1);
+    }
+
+    /// The `ALPN` list a carrier offers is built once and shared: a dial that built its own paid a vector and an arc for a list of one, and the list is a function of the carrier alone.
+    #[test]
+    fn a_carriers_alpn_list_is_shared_rather_than_built_per_dial() {
+        let first = carrier_alpn(Carrier::H2);
+        let second = carrier_alpn(Carrier::H2);
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "two dials hold the same list, not two lists"
+        );
+        assert_eq!(
+            &*first,
+            &[b"h2".to_vec()],
+            "and the list is the carrier's own protocol"
+        );
+        // The list is warmed before the window opens, so what the window prices is a dial's own lookup and not the one build the process does.
+        std::hint::black_box(carrier_alpn(Carrier::H2));
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                std::hint::black_box(carrier_alpn(Carrier::H2));
+            }
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "4096 dials ask for the carrier's list and none of them builds one"
+        );
     }
 
     /// The order the lane trusts to find a tunnel, and the order a datagram trusts: `auto` walks all three, UDP walks the two that can carry a capsule at all.
@@ -3348,16 +3390,16 @@ mod tests {
     fn an_upstream_proxy_names_its_scheme_host_and_port() {
         let http = upstream_proxy("http://proxy.local:8080").expect("parses");
         assert!(http.http);
-        assert_eq!((http.host, http.port), ("proxy.local".to_owned(), 8080));
+        assert_eq!((&*http.host, http.port), ("proxy.local", 8080));
         let socks = upstream_proxy("socks5://proxy.local:1080").expect("parses");
         assert!(!socks.http);
-        assert_eq!((socks.host, socks.port), ("proxy.local".to_owned(), 1080));
+        assert_eq!((&*socks.host, socks.port), ("proxy.local", 1080));
         let h = upstream_proxy("socks5h://proxy.local:1080").expect("parses");
         assert!(!h.http);
         let v6 = upstream_proxy("socks5://[2001:db8::1]:1080").expect("parses");
         assert_eq!(
             (v6.host, v6.port),
-            ("2001:db8::1".to_owned(), 1080),
+            (std::sync::Arc::from("2001:db8::1"), 1080),
             "a v6 hop is read as the address it spells, brackets and all"
         );
         for bad in [
@@ -3425,7 +3467,7 @@ pub(crate) mod loopback {
         pins: foxy::pin::Pins,
     ) -> FoxyDial {
         FoxyDial {
-            host: "localhost".to_owned(),
+            host: std::sync::Arc::from("localhost"),
             port,
             address: Some(SocketAddr::from(([127, 0, 0, 1], port))),
             carrier,
@@ -3500,7 +3542,7 @@ pub(crate) mod loopback {
 
         let dial = FoxyDial {
             // The port the name resolves to for both families, so the two listeners are the two addresses of one name.
-            host: "localhost".to_owned(),
+            host: std::sync::Arc::from("localhost"),
             port: mute_port.min(port) + mute_port.max(port).saturating_sub(mute_port),
             address: None,
             carrier: Carrier::H2,
@@ -3526,7 +3568,7 @@ pub(crate) mod loopback {
     fn an_address_the_config_names_is_the_dial_it_named() {
         let (roots, _server) = minted(b"h2");
         let dial = FoxyDial {
-            host: "localhost".to_owned(),
+            host: std::sync::Arc::from("localhost"),
             port: 443,
             address: Some(SocketAddr::from(([127, 0, 0, 1], 1))),
             carrier: Carrier::H2,
@@ -3691,7 +3733,7 @@ pub(crate) mod loopback {
 
     fn upstream_dial(proxy: UpstreamProxy, edge: Option<SocketAddr>) -> FoxyDial {
         FoxyDial {
-            host: "edge.test".to_owned(),
+            host: std::sync::Arc::from("edge.test"),
             port: 2499,
             address: edge,
             carrier: Carrier::H1,
@@ -6740,8 +6782,8 @@ pub(crate) mod loopback {
         let edge = quic_ip_edge(sock, server, seen_tx, udp_tx, 1);
         let dial = crate::quic::QuicDial {
             id: [0u8; 16],
-            host: "localhost".to_owned(),
-            address: "127.0.0.1".to_owned(),
+            host: std::sync::Arc::from("localhost"),
+            address: std::sync::Arc::from("127.0.0.1"),
             port,
             upstream: None,
             roots: Some(roots.clone().into()),
@@ -6808,8 +6850,8 @@ pub(crate) mod loopback {
         let edge = quic_ip_edge(sock, server, seen_tx, udp_tx, 1);
         let dial = crate::quic::QuicDial {
             id: [0u8; 16],
-            host: "localhost".to_owned(),
-            address: "127.0.0.1".to_owned(),
+            host: std::sync::Arc::from("localhost"),
+            address: std::sync::Arc::from("127.0.0.1"),
             port,
             upstream: None,
             roots: Some(roots.clone().into()),
@@ -7095,7 +7137,7 @@ pub(crate) mod loopback {
         let (roots, _) = minted(b"http/1.1");
         // The minted leaf covers `localhost`; this dial names another host to the same address.
         let dial = FoxyDial {
-            host: "edge.test".to_owned(),
+            host: std::sync::Arc::from("edge.test"),
             ..dial_for(roots, port, Carrier::H1, right)
         };
         let failure = Tunnel::open(&dial, "example.com:443", None)

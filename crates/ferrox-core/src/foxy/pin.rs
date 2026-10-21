@@ -80,9 +80,10 @@ pub fn spki_pin(leaf_der: &[u8]) -> Option<String> {
     Some(format!("sha256/{}", b64::encode(&digest(leaf_der)?)))
 }
 
+/// The leaf keys a lane accepts, behind one allocation: a config names them and never changes them, and a dial copies this set per flow, so a copy that shared the bytes costs a reference count rather than a buffer.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Pins {
-    entries: Vec<[u8; 32]>,
+    entries: std::sync::Arc<[[u8; 32]]>,
 }
 
 impl Pins {
@@ -99,7 +100,9 @@ impl Pins {
                 }
             }
         }
-        Self { entries }
+        Self {
+            entries: std::sync::Arc::from(entries),
+        }
     }
 
     #[must_use]

@@ -233,7 +233,7 @@ fn transport_tls(stream: &Json, security: &str) -> Option<Arc<TlsConfig>> {
                 .and_then(Json::as_str)
                 .unwrap_or("")
                 .to_owned(),
-            alpn: Vec::new(),
+            alpn: Vec::new().into(),
             roots: tls
                 .get("caCertFile")
                 .and_then(Json::as_str)

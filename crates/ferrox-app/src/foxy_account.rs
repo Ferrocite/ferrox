@@ -320,7 +320,7 @@ impl Endpoint {
     fn tls(&self) -> TlsConfig {
         TlsConfig {
             server_name: self.host.clone(),
-            alpn: Vec::new(),
+            alpn: Vec::new().into(),
             roots: std::sync::Arc::clone(&self.roots),
             pins: ferrox_core::foxy::pin::Pins::default(),
             cipher_suites: Vec::new(),
