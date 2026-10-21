@@ -976,10 +976,9 @@ impl FoxyOut {
         edge: &ferrox_core::foxy::Candidate,
         carrier: crate::foxy::Carrier,
     ) -> bool {
-        let key = carrier_key(edge, carrier);
         self.carrier_dead
             .lock()
-            .is_ok_and(|cache| cache.blocked(&key, now_secs()))
+            .is_ok_and(|cache| cache.blocked(carrier.key(), &edge.host, edge.port, now_secs()))
     }
 
     /// Only silence is cached: a status means the edge answered, so it never marks a carrier dead.
@@ -997,17 +996,20 @@ impl FoxyOut {
         ) {
             return;
         }
-        let key = carrier_key(edge, carrier);
         if let Ok(mut cache) = self.carrier_dead.lock() {
-            cache.remember(&key, now_secs() + CARRIER_DEAD_SECS);
+            cache.remember(
+                carrier.key(),
+                &edge.host,
+                edge.port,
+                now_secs() + CARRIER_DEAD_SECS,
+            );
         }
     }
 
     /// The edge answered this carrier: the remembered silence was wrong, so it is found again at once.
     fn carrier_answered(&self, edge: &ferrox_core::foxy::Candidate, carrier: crate::foxy::Carrier) {
-        let key = carrier_key(edge, carrier);
         if let Ok(mut cache) = self.carrier_dead.lock() {
-            cache.clear(&key);
+            cache.clear(carrier.key(), &edge.host, edge.port);
         }
     }
 
@@ -1050,11 +1052,6 @@ impl FoxyOut {
             cache.note_end(&edge.authority(), lasted, now_secs());
         }
     }
-}
-
-/// The key a carrier's silence is remembered under: carrier, edge, and the port it was reached on.
-fn carrier_key(edge: &ferrox_core::foxy::Candidate, carrier: crate::foxy::Carrier) -> String {
-    format!("{carrier:?} {}:{}", edge.host, edge.port)
 }
 
 #[derive(Debug, Clone)]
@@ -2830,6 +2827,19 @@ pub(crate) fn resize_scratch(buf: &mut Vec<u8>, len: usize) {
     if buf.capacity() < len {
         buf.reserve(len);
     }
+    unsafe { buf.set_len(len) }
+}
+
+/// Grows a buffer to `len` without a zero pass and without losing what it already holds: the bytes past the old length are claimed, not written, and the caller fills them. A buffer that grew by `resize(len, 0)` paid a memset of the whole new region for bytes the caller was about to overwrite.
+#[allow(
+    clippy::uninit_vec,
+    reason = "the room is handed straight to a read, and every path that does not fill it truncates"
+)]
+pub(crate) fn grow_scratch(buf: &mut Vec<u8>, len: usize) {
+    if buf.capacity() < len {
+        buf.reserve_exact(len - buf.len());
+    }
+    // SAFETY: the region past the old length is claimed rather than written, and the caller truncates back to what it filled.
     unsafe { buf.set_len(len) }
 }
 
@@ -6404,7 +6414,7 @@ fn start_renewal(account: std::sync::Arc<crate::foxy_account::Account>) {
 
 /// First bytes of each direction behind `FOXY_DEBUG`, so a tunnel that answers TLS with plaintext names itself.
 fn debug_bytes(direction: &str, buf: &[u8]) {
-    if std::env::var("FOXY_DEBUG").is_ok() {
+    if crate::foxy::debug_on() {
         let end = buf.len().min(32);
         eprintln!(
             "foxy-debug: {direction} first {end} B: {:02x?}",
@@ -6413,16 +6423,20 @@ fn debug_bytes(direction: &str, buf: &[u8]) {
     }
 }
 
-/// Lane trace behind `FOXY_DEBUG`: edge, carrier and outcome per dial, so a stall names where it stopped.
-fn debug_lane(edge: &ferrox_core::foxy::Candidate, carrier: crate::foxy::Carrier, what: &str) {
-    if std::env::var("FOXY_DEBUG").is_ok() {
-        eprintln!("foxy-debug: {} {:?} {what}", edge.authority(), carrier);
+/// Lane trace behind `FOXY_DEBUG`: edge, carrier and outcome per dial, so a stall names where it stopped. The outcome is a closure because the lane's own trace is off by default, and the text it carries was built per flow: an authority joined per dial and a message formatted per attempt, both for a line nobody reads.
+fn debug_lane(
+    edge: &ferrox_core::foxy::Candidate,
+    carrier: crate::foxy::Carrier,
+    what: impl FnOnce() -> String,
+) {
+    if crate::foxy::debug_on() {
+        eprintln!("foxy-debug: {} {:?} {}", edge.authority(), carrier, what());
     }
 }
 
 /// Relay totals behind `FOXY_DEBUG`: which direction ended, after how many bytes, on what error kind.
 fn debug_relay(direction: &str, moved: u64, error: Option<std::io::ErrorKind>) {
-    if std::env::var("FOXY_DEBUG").is_ok() {
+    if crate::foxy::debug_on() {
         eprintln!("foxy-debug: relay {direction} ended after {moved} B on {error:?}");
     }
 }
@@ -6606,11 +6620,9 @@ fn verify_exit(foxy: &FoxyOut) {
         let agreed = probe_edge_exit(foxy, edge, &authority).map(|seen| {
             let agrees = exit_agrees(&foxy.country, &seen);
             if !agrees {
-                debug_lane(
-                    edge,
-                    crate::foxy::Carrier::H3,
-                    &format!("exit {seen} differs from pin {pin}"),
-                );
+                debug_lane(edge, crate::foxy::Carrier::H3, || {
+                    format!("exit {seen} differs from pin {pin}")
+                });
             }
             agrees
         });
@@ -6725,7 +6737,7 @@ fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
             };
             match crate::foxy::Tunnel::open(&dial, &target, quic) {
                 Ok(tunnel) => {
-                    debug_lane(&edge, carrier, &format!("opened for {target}"));
+                    debug_lane(&edge, carrier, || format!("opened for {target}"));
                     foxy.unauthenticated
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                     clear_limited(&foxy.limited_strikes, &foxy.limited_until);
@@ -6733,7 +6745,7 @@ fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
                     return FoxyOpen::Tunnel(Box::new(tunnel), edge.clone());
                 }
                 Err(failure) => {
-                    debug_lane(&edge, carrier, &failure.to_string());
+                    debug_lane(&edge, carrier, || failure.to_string());
                     // A refused pass is the pass, not the edge: all carriers answer it the same.
                     if let ferrox_core::foxy::Failure::Rejected(status) = failure {
                         if ferrox_core::foxy::pass_is_rejected(status) {
@@ -7452,6 +7464,7 @@ fn serve_socks_udp_foxy_ip(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connec
     let mut width = 0usize;
     let mut buf = udp_buffer();
     let mut reply = Vec::with_capacity(UDP_BUF);
+    let mut packet = Vec::with_capacity(UDP_BUF);
     let mut client = None;
     // One port per destination so a reply lands where it was sent from: the address is shared, the port is not.
     let mut ports: HashMap<SocketAddr, u16> = HashMap::new();
@@ -7528,7 +7541,7 @@ fn serve_socks_udp_foxy_ip(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connec
         }
         // One pass reads the tunnel until it goes quiet, so a reply burst leaves on the tick it arrived on.
         if let Some(lane) = tunnel.as_mut() {
-            match drain_foxy_ip_tunnel(lane, relay, client, &mut reply) {
+            match drain_foxy_ip_tunnel(lane, relay, client, &mut reply, &mut packet) {
                 Some(0) => {}
                 Some(_) => quiet = Instant::now(),
                 None => {
@@ -7547,13 +7560,14 @@ fn drain_foxy_ip_tunnel(
     relay: &UdpSocket,
     client: Option<SocketAddr>,
     reply: &mut Vec<u8>,
+    packet: &mut Vec<u8>,
 ) -> Option<usize> {
     let mut packets = 0usize;
     for _ in 0..UDP_BURST {
-        match lane.read() {
-            Ok(Some(packet)) => {
+        match lane.read(packet) {
+            Ok(true) => {
                 packets += 1;
-                let Some(read) = ferrox_core::foxy::connectip::udp_from_packet(&packet) else {
+                let Some(read) = ferrox_core::foxy::connectip::udp_from_packet(packet) else {
                     continue;
                 };
                 if !read.verified {
@@ -7569,7 +7583,7 @@ fn drain_foxy_ip_tunnel(
                 }
             }
             Err(error) if is_timeout(&error) => break,
-            Ok(None) | Err(_) => return None,
+            Ok(false) | Err(_) => return None,
         }
     }
     Some(packets)
@@ -7643,15 +7657,13 @@ fn open_foxy_ip_tunnel(
             };
             match crate::foxy::Ip::open(&dial, quic) {
                 Ok((mut lane, assigned)) => {
-                    debug_lane(&edge, carrier, "connect-ip opened");
+                    debug_lane(&edge, carrier, || "connect-ip opened".to_owned());
                     clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                     foxy.carrier_answered(&edge, carrier);
                     let Some(granted) = assigned else {
-                        debug_lane(
-                            &edge,
-                            carrier,
-                            "the edge granted no address, so the tunnel carries nothing",
-                        );
+                        debug_lane(&edge, carrier, || {
+                            "the edge granted no address, so the tunnel carries nothing".to_owned()
+                        });
                         continue;
                     };
                     *width = granted.width();
@@ -7662,7 +7674,7 @@ fn open_foxy_ip_tunnel(
                     return true;
                 }
                 Err(failure) => {
-                    debug_lane(&edge, carrier, &failure.to_string());
+                    debug_lane(&edge, carrier, || failure.to_string());
                     let silent = matches!(
                         failure,
                         ferrox_core::foxy::Failure::Io
@@ -7743,7 +7755,7 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
                     match crate::foxy::H3::open_udp(&dial, &host, dest.port(), lease) {
                         Ok(mut lane) => {
                             lane.set_read_quantum(UDP_POLL);
-                            debug_lane(&edge, carrier, &format!("udp opened for {dest}"));
+                            debug_lane(&edge, carrier, || format!("udp opened for {dest}"));
                             clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                             foxy.carrier_answered(&edge, carrier);
                             return Some(crate::foxy::Datagram::H3(Box::new(lane)));
@@ -7754,7 +7766,7 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
                 _ => match crate::foxy::open_udp(&dial, &host, dest.port()) {
                     Ok(lane) => {
                         let _ = lane.set_read_quantum(UDP_POLL);
-                        debug_lane(&edge, carrier, &format!("udp opened for {dest}"));
+                        debug_lane(&edge, carrier, || format!("udp opened for {dest}"));
                         clear_limited(&foxy.limited_strikes, &foxy.limited_until);
                         foxy.carrier_answered(&edge, carrier);
                         return Some(crate::foxy::Datagram::H2(Box::new(lane)));
@@ -7762,7 +7774,7 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
                     Err(failure) => failure,
                 },
             };
-            debug_lane(&edge, carrier, &failure.to_string());
+            debug_lane(&edge, carrier, || failure.to_string());
             if matches!(failure, ferrox_core::foxy::Failure::Rejected(429)) {
                 note_limited(&foxy.limited_strikes, &foxy.limited_until, now_secs());
                 break;
@@ -9885,6 +9897,33 @@ pub(crate) fn sockaddr_of(addr: SocketAddr) -> (libc::sockaddr_storage, libc::so
     }
 }
 
+/// The address a `sockaddr` the kernel wrote carries, read out of it in place: a batched receive names the peer in the storage the kernel filled, and the address is read rather than joined, so a batch of datagrams costs no name per datagram.
+#[cfg(target_os = "linux")]
+pub(crate) fn socket_addr_of(
+    storage: &libc::sockaddr_storage,
+    len: libc::socklen_t,
+) -> Option<SocketAddr> {
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET if len as usize >= std::mem::size_of::<libc::sockaddr_in>() => {
+            // SAFETY: the family says the storage holds a `sockaddr_in`, and the length says it is whole.
+            let sin = unsafe { &*(&raw const *storage).cast::<libc::sockaddr_in>() };
+            Some(SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes())),
+                u16::from_be(sin.sin_port),
+            ))
+        }
+        libc::AF_INET6 if len as usize >= std::mem::size_of::<libc::sockaddr_in6>() => {
+            // SAFETY: the family says the storage holds a `sockaddr_in6`, and the length says it is whole.
+            let sin6 = unsafe { &*(&raw const *storage).cast::<libc::sockaddr_in6>() };
+            Some(SocketAddr::new(
+                std::net::IpAddr::V6(std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr)),
+                u16::from_be(sin6.sin6_port),
+            ))
+        }
+        _ => None,
+    }
+}
+
 /// Segments one vectored write carries: a gathered batch of h2 frames is sixty-four of them, and the
 /// list stays on the stack at that width on every platform in scope.
 const VECTOR_PARTS: usize = 64;
@@ -11251,7 +11290,7 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             continue;
         }
         let pasted = ferrox_core::foxy::Pass {
-            token: configured.clone(),
+            token: std::sync::Arc::from(configured.clone()),
             expires_at: ferrox_core::foxy::account::jwt_expiry(&configured),
             quota_remaining: None,
             quota_reset: None,
@@ -17119,7 +17158,7 @@ mod tests {
             roots: Vec::new().into(),
             pins: ferrox_core::foxy::pin::Pins::default(),
             pass: ferrox_core::foxy::Pass {
-                token: "the-pass".to_owned(),
+                token: std::sync::Arc::from("the-pass"),
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
@@ -23878,7 +23917,7 @@ mod tests {
             roots: vec![CARRIER_CERT.to_vec()].into(),
             pins: ferrox_core::foxy::pin::Pins::default(),
             pass: ferrox_core::foxy::Pass {
-                token: "the-pass".to_owned(),
+                token: std::sync::Arc::from("the-pass"),
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
@@ -23919,7 +23958,9 @@ mod tests {
         let edge = &foxy.candidates[0];
         if let Ok(mut cache) = foxy.carrier_dead.lock() {
             cache.remember(
-                &carrier_key(edge, edge_carrier),
+                edge_carrier.key(),
+                &edge.host,
+                edge.port,
                 now_secs().saturating_sub(1),
             );
         }
@@ -23976,7 +24017,7 @@ mod tests {
             roots: Vec::new().into(),
             pins: ferrox_core::foxy::pin::Pins::default(),
             pass: ferrox_core::foxy::Pass {
-                token: "the-pass".to_owned(),
+                token: std::sync::Arc::from("the-pass"),
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
@@ -23995,7 +24036,9 @@ mod tests {
         for carrier in crate::foxy::Carrier::udp_order() {
             if let Ok(mut cache) = foxy.carrier_dead.lock() {
                 cache.remember(
-                    &carrier_key(&foxy.candidates[0], carrier),
+                    carrier.key(),
+                    &foxy.candidates[0].host,
+                    foxy.candidates[0].port,
                     now_secs() + CARRIER_DEAD_SECS,
                 );
             }
@@ -24014,7 +24057,11 @@ mod tests {
         );
         // The window, not the verdict: a carrier left alone for its quarantine is asked again when it ends.
         if let Ok(mut cache) = foxy.carrier_dead.lock() {
-            cache.clear(&carrier_key(&foxy.candidates[0], edge_carrier));
+            cache.clear(
+                edge_carrier.key(),
+                &foxy.candidates[0].host,
+                foxy.candidates[0].port,
+            );
         }
         assert!(
             !open_foxy_ip_tunnel(&foxy, &mut tunnel, &mut source, &mut width),

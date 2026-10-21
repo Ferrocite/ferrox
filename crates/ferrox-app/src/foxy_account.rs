@@ -555,7 +555,7 @@ pub(crate) fn pass(
         .filter(|at| *at > 0)
         .or_else(|| account::jwt_expiry(&token));
     Ok(Pass {
-        token,
+        token: std::sync::Arc::from(token),
         expires_at,
         quota_remaining: reply.header_number("X-Quota-Remaining"),
         quota_reset: reply.header_number("X-Quota-Reset"),
@@ -1010,7 +1010,7 @@ impl Account {
     pub(crate) fn current(&self) -> Pass {
         self.pass.lock().map_or_else(
             |_| Pass {
-                token: String::new(),
+                token: std::sync::Arc::from(""),
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,
@@ -1062,7 +1062,7 @@ mod renewal {
     #[test]
     fn the_clock_a_pass_asks_for_is_the_one_the_core_wrote() {
         let account = account_with(Pass {
-            token: "t".to_owned(),
+            token: std::sync::Arc::from("t"),
             expires_at: Some(epoch() + 600),
             quota_remaining: None,
             quota_reset: None,
@@ -1076,7 +1076,7 @@ mod renewal {
     #[test]
     fn only_a_signed_in_account_can_renew() {
         let account = account_with(Pass {
-            token: "t".to_owned(),
+            token: std::sync::Arc::from("t"),
             expires_at: None,
             quota_remaining: None,
             quota_reset: None,
@@ -1097,14 +1097,14 @@ mod renewal {
     #[test]
     fn an_unknown_expiry_asks_for_the_four_minute_fallback() {
         let account = account_with(Pass {
-            token: "t".to_owned(),
+            token: std::sync::Arc::from("t"),
             expires_at: None,
             quota_remaining: None,
             quota_reset: None,
             quota_limit: None,
         });
         assert_eq!(account.renews_in(), std::time::Duration::from_secs(240));
-        assert_eq!(account.current().token, "t");
+        assert_eq!(account.current().token.as_ref(), "t");
     }
 }
 
@@ -1348,7 +1348,7 @@ mod loopback {
                 expires_at: 0,
             })),
             pass: std::sync::Arc::new(std::sync::Mutex::new(Pass {
-                token: String::new(),
+                token: std::sync::Arc::from(""),
                 expires_at: None,
                 quota_remaining: None,
                 quota_reset: None,

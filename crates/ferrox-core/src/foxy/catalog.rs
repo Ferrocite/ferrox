@@ -38,7 +38,9 @@ pub fn tier(
                 break;
             }
             if in_city(edge) != want_city
-                || out.iter().any(|kept| kept.authority() == edge.authority())
+                || out
+                    .iter()
+                    .any(|kept| kept.host == edge.host && kept.port == edge.port)
             {
                 continue;
             }
