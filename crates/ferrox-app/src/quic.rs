@@ -886,6 +886,29 @@ fn debug_handshake(trace: Option<Instant>, how: &str, turns: u32, conn: &quiche:
     );
 }
 
+/// A cold lane's phases behind `FOXY_DEBUG`: the name lookup, the socket, the handshake and the opening settings the first flow pays and its successors ride past. An untraced build hands these `None`, so a lane that is not being read makes no clock call.
+fn debug_pool(
+    dial: &QuicDial,
+    built: Option<Instant>,
+    resolved: Option<Instant>,
+    bound: Option<Instant>,
+    handed: Option<Instant>,
+) {
+    let (Some(built), Some(resolved), Some(bound), Some(handed)) = (built, resolved, bound, handed)
+    else {
+        return;
+    };
+    eprintln!(
+        "foxy-debug: quic pool {}:{} resolve={}ms bind={}ms hand={}ms opening={}ms",
+        dial.address,
+        dial.port,
+        resolved.duration_since(built).as_millis(),
+        bound.duration_since(resolved).as_millis(),
+        handed.duration_since(bound).as_millis(),
+        Instant::now().duration_since(handed).as_millis(),
+    );
+}
+
 pub(crate) fn stream_send_all(
     conn: &mut quiche::Connection,
     sock: &Datagram,
@@ -2492,11 +2515,13 @@ fn build_pooled(dial: &QuicDial) -> Option<PooledConn> {
 
 fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> {
     let roots = dial.roots.as_deref().unwrap_or(&[]);
+    let built = crate::foxy::debug_on().then(Instant::now);
     // One attempt per resolved address: the first answer is not always the reachable one.
     let peers: Vec<SocketAddr> = format!("{}:{}", dial.address, dial.port)
         .to_socket_addrs()
         .ok()?
         .collect();
+    let resolved = built.map(|_| Instant::now());
     // One hop per connection, not per address. An HTTP hop is TCP-only: refusing beats bypassing the proxy.
     let relay = match dial.upstream.as_ref() {
         Some(proxy) if proxy.http() => return None,
@@ -2518,9 +2543,11 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
             Some((control, via)) => Datagram::relayed(sock, *via, Arc::clone(control)),
             None => Datagram::plain(sock),
         };
+        let bound = resolved.map(|_| Instant::now());
         let Some(mut conn) = handshake_within(&sock, peer, local, &dial.host, roots, budget) else {
             continue;
         };
+        let handed = bound.map(|_| Instant::now());
         if !send_h3_opening(&mut conn, &sock) {
             continue;
         }
@@ -2531,6 +2558,7 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
             // No thread yet: only a lease whose bytes the pump can hand over starts one, so a connection nobody rode and a flow that reads its own socket cost none.
             parked: Some(Instant::now()),
         }));
+        debug_pool(dial, built, resolved, bound, handed);
         return Some(PooledConn {
             conn: Arc::new(Mutex::new(conn)),
             table,
