@@ -6941,7 +6941,7 @@ enum ProxyRequest {
 }
 
 /// CONNECT tunnels; absolute- and origin-form forward the head with its line rewritten to origin-form.
-fn http_proxy_request(head: Vec<u8>) -> Option<ProxyRequest> {
+fn http_proxy_request(mut head: Vec<u8>) -> Option<ProxyRequest> {
     let line_end = head.iter().position(|byte| *byte == b'\n');
     let raw = &head[..line_end.unwrap_or(head.len())];
     let line = raw.strip_suffix(b"\r").unwrap_or(raw);
@@ -6949,7 +6949,6 @@ fn http_proxy_request(head: Vec<u8>) -> Option<ProxyRequest> {
     let method = parts.next()?;
     let target = parts.next()?;
     let sent_version = parts.next();
-    let version = sent_version.unwrap_or(b"HTTP/1.1");
     if method.eq_ignore_ascii_case(b"CONNECT") {
         return authority_target(connect_authority(target)).map(ProxyRequest::Connect);
     }
@@ -6965,10 +6964,23 @@ fn http_proxy_request(head: Vec<u8>) -> Option<ProxyRequest> {
             None => (rest, b"/".as_slice()),
         };
         let asked = authority_target(authority)?;
-        return Some(ProxyRequest::Forward(
-            asked,
-            origin_head(method, path, version, &head, line_end),
-        ));
+        // The pieces' places in the head, for a rewrite that moves the head's own bytes.
+        let base = head.as_ptr() as usize;
+        let place = |piece: &[u8]| {
+            let at = piece.as_ptr() as usize - base;
+            (at, at + piece.len())
+        };
+        let line = RequestLine {
+            method: place(method),
+            path: if path == b"/" {
+                None
+            } else {
+                Some(place(path))
+            },
+            version: sent_version.map(place),
+        };
+        origin_head(&mut head, line_end, &line);
+        return Some(ProxyRequest::Forward(asked, head));
     }
     if target.starts_with(b"/") {
         let host = header_value(&head, "host")?;
@@ -6978,14 +6990,20 @@ fn http_proxy_request(head: Vec<u8>) -> Option<ProxyRequest> {
             && raw.len() == line.len() + 1
             && sent_version.is_some()
             && parts.next().is_none();
-        return Some(ProxyRequest::Forward(
-            asked,
-            if untouched {
-                head
-            } else {
-                origin_head(method, target, version, &head, line_end)
-            },
-        ));
+        if !untouched {
+            let base = head.as_ptr() as usize;
+            let place = |piece: &[u8]| {
+                let at = piece.as_ptr() as usize - base;
+                (at, at + piece.len())
+            };
+            let line = RequestLine {
+                method: place(method),
+                path: Some(place(target)),
+                version: sent_version.map(place),
+            };
+            origin_head(&mut head, line_end, &line);
+        }
+        return Some(ProxyRequest::Forward(asked, head));
     }
     None
 }
@@ -7004,23 +7022,56 @@ fn connect_authority(target: &[u8]) -> &[u8] {
     }
 }
 
-/// Rewrites the request line to origin-form, keeping every header byte as sent.
-fn origin_head(
-    method: &[u8],
-    path: &[u8],
-    version: &[u8],
-    head: &[u8],
-    line_end: Option<usize>,
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(head.len());
-    out.extend_from_slice(method);
-    out.push(b' ');
-    out.extend_from_slice(path);
-    out.push(b' ');
-    out.extend_from_slice(version);
-    out.extend_from_slice(b"\r\n");
-    out.extend_from_slice(&head[line_end.map_or(0, |at| at + 1)..]);
-    out
+/// The request line's three pieces, as ranges inside the head they were read from: the
+/// rewrite moves the head's own bytes, so the pieces are named by where they are rather
+/// than by what they point at.
+struct RequestLine {
+    method: (usize, usize),
+    /// The path inside the head, or the root path when the absolute form carried none.
+    path: Option<(usize, usize)>,
+    version: Option<(usize, usize)>,
+}
+
+/// Rewrites the request line to origin-form, keeping every header byte as sent. The
+/// rewrite happens inside the head's own buffer: the headers shift left to where the
+/// shorter line ends, so they are not copied at all.
+fn origin_head(head: &mut Vec<u8>, line_end: Option<usize>, line: &RequestLine) {
+    const VERSION: &[u8] = b"HTTP/1.1";
+    const ROOT: &[u8] = b"/";
+    let at = line_end.map_or(0, |at| at + 1);
+    let tail = head.len() - at;
+    let (m0, m1) = line.method;
+    let (p0, p1) = line.path.unwrap_or((0, ROOT.len()));
+    let version = line.version.unwrap_or((0, VERSION.len()));
+    let want = (m1 - m0) + 1 + (p1 - p0) + 1 + (version.1 - version.0) + 2;
+    if want > at {
+        head.resize(head.len() + (want - at), 0);
+    }
+    let mut at_new = 0;
+    head.copy_within(m0..m1, at_new);
+    at_new += m1 - m0;
+    head[at_new] = b' ';
+    at_new += 1;
+    if line.path.is_some() {
+        head.copy_within(p0..p1, at_new);
+        at_new += p1 - p0;
+    } else {
+        head[at_new..at_new + ROOT.len()].copy_from_slice(ROOT);
+        at_new += ROOT.len();
+    }
+    head[at_new] = b' ';
+    at_new += 1;
+    if line.version.is_some() {
+        head.copy_within(version.0..version.1, at_new);
+        at_new += version.1 - version.0;
+    } else {
+        head[at_new..at_new + VERSION.len()].copy_from_slice(VERSION);
+        at_new += VERSION.len();
+    }
+    head[at_new..at_new + 2].copy_from_slice(b"\r\n");
+    // The headers move to where the new line ends, over the old line's own bytes.
+    head.copy_within(at..at + tail, want);
+    head.truncate(want + tail);
 }
 
 /// An authority as a target: a literal address stays one, a name rides the tunnel untouched, no port means 80.
@@ -23563,6 +23614,28 @@ mod tests {
         }
     }
 
+    /// The request line is rewritten inside the head's own buffer: the headers shift left
+    /// and no copy of them is made, so the head the caller gets is the head it read.
+    #[test]
+    fn a_forwarded_head_is_the_head_that_was_read() {
+        let head = b"GET http://example.com:8080/p?q=1 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n"
+            .to_vec();
+        let base = head.as_ptr() as usize;
+        let request = http_proxy_request(head);
+        let Some(ProxyRequest::Forward(_, origin)) = request else {
+            panic!("absolute-form parses");
+        };
+        assert_eq!(
+            origin.as_ptr() as usize,
+            base,
+            "the head the caller gets is the head it read"
+        );
+        assert_eq!(
+            origin,
+            b"GET /p?q=1 HTTP/1.1\r\nHost: example.com:8080\r\n\r\n"
+        );
+    }
+
     #[test]
     fn http_request_parses_connect_and_both_get_forms() {
         let connect = b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n".to_vec();
@@ -23597,7 +23670,7 @@ mod tests {
         assert!(http_proxy_request(b"GARBAGE\r\n\r\n".to_vec()).is_none());
     }
 
-    /// The rewrite is a copy and a fresh buffer, so the gate is the pointer the untouched head keeps.
+    /// The rewrite moves the head's own bytes, so the gate is the pointer the head keeps.
     #[test]
     fn an_origin_form_head_reaches_the_uplink_where_it_landed() {
         let head = b"GET /p HTTP/1.1\r\nHost: example.com\r\n\r\n".to_vec();
@@ -23616,10 +23689,10 @@ mod tests {
         let Some(ProxyRequest::Forward(_, rebuilt)) = http_proxy_request(rewritten) else {
             panic!("a fourth token still parses");
         };
-        assert_ne!(
+        assert_eq!(
             rebuilt.as_ptr(),
             other,
-            "a changed line gets its own buffer"
+            "a changed line is rewritten in the head it was read into"
         );
         assert_eq!(rebuilt, b"GET /p HTTP/1.1\r\nHost: example.com\r\n\r\n");
         let bare_lf = b"GET http://example.com:8080/p HTTP/1.1\nHost: example.com:8080\n".to_vec();

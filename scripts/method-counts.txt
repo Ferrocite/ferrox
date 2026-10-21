@@ -489,6 +489,7 @@ http-proxy ops-retired-instructions UNBLESSED scripts/count-ops.sh
 http-proxy connect-grant-allocations 0 ferrox-app-proxy::tests::a_connect_grant_costs_no_heap_buffer
 http-proxy connect-request-allocations 0 ferrox-app-proxy::tests::the_connect_request_builds_in_one_buffer
 http-proxy forwarded-head-allocations 0 ferrox-app-proxy::tests::an_origin_form_head_reaches_the_uplink_where_it_landed
+http-proxy forwarded-head-copies 0 ferrox-app-proxy::tests::a_forwarded_head_is_the_head_that_was_read
 
 # --- Routing rules and geosite/geoip -----------------------------------------
 engine-router ops-retired-instructions UNBLESSED scripts/count-ops.sh
