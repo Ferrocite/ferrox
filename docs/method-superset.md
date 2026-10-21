@@ -48,7 +48,7 @@ The shared protocol in `crates/ferrox-prompt/prompts.md` states it as "a superse
 | cloudflared | protocol | planned | upstream/sing-box/protocol/cloudflare | Argo tunnel inbound |
 | bridge | protocol | not-scheduled | upstream/sing-box/protocol/bridge | L2 bridge: pf, netlink/nft, WinDivert NAT |
 | freedom | protocol | implemented | upstream/xray-core/proxy/freedom, upstream/sing-box/protocol/direct | the sink outbound; `fragment`/`noises`/`finalRules` and the `proxyProtocol: 1\|2` send (`zeronet/crates/zero-config/src/xray_json.rs`) not carried |
-| blackhole | protocol | planned | upstream/xray-core/proxy/blackhole, upstream/sing-box/protocol/block | `none`/`http`/`custom` response |
+| blackhole | protocol | implemented | upstream/xray-core/proxy/blackhole, upstream/sing-box/protocol/block, upstream/xray-core-rust/crates/xray-proxy-blackhole, upstream/zeronet/crates/zero-config/src/xray_json.rs, docs/function/blackhole.md | `none`/`http`/`custom` response, the 403's bytes the reference's own; the flow ends when the peer is done, and the datagram lane refuses the association with `0x07` |
 | dns-outbound | protocol | planned | upstream/xray-core/proxy/dns, upstream/sing-box/protocol/dns | rules `direct`/`drop`/`return`/`hijack`, `rewrite_server` |
 | masterdns | protocol | planned | upstream/zeronet/crates/zero-masterdns, upstream/zeronet/crates/zero-protocol/src/masterdns | a VPN over DNS queries: the base/codec wire half and the live half that carries it — UDP resolver, optional compression, ARQ reliability, session handshake, SOCKS stream management |
 | loopback | protocol | implemented | upstream/xray-core/proxy/loopback, docs/function/loopback.md | re-inject into a named inbound tag, with sniffing refused |
