@@ -41,12 +41,13 @@ graph TD
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | datagrams-carrying-to-the-target | 1 | ferrox-app-proxy::tests::a_dokodemo_door_carries_a_datagram_to_its_target |
+| datagram-frame-allocations-per-frame | 0 | ferrox-app-proxy::tests::a_forwarded_datagram_is_the_frame_the_client_framed |
 | associations-answering-with-the-relay | 1 | ferrox-app-proxy::tests::the_udp_association_carries_a_datagram_to_the_target |
 | transparent-settings-refused | 2 | ferrox-app-proxy::tests::a_dokodemo_front_refuses_the_transparent_settings |
 | xray-scenario-tests-passing | 2 | scripts/run-upstream-suite.sh |
 <!-- counts:end -->
 
-The datagram row is the shape: a datagram the door receives reaches the target the config names, and the answer comes back to the client that sent it. The association row is the wiring under it — the relay the lane reads from is named by the association's own reply, and a framed datagram through that relay reaches the target and comes back framed. The refusal row is the front's other half: `followRedirect` and `portMap` are refused by name, because the original destination is the kernel's to give and this tree asks for no such socket option. The scenario row is xray-core's own: `TestDokodemoTCP` and `TestDokodemoUDP` run against this tree unmodified through the `scripts/xray-scenarios.sh` seam, and the UDP one was red before this slice.
+The datagram row is the shape: a datagram the door receives reaches the target the config names, and the answer comes back to the client that sent it. The frame row is what the door's own frame costs: the frame the door writes is the lane's buffer and the framing allocates nothing, so a datagram through the door costs no heap buffer of its own (the `socks` page's witness, `a_forwarded_datagram_is_the_frame_the_client_framed`, is the one that sees it). The association row is the wiring under it — the relay the lane reads from is named by the association's own reply, and a framed datagram through that relay reaches the target and comes back framed. The refusal row is the front's other half: `followRedirect` and `portMap` are refused by name, because the original destination is the kernel's to give and this tree asks for no such socket option. The scenario row is xray-core's own: `TestDokodemoTCP` and `TestDokodemoUDP` run against this tree unmodified through the `scripts/xray-scenarios.sh` seam, and the UDP one was red before this slice.
 
 ## Ops
 
@@ -65,6 +66,7 @@ The datagram row is the shape: a datagram the door receives reaches the target t
 
 - **A private handshake between the device front and the lane.** The `tun` front and this door both need the outbound's datagram lane, and both reached it over a loopback pair whose two halves did not agree on the handshake: the client wrote a SOCKS5 greeting and a request and read twelve bytes, while the server side wrote the ten-byte reply and read nothing. The association is now one shape — the tree's own SOCKS5 UDP client asking the tree's own front — so the bytes on that loopback are the protocol's own, and the device front's production datagram lane works for the first time. `the_udp_association_carries_a_datagram_to_the_target` is the witness: the server half is the tree's own `serve_socks`, and a framed datagram through the relay reaches the target and comes back.
 - **The door's own relay.** The door does not open a socket to the target and relay by itself; it rides the outbound's lane, so the datagram goes where the config's outbound says and the lane's framing is the one the rest of the tree already speaks.
+- **A frame buffer per datagram.** The door built the frame it writes in a buffer of its own, allocated for that datagram. The frame is the door's now — one buffer for the door's life, its capacity held across the datagrams it carries — and the framing itself allocates nothing.
 
 ## What was not removed
 
