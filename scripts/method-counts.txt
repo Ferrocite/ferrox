@@ -213,6 +213,7 @@ carrier-grpc message-bytes-moved-per-padded-frame 0 ferrox-app-grpc::tests::a_pa
 carrier-grpc credit-bytes 2097152 ferrox-app-grpc::tests::a_credit_grants_the_window_it_owes_in_one_write
 carrier-grpc window-update-writes-per-credit 1 ferrox-app-grpc::tests::a_credit_grants_the_window_it_owes_in_one_write
 carrier-grpc window-update-frames-per-credit 2 ferrox-app-grpc::tests::a_credit_grants_the_window_it_owes_in_one_write
+carrier-grpc padded-frame-credit-octets 0 ferrox-app-grpc::tests::a_padded_frame_credits_its_whole_wire_payload
 carrier-grpc connection-window-credit-at-preface 4128769 ferrox-app-grpc::tests::the_preface_grants_the_peer_a_whole_window
 carrier-grpc pinned-threads-per-silent-preface 0 ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_preface
 carrier-grpc pinned-threads-per-silent-request-head 0 ferrox-app-proxy::tests::a_silent_peer_cannot_pin_a_grpc_request_head
@@ -293,6 +294,7 @@ carrier-foxy uplink-bytes-blocked-by-a-parked-leg 0 ferrox-app-foxy::loopback::a
 carrier-foxy h2-upload-bytes-blocked-by-an-unread-grant 0 ferrox-app-foxy::loopback::an_upload_is_paced_by_the_grants_the_edge_sends_rather_than_by_the_bytes_it_reads
 carrier-foxy window-update-frames-per-floor-crossing 2 ferrox-app-foxy::loopback::credit_crossing_the_floor_costs_one_pair_not_one_per_frame
 carrier-foxy window-update-frames-below-the-floor 0 ferrox-app-foxy::loopback::credit_held_under_the_floor_never_reaches_the_wire
+carrier-foxy padded-frame-credit-octets 0 ferrox-app-foxy::loopback::a_padded_frame_credits_its_whole_wire_payload
 carrier-foxy dead-carrier-dials-per-connect-ip-packet 0 ferrox-app-proxy::tests::the_connect_ip_lane_leaves_a_dead_carrier_dead
 carrier-foxy carriers-dialled 3 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_answers_best
 carrier-foxy udp-carriers-dialled 2 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_answers_best
