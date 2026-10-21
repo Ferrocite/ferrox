@@ -134,7 +134,8 @@ fn serve_root(label: &str, root: &Json) -> ! {
             .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}"))),
     );
     let freedom = has_protocol(root, "outbounds", "freedom");
-    let outbound = find_outbound(root);
+    let outbound =
+        find_outbound(root).unwrap_or_else(|reason| exit(&format!("bad config {label}: {reason}")));
     // A loopback outbound names its inbound by tag, so it resolves only when no concrete dial won.
     let loopback = find_loopback_outbound(root);
     let outbound = match outbound {
@@ -709,7 +710,7 @@ pub(crate) enum Outbound {
     /// The rules choose the outbound per flow; the plan holds the registry and the fallback.
     Route(Arc<RoutePlan>),
     /// The rules drop the flow after the front has granted it.
-    Block,
+    Block(ferrox_core::blackhole::Response),
 }
 
 impl Outbound {
@@ -722,7 +723,9 @@ impl Outbound {
             Self::Shadowsocks(ss) => resolve_outbound(&ss.address, ss.port),
             Self::Socks(socks) => resolve_outbound(&socks.address, socks.port),
             Self::Http(http) => resolve_outbound(&http.address, http.port),
-            Self::Foxy(_) | Self::Veepn(_) | Self::Freedom | Self::Route(_) | Self::Block => None,
+            Self::Foxy(_) | Self::Veepn(_) | Self::Freedom | Self::Route(_) | Self::Block(_) => {
+                None
+            }
         }
     }
 
@@ -850,23 +853,16 @@ fn build_outbound(config: &Json, tag: &str) -> Result<Outbound, String> {
         ));
     }
     if protocol == "blackhole" {
-        let response = config
-            .get("settings")
-            .and_then(|settings| settings.get("response"))
-            .and_then(Json::as_str)
-            .unwrap_or("none");
-        if !response.is_empty() && !response.eq_ignore_ascii_case("none") {
-            return Err(format!(
-                "outbound `{tag}` blackhole response `{response}` is not carried"
-            ));
-        }
-        return Ok(Outbound::Block);
+        let answer = crate::blackhole::answer(config.get("settings"))
+            .map_err(|reason| format!("outbound `{tag}` {reason}"))?;
+        return Ok(Outbound::Block(answer));
     }
     let single = Json::Obj(vec![(
         "outbounds".to_owned(),
         Json::Arr(vec![config.clone()]),
     )]);
     find_outbound(&single)
+        .map_err(|reason| format!("outbound `{tag}` {reason}"))?
         .ok_or_else(|| format!("outbound `{tag}` protocol `{protocol}` is not carried"))
 }
 
@@ -6205,8 +6201,9 @@ fn serve_connect(
     front: Front,
     prefix: &[u8],
 ) {
-    // The rules dropped this flow: the front has granted it, so closing is the whole answer.
-    if matches!(out, Outbound::Block) {
+    // The rules dropped this flow: the front has granted it, so the sink answers and ends it.
+    if let Outbound::Block(answer) = out {
+        crate::blackhole::serve(client, answer);
         return;
     }
     if let Outbound::Foxy(foxy) = out {
@@ -6334,7 +6331,7 @@ fn dial_socks_outbound(
         | Outbound::Veepn(_)
         | Outbound::Freedom
         | Outbound::Route(_)
-        | Outbound::Block => {}
+        | Outbound::Block(_) => {}
     }
 }
 
@@ -7161,7 +7158,7 @@ fn serve_socks_udp(mut client: Connection, out: &Outbound) {
         out
     };
     // A blackhole association is the same refusal: a relay that drops every datagram reads as working.
-    if matches!(out, Outbound::Block) {
+    if matches!(out, Outbound::Block(_)) {
         let _ = client.write_all(&foxy_socks_reply(0x07));
         return;
     }
@@ -10732,31 +10729,56 @@ fn inbound_password(inbound: &Json) -> String {
         .to_owned()
 }
 
-fn find_outbound(root: &Json) -> Option<Outbound> {
+fn find_outbound(root: &Json) -> Result<Option<Outbound>, String> {
     if let Some(foxy) = find_foxy_outbound(root) {
-        return Some(Outbound::Foxy(Box::new(foxy)));
+        return Ok(Some(Outbound::Foxy(Box::new(foxy))));
     }
     if let Some(lane) = find_veepn_outbound(root) {
-        return Some(Outbound::Veepn(lane));
+        return Ok(Some(Outbound::Veepn(lane)));
     }
     if let Some(vless) = find_vless_outbound(root) {
-        return Some(Outbound::Vless(vless));
+        return Ok(Some(Outbound::Vless(vless)));
     }
     if let Some(vmess) = find_vmess_outbound(root) {
-        return Some(Outbound::Vmess(vmess));
+        return Ok(Some(Outbound::Vmess(vmess)));
     }
     if let Some(trojan) = find_trojan_outbound(root) {
-        return Some(Outbound::Trojan(trojan));
+        return Ok(Some(Outbound::Trojan(trojan)));
     }
     if let Some(http) = find_http_outbound(root) {
-        return Some(Outbound::Http(http));
+        return Ok(Some(Outbound::Http(http)));
     }
     if let Some(socks) = find_socks_outbound(root) {
-        return Some(Outbound::Socks(socks));
+        return Ok(Some(Outbound::Socks(socks)));
     }
-    find_shadowsocks_outbound(root)
-        .map(Outbound::Shadowsocks)
-        .or_else(|| is_freedom(root).then_some(Outbound::Freedom))
+    if let Some(shadowsocks) = find_shadowsocks_outbound(root) {
+        return Ok(Some(Outbound::Shadowsocks(shadowsocks)));
+    }
+    if is_freedom(root) {
+        return Ok(Some(Outbound::Freedom));
+    }
+    // The sink is the last resort: a config that names a dial takes the dial.
+    Ok(find_blackhole_outbound(root)?.map(Outbound::Block))
+}
+
+/// The blackhole outbound's answer, read the way the reference's own config
+/// builder reads it. An answer the reference does not know is a startup
+/// refusal, not an outbound this tree skips.
+fn find_blackhole_outbound(
+    root: &Json,
+) -> Result<Option<ferrox_core::blackhole::Response>, String> {
+    let empty = Vec::new();
+    let outbounds = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty);
+    for outbound in outbounds {
+        if outbound.get("protocol").and_then(Json::as_str) != Some("blackhole") {
+            continue;
+        }
+        return Ok(Some(crate::blackhole::answer(outbound.get("settings"))?));
+    }
+    Ok(None)
 }
 
 fn is_freedom(root: &Json) -> bool {
@@ -13772,7 +13794,9 @@ mod tests {
             network,
         ))
         .expect("parses");
-        let outbound = find_outbound(&root).expect("a REALITY outbound");
+        let outbound = find_outbound(&root)
+            .expect("a REALITY outbound")
+            .expect("the config names one");
         RealityPair {
             outbound,
             server: server_addr,
@@ -15653,7 +15677,10 @@ mod tests {
             "",
         ))
         .expect("parses");
-        let Outbound::Vless(vless) = find_outbound(&root).expect("a REALITY outbound") else {
+        let Outbound::Vless(vless) = find_outbound(&root)
+            .expect("a REALITY outbound")
+            .expect("the config names one")
+        else {
             panic!("the outbound dials VLESS");
         };
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -22596,7 +22623,8 @@ mod tests {
             r#"{"outbounds":[{"protocol":"socks","settings":{"servers":[{"address":"127.0.0.1","port":1080,"users":[{"user":"Test Account","pass":"Test Password"}]}]}}]}"#,
         )
         .expect("parses");
-        let Some(Outbound::Socks(lane)) = find_outbound(&root) else {
+        let Some(Outbound::Socks(lane)) = find_outbound(&root).expect("the config names one")
+        else {
             panic!("the socks outbound is the one the config names");
         };
         assert_eq!(lane.address, "127.0.0.1");
@@ -24236,6 +24264,39 @@ mod tests {
         client
     }
 
+    /// A config whose only outbound is the sink takes it: the lane a front
+    /// gets is the answer, and the answer is the reference's.
+    #[test]
+    fn a_config_whose_only_outbound_is_the_sink_serves_the_sink() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"blackhole","settings":{"response":{"type":"http"}}}]}"#,
+        )
+        .expect("parses");
+        let Some(Outbound::Block(answer)) = find_outbound(&root).expect("the config names one")
+        else {
+            panic!("the sink is the only outbound");
+        };
+        assert_eq!(answer.bytes(), ferrox_core::blackhole::HTTP_403);
+    }
+
+    /// The sink answers the front's client with the reference's bytes and dials
+    /// nothing: the destination it was asked for never sees a connection.
+    #[test]
+    fn a_blackhole_front_answers_the_client_and_dials_nothing() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let front = socks_front_with(Outbound::Block(ferrox_core::blackhole::Response::Http));
+        let mut client = socks_tcp_client(front, port);
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).expect("closes");
+        assert_eq!(got, ferrox_core::blackhole::HTTP_403);
+        listener.set_nonblocking(true).expect("nonblocking");
+        assert!(
+            listener.accept().is_err(),
+            "the sink dialled the destination it was asked for"
+        );
+    }
+
     /// The first configured outbound is xray's default handler, and the rule's tag is the only one
     /// that decides before it: a name rule blocks without ever resolving the name.
     #[test]
@@ -24329,6 +24390,16 @@ mod tests {
         );
 
         let response = crate::json::parse(
+            r#"{"outbounds":[{"tag":"drop","protocol":"blackhole","settings":{"response":{"type":"teapot"}}}],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&response, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let error = route_shared(&response, routing).expect_err("refused");
+        assert!(error.contains("teapot"), "{error}");
+
+        let response = crate::json::parse(
             r#"{"outbounds":[{"tag":"drop","protocol":"blackhole","settings":{"response":"http"}}],"routing":{}}"#,
         )
         .expect("parses");
@@ -24336,7 +24407,7 @@ mod tests {
             .expect("parses")
             .expect("routing");
         let error = route_shared(&response, routing).expect_err("refused");
-        assert!(error.contains("http"), "{error}");
+        assert!(error.contains("object"), "{error}");
     }
 
     /// A decision on a literal address reads the tables and returns a borrowed lane: no buffer, no
@@ -24356,7 +24427,7 @@ mod tests {
         let (picked, counts) = ferrox_core::alloc_count::measure(|| {
             plan.pick(&asked, crate::router::Network::Tcp, None)
         });
-        assert!(matches!(picked, Outbound::Block), "the rule decides");
+        assert!(matches!(picked, Outbound::Block(_)), "the rule decides");
         assert_eq!(counts.allocs, 0, "{counts:?}");
     }
 
@@ -24375,7 +24446,7 @@ mod tests {
         let asked = Destination::Name("example.test".to_owned(), 80);
         assert!(matches!(
             plan.pick(&asked, crate::router::Network::Tcp, None),
-            Outbound::Block
+            Outbound::Block(_)
         ));
     }
 

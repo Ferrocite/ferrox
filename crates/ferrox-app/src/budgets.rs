@@ -13,6 +13,9 @@ pub(crate) const RELAY_POLL: Duration = Duration::from_millis(20);
 /// How long a connection we refused stays open after its GOAWAY: closing with the peer's bytes still unread makes the stack abort with RST, and that can swallow the refusal itself.
 pub(crate) const GOAWAY_GRACE: Duration = Duration::from_millis(100);
 
+/// How long the blackhole sink holds a flow open after its answer: the peer's bytes are read in that window, so the close is a finish and not the reset an unread request earns. Half the reference's own second, so the flow the sink holds is never longer than the one it replaces.
+pub(crate) const SINK_GRACE: Duration = Duration::from_millis(500);
+
 /// How long a shared read holds the lock: under one grain on purpose, so a writer never waits out the wait.
 pub(crate) const SESSION_POLL: Duration = Duration::from_millis(1);
 
@@ -69,6 +72,7 @@ static RELAY_STALL_MS: AtomicU64 = AtomicU64::new(0);
 static UDP_IDLE_MS: AtomicU64 = AtomicU64::new(0);
 static PAYLOAD_GRACE_MS: AtomicU64 = AtomicU64::new(0);
 static GOAWAY_GRACE_MS: AtomicU64 = AtomicU64::new(0);
+static SINK_GRACE_MS: AtomicU64 = AtomicU64::new(0);
 static CARRIER_PROBE_MS: AtomicU64 = AtomicU64::new(0);
 
 fn named(set: &AtomicU64, default: Duration) -> Duration {
@@ -114,6 +118,10 @@ pub(crate) fn goaway_grace() -> Duration {
     named(&GOAWAY_GRACE_MS, GOAWAY_GRACE)
 }
 
+pub(crate) fn sink_grace() -> Duration {
+    named(&SINK_GRACE_MS, SINK_GRACE)
+}
+
 pub(crate) fn carrier_probe() -> Duration {
     named(&CARRIER_PROBE_MS, CARRIER_PROBE)
 }
@@ -137,6 +145,7 @@ pub(crate) fn apply(overrides: &crate::config::Budgets) {
     one(&UDP_IDLE_MS, overrides.udp_idle);
     one(&PAYLOAD_GRACE_MS, overrides.payload_grace);
     one(&GOAWAY_GRACE_MS, overrides.goaway_grace);
+    one(&SINK_GRACE_MS, overrides.sink_grace);
     one(&CARRIER_PROBE_MS, overrides.carrier_probe);
 }
 
@@ -153,6 +162,7 @@ pub(crate) fn clear() {
         &UDP_IDLE_MS,
         &PAYLOAD_GRACE_MS,
         &GOAWAY_GRACE_MS,
+        &SINK_GRACE_MS,
         &CARRIER_PROBE_MS,
     ] {
         set.store(0, Ordering::Relaxed);
@@ -190,12 +200,13 @@ mod tests {
         assert_eq!(udp_idle(), UDP_IDLE);
         assert_eq!(payload_grace(), PAYLOAD_GRACE);
         assert_eq!(goaway_grace(), GOAWAY_GRACE);
+        assert_eq!(sink_grace(), SINK_GRACE);
         assert_eq!(carrier_probe(), CARRIER_PROBE);
 
         let root = crate::json::parse(
             r#"{"budgets": {"dial": "20s", "handshake": "30s", "headArrival": "40s",
                             "relayJoin": "5mn", "relayQuantum": "250ms", "relayStall": "180s",
-                            "udpIdle": "300s",
+                            "udpIdle": "300s", "sinkGrace": "750ms",
                             "payloadGrace": "400ms", "goawayGrace": "200ms", "carrierProbe": "3s"}}"#,
         )
         .expect("parses");
@@ -206,7 +217,7 @@ mod tests {
         let root = crate::json::parse(
             r#"{"budgets": {"dial": "20s", "handshake": "30s", "headArrival": "40s",
                             "relayJoin": "300s", "relayQuantum": "250ms", "relayStall": "180s",
-                            "udpIdle": "300s",
+                            "udpIdle": "300s", "sinkGrace": "750ms",
                             "payloadGrace": "400ms", "goawayGrace": "200ms", "carrierProbe": "3s"}}"#,
         )
         .expect("parses");
@@ -218,6 +229,7 @@ mod tests {
         assert_eq!(relay_quantum(), Duration::from_millis(250));
         assert_eq!(relay_stall(), Duration::from_secs(180));
         assert_eq!(udp_idle(), Duration::from_secs(300));
+        assert_eq!(sink_grace(), Duration::from_millis(750));
         assert_eq!(payload_grace(), Duration::from_millis(400));
         assert_eq!(goaway_grace(), Duration::from_millis(200));
         assert_eq!(carrier_probe(), Duration::from_secs(3));

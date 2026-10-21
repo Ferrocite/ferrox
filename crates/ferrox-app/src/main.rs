@@ -13,6 +13,7 @@ mod budgets;
 #[cfg(test)]
 #[macro_use]
 mod census;
+mod blackhole;
 mod config;
 mod conn;
 mod foxy;

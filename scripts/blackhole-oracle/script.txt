@@ -1,0 +1,11 @@
+# The script the blackhole oracle replays.
+#
+# Each line names one answer the reference's handler writes to the client.
+#
+#   http            the 403 the reference's `http403response` serialises
+#   custom <hex>    the bytes a custom answer writes, verbatim
+#   none            no answer at all
+http
+custom 00ff1020
+custom
+none
