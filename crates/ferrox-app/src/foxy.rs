@@ -1639,14 +1639,11 @@ impl H3 {
         self.set_read_quantum(quantum.min(crate::budgets::SESSION_POLL));
     }
 
-    /// The socket to park on, when the wire is the only thing that can move this lane: bytes already in the window, a block the lane is mid-way through consuming, or a frame body whose rest the next read hands over without a packet all have to reach the caller first. The wait is cut to the connection's own next tick, because this lane's read is what services its loss timer and no other thread pumps it.
+    /// The socket to park on, when the wire is the only thing that can move this lane. Bytes already in the window are the state to refuse on: a header the window can hold is parsed by the read that has it, so a read that handed back `WouldBlock` with the window spent did so after looking at the stream — a frame body or a block still in flight is then waiting on a packet, and a blind sleep costs it the whole of `RELAY_IDLE`. The wait is cut to the connection's own next tick, because this lane's read is what services its loss timer and no other thread pumps it.
     pub(crate) fn read_wait(&self) -> Option<(EdgeWait, Duration)> {
-        let park = self.park.filter(|_| {
-            self.carried >= self.filled
-                && self.body == 0
-                && self.pending.is_none()
-                && self.quic.sock.waits_here().is_some()
-        })?;
+        let park = self
+            .park
+            .filter(|_| self.carried >= self.filled && self.quic.sock.waits_here().is_some())?;
         let tick = self
             .with_conn_read(quiche::Connection::timeout)
             .flatten()
