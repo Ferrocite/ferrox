@@ -2826,6 +2826,19 @@ pub(crate) fn resize_scratch(buf: &mut Vec<u8>, len: usize) {
     unsafe { buf.set_len(len) }
 }
 
+/// Room for a read to write into without a zero pass first: every byte is written before any
+/// code observes it, so the fill was work generated and thrown away.
+#[allow(
+    clippy::uninit_vec,
+    reason = "the buffer is a read target: the read that owns every byte writes before any code reads one"
+)]
+pub(crate) fn unfilled(len: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(len);
+    // SAFETY: every path hands the buffer to a read that initialises the bytes it reports, and no path reads a byte that was not written.
+    unsafe { buf.set_len(len) };
+    buf
+}
+
 /// Grows a buffer to `len` without a zero pass and without losing what it already holds: the bytes past the old length are claimed, not written, and the caller fills them. A buffer that grew by `resize(len, 0)` paid a memset of the whole new region for bytes the caller was about to overwrite.
 #[allow(
     clippy::uninit_vec,
