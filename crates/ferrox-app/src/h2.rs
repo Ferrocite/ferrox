@@ -109,8 +109,30 @@ pub(crate) fn push_str(out: &mut Vec<u8>, text: &str) {
     out.extend_from_slice(text.as_bytes());
 }
 
+/// The octets one header's literal costs: the never-indexed prefix, the name's length
+/// prefix and its bytes, the value's length prefix and its bytes.
+fn header_len(name: &str, value: &str) -> usize {
+    1 + int_len(name.len()) + name.len() + int_len(value.len()) + value.len()
+}
+
+/// The octets a length prefix costs: one below the prefix's maximum, the prefix and a
+/// varint of the rest above it.
+fn int_len(value: usize) -> usize {
+    if value < 127 {
+        return 1;
+    }
+    let mut rest = value - 127;
+    let mut len = 1;
+    while rest >= 128 {
+        len += 1;
+        rest >>= 7;
+    }
+    len + 1
+}
+
 pub(crate) fn block_encode(headers: &[(&str, &str)]) -> Vec<u8> {
-    let mut out = Vec::new();
+    // The block's own length is known before it is written, so the buffer is opened once.
+    let mut out = Vec::with_capacity(headers.iter().map(|(n, v)| header_len(n, v)).sum());
     for (name, value) in headers {
         out.push(0x00);
         push_str(&mut out, name);
@@ -312,6 +334,24 @@ mod tests {
         let range = block.as_ptr_range();
         assert!(range.contains(&field.as_ptr()));
         field.as_ptr() as usize - range.start as usize
+    }
+
+    /// The header block's own length is known before it is written, so the buffer is
+    /// opened once: the counting allocator is the witness.
+    #[test]
+    fn a_header_block_is_opened_once() {
+        let headers = [
+            (":method", "POST"),
+            (":path", "/TunnelService/Tun"),
+            ("x-sid", "mux"),
+        ];
+        let (block, counts) = ferrox_core::alloc_count::measure(|| block_encode(&headers));
+        assert_eq!(counts.allocs, 1, "the block is one buffer");
+        assert_eq!(
+            counts.bytes,
+            block.len(),
+            "the buffer is the block's own length, not a grown one"
+        );
     }
 
     #[test]
