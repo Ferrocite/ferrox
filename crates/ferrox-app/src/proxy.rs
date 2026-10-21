@@ -6392,6 +6392,10 @@ fn start_renewal(account: std::sync::Arc<crate::foxy_account::Account>) {
             thread::sleep(account.renews_in());
             let Err(denied) = account.renew() else {
                 attempt = 0;
+                // The plane re-states the allowance on every mint, so the line a status reads is the one the latest pass carries.
+                if let Some(line) = account.current().allowance_line() {
+                    eprintln!("foxy: allowance {line}");
+                }
                 continue;
             };
             // A refused token is the only end: a rate limit, a challenge or an unreachable plane is asked again on the plane's own pause, since the pass it stands over keeps expiring meanwhile.
@@ -11186,6 +11190,9 @@ fn foxy_pass_guard(
             pass.expires_at
         ));
     }
+    if let Some(line) = pass.allowance_line() {
+        eprintln!("foxy: allowance {line}");
+    }
     if let Some(account) = renews {
         start_renewal(std::sync::Arc::clone(account));
     }
@@ -11336,6 +11343,7 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             eprintln!("foxy: {reason}: serves nothing");
             continue;
         }
+        eprintln!("foxy: carrier {}", carrier.name());
         return Some(FoxyOut {
             account,
             candidates,

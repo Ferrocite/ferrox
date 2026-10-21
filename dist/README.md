@@ -15,8 +15,8 @@ The Foxy lane needs a Firefox account: an email and a password, nothing else. Th
 ```bash
 tar xzf ferrox-*-aarch64-apple-darwin.tar.gz   # or your platform's package
 cd ferrox-*-aarch64-apple-darwin
-./ferrox-cli.sh up --foxy --vpn    # asks email + password the first time, then connects
-./ferrox-cli.sh status             # the exit IP and country through the lane
+./ferrox-cli.sh up --foxy --vpn    # asks email + password and the carrier, then connects
+./ferrox-cli.sh status             # uptime, carrier, quota left, exit IP and country
 ./ferrox-cli.sh down               # stop and clear the system proxy
 ```
 

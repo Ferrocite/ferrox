@@ -23,6 +23,7 @@ CASES = [
     ("up --trojan without --password", ["up", "--trojan", "host:443"], "--password"),
     ("up --ss without --password", ["up", "--ss", "host:8388"], "--password"),
     ("up --config without a path", ["up", "--config"], "JSON config path"),
+    ("up with an unknown carrier", ["up", "--carrier", "banana"], "h1, h2 or h3"),
     ("up with no lane", ["up"], "no outbound chosen"),
 ]
 

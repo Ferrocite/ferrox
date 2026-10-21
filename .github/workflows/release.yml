@@ -165,8 +165,8 @@ jobs:
             ```bash
             tar xzf ferrox-VERSION_PLACEHOLDER-aarch64-apple-darwin.tar.gz
             cd ferrox-VERSION_PLACEHOLDER-aarch64-apple-darwin
-            ./ferrox-cli.sh up --foxy --vpn   # first run asks for email + password, then connects
-            ./ferrox-cli.sh status            # the exit IP and country through the lane
+            ./ferrox-cli.sh up --foxy --vpn   # asks for email, password and carrier, then connects
+            ./ferrox-cli.sh status            # uptime, carrier, quota left, exit IP and country
             ./ferrox-cli.sh down
             ```
 

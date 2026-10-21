@@ -57,6 +57,7 @@ COUNTRY="US"
 COUNTRY_SET=0
 CITY=""
 CARRIER="auto"
+CARRIER_SET=0
 UPSTREAM=""
 # VeePN has no account and no server: an empty region lets the plane pick, and
 # the device id is kept under $CONF_DIR so a restart is the same device.
@@ -130,8 +131,9 @@ foxy options (email + password is the whole setup; there is no server to name)
   --country CC           exit country, default US
   --city CODE            city tier inside the country
   --carrier NAME         auto|h1|h2|h3, default auto (h2, then h1, then h3);
-                         h2 outran h3 on CI in every run and on every runner, so
-                         auto opens on h2; name h3 for UDP
+                         asked once on a terminal when the flag is left off, and
+                         auto on a pipe; h2 outran h3 on CI in every run and on
+                         every runner, so auto opens on h2; name h3 for UDP
   --upstream URL         http:// or socks5(h):// hop to reach the edge through
 
 veepn options (nothing is required: the plane names the region and its edges)
@@ -577,6 +579,30 @@ EOF
   write_config "$outbound" || die "cannot write $CFG"
 }
 
+# The carrier is a choice, not a default: h2 is the rung auto opens on and h3 is
+# the only one that carries UDP. Asked once on a terminal, never of a pipe, and
+# an empty answer or an unreadable one takes auto rather than stopping the lane.
+choose_carrier() {
+  if [ "$OUTBOUND" != foxy ] || [ "$CARRIER_SET" = 1 ] || [ ! -t 0 ]; then
+    return 0
+  fi
+  say "carrier: where the lane sends its flows (name --carrier to skip this):"
+  say "  1) auto  h2, then h1, then h3 — the fastest that answers (default)"
+  say "  2) h2    HTTPS/2 on a session reused across flows"
+  say "  3) h1    one TLS connection per flow"
+  say "  4) h3    QUIC, the only carrier that also carries UDP"
+  printf 'carrier [auto]: '
+  local answer=""
+  IFS= read -r answer || true
+  case "$(printf '%s' "$answer" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')" in
+    ""|1|auto) CARRIER=auto ;;
+    2|h2) CARRIER=h2 ;;
+    3|h1) CARRIER=h1 ;;
+    4|h3) CARRIER=h3 ;;
+    *) say "carrier: '$answer' is not one of the four; using auto."; CARRIER=auto ;;
+  esac
+}
+
 start_lane() {
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
   # Validate first: an invocation that cannot start must not stop a healthy lane,
@@ -751,6 +777,7 @@ verify_flow() {
 }
 
 action_up() {
+  choose_carrier
   start_lane
   if [ "$OUTBOUND" != config ] && ! wait_fronts; then
     say "the lane did not open its fronts; last lines of $LOG:"
@@ -764,6 +791,7 @@ action_up() {
   else
     port_map
   fi
+  [ "$OUTBOUND" = foxy ] && say "carrier: $CARRIER"
   local ok=0
   if [ "$OUTBOUND" != config ]; then verify_flow || ok=1; fi
   # Route the machine only at a lane that proved it carries a flow: an armed
@@ -783,6 +811,7 @@ action_up() {
 }
 
 action_serve() {
+  choose_carrier
   start_lane
   if [ "$OUTBOUND" != config ] && ! wait_fronts; then
     say "the lane did not open its fronts; last lines of $LOG:"
@@ -795,6 +824,7 @@ action_serve() {
   else
     port_map
   fi
+  [ "$OUTBOUND" = foxy ] && say "carrier: $CARRIER"
   local ok=0
   if [ "$OUTBOUND" != config ]; then verify_flow || ok=1; fi
   if [ "$ok" = 0 ] && [ "$WANT_VPN" = 1 ]; then system_proxy_on; fi
@@ -814,6 +844,14 @@ action_status() {
   fi
   say "lane pid $(lane_pid), fronts:"
   port_map
+  local pid uptime chosen quota
+  pid="$(lane_pid)"
+  uptime="$(ps -o etime= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+  [ -n "$uptime" ] && say "up for $uptime"
+  chosen="$(sed -n 's/^foxy: carrier //p' "$LOG" 2>/dev/null | tail -n 1)"
+  [ -n "$chosen" ] && say "carrier: $chosen"
+  quota="$(sed -n 's/^foxy: allowance //p' "$LOG" 2>/dev/null | tail -n 1)"
+  [ -n "$quota" ] && say "quota left: $quota"
   local front port mode answer
   front="${FRONTS%%,*}"
   case "$front" in
@@ -900,7 +938,13 @@ while [ $# -gt 0 ]; do
     --domains) need_value --domains "comma-separated origins" "$#" "${2:-}"; VEEPN_DOMAINS="$2"; shift 2 ;;
     --udid) need_value --udid "a device id" "$#" "${2:-}"; VEEPN_UDID="$2"; shift 2 ;;
     --city) need_value --city "a city code" "$#" "${2:-}"; CITY="$2"; shift 2 ;;
-    --carrier) need_value --carrier "auto, h1, h2 or h3" "$#" "${2:-}"; CARRIER="$2"; shift 2 ;;
+    --carrier)
+      need_value --carrier "auto, h1, h2 or h3" "$#" "${2:-}"
+      case "$2" in
+        auto|h1|h2|h3) CARRIER="$2" ;;
+        *) die "--carrier wants auto, h1, h2 or h3, got '$2'; nothing was started." ;;
+      esac
+      CARRIER_SET=1; shift 2 ;;
     --upstream) need_value --upstream "an http:// or socks5:// URL" "$#" "${2:-}"; UPSTREAM="$2"; shift 2 ;;
     --fronts) need_value --fronts "a comma-separated front list" "$#" "${2:-}"; FRONTS="$2"; shift 2 ;;
     --socks) need_value --socks "a port" "$#" "${2:-}"; SOCKS_PORT="$2"; shift 2 ;;
