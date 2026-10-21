@@ -319,16 +319,17 @@ impl Refusals {
     #[must_use]
     pub fn blocked(&self, carrier: u8, host: &str, port: u16, now: u64) -> bool {
         self.entries.iter().any(|(known, until)| {
-            known.carrier == carrier && known.host == host && known.port == port && *until > now
+            known.carrier == carrier
+                && known.host.as_ref() == host
+                && known.port == port
+                && *until > now
         })
     }
 
     pub fn remember(&mut self, carrier: u8, host: &str, port: u16, until: u64) {
-        if let Some(entry) = self
-            .entries
-            .iter_mut()
-            .find(|(known, _)| known.carrier == carrier && known.host == host && known.port == port)
-        {
+        if let Some(entry) = self.entries.iter_mut().find(|(known, _)| {
+            known.carrier == carrier && known.host.as_ref() == host && known.port == port
+        }) {
             entry.1 = until;
             return;
         }
@@ -350,7 +351,7 @@ impl Refusals {
 
     pub fn clear(&mut self, carrier: u8, host: &str, port: u16) {
         self.entries.retain(|(known, _)| {
-            known.carrier != carrier || known.host != host || known.port != port
+            known.carrier != carrier || known.host.as_ref() != host || known.port != port
         });
     }
 }
@@ -363,7 +364,7 @@ struct CarrierKey {
     /// The carrier the edge went silent on.
     carrier: u8,
     /// The edge's name.
-    host: String,
+    host: std::sync::Arc<str>,
     /// The port the edge was reached on.
     port: u16,
 }
@@ -372,7 +373,7 @@ impl CarrierKey {
     fn new(carrier: u8, host: &str, port: u16) -> Self {
         Self {
             carrier,
-            host: host.to_owned(),
+            host: std::sync::Arc::from(host),
             port,
         }
     }
@@ -398,9 +399,11 @@ pub fn count_tunnel_end(in_a_row: u32, lasted: std::time::Duration) -> u32 {
 }
 
 /// The edges whose tunnels kept ending soon: each one's quick-end streak and, once the streak reached [`EDGE_REST_STRIKES`], until when the edge is out of the dial order. A check that only proves an edge answers keeps dialing one whose tunnel dies on arrival, as on an exit the edge refuses; this rests it so the next flow asks a different one.
+///
+/// The entries are a list keyed by the edge's own name and port rather than a map keyed by a joined string, the way [`Refusals`] is keyed: the lookup is on the dial path, once per edge per flow, and the joined key cost one allocation and a hash of the joined bytes every time.
 #[derive(Debug)]
 pub struct EdgeStrikes {
-    entries: std::collections::HashMap<String, (u32, u64)>,
+    entries: Vec<(EdgeKey, (u32, u64))>,
     cap: usize,
 }
 
@@ -408,33 +411,47 @@ impl EdgeStrikes {
     #[must_use]
     pub fn new(cap: usize) -> Self {
         Self {
-            entries: std::collections::HashMap::new(),
+            entries: Vec::new(),
             cap: cap.max(1),
         }
     }
 
-    /// Whether the edge is rested at `now`.
+    /// Whether the edge at `host`:`port` is rested at `now`.
     #[must_use]
-    pub fn resting(&self, key: &str, now: u64) -> bool {
-        self.entries.get(key).is_some_and(|&(_, until)| until > now)
+    pub fn resting(&self, host: &str, port: u16, now: u64) -> bool {
+        self.entries.iter().any(|(known, until)| {
+            known.host.as_ref() == host && known.port == port && until.1 > now
+        })
     }
 
-    /// Records a tunnel through `key` that ended after lasting `lasted`, at `now`. A tunnel that stayed up clears the streak and frees the entry; a short one that completes the strikes rests the edge, otherwise it only bumps the streak.
-    pub fn note_end(&mut self, key: &str, lasted: std::time::Duration, now: u64) {
-        let next = count_tunnel_end(self.entries.get(key).map_or(0, |&(count, _)| count), lasted);
+    /// Records a tunnel through `host`:`port` that ended after lasting `lasted`, at `now`. A tunnel that stayed up clears the streak and frees the entry; a short one that completes the strikes rests the edge, otherwise it only bumps the streak.
+    pub fn note_end(&mut self, host: &str, port: u16, lasted: std::time::Duration, now: u64) {
+        let count = self
+            .entries
+            .iter()
+            .find(|(known, _)| known.host.as_ref() == host && known.port == port)
+            .map_or(0, |&(_, (count, _))| count);
+        let next = count_tunnel_end(count, lasted);
         if next == 0 {
-            self.entries.remove(key);
+            self.entries
+                .retain(|(known, _)| known.host.as_ref() != host || known.port != port);
             return;
         }
         let entry = next >= EDGE_REST_STRIKES;
-        if entry && !self.entries.contains_key(key) && self.entries.len() >= self.cap {
-            if let Some(oldest) = self
+        let known = self
+            .entries
+            .iter()
+            .any(|(known, _)| known.host.as_ref() == host && known.port == port);
+        if entry && !known && self.entries.len() >= self.cap {
+            // The entry that expires first is the one to drop: the window is the whole of what an entry says, so the earliest expiry is the oldest news.
+            if let Some(at) = self
                 .entries
                 .iter()
-                .min_by_key(|(_, &(_, until))| until)
-                .map(|(key, _)| key.clone())
+                .enumerate()
+                .min_by_key(|entry| (entry.1).1)
+                .map(|(at, _)| at)
             {
-                self.entries.remove(&oldest);
+                self.entries.remove(at);
             }
         }
         let until = if entry {
@@ -442,13 +459,37 @@ impl EdgeStrikes {
         } else {
             0
         };
-        self.entries.insert(key.to_owned(), (next, until));
+        match self
+            .entries
+            .iter_mut()
+            .find(|(known, _)| known.host.as_ref() == host && known.port == port)
+        {
+            Some(slot) => slot.1 = (next, until),
+            None => self.entries.push((EdgeKey::new(host, port), (next, until))),
+        }
+    }
+}
+
+/// The edge a strike is counted against: its name and the port it was reached on, as two fields rather than a joined string.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EdgeKey {
+    host: std::sync::Arc<str>,
+    port: u16,
+}
+
+impl EdgeKey {
+    fn new(host: &str, port: u16) -> Self {
+        Self {
+            host: std::sync::Arc::from(host),
+            port,
+        }
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Candidate {
-    pub host: String,
+    /// The edge's name, shared rather than copied: a flow dials the edge many times and every one of them reads this name, so a lane that held it once and copied it per dial paid the copy per flow.
+    pub host: std::sync::Arc<str>,
     pub port: u16,
     pub country: String,
     pub city: String,
@@ -471,26 +512,116 @@ pub fn candidates_for_country(candidates: &[Candidate], country: &str) -> Vec<Ca
 }
 
 /// Stored edge first when it is in the pinned country, then that country's listed edges in order, one alternate more than the last.
+///
+/// The order is borrowed and held in a fixed array rather than collected into a `Vec`, because the walk is on the dial path and the list is short enough to know its own size: the first edge and its alternates, and no more.
 #[must_use]
-pub fn dial_order(
-    candidates: &[Candidate],
+pub fn dial_order<'a>(
+    candidates: &'a [Candidate],
     country: &str,
-    stored: Option<&Candidate>,
+    stored: Option<&'a Candidate>,
     max_alternates: usize,
-) -> Vec<Candidate> {
-    let mut order: Vec<Candidate> = Vec::new();
+) -> DialOrder<'a> {
+    let mut order = DialOrder::new();
     if let Some(stored) = stored.filter(|edge| edge.country.eq_ignore_ascii_case(country)) {
-        order.push(stored.clone());
+        order.push(stored);
     }
     for edge in candidates {
-        if order.len() > max_alternates {
+        if order.len() > max_alternates || order.len() == DIAL_ORDER_MAX {
             break;
         }
         if edge.country.eq_ignore_ascii_case(country) && !order.contains(edge) {
-            order.push(edge.clone());
+            order.push(edge);
         }
     }
     order
+}
+
+/// The edges one flow may dial, in order, held where the flow already has its stack: the first edge and its alternates, and no more, so the order costs no allocation on the dial path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DialOrder<'a> {
+    edges: [Option<&'a Candidate>; DIAL_ORDER_MAX],
+    len: usize,
+}
+
+/// How many edges one flow's order holds: the first and its alternates, and the cap on the count a dial walk asks for.
+pub const DIAL_ORDER_MAX: usize = 8;
+
+impl<'a> DialOrder<'a> {
+    fn new() -> Self {
+        Self {
+            edges: [None; DIAL_ORDER_MAX],
+            len: 0,
+        }
+    }
+
+    fn push(&mut self, edge: &'a Candidate) {
+        if self.len < DIAL_ORDER_MAX {
+            self.edges[self.len] = Some(edge);
+            self.len += 1;
+        }
+    }
+
+    /// The order's length: how many edges it holds.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether the order holds no edge at all.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Whether this edge is already in the order.
+    #[must_use]
+    pub fn contains(&self, edge: &Candidate) -> bool {
+        self.edges[..self.len]
+            .iter()
+            .flatten()
+            .any(|held| *held == edge)
+    }
+
+    /// The edge at this place in the order, if the order reaches that far.
+    #[must_use]
+    pub fn get(&self, at: usize) -> Option<&'a Candidate> {
+        self.edges.get(at).copied().flatten()
+    }
+
+    /// The order's edges, in the order they are dialed.
+    pub fn iter(&self) -> impl Iterator<Item = &'a Candidate> {
+        // The array is copied rather than borrowed: the iterator then carries the order's own lifetime and no borrow of the order, so a caller can walk it while holding the order.
+        let edges = self.edges;
+        edges.into_iter().flatten()
+    }
+
+    /// The order with the edges a caller rejects left out, or the whole order when every edge is rejected: a full rejection must not black-hole a flow, so an order that would come back empty keeps every edge it had.
+    ///
+    /// The result is another fixed array, because the walk is on the dial path: a caller that collected the survivors into a vector paid a heap buffer for a list it walks once.
+    #[must_use]
+    pub fn filtered(&self, keep: impl Fn(&Candidate) -> bool) -> DialOrder<'a> {
+        let mut out = DialOrder::new();
+        for edge in self.iter() {
+            if keep(edge) {
+                out.push(edge);
+            }
+        }
+        if out.is_empty() {
+            for edge in self.iter() {
+                out.push(edge);
+            }
+        }
+        out
+    }
+}
+
+impl<'a> IntoIterator for DialOrder<'a> {
+    type Item = &'a Candidate;
+    type IntoIter = std::iter::Flatten<std::array::IntoIter<Option<&'a Candidate>, DIAL_ORDER_MAX>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.edges.into_iter().flatten()
+    }
 }
 
 /// One verdict per failure, not a score: the pass, the tunnel, or the target.
@@ -909,43 +1040,60 @@ mod tests {
         assert_eq!(count_tunnel_end(5, Duration::from_secs(3600)), 0);
     }
 
+    /// The strike lookup takes the edge's own name, so a caller that already holds it asks without copying it: the joined key this replaced cost one allocation and a hash of the joined bytes per lookup, and the lookup is on the dial path, once per edge per flow.
+    #[test]
+    fn an_edge_strike_lookup_allocates_nothing() {
+        let mut strikes = EdgeStrikes::new(8);
+        strikes.note_end("edge.example", 2499, TUNNEL_STAYED_UP, 100);
+        let host = String::from("edge.example");
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                assert!(!strikes.resting(&host, 2499, 100));
+            }
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "the lookup copies nothing: the name is the caller's own"
+        );
+    }
+
     /// Two quick ends rest the edge for the window; a third carrier that carried traffic for its length frees the entry instead of adding a strike.
     #[test]
     fn two_quick_ends_rest_an_edge_and_a_long_tunnel_frees_it() {
         use std::time::Duration;
         let short = TUNNEL_STAYED_UP.saturating_sub(Duration::from_secs(1));
         let mut strikes = EdgeStrikes::new(8);
-        strikes.note_end("edge:443", short, 100);
+        strikes.note_end("edge", 443, short, 100);
         assert!(
-            !strikes.resting("edge:443", 100),
+            !strikes.resting("edge", 443, 100),
             "one quick end is not yet a reason to rest"
         );
-        strikes.note_end("edge:443", short, 100);
+        strikes.note_end("edge", 443, short, 100);
         assert!(
-            strikes.resting("edge:443", 100),
+            strikes.resting("edge", 443, 100),
             "the second quick end in a row rests it"
         );
         assert!(
-            !strikes.resting("edge:443", 400),
+            !strikes.resting("edge", 443, 400),
             "another edge is untouched"
         );
         assert!(
-            !strikes.resting("edge:443", 100 + EDGE_REST.as_secs()),
+            !strikes.resting("edge", 443, 100 + EDGE_REST.as_secs()),
             "the rest expires and the edge is dialed again"
         );
         // A fresh streak that runs long is proof of a good edge, not a third strike.
-        strikes.note_end("edge:443", short, 500);
-        strikes.note_end("edge:443", Duration::from_secs(300), 500);
-        strikes.note_end("edge:443", short, 500);
+        strikes.note_end("edge", 443, short, 500);
+        strikes.note_end("edge", 443, Duration::from_secs(300), 500);
+        strikes.note_end("edge", 443, short, 500);
         assert!(
-            !strikes.resting("edge:443", 500),
+            !strikes.resting("edge", 443, 500),
             "the long tunnel cleared the streak, so one short end is not a rest"
         );
     }
 
     fn edge(host: &str, country: &str, city: &str) -> Candidate {
         Candidate {
-            host: host.to_owned(),
+            host: std::sync::Arc::from(host),
             port: 443,
             country: country.to_owned(),
             city: city.to_owned(),
@@ -961,17 +1109,89 @@ mod tests {
             edge("us2", "US", "sf"),
         ];
         let authorities =
-            |order: &[Candidate]| order.iter().map(Candidate::authority).collect::<Vec<_>>();
+            |order: DialOrder<'_>| order.iter().map(Candidate::authority).collect::<Vec<_>>();
         assert_eq!(
-            authorities(&dial_order(&edges, "de", Some(&edges[2]), 2)),
+            authorities(dial_order(&edges, "de", Some(&edges[2]), 2)),
             ["de2:443", "de1:443"]
         );
         assert_eq!(
-            authorities(&dial_order(&edges, "DE", Some(&edges[1]), 2)),
+            authorities(dial_order(&edges, "DE", Some(&edges[1]), 2)),
             ["de1:443", "de2:443"]
         );
-        assert_eq!(authorities(&dial_order(&edges, "us", None, 0)), ["us1:443"]);
-        assert_eq!(dial_order(&edges, "fr", None, 3), Vec::new());
+        assert_eq!(authorities(dial_order(&edges, "us", None, 0)), ["us1:443"]);
+        assert!(dial_order(&edges, "fr", None, 3).is_empty());
+    }
+
+    /// The order a flow walks is held, not built: a flow that collected the ladder into a vector paid a heap buffer for a list it had already, and a flow that copied the edges paid four strings per edge to name a list that never changes.
+    #[test]
+    fn a_dial_order_walks_without_touching_the_heap() {
+        let edges = vec![
+            edge("de1", "DE", "berlin"),
+            edge("us1", "US", "nyc"),
+            edge("de2", "de", "frankfurt"),
+            edge("us2", "US", "sf"),
+        ];
+        let (order, counts) = crate::alloc_count::measure(|| {
+            let order = dial_order(&edges, "de", Some(&edges[2]), 3);
+            std::hint::black_box(order.iter().count());
+            order
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "building the order a flow walks takes no heap at all"
+        );
+        assert_eq!(
+            order.len(),
+            2,
+            "the pinned country's edges, the stored one first"
+        );
+    }
+
+    /// The order the rest of the walk filters: the survivors are held in the order's own array, so a flow that collected them into a vector paid a heap buffer for a list of four.
+    #[test]
+    fn a_filtered_dial_order_holds_its_survivors_without_touching_the_heap() {
+        let edges = vec![
+            edge("de1", "DE", "berlin"),
+            edge("de2", "de", "frankfurt"),
+            edge("de3", "DE", "berlin"),
+        ];
+        let (kept, counts) = crate::alloc_count::measure(|| {
+            let order = dial_order(&edges, "de", None, 3);
+            let kept = order.filtered(|edge| edge.city == "berlin");
+            std::hint::black_box(kept.len());
+            kept
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "filtering the order takes no heap at all"
+        );
+        assert_eq!(
+            kept.len(),
+            2,
+            "the two berlin edges, and the frankfurt one left out"
+        );
+    }
+
+    /// Every edge that rests comes back: a filter that emptied the order would black-hole a flow, and the one that rests is the edge the lane has least reason to try.
+    #[test]
+    fn a_filter_that_rejects_every_edge_keeps_them_all() {
+        let edges = vec![edge("de1", "DE", "berlin"), edge("de2", "de", "frankfurt")];
+        let order = dial_order(&edges, "de", None, 3);
+        let kept = order.filtered(|_| false);
+        assert_eq!(kept.len(), 2, "a full rest must not black-hole a flow");
+    }
+
+    /// The edge's name is shared: a flow that cloned it paid a copy of the name per dial, and the name is the same bytes for every flow of the lane.
+    #[test]
+    fn an_edge_name_is_shared_rather_than_copied() {
+        let edge = edge("de1", "DE", "berlin");
+        let copy = edge.clone();
+        assert!(
+            std::sync::Arc::ptr_eq(&edge.host, &copy.host),
+            "the copy holds the same name, not a copy of it"
+        );
     }
 
     #[test]

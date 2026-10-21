@@ -933,12 +933,12 @@ fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
 pub(crate) struct FoxyOut {
     account: Option<std::sync::Arc<crate::foxy_account::Account>>,
     country: String,
-    city: String,
     carrier: crate::foxy::Carrier,
     /// The configured upstream; dialing past it leaks, so a value that does not parse refuses the outbound.
     upstream: Option<crate::foxy::UpstreamProxy>,
-    candidates: Vec<ferrox_core::foxy::Candidate>,
-    stored: Option<ferrox_core::foxy::Candidate>,
+    /// The ladder this lane walks, tiered once: the country's edges in tier order, the order every flow reads rather than rebuilds.
+    ladder: Vec<ferrox_core::foxy::Candidate>,
+    stored: Option<std::sync::Arc<ferrox_core::foxy::Candidate>>,
     /// Set when an edge refuses the pass: later flows answer locally instead of paying that round trip again.
     unauthenticated: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Strikes and the earliest next dial: one attempt answers a 429, the rest wait out the refusal curve.
@@ -956,7 +956,8 @@ pub(crate) struct FoxyOut {
     direct_suffixes: Vec<String>,
     exit_probe: Option<String>,
     /// The pinned-country edge whose real exit the pre-flight confirmed, tried before the label order; empty until one agrees.
-    verified: std::sync::Arc<std::sync::Mutex<Option<ferrox_core::foxy::Candidate>>>,
+    verified:
+        std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<ferrox_core::foxy::Candidate>>>>,
     /// Set when no edge could carry a probe tunnel here: the pre-flight then stops rather than costing every flow a dead dial.
     probe_unavailable: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set while the sweep runs on its own thread: one lane probes once, and a flow that arrives mid-sweep rides the label order rather than waiting.
@@ -1009,43 +1010,35 @@ impl FoxyOut {
         }
     }
 
-    /// The edge every carrier should try first: the pre-flight's verified exit, else the configured stored edge.
-    fn preferred_edge(&self) -> Option<ferrox_core::foxy::Candidate> {
-        self.verified
-            .lock()
-            .ok()
-            .and_then(|kept| kept.clone())
-            .or_else(|| self.stored.clone())
+    /// The edge every carrier should try first: the pre-flight's verified exit, else the configured stored edge. The edge is held, not copied: a flow that cloned it paid four strings to name an edge the lane already holds, and the mutex is not held across the dial.
+    fn preferred_edge(&self) -> Option<std::sync::Arc<ferrox_core::foxy::Candidate>> {
+        if let Ok(kept) = self.verified.lock() {
+            if let Some(edge) = kept.clone() {
+                return Some(edge);
+            }
+        }
+        self.stored.clone()
     }
 
     /// Whether this edge's TCP tunnels kept ending soon enough to rest it right now.
     fn edge_resting(&self, edge: &ferrox_core::foxy::Candidate) -> bool {
         self.edge_strikes
             .lock()
-            .is_ok_and(|cache| cache.resting(&edge.authority(), now_secs()))
+            .is_ok_and(|cache| cache.resting(&edge.host, edge.port, now_secs()))
     }
 
-    /// The dial order with rested edges left out, or the whole order when every edge rests, so a full rest cannot black-hole a flow.
-    fn live_dials(
-        &self,
-        order: &[ferrox_core::foxy::Candidate],
-    ) -> Vec<ferrox_core::foxy::Candidate> {
-        let live: Vec<_> = order
-            .iter()
-            .filter(|edge| !self.edge_resting(edge))
-            .cloned()
-            .collect();
-        if live.is_empty() {
-            order.to_vec()
-        } else {
-            live
-        }
+    /// The dial order with rested edges left out, or the whole order when every edge rests, so a full rest cannot black-hole a flow. The survivors are held in the order's own array: a flow that collected them into a vector paid a heap buffer for a list of four it walks once.
+    fn live_dials<'a>(
+        &'a self,
+        order: &ferrox_core::foxy::DialOrder<'a>,
+    ) -> ferrox_core::foxy::DialOrder<'a> {
+        order.filtered(|edge| !self.edge_resting(edge))
     }
 
     /// A TCP tunnel through this edge ended after lasting this long: two quick ends in a row rest the edge, a tunnel that carried traffic frees it.
     fn note_edge_end(&self, edge: &ferrox_core::foxy::Candidate, lasted: Duration) {
         if let Ok(mut cache) = self.edge_strikes.lock() {
-            cache.note_end(&edge.authority(), lasted, now_secs());
+            cache.note_end(&edge.host, edge.port, lasted, now_secs());
         }
     }
 }
@@ -6307,8 +6300,8 @@ fn serve_connect(
                     &client,
                     &crate::quic::QuicDial {
                         id: vless.id,
-                        host: vless.host.clone(),
-                        address: vless.address.clone(),
+                        host: std::sync::Arc::from(vless.host.as_str()),
+                        address: std::sync::Arc::from(vless.address.as_str()),
                         port: vless.port,
                         upstream: None,
                         roots: vless.quic_roots.clone(),
@@ -6682,21 +6675,15 @@ fn verify_exit(foxy: &FoxyOut) {
         return;
     };
     let authority = format!("{host}:80");
-    let order = ferrox_core::foxy::catalog::tier(
-        &foxy.candidates,
-        &foxy.country,
-        &foxy.city,
-        MAX_FOXY_ALTERNATES,
-    );
     let edges = ferrox_core::foxy::dial_order(
-        &order,
+        &foxy.ladder,
         &foxy.country,
-        foxy.stored.as_ref(),
+        foxy.stored.as_deref(),
         MAX_FOXY_ALTERNATES,
     );
     let pin = foxy.country.to_ascii_uppercase();
     let mut flags: Vec<Option<bool>> = Vec::with_capacity(edges.len());
-    for edge in &edges {
+    for edge in edges.iter() {
         let agreed = probe_edge_exit(foxy, edge, &authority).map(|seen| {
             let agrees = exit_agrees(&foxy.country, &seen);
             if !agrees {
@@ -6714,7 +6701,9 @@ fn verify_exit(foxy: &FoxyOut) {
     match sweep_verdict(&flags) {
         Sweep::Agreed(at) => {
             if let Ok(mut kept) = foxy.verified.lock() {
-                *kept = Some(edges[at].clone());
+                if let Some(edge) = edges.get(at) {
+                    *kept = Some(std::sync::Arc::new(edge.clone()));
+                }
             }
         }
         // The pin is not what this runner gets out; re-sweeping it per flow would only buy the same refusal again.
@@ -6767,20 +6756,16 @@ fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
         };
         return FoxyOpen::Direct(target);
     }
-    let target = asked.authority();
+    // The target is spelled once, into a buffer the flow owns: a flow that joined the name and the port into a fresh string per carrier paid a heap buffer for every carrier it tried.
+    let mut target = String::new();
+    asked.authority_into(&mut target);
     schedule_exit_probe(foxy);
     let preferred = foxy.preferred_edge();
-    let order = ferrox_core::foxy::catalog::tier(
-        &foxy.candidates,
-        &foxy.country,
-        &foxy.city,
-        MAX_FOXY_ALTERNATES,
-    );
     let mut last = None;
     let order = ferrox_core::foxy::dial_order(
-        &order,
+        &foxy.ladder,
         &foxy.country,
-        preferred.as_ref(),
+        preferred.as_deref(),
         MAX_FOXY_ALTERNATES,
     );
     for edge in foxy.live_dials(&order) {
@@ -6790,7 +6775,7 @@ fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
             .map_or_else(|| foxy.pass.clone(), |account| account.current());
         for carrier in foxy.carrier.order() {
             // As on UDP: a silent carrier is left alone for the window, not probed per flow.
-            if foxy.carrier_unanswered(&edge, carrier) {
+            if foxy.carrier_unanswered(edge, carrier) {
                 continue;
             }
             let dial = crate::foxy::FoxyDial {
@@ -6806,7 +6791,7 @@ fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
             // A named carrier gets the full budget; an `auto` walk is a probe and gets the probe's.
             let quic = match carrier {
                 crate::foxy::Carrier::H3 => crate::quic::pooled_stream_within(
-                    &foxy_quic_dial(foxy, &edge),
+                    &foxy_quic_dial(foxy, edge),
                     if foxy.carrier == crate::foxy::Carrier::H3 {
                         crate::quic::HANDSHAKE_TIMEOUT
                     } else {
@@ -6817,15 +6802,15 @@ fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
             };
             match crate::foxy::Tunnel::open(&dial, &target, quic) {
                 Ok(tunnel) => {
-                    debug_lane(&edge, carrier, || format!("opened for {target}"));
+                    debug_lane(edge, carrier, || format!("opened for {target}"));
                     foxy.unauthenticated
                         .store(false, std::sync::atomic::Ordering::Relaxed);
                     clear_limited(&foxy.limited_strikes, &foxy.limited_until);
-                    foxy.carrier_answered(&edge, carrier);
-                    return FoxyOpen::Tunnel(Box::new(tunnel), edge.clone());
+                    foxy.carrier_answered(edge, carrier);
+                    return FoxyOpen::Tunnel(Box::new(tunnel), (*edge).clone());
                 }
                 Err(failure) => {
-                    debug_lane(&edge, carrier, || failure.to_string());
+                    debug_lane(edge, carrier, || failure.to_string());
                     // A refused pass is the pass, not the edge: all carriers answer it the same.
                     if let ferrox_core::foxy::Failure::Rejected(status) = failure {
                         if ferrox_core::foxy::pass_is_rejected(status) {
@@ -6840,7 +6825,7 @@ fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
                         }
                     }
                     // A status is the edge speaking, so only a silent carrier is remembered as dead.
-                    foxy.remember_unanswered(&edge, carrier, failure);
+                    foxy.remember_unanswered(edge, carrier, failure);
                     last = Some(failure);
                     // A refused chain is the edge's own certificate, not the carrier's: HTTP/2 and HTTP/1.1 would answer a trust failure exactly as this one did.
                     if matches!(failure, ferrox_core::foxy::Failure::Untrusted) {
@@ -7735,16 +7720,10 @@ fn open_foxy_ip_tunnel(
     if edge_limited(&foxy.limited_until, now_secs()) {
         return false;
     }
-    let order = ferrox_core::foxy::catalog::tier(
-        &foxy.candidates,
-        &foxy.country,
-        &foxy.city,
-        MAX_FOXY_ALTERNATES,
-    );
     for edge in ferrox_core::foxy::dial_order(
-        &order,
+        &foxy.ladder,
         &foxy.country,
-        foxy.stored.as_ref(),
+        foxy.stored.as_deref(),
         MAX_FOXY_ALTERNATES,
     ) {
         let pass = foxy
@@ -7753,7 +7732,7 @@ fn open_foxy_ip_tunnel(
             .map_or_else(|| foxy.pass.clone(), |account| account.current());
         for carrier in crate::foxy::Carrier::udp_order() {
             // As on TCP and CONNECT-UDP: a silent carrier is left alone for the window, not probed per packet.
-            if foxy.carrier_unanswered(&edge, carrier) {
+            if foxy.carrier_unanswered(edge, carrier) {
                 continue;
             }
             let dial = crate::foxy::FoxyDial {
@@ -7768,7 +7747,7 @@ fn open_foxy_ip_tunnel(
             };
             let quic = match carrier {
                 crate::foxy::Carrier::H3 => crate::quic::pooled_stream_within(
-                    &foxy_quic_dial(foxy, &edge),
+                    &foxy_quic_dial(foxy, edge),
                     if foxy.carrier == crate::foxy::Carrier::H3 {
                         crate::quic::HANDSHAKE_TIMEOUT
                     } else {
@@ -7779,11 +7758,11 @@ fn open_foxy_ip_tunnel(
             };
             match crate::foxy::Ip::open(&dial, quic) {
                 Ok((mut lane, assigned)) => {
-                    debug_lane(&edge, carrier, || "connect-ip opened".to_owned());
+                    debug_lane(edge, carrier, || "connect-ip opened".to_owned());
                     clear_limited(&foxy.limited_strikes, &foxy.limited_until);
-                    foxy.carrier_answered(&edge, carrier);
+                    foxy.carrier_answered(edge, carrier);
                     let Some(granted) = assigned else {
-                        debug_lane(&edge, carrier, || {
+                        debug_lane(edge, carrier, || {
                             "the edge granted no address, so the tunnel carries nothing".to_owned()
                         });
                         continue;
@@ -7796,7 +7775,7 @@ fn open_foxy_ip_tunnel(
                     return true;
                 }
                 Err(failure) => {
-                    debug_lane(&edge, carrier, || failure.to_string());
+                    debug_lane(edge, carrier, || failure.to_string());
                     let silent = matches!(
                         failure,
                         ferrox_core::foxy::Failure::Io
@@ -7804,7 +7783,7 @@ fn open_foxy_ip_tunnel(
                             | ferrox_core::foxy::Failure::Frame
                     );
                     if silent {
-                        foxy.remember_unanswered(&edge, carrier, failure);
+                        foxy.remember_unanswered(edge, carrier, failure);
                     }
                     if matches!(failure, ferrox_core::foxy::Failure::Rejected(429)) {
                         note_limited(&foxy.limited_strikes, &foxy.limited_until, now_secs());
@@ -7822,16 +7801,10 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
     if edge_limited(&foxy.limited_until, now_secs()) {
         return None;
     }
-    let order = ferrox_core::foxy::catalog::tier(
-        &foxy.candidates,
-        &foxy.country,
-        &foxy.city,
-        MAX_FOXY_ALTERNATES,
-    );
     for edge in ferrox_core::foxy::dial_order(
-        &order,
+        &foxy.ladder,
         &foxy.country,
-        foxy.stored.as_ref(),
+        foxy.stored.as_deref(),
         MAX_FOXY_ALTERNATES,
     ) {
         let pass = foxy
@@ -7840,7 +7813,7 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
             .map_or_else(|| foxy.pass.clone(), |account| account.current());
         for carrier in crate::foxy::Carrier::udp_order() {
             // As on TCP: a silent carrier is left alone for the window, not probed per datagram.
-            if foxy.carrier_unanswered(&edge, carrier) {
+            if foxy.carrier_unanswered(edge, carrier) {
                 continue;
             }
             if carrier == crate::foxy::Carrier::H3
@@ -7865,7 +7838,7 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
             let failure = match carrier {
                 crate::foxy::Carrier::H3 => {
                     let Some(lease) = crate::quic::pooled_stream_within(
-                        &foxy_quic_dial(foxy, &edge),
+                        &foxy_quic_dial(foxy, edge),
                         if foxy.carrier == crate::foxy::Carrier::H3 {
                             crate::quic::HANDSHAKE_TIMEOUT
                         } else {
@@ -7877,9 +7850,9 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
                     match crate::foxy::H3::open_udp(&dial, &host, dest.port(), lease) {
                         Ok(mut lane) => {
                             lane.set_read_quantum(UDP_POLL);
-                            debug_lane(&edge, carrier, || format!("udp opened for {dest}"));
+                            debug_lane(edge, carrier, || format!("udp opened for {dest}"));
                             clear_limited(&foxy.limited_strikes, &foxy.limited_until);
-                            foxy.carrier_answered(&edge, carrier);
+                            foxy.carrier_answered(edge, carrier);
                             return Some(crate::foxy::Datagram::H3(Box::new(lane)));
                         }
                         Err(failure) => failure,
@@ -7888,20 +7861,20 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
                 _ => match crate::foxy::open_udp(&dial, &host, dest.port()) {
                     Ok(lane) => {
                         let _ = lane.set_read_quantum(UDP_POLL);
-                        debug_lane(&edge, carrier, || format!("udp opened for {dest}"));
+                        debug_lane(edge, carrier, || format!("udp opened for {dest}"));
                         clear_limited(&foxy.limited_strikes, &foxy.limited_until);
-                        foxy.carrier_answered(&edge, carrier);
+                        foxy.carrier_answered(edge, carrier);
                         return Some(crate::foxy::Datagram::H2(Box::new(lane)));
                     }
                     Err(failure) => failure,
                 },
             };
-            debug_lane(&edge, carrier, || failure.to_string());
+            debug_lane(edge, carrier, || failure.to_string());
             if matches!(failure, ferrox_core::foxy::Failure::Rejected(429)) {
                 note_limited(&foxy.limited_strikes, &foxy.limited_until, now_secs());
                 break;
             }
-            foxy.remember_unanswered(&edge, carrier, failure);
+            foxy.remember_unanswered(edge, carrier, failure);
         }
     }
     None
@@ -8421,8 +8394,8 @@ fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
 fn foxy_quic_dial(foxy: &FoxyOut, edge: &ferrox_core::foxy::Candidate) -> crate::quic::QuicDial {
     crate::quic::QuicDial {
         id: [0; 16],
-        host: edge.host.clone(),
-        address: edge.host.clone(),
+        host: std::sync::Arc::clone(&edge.host),
+        address: std::sync::Arc::clone(&edge.host),
         port: edge.port,
         upstream: foxy.upstream.clone(),
         roots: Some(foxy.roots.clone()),
@@ -9306,14 +9279,18 @@ const SPLICE_PIPE_BYTES: usize = DEFAULT_SPLICE_PIPE_BYTES;
 #[cfg(target_os = "linux")]
 const DEFAULT_SPLICE_PIPE_BYTES: usize = 256 * 1024;
 
+/// The pipe's size, asked once: the environment is read at startup, and a relay that read it per pipe paid an environment lookup and a `String` for every connection it carried.
 #[cfg(target_os = "linux")]
 fn splice_pipe_bytes() -> libc::c_int {
-    let asked = std::env::var("FERROX_SPLICE_PIPE_BYTES")
-        .ok()
-        .and_then(|raw| raw.trim().parse::<usize>().ok())
-        .filter(|bytes| *bytes > 0)
-        .unwrap_or(SPLICE_PIPE_BYTES);
-    libc::c_int::try_from(asked).unwrap_or(libc::c_int::MAX)
+    static ASKED: OnceLock<libc::c_int> = OnceLock::new();
+    *ASKED.get_or_init(|| {
+        let asked = std::env::var("FERROX_SPLICE_PIPE_BYTES")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .filter(|bytes| *bytes > 0)
+            .unwrap_or(SPLICE_PIPE_BYTES);
+        libc::c_int::try_from(asked).unwrap_or(libc::c_int::MAX)
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -10710,6 +10687,20 @@ impl Destination {
         }
     }
 
+    /// The authority in a buffer the caller owns, so a flow that dials several carriers spells the target once: the joined form this replaced cost a heap buffer per flow for a name and a port.
+    fn authority_into(&self, out: &mut String) {
+        use std::fmt::Write;
+        out.clear();
+        let _ = match self {
+            Self::Name(host, port) if host.contains(':') => write!(out, "[{host}]:{port}"),
+            Self::Name(host, port) => write!(out, "{host}:{port}"),
+            Self::Address(address) if address.ip().is_ipv6() => {
+                write!(out, "[{}]:{}", address.ip(), address.port())
+            }
+            Self::Address(address) => write!(out, "{address}"),
+        };
+    }
+
     /// Appends the authority's octets: the same bytes `authority` returns, without the buffer they used to pass through.
     fn push_authority(&self, out: &mut Vec<u8>) {
         use std::io::Write;
@@ -11129,7 +11120,7 @@ fn foxy_candidates(
 ) -> Vec<ferrox_core::foxy::Candidate> {
     let named = link.host();
     let named_edge = (!named.is_empty()).then(|| ferrox_core::foxy::Candidate {
-        host: named.to_owned(),
+        host: std::sync::Arc::from(named),
         port: link.port(),
         country: country.to_owned(),
         city: city.to_owned(),
@@ -11211,7 +11202,7 @@ fn foxy_edges(outbound: &Json, country: &str, city: &str) -> Vec<ferrox_core::fo
     edges
         .iter()
         .filter_map(|edge| {
-            let host = edge.get("host").and_then(Json::as_str)?.to_owned();
+            let host = std::sync::Arc::from(edge.get("host").and_then(Json::as_str)?);
             let port = edge.get("port").and_then(Json::as_port)?;
             let code = edge
                 .get("country")
@@ -11474,9 +11465,12 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             continue;
         }
         eprintln!("foxy: carrier {}", carrier.name());
+        // The ladder is tiered once: the country's edges in tier order never change, and a flow that rebuilt them copied four strings per edge to walk a list it had already.
+        let ladder =
+            ferrox_core::foxy::catalog::tier(&candidates, &country, &city, MAX_FOXY_ALTERNATES);
         return Some(FoxyOut {
             account,
-            candidates,
+            ladder,
             stored: None,
             unauthenticated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             limited_strikes: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -11488,7 +11482,6 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
                 ferrox_core::foxy::EdgeStrikes::new(32),
             )),
             country,
-            city,
             carrier,
             upstream,
             roots,
@@ -15134,7 +15127,7 @@ mod tests {
         ferrox_core::tls::TlsConfig,
     ) {
         let server = std::sync::Arc::new(ferrox_core::tls::TlsServerConfig {
-            alpn: Vec::new(),
+            alpn: Vec::default(),
             cert_chain: vec![CARRIER_CERT.to_vec()],
             key_der: CARRIER_KEY.to_vec(),
             key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
@@ -15142,7 +15135,7 @@ mod tests {
         });
         let client = ferrox_core::tls::TlsConfig {
             server_name: "carrier.test".to_owned(),
-            alpn: Vec::new(),
+            alpn: std::sync::Arc::default(),
             roots: vec![CARRIER_CERT.to_vec()].into(),
             pins: ferrox_core::foxy::pin::Pins::default(),
             cipher_suites: Vec::new(),
@@ -16110,7 +16103,7 @@ mod tests {
             .tls
             .expect("carries tls");
         assert_eq!(tls.server_name, "tls.test");
-        assert_eq!(tls.alpn, vec![b"h2".to_vec()]);
+        assert_eq!(&*tls.alpn, &[b"h2".to_vec()]);
         assert_eq!(tls.roots.len(), 1);
         let insecure = format!(
             r#""network": "tcp", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}", "allowInsecure": true}}"#
@@ -17480,10 +17473,9 @@ mod tests {
         FoxyOut {
             account: None,
             country: "US".to_owned(),
-            city: String::new(),
             carrier: crate::foxy::Carrier::H2,
             upstream: None,
-            candidates: Vec::new(),
+            ladder: Vec::new(),
             stored: None,
             unauthenticated: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             limited_strikes: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -17521,6 +17513,57 @@ mod tests {
         let peer = Connection::connect(addr).expect("connects");
         let (associate, _) = front.accept().expect("accepts");
         (associate, peer)
+    }
+
+    /// A lane with one edge in its ladder, so the dial path has something to walk.
+    fn foxy_with_one_edge() -> FoxyOut {
+        let mut foxy = foxy_without_edges();
+        foxy.ladder = vec![ferrox_core::foxy::Candidate {
+            host: std::sync::Arc::from("edge.example"),
+            port: 443,
+            country: "US".to_owned(),
+            city: String::new(),
+        }];
+        foxy
+    }
+
+    /// The per-flow walk of the ladder costs no heap: the order is held in a fixed array, the edge's name is shared, and the pins and the hop are shared. A flow that collected the order into a vector, and copied the edge's four strings per carrier, paid for a list that never changes.
+    ///
+    /// The lock is taken once before the window opens, because a mutex's first lock allocates its wait state on this platform — a cost paid once per lane, not once per flow, and one the count here would otherwise charge to the first flow that walked the ladder.
+    #[test]
+    fn a_flow_walks_the_ladder_without_touching_the_heap() {
+        let foxy = foxy_with_one_edge();
+        std::hint::black_box(foxy.edge_resting(&foxy.ladder[0]));
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                let order = ferrox_core::foxy::dial_order(
+                    &foxy.ladder,
+                    &foxy.country,
+                    None,
+                    MAX_FOXY_ALTERNATES,
+                );
+                let live = foxy.live_dials(&order);
+                for edge in live.iter() {
+                    // The dial a flow makes per carrier: the name, the pins and the hop are the lane's own, so the copy is a reference count.
+                    let dial = crate::foxy::FoxyDial {
+                        host: std::sync::Arc::clone(&edge.host),
+                        port: edge.port,
+                        address: foxy.edge_address,
+                        carrier: crate::foxy::Carrier::H2,
+                        upstream: foxy.upstream.clone(),
+                        roots: foxy.roots.clone(),
+                        pins: foxy.pins.clone(),
+                        pass: foxy.pass.clone(),
+                    };
+                    std::hint::black_box(dial.port);
+                }
+            }
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "4096 flows walk the ladder and build their dials without touching the heap"
+        );
     }
 
     /// Silence past the budget is death, not a leak: a stream-per-destination association with no traffic hands its thread back at the idle budget.
@@ -21292,8 +21335,8 @@ mod tests {
         let front_port = front.local_addr().expect("addr").port();
         let dial = crate::quic::QuicDial {
             id,
-            host: "localhost".to_owned(),
-            address: "127.0.0.1".to_owned(),
+            host: std::sync::Arc::from("localhost"),
+            address: std::sync::Arc::from("127.0.0.1"),
             port: quic_port,
             upstream: None,
             roots: Some(roots.into()),
@@ -21385,8 +21428,8 @@ mod tests {
         );
         let dial = crate::quic::QuicDial {
             id,
-            host: "localhost".to_owned(),
-            address: "127.0.0.1".to_owned(),
+            host: std::sync::Arc::from("localhost"),
+            address: std::sync::Arc::from("127.0.0.1"),
             port: quic_port,
             upstream: None,
             roots: Some(roots.into()),
@@ -24364,11 +24407,10 @@ mod tests {
         let foxy = FoxyOut {
             account: None,
             country: "US".to_owned(),
-            city: String::new(),
             carrier: edge_carrier,
             upstream: None,
-            candidates: vec![ferrox_core::foxy::Candidate {
-                host: "carrier.test".to_owned(),
+            ladder: vec![ferrox_core::foxy::Candidate {
+                host: std::sync::Arc::from("carrier.test"),
                 port: edge.port(),
                 country: "US".to_owned(),
                 city: String::new(),
@@ -24424,7 +24466,7 @@ mod tests {
         );
 
         // The window, not the verdict: an edge left alone for its quarantine is asked again the moment it ends.
-        let edge = &foxy.candidates[0];
+        let edge = &foxy.ladder[0];
         if let Ok(mut cache) = foxy.carrier_dead.lock() {
             cache.remember(
                 edge_carrier.key(),
@@ -24464,11 +24506,10 @@ mod tests {
         let foxy = FoxyOut {
             account: None,
             country: "US".to_owned(),
-            city: String::new(),
             carrier: crate::foxy::Carrier::Auto,
             upstream: None,
-            candidates: vec![ferrox_core::foxy::Candidate {
-                host: "carrier.test".to_owned(),
+            ladder: vec![ferrox_core::foxy::Candidate {
+                host: std::sync::Arc::from("carrier.test"),
                 port: edge.port(),
                 country: "US".to_owned(),
                 city: String::new(),
@@ -24506,8 +24547,8 @@ mod tests {
             if let Ok(mut cache) = foxy.carrier_dead.lock() {
                 cache.remember(
                     carrier.key(),
-                    &foxy.candidates[0].host,
-                    foxy.candidates[0].port,
+                    &foxy.ladder[0].host,
+                    foxy.ladder[0].port,
                     now_secs() + CARRIER_DEAD_SECS,
                 );
             }
@@ -24528,8 +24569,8 @@ mod tests {
         if let Ok(mut cache) = foxy.carrier_dead.lock() {
             cache.clear(
                 edge_carrier.key(),
-                &foxy.candidates[0].host,
-                foxy.candidates[0].port,
+                &foxy.ladder[0].host,
+                foxy.ladder[0].port,
             );
         }
         assert!(

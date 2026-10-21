@@ -86,8 +86,8 @@ fn try_carrier(
     };
     let quic_dial = crate::quic::QuicDial {
         id: [0u8; 16],
-        host: edge.host.clone(),
-        address: edge.host.clone(),
+        host: std::sync::Arc::clone(&edge.host),
+        address: std::sync::Arc::clone(&edge.host),
         port: edge.port,
         upstream: None,
         roots: None,
@@ -188,8 +188,8 @@ fn the_quic_lane_reaches_the_edge_over_udp_or_says_why_not() {
     };
     let dial = crate::quic::QuicDial {
         id: [0u8; 16],
-        host: edge.host.clone(),
-        address: edge.host.clone(),
+        host: std::sync::Arc::clone(&edge.host),
+        address: std::sync::Arc::clone(&edge.host),
         port: edge.port,
         upstream: None,
         roots: None,
