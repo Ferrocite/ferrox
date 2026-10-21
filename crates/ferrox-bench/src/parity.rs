@@ -243,10 +243,16 @@ pub enum Error {
     },
     Workload(String),
     Transient(String),
-    Desync {
-        flow: usize,
-        offset: u64,
-    },
+    Desync(Forged),
+}
+
+/// What a forged byte says: which flow, which absolute byte, which direction, and the ring's byte against the stream's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Forged {
+    flow: usize,
+    offset: u64,
+    side: &'static str,
+    detail: String,
 }
 
 impl std::fmt::Display for Error {
@@ -257,9 +263,10 @@ impl std::fmt::Display for Error {
             Self::Engine { message } => write!(f, "engine: {message}"),
             Self::Workload(m) => write!(f, "workload: {m}"),
             Self::Transient(m) => write!(f, "transient: {m}"),
-            Self::Desync { flow, offset } => write!(
+            Self::Desync(forged) => write!(
                 f,
-                "workload: flow {flow} relayed a byte that is not the validated pattern at byte {offset}"
+                "workload: flow {} relayed a byte that is not the validated pattern at byte {} on the {}: {}",
+                forged.flow, forged.offset, forged.side, forged.detail
             ),
         }
     }
@@ -268,20 +275,20 @@ impl std::fmt::Display for Error {
 impl std::error::Error for Error {}
 
 // The first forged byte any flow of a run relayed, shared so a nondeterministic desync is re-measured instead of trusted; only the first write sticks.
-type Desync = Arc<std::sync::Mutex<Option<(usize, u64)>>>;
+type Desync = Arc<std::sync::Mutex<Option<Forged>>>;
 
-fn note_desync(desync: &Desync, flow: usize, offset: u64) {
+fn note_desync(desync: &Desync, forged: Forged) {
     if let Ok(mut slot) = desync.lock() {
-        slot.get_or_insert((flow, offset));
+        slot.get_or_insert(forged);
     }
 }
 
 fn is_desync(err: &Error) -> bool {
-    matches!(err, Error::Desync { .. })
+    matches!(err, Error::Desync(_))
 }
 
 fn is_retryable(err: &Error) -> bool {
-    matches!(err, Error::Desync { .. } | Error::Transient(_))
+    matches!(err, Error::Desync(_) | Error::Transient(_))
 }
 
 // The socket-layer signatures of a saturated runner rather than a fault in the engine: EAGAIN (the macos write ride and the read timeout both end here), ENOBUFS, EPIPE and ECONNRESET — the last two usually the cascade of a sibling flow whose ride expired. A genuinely slow engine still completes the transfer and fails on its ratio, not here.
@@ -1010,8 +1017,8 @@ fn measure_once(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> R
     sink_thread.join()?;
 
     // Checked before the byte totals: a forged byte shortens the transfer too, but naming it as a desync is what lets `measure` re-measure it instead of banking a workload fault.
-    if let Some((flow, offset)) = desync.lock().ok().and_then(|slot| *slot) {
-        return Err(Error::Desync { flow, offset });
+    if let Some(forged) = desync.lock().ok().and_then(|slot| slot.as_ref().cloned()) {
+        return Err(Error::Desync(forged));
     }
 
     let expected = request.total_bytes();
@@ -1303,6 +1310,7 @@ struct FlowResult {
     stopped: Option<String>,
 }
 
+#[derive(Clone)]
 struct FlowPlan {
     bytes: u64,
     pattern: Vec<u8>,
@@ -1311,6 +1319,7 @@ struct FlowPlan {
     target: SocketAddr,
     index: usize,
     desync: Desync,
+    abort: Arc<AtomicBool>,
 }
 
 struct SinkThread {
@@ -1350,6 +1359,7 @@ fn spawn_flows(
                 target: targets[index],
                 index,
                 desync: Arc::clone(desync),
+                abort: Arc::new(AtomicBool::new(false)),
             };
             std::thread::spawn(move || run_flow(&plan))
         })
@@ -1407,6 +1417,11 @@ fn run_flow(plan: &FlowPlan) -> FlowResult {
     };
     let _ = stream.set_nodelay(true);
     apply_flow_timeouts(&stream);
+    #[cfg(target_vendor = "apple")]
+    if let Err(e) = bound_flow_send(&stream) {
+        result.stopped = Some(format!("could not bound the flow's send window: {e}"));
+        return result;
+    }
     result.setup.tcp_connect_us = t0.elapsed().as_micros();
 
     let t1 = Instant::now();
@@ -1456,26 +1471,10 @@ fn run_flow(plan: &FlowPlan) -> FlowResult {
     result.setup.total_us = t0.elapsed().as_micros();
 
     let window_start = Instant::now();
-    if plan.traffic.uplink() {
-        if let Err(e) = plan.stream_up(&mut stream, &mut result.bytes_sent) {
-            result.stopped = Some(format!(
-                "upload write failed after {} of {} bytes: {e}",
-                result.bytes_sent, plan.bytes
-            ));
-            return result;
-        }
-    }
-
-    if plan.traffic.downlink() {
-        match plan.stream_down(&mut stream) {
-            Ok(received) => result.bytes_received = received,
-            Err(why) => {
-                result.stopped = Some(why);
-                return result;
-            }
-        }
-    }
-
+    let (sent, received, stopped) = exchange(plan, &mut stream);
+    result.bytes_sent = sent;
+    result.bytes_received = received;
+    result.stopped = stopped;
     if (plan.traffic.uplink() || plan.traffic.downlink()) && result.stopped.is_none() {
         result.window = Some((window_start, Instant::now()));
     }
@@ -1483,9 +1482,101 @@ fn run_flow(plan: &FlowPlan) -> FlowResult {
     result
 }
 
+/// Both directions at once: a duplex flow that uploads its whole side before reading has queued every download byte between the engine and the client, a half-duplex workload wearing the name that starves a small runner on a backlog no engine should hold.
+fn exchange(plan: &FlowPlan, stream: &mut TcpStream) -> (u64, u64, Option<String>) {
+    let mut sent = 0u64;
+    let mut received = 0u64;
+    match (plan.traffic.uplink(), plan.traffic.downlink()) {
+        (true, true) => {
+            let Ok(mut reader) = stream.try_clone() else {
+                return (
+                    0,
+                    0,
+                    Some("the flow could not clone its socket for the download".to_owned()),
+                );
+            };
+            apply_flow_timeouts(&reader);
+            let down = plan.clone();
+            let download = std::thread::spawn(move || down.stream_down(&mut reader));
+            let upload = plan.stream_up(stream, &mut sent).err();
+            if upload.is_some() {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            let upload = upload.map(|e| {
+                format!(
+                    "upload write failed after {sent} of {} bytes: {e}",
+                    plan.bytes
+                )
+            });
+            let stopped = match download.join() {
+                Ok(Ok(n)) => {
+                    received = n;
+                    upload
+                }
+                Ok(Err(why)) => Some(match upload {
+                    Some(upload) => format!("{why}; {upload}"),
+                    None => why,
+                }),
+                Err(_) => Some("the download half panicked".to_owned()),
+            };
+            (sent, received, stopped)
+        }
+        (true, false) => {
+            let stopped = plan.stream_up(stream, &mut sent).err().map(|e| {
+                format!(
+                    "upload write failed after {sent} of {} bytes: {e}",
+                    plan.bytes
+                )
+            });
+            (sent, received, stopped)
+        }
+        (false, true) => {
+            let stopped = match plan.stream_down(stream) {
+                Ok(n) => {
+                    received = n;
+                    None
+                }
+                Err(why) => Some(why),
+            };
+            (sent, received, stopped)
+        }
+        (false, false) => (sent, received, None),
+    }
+}
+
+/// A send of at most this many bytes reaches sosend's `pru_send` as one mbuf
+/// chain, so an ENOBUFS there appended none of the slice and a retry is exact.
+#[cfg(target_vendor = "apple")]
+const SEND_LOWAT: usize = 64 * 1024;
+
+#[cfg(target_vendor = "apple")]
+const UPLOAD_CHUNK: usize = SEND_LOWAT;
+
+#[cfg(not(target_vendor = "apple"))]
 const UPLOAD_CHUNK: usize = 1024 * 1024;
 
 const DOWNLOAD_CHUNK: usize = 64 * 1024;
+
+#[cfg(target_vendor = "apple")]
+fn bound_flow_send(stream: &TcpStream) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let lowat: libc::c_int = SEND_LOWAT.try_into().unwrap_or(libc::c_int::MAX);
+    // SAFETY: `lowat` is a live `c_int`, sized as the kernel reads the option, on the stream's own descriptor.
+    let rc = unsafe {
+        libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDLOWAT,
+            (&raw const lowat).cast::<libc::c_void>(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
 
 fn read_validated(stream: &mut TcpStream, pattern: &[u8], bytes: u64) -> Result<u64, String> {
     let mut chunk = vec![0u8; pattern.len().clamp(1, DOWNLOAD_CHUNK)];
@@ -1500,9 +1591,11 @@ fn read_validated(stream: &mut TcpStream, pattern: &[u8], bytes: u64) -> Result<
             ));
         }
         if let Some(at) = pattern_mismatch(pattern, read_total as usize, &chunk[..want]) {
+            let (expect, saw) = mismatch_bytes(pattern, read_total as usize, &chunk[..want], at);
             return Err(format!(
-                "bytes at offset {read_total} are not the validated pattern, first at byte {}",
-                read_total + at as u64
+                "bytes at offset {read_total} are not the validated pattern, first at byte {} (expected 0x{expect:02x}, saw 0x{saw:02x}; read {want}, local {at}; {})",
+                read_total + at as u64,
+                mismatch_window(pattern, read_total as usize, &chunk[..want], at)
             ));
         }
         read_total += want as u64;
@@ -1534,6 +1627,23 @@ fn pattern_mismatch(pattern: &[u8], offset: usize, chunk: &[u8]) -> Option<usize
     None
 }
 
+/// The byte the ring holds at the mismatch and the byte the stream carried there: a duplicate and a drop read differently at the same offset.
+fn mismatch_bytes(pattern: &[u8], offset: usize, chunk: &[u8], at: usize) -> (u8, u8) {
+    let want = pattern[(offset + at) % pattern.len()];
+    (want, chunk[at])
+}
+
+/// Sixteen pattern bytes and sixteen stream bytes from the first mismatch: a buffer that restarted reads `pattern[0..]`, a shifted stream reads `pattern[k..]`.
+fn mismatch_window(pattern: &[u8], offset: usize, chunk: &[u8], at: usize) -> String {
+    let period = pattern.len();
+    let start = (offset + at) % period;
+    let want: Vec<u8> = (0..16.min(period))
+        .map(|i| pattern[(start + i) % period])
+        .collect();
+    let end = (at + 16).min(chunk.len());
+    format!("pattern {want:02x?} stream {:02x?}", &chunk[at..end])
+}
+
 // A blocking socket returns WouldBlock/EAGAIN (macOS 35), ENOBUFS (macOS 55, Linux 105, Windows 10055) and their EAGAIN kin transiently when a full-rate flow outruns the kernel's send buffers; on an 8-flow macos-15 cell that aborted the reference engine and collapsed the gate-5 comparison into a false PROCESS REGRESSION, so ride it out until the per-op timeout rather than treating backpressure as a fault.
 fn is_send_backpressure(e: &std::io::Error) -> bool {
     if e.kind() == std::io::ErrorKind::WouldBlock {
@@ -1550,7 +1660,7 @@ fn is_send_backpressure(e: &std::io::Error) -> bool {
     }
 }
 
-// Write `buf` in full, retrying only transient send-buffer backpressure and resetting `idle` on every byte of progress so a slow-but-live flow is never cut off while a truly wedged one still fails.
+// Write `buf` in full, retrying only transient send-buffer backpressure and resetting `idle` on every byte of progress so a slow-but-live flow is never cut off while a truly wedged one still fails. On apple `bound_flow_send` holds every slice within SO_SNDLOWAT, so a retry can only re-send bytes the kernel appended none of.
 fn write_riding_backpressure(
     stream: &mut TcpStream,
     buf: &[u8],
@@ -1581,8 +1691,17 @@ fn write_riding_backpressure(
 impl FlowPlan {
     fn stream_down(&self, stream: &mut TcpStream) -> Result<u64, String> {
         read_validated(&mut *stream, &self.pattern, self.bytes).map_err(|why| {
+            self.abort.store(true, Ordering::Relaxed);
             if let Some(at) = first_mismatch_byte(&why) {
-                note_desync(&self.desync, self.index, at);
+                note_desync(
+                    &self.desync,
+                    Forged {
+                        flow: self.index,
+                        offset: at,
+                        side: "download",
+                        detail: why.clone(),
+                    },
+                );
                 return format!("flow {} download desynced at byte {at}", self.index);
             }
             format!("flow {} download stopped early: {why}", self.index)
@@ -1594,7 +1713,11 @@ impl FlowPlan {
         while chunk.len() < UPLOAD_CHUNK {
             chunk.extend_from_slice(&self.pattern);
         }
+        chunk.truncate(UPLOAD_CHUNK);
         while *sent < self.bytes {
+            if self.abort.load(Ordering::Relaxed) {
+                return Err(std::io::Error::other("the download leg ended the flow"));
+            }
             let take = usize::try_from((self.bytes - *sent).min(chunk.len() as u64))
                 .unwrap_or(chunk.len());
             write_riding_backpressure(stream, &chunk[..take], FLOW_IO_TIMEOUT)?;
@@ -1657,6 +1780,10 @@ fn spawn_sink(
                     return;
                 }
                 apply_flow_timeouts(&stream);
+                #[cfg(target_vendor = "apple")]
+                if bound_flow_send(&stream).is_err() {
+                    return;
+                }
                 if let Some(reason) = serve_flow(
                     stream,
                     &flow,
@@ -1694,6 +1821,8 @@ fn serve_flow(
         let Ok(read_half) = stream.try_clone() else {
             return Some("the sink could not clone its socket".to_owned());
         };
+        // A duplicated handle does not inherit the socket's timeouts on Windows, so the writer arms them on the handle it will use.
+        apply_flow_timeouts(&read_half);
         let pattern = Arc::clone(pattern);
         Some(std::thread::spawn(move || {
             emit(read_half, &pattern, index, download_bytes)
@@ -1737,11 +1866,24 @@ fn validate(
             Ok(n) => n,
             Err(e) => return Some(format!("the upload read failed after {seen} bytes: {e}")),
         };
-        if let Some(at) = pattern_mismatch(pattern, offset, &buffer[..n]) {
-            let at = seen + at as u64;
-            note_desync(desync, index, at);
+        if let Some(local) = pattern_mismatch(pattern, offset, &buffer[..n]) {
+            let at = seen + local as u64;
+            let (want, saw) = mismatch_bytes(pattern, offset, &buffer[..n], local);
+            let detail = format!(
+                "expected 0x{want:02x}, saw 0x{saw:02x}; read {n}, local {local}; {}",
+                mismatch_window(pattern, offset, &buffer[..n], local)
+            );
+            note_desync(
+                desync,
+                Forged {
+                    flow: index,
+                    offset: at,
+                    side: "upload",
+                    detail: detail.clone(),
+                },
+            );
             return Some(format!(
-                "flow {index} upload desynced at byte {at}: a byte is not the validated pattern"
+                "flow {index} upload desynced at byte {at}: {detail}"
             ));
         }
         offset = (offset + n) % pattern.len();
@@ -1757,10 +1899,11 @@ fn emit(
     expect: u64,
 ) -> Option<String> {
     let _ = index;
-    let mut buffer = Vec::with_capacity(64 * 1024);
-    while buffer.len() < 64 * 1024 {
+    let mut buffer = Vec::with_capacity(DOWNLOAD_CHUNK);
+    while buffer.len() < DOWNLOAD_CHUNK {
         buffer.extend_from_slice(pattern);
     }
+    buffer.truncate(DOWNLOAD_CHUNK);
     let mut sent = 0u64;
     while sent < expect {
         let take =
@@ -2050,6 +2193,8 @@ fn accept_until(listener: &TcpListener, deadline: Instant) -> Option<TcpStream> 
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).ok()?;
                 apply_flow_timeouts(&stream);
+                #[cfg(target_vendor = "apple")]
+                bound_flow_send(&stream).ok()?;
                 return Some(stream);
             }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -2086,14 +2231,20 @@ pub fn harness_ceiling(connections: usize, payload_size: usize, bytes: u64) -> R
     let mut flows = Vec::with_capacity(connections);
     for (index, addr) in targets.into_iter().enumerate() {
         let template = Arc::clone(&pattern);
-        flows.push(std::thread::spawn(move || {
-            ceiling_flow(addr, &template, index, connections, bytes)
-        }));
+        flows.push((
+            index,
+            std::thread::spawn(move || ceiling_flow(addr, &template, index, connections, bytes)),
+        ));
     }
 
     let mut best = 0.0f64;
-    for flow in flows {
-        let Ok(rate) = flow.join() else { continue };
+    for (index, flow) in flows {
+        let Ok((rate, why)) = flow.join() else {
+            continue;
+        };
+        if let Some(why) = why {
+            eprintln!("harness ceiling flow {index}: {why}");
+        }
         best = best.max(rate);
     }
     let _ = sink.join();
@@ -2113,21 +2264,27 @@ fn ceiling_flow(
     index: usize,
     flows: usize,
     bytes: u64,
-) -> f64 {
+) -> (f64, Option<String>) {
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(10)) else {
-        return 0.0;
+        return (0.0, Some("could not connect to the sink".to_owned()));
     };
     let _ = stream.set_nodelay(true);
     apply_flow_timeouts(&stream);
     let pattern = rotate(template, index, flows);
     let started = Instant::now();
-    let read_total = read_validated(&mut stream, &pattern, bytes).unwrap_or(0);
+    let (read_total, why) = match read_validated(&mut stream, &pattern, bytes) {
+        Ok(n) => (n, None),
+        Err(why) => (0, Some(why)),
+    };
     let elapsed = started.elapsed();
     let _ = stream.shutdown(Shutdown::Both);
     if elapsed.is_zero() || read_total == 0 {
-        return 0.0;
+        return (0.0, why);
     }
-    read_total as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0)
+    (
+        read_total as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0),
+        why,
+    )
 }
 
 #[cfg(test)]
@@ -2147,6 +2304,36 @@ mod tests {
         assert_eq!(
             stream.write_timeout().expect("readable"),
             Some(FLOW_IO_TIMEOUT)
+        );
+    }
+
+    /// The macos duplex desync was a retried slice the kernel had already appended
+    /// in part; a slice within `sb_lowat` is taken whole or not at all, so the armed
+    /// value is read back rather than trusting that `setsockopt` accepted it.
+    #[cfg(target_vendor = "apple")]
+    #[test]
+    fn an_apple_flow_arms_the_send_lowat() {
+        use std::os::fd::AsRawFd;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let stream = TcpStream::connect(addr).expect("connects");
+        bound_flow_send(&stream).expect("arms the lowat");
+        let mut value: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `value` and `len` are live and the latter names `value`'s size, as the kernel writes them.
+        let rc = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDLOWAT,
+                (&raw mut value).cast::<libc::c_void>(),
+                &raw mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt: {}", std::io::Error::last_os_error());
+        assert_eq!(
+            usize::try_from(value).expect("a non-negative lowat"),
+            SEND_LOWAT
         );
     }
 
@@ -2502,10 +2689,12 @@ mod tests {
         let recovered = remeasure_disturbed(REMEASURE_ATTEMPTS, REMEASURE_BUDGET, || {
             calls += 1;
             if calls < 2 {
-                Err(Error::Desync {
+                Err(Error::Desync(Forged {
                     flow: 3,
                     offset: 4096,
-                })
+                    side: "download",
+                    detail: "expected 0x01, saw 0x02".to_owned(),
+                }))
             } else {
                 Ok(calls)
             }
@@ -2519,7 +2708,12 @@ mod tests {
         calls = 0;
         let stuck = remeasure_disturbed(REMEASURE_ATTEMPTS, REMEASURE_BUDGET, || {
             calls += 1;
-            Err::<(), Error>(Error::Desync { flow: 0, offset: 7 })
+            Err::<(), Error>(Error::Desync(Forged {
+                flow: 0,
+                offset: 7,
+                side: "upload",
+                detail: "expected 0x01, saw 0x02".to_owned(),
+            }))
         });
         assert!(
             matches!(&stuck, Err(Error::Workload(message)) if message.contains("survives every retry")),
@@ -2661,19 +2855,32 @@ mod tests {
     #[test]
     fn the_first_forged_byte_wins_the_slot_and_the_error_names_it() {
         let slot: Desync = Arc::new(std::sync::Mutex::new(None));
-        note_desync(&slot, 5, 8192);
-        note_desync(&slot, 1, 16);
+        let first = Forged {
+            flow: 5,
+            offset: 8192,
+            side: "upload",
+            detail: "expected 0x01, saw 0x02".to_owned(),
+        };
+        note_desync(&slot, first.clone());
+        note_desync(
+            &slot,
+            Forged {
+                flow: 1,
+                offset: 16,
+                side: "download",
+                detail: "expected 0x03, saw 0x04".to_owned(),
+            },
+        );
         assert_eq!(
             *slot.lock().expect("uncontended"),
-            Some((5, 8192)),
+            Some(first.clone()),
             "only the first forged byte is recorded"
         );
-        assert!(Error::Desync {
-            flow: 5,
-            offset: 8192
-        }
-        .to_string()
-        .contains("flow 5"));
+        let text = Error::Desync(first).to_string();
+        assert!(
+            text.contains("flow 5") && text.contains("byte 8192") && text.contains("on the upload"),
+            "{text}"
+        );
     }
 
     /// The sink's upload validation must hand a forged byte to the shared slot and return its reason as data — the cell it lives in re-measures it; a `process::exit` there once killed the whole gate-5 run, reference included.
@@ -2697,7 +2904,19 @@ mod tests {
             reason.contains("flow 2 upload desynced at byte 15"),
             "{reason}"
         );
-        assert_eq!(*slot.lock().expect("uncontended"), Some((2, 15)));
+        let forged = slot
+            .lock()
+            .expect("uncontended")
+            .clone()
+            .expect("a forged byte reached the slot");
+        assert_eq!(forged.flow, 2);
+        assert_eq!(forged.offset, 15);
+        assert_eq!(forged.side, "upload");
+        assert!(
+            forged.detail.starts_with("expected 0x66, saw 0x7a;"),
+            "the slot names both bytes: {}",
+            forged.detail
+        );
         drop(engine);
         let _ = sink.join();
     }
@@ -2755,6 +2974,71 @@ mod tests {
             "the surfaced reason is the download write fault: {reason}"
         );
         let _ = serving.join();
+    }
+
+    /// A duplex flow reads while it writes: the peer here sends its whole download before reading any upload, which a client that uploaded first could never answer, and both directions must still land in full.
+    #[test]
+    fn a_duplex_flow_moves_both_directions_at_once() {
+        let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) else {
+            return;
+        };
+        let addr = listener.local_addr().expect("has an address");
+        let template = bulk_pattern_template(4096);
+        let bytes = 32u64 << 20;
+        let pattern = template.clone();
+
+        let peer = std::thread::spawn(move || -> Result<(), String> {
+            let (mut stream, _) = listener.accept().map_err(|e| e.to_string())?;
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .map_err(|e| e.to_string())?;
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .map_err(|e| e.to_string())?;
+            let block: Vec<u8> = template
+                .iter()
+                .cycle()
+                .take(DOWNLOAD_CHUNK)
+                .copied()
+                .collect();
+            let mut sent = 0u64;
+            while sent < bytes {
+                stream
+                    .write_all(&block)
+                    .map_err(|e| format!("the peer's download stalled after {sent}: {e}"))?;
+                sent += block.len() as u64;
+            }
+            let mut got = vec![0u8; DOWNLOAD_CHUNK];
+            let mut read = 0usize;
+            while (read as u64) < bytes {
+                stream
+                    .read_exact(&mut got)
+                    .map_err(|e| format!("the peer's upload stopped after {read}: {e}"))?;
+                if let Some(at) = pattern_mismatch(&template, read, &got) {
+                    return Err(format!("the upload desynced at byte {}", read + at));
+                }
+                read += got.len();
+            }
+            Ok(())
+        });
+
+        let plan = FlowPlan {
+            bytes,
+            pattern,
+            traffic: Traffic::FullDuplex,
+            engine: addr,
+            target: addr,
+            index: 0,
+            desync: Arc::new(std::sync::Mutex::new(None)),
+            abort: Arc::new(AtomicBool::new(false)),
+        };
+        let mut stream = TcpStream::connect(addr).expect("connects to the peer");
+        apply_flow_timeouts(&stream);
+        let (sent, received, stopped) = exchange(&plan, &mut stream);
+        let peer = peer.join().expect("the peer thread survived");
+        assert!(peer.is_ok(), "{peer:?}");
+        assert_eq!(stopped, None, "both directions completed");
+        assert_eq!((sent, received), (bytes, bytes), "every byte moved");
     }
 
     #[test]
