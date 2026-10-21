@@ -248,15 +248,16 @@ fn xor_y(dst: &mut [u8], v: __m256i) {
 #[inline(always)]
 fn pass(state: &[u32; 16], ctr: u32, head: Option<&mut [u8; 32]>, out: &mut [u8]) {
     debug_assert_eq!(state[12], 0, "the counter register is only a base at zero");
-    debug_assert_eq!(
-        out.len(),
-        if head.is_some() {
-            PASS_BYTES - 64
-        } else {
-            PASS_BYTES
-        },
-        "a pass writes eight blocks, or seven beside a head"
+    debug_assert!(
+        out.len()
+            <= if head.is_some() {
+                PASS_BYTES - 64
+            } else {
+                PASS_BYTES
+            },
+        "a pass writes eight blocks, or seven beside a head, and never more"
     );
+    debug_assert_eq!(out.len() % 64, 0, "the buffer holds whole blocks");
 
     // Black-boxed as in the lane: a constant mask here is read back as two lane swaps.
     let masked = core::hint::black_box(ROTL16.as_ptr().cast::<i8>());
@@ -329,6 +330,9 @@ fn pass(state: &[u32; 16], ctr: u32, head: Option<&mut [u8; 32]>, out: &mut [u8]
         if skip && block == 0 {
             continue;
         }
+        if at + 64 > out.len() {
+            break;
+        }
         // Block `b` shares register `b / 2` with its pair: even blocks are the transposes' low halves, odd blocks the high ones.
         let pair = block / 2;
         let (lo, hi) = if block % 2 == 0 {
@@ -377,6 +381,20 @@ pub(crate) unsafe fn xor_blocks(
         pass(&state, ctr, head.take(), chunk);
         blocks += PASS_BLOCKS;
         ctr = ctr.wrapping_add(PASS_BLOCKS);
+        rest = tail;
+    }
+
+    // The remainder: the pass stores the blocks the buffer holds, so the ladder only takes what a pass cannot cover.
+    let owed = 64 * usize::from(head.is_some());
+    if (rest.len() + owed).div_ceil(64) >= 3 {
+        let take = (rest.len() / 64) * 64;
+        let (chunk, tail) = rest.split_at_mut(take);
+        let whole = (take / 64) as u32;
+        let headed = head.is_some();
+        pass(&state, ctr, head.take(), chunk);
+        let written = whole + u32::from(headed);
+        blocks += written;
+        ctr = ctr.wrapping_add(written);
         rest = tail;
     }
 

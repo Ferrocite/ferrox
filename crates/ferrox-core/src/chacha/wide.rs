@@ -114,15 +114,16 @@ pub(crate) fn pass<V: Wide16>(
     out: &mut [u8],
 ) {
     debug_assert_eq!(state[12], 0, "the counter register is only a base at zero");
-    debug_assert_eq!(
-        out.len(),
-        if head.is_some() {
-            PASS_BYTES - 64
-        } else {
-            PASS_BYTES
-        },
-        "a pass writes sixteen blocks, or fifteen beside a head"
+    debug_assert!(
+        out.len()
+            <= if head.is_some() {
+                PASS_BYTES - 64
+            } else {
+                PASS_BYTES
+            },
+        "a pass writes sixteen blocks, or fifteen beside a head, and never more"
     );
+    debug_assert_eq!(out.len() % 64, 0, "the buffer holds whole blocks");
 
     let lanes = V::lanes();
 
@@ -216,6 +217,20 @@ pub(crate) fn wide_blocks<V: Wide16>(
         pass::<V>(&state, ctr, head.take(), chunk);
         blocks += PASS_BLOCKS;
         ctr = ctr.wrapping_add(PASS_BLOCKS);
+        left = tail;
+    }
+
+    // The remainder: the pass stores the blocks the buffer holds, so the narrower pass below it only takes what a pass cannot cover.
+    let owed = 64 * usize::from(head.is_some());
+    if (left.len() + owed).div_ceil(64) >= 3 {
+        let take = (left.len() / 64) * 64;
+        let (chunk, tail) = left.split_at_mut(take);
+        let whole = (take / 64) as u32;
+        let headed = head.is_some();
+        pass::<V>(&state, ctr, head.take(), chunk);
+        let written = whole + u32::from(headed);
+        blocks += written;
+        ctr = ctr.wrapping_add(written);
         left = tail;
     }
 
@@ -460,10 +475,10 @@ mod tests {
             |_, _, _, head, buf| u32::from(head.is_some() || !buf.is_empty()),
         );
         assert_eq!(
-            blocks, 1,
-            "one byte short of a pass is no pass at all, and the head is left to the caller"
+            blocks, PASS_BLOCKS,
+            "one byte short of a pass is a partial pass, and the last block is the caller's"
         );
-        assert_eq!(head, [0u8; 32], "and the head is not written here");
+        assert_ne!(head, [0u8; 32], "and the head rides the partial pass");
     }
 
     /// Passing the whole buffer through leaves the counter and block count where the ladder would have them.
