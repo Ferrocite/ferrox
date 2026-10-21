@@ -287,8 +287,9 @@ carrier-foxy h2-upload-bytes-blocked-by-an-unread-grant 0 ferrox-app-foxy::loopb
 carrier-foxy window-update-frames-per-floor-crossing 2 ferrox-app-foxy::loopback::credit_crossing_the_floor_costs_one_pair_not_one_per_frame
 carrier-foxy window-update-frames-below-the-floor 0 ferrox-app-foxy::loopback::credit_held_under_the_floor_never_reaches_the_wire
 carrier-foxy dead-carrier-dials-per-connect-ip-packet 0 ferrox-app-proxy::tests::the_connect_ip_lane_leaves_a_dead_carrier_dead
-carrier-foxy carriers-dialled 3 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer
-carrier-foxy udp-carriers-dialled 2 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_can_answer
+carrier-foxy carriers-dialled 3 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_answers_best
+carrier-foxy udp-carriers-dialled 2 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_answers_best
+carrier-foxy auto-carrier-opened-on H2 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_answers_best
 carrier-foxy datagram-frames-per-capsule 1 ferrox-app-foxy::loopback::the_masque_carrier_opens_connect_udp_over_quic_and_echoes_a_datagram
 carrier-foxy capsules-reassembled-across-frames 1 ferrox-app-foxy::loopback::a_capsule_split_over_frames_reassembles_as_one_datagram
 carrier-foxy datagrams-out-of-one-frame 2 ferrox-app-foxy::loopback::a_frame_of_two_datagrams_arrives_as_two_datagrams
@@ -319,6 +320,9 @@ carrier-foxy renewal-pauses-past-their-own-ceiling 0 ferrox-app-foxy_account::te
 carrier-foxy edge-peer-read-allocations-per-open 0 ferrox-core-foxy::tests::a_literal_edge_address_is_read_without_a_buffer_of_its_own
 carrier-foxy edge-authority-allocations-per-lane-open 0 ferrox-core-foxy::tests::an_edge_authority_brackets_an_address_and_borrows_a_plain_default_port_name
 carrier-foxy huffman-literal-allocations-per-decode 1 ferrox-core-foxy::hpack::tests::a_coded_literal_is_decoded_into_one_allocation
+carrier-foxy ip-packet-allocations-per-datagram 0 ferrox-app-foxy::loopback::the_packet_scratch_is_the_lanes_own_buffer_and_it_stays_there
+carrier-foxy ip-read-packet-allocations-per-datagram 0 ferrox-app-foxy::loopback::the_read_packet_is_the_callers_own_buffer_and_it_stays_there
+carrier-foxy pass-token-copies-per-dial 0 ferrox-core-foxy::tests::a_cloned_pass_shares_its_token_rather_than_copying_it
 
 carrier-quic ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-quic zero-filled-bytes-per-relayed-frame 3 ferrox-app-quic::tests::a_relayed_datagram_frames_its_target_ahead_of_its_payload
@@ -523,3 +527,6 @@ front-dokodemo datagrams-carrying-to-the-target 1 ferrox-app-proxy::tests::a_dok
 front-dokodemo associations-answering-with-the-relay 1 ferrox-app-proxy::tests::the_udp_association_carries_a_datagram_to_the_target
 front-dokodemo transparent-settings-refused 2 ferrox-app-proxy::tests::a_dokodemo_front_refuses_the_transparent_settings
 front-dokodemo xray-scenario-tests-passing 2 scripts/run-upstream-suite.sh
+carrier-foxy h3-read-calls-per-16k-download 5 ferrox-app-foxy::loopback::an_h3_read_crosses_the_frames_under_it
+carrier-foxy h3-bytes-lost-when-the-peer-finishes 0 ferrox-app-foxy::loopback::an_h3_stream_the_peer_finished_ends_the_tunnel
+carrier-foxy carrier-cache-lookup-allocations 0 ferrox-core-foxy::tests::a_carrier_cache_lookup_allocates_nothing

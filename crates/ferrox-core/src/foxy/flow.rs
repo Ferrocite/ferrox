@@ -1,52 +1,48 @@
-//! Flow credit for one HTTP/2 stream and its connection in one type, spent against `INITIAL_WINDOW_SIZE` and `WINDOW_UPDATE` at once because a DATA frame the connection window refuses is refused at the stream too.
+//! Flow credit for one HTTP/2 window: the bytes the peer may send before it needs a `WINDOW_UPDATE`. A stream has one and a connection has another, and they are separate windows because a connection's credit is spent by every stream's bytes at once — one type, used once per window.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Window {
-    stream: i64,
-    connection: i64,
+    bytes: i64,
 }
 
 impl Window {
-    /// Both windows start at the protocol default until the peer's settings say otherwise.
+    /// The window starts at the protocol default until the peer's settings say otherwise.
     #[must_use]
-    pub const fn new(stream: i64, connection: i64) -> Self {
-        Self { stream, connection }
+    pub const fn new(bytes: i64) -> Self {
+        Self { bytes }
     }
 
-    /// Adopts the peer's `INITIAL_WINDOW_SIZE`, which applies to streams not yet open and so cannot be moved by an already-sent update.
-    pub fn reset_stream(&mut self, size: u32) {
-        self.stream = i64::from(size);
+    /// Raises the window by what the peer granted.
+    pub fn add(&mut self, increment: u32) {
+        self.bytes = self.bytes.saturating_add(i64::from(increment));
     }
 
-    pub fn add_stream(&mut self, increment: u32) {
-        self.stream = self.stream.saturating_add(i64::from(increment));
-    }
-
-    pub fn add_connection(&mut self, increment: u32) {
-        self.connection = self.connection.saturating_add(i64::from(increment));
+    /// Moves the window by a change in the peer's `INITIAL_WINDOW_SIZE`: the setting applies to every stream, open or not, so a stream that is already running gains or loses the difference.
+    pub fn shift(&mut self, delta: i64) {
+        self.bytes = if delta >= 0 {
+            self.bytes.saturating_add(delta)
+        } else {
+            // The magnitude is clamped to the window's own ceiling before it is subtracted: a delta of `i64::MIN` has a magnitude of `2^63`, one past `i64::MAX`, and casting that back would wrap it negative and grow the window instead of emptying it.
+            let drop = i64::try_from(delta.unsigned_abs().min(i64::MAX.unsigned_abs()))
+                .unwrap_or(i64::MAX);
+            self.bytes.saturating_sub(drop)
+        };
     }
 
     #[must_use]
     pub fn allows(&self, len: u32) -> bool {
-        let len = i64::from(len);
-        self.stream >= len && self.connection >= len
+        self.bytes >= i64::from(len)
     }
 
     /// Spends `len` bytes of credit. Only call this after `allows`.
     pub fn take(&mut self, len: u32) {
-        let len = i64::from(len);
-        self.stream -= len;
-        self.connection -= len;
+        self.bytes -= i64::from(len);
     }
 
+    /// The credit left in the window.
     #[must_use]
-    pub fn stream(&self) -> u32 {
-        self.stream.max(0) as u32
-    }
-
-    #[must_use]
-    pub fn connection(&self) -> u32 {
-        self.connection.max(0) as u32
+    pub fn left(&self) -> u32 {
+        self.bytes.max(0) as u32
     }
 }
 
@@ -62,37 +58,49 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_frame_the_stream_allows_but_the_connection_does_not_may_not_go_out() {
-        let window = Window::new(100, 10);
-        assert!(!window.allows(11), "the connection is the tighter window");
+    fn a_window_allows_exactly_what_is_left_of_it() {
+        let window = Window::new(10);
         assert!(window.allows(10));
-        assert!(!Window::new(10, 100).allows(11), "and so is the stream");
+        assert!(!window.allows(11), "one byte over is refused");
     }
 
     #[test]
     fn spending_credit_leaves_exactly_what_is_left() {
-        let mut window = Window::new(100, 100);
+        let mut window = Window::new(100);
         window.take(30);
-        assert_eq!((window.stream(), window.connection()), (70, 70));
-        window.add_stream(5);
-        assert_eq!(window.stream(), 75);
-        assert_eq!(window.connection(), 70);
+        assert_eq!(window.left(), 70);
+        window.add(5);
+        assert_eq!(window.left(), 75);
     }
 
     #[test]
-    fn a_settings_change_moves_the_stream_window_without_moving_the_connection() {
-        let mut window = Window::new(65_535, 65_535);
-        window.reset_stream(1_048_576);
-        assert_eq!(window.stream(), 1_048_576);
-        assert_eq!(window.connection(), 65_535);
+    fn a_settings_change_moves_the_window_it_names() {
+        let mut window = Window::new(65_535);
+        window.add(1_048_576 - 65_535);
+        assert_eq!(window.left(), 1_048_576);
+    }
+
+    #[test]
+    fn a_peer_that_shrinks_its_window_takes_the_credit_back() {
+        let mut window = Window::new(1_048_576);
+        window.shift(-(1_048_576 - 65_535));
+        assert_eq!(window.left(), 65_535);
+        window.shift(i64::MIN);
+        assert_eq!(window.left(), 0, "a window never goes below nothing");
+    }
+
+    #[test]
+    fn a_peer_that_grows_its_window_raises_every_stream() {
+        let mut window = Window::new(65_535);
+        window.shift(1_048_576 - 65_535);
+        assert_eq!(window.left(), 1_048_576);
     }
 
     #[test]
     fn credit_never_wraps_even_when_the_peer_over_announces() {
-        let mut window = Window::new(i64::MAX - 1, i64::MAX - 1);
-        window.add_stream(u32::MAX);
-        window.add_connection(u32::MAX);
-        assert_eq!((window.stream(), window.connection()), (u32::MAX, u32::MAX));
+        let mut window = Window::new(i64::MAX - 1);
+        window.add(u32::MAX);
+        assert_eq!(window.left(), u32::MAX);
     }
 
     #[test]
