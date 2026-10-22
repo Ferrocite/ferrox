@@ -1218,14 +1218,14 @@ impl Tls2 {
         self.tls.write_all(&self.out).map_err(|_| Failure::Io)
     }
 
-    /// A push promise is refused by name — the only stream the lane answers that is not the one it opened.
-    fn refuse_push(&mut self) -> Result<(), Failure> {
+    /// HTTP/2 8.2: a push is refused on the stream it promises, with `REFUSED_STREAM` — the only stream the lane answers that is not the one it opened, and the one it opened stays open.
+    fn refuse_push(&mut self, promised: u32) -> Result<(), Failure> {
         self.out.clear();
         h2_frame(
             frames::RST_STREAM,
             0,
-            self.stream,
-            &8u32.to_be_bytes(),
+            promised,
+            &7u32.to_be_bytes(),
             &mut self.out,
         );
         self.tls.write_all(&self.out).map_err(|_| Failure::Io)
@@ -1254,7 +1254,9 @@ impl Tls2 {
                         frames::H2Event::Ping { ack: false, .. } => {
                             lane.ack(frames::PING, payload).map(|()| None)
                         }
-                        frames::H2Event::Push => lane.refuse_push().map(|()| None),
+                        frames::H2Event::Push { promised } => {
+                            lane.refuse_push(promised).map(|()| None)
+                        }
                         frames::H2Event::Window { stream, increment } => {
                             lane.grant(stream, increment);
                             Ok(None)
