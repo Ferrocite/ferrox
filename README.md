@@ -96,7 +96,7 @@ Each table A row carries two independent verdicts: `link` (what `VlessLink::supp
 
 ### A — proxy protocols
 
-Rows 1–22 are the share-link world; rows 23–39 are the xray-core config surface. Pages carry the evidence.
+Rows 1–22 are the share-link world; rows 23–39 are the xray-core config surface, and row 139 is the outline-sdk stack-in-a-string delta. Pages carry the evidence.
 
 | # | method | link | binary | page | notes |
 | --- | --- | --- | --- | --- | --- |
@@ -139,6 +139,7 @@ Rows 1–22 are the share-link world; rows 23–39 are the xray-core config surf
 | 37 | TLS client from config | `vless-tcp-tls` + carriers | implemented (vless/vmess/trojan over raw + carried carriers) | — | One session dials TCP, handshakes, then runs carrier + protocol header inside it; roots from `caCertFile` or system store; `allowInsecure` refused. |
 | 38 | uTLS fingerprints | — | planned | — | Nothing shapes a ClientHello (row 18). `security-utls` owns it. |
 | 39 | ECH | — | planned | — | Xray `ech.go`, sing-box `common/tls/ech.go`. Leaf `TlsInboundSettings.echConfig`/`echKey` — the server side. `security-ech` owns it. |
+| 139 | transport stack as one shareable string | — | planned | — | Outline SDK `x/configurl/` (not pinned) — a pipe-separated sequence whose each URL-shaped element wraps the one on its left (`ss://…\|tlsfrag://`), so one paste carries a proxy *and* its shaping stack; rows 1–22's share links name a server, not a stack, and row 133 is the same composability spelled in config objects |
 
 ### B — PattNG in full
 
@@ -192,7 +193,7 @@ Rows 1–22 are the share-link world; rows 23–39 are the xray-core config surf
 | 69 | Config Studio + Config Arena | planned | mlmvpn |
 | 70 | Game Booster: DNS/latency racing + DNS-only VPN | planned | mlmvpn |
 | 71 | Sanction-domain smart routing | planned | mlmvpn |
-| 72 | Server-less domain fronting | planned | mlmvpn |
+| 72 | Server-less domain fronting | planned | mlmvpn; Outline SDK `transport/tls/` OuterName — SNI and `Host` name different sites (not pinned) |
 | 73 | Serverless / mihomo / superdns / pdoq / http-injector / oblivion lanes | planned | configer |
 | 74 | Three-tier Emergency fallback | planned | mlmvpn |
 
@@ -226,7 +227,7 @@ Today exactly one method dials per hop. The engine to build stacks them as an or
 | --- | --- | --- | --- |
 | 78 | Routing rules + geosite/geoip | partial — rules with AND selectors and first match, domain/geoip/geosite assets, `blackhole`, per-inbound tags, `AsIs`/`IpOnDemand`/`IpIfNonMatch`; balancers, scripts, sniffing selectors and per-destination UDP routing refuse by name; [page](docs/function/engine-router.md) | Xray `app/router` + `app/geodata`; sing-box `route/`; ZeroNet `zero-router`; Leaf `app/router.rs` + `config/geosite.rs` + `common/dns_sniff.rs` |
 | 79 | Balancers leastPing/leastLoad/roundRobin/random + urltest/selector | planned | Xray `router/balancing.go`; sing-box `protocol/group/`; ZeroNet `zero-observatory`; Leaf `proxy/tryall`, `proxy/failover`, `proxy/select`, `proxy/static` |
-| 80 | Built-in DNS app (UDP/TCP/DoT/DoH/DoQ/FakeDNS/cache) | planned | Xray `app/dns`; sing-box `dns/`; ZeroNet `zero-dns`; Leaf `app/dns` + `app/fake_dns.rs`. Row 26 is the outbound |
+| 80 | Built-in DNS app (UDP/TCP/DoT/DoH/DoQ/FakeDNS/cache) | planned | Xray `app/dns`; sing-box `dns/`; ZeroNet `zero-dns`; Leaf `app/dns` + `app/fake_dns.rs`; Outline SDK `dns/resolver.go` — DoH/DoT with alternate host:port (not pinned). Row 26 is the outbound |
 | 81 | Reverse tunnel bridge/portal | planned | Xray `app/reverse`; ZeroNet `reverse.rs` over Mux.cool; xray-core-rust `xray-app-reverse` |
 | 82 | Commander gRPC management API | planned | Xray `app/commander` |
 | 83 | Connection-planner ladder (climb on failure, earned descent) | planned | ZeroNet `zero-observatory`; Leaf `app/healthcheck.rs` (the per-outbound latency the balancers read) |
@@ -288,7 +289,7 @@ Today exactly one method dials per hop. The engine to build stacks them as an or
 | 117 | freedom `proxyProtocol: 1\|2` send + fallback `xver` parity | planned | ZeroNet freedom; xray `proxy/freedom` |
 | 118 | REALITY `mldsa65Seed`/`mldsa65Verify` (post-quantum binding) | planned | ZeroNet `xray_json.rs`; the oracle row waits on it |
 | 119 | `customSockopt` raw setsockopt escape hatch | planned | ZeroNet `custom_sockopt.rs`; xray `sockopt` |
-| 120 | Tunable dial params (`tcpCongestion`, `tcpUserTimeout`, `dialerProxy`, `mark`, Happy-Eyeballs…) | planned | ZeroNet `parse_sockopt`; xray-core-rust `sockopt`. Row 124 is the runtime-configurable *wait* surface |
+| 120 | Tunable dial params (`tcpCongestion`, `tcpUserTimeout`, `dialerProxy`, `mark`, Happy-Eyeballs…) | planned | ZeroNet `parse_sockopt`; xray-core-rust `sockopt`; Outline SDK `transport/happyeyeballs.go` — the dual-stack race dial (not pinned). Row 124 is the runtime-configurable *wait* surface |
 | 121 | Tide down/up traffic-ratio shaping | planned | ZeroNet `tide/shape.rs`. Read as a superset rung beside row 103 |
 | 122 | Fountain-coded carrier rendezvous over DoH TXT | planned | ZeroNet `rendezvous.rs` |
 | 123 | Multi-file config layering (`-c` repeats, `-confdir`, tag-merge) | planned | ZeroNet `merge.rs`. Rows 119–122 land per-file layers once merging exists |
@@ -296,7 +297,7 @@ Today exactly one method dials per hop. The engine to build stacks them as an or
 
 ### O — client shaping, mobile service and the TUN edge
 
-Rows 125–130 are the client-side gaps the FoxyVPN v1.0.7 release surfaces, read against the pinned trees. Row 31 keeps the generic ClientHello mask and row 29 the native TUN; these rows are the parts neither reaches.
+Rows 125–130 are the client-side gaps the FoxyVPN v1.0.7 release surfaces, read against the pinned trees; rows 134–138 are the DPI-evasion moves the Outline SDK `x/` module makes, learned from it without pinning it. Row 31 keeps the generic ClientHello mask and row 29 the native TUN; these rows are the parts neither reaches.
 
 | # | method | state | supported today by |
 | --- | --- | --- | --- |
@@ -306,6 +307,11 @@ Rows 125–130 are the client-side gaps the FoxyVPN v1.0.7 release surfaces, rea
 | 128 | QUIC congestion controller and pacing (CUBIC/BBR/BBR2) | planned | quiche `quiche/src/recovery/mod.rs`; ZeroNet `zero-transport/src/quic_shape.rs`; SlipStream `docs/protocol.md` (DCUBIC). Hysteria picks BBR; the Foxy h3 lane leaves quiche's CUBIC default and paces nothing |
 | 129 | TUN stack and offloads (`userspace`/`system`/`hybrid`, GSO/GRO, multi-queue) | planned | zeptun `docs/wiki/Stacks.md`; sing-box `option/tun.go`; mqvpn `src/mqvpn_internal.h`; aether `aether/src/netstack.rs`; ZeroNet `zero-tun`. The tree opens one userspace device on one handler loop, without GSO/GRO |
 | 130 | Split tunneling (per-app/per-UID and per-domain) | planned | sing-box `option/tun.go` (`include_package`/`exclude_package`); LxBox 011-SPLIT_TUNNELING; xray-rust `platform/android/README.md`; Leaf `ProcessNameMatcher` (a regex over the session's process name). Router field rules (row 78) carry no app identity |
+| 134 | QUIC prelude: an unparseable Initial before every parseable one | planned | Outline SDK `x/quicprelude/` (not pinned) — decoy Initial-shaped datagrams precede each packet that may carry a QUIC ClientHello, judged from the header alone and remembered nowhere, so a middlebox that reads the SNI off the first Initial it can parse reaches no decision and matches nothing after it; rows 31 and 125 cut TCP streams, this is the h3 seat (rows 76, 128) |
+| 135 | In-flight TTL drop ("disorder") | planned | Outline SDK `x/disorder/` (not pinned) — the Nth write goes out with TTL 1, dies at the first hop, and the stack retransmits it with TTL restored; every byte lands but the observer's reassembly holds a hole that never fills. Rows 31 and 125 re-time writes, none drops one |
+| 136 | Boot strategy race over resolvers and shaping | planned | Outline SDK `x/smart/` (not pinned) — a list of (DNS resolver × stream split × TLS-record frag) strategies raced against test domains at boot, the first that resolves *and* handshakes is kept, with an access-key fallback beneath; rows 70, 74 and 83 each own one tier of this, none races across the DNS and TCP/TLS layers at once |
+| 137 | Interference probe that names what the network blocks | planned | Outline SDK `x/connectivity/` + `x/tools/test-connectivity/` (not pinned) — layered probes classify the failure (poisoned resolution, blackholed address, SNI reset, blocked TLS) so the user learns what is censored instead of "connection failed"; row 83's ladder is the engine that wants this verdict |
+| 138 | Truncated-answer DNS front (force the retry onto TCP) | planned | Outline SDK `network/dnstruncate/` (not pinned) — a listener answers the client's UDP query with the TC bit set so the retry rides TCP, the one path the tunnel owns; row 80's app picks TCP for itself, this is the trick for apps whose resolver the engine does not own |
 
 ### Conformance, per row
 
