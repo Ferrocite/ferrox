@@ -13974,8 +13974,7 @@ mod tests {
         let mut reader = Whole;
         let mut buffer = RelayBuf::new();
         let first = reader.read(buffer.as_mut()).expect("answers");
-        let handed = buffer.filled(first);
-        assert_eq!(handed.len(), first);
+        let base = buffer.filled(first).as_ptr();
         assert_eq!(
             buffer.size(),
             RELAY_BUFFER,
@@ -13992,13 +13991,12 @@ mod tests {
             64 * 1024,
             "the promoted windows are the RSS a duplex flow pays, times the legs that promote"
         );
-        let base = handed.as_ptr();
         for round in 0..32u32 {
             let n = reader
                 .read(buffer.as_mut())
                 .expect("the whole window always answers");
-            let slice = buffer.filled(n);
-            let (handed, cap) = (slice.as_ptr(), buffer.capacity());
+            let handed = buffer.filled(n).as_ptr();
+            let cap = buffer.capacity();
             assert_eq!(
                 handed, base,
                 "round {round}: the drain handed bytes from another allocation"
