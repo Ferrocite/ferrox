@@ -26850,8 +26850,7 @@ mod poll_copy {
 
     impl Drop for Flow {
         fn drop(&mut self) {
-            // Hand the sockets back blocking before the joiner wakes, because a duplicate
-            // shares the descriptor's status flags with the caller's handle.
+            // Restore blocking before the joiner wakes; a duplicate shares the descriptor's status flags.
             for direction in &self.directions {
                 let _ = direction.src.set_nonblocking(false);
                 let _ = direction.dst.set_nonblocking(false);
@@ -27223,8 +27222,7 @@ mod poll_relay {
 
     struct Flow {
         directions: Vec<Direction>,
-        // The arm lives with the flow, not the hand-off: a detached hand-off returns while the
-        // workers still splice, so the flags can only be restored when both directions end.
+        // The arm lives here so a detached hand-off can restore it when both directions end.
         guards: Option<[Option<SpliceGuard>; 4]>,
         done: Vec<mpsc::Sender<Result<(), ()>>>,
     }
@@ -27237,8 +27235,7 @@ mod poll_relay {
 
     impl Drop for Flow {
         fn drop(&mut self) {
-            // Restore before the joiner wakes: a relay that has handed back is a relay whose
-            // sockets are blocking again, as the caller found them.
+            // Restore the sockets' flags before the joiner wakes, as the caller found them.
             drop(self.guards.take());
             for done in self.done.drain(..) {
                 let _ = done.send(Ok(()));
