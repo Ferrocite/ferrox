@@ -5,7 +5,9 @@ A terminal gets the four-way prompt and the answer is the carrier the lane is
 started with; a pipe is never prompted and takes auto. `status` reads the
 carrier, the allowance and the uptime back from the lane it was given: a fake
 pid and a synthetic log stand in for a live account, and the front refuses the
-trace immediately because nothing listens on its port.
+trace immediately because nothing listens on its port. `locations --ping` is
+given a fake catalogue: the rows must order by latency, keep a silent edge as
+`no answer`, pin REC, and leave the readings out of the offline copy.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ import json
 import os
 import pathlib
 import pty
+import re
 import shutil
 import socket
 import subprocess
@@ -167,11 +170,102 @@ def check_status(state: pathlib.Path) -> int:
     return 0
 
 
+def check_locations(state: pathlib.Path) -> int:
+    binary = state / "fake-edges"
+    binary.write_text(
+        """#!/bin/sh
+if [ "${2:-}" = "--ping" ]; then
+  printf '%s\\n' \\
+    '{"host":"c","port":1,"city":"BER","country":"DE","ms":70}' \\
+    '{"host":"a","port":1,"city":"SFO","country":"US","ms":40}' \\
+    '{"host":"b","port":1,"city":"NYC","country":"US","ms":null}' \\
+    '{"host":"d","port":1,"city":"ANY","country":"REC","ms":90}'
+else
+  printf '%s\\n' \\
+    '{"host":"c","port":1,"city":"BER","country":"DE"}' \\
+    '{"host":"a","port":1,"city":"SFO","country":"US"}' \\
+    '{"host":"b","port":1,"city":"NYC","country":"US"}' \\
+    '{"host":"d","port":1,"city":"ANY","country":"REC"}'
+fi
+""",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    env = env_for(state)
+    env["FERROX_BIN"] = str(binary)
+    run = subprocess.run(
+        [str(CLI), "locations", "--ping"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH,
+        env=env,
+    )
+    output = run.stdout + run.stderr
+    if run.returncode != 0:
+        print(
+            f"check-cli-lane: locations --ping exited {run.returncode}:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    marked = re.search(r"REC\s+1 edges\s+90 ms", output)
+    fast = re.search(r"US\s+2 edges\s+40 ms", output)
+    slow = re.search(r"DE\s+1 edges\s+70 ms", output)
+    if not (marked and fast and slow):
+        print(
+            f"check-cli-lane: locations --ping lost a reading:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if not (marked.start() < fast.start() < slow.start()):
+        print(
+            f"check-cli-lane: locations --ping did not order REC, then fastest first:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    quick = re.search(r"SFO\s+1\s+40 ms", output)
+    silent = re.search(r"NYC\s+1\s+no answer", output)
+    if not (quick and silent and quick.start() < silent.start()):
+        print(
+            f"check-cli-lane: locations --ping did not put the silent city last:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    cache = (state / "foxy-locations.jsonl").read_text(encoding="utf-8")
+    if '"ms"' in cache or "SFO" not in cache:
+        print(
+            "check-cli-lane: the offline list kept a reading or lost the rows",
+            file=sys.stderr,
+        )
+        return 1
+    plain = subprocess.run(
+        [str(CLI), "locations"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH,
+        env=env,
+    )
+    spoken = plain.stdout + plain.stderr
+    if "40 ms" in spoken or "SFO" not in spoken:
+        print(
+            f"check-cli-lane: locations without --ping shows a reading or an empty list:\n{spoken}",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "check-cli-lane: locations --ping orders by latency, marks silence, and caches no reading"
+    )
+    return 0
+
+
 def main() -> int:
     state = pathlib.Path(tempfile.mkdtemp(prefix="ferrox-cli-lane-"))
     if check_picker(state) != 0:
         return 1
-    return check_status(state)
+    if check_status(state) != 0:
+        return 1
+    return check_locations(state)
 
 
 if __name__ == "__main__":

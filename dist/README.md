@@ -33,6 +33,7 @@ Pick an exit before connecting — the catalogue is public, so this needs no acc
 
 ```bash
 ./ferrox-cli.sh locations           # every country and its cities, remembered one marked *
+./ferrox-cli.sh locations --ping    # nearest exit first: one handshake per edge, in ms
 ./ferrox-cli.sh locations US        # one country in detail
 ./ferrox-cli.sh location DE         # remember Germany for every up
 ./ferrox-cli.sh location US SFO     # remember a country and a city
