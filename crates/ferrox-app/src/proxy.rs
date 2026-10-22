@@ -33,15 +33,32 @@ pub(crate) fn print_x25519() {
     println!("Password (PublicKey): {public}");
 }
 
-/// Published edges as JSON rows on stdout: the catalogue is public, so the list needs no config, account or lane.
-pub(crate) fn print_foxy_edges() {
+/// Published edges as JSON rows on stdout: the catalogue is public, so the list needs no config, account or lane. `--ping` adds the handshake time, and a null is an edge that did not answer.
+pub(crate) fn print_foxy_edges(ping: bool) {
     let edges = crate::foxy_catalog::edges(crate::quic::system_roots());
-    for edge in edges {
-        println!(
-            "{{\"host\":\"{}\",\"port\":{},\"city\":\"{}\",\"country\":\"{}\"}}",
-            edge.host, edge.port, edge.city, edge.country
-        );
+    let readings = ping.then(|| crate::foxy_latency::readings(&edges));
+    for (index, edge) in edges.iter().enumerate() {
+        if let Some(readings) = &readings {
+            println!(
+                "{}",
+                foxy_edge_row(edge, readings.get(index).copied().flatten())
+            );
+        } else {
+            println!(
+                "{{\"host\":\"{}\",\"port\":{},\"city\":\"{}\",\"country\":\"{}\"}}",
+                edge.host, edge.port, edge.city, edge.country
+            );
+        }
     }
+}
+
+/// The measured row a pinged listing prints: a number of milliseconds, or the null an unanswered edge earns.
+fn foxy_edge_row(edge: &ferrox_core::foxy::Candidate, reading: Option<u64>) -> String {
+    let ms = reading.map_or_else(|| "null".to_owned(), |ms| ms.to_string());
+    format!(
+        "{{\"host\":\"{}\",\"port\":{},\"city\":\"{}\",\"country\":\"{}\",\"ms\":{ms}}}",
+        edge.host, edge.port, edge.city, edge.country
+    )
 }
 
 pub(crate) fn serve_json(label: &str, text: &str) -> ! {
@@ -29087,6 +29104,34 @@ mod census_tests {
             took < CEILING,
             "the carried relay took {took:?} to end a flow whose peer stopped taking the upload, \
              so a write is parked past its stall budget"
+        );
+    }
+}
+
+#[cfg(test)]
+mod foxy_ping_tests {
+    use super::foxy_edge_row;
+    use ferrox_core::foxy::Candidate;
+
+    fn edge() -> Candidate {
+        Candidate {
+            host: std::sync::Arc::from("us.m1.example"),
+            port: 2499,
+            country: "US".to_owned(),
+            city: "SFO".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_pinged_row_carries_the_reading_and_a_silent_edge_carries_a_null() {
+        assert_eq!(
+            foxy_edge_row(&edge(), Some(41)),
+            r#"{"host":"us.m1.example","port":2499,"city":"SFO","country":"US","ms":41}"#
+        );
+        assert_eq!(
+            foxy_edge_row(&edge(), None),
+            r#"{"host":"us.m1.example","port":2499,"city":"SFO","country":"US","ms":null}"#,
+            "an unanswered edge is still a row: silence is the reading"
         );
     }
 }

@@ -39,12 +39,16 @@ The catalogue is public and unauthenticated, so the location list needs no accou
 ```bash
 ./dist/ferrox-cli.sh locations              # every country, and the cities each one publishes
 ./dist/ferrox-cli.sh locations US           # one country in detail
+./dist/ferrox-cli.sh locations --ping       # the same list, nearest exit first
+./dist/ferrox-cli.sh locations --ping US    # one country, its cities by latency
 ./dist/ferrox-cli.sh location DE            # remember Germany for every up
 ./dist/ferrox-cli.sh location US SFO        # remember a country and a city
 ./dist/ferrox-cli.sh up --foxy --vpn        # connects to the remembered exit
 ```
 
 The list prints one line per country and one per city with the number of published edges, marks the remembered choice with `*`, and keeps the raw JSON rows in `~/.config/ferrox/foxy-locations.jsonl`; when the catalogue cannot be reached, the last copy is what `locations` prints. `--country` and `--city` still win over the remembered exit for one launch and become the new remembered one. `REC` is the catalogue's recommended country: it picks the exit Mozilla considers best and verification accepts whichever country that edge reports.
+
+`--ping` adds one TCP handshake per edge and prints its time in milliseconds. Countries and cities sort fastest first, and `REC` stays at the top because it is a recommendation rather than a measurement. An edge that does not answer inside 1.5 s prints `no answer`, the same silence that would cost a flow its dial. The reading is this machine's own path to the edge's TCP port: it measures the hop, not the MASQUE session, and an `--upstream` hop is not in it. The readings are not kept: `foxy-locations.jsonl` stores the rows without them, and an offline `locations --ping` says the latency was not measured instead of printing stale numbers.
 
 ## 2. Connect (CLI)
 

@@ -69,6 +69,7 @@ CARRIER_SET=0
 LOC_COUNTRY=""
 LOC_CITY=""
 LOC_FILTER=""
+LOC_PING=0
 UPSTREAM=""
 # VeePN has no account and no server: an empty region lets the plane pick, and
 # the device id is kept under $CONF_DIR so a restart is the same device.
@@ -110,6 +111,7 @@ commands
   login      save the foxy account once (prompts for the password; file is 0600)
   logout     stop the lane, then forget the account and its stored session
   locations  list the countries and cities the catalogue publishes
+             (--ping measures the handshake to each edge, fastest first)
   location   remember an exit: location CC [CITY] (survives every up)
   up         start the lane in the background, print the port map (default)
   serve      start the lane in this terminal, until Ctrl-C
@@ -126,6 +128,7 @@ so no password is asked again and FxA sends no new-sign-in mail.
   ferrox-cli up --foxy --vpn                    # asks once, then connects
   ferrox-cli up --foxy --vpn                    # second run: resumes, no sign-in
   ferrox-cli locations                          # countries and cities to pin
+  ferrox-cli locations --ping                   # the same list, nearest exit first
   ferrox-cli location DE                        # remember Germany for every up
   ferrox-cli status                             # exit IP and country
   ferrox-cli down                               # stop, clear the system proxy
@@ -158,11 +161,12 @@ foxy options (email + password is the whole setup; there is no server to name)
   --upstream URL         http:// or socks5(h):// hop to reach the edge through
 
 locations
-  ferrox-cli locations [CC]        every country, and the cities each one has
-  ferrox-cli location CC [CITY]    remember it; up --foxy moves there
+  ferrox-cli locations [--ping] [CC]   every country, and the cities each one has
+  ferrox-cli location CC [CITY]        remember it; up --foxy moves there
   The list is public: it needs no account and is cached by the binary, and the
   last one fetched is kept in \$CONF_DIR/foxy-locations.jsonl for when the
-  catalogue cannot be reached.
+  catalogue cannot be reached.  --ping adds a TCP-handshake latency per edge,
+  sorts the exits fastest first, and marks an edge that did not answer.
 
 veepn options (nothing is required: the plane names the region and its edges)
   --region CC            exit region id (lowercase, e.g. nl, us-va), else the plane picks
@@ -260,11 +264,15 @@ action_logout() {
 # The list is public and needs no account, so it is the binary's catalogue call
 # and not an authenticated one; the last answer is kept for an offline listing.
 action_locations() {
-  local filter rows
+  local filter rows plain formatter
   filter="$(printf '%s' "$LOC_FILTER" | tr '[:lower:]' '[:upper:]')"
   require_bin
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
-  rows="$("$BIN" edges 2>/dev/null)"
+  if [ "$LOC_PING" = 1 ]; then
+    rows="$("$BIN" edges --ping 2>/dev/null)"
+  else
+    rows="$("$BIN" edges 2>/dev/null)"
+  fi
   if [ -z "$rows" ]; then
     if [ -s "$LOCATIONS_FILE" ]; then
       say "the catalogue did not answer; showing the last list it gave ($LOCATIONS_FILE)."
@@ -273,14 +281,20 @@ action_locations() {
       die "the catalogue did not answer and no list is saved yet: check the network, then run 'ferrox-cli locations' again."
     fi
   else
-    ( umask 077; printf '%s\n' "$rows" >"$LOCATIONS_FILE" )
+    # The offline copy keeps the same rows without this launch's readings.
+    plain="$(printf '%s\n' "$rows" | sed -e 's/,"ms":null//' -e 's/,"ms":[0-9][0-9]*//')"
+    ( umask 077; printf '%s\n' "$plain" >"$LOCATIONS_FILE" )
   fi
-  printf '%s\n' "$rows" | python3 - "$filter" "$(remembered_country)" "$(remembered_city)" "$LOCATIONS_FILE" <<'PY'
+  # A here-document on this command would take stdin's place and hide the rows.
+  formatter="$(cat <<'PY'
 import json, sys
 
-wanted, current_country, current_city, saved = sys.argv[1:5]
+wanted, current_country, current_city, saved, ping = sys.argv[1:6]
+ping = ping == "1"
 places = {}
+best = {}
 total = 0
+measured = False
 for line in sys.stdin:
     line = line.strip()
     if not line:
@@ -298,25 +312,77 @@ for line in sys.stdin:
     cities = places.setdefault(country, {})
     cities[city] = cities.get(city, 0) + 1
     total += 1
+    if "ms" in edge:
+        measured = True
+        reading = edge.get("ms")
+        key = (country, city)
+        if not isinstance(reading, int):
+            best.setdefault(key, None)
+        elif key not in best or best[key] is None or reading < best[key]:
+            best[key] = reading
 if not places:
     if wanted:
         print(f"{wanted} is not in the published catalogue; run 'ferrox-cli locations' for every country it lists.")
     else:
         print("the catalogue listed no dialable edge just now; the lane would refuse every country.")
     sys.exit(1)
+country_best = {}
+for (country, _city), reading in best.items():
+    if not isinstance(reading, int):
+        country_best.setdefault(country, None)
+    elif country not in country_best or country_best[country] is None or reading < country_best[country]:
+        country_best[country] = reading
+
+def reading_of(key, table):
+    if not ping or key not in table:
+        return ""
+    value = table[key]
+    if not isinstance(value, int):
+        return "no answer".rjust(12)
+    return f"{value} ms".rjust(12)
+
+def country_order(code):
+    if code == "REC":
+        return (0, 0, code)
+    if code not in country_best:
+        return (3, 0, code)
+    reading = country_best[code]
+    return (1, reading, code) if isinstance(reading, int) else (2, 0, code)
+
+def city_order(country, code):
+    key = (country, code)
+    if key not in best:
+        return (3, 0, code)
+    reading = best[key]
+    return (1, reading, code) if isinstance(reading, int) else (2, 0, code)
+
 print(f"exit locations from Mozilla's catalogue: {len(places)} countries, {total} edges")
 print("country and city are the codes --country and --city take; * is what this machine remembers.")
-for country in sorted(places, key=lambda code: (code != "REC", code)):
+if ping:
+    print("ms is one TCP handshake from this machine to the edge (1.5 s budget); 'no answer' is an edge that did not take it.")
+    if not measured:
+        print("latency not measured: this listing came from the offline copy; run 'locations --ping' again when the catalogue answers.")
+if ping:
+    countries = sorted(places, key=country_order)
+else:
+    countries = sorted(places, key=lambda code: (code != "REC", code))
+for country in countries:
     cities = places[country]
     mark = "*" if country == current_country else " "
-    print(f" {mark} {country:<4} {sum(cities.values()):>3} edges")
-    for city in sorted(cities, key=lambda code: (code == "", code)):
+    print(f" {mark} {country:<4} {sum(cities.values()):>3} edges{reading_of(country, country_best)}")
+    if ping:
+        ordered = sorted(cities, key=lambda code: city_order(country, code))
+    else:
+        ordered = sorted(cities, key=lambda code: (code == "", code))
+    for city in ordered:
         star = "*" if country == current_country and city == current_city else " "
-        print(f"   {star}   {(city or 'any'):<6} {cities[city]:>3}")
+        print(f"   {star}   {(city or 'any'):<6} {cities[city]:>3}{reading_of((country, city), best)}")
 print()
 print("remember one:  ferrox-cli location <CC> [CITY]")
 print(f"the list is saved in {saved}")
 PY
+)"
+  printf '%s\n' "$rows" | python3 -c "$formatter" "$filter" "$(remembered_country)" "$(remembered_city)" "$LOCATIONS_FILE" "$LOC_PING"
 }
 
 action_location() {
@@ -1107,6 +1173,8 @@ while [ $# -gt 0 ]; do
     up|serve|down|status|ports|tun|login|logout|version) ACTION="$1"; shift ;;
     locations)
       ACTION=locations; shift
+      # Both spellings: `locations --ping US` and `locations US --ping`.
+      if [ $# -gt 0 ] && [ "$1" = --ping ]; then LOC_PING=1; shift; fi
       if [ $# -gt 0 ]; then
         case "$1" in
           -*) ;;
@@ -1159,12 +1227,18 @@ while [ $# -gt 0 ]; do
     --mixed) need_value --mixed "a port" "$#" "${2:-}"; MIXED_PORT="$2"; shift 2 ;;
     --vpn) WANT_VPN=1; shift ;;
     --debug) DEBUG=1; shift ;;
+    --ping) LOC_PING=1; shift ;;
     --tun) ACTION=tun; shift ;;
     -h|--help) usage; exit 0 ;;
     -V|--version) ACTION=version; shift ;;
     *) die "unknown argument: $1 (see --help)" ;;
   esac
 done
+
+# A measurement flag belongs to the listing: a lane started by a typo is not one.
+if [ "$LOC_PING" = 1 ] && [ "$ACTION" != locations ]; then
+  die "--ping belongs to 'locations' (ferrox-cli locations --ping); nothing was started."
+fi
 
 # A VeePN flow pays a launch and a list before bytes move, so its first probe
 # waits longer than a lane that configures the server it dials.
