@@ -303,6 +303,9 @@ carrier-foxy padded-frame-pad-octets-delivered-in-pieces 0 ferrox-app-foxy::loop
 carrier-foxy padding-only-frame-window-octets-lost 0 ferrox-app-foxy::loopback::a_frame_of_only_padding_hands_the_caller_nothing_and_still_credits_its_wire
 carrier-foxy staged-frame-bytes-dropped 0 ferrox-app-foxy::loopback::a_frame_wider_than_the_edge_s_own_send_limit_is_read_whole
 carrier-foxy oversized-frame-buffer-bytes 0 ferrox-app-foxy::loopback::a_frame_wider_than_the_lane_ever_asked_for_is_refused_not_allocated
+
+carrier-foxy foreign-stream-ends-that-end-this-lane 0 ferrox-app-foxy::loopback::a_foreign_stream_s_end_does_not_end_our_lane
+
 carrier-foxy dead-carrier-dials-per-connect-ip-packet 0 ferrox-app-proxy::tests::the_connect_ip_lane_leaves_a_dead_carrier_dead
 carrier-foxy carriers-dialled 3 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_answers_best
 carrier-foxy udp-carriers-dialled 2 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_answers_best
