@@ -26505,6 +26505,7 @@ mod tests {
 mod poll_copy {
     use super::{Connection, RelayEnd, Shutdown};
     use std::io::{self, Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex, OnceLock};
     use std::time::Duration;
 
