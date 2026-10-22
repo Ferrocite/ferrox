@@ -5764,6 +5764,11 @@ pub(crate) mod loopback {
             back, payload,
             "the delivery opened with the pad-length octet and closed on the pad tail"
         );
+        assert_eq!(
+            lane.carry.capacity(),
+            FRAME,
+            "the whole payload was staged once, which is the price of taking the padding off"
+        );
         drop(tunnel);
         edge.join().expect("the edge finishes");
     }
