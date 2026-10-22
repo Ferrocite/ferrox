@@ -26575,15 +26575,15 @@ mod poll_copy {
 
     #[cfg(unix)]
     fn ready_mask() -> i16 {
-        libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL
+        libc::POLLIN | libc::POLLOUT | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL
     }
 
     #[cfg(windows)]
     fn ready_mask() -> i16 {
         use windows_sys::Win32::Networking::WinSock::{
-            POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLRDNORM,
+            POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT, POLLRDNORM,
         };
-        POLLIN | POLLRDNORM | POLLHUP | POLLERR | POLLNVAL
+        POLLIN | POLLRDNORM | POLLOUT | POLLHUP | POLLERR | POLLNVAL
     }
 
     #[cfg(unix)]
