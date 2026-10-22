@@ -26824,11 +26824,12 @@ mod poll_copy {
                 .is_some_and(|since| since.elapsed() >= self.stall_budget)
         }
 
-        /// A destination that has not taken a byte for the stall budget gives up both halves,
-        /// so the partner leg parked on that socket wakes and the flow ends together.
-        fn give_up(&mut self) {
+        /// The flow has given up: close both halves so neither leg waits on the other.
+        fn abandon(&mut self) {
+            self.ended = true;
+            self.stalled = None;
+            let _ = self.src.shutdown(Shutdown::Both);
             let _ = self.dst.shutdown(Shutdown::Both);
-            self.end();
         }
 
         fn end(&mut self) {
@@ -26849,6 +26850,12 @@ mod poll_copy {
     impl Flow {
         fn finished(&self) -> bool {
             self.directions.iter().all(|d| d.ended)
+        }
+
+        fn give_up(&mut self) {
+            for direction in &mut self.directions {
+                direction.abandon();
+            }
         }
     }
 
@@ -26939,16 +26946,15 @@ mod poll_copy {
                     }
                 }
             }
-            if wait(&mut rows, timeout).is_none() {
+            let answered = wait(&mut rows, timeout);
+            for flow in &mut flows {
+                if flow.directions.iter().any(Direction::stalled_for_budget) {
+                    flow.give_up();
+                }
+            }
+            if answered.is_none() {
                 std::thread::sleep(Duration::from_millis(1));
                 continue;
-            }
-            for flow in &mut flows {
-                for direction in &mut flow.directions {
-                    if direction.stalled_for_budget() {
-                        direction.give_up();
-                    }
-                }
             }
             for index in 0..rows.len() {
                 if !is_ready(&rows[index]) {
@@ -27690,6 +27696,7 @@ mod relay_tests {
     /// nothing.
     #[test]
     fn a_stalled_destination_does_not_freeze_the_flows_behind_it() {
+        let _guard = budgets::lock();
         const ROUNDS: usize = 512;
         const NEIGHBOURS: usize = 16;
 
@@ -28128,6 +28135,7 @@ mod relay_tests {
     /// many relays ended. Loopback only, dials nothing.
     #[test]
     fn sixteen_flows_at_once_all_arrive_whole() {
+        let _guard = budgets::lock();
         const FLOWS: usize = 16;
         const CHUNK: usize = 65_536;
         const ROUNDS: usize = 128;
