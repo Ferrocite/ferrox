@@ -9446,7 +9446,8 @@ fn join(direction: &RelayEnd) -> bool {
     join_within(direction, budgets::relay_join())
 }
 
-pub(crate) const RELAY_BUFFER: usize = 256 * 1024;
+/// The window a busy relay leg promotes to: 16 promoted windows of a duplex flow at 256 KiB were the 4 MiB the RSS cells carried (issue #382), and 64 KiB still reads coarser than every comparator's own copy.
+pub(crate) const RELAY_BUFFER: usize = 64 * 1024;
 
 pub(crate) const RELAY_SMALL_BUFFER: usize = 16 * 1024;
 
@@ -14099,7 +14100,9 @@ mod tests {
         let mut reader = Quantum;
         let mut buffer = RelayBuf::new();
         let base = buffer.as_mut().as_ptr();
-        for round in 0..64u32 {
+        // One read under the promotion edge: the quantum that crosses `RELAY_BUFFER` moved promotes, and that is the cap's test, not this one.
+        let rounds = RELAY_BUFFER / 1024 - 1;
+        for round in 0..rounds as u32 {
             let n = reader
                 .read(buffer.as_mut())
                 .expect("the quantum always answers");
@@ -14122,6 +14125,59 @@ mod tests {
                 RELAY_SMALL_BUFFER,
                 "round {round}: and did not grow it"
             );
+        }
+    }
+
+    /// The promotion stops at the cap: one full read puts the buffer at `RELAY_BUFFER` and the cycles after it neither grow the allocation nor move the bytes — the RSS a duplex flow carries is the promotion times the legs that promote (`rss_mib`, `benchmark-matrix.yml`), so the bound is the resident claim, and the handoff's base pointer proves the slice handed on is the buffer's own allocation.
+    #[test]
+    fn the_window_promotes_to_the_cap_and_holds_it_over_push_and_drain() {
+        struct Whole;
+        impl std::io::Read for Whole {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                buf.fill(0x5a);
+                Ok(buf.len())
+            }
+        }
+        let mut reader = Whole;
+        let mut buffer = RelayBuf::new();
+        let first = reader.read(buffer.as_mut()).expect("answers");
+        let base = buffer.filled(first).as_ptr();
+        assert_eq!(
+            buffer.size(),
+            RELAY_BUFFER,
+            "a full window promoted past the cap"
+        );
+        assert_eq!(
+            buffer.capacity(),
+            RELAY_BUFFER,
+            "the promotion paid more than the cap"
+        );
+        // 16 promoted windows of an 8-flow duplex cell: 64 KiB × 16 = 1 MiB where 256 KiB × 16 was 4 MiB — the delta the issue's `rss_mib` table reads.
+        assert_eq!(
+            RELAY_BUFFER,
+            64 * 1024,
+            "the promoted windows are the RSS a duplex flow pays, times the legs that promote"
+        );
+        for round in 0..32u32 {
+            let n = reader
+                .read(buffer.as_mut())
+                .expect("the whole window always answers");
+            let handed = buffer.filled(n).as_ptr();
+            let cap = buffer.capacity();
+            assert_eq!(
+                handed, base,
+                "round {round}: the drain handed bytes from another allocation"
+            );
+            assert!(
+                base >= buffer.as_mut().as_ptr()
+                    && base < buffer.as_mut().as_ptr().wrapping_add(buffer.capacity()),
+                "round {round}: the handed slice left the buffer's allocation"
+            );
+            assert_eq!(
+                cap, RELAY_BUFFER,
+                "round {round}: a push/drain cycle grew the window"
+            );
+            assert_eq!(buffer.size(), RELAY_BUFFER, "round {round}: size moved");
         }
     }
 
