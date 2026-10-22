@@ -26737,6 +26737,8 @@ mod poll_copy {
         off: usize,
         src_at_eof: bool,
         ended: bool,
+        /// The stall budget this direction was born with, as `copy_all` read it once per leg.
+        stall_budget: Duration,
         /// The first write that found no room, cleared by the next byte the destination takes.
         stalled: Option<std::time::Instant>,
     }
@@ -26751,6 +26753,7 @@ mod poll_copy {
                 off: 0,
                 src_at_eof: false,
                 ended: false,
+                stall_budget: crate::budgets::relay_stall(),
                 stalled: None,
             }
         }
@@ -26816,8 +26819,9 @@ mod poll_copy {
             }
         }
 
-        fn stalled_for(&self, budget: Duration) -> bool {
-            self.stalled.is_some_and(|since| since.elapsed() >= budget)
+        fn stalled_for_budget(&self) -> bool {
+            self.stalled
+                .is_some_and(|since| since.elapsed() >= self.stall_budget)
         }
 
         /// A destination that has not taken a byte for the stall budget gives up both halves,
@@ -26921,12 +26925,11 @@ mod poll_copy {
                     }
                 }
             }
-            let budget = crate::budgets::relay_stall();
             let mut timeout = -1;
             for flow in &flows {
                 for direction in &flow.directions {
                     if let Some(since) = direction.stalled {
-                        let left = budget.saturating_sub(since.elapsed());
+                        let left = direction.stall_budget.saturating_sub(since.elapsed());
                         let millis = i32::try_from(left.as_millis()).unwrap_or(i32::MAX);
                         timeout = if timeout < 0 {
                             millis
@@ -26942,7 +26945,7 @@ mod poll_copy {
             }
             for flow in &mut flows {
                 for direction in &mut flow.directions {
-                    if direction.stalled_for(budget) {
+                    if direction.stalled_for_budget() {
                         direction.give_up();
                     }
                 }
