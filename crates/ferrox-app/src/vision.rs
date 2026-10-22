@@ -966,7 +966,7 @@ mod tests {
         );
     }
 
-    /// The relay hands one buffer of up to 256 KiB; past one `buf.Size` block the u16 length wraps and the reference's reader refuses the frame, so the buffer frames as whole blocks and every byte still arrives.
+    /// The relay hands one buffer of up to 64 KiB; past one `buf.Size` block the u16 length wraps and the reference's reader refuses the frame, so the buffer frames as whole blocks and every byte still arrives.
     #[test]
     fn a_bulk_write_frames_every_block_inside_the_bound() {
         let body: Vec<u8> = (0..crate::proxy::RELAY_BUFFER as u32)

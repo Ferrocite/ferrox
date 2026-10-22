@@ -663,11 +663,11 @@ impl<R: Read> Read for GrpcReader<R> {
     }
 }
 
-/// The frames one write carries: a relay read is `256 KiB` of full `HUNK`s, and a full hunk leaves as
-/// two DATA frames at the frame size this lane advertises, so one read of the relay's own buffer is
-/// one batch and one socket call. Wider would never fill and narrower would pay a call it was not
-/// asked for.
-const FRAMES_PER_WRITE: usize = 32;
+/// The frames one write carries: a promoted relay read is `64 KiB` of full `HUNK`s, each hunk leaving
+/// as two DATA frames at the frame size this lane advertises, so one read of the relay's own buffer is
+/// one batch and one socket call. A wider caller flushes mid-write when the batch fills; a narrower
+/// one pays the call it was asked for and no other.
+const FRAMES_PER_WRITE: usize = 8;
 
 /// A gathered frame's own bytes: its nine-byte head and the envelope prefix it carries, which is at
 /// most the `16` bytes `frame_prefix` can fill.
@@ -1510,7 +1510,7 @@ mod tests {
         assert_eq!(payload.capacity(), capacity, "the caller's buffer grew");
     }
 
-    /// The witnesses for `carrier-grpc writes-per-relay-read 1`, `carrier-grpc segments-per-socket-write 64` and `carrier-grpc payload-runs-per-socket-write 32`: a relay read of sixteen full `HUNK`s is thirty-two DATA frames and leaves as one write of sixty-four segments whose bytes are those frames in order, with thirty-two of them still runs of the caller's own buffer — a gather holds heads and envelopes apart, it does not stage a byte of payload.
+    /// The witnesses for `carrier-grpc writes-per-relay-read 1`, `carrier-grpc segments-per-socket-write 16` and `carrier-grpc payload-runs-per-socket-write 8`: a relay read of four full `HUNK`s is eight DATA frames and leaves as one write of sixteen segments whose bytes are those frames in order, with eight of them still runs of the caller's own buffer — a gather holds heads and envelopes apart, it does not stage a byte of payload.
     #[test]
     fn a_relay_read_gathers_its_frames_into_one_write() {
         let data: Vec<u8> = (0..FRAMES_PER_WRITE / 2 * HUNK)
@@ -1555,7 +1555,7 @@ mod tests {
     }
 
     /// The same batch driven over a real socket, where the only thing a loopback test can assert is
-    /// its bytes: sixty-four segments is the widest list this carrier hands `writev` or `WSASend`, so
+    /// its bytes: sixteen segments is the widest list this carrier hands `writev` or `WSASend`, so
     /// a platform that split the list or refused its width would answer with missing or reordered
     /// frames rather than with a count.
     #[test]
