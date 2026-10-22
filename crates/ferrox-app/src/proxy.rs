@@ -27696,10 +27696,10 @@ mod relay_tests {
     /// nothing.
     #[test]
     fn a_stalled_destination_does_not_freeze_the_flows_behind_it() {
-        let _guard = budgets::lock();
         const ROUNDS: usize = 512;
         const NEIGHBOURS: usize = 16;
 
+        let _guard = budgets::lock();
         let stalled_front = listener();
         let stalled_front_port = port_of(&stalled_front);
         let stalled_back = listener();
@@ -28135,11 +28135,12 @@ mod relay_tests {
     /// many relays ended. Loopback only, dials nothing.
     #[test]
     fn sixteen_flows_at_once_all_arrive_whole() {
-        let _guard = budgets::lock();
         const FLOWS: usize = 16;
         const CHUNK: usize = 65_536;
         const ROUNDS: usize = 128;
         const LEN: usize = CHUNK * ROUNDS;
+
+        let _guard = budgets::lock();
         let front = Arc::new(listener());
         let front_port = port_of(&front);
         let back = Arc::new(listener());
