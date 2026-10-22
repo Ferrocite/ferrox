@@ -47,6 +47,19 @@ pub trait TlsProvider: std::io::Read + std::io::Write {
     fn peer_leaf(&self) -> Option<&[u8]> {
         None
     }
+
+    /// The ciphertext the caller read from the transport is decrypted, and the plaintext comes
+    /// out: the caller read the transport itself, so the wait for the peer's bytes happened
+    /// outside this session's lock, and only the decryption is under it. The plaintext's length
+    /// and the ciphertext's length come back together, because a session takes only what its
+    /// own buffer has room for and the rest is the caller's to feed again. A provider that
+    /// reads its own transport has no use for this and says so.
+    fn open(&mut self, ciphertext: &[u8], buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
+        let _ = (ciphertext, buf);
+        Err(std::io::Error::other(
+            "this provider reads its own transport",
+        ))
+    }
 }
 
 /// Stops the socket reads behind a session at TLS record ends once Vision can go direct, so the unwrap finds every following byte still in the kernel.
