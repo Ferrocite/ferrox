@@ -182,7 +182,7 @@ impl VeepnOut {
                     &dial.pass.token,
                     Some(veepn::FORBIDDEN_TARGET),
                 ) {
-                    Ok(lane) => return Ok(Tunnel::H1(lane)),
+                    Ok(lane) => return Ok(Tunnel::H1(Box::new(lane))),
                     Err(ferrox_core::foxy::Failure::BlockedHost(status)) => {
                         return Err(Refusal {
                             why: format!("{target} is refused by the edge ({status})"),
