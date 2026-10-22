@@ -5174,6 +5174,109 @@ impl<S> TlsHalf<S> {
     }
 }
 
+// The ciphertext one read of the transport carries: a record is at most sixteen kilobytes, so one read holds a whole record.
+const DRIVEN_CIPHERTEXT: usize = 32 * 1024;
+
+// A session whose transport the relay reads: the ciphertext comes off the socket with no session lock held.
+#[derive(Debug)]
+struct DrivenHalf<S, R> {
+    session: Arc<Mutex<S>>,
+    reader: Arc<Mutex<R>>,
+    scratch: Vec<u8>,
+    pending_at: usize,
+    pending_end: usize,
+}
+
+impl<S, R> DrivenHalf<S, R> {
+    /// The two halves of one session: the reader reads the transport and decrypts, the writer
+    /// only encrypts, and both name the same session and the same transport.
+    fn new(session: Arc<Mutex<S>>, reader: Arc<Mutex<R>>) -> Self {
+        Self {
+            session,
+            reader,
+            scratch: Vec::new(),
+            pending_at: 0,
+            pending_end: 0,
+        }
+    }
+}
+
+impl<S: ferrox_core::tls::TlsProvider, R: Read> Read for DrivenHalf<S, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.scratch.is_empty() {
+            self.scratch = unfilled(DRIVEN_CIPHERTEXT);
+        }
+        let mut filled = 0usize;
+        loop {
+            if filled == buf.len() {
+                // The caller's window is full: the rest waits for the next read.
+                return Ok(filled);
+            }
+            // The session's own plaintext comes out first, and the ciphertext it has not taken yet is fed after it.
+            let pending = &self.scratch[self.pending_at..self.pending_end];
+            let (plain, taken) = {
+                let mut session = self
+                    .session
+                    .lock()
+                    .map_err(|_| std::io::Error::other("tls half poisoned"))?;
+                session.open(pending, &mut buf[filled..])?
+            };
+            self.pending_at += taken;
+            filled += plain;
+            if self.pending_at < self.pending_end {
+                if taken == 0 && plain == 0 {
+                    // The session took nothing and gave nothing: the peer is gone.
+                    return Ok(filled);
+                }
+                // The session has more ciphertext to take.
+                continue;
+            }
+            // The transport's wait happens here, with no session lock held.
+            let read = {
+                let mut reader = self
+                    .reader
+                    .lock()
+                    .map_err(|_| std::io::Error::other("tls half poisoned"))?;
+                reader.read(&mut self.scratch)
+            };
+            let read = match read {
+                Ok(0) => {
+                    // The peer is gone: what was read is handed over, and the next read reports the end.
+                    return Ok(filled);
+                }
+                Ok(read) => read,
+                Err(error) if is_timeout(&error) => {
+                    if filled > 0 {
+                        return Ok(filled);
+                    }
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
+            self.pending_at = 0;
+            self.pending_end = read;
+        }
+    }
+}
+
+impl<S: ferrox_core::tls::TlsProvider, R> Write for DrivenHalf<S, R> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| std::io::Error::other("tls half poisoned"))?;
+        session.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut session = self
+            .session
+            .lock()
+            .map_err(|_| std::io::Error::other("tls half poisoned"))?;
+        session.flush()
+    }
+}
+
 impl<S: ferrox_core::tls::TlsProvider> Write for TlsHalf<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut session = self
@@ -5345,7 +5448,23 @@ fn dial_vless_tls(
                     let _ = downstream.shutdown(Shutdown::Both);
                 }
             });
-            relay_stream(Half::socket(downstream), Half::shared(session), &close);
+            // The relay reads the session's transport itself: the idle leg's wait costs the busy leg's write nothing.
+            let Ok(cipher) = session.get_ref().try_clone() else {
+                return;
+            };
+            if cipher.set_read_timeout(Some(SESSION_POLL)).is_err() {
+                return;
+            }
+            let session = Arc::new(Mutex::new(session));
+            let cipher = Arc::new(Mutex::new(cipher));
+            relay_stream(
+                Half::socket(downstream),
+                Half::split(
+                    DrivenHalf::new(Arc::clone(&session), Arc::clone(&cipher)),
+                    DrivenHalf::new(session, cipher),
+                ),
+                &close,
+            );
         }
         _ => ride_carrier(server, session, vless, &header, client),
     }
@@ -12124,6 +12243,177 @@ mod tests {
         let _ = leg.join().expect("joins");
     }
 
+    /// A transport that parks in its read until it is released: the wait an idle relay leg
+    /// spends in the kernel, with no session lock held around it.
+    struct ParkedTransport {
+        entered: std::sync::mpsc::Sender<()>,
+        released: std::sync::mpsc::Sender<()>,
+        open: Arc<(Mutex<bool>, std::sync::Condvar)>,
+    }
+
+    impl Read for ParkedTransport {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            self.entered.send(()).expect("signals");
+            let (lock, cvar) = &*self.open;
+            let mut open = lock.lock().expect("locks");
+            while !*open {
+                open = cvar.wait(open).expect("waits");
+            }
+            self.released.send(()).expect("signals");
+            Ok(0)
+        }
+    }
+
+    /// A session that records the bytes written into it and hands back nothing to read.
+    struct RecordingSession {
+        written: std::sync::mpsc::Sender<Vec<u8>>,
+    }
+
+    impl ferrox_core::tls::TlsProvider for RecordingSession {
+        fn name() -> &'static str {
+            "recording"
+        }
+
+        fn suites(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn handshake(&mut self) -> Result<(), ferrox_core::tls::TlsError> {
+            Ok(())
+        }
+
+        fn alpn(&self) -> Option<&[u8]> {
+            None
+        }
+
+        fn open(&mut self, _ciphertext: &[u8], _buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
+            Ok((0, 0))
+        }
+    }
+
+    impl Read for RecordingSession {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for RecordingSession {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.send(buf.to_vec()).expect("signals");
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The session's own half: the relay reads the transport with no session lock held, so the
+    /// idle leg's wait costs the busy leg's write nothing.
+    #[test]
+    fn a_session_write_goes_out_while_its_read_is_parked() {
+        use std::sync::mpsc;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (written_tx, written_rx) = mpsc::channel();
+        let (released_tx, released_rx) = mpsc::channel();
+        let open = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let transport = Arc::new(Mutex::new(ParkedTransport {
+            entered: entered_tx,
+            released: released_tx,
+            open: Arc::clone(&open),
+        }));
+        let session = Arc::new(Mutex::new(RecordingSession {
+            written: written_tx,
+        }));
+        let mut reader = DrivenHalf::new(Arc::clone(&session), Arc::clone(&transport));
+        let mut writer = DrivenHalf::new(session, transport);
+        let leg = std::thread::spawn(move || {
+            let mut buf = [0u8; 16];
+            reader.read(&mut buf)
+        });
+        entered_rx
+            .recv()
+            .expect("the reader is parked in its transport");
+        writer.write_all(b"ping").expect("writes");
+        assert!(
+            written_rx.try_recv().is_ok(),
+            "the write went out while the reader was parked"
+        );
+        assert!(
+            released_rx.try_recv().is_err(),
+            "the reader's read ended before the write went out: the write waited for it"
+        );
+        {
+            let (lock, cvar) = &*open;
+            *lock.lock().expect("locks") = true;
+            cvar.notify_all();
+        }
+        let _ = leg.join().expect("joins");
+    }
+
+    /// The driven half carries the bytes: a payload that crosses several records comes back
+    /// byte for byte through the relay's own read of the transport.
+    #[test]
+    fn a_driven_session_carries_a_bulk_echo() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut buf = [0u8; 16 * 1024];
+            loop {
+                match tls.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        tls.write_all(&buf[..n]).expect("echoes");
+                        tls.flush().expect("flushes");
+                    }
+                }
+            }
+        });
+
+        let mut session = ferrox_core::tls::RustlsProvider::connect(
+            &client_config,
+            Connection::connect(("127.0.0.1", port)).expect("connects"),
+        )
+        .expect("opens");
+        session.handshake().expect("handshakes");
+        let cipher = session.get_ref().try_clone().expect("dups the transport");
+        cipher.set_read_timeout(Some(SESSION_POLL)).expect("arms");
+        let session = Arc::new(Mutex::new(session));
+        let cipher = Arc::new(Mutex::new(cipher));
+        let mut reader = DrivenHalf::new(Arc::clone(&session), Arc::clone(&cipher));
+        let mut writer = DrivenHalf::new(session, cipher);
+
+        let payload: Vec<u8> = (0..64 * 1024u32)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
+            .collect();
+        let expected = payload.clone();
+        let sending = thread::spawn(move || {
+            writer.write_all(&payload).expect("writes");
+            writer.flush().expect("flushes");
+        });
+        let mut back = Vec::with_capacity(expected.len());
+        let mut buf = vec![0u8; 64 * 1024];
+        while back.len() < expected.len() {
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => back.extend_from_slice(&buf[..n]),
+                Err(error) if is_timeout(&error) => {}
+                Err(error) => panic!("reads the echo: {error:?}"),
+            }
+        }
+        sending.join().expect("joins");
+        assert_eq!(
+            back, expected,
+            "the echo came back altered through the driven session"
+        );
+    }
+
     /// One handle of a relay half that records which handle served a call: `armed` is the
     /// handle its caller sets a read timeout on, `duplicate` the one `Half::socket` clones.
     struct Marked {
@@ -16248,6 +16538,81 @@ mod tests {
         let out = find_vmess_outbound(&plain).expect("finds plain");
         assert!(out.tls.is_none());
         let _ = std::fs::remove_file(&ca);
+    }
+
+    /// The bulk download through the same relay: the session's own buffer is finite, and a
+    /// relay that kept feeding it after the caller's window was full filled it.
+    #[test]
+    fn vless_over_tls_carries_a_bulk_download() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x47u8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let Some((got, _flow, cmd, _target)) = decode_request(&mut tls) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(cmd, 1);
+            tls.write_all(&[0, 0]).expect("answers");
+            let block = vec![0x5Au8; 64 * 1024];
+            for _ in 0..16 {
+                tls.write_all(&block).expect("answers the download");
+            }
+            tls.flush().expect("flushes");
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+            let vless = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                carrier: Carrier::Raw(Chain::default()),
+                host: String::new(),
+                mux: false,
+                quic_roots: None,
+                hysteria_roots: None,
+                tls: Some(Arc::new(client_config)),
+                flow: String::new(),
+                reality: None,
+            };
+            dial_vless(
+                &client,
+                &server,
+                &vless,
+                &Destination::from(target),
+                Ladder::global(),
+            );
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(120)))
+            .expect("timeout");
+        let mut bulk = vec![0u8; 1024 * 1024];
+        let mut at = 0;
+        while at < bulk.len() {
+            match sock.read(&mut bulk[at..]) {
+                Ok(0) => panic!("the bulk download closed after {at} bytes"),
+                Ok(n) => at += n,
+                Err(error) if is_timeout(&error) => {}
+                Err(error) => panic!("the bulk download failed: {error:?}"),
+            }
+        }
+        assert!(
+            bulk.iter().all(|byte| *byte == 0x5A),
+            "the bulk download came back altered"
+        );
+        drop(sock);
+        relay.join().expect("joins");
+        server.join().expect("joins");
     }
 
     #[test]
