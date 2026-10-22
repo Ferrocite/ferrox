@@ -133,7 +133,8 @@ fn serve_root(label: &str, root: &Json) -> ! {
         &crate::config::budgets(root)
             .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}"))),
     );
-    let freedom = has_protocol(root, "outbounds", "freedom");
+    let freedom =
+        has_protocol(root, "outbounds", "freedom") || find_unbuilt_outbound(root).is_some();
     let outbound =
         find_outbound(root).unwrap_or_else(|reason| exit(&format!("bad config {label}: {reason}")));
     // A loopback outbound names its inbound by tag, so it resolves only when no concrete dial won.
@@ -202,7 +203,8 @@ fn serve_inbounds(
     let mut hysteria_served = false;
     if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
         for inbound in list {
-            let protocol = inbound.get("protocol").and_then(Json::as_str).unwrap_or("");
+            let protocol =
+                canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or(""));
             let address = if crate::tun::is_device(protocol) {
                 String::new()
             } else {
@@ -873,7 +875,7 @@ fn inbound_tag(inbound: &Json) -> Option<String> {
 /// The outbound one configured entry names, with the reason when this tree cannot dial it: a tag a
 /// rule can reach is built at startup, so a missing or unbuildable one stops the process, not a flow.
 fn build_outbound(config: &Json, tag: &str) -> Result<Outbound, String> {
-    let protocol = config.get("protocol").and_then(Json::as_str).unwrap_or("");
+    let protocol = canonical_protocol(config.get("protocol").and_then(Json::as_str).unwrap_or(""));
     if protocol == "loopback" {
         return Err(format!(
             "outbound `{tag}` is loopback, which routing over a re-inject does not carry"
@@ -11069,11 +11071,42 @@ fn inbound_id(inbound: &Json) -> [u8; 16] {
         .unwrap_or([0u8; 16])
 }
 
+/// xray registers each handler under more than one name; the alias resolves to the one protocol this tree builds.
+fn canonical_protocol(protocol: &str) -> &str {
+    match protocol {
+        "direct" => "freedom",
+        "block" => "blackhole",
+        "tunnel" => "dokodemo-door",
+        other => other,
+    }
+}
+
+/// The protocols xray registers with no handler here: a config naming one dials direct and says so at the outbound.
+const UNBUILT_OUTBOUNDS: [&str; 3] = ["dns", "wireguard", "masque"];
+
+/// The first outbound naming an unbuilt protocol, with its tag and that name.
+fn find_unbuilt_outbound(root: &Json) -> Option<(&str, &str)> {
+    let outbounds = root.get("outbounds").and_then(Json::as_arr)?;
+    outbounds.iter().find_map(|outbound| {
+        let protocol = canonical_protocol(outbound.get("protocol").and_then(Json::as_str)?);
+        if !UNBUILT_OUTBOUNDS.contains(&protocol) {
+            return None;
+        }
+        let tag = outbound
+            .get("tag")
+            .and_then(Json::as_str)
+            .unwrap_or("<untagged>");
+        Some((tag, protocol))
+    })
+}
+
 fn has_protocol(root: &Json, array: &str, protocol: &str) -> bool {
     root.get(array).and_then(Json::as_arr).is_some_and(|items| {
-        items
-            .iter()
-            .any(|item| item.get("protocol").and_then(Json::as_str) == Some(protocol))
+        items.iter().any(|item| {
+            item.get("protocol")
+                .and_then(Json::as_str)
+                .is_some_and(|named| canonical_protocol(named) == protocol)
+        })
     })
 }
 
@@ -11132,7 +11165,14 @@ fn find_outbound(root: &Json) -> Result<Option<Outbound>, String> {
         return Ok(Some(Outbound::Freedom));
     }
     // The sink is the last resort: a config that names a dial takes the dial.
-    Ok(find_blackhole_outbound(root)?.map(Outbound::Block))
+    if let Some(answer) = find_blackhole_outbound(root)? {
+        return Ok(Some(Outbound::Block(answer)));
+    }
+    if let Some((tag, protocol)) = find_unbuilt_outbound(root) {
+        eprintln!("outbound `{tag}` protocol `{protocol}` is not carried; dialing direct");
+        return Ok(Some(Outbound::Freedom));
+    }
+    Ok(None)
 }
 
 /// The blackhole outbound's answer, read the way the reference's own config
@@ -11147,7 +11187,13 @@ fn find_blackhole_outbound(
         .and_then(Json::as_arr)
         .unwrap_or(&empty);
     for outbound in outbounds {
-        if outbound.get("protocol").and_then(Json::as_str) != Some("blackhole") {
+        let protocol = canonical_protocol(
+            outbound
+                .get("protocol")
+                .and_then(Json::as_str)
+                .unwrap_or(""),
+        );
+        if protocol != "blackhole" {
             continue;
         }
         return Ok(Some(crate::blackhole::answer(outbound.get("settings"))?));
@@ -11219,9 +11265,9 @@ fn resolve_loopback(root: &Json, tag: &str, freedom: bool) -> Result<Outbound, S
         .iter()
         .find(|inbound| inbound.get("tag").and_then(Json::as_str) == Some(tag))
         .ok_or_else(|| format!("names an unknown inbound `{tag}`"))?;
-    let protocol = inbound.get("protocol").and_then(Json::as_str).unwrap_or("");
+    let protocol = canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or(""));
     // A front would re-enter this same resolution through the single outbound.
-    if matches!(protocol, "socks" | "http" | "mixed") {
+    if matches!(protocol, "socks" | "http" | "mixed" | "dokodemo-door") {
         return Err(format!(
             "names front `{tag}`, which would re-enter the loopback"
         ));
@@ -23723,6 +23769,26 @@ mod tests {
         }
     }
 
+    /// xray registers `tunnel` as another name for `dokodemo-door`: a config written with either serves the door.
+    #[test]
+    fn the_tunnel_inbound_is_the_dokodemo_front() {
+        let echo = echo_loop();
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let text = format!(
+            r#"{{"inbounds":[{{"protocol":"tunnel","listen":"127.0.0.1","port":{port},"settings":{{"network":"tcp","address":"127.0.0.1","port":{echo}}}}}]}}"#
+        );
+        let root = crate::json::parse(&text).expect("parses");
+        let (opened, _) = serve_inbounds("test", &root, Some(&Outbound::Freedom), None, false);
+        assert_eq!(opened, 1, "the tunnel inbound opens the door");
+        let mut client = connect_until(port);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
     /// The SOCKS5 client lane: the greeting, the request, and the tunnel that follows.
     #[test]
     fn a_socks_client_dials_the_front_and_carries_an_echo() {
@@ -25413,6 +25479,58 @@ mod tests {
             panic!("the sink is the only outbound");
         };
         assert_eq!(answer.bytes(), ferrox_core::blackhole::HTTP_403);
+    }
+
+    /// xray's `direct` outbound is the handler `freedom` names: a config with only that outbound serves the direct lane.
+    #[test]
+    fn the_direct_outbound_is_the_freedom_lane() {
+        let root = crate::json::parse(r#"{"outbounds":[{"protocol":"direct","settings":{}}]}"#)
+            .expect("parses");
+        assert!(
+            is_freedom(&root),
+            "`direct` is xray's other name for freedom"
+        );
+        assert!(
+            matches!(find_outbound(&root), Ok(Some(Outbound::Freedom))),
+            "the alias resolves to the direct dial"
+        );
+    }
+
+    /// A `block` outbound is the blackhole handler under xray's other name, both as the only lane and as a rule's tag.
+    #[test]
+    fn a_block_outbound_is_the_sink_under_either_name() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"block","settings":{"response":{"type":"http"}}}]}"#,
+        )
+        .expect("parses");
+        let Ok(Some(Outbound::Block(answer))) = find_outbound(&root) else {
+            panic!("the alias finds the sink");
+        };
+        assert_eq!(answer.bytes(), ferrox_core::blackhole::HTTP_403);
+
+        let echo_port = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"direct","settings":{}},{"tag":"b","protocol":"block","settings":{"response":{"type":"http"}}}],
+            "routing":{"rules":[{"type":"field","domain":["full:blocked.test"],"outboundTag":"b"}]}}"#;
+        let front = socks_front_with(route_outbound(config, Some("in"), true));
+        let mut blocked = socks_name_client(front, "blocked.test", echo_port);
+        let mut answer = Vec::new();
+        blocked.read_to_end(&mut answer).expect("closes");
+        assert_eq!(answer, ferrox_core::blackhole::HTTP_403);
+    }
+
+    /// A handler xray registers and this tree has not built serves as the direct lane rather than refusing the config.
+    #[test]
+    fn an_unbuilt_outbound_dials_direct_instead_of_refusing_the_config() {
+        for protocol in ["dns", "wireguard", "masque"] {
+            let text = format!(
+                r#"{{"outbounds":[{{"tag":"named","protocol":"{protocol}","settings":{{}}}}]}}"#
+            );
+            let root = crate::json::parse(&text).expect("parses");
+            assert!(
+                matches!(find_outbound(&root), Ok(Some(Outbound::Freedom))),
+                "`{protocol}` is named at its outbound and dials direct"
+            );
+        }
     }
 
     /// The sink answers the front's client with the reference's bytes and dials
