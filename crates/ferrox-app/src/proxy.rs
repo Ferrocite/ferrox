@@ -5324,9 +5324,7 @@ fn tls_halves(
     Some((reader, writer, raw))
 }
 
-// One session, two owners: the carrier accept takes a reader and a writer. The reader
-// drives the transport when the session exposes one, so its parked read holds no session
-// lock; a session that reads its own transport keeps the shared shape.
+// One session, two owners: the reader drives the transport when the session exposes one, so its parked read holds no session lock.
 fn session_halves<S, W>(session: S, transport: W) -> (TlsHalf<S>, TlsHalf<S>)
 where
     W: Write + Send + 'static,
@@ -5526,8 +5524,7 @@ fn seal_out<S: CipherOpen>(
     Ok(wrote)
 }
 
-// One session, two owners: the carrier cores take a reader and a writer. A reader that
-// drives the transport parks outside the session lock; one that cannot stays behind it.
+// A reader that drives the transport parks outside the session lock; one that cannot stays behind it.
 struct TlsHalf<S> {
     session: Arc<Mutex<S>>,
     out: Arc<Mutex<Sealed>>,
