@@ -1,0 +1,110 @@
+name: diag-381
+
+on:
+  push:
+    branches: [issue-381]
+    paths:
+      - ".github/workflows/diag-381.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: build the serving binary
+        run: cargo build --locked --release -p ferrox-app
+      - name: start the loopback cell and census its threads
+        run: |
+          set -euo pipefail
+          python3 - <<'EOF'
+          import json, socket, subprocess, threading, time, os, glob
+          sink = socket.socket(); sink.bind(("127.0.0.1", 0)); sink.listen(64)
+          sink_port = sink.getsockname()[1]
+          def accept_sink():
+              while True:
+                  try:
+                      c, _ = sink.accept()
+                  except OSError:
+                      return
+                  threading.Thread(target=drain, args=(c,), daemon=True).start()
+          def drain(c):
+              try:
+                  while c.recv(65536):
+                      pass
+              except OSError:
+                  pass
+              c.close()
+          threading.Thread(target=accept_sink, daemon=True).start()
+          def port():
+              s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
+          vless_port, socks_port = port(), port()
+          cfg = {
+            "inbounds": [
+              {"tag": "matrix-server", "listen": "127.0.0.1", "port": vless_port,
+               "protocol": "vless",
+               "settings": {"clients": [{"id": "f47ac10b-58cc-4372-a567-0e02b2c3d479"}], "decryption": "none"},
+               "streamSettings": {"network": "tcp"}},
+              {"tag": "harness-socks", "protocol": "socks", "listen": "127.0.0.1", "port": socks_port,
+               "settings": {"auth": "noauth", "udp": False}},
+            ],
+            "outbounds": [
+              {"tag": "proxy", "protocol": "vless",
+               "settings": {"vnext": [{"address": "127.0.0.1", "port": vless_port,
+                 "users": [{"id": "f47ac10b-58cc-4372-a567-0e02b2c3d479", "encryption": "none"}]}]},
+               "streamSettings": {"network": "tcp"}},
+              {"tag": "direct", "protocol": "freedom", "settings": {"finalRules": [{"action": "allow"}]}},
+            ],
+            "routing": {"rules": [
+              {"type": "field", "inboundTag": ["harness-socks"], "outboundTag": "proxy"},
+              {"type": "field", "inboundTag": ["matrix-server"], "outboundTag": "direct"},
+            ]},
+          }
+          open("/tmp/diag.json", "w").write(json.dumps(cfg))
+          proc = subprocess.Popen(["target/release/ferrox-app", "run", "-c", "/tmp/diag.json"],
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+          time.sleep(1.5)
+          def flow(stop, tag):
+              c = socket.create_connection(("127.0.0.1", socks_port))
+              c.sendall(bytes([5,1,0])); c.recv(2)
+              c.sendall(bytes([5,1,0,1]) + socket.inet_aton("127.0.0.1") + sink_port.to_bytes(2, "big"))
+              c.recv(10)
+              c.sendall(b"x" * 4096)
+              while not stop.is_set():
+                  try:
+                      c.sendall(b"y" * 8192)
+                  except OSError:
+                      return
+                  time.sleep(0.001)
+              c.close()
+          def census(label):
+              tasks = glob.glob(f"/proc/{proc.pid}/task/*")
+              names = {}
+              for t in tasks:
+                  try:
+                      comm = open(f"{t}/comm").read().strip()
+                      wchan = open(f"{t}/wchan").read().strip()
+                  except OSError:
+                      continue
+                  names[(comm, wchan)] = names.get((comm, wchan), 0) + 1
+              print(f"=== {label}: {len(tasks)} threads", flush=True)
+              for (comm, wchan), n in sorted(names.items(), key=lambda kv: -kv[1]):
+                  print(f"{n:3d} {comm} wchan={wchan}", flush=True)
+          census("baseline")
+          stop = threading.Event()
+          threads = [threading.Thread(target=flow, args=(stop, i), daemon=True) for i in range(8)]
+          for t in threads: t.start()
+          time.sleep(1.0)
+          census("8 flows moving")
+          stop.set()
+          time.sleep(0.3)
+          census("flows stopped")
+          time.sleep(1.0)
+          census("flows stopped +1s")
+          proc.kill(); proc.wait()
+          print(proc.stderr.read().decode()[-3000:])
+          EOF
