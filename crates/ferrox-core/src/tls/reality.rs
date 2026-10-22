@@ -173,6 +173,14 @@ impl<S: Stream> TlsProvider for RealityServer<S> {
     fn alpn(&self) -> Option<&[u8]> {
         self.inner.alpn()
     }
+
+    fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+        self.inner.seal_into(plaintext, out)
+    }
+
+    fn seal_slices_into(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> std::io::Result<()> {
+        self.inner.seal_slices_into(parts, out)
+    }
 }
 
 // Already bounded outside: the accept path reads through a limiter from the first byte.
@@ -1105,6 +1113,14 @@ impl<S: Stream> TlsProvider for RealityClientSession<S> {
 
     fn alpn(&self) -> Option<&[u8]> {
         self.inner.alpn()
+    }
+
+    fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+        self.inner.seal_into(plaintext, out)
+    }
+
+    fn seal_slices_into(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> std::io::Result<()> {
+        self.inner.seal_slices_into(parts, out)
     }
 }
 
