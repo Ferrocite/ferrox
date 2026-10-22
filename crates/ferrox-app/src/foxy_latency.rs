@@ -81,6 +81,6 @@ mod tests {
 
     #[test]
     fn no_edges_read_as_no_readings() {
-        assert!(readings(&[]).is_empty());
+        assert_eq!(readings(&[]), Vec::new());
     }
 }
