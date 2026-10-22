@@ -17,7 +17,7 @@ pub const WINDOW_UPDATE: u8 = 0x8;
 
 /// The flag a DATA or HEADERS frame carries when it is the stream's last.
 pub const END_STREAM: u8 = 0x1;
-const PADDED: u8 = 0x8;
+pub const PADDED: u8 = 0x8;
 const FLAG_ACK: u8 = 0x1;
 
 /// The client preface, sent before the first settings and answered by any HTTP/2 server.
@@ -142,7 +142,12 @@ pub fn h2_event(frame: H2Frame, payload: &[u8], ours: u32) -> H2Event<'_> {
                 end: frame.flags & END_STREAM != 0,
                 wire: payload.len(),
             },
-            None => H2Event::Other { kind: frame.kind },
+            // A pad length that does not fit the frame has no payload to hand over, but its octets still spent the window.
+            None => H2Event::Data {
+                payload: &[],
+                end: frame.flags & END_STREAM != 0,
+                wire: payload.len(),
+            },
         },
         HEADERS if frame.stream == ours => match trimmed {
             Some(body) => H2Event::Headers {
@@ -462,6 +467,7 @@ mod tests {
         );
     }
 
+    /// The witness that an impossible pad hands over no payload yet still costs the window its whole body.
     #[test]
     fn padding_comes_off_both_ends_and_an_impossible_pad_has_no_payload() {
         let (frame, raw) = frame_of(DATA, PADDED, 1, &[3, b'a', b'b', b'c', 9, 9, 9]);
@@ -470,14 +476,22 @@ mod tests {
         };
         assert_eq!(payload, b"abc");
         let (frame, raw) = frame_of(DATA, PADDED, 1, &[200]);
-        assert_eq!(
-            h2_event(frame, &raw[H2_HEADER..], 1),
-            H2Event::Other { kind: DATA }
+        let H2Event::Data { payload, wire, .. } = h2_event(frame, &raw[H2_HEADER..], 1) else {
+            panic!("not data");
+        };
+        assert!(
+            payload.is_empty(),
+            "the pad byte names more than the frame holds"
         );
+        assert_eq!(wire, 1, "the octet still spent the window");
         let (frame, raw) = frame_of(DATA, PADDED, 1, &[]);
         assert_eq!(
             h2_event(frame, &raw[H2_HEADER..], 1),
-            H2Event::Other { kind: DATA }
+            H2Event::Data {
+                payload: &[],
+                end: false,
+                wire: 0
+            }
         );
     }
 
