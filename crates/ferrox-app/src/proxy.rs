@@ -9981,15 +9981,47 @@ impl FrameWrite for Connection {
     }
 }
 
+/// The plaintext one TLS record carries. A carrier frames what a relay handed it, and a window larger than this goes to the session as record-sized pieces rather than as one payload no session buffer holds.
+const SESSION_WINDOW: usize = 16 * 1024;
+
+/// Offer `parts` to `write` in windows of at most [`SESSION_WINDOW`], in order and without a copy: a window is a run of subslices of the caller's parts, so a frame of any size leaves the session as the records it would have taken had each window been a frame of its own.
+fn write_windows<F>(parts: &[&[u8]], mut write: F) -> bool
+where
+    F: FnMut(&[&[u8]]) -> bool,
+{
+    const PARTS: usize = 8;
+    let mut window: [&[u8]; PARTS] = [&[]; PARTS];
+    let mut kept = 0usize;
+    let mut room = SESSION_WINDOW;
+    for part in parts.iter().copied().filter(|part| !part.is_empty()) {
+        let mut left = part;
+        while !left.is_empty() {
+            let take = left.len().min(room);
+            window[kept] = &left[..take];
+            kept += 1;
+            room -= take;
+            left = &left[take..];
+            if room == 0 || kept == PARTS {
+                if !write(&window[..kept]) {
+                    return false;
+                }
+                kept = 0;
+                room = SESSION_WINDOW;
+            }
+        }
+    }
+    kept == 0 || write(&window[..kept])
+}
+
 impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send> FrameWrite
     for TlsHalf<S>
 {
-    // One lock, one call: every part of the frame reaches the session as segments of one payload, so it seals one record where a write per part sealed one each.
+    // One lock, a window per record: every part of a window reaches the session as segments of one payload, so it seals one record where a write per part sealed one each, and a frame larger than a record is cut rather than handed over as a payload the session cannot hold.
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
         let Ok(mut session) = self.session.lock() else {
             return false;
         };
-        session.write_all_slices(parts).is_ok()
+        write_windows(parts, |window| session.write_all_slices(window).is_ok())
     }
 }
 
@@ -14186,6 +14218,31 @@ mod tests {
         assert!(
             sent.iter().any(|&len| len > RELAY_SMALL_BUFFER),
             "a send carried more than the small window, so the carrier frames the promoted one: {sent:?}"
+        );
+    }
+
+    /// A session seals one record per window of plaintext, so a frame the promoted relay window produced is cut at the record rather than offered as a payload no session buffer holds — the shape a REALITY ws flow takes when its relay leg promotes.
+    #[test]
+    fn a_carrier_frame_is_offered_in_record_windows() {
+        let data = vec![0x5au8; RELAY_BUFFER];
+        let parts: [&[u8]; 3] = [b"\x00\x01", &data, b"\r\n"];
+        let mut windows: Vec<usize> = Vec::new();
+        let mut total = 0usize;
+        assert!(write_windows(&parts, |window| {
+            let bytes = window.iter().map(|part| part.len()).sum::<usize>();
+            windows.push(bytes);
+            total += bytes;
+            true
+        }));
+        assert_eq!(total, data.len() + 4, "every byte is offered once: {total}");
+        assert!(
+            windows.iter().all(|&bytes| bytes <= SESSION_WINDOW),
+            "no window is larger than a record: {windows:?}"
+        );
+        assert_eq!(
+            windows.len(),
+            total.div_ceil(SESSION_WINDOW),
+            "a frame larger than a record is cut at the record: {windows:?}"
         );
     }
 
