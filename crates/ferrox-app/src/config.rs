@@ -296,17 +296,21 @@ fn tls_version(settings: Option<&Json>, key: &str) -> Option<u16> {
 pub(crate) fn outbound_tls(
     outbound: &Json,
     address: &str,
-) -> Option<Arc<ferrox_core::tls::TlsConfig>> {
-    let settings = outbound.get("streamSettings")?;
+) -> Result<Arc<ferrox_core::tls::TlsConfig>, String> {
+    let settings = outbound
+        .get("streamSettings")
+        .ok_or("no streamSettings in the outbound")?;
     if settings.get("security").and_then(Json::as_str) != Some("tls") {
-        return None;
+        return Err("security is not tls".to_owned());
     }
     let tls = settings.get("tlsSettings");
     if matches!(
         tls.and_then(|s| s.get("allowInsecure")),
         Some(Json::Bool(true))
     ) {
-        return None;
+        return Err(
+            "allowInsecure is removed; use pinnedPeerCertSha256 or verifyPeerCertByName".to_owned(),
+        );
     }
     let server_name = tls
         .and_then(|s| s.get("serverName"))
@@ -315,7 +319,7 @@ pub(crate) fn outbound_tls(
         .unwrap_or(address)
         .to_owned();
     if server_name.is_empty() {
-        return None;
+        return Err("no serverName".to_owned());
     }
     let alpn = tls_alpn(tls);
     let system_only = !matches!(
@@ -326,11 +330,17 @@ pub(crate) fn outbound_tls(
         system_only
             .then(crate::quic::system_roots)
             .filter(|r| !r.is_empty())
-    })?;
-    if roots.is_empty() {
-        return None;
-    }
-    Some(Arc::new(ferrox_core::tls::TlsConfig {
+    });
+    let roots = match roots {
+        Some(roots) if !roots.is_empty() => roots,
+        _ => {
+            return Err(
+                "no certificate authorities: no caCertFile and the system roots are empty"
+                    .to_owned(),
+            )
+        }
+    };
+    Ok(Arc::new(ferrox_core::tls::TlsConfig {
         server_name,
         alpn: alpn.into(),
         roots,

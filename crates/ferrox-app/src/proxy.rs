@@ -192,6 +192,8 @@ fn serve_root(label: &str, root: &Json) -> ! {
         }
         selected => selected,
     };
+    // Named only when no outbound was built, so the reason behind an exit that names nothing is on its own line first.
+    let refused = outbound.is_none().then(|| diagnose_outbounds(root));
     let routing = crate::router::Routing::parse(root)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     let route = routing.map(|routing| {
@@ -201,7 +203,10 @@ fn serve_root(label: &str, root: &Json) -> ! {
     let (inbounds, hysteria_served) =
         serve_inbounds(label, root, outbound.as_ref(), route.as_ref(), freedom);
     if inbounds == 0 {
-        exit(&format!("no servable inbound in {label}"));
+        match refused.as_deref().unwrap_or(&[]).first() {
+            Some(reason) => exit(&format!("bad config {label}: {reason}")),
+            None => exit(&format!("no servable inbound in {label}")),
+        }
     }
     if hysteria_served {
         // The readiness token the pinned interop harness scans the server log for; not this binary's name.
@@ -255,14 +260,8 @@ fn serve_inbounds(
                 refuse_inbound(protocol, label, inbound);
                 continue;
             }
-            // A server inbound dials direct, so every rule that can reach it must agree with that at startup.
-            if matches!(
-                protocol,
-                "vless" | "trojan" | "vmess" | "shadowsocks" | "hysteria"
-            ) {
-                if let Some(shared) = route {
-                    prove_server_route(shared, inbound, label);
-                }
+            if let Some(shared) = route {
+                prove_server_route(shared, inbound, label);
             }
             for address in &addresses {
                 match protocol {
@@ -291,6 +290,7 @@ fn serve_inbounds(
                     }
                     "socks" | "http" | "mixed" => {
                         let Some(out) = routed(inbound, true) else {
+                            eprintln!("inbound `{protocol}` in {label} names no outbound to carry it");
                             continue;
                         };
                         // A front with no tcp carrier has no chain to arm, so the inbound is refused rather than served unmasked.
@@ -996,6 +996,13 @@ fn route_shared(root: &Json, routing: crate::router::Routing) -> Result<Arc<Rout
 /// A server inbound dials direct, so every rule that can reach it must name a freedom outbound and
 /// the fallback must be one too; anything else refuses the start rather than serving the wrong lane.
 fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
+    // A server inbound dials direct, so every rule that can reach it must agree with that at startup.
+    if !matches!(
+        canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or("")),
+        "vless" | "trojan" | "vmess" | "shadowsocks" | "hysteria"
+    ) {
+        return;
+    }
     let tag = inbound_tag(inbound);
     let direct = |named: &str| matches!(shared.tagged.get(named), Some(Outbound::Freedom));
     if let Err(error) = shared.routing.server_routes(
@@ -11825,6 +11832,161 @@ fn inbound_password(inbound: &Json) -> String {
         .to_owned()
 }
 
+// A lane the tree can carry when its fields are honest; the field it lacks is the refusal's
+// word, so a config that cannot build names what it named wrong before the inbounds' verdict
+// says only that nothing served.
+fn outbound_refusal(outbound: &Json, protocol: &str) -> Option<String> {
+    let settings = outbound.get("settings");
+    let tls_reason = |outbound: &Json, address: &str| {
+        let network = outbound
+            .get("streamSettings")
+            .and_then(|s| s.get("network"))
+            .and_then(Json::as_str)
+            .unwrap_or("tcp");
+        if let Err(reason) = outbound_tls(outbound, address) {
+            reason
+        } else {
+            format!("security `tls` does not ride `{network}`")
+        }
+    };
+    match protocol {
+        "vless" | "vmess" => {
+            let server = lane_server(settings, "vnext")?;
+            if let Some(field) = dial_fields(server) {
+                return Some(field);
+            }
+            if server
+                .get("users")
+                .and_then(Json::as_arr)
+                .and_then(|users| users.first())
+                .and_then(|user| user.get("id"))
+                .and_then(Json::as_str)
+                .and_then(uuid_bytes)
+                .is_none()
+            {
+                return Some("no user id that is a uuid in the first user".to_owned());
+            }
+            if stream_security(outbound) == "tls" {
+                let address = server
+                    .get("address")
+                    .and_then(Json::as_str)
+                    .unwrap_or_default();
+                return Some(tls_reason(outbound, address));
+            }
+            None
+        }
+        "trojan" => {
+            let server = lane_server(settings, "servers")?;
+            if let Some(field) = dial_fields(server) {
+                return Some(field);
+            }
+            if server.get("password").and_then(Json::as_str).is_none() {
+                return Some("no password in the server entry".to_owned());
+            }
+            if stream_security(outbound) == "tls" {
+                let address = server
+                    .get("address")
+                    .and_then(Json::as_str)
+                    .unwrap_or_default();
+                return Some(tls_reason(outbound, address));
+            }
+            None
+        }
+        "http" | "socks" | "shadowsocks" => {
+            let server = lane_server(settings, "servers")?;
+            if let Some(field) = dial_fields(server) {
+                return Some(field);
+            }
+            if protocol == "shadowsocks" {
+                if server.get("method").and_then(Json::as_str).is_none() {
+                    return Some("no cipher method in the server entry".to_owned());
+                }
+                if server.get("password").and_then(Json::as_str).is_none() {
+                    return Some("no password in the server entry".to_owned());
+                }
+            }
+            if protocol == "socks" {
+                match settings
+                    .and_then(|s| s.get("version"))
+                    .and_then(Json::as_str)
+                {
+                    None | Some("5" | "4" | "4a") => {}
+                    Some(other) => return Some(format!("version `{other}` is not carried")),
+                }
+            }
+            None
+        }
+        "loopback" => {
+            let absent = settings
+                .and_then(|s| s.get("inboundTag"))
+                .and_then(Json::as_str)
+                .is_none_or(str::is_empty);
+            if absent {
+                return Some("no inboundTag in the loopback settings".to_owned());
+            }
+            None
+        }
+        // The chain's own refusals carry their one line already.
+        "foxy" | "veepn" => None,
+        // A lane without an outbound this binary builds: the name is xray's, not a typo to diagnose.
+        "dokodemo-door" | "hysteria" | "masque" => {
+            Some(format!("the `{protocol}` outbound is not carried"))
+        }
+        _ => Some(format!("unknown outbound protocol: {protocol}")),
+    }
+}
+
+/// The one server entry a client lane reads: `vnext[0]` for vless and vmess, `servers[0]` for the trojan and front lanes, or nothing to diagnose.
+fn lane_server<'a>(settings: Option<&'a Json>, key: &str) -> Option<&'a Json> {
+    settings
+        .and_then(|s| s.get(key))
+        .and_then(Json::as_arr)
+        .and_then(|servers| servers.first())
+}
+
+/// The dial pair a server entry must carry; the missing one is the refusal's word.
+fn dial_fields(server: &Json) -> Option<String> {
+    if server
+        .get("address")
+        .and_then(Json::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return Some("no address in the server entry".to_owned());
+    }
+    if server.get("port").and_then(Json::as_port).is_none() {
+        return Some("no port in the server entry".to_owned());
+    }
+    None
+}
+
+/// One line per outbound a lane could carry that names neither a dial nor the field it lacks.
+fn diagnose_outbounds(root: &Json) -> Vec<String> {
+    let empty = Vec::new();
+    let mut refused = Vec::new();
+    for outbound in root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty)
+    {
+        let named = outbound
+            .get("protocol")
+            .and_then(Json::as_str)
+            .unwrap_or("");
+        let protocol = canonical_protocol(named);
+        let tag = outbound
+            .get("tag")
+            .and_then(Json::as_str)
+            .unwrap_or("<untagged>");
+        let Some(reason) = outbound_refusal(outbound, protocol) else {
+            continue;
+        };
+        let line = format!("outbound `{tag}` ({named}) cannot be built: {reason}");
+        eprintln!("{line}");
+        refused.push(line);
+    }
+    refused
+}
+
 fn find_outbound(root: &Json) -> Result<Option<Outbound>, String> {
     if let Some(foxy) = find_foxy_outbound(root) {
         return Ok(Some(Outbound::Foxy(Box::new(foxy))));
@@ -12978,7 +13140,9 @@ fn tls_parts(
         | Carrier::Http
         | Carrier::Unknown { .. } => return None,
     }
-    outbound_tls(outbound, address).map(|tls| (carrier, host, tls))
+    outbound_tls(outbound, address)
+        .ok()
+        .map(|tls| (carrier, host, tls))
 }
 
 fn x25519_pair() -> (String, String) {
@@ -13091,6 +13255,30 @@ mod tests {
             addresses(r#"{"port": "env:FERROX_UNSET_PORT_PIECE"}"#),
             [] as [String; 0]
         );
+    }
+
+    /// A naming refusal is not a silent drop: the lane that cannot build says the outbound,
+    /// and the field the build stopped at is the refusal's own word.
+    #[test]
+    fn an_unbuildable_outbound_names_its_field() {
+        let diagnose = |text: &str| diagnose_outbounds(&crate::json::parse(text).expect("parses"));
+        assert_eq!(
+            diagnose(
+                r#"{"outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"192.0.2.6","port":443,"users":[{"id":"0d3f5bd4-0e22-45a4-bb8c-838b3a5aa3d6"}]}]},"streamSettings":{"security":"tls","tlsSettings":{"allowInsecure":true}}}]}"#,
+            ),
+            ["outbound `proxy` (vless) cannot be built: allowInsecure is removed; use pinnedPeerCertSha256 or verifyPeerCertByName"]
+        );
+        assert_eq!(
+            diagnose(
+                r#"{"outbounds":[{"tag":"t","protocol":"trojan","settings":{"servers":[{"address":"192.0.2.6","port":443}]}}]}"#,
+            ),
+            ["outbound `t` (trojan) cannot be built: no password in the server entry"]
+        );
+        assert_eq!(
+            diagnose(r#"{"outbounds":[{"protocol":"quux"}]}"#),
+            ["outbound `<untagged>` (quux) cannot be built: unknown outbound protocol: quux"]
+        );
+        assert_eq!(diagnose(r#"{"outbounds":[]}"#), [] as [String; 0]);
     }
 
     /// The census is a stall hunt's instrument: a release build's relay registers no wait
