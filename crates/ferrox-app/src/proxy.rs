@@ -1856,9 +1856,8 @@ fn handle_mux_tcp_new(
     let Some(mut uplink) = dial_or_report(&target) else {
         return send_mux_end(shared, staging, frame.id);
     };
-    let (mut read_half, stop) = match (uplink.try_clone(), uplink.try_clone()) {
-        (Ok(read_half), Ok(stop)) => (read_half, stop),
-        _ => return send_mux_end(shared, staging, frame.id),
+    let (Ok(mut read_half), Ok(stop)) = (uplink.try_clone(), uplink.try_clone()) else {
+        return send_mux_end(shared, staging, frame.id);
     };
     let (pending, queued) = std::sync::mpsc::sync_channel(MUX_PENDING);
     if let Some(data) = frame.data {
