@@ -602,8 +602,7 @@ fn no_accounts() -> SocksAccounts {
 
 /// The accounts a SOCKS front accepts, read from the inbound's own settings.
 ///
-/// The shape is xray's: an `auth` of `password` and a list of `accounts`, each a
-/// `user` and a `pass`. A front that names no `auth` asks for no authentication.
+/// The shape is xray's: an `auth` of `password` and a list of `accounts` (or its `users` alias), each a `user` and a `pass`. A front that names no `auth` asks for no authentication.
 fn socks_accounts(inbound: &Json) -> SocksAccounts {
     let settings = inbound.get("settings");
     let auth = settings
@@ -615,7 +614,7 @@ fn socks_accounts(inbound: &Json) -> SocksAccounts {
     }
     let empty = Vec::new();
     let accounts = settings
-        .and_then(|s| s.get("accounts"))
+        .and_then(|s| s.get("accounts").or_else(|| s.get("users")))
         .and_then(Json::as_arr)
         .unwrap_or(&empty);
     let mut pairs = Vec::new();

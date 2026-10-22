@@ -2,6 +2,8 @@
 
 Row 45: the `socks` protocol is served by the tree's front and, since this slice, **dialled** by it. The client half writes the three stages a SOCKS5 client writes — the greeting, the RFC 1929 credential exchange when a credential is configured, and the request — and it is a lane in the tree's own front layer, not a second dialer: the native device inbound (`tun`) hands its flows to `serve_device_flow`, which asks the routing rules for the lane and then calls `serve_connect`, the same entry the `socks` and `http` fronts reach, and the lane decides that the bytes on the wire are SOCKS5.
 
+The front reads its account list from `settings.accounts`, or from xray's `users` alias when `accounts` is absent (`infra/conf/socks.go:30-42`); the `mixed` front's HTTP side reads the same list.
+
 The datagram half is the same protocol in the other direction: one `UDP ASSOCIATE` association to the upstream server, and every datagram rides it framed the way RFC 1928 frames them.
 
 ## Byte-identity
