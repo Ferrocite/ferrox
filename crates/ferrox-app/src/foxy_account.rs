@@ -95,7 +95,7 @@ pub(crate) struct Session {
     pub(crate) pending: Option<String>,
 }
 
-/// The one file that spares a launch FxA's sign-in: the email it belongs to is stored with the grant, so a different account never resumes the last one's session.
+/// The one file that spares a launch `FxA`'s sign-in: the email it belongs to is stored with the grant, so a different account never resumes the last one's session.
 #[derive(Debug, Clone)]
 pub(crate) struct TokenFile {
     path: std::path::PathBuf,
@@ -107,7 +107,10 @@ impl TokenFile {
     pub(crate) fn new(path: &str, email: &str) -> Option<Self> {
         let email = normalize_identity(email);
         // A grant is bound to the account it was written for: a file with no account to bind it to is a sign-in, not a resume.
-        (!path.is_empty() && !email.is_empty()).then(|| Self {
+        if path.is_empty() || email.is_empty() {
+            return None;
+        }
+        Some(Self {
             path: std::path::PathBuf::from(path),
             email,
         })
@@ -160,7 +163,8 @@ impl TokenFile {
                 "refresh_token".to_owned(),
                 Json::Str(auth.refresh_token.clone()),
             ));
-            pairs.push(("expires_at".to_owned(), Json::Num(auth.expires_at as f64)));
+            let expires_at = u32::try_from(auth.expires_at).unwrap_or(u32::MAX);
+            pairs.push(("expires_at".to_owned(), Json::Num(f64::from(expires_at))));
         }
         if let Some(pending) = pending {
             pairs.push(("pending_session".to_owned(), Json::Str(pending.to_owned())));
@@ -1409,6 +1413,35 @@ mod loopback {
         }
     }
 
+    /// A Hawk-signed session exchange mints the first pair; an unsigned refresh rotates the stored one.
+    fn token_answer(seen: &Seen) -> Vec<u8> {
+        let body = String::from_utf8_lossy(&seen.body);
+        if body.contains(r#""grant_type":"refresh_token""#) {
+            assert!(
+                seen.authorization.is_none(),
+                "a refresh grant is not Hawk-signed"
+            );
+            assert!(
+                body.contains(r#""refresh_token":"refresh-1""#),
+                "the stored refresh token is the grant: {body}"
+            );
+            return reply(
+                200,
+                &[],
+                r#"{"access_token":"access-2","refresh_token":"refresh-2","expires_in":3600}"#,
+            );
+        }
+        let auth = seen.authorization.as_deref().unwrap_or_default();
+        assert!(auth.starts_with("Hawk id=\""), "{auth}");
+        assert!(auth.contains("mac=\""), "{auth}");
+        assert!(auth.contains(", hash=\""), "a body is hashed in: {auth}");
+        reply(
+            200,
+            &[],
+            r#"{"access_token":"access-1","refresh_token":"refresh-1","expires_in":3600}"#,
+        )
+    }
+
     fn answer(seen: &Seen, tx: &mpsc::Sender<Seen>) -> Vec<u8> {
         let _ = tx.send(seen.clone());
         let cleared = seen
@@ -1458,33 +1491,7 @@ mod loopback {
                 );
                 reply(200, &[], &session_answer())
             }
-            ("POST", "/v1/oauth/token") => {
-                let body = String::from_utf8_lossy(&seen.body);
-                if body.contains(r#""grant_type":"refresh_token""#) {
-                    assert!(
-                        seen.authorization.is_none(),
-                        "a refresh grant is not Hawk-signed"
-                    );
-                    assert!(
-                        body.contains(r#""refresh_token":"refresh-1""#),
-                        "the stored refresh token is the grant: {body}"
-                    );
-                    return reply(
-                        200,
-                        &[],
-                        r#"{"access_token":"access-2","refresh_token":"refresh-2","expires_in":3600}"#,
-                    );
-                }
-                let auth = seen.authorization.as_deref().unwrap_or_default();
-                assert!(auth.starts_with("Hawk id=\""), "{auth}");
-                assert!(auth.contains("mac=\""), "{auth}");
-                assert!(auth.contains(", hash=\""), "a body is hashed in: {auth}");
-                reply(
-                    200,
-                    &[],
-                    r#"{"access_token":"access-1","refresh_token":"refresh-1","expires_in":3600}"#,
-                )
-            }
+            ("POST", "/v1/oauth/token") => token_answer(seen),
             ("POST", "/v1/session/verify_code") => {
                 assert_eq!(
                     seen.body,
@@ -1657,7 +1664,7 @@ mod loopback {
             .collect()
     }
 
-    /// The point of the file: a second launch mints from the stored grant and never asks FxA to sign in.
+    /// The point of the file: a second launch mints from the stored grant and never asks `FxA` to sign in.
     #[test]
     fn a_stored_grant_mints_a_pass_without_a_sign_in() {
         let _turn = EDGE

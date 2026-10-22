@@ -12367,6 +12367,14 @@ fn find_veepn_outbound(root: &Json) -> Option<crate::veepn::VeepnOut> {
     None
 }
 
+/// An HTTP hop carries streams, not datagrams, so h3 over one is a refusal rather than a silent carrier switch.
+fn foxy_h3_over_http(
+    upstream: Option<&crate::foxy::UpstreamProxy>,
+    carrier: crate::foxy::Carrier,
+) -> bool {
+    upstream.is_some_and(crate::foxy::UpstreamProxy::http) && carrier == crate::foxy::Carrier::H3
+}
+
 fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
     let empty = Vec::new();
     for outbound in root
@@ -12403,11 +12411,7 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
         let candidates = foxy_candidates(outbound, &link, &country, &city, roots.clone());
         let carrier = foxy_carrier(settings, &link);
         // An HTTP hop carries streams not datagrams, so this is a refusal, not a silent carrier switch.
-        if upstream
-            .as_ref()
-            .is_some_and(crate::foxy::UpstreamProxy::http)
-            && carrier == crate::foxy::Carrier::H3
-        {
+        if foxy_h3_over_http(upstream.as_ref(), carrier) {
             eprintln!("foxy: carrier h3 cannot ride an http upstreamProxy: use socks5(h)://, h1, h2 or auto");
             continue;
         }
