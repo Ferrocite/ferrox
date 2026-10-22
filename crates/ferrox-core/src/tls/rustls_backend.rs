@@ -444,6 +444,19 @@ impl<S: Stream> TlsProvider for RustlsProvider<S> {
             .map(rustls::pki_types::CertificateDer::as_ref)
     }
 
+    fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+        self.drive()?;
+        let len = self.conn.writer().write(plaintext)?;
+        self.drain_into(out)?;
+        Ok(len)
+    }
+
+    fn seal_slices_into(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> std::io::Result<()> {
+        self.drive()?;
+        coalesce(&mut self.conn.writer(), parts)?;
+        self.drain_into(out)
+    }
+
     fn open(&mut self, ciphertext: &[u8], buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
         // The plaintext the layer holds comes out first: its room is finite, and the ciphertext that follows waits for it.
         let plain = match self.conn.reader().read(buf) {
@@ -459,10 +472,7 @@ impl<S: Stream> TlsProvider for RustlsProvider<S> {
         self.conn
             .process_new_packets()
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        // A peer that asked for fresh keys has its request queued now, and it goes out as it would have under `complete_io`.
-        if self.conn.wants_write() {
-            self.flush_pending()?;
-        }
+        // A peer's key update is answered into the queue here and leaves with the next seal: a read never writes the transport.
         let plain = match self.conn.reader().read(buf) {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
             outcome => outcome?,
@@ -494,6 +504,18 @@ impl<S: Stream> Read for RustlsProvider<S> {
 }
 
 impl<S: Stream> RustlsProvider<S> {
+    /// Every record this session has queued goes into the caller's buffer, in wire order, so the
+    /// caller sends them after the session's lock drops.
+    fn drain_into(&mut self, out: &mut Vec<u8>) -> std::io::Result<()> {
+        while self.conn.wants_write() {
+            let wrote = self.conn.write_tls(out)?;
+            if wrote == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// The ciphertext this session has queued goes out, and nothing comes in: `complete_io` reads as well as it writes, so a write that used it waited for a record the peer had not sent — a socket read per frame, up to the read quantum, under the relay's lock.
     fn flush_pending(&mut self) -> std::io::Result<()> {
         while self.conn.wants_write() {
@@ -753,6 +775,19 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
         self.conn.alpn_protocol()
     }
 
+    fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+        self.drive()?;
+        let len = self.conn.writer().write(plaintext)?;
+        self.drain_into(out)?;
+        Ok(len)
+    }
+
+    fn seal_slices_into(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> std::io::Result<()> {
+        self.drive()?;
+        coalesce(&mut self.conn.writer(), parts)?;
+        self.drain_into(out)
+    }
+
     fn open(&mut self, ciphertext: &[u8], buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
         let plain = match self.conn.reader().read(buf) {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
@@ -766,9 +801,7 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
         self.conn
             .process_new_packets()
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        if self.conn.wants_write() {
-            self.flush_pending()?;
-        }
+        // The client's `open`: a key update waits for the next seal rather than a transport write under this lock.
         let plain = match self.conn.reader().read(buf) {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
             outcome => outcome?,
@@ -803,6 +836,17 @@ impl<S: Stream> RustlsServerProvider<S> {
     /// The transport this session reads and writes, for a relay that would read it itself and hand the session only the ciphertext.
     pub fn get_ref(&self) -> &S {
         &self.io
+    }
+
+    /// The client's `drain_into`: the queued records leave in wire order for the caller to send.
+    fn drain_into(&mut self, out: &mut Vec<u8>) -> std::io::Result<()> {
+        while self.conn.wants_write() {
+            let wrote = self.conn.write_tls(out)?;
+            if wrote == 0 {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// The ciphertext this session has queued goes out, and nothing comes in: the reason is
