@@ -1832,9 +1832,9 @@ mod tests {
         );
     }
 
-    /// A saturated macOS runner can disturb every engine, the reference included, so no baseline lands; a comparison with no reference is not a regression the engine under test caused.
+    /// A reference that landed no run is no baseline, so the cell is `no-reference` and fails: zero reference runs is missing data, and missing data must never read as parity (#358). The old line called it `unmeasured by the runner` and passed.
     #[test]
-    fn a_reference_that_landed_no_run_is_unmeasured_not_a_regression() {
+    fn a_reference_that_landed_no_run_is_no_reference_not_a_pass() {
         let empty = |engine: &'static str| EngineRuns {
             engine,
             dialect: parity::Dialect::Xray,
@@ -1855,16 +1855,61 @@ mod tests {
         };
         let gate = comparison.gate();
         assert!(
-            gate.passed,
-            "an empty reference is not a ferrox regression: {:?}",
+            !gate.passed,
+            "an empty reference has nothing to compare against, so the cell is not a pass: {:?}",
             gate.lines
         );
         assert!(
+            gate.lines.iter().any(|line| line.contains("no reference")
+                && line.contains("xray-core")),
+            "the line names the missing reference: {:?}",
             gate.lines
-                .iter()
-                .any(|line| line.contains("unmeasured by the runner")),
-            "the line says the machine, not the engine, left it unmeasured: {:?}",
+        );
+    }
+
+    /// #358's shape: `xray-core` exits during startup in every repeat while `ferrox` measures, and the cell used to report `gate_passed: true` over three empty reference runs and three `unproven` rows.
+    #[test]
+    fn a_reference_that_died_at_startup_is_no_reference_not_a_pass() {
+        let startup_failure =
+            "engine: exited during startup with exit status: 23; stderr tail: <empty>";
+        let comparison = Comparison {
+            workload: workload(),
+            repeats: 3,
+            by_engine: vec![
+                EngineRuns {
+                    engine: "xray-core",
+                    dialect: parity::Dialect::Xray,
+                    runs: Vec::new(),
+                },
+                synth_engine(
+                    "ferrox",
+                    [(200, 3000, 10240), (220, 3100, 10250), (240, 3200, 10260)],
+                ),
+            ],
+            ceilings_mib_s: vec![900.0, 950.0, 1000.0],
+            gated: Some("ferrox"),
+            failures: vec![
+                ("xray-core".to_owned(), startup_failure.to_owned()),
+                ("xray-core".to_owned(), startup_failure.to_owned()),
+                ("xray-core".to_owned(), startup_failure.to_owned()),
+            ],
+            skipped: Vec::new(),
+            machine: "test".into(),
+        };
+        let gate = comparison.gate();
+        assert!(
+            !gate.passed,
+            "a reference that never started cannot make the cell pass: {:?}",
             gate.lines
+        );
+        let line = gate.lines.join("\n");
+        assert!(
+            line.contains("no reference") && line.contains("xray-core"),
+            "the line names the missing reference: {line}"
+        );
+        assert!(
+            line.contains("exit status: 23") && line.contains("3 failure(s)"),
+            "the line carries why the reference never ran: {line}"
         );
     }
 
