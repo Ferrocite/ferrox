@@ -19480,6 +19480,133 @@ mod tests {
         mux_test_expect_close(&mut stream);
     }
 
+    /// One flow's origin stops reading and the session must not stop with it: the flood is larger
+    /// than a loopback receive window, so the old shape parks the session thread inside the first
+    /// flow's Keep and the second flow's ping is never read. A slow origin costs its own flow, not
+    /// every flow on the session.
+    #[test]
+    fn a_stalled_origin_does_not_park_the_mux_session() {
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let stalled = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let stalled_port = stalled.local_addr().expect("addr").port();
+        // Accepted and never read, so the receive window closes and stays closed.
+        let held: Arc<Mutex<Vec<Connection>>> = Arc::new(Mutex::new(Vec::new()));
+        let keep_open = Arc::clone(&held);
+        thread::spawn(move || {
+            for stream in stalled.incoming() {
+                let Ok(stream) = stream else {
+                    continue;
+                };
+                if let Ok(mut held) = keep_open.lock() {
+                    held.push(stream);
+                }
+            }
+        });
+        let echo_port = mux_test_echo();
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = tunnel.accept().expect("accepts");
+            serve_vless_raw(stream, &id, true);
+        });
+        let mut client = mux_test_connect(&id, tunnel_port);
+        client
+            .set_write_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let new = |id: u16, port: u16| ferrox_core::mux::Outgoing {
+            id,
+            status: ferrox_core::mux::Status::New,
+            options: 0,
+            target: Some(mux_test_target(port)),
+            global_id: None,
+        };
+        mux_test_send(&mut client, new(1, stalled_port), None);
+        mux_test_send(&mut client, new(2, echo_port), None);
+        let keep = |id: u16| ferrox_core::mux::Outgoing {
+            id,
+            status: ferrox_core::mux::Status::Keep,
+            options: ferrox_core::mux::DATA,
+            target: None,
+            global_id: None,
+        };
+        let payload = [0x5au8; ferrox_core::mux::CHUNK_MAX];
+        let mut frame = vec![0u8; keep(1).frame_len(payload.len())];
+        let n = keep(1).encode_into(Some(&payload), &mut frame);
+        let mut kept_reading = true;
+        for _ in 0..4096 {
+            if client.write_all(&frame[..n]).is_err() {
+                kept_reading = false;
+                break;
+            }
+        }
+        assert!(
+            kept_reading,
+            "the session kept reading while one origin was stalled"
+        );
+        mux_test_send(&mut client, keep(2), Some(b"ping"));
+        let mut answered = false;
+        for _ in 0..64 {
+            let (got, status, data) = mux_test_recv(&mut client);
+            if got == 2 && status == ferrox_core::mux::Status::Keep {
+                assert_eq!(data, b"ping");
+                answered = true;
+                break;
+            }
+        }
+        assert!(
+            answered,
+            "the second flow was answered, not queued behind the first"
+        );
+    }
+
+    /// An origin that accepts and says nothing keeps no thread after the session it served is gone:
+    /// the flow's read polls, the session marks itself done, and the teardown joins instead of
+    /// waiting out its whole join budget on a parked read.
+    #[test]
+    fn an_ended_mux_flow_releases_a_silent_origin() {
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let silent = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let silent_port = silent.local_addr().expect("addr").port();
+        let held: Arc<Mutex<Vec<Connection>>> = Arc::new(Mutex::new(Vec::new()));
+        let keep_open = Arc::clone(&held);
+        thread::spawn(move || {
+            for stream in silent.incoming() {
+                let Ok(stream) = stream else {
+                    continue;
+                };
+                if let Ok(mut held) = keep_open.lock() {
+                    held.push(stream);
+                }
+            }
+        });
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_raw(stream, &id, true);
+            let _ = done_tx.send(());
+        });
+        let mut client = mux_test_connect(&id, addr.port());
+        let new = ferrox_core::mux::Outgoing {
+            id: 5,
+            status: ferrox_core::mux::Status::New,
+            options: 0,
+            target: Some(mux_test_target(silent_port)),
+            global_id: None,
+        };
+        mux_test_send(&mut client, new, None);
+        let end = ferrox_core::mux::Outgoing::bare(5, ferrox_core::mux::Status::End, 0);
+        mux_test_send(&mut client, end, None);
+        drop(client);
+        let returned = done_rx.recv_timeout(Duration::from_secs(5));
+        assert!(
+            returned.is_ok(),
+            "the session handed back instead of waiting out its join budget on a silent origin"
+        );
+        serving.join().expect("joins");
+    }
+
     /// Pointer identity is the only test that can see the copy: a staged payload delivers the same bytes.
     #[cfg(unix)]
     #[test]
