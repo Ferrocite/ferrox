@@ -443,6 +443,32 @@ impl<S: Stream> TlsProvider for RustlsProvider<S> {
             .and_then(|chain| chain.first())
             .map(rustls::pki_types::CertificateDer::as_ref)
     }
+
+    fn open(&mut self, ciphertext: &[u8], buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
+        // The plaintext the layer holds comes out first: its room is finite, and the ciphertext that follows waits for it.
+        let plain = match self.conn.reader().read(buf) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+            outcome => outcome?,
+        };
+        if plain > 0 || ciphertext.is_empty() {
+            return Ok((plain, 0));
+        }
+        // The layer is empty, so the ciphertext has room to be decrypted.
+        let mut cursor = std::io::Cursor::new(ciphertext);
+        let taken = self.conn.read_tls(&mut cursor).map_err(recover)?;
+        self.conn
+            .process_new_packets()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        // A peer that asked for fresh keys has its request queued now, and it goes out as it would have under `complete_io`.
+        if self.conn.wants_write() {
+            self.flush_pending()?;
+        }
+        let plain = match self.conn.reader().read(buf) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+            outcome => outcome?,
+        };
+        Ok((plain, taken))
+    }
 }
 
 impl<S: Stream> Read for RustlsProvider<S> {
@@ -725,6 +751,29 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
 
     fn alpn(&self) -> Option<&[u8]> {
         self.conn.alpn_protocol()
+    }
+
+    fn open(&mut self, ciphertext: &[u8], buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
+        let plain = match self.conn.reader().read(buf) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+            outcome => outcome?,
+        };
+        if plain > 0 || ciphertext.is_empty() {
+            return Ok((plain, 0));
+        }
+        let mut cursor = std::io::Cursor::new(ciphertext);
+        let taken = self.conn.read_tls(&mut cursor).map_err(recover)?;
+        self.conn
+            .process_new_packets()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        if self.conn.wants_write() {
+            self.flush_pending()?;
+        }
+        let plain = match self.conn.reader().read(buf) {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+            outcome => outcome?,
+        };
+        Ok((plain, taken))
     }
 }
 

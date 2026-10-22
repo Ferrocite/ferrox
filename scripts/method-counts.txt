@@ -400,6 +400,7 @@ reality-tls transport-reads-per-flush 0 ferrox-core-tls::rustls_backend::tests::
 reality-tls transport-reads-per-write 0 ferrox-core-tls::rustls_backend::tests::a_write_does_not_read_the_transport
 reality-tls transport-reads-per-answer-write 0 ferrox-core-tls::rustls_backend::tests::a_server_answer_write_does_not_read_the_transport
 reality-tls relay-write-waits-for-a-parked-read 0 ferrox-app-proxy::tests::a_relay_write_goes_out_while_the_reader_is_parked
+reality-tls session-write-waits-for-a-parked-read 0 ferrox-app-proxy::tests::a_session_write_goes_out_while_its_read_is_parked
 reality-tls relay-reads-on-an-unarmed-handle 0 ferrox-app-proxy::tests::the_socket_half_reads_on_the_armed_handle
 reality-tls tls-arm-cells 2 scripts/run-benchmark-matrix.sh
 reality-tls census-waits-per-relay-read 0 ferrox-app-proxy::tests::a_release_build_registers_no_census_wait
