@@ -75,6 +75,7 @@ graph TD
 | tls-arm-cells | 4 | scripts/run-benchmark-matrix.sh |
 | census-waits-per-relay-read | 0 | ferrox-app-proxy::tests::a_release_build_registers_no_census_wait |
 | user-space-copies-per-framed-write | 0 | ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call |
+| seal-into-instructions | UNBLESSED | scripts/count-ops.sh |
 <!-- counts:end -->
 
 `certificate-refusals-folded-into-other 0` is the shape of a refused chain in the error type: the reason lives inside `BadCertificate`, so a caller matches the kind and still reads which certificate problem it is. `untrusted-dials-counted-as-retryable 0` is what that buys on the dial plane — `tls_failure` can only report a refusal when the backend still names one, and before this a refused chain reached it as `Other`, so it classified as a peer that hung up and counted into the retryable dial total.
@@ -89,7 +90,7 @@ graph TD
   reality::tests::an_authenticated_hello_is_accepted 'ferrox_core::tls::reality::authenticate'
 ```
 
-`UNBLESSED`, as above, and `scripts/method-ops.txt` names no REALITY symbol, so `ops.yml` will not report one until it does.
+`UNBLESSED`, as above, and `scripts/method-ops.txt` names no REALITY symbol, so `ops.yml` will not report one until it does. `seal-into-instructions` is the encrypt-to-buffer step's own count and is `UNBLESSED` for the same reason: `scripts/method-ops.txt` names no TLS `seal_into`, so no frame is measured and no number is quoted.
 
 ## Time
 
