@@ -2835,6 +2835,10 @@ impl Tls2 {
             if self.fin {
                 return Err(Failure::Stream);
             }
+            if self.capsule_buf.len() > DATAGRAM_BUF_MAX {
+                self.capsule_buf.clear();
+                return Err(Failure::Frame);
+            }
             let read = self.with_frame(&mut [], |lane, frame, payload| -> std::io::Result<()> {
                 match frames::h2_event(frame, payload, lane.stream) {
                     frames::H2Event::Data { payload, end, wire } => {
@@ -2881,6 +2885,12 @@ impl Tls2 {
             }
             if self.fin {
                 return Ok(false);
+            }
+            if self.capsule_buf.len() > DATAGRAM_BUF_MAX {
+                self.capsule_buf.clear();
+                return Err(std::io::Error::other(
+                    "foxy: a capsule stream that never parses",
+                ));
             }
             let read = self.with_frame(&mut [], |lane, frame, payload| -> std::io::Result<bool> {
                 match frames::h2_event(frame, payload, lane.stream) {
