@@ -962,7 +962,7 @@ fn read_frame<S: Read>(
             } else {
                 0
             },
-            stream: 0,
+            stream,
             length: if done { state.data_len } else { 0 },
         };
         if done {
@@ -992,7 +992,7 @@ fn read_frame<S: Read>(
             return Ok(frames::H2Frame {
                 kind: frames::DATA,
                 flags: 0,
-                stream: 0,
+                stream,
                 length: 0,
             });
         }
@@ -1489,7 +1489,7 @@ impl Read for Tls2 {
             // An unpadded payload is copied once, by the frame reader, straight into the caller's buffer: nothing is staged between the lane and its caller, and a frame the caller has no room left for resumes in the caller's own space on the next read.
             let read = self.with_frame(buf, |lane, frame, payload| -> std::io::Result<usize> {
                 // A DATA frame the reader delivered arrives with the wire's payload already in the caller's buffer and none left in the lane's hands: what this call handed over is counted in `delivered`, and the credit is owed for exactly that.
-                if frame.kind == frames::DATA && payload.is_empty() {
+                if frame.kind == frames::DATA && frame.stream == lane.stream && payload.is_empty() {
                     lane.fin = frame.flags & frames::END_STREAM != 0;
                     let got = lane.frame.delivered as usize;
                     if got > 0 {
@@ -4556,7 +4556,7 @@ pub(crate) mod loopback {
         );
     }
 
-    /// An h2 edge that answers the open and then writes the frames handed to it, staying on the socket afterwards so a lane that reads has bytes to read.
+    /// An h2 edge that answers the open, writes the frames handed to it, and then drains until the socket goes quiet.
     fn scripted_h2_edge(
         listener: Listener,
         server: ferrox_core::tls::TlsServerConfig,
@@ -4583,16 +4583,10 @@ pub(crate) mod loopback {
             tls.write_all(&opening).expect("writes the script");
             tls.flush().expect("flushes the script");
             loop {
-                let mut header = [0u8; frames::H2_HEADER];
-                if !read_exact_poll(&mut tls, &mut header) {
-                    return;
-                }
-                let Some(frame) = frames::H2Frame::parse(&header) else {
-                    return;
-                };
-                let mut body = vec![0u8; frame.length as usize];
-                if !read_exact_poll(&mut tls, &mut body) {
-                    return;
+                let mut byte = [0u8; 1];
+                match tls.read(&mut byte) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
                 }
             }
         })
