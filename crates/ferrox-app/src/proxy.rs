@@ -257,11 +257,19 @@ fn serve_inbounds(
                         eprintln!("inbound `{protocol}` in {label} asks for a finalmask tcp chain it cannot arm");
                         continue;
                     }
-                    let accounts = Arc::new(socks_accounts(inbound));
                     let role = match protocol {
-                        "socks" => Role::Socks { out, accounts },
-                        "http" => Role::Http { out },
-                        _ => Role::Mixed { out, accounts },
+                        "socks" => Role::Socks {
+                            out,
+                            accounts: Arc::new(socks_accounts(inbound)),
+                        },
+                        "http" => Role::Http {
+                            out,
+                            accounts: Arc::new(http_accounts(inbound)),
+                        },
+                        _ => Role::Mixed {
+                            out,
+                            accounts: Arc::new(socks_accounts(inbound)),
+                        },
                     };
                     thread::spawn(move || accept_loop(&address, &role));
                     inbounds += 1;
@@ -584,6 +592,11 @@ impl SocksAccounts {
             .iter()
             .any(|(name, password)| name.as_bytes() == user && password.as_bytes() == pass)
     }
+
+    /// Whether the front has an account at all, which is what xray's HTTP side gates its 407 on.
+    fn names_accounts(&self) -> bool {
+        !self.pairs.is_empty()
+    }
 }
 
 /// The no-authentication front: the account list a config that names none carries.
@@ -621,6 +634,27 @@ fn socks_accounts(inbound: &Json) -> SocksAccounts {
     }
     SocksAccounts {
         password: true,
+        pairs,
+    }
+}
+
+/// The accounts an HTTP front accepts: xray reads `accounts` when the key is there, else `users`, and asks for a credential only when the list names one.
+fn http_accounts(inbound: &Json) -> SocksAccounts {
+    let listed = inbound
+        .get("settings")
+        .and_then(|settings| settings.get("accounts").or_else(|| settings.get("users")))
+        .and_then(Json::as_arr)
+        .unwrap_or(&[]);
+    let pairs = listed
+        .iter()
+        .map(|account| {
+            let user = account.get("user").and_then(Json::as_str).unwrap_or("");
+            let pass = account.get("pass").and_then(Json::as_str).unwrap_or("");
+            (user.to_owned(), pass.to_owned())
+        })
+        .collect::<Vec<_>>();
+    SocksAccounts {
+        password: !pairs.is_empty(),
         pairs,
     }
 }
@@ -666,16 +700,14 @@ enum Role {
     },
     Http {
         out: Outbound,
+        accounts: Arc<SocksAccounts>,
     },
     Mixed {
         out: Outbound,
         accounts: Arc<SocksAccounts>,
     },
     /// dokodemo-door: a raw stream to the address its config rewrites every flow to.
-    Dokodemo {
-        out: Outbound,
-        dest: Destination,
-    },
+    Dokodemo { out: Outbound, dest: Destination },
 }
 
 impl Role {
@@ -1229,7 +1261,7 @@ fn accept_loop(address: &str, role: &Role) {
                     freedom,
                 } => serve_shadowsocks(stream, &password, &method, &carrier, freedom),
                 Role::Socks { out, accounts } => serve_socks(stream, &out, &accounts),
-                Role::Http { out } => serve_http(stream, &out),
+                Role::Http { out, accounts } => serve_http(stream, &out, &accounts),
                 Role::Mixed { out, accounts } => serve_mixed(stream, &out, &accounts),
                 Role::Dokodemo { out, dest } => {
                     let target = out.resolved(&dest, crate::router::Network::Tcp, Some(&stream));
@@ -7227,11 +7259,64 @@ fn authority_target(authority: &[u8]) -> Option<Destination> {
     Some(Destination::Name(host.to_owned(), port))
 }
 
+/// xray's answer to an HTTP front that asks for a credential and was not handed an accepted one.
+const HTTP_AUTH_REQUIRED: &[u8] =
+    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n";
+
+/// Whether the head carries an account this front accepts, decoded as xray decodes it: `Basic `, standard base64, the first colon.
+fn http_credential_accepted(head: &[u8], accounts: &SocksAccounts) -> bool {
+    use base64::Engine as _;
+    let Some(value) = header_value(head, "proxy-authorization") else {
+        return false;
+    };
+    let Some(encoded) = value.strip_prefix("Basic ") else {
+        return false;
+    };
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return false;
+    };
+    let Some(colon) = decoded.iter().position(|byte| *byte == b':') else {
+        return false;
+    };
+    accounts.accepts(&decoded[..colon], &decoded[colon + 1..])
+}
+
+/// Removes every line naming a header, in place; the credential is the proxy's, not the origin's.
+fn drop_header(head: &mut Vec<u8>, name: &str) {
+    let mut at = head
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(head.len(), |at| at + 1);
+    while at < head.len() {
+        let Some(end) = head[at..].windows(2).position(|pair| pair == b"\r\n") else {
+            return;
+        };
+        let named = {
+            let line = &head[at..at + end];
+            line.len() > name.len()
+                && line[name.len()] == b':'
+                && line[..name.len()].eq_ignore_ascii_case(name.as_bytes())
+        };
+        if named {
+            head.copy_within(at + end + 2.., at);
+            head.truncate(head.len() - end - 2);
+            continue;
+        }
+        at += end + 2;
+    }
+}
+
 /// The `http` front: CONNECT tunnels like SOCKS, plain HTTP forwards its head, unparsable input closes quietly.
-fn serve_http(mut client: Connection, out: &Outbound) {
-    let Some(head) = read_http_head(&mut client, HTTP_HEAD_LIMIT, budgets::head_arrival()) else {
+fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) {
+    let Some(mut head) = read_http_head(&mut client, HTTP_HEAD_LIMIT, budgets::head_arrival())
+    else {
         return;
     };
+    if accounts.names_accounts() && !http_credential_accepted(&head, accounts) {
+        let _ = client.write_all(HTTP_AUTH_REQUIRED);
+        return;
+    }
+    drop_header(&mut head, "proxy-authorization");
     let Some(request) = http_proxy_request(head) else {
         return;
     };
@@ -7268,7 +7353,7 @@ fn serve_mixed(client: Connection, out: &Outbound, accounts: &SocksAccounts) {
     if first[0] == 5 || first[0] == ferrox_core::socks::VERSION4 {
         serve_socks(client, out, accounts);
     } else {
-        serve_http(client, out);
+        serve_http(client, out, accounts);
     }
 }
 
@@ -23875,7 +23960,7 @@ mod tests {
         let port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_http(stream, &out);
+            serve_http(stream, &out, &no_accounts());
         });
         port
     }
@@ -23926,10 +24011,6 @@ mod tests {
             }
         }
     }
-
-    /// xray's refusal head, byte for byte.
-    const HTTP_AUTH_REQUIRED: &[u8] =
-        b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n";
 
     #[test]
     fn http_inbound_demands_the_credential_its_settings_name() {
