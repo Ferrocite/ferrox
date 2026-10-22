@@ -129,7 +129,7 @@ xtls-vision coalesce-segment-allocations 0 ferrox-core-tls::rustls_backend::test
 # --- Mux.Cool ---------------------------------------------------------------
 mux-cool ops-retired-instructions UNBLESSED scripts/count-ops.sh
 mux-cool maximum-frame-payload-bytes 8192 ferrox-core-mux::tests::the_decoder_refuses_only_what_it_cannot_frame
-mux-cool relay-copies-per-byte-written 0 ferrox-app-proxy::tests::a_two_part_write_hands_the_payload_over_by_pointer
+mux-cool downlink-copies-per-byte-written 0 ferrox-app-proxy::tests::a_two_part_write_hands_the_payload_over_by_pointer
 mux-cool xudp-uplink-copies-per-byte-written 0 ferrox-app-proxy::tests::xudp_uplink_hands_the_payload_over_by_pointer
 mux-cool xudp-reply-copies-per-byte-written 0 ferrox-app-proxy::tests::a_udp_reply_hands_the_payload_over_by_pointer
 mux-cool downlink-writes-per-read-batch 1 ferrox-app-proxy::tests::a_mux_downlink_hands_a_batch_of_frames_over_in_one_call
