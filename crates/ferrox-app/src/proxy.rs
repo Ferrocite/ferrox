@@ -257,19 +257,15 @@ fn serve_inbounds(
                         eprintln!("inbound `{protocol}` in {label} asks for a finalmask tcp chain it cannot arm");
                         continue;
                     }
+                    let accounts = Arc::new(if protocol == "http" {
+                        http_accounts(inbound)
+                    } else {
+                        socks_accounts(inbound)
+                    });
                     let role = match protocol {
-                        "socks" => Role::Socks {
-                            out,
-                            accounts: Arc::new(socks_accounts(inbound)),
-                        },
-                        "http" => Role::Http {
-                            out,
-                            accounts: Arc::new(http_accounts(inbound)),
-                        },
-                        _ => Role::Mixed {
-                            out,
-                            accounts: Arc::new(socks_accounts(inbound)),
-                        },
+                        "http" => Role::Http { out, accounts },
+                        "socks" => Role::Socks { out, accounts },
+                        _ => Role::Mixed { out, accounts },
                     };
                     thread::spawn(move || accept_loop(&address, &role));
                     inbounds += 1;
