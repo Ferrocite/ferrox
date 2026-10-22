@@ -60,7 +60,7 @@ LIST_KEYS = ("methods", "scenarios", "go_packages", "suites_skipped", "engines")
 # leaves out are engines it has recorded as unable to serve the method, so a cell
 # need not build, fetch or probe them. `xray-core` is not optional: the harness
 # refuses a comparison without it.
-ENGINES = ("xray-core", "sing-box", "zeronet", "xray-rust")
+ENGINES = ("xray-core", "sing-box", "zeronet", "xray-rust", "leaf")
 REFERENCE = "xray-core"
 
 # The data files whose every row names its own page in the first column: a hunk

@@ -35,6 +35,7 @@ pub enum ConfigArg {
     Long,
     Short,
     Positional,
+    DashC,
 }
 
 impl ConfigArg {
@@ -43,10 +44,11 @@ impl ConfigArg {
             "long" | "-config" | "--config" => Ok(Self::Long),
             "short" | "-c" => Ok(Self::Short),
             "positional" | "bare" => Ok(Self::Positional),
+            "dash-c" => Ok(Self::DashC),
             other => Err(Error::Invalid(format!(
                 "unknown config-argument shape `{other}`. Expected one of: long \
                  (`run -config <path>`), short (`run -c <path>`), positional \
-                 (`run <path>`)"
+                 (`run <path>`), dash-c (`-c <path>`, no subcommand)"
             ))),
         }
     }
@@ -56,6 +58,7 @@ impl ConfigArg {
             Self::Long => vec!["run".into(), "-config".into(), path.display().to_string()],
             Self::Short => vec!["run".into(), "-c".into(), path.display().to_string()],
             Self::Positional => vec!["run".into(), path.display().to_string()],
+            Self::DashC => vec!["-c".into(), path.display().to_string()],
         }
     }
 }
@@ -64,6 +67,7 @@ impl ConfigArg {
 pub enum Dialect {
     Xray,
     SingBox,
+    Leaf,
 }
 
 impl Dialect {
@@ -71,10 +75,12 @@ impl Dialect {
         match raw {
             "xray" | "protocol" => Ok(Self::Xray),
             "sing-box" | "singbox" | "type" => Ok(Self::SingBox),
+            "leaf" => Ok(Self::Leaf),
             other => Err(Error::Invalid(format!(
                 "unknown config dialect `{other}`. Expected one of: `xray` \
                  (`protocol`-keyed, `port`), `sing-box` (`type`-keyed, \
-                 `listen_port`)"
+                 `listen_port`), `leaf` (`protocol`-keyed, `address` and `port` \
+                 on the inbound itself)"
             ))),
         }
     }
@@ -90,10 +96,17 @@ impl Dialect {
                 inbound.insert("type", Json::Str("socks".into()));
                 inbound.insert("tag", Json::Str("socks-in".into()));
             }
+            Self::Leaf => {
+                inbound.insert("tag", Json::Str("socks-in".into()));
+                inbound.insert("protocol", Json::Str("socks".into()));
+            }
         }
-        inbound.insert("listen", Json::Str(listen.to_string()));
         match self {
-            Self::Xray => {
+            Self::Leaf => inbound.insert("address", Json::Str(listen.to_string())),
+            _ => inbound.insert("listen", Json::Str(listen.to_string())),
+        }
+        match self {
+            Self::Xray | Self::Leaf => {
                 inbound.insert("port", Json::Num(f64::from(port)));
             }
             Self::SingBox => {
@@ -111,6 +124,9 @@ impl Dialect {
                 let _ = settings;
                 inbound.insert("users", Json::Arr(Vec::new()));
             }
+            Self::Leaf => {
+                let _ = settings;
+            }
         }
         inbound
     }
@@ -125,6 +141,9 @@ impl Dialect {
                 outbound.insert("type", Json::Str("direct".into()));
                 outbound.insert("tag", Json::Str("direct-out".into()));
             }
+            Self::Leaf => {
+                outbound.insert("protocol", Json::Str("direct".into()));
+            }
         }
         outbound
     }
@@ -133,7 +152,7 @@ impl Dialect {
         let mut root = Json::object();
         root.insert("outbounds", Json::Arr(vec![self.direct_outbound()]));
         match self {
-            Self::Xray => {}
+            Self::Xray | Self::Leaf => {}
             Self::SingBox => {
                 root.insert("route", Json::object());
             }
@@ -3228,7 +3247,7 @@ mod tests {
 
     #[test]
     fn each_dialect_writes_the_fields_that_engine_actually_reads() {
-        for dialect in [Dialect::Xray, Dialect::SingBox] {
+        for dialect in [Dialect::Xray, Dialect::SingBox, Dialect::Leaf] {
             let base = dialect.base_config().to_string().expect("serialises");
             let out = inject_inbound(&base, Ipv4Addr::new(192, 0, 2, 7), 1080, dialect)
                 .expect("injectable");
@@ -3245,6 +3264,7 @@ mod tests {
             let (type_key, type_value) = match dialect {
                 Dialect::Xray => ("protocol", "freedom"),
                 Dialect::SingBox => ("type", "direct"),
+                Dialect::Leaf => ("protocol", "direct"),
             };
             assert_eq!(
                 outbound.get(type_key).and_then(Json::as_str),
@@ -3252,14 +3272,14 @@ mod tests {
                 "{dialect:?} outbound names itself with `{type_key}`"
             );
             let (in_key, in_value) = match dialect {
-                Dialect::Xray => ("protocol", "socks"),
                 Dialect::SingBox => ("type", "socks"),
+                Dialect::Xray | Dialect::Leaf => ("protocol", "socks"),
             };
             assert_eq!(inbound.get(in_key).and_then(Json::as_str), Some(in_value));
 
             let (port_key, port_value) = match dialect {
-                Dialect::Xray => ("port", 1080.0),
                 Dialect::SingBox => ("listen_port", 1080.0),
+                Dialect::Xray | Dialect::Leaf => ("port", 1080.0),
             };
             assert_eq!(
                 inbound.get(port_key).and_then(Json::as_num),
@@ -3267,8 +3287,19 @@ mod tests {
                 "{dialect:?} listens on `{port_key}`"
             );
 
+            // leaf binds the address under `address`, not `listen`; the other two carry none. Witness each engine's own field name.
+            let (addr_key, addr_value) = match dialect {
+                Dialect::Leaf => ("address", "192.0.2.7"),
+                _ => ("listen", "192.0.2.7"),
+            };
+            assert_eq!(
+                inbound.get(addr_key).and_then(Json::as_str),
+                Some(addr_value),
+                "{dialect:?} binds on `{addr_key}`"
+            );
+
             let foreign = match dialect {
-                Dialect::Xray => ("type", "socks"),
+                Dialect::Xray | Dialect::Leaf => ("type", "socks"),
                 Dialect::SingBox => ("protocol", "socks"),
             };
             assert!(
@@ -3277,12 +3308,20 @@ mod tests {
                 foreign.0
             );
             let foreign_port = match dialect {
-                Dialect::Xray => "listen_port",
+                Dialect::Xray | Dialect::Leaf => "listen_port",
                 Dialect::SingBox => "port",
             };
             assert!(
                 inbound.get(foreign_port).is_none(),
                 "{dialect:?} must not carry a `{foreign_port}` key"
+            );
+            let foreign_address = match dialect {
+                Dialect::Leaf => "listen",
+                _ => "address",
+            };
+            assert!(
+                inbound.get(foreign_address).is_none(),
+                "{dialect:?} must not carry a `{foreign_address}` key"
             );
         }
     }
@@ -3294,6 +3333,7 @@ mod tests {
         assert_eq!(ok("protocol"), Some(Dialect::Xray));
         assert_eq!(ok("sing-box"), Some(Dialect::SingBox));
         assert_eq!(ok("singbox"), Some(Dialect::SingBox));
+        assert_eq!(ok("leaf"), Some(Dialect::Leaf));
         assert_eq!(ok("v2ray"), None);
         assert_eq!(ok(""), None);
     }
@@ -3376,6 +3416,7 @@ mod tests {
         assert_eq!(render(ConfigArg::Long), "run -config /tmp/cfg.json");
         assert_eq!(render(ConfigArg::Short), "run -c /tmp/cfg.json");
         assert_eq!(render(ConfigArg::Positional), "run /tmp/cfg.json");
+        assert_eq!(render(ConfigArg::DashC), "-c /tmp/cfg.json");
     }
 
     #[test]
@@ -3387,6 +3428,7 @@ mod tests {
             ("short", ConfigArg::Short),
             ("-c", ConfigArg::Short),
             ("positional", ConfigArg::Positional),
+            ("dash-c", ConfigArg::DashC),
         ] {
             assert_eq!(ConfigArg::parse(raw).expect("parses"), want, "{raw}");
         }
