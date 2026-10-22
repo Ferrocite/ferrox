@@ -4767,6 +4767,8 @@ pub(crate) mod loopback {
         let Tunnel::H2(lane) = &mut tunnel else {
             panic!("an h2 lane");
         };
+        lane.set_read_quantum(Duration::from_millis(20))
+            .expect("bounds one read");
         let staged = lane.out.capacity();
         let mut buf = [0u8; 4096];
         let error = (0..20)
