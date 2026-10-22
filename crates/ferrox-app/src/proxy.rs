@@ -12736,6 +12736,86 @@ mod tests {
         let _ = leg.join().expect("joins");
     }
 
+    /// A session whose write parks while it holds the session's lock, as a transport write inside
+    /// `session.write` did, and whose `open` answers four bytes without a transport read.
+    struct WritingSession {
+        entered: std::sync::mpsc::Sender<()>,
+        released: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl ferrox_core::tls::TlsProvider for WritingSession {
+        fn name() -> &'static str {
+            "writing"
+        }
+
+        fn suites(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn handshake(&mut self) -> Result<(), ferrox_core::tls::TlsError> {
+            Ok(())
+        }
+
+        fn alpn(&self) -> Option<&[u8]> {
+            None
+        }
+
+        fn open(&mut self, _ciphertext: &[u8], buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
+            buf[..4].copy_from_slice(b"pong");
+            Ok((4, 0))
+        }
+    }
+
+    impl Read for WritingSession {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for WritingSession {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.entered.send(()).expect("signals");
+            let _ = self.released.recv();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The write's own half: a session seals under its lock and sends outside it, so a peer that
+    /// is not draining this direction parks the write alone.
+    #[test]
+    fn a_session_read_runs_while_its_write_is_parked() {
+        use std::sync::mpsc;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (released_tx, released_rx) = mpsc::channel();
+        let session = Arc::new(Mutex::new(WritingSession {
+            entered: entered_tx,
+            released: released_rx,
+        }));
+        let mut reader =
+            DrivenHalf::new(Arc::clone(&session), Arc::new(Mutex::new(std::io::empty())));
+        let mut writer = DrivenHalf::new(session, Arc::new(Mutex::new(std::io::empty())));
+        let writing = thread::spawn(move || writer.write_all(b"ping"));
+        entered_rx.recv().expect("the write reached its session");
+        let (done_tx, done_rx) = mpsc::channel();
+        let reading = thread::spawn(move || {
+            let mut buf = [0u8; 4];
+            let read = reader.read(&mut buf);
+            let _ = done_tx.send(read.map(|read| (read, buf)));
+        });
+        let read = done_rx.recv_timeout(Duration::from_secs(2));
+        let _ = released_tx.send(());
+        reading.join().expect("joins");
+        writing.join().expect("joins").expect("writes");
+        let (read, buf) =
+            read.expect("the read ran while the write was parked, not after it was released");
+        assert_eq!(read.expect("reads"), 4);
+        assert_eq!(&buf, b"pong");
+    }
+
     /// The driven half carries the bytes: a payload that crosses several records comes back
     /// byte for byte through the relay's own read of the transport.
     #[test]
