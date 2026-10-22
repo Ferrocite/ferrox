@@ -817,6 +817,9 @@ jobs:
           rm -f ferrox-relay.pid
           echo "== udp lines =="
           grep -iE "udp|masque|datagram" ferrox-relay.log | tail -n 100 || true
+          # A tail of 60 never reaches the h3 legs, and the phase stamps are the whole point of them.
+          echo "== lane phase stamps (handshake, head, open, relay) =="
+          grep -E "foxy-debug: quic hand|foxy-debug: quic pool|foxy-debug: h3 stream|lane=[0-9]+ms|unparked sleeps|first [0-9]+ B in" ferrox-relay.log | tail -n 240 || true
           echo "== lane log tail (edges, carriers, relay totals; no secrets) =="
           tail -n 60 ferrox-relay.log
       - name: Keep the whole lane log
