@@ -2375,7 +2375,8 @@ fn serve_session_grpc<R: Read, W: FrameWrite + 'static>(
 fn accept_tls_session(
     stream: Connection,
     server: &ferrox_core::tls::TlsServerConfig,
-) -> Option<impl ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send> {
+) -> Option<impl ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send + Drivable>
+{
     let Ok(mut session) = ferrox_core::tls::accept(server, stream) else {
         echo_trace("tls-server accept refused");
         return None;
@@ -2456,13 +2457,18 @@ fn serve_vless_tls(
     }
 }
 
-fn serve_carried_tls<S: Read + Write + Send + 'static>(
-    stream: S,
+fn serve_vless_kcp_tls(
+    conn: &Arc<ferrox_core::kcp::Connection>,
     id: &[u8; 16],
     freedom: bool,
     server: &ferrox_core::tls::TlsServerConfig,
 ) {
-    let Ok(mut tls) = ferrox_core::tls::accept(server, stream) else {
+    let Ok(mut tls) = ferrox_core::tls::accept(
+        server,
+        KcpIo {
+            conn: Arc::clone(conn),
+        },
+    ) else {
         return;
     };
     if tls.handshake().is_err() {
@@ -2635,8 +2641,8 @@ impl Gauge {
 }
 
 /// An authenticated session carries the record; an unauthenticated peer is spliced to the cover origin.
-fn answer_reality<S: Stream + Send + 'static>(
-    accepted: Result<ferrox_core::tls::RealityAccept<S>, ferrox_core::tls::TlsError>,
+fn answer_reality(
+    accepted: Result<ferrox_core::tls::RealityAccept<Connection>, ferrox_core::tls::TlsError>,
     raw: Option<Connection>,
     id: &[u8; 16],
     freedom: bool,
@@ -2717,14 +2723,16 @@ fn copy_paced<R: Read, W: Write>(
     ended.store(true, Ordering::Relaxed);
 }
 
-fn finish_reality<
-    S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send + 'static,
->(
-    mut session: S,
-    raw: Option<Connection>,
-    id: &[u8; 16],
-    freedom: bool,
-) {
+fn finish_reality<S>(mut session: S, raw: Option<Connection>, id: &[u8; 16], freedom: bool)
+where
+    S: std::io::Read
+        + std::io::Write
+        + ferrox_core::tls::TlsProvider
+        + ferrox_core::tls::RecordAlignment
+        + Drivable
+        + Send
+        + 'static,
+{
     if !shake_tls(&mut session) {
         return;
     }
@@ -2800,12 +2808,8 @@ fn open_vless<S: Read + Write>(
     Some((flow, uplink, close))
 }
 
-fn relay_vless<S>(
-    mut session: S,
-    raw: Option<Connection>,
-    id: &[u8; 16],
-    freedom: bool,
-) where
+fn relay_vless<S>(mut session: S, raw: Option<Connection>, id: &[u8; 16], freedom: bool)
+where
     S: std::io::Read
         + std::io::Write
         + Send
@@ -2929,10 +2933,7 @@ impl<T> Grain<T> {
     fn before_read(&self, value: &T, wanted: bool) {
         let short = wanted || self.quiet.load(Ordering::Relaxed) < RELAY_MOVING_READS;
         if short != self.short.load(Ordering::Relaxed) {
-            let _ = (self.arm)(
-                value,
-                if short { SESSION_POLL } else { self.long },
-            );
+            let _ = (self.arm)(value, if short { SESSION_POLL } else { self.long });
             self.short.store(short, Ordering::Relaxed);
         }
     }
@@ -3751,22 +3752,6 @@ fn dial_vless_kcp(
         return;
     }
     kcp_relay(client, conn);
-}
-
-fn serve_vless_kcp_tls(
-    conn: &Arc<ferrox_core::kcp::Connection>,
-    id: &[u8; 16],
-    freedom: bool,
-    server: &ferrox_core::tls::TlsServerConfig,
-) {
-    serve_carried_tls(
-        KcpIo {
-            conn: Arc::clone(conn),
-        },
-        id,
-        freedom,
-        server,
-    );
 }
 
 fn serve_vless_kcp_reality(
@@ -5334,9 +5319,12 @@ where
     S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Drivable,
 {
     let out = Arc::new(Mutex::new(Sealed::new(transport)));
-    let cipher = session
-        .transport()
-        .and_then(|cipher| cipher.set_read_timeout(Some(RELAY_POLL)).ok().map(|()| cipher));
+    let cipher = session.transport().and_then(|cipher| {
+        cipher
+            .set_read_timeout(Some(RELAY_POLL))
+            .ok()
+            .map(|()| cipher)
+    });
     let mut session = session;
     let shared = match cipher.as_ref() {
         Some(_) => {
@@ -5626,9 +5614,7 @@ impl Drivable for ferrox_core::tls::RealityServer<KcpIo> {
 }
 
 impl Drivable
-    for ferrox_core::tls::RealityClientSession<
-        ferrox_core::tls::reality::RecordLimiter<Connection>,
-    >
+    for ferrox_core::tls::RealityClientSession<ferrox_core::tls::reality::RecordLimiter<Connection>>
 {
     fn transport(&self) -> Option<Connection> {
         self.get_ref().get_ref().try_clone().ok()
@@ -5690,14 +5676,9 @@ impl CipherOpen for KcpIo {
 /// session's lock: the shape one split takes, so five callers need not spell it.
 fn driven_halves<S>(session: S, grain: Duration) -> Result<Half<DrivenHalf<S, Connection>>, S>
 where
-    S: Drivable
-        + CipherOpen
-        + ferrox_core::tls::RecordAlignment
-        + Send
-        + Sized
-        + 'static,
+    S: Drivable + CipherOpen + ferrox_core::tls::RecordAlignment + Send + Sized + 'static,
 {
-    let Some(mut cipher) = session.transport() else {
+    let Some(cipher) = session.transport() else {
         return Err(session);
     };
     if cipher.set_read_timeout(Some(grain)).is_err() {
@@ -6058,7 +6039,7 @@ fn dial_vless_reality(
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
             drop(reader);
-            let Some(Ok(mut session)) = Arc::into_inner(shared).map(Mutex::into_inner) else {
+            let Some(Ok(session)) = Arc::into_inner(shared).map(Mutex::into_inner) else {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Local));
             };
             let Ok(downstream) = client.try_clone() else {
@@ -6080,14 +6061,17 @@ fn dial_vless_reality(
             if vless.flow == crate::vision::FLOW {
                 // The Link reads its own transport, so the split is not its shape: the quiet grain stops at the tick instead, and a park never outlasts a writer.
                 let link = crate::vision::Link::new(session, Some(raw), &vless.id);
-                let half =
-                    Half::shared_armed_capped(link, crate::vision::Link::arm_read_timeout, SESSION_POLL);
+                let half = Half::shared_armed_capped(
+                    link,
+                    crate::vision::Link::arm_read_timeout,
+                    SESSION_POLL,
+                );
                 relay_stream(Half::socket(downstream), half, &close);
             } else {
                 // The limiter stops bounding, the transport's wait leaves the lock, and only the decryption stays under it.
                 match driven_halves(session, RELAY_POLL) {
                     Ok(half) => relay_stream(Half::socket(downstream), half, &close),
-                    Err(session) => {
+                    Err(mut session) => {
                         session.disarm_record_alignment();
                         relay_stream(
                             Half::socket(downstream),
@@ -9561,14 +9545,16 @@ fn dial_http_outbound(
             return;
         }
         // The transport's wait leaves the lock, and only the decryption stays under it; a split that fails falls back to the shared shape.
-        do_connect(client, session, http, target, |stream, downstream, close| {
-            match driven_halves(stream, RELAY_POLL) {
+        do_connect(
+            client,
+            session,
+            http,
+            target,
+            |stream, downstream, close| match driven_halves(stream, RELAY_POLL) {
                 Ok(half) => relay_stream(half, Half::socket(downstream), &close),
-                Err(stream) => {
-                    relay_stream(Half::shared(stream), Half::socket(downstream), &close)
-                }
-            }
-        });
+                Err(stream) => relay_stream(Half::shared(stream), Half::socket(downstream), &close),
+            },
+        );
     } else {
         let Some(s) = dial_or_report(server) else {
             return;
@@ -17162,11 +17148,9 @@ mod tests {
             serve_vless_tls(stream, &id, true, &carrier, &server_config);
             let _ = done_tx.send(());
         });
-        let stream = Connection::connect(addr).expect("connects");
-        let out = stream.try_clone().expect("dups the transport");
-        let mut session = ferrox_core::tls::connect(&client_config, stream).expect("opens");
-        session.handshake().expect("handshakes");
-        let (read, write) = session_halves(session, out);
+        let session = dial_tls_session(&addr, &client_config, None).expect("dialled");
+        let transport = session.get_ref().try_clone().expect("dups the transport");
+        let (read, write) = session_halves(session, transport);
         let (_reader, _writer) =
             crate::grpc::connect_split(read, write, "127.0.0.1", "/p").expect("dials the head");
         let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
