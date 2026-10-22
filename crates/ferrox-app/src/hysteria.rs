@@ -232,7 +232,7 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     let roots = dial.roots.as_deref().unwrap_or(&[]);
     let (sock, peer, local) = crate::quic::udp_to_server(&dial.address, dial.port)?;
     let mut scid = [0u8; SCID_LEN];
-    getrandom::getrandom(&mut scid).ok()?;
+    getrandom::fill(&mut scid).ok()?;
     let cid = quiche::ConnectionId::from_ref(&scid);
     let mut config = crate::quic::quiche_config(roots, Some(dial.config.cc.quiche_name()))?;
     // The client enables the datagram lane exactly as the served connection does: advertising it changes no stream byte of a TCP-only flow, and it is what lets `dgram_max_writable_len` answer for a UDP dial on this connection.
@@ -1588,7 +1588,7 @@ impl Router<'_> {
         client_cid: &[u8],
     ) {
         let mut scid = [0u8; SCID_LEN];
-        if getrandom::getrandom(&mut scid).is_err() {
+        if getrandom::fill(&mut scid).is_err() {
             return;
         }
         let cid = quiche::ConnectionId::from_ref(&scid);

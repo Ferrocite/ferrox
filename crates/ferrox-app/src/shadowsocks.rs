@@ -74,7 +74,7 @@ pub(crate) fn serve(mut stream: Connection, password: &str, method: &str, freedo
     // The relay allocates its own chunk buffer, so this one stops costing 16 KiB.
     drop(head);
     let mut salt = [0u8; SALT_LEN];
-    if getrandom::getrandom(&mut salt[..salt_len]).is_err() {
+    if getrandom::fill(&mut salt[..salt_len]).is_err() {
         return;
     }
     let Some(send) = Cipher::from_master_key(method, &master, &salt[..salt_len]) else {
@@ -133,7 +133,7 @@ fn serve_stream(mut stream: Connection, password: &str) {
         return;
     }
     let mut iv = [0u8; IV_LEN];
-    if getrandom::getrandom(&mut iv).is_err() {
+    if getrandom::fill(&mut iv).is_err() {
         return;
     }
     let Some(key) = rc4_md5_key(master.as_bytes(), &iv) else {
@@ -355,7 +355,7 @@ fn accept_stream(
     let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
     uplink.write_all(&head[used..len]).ok()?;
     let mut iv = [0u8; IV_LEN];
-    getrandom::getrandom(&mut iv).ok()?;
+    getrandom::fill(&mut iv).ok()?;
     let key = rc4_md5_key(master.as_bytes(), &iv)?;
     let send = Rc4::new(&key)?;
     writer.write_all(&iv).ok()?;
@@ -388,7 +388,7 @@ fn accept_on(
     uplink.write_all(&chunk[used..]).ok()?;
     drop(head);
     let mut salt = [0u8; SALT_LEN];
-    getrandom::getrandom(&mut salt[..salt_len]).ok()?;
+    getrandom::fill(&mut salt[..salt_len]).ok()?;
     let send = Cipher::from_master_key(method, &master, &salt[..salt_len])?;
     writer.write_all(&salt[..salt_len]).ok()?;
     Some((uplink, Uplink::Aead(send), Recv::Ready(recv)))
@@ -404,7 +404,7 @@ pub(crate) fn client_send_handshake(
     let master = MasterKey::new(password, method.key_len());
     if method.is_stream() {
         let mut iv = [0u8; IV_LEN];
-        getrandom::getrandom(&mut iv).ok()?;
+        getrandom::fill(&mut iv).ok()?;
         uplink.write_all(&iv).ok()?;
         let key = rc4_md5_key(master.as_bytes(), &iv)?;
         let mut send = Rc4::new(&key)?;
@@ -417,7 +417,7 @@ pub(crate) fn client_send_handshake(
     }
     let salt_len = method.key_len();
     let mut salt = [0u8; SALT_LEN];
-    getrandom::getrandom(&mut salt[..salt_len]).ok()?;
+    getrandom::fill(&mut salt[..salt_len]).ok()?;
     uplink.write_all(&salt[..salt_len]).ok()?;
     let mut send = Uplink::Aead(Cipher::from_master_key(method, &master, &salt[..salt_len])?);
     let mut addr = Vec::with_capacity(2 + target.addr_len());
@@ -910,7 +910,7 @@ pub(crate) fn seal_datagram<'a>(
             return None;
         }
         let mut iv = [0u8; IV_LEN];
-        getrandom::getrandom(&mut iv).ok()?;
+        getrandom::fill(&mut iv).ok()?;
         let key = rc4_md5_key(master.as_bytes(), &iv)?;
         let mut rc4 = Rc4::new(&key)?;
         let clear_at = at - head;
@@ -925,7 +925,7 @@ pub(crate) fn seal_datagram<'a>(
         return None;
     }
     let mut salt = [0u8; SALT_LEN];
-    getrandom::getrandom(&mut salt[..salt_len]).ok()?;
+    getrandom::fill(&mut salt[..salt_len]).ok()?;
     // The first datagram on the chain builds the engine; every one after rekeys it: the salt is the key, so the HKDF and the schedule run again and the heap holds still.
     let cipher: &mut Cipher = match hop {
         Some(cipher) => {

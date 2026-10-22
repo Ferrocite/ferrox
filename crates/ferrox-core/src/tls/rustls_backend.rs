@@ -800,6 +800,11 @@ impl<S: Stream> Read for RustlsServerProvider<S> {
 }
 
 impl<S: Stream> RustlsServerProvider<S> {
+    /// The transport this session reads and writes, for a relay that would read it itself and hand the session only the ciphertext.
+    pub fn get_ref(&self) -> &S {
+        &self.io
+    }
+
     /// The ciphertext this session has queued goes out, and nothing comes in: the reason is
     /// the client's `flush_pending`, and the wait it removed is the same wait.
     fn flush_pending(&mut self) -> std::io::Result<()> {

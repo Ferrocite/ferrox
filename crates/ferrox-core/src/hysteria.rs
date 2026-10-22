@@ -452,7 +452,7 @@ impl Salamander {
     /// Obfuscate `plain` under a fresh random salt appended to `out`; `None` only when the system RNG fails.
     pub fn obfuscate(&self, plain: &[u8], out: &mut Vec<u8>) -> Option<()> {
         let mut salt = [0u8; SALAMANDER_SALT];
-        getrandom::getrandom(&mut salt).ok()?;
+        getrandom::fill(&mut salt).ok()?;
         self.obfuscate_with_salt(&salt, plain, out);
         Some(())
     }
@@ -480,7 +480,7 @@ impl Salamander {
             return None;
         }
         let mut salt = [0u8; SALAMANDER_SALT];
-        getrandom::getrandom(&mut salt).ok()?;
+        getrandom::fill(&mut salt).ok()?;
         Some(self.obfuscate_into(&salt, plain, out))
     }
 

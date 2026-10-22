@@ -285,7 +285,7 @@ fn fnv1a(data: &[u8]) -> u32 {
 }
 
 fn random_into(buf: &mut [u8]) -> bool {
-    getrandom::getrandom(buf).is_ok()
+    getrandom::fill(buf).is_ok()
 }
 
 pub(crate) struct PadSource {
@@ -447,14 +447,14 @@ fn valid_auth_id(key: &AuthKey, auth_id: &[u8; 16]) -> bool {
 }
 
 struct Shake {
-    reader: sha3::Shake128Reader,
+    reader: shake::Shake128Reader,
     padding: bool,
 }
 
 impl Shake {
     fn fresh(iv: &[u8; 16], padding: bool) -> Self {
         use sha3::digest::{ExtendableOutput as _, Update as _};
-        let mut shake = sha3::Shake128::default();
+        let mut shake = shake::Shake128::default();
         shake.update(iv);
         Self {
             reader: shake.finalize_xof(),

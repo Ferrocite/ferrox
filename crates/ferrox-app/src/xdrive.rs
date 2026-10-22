@@ -357,7 +357,7 @@ fn unix_nanos(now: SystemTime) -> i64 {
 /// The 32 lowercase hex characters that name one session.
 fn session_id() -> io::Result<String> {
     let mut raw = [0u8; 16];
-    getrandom::getrandom(&mut raw).map_err(|error| io::Error::other(error.to_string()))?;
+    getrandom::fill(&mut raw).map_err(|error| io::Error::other(error.to_string()))?;
     let mut hex = String::with_capacity(32);
     for byte in raw {
         let _ = write!(hex, "{byte:02x}");
@@ -2277,7 +2277,7 @@ fn roll(top: u64) -> u64 {
         return 0;
     }
     let mut raw = [0u8; 8];
-    getrandom::getrandom(&mut raw).map_or(0, |()| u64::from_le_bytes(raw) % top)
+    getrandom::fill(&mut raw).map_or(0, |()| u64::from_le_bytes(raw) % top)
 }
 
 /// Half the wait kept, half of it rolled, so a whole fleet of sessions does not poll one store in lockstep.

@@ -370,7 +370,7 @@ mod win32 {
 
     pub(super) fn sample(pid: u32, elapsed_ms: u128) -> Result<Sample, SampleError> {
         let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-        if handle == 0 {
+        if handle.is_null() {
             return Err(failed("OpenProcess"));
         }
         let sample = read(handle, pid, elapsed_ms);
@@ -448,7 +448,7 @@ mod win32 {
         let snapshot = (0..4)
             .find_map(|_| {
                 let handle = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-                if handle == INVALID_HANDLE_VALUE || handle == 0 {
+                if handle.is_null() || handle == INVALID_HANDLE_VALUE {
                     None
                 } else {
                     Some(handle)

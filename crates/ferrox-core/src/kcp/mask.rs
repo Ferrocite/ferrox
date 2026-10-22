@@ -301,7 +301,7 @@ impl Encoder {
                         Fill::None => {}
                         Fill::DnsTxid => {
                             let mut two = [0u8; 2];
-                            if getrandom::getrandom(&mut two).is_err() {
+                            if getrandom::fill(&mut two).is_err() {
                                 return None; // never reuse the template's zero id
                             }
                             gap[..2].copy_from_slice(&two);
@@ -334,7 +334,7 @@ impl Encoder {
                 }
                 Entry::Aes(aes) => {
                     let nonce_at = base;
-                    if getrandom::getrandom(&mut self.scratch[nonce_at..nonce_at + 12]).is_err() {
+                    if getrandom::fill(&mut self.scratch[nonce_at..nonce_at + 12]).is_err() {
                         return None; // no entropy: drop the frame, never send a reused nonce
                     }
                     let (nonce_view, pt) = self.scratch[nonce_at..total].split_at_mut(12);
