@@ -29,11 +29,19 @@ vless_client() {
 }
 # The TLS arm's fixture: a self-signed certificate and its key, minted into the ignored target
 # tree by the harness at run time, so no private key is ever in the tree and no CA is needed in
-# the runner's store. The path is relative to the repository root, where every engine is
-# spawned, because a Git-Bash absolute path is not one a native Windows engine can open; the
-# pin is hashed off the minted file, so the two cannot drift.
+# the runner's store. The path is absolute, because the engines do not read it the same way:
+# `xray-core` resolves a relative certificate path against its own executable directory rather
+# than the directory it was spawned in, so a relative path finds the file for one engine and
+# not for another. On Windows the absolute path is the one Windows spells, because a Git-Bash
+# path is not one a native engine can open; the pin is hashed off the minted file, so the two
+# cannot drift.
 matrix_tls_dir() {
-  local dir="target/matrix-tls"
+  local dir="target/matrix-tls" root
+  case "${OS:-}" in
+    Windows_NT) root="$(pwd -W 2>/dev/null || pwd)" ;;
+    *) root="$(pwd)" ;;
+  esac
+  dir="$root/$dir"
   if [[ ! -s "$dir/cert.pem" ]]; then
     "${bench_bin:?no harness binary to mint the fixture}" make-tls "$dir" || return 1
   fi
