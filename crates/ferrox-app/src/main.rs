@@ -20,6 +20,7 @@ mod foxy;
 mod foxy_account;
 mod foxy_catalog;
 mod foxy_challenge;
+mod foxy_latency;
 #[cfg(test)]
 mod foxy_live;
 mod grpc;
@@ -61,7 +62,7 @@ fn usage() -> ! {
     eprintln!("  ferrox-app mint-foxy-pass -c <config.json> -o <pass.json>");
     eprintln!("                                sign in once, store the proxy pass (0600)");
     eprintln!(
-        "  ferrox-app edges                  list the catalogue's published edges as JSON rows"
+        "  ferrox-app edges [--ping]         list the catalogue's edges as JSON rows; --ping adds a handshake ms (null when silent)"
     );
     std::process::exit(2);
 }
@@ -203,18 +204,18 @@ fn main() {
             proxy::mint_foxy_pass(&config, &out);
         }
         "edges" => {
-            // A config is accepted and ignored for the spelling the docs already carry: the catalogue needs no lane.
-            match args.next().as_deref() {
-                None => {}
-                Some("-c" | "-config") => {
-                    args.next().unwrap_or_else(|| usage());
+            let mut ping = false;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--ping" => ping = true,
+                    // A config is accepted and ignored for the spelling the docs already carry: the catalogue needs no lane.
+                    "-c" | "-config" => {
+                        args.next().unwrap_or_else(|| usage());
+                    }
+                    _ => usage(),
                 }
-                Some(_) => usage(),
             }
-            if args.next().is_some() {
-                usage();
-            }
-            proxy::print_foxy_edges();
+            proxy::print_foxy_edges(ping);
         }
         "x25519" => {
             if args.next().is_some() {
