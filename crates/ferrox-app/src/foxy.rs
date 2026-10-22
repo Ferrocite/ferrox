@@ -4645,6 +4645,83 @@ pub(crate) mod loopback {
         edge.join().expect("the edge finishes");
     }
 
+    /// An edge that advertises a small `SETTINGS_MAX_FRAME_SIZE` says what *it* will send us never bigger than: this lane asked for 256 KiB in its own SETTINGS, so a 32 KiB frame from that edge is legal and arrives whole.
+    #[test]
+    fn a_frame_wider_than_the_edge_s_own_limit_arrives_whole() {
+        const FRAME: usize = 32 * 1024;
+        const SEND_LIMIT: u32 = 16 * 1024;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let payload: Vec<u8> = (0..FRAME).map(|i| (i % 251) as u8).collect();
+        let body = payload.clone();
+        let edge = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) {
+                return;
+            }
+            let mut opening = Vec::new();
+            let mut setting = Vec::new();
+            setting.extend_from_slice(&5u16.to_be_bytes());
+            setting.extend_from_slice(&SEND_LIMIT.to_be_bytes());
+            h2_frame(frames::SETTINGS, 0, 0, &setting, &mut opening);
+            h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut opening);
+            tls.write_all(&opening).expect("answers the status");
+            tls.flush().expect("flushes");
+            tls.write_all(&data_frame(&body)).expect("pushes the frame");
+            tls.flush().expect("flushes the frame");
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut rest = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut rest) {
+                    return;
+                }
+            }
+        });
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        tunnel
+            .set_read_quantum(Duration::from_millis(20))
+            .expect("bounds one read");
+        let mut back = Vec::new();
+        let mut buf = [0u8; 4096];
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while back.len() < FRAME && std::time::Instant::now() < deadline {
+            match tunnel.read(&mut buf) {
+                Ok(0) => panic!("the lane called an end of stream inside a frame"),
+                Ok(read) => back.extend_from_slice(&buf[..read]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("the lane lost the frame: {error}"),
+            }
+        }
+        assert_eq!(
+            back, payload,
+            "the octets past the edge's own limit were read as the next frame's header"
+        );
+        drop(tunnel);
+        edge.join().expect("the edge finishes");
+    }
+
     /// The census line for a leg parked at a named wait, waited for: a moment spent is not evidence the leg parked, and a flow that never reached its wait hands its lane back for free.
     fn wait_for_leg(name: &str, leg: std::thread::ThreadId, budget: Duration) {
         let began = Instant::now();
