@@ -16,8 +16,11 @@ pub(crate) const GOAWAY_GRACE: Duration = Duration::from_millis(100);
 /// How long the blackhole sink holds a flow open after its answer: the peer's bytes are read in that window, so the close is a finish and not the reset an unread request earns. Half the reference's own second, so the flow the sink holds is never longer than the one it replaces.
 pub(crate) const SINK_GRACE: Duration = Duration::from_millis(500);
 
-/// How long a shared read holds the lock: under one grain on purpose, so a writer never waits out the wait.
+/// How long a shared read holds the lock while its flow is moving: under one grain on purpose, so a writer never waits out the wait.
 pub(crate) const SESSION_POLL: Duration = Duration::from_millis(1);
+
+/// Empty shared reads a flow may keep the short grain for: a pause between two writes must not cost the second the long grain.
+pub(crate) const RELAY_MOVING_READS: u32 = 64;
 
 pub(crate) const RELAY_HANDOFF_SPINS: u32 = 64;
 
