@@ -33,10 +33,8 @@ pub(crate) fn print_x25519() {
     println!("Password (PublicKey): {public}");
 }
 
-/// Published edges as JSON rows on stdout: the catalogue needs the network, so it is a command, not a lane call.
-pub(crate) fn print_foxy_edges(path: &str) {
-    // The config is read only to name itself in errors; printing the catalogue needs no config.
-    let _ = std::fs::metadata(path).map_err(|error| exit(&format!("cannot read {path}: {error}")));
+/// Published edges as JSON rows on stdout: the catalogue is public, so the list needs no config, account or lane.
+pub(crate) fn print_foxy_edges() {
     let edges = crate::foxy_catalog::edges(crate::quic::system_roots());
     for edge in edges {
         println!(
@@ -12150,6 +12148,29 @@ fn foxy_ports(value: Option<&Json>) -> Vec<u16> {
         .collect()
 }
 
+/// One plane refusal's pace: a retryable one is asked again after the gap it named, a final one is handed back at once.
+fn retry_plane(
+    what: &str,
+    mut ask: impl FnMut() -> Result<(), crate::foxy_account::Denied>,
+) -> Result<(), crate::foxy_account::Denied> {
+    let mut attempt = 0usize;
+    loop {
+        match ask() {
+            Ok(()) => return Ok(()),
+            Err(denied) if attempt + 1 < ACCOUNT_ATTEMPTS && !denied.is_final() => {
+                let pause = crate::foxy_account::renewal_gap(&denied, attempt as u32, None);
+                attempt += 1;
+                eprintln!(
+                    "foxy: the account plane refused the {what} ({denied}), again in {}s",
+                    pause.as_secs()
+                );
+                std::thread::sleep(pause);
+            }
+            Err(denied) => return Err(denied),
+        }
+    }
+}
+
 /// A `foxy` outbound's account, sign-in or pasted pass, as one `Account` whose pass the renewal thread owns.
 fn foxy_account(
     email: &str,
@@ -12157,12 +12178,17 @@ fn foxy_account(
     code: &str,
     pasted: &ferrox_core::foxy::Pass,
     guardian: &str,
+    token_file: &str,
     roots: &ferrox_core::tls::Anchors,
 ) -> Option<std::sync::Arc<crate::foxy_account::Account>> {
     let pass = pasted.clone();
     if email.is_empty() && pass.token.is_empty() {
         return None;
     }
+    let tokens = crate::foxy_account::TokenFile::new(token_file, email);
+    let session = tokens
+        .as_ref()
+        .and_then(crate::foxy_account::TokenFile::load);
     let account = std::sync::Arc::new(crate::foxy_account::Account {
         fxa: crate::foxy_account::Endpoint::parse(
             ferrox_core::foxy::account::FXA_SERVER,
@@ -12177,26 +12203,49 @@ fn foxy_account(
             expires_at: 0,
         })),
         pass: std::sync::Arc::new(std::sync::Mutex::new(pass.clone())),
+        tokens,
     });
-    if !email.is_empty() && pass.token.is_empty() {
-        // Mints collide on one rate-limited plane: a plane refusal retries, a credential refusal does not.
-        let mut attempt = 0usize;
-        loop {
-            match account.sign_in(email, password) {
-                Ok(()) => break,
-                Err(denied) if attempt + 1 < ACCOUNT_ATTEMPTS && !denied.is_final() => {
-                    let pause = crate::foxy_account::renewal_gap(&denied, attempt as u32, None);
-                    attempt += 1;
-                    eprintln!(
-                        "foxy: the account plane refused the sign-in ({denied}), again in {}s",
-                        pause.as_secs()
-                    );
-                    std::thread::sleep(pause);
+    if pass.token.is_empty() {
+        // A stored grant answers the launch: no sign-in, so no new-sign-in mail, and a password only when the grant is dead.
+        let mut resumed = false;
+        if let Some(session) = session {
+            match retry_plane("stored session", || account.resume(session.clone())) {
+                Ok(()) => resumed = true,
+                Err(denied) if denied.is_final() => {
+                    eprintln!("foxy: the stored session was refused ({denied}), signing in again");
+                    account.forget();
                 }
                 Err(denied) => {
-                    eprintln!("foxy: the account did not sign in: {denied}");
+                    eprintln!("foxy: the stored session did not resume: {denied}");
                     return None;
                 }
+            }
+        }
+        if !resumed {
+            if password.is_empty() {
+                eprintln!(
+                    "foxy: no stored session and no settings.password: the sign-in needs one"
+                );
+                return None;
+            }
+            let mut signed_in = false;
+            let sign_in = || {
+                // A retry resumes the grant the first attempt stored before minting: one sign-in, however many attempts the plane's mood costs.
+                if signed_in {
+                    if let Some(session) = account
+                        .tokens
+                        .as_ref()
+                        .and_then(crate::foxy_account::TokenFile::load)
+                    {
+                        return account.resume(session);
+                    }
+                }
+                signed_in = true;
+                account.sign_in(email, password)
+            };
+            if let Err(denied) = retry_plane("sign-in", sign_in) {
+                eprintln!("foxy: the account did not sign in: {denied}");
+                return None;
             }
         }
         if account.needs_code() {
@@ -12318,6 +12367,14 @@ fn find_veepn_outbound(root: &Json) -> Option<crate::veepn::VeepnOut> {
     None
 }
 
+/// An HTTP hop carries streams, not datagrams, so h3 over one is a refusal rather than a silent carrier switch.
+fn foxy_h3_over_http(
+    upstream: Option<&crate::foxy::UpstreamProxy>,
+    carrier: crate::foxy::Carrier,
+) -> bool {
+    upstream.is_some_and(crate::foxy::UpstreamProxy::http) && carrier == crate::foxy::Carrier::H3
+}
+
 fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
     let empty = Vec::new();
     for outbound in root
@@ -12335,6 +12392,7 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
         let email = foxy_text_or(&link, settings, "email");
         let password = foxy_text_or(&link, settings, "password");
         let code = foxy_text_or(&link, settings, "code");
+        let token_file = foxy_text_or(&link, settings, "tokenFile");
         if configured.is_empty() && email.is_empty() {
             continue;
         }
@@ -12353,11 +12411,7 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
         let candidates = foxy_candidates(outbound, &link, &country, &city, roots.clone());
         let carrier = foxy_carrier(settings, &link);
         // An HTTP hop carries streams not datagrams, so this is a refusal, not a silent carrier switch.
-        if upstream
-            .as_ref()
-            .is_some_and(crate::foxy::UpstreamProxy::http)
-            && carrier == crate::foxy::Carrier::H3
-        {
+        if foxy_h3_over_http(upstream.as_ref(), carrier) {
             eprintln!("foxy: carrier h3 cannot ride an http upstreamProxy: use socks5(h)://, h1, h2 or auto");
             continue;
         }
@@ -12368,7 +12422,15 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             quota_reset: None,
             quota_limit: None,
         };
-        let account = foxy_account(&email, &password, &code, &pasted, link.guardian(), &roots);
+        let account = foxy_account(
+            &email,
+            &password,
+            &code,
+            &pasted,
+            link.guardian(),
+            &token_file,
+            &roots,
+        );
         let pass = account
             .as_ref()
             .map_or_else(|| pasted.clone(), |account| account.current());
