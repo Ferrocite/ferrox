@@ -816,7 +816,9 @@ mod winunix {
         // SAFETY: an all-zero `SOCKADDR_UN` is a valid address with an empty path and a zero length.
         let mut addr: SOCKADDR_UN = unsafe { std::mem::zeroed() };
         addr.sun_family = AF_UNIX;
-        addr.sun_path[..bytes.len()].copy_from_slice(bytes);
+        for (slot, byte) in addr.sun_path.iter_mut().zip(bytes) {
+            *slot = *byte as i8;
+        }
         Ok((
             addr,
             i32::try_from(field + bytes.len() + 1).unwrap_or(i32::MAX),

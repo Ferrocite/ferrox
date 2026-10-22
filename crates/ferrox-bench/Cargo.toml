@@ -15,13 +15,19 @@ chacha20 = "0.9"
 aes-gcm = "0.10"
 # Only the `TLS` arm's fixture: a key and certificate minted at run time so no private key
 # is ever checked in. The harness is `publish = false`, so nothing shipped carries it.
-rcgen = "0.13"
+rcgen = "0.14"
+
+[dev-dependencies]
+# The fixture's own checker reads the minted certificate the way the references do: through
+# the verifier that refuses a CN-only certificate. Both are already in the graph under `rustls`.
+rustls-pki-types = "1"
+rustls-webpki = "0.103"
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 libc = "0.2"
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.52", features = [
+windows-sys = { version = "0.61", features = [
   "Win32_Foundation",
   "Win32_System_Diagnostics_ToolHelp",
   "Win32_System_ProcessStatus",

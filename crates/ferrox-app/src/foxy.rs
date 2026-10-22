@@ -3945,7 +3945,7 @@ pub(crate) mod loopback {
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
         let server = ferrox_core::tls::TlsServerConfig {
             cert_chain: vec![minted.cert.der().to_vec()],
-            key_der: minted.key_pair.serialize_der(),
+            key_der: minted.signing_key.serialize_der(),
             key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
             alpn: vec![alpn.to_vec()],
             send_tickets: true,

@@ -19,7 +19,7 @@ fn write_pair(dir: &std::path::Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     for (name, pem) in [
         ("cert.pem", minted.cert.pem()),
-        ("key.pem", minted.key_pair.serialize_pem()),
+        ("key.pem", minted.signing_key.serialize_pem()),
     ] {
         let path = dir.join(name);
         std::fs::write(&path, pem.as_bytes()).map_err(|e| format!("{}: {e}", path.display()))?;
@@ -29,7 +29,7 @@ fn write_pair(dir: &std::path::Path) -> Result<(), String> {
 
 /// `carrier.test` as both the subject and the one DNS alternative name, because a verifier reads
 /// the alternative name and never the subject, so a CN-only certificate is refused by all of them.
-fn mint() -> Result<rcgen::CertifiedKey, String> {
+fn mint() -> Result<rcgen::CertifiedKey<rcgen::KeyPair>, String> {
     let mut params =
         rcgen::CertificateParams::new(vec![HOST.to_owned()]).map_err(|e| e.to_string())?;
     params
@@ -37,7 +37,10 @@ fn mint() -> Result<rcgen::CertifiedKey, String> {
         .push(rcgen::DnType::CommonName, HOST);
     let key_pair = rcgen::KeyPair::generate().map_err(|e| e.to_string())?;
     let cert = params.self_signed(&key_pair).map_err(|e| e.to_string())?;
-    Ok(rcgen::CertifiedKey { cert, key_pair })
+    Ok(rcgen::CertifiedKey {
+        cert,
+        signing_key: key_pair,
+    })
 }
 
 #[cfg(test)]
@@ -60,14 +63,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).expect("the fixture is cleaned up");
         assert!(cert.contains("BEGIN CERTIFICATE"), "{cert}");
         assert!(key.contains("PRIVATE KEY"), "{key}");
-        let params = mint().expect("mints").cert;
-        assert!(
-            matches!(
-                params.params().subject_alt_names.as_slice(),
-                [rcgen::SanType::DnsName(name)] if name == HOST
-            ),
-            "the certificate names a DNS {HOST}: {:?}",
-            params.params().subject_alt_names
-        );
+        let minted = mint().expect("mints");
+        let cert = webpki::EndEntityCert::try_from(minted.cert.der()).expect("parses");
+        let name = rustls_pki_types::DnsName::try_from(HOST).expect("a dns name");
+        cert.verify_is_valid_for_subject_name(&rustls_pki_types::ServerName::DnsName(name))
+            .expect("the certificate names the carrier");
     }
 }

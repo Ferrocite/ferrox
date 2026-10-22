@@ -44,7 +44,7 @@ impl Entropy {
     fn draw(&mut self) -> Option<u64> {
         if self.at == 4 {
             let mut raw = [0u8; 32];
-            getrandom::getrandom(&mut raw).ok()?;
+            getrandom::fill(&mut raw).ok()?;
             let array = raw.as_chunks::<8>().0;
             self.cache = [
                 u64::from_le_bytes(array[0]),

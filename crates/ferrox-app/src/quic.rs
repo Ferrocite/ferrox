@@ -1338,7 +1338,7 @@ pub(crate) struct Hopper {
 /// rather than failing the dial outright.
 fn entropy() -> u64 {
     let mut bytes = [0u8; 8];
-    getrandom::getrandom(&mut bytes).map_or(0, |()| u64::from_le_bytes(bytes))
+    getrandom::fill(&mut bytes).map_or(0, |()| u64::from_le_bytes(bytes))
 }
 
 impl Hopper {
@@ -1623,7 +1623,7 @@ impl Gecko {
             ));
             if pad_len > 0 {
                 // Padding is the point of the lane; a failed draw leaves zeros, which salamander still masks to noise.
-                let _ = getrandom::getrandom(&mut pad[..pad_len]);
+                let _ = getrandom::fill(&mut pad[..pad_len]);
             }
             let written = ferrox_core::hysteria::encode_gecko_frame(
                 ferrox_core::hysteria::GeckoFrame {
@@ -2106,7 +2106,7 @@ pub(crate) fn handshake_within(
     budget: Duration,
 ) -> Option<quiche::Connection> {
     let mut scid = [0u8; SCID_LEN];
-    getrandom::getrandom(&mut scid).ok()?;
+    getrandom::fill(&mut scid).ok()?;
     let cid = quiche::ConnectionId::from_ref(&scid);
     let mut conn = with_config(roots, |config| {
         quiche::connect(Some(server_name), &cid, local, peer, config).ok()
@@ -2860,7 +2860,7 @@ fn route(
     }
     // Server SCIDs are the parse length, so short-header DCIDs read exactly, not into payload.
     let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
-    if getrandom::getrandom(&mut scid).is_err() {
+    if getrandom::fill(&mut scid).is_err() {
         return;
     }
     let cid = quiche::ConnectionId::from_ref(&scid);
@@ -3005,7 +3005,7 @@ pub(crate) fn server_accept(
             continue;
         }
         let mut scid = [0u8; 16];
-        getrandom::getrandom(&mut scid).expect("random");
+        getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
         let mut fresh = quiche::accept(&cid, None, local, from, config).expect("accepts");
         let info = quiche::RecvInfo { from, to: local };
@@ -3068,7 +3068,7 @@ mod tests {
         let local = sock.local_addr().expect("local");
         let sock = Datagram::plain(sock);
         let mut scid = [0u8; SCID_LEN];
-        getrandom::getrandom(&mut scid).expect("random");
+        getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("config");
         config.set_application_protos(&[ALPN]).expect("alpn");
@@ -3449,7 +3449,7 @@ mod tests {
         assert_ne!(roots, Vec::<Vec<u8>>::new());
         ferrox_core::tls::TlsServerConfig {
             cert_chain: roots,
-            key_der: minted.key_pair.serialize_der(),
+            key_der: minted.signing_key.serialize_der(),
             key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
             alpn: Vec::new(),
             send_tickets: true,
@@ -3664,7 +3664,7 @@ mod tests {
         let local = sock.local_addr().expect("addr");
         let mut config = serve_config(&minted_identity()).expect("serves");
         let mut cid = [0u8; 16];
-        getrandom::getrandom(&mut cid).expect("random");
+        getrandom::fill(&mut cid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&cid);
         let peer: SocketAddr = "127.0.0.1:53099".parse().expect("addr");
         let conn = quiche::accept(&cid, None, local, peer, &mut config).expect("accepts");
@@ -3708,7 +3708,7 @@ mod tests {
         let client_sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
         let client_addr = client_sock.local_addr().expect("addr");
         let mut bytes = [0u8; 16];
-        getrandom::getrandom(&mut bytes).expect("random");
+        getrandom::fill(&mut bytes).expect("random");
         let server_id = quiche::ConnectionId::from_ref(&bytes);
         let server = quiche::accept(
             &server_id,
@@ -3718,7 +3718,7 @@ mod tests {
             &mut server_config,
         )
         .expect("accepts");
-        getrandom::getrandom(&mut bytes).expect("random");
+        getrandom::fill(&mut bytes).expect("random");
         let client_id = quiche::ConnectionId::from_ref(&bytes);
         let client = quiche::connect(
             Some("quic.test"),

@@ -246,7 +246,7 @@ pub fn connect<S: Stream + RecordAlignment>(
 pub fn accept<S: Stream + Send>(
     cfg: &TlsServerConfig,
     io: S,
-) -> Result<impl TlsProvider + RecordAlignment + Send + use<S>, TlsError> {
+) -> Result<RustlsServerProvider<reality::RecordLimiter<S>>, TlsError> {
     RustlsServerProvider::accept(cfg.clone(), reality::RecordLimiter::new_open(io))
 }
 
