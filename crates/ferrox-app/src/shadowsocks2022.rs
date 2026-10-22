@@ -40,7 +40,7 @@ fn psks(password: &str, method: Method) -> Option<Vec<Vec<u8>>> {
 
 fn fresh_salt(key_len: usize) -> Option<Vec<u8>> {
     let mut salt = vec![0u8; key_len];
-    getrandom::getrandom(&mut salt).ok()?;
+    getrandom::fill(&mut salt).ok()?;
     Some(salt)
 }
 
@@ -922,7 +922,7 @@ pub(crate) struct Datagrams {
 impl Datagrams {
     pub(crate) fn new() -> Self {
         let mut session = [0u8; 8];
-        let _ = getrandom::getrandom(&mut session);
+        let _ = getrandom::fill(&mut session);
         Self {
             sealed: Vec::new(),
             opened: Vec::new(),
@@ -948,7 +948,7 @@ impl Datagrams {
         }
         if method.is_chacha() {
             let mut nonce = [0u8; 24];
-            getrandom::getrandom(&mut nonce).ok()?;
+            getrandom::fill(&mut nonce).ok()?;
             let out = &mut self.sealed;
             out.clear();
             out.reserve(24 + 16 + 11 + payload.len() + TAG_LEN);
@@ -1196,7 +1196,7 @@ impl Datagrams {
         });
         if fresh {
             let mut sid = [0u8; 8];
-            getrandom::getrandom(&mut sid).ok()?;
+            getrandom::fill(&mut sid).ok()?;
             let sid = u64::from_be_bytes(sid);
             if sid == 0 {
                 return None;
@@ -1226,7 +1226,7 @@ impl Datagrams {
                 (entry.server_session, id)
             };
             let mut nonce = [0u8; 24];
-            getrandom::getrandom(&mut nonce).ok()?;
+            getrandom::fill(&mut nonce).ok()?;
             let out = &mut self.sealed;
             out.clear();
             out.reserve(24 + 16 + 19 + payload.len() + TAG_LEN);

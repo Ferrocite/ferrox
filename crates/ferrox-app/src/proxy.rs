@@ -12231,8 +12231,7 @@ fn tls_parts(
 
 fn x25519_pair() -> (String, String) {
     let mut private = [0u8; 32];
-    getrandom::getrandom(&mut private)
-        .unwrap_or_else(|error| exit(&format!("no entropy: {error}")));
+    getrandom::fill(&mut private).unwrap_or_else(|error| exit(&format!("no entropy: {error}")));
     private[0] &= 0xF8;
     private[31] &= 0x7F;
     private[31] |= 0x40;
@@ -20483,7 +20482,7 @@ mod tests {
         assert_ne!(roots, Vec::<Vec<u8>>::new());
         let identity = ferrox_core::tls::parse_pem_identity(
             minted.cert.pem().as_bytes(),
-            minted.key_pair.serialize_pem().as_bytes(),
+            minted.signing_key.serialize_pem().as_bytes(),
         )
         .expect("identity loads");
         let config = crate::quic::serve_config(&identity).expect("serves");
@@ -20706,7 +20705,7 @@ mod tests {
         let cert_path = dir.join("c.crt");
         let key_path = dir.join("c.key");
         std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages");
-        std::fs::write(&key_path, minted.key_pair.serialize_pem().as_bytes()).expect("stages");
+        std::fs::write(&key_path, minted.signing_key.serialize_pem().as_bytes()).expect("stages");
         let root = crate::json::parse(&format!(
             r#"{{"streamSettings": {{"network": "quic", "security": "tls",
                 "tlsSettings": {{"certificates": [{{"certificateFile": "{}", "keyFile": "{}"}}]}}}}}}"#,
@@ -21014,7 +21013,7 @@ mod tests {
             }
             let peer_scid = header.scid.as_ref().to_vec();
             let mut scid = [0u8; 16];
-            getrandom::getrandom(&mut scid).expect("random");
+            getrandom::fill(&mut scid).expect("random");
             let cid = quiche::ConnectionId::from_ref(&scid);
             let mut fresh = quiche::accept(&cid, None, local, from, config).expect("accepts");
             let info = quiche::RecvInfo { from, to: local };
@@ -21411,7 +21410,7 @@ mod tests {
         let tag = format!("ferrox-quic-pipe-{}-{stamp}", std::process::id());
         let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
         let key_path = std::env::temp_dir().join(format!("{tag}.key"));
-        let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
+        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
         std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
         std::fs::write(&key_path, &key_pem).expect("stages key");
         let mut server_config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
@@ -21437,7 +21436,7 @@ mod tests {
         let client_addr: SocketAddr = "127.0.0.1:4433".parse().expect("addr");
         let server_addr: SocketAddr = "127.0.0.1:8443".parse().expect("addr");
         let mut ccid = [0u8; 16];
-        getrandom::getrandom(&mut ccid).expect("random");
+        getrandom::fill(&mut ccid).expect("random");
         let ccid = quiche::ConnectionId::from_ref(&ccid);
         let mut client = quiche::connect(
             Some("localhost"),
@@ -21452,7 +21451,7 @@ mod tests {
         let initial = quiche::Header::from_slice(&mut first[..n], 20).expect("parses");
         assert_eq!(initial.ty, quiche::Type::Initial);
         let mut scid = [0u8; 16];
-        getrandom::getrandom(&mut scid).expect("random");
+        getrandom::fill(&mut scid).expect("random");
         let scid = quiche::ConnectionId::from_ref(&scid);
         let mut server = quiche::accept(&scid, None, server_addr, client_addr, &mut server_config)
             .expect("accepts");
@@ -21753,7 +21752,7 @@ mod tests {
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
         assert_ne!(roots, Vec::<Vec<u8>>::new());
-        let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
+        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
         let quic_sock =
             crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
         let quic_port = quic_sock.local_addr().expect("addr").port();
@@ -21927,7 +21926,7 @@ mod tests {
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
         assert_ne!(roots, Vec::<Vec<u8>>::new());
-        let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
+        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
         let quic_sock =
             crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
         let quic_port = quic_sock.local_addr().expect("addr").port();
@@ -22021,7 +22020,7 @@ mod tests {
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
         assert_ne!(roots, Vec::<Vec<u8>>::new());
-        let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
+        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
         let quic_sock =
             crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
         let quic_port = quic_sock.local_addr().expect("addr").port();
@@ -22323,7 +22322,7 @@ mod tests {
         let tag = format!("ferrox-hysteria-test-{}-{stamp}", std::process::id());
         let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
         let key_path = std::env::temp_dir().join(format!("{tag}.key"));
-        let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
+        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
         std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
         std::fs::write(&key_path, &key_pem).expect("stages key");
         let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
@@ -22500,7 +22499,7 @@ mod tests {
         let tag = format!("ferrox-hysteria-bisect-{}-{stamp}", std::process::id());
         let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
         let key_path = std::env::temp_dir().join(format!("{tag}.key"));
-        let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
+        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
         std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
         std::fs::write(&key_path, &key_pem).expect("stages key");
         let sock =
@@ -22585,7 +22584,7 @@ mod tests {
         let sock = crate::quic::Datagram::plain(sock);
         let mut config = crate::quic::quiche_config(&roots, Some("bbr")).expect("configures");
         let mut scid = [0u8; 16];
-        getrandom::getrandom(&mut scid).expect("random");
+        getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
         let mut conn =
             quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
@@ -22647,7 +22646,7 @@ mod tests {
         let sock = crate::quic::Datagram::plain(sock);
         let mut config = crate::quic::quiche_config(roots, Some("bbr")).expect("configures");
         let mut scid = [0u8; 16];
-        getrandom::getrandom(&mut scid).expect("random");
+        getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
         let mut conn =
             quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
@@ -22936,7 +22935,7 @@ mod tests {
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
         let identity = ferrox_core::tls::parse_pem_identity(
             minted.cert.pem().as_bytes(),
-            minted.key_pair.serialize_pem().as_bytes(),
+            minted.signing_key.serialize_pem().as_bytes(),
         )
         .expect("identity");
         thread::spawn(move || {
@@ -23042,7 +23041,7 @@ mod tests {
         let sock = crate::quic::Datagram::plain(sock);
         let mut config = crate::quic::quiche_config(&roots, Some("bbr")).expect("configures");
         let mut scid = [0u8; 16];
-        getrandom::getrandom(&mut scid).expect("random");
+        getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
         let mut conn =
             quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
@@ -23120,7 +23119,7 @@ mod tests {
         let sock = crate::quic::Datagram::plain(sock);
         let mut config = crate::quic::quiche_config(&roots, Some("bbr")).expect("configures");
         let mut scid = [0u8; 16];
-        getrandom::getrandom(&mut scid).expect("random");
+        getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
         let mut conn =
             quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");
@@ -23183,7 +23182,7 @@ mod tests {
         let mut config = crate::quic::quiche_config(&roots, Some("bbr")).expect("configures");
         config.enable_dgram(true, 1024, 1024);
         let mut scid = [0u8; 16];
-        getrandom::getrandom(&mut scid).expect("random");
+        getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
         let mut conn =
             quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connects");

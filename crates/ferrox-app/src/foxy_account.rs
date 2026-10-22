@@ -873,7 +873,7 @@ pub(crate) fn epoch() -> u64 {
 
 fn nonce() -> String {
     let mut raw = [0u8; 6];
-    getrandom::getrandom(&mut raw).unwrap_or_default();
+    getrandom::fill(&mut raw).unwrap_or_default();
     ferrox_core::b64::encode(&raw)
 }
 
@@ -1367,7 +1367,7 @@ mod loopback {
         )
         .expect("mints");
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
-        let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
+        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
         let root = ferrox_core::tls::parse_pem_identity(minted.cert.pem().as_bytes(), &key_pem)
             .expect("identity");
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -1395,7 +1395,7 @@ mod loopback {
         )
         .expect("mints");
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
-        let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
+        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
         let root = ferrox_core::tls::parse_pem_identity(minted.cert.pem().as_bytes(), &key_pem)
             .expect("identity");
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -1466,7 +1466,7 @@ mod two_factor {
         )
         .expect("mints");
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
-        let key_pem = crate::quic::der_to_pem(&minted.key_pair.serialize_der(), "PRIVATE KEY");
+        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
         let root = ferrox_core::tls::parse_pem_identity(minted.cert.pem().as_bytes(), &key_pem)
             .expect("identity");
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");

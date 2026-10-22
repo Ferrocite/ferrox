@@ -33,7 +33,7 @@ fn accept_key(key: &str) -> [u8; ACCEPT_LEN] {
 /// The key the client asks with: twenty-four bytes of base64, on the stack.
 fn fresh_key() -> Option<[u8; KEY_LEN]> {
     let mut raw = [0u8; 16];
-    getrandom::getrandom(&mut raw).ok()?;
+    getrandom::fill(&mut raw).ok()?;
     let mut out = [0u8; KEY_LEN];
     let written = ferrox_core::b64::encode_parts_into(&[&raw], &mut out)
         .expect("the key's window is long enough");
@@ -200,7 +200,7 @@ fn fresh_mask() -> Option<[u8; 4]> {
         .try_with(|cell| {
             let (buf, at) = &mut *cell.borrow_mut();
             if *at + 4 > buf.len() {
-                getrandom::getrandom(&mut buf[..]).ok()?;
+                getrandom::fill(&mut buf[..]).ok()?;
                 *at = 0;
             }
             let mask: [u8; 4] = buf[*at..*at + 4].try_into().ok()?;

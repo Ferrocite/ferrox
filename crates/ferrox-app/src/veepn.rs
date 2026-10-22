@@ -544,7 +544,7 @@ pub(crate) fn udid(named: &str) -> String {
         return named.to_owned();
     }
     let mut raw = [0u8; 16];
-    getrandom::getrandom(&mut raw).unwrap_or_default();
+    getrandom::fill(&mut raw).unwrap_or_default();
     raw[6] = (raw[6] & 0x0f) | 0x40;
     raw[8] = (raw[8] & 0x3f) | 0x80;
     let mut text = String::with_capacity(36);

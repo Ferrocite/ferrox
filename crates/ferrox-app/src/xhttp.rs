@@ -800,7 +800,7 @@ fn huffman_len(s: &[u8]) -> usize {
 fn generate_tokenish(target_huffman_bytes: usize) -> String {
     let n = (target_huffman_bytes * 10).div_ceil(8);
     let mut raw = vec![0u8; n.max(1)];
-    getrandom::getrandom(&mut raw).unwrap_or_default();
+    getrandom::fill(&mut raw).unwrap_or_default();
     tokenish_adjust(&raw, target_huffman_bytes)
 }
 
@@ -848,7 +848,7 @@ fn pad_target_len(settings: &XhttpSettings) -> usize {
         return from as usize;
     }
     let mut raw = [0u8; 4];
-    getrandom::getrandom(&mut raw).unwrap_or_default();
+    getrandom::fill(&mut raw).unwrap_or_default();
     from as usize + (u32::from_le_bytes(raw) as usize % (to as usize - from as usize + 1))
 }
 
@@ -1687,7 +1687,7 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
     const TAIL: &str = "\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n";
     const PADDING_MAX: usize = 1000;
     let mut raw = [0u8; 4];
-    getrandom::getrandom(&mut raw).unwrap_or_default();
+    getrandom::fill(&mut raw).unwrap_or_default();
     let len = 100 + u32::from_le_bytes(raw) as usize % 901;
     DIAL_HEAD.with(|cell| {
         let mut head = cell.borrow_mut();

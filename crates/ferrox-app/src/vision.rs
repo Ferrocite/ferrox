@@ -478,7 +478,7 @@ fn random_below(bound: u32) -> usize {
         .try_with(|cell| {
             let (buf, at) = &mut *cell.borrow_mut();
             if *at + 4 > buf.len() {
-                getrandom::getrandom(&mut buf[..]).ok()?;
+                getrandom::fill(&mut buf[..]).ok()?;
                 *at = 0;
             }
             let word = u32::from_be_bytes(buf[*at..*at + 4].try_into().ok()?);

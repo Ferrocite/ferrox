@@ -1037,7 +1037,7 @@ impl<S: Stream> RealityClientSession<S> {
             .map_err(|e| TlsError::Other(format!("reality: server name: {e}")))?;
         // One entropy fill arms the share, the random and the grease pair: one syscall where three ran, the same stream getrandom serves.
         let mut entropy = [0u8; 66];
-        getrandom::getrandom(&mut entropy)
+        getrandom::fill(&mut entropy)
             .map_err(|e| TlsError::Other(format!("reality: no entropy: {e}")))?;
         let (secret, tail) = entropy.split_at(32);
         let (grease, random) = tail.split_at(2);

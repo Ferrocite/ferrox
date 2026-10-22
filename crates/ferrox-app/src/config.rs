@@ -1412,7 +1412,7 @@ mod tests {
         let array_form = crate::json::parse(&format!(
             r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"certificates": [{{"certificate": [{}], "key": [{}]}}]}}}}}}"#,
             lines_json(&minted.cert.pem()),
-            lines_json(&minted.key_pair.serialize_pem())
+            lines_json(&minted.signing_key.serialize_pem())
         ))
         .expect("parses");
         assert!(
@@ -1423,7 +1423,7 @@ mod tests {
         let string_form = crate::json::parse(&format!(
             r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"certificates": [{{"certificate": {}, "key": {}}}]}}}}}}"#,
             string_json(&minted.cert.pem()),
-            string_json(&minted.key_pair.serialize_pem())
+            string_json(&minted.signing_key.serialize_pem())
         ))
         .expect("parses");
         assert!(
