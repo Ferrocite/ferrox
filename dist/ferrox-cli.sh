@@ -36,6 +36,13 @@ resolve_bin() {
 CONF_DIR="${FERROX_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ferrox}"
 CREDS="${FOXY_CREDENTIALS:-$CONF_DIR/credentials}"
 CFG="$CONF_DIR/lane.json"
+# The signed-in session FxA handed back, so a launch after the first signs in
+# once and never sees a new-sign-in mail: the grant lives here, not in the config.
+TOKEN_FILE="$CONF_DIR/foxy-token.json"
+# The exit the user remembered, and the last published edge list kept so the
+# selection still answers when the catalogue is down.
+LOCATION_FILE="$CONF_DIR/foxy-location"
+LOCATIONS_FILE="$CONF_DIR/foxy-locations.jsonl"
 PID_FILE="$CONF_DIR/lane.pid"
 LOG="$CONF_DIR/lane.log"
 PROXY_PORTS="$CONF_DIR/system-proxy.ports"
@@ -56,8 +63,12 @@ CODE=""
 COUNTRY="US"
 COUNTRY_SET=0
 CITY=""
+CITY_SET=0
 CARRIER="auto"
 CARRIER_SET=0
+LOC_COUNTRY=""
+LOC_CITY=""
+LOC_FILTER=""
 UPSTREAM=""
 # VeePN has no account and no server: an empty region lets the plane pick, and
 # the device id is kept under $CONF_DIR so a restart is the same device.
@@ -97,6 +108,9 @@ usage: ferrox-cli <command> [options]
 
 commands
   login      save the foxy account once (prompts for the password; file is 0600)
+  logout     stop the lane, then forget the account and its stored session
+  locations  list the countries and cities the catalogue publishes
+  location   remember an exit: location CC [CITY] (survives every up)
   up         start the lane in the background, print the port map (default)
   serve      start the lane in this terminal, until Ctrl-C
   down       stop the lane and clear the system proxy it set
@@ -105,12 +119,17 @@ commands
   tun        what TUN mode would need, and why this binary refuses it
   version    print the release binary's version
 
-three commands from a fresh package (the foxy lane needs no server: the edge
-comes from Mozilla's catalogue, and --country moves the exit; with no account
-stored yet, the first up --foxy simply asks for the email and password):
+first run, then every run: the foxy lane signs in once and keeps the session in
+\$CONF_DIR/foxy-token.json (0600). The launches after it mint a pass from that grant,
+so no password is asked again and FxA sends no new-sign-in mail.
+
   ferrox-cli up --foxy --vpn                    # asks once, then connects
+  ferrox-cli up --foxy --vpn                    # second run: resumes, no sign-in
+  ferrox-cli locations                          # countries and cities to pin
+  ferrox-cli location DE                        # remember Germany for every up
   ferrox-cli status                             # exit IP and country
   ferrox-cli down                               # stop, clear the system proxy
+  ferrox-cli logout                             # forget the account and session
 
 and from the same fresh package, with nothing to type in at all:
   ferrox-cli up --veepn --vpn                   # anonymous, no account, no server
@@ -127,9 +146,9 @@ outbound (choose one)
 foxy options (email + password is the whole setup; there is no server to name)
   --email ADDR           Firefox account, else \$FOXY_EMAIL, else the credentials file
   --password PW          password, else \$FOXY_PASS (a file with 0600 is better)
-  --code CODE            two-factor code
-  --country CC           exit country, default US
-  --city CODE            city tier inside the country
+  --code CODE            two-factor code (kept with the pending sign-in until it verifies)
+  --country CC           exit country; default is the remembered one, else US
+  --city CODE            city tier inside the country (SFO, NYC; see locations)
   --carrier NAME         auto|h1|h2|h3, default auto (h2, then h1, then h3);
                          asked once on a terminal when the flag is left off, and
                          auto on a pipe; h2 outran h3 on CI in every run and on
@@ -137,6 +156,13 @@ foxy options (email + password is the whole setup; there is no server to name)
                          carrier UDP asks first, and a named h3 falls back to
                          h2 and h1 when the path drops QUIC
   --upstream URL         http:// or socks5(h):// hop to reach the edge through
+
+locations
+  ferrox-cli locations [CC]        every country, and the cities each one has
+  ferrox-cli location CC [CITY]    remember it; up --foxy moves there
+  The list is public: it needs no account and is cached by the binary, and the
+  last one fetched is kept in \$CONF_DIR/foxy-locations.jsonl for when the
+  catalogue cannot be reached.
 
 veepn options (nothing is required: the plane names the region and its edges)
   --region CC            exit region id (lowercase, e.g. nl, us-va), else the plane picks
@@ -185,9 +211,11 @@ action_login() {
     } >"$CREDS"
   )
   chmod 600 "$CREDS"
+  # A login is the user asking for this account now: the grant the last one left is not the one to resume.
+  rm -f "$TOKEN_FILE"
   if [ "${LOGIN_QUIET:-0}" != 1 ]; then
     say "account saved to $CREDS: owner-only, outside the repository, read by every future up."
-    say "next:  ferrox-cli up --foxy --vpn"
+    say "the next up --foxy signs in once and keeps the session in $TOKEN_FILE."
   fi
 }
 
@@ -203,6 +231,109 @@ read_credentials() {
   # A named flag beats a stored file: what you typed this minute is what you mean.
   EMAIL="${EMAIL:-${FOXY_EMAIL:-$EMAIL}}"
   PASSWORD="${PASSWORD:-${FOXY_PASS:-$PASSWORD}}"
+}
+
+# The account a stored session belongs to, so a launch can resume it even when
+# the credentials file is gone; a missing or corrupt session answers nothing.
+stored_email() {
+  [ -f "$TOKEN_FILE" ] || return 0
+  python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("email", ""))' "$TOKEN_FILE" 2>/dev/null || true
+}
+
+same_stored_account() {
+  local stored
+  stored="$(stored_email)"
+  [ -n "$stored" ] || return 1
+  [ "$(printf '%s' "$stored" | tr '[:upper:]' '[:lower:]')" = \
+    "$(printf '%s' "$EMAIL" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')" ]
+}
+
+action_logout() {
+  stop_lane 1
+  rm -f "$CFG" "$TOKEN_FILE" "$CREDS"
+  say "signed out: the stored session, the saved account and the lane config are gone."
+  say "the remembered exit stays in $LOCATION_FILE; 'ferrox-cli login' signs in again."
+}
+
+# ---------------------------------------------------------------- locations
+
+# The list is public and needs no account, so it is the binary's catalogue call
+# and not an authenticated one; the last answer is kept for an offline listing.
+action_locations() {
+  local filter rows
+  filter="$(printf '%s' "$LOC_FILTER" | tr '[:lower:]' '[:upper:]')"
+  require_bin
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
+  rows="$("$BIN" edges 2>/dev/null)"
+  if [ -z "$rows" ]; then
+    if [ -s "$LOCATIONS_FILE" ]; then
+      say "the catalogue did not answer; showing the last list it gave ($LOCATIONS_FILE)."
+      rows="$(cat "$LOCATIONS_FILE")"
+    else
+      die "the catalogue did not answer and no list is saved yet: check the network, then run 'ferrox-cli locations' again."
+    fi
+  else
+    ( umask 077; printf '%s\n' "$rows" >"$LOCATIONS_FILE" )
+  fi
+  printf '%s\n' "$rows" | python3 - "$filter" "$(remembered_country)" "$(remembered_city)" "$LOCATIONS_FILE" <<'PY'
+import json, sys
+
+wanted, current_country, current_city, saved = sys.argv[1:5]
+places = {}
+total = 0
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        edge = json.loads(line)
+    except ValueError:
+        continue
+    country = str(edge.get("country") or "").upper()
+    city = str(edge.get("city") or "").upper()
+    if not country:
+        continue
+    if wanted and country != wanted:
+        continue
+    cities = places.setdefault(country, {})
+    cities[city] = cities.get(city, 0) + 1
+    total += 1
+if not places:
+    if wanted:
+        print(f"{wanted} is not in the published catalogue; run 'ferrox-cli locations' for every country it lists.")
+    else:
+        print("the catalogue listed no dialable edge just now; the lane would refuse every country.")
+    sys.exit(1)
+print(f"exit locations from Mozilla's catalogue: {len(places)} countries, {total} edges")
+print("country and city are the codes --country and --city take; * is what this machine remembers.")
+for country in sorted(places, key=lambda code: (code != "REC", code)):
+    cities = places[country]
+    mark = "*" if country == current_country else " "
+    print(f" {mark} {country:<4} {sum(cities.values()):>3} edges")
+    for city in sorted(cities, key=lambda code: (code == "", code)):
+        star = "*" if country == current_country and city == current_city else " "
+        print(f"   {star}   {(city or 'any'):<6} {cities[city]:>3}")
+print()
+print("remember one:  ferrox-cli location <CC> [CITY]")
+print(f"the list is saved in {saved}")
+PY
+}
+
+action_location() {
+  local country city
+  country="$(printf '%s' "$LOC_COUNTRY" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+  city="$(printf '%s' "$LOC_CITY" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+  [ -n "$country" ] || die "usage: ferrox-cli location <CC> [CITY]   (see 'ferrox-cli locations')"
+  if [ -s "$LOCATIONS_FILE" ] && ! grep -qiF "\"country\":\"$country\"" "$LOCATIONS_FILE"; then
+    die "'$country' is not in the saved catalogue list; run 'ferrox-cli locations' to refresh it, or pick a code it prints."
+  fi
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
+  ( umask 077; printf '%s %s\n' "$country" "$city" >"$LOCATION_FILE" )
+  if [ -n "$city" ]; then
+    say "exit remembered: $country / $city. The next 'up --foxy' moves there."
+  else
+    say "exit remembered: $country (its catalogue order picks the city). The next 'up --foxy' moves there."
+  fi
 }
 
 # ---------------------------------------------------------------- config files
@@ -230,13 +361,17 @@ PY
 }
 
 foxy_outbound() {
-  python3 - "$EMAIL" "$PASSWORD" "$CODE" "$COUNTRY" "$CITY" "$CARRIER" "$UPSTREAM" <<'PY'
+  python3 - "$EMAIL" "$PASSWORD" "$CODE" "$COUNTRY" "$CITY" "$CARRIER" "$UPSTREAM" "$TOKEN_FILE" <<'PY'
 import json, sys
 
-email, password, code, country, city, carrier, upstream = sys.argv[1:8]
+email, password, code, country, city, carrier, upstream, token_file = sys.argv[1:9]
 # The account, not a minted pass: the pass the edge accepts lives 600 seconds,
 # so a lane handed a bare token cannot renew it and dies when it expires.
 settings = {"email": email, "password": password, "country": country.upper(), "carrier": carrier}
+# The session the first sign-in leaves: later launches mint from it instead of
+# signing in again, which is what keeps FxA from mailing a new-sign-in notice.
+if token_file:
+    settings["tokenFile"] = token_file
 if city:
     settings["city"] = city.upper()
 if upstream:
@@ -245,6 +380,46 @@ if code:
     settings["code"] = code
 print(json.dumps({"protocol": "foxy", "settings": settings}))
 PY
+}
+
+# ---------------------------------------------------------------- locations
+
+# The remembered exit fills only the flags nobody typed: a country typed now
+# starts from that country's own edges, so a city remembered for another one is dropped.
+load_foxy_location() {
+  [ -f "$LOCATION_FILE" ] || return 0
+  [ "$COUNTRY_SET" = 1 ] && return 0
+  local country city
+  IFS=' ' read -r country city < "$LOCATION_FILE" || true
+  [ -n "$country" ] || return 0
+  COUNTRY="$country"
+  if [ "$CITY_SET" = 0 ] && [ -n "$city" ]; then CITY="$city"; fi
+  return 0
+}
+
+save_foxy_location() {
+  [ -n "$COUNTRY" ] || return 0
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
+  (
+    umask 077
+    printf '%s %s\n' \
+      "$(printf '%s' "$COUNTRY" | tr '[:lower:]' '[:upper:]')" \
+      "$(printf '%s' "$CITY" | tr '[:lower:]' '[:upper:]')" >"$LOCATION_FILE"
+  )
+}
+
+remembered_country() {
+  [ -f "$LOCATION_FILE" ] || return 0
+  local country _city
+  IFS=' ' read -r country _city < "$LOCATION_FILE" || true
+  printf '%s' "$country"
+}
+
+remembered_city() {
+  [ -f "$LOCATION_FILE" ] || return 0
+  local _country city
+  IFS=' ' read -r _country city < "$LOCATION_FILE" || true
+  printf '%s' "$city"
 }
 
 # --region wins, --country is the alias, and an empty answer means the plane picks.
@@ -535,9 +710,11 @@ build_config() {
   case "$OUTBOUND" in
     foxy)
       read_credentials
-      # No stored account and a terminal to type in: ask right here, so the one
-      # command the user typed is the one command that gets connected.
-      if [ -z "$EMAIL" ] || [ -z "$PASSWORD" ]; then
+      load_foxy_location
+      # A session already signed in is the account: the credentials file only
+      # has to exist for the first sign-in, and a resume needs no password.
+      if [ -z "$EMAIL" ]; then EMAIL="$(stored_email)"; fi
+      if [ -z "$EMAIL" ] || { [ -z "$PASSWORD" ] && ! same_stored_account; }; then
         [ -t 0 ] || die "no account: run 'ferrox-cli login' first, or pass --email and --password"
         say "Foxy needs a Firefox account — an email and a password, no server to name."
         LOGIN_QUIET=1 action_login
@@ -545,6 +722,7 @@ build_config() {
         read_credentials
       fi
       outbound="$(foxy_outbound)" || die "cannot build the foxy outbound"
+      save_foxy_location
       ;;
     vless)
       case "$VLESS" in
@@ -773,7 +951,7 @@ verify_flow() {
       say "pool can route elsewhere, so the front is carrying the flow either way."
     fi
   fi
-  if [ "$OUTBOUND" = foxy ] && [ "$got" != "$want" ]; then
+  if [ "$OUTBOUND" = foxy ] && [ "$want" != REC ] && [ "$got" != "$want" ]; then
     say "the exit reads ${got:-unreadable}, not the pinned $want: that is either another"
     say "country's edge or this machine's own address, so the lane is not carrying it."
     diagnose
@@ -846,6 +1024,7 @@ action_serve() {
 action_status() {
   if ! lane_running; then
     say "lane not running."
+    [ -f "$TOKEN_FILE" ] && say "foxy session stored in $TOKEN_FILE: the next up --foxy resumes it without a sign-in mail."
     return 1
   fi
   say "lane pid $(lane_pid), fronts:"
@@ -925,7 +1104,29 @@ EOF
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    up|serve|down|status|ports|tun|login|version) ACTION="$1"; shift ;;
+    up|serve|down|status|ports|tun|login|logout|version) ACTION="$1"; shift ;;
+    locations)
+      ACTION=locations; shift
+      if [ $# -gt 0 ]; then
+        case "$1" in
+          -*) ;;
+          *) LOC_FILTER="$1"; shift ;;
+        esac
+      fi ;;
+    location)
+      ACTION=location; shift
+      if [ $# -gt 0 ]; then
+        case "$1" in
+          -*) ;;
+          *) LOC_COUNTRY="$1"; shift ;;
+        esac
+      fi
+      if [ $# -gt 0 ]; then
+        case "$1" in
+          -*) ;;
+          *) LOC_CITY="$1"; shift ;;
+        esac
+      fi ;;
     --foxy) OUTBOUND=foxy; shift ;;
     --veepn) OUTBOUND=veepn; shift ;;
     --vless) need_value --vless "a vless:// share link" "$#" "${2:-}"; OUTBOUND=vless; VLESS="$2"; shift 2 ;;
@@ -943,7 +1144,7 @@ while [ $# -gt 0 ]; do
     --region) need_value --region "a region id" "$#" "${2:-}"; REGION="$2"; shift 2 ;;
     --domains) need_value --domains "comma-separated origins" "$#" "${2:-}"; VEEPN_DOMAINS="$2"; shift 2 ;;
     --udid) need_value --udid "a device id" "$#" "${2:-}"; VEEPN_UDID="$2"; shift 2 ;;
-    --city) need_value --city "a city code" "$#" "${2:-}"; CITY="$2"; shift 2 ;;
+    --city) need_value --city "a city code" "$#" "${2:-}"; CITY="$2"; CITY_SET=1; shift 2 ;;
     --carrier)
       need_value --carrier "auto, h1, h2 or h3" "$#" "${2:-}"
       case "$2" in
@@ -989,7 +1190,10 @@ case "$ACTION" in
   up) action_up ;;
   serve) action_serve ;;
   login) action_login ;;
-  down) stop_lane 1; rm -f "$CFG"; say "lane stopped; the lane config is removed." ;;
+  logout) action_logout ;;
+  locations) action_locations ;;
+  location) action_location ;;
+  down) stop_lane 1; rm -f "$CFG"; say "lane stopped; the lane config is removed. The stored foxy session is kept; 'ferrox-cli logout' forgets it." ;;
   status) action_status ;;
   ports) action_ports ;;
   tun) action_tun ;;

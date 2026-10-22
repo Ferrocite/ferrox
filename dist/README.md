@@ -4,7 +4,7 @@ Three files, no installer: the binary, the one-command CLI (`ferrox-cli.sh`), an
 
 ```
 ferrox-app            the lane engine: serves SOCKS5/HTTP/mixed fronts, dials every implemented lane
-ferrox-cli.sh         login, up, down, status, ports, version — the only command you need
+ferrox-cli.sh         login, up, down, status, ports, locations, version — the only command you need
 USAGE.md              the manual: every lane, every port, what to do when it does not work
 ```
 
@@ -20,12 +20,22 @@ cd ferrox-*-aarch64-apple-darwin
 ./ferrox-cli.sh down               # stop and clear the system proxy
 ```
 
-The answer is stored once, in `~/.config/ferrox/credentials`, mode 0600, outside every repository; a copy inside a git repository is refused on purpose. Later runs read it silently and never ask again. Prefer to save it up front, or pass it non-interactively:
+The answer is stored once, in `~/.config/ferrox/credentials`, mode 0600, outside every repository; a copy inside a git repository is refused on purpose. Later runs read it silently and never ask again. The first launch also saves the FxA session it signed in with — access token, refresh token, account — to `~/.config/ferrox/foxy-token.json` (0600), so every launch after it resumes that grant instead of calling `/account/login`: Mozilla sends one new-sign-in mail, not one per connect, and the password is only asked for again when the plane refuses the grant. The browser challenge is solved locally. Prefer to save the account up front, or pass it non-interactively:
 
 ```bash
 ./ferrox-cli.sh login --email you@example.com   # prompts for the password, hidden
 ./ferrox-cli.sh login --email you@example.com --password 'the-password'
 ./ferrox-cli.sh up --foxy --country DE          # any exit country, no --vpn for ports-only
+./ferrox-cli.sh logout                          # forget the account and the saved session
+```
+
+Pick an exit before connecting — the catalogue is public, so this needs no account:
+
+```bash
+./ferrox-cli.sh locations           # every country and its cities, remembered one marked *
+./ferrox-cli.sh locations US        # one country in detail
+./ferrox-cli.sh location DE         # remember Germany for every up
+./ferrox-cli.sh location US SFO     # remember a country and a city
 ```
 
 `up` prints the port map, then proves one real flow through a front before it routes anything: a lane that carries nothing never takes the machine's traffic with it. If it says NOT CONNECTED it also prints why, from the lane's own log, with the fix to run.

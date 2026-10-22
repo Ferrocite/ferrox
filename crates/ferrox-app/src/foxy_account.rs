@@ -87,6 +87,113 @@ impl Auth {
     }
 }
 
+/// The grant one process leaves the next, and a sign-in stopped at two-factor, so a password is asked for once rather than per launch.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Session {
+    pub(crate) email: String,
+    pub(crate) auth: Option<Auth>,
+    pub(crate) pending: Option<String>,
+}
+
+/// The one file that spares a launch FxA's sign-in: the email it belongs to is stored with the grant, so a different account never resumes the last one's session.
+#[derive(Debug, Clone)]
+pub(crate) struct TokenFile {
+    path: std::path::PathBuf,
+    email: String,
+}
+
+impl TokenFile {
+    #[must_use]
+    pub(crate) fn new(path: &str, email: &str) -> Option<Self> {
+        let email = normalize_identity(email);
+        // A grant is bound to the account it was written for: a file with no account to bind it to is a sign-in, not a resume.
+        (!path.is_empty() && !email.is_empty()).then(|| Self {
+            path: std::path::PathBuf::from(path),
+            email,
+        })
+    }
+
+    /// A file for another account, an unreadable file and a file with neither a grant nor a pending sign-in all read as no session.
+    pub(crate) fn load(&self) -> Option<Session> {
+        let text = std::fs::read_to_string(&self.path).ok()?;
+        let doc = crate::json::parse(&text).ok()?;
+        let field = |key: &str| {
+            doc.get(key)
+                .and_then(crate::json::Json::as_str)
+                .map(str::to_owned)
+        };
+        let email = field("email").unwrap_or_default();
+        if !email.eq_ignore_ascii_case(&self.email) {
+            return None;
+        }
+        let access = field("access_token").filter(|token| !token.is_empty());
+        let refresh = field("refresh_token").filter(|token| !token.is_empty());
+        let auth = (access.is_some() || refresh.is_some()).then(|| Auth {
+            access_token: access.unwrap_or_default(),
+            refresh_token: refresh.unwrap_or_default(),
+            expires_at: doc
+                .get("expires_at")
+                .and_then(crate::json::Json::as_u32)
+                .map_or(0, u64::from),
+        });
+        let pending = field("pending_session").filter(|session| !session.is_empty());
+        (auth.is_some() || pending.is_some()).then_some(Session {
+            email,
+            auth,
+            pending,
+        })
+    }
+
+    /// Best-effort and owner-only: a session that cannot be written costs the next launch a sign-in, which is a line, not a failed lane.
+    pub(crate) fn save(&self, auth: Option<&Auth>, pending: Option<&str>) {
+        use crate::json::{self, Json};
+        if let Some(dir) = self.path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let mut pairs = vec![("email".to_owned(), Json::Str(self.email.clone()))];
+        if let Some(auth) = auth {
+            pairs.push((
+                "access_token".to_owned(),
+                Json::Str(auth.access_token.clone()),
+            ));
+            pairs.push((
+                "refresh_token".to_owned(),
+                Json::Str(auth.refresh_token.clone()),
+            ));
+            pairs.push(("expires_at".to_owned(), Json::Num(auth.expires_at as f64)));
+        }
+        if let Some(pending) = pending {
+            pairs.push(("pending_session".to_owned(), Json::Str(pending.to_owned())));
+        }
+        let mut text = String::new();
+        json::write(&Json::Obj(pairs), &mut text);
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let Ok(mut file) = options.open(&self.path) else {
+            eprintln!("foxy: cannot write the session to {}", self.path.display());
+            return;
+        };
+        if file.write_all(text.as_bytes()).is_err() {
+            eprintln!("foxy: cannot write the session to {}", self.path.display());
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+    }
+
+    pub(crate) fn clear(&self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// A response with head and body already split: a chunked body cannot be read until the head is off.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Reply {
@@ -505,6 +612,10 @@ pub(crate) fn token(
     if let Some(denied) = reply.denied() {
         return Err(denied);
     }
+    // A refresh grant FxA refuses outright is dead, not a plane to ask again: 400 joins the 401/403s that mean sign-in.
+    if session_token.is_none() && reply.status == 400 {
+        return Err(Denied::Token);
+    }
     if reply.status != 200 {
         return Err(Denied::Other(reply.status));
     }
@@ -863,6 +974,8 @@ pub(crate) struct Account {
     pub(crate) jar: std::sync::Arc<Mutex<Jar>>,
     pub(crate) auth: std::sync::Arc<std::sync::Mutex<Auth>>,
     pub(crate) pass: std::sync::Arc<std::sync::Mutex<Pass>>,
+    /// Where the grant is kept between launches; none is a lane that signs in every time.
+    pub(crate) tokens: Option<TokenFile>,
 }
 
 pub(crate) fn epoch() -> u64 {
@@ -884,15 +997,85 @@ impl Account {
         let (session, verified) = login(&self.fxa, &self.jar, email, password)?;
         if !verified {
             *self.pending.lock().map_err(|_| Denied::Token)? = Some(session);
+            self.persist();
             return Ok(());
         }
         self.exchange(&session, now)
+    }
+
+    /// Continues from the grant a previous launch stored: a live access token is used, a lapsed one is refreshed, and only a rejected grant reaches the password again.
+    pub(crate) fn resume(&self, session: Session) -> Result<(), Denied> {
+        if let Some(pending) = session.pending {
+            *self.pending.lock().map_err(|_| Denied::Token)? = Some(pending);
+            return Ok(());
+        }
+        let auth = session.auth.ok_or(Denied::Token)?;
+        let current = self.auth.lock().map_err(|_| Denied::Token)?.clone();
+        // A retry keeps the grant a refresh already rotated in, rather than spending the old token a second time.
+        let auth = if !current.access_token.is_empty() && current.valid_at(epoch()) {
+            current
+        } else {
+            *self.auth.lock().map_err(|_| Denied::Token)? = auth.clone();
+            auth
+        };
+        if auth.valid_at(epoch()) {
+            match self.mint(&auth.access_token) {
+                Err(Denied::Token) if !auth.refresh_token.is_empty() => {
+                    self.mint(&self.refresh(&auth)?.access_token)
+                }
+                other => other,
+            }
+        } else if !auth.refresh_token.is_empty() {
+            self.mint(&self.refresh(&auth)?.access_token)
+        } else {
+            Err(Denied::Token)
+        }
+    }
+
+    /// Forgets a grant the plane refused, so the next launch asks for the password instead of replaying a dead token.
+    pub(crate) fn forget(&self) {
+        if let Ok(mut auth) = self.auth.lock() {
+            *auth = Auth {
+                access_token: String::new(),
+                refresh_token: String::new(),
+                expires_at: 0,
+            };
+        }
+        if let Some(tokens) = &self.tokens {
+            tokens.clear();
+        }
+    }
+
+    /// Sets the new grant before minting so a refresh that is written but not yet used still renews the next launch.
+    fn refresh(&self, stale: &Auth) -> Result<Auth, Denied> {
+        let fresh = token(
+            &self.fxa,
+            &self.jar,
+            None,
+            Some(&stale.refresh_token),
+            &nonce(),
+            epoch(),
+        )?;
+        *self.auth.lock().map_err(|_| Denied::Token)? = fresh.clone();
+        self.persist();
+        Ok(fresh)
+    }
+
+    fn persist(&self) {
+        let Some(tokens) = &self.tokens else {
+            return;
+        };
+        let auth = self.auth.lock().ok().map(|auth| auth.clone());
+        let pending = self.pending.lock().ok().and_then(|pending| pending.clone());
+        tokens.save(auth.as_ref(), pending.as_deref());
     }
 
     /// Turns a session token into an access token and mints the first pass.
     fn exchange(&self, session: &str, now: u64) -> Result<(), Denied> {
         let auth = token(&self.fxa, &self.jar, Some(session), None, &nonce(), now)?;
         *self.auth.lock().map_err(|_| Denied::Token)? = auth.clone();
+        *self.pending.lock().map_err(|_| Denied::Token)? = None;
+        self.persist();
         self.mint(&auth.access_token)
     }
 
@@ -959,18 +1142,7 @@ impl Account {
             .map_or(true, |auth| !auth.valid_at(epoch()));
         let access_token = if stale {
             let current = self.auth.lock().map_err(|_| Denied::Token)?.clone();
-            let now = epoch();
-            let fresh = token(
-                &self.fxa,
-                &self.jar,
-                None,
-                Some(&current.refresh_token),
-                &nonce(),
-                now,
-            )?;
-            let access = fresh.access_token.clone();
-            *self.auth.lock().map_err(|_| Denied::Token)? = fresh;
-            access
+            self.refresh(&current)?.access_token
         } else {
             self.auth
                 .lock()
@@ -1056,6 +1228,7 @@ mod renewal {
                 expires_at: 0,
             })),
             pass: std::sync::Arc::new(std::sync::Mutex::new(pass)),
+            tokens: None,
         }
     }
 
@@ -1286,6 +1459,22 @@ mod loopback {
                 reply(200, &[], &session_answer())
             }
             ("POST", "/v1/oauth/token") => {
+                let body = String::from_utf8_lossy(&seen.body);
+                if body.contains(r#""grant_type":"refresh_token""#) {
+                    assert!(
+                        seen.authorization.is_none(),
+                        "a refresh grant is not Hawk-signed"
+                    );
+                    assert!(
+                        body.contains(r#""refresh_token":"refresh-1""#),
+                        "the stored refresh token is the grant: {body}"
+                    );
+                    return reply(
+                        200,
+                        &[],
+                        r#"{"access_token":"access-2","refresh_token":"refresh-2","expires_in":3600}"#,
+                    );
+                }
                 let auth = seen.authorization.as_deref().unwrap_or_default();
                 assert!(auth.starts_with("Hawk id=\""), "{auth}");
                 assert!(auth.contains("mac=\""), "{auth}");
@@ -1313,11 +1502,10 @@ mod loopback {
                 reply(401, &[], "")
             }
             ("GET", "/api/v1/fpn/token") => {
-                assert_eq!(
-                    seen.authorization.as_deref(),
-                    Some("Bearer access-1"),
-                    "{:?}",
-                    seen.authorization
+                let bearer = seen.authorization.as_deref().unwrap_or_default();
+                assert!(
+                    bearer == "Bearer access-1" || bearer == "Bearer access-2",
+                    "a resumed grant mints with the token it carries: {bearer:?}"
                 );
                 reply(200, &PASS_HEADERS, PASS_BODY)
             }
@@ -1354,11 +1542,22 @@ mod loopback {
                 quota_reset: None,
                 quota_limit: None,
             })),
+            tokens: None,
         }
     }
 
     /// The edge loopback two tests share: a certificate, a port and a listener with the whole plane behind it.
     pub(crate) fn edge() -> (std::net::SocketAddr, ferrox_core::tls::Anchors) {
+        let (address, roots, _rx) = edge_with_log();
+        (address, roots)
+    }
+
+    /// The same edge with its request log, for the turns that prove what was not asked.
+    fn edge_with_log() -> (
+        std::net::SocketAddr,
+        ferrox_core::tls::Anchors,
+        mpsc::Receiver<Seen>,
+    ) {
         let minted = rcgen::generate_simple_self_signed(
             HOSTS
                 .iter()
@@ -1372,11 +1571,12 @@ mod loopback {
             .expect("identity");
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
-        let (tx, _rx) = mpsc::channel();
+        let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || serve(&listener, &root, &tx));
         (
             format!("127.0.0.1:{port}").parse().expect("addr"),
             roots.into(),
+            rx,
         )
     }
 
@@ -1442,6 +1642,209 @@ mod loopback {
             seen.last().map(String::as_str),
             Some("GET /api/v1/fpn/token")
         );
+    }
+
+    /// An edge with its request log, for the turns that prove what was not asked.
+    fn edge_with_log() -> (
+        std::net::SocketAddr,
+        ferrox_core::tls::Anchors,
+        mpsc::Receiver<Seen>,
+    ) {
+        let minted = rcgen::generate_simple_self_signed(
+            HOSTS
+                .iter()
+                .map(|h| (*h).to_owned())
+                .collect::<Vec<String>>(),
+        )
+        .expect("mints");
+        let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
+        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
+        let root = ferrox_core::tls::parse_pem_identity(minted.cert.pem().as_bytes(), &key_pem)
+            .expect("identity");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || serve(&listener, &root, &tx));
+        (
+            format!("127.0.0.1:{port}").parse().expect("addr"),
+            roots.into(),
+            rx,
+        )
+    }
+
+    fn token_path(label: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "ferrox-foxy-token-{}-{label}.json",
+            std::process::id()
+        ))
+    }
+
+    fn seen(rx: &mpsc::Receiver<Seen>) -> Vec<String> {
+        rx.try_iter()
+            .map(|s| format!("{} {}", s.method, s.path))
+            .collect()
+    }
+
+    /// The point of the file: a second launch mints from the stored grant and never asks FxA to sign in.
+    #[test]
+    fn a_stored_grant_mints_a_pass_without_a_sign_in() {
+        let _turn = EDGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        TWO_FACTOR.store(false, std::sync::atomic::Ordering::Relaxed);
+        ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (address, roots, rx) = edge_with_log();
+        let path = token_path("resume");
+        let tokens =
+            TokenFile::new(path.to_str().expect("utf-8"), "Person@Example.com").expect("bound");
+        tokens.save(
+            Some(&Auth {
+                access_token: "access-1".to_owned(),
+                refresh_token: "refresh-1".to_owned(),
+                expires_at: epoch() + 3_600,
+            }),
+            None,
+        );
+        let session = tokens.load().expect("the file reads back");
+        assert_eq!(
+            session.email, "person@example.com",
+            "the identity is stored normalized, so the binding does not depend on casing"
+        );
+        let mut account = account(address, roots);
+        account.tokens = Some(tokens);
+        account.resume(session).expect("resumes");
+        assert!(account.current().token.starts_with("eyJ"), "and mints");
+        let log = seen(&rx);
+        assert!(
+            !log.iter().any(|line| line == "POST /v1/account/login"),
+            "a resumed launch sends no sign-in, which is the mail it must not send: {log:?}"
+        );
+        assert_eq!(
+            log.last().map(String::as_str),
+            Some("GET /api/v1/fpn/token")
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An access token past its window refreshes with the stored grant, and the rotated pair is written for the next launch.
+    #[test]
+    fn a_lapsed_grant_refreshes_and_the_rotated_pair_is_written_down() {
+        let _turn = EDGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        TWO_FACTOR.store(false, std::sync::atomic::Ordering::Relaxed);
+        ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (address, roots, rx) = edge_with_log();
+        let path = token_path("refresh");
+        let tokens =
+            TokenFile::new(path.to_str().expect("utf-8"), "person@example.com").expect("bound");
+        tokens.save(
+            Some(&Auth {
+                access_token: "access-1".to_owned(),
+                refresh_token: "refresh-1".to_owned(),
+                expires_at: 1,
+            }),
+            None,
+        );
+        let session = tokens.load().expect("reads");
+        let mut account = account(address, roots);
+        account.tokens = Some(tokens);
+        account.resume(session).expect("refreshes and mints");
+        assert!(account.current().token.starts_with("eyJ"));
+        let log = seen(&rx);
+        assert!(
+            !log.iter().any(|line| line == "POST /v1/account/login"),
+            "a refresh is not a sign-in: {log:?}"
+        );
+        assert!(
+            log.iter().any(|line| line == "POST /v1/oauth/token"),
+            "the lapsed access token is renewed: {log:?}"
+        );
+        let stored = account
+            .tokens
+            .as_ref()
+            .expect("the file rides the account")
+            .load()
+            .expect("the rotation is written")
+            .auth
+            .expect("and it is a grant");
+        assert_eq!(
+            (stored.access_token.as_str(), stored.refresh_token.as_str()),
+            ("access-2", "refresh-2"),
+            "the refresh token FxA rotated in is the one the next launch spends"
+        );
+        assert!(stored.expires_at > epoch() + 3_000);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A launch that stopped at two-factor resumes the pending session: the code is the only thing it asks for.
+    #[test]
+    fn a_pending_two_factor_session_resumes_without_the_password() {
+        let _turn = EDGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (address, roots, rx) = edge_with_log();
+        let path = token_path("pending");
+        let tokens =
+            TokenFile::new(path.to_str().expect("utf-8"), "person@example.com").expect("bound");
+        tokens.save(None, Some(SESSION));
+        let session = tokens.load().expect("reads");
+        let mut account = account(address, roots);
+        account.tokens = Some(tokens);
+        account.resume(session).expect("resumes");
+        assert!(
+            account.needs_code(),
+            "the pending session waits for its code"
+        );
+        account.verify_code("424242").expect("verifies");
+        assert!(!account.needs_code(), "the code clears the wait");
+        assert!(account.current().token.starts_with("eyJ"), "and mints");
+        let log = seen(&rx);
+        assert!(
+            !log.iter().any(|line| line == "POST /v1/account/login"),
+            "the password is not asked for again: {log:?}"
+        );
+        let stored = account
+            .tokens
+            .as_ref()
+            .expect("the file rides the account")
+            .load()
+            .expect("the exchange is written");
+        assert!(stored.pending.is_none(), "the verified session is done");
+        assert!(stored.auth.is_some(), "and its grant is kept");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A file belongs to the account it names: another identity and an unbound file both read as no session, not someone else's.
+    #[test]
+    fn a_token_file_belongs_to_the_account_it_names() {
+        let path = token_path("binding");
+        let tokens =
+            TokenFile::new(path.to_str().expect("utf-8"), "person@example.com").expect("bound");
+        tokens.save(
+            Some(&Auth {
+                access_token: "access-1".to_owned(),
+                refresh_token: "refresh-1".to_owned(),
+                expires_at: epoch() + 3_600,
+            }),
+            None,
+        );
+        let other =
+            TokenFile::new(path.to_str().expect("utf-8"), "someone@example.com").expect("bound");
+        assert!(
+            other.load().is_none(),
+            "another account's grant is never resumed for this one"
+        );
+        assert!(
+            TokenFile::new("", "person@example.com").is_none(),
+            "no path is no file"
+        );
+        assert!(
+            TokenFile::new(path.to_str().expect("utf-8"), " ").is_none(),
+            "no account is no binding"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
 

@@ -60,6 +60,9 @@ fn usage() -> ! {
     eprintln!("  ferrox-app -config=<file|stdin:> [-format=json|pb]   same, xray's own invocation");
     eprintln!("  ferrox-app mint-foxy-pass -c <config.json> -o <pass.json>");
     eprintln!("                                sign in once, store the proxy pass (0600)");
+    eprintln!(
+        "  ferrox-app edges                  list the catalogue's published edges as JSON rows"
+    );
     std::process::exit(2);
 }
 
@@ -200,15 +203,18 @@ fn main() {
             proxy::mint_foxy_pass(&config, &out);
         }
         "edges" => {
-            let next = args.next().unwrap_or_else(|| usage());
-            if next != "-c" && next != "-config" {
-                usage();
+            // A config is accepted and ignored for the spelling the docs already carry: the catalogue needs no lane.
+            match args.next().as_deref() {
+                None => {}
+                Some("-c" | "-config") => {
+                    args.next().unwrap_or_else(|| usage());
+                }
+                Some(_) => usage(),
             }
-            let config = args.next().unwrap_or_else(|| usage());
             if args.next().is_some() {
                 usage();
             }
-            proxy::print_foxy_edges(&config);
+            proxy::print_foxy_edges();
         }
         "x25519" => {
             if args.next().is_some() {

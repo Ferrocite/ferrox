@@ -28,7 +28,23 @@ FOXY_PASS='the-password'
 
 `ferrox-cli` reads it, or `--email` / `--password`, or `FOXY_EMAIL` / `FOXY_PASS` in the environment. A copy inside the repository is refused when git tracks it. Nothing in this tool writes a password into a tracked file, and `/lane.json` and `/pass.json` are ignored.
 
-The lane is handed the account, not a saved token: the pass the edge accepts lives 600 seconds, so a lane given only a pasted token stops carrying when it expires and cannot replace it. Signed in, it renews on its own clock and a lane left running overnight keeps working. The account plane rate-limits logins with `429`, so `up` signs in once and the lane reuses that session's refresh grant.
+The lane is handed the account, not a saved pass: the pass the edge accepts lives 600 seconds, so a lane given only a pasted token stops carrying when it expires and cannot replace it. Signed in, it renews on its own clock and a lane left running overnight keeps working. The account plane rate-limits sign-ins with `429`, so `up` signs in once and the lane reuses that session's refresh grant.
+
+That sign-in is also the only one. The first launch writes the session FxA returned — its access token, its refresh token, the account it belongs to, and a two-factor sign-in that has not been verified yet — to `~/.config/ferrox/foxy-token.json`, mode 0600, outside the repository. Every launch after it resumes that grant: a live access token mints the pass with no sign-in at all, a lapsed one is refreshed in place, and the password only reaches FxA when the plane refuses the grant (or `logout` or `login` removed it). That is why Mozilla sends a new-sign-in mail on the first launch and not on the rest: no `/account/login` request is made. The browser challenge, when the plane asks for one, is solved locally by the binary, so it never waits for a person. `ferrox-cli logout` stops the lane and removes the session, the saved account and the lane config; `ferrox-cli login` replaces the account and clears the old session.
+
+## 1b. Choosing an exit
+
+The catalogue is public and unauthenticated, so the location list needs no account:
+
+```bash
+./dist/ferrox-cli.sh locations              # every country, and the cities each one publishes
+./dist/ferrox-cli.sh locations US           # one country in detail
+./dist/ferrox-cli.sh location DE            # remember Germany for every up
+./dist/ferrox-cli.sh location US SFO        # remember a country and a city
+./dist/ferrox-cli.sh up --foxy --vpn        # connects to the remembered exit
+```
+
+The list prints one line per country and one per city with the number of published edges, marks the remembered choice with `*`, and keeps the raw JSON rows in `~/.config/ferrox/foxy-locations.jsonl`; when the catalogue cannot be reached, the last copy is what `locations` prints. `--country` and `--city` still win over the remembered exit for one launch and become the new remembered one. `REC` is the catalogue's recommended country: it picks the exit Mozilla considers best and verification accepts whichever country that edge reports.
 
 ## 2. Connect (CLI)
 
@@ -128,6 +144,7 @@ Drag `dist/Ferrox.app` to `/Applications` to keep it. It is ad-hoc signed, so th
 | --- | --- |
 | `lane up`, then "no flow got through" with `429` in the log | the account plane is rate-limiting sign-ins; wait it out, a second login does not buy bytes back |
 | same, with `did not sign in` | the account or password is refused, or the account wants a two-factor code: `up --foxy --code 123456` |
+| same, with `the stored session was refused` | the saved grant was revoked or expired and the password fallback is not there: `ferrox-cli login --email you@example.com`, or delete `~/.config/ferrox/foxy-token.json` |
 | same, with `401`/`403` after a sign-in that worked | the edge refuses this account's pass at this exit: the subscription or its devices say otherwise; try `--country`, and check the account on vpn.mozilla.org |
 | same, with "the TLS handshake with the edge failed" | this network blocks TLS to `*.fastly-masque.net:2499`; see below |
 | `the lane did not open its fronts` | the port is taken (`lsof -nP -iTCP:8080`), the config names an inbound this binary refuses, or its `settings.pass` is past its `exp` and nothing can replace it |
