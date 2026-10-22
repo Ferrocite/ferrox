@@ -2,13 +2,16 @@
 
 Row 23: the `http`/`mixed` inbound answers a client (front), and the `http` outbound tunnels through an upstream proxy (hop). Both roles speak the same one-line grammar — a `CONNECT authority HTTP/1.1` to open a tunnel, an absolute-URI or origin-form head to forward a plain request — and both now pay for it in the caller's own buffer: the front's grant is one static byte string, the hop's CONNECT request is built with zero staging allocations, and a head that is already origin-form reaches the uplink where it landed.
 
+A front whose settings name `accounts` (or `users`) demands `Proxy-Authorization: Basic` and answers a missing or unknown credential in xray's own 407 head; the credential is consumed before the head leaves for the origin, and the `mixed` front lends the same accounts its SOCKS side carries, which is what xray's socks server does (`server.go:44-50`).
+
 ## Data path
 
 ```mermaid
 graph TD
     C["client: CONNECT, absolute-URI GET,<br/>or origin-form GET"] --> S["serve_http: read the head, split the request line once"]
-    S --> G["grant: one static byte string per front"]
-    S --> O["forward: origin-form head moves untouched,<br/>absolute-form rewrites the line only"]
+    S --> A["front names accounts: Basic credential checked,<br/>refused in xray's 407 bytes"]
+    A --> G["grant: one static byte string per front"]
+    A --> O["forward: origin-form head moves untouched,<br/>absolute-form rewrites the line only"]
     S --> X["dial_http_outbound: CONNECT built in the caller's buffer,<br/>authority pushed once, Host duplicated in place"]
     X --> Z["0 staging buffers per hop<br/>1 copy per byte, the relay's own"]
 ```
@@ -69,6 +72,6 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 
 <!-- scope:begin -->
 - paths: -
-- symbols: serve_http, http_proxy, http_proxy_request, http_request_parses, http_connect, connect_request, connect_grant, connect_authority, origin_head, origin_form, grant_line, direct_grant, SOCKS_GRANTED, authority_len, push_authority, authority_target, http_outbound
+- symbols: serve_http, http_proxy, http_proxy_request, http_request_parses, http_connect, connect_request, connect_grant, connect_authority, origin_head, origin_form, grant_line, direct_grant, SOCKS_GRANTED, authority_len, push_authority, authority_target, http_outbound, http_accounts, http_credential_accepted, drop_header, HTTP_AUTH_REQUIRED
 - go: ./proxy/http/...
 <!-- scope:end -->
