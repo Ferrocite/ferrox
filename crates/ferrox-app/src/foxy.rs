@@ -6653,7 +6653,7 @@ pub(crate) mod loopback {
         }
         let held = match &lane {
             Ip::H2(inner) => inner.capsule_buf.len(),
-            _ => unreachable!("an h2 dial opens an h2 lane"),
+            Ip::H3(_) => unreachable!("an h2 dial opens an h2 lane"),
         };
         assert!(
             held <= DATAGRAM_BUF_MAX,
