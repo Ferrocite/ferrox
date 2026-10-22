@@ -9350,6 +9350,7 @@ pub(crate) const RELAY_SMALL_BUFFER: usize = 16 * 1024;
 /// `read` takes the whole buffer and only the reported prefix escapes; no `Debug`, which would read uninit bytes.
 pub(crate) struct RelayBuf {
     bytes: Vec<u8>,
+    moved: usize,
 }
 
 impl RelayBuf {
@@ -9368,7 +9369,7 @@ impl RelayBuf {
         let mut bytes = Vec::with_capacity(len);
         // SAFETY: only the prefix a read reports is ever read back, so the uninitialised tail is unreachable.
         unsafe { bytes.set_len(len) };
-        Self { bytes }
+        Self { bytes, moved: 0 }
     }
 
     #[must_use]
@@ -9382,13 +9383,16 @@ impl RelayBuf {
         self.bytes
     }
 
+    /// A read that filled the window promotes at once, and a leg whose reads are all short promotes once it has moved a whole window: `recv` returns what is queued rather than what was asked, so a busy leg would otherwise stay at 16 KiB for the life of the flow.
     #[must_use]
     #[allow(
         clippy::uninit_vec,
         reason = "the room a promotion adds lies past the bytes the read reported, and the next read starts at index 0"
     )]
     pub fn filled(&mut self, n: usize) -> &[u8] {
-        if n == self.bytes.len() && n < RELAY_BUFFER {
+        self.moved = self.moved.saturating_add(n);
+        if self.bytes.len() < RELAY_BUFFER && (n == self.bytes.len() || self.moved >= RELAY_BUFFER)
+        {
             self.bytes.reserve(RELAY_BUFFER - self.bytes.len());
             // SAFETY: added room sits past the prefix and the next read overwrites it from index 0.
             unsafe { self.bytes.set_len(RELAY_BUFFER) };
@@ -13845,18 +13849,41 @@ mod tests {
         );
     }
 
+    /// A `recv` returns what is queued, not what was asked, so a busy leg's reads can stay short for the life of a flow: it must promote once it has moved a whole window, or every read of a bulk transfer stays at 16 KiB.
     #[test]
-    fn a_relay_buffer_promotes_only_on_a_read_that_filled_it() {
+    fn a_relay_buffer_promotes_once_a_whole_window_has_moved() {
         let mut buffer = RelayBuf::new();
-        assert_eq!(buffer.size(), RELAY_SMALL_BUFFER);
-
-        for round in 0..64u8 {
-            buffer.as_mut().fill(round);
-            let short = buffer.filled(RELAY_SMALL_BUFFER - 1);
-            assert_eq!(short.len(), RELAY_SMALL_BUFFER - 1);
-            assert_eq!(buffer.size(), RELAY_SMALL_BUFFER, "a short read promoted");
+        let short = RELAY_SMALL_BUFFER - 1;
+        let window = (RELAY_BUFFER - 1) / short;
+        for _ in 0..window {
+            assert_eq!(buffer.filled(short).len(), short);
         }
+        assert_eq!(
+            buffer.size(),
+            RELAY_SMALL_BUFFER,
+            "{window} short reads moved {} bytes, one short of a relay window",
+            window * short
+        );
 
+        assert_eq!(buffer.filled(short).len(), short);
+        assert_eq!(
+            buffer.size(),
+            RELAY_BUFFER,
+            "the read that moved a whole window did not promote"
+        );
+
+        let mut small = RelayBuf::new();
+        assert_eq!(small.filled(1).len(), 1);
+        assert_eq!(
+            small.size(),
+            RELAY_SMALL_BUFFER,
+            "a one-byte flow paid for a relay window"
+        );
+    }
+
+    #[test]
+    fn a_read_that_fills_the_window_promotes_it_at_once() {
+        let mut buffer = RelayBuf::new();
         buffer.as_mut().fill(0xff);
         assert_eq!(buffer.filled(RELAY_SMALL_BUFFER).len(), RELAY_SMALL_BUFFER);
         assert_eq!(buffer.size(), RELAY_BUFFER, "a full read did not promote");
