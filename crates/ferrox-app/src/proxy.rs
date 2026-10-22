@@ -9981,15 +9981,47 @@ impl FrameWrite for Connection {
     }
 }
 
+/// The plaintext one TLS record carries. A carrier frames what a relay handed it, and a window larger than this goes to the session as record-sized pieces rather than as one payload no session buffer holds.
+const SESSION_WINDOW: usize = 16 * 1024;
+
+/// Offer `parts` to `write` in windows of at most [`SESSION_WINDOW`], in order and without a copy: a window is a run of subslices of the caller's parts, so a frame of any size leaves the session as the records it would have taken had each window been a frame of its own.
+fn write_windows<F>(parts: &[&[u8]], mut write: F) -> bool
+where
+    F: FnMut(&[&[u8]]) -> bool,
+{
+    const PARTS: usize = 8;
+    let mut window: [&[u8]; PARTS] = [&[]; PARTS];
+    let mut kept = 0usize;
+    let mut room = SESSION_WINDOW;
+    for part in parts.iter().copied().filter(|part| !part.is_empty()) {
+        let mut left = part;
+        while !left.is_empty() {
+            let take = left.len().min(room);
+            window[kept] = &left[..take];
+            kept += 1;
+            room -= take;
+            left = &left[take..];
+            if room == 0 || kept == PARTS {
+                if !write(&window[..kept]) {
+                    return false;
+                }
+                kept = 0;
+                room = SESSION_WINDOW;
+            }
+        }
+    }
+    kept == 0 || write(&window[..kept])
+}
+
 impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send> FrameWrite
     for TlsHalf<S>
 {
-    // One lock, one call: every part of the frame reaches the session as segments of one payload, so it seals one record where a write per part sealed one each.
+    // One lock, a window per record: every part of a window reaches the session as segments of one payload, so it seals one record where a write per part sealed one each, and a frame larger than a record is cut rather than handed over as a payload the session cannot hold.
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
         let Ok(mut session) = self.session.lock() else {
             return false;
         };
-        session.write_all_slices(parts).is_ok()
+        write_windows(parts, |window| session.write_all_slices(window).is_ok())
     }
 }
 
@@ -10049,7 +10081,7 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
                     if first {
                         echo_trace("relay fwd sending");
                     }
-                    let sent = uplink.send(&buf.as_mut()[..n]);
+                    let sent = uplink.send(buf.filled(n));
                     if first {
                         echo_trace("relay fwd sent");
                     }
@@ -10129,7 +10161,7 @@ fn carry_upload<R: Read>(
                     crate::census::handle(peer_write),
                     Some(stall)
                 );
-                if peer_write.write_all(&buf.as_mut()[..n]).is_err() {
+                if peer_write.write_all(buf.filled(n)).is_err() {
                     echo_trace("relay bwd peer write failed");
                     break;
                 }
@@ -10192,7 +10224,7 @@ pub(crate) fn relay_carried<R: Read>(mut reader: R, write: &Connection, peer: &C
             };
             match read {
                 Ok(n) if n > 0 => {
-                    if uplink.write_all(&buf.as_mut()[..n]).is_err() {
+                    if uplink.write_all(buf.filled(n)).is_err() {
                         break;
                     }
                 }
@@ -10216,7 +10248,7 @@ pub(crate) fn relay_carried<R: Read>(mut reader: R, write: &Connection, peer: &C
                     crate::census::handle(&peer_write),
                     Some(stall)
                 );
-                if peer_write.write_all(&buf.as_mut()[..n]).is_err() {
+                if peer_write.write_all(buf.filled(n)).is_err() {
                     break;
                 }
             }
@@ -14116,6 +14148,101 @@ mod tests {
             small.size(),
             RELAY_SMALL_BUFFER,
             "a one-byte flow paid for a relay window"
+        );
+    }
+
+    /// The carrier legs read the window `filled` promotes: while they sliced `as_mut()[..n]` a ws, xhttp or grpc flow relayed in 16 KiB pieces for its whole life, and a read that filled the window never paid off. A leg that moves a window of short reads is handed `RELAY_BUFFER` from then on, and its sends grow with it.
+    #[test]
+    fn a_carrier_leg_reads_the_window_it_promoted() {
+        struct Windowed {
+            left: usize,
+            asked: Arc<Mutex<Vec<usize>>>,
+        }
+        impl std::io::Read for Windowed {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.asked.lock().expect("locks").push(buf.len());
+                let n = buf.len().min(self.left).min(RELAY_SMALL_BUFFER / 4);
+                buf[..n].fill(0x5a);
+                self.left -= n;
+                Ok(n)
+            }
+        }
+        #[derive(Clone, Default)]
+        struct SizedSink {
+            sizes: Arc<Mutex<Vec<usize>>>,
+        }
+        impl CarrierSink for SizedSink {
+            fn send(&self, bytes: &[u8]) -> bool {
+                self.sizes.lock().expect("locks").push(bytes.len());
+                true
+            }
+            fn close(&self) {}
+        }
+
+        let peer = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let peer_port = peer.local_addr().expect("addr").port();
+        let source = thread::spawn(move || {
+            let (mut stream, _) = peer.accept().expect("accepts");
+            let payload = vec![0x5au8; RELAY_BUFFER * 8];
+            stream.write_all(&payload).expect("writes");
+            let _ = stream.shutdown(Shutdown::Write);
+            // Bounded: a relay that forgets its own close must fail this leg, not hang it.
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut back = Vec::new();
+            let _ = stream.read_to_end(&mut back);
+        });
+
+        let sink = SizedSink::default();
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let reader = Windowed {
+            left: RELAY_BUFFER * 2,
+            asked: Arc::clone(&asked),
+        };
+        let uplink = Connection::connect(("127.0.0.1", peer_port)).expect("dials");
+        // Drained, not close-first: the upload leg finishing must not abort the peer's write before the forward leg has drained it.
+        relay_sink_drained(reader, &sink, &uplink);
+        drop(uplink);
+        source.join().expect("joins");
+
+        let asked = asked.lock().expect("locks").clone();
+        assert_eq!(
+            asked.first(),
+            Some(&RELAY_SMALL_BUFFER),
+            "a fresh leg starts at the small window: {asked:?}"
+        );
+        assert!(
+            asked.contains(&RELAY_BUFFER),
+            "the leg that moved a window was handed the promoted one: {asked:?}"
+        );
+        let sent = sink.sizes.lock().expect("locks").clone();
+        assert!(
+            sent.iter().any(|&len| len > RELAY_SMALL_BUFFER),
+            "a send carried more than the small window, so the carrier frames the promoted one: {sent:?}"
+        );
+    }
+
+    /// A session seals one record per window of plaintext, so a frame the promoted relay window produced is cut at the record rather than offered as a payload no session buffer holds — the shape a REALITY ws flow takes when its relay leg promotes.
+    #[test]
+    fn a_carrier_frame_is_offered_in_record_windows() {
+        let data = vec![0x5au8; RELAY_BUFFER];
+        let parts: [&[u8]; 3] = [b"\x00\x01", &data, b"\r\n"];
+        let mut windows: Vec<usize> = Vec::new();
+        let mut total = 0usize;
+        assert!(write_windows(&parts, |window| {
+            let bytes = window.iter().map(|part| part.len()).sum::<usize>();
+            windows.push(bytes);
+            total += bytes;
+            true
+        }));
+        assert_eq!(total, data.len() + 4, "every byte is offered once: {total}");
+        assert!(
+            windows.iter().all(|&bytes| bytes <= SESSION_WINDOW),
+            "no window is larger than a record: {windows:?}"
+        );
+        assert_eq!(
+            windows.len(),
+            total.div_ceil(SESSION_WINDOW),
+            "a frame larger than a record is cut at the record: {windows:?}"
         );
     }
 
