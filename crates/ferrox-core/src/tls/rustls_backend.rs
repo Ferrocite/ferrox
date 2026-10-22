@@ -1385,8 +1385,9 @@ mod tests {
 
     impl Read for ReadCounter {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let n = self.inner.read(buf)?;
+            // Counted before the call: a read that answers `WouldBlock` with nothing in it is the wait these rows name, and counting only reads that returned would hide it.
             self.calls.fetch_add(1, Ordering::Relaxed);
+            let n = self.inner.read(buf)?;
             self.bytes.fetch_add(n, Ordering::Relaxed);
             self.sizes.lock().expect("locks").push(n);
             Ok(n)
@@ -1457,6 +1458,12 @@ mod tests {
         });
     }
 
+    /// The write's half of the same rule, and the zero-length write is its edge: a call that
+    /// queues no record gives `complete_io` nothing to send, which is the state where it reads.
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
     #[test]
     fn a_write_does_not_read_the_transport() {
         let cert_pem = anchor_pem("CERTIFICATE", ANCHOR);
@@ -1489,12 +1496,20 @@ mod tests {
                 sizes: Arc::clone(&sizes),
             };
             let mut client =
-                crate::tls::connect(&client("tls.test", &[]), counter).expect("configures");
+                RustlsProvider::connect(&client("tls.test", &[]), counter).expect("configures");
             client.handshake().expect("handshakes");
+            // The relay's own arm for a shared session, so a read inside the window costs one counted grain rather than a parked thread.
+            client
+                .io
+                .inner
+                .set_read_timeout(Some(std::time::Duration::from_millis(1)))
+                .expect("arms a grain");
             let before = calls.load(Ordering::Relaxed);
             let wrote = client.write(b"payload").expect("writes");
+            let empty = client.write(&[]).expect("an empty write shows nothing");
             let after = calls.load(Ordering::Relaxed);
             assert_eq!(wrote, 7);
+            assert_eq!(empty, 0);
             assert_eq!(
                 after - before,
                 0,
@@ -1529,8 +1544,15 @@ mod tests {
                     bytes: Arc::clone(&bytes),
                     sizes: Arc::clone(&sizes),
                 };
-                let mut server = crate::tls::accept(&identity, counter).expect("accepts");
+                let mut server =
+                    RustlsServerProvider::accept(identity, counter).expect("accepts a session");
                 server.handshake().expect("handshakes");
+                // The relay's own arm for a shared session, so a read inside the window costs one counted grain rather than a parked thread.
+                server
+                    .io
+                    .inner
+                    .set_read_timeout(Some(std::time::Duration::from_millis(1)))
+                    .expect("arms a grain");
                 let before = calls.load(Ordering::Relaxed);
                 server.write_all(b"answer").expect("answers");
                 server.flush().expect("flushes");
