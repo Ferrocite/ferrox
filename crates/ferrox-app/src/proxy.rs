@@ -16786,11 +16786,10 @@ mod tests {
             serve_vless_tls(stream, &id, true, &carrier, &server_config);
             let _ = done_tx.send(());
         });
-        let mut session =
-            ferrox_core::tls::connect(&client_config, Connection::connect(addr).expect("connects"))
-                .expect("opens");
+        let stream = Connection::connect(addr).expect("connects");
+        let out = stream.try_clone().expect("dups the transport");
+        let mut session = ferrox_core::tls::connect(&client_config, stream).expect("opens");
         session.handshake().expect("handshakes");
-        let out = session.get_ref().try_clone().expect("dups the transport");
         let (read, write) = session_halves(session, out);
         let (_reader, _writer) =
             crate::grpc::connect_split(read, write, "127.0.0.1", "/p").expect("dials the head");
