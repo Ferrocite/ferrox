@@ -26505,46 +26505,10 @@ mod tests {
 mod poll_copy {
     use super::{Connection, RelayEnd, Shutdown};
     use std::io::{self, Read, Write};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex, OnceLock};
     use std::time::Duration;
 
     const WINDOW: usize = 64 * 1024;
-
-    #[cfg(test)]
-    static ADVANCES: AtomicUsize = AtomicUsize::new(0);
-    #[cfg(test)]
-    static READ_BYTES: AtomicUsize = AtomicUsize::new(0);
-    #[cfg(test)]
-    static WRITE_BYTES: AtomicUsize = AtomicUsize::new(0);
-    #[cfg(test)]
-    static GIVE_UPS: AtomicUsize = AtomicUsize::new(0);
-    #[cfg(test)]
-    static ERROR_ENDS: AtomicUsize = AtomicUsize::new(0);
-    #[cfg(test)]
-    static WAITS: AtomicUsize = AtomicUsize::new(0);
-    #[cfg(test)]
-    static TIMEOUTS: AtomicUsize = AtomicUsize::new(0);
-    #[cfg(test)]
-    static LAST_BUDGET_MS: AtomicUsize = AtomicUsize::new(0);
-    #[cfg(test)]
-    static LAST_STALLED_MS: AtomicUsize = AtomicUsize::new(0);
-
-    #[cfg(test)]
-    pub(super) fn stats() -> String {
-        format!(
-            "advances {} read {} written {} give-ups {} (last budget {}ms after {}ms) errors {} waits {} timeouts {}",
-            ADVANCES.load(Ordering::Relaxed),
-            READ_BYTES.load(Ordering::Relaxed),
-            WRITE_BYTES.load(Ordering::Relaxed),
-            GIVE_UPS.load(Ordering::Relaxed),
-            LAST_BUDGET_MS.load(Ordering::Relaxed),
-            LAST_STALLED_MS.load(Ordering::Relaxed),
-            ERROR_ENDS.load(Ordering::Relaxed),
-            WAITS.load(Ordering::Relaxed),
-            TIMEOUTS.load(Ordering::Relaxed),
-        )
-    }
 
     #[cfg(unix)]
     type Row = libc::pollfd;
@@ -26805,8 +26769,6 @@ mod poll_copy {
             if self.ended {
                 return;
             }
-            #[cfg(test)]
-            ADVANCES.fetch_add(1, Ordering::Relaxed);
             if self.off == self.filled {
                 self.off = 0;
                 self.filled = 0;
@@ -26818,15 +26780,9 @@ mod poll_copy {
             if self.can_ingest() {
                 match self.src.read(&mut self.bytes[self.filled..]) {
                     Ok(0) => self.src_at_eof = true,
-                    Ok(n) => {
-                        self.filled += n;
-                        #[cfg(test)]
-                        READ_BYTES.fetch_add(n, Ordering::Relaxed);
-                    }
+                    Ok(n) => self.filled += n,
                     Err(error) if would_block(&error) => {}
                     Err(_) => {
-                        #[cfg(test)]
-                        ERROR_ENDS.fetch_add(1, Ordering::Relaxed);
                         self.end();
                         return;
                     }
@@ -26841,16 +26797,12 @@ mod poll_copy {
                     Ok(n) => {
                         self.off += n;
                         self.stalled = None;
-                        #[cfg(test)]
-                        WRITE_BYTES.fetch_add(n, Ordering::Relaxed);
                     }
                     Err(error) if would_block(&error) => {
                         self.stalled.get_or_insert_with(std::time::Instant::now);
                         break;
                     }
                     Err(_) => {
-                        #[cfg(test)]
-                        ERROR_ENDS.fetch_add(1, Ordering::Relaxed);
                         self.end();
                         return;
                     }
@@ -26900,19 +26852,6 @@ mod poll_copy {
         }
 
         fn give_up(&mut self) {
-            #[cfg(test)]
-            if let Some(since) = self
-                .directions
-                .iter()
-                .find_map(|direction| direction.stalled)
-            {
-                GIVE_UPS.fetch_add(1, Ordering::Relaxed);
-                LAST_BUDGET_MS.store(
-                    self.directions[0].stall_budget.as_millis() as usize,
-                    Ordering::Relaxed,
-                );
-                LAST_STALLED_MS.store(since.elapsed().as_millis() as usize, Ordering::Relaxed);
-            }
             for direction in &mut self.directions {
                 direction.abandon();
             }
@@ -27006,13 +26945,7 @@ mod poll_copy {
                     }
                 }
             }
-            #[cfg(test)]
-            WAITS.fetch_add(1, Ordering::Relaxed);
             let answered = wait(&mut rows, timeout);
-            #[cfg(test)]
-            if answered == Some(0) {
-                TIMEOUTS.fetch_add(1, Ordering::Relaxed);
-            }
             for flow in &mut flows {
                 if flow.directions.iter().any(Direction::stalled_for_budget) {
                     flow.give_up();
@@ -27563,16 +27496,6 @@ mod relay_tests {
 
     const PATIENCE: Duration = Duration::from_secs(30);
 
-    #[cfg(not(target_os = "linux"))]
-    fn poll_stats() -> String {
-        super::poll_copy::stats()
-    }
-
-    #[cfg(target_os = "linux")]
-    fn poll_stats() -> String {
-        String::new()
-    }
-
     const REQUEST: &[u8] = b"both ways at once";
     const REPLY: &[u8] = b"and back";
 
@@ -27776,10 +27699,6 @@ mod relay_tests {
         const NEIGHBOURS: usize = 16;
 
         let _guard = budgets::lock();
-        budgets::apply(&crate::config::Budgets {
-            relay_stall: Some(Duration::from_secs(300)),
-            ..Default::default()
-        });
         let stalled_front = listener();
         let stalled_front_port = port_of(&stalled_front);
         let stalled_back = listener();
@@ -27866,11 +27785,9 @@ mod relay_tests {
             "the flows a parked worker was holding never closed with it"
         );
         assert_eq!(
-            held,
-            pushed,
+            held, pushed,
             "the stalled flow did not carry everything its client managed to write ({pushed} \
-             bytes) once its destination read again ({held} drained); {}",
-            poll_stats()
+             bytes) once its destination read again ({held} drained)"
         );
         stalled_relay.join().expect("joins");
     }
@@ -28223,10 +28140,6 @@ mod relay_tests {
         const LEN: usize = CHUNK * ROUNDS;
 
         let _guard = budgets::lock();
-        budgets::apply(&crate::config::Budgets {
-            relay_stall: Some(Duration::from_secs(300)),
-            ..Default::default()
-        });
         let front = Arc::new(listener());
         let front_port = port_of(&front);
         let back = Arc::new(listener());
@@ -28304,8 +28217,7 @@ mod relay_tests {
         assert!(
             arrived.iter().all(|count| *count == LEN) && finished == FLOWS,
             "{FLOWS} concurrent flows of {LEN} bytes each arrived {arrived:?}, were written \
-             {written:?}, and {finished} of {FLOWS} relays ended; {}",
-            poll_stats()
+             {written:?}, and {finished} of {FLOWS} relays ended"
         );
 
         for user in users {
