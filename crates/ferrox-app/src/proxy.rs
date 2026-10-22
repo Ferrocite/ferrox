@@ -12228,7 +12228,22 @@ fn foxy_account(
                 );
                 return None;
             }
-            if let Err(denied) = retry_plane("sign-in", || account.sign_in(email, password)) {
+            let mut signed_in = false;
+            let sign_in = || {
+                // A retry resumes the grant the first attempt stored before minting: one sign-in, however many attempts the plane's mood costs.
+                if signed_in {
+                    if let Some(session) = account
+                        .tokens
+                        .as_ref()
+                        .and_then(crate::foxy_account::TokenFile::load)
+                    {
+                        return account.resume(session);
+                    }
+                }
+                signed_in = true;
+                account.sign_in(email, password)
+            };
+            if let Err(denied) = retry_plane("sign-in", sign_in) {
                 eprintln!("foxy: the account did not sign in: {denied}");
                 return None;
             }
