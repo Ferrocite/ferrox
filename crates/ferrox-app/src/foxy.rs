@@ -4633,6 +4633,100 @@ pub(crate) mod loopback {
         edge.join().expect("joins");
     }
 
+    /// An edge that answers the open, sends one `SETTINGS` after the status has been handed back, and then reports every frame the lane writes as `(kind, flags, length)`.
+    fn midflow_settings_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+        settings: Vec<u8>,
+        seen_tx: std::sync::mpsc::Sender<(u8, u8, u32)>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) {
+                return;
+            }
+            let mut opening = Vec::new();
+            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut opening);
+            h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut opening);
+            h2_frame(frames::SETTINGS, 0, 0, &settings, &mut opening);
+            tls.write_all(&opening).expect("writes the script");
+            tls.flush().expect("flushes the script");
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let Some(frame) = frames::H2Frame::parse(&header) else {
+                    return;
+                };
+                let mut body = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut body) {
+                    return;
+                }
+                if seen_tx
+                    .send((frame.kind, frame.flags, frame.length))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// HTTP/2 6.5.3 and 6.9.2: a `SETTINGS` frame arrives whenever the peer likes, bounds every frame sent after it, and is owed an answer.
+    #[test]
+    fn a_settings_that_arrives_mid_flow_bounds_the_frames_we_send() {
+        const BODY: usize = 48 * 1024;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let _edge = midflow_settings_edge(
+            listener,
+            server,
+            vec![0x00, 0x05, 0x00, 0x00, 0x40, 0x00],
+            seen_tx,
+        );
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        lane.set_read_quantum(Duration::from_millis(20))
+            .expect("arms a quantum");
+        let mut peek = [0u8; 16];
+        let _ = lane.read(&mut peek);
+        assert_eq!(
+            lane.max_frame,
+            16 * 1024,
+            "the ask that arrived after the status never moved the lane"
+        );
+        lane.write_all(&vec![0xa5u8; BODY])
+            .expect("writes the body");
+        let mut sizes = Vec::new();
+        let mut acked = false;
+        for _ in 0..8 {
+            match seen_rx.recv_timeout(Duration::from_secs(5)) {
+                Ok((frames::SETTINGS, 0x1, 0)) => acked = true,
+                Ok((frames::DATA, _, len)) => sizes.push(len),
+                Ok(_) => {}
+                Err(_) => break,
+            }
+        }
+        assert!(acked, "a SETTINGS the lane read went unacknowledged");
+        assert!(
+            sizes.iter().all(|len| *len <= 16 * 1024),
+            "frames wider than the mid-flow ask: {sizes:?}"
+        );
+    }
+
     /// The read quantum is what lets the writer behind the same mutex have a turn, so it must not cost the frame: a pause inside one DATA frame has to resume where it stopped, not abandon the bytes already promised to the header.
     #[test]
     fn a_frame_that_straddles_a_read_quantum_arrives_whole() {
