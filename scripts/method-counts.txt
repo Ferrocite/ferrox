@@ -388,6 +388,7 @@ reality-tls trust-anchor-bytes-copied-per-dial 0 ferrox-app-foxy::loopback::ever
 reality-tls handshakes-skipped-by-an-earlier-dials-ticket 0 ferrox-core-tls::rustls_backend::tests::a_second_dial_with_the_same_config_still_fetches_the_chain
 reality-tls untrusted-dials-counted-as-retryable 0 ferrox-app-proxy::tests::a_refused_chain_is_a_refusal_not_a_drop
 reality-tls session-writes-per-frame 1 ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call
+reality-tls transport-reads-per-flush 0 ferrox-core-tls::rustls_backend::tests::a_flush_does_not_read_the_transport
 reality-tls relay-write-waits-for-a-parked-read 0 ferrox-app-proxy::tests::a_relay_write_goes_out_while_the_reader_is_parked
 reality-tls relay-reads-on-an-unarmed-handle 0 ferrox-app-proxy::tests::the_socket_half_reads_on_the_armed_handle
 reality-tls tls-arm-cells 2 scripts/run-benchmark-matrix.sh

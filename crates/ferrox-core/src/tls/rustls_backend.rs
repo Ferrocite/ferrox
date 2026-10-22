@@ -473,6 +473,19 @@ impl<S: Stream> Read for RustlsProvider<S> {
     }
 }
 
+impl<S: Stream> RustlsProvider<S> {
+    /// The ciphertext this session has queued goes out, and nothing comes in: `complete_io` reads as well as it writes, so a flush that used it waited for a record the peer had not sent, and the relay's write held the session's lock through that wait.
+    fn flush_pending(&mut self) -> std::io::Result<()> {
+        while self.conn.wants_write() {
+            let wrote = self.conn.write_tls(&mut self.io)?;
+            if wrote == 0 {
+                break;
+            }
+        }
+        self.io.flush()
+    }
+}
+
 impl<S: Stream> Write for RustlsProvider<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.drive()?;
@@ -484,8 +497,8 @@ impl<S: Stream> Write for RustlsProvider<S> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.drive()?;
         self.conn.writer().flush()?;
-        // complete_io reads as well as it writes, and an idle read is not a failed flush: the record this pushed went out either way.
-        match self.conn.complete_io(&mut self.io) {
+        // The ciphertext this queued goes out, and nothing comes in: `complete_io` reads as well as it writes, so a flush that used it waited for a record the peer had not sent, and the relay's write held the session's lock through that wait.
+        match self.flush_pending() {
             Err(error) if !idle(&error) => return Err(recover(error).into()),
             _ => {}
         }
@@ -742,6 +755,20 @@ impl<S: Stream> Read for RustlsServerProvider<S> {
     }
 }
 
+impl<S: Stream> RustlsServerProvider<S> {
+    /// The ciphertext this session has queued goes out, and nothing comes in: the reason is
+    /// the client's `flush_pending`, and the wait it removed is the same wait.
+    fn flush_pending(&mut self) -> std::io::Result<()> {
+        while self.conn.wants_write() {
+            let wrote = self.conn.write_tls(&mut self.io)?;
+            if wrote == 0 {
+                break;
+            }
+        }
+        self.io.flush()
+    }
+}
+
 impl<S: Stream> Write for RustlsServerProvider<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.drive()?;
@@ -753,8 +780,8 @@ impl<S: Stream> Write for RustlsServerProvider<S> {
     fn flush(&mut self) -> std::io::Result<()> {
         self.drive()?;
         self.conn.writer().flush()?;
-        // complete_io reads as well as it writes, and an idle read is not a failed flush: the record this pushed went out either way.
-        match self.conn.complete_io(&mut self.io) {
+        // The ciphertext this queued goes out, and nothing comes in: `complete_io` reads as well as it writes, so a flush that used it waited for a record the peer had not sent, and the relay's write held the session's lock through that wait.
+        match self.flush_pending() {
             Err(error) if !idle(&error) => return Err(recover(error).into()),
             _ => {}
         }
@@ -824,6 +851,7 @@ fn map_error(e: &rustls::Error) -> TlsError {
 mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
     const ANCHOR: &[u8] = &[
@@ -1292,6 +1320,88 @@ mod tests {
         assert!(crate::tls::parse_pem_identity(b"nothing here", b"nothing here").is_err());
         let cert_pem = anchor_pem("CERTIFICATE", ANCHOR);
         assert!(crate::tls::parse_pem_identity(&cert_pem, b"nothing here").is_err());
+    }
+
+    /// A socket that counts the reads that reach it and the bytes each one carried.
+    struct ReadCounter {
+        inner: TcpStream,
+        calls: Arc<AtomicUsize>,
+        bytes: Arc<AtomicUsize>,
+        sizes: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl Read for ReadCounter {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.bytes.fetch_add(n, Ordering::Relaxed);
+            self.sizes.lock().expect("locks").push(n);
+            Ok(n)
+        }
+    }
+
+    impl Write for ReadCounter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    impl super::super::RecordAlignment for ReadCounter {}
+
+    /// A flush that also read waited for a record the peer had not sent, and the relay holds
+    /// the session's lock through that wait. The count is exact: the peer never sends, so
+    /// every read the session makes is one this tree asked for.
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_flush_does_not_read_the_transport() {
+        let cert_pem = anchor_pem("CERTIFICATE", ANCHOR);
+        let key_pem = anchor_pem("PRIVATE KEY", ANCHOR_KEY);
+        let identity = crate::tls::parse_pem_identity(&cert_pem, &key_pem).expect("parses");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                let (stream, _) = listener.accept().expect("accepts");
+                let mut server = crate::tls::accept(&identity, stream).expect("accepts");
+                server.handshake().expect("handshakes");
+                // The peer writes and nothing answers, so no record ever arrives here.
+                let mut buf = [0u8; 64];
+                loop {
+                    match server.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            });
+            let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let counter = ReadCounter {
+                inner: stream,
+                calls: Arc::clone(&calls),
+                bytes: Arc::clone(&bytes),
+                sizes: Arc::clone(&sizes),
+            };
+            let mut client =
+                crate::tls::connect(&client("tls.test", &[]), counter).expect("configures");
+            client.handshake().expect("handshakes");
+            let before = calls.load(Ordering::Relaxed);
+            client.write_all(b"payload").expect("writes");
+            client.flush().expect("flushes");
+            let after = calls.load(Ordering::Relaxed);
+            assert_eq!(
+                after - before,
+                0,
+                "the flush read the transport {after} times where it had read {before}"
+            );
+        });
     }
 
     /// Counts the segments a coalesced write reached the writer with, allocating nothing itself
