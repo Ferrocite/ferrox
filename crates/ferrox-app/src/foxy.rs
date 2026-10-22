@@ -4556,6 +4556,89 @@ pub(crate) mod loopback {
         );
     }
 
+    /// An h2 edge that answers the open and then writes the frames handed to it, staying on the socket afterwards so a lane that reads has bytes to read.
+    fn scripted_h2_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+        pieces: Vec<Vec<u8>>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) {
+                return;
+            }
+            let mut opening = Vec::new();
+            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut opening);
+            h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut opening);
+            for piece in pieces {
+                opening.extend_from_slice(&piece);
+            }
+            tls.write_all(&opening).expect("writes the script");
+            tls.flush().expect("flushes the script");
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let Some(frame) = frames::H2Frame::parse(&header) else {
+                    return;
+                };
+                let mut body = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut body) {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// On a session two flows share, a flow ends with an empty DATA carrying `END_STREAM` on its own stream: the frame that closes a predecessor's stream must not close the lane that rides the session after it.
+    #[test]
+    fn a_foreign_stream_s_end_does_not_end_our_lane() {
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let mut foreign = Vec::new();
+        h2_frame(frames::DATA, frames::END_STREAM, 3, &[], &mut foreign);
+        let edge = scripted_h2_edge(listener, server, vec![foreign, data_frame(b"tail")]);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        lane.set_read_quantum(Duration::from_millis(20))
+            .expect("arms a quantum");
+        let mut buf = [0u8; 16];
+        let mut back = Vec::new();
+        for _ in 0..200 {
+            match lane.read(&mut buf) {
+                Ok(0) => break,
+                Ok(got) => {
+                    back.extend_from_slice(&buf[..got]);
+                    if back == b"tail" {
+                        break;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => panic!("the lane said: {error}"),
+            }
+        }
+        assert_eq!(back, b"tail", "a frame for another stream ended this lane");
+        edge.join().expect("joins");
+    }
+
     /// The read quantum is what lets the writer behind the same mutex have a turn, so it must not cost the frame: a pause inside one DATA frame has to resume where it stopped, not abandon the bytes already promised to the header.
     #[test]
     fn a_frame_that_straddles_a_read_quantum_arrives_whole() {
