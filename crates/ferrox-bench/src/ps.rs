@@ -1187,7 +1187,10 @@ mod tests {
             }
             Host::Macos => {
                 assert_eq!(floor, 10, "macOS ps prints hundredths");
-                assert!(s.threads.is_none(), "macOS ps cannot count threads");
+                assert!(
+                    s.threads.is_some_and(|threads| threads > 0),
+                    "macOS counts this process's threads through proc_pidinfo"
+                );
                 assert_eq!(s.user_millis, None, "a ps line offers no split here");
             }
             #[cfg(target_os = "windows")]
