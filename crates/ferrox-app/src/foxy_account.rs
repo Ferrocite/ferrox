@@ -1644,34 +1644,6 @@ mod loopback {
         );
     }
 
-    /// An edge with its request log, for the turns that prove what was not asked.
-    fn edge_with_log() -> (
-        std::net::SocketAddr,
-        ferrox_core::tls::Anchors,
-        mpsc::Receiver<Seen>,
-    ) {
-        let minted = rcgen::generate_simple_self_signed(
-            HOSTS
-                .iter()
-                .map(|h| (*h).to_owned())
-                .collect::<Vec<String>>(),
-        )
-        .expect("mints");
-        let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
-        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
-        let root = ferrox_core::tls::parse_pem_identity(minted.cert.pem().as_bytes(), &key_pem)
-            .expect("identity");
-        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let port = listener.local_addr().expect("addr").port();
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || serve(&listener, &root, &tx));
-        (
-            format!("127.0.0.1:{port}").parse().expect("addr"),
-            roots.into(),
-            rx,
-        )
-    }
-
     fn token_path(label: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
             "ferrox-foxy-token-{}-{label}.json",
