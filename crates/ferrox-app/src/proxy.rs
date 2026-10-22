@@ -2411,40 +2411,45 @@ fn serve_vless_tls(
             relay_vless_driven(tls, Some(raw), id, freedom);
         }
         Carrier::Ws { path, .. } => {
+            let Ok(out) = stream.try_clone() else { return };
             let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
-            let (reader, writer) = session_halves(session);
+            let (reader, writer) = session_halves(session, out);
             serve_session_ws(reader, writer, path, id, freedom);
         }
         Carrier::Xhttp { settings, .. } => {
+            let Ok(out) = stream.try_clone() else { return };
             let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
-            let (reader, writer) = session_halves(session);
+            let (reader, writer) = session_halves(session, out);
             serve_xhttp_stream(reader, writer, settings, id, freedom);
         }
         Carrier::HttpUpgrade { path, .. } => {
             let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
             let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
-            let (reader, writer) = session_halves(session);
+            let (reader, writer) = session_halves(session, out);
             serve_session_httpupgrade(reader, writer, raw, path, id, freedom);
         }
         Carrier::HttpHeader { path } => {
             let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
             let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
-            let (reader, writer) = session_halves(session);
+            let (reader, writer) = session_halves(session, out);
             serve_session_httpheader(reader, writer, raw, path, id, freedom);
         }
         Carrier::Grpc { path } => {
+            let Ok(out) = stream.try_clone() else { return };
             let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
-            let (reader, writer) = session_halves(session);
+            let (reader, writer) = session_halves(session, out);
             serve_session_grpc(reader, writer, path, id, freedom);
         }
         refused_carriers!() => {}
@@ -2497,49 +2502,54 @@ fn serve_vless_reality(
             answer_reality(accepted, Some(raw), id, freedom, server);
         }
         Carrier::Ws { path, .. } => {
+            let Ok(out) = stream.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
                 if !shake_tls(&mut session) {
                     return;
                 }
-                let (reader, writer) = session_halves(session);
+                let (reader, writer) = session_halves(session, out);
                 serve_session_ws(reader, writer, path, id, freedom);
             });
         }
         Carrier::Xhttp { settings, .. } => {
+            let Ok(out) = stream.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
                 if !shake_tls(&mut session) {
                     return;
                 }
-                let (reader, writer) = session_halves(session);
+                let (reader, writer) = session_halves(session, out);
                 serve_xhttp_stream(reader, writer, settings, id, freedom);
             });
         }
         Carrier::HttpUpgrade { path, .. } => {
             let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
                 if !shake_tls(&mut session) {
                     return;
                 }
-                let (reader, writer) = session_halves(session);
+                let (reader, writer) = session_halves(session, out);
                 serve_session_httpupgrade(reader, writer, raw, path, id, freedom);
             });
         }
         Carrier::HttpHeader { path } => {
             let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
                 if !shake_tls(&mut session) {
                     return;
                 }
-                let (reader, writer) = session_halves(session);
+                let (reader, writer) = session_halves(session, out);
                 serve_session_httpheader(reader, writer, raw, path, id, freedom);
             });
         }
         Carrier::Grpc { path } => {
+            let Ok(out) = stream.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
                 if !shake_tls(&mut session) {
                     return;
                 }
-                let (reader, writer) = session_halves(session);
+                let (reader, writer) = session_halves(session, out);
                 serve_session_grpc(reader, writer, path, id, freedom);
             });
         }
@@ -2843,6 +2853,9 @@ fn relay_vless_driven(
     let Ok(cipher) = session.get_ref().get_ref().try_clone() else {
         return;
     };
+    let Ok(out) = session.get_ref().get_ref().try_clone() else {
+        return;
+    };
     // The transport wait holds no lock, so the idle leg arms the relay grain and a writer never waits on it.
     if cipher.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
@@ -2850,10 +2863,11 @@ fn relay_vless_driven(
     session.disarm_record_alignment();
     let session = Arc::new(Mutex::new(session));
     let cipher = Arc::new(Mutex::new(cipher));
+    let out = Arc::new(Mutex::new(Sealed::new(out)));
     relay_stream(
         Half::split(
-            DrivenHalf::new(Arc::clone(&session), Arc::clone(&cipher)),
-            DrivenHalf::new(session, cipher),
+            DrivenHalf::new(Arc::clone(&session), Arc::clone(&cipher), Arc::clone(&out)),
+            DrivenHalf::new(session, cipher, out),
         ),
         Half::socket(uplink),
         &close,
@@ -5262,21 +5276,37 @@ fn tls_halves(
     session: ferrox_core::tls::RustlsProvider<Connection>,
 ) -> Option<(ClientHalf, ClientHalf, Arc<Connection>)> {
     let raw = Arc::new(session.get_ref().try_clone().ok()?);
+    let out = Arc::new(Mutex::new(Sealed::new(session.get_ref().try_clone().ok()?)));
     let shared = Arc::new(Mutex::new(session));
     let reader = TlsHalf {
         session: Arc::clone(&shared),
+        out: Arc::clone(&out),
     };
-    let writer = TlsHalf { session: shared };
+    let writer = TlsHalf {
+        session: shared,
+        out,
+    };
     Some((reader, writer, raw))
 }
 
 // One session, two owners: the carrier accept takes a reader and a writer.
-fn session_halves<S>(session: S) -> (TlsHalf<S>, TlsHalf<S>) {
+fn session_halves<S, W>(session: S, transport: W) -> (TlsHalf<S>, TlsHalf<S>)
+where
+    W: Write + Send + 'static,
+{
+    let out = Arc::new(Mutex::new(Sealed::new(transport)));
     let shared = Arc::new(Mutex::new(session));
     let reader = TlsHalf {
         session: Arc::clone(&shared),
+        out: Arc::clone(&out),
     };
-    (reader, TlsHalf { session: shared })
+    (
+        reader,
+        TlsHalf {
+            session: shared,
+            out,
+        },
+    )
 }
 
 // A dialled TLS session a carrier can drive: split into a reader and a writer over one lock, plus the raw socket the sink shuts down on teardown.
@@ -5299,7 +5329,7 @@ impl Dialed
 {
     fn into_halves(self) -> Option<(TlsHalf<Self>, TlsHalf<Self>, Arc<Connection>)> {
         let raw = Arc::new(self.get_ref().get_ref().try_clone().ok()?);
-        let (reader, writer) = session_halves(self);
+        let (reader, writer) = session_halves(self, raw.try_clone().ok()?);
         Some((reader, writer, raw))
     }
 }
@@ -5381,16 +5411,72 @@ fn tls_xhttp<S: Dialed>(
     crate::xhttp::connect_split(reader, writer, host, path).or_else(|| tls_unreachable(server))
 }
 
+// The write side of a split session: one seal fills a buffer, and the lock keeps seals and sends in wire order.
+struct Sealed {
+    transport: Box<dyn Write + Send>,
+    bytes: Vec<u8>,
+}
+
+impl Sealed {
+    fn new(transport: impl Write + Send + 'static) -> Self {
+        Self {
+            transport: Box::new(transport),
+            bytes: Vec::new(),
+        }
+    }
+
+    /// The record goes out with no session lock held, so a peer that is not draining this
+    /// direction parks this write alone.
+    fn send(&mut self) -> std::io::Result<()> {
+        let written = if self.bytes.is_empty() {
+            Ok(())
+        } else {
+            self.transport.write_all(&self.bytes)
+        };
+        self.bytes.clear();
+        written?;
+        self.transport.flush()
+    }
+}
+
+/// Seals under the session's lock and sends after it drops: the transport write is the one wait
+/// that must not stand between the peer and the same session's decryption.
+fn seal_out<S: ferrox_core::tls::TlsProvider>(
+    session: &Arc<Mutex<S>>,
+    out: &Arc<Mutex<Sealed>>,
+    plaintext: &[u8],
+) -> std::io::Result<usize> {
+    let mut out = out
+        .lock()
+        .map_err(|_| std::io::Error::other("tls half poisoned"))?;
+    let wrote = {
+        let mut session = session
+            .lock()
+            .map_err(|_| std::io::Error::other("tls half poisoned"))?;
+        match session.seal_into(plaintext, &mut out.bytes) {
+            Ok(wrote) => wrote,
+            Err(error) => {
+                // A refused seal leaves a partial record; it must never reach the transport.
+                out.bytes.clear();
+                return Err(error);
+            }
+        }
+    };
+    out.send()?;
+    Ok(wrote)
+}
+
 // One session, two owners: the pump takes a reader and a writer, and a TLS session cannot split.
-#[derive(Debug)]
 struct TlsHalf<S> {
     session: Arc<Mutex<S>>,
+    out: Arc<Mutex<Sealed>>,
 }
 
 impl<S> Clone for TlsHalf<S> {
     fn clone(&self) -> Self {
         Self {
             session: Arc::clone(&self.session),
+            out: Arc::clone(&self.out),
         }
     }
 }
@@ -5413,6 +5499,11 @@ impl<S> TlsHalf<S> {
     where
         S: ferrox_core::tls::TlsProvider,
     {
+        // A read answers the peer's key update on the wire, so it takes the send order too.
+        let _out = self
+            .out
+            .lock()
+            .map_err(|_| std::io::Error::other("tls half poisoned"))?;
         let mut session = self
             .session
             .lock()
@@ -5425,10 +5516,10 @@ impl<S> TlsHalf<S> {
 const DRIVEN_CIPHERTEXT: usize = 32 * 1024;
 
 // A session whose transport the relay reads: the ciphertext comes off the socket with no session lock held.
-#[derive(Debug)]
 struct DrivenHalf<S, R> {
     session: Arc<Mutex<S>>,
     reader: Arc<Mutex<R>>,
+    out: Arc<Mutex<Sealed>>,
     scratch: Vec<u8>,
     pending_at: usize,
     pending_end: usize,
@@ -5437,10 +5528,11 @@ struct DrivenHalf<S, R> {
 impl<S, R> DrivenHalf<S, R> {
     /// The two halves of one session: the reader reads the transport and decrypts, the writer
     /// only encrypts, and both name the same session and the same transport.
-    fn new(session: Arc<Mutex<S>>, reader: Arc<Mutex<R>>) -> Self {
+    fn new(session: Arc<Mutex<S>>, reader: Arc<Mutex<R>>, out: Arc<Mutex<Sealed>>) -> Self {
         Self {
             session,
             reader,
+            out,
             scratch: Vec::new(),
             pending_at: 0,
             pending_end: 0,
@@ -5508,37 +5600,21 @@ impl<S: ferrox_core::tls::TlsProvider, R: Read> Read for DrivenHalf<S, R> {
 
 impl<S: ferrox_core::tls::TlsProvider, R> Write for DrivenHalf<S, R> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|_| std::io::Error::other("tls half poisoned"))?;
-        session.write(buf)
+        seal_out(&self.session, &self.out, buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|_| std::io::Error::other("tls half poisoned"))?;
-        session.flush()
+        seal_out(&self.session, &self.out, &[]).map(|_| ())
     }
 }
 
 impl<S: ferrox_core::tls::TlsProvider> Write for TlsHalf<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|_| std::io::Error::other("tls half poisoned"))?;
-        session.write(buf)
+        seal_out(&self.session, &self.out, buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        let mut session = self
-            .session
-            .lock()
-            .map_err(|_| std::io::Error::other("tls half poisoned"))?;
-        session.flush()
+        seal_out(&self.session, &self.out, &[]).map(|_| ())
     }
 }
 
@@ -5699,16 +5775,20 @@ fn dial_vless_tls(
             let Ok(cipher) = session.get_ref().try_clone() else {
                 return;
             };
+            let Ok(out) = session.get_ref().try_clone() else {
+                return;
+            };
             if cipher.set_read_timeout(Some(RELAY_POLL)).is_err() {
                 return;
             }
             let session = Arc::new(Mutex::new(session));
             let cipher = Arc::new(Mutex::new(cipher));
+            let out = Arc::new(Mutex::new(Sealed::new(out)));
             relay_stream(
                 Half::socket(downstream),
                 Half::split(
-                    DrivenHalf::new(Arc::clone(&session), Arc::clone(&cipher)),
-                    DrivenHalf::new(session, cipher),
+                    DrivenHalf::new(Arc::clone(&session), Arc::clone(&cipher), Arc::clone(&out)),
+                    DrivenHalf::new(session, cipher, out),
                 ),
                 &close,
             );
@@ -5770,13 +5850,17 @@ fn dial_vless_reality(
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
             // A server may hold its answer until it has payload to send, so the upload runs through the pump while this leg waits, as on every other carrier; a TLS session cannot split, so both legs share it behind one lock until the pump's owner joins and hands it back.
+            let Ok(out) = raw.try_clone() else { return };
             let shared = Arc::new(Mutex::new(session));
+            let out = Arc::new(Mutex::new(Sealed::new(out)));
             let mut reader = TlsHalf {
                 session: Arc::clone(&shared),
+                out: Arc::clone(&out),
             };
             let pump = Pump::over(client, {
                 let mut writer = TlsHalf {
                     session: Arc::clone(&shared),
+                    out: Arc::clone(&out),
                 };
                 move |bytes| writer.write_all(bytes).is_ok()
             });
@@ -5939,12 +6023,20 @@ fn vmess_tls_raw(
     let Ok(raw) = session.get_ref().try_clone() else {
         return;
     };
+    let Ok(out) = session.get_ref().try_clone() else {
+        return;
+    };
     let shared = Arc::new(Mutex::new(session));
+    let out = Arc::new(Mutex::new(Sealed::new(out)));
     let reader = TlsHalf {
         session: Arc::clone(&shared),
+        out: Arc::clone(&out),
     };
     let writer = SessionSink {
-        half: TlsHalf { session: shared },
+        half: TlsHalf {
+            session: shared,
+            out,
+        },
         raw: Arc::new(raw),
     };
     let closer = writer.clone();
@@ -10093,12 +10185,23 @@ where
 impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send> FrameWrite
     for TlsHalf<S>
 {
-    // One lock, a window per record: every part of a window reaches the session as segments of one payload, so it seals one record where a write per part sealed one each, and a frame larger than a record is cut rather than handed over as a payload the session cannot hold.
+    // One seal per window, sent after the session's lock drops: every part of a window reaches the session as segments of one payload, so it seals one record where a write per part sealed one each, and a frame larger than a record is cut rather than handed over as a payload the session cannot hold.
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
-        let Ok(mut session) = self.session.lock() else {
+        let Ok(mut out) = self.out.lock() else {
             return false;
         };
-        write_windows(parts, |window| session.write_all_slices(window).is_ok())
+        let session = Arc::clone(&self.session);
+        write_windows(parts, |window| {
+            let sealed = match session.lock() {
+                Ok(mut session) => session.seal_slices_into(window, &mut out.bytes).is_ok(),
+                Err(_) => false,
+            };
+            if !sealed {
+                out.bytes.clear();
+                return false;
+            }
+            out.send().is_ok()
+        })
     }
 }
 
@@ -12787,8 +12890,13 @@ mod tests {
         let session = Arc::new(Mutex::new(RecordingSession {
             written: written_tx,
         }));
-        let mut reader = DrivenHalf::new(Arc::clone(&session), Arc::clone(&transport));
-        let mut writer = DrivenHalf::new(session, transport);
+        let out = Arc::new(Mutex::new(Sealed::new(std::io::sink())));
+        let mut reader = DrivenHalf::new(
+            Arc::clone(&session),
+            Arc::clone(&transport),
+            Arc::clone(&out),
+        );
+        let mut writer = DrivenHalf::new(session, transport, out);
         let leg = std::thread::spawn(move || {
             let mut buf = [0u8; 16];
             reader.read(&mut buf)
@@ -12811,6 +12919,110 @@ mod tests {
             cvar.notify_all();
         }
         let _ = leg.join().expect("joins");
+    }
+
+    /// A session that seals into the caller's buffer and never touches a transport, as the real
+    /// one does, and whose `open` answers four bytes without a transport read.
+    struct WritingSession;
+
+    impl ferrox_core::tls::TlsProvider for WritingSession {
+        fn name() -> &'static str {
+            "writing"
+        }
+
+        fn suites(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn handshake(&mut self) -> Result<(), ferrox_core::tls::TlsError> {
+            Ok(())
+        }
+
+        fn alpn(&self) -> Option<&[u8]> {
+            None
+        }
+
+        fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+            out.extend_from_slice(plaintext);
+            Ok(plaintext.len())
+        }
+
+        fn open(&mut self, _ciphertext: &[u8], buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
+            buf[..4].copy_from_slice(b"pong");
+            Ok((4, 0))
+        }
+    }
+
+    impl Read for WritingSession {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for WritingSession {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A transport whose write parks until released: the kernel wait a full peer receive window
+    /// costs, now outside the session's lock.
+    struct ParkedWrite {
+        entered: std::sync::mpsc::Sender<()>,
+        released: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Write for ParkedWrite {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.entered.send(()).expect("signals");
+            let _ = self.released.recv();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The write's own half: a session seals under its lock and sends outside it, so a peer that
+    /// is not draining this direction parks the write alone.
+    #[test]
+    fn a_session_read_runs_while_its_write_is_parked() {
+        use std::sync::mpsc;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (released_tx, released_rx) = mpsc::channel();
+        let session = Arc::new(Mutex::new(WritingSession));
+        let out = Arc::new(Mutex::new(Sealed::new(ParkedWrite {
+            entered: entered_tx,
+            released: released_rx,
+        })));
+        let mut reader = DrivenHalf::new(
+            Arc::clone(&session),
+            Arc::new(Mutex::new(std::io::empty())),
+            Arc::clone(&out),
+        );
+        let mut writer = DrivenHalf::new(session, Arc::new(Mutex::new(std::io::empty())), out);
+        let writing = thread::spawn(move || writer.write_all(b"ping"));
+        entered_rx.recv().expect("the write reached its transport");
+        let (done_tx, done_rx) = mpsc::channel();
+        let reading = thread::spawn(move || {
+            let mut buf = [0u8; 4];
+            let read = reader.read(&mut buf);
+            let _ = done_tx.send(read.map(|read| (read, buf)));
+        });
+        let read = done_rx.recv_timeout(Duration::from_secs(2));
+        let _ = released_tx.send(());
+        reading.join().expect("joins");
+        writing.join().expect("joins").expect("writes");
+        let (read, buf) = read
+            .expect("the read ran while the write was parked, not after it was released")
+            .expect("reads");
+        assert_eq!(read, 4);
+        assert_eq!(&buf, b"pong");
     }
 
     /// The driven half carries the bytes: a payload that crosses several records comes back
@@ -12845,11 +13057,14 @@ mod tests {
         .expect("opens");
         session.handshake().expect("handshakes");
         let cipher = session.get_ref().try_clone().expect("dups the transport");
+        let out = session.get_ref().try_clone().expect("dups the transport");
         cipher.set_read_timeout(Some(SESSION_POLL)).expect("arms");
         let session = Arc::new(Mutex::new(session));
         let cipher = Arc::new(Mutex::new(cipher));
-        let mut reader = DrivenHalf::new(Arc::clone(&session), Arc::clone(&cipher));
-        let mut writer = DrivenHalf::new(session, cipher);
+        let out = Arc::new(Mutex::new(Sealed::new(out)));
+        let mut reader =
+            DrivenHalf::new(Arc::clone(&session), Arc::clone(&cipher), Arc::clone(&out));
+        let mut writer = DrivenHalf::new(session, cipher, out);
 
         let payload: Vec<u8> = (0..64 * 1024u32)
             .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
@@ -16648,11 +16863,11 @@ mod tests {
             serve_vless_tls(stream, &id, true, &carrier, &server_config);
             let _ = done_tx.send(());
         });
-        let mut session =
-            ferrox_core::tls::connect(&client_config, Connection::connect(addr).expect("connects"))
-                .expect("opens");
+        let stream = Connection::connect(addr).expect("connects");
+        let out = stream.try_clone().expect("dups the transport");
+        let mut session = ferrox_core::tls::connect(&client_config, stream).expect("opens");
         session.handshake().expect("handshakes");
-        let (read, write) = session_halves(session);
+        let (read, write) = session_halves(session, out);
         let (_reader, _writer) =
             crate::grpc::connect_split(read, write, "127.0.0.1", "/p").expect("dials the head");
         let returned = done_rx.recv_timeout(budgets::handshake() + Duration::from_secs(5));
@@ -17622,12 +17837,18 @@ mod tests {
                     .expect("accepts");
             tls.handshake().expect("handshakes");
             echo_trace(&format!("srv {port} handshook"));
+            let out = tls.get_ref().try_clone().expect("dups the transport");
             let shared = Arc::new(Mutex::new(tls));
+            let out = Arc::new(Mutex::new(Sealed::new(out)));
             let (mut reader, mut writer) = accept(
                 TlsHalf {
                     session: Arc::clone(&shared),
+                    out: Arc::clone(&out),
                 },
-                TlsHalf { session: shared },
+                TlsHalf {
+                    session: shared,
+                    out,
+                },
             )
             .expect("accepts carrier");
             echo_trace(&format!("srv {port} carrier up"));
@@ -20198,28 +20419,32 @@ mod tests {
         fn alpn(&self) -> Option<&[u8]> {
             None
         }
-    }
 
-    impl ferrox_core::tls::RecordAlignment for CountedSession {
-        fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        fn seal_slices_into(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> std::io::Result<()> {
             let mut seam = self.seam.lock().expect("records");
             let bases = parts.iter().map(|part| part.as_ptr() as usize).collect();
             seam.calls.push((parts.len(), bases));
             for part in parts {
                 seam.out.extend_from_slice(part);
+                out.extend_from_slice(part);
             }
             Ok(())
         }
     }
+
+    impl ferrox_core::tls::RecordAlignment for CountedSession {}
 
     /// One frame reaches a TLS session in one call whose segments are the caller's buffers: a write
     /// per part sealed one record each, and staging the frame would deliver the same bytes by copy.
     #[test]
     fn a_frame_reaches_the_tls_session_in_one_call() {
         let seam = Arc::new(Mutex::new(Seam::default()));
-        let (_reader, mut writer) = session_halves(CountedSession {
-            seam: Arc::clone(&seam),
-        });
+        let (_reader, mut writer) = session_halves(
+            CountedSession {
+                seam: Arc::clone(&seam),
+            },
+            std::io::sink(),
+        );
         let body: Vec<u8> = (0..1400).map(|i| (i as u8) ^ 0x5A).collect();
         let tail: Vec<u8> = (0..64).map(|i| !i).collect();
 

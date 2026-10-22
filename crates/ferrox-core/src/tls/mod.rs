@@ -60,6 +60,31 @@ pub trait TlsProvider: std::io::Read + std::io::Write {
             "this provider reads its own transport",
         ))
     }
+
+    /// The plaintext is encrypted under this session's lock into the caller's buffer, and the
+    /// ciphertext leaves for the transport only after the lock is dropped: a peer that stopped
+    /// draining this direction then parks that transport write alone instead of the decryption
+    /// the other direction needs. A provider that writes its own transport falls back to `write`.
+    fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+        let _ = out;
+        std::io::Write::write(self, plaintext)
+    }
+
+    /// Several slices sealed in one call, so a caller's frame reaches the session as the
+    /// segments it was handed rather than a copy staged into one buffer.
+    fn seal_slices_into(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> std::io::Result<()> {
+        for part in parts {
+            let mut left = *part;
+            while !left.is_empty() {
+                let wrote = self.seal_into(left, out)?;
+                if wrote == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WriteZero));
+                }
+                left = &left[wrote..];
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Stops the socket reads behind a session at TLS record ends once Vision can go direct, so the unwrap finds every following byte still in the kernel.

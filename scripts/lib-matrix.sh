@@ -113,6 +113,7 @@ standard_scenarios() {
   echo "vless-raw-setup-1k download 1 1000 8"
   echo "vless-tls-raw-down-8 download 8 16384 65536"
   echo "vless-tls-raw-up-1 upload 1 131072 65536"
+  echo "vless-tls-raw-duplex-8 full-duplex 8 8192 65536"
 }
 
 scenarios() {
@@ -124,6 +125,7 @@ scenarios() {
       echo "vless-raw-down-16 download 16 8192 65536"
       echo "vless-ws-down-16 download 16 8192 65536"
       echo "vless-raw-duplex-16 full-duplex 16 4096 65536"
+      echo "vless-tls-raw-duplex-16 full-duplex 16 4096 65536"
       ;;
   esac
 }
