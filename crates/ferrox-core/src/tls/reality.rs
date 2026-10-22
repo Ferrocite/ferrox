@@ -115,6 +115,10 @@ pub struct RealityServer<S: Stream> {
 }
 
 impl<S: Stream> RealityServer<S> {
+    pub fn transport(&self) -> &S {
+        self.inner.get_ref().transport().get_ref()
+    }
+
     /// Reads the `ClientHello`, authenticates it, and answers with the session or
     /// with the splice. A hello that does not authenticate and has no cover
     /// origin configured is an error, which is the whole of a refusal. A peer
@@ -168,6 +172,10 @@ impl<S: Stream> TlsProvider for RealityServer<S> {
 
     fn handshake(&mut self) -> Result<(), TlsError> {
         self.inner.handshake()
+    }
+
+    fn open(&mut self, ciphertext: &[u8], buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
+        self.inner.open(ciphertext, buf)
     }
 
     fn alpn(&self) -> Option<&[u8]> {
@@ -346,6 +354,13 @@ impl<S> Replay<S> {
             at: 0,
             io,
         }
+    }
+
+    /// The socket under the replay: past the handshake the record layer is the
+    /// caller's, and a relay's split reader reads this handle parked outside
+    /// the session lock.
+    fn transport(&self) -> &S {
+        &self.io
     }
 
     fn set_prefix(&mut self, bytes: Vec<u8>) {
@@ -1109,6 +1124,10 @@ impl<S: Stream> TlsProvider for RealityClientSession<S> {
 
     fn handshake(&mut self) -> Result<(), TlsError> {
         self.inner.handshake()
+    }
+
+    fn open(&mut self, ciphertext: &[u8], buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
+        self.inner.open(ciphertext, buf)
     }
 
     fn alpn(&self) -> Option<&[u8]> {

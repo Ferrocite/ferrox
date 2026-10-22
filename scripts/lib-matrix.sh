@@ -71,6 +71,20 @@ tls_client_settings() {
   echo "\"streamSettings\": {\"network\": \"tcp\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}}"
 }
 
+# The TLS arm of a carried lane: the same identity the tcp arm uses, under the carrier's framing.
+tls_ws_server_settings() {
+  local dir
+  dir="$(matrix_tls_dir)"
+  echo "\"streamSettings\": {\"network\": \"ws\", \"security\": \"tls\", \"wsSettings\": {\"path\": \"/tunnel\"}, \"tlsSettings\": {\"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"keyFile\": \"$dir/key.pem\"}]}}"
+}
+
+tls_ws_client_settings() {
+  local dir pin
+  dir="$(matrix_tls_dir)"
+  pin="$(matrix_tls_pin "$dir/cert.pem")"
+  echo "\"streamSettings\": {\"network\": \"ws\", \"security\": \"tls\", \"wsSettings\": {\"path\": \"/tunnel\"}, \"tlsSettings\": {\"serverName\": \"carrier.test\", \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}}"
+}
+
 stream_json() {
   case "$1" in
     tcp) echo '"streamSettings": {"network": "tcp"}' ;;
@@ -90,6 +104,8 @@ scenario_config() {
     vless-xhttp-*) server_config "$(vless_server ", $(stream_json xhttp)")" "$(vless_client ", $(stream_json xhttp)" "$port")" "$port" ;;
     vmess-raw-*) server_config "\"protocol\": \"vmess\", \"settings\": {\"clients\": [{\"id\": \"$UUID\"}]}, \"streamSettings\": {\"network\": \"tcp\"}" "\"tag\": \"proxy\", \"protocol\": \"vmess\", \"settings\": {\"vnext\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"users\": [{\"id\": \"$UUID\", \"security\": \"auto\"}]}]}, \"streamSettings\": {\"network\": \"tcp\"}" "$port" ;;
     trojan-raw-*) server_config "\"protocol\": \"trojan\", \"settings\": {\"clients\": [{\"password\": \"$PASSWORD\"}]}" "\"tag\": \"proxy\", \"protocol\": \"trojan\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"password\": \"$PASSWORD\"}]}" "$port" ;;
+    trojan-tls-raw-*) server_config "\"protocol\": \"trojan\", \"settings\": {\"clients\": [{\"password\": \"$PASSWORD\"}]}, $(tls_server_settings)" "\"tag\": \"proxy\", \"protocol\": \"trojan\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"password\": \"$PASSWORD\"}]}, $(tls_client_settings)" "$port" ;;
+    vless-tls-ws-*) server_config "$(vless_server ", $(tls_ws_server_settings)")" "$(vless_client ", $(tls_ws_client_settings)" "$port")" "$port" ;;
     shadowsocks-raw-*) server_config "\"protocol\": \"shadowsocks\", \"settings\": {\"method\": \"aes-256-gcm\", \"password\": \"$SS_PASSWORD\", \"network\": \"tcp\"}" "\"tag\": \"proxy\", \"protocol\": \"shadowsocks\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"method\": \"aes-256-gcm\", \"password\": \"$SS_PASSWORD\"}]}" "$port" ;;
     *) echo "::error::unknown scenario $1" >&2; return 1 ;;
   esac
@@ -114,6 +130,8 @@ standard_scenarios() {
   echo "vless-tls-raw-down-8 download 8 16384 65536"
   echo "vless-tls-raw-up-1 upload 1 131072 65536"
   echo "vless-tls-raw-duplex-8 full-duplex 8 8192 65536"
+  echo "vless-tls-ws-down-8 download 8 16384 65536"
+  echo "trojan-tls-raw-down-8 download 8 16384 65536"
 }
 
 scenarios() {
