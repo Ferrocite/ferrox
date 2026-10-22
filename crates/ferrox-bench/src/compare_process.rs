@@ -243,11 +243,31 @@ impl Comparison {
         if self.candidates().is_empty() {
             return stats::Gate::no_comparison();
         }
-        // A gated comparison needs a usable pair and a healthy machine. With no pair to gate the cell is unmeasured - not a regression the engine under test caused - in exactly two cases: the reference landed nothing (no baseline), or the engine under test landed nothing while the same runner disturbed the other engines too (a machine-wide storm starved it). A candidate that lands nothing while every other engine measures clean is not the machine's fault, so it stays a regression.
+        // A cell whose reference landed no run has no baseline: no-reference and failed, because zero reference runs is missing data, not parity. The machine-wide escape below needs the reference to have run.
         if self.runs(reference).is_empty() {
-            return stats::Gate::unmeasured_by_runner(format!(
-                "`{reference}` (the reference) landed no run, so the gated comparison has no baseline"
-            ));
+            let failures: Vec<&str> = self
+                .failures
+                .iter()
+                .filter(|(engine, _)| engine == reference)
+                .map(|(_, reason)| reason.as_str())
+                .collect();
+            let detail = match failures.as_slice() {
+                [] => format!(
+                    "`{reference}` (the reference) landed none of {} run(s) and recorded no failure",
+                    self.repeats
+                ),
+                [only] => format!(
+                    "`{reference}` (the reference) landed none of {} run(s); its failure was: {only}",
+                    self.repeats
+                ),
+                [first, ..] => format!(
+                    "`{reference}` (the reference) landed none of {} run(s); the runner recorded \
+                     {} failure(s) for it, the first: {first}",
+                    self.repeats,
+                    failures.len()
+                ),
+            };
+            return stats::Gate::no_reference(detail);
         }
         if self
             .gated
@@ -782,11 +802,13 @@ impl Comparison {
              data must never silently pass. A run whose gating rows all land \
              within noise passes — measured parity is not a regression — while \
              a run with an unproven gating row fails, because the comparison \
-             never happened — unless the runner left no gated pair to measure (the \
-             reference landed no run, or the engine under test landed none while the \
-             same runner disturbed the other engines), when the cell is reported \
-             `unmeasured by the runner`, a fact about the machine and not the engine \
-             under test (`.../zbench/report.py:968`).\n\
+             never happened. A cell whose reference landed no run is reported \
+             `no-reference` and fails: zero reference runs is missing data, and \
+             missing data must never read as parity. The one pair-less cell that \
+             passes is the engine under test landing none while the same runner \
+             disturbed the other engines — that pair was starved by the machine, \
+             not the engine, and is reported `unmeasured by the runner` \
+             (`.../zbench/report.py:968`).\n\
              Only the rows for `{}` decide this gate. Every other engine here is a \
              pinned comparator: it is measured and published so a reader can see \
              where it sits, but a comparator measuring worse than the reference is \
@@ -1860,8 +1882,9 @@ mod tests {
             gate.lines
         );
         assert!(
-            gate.lines.iter().any(|line| line.contains("no reference")
-                && line.contains("xray-core")),
+            gate.lines
+                .iter()
+                .any(|line| line.contains("no reference") && line.contains("xray-core")),
             "the line names the missing reference: {:?}",
             gate.lines
         );

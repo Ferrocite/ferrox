@@ -190,7 +190,20 @@ impl Gate {
         }
     }
 
-    /// The runner never let a gated comparison land: there is no usable pair to gate, so there is no regression to claim against the engine under test. It passes only in the sense that an unmeasured comparison cannot be blamed on the engine; `detail` names what the machine starved so the report says it was not measured, never that it was fine.
+    /// The reference landed no run, so the cell has no baseline: reported `no-reference` and failed, because zero reference runs is missing data and missing data must never read as parity. `detail` names the reference and what its runs reported.
+    pub fn no_reference(detail: impl Into<String>) -> Self {
+        Self {
+            passed: false,
+            lines: vec![format!(
+                "no reference: {}; the cell is reported `no-reference` rather than passed, \
+                 because no pair was compared — a fact about the reference engine or the \
+                 runner, not a regression in the engine under test",
+                detail.into()
+            )],
+        }
+    }
+
+    /// The reference ran and the runner starved only the engine under test: the pair was never measured because of the machine, so it cannot read as a regression the engine caused. `detail` names what the machine starved.
     pub fn unmeasured_by_runner(detail: impl Into<String>) -> Self {
         Self {
             passed: true,
