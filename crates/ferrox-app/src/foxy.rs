@@ -938,7 +938,7 @@ fn fill_data<S: Read>(
 }
 
 /// One frame off the wire; a socket timeout keeps its kind so a relay can tell an idle quantum from a dead peer.
-/// A DATA frame whose caller has room goes straight into `dst` with no staging buffer between the lane and its caller: the answer carries the frame's end flag only on the delivery of its last byte, and a caller whose buffer filled mid-frame sees a zero-length marker, the bytes where it put them, and the remainder waiting in `state`.
+/// An unpadded DATA frame whose caller has room goes straight into `dst` with no staging buffer between the lane and its caller: the answer carries the frame's end flag only on the delivery of its last byte, and a caller whose buffer filled mid-frame sees a zero-length marker, the bytes where it put them, and the remainder waiting in `state`. A padded one stages, because the padding comes off before the caller sees a byte.
 fn read_frame<S: Read>(
     io: &mut S,
     state: &mut FrameState,
@@ -976,7 +976,12 @@ fn read_frame<S: Read>(
     fill_from(io, &mut state.head, &mut state.head_at)?;
     let frame = frames::H2Frame::parse(&state.head)
         .ok_or_else(|| std::io::Error::other("foxy: a header that is not a frame"))?;
-    if frame.kind == frames::DATA && frame.stream == stream && frame.length > 0 && !dst.is_empty() {
+    if frame.kind == frames::DATA
+        && frame.stream == stream
+        && frame.length > 0
+        && frame.flags & frames::PADDED == 0
+        && !dst.is_empty()
+    {
         out.clear();
         state.data_len = frame.length;
         state.data_at = 0;
@@ -1232,11 +1237,9 @@ impl Tls2 {
                             lane.ack(frames::SETTINGS, &[]).map(|()| None)
                         }
                         // A DATA frame that arrives while the status is still out is payload the edge sent early: hold its credit like any other, and let the walk ignore the bytes until `END_STREAM` says the status itself is gone.
-                        frames::H2Event::Data { payload, end, wire } => {
+                        frames::H2Event::Data { end, wire, .. } => {
                             lane.fin = end;
-                            if !payload.is_empty() {
-                                lane.credit(wire)?;
-                            }
+                            lane.credit(wire)?;
                             Ok(None)
                         }
                         frames::H2Event::Ping { ack: false, .. } => {
@@ -1368,11 +1371,8 @@ impl Tls2 {
             let read = self.with_frame(&mut [], |lane, frame, payload| -> std::io::Result<usize> {
                 match frames::h2_event(frame, payload, lane.stream) {
                     frames::H2Event::Data { payload, end, wire } => {
-                        let len = payload.len();
                         lane.fin = end;
-                        if len > 0 {
-                            lane.credit(wire).map_err(io)?;
-                        }
+                        lane.credit(wire).map_err(io)?;
                         // A capsule is usually whole inside one DATA frame, so it is handed over where it lies and only the ones behind it staged; nothing is handed over while a split capsule waits, because stream order is datagram order.
                         if lane.capsule_buf.is_empty() {
                             if let Some((used, datagram)) = masque::datagram_split(payload) {
@@ -1482,7 +1482,7 @@ impl Read for Tls2 {
             if self.fin {
                 return Ok(0);
             }
-            // The payload is copied once, by the frame reader, straight into the caller's buffer: nothing is staged between the lane and its caller, and a frame the caller has no room left for resumes in the caller's own space on the next read.
+            // An unpadded payload is copied once, by the frame reader, straight into the caller's buffer: nothing is staged between the lane and its caller, and a frame the caller has no room left for resumes in the caller's own space on the next read.
             let read = self.with_frame(buf, |lane, frame, payload| -> std::io::Result<usize> {
                 // A DATA frame the reader delivered arrives with the wire's payload already in the caller's buffer and none left in the lane's hands: what this call handed over is counted in `delivered`, and the credit is owed for exactly that.
                 if frame.kind == frames::DATA && payload.is_empty() {
@@ -1496,13 +1496,10 @@ impl Read for Tls2 {
                 }
                 match frames::h2_event(frame, payload, lane.stream) {
                     frames::H2Event::Data { payload, end, wire } => {
-                        // Only reachable for a caller that asked for nothing: the frame stages whole, and a later read with room is fed from the stage.
-                        let len = payload.len();
+                        // A caller that asked for nothing and a padded frame both land here: the padding comes off before the rest stages, so the stage holds the payload and the window is owed the body the frame spent.
                         lane.stage(payload, 0);
                         lane.fin = end;
-                        if len > 0 {
-                            lane.credit(wire).map_err(io)?;
-                        }
+                        lane.credit(wire).map_err(io)?;
                         Ok(0)
                     }
                     frames::H2Event::Window { stream, increment } => {
@@ -2826,9 +2823,7 @@ impl Tls2 {
                     frames::H2Event::Data { payload, end, wire } => {
                         lane.capsule_buf.extend_from_slice(payload);
                         lane.fin = end;
-                        if !payload.is_empty() {
-                            lane.credit(wire).map_err(io)?;
-                        }
+                        lane.credit(wire).map_err(io)?;
                         Ok(())
                     }
                     frames::H2Event::Window { stream, increment } => {
@@ -2870,9 +2865,7 @@ impl Tls2 {
                 match frames::h2_event(frame, payload, lane.stream) {
                     frames::H2Event::Data { payload, end, wire } => {
                         lane.fin = end;
-                        if !payload.is_empty() {
-                            lane.credit(wire).map_err(io)?;
-                        }
+                        lane.credit(wire).map_err(io)?;
                         // The capsule is usually whole inside one DATA frame, so it is handed out where it lies and only the bytes behind it staged; nothing is handed out while a split capsule waits, because stream order is packet order.
                         if lane.capsule_buf.is_empty() {
                             if let Some((used, connectip::Capsule::Datagram(packet))) =
