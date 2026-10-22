@@ -943,7 +943,6 @@ fn read_frame<S: Read>(
     io: &mut S,
     state: &mut FrameState,
     out: &mut Vec<u8>,
-    max_frame: usize,
     dst: &mut [u8],
     stream: u32,
 ) -> std::io::Result<frames::H2Frame> {
@@ -1008,7 +1007,13 @@ fn read_frame<S: Read>(
         });
     }
     if state.payload_at == 0 {
-        crate::proxy::resize_scratch(out, (frame.length as usize).min(max_frame));
+        // The widest frame worth a buffer is the one this lane asked the edge to be allowed to send, not the limit the edge named for its own receives.
+        if frame.length > frames::MAX_FRAME {
+            return Err(std::io::Error::other(
+                "foxy: a frame wider than the lane ever asked for",
+            ));
+        }
+        crate::proxy::resize_scratch(out, frame.length as usize);
     }
     fill_from(io, out, &mut state.payload_at)?;
     state.head_at = 0;
@@ -1131,7 +1136,6 @@ impl Tls2 {
             &mut self.tls,
             &mut self.frame,
             &mut payload,
-            self.max_frame,
             dst,
             self.stream,
         );
@@ -4642,6 +4646,158 @@ pub(crate) mod loopback {
             back, want,
             "a quantum inside a frame must not drop its tail"
         );
+        edge.join().expect("the edge finishes");
+    }
+
+    /// An edge that names a 16 KiB `SETTINGS_MAX_FRAME_SIZE` for its own receives, answers the status, then pushes each piece and drains what the lane sends back until the socket ends.
+    fn narrow_receive_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+        pieces: Vec<Vec<u8>>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) {
+                return;
+            }
+            let mut setting = Vec::new();
+            setting.extend_from_slice(&5u16.to_be_bytes());
+            setting.extend_from_slice(&(16 * 1024u32).to_be_bytes());
+            let mut opening = Vec::new();
+            h2_frame(frames::SETTINGS, 0, 0, &setting, &mut opening);
+            h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut opening);
+            tls.write_all(&opening).expect("answers the status");
+            tls.flush().expect("flushes");
+            for piece in pieces {
+                tls.write_all(&piece).expect("pushes");
+                tls.flush().expect("flushes");
+            }
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut rest = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut rest) {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// The size an edge may *send* is the one this lane asked for in its own SETTINGS, not the one the edge asked for, so a 32 KiB trailer from an edge that named a 16 KiB limit is read whole instead of leaving its tail to be parsed as the next frame's header.
+    #[test]
+    fn a_frame_wider_than_the_edge_s_own_send_limit_is_read_whole() {
+        const TRAILER: usize = 32 * 1024;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let mut trailer = Vec::new();
+        h2_frame(frames::HEADERS, 0x4, 1, &vec![0xa5; TRAILER], &mut trailer);
+        let pieces = vec![trailer, data_frame(b"tail")];
+        let edge = narrow_receive_edge(listener, server, pieces);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        assert_eq!(
+            lane.max_frame,
+            16 * 1024,
+            "the edge's own limit is what the lane sends by"
+        );
+        tunnel
+            .set_read_quantum(Duration::from_millis(20))
+            .expect("bounds one read");
+        let mut back = Vec::new();
+        let mut buf = [0u8; 4096];
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while back.len() < 4 && std::time::Instant::now() < deadline {
+            match tunnel.read(&mut buf) {
+                Ok(0) => panic!("the lane called an end of stream before the body arrived"),
+                Ok(read) => back.extend_from_slice(&buf[..read]),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("the lane lost the frame: {error}"),
+            }
+        }
+        assert_eq!(
+            back, b"tail",
+            "the octets past the edge's own limit became the next frame's header"
+        );
+        drop(tunnel);
+        edge.join().expect("the edge finishes");
+    }
+
+    /// A length the lane never asked for is refused before it is believed: the frame buffer is never sized by a header a peer invented, so the widest body the lane will hold is the 256 KiB its own SETTINGS named.
+    #[test]
+    fn a_frame_wider_than_the_lane_ever_asked_for_is_refused_not_allocated() {
+        const OVER: usize = frames::MAX_FRAME as usize + 1024;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        // The header of a frame this wide, and no body at all: the lane is asked to wait for OVER octets it must not promise room for.
+        let head = frames::H2Frame {
+            kind: frames::HEADERS,
+            flags: 0x4,
+            stream: 1,
+            length: OVER as u32,
+        }
+        .header()
+        .to_vec();
+        let edge = narrow_receive_edge(listener, server, vec![head]);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        lane.set_read_quantum(Duration::from_millis(20))
+            .expect("bounds one read");
+        let staged = lane.out.capacity();
+        let mut buf = [0u8; 4096];
+        let error = (0..20)
+            .find_map(|_| match lane.read(&mut buf) {
+                Ok(0) => Some(std::io::Error::other("the lane called an end of stream")),
+                Ok(_) => None,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    None
+                }
+                Err(error) => Some(error),
+            })
+            .expect("a refusal, not a wait");
+        assert!(
+            error.to_string().contains("wider than the lane"),
+            "the lane said: {error}"
+        );
+        assert_eq!(
+            lane.out.capacity(),
+            staged,
+            "the frame's own length was never used to size a buffer"
+        );
+        drop(tunnel);
         edge.join().expect("the edge finishes");
     }
 
