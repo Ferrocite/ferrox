@@ -23899,6 +23899,133 @@ mod tests {
         String::from_utf8(line.to_vec()).expect("text")
     }
 
+    /// One `http` inbound built from its settings the way a config builds it: the planner underneath is the one a file names.
+    fn http_inbound_from(settings: &str) -> u16 {
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let text = format!(
+            r#"{{"inbounds":[{{"protocol":"http","listen":"127.0.0.1","port":{port},"settings":{settings}}}]}}"#
+        );
+        let root = crate::json::parse(&text).expect("parses");
+        let (opened, _) = serve_inbounds("test", &root, Some(&Outbound::Freedom), None, false);
+        assert_eq!(opened, 1, "the http inbound opens");
+        port
+    }
+
+    /// A client that connects once the accept thread has bound; the inbound binds after the config is read.
+    fn connect_until(port: u16) -> Connection {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            match Connection::connect(("127.0.0.1", port)) {
+                Ok(client) => return client,
+                Err(_) if Instant::now() < until => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("connects: {error}"),
+            }
+        }
+    }
+
+    /// xray's refusal head, byte for byte.
+    const HTTP_AUTH_REQUIRED: &[u8] =
+        b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n";
+
+    #[test]
+    fn http_inbound_demands_the_credential_its_settings_name() {
+        let echo = echo_loop();
+        let port = http_inbound_from(r#"{"accounts":[{"user":"alice","pass":"s3cr3t"}]}"#);
+        let mut client = connect_until(port);
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client
+            .write_all(
+                format!("GET http://127.0.0.1:{echo}/ HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .expect("gets");
+        let head = read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("answers");
+        assert_eq!(head, HTTP_AUTH_REQUIRED, "the front refuses anonymously");
+    }
+
+    #[test]
+    fn http_inbound_refuses_a_credential_it_does_not_know() {
+        use base64::Engine as _;
+        let echo = echo_loop();
+        let port = http_inbound_from(r#"{"accounts":[{"user":"alice","pass":"s3cr3t"}]}"#);
+        let credential = base64::engine::general_purpose::STANDARD.encode("alice:wrong");
+        let mut client = connect_until(port);
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{echo}/ HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\nProxy-Authorization: Basic {credential}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("gets");
+        let head = read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("answers");
+        assert_eq!(head, HTTP_AUTH_REQUIRED, "an unknown credential is refused");
+    }
+
+    #[test]
+    fn http_inbound_admits_the_users_spelling_and_keeps_the_credential_from_the_origin() {
+        use base64::Engine as _;
+        let echo = echo_loop();
+        let port = http_inbound_from(r#"{"users":[{"user":"alice","pass":"s3cr3t"}]}"#);
+        let credential = base64::engine::general_purpose::STANDARD.encode("alice:s3cr3t");
+        let mut client = connect_until(port);
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{echo}/ HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\nProxy-Authorization: Basic {credential}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("gets");
+        let head = read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("answers");
+        assert_eq!(
+            head,
+            format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n").into_bytes(),
+            "the credential is the proxy's and does not reach the origin"
+        );
+    }
+
+    #[test]
+    fn mixed_http_side_demands_the_credential_its_socks_side_accepts() {
+        let echo = echo_loop();
+        let inbound = crate::json::parse(
+            r#"{"settings":{"auth":"password","accounts":[{"user":"alice","pass":"s3cr3t"}]}}"#,
+        )
+        .expect("parses");
+        let accounts = socks_accounts(&inbound);
+        assert!(accounts.wants_credential(), "the socks side asks");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_mixed(stream, &Outbound::Freedom, &accounts);
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client
+            .write_all(
+                format!("GET http://127.0.0.1:{echo}/ HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .expect("gets");
+        let head = read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("answers");
+        assert_eq!(head, HTTP_AUTH_REQUIRED, "the http side asks the same");
+    }
+
     #[test]
     fn http_connect_reaches_echo_direct() {
         let echo = echo_loop();
