@@ -4,24 +4,29 @@ Mux is the only method here whose bytes are not the caller's bytes: the frame he
 
 A data frame is `metadataLen(2) | metadata | dataLen(2) | data`, where the metadata is `sessionID(2) | status(1) | option(1)` and the `New` status carries a source and a local address. The payload is handed to the relay exactly as it arrived — `mux::CHUNK_MAX` is 8192 and nothing else in the pipeline touches it.
 
-Write is therefore **zero** user-space copies per payload byte: the header is appended in front of the caller's buffer and the whole thing is handed down as one buffer. Read is one copy, out of the connection's own read buffer into the caller's. There is no staging buffer, no temp and no per-frame allocation, and `ferrox-bench` gate 6 requires all three of those to be exactly zero.
+Every write that hands a payload to a socket from where it was read is **zero** user-space copies per byte: the header is appended in front of the payload and the pair goes down as one `writev`. The one exception is the session's client-to-origin path, which stages each payload once into the flow's writer queue so the session thread never waits on an origin's window; `## A stalled origin` is that design and why the copy is the price. The codec's own write side is one copy into the frame buffer (`codec-copies-per-byte-written 1`), and `ferrox-bench` gate 6 requires zero staging, zero temp and zero per-frame allocation on the codec path.
 
 ## Data path
 
 ```mermaid
 graph TD
-    A["payload from the session queue"] --> B["encode the metadata:<br/>id, status, option"]
-    B --> C["write the 2-byte metadata length,<br/>the metadata, the 2-byte data length"]
-    C --> D["one buffer: our header, then<br/>their payload, not copied"]
-    D --> E["write_all, 1 syscall"]
-    E --> W(("wire"))
-    W --> R["read into the connection's buffer"]
-    R --> S["parse the metadata in place"]
-    S --> T{"status"}
-    T -- data --> U["copy the payload out: 1 copy"]
-    T -- new --> V["bind the target, then data"]
-    U --> H["hand to the session"]
-    V --> H
+    subgraph downlink["origin -> client"]
+        A["payload from the origin's read buffer"] --> B["encode the metadata:<br/>id, status, option"]
+        B --> C["write the 2-byte metadata length,<br/>the metadata, the 2-byte data length"]
+        C --> D["one buffer: our header, then<br/>their payload, not copied"]
+        D --> E["writev, 1 syscall"]
+        E --> W(("wire"))
+    end
+    subgraph uplink["client -> origin"]
+        W --> R["read into the session's buffer"]
+        R --> S["parse the metadata in place"]
+        S --> T{"status"}
+        T -- keep --> U["copy the payload once<br/>into the flow's queue"]
+        U --> Q["the flow's writer owns the origin:<br/>16 pending, then that flow ends"]
+        Q --> O(("origin"))
+        T -- new --> V["dial the target,<br/>then queue its first data"]
+        V --> O
+    end
 ```
 
 ## Measured
@@ -31,7 +36,7 @@ graph TD
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | maximum-frame-payload-bytes | 8192 | ferrox-core-mux::tests::the_decoder_refuses_only_what_it_cannot_frame |
-| relay-copies-per-byte-written | 0 | ferrox-app-proxy::tests::a_two_part_write_hands_the_payload_over_by_pointer |
+| downlink-copies-per-byte-written | 0 | ferrox-app-proxy::tests::a_two_part_write_hands_the_payload_over_by_pointer |
 | xudp-uplink-copies-per-byte-written | 0 | ferrox-app-proxy::tests::xudp_uplink_hands_the_payload_over_by_pointer |
 | xudp-reply-copies-per-byte-written | 0 | ferrox-app-proxy::tests::a_udp_reply_hands_the_payload_over_by_pointer |
 | downlink-writes-per-read-batch | 1 | ferrox-app-proxy::tests::a_mux_downlink_hands_a_batch_of_frames_over_in_one_call |
@@ -55,6 +60,18 @@ graph TD
 
 **Not measured yet.** `ferrox-bench` gate 6 compares Mux rows field-for-field and requires zero allocations on both sides; that is a correctness and allocation gate, not a clock. The clock is `.github/workflows/parity.yml`. No CI artefact has been read.
 
+## A stalled origin
+
+The session thread used to write every client `Keep` straight to its origin under that flow's mutex: once an origin stopped reading, its window filled, the write parked, and the session read nothing for any flow until it returned. The session side of issue #389 follows from that one blocking call; its other half is the uplink read that never timed out.
+
+Each TCP flow is now two directions with their own handles. The session never writes to an origin: it copies the payload into the flow's `sync_channel(MUX_PENDING = 16)` and goes back to reading. The writer owns the origin socket, arms `relay_stall` once before its loop, and half-closes after the queue drains, so a client `End` still sends FIN behind every byte that was queued. A full queue is a stalled origin: that flow is removed and its socket shut down, and the session keeps reading — the flow's next `Keep` finds no entry and is dropped. The origin-bound copy is what buys that, and it is prose rather than a row because a pointer gate witnesses a copy removed, not one paid deliberately.
+
+The uplink reader polls its origin on `RELAY_POLL` rather than blocking, and a timeout asks the session's table whether it is done; teardown sets that flag, drains the flows, shuts each socket and then joins, so a silent origin costs one poll instead of the whole join budget. The session's client-bound writes carry the same `relay_stall` deadline as a relay leg: a client that stops reading makes its write error and the session unwind, and a flow parked writing to it is woken by the session's own shutdown rather than waiting out the deadline.
+
+`a_stalled_origin_does_not_park_the_mux_session` is the gate: an origin accepts and never reads, the client floods 32 MiB of `Keep`s past its loopback window, and the test requires the client's writes to keep landing and a second flow's ping to come back. Before this change the client's write times out with the session parked inside the first flow. `an_ended_mux_flow_releases_a_silent_origin` covers the poll: an origin that accepts and says nothing must not hold the session past its join budget once the client is gone.
+
+The cost is one more pooled thread per live TCP flow — a writer beside the reader, bounded by the 8-flow cap — and one `Vec` per queued frame, at most 128 KiB per flow at the cap. Both are the price of the session's read loop never touching an origin socket.
+
 ## What we removed
 
 - **A full `memcpy` of every inbound byte, on all three read loops.** The accept loop, `mux_dial_downlink` and the XUDP reader each read into an 8 KiB stack array and then did `buf.extend_from_slice(&probe[..n])`, so every byte off the socket was copied once before the framing loop could see it — while `mux::decode` was already handing out a *borrowed* subslice of `buf`, which the consumer then writes straight to its socket. The framing buffer's own spare capacity is the read destination now, via `proxy::read_into_tail`, the same idiom `ws.rs::pull` and `vision.rs::fill` already used and for the same reason. The buffer is sized once with `with_capacity(READ_SLICE)` and `clear`ed between reads, so the relay loop never reallocates either. The user-space copy count on the read side goes from one to zero; the syscall count is unchanged, because a TCP read is a read either way. `a_read_into_the_tail_appends_exactly_what_the_stream_held` is the gate: it drains a stream through a five-bytes-at-a-time reader — 3 300-odd short reads over 16.5 KiB — and checks after *every* read that the buffer holds exactly the prefix the source held. A second test covers the two ways the `set_len` can be rolled back, the failing reader and the empty one, because a buffer left longer than the bytes read is how this idiom reads uninitialised memory.
@@ -70,9 +87,9 @@ graph TD
   - **The wiring delivers what the codec describes.** `the_mux_uplink_frames_every_relay_read_the_same_way` drives the relay over a real socket pair at seven total lengths, decodes every frame off the wire and requires the reassembled bytes to equal what was written to the client.
   - **The payload is handed over by pointer, not copied.** `a_two_part_write_hands_the_payload_over_by_pointer` asserts the second `writev` part's base address *is* the payload slice's. This is the only kind of test that can see the copy: a byte-level test cannot, because the bytes are identical either way — reverting to the copying form still passes the framing test, and that is the honest shape of this claim.
 
-  The server relay shared the same copy through `write_mux_frame`, which `encode_into`d every Keep payload into a staging buffer on both the TCP relay task and the UDP reader. It now takes the same header-plus-`writev` path for any frame with a payload — the header is rebuilt per frame there rather than hoisted, because the UDP reader's target varies per datagram — and the `CHUNK_MAX` bound `encode_into` enforced moved with it, so an oversize relay payload is still refused rather than truncated into the two-byte length (`a_relay_payload_longer_than_a_frame_is_refused_not_truncated`). `relay-copies-per-byte-written 0` covers both relay directions through the one pointer gate, and the TCP/UDP loopbacks pin the bytes on each path.
+  The server relay shared the same copy through `write_mux_frame`, which `encode_into`d every client-bound Keep payload into a staging buffer on both the TCP relay task and the UDP reader. It now takes the same header-plus-`writev` path for any client-bound frame with a payload — the header is rebuilt per frame there rather than hoisted, because the UDP reader's target varies per datagram — and the `CHUNK_MAX` bound `encode_into` enforced moved with it, so an oversize relay payload is still refused rather than truncated into the two-byte length (`a_relay_payload_longer_than_a_frame_is_refused_not_truncated`). `downlink-copies-per-byte-written 0` covers the origin-to-client direction through the one pointer gate, and the TCP/UDP loopbacks pin the bytes on each path; the client-to-origin direction's single queue copy is the exception `## A stalled origin` explains, and it carries no row.
 
-  **Two rows on this page were wrong and are corrected rather than kept.** Both `user-space-copies-per-byte-written 0` and `-read 1` named `ferrox-bench-gate-6`, which counts *allocations, bytes allocated and zero-fills* — not copies (`check_encode_allocs`, `muxframe.rs:234`). So the checker did not observe what the row claimed, and the written value was also wrong for the codec: `encode_into` copies the payload into the output buffer, so the codec's write side is **1** copy per byte, not 0. They are now `relay-copies-per-byte-written 0` — gated by the pointer identity above — and `codec-copies-per-byte-written 1`, which is the floor for an in-place-serialised codec and what the decode side's borrowed subslice already achieves.
+  **Two rows on this page were wrong and are corrected rather than kept.** Both `user-space-copies-per-byte-written 0` and `-read 1` named `ferrox-bench-gate-6`, which counts *allocations, bytes allocated and zero-fills* — not copies (`check_encode_allocs`, `muxframe.rs:234`). So the checker did not observe what the row claimed, and the written value was also wrong for the codec: `encode_into` copies the payload into the output buffer, so the codec's write side is **1** copy per byte, not 0. They are now `downlink-copies-per-byte-written 0` — gated by the pointer identity above — and `codec-copies-per-byte-written 1`, which is the floor for an in-place-serialised codec and what the decode side's borrowed subslice already achieves.
 - **The write-side payload copy.** Xray's `common/mux/writer.go:83` allocates a `MultiBuffer` per frame — `mb2 := make(buf.MultiBuffer, 0, len(data)+1)` — and appends the header buffer and the caller's payload buffers to it, so the payload is not copied but a slice is allocated per frame. sing-box, on the `smux` path, does `copy(buf[headerSize:], request.frame.data)` for every frame that is not vectorised, plus `result: make(chan writeResult, 1)` per frame and two goroutine handoffs. This tree appends into one buffer that exists for the connection, and gate 6 holds the allocation count at zero.
 - **The read-side double copy.** Xray's frame unmarshal (`common/mux/frame.go:114-130`) reads the metadata into a pooled buffer, parses it, and then the chunk reader copies the payload out of the `BufferedReader` into the caller's buffer — two copies for one byte. Zray's `read_frame` reads the payload through `spare_capacity_mut` + `set_len`, which is one copy and no zero-fill; that is the shape here.
 - **A 4 MiB receive buffer per session.** sing-box's smux defaults are `MaxReceiveBuffer = 4194304` and `MaxFrameSize = 32768` (`sagernet/smux/mux.go:62-71`), and `Allocator.Get` returns a `*[]byte`, so every frame costs a pool round trip plus one heap allocation for the head. The session cap here is 8, which is the smaller number that still gives one connection a handful of parallel streams.
