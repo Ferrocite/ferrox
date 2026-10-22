@@ -2891,9 +2891,8 @@ fn relay_vless_driven(
         );
         return;
     }
-    match driven_halves(session, RELAY_POLL) {
-        Ok(half) => relay_stream(half, Half::socket(uplink), &close),
-        Err(_) => (),
+    if let Ok(half) = driven_halves(session, RELAY_POLL) {
+        relay_stream(half, Half::socket(uplink), &close);
     }
 }
 
@@ -5965,9 +5964,8 @@ fn dial_vless_tls(
             }
             let close = shutdown_pair(downstream.try_clone().ok(), None);
             // The relay reads the session's transport itself: the idle leg's wait holds no lock, so it takes the relay grain itself.
-            match driven_halves(session, RELAY_POLL) {
-                Ok(half) => relay_stream(Half::socket(downstream), half, &close),
-                Err(_) => (),
+            if let Ok(half) = driven_halves(session, RELAY_POLL) {
+                relay_stream(Half::socket(downstream), half, &close);
             }
         }
         _ => ride_carrier(server, session, vless, &header, client),
@@ -6114,9 +6112,8 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
             }
             let close = shutdown_pair(downstream.try_clone().ok(), None);
             // The relay reads the session's transport itself: the idle leg's wait holds no lock, so it takes the relay grain itself.
-            match driven_halves(session, RELAY_POLL) {
-                Ok(half) => relay_stream(Half::socket(downstream), half, &close),
-                Err(_) => (),
+            if let Ok(half) = driven_halves(session, RELAY_POLL) {
+                relay_stream(Half::socket(downstream), half, &close);
             }
         }
         Carrier::Ws { path, ed } => {
@@ -17123,7 +17120,6 @@ mod tests {
     /// A session inbound whose peer answers the head and then stops speaking releases the serve thread: the dispatcher's poll makes the session read answer, and the request's own clock makes it refuse.
     #[test]
     fn a_silent_peer_cannot_pin_a_grpc_tls_vless_request() {
-        use ferrox_core::tls::TlsProvider as _;
         let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
@@ -18112,7 +18108,6 @@ mod tests {
                 ferrox_core::tls::RustlsServerProvider::accept((*server_config).clone(), stream)
                     .expect("accepts");
             tls.handshake().expect("handshakes");
-            echo_trace(&format!("srv {port} handshook"));
             let out = tls.get_ref().try_clone().expect("dups the transport");
             let shared = Arc::new(Mutex::new(tls));
             let out = Arc::new(Mutex::new(Sealed::new(out)));
@@ -18129,7 +18124,6 @@ mod tests {
                 },
             )
             .expect("accepts carrier");
-            echo_trace(&format!("srv {port} carrier up"));
             match kind {
                 TlsEcho::Vless(id) => {
                     let Some((got, _flow, cmd, _target)) = decode_request(&mut reader) else {
