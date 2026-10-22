@@ -26,7 +26,7 @@ A from-scratch proxy core, **bit-identical to the implementations it replaces** 
 - **The reference is not as fast as it looks.** Comparators often ship SIMD behind a cfg nothing sets; every report prints both backends, and a ratio without both names is not a measurement.
 - **Lints and operation counts are local; nothing connection-dependent is.** `./scripts/check.sh` runs before every push; benchmarks, parity, upstream suites and Miri are CI-only.
 - **Nothing runs on a merge.** Every gate fires on the PR; `main` is covered by schedules (benches daily, Miri weekly, pins on input change).
-- **Pooled blocking relay today, a readiness seam planned.** A leg holds a worker only while it copies, but a leg blocked in `read` still holds its OS thread — the per-concurrency tax batching cannot reach (batching cuts syscalls per byte, not threads per connection). The design answer is an `epoll`/`kqueue`/IOCP seam so N legs ride ~`cores` threads behind the unchanged `Read`/`Write` contract; see [concurrency](docs/concurrency.md).
+- **Fixed-worker readiness seam on raw TCP, pooled blocking relay on carrier legs.** Raw flows hand their descriptors to `min(cores, 8)` workers and the accept thread returns, so `threads_peak` at eight flows fell 31 → 7 (Linux x86_64) and 39 → 11 (Windows), and is the same at one flow where both were measured; macOS now reports 6 against xray-core's 19. Carrier legs (TLS, mux, Shadowsocks, xHTTP) still hold a thread per parked leg; see [concurrency](docs/concurrency.md).
 
 ## What is checked
 

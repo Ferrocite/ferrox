@@ -87,8 +87,6 @@ impl Connection {
 
     /// Whether a write to this stream must pass the chain, which a descriptor-level fast path
     /// addressing the socket would skip. Reads, teardown and the census are unaffected by it.
-    /// Only linux has such a lane to gate, so only linux builds the question.
-    #[cfg(target_os = "linux")]
     pub(crate) fn masked(&self) -> bool {
         matches!(self, Connection::Masked(_))
     }
@@ -348,6 +346,18 @@ impl Connection {
                 io::ErrorKind::Unsupported,
                 "a unix stream reports no local address",
             )),
+        }
+    }
+
+    /// Switch the socket's blocking mode, the readiness seam's one socket-shape change: a
+    /// duplicate shares the descriptor's status flags, so the relay restores it when the flow ends.
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        match self {
+            Connection::Tcp(stream) => stream.set_nonblocking(nonblocking),
+            Connection::Masked(masked) => masked.stream.set_nonblocking(nonblocking),
+            #[cfg(any(unix, windows))]
+            Connection::Unix(stream) => stream.set_nonblocking(nonblocking),
         }
     }
 
@@ -751,7 +761,6 @@ mod winunix {
         SD_BOTH, SD_RECEIVE, SD_SEND, SOCKADDR, SOCKADDR_UN, SOCKET, SOCKET_ERROR, SOCK_STREAM,
         SOL_SOCKET, WSABUF, WSADATA, WSAESHUTDOWN,
     };
-    #[cfg(test)]
     use windows_sys::Win32::Networking::WinSock::{ioctlsocket, FIONBIO};
 
     pub(crate) use windows_sys::Win32::Networking::WinSock::{SO_RCVTIMEO, SO_SNDTIMEO};
@@ -957,6 +966,17 @@ mod winunix {
             };
             // SAFETY: this is the stream's own socket and `how` is one of WinSock's three directions.
             if unsafe { shutdown(self.socket.0, how) } == SOCKET_ERROR {
+                return Err(last_error());
+            }
+            Ok(())
+        }
+
+        /// Switch the socket's blocking mode; every leg shares the one handle, so the flags
+        /// change for the relay's duplicates together and are restored together.
+        pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+            // SAFETY: `mode` is the one `u32` flag `FIONBIO` reads, on this socket.
+            let mut mode = u32::from(nonblocking);
+            if unsafe { ioctlsocket(self.socket.0, FIONBIO, &raw mut mode) } == SOCKET_ERROR {
                 return Err(last_error());
             }
             Ok(())

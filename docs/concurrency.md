@@ -1,10 +1,12 @@
 # Concurrency model
 
-One decision, stated with its checker. This is the design answer to the thread/kernel-CPU tax the method pages name and batching does not remove; it is `planned`, not measured, and the one number it would move is `UNBLESSED` until a run reads it.
+One decision, stated with its checker. This is the design answer to the thread/kernel-CPU tax the method pages name and batching does not remove. The raw TCP data path has it and is measured; the carriered legs still run the old pooled blocking copy.
 
 ## The tax, honestly
 
-Ferrox is a **pooled blocking relay**. Each accepted flow hands its directions to a `RelayTask` worker pool (`crates/ferrox-app/src/proxy.rs`): a worker runs a leg, and on completion parks itself in an idle lot a later flow can claim. Idle workers cost nothing. But a leg that is *waiting* — blocked in `read` on a socket the peer has not fed — holds its OS thread for the whole wait. So the thread a flow costs is not one-per-connection, it is **one-per-*active*-leg**, and "active" includes "blocked, waiting for bytes". At ten thousand quiet-but-open tunnels that is tens of thousands of threads parked in the kernel, each with a stack the scheduler must switch.
+Ferrox is a **pooled blocking relay** on its carriered legs. Each accepted flow hands its directions to a `RelayTask` worker pool (`crates/ferrox-app/src/proxy.rs`): a worker runs a leg, and on completion parks itself in an idle lot a later flow can claim. Idle workers cost nothing. But a leg that is *waiting* — blocked in `read` on a socket the peer has not fed — holds its OS thread for the whole wait. So the thread a flow costs is not one-per-connection, it is **one-per-*active*-leg**, and "active" includes "blocked, waiting for bytes". At ten thousand quiet-but-open tunnels that is tens of thousands of threads parked in the kernel, each with a stack the scheduler must switch.
+
+The raw TCP legs have left that shape. Their descriptors are handed to a fixed worker set and the connection's own thread returns to accept the next flow, so the peak is a property of the machine rather than of the flow count. The copy above is what the carrier paths (TLS, mux, Shadowsocks, xHTTP) still run.
 
 `xray-core` does not pay this. A Go goroutine blocked on a read is descheduled by the runtime netpoller and its OS thread released for other work; a per-connection goroutine is ~2 KiB of heap and a link in a run queue, not a kernel thread. The pages that admit the gap are honest about which half they closed: [`shadowsocks`](function/shadowsocks.md) says of its batch "the thread count did not move at all (36 before, 36 after)", [`carrier-xhttp`](function/carrier-xhttp.md) buys "a thread per idle connection", [`carrier-quic`](function/carrier-quic.md) "a thread per idle lane", and [`carrier-grpc`](function/carrier-grpc.md) prices "95% of this carrier's Windows cpu is kernel time".
 
@@ -14,9 +16,13 @@ Batching is real and it landed: `CHUNKS_PER_BATCH` folds four chunks into one `r
 
 ## The chosen design: a readiness seam, not an async rewrite
 
-Add a `Poller` behind the existing pool — `epoll` on Linux, `kqueue` on macOS, IOCP on Windows — so a blocking leg-read becomes three steps: register the fd for readability as a `RelayTask` *interest*, release the worker back to the idle lot, and re-claim a worker only when the fd is ready with bytes in hand. This is the same M:N trick the goroutine netpoller runs: **N legs ride ~`cores` worker threads**, and a thread is held while a leg has work, not while it waits. It does not release a thread for a leg that is actively copying — that leg was never the tax — it releases the ones parked in `read`.
+The seam sits *under* the `Read`/`Write` contract, so nothing above it changes. On Linux the raw legs reuse the `splice` pump that already existed: a direction splices source to a pipe and pipe to destination, and one `poll` wake on either descriptor drives both legs. On the hosts without `splice`, `poll_copy` keeps the same shape with a 64 KiB buffered copy and `poll`/`WSAPoll`; a wake pipe (Unix) or loopback TCP pair (Windows) releases a worker when a flow is queued. Both pools are fixed at `min(available_parallelism, 8)` workers and both hand a flow back only when both directions have ended.
 
-The seam sits *under* the `Read`/`Write` contract, so nothing above it changes. Byte-identity is a claim about bytes, not about how a wait is slept through, and every codec/carrier keeps its synchronous `read_exact`/`write_all` shapes. It reuses machinery that already exists: the `RelayTask` lot is the worker set, and the `census` wait table (`crates/ferrox-app/src/census.rs`, `engine-budgets` in the superset) already registers each parked leg with the descriptor it blocks on — that table is both the design's bookkeeping and its checker. Linux already runs a `splice` `pull`/`push` copy shape for raw legs; the poller generalises "don't hold a thread for a wait" from one copy shape to every leg.
+Ownership is what makes the hand-off real: `relay_handoff` clones the four descriptors, arms them non-blocking, queues the flow, and returns. The accept loop's thread is therefore finished with the flow before the first byte moves. The guards and the completion channels live in the `Flow`, so the sockets' blocking mode is restored and the joiner woken when the workers finish — not by the caller's thread parked on a channel. `Pump` uses a one-shot `RelayPool::run_once` for the same reason: a finished pump thread leaves instead of parking for `RELAY_WORKER_LIFE`.
+
+A masked leg, or a host where the arm fails, still falls back to one spawned blocking relay thread; that is the safe path, not the measured one.
+
+This is the same M:N trick the goroutine netpoller runs: **N legs ride ~`cores` worker threads**, and a thread is held while a leg has work, not while it waits. It does not release a thread for a leg that is actively copying — that leg was never the tax — it releases the ones parked in `read`.
 
 ## Rejected, and why
 
@@ -26,8 +32,23 @@ The seam sits *under* the `Read`/`Write` contract, so nothing above it changes. 
 
 ## The checker (has to observe the thing the row claims)
 
-A duration suggests; a thread count proves. The claim to gate is **idle legs pin no thread**, and the tree already carries its shape: `carrier-grpc.md` asserts `pinned-threads-per-silent-{preface,request-head,vless-request,tls-request,trojan-request,vmess-request,shadowsocks-request} = 0` against a silent peer. The seam generalises that per-peer assertion to a scale count — **live OS threads at N concurrent mostly-idle connections**, read from `/proc/<pid>/task` (Linux) or `task_threads` (macOS), gated in the `parity.yml`/`bench.yml` matrix beside the existing kernel-ms/GiB ratio against `xray-core`. Until a CI run reads it, `idle-legs-pinned-threads-per-connection` stays `UNBLESSED` on each page and this doc quotes no figure for it.
+A duration suggests; a thread count proves. The matrix already records `threads_peak` per engine per cell, and the same cell records the paired throughput and CPU intervals, so the claim is read from one run rather than two. The measured cell is `vless-raw-down-8` at five repeats, CI run `39826752985`; the one-flow control is `vless-raw-down-1`, CI run `39833614246`:
+
+| cell | ferrox before | ferrox now | xray-core | zeronet |
+| --- | ---: | ---: | ---: | ---: |
+| ubuntu x86_64, 8 connections | 31 | 7 | 17 | 5 |
+| ubuntu aarch64, 8 connections | — | 7 | 17 | 5 |
+| windows x86_64, 8 connections | 39 | 11 | 11 | 9 |
+| macOS aarch64, 8 connections | `None` | 6 | 19 | 4 |
+
+The "before" Linux and Windows numbers are the source run in issue #381 (`39707834882`); macOS reported no count there because the sampler had no thread column on that host. At one connection the peak is **7** on both Ubuntu runners and **11** on Windows, the same as at eight; on the three platforms measured at both counts the number does not move with the flow count. macOS was measured at eight only, where it is 6.
+
+The throughput gate passed in every cell, so no leg got slower: the paired ferrox/xray-core midpoints are 2.13× on ubuntu x86_64, 2.63× on ubuntu aarch64, 1.20× on Windows, and within noise on macOS (median 1.08×, paired midpoint 1.28×). CPU per GiB and peak RSS are lower than xray-core in the same cells.
+
+The **idle-leg** form of the claim is still open for the carriered paths: this cell carries active traffic, so it proves the fixed peak for raw TCP, not that a silent TLS or mux peer pins nothing. The per-peer `pinned-threads` rows on the carrier pages remain the checker for that half, and `idle-legs-pinned-threads-per-connection` stays `UNBLESSED` until a carrier cell reads it.
 
 ## Status
 
-`planned`, its own slice — a cross-carrier change to the copy seam, not a method row and not a fold into any batching slice. The pool, the batch, the splice rung and the census table are the rungs already climbed; closing the concurrency axis is the one rung left between "bit-identical and not slower per byte" and "not slower per connection at scale".
+`landed and measured` for the raw TCP data path: vless/vmess/trojan raw, the SOCKS client and freedom direct paths now hand off to the fixed worker set, and the thread peak is 7 (Linux), 11 (Windows) and 6 (macOS) at eight flows, unchanged at one flow where both were measured. The `census` wait table, the batch rungs and the splice pump are unchanged above the seam.
+
+`open` for every carriered leg (`relay_stream`, `Half`, xHTTP idle connections, Shadowsocks, gRPC): those still hold a thread per parked leg, and no number here claims otherwise. Closing that half is the next slice; this one does not fold into it.
