@@ -1008,6 +1008,8 @@ fn measure_once(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> R
         });
     }
 
+    // Read at first listen, before a byte of payload moves: a clock read at the end of the run reports the transfer, not the startup.
+    let startup_seconds = started.elapsed().as_secs_f64();
     let startup_samples = sample_for(pid, Phase::Startup, PRE_SLEEP)?;
     let startup_cpu_millis = startup_samples
         .first()
@@ -1083,7 +1085,7 @@ fn measure_once(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> R
             threads_peak: summary.threads_peak,
             io: summary.io,
             startup_cpu_millis,
-            startup_seconds: started.elapsed().as_secs_f64(),
+            startup_seconds,
             samples,
         },
     })
