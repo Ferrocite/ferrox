@@ -6,7 +6,9 @@ The answer's bytes are the reference's own. The oracle (`scripts/blackhole-oracl
 
 The config is the reference's shape — `{"response": {"type": "none" | "http" | "custom", "customResponseData": "<base64>"}}` — read the way the reference's own config builder reads it, with the type folded to lower case. An answer the reference does not know, and a response that is not an object at all, are refused at startup with the reason named.
 
-The sink is the last resort of the untagged lane: a config that names a dial takes the dial, and a config that names only the sink takes the sink. A routing rule names it by tag, and a rule that sends a flow to the tag gets the sink. xray registers `block` as another name for the handler, and both the only-lane and the tagged-rule path accept it (`upstream/xray-core/infra/conf/xray.go:27-53`).
+The sink is the last resort of the untagged lane: a config that names a dial takes the dial, and a config that names only the sink takes the sink. A routing rule names it by tag, and a rule that sends a flow to the tag gets the sink.
+
+xray registers `block` as another name for the handler, and both the only-lane and the tagged-rule path accept it (`upstream/xray-core/infra/conf/xray.go:27-53`).
 
 The datagram lane is not the sink's to answer: a SOCKS association to a blackhole is refused with `0x07` before the relay binds, the way sing-box refuses the dial and ZeroNet rejects the datagram, so a client learns its datagrams go nowhere instead of watching them vanish.
 
