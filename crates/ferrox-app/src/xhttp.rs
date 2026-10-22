@@ -9,7 +9,8 @@ use crate::conn::Connection;
 use ferrox_core::transport::url_decode;
 
 const HEAD_LIMIT: usize = 64 * 1024;
-const CHUNK: usize = 16 * 1024;
+/// One chunk per relay window: a promoted read leaves as one chunked frame, not as a 16 KiB chunk per quarter of it.
+const CHUNK: usize = crate::proxy::RELAY_BUFFER;
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
 fn path_covers(configured: &str, requested: &str) -> bool {
@@ -35,7 +36,7 @@ fn read_head(stream: &mut Connection) -> Option<(Vec<u8>, usize)> {
     crate::proxy::read_http_head_kept(stream, HEAD_LIMIT, crate::budgets::head_arrival())
 }
 
-fn size_line(n: usize, out: &mut [u8; 6]) -> usize {
+fn size_line(n: usize, out: &mut [u8; 7]) -> usize {
     debug_assert!((1..=CHUNK).contains(&n));
     if n < 16 {
         out[0] = HEX[n & 0xf];
@@ -55,7 +56,7 @@ fn size_line(n: usize, out: &mut [u8; 6]) -> usize {
         out[3] = b'\r';
         out[4] = b'\n';
         5
-    } else {
+    } else if n < 0x1_0000 {
         out[0] = HEX[(n >> 12) & 0xf];
         out[1] = HEX[(n >> 8) & 0xf];
         out[2] = HEX[(n >> 4) & 0xf];
@@ -63,6 +64,15 @@ fn size_line(n: usize, out: &mut [u8; 6]) -> usize {
         out[4] = b'\r';
         out[5] = b'\n';
         6
+    } else {
+        out[0] = HEX[(n >> 16) & 0xf];
+        out[1] = HEX[(n >> 12) & 0xf];
+        out[2] = HEX[(n >> 8) & 0xf];
+        out[3] = HEX[(n >> 4) & 0xf];
+        out[4] = HEX[n & 0xf];
+        out[5] = b'\r';
+        out[6] = b'\n';
+        7
     }
 }
 
@@ -345,7 +355,7 @@ impl XhttpWriter {
             if piece.is_empty() {
                 continue;
             }
-            let mut line = [0u8; 6];
+            let mut line = [0u8; 7];
             let len = size_line(piece.len(), &mut line);
             if !stream.write_slices(&[&line[..len], piece, b"\r\n"]) {
                 return false;
@@ -1852,11 +1862,58 @@ mod tests {
 
     #[test]
     fn size_lines_match_format_without_allocating() {
-        for n in [1usize, 9, 10, 15, 16, 255, 256, 4096, 16384] {
-            let mut line = [0u8; 6];
+        for n in [
+            1usize, 9, 10, 15, 16, 255, 256, 4096, 16384, 65535, 65536, CHUNK,
+        ] {
+            let mut line = [0u8; 7];
             let len = size_line(n, &mut line);
             assert_eq!(&line[..len], format!("{n:X}\r\n").as_bytes());
         }
+    }
+
+    /// The sink frames one relay window once: `one_window_is_one_chunked_frame` counts the `write_slices` calls and reassembles their bytes, because a socket sees the bytes and not how many calls carried them.
+    #[test]
+    fn one_window_is_one_chunked_frame() {
+        #[derive(Default)]
+        struct Frames {
+            calls: usize,
+            bytes: Vec<u8>,
+        }
+        struct Counting(Arc<Mutex<Frames>>);
+        impl Write for Counting {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("sink").bytes.extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl crate::proxy::FrameWrite for Counting {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                let mut seen = self.0.lock().expect("sink");
+                seen.calls += 1;
+                for part in parts {
+                    seen.bytes.extend_from_slice(part);
+                }
+                true
+            }
+        }
+        let log = Arc::new(Mutex::new(Frames::default()));
+        let writer = XhttpWriter::new(Counting(Arc::clone(&log)));
+        let payload = vec![0x5Au8; CHUNK];
+        assert!(writer.send(&payload), "the window is framed");
+        let seen = log.lock().expect("sink");
+        assert_eq!(
+            seen.calls, 1,
+            "a promoted window left as {} chunked frames",
+            seen.calls
+        );
+        let head = format!("{CHUNK:X}\r\n");
+        assert_eq!(seen.bytes.len(), head.len() + CHUNK + 2);
+        assert_eq!(&seen.bytes[..head.len()], head.as_bytes());
+        assert_eq!(&seen.bytes[head.len()..head.len() + CHUNK], &payload[..]);
+        assert_eq!(&seen.bytes[head.len() + CHUNK..], b"\r\n");
     }
 
     #[test]

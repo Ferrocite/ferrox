@@ -88,8 +88,9 @@ Both H1 handshakes — the `POST` a server reads and the `200` a dialer reads �
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | framing-size-lines-without-an-allocation | 0 | ferrox-app-xhttp::tests::size_lines_match_format_without_allocating |
-| framing-read-syscalls-per-16KiB-chunk | 1 | ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three |
-| read-syscalls-per-16KiB-chunk | 2 | ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three |
+| framing-read-syscalls-per-chunk | 1 | ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three |
+| read-syscalls-per-chunk | 2 | ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three |
+| write-slices-per-window | 1 | ferrox-app-xhttp::tests::one_window_is_one_chunked_frame |
 | user-space-copies-per-byte-written | 1 | ferrox-app-xhttp::tests::exchange_carries_an_echo_over_loopback |
 | requests-served-per-connection | 2 | ferrox-app-xhttp::tests::one_connection_carries_the_packet_up_uplink |
 | requests-served-before-a-close | 1 | ferrox-app-xhttp::tests::a_request_that_says_close_takes_the_connection_with_it |
@@ -121,7 +122,8 @@ CI `vless-xhttp-down-8` (full tier, 5 repeats, linux x86_64, gate passed): **2.1
 
 What that cell does *not* witness is named, because it is not a small thing: its config is `network: xhttp` with `path: /share` and no mode, the dialer writes the H1 `stream-one` head for that shape, and the hub reaches `xhttp_h2` only behind a peer's 24-byte HTTP/2 preface (`proxy.rs:1513`), so the request never spends a credit. The cell is this page's no-regression gate and the ratio is our standing against the reference; `writes-per-credit 1` is gated by the in-memory writer above, which is the only checker that can count writes.
 
-- **A framing read syscall per chunk, and the second one was two bytes.** The reader spent three reads per 16 KiB chunk: one to fetch the size line, one for the body, and one `read_exact` for the two-byte CRLF that closes the chunk. The CRLF read now fills a 128-byte window instead, and the bytes past the CRLF are the *next* size line, which `read_line_into` then finds without asking the socket again — so the framing reads amortise to one per chunk and the count is `2 * chunks + 1`, measured: **33 reads for 16 chunks against 49** for the old shape over the same loopback socket, with the payload byte-identical.
+- **A chunk per 16 KiB of a window the relay already framed.** The sink cut every send at 16 KiB, so a promoted 64 KiB relay window left as four chunked frames — four size lines, four `write_slices` calls, and on Windows four `WSASend`s for bytes one call could carry. `CHUNK` is the relay window now, so the same window is one chunk, one size line and one call: `one_window_is_one_chunked_frame` counts the calls and reassembles their bytes, one call carrying the seven-byte line `10000\r\n`, the payload and the closing CRLF. This does change the bytes on the wire — fewer, larger chunk boundaries — and says so: the payload and its order are untouched, and the size line grew a fifth hex digit, which `size_lines_match_format_without_allocating` checks against `format!("{n:X}\r\n")` at 65 535, 65 536 and one whole chunk. A chunked reader takes an arbitrary size by definition, so the interop proof is the upstream suites in CI. What did not move: the h2 lane keeps its own DATA frames (`send` hands an h2 stream its payload whole and never sees `CHUNK`), and a peer whose relay reads land short of a window still pays one chunk per read.
+- **A framing read syscall per chunk, and the second one was two bytes.** The reader spent three reads per chunk: one to fetch the size line, one for the body, and one `read_exact` for the two-byte CRLF that closes the chunk. The CRLF read now fills a 128-byte window instead, and the bytes past the CRLF are the *next* size line, which `read_line_into` then finds without asking the socket again — so the framing reads amortise to one per chunk and the count is `2 * chunks + 1`, measured: **33 reads for 16 chunks against 49** for the old shape over the same loopback socket, with the payload byte-identical.
 
   Two things this needed to get right, both of which the worst case caught rather than the average:
 
