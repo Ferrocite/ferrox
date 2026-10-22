@@ -27204,23 +27204,11 @@ mod poll_relay {
             }
         }
 
-        fn stalled_for(&self, budget: Duration) -> bool {
-            self.stalled.is_some_and(|since| since.elapsed() >= budget)
-        }
-
-        /// A destination that has not taken a byte for the stall budget gives up both halves,
-        /// so the partner leg parked on that socket wakes and the flow ends together.
-        fn give_up(&mut self) {
-            let _ = self.dst.shutdown(Shutdown::Both);
-            self.end();
-        }
-
         fn end(&mut self) {
             if self.ended {
                 return;
             }
             self.ended = true;
-            self.stalled = None;
             let _ = self.dst.shutdown(Shutdown::Write);
         }
     }
