@@ -1449,6 +1449,52 @@ mod tests {
         });
     }
 
+    /// The answer's half of the write rule: a server session's write pushes the records it
+    /// framed and leaves the request's bytes to whichever call is reading them. The count is
+    /// exact: the peer answers nothing, so every read the session makes is one this tree asked for.
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_server_answer_write_does_not_read_the_transport() {
+        let cert_pem = anchor_pem("CERTIFICATE", ANCHOR);
+        let key_pem = anchor_pem("PRIVATE KEY", ANCHOR_KEY);
+        let identity = crate::tls::parse_pem_identity(&cert_pem, &key_pem).expect("parses");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let bytes = Arc::new(AtomicUsize::new(0));
+        let sizes = Arc::new(Mutex::new(Vec::new()));
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                let (stream, _) = listener.accept().expect("accepts");
+                let counter = ReadCounter {
+                    inner: stream,
+                    calls: Arc::clone(&calls),
+                    bytes: Arc::clone(&bytes),
+                    sizes: Arc::clone(&sizes),
+                };
+                let mut server = crate::tls::accept(&identity, counter).expect("accepts");
+                server.handshake().expect("handshakes");
+                let before = calls.load(Ordering::Relaxed);
+                server.write_all(b"answer").expect("answers");
+                server.flush().expect("flushes");
+                let after = calls.load(Ordering::Relaxed);
+                assert_eq!(
+                    after - before,
+                    0,
+                    "the answer read the transport {after} times where it had read {before}"
+                );
+            });
+            let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut client = crate::tls::connect(&client("tls.test", &[]), stream).expect("dials");
+            client.handshake().expect("handshakes");
+            let mut sink = [0u8; 64];
+            while matches!(client.read(&mut sink), Ok(read) if read > 0) {}
+        });
+    }
+
     /// Counts the segments a coalesced write reached the writer with, allocating nothing itself
     /// so it can sit inside the measurement window.
     struct SegmentRecorder {
