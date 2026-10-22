@@ -962,7 +962,7 @@ fn read_frame<S: Read>(
             } else {
                 0
             },
-            stream: 0,
+            stream,
             length: if done { state.data_len } else { 0 },
         };
         if done {
@@ -992,7 +992,7 @@ fn read_frame<S: Read>(
             return Ok(frames::H2Frame {
                 kind: frames::DATA,
                 flags: 0,
-                stream: 0,
+                stream,
                 length: 0,
             });
         }
@@ -1489,7 +1489,7 @@ impl Read for Tls2 {
             // An unpadded payload is copied once, by the frame reader, straight into the caller's buffer: nothing is staged between the lane and its caller, and a frame the caller has no room left for resumes in the caller's own space on the next read.
             let read = self.with_frame(buf, |lane, frame, payload| -> std::io::Result<usize> {
                 // A DATA frame the reader delivered arrives with the wire's payload already in the caller's buffer and none left in the lane's hands: what this call handed over is counted in `delivered`, and the credit is owed for exactly that.
-                if frame.kind == frames::DATA && payload.is_empty() {
+                if frame.kind == frames::DATA && frame.stream == lane.stream && payload.is_empty() {
                     lane.fin = frame.flags & frames::END_STREAM != 0;
                     let got = lane.frame.delivered as usize;
                     if got > 0 {
@@ -4554,6 +4554,83 @@ pub(crate) mod loopback {
             1,
             "every flow after the first rides the session the first opened"
         );
+    }
+
+    /// An h2 edge that answers the open, writes the frames handed to it, and then drains until the socket goes quiet.
+    fn scripted_h2_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+        pieces: Vec<Vec<u8>>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) {
+                return;
+            }
+            let mut opening = Vec::new();
+            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut opening);
+            h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut opening);
+            for piece in pieces {
+                opening.extend_from_slice(&piece);
+            }
+            tls.write_all(&opening).expect("writes the script");
+            tls.flush().expect("flushes the script");
+            loop {
+                let mut byte = [0u8; 1];
+                match tls.read(&mut byte) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => {}
+                }
+            }
+        })
+    }
+
+    /// On a session two flows share, a flow ends with an empty DATA carrying `END_STREAM` on its own stream: the frame that closes a predecessor's stream must not close the lane that rides the session after it.
+    #[test]
+    fn a_foreign_stream_s_end_does_not_end_our_lane() {
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let mut foreign = Vec::new();
+        h2_frame(frames::DATA, frames::END_STREAM, 3, &[], &mut foreign);
+        let edge = scripted_h2_edge(listener, server, vec![foreign, data_frame(b"tail")]);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        lane.set_read_quantum(Duration::from_millis(20))
+            .expect("arms a quantum");
+        let mut buf = [0u8; 16];
+        let mut back = Vec::new();
+        for _ in 0..200 {
+            match lane.read(&mut buf) {
+                Ok(0) => break,
+                Ok(got) => {
+                    back.extend_from_slice(&buf[..got]);
+                    if back == b"tail" {
+                        break;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => panic!("the lane said: {error}"),
+            }
+        }
+        assert_eq!(back, b"tail", "a frame for another stream ended this lane");
+        edge.join().expect("joins");
     }
 
     /// The read quantum is what lets the writer behind the same mutex have a turn, so it must not cost the frame: a pause inside one DATA frame has to resume where it stopped, not abandon the bytes already promised to the header.
