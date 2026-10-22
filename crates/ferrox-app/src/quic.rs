@@ -502,7 +502,9 @@ pub(crate) fn with_config<T>(
         if let Some(cell) = configs.get(roots) {
             Arc::clone(cell)
         } else {
+            let staged = crate::foxy::debug_on().then(Instant::now);
             let config = quiche_config(roots, None)?;
+            debug_staged(staged);
             let cell = Arc::new(Mutex::new(config));
             configs.insert(roots.to_vec(), Arc::clone(&cell));
             cell
@@ -510,6 +512,15 @@ pub(crate) fn with_config<T>(
     };
     let mut config = cell.lock().ok()?;
     dial(&mut config)
+}
+
+/// The one phase a warm dial stops paying, behind `FOXY_DEBUG`: the bundle written out, parsed back and deleted. An untraced lane makes no clock call here.
+fn debug_staged(staged: Option<Instant>) {
+    let Some(staged) = staged else { return };
+    eprintln!(
+        "foxy-debug: quic config staged in {}ms",
+        staged.elapsed().as_millis()
+    );
 }
 
 /// The datagrams one egress sweep hands the socket in one call: a 32 KiB write queues about ten behind each other, so a batch of eight sends most of a frame where the loop paid one syscall per packet.
