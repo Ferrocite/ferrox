@@ -9047,6 +9047,7 @@ fn write_full(
     total - buf.len()
 }
 
+#[cfg(test)]
 fn relay(client: &Connection, target: &Connection) {
     let Ok(client_read) = client.try_clone() else {
         return;
@@ -9521,7 +9522,7 @@ impl RelayPool {
 
     /// A one-shot direction: a task that exists for one startup window and then leaves. It does
     /// not park, because a parked thread is a thread a peak census sees until the worker life ends.
-    fn run_once(self: &Arc<Self>, direction: impl FnOnce() + Send + 'static) -> RelayEnd {
+    fn run_once(direction: impl FnOnce() + Send + 'static) -> RelayEnd {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         thread::spawn(move || {
             let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(direction));
@@ -10662,7 +10663,7 @@ impl Pump {
     fn over(peer: &Connection, mut to_carrier: impl FnMut(&[u8]) -> bool + Send + 'static) -> Self {
         let (stop, stop_rx) = std::sync::mpsc::channel();
         let running = match peer.try_clone() {
-            Ok(reading) => Some(RelayPool::global().run_once(move || {
+            Ok(reading) => Some(RelayPool::run_once(move || {
                 use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
                 let mut reading = reading;
                 if !matches!(
@@ -26603,6 +26604,15 @@ mod poll_copy {
         )
     }
 
+    fn arm(connections: [&Connection; 4]) -> bool {
+        for connection in connections {
+            if connection.set_nonblocking(true).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
     #[cfg(unix)]
     struct Wake {
         read: libc::c_int,
@@ -26992,18 +27002,16 @@ mod poll_copy {
     ) -> (RelayEnd, RelayEnd) {
         let (first_tx, first_rx) = mpsc::channel::<Result<(), ()>>();
         let (second_tx, second_rx) = mpsc::channel::<Result<(), ()>>();
-        for connection in [&client_read, &target_write, &target_read, &client_write] {
-            if connection.set_nonblocking(true).is_err() {
-                for connection in [&client_read, &target_write, &target_read, &client_write] {
-                    let _ = connection.set_nonblocking(false);
-                }
-                std::thread::spawn(move || {
-                    super::relay_owned(client_read, target_write, target_read, client_write);
-                    let _ = first_tx.send(Ok(()));
-                    let _ = second_tx.send(Ok(()));
-                });
-                return (first_rx, second_rx);
+        if !arm([&client_read, &target_write, &target_read, &client_write]) {
+            for connection in [&client_read, &target_write, &target_read, &client_write] {
+                let _ = connection.set_nonblocking(false);
             }
+            std::thread::spawn(move || {
+                super::relay_owned(client_read, target_write, target_read, client_write);
+                let _ = first_tx.send(Ok(()));
+                let _ = second_tx.send(Ok(()));
+            });
+            return (first_rx, second_rx);
         }
         let worker = next();
         let first = Direction::new(client_read, target_write);
