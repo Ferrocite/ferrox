@@ -59,51 +59,78 @@ pub(crate) fn serve_protobuf(label: &str, bytes: &[u8]) -> ! {
     serve_root(label, &root)
 }
 
-/// The listen address an inbound names. A `unix` field is an `AF_UNIX` path standing in for
-/// `listen`+`port`; otherwise it is the TCP `host:port`. `None` is an inbound naming neither,
-/// which the caller skips; a datagram carrier keeps the IP address by the same rule.
-fn inbound_address(inbound: &Json) -> Option<String> {
+/// The listen addresses an inbound names: every port its `port` field expands, on the
+/// `listen` host, or the `unix` path standing in for both. An empty answer is an inbound
+/// naming no socket, which the caller skips; a datagram carrier keeps the IP address by
+/// the same rule.
+fn inbound_addresses(inbound: &Json) -> Vec<String> {
     #[cfg(unix)]
-    let unix_path = inbound
-        .get("unix")
-        .and_then(Json::as_str)
-        .filter(|path| !path.is_empty());
-    #[cfg(unix)]
-    if unix_path.is_none() && inbound.get("port").and_then(Json::as_port).is_none() {
-        return None;
-    }
-    #[cfg(not(unix))]
-    if inbound.get("port").and_then(Json::as_port).is_none() {
-        return None;
-    }
-    #[cfg(unix)]
-    let address = match unix_path {
-        Some(path) => format!("unix:{path}"),
-        None => format!(
-            "{}:{}",
-            inbound
-                .get("listen")
-                .and_then(Json::as_str)
-                .unwrap_or("127.0.0.1"),
-            inbound
-                .get("port")
-                .and_then(Json::as_port)
-                .unwrap_or_default()
-        ),
-    };
-    #[cfg(not(unix))]
-    let address = format!(
-        "{}:{}",
-        inbound
-            .get("listen")
+    {
+        let unix_path = inbound
+            .get("unix")
             .and_then(Json::as_str)
-            .unwrap_or("127.0.0.1"),
-        inbound
-            .get("port")
-            .and_then(Json::as_port)
-            .unwrap_or_default()
-    );
-    Some(address)
+            .filter(|path| !path.is_empty());
+        if let Some(path) = unix_path {
+            return vec![format!("unix:{path}")];
+        }
+    }
+    let Some(field) = inbound.get("port") else {
+        return Vec::new();
+    };
+    let ports = inbound_ports(field);
+    if ports.is_empty() {
+        return Vec::new();
+    }
+    let host = inbound
+        .get("listen")
+        .and_then(Json::as_str)
+        .filter(|listen| !listen.is_empty())
+        .unwrap_or("0.0.0.0");
+    ports
+        .into_iter()
+        .map(|port| format!("{host}:{port}"))
+        .collect()
+}
+
+/// The ports a `port` field names, in the forms the reference `PortList` accepts: a JSON
+/// number, a plain or `"env:NAME"`-sourced decimal string, an `"a-b"` range expanded to
+/// every port in it, and comma-separated combinations of those.
+fn inbound_ports(field: &Json) -> Vec<u16> {
+    if let Some(port) = field.as_port() {
+        return vec![port];
+    }
+    let Some(spec) = field.as_str() else {
+        return Vec::new();
+    };
+    let mut ports = Vec::new();
+    for piece in spec.split(',') {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        let env_value = piece
+            .strip_prefix("env:")
+            .and_then(|name| std::env::var(name).ok());
+        if piece.starts_with("env:") && env_value.is_none() {
+            eprintln!(
+                "env `{}` in the port list is unset, so its piece names no port",
+                &piece[4..]
+            );
+            continue;
+        }
+        let piece = env_value.as_deref().unwrap_or(piece);
+        let (from, to) = piece.split_once('-').unwrap_or((piece, piece));
+        let (Ok(from), Ok(to)) = (from.parse::<u16>(), to.parse::<u16>()) else {
+            eprintln!("port piece `{piece}` is not a port the reference names; piece skipped");
+            continue;
+        };
+        if from > to {
+            eprintln!("port range `{piece}` descends, piece skipped");
+            continue;
+        }
+        ports.extend(from..=to);
+    }
+    ports
 }
 
 /// The address dokodemo-door rewrites every flow to; no usable target means the inbound serves nothing.
@@ -205,13 +232,15 @@ fn serve_inbounds(
         for inbound in list {
             let protocol =
                 canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or(""));
-            let address = if crate::tun::is_device(protocol) {
-                String::new()
+            // The reference expands a port list and datagram carrier to one listener per port.
+            let addresses = if crate::tun::is_device(protocol) {
+                vec![String::new()]
             } else {
-                let Some(a) = inbound_address(inbound) else {
+                let addresses = inbound_addresses(inbound);
+                if addresses.is_empty() {
                     continue;
-                };
-                a
+                }
+                addresses
             };
             if !inbound_served(protocol) {
                 refuse_inbound(protocol, label, inbound);
@@ -226,76 +255,78 @@ fn serve_inbounds(
                     prove_server_route(shared, inbound, label);
                 }
             }
-            match protocol {
-                "vless" => {
-                    if serve_vless_inbound(&address, inbound, freedom, label) {
-                        inbounds += 1;
-                    }
-                }
-                "trojan" => {
-                    serve_trojan_inbound(&address, inbound, freedom);
-                    inbounds += 1;
-                }
-                "vmess" => {
-                    serve_vmess_inbound(&address, inbound, freedom);
-                    inbounds += 1;
-                }
-                "shadowsocks" => {
-                    serve_shadowsocks_inbound(&address, inbound, freedom);
-                    inbounds += 1;
-                }
-                "hysteria" => {
-                    if serve_hysteria_inbound(&address, inbound, freedom, label) {
-                        inbounds += 1;
-                        hysteria_served = true;
-                    }
-                }
-                "socks" | "http" | "mixed" => {
-                    let Some(out) = routed(inbound, true) else {
-                        continue;
-                    };
-                    // A front with no tcp carrier has no chain to arm, so the inbound is refused rather than served unmasked.
-                    if crate::config::has_tcp_mask(inbound.get("streamSettings")) {
-                        eprintln!("inbound `{protocol}` in {label} asks for a finalmask tcp chain it cannot arm");
-                        continue;
-                    }
-                    let accounts = Arc::new(if protocol == "http" {
-                        http_accounts(inbound)
-                    } else {
-                        socks_accounts(inbound)
-                    });
-                    let role = match protocol {
-                        "http" => Role::Http { out, accounts },
-                        "socks" => Role::Socks { out, accounts },
-                        _ => Role::Mixed { out, accounts },
-                    };
-                    thread::spawn(move || accept_loop(&address, &role));
-                    inbounds += 1;
-                }
-                "dokodemo-door" => {
-                    if let Some(out) = routed(inbound, true) {
-                        inbounds += serve_dokodemo(&address, inbound, &out, label);
-                    }
-                }
-                "tun" => {
-                    // A tun flow has no source or local address, so a reaching rule that names one is refused here.
-                    if let Some(shared) = route {
-                        let tag = inbound_tag(inbound);
-                        if let Some(selector) = shared.routing.source_refusal(tag.as_deref()) {
-                            exit(&format!(
-                                "bad config {label}: tun inbound {} names `{selector}`, which a tun flow cannot answer",
-                                tag.as_deref().unwrap_or("<untagged>")
-                            ));
+            for address in &addresses {
+                match protocol {
+                    "vless" => {
+                        if serve_vless_inbound(address, inbound, freedom, label) {
+                            inbounds += 1;
                         }
                     }
-                    let Some(out) = routed(inbound, false) else {
-                        continue;
-                    };
-                    if serve_tun_inbound(inbound, &out, &address) {
+                    "trojan" => {
+                        serve_trojan_inbound(address, inbound, freedom);
                         inbounds += 1;
                     }
+                    "vmess" => {
+                        serve_vmess_inbound(address, inbound, freedom);
+                        inbounds += 1;
+                    }
+                    "shadowsocks" => {
+                        serve_shadowsocks_inbound(address, inbound, freedom);
+                        inbounds += 1;
+                    }
+                    "hysteria" => {
+                        if serve_hysteria_inbound(address, inbound, freedom, label) {
+                            inbounds += 1;
+                            hysteria_served = true;
+                        }
+                    }
+                    "socks" | "http" | "mixed" => {
+                        let Some(out) = routed(inbound, true) else {
+                            continue;
+                        };
+                        // A front with no tcp carrier has no chain to arm, so the inbound is refused rather than served unmasked.
+                        if crate::config::has_tcp_mask(inbound.get("streamSettings")) {
+                            eprintln!("inbound `{protocol}` in {label} asks for a finalmask tcp chain it cannot arm");
+                            continue;
+                        }
+                        let accounts = Arc::new(if protocol == "http" {
+                            http_accounts(inbound)
+                        } else {
+                            socks_accounts(inbound)
+                        });
+                        let role = match protocol {
+                            "http" => Role::Http { out, accounts },
+                            "socks" => Role::Socks { out, accounts },
+                            _ => Role::Mixed { out, accounts },
+                        };
+                        spawn_role(address, role);
+                        inbounds += 1;
+                    }
+                    "dokodemo-door" => {
+                        if let Some(out) = routed(inbound, true) {
+                            inbounds += serve_dokodemo(address, inbound, &out, label);
+                        }
+                    }
+                    "tun" => {
+                        // A tun flow has no source or local address, so a reaching rule that names one is refused here.
+                        if let Some(shared) = route {
+                            let tag = inbound_tag(inbound);
+                            if let Some(selector) = shared.routing.source_refusal(tag.as_deref()) {
+                                exit(&format!(
+                                    "bad config {label}: tun inbound {} names `{selector}`, which a tun flow cannot answer",
+                                    tag.as_deref().unwrap_or("<untagged>")
+                                ));
+                            }
+                        }
+                        let Some(out) = routed(inbound, false) else {
+                            continue;
+                        };
+                        if serve_tun_inbound(inbound, &out, address) {
+                            inbounds += 1;
+                        }
+                    }
+                    _ => eprintln!("unsupported inbound protocol `{protocol}` in {label}"),
                 }
-                _ => eprintln!("unsupported inbound protocol `{protocol}` in {label}"),
             }
         }
     }
@@ -11921,7 +11952,10 @@ fn resolve_loopback(root: &Json, tag: &str, freedom: bool) -> Result<Outbound, S
         "0.0.0.0" | "::" | "" => "127.0.0.1",
         named => named,
     };
-    let Some(port) = inbound.get("port").and_then(Json::as_port) else {
+    let Some(field) = inbound.get("port") else {
+        return Err(format!("names `{tag}`, which binds no port"));
+    };
+    let Some(port) = inbound_ports(field).into_iter().next() else {
         return Err(format!("names `{tag}`, which binds no port"));
     };
     let address = listen.to_owned();
@@ -12942,6 +12976,31 @@ mod tests {
             target,
             Some(Destination::Name("example.test".to_owned(), 443))
         );
+    }
+
+    #[test]
+    fn an_inbound_expands_the_port_forms_the_reference_accepts() {
+        let addresses = |text: &str| inbound_addresses(&crate::json::parse(text).expect("parses"));
+        assert_eq!(addresses(r#"{"port": 18084}"#), ["0.0.0.0:18084"]);
+        assert_eq!(addresses(r#"{"port": "18085"}"#), ["0.0.0.0:18085"]);
+        assert_eq!(
+            addresses(r#"{"port": "18086-18087"}"#),
+            ["0.0.0.0:18086", "0.0.0.0:18087"]
+        );
+        assert_eq!(
+            addresses(r#"{"port": "not-a-port, toronto, 400-401"}"#),
+            ["0.0.0.0:400", "0.0.0.0:401"]
+        );
+        assert!(addresses(r#"{"port": "402-401"}"#).is_empty());
+        assert_eq!(
+            addresses(r#"{"listen": "192.0.2.7", "port": "400,401"}"#),
+            ["192.0.2.7:400", "192.0.2.7:401"]
+        );
+        assert_eq!(
+            addresses(r#"{"listen": "", "port": "402"}"#),
+            ["0.0.0.0:402"]
+        );
+        assert!(addresses(r#"{"port": "env:FERROX_UNSET_PORT_PIECE"}"#).is_empty());
     }
 
     /// The census is a stall hunt's instrument: a release build's relay registers no wait
