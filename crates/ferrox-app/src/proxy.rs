@@ -257,10 +257,14 @@ fn serve_inbounds(
                         eprintln!("inbound `{protocol}` in {label} asks for a finalmask tcp chain it cannot arm");
                         continue;
                     }
-                    let accounts = Arc::new(socks_accounts(inbound));
+                    let accounts = Arc::new(if protocol == "http" {
+                        http_accounts(inbound)
+                    } else {
+                        socks_accounts(inbound)
+                    });
                     let role = match protocol {
+                        "http" => Role::Http { out, accounts },
                         "socks" => Role::Socks { out, accounts },
-                        "http" => Role::Http { out },
                         _ => Role::Mixed { out, accounts },
                     };
                     thread::spawn(move || accept_loop(&address, &role));
@@ -584,6 +588,11 @@ impl SocksAccounts {
             .iter()
             .any(|(name, password)| name.as_bytes() == user && password.as_bytes() == pass)
     }
+
+    /// Whether the front has an account at all, which is what xray's HTTP side gates its 407 on.
+    fn names_accounts(&self) -> bool {
+        !self.pairs.is_empty()
+    }
 }
 
 /// The no-authentication front: the account list a config that names none carries.
@@ -621,6 +630,27 @@ fn socks_accounts(inbound: &Json) -> SocksAccounts {
     }
     SocksAccounts {
         password: true,
+        pairs,
+    }
+}
+
+/// The accounts an HTTP front accepts: xray reads `accounts` when the key is there, else `users`, and asks for a credential only when the list names one.
+fn http_accounts(inbound: &Json) -> SocksAccounts {
+    let listed = inbound
+        .get("settings")
+        .and_then(|settings| settings.get("accounts").or_else(|| settings.get("users")))
+        .and_then(Json::as_arr)
+        .unwrap_or(&[]);
+    let pairs = listed
+        .iter()
+        .map(|account| {
+            let user = account.get("user").and_then(Json::as_str).unwrap_or("");
+            let pass = account.get("pass").and_then(Json::as_str).unwrap_or("");
+            (user.to_owned(), pass.to_owned())
+        })
+        .collect::<Vec<_>>();
+    SocksAccounts {
+        password: !pairs.is_empty(),
         pairs,
     }
 }
@@ -666,16 +696,14 @@ enum Role {
     },
     Http {
         out: Outbound,
+        accounts: Arc<SocksAccounts>,
     },
     Mixed {
         out: Outbound,
         accounts: Arc<SocksAccounts>,
     },
     /// dokodemo-door: a raw stream to the address its config rewrites every flow to.
-    Dokodemo {
-        out: Outbound,
-        dest: Destination,
-    },
+    Dokodemo { out: Outbound, dest: Destination },
 }
 
 impl Role {
@@ -1229,7 +1257,7 @@ fn accept_loop(address: &str, role: &Role) {
                     freedom,
                 } => serve_shadowsocks(stream, &password, &method, &carrier, freedom),
                 Role::Socks { out, accounts } => serve_socks(stream, &out, &accounts),
-                Role::Http { out } => serve_http(stream, &out),
+                Role::Http { out, accounts } => serve_http(stream, &out, &accounts),
                 Role::Mixed { out, accounts } => serve_mixed(stream, &out, &accounts),
                 Role::Dokodemo { out, dest } => {
                     let target = out.resolved(&dest, crate::router::Network::Tcp, Some(&stream));
@@ -7227,11 +7255,64 @@ fn authority_target(authority: &[u8]) -> Option<Destination> {
     Some(Destination::Name(host.to_owned(), port))
 }
 
+/// xray's answer to an HTTP front that asks for a credential and was not handed an accepted one.
+const HTTP_AUTH_REQUIRED: &[u8] =
+    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n";
+
+/// Whether the head carries an account this front accepts, decoded as xray decodes it: `Basic `, standard base64, the first colon.
+fn http_credential_accepted(head: &[u8], accounts: &SocksAccounts) -> bool {
+    use base64::Engine as _;
+    let Some(value) = header_value(head, "proxy-authorization") else {
+        return false;
+    };
+    let Some(encoded) = value.strip_prefix("Basic ") else {
+        return false;
+    };
+    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
+        return false;
+    };
+    let Some(colon) = decoded.iter().position(|byte| *byte == b':') else {
+        return false;
+    };
+    accounts.accepts(&decoded[..colon], &decoded[colon + 1..])
+}
+
+/// Removes every line naming a header, in place; the credential is the proxy's, not the origin's.
+fn drop_header(head: &mut Vec<u8>, name: &str) {
+    let mut at = head
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .map_or(head.len(), |at| at + 1);
+    while at < head.len() {
+        let Some(end) = head[at..].windows(2).position(|pair| pair == b"\r\n") else {
+            return;
+        };
+        let named = {
+            let line = &head[at..at + end];
+            line.len() > name.len()
+                && line[name.len()] == b':'
+                && line[..name.len()].eq_ignore_ascii_case(name.as_bytes())
+        };
+        if named {
+            head.copy_within(at + end + 2.., at);
+            head.truncate(head.len() - end - 2);
+            continue;
+        }
+        at += end + 2;
+    }
+}
+
 /// The `http` front: CONNECT tunnels like SOCKS, plain HTTP forwards its head, unparsable input closes quietly.
-fn serve_http(mut client: Connection, out: &Outbound) {
-    let Some(head) = read_http_head(&mut client, HTTP_HEAD_LIMIT, budgets::head_arrival()) else {
+fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) {
+    let Some(mut head) = read_http_head(&mut client, HTTP_HEAD_LIMIT, budgets::head_arrival())
+    else {
         return;
     };
+    if accounts.names_accounts() && !http_credential_accepted(&head, accounts) {
+        let _ = client.write_all(HTTP_AUTH_REQUIRED);
+        return;
+    }
+    drop_header(&mut head, "proxy-authorization");
     let Some(request) = http_proxy_request(head) else {
         return;
     };
@@ -7268,7 +7349,7 @@ fn serve_mixed(client: Connection, out: &Outbound, accounts: &SocksAccounts) {
     if first[0] == 5 || first[0] == ferrox_core::socks::VERSION4 {
         serve_socks(client, out, accounts);
     } else {
-        serve_http(client, out);
+        serve_http(client, out, accounts);
     }
 }
 
@@ -23875,7 +23956,7 @@ mod tests {
         let port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_http(stream, &out);
+            serve_http(stream, &out, &no_accounts());
         });
         port
     }
@@ -23897,6 +23978,129 @@ mod tests {
         let head = read_http_head(client, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("reads a head");
         let line = head.split(|byte| *byte == b'\n').next().expect("a line");
         String::from_utf8(line.to_vec()).expect("text")
+    }
+
+    /// One `http` inbound built from its settings the way a config builds it: the planner underneath is the one a file names.
+    fn http_inbound_from(settings: &str) -> u16 {
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let text = format!(
+            r#"{{"inbounds":[{{"protocol":"http","listen":"127.0.0.1","port":{port},"settings":{settings}}}]}}"#
+        );
+        let root = crate::json::parse(&text).expect("parses");
+        let (opened, _) = serve_inbounds("test", &root, Some(&Outbound::Freedom), None, false);
+        assert_eq!(opened, 1, "the http inbound opens");
+        port
+    }
+
+    /// A client that connects once the accept thread has bound; the inbound binds after the config is read.
+    fn connect_until(port: u16) -> Connection {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            match Connection::connect(("127.0.0.1", port)) {
+                Ok(client) => return client,
+                Err(_) if Instant::now() < until => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("connects: {error}"),
+            }
+        }
+    }
+
+    #[test]
+    fn http_inbound_demands_the_credential_its_settings_name() {
+        let echo = echo_loop();
+        let port = http_inbound_from(r#"{"accounts":[{"user":"alice","pass":"s3cr3t"}]}"#);
+        let mut client = connect_until(port);
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client
+            .write_all(
+                format!("GET http://127.0.0.1:{echo}/ HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .expect("gets");
+        let head = read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("answers");
+        assert_eq!(head, HTTP_AUTH_REQUIRED, "the front refuses anonymously");
+    }
+
+    #[test]
+    fn http_inbound_refuses_a_credential_it_does_not_know() {
+        use base64::Engine as _;
+        let echo = echo_loop();
+        let port = http_inbound_from(r#"{"accounts":[{"user":"alice","pass":"s3cr3t"}]}"#);
+        let credential = base64::engine::general_purpose::STANDARD.encode("alice:wrong");
+        let mut client = connect_until(port);
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{echo}/ HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\nProxy-Authorization: Basic {credential}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("gets");
+        let head = read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("answers");
+        assert_eq!(head, HTTP_AUTH_REQUIRED, "an unknown credential is refused");
+    }
+
+    #[test]
+    fn http_inbound_admits_the_users_spelling_and_keeps_the_credential_from_the_origin() {
+        use base64::Engine as _;
+        let echo = echo_loop();
+        let port = http_inbound_from(r#"{"users":[{"user":"alice","pass":"s3cr3t"}]}"#);
+        let credential = base64::engine::general_purpose::STANDARD.encode("alice:s3cr3t");
+        let mut client = connect_until(port);
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{echo}/ HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\nProxy-Authorization: Basic {credential}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("gets");
+        let head = read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("answers");
+        assert_eq!(
+            head,
+            format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n").into_bytes(),
+            "the credential is the proxy's and does not reach the origin"
+        );
+    }
+
+    #[test]
+    fn mixed_http_side_demands_the_credential_its_socks_side_accepts() {
+        let echo = echo_loop();
+        let inbound = crate::json::parse(
+            r#"{"settings":{"auth":"password","accounts":[{"user":"alice","pass":"s3cr3t"}]}}"#,
+        )
+        .expect("parses");
+        let accounts = socks_accounts(&inbound);
+        assert!(accounts.wants_credential(), "the socks side asks");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_mixed(stream, &Outbound::Freedom, &accounts);
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client
+            .write_all(
+                format!("GET http://127.0.0.1:{echo}/ HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .expect("gets");
+        let head = read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("answers");
+        assert_eq!(head, HTTP_AUTH_REQUIRED, "the http side asks the same");
     }
 
     #[test]
