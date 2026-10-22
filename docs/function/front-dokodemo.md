@@ -1,6 +1,6 @@
 # dokodemo-door transparent inbound
 
-Matrix row 24 of table A: a `dokodemo-door` inbound is a door, not a proxy. Every flow that arrives is rewritten to one target the config names — a TCP connection to it, a datagram through it — and the answer comes back to whoever sent it. The tcp half was already served; this slice adds the **udp** half, and the transparent redirect is refused by name rather than served as if it had been asked for.
+Matrix row 24 of table A: a `dokodemo-door` inbound is a door, not a proxy. xray registers `tunnel` as another name for the same handler, and a config written with either serves the door (`upstream/xray-core/infra/conf/xray.go:27-53`). Every flow that arrives is rewritten to one target the config names — a TCP connection to it, a datagram through it — and the answer comes back to whoever sent it. The tcp half was already served; this slice adds the **udp** half, and the transparent redirect is refused by name rather than served as if it had been asked for.
 
 ## What the door does
 
