@@ -479,7 +479,10 @@ mod tests {
         let H2Event::Data { payload, wire, .. } = h2_event(frame, &raw[H2_HEADER..], 1) else {
             panic!("not data");
         };
-        assert!(payload.is_empty(), "the pad byte names more than the frame holds");
+        assert!(
+            payload.is_empty(),
+            "the pad byte names more than the frame holds"
+        );
         assert_eq!(wire, 1, "the octet still spent the window");
         let (frame, raw) = frame_of(DATA, PADDED, 1, &[]);
         assert_eq!(

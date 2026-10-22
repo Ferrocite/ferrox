@@ -5787,7 +5787,12 @@ pub(crate) mod loopback {
         let port = listener.local_addr().expect("addr").port();
         let payload: Vec<u8> = (0..FRAME * FRAMES).map(|i| (i % 251) as u8).collect();
         let pieces = (0..FRAMES)
-            .map(|i| (padded_data_frame(&payload[i * FRAME..(i + 1) * FRAME], PAD), None))
+            .map(|i| {
+                (
+                    padded_data_frame(&payload[i * FRAME..(i + 1) * FRAME], PAD),
+                    None,
+                )
+            })
             .collect();
         let (tx, _rx) = std::sync::mpsc::channel();
         let edge = downlink_edge(listener, server, pieces, tx);
