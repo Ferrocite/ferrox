@@ -5669,8 +5669,10 @@ fn dial_vless_reality(
     let mut session = match ferrox_core::tls::RealityClientSession::connect(cfg, now, limiter) {
         Ok(session) => session,
         Err(error) => {
-            let failure =
-                Failure::new(Stage::SocketConnected, Kind::of(&std::io::Error::from(error)));
+            let failure = Failure::new(
+                Stage::SocketConnected,
+                Kind::of(&std::io::Error::from(error)),
+            );
             return note_dial_failure(server, failure);
         }
     };
@@ -5735,11 +5737,8 @@ fn dial_vless_reality(
             });
             if vless.flow == crate::vision::FLOW {
                 let link = crate::vision::Link::new(session, Some(raw), &vless.id);
-                relay_stream(
-                    Half::socket(downstream),
-                    Half::shared_armed(link, crate::vision::Link::arm_read_timeout),
-                    &close,
-                );
+                let half = Half::shared_armed(link, crate::vision::Link::arm_read_timeout);
+                relay_stream(Half::socket(downstream), half, &close);
             } else {
                 session.disarm_record_alignment();
                 relay_stream(
