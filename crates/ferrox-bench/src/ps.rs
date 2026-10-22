@@ -212,7 +212,45 @@ pub fn sample(host: Host, pid: u32, elapsed_ms: u128) -> Result<Sample, SampleEr
         sample.sys_millis = Some(sys);
         sample.io = proc_io(pid);
     }
+    #[cfg(target_os = "macos")]
+    if host == Host::Macos {
+        sample.threads = macos_thread_count(pid);
+    }
     Ok(sample)
+}
+
+/// Mach keeps the thread list behind `proc_pidinfo`: the flavour is not in `libc`, and `ps` has
+/// no thread column here, so this is the only way a macOS sample can name the process's threads.
+#[cfg(target_os = "macos")]
+fn macos_thread_count(pid: u32) -> Option<u64> {
+    const PROC_PIDLISTTHREADS: libc::c_int = 6;
+    const THREAD_ID: usize = std::mem::size_of::<u64>();
+    let mut ids = vec![0u64; 64];
+    loop {
+        let bytes = ids.len().checked_mul(THREAD_ID)?;
+        let size = libc::c_int::try_from(bytes).ok()?;
+        // SAFETY: `ids` has room for `size` bytes and the call writes only inside that span.
+        let read = unsafe {
+            libc::proc_pidinfo(
+                libc::c_int::try_from(pid).ok()?,
+                PROC_PIDLISTTHREADS,
+                0,
+                ids.as_mut_ptr().cast(),
+                size,
+            )
+        };
+        if read <= 0 {
+            return None;
+        }
+        let read = read as usize;
+        if read < bytes {
+            return u64::try_from(read / THREAD_ID).ok();
+        }
+        if ids.len() >= 1 << 20 {
+            return None;
+        }
+        ids.resize(ids.len() * 2, 0);
+    }
 }
 
 /// What the process's threads crossed the boundary for, as one tally.
@@ -606,7 +644,14 @@ mod tests {
         let s = parse(" 4096 0:00.50 ", 0).expect("sample");
         assert_eq!(s.rss_kib, 4096);
         assert_eq!(s.cpu_millis, 500);
-        assert_eq!(s.threads, None);
+        assert_eq!(s.threads, None, "the ps line carries no thread column");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_counts_its_own_threads() {
+        let count = super::macos_thread_count(std::process::id()).expect("thread list");
+        assert!(count >= 1, "a running process has at least its leader");
     }
 
     #[test]
