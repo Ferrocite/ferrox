@@ -259,7 +259,7 @@ fn serve_from_flags(args: &[String]) -> ! {
                 }
             }
             "-confdir" => {
-                eprintln!("ferrox-app: -confdir needs README row 123 (multi-file config layering); refused");
+                eprintln!("ferrox-app: -confdir needs README row 127 (multi-file config layering); refused");
                 std::process::exit(1);
             }
             "-test" | "-dump" => {
@@ -272,7 +272,7 @@ fn serve_from_flags(args: &[String]) -> ! {
     }
     if configs.len() > 1 {
         eprintln!(
-            "ferrox-app: {} -config files need README row 123 (multi-file config layering); refused",
+            "ferrox-app: {} -config files need README row 127 (multi-file config layering); refused",
             configs.len()
         );
         std::process::exit(1);

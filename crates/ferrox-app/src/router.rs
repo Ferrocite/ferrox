@@ -135,7 +135,7 @@ impl Routing {
                 "balancers" => {
                     if value.as_arr().is_some_and(|items| !items.is_empty()) {
                         return Err(
-                            "routing balancers is row 79, which this tree does not carry".into(),
+                            "routing balancers is row 81, which this tree does not carry".into(),
                         );
                     }
                 }
@@ -430,7 +430,7 @@ impl Rule {
                 }
                 "balancerTag" => {
                     if field.as_str().is_some_and(|tag| !tag.is_empty()) {
-                        return Err("routing rule balancerTag is row 79, which this tree does not carry".into());
+                        return Err("routing rule balancerTag is row 81, which this tree does not carry".into());
                     }
                 }
                 "type" => {
