@@ -459,7 +459,7 @@ mod tests {
         let tun = rows
             .iter()
             .find(|row| row.method.starts_with("tun2socks"))
-            .expect("row 58 is in the matrix");
+            .expect("row 59 is in the matrix");
         let tun_refs = references_for(&pins, &tun.text).to_ascii_lowercase();
         assert!(tun_refs.contains("zeptun"), "{tun_refs}");
         assert!(

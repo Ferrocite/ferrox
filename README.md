@@ -96,7 +96,7 @@ Each table A row carries two independent verdicts: `link` (what `VlessLink::supp
 
 ### A — proxy protocols
 
-Rows 1–22 are the share-link world; rows 23–39 are the xray-core config surface, and row 139 is the outline-sdk stack-in-a-string delta. Pages carry the evidence.
+Rows 1–22 are the share-link world; rows 23–39 are the xray-core config surface, and row 40 is the outline-sdk stack-in-a-string delta. Pages carry the evidence.
 
 | # | method | link | binary | page | notes |
 | --- | --- | --- | --- | --- | --- |
@@ -108,7 +108,7 @@ Rows 1–22 are the share-link world; rows 23–39 are the xray-core config surf
 | 6 | VMess TCP (AEAD) | — (config) | implemented, raw + TLS over every dialled carrier | [vmess](docs/function/vmess.md) | Ciphers aes-128-gcm, chacha20-ietf-poly1305, none/unknown→Auto. UDP both roles, raw carrier only. Carriers: raw, ws, xhttp, http header, httpUpgrade, gRPC. |
 | 7 | Shadowsocks TCP/UDP | — (config) | implemented | [shadowsocks](docs/function/shadowsocks.md) | aes-gcm/chacha variants + Xray spellings. **MD5 chain only**, plus `rc4-md5` stream zero-copy both ways. UDP both roles, every carried carrier. The pb bridge decodes `xray.proxy.shadowsocks.ServerConfig` (one user → `method`/`password`, the four AEAD `cipher_type` values spelled the way `Method::parse` reads them, its `network` list checked not carried because this front serves both) and `ClientConfig` (one endpoint → `servers[0]`); a user's `level` is dropped — it feeds the policy app and stats nothing here reads — and `iv_check`, an unknown cipher, a second user, an email or a unix network refuse by name. Measured by `conformance.yml`'s scenario-map job at this pin: `shadowsocks` 2/4 where 0 of 4 reached the binary before this row, and the map's total is 18 of the 72. |
 | 8 | VLESS over ws | `vless-ws`, `vless-ws-tls` | implemented | [carrier-websocket](docs/function/carrier-websocket.md) | Both roles; TLS/REALITY sit outside the carrier on both. |
-| 9 | VLESS over xhttp | `vless-xhttp`, `vless-xhttp-tls` | implemented, one mode | [carrier-xhttp](docs/function/carrier-xhttp.md) | POST + `Transfer-Encoding: chunked`, `stream-one` only: the dialer cannot speak `stream-up` or `packet-up`, and an app half-close does not end the request body. Other modes/padding/placements planned (row 106). |
+| 9 | VLESS over xhttp | `vless-xhttp`, `vless-xhttp-tls` | implemented, one mode | [carrier-xhttp](docs/function/carrier-xhttp.md) | POST + `Transfer-Encoding: chunked`, `stream-one` only: the dialer cannot speak `stream-up` or `packet-up`, and an app half-close does not end the request body. Other modes/padding/placements planned (row 110). |
 | 10 | VLESS over gRPC | `vless-grpc`, `vless-grpc-tls` | implemented | [carrier-grpc](docs/function/carrier-grpc.md) | Both roles, full HTTP/2 + HPACK; path `/<service>/Tun`. The multi-mode dial and the reference's method-path derivation are not carried. |
 | 11 | VLESS over httpUpgrade | `vless-httpupgrade`, `vless-httpupgrade-tls` | implemented | [carrier-httpupgrade](docs/function/carrier-httpupgrade.md) | Both roles. |
 | 12 | VLESS http masquerade | `vless-tcp` | implemented | [carrier-httpheader](docs/function/carrier-httpheader.md) | Both roles; selected by `tcpSettings.header.type == "http"`. |
@@ -120,89 +120,89 @@ Rows 1–22 are the share-link world; rows 23–39 are the xray-core config surf
 | 18 | `unsafe-*` fingerprints (PattNG) | unsafe opt-in | implemented under opt-in | [reality-tls](docs/function/reality-tls.md) | PattNG `unsafe` = stock `crypto/tls` hello, so the dimension collapses to the consent gate; `--allow-unsafe-fp` clears the veto. Hello is byte-identical to no-`fp`. |
 | 19 | Hysteria v2 | `vless-hysteria` | implemented, both roles both shapes | [carrier-hysteria](docs/function/carrier-hysteria.md) | quiche ALPN `h3`; TCP streams + UDP datagram lane, salamander + gecko obfs, masquerade site (404/response/file/proxy), client port-hop, dial pooling. Only the sing-box-only realm/server_url/STUN discovery is refused by name (no peer to pin bytes against). |
 | 20 | MASQUE CONNECT-IP (RFC 9484) | `vless-masque` (planned) | client both carriers; server planned | [carrier-foxy](docs/function/carrier-foxy.md) | CONNECT-IP client loopback-proven over h2 and quiche h3; codec reads and writes every capsule. Terminating server (address pool + IP/ICMP forwarding) and standalone `Carrier::Masque` outbound are planned (`prompts.md` add-on). |
-| 21 | TUIC/AnyTLS/ShadowTLS/Snell/Naive/SSH/OpenConnect/OpenVPN | parse to `TransportKind::Other` | planned | — | Refused by falling into `Other`, not a hand-written list. Rows 87–95 own each. |
+| 21 | TUIC/AnyTLS/ShadowTLS/Snell/Naive/SSH/OpenConnect/OpenVPN | parse to `TransportKind::Other` | planned | — | Refused by falling into `Other`, not a hand-written list. Rows 90–98 own each. |
 | 22 | Mux / XUDP / `multi` | — | implemented, raw carrier only | [mux-cool](docs/function/mux-cool.md) | Full codec wired both roles when `mux.enabled`; XUDP rides the mux; one XUDP session per SOCKS association. |
 | 23 | HTTP proxy, both roles | — (config) | implemented | [http-proxy](docs/function/http-proxy.md) | `http`/`mixed` inbound serves CONNECT and origin-form; `http` outbound tunnels CONNECT with optional TLS/headers/basic auth. Chaining (section G) planned. |
-| 24 | dokodemo-door transparent inbound | — (config) | tcp and udp rewrite served, the transparent redirect refused by name | [front-dokodemo](docs/function/front-dokodemo.md) | Xray `proxy/dokodemo/`. The pb bridge decodes `dokodemo.Config` — rewrite address, rewrite port, `AllowedNetworks` read packed or per field, an empty list refused the way the pinned handler refuses it (`no network specified`) — and `PortList` ranges fan out one inbound per port up to 64; `serve_dokodemo` binds each and hands every accepted TCP stream to `serve_connect` with the config's fixed target over the `Front::Socks` dial the `tun` front already uses. An inbound asking for a finalmask tcp chain is refused by name, not served quietly. Measured by `conformance.yml`'s scenario-map job at this pin: `dokodemo` 2/2 (both green — the UDP half was red until this slice), `vmess` 3/10, `policy` 2/2, `feature` 2/8; the map counts 22 of the package's 72 green. The udp half landed with this slice: the door rides the outbound's datagram lane over the tree's own SOCKS5 UDP association, one leg per client, and the answer comes back to the client that sent it. `followRedirect` + `portMap` over `SO_ORIGINAL_DST`/TPROXY refuse by name (the original destination is the kernel's to give, and the `tun` front is this tree's transparent path), as does the pb `streamSettings` on a receiver; row 86 is the sing-box spelling. |
+| 24 | dokodemo-door transparent inbound | — (config) | tcp and udp rewrite served, the transparent redirect refused by name | [front-dokodemo](docs/function/front-dokodemo.md) | Xray `proxy/dokodemo/`. The pb bridge decodes `dokodemo.Config` — rewrite address, rewrite port, `AllowedNetworks` read packed or per field, an empty list refused the way the pinned handler refuses it (`no network specified`) — and `PortList` ranges fan out one inbound per port up to 64; `serve_dokodemo` binds each and hands every accepted TCP stream to `serve_connect` with the config's fixed target over the `Front::Socks` dial the `tun` front already uses. An inbound asking for a finalmask tcp chain is refused by name, not served quietly. Measured by `conformance.yml`'s scenario-map job at this pin: `dokodemo` 2/2 (both green — the UDP half was red until this slice), `vmess` 3/10, `policy` 2/2, `feature` 2/8; the map counts 22 of the package's 72 green. The udp half landed with this slice: the door rides the outbound's datagram lane over the tree's own SOCKS5 UDP association, one leg per client, and the answer comes back to the client that sent it. `followRedirect` + `portMap` over `SO_ORIGINAL_DST`/TPROXY refuse by name (the original destination is the kernel's to give, and the `tun` front is this tree's transparent path), as does the pb `streamSettings` on a receiver; row 89 is the sing-box spelling. |
 | 25 | blackhole sink outbound | — (config) | implemented, outbound | [blackhole](docs/function/blackhole.md) | Xray `proxy/blackhole/`; sing-box `protocol/block/`; ZeroNet's `block`; xray-core-rust's `xray-proxy-blackhole`; Leaf `proxy/drop/`. The three answers (`none`/`http`/`custom`), the 403's bytes the reference's own — an oracle drives the pinned `xray-core`'s handler and the comparison is octet for octet — the flow ending when the peer is done rather than after the reference's second, and the peer's bytes read so the close is a finish and not the reset an unread request earns. The datagram lane refuses the association with `0x07`, the way sing-box refuses the dial and ZeroNet rejects the datagram. The protobuf form decodes: `xray.proxy.blackhole.Config` is the shape the pinned scenario suite writes, and the router app's tag and port list with it, so the rule that sends a flow to the sink reaches this tree's own router. Measured by `conformance.yml`'s scenario-map job at this pin: the `feature` family is 2/8 with `TestBlackhole` green — the flow is swallowed where the reference swallows it, where the same test was green for the wrong reason before this slice (the blackhole's config was refused and the port was never bound). |
-| 26 | DNS outbound | — (config) | planned | — | Xray `proxy/dns` + `app/dns`; sing-box `protocol/dns`; ZeroNet `zero-dns`. Row 80 is the resolver. |
+| 26 | DNS outbound | — (config) | planned | — | Xray `proxy/dns` + `app/dns`; sing-box `protocol/dns`; ZeroNet `zero-dns`. Row 82 is the resolver. |
 | 27 | loopback re-inject inbound | — (config) | implemented | [loopback](docs/function/loopback.md) | A `loopback` outbound resolves to the client dial the named inbound's credentials imply; TCP+UDP. Protobuf form refused (no pinned scenario names it). |
 | 28 | Shadowsocks-2022 ciphers | — (config) | implemented | [shadowsocks-2022](docs/function/shadowsocks-2022.md) | `2022-blake3-*`, BLAKE3 subkeys, EIH multi-user, TCP+UDP relay. The client's handshake leaves in three writes, not the one SIP022 §3.1.4 asks for. |
-| 29 | TUN inbound (native) | — (config) | implemented, both roles | [front-tun](docs/function/front-tun.md) | Raw IPv4 packets off a virtual device; each TCP flow becomes a proxy dial through `serve_connect`, responses re-wrapped as IP. Differential against smoltcp; UDP rides the SOCKS5 UDP association; ICMP echo answered. Row 58 is the tun2socks translator. |
+| 29 | TUN inbound (native) | — (config) | implemented, both roles | [front-tun](docs/function/front-tun.md) | Raw IPv4 packets off a virtual device; each TCP flow becomes a proxy dial through `serve_connect`, responses re-wrapped as IP. Differential against smoltcp; UDP rides the SOCKS5 UDP association; ICMP echo answered. Row 59 is the tun2socks translator. |
 | 30 | Unix domain sockets | — (config) | implemented, both roles, both hosts | [unix](docs/function/unix.md) | A `unix` field names an `AF_UNIX` path; one `Connection` seam carries both families, byte-identical to TCP. The arm builds on either host: `std` keeps a Windows `UnixStream` behind the unstable `windows_unix_domain_sockets` feature, so `conn.rs`'s `winunix` drives the same `SOCK_STREAM` family through `WinSock`, and the two round-trip rows check it there too. Datagram carriers keep the IP address given. |
 | 31 | finalmask post-TLS mask chain | — (config) | implemented, both roles (`fragment`) | [finalmask](docs/function/finalmask.md) | A `finalmask.tcp[]` `fragment` list wraps a TCP stream below TLS both roles. `header-custom`, `sudoku`, `xmc` refuse by name (planned in `obfs-finalmask`). UDP `finalmask.udp` rides KCP mkcp-legacy and hysteria salamander. |
 | 32 | xdrive cloud-drive carrier | — (config) | implemented, both roles, three services | [carrier-xdrive](docs/function/carrier-xdrive.md) | Xray `transport/internet/xdrive/` polls a cloud drive as a transport. This row carries `local`, `template` and `Google Drive` in both roles, the WAL hold, the `.err`/hole/TTL names, a kept-alive `HTTP/1.1` lane pool per store and one store per identical config. No `Yandex`, no reality, and no conformance cell: every reference test for this transport is in-package Go with no seam to inject `ferrox-app`. |
-| 33 | native HTTP/H2/H3 transport | — (config) | planned | — | `TransportKind::Http` parses, never dialled. Xray itself refuses these (removed-feature, points at XHTTP); rows 96/106 are the superset path. |
+| 33 | native HTTP/H2/H3 transport | — (config) | planned | — | `TransportKind::Http` parses, never dialled. Xray itself refuses these (removed-feature, points at XHTTP); rows 99/110 are the superset path. |
 | 34 | VLESS `encryption=mlkem768x25519plus` | — | planned | — | ZeroNet `vless_encryption.rs` and xray-core-rust `encryption/` are the references; only ML-KEM today is the REALITY hybrid key-share group. |
 | 35 | `flow=xtls-rprx-vision-udp443` | — | planned | — | Xray accepts it outbound; the tree knows only `xtls-rprx-vision`. |
 | 36 | REALITY client | `vless-tcp-reality-vision` | client dials raw + ws + httpUpgrade + gRPC + xhttp + http header; UDP refused | [reality-tls](docs/function/reality-tls.md) | Outbounds with `realitySettings` dial with/without Vision over raw TCP and every carried carrier; a loopback dial round-trips 200 KB byte-for-byte over `ws`. |
 | 37 | TLS client from config | `vless-tcp-tls` + carriers | implemented (vless/vmess/trojan over raw + carried carriers) | — | One session dials TCP, handshakes, then runs carrier + protocol header inside it; roots from `caCertFile` or system store; `allowInsecure` refused. |
 | 38 | uTLS fingerprints | — | planned | — | Nothing shapes a ClientHello (row 18). `security-utls` owns it. |
 | 39 | ECH | — | planned | — | Xray `ech.go`, sing-box `common/tls/ech.go`. Leaf `TlsInboundSettings.echConfig`/`echKey` — the server side. `security-ech` owns it. |
-| 139 | transport stack as one shareable string | — | planned | — | Outline SDK `x/configurl/` (not pinned) — a pipe-separated sequence whose each URL-shaped element wraps the one on its left (`ss://…\|tlsfrag://`), so one paste carries a proxy *and* its shaping stack; rows 1–22's share links name a server, not a stack, and row 133 is the same composability spelled in config objects |
+| 40 | transport stack as one shareable string | — | planned | — | Outline SDK `x/configurl/` (not pinned) — a pipe-separated sequence whose each URL-shaped element wraps the one on its left (`ss://…\|tlsfrag://`), so one paste carries a proxy *and* its shaping stack; rows 1–22's share links name a server, not a stack, and row 104 is the same composability spelled in config objects |
 
 ### B — PattNG in full
 
 | # | method | state | supported today by |
 | --- | --- | --- | --- |
-| 40 | `PROXYCHAIN` ordered member list | planned (chaining, section G) | PattNG — at most one `AETHER` member per chain |
-| 41 | `POLICYGROUP` / routing groups | planned | PattNG |
-| 42 | Psiphon as its own program (`AETHER_PSIPHON_BIN`) | planned | PattNG, mlmvpn |
-| 43 | Pluggable transports via lyrebird (`obfs4`/`snowflake`/`webtunnel`/`meek`) | planned | PattNG, Aether |
-| 44 | hev-socks5-tunnel TUN (`libhev-socks5-tunnel.so`) | implemented | PattNG — the SOCKS5 **client** role (CONNECT + UDP ASSOCIATE, RFC 1929 credential) as a lane of the tree's own front layer, driven by the native `tun` device front: [socks](docs/function/socks.md). The datagram lane's frame is the frame the client framed: a datagram whose address is a literal is sent as it arrived, with no copy of its payload and no buffer of its own. |
+| 41 | `PROXYCHAIN` ordered member list | planned (chaining, section G) | PattNG — at most one `AETHER` member per chain |
+| 42 | `POLICYGROUP` / routing groups | planned | PattNG |
+| 43 | Psiphon as its own program (`AETHER_PSIPHON_BIN`) | planned | PattNG, mlmvpn |
+| 44 | Pluggable transports via lyrebird (`obfs4`/`snowflake`/`webtunnel`/`meek`) | planned | PattNG, Aether |
+| 45 | hev-socks5-tunnel TUN (`libhev-socks5-tunnel.so`) | implemented | PattNG — the SOCKS5 **client** role (CONNECT + UDP ASSOCIATE, RFC 1929 credential) as a lane of the tree's own front layer, driven by the native `tun` device front: [socks](docs/function/socks.md). The datagram lane's frame is the frame the client framed: a datagram whose address is a literal is sent as it arrived, with no copy of its payload and no buffer of its own. |
 
 ### C — VPN / tunnel carriers
 
 | # | method | state | supported today by |
 | --- | --- | --- | --- |
-| 45 | WireGuard (UDP) | planned | Xray-core, sing-box, Aether, PattNG, mlmvpn; ZeroNet ships both ends. Primitives in `ferrox-core/src/wireguard/`; handshake/record done — timers, config binding, inbound are the method slice. |
-| 46 | AmneziaWG | planned | amneziawg-go, amnezia-client, mlmvpn |
-| 47 | MASQUE CONNECT-IP over QUIC | planned, quiche default | mqvpn, Aether, sing-box, Xray-core, PattNG |
-| 48 | MASQUE over HTTP/3 vs HTTP/2 | planned | Aether, mqvpn |
-| 49 | Multipath QUIC | planned | mqvpn, slipstream, quiche |
-| 50 | quiche: QUIC + HTTP/3, 0-RTT, migration, key updates, batched datagrams | provider, in use for row 13 | quiche pin |
-| 51 | Multipath schedulers `minrtt`/`wlb`/`backup-fec` | planned | mqvpn |
-| 52 | Hybrid TCP lane (local termination over an H3 stream) | planned | mqvpn |
-| 53 | Reorder buffer + reinjection | planned | mqvpn |
-| 54 | Nested WireGuard (`gool`, two hops) | planned | Aether |
-| 55 | Nested MASQUE (`mim`, tunnel in a tunnel) | planned | Aether |
-| 56 | TCP-over-DNS covert channel | planned | slipstream |
-| 57 | Multi-resolver parallel + port-53 impersonation, DCUBIC/BBR | planned | slipstream |
-| 58 | tun2socks engine (zeptun) | planned | zeptun; Leaf `proxy/tun/` (device front + smoltcp translator in one tree); a TUN device is the whole gap |
-| 131 | filter-driver transparent front (no TUN device) | planned | Leaf `proxy/nf/` — a Windows-only inbound that dlopens a filter-driver API (`nf_addRule`, `nf_free`) and feeds the captured flows straight into the tun2socks lane, with fake-DNS include/exclude lists deciding what is captured; rows 24 and 86 are the Linux spellings, and this is the third one — no device node, no route table |
+| 46 | WireGuard (UDP) | planned | Xray-core, sing-box, Aether, PattNG, mlmvpn; ZeroNet ships both ends. Primitives in `ferrox-core/src/wireguard/`; handshake/record done — timers, config binding, inbound are the method slice. |
+| 47 | AmneziaWG | planned | amneziawg-go, amnezia-client, mlmvpn |
+| 48 | MASQUE CONNECT-IP over QUIC | planned, quiche default | mqvpn, Aether, sing-box, Xray-core, PattNG |
+| 49 | MASQUE over HTTP/3 vs HTTP/2 | planned | Aether, mqvpn |
+| 50 | Multipath QUIC | planned | mqvpn, slipstream, quiche |
+| 51 | quiche: QUIC + HTTP/3, 0-RTT, migration, key updates, batched datagrams | provider, in use for row 13 | quiche pin |
+| 52 | Multipath schedulers `minrtt`/`wlb`/`backup-fec` | planned | mqvpn |
+| 53 | Hybrid TCP lane (local termination over an H3 stream) | planned | mqvpn |
+| 54 | Reorder buffer + reinjection | planned | mqvpn |
+| 55 | Nested WireGuard (`gool`, two hops) | planned | Aether |
+| 56 | Nested MASQUE (`mim`, tunnel in a tunnel) | planned | Aether |
+| 57 | TCP-over-DNS covert channel | planned | slipstream |
+| 58 | Multi-resolver parallel + port-53 impersonation, DCUBIC/BBR | planned | slipstream |
+| 59 | tun2socks engine (zeptun) | planned | zeptun; Leaf `proxy/tun/` (device front + smoltcp translator in one tree); a TUN device is the whole gap |
+| 60 | filter-driver transparent front (no TUN device) | planned | Leaf `proxy/nf/` — a Windows-only inbound that dlopens a filter-driver API (`nf_addRule`, `nf_free`) and feeds the captured flows straight into the tun2socks lane, with fake-DNS include/exclude lists deciding what is captured; rows 24 and 89 are the Linux spellings, and this is the third one — no device node, no route table |
 
 ### D — DNS-tunnel ways (learned from CottenDNS / MasterDnsVPN, not pinned)
 
 | # | method | state | learned from |
 | --- | --- | --- | --- |
-| 59 | DNS carriers UDP/TCP/DoT/DoH, per-resolver `auto` | planned | CottenDNS |
-| 60 | Record-type rotation + QNAME reshaping + ID randomization | planned | CottenDNS |
-| 61 | ARQ + ACK/NACK, adaptive duplication, Reed-Solomon FEC, MTU discovery, compression | planned | CottenDNS, MasterDnsVPN |
-| 62 | Resolver balancing + health checks + failover | planned | CottenDNS, MasterDnsVPN |
-| 63 | Local DNS service + cache + DNS-over-SOCKS5 + hijack guards | planned | CottenDNS, MasterDnsVPN |
-| 64 | Server egress direct / upstream-SOCKS5 chaining + flood protection | planned | CottenDNS, MasterDnsVPN |
-| 65 | Encryption methods 0–5 (none/XOR/ChaCha20/AES-GCM) + auto-detect | planned | CottenDNS |
+| 61 | DNS carriers UDP/TCP/DoT/DoH, per-resolver `auto` | planned | CottenDNS |
+| 62 | Record-type rotation + QNAME reshaping + ID randomization | planned | CottenDNS |
+| 63 | ARQ + ACK/NACK, adaptive duplication, Reed-Solomon FEC, MTU discovery, compression | planned | CottenDNS, MasterDnsVPN |
+| 64 | Resolver balancing + health checks + failover | planned | CottenDNS, MasterDnsVPN |
+| 65 | Local DNS service + cache + DNS-over-SOCKS5 + hijack guards | planned | CottenDNS, MasterDnsVPN |
+| 66 | Server egress direct / upstream-SOCKS5 chaining + flood protection | planned | CottenDNS, MasterDnsVPN |
+| 67 | Encryption methods 0–5 (none/XOR/ChaCha20/AES-GCM) + auto-detect | planned | CottenDNS |
 
 ### E — circumvention engines (learned from mlmvpn_android, not pinned)
 
 | # | method | state | learned from |
 | --- | --- | --- | --- |
-| 66 | SoftEther / L2TP + WireGuard via `kittoku`; VPN Gate relays | planned | mlmvpn |
-| 67 | GST / EDG relay engines; GitHub Tunnel; OpenVPN with TunnelBear | planned | mlmvpn |
-| 68 | MLM Adaptive Engine: per-app route learning + repair ladder | planned | mlmvpn |
-| 69 | Config Studio + Config Arena | planned | mlmvpn |
-| 70 | Game Booster: DNS/latency racing + DNS-only VPN | planned | mlmvpn |
-| 71 | Sanction-domain smart routing | planned | mlmvpn |
-| 72 | Server-less domain fronting | planned | mlmvpn; Outline SDK `transport/tls/` OuterName — SNI and `Host` name different sites (not pinned) |
-| 73 | Serverless / mihomo / superdns / pdoq / http-injector / oblivion lanes | planned | configer |
-| 74 | Three-tier Emergency fallback | planned | mlmvpn |
+| 68 | SoftEther / L2TP + WireGuard via `kittoku`; VPN Gate relays | planned | mlmvpn |
+| 69 | GST / EDG relay engines; GitHub Tunnel; OpenVPN with TunnelBear | planned | mlmvpn |
+| 70 | MLM Adaptive Engine: per-app route learning + repair ladder | planned | mlmvpn |
+| 71 | Config Studio + Config Arena | planned | mlmvpn |
+| 72 | Game Booster: DNS/latency racing + DNS-only VPN | planned | mlmvpn |
+| 73 | Sanction-domain smart routing | planned | mlmvpn |
+| 74 | Server-less domain fronting | planned | mlmvpn; Outline SDK `transport/tls/` OuterName — SNI and `Host` name different sites (not pinned) |
+| 75 | Serverless / mihomo / superdns / pdoq / http-injector / oblivion lanes | planned | configer |
+| 76 | Three-tier Emergency fallback | planned | mlmvpn |
 
 ### F — configer `https-proxy` + `foxy` lanes
 
 | # | method | state | learned from |
 | --- | --- | --- | --- |
-| 75 | Free HTTPS-proxy lane (token mint, proxy export) | planned | configer |
-| 76 | Foxy lane: CONNECT over HTTP/1.1, HTTP/2 or HTTP/3, country-pinned, per-flow Bearer, failover, SPKI pins, split-tunnel | in tree — every carrier socket-proven over real QUIC/TCP/TLS; `foxy-relay.yml` downloads 1 MB per carrier, `foxy-live.yml` reports sign-in weekly | configer, FoxyVPN |
+| 77 | Free HTTPS-proxy lane (token mint, proxy export) | planned | configer |
+| 78 | Foxy lane: CONNECT over HTTP/1.1, HTTP/2 or HTTP/3, country-pinned, per-flow Bearer, failover, SPKI pins, split-tunnel | in tree — every carrier socket-proven over real QUIC/TCP/TLS; `foxy-relay.yml` downloads 1 MB per carrier, `foxy-live.yml` reports sign-in weekly | configer, FoxyVPN |
 
 ### G — chaining
 
@@ -217,7 +217,7 @@ Today exactly one method dials per hop. The engine to build stacks them as an or
 
 | # | method | state | learned from |
 | --- | --- | --- | --- |
-| 77 | Fake-ClientHello SNI spoofing (DPI bypass, no root) | planned — nothing in CI checks it | `UAC-SNI-Spoofer-Android`, `sni-spoofing-rust` |
+| 79 | Fake-ClientHello SNI spoofing (DPI bypass, no root) | planned — nothing in CI checks it | `UAC-SNI-Spoofer-Android`, `sni-spoofing-rust` |
 
 `VpnService` TUN plus a userspace TCP stack sends a fake ClientHello (spoofed SNI, wrong sequence number) first; DPI permits the flow, the real server discards the bad-seq packet, the legitimate handshake proceeds. A row keeps `planned` until its differential proof and benchmark gate are green.
 
@@ -225,93 +225,93 @@ Today exactly one method dials per hop. The engine to build stacks them as an or
 
 | # | method | state | supported today by |
 | --- | --- | --- | --- |
-| 78 | Routing rules + geosite/geoip | partial — rules with AND selectors and first match, domain/geoip/geosite assets, `blackhole`, per-inbound tags, `AsIs`/`IpOnDemand`/`IpIfNonMatch`; balancers, scripts, sniffing selectors and per-destination UDP routing refuse by name; [page](docs/function/engine-router.md) | Xray `app/router` + `app/geodata`; sing-box `route/`; ZeroNet `zero-router`; Leaf `app/router.rs` + `config/geosite.rs` + `common/dns_sniff.rs` |
-| 79 | Balancers leastPing/leastLoad/roundRobin/random + urltest/selector | planned | Xray `router/balancing.go`; sing-box `protocol/group/`; ZeroNet `zero-observatory`; Leaf `proxy/tryall`, `proxy/failover`, `proxy/select`, `proxy/static` |
-| 80 | Built-in DNS app (UDP/TCP/DoT/DoH/DoQ/FakeDNS/cache) | planned | Xray `app/dns`; sing-box `dns/`; ZeroNet `zero-dns`; Leaf `app/dns` + `app/fake_dns.rs`; Outline SDK `dns/resolver.go` — DoH/DoT with alternate host:port (not pinned). Row 26 is the outbound |
-| 81 | Reverse tunnel bridge/portal | planned | Xray `app/reverse`; ZeroNet `reverse.rs` over Mux.cool; xray-core-rust `xray-app-reverse` |
-| 82 | Commander gRPC management API | planned | Xray `app/commander` |
-| 83 | Connection-planner ladder (climb on failure, earned descent) | planned | ZeroNet `zero-observatory`; Leaf `app/healthcheck.rs` (the per-outbound latency the balancers read) |
-| 84 | Subnet scanner + server discovery | planned | ZeroNet `zero-scanner`, `zero-discovery` |
-| 132 | Load-balancer healthcheck probe inbound | planned | Leaf `proxy/hc/` — answers one HTTP path with a fixed body and an optional request signature; the far end urltest/leastPing (row 79) actually check against |
+| 80 | Routing rules + geosite/geoip | partial — rules with AND selectors and first match, domain/geoip/geosite assets, `blackhole`, per-inbound tags, `AsIs`/`IpOnDemand`/`IpIfNonMatch`; balancers, scripts, sniffing selectors and per-destination UDP routing refuse by name; [page](docs/function/engine-router.md) | Xray `app/router` + `app/geodata`; sing-box `route/`; ZeroNet `zero-router`; Leaf `app/router.rs` + `config/geosite.rs` + `common/dns_sniff.rs` |
+| 81 | Balancers leastPing/leastLoad/roundRobin/random + urltest/selector | planned | Xray `router/balancing.go`; sing-box `protocol/group/`; ZeroNet `zero-observatory`; Leaf `proxy/tryall`, `proxy/failover`, `proxy/select`, `proxy/static` |
+| 82 | Built-in DNS app (UDP/TCP/DoT/DoH/DoQ/FakeDNS/cache) | planned | Xray `app/dns`; sing-box `dns/`; ZeroNet `zero-dns`; Leaf `app/dns` + `app/fake_dns.rs`; Outline SDK `dns/resolver.go` — DoH/DoT with alternate host:port (not pinned). Row 26 is the outbound |
+| 83 | Reverse tunnel bridge/portal | planned | Xray `app/reverse`; ZeroNet `reverse.rs` over Mux.cool; xray-core-rust `xray-app-reverse` |
+| 84 | Commander gRPC management API | planned | Xray `app/commander` |
+| 85 | Connection-planner ladder (climb on failure, earned descent) | planned | ZeroNet `zero-observatory`; Leaf `app/healthcheck.rs` (the per-outbound latency the balancers read) |
+| 86 | Subnet scanner + server discovery | planned | ZeroNet `zero-scanner`, `zero-discovery` |
+| 87 | Load-balancer healthcheck probe inbound | planned | Leaf `proxy/hc/` — answers one HTTP path with a fixed body and an optional request signature; the far end urltest/leastPing (row 81) actually check against |
 
 ### K — sing-box-only protocols and transports
 
 | # | method | state | supported today by |
 | --- | --- | --- | --- |
-| 85 | mixed (HTTP + SOCKS) inbound | implemented | sing-box `protocol/mixed/`; one-byte sniff between SOCKS and HTTP |
-| 86 | redirect + tproxy inbounds | planned | sing-box `protocol/redirect/`; Leaf `proxy/redirect/` (the origin-destination spelling, inbound and outbound) |
-| 87 | NaïveProxy | planned | sing-box `protocol/naive/`; LxBox `naive+https://` |
-| 88 | AnyTLS | planned | sing-box `protocol/anytls/`; ZeroNet `anytls.rs`. Row 21 is the link parse |
-| 89 | ShadowTLS | planned | sing-box `protocol/shadowtls/` |
-| 90 | Snell | planned | sing-box `protocol/snell/` |
-| 91 | SSH outbound | planned | sing-box `protocol/ssh/`; LxBox `ssh://` |
-| 92 | TUIC v5 over QUIC | planned | sing-box `protocol/tuic/`; ZeroNet `tuic.rs`. LxBox `tuic://` |
-| 93 | Tailscale endpoint (tsnet, MagicDNS, exit nodes) | planned | sing-box `protocol/tailscale/`; LxBox feature 030 |
-| 94 | OpenConnect / OpenVPN endpoints | planned | sing-box `protocol/openconnect/`, `openvpn/` |
-| 95 | cloudflared (Argo) inbound | planned | sing-box `protocol/cloudflare/` |
-| 96 | Plain H2 + gRPC-lite transports | planned | sing-box `transport/v2rayhttp/`, `v2raygrpclite/`. Tree has full gRPC (row 10) |
-| 97 | simple-obfs (http/tls) | planned | sing-box `transport/simple-obfs/`; Leaf `proxy/obfs/` (http + tls shapes) |
-| 98 | SIP003 plugin manager | planned | sing-box `transport/sip003/`; LxBox `plugin`/`plugin_opts`; Leaf `OutboundSettings::Plugin` (an external transformer named by `path`+`args`) |
-| 99 | Mux variants smux/yamux/h2mux | planned | sing-box `common/mux/`; Leaf `proxy/amux`, `proxy/mptp` (multipath TCP beside the muxes). Tree has mux-cool (row 22) |
-| 100 | Hysteria2 multiport (`mport`/`server_ports`) | implemented (with salamander/gecko, row 19) | sing-box `protocol/hysteria2/`; LxBox §5. Port-hop rotates among the expanded set; `gecko` obfs splits/masks long-header packets; a dial naming both port-hop and gecko is refused at `connect` |
-| 133 | carrier fronts as standalone stackable in/out objects | planned | Leaf `proxy/{tls,websocket,amux,quic,mptp}/` — each carrier is its own inbound and outbound protocol that chains to another by tag, not a `streamSettings` stanza inside one protocol's config; the same seat row 104's chain engine fills, and row 78's per-inbound tags read it |
+| 88 | mixed (HTTP + SOCKS) inbound | implemented | sing-box `protocol/mixed/`; one-byte sniff between SOCKS and HTTP |
+| 89 | redirect + tproxy inbounds | planned | sing-box `protocol/redirect/`; Leaf `proxy/redirect/` (the origin-destination spelling, inbound and outbound) |
+| 90 | NaïveProxy | planned | sing-box `protocol/naive/`; LxBox `naive+https://` |
+| 91 | AnyTLS | planned | sing-box `protocol/anytls/`; ZeroNet `anytls.rs`. Row 21 is the link parse |
+| 92 | ShadowTLS | planned | sing-box `protocol/shadowtls/` |
+| 93 | Snell | planned | sing-box `protocol/snell/` |
+| 94 | SSH outbound | planned | sing-box `protocol/ssh/`; LxBox `ssh://` |
+| 95 | TUIC v5 over QUIC | planned | sing-box `protocol/tuic/`; ZeroNet `tuic.rs`. LxBox `tuic://` |
+| 96 | Tailscale endpoint (tsnet, MagicDNS, exit nodes) | planned | sing-box `protocol/tailscale/`; LxBox feature 030 |
+| 97 | OpenConnect / OpenVPN endpoints | planned | sing-box `protocol/openconnect/`, `openvpn/` |
+| 98 | cloudflared (Argo) inbound | planned | sing-box `protocol/cloudflare/` |
+| 99 | Plain H2 + gRPC-lite transports | planned | sing-box `transport/v2rayhttp/`, `v2raygrpclite/`. Tree has full gRPC (row 10) |
+| 100 | simple-obfs (http/tls) | planned | sing-box `transport/simple-obfs/`; Leaf `proxy/obfs/` (http + tls shapes) |
+| 101 | SIP003 plugin manager | planned | sing-box `transport/sip003/`; LxBox `plugin`/`plugin_opts`; Leaf `OutboundSettings::Plugin` (an external transformer named by `path`+`args`) |
+| 102 | Mux variants smux/yamux/h2mux | planned | sing-box `common/mux/`; Leaf `proxy/amux`, `proxy/mptp` (multipath TCP beside the muxes). Tree has mux-cool (row 22) |
+| 103 | Hysteria2 multiport (`mport`/`server_ports`) | implemented (with salamander/gecko, row 19) | sing-box `protocol/hysteria2/`; LxBox §5. Port-hop rotates among the expanded set; `gecko` obfs splits/masks long-header packets; a dial naming both port-hop and gecko is refused at `connect` |
+| 104 | carrier fronts as standalone stackable in/out objects | planned | Leaf `proxy/{tls,websocket,amux,quic,mptp}/` — each carrier is its own inbound and outbound protocol that chains to another by tag, not a `streamSettings` stanza inside one protocol's config; the same seat row 108's chain engine fills, and row 80's per-inbound tags read it |
 
 ### L — ZeroNet + LxBox superset
 
 | # | method | state | supported today by |
 | --- | --- | --- | --- |
-| 101 | WARP: auto-race WireGuard vs MASQUE + one-tap registration | planned | ZeroNet `warp.rs`; LxBox feature 015. Row 45 is the carrier |
-| 102 | AmneziaWG 1.0–3.1 parameter set | planned | LxBox §8.5; ZeroNet `amnezia.rs`; amneziawg-go. Row 46 pointer |
-| 103 | Evasion on TCP/TLS (fragment, keepalive shaping, noise, fake-SNI) | planned | ZeroNet `zero-evasion/`; LxBox 016 |
-| 104 | Detour graph + hop chains with cycle detection | planned (section G engine) | LxBox 006; Xray `dialerProxy`; sing-box `detour`; Leaf `proxy/chain/` |
-| 105 | Import superset (Xray/sing-box JSON, WG INI, Amnezia `vpn://`, OpenVPN) | planned | LxBox 002 + `PROTOCOLS.md` §§9–11 |
-| 106 | VLESS `flow`/`encryption` grammar + XHTTP full params | planned | LxBox 016; ZeroNet `xhttp.rs`. Rows 9 and 35 are the gaps. The three xhttp dial shapes, both packet placements and the app half-close have a working implementation on the local `option1` branch (`b37bbc9`, `5fda672`) — a port candidate, not a landed diff; [carrier-xhttp](docs/function/carrier-xhttp.md) names what a port owes |
-| 107 | Config template + contract registry | planned | LxBox features 024/025 |
+| 105 | WARP: auto-race WireGuard vs MASQUE + one-tap registration | planned | ZeroNet `warp.rs`; LxBox feature 015. Row 46 is the carrier |
+| 106 | AmneziaWG 1.0–3.1 parameter set | planned | LxBox §8.5; ZeroNet `amnezia.rs`; amneziawg-go. Row 47 pointer |
+| 107 | Evasion on TCP/TLS (fragment, keepalive shaping, noise, fake-SNI) | planned | ZeroNet `zero-evasion/`; LxBox 016 |
+| 108 | Detour graph + hop chains with cycle detection | planned (section G engine) | LxBox 006; Xray `dialerProxy`; sing-box `detour`; Leaf `proxy/chain/` |
+| 109 | Import superset (Xray/sing-box JSON, WG INI, Amnezia `vpn://`, OpenVPN) | planned | LxBox 002 + `PROTOCOLS.md` §§9–11 |
+| 110 | VLESS `flow`/`encryption` grammar + XHTTP full params | planned | LxBox 016; ZeroNet `xhttp.rs`. Rows 9 and 35 are the gaps. The three xhttp dial shapes, both packet placements and the app half-close have a working implementation on the local `option1` branch (`b37bbc9`, `5fda672`) — a port candidate, not a landed diff; [carrier-xhttp](docs/function/carrier-xhttp.md) names what a port owes |
+| 111 | Config template + contract registry | planned | LxBox features 024/025 |
 
 ### M — SlipNet tunnel types (learned from anonvector/SlipNet, not pinned)
 
 | # | method | state | supported today by |
 | --- | --- | --- | --- |
-| 108 | DNSTT (KCP + Noise DNS tunneling) | planned | SlipNet `dnstt` |
-| 109 | NoizDNS (DPI-resistant DNS tunneling) | planned | SlipNet `noizdns` |
-| 110 | VayDNS (configurable wire format) | planned | SlipNet `vaydns` |
-| 111 | `+ SSH` chaining over any tunnel | planned | SlipNet tunnel table. Row 91 standalone SSH |
-| 112 | SSH over TLS / ws-wss / HTTP CONNECT | planned | SlipNet features |
-| 113 | SSH payload injection + cipher selection | planned | SlipNet features |
-| 114 | DoH lane (DNS-only, RFC 8484) | planned | SlipNet `DOH`. Row 80 is the resolver |
-| 115 | DNS server scanner (EDNS, NXDOMAIN-hijack, country scan) | planned | SlipNet built-in scanner |
+| 112 | DNSTT (KCP + Noise DNS tunneling) | planned | SlipNet `dnstt` |
+| 113 | NoizDNS (DPI-resistant DNS tunneling) | planned | SlipNet `noizdns` |
+| 114 | VayDNS (configurable wire format) | planned | SlipNet `vaydns` |
+| 115 | `+ SSH` chaining over any tunnel | planned | SlipNet tunnel table. Row 94 standalone SSH |
+| 116 | SSH over TLS / ws-wss / HTTP CONNECT | planned | SlipNet features |
+| 117 | SSH payload injection + cipher selection | planned | SlipNet features |
+| 118 | DoH lane (DNS-only, RFC 8484) | planned | SlipNet `DOH`. Row 82 is the resolver |
+| 119 | DNS server scanner (EDNS, NXDOMAIN-hijack, country scan) | planned | SlipNet built-in scanner |
 
 ### N — ZeroNet server engine + xray-core-rust config deltas
 
 | # | method | state | supported today by |
 | --- | --- | --- | --- |
-| 116 | PROXY protocol v1+v2 parsed on an inbound (`acceptProxyProtocol`) | planned | ZeroNet `proxy_protocol.rs`. Tree only writes the header into a REALITY `dest` |
-| 117 | freedom `proxyProtocol: 1\|2` send + fallback `xver` parity | planned | ZeroNet freedom; xray `proxy/freedom` |
-| 118 | REALITY `mldsa65Seed`/`mldsa65Verify` (post-quantum binding) | planned | ZeroNet `xray_json.rs`; the oracle row waits on it |
-| 119 | `customSockopt` raw setsockopt escape hatch | planned | ZeroNet `custom_sockopt.rs`; xray `sockopt` |
-| 120 | Tunable dial params (`tcpCongestion`, `tcpUserTimeout`, `tcpFastOpen`, `dialerProxy`, `mark`, Happy-Eyeballs…) | planned | ZeroNet `parse_sockopt`; xray-core-rust `sockopt`; Outline SDK `transport/happyeyeballs.go` — the dual-stack race dial (not pinned). `tcpFastOpen` is xray's own sockopt: a stored kernel cookie lets the next SYN carry the ClientHello, one RTT back on every reconnect. Row 124 is the runtime-configurable *wait* surface |
-| 121 | Tide down/up traffic-ratio shaping | planned | ZeroNet `tide/shape.rs`. Read as a superset rung beside row 103 |
-| 122 | Fountain-coded carrier rendezvous over DoH TXT | planned | ZeroNet `rendezvous.rs` |
-| 123 | Multi-file config layering (`-c` repeats, `-confdir`, tag-merge) | planned | ZeroNet `merge.rs`. Rows 119–122 land per-file layers once merging exists |
-| 124 | Ten wait budgets (`dial`, `handshake`, `headArrival`, `relayJoin`, `relayQuantum`, `relayStall`, `udpIdle`, `payloadGrace`, `goawayGrace`, `carrierProbe`) | implemented | Each wait named once (`budgets.rs`), armed before the first inbound; unknown/missing-unit/zero refused by name. Loop cadences stay constants |
+| 120 | PROXY protocol v1+v2 parsed on an inbound (`acceptProxyProtocol`) | planned | ZeroNet `proxy_protocol.rs`. Tree only writes the header into a REALITY `dest` |
+| 121 | freedom `proxyProtocol: 1\|2` send + fallback `xver` parity | planned | ZeroNet freedom; xray `proxy/freedom` |
+| 122 | REALITY `mldsa65Seed`/`mldsa65Verify` (post-quantum binding) | planned | ZeroNet `xray_json.rs`; the oracle row waits on it |
+| 123 | `customSockopt` raw setsockopt escape hatch | planned | ZeroNet `custom_sockopt.rs`; xray `sockopt` |
+| 124 | Tunable dial params (`tcpCongestion`, `tcpUserTimeout`, `tcpFastOpen`, `dialerProxy`, `mark`, Happy-Eyeballs…) | planned | ZeroNet `parse_sockopt`; xray-core-rust `sockopt`; Outline SDK `transport/happyeyeballs.go` — the dual-stack race dial (not pinned). `tcpFastOpen` is xray's own sockopt: a stored kernel cookie lets the next SYN carry the ClientHello, one RTT back on every reconnect. Row 128 is the runtime-configurable *wait* surface |
+| 125 | Tide down/up traffic-ratio shaping | planned | ZeroNet `tide/shape.rs`. Read as a superset rung beside row 107 |
+| 126 | Fountain-coded carrier rendezvous over DoH TXT | planned | ZeroNet `rendezvous.rs` |
+| 127 | Multi-file config layering (`-c` repeats, `-confdir`, tag-merge) | planned | ZeroNet `merge.rs`. Rows 123–126 land per-file layers once merging exists |
+| 128 | Ten wait budgets (`dial`, `handshake`, `headArrival`, `relayJoin`, `relayQuantum`, `relayStall`, `udpIdle`, `payloadGrace`, `goawayGrace`, `carrierProbe`) | implemented | Each wait named once (`budgets.rs`), armed before the first inbound; unknown/missing-unit/zero refused by name. Loop cadences stay constants |
 
 ### O — client shaping, mobile service and the TUN edge
 
-Rows 125–130 are the client-side gaps the FoxyVPN v1.0.7 release surfaces, read against the pinned trees; rows 134–138 are the DPI-evasion moves the Outline SDK `x/` module makes, learned from it without pinning it. Row 31 keeps the generic ClientHello mask and row 29 the native TUN; these rows are the parts neither reaches.
+Rows 129–134 are the client-side gaps the FoxyVPN v1.0.7 release surfaces, read against the pinned trees; rows 135–139 are the DPI-evasion moves the Outline SDK `x/` module makes, learned from it without pinning it. Row 31 keeps the generic ClientHello mask and row 29 the native TUN; these rows are the parts neither reaches.
 
 | # | method | state | supported today by |
 | --- | --- | --- | --- |
-| 125 | ClientHello fragmentation on the Foxy lane (first-byte and SNI-aware cut) | planned | FoxyVPN v1.0.7 `TlsClientHelloSplitter.kt`; ZeroNet `zero-evasion/src/fragment.rs` (`tlssni`). Generic `tlshello` re-framing ships row 31, but the Foxy lane's TCP carriers (rustls) arm neither cut and the h3 handshake is quiche's own |
-| 126 | Custom tunnel MTU (576–9000) | planned | FoxyVPN v1.0.7 `SettingsStore.kt`/`HevSocks5TunnelConfig.kt`; sing-box `option/tun.go`; mqvpn `src/config.h` (`tun_mtu`). The native TUN honours `settings.mtu` (row 29); Foxy, tun2socks (row 58) and MASQUE (row 20) carry no MTU knob |
-| 127 | Cellular keepalive and handover rebind | planned | FoxyVPN v1.0.7 h2 PING (3 s check, 15 s idle, 25 s timeout) and `NetworkCallback`; ZeroNet `zero-evasion/src/keepalive.rs`. The Foxy h2 lane acks a peer PING and sends none; no lane rebinds after a network change |
-| 128 | QUIC congestion controller and pacing (CUBIC/BBR/BBR2) | planned | quiche `quiche/src/recovery/mod.rs`; ZeroNet `zero-transport/src/quic_shape.rs`; SlipStream `docs/protocol.md` (DCUBIC). Hysteria picks BBR; the Foxy h3 lane leaves quiche's CUBIC default and paces nothing |
-| 129 | TUN stack and offloads (`userspace`/`system`/`hybrid`, GSO/GRO, multi-queue) | planned | zeptun `docs/wiki/Stacks.md`; sing-box `option/tun.go`; mqvpn `src/mqvpn_internal.h`; aether `aether/src/netstack.rs`; ZeroNet `zero-tun`. The tree opens one userspace device on one handler loop, without GSO/GRO |
-| 130 | Split tunneling (per-app/per-UID and per-domain) | planned | sing-box `option/tun.go` (`include_package`/`exclude_package`); LxBox 011-SPLIT_TUNNELING; xray-rust `platform/android/README.md`; Leaf `ProcessNameMatcher` (a regex over the session's process name). Router field rules (row 78) carry no app identity |
-| 134 | QUIC prelude: an unparseable Initial before every parseable one | planned | Outline SDK `x/quicprelude/` (not pinned) — decoy Initial-shaped datagrams precede each packet that may carry a QUIC ClientHello, judged from the header alone and remembered nowhere, so a middlebox that reads the SNI off the first Initial it can parse reaches no decision and matches nothing after it; rows 31 and 125 cut TCP streams, this is the h3 seat (rows 76, 128) |
-| 135 | In-flight TTL drop ("disorder") | planned | Outline SDK `x/disorder/` (not pinned) — the Nth write goes out with TTL 1, dies at the first hop, and the stack retransmits it with TTL restored; every byte lands but the observer's reassembly holds a hole that never fills. Rows 31 and 125 re-time writes, none drops one |
-| 136 | Boot strategy race over resolvers and shaping | planned | Outline SDK `x/smart/` (not pinned) — a list of (DNS resolver × stream split × TLS-record frag) strategies raced against test domains at boot, the first that resolves *and* handshakes is kept, with an access-key fallback beneath; rows 70, 74 and 83 each own one tier of this, none races across the DNS and TCP/TLS layers at once |
-| 137 | Interference probe that names what the network blocks | planned | Outline SDK `x/connectivity/` + `x/tools/test-connectivity/` (not pinned) — layered probes classify the failure (poisoned resolution, blackholed address, SNI reset, blocked TLS) so the user learns what is censored instead of "connection failed"; row 83's ladder is the engine that wants this verdict |
-| 138 | Truncated-answer DNS front (force the retry onto TCP) | planned | Outline SDK `network/dnstruncate/` (not pinned) — a listener answers the client's UDP query with the TC bit set so the retry rides TCP, the one path the tunnel owns; row 80's app picks TCP for itself, this is the trick for apps whose resolver the engine does not own |
+| 129 | ClientHello fragmentation on the Foxy lane (first-byte and SNI-aware cut) | planned | FoxyVPN v1.0.7 `TlsClientHelloSplitter.kt`; ZeroNet `zero-evasion/src/fragment.rs` (`tlssni`). Generic `tlshello` re-framing ships row 31, but the Foxy lane's TCP carriers (rustls) arm neither cut and the h3 handshake is quiche's own |
+| 130 | Custom tunnel MTU (576–9000) | planned | FoxyVPN v1.0.7 `SettingsStore.kt`/`HevSocks5TunnelConfig.kt`; sing-box `option/tun.go`; mqvpn `src/config.h` (`tun_mtu`). The native TUN honours `settings.mtu` (row 29); Foxy, tun2socks (row 59) and MASQUE (row 20) carry no MTU knob |
+| 131 | Cellular keepalive and handover rebind | planned | FoxyVPN v1.0.7 h2 PING (3 s check, 15 s idle, 25 s timeout) and `NetworkCallback`; ZeroNet `zero-evasion/src/keepalive.rs`. The Foxy h2 lane acks a peer PING and sends none; no lane rebinds after a network change |
+| 132 | QUIC congestion controller and pacing (CUBIC/BBR/BBR2) | planned | quiche `quiche/src/recovery/mod.rs`; ZeroNet `zero-transport/src/quic_shape.rs`; SlipStream `docs/protocol.md` (DCUBIC). Hysteria picks BBR; the Foxy h3 lane leaves quiche's CUBIC default and paces nothing |
+| 133 | TUN stack and offloads (`userspace`/`system`/`hybrid`, GSO/GRO, multi-queue) | planned | zeptun `docs/wiki/Stacks.md`; sing-box `option/tun.go`; mqvpn `src/mqvpn_internal.h`; aether `aether/src/netstack.rs`; ZeroNet `zero-tun`. The tree opens one userspace device on one handler loop, without GSO/GRO |
+| 134 | Split tunneling (per-app/per-UID and per-domain) | planned | sing-box `option/tun.go` (`include_package`/`exclude_package`); LxBox 011-SPLIT_TUNNELING; xray-rust `platform/android/README.md`; Leaf `ProcessNameMatcher` (a regex over the session's process name). Router field rules (row 80) carry no app identity |
+| 135 | QUIC prelude: an unparseable Initial before every parseable one | planned | Outline SDK `x/quicprelude/` (not pinned) — decoy Initial-shaped datagrams precede each packet that may carry a QUIC ClientHello, judged from the header alone and remembered nowhere, so a middlebox that reads the SNI off the first Initial it can parse reaches no decision and matches nothing after it; rows 31 and 129 cut TCP streams, this is the h3 seat (rows 78, 132) |
+| 136 | In-flight TTL drop ("disorder") | planned | Outline SDK `x/disorder/` (not pinned) — the Nth write goes out with TTL 1, dies at the first hop, and the stack retransmits it with TTL restored; every byte lands but the observer's reassembly holds a hole that never fills. Rows 31 and 129 re-time writes, none drops one |
+| 137 | Boot strategy race over resolvers and shaping | planned | Outline SDK `x/smart/` (not pinned) — a list of (DNS resolver × stream split × TLS-record frag) strategies raced against test domains at boot, the first that resolves *and* handshakes is kept, with an access-key fallback beneath; rows 72, 76 and 85 each own one tier of this, none races across the DNS and TCP/TLS layers at once |
+| 138 | Interference probe that names what the network blocks | planned | Outline SDK `x/connectivity/` + `x/tools/test-connectivity/` (not pinned) — layered probes classify the failure (poisoned resolution, blackholed address, SNI reset, blocked TLS) so the user learns what is censored instead of "connection failed"; row 85's ladder is the engine that wants this verdict |
+| 139 | Truncated-answer DNS front (force the retry onto TCP) | planned | Outline SDK `network/dnstruncate/` (not pinned) — a listener answers the client's UDP query with the TC bit set so the retry rides TCP, the one path the tunnel owns; row 82's app picks TCP for itself, this is the trick for apps whose resolver the engine does not own |
 
 ### P — seats of our own: speed, fairness and a verdict
 
@@ -319,13 +319,13 @@ Nothing on the pinned trees spells these; they are read off this engine's own se
 
 | # | method | state | supported today by |
 | --- | --- | --- | --- |
-| 140 | TLS resumption that survives a restart and the LRU | planned | `tls/rustls_backend.rs` caches one `rustls::ClientConfig` per (material, alpn, insecure) exactly so its in-memory store resumes within a process — but a restart throws every ticket away, and the LRU cap evicts edge tickets along with their configs. Writing the store to disk and re-seeding it at boot makes a restart's first flow 1-RTT like its second. Row 37 is the dial; row 50's 0-RTT is quiche's, on the QUIC side only. Early data refuses by name — replay risk on a censor-facing wire is not worth one RTT |
+| 140 | TLS resumption that survives a restart and the LRU | planned | `tls/rustls_backend.rs` caches one `rustls::ClientConfig` per (material, alpn, insecure) exactly so its in-memory store resumes within a process — but a restart throws every ticket away, and the LRU cap evicts edge tickets along with their configs. Writing the store to disk and re-seeding it at boot makes a restart's first flow 1-RTT like its second. Row 37 is the dial; row 51's 0-RTT is quiche's, on the QUIC side only. Early data refuses by name — replay risk on a censor-facing wire is not worth one RTT |
 | 141 | Carrier lane pre-warm pool | planned | the client holds K idle carrier sessions — dialled, handshaked, carrier-opened — hands one to the next flow and refills asynchronously, so a burst's first packet pays no TCP+TLS+carrier open. The xdrive per-store lane pool (row 32) and xhttp's kept-alive lane are the single-carrier precedents; this is the seat under every carrier at once |
-| 142 | MPTCP carrier (`IPPROTO_MPTCP`, RFC 8684) | planned | a TCP-carrier flow that walks from wifi to cellular without a redial, in the kernel, with transparent fallback to plain TCP where MPTCP is absent (every Windows build takes the fallback). Row 127 rebinds at the app layer and row 49's MPQUIC needs a QUIC stack; Leaf's `mptp` (row 133) is userspace framing over several lanes, kernel MPTCP needs neither |
-| 143 | Fail-closed TUN kill switch | planned | the native TUN (row 29) opens a device and touches no route table; the switch owns the routes it adds, pulls them when the lane they feed dies inside one budget tick (row 124), and reclaims them on exit — an app is never handed a dead tunnel that quietly falls back to bare egress. A keep-routes-on-failure escape hatch refuses by name |
-| 144 | Weighted fair-share scheduler per user or inbound tag | planned | token buckets per authenticated user with an interactive priority band, so one user's bulk download cannot starve another's VoIP on a shared server. xray-core has no bandwidth fairness at all; row 121 shapes a down/up ratio, not people. The identity already exists — per-inbound tags ship in row 78 |
-| 145 | Hot config reload with a drained old generation | planned | SIGHUP or the commander RPC (row 82 is that seat) swaps in a new generation: new dials read the new config, live sessions finish on the snapshot they dialled with, and the swap prints a per-tag diff. Today a config edit means a restart, and every flow dies with it |
-| 146 | Close-verdict journal: why every flow ended, in one line | planned | each flow closes with tag, bytes each way, duration, and *which* of the ten named budgets (row 124) or which socket error ended it — the budgets are already named and the errors already observed, nothing joins them into a per-flow verdict. Row 137's probe, from the operator's seat: a censoring shift becomes a verdict distribution, not a user report |
+| 142 | MPTCP carrier (`IPPROTO_MPTCP`, RFC 8684) | planned | a TCP-carrier flow that walks from wifi to cellular without a redial, in the kernel, with transparent fallback to plain TCP where MPTCP is absent (every Windows build takes the fallback). Row 131 rebinds at the app layer and row 50's MPQUIC needs a QUIC stack; Leaf's `mptp` (row 104) is userspace framing over several lanes, kernel MPTCP needs neither |
+| 143 | Fail-closed TUN kill switch | planned | the native TUN (row 29) opens a device and touches no route table; the switch owns the routes it adds, pulls them when the lane they feed dies inside one budget tick (row 128), and reclaims them on exit — an app is never handed a dead tunnel that quietly falls back to bare egress. A keep-routes-on-failure escape hatch refuses by name |
+| 144 | Weighted fair-share scheduler per user or inbound tag | planned | token buckets per authenticated user with an interactive priority band, so one user's bulk download cannot starve another's VoIP on a shared server. xray-core has no bandwidth fairness at all; row 125 shapes a down/up ratio, not people. The identity already exists — per-inbound tags ship in row 80 |
+| 145 | Hot config reload with a drained old generation | planned | SIGHUP or the commander RPC (row 84 is that seat) swaps in a new generation: new dials read the new config, live sessions finish on the snapshot they dialled with, and the swap prints a per-tag diff. Today a config edit means a restart, and every flow dies with it |
+| 146 | Close-verdict journal: why every flow ended, in one line | planned | each flow closes with tag, bytes each way, duration, and *which* of the ten named budgets (row 128) or which socket error ended it — the budgets are already named and the errors already observed, nothing joins them into a per-flow verdict. Row 138's probe, from the operator's seat: a censoring shift becomes a verdict distribution, not a user report |
 
 ### Conformance, per row
 
