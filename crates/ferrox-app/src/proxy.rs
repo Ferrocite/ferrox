@@ -2723,6 +2723,21 @@ fn copy_paced<R: Read, W: Write>(
     ended.store(true, Ordering::Relaxed);
 }
 
+/// A relayed pair retires its sockets together: the close closes both handles it was handed.
+fn shutdown_pair(
+    downstream: Option<Connection>,
+    raw: Option<Connection>,
+) -> Arc<dyn Fn() + Send + Sync> {
+    Arc::new(move || {
+        if let Some(sockets) = downstream.as_ref() {
+            let _ = sockets.shutdown(Shutdown::Both);
+        }
+        if let Some(raw) = raw.as_ref() {
+            let _ = raw.shutdown(Shutdown::Both);
+        }
+    })
+}
+
 fn finish_reality<S>(mut session: S, raw: Option<Connection>, id: &[u8; 16], freedom: bool)
 where
     S: std::io::Read
@@ -2826,7 +2841,7 @@ where
         relay_stream(
             Half::shared_armed_capped(
                 crate::vision::Link::new(session, raw, id),
-                |link, grain| link.arm_read_timeout(grain),
+                super::vision::Link::arm_read_timeout,
                 SESSION_POLL,
             ),
             Half::socket(uplink),
@@ -2868,7 +2883,7 @@ fn relay_vless_driven(
         relay_stream(
             Half::shared_armed_capped(
                 crate::vision::Link::new(session, raw, id),
-                |link, grain| link.arm_read_timeout(grain),
+                super::vision::Link::arm_read_timeout,
                 SESSION_POLL,
             ),
             Half::socket(uplink),
@@ -2878,7 +2893,7 @@ fn relay_vless_driven(
     }
     match driven_halves(session, RELAY_POLL) {
         Ok(half) => relay_stream(half, Half::socket(uplink), &close),
-        Err(_) => return,
+        Err(_) => (),
     }
 }
 
@@ -5948,16 +5963,11 @@ fn dial_vless_tls(
             if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
                 return;
             }
-            let close_downstream = downstream.try_clone().ok();
-            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                if let Some(downstream) = close_downstream.as_ref() {
-                    let _ = downstream.shutdown(Shutdown::Both);
-                }
-            });
+            let close = shutdown_pair(downstream.try_clone().ok(), None);
             // The relay reads the session's transport itself: the idle leg's wait holds no lock, so it takes the relay grain itself.
             match driven_halves(session, RELAY_POLL) {
                 Ok(half) => relay_stream(Half::socket(downstream), half, &close),
-                Err(_) => return,
+                Err(_) => (),
             }
         }
         _ => ride_carrier(server, session, vless, &header, client),
@@ -6048,16 +6058,7 @@ fn dial_vless_reality(
             if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
                 return;
             }
-            let close_downstream = downstream.try_clone().ok();
-            let close_raw = raw.try_clone().ok();
-            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                if let Some(downstream) = close_downstream.as_ref() {
-                    let _ = downstream.shutdown(Shutdown::Both);
-                }
-                if let Some(raw) = close_raw.as_ref() {
-                    let _ = raw.shutdown(Shutdown::Both);
-                }
-            });
+            let close = shutdown_pair(downstream.try_clone().ok(), raw.try_clone().ok());
             if vless.flow == crate::vision::FLOW {
                 // The Link reads its own transport, so the split is not its shape: the quiet grain stops at the tick instead, and a park never outlasts a writer.
                 let link = crate::vision::Link::new(session, Some(raw), &vless.id);
@@ -6073,13 +6074,10 @@ fn dial_vless_reality(
                     Ok(half) => relay_stream(Half::socket(downstream), half, &close),
                     Err(mut session) => {
                         session.disarm_record_alignment();
-                        relay_stream(
-                            Half::socket(downstream),
-                            Half::shared_armed(session, |session, grain| {
-                                session.get_ref().get_ref().set_read_timeout(Some(grain))
-                            }),
-                            &close,
-                        );
+                        let rearmed = Half::shared_armed(session, |session, grain| {
+                            session.get_ref().get_ref().set_read_timeout(Some(grain))
+                        });
+                        relay_stream(Half::socket(downstream), rearmed, &close);
                     }
                 }
             }
@@ -6114,16 +6112,11 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
             if session.write_all(header).is_err() {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            let close_downstream = downstream.try_clone().ok();
-            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-                if let Some(downstream) = close_downstream.as_ref() {
-                    let _ = downstream.shutdown(Shutdown::Both);
-                }
-            });
+            let close = shutdown_pair(downstream.try_clone().ok(), None);
             // The relay reads the session's transport itself: the idle leg's wait holds no lock, so it takes the relay grain itself.
             match driven_halves(session, RELAY_POLL) {
                 Ok(half) => relay_stream(Half::socket(downstream), half, &close),
-                Err(_) => return,
+                Err(_) => (),
             }
         }
         Carrier::Ws { path, ed } => {
@@ -13539,7 +13532,7 @@ mod tests {
             SESSION_POLL,
         );
         let mut buf = [0u8; 8];
-        for _ in 0..RELAY_MOVING_READS + 1 {
+        for _ in 0..=RELAY_MOVING_READS {
             assert!(half.read_once(&mut buf).is_err());
         }
         assert_eq!(
@@ -16727,7 +16720,7 @@ mod tests {
         let reading = thread::spawn(move || {
             let mut reader = reader;
             started_tx.send(()).ok();
-            reader.read(&mut [0u8; 512]).ok();
+            let _ = reader.read(&mut [0u8; 512]);
         });
         started_rx
             .recv_timeout(Duration::from_secs(5))
