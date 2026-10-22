@@ -4765,6 +4765,104 @@ pub(crate) mod loopback {
         );
     }
 
+    /// An edge that answers the open with a `PUSH_PROMISE` ahead of the status and reports every `RST_STREAM` the lane writes as `(stream, code)`.
+    fn push_promise_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+        promised: u32,
+        rst_tx: std::sync::mpsc::Sender<(u32, u32)>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) {
+                return;
+            }
+            let mut promise = promised.to_be_bytes().to_vec();
+            promise.push(0x88);
+            let mut opening = Vec::new();
+            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut opening);
+            h2_frame(frames::PUSH_PROMISE, 0x4, 1, &promise, &mut opening);
+            h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut opening);
+            opening.extend_from_slice(&data_frame(b"tail"));
+            tls.write_all(&opening).expect("writes the script");
+            tls.flush().expect("flushes the script");
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let Some(frame) = frames::H2Frame::parse(&header) else {
+                    return;
+                };
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                if frame.kind == frames::RST_STREAM
+                    && rst_tx.send((frame.stream, frames::be32(&payload))).is_err()
+                {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// HTTP/2 8.2: a push is refused on the stream it promises, with `REFUSED_STREAM`, and the stream the tunnel opened stays open.
+    #[test]
+    fn a_push_promise_is_refused_on_the_stream_it_promises() {
+        const PROMISED: u32 = 2;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (rst_tx, rst_rx) = std::sync::mpsc::channel();
+        let _edge = push_promise_edge(listener, server, PROMISED, rst_tx);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        lane.set_read_quantum(Duration::from_millis(20))
+            .expect("arms a quantum");
+        let mut buf = [0u8; 16];
+        let mut back = Vec::new();
+        for _ in 0..200 {
+            match lane.read(&mut buf) {
+                Ok(0) => break,
+                Ok(got) => {
+                    back.extend_from_slice(&buf[..got]);
+                    if back == b"tail" {
+                        break;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => panic!("the lane said: {error}"),
+            }
+        }
+        assert_eq!(back, b"tail", "refusing the push ended the lane's own flow");
+        let mut refused = Vec::new();
+        while let Ok(one) = rst_rx.recv_timeout(Duration::from_millis(200)) {
+            refused.push(one);
+        }
+        assert_eq!(
+            refused,
+            vec![(PROMISED, 7)],
+            "the push was not refused on the stream it promised, with `REFUSED_STREAM`"
+        );
+    }
+
     /// The read quantum is what lets the writer behind the same mutex have a turn, so it must not cost the frame: a pause inside one DATA frame has to resume where it stopped, not abandon the bytes already promised to the header.
     #[test]
     fn a_frame_that_straddles_a_read_quantum_arrives_whole() {
