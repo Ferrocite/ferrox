@@ -474,6 +474,14 @@ pub fn qpack_status(block: &[u8]) -> Option<u16> {
             let index = read_integer(block, &mut at, 6)?;
             status = Some(static_status(index, false)?);
             continue;
+        } else if first & 0xC0 == 0x40 {
+            // The `01` pattern, a literal line naming a field the static table holds: the edge's own answer names `:status` this way, and a reader that does not know the pattern cannot read a status the edge sent.
+            if first & 0x10 == 0 {
+                // The T bit clear names the dynamic table, which this lane never fills.
+                return None;
+            }
+            let index = read_integer(block, &mut at, 4)?;
+            static_name(index) == Some(b":status".as_slice())
         } else if first & 0xE0 == 0x20 {
             qpack_name(block, &mut at)?.is_status()
         } else {
@@ -485,6 +493,11 @@ pub fn qpack_status(block: &[u8]) -> Option<u16> {
         }
     }
     status
+}
+
+/// A static table entry's name, which the `01` pattern names instead of spelling out: the entry's value is not read, only its name.
+fn static_name(index: usize) -> Option<&'static [u8]> {
+    QPACK_STATIC.get(index).map(|(name, _)| *name)
 }
 
 /// QPACK's literal field line packs the `001` pattern, the never-indexed bit, the name's Huffman bit and a three-bit name length into one byte, so the name is a prefixed integer read from that byte.
@@ -566,7 +579,8 @@ pub fn qpack_fields(block: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
             let (name, value) = QPACK_STATIC.get(index)?;
             fields.push((name.to_vec(), value.to_vec()));
         } else if first & 0xC0 == 0x40 {
-            if first & 0x20 != 0 {
+            if first & 0x10 == 0 {
+                // The T bit clear names the dynamic table, which this lane never fills. The N bit beside it is a hint about a later hop's table and says nothing about this one.
                 return None;
             }
             let index = read_integer(block, &mut at, 4)?;
@@ -1195,7 +1209,8 @@ mod tests {
             &mut block,
         );
         block.push(0x80 | 0x17);
-        block.extend_from_slice(&[0x4F, 0x0A, 0x03, b'2', b'3', b'3']);
+        // A static name reference to `:status` (index 24), which the four-bit prefix does not hold, so the index continues in the byte after it.
+        block.extend_from_slice(&[0x5F, 0x09, 0x03, b'2', b'3', b'3']);
         assert_eq!(
             qpack_fields(&block),
             Some(vec![
@@ -1225,6 +1240,70 @@ mod tests {
         assert_eq!(qpack_fields(&[0x00, 0x00, 0x60, 0x00]), None);
         assert_eq!(qpack_fields(&[0x00, 0x00, 0x10]), None);
         assert_eq!(qpack_fields(&[0x00, 0x00, 0x00]), None);
+    }
+
+    /// The edge's own answer, taken off a live h3 lane: it names its status with the `01` pattern and a static name index, so a reader that does not know the pattern cannot read a status the edge sent. The block is the one the live lane refused, byte for byte.
+    #[test]
+    fn the_status_the_edge_sent_with_a_static_name_reference_is_read() {
+        let block = hex(
+            "0000 5f09 826c 0254 0232 352f 02ae c3f9 f4b2 1234 da8f 9cc2 3426 8f5f 6a16 cb0f 6412\
+             1509 3543 498f 5446 ae2a ec3c e68c c92c 9f5f 1d92 497c a58a e819 aafb 5093 8ec4 1530\
+             5a99 567b 2f02 f2b2 0b67 72c8 b47e bf8f 20c9 3956 2f8b 16ea 5f16 05d6 8006 d9",
+        );
+        assert_eq!(
+            qpack_status(&block),
+            Some(502),
+            "the status the edge sent, read out of a name reference"
+        );
+        let fields = qpack_fields(&block).expect("the block reads");
+        assert_eq!(fields[0], (b":status".to_vec(), b"502".to_vec()));
+    }
+
+    /// A name reference into the static table, with the never-indexed bit set, is the same line: the bit beside the T bit is a hint about a later hop's table and says nothing about this one.
+    #[test]
+    fn a_static_name_reference_reads_whether_or_not_the_never_indexed_bit_is_set() {
+        for never in [0x00u8, 0x20] {
+            let mut block = vec![0x00, 0x00];
+            // The `01` pattern with the T bit set: the name index is a four-bit integer, and `:status` sits past what four bits hold, so the index continues in the byte after it.
+            integer(&mut block, 4, 0x40 | 0x10 | never, 24);
+            block.extend_from_slice(&[0x03, b'2', b'0', b'0']);
+            assert_eq!(
+                qpack_status(&block),
+                Some(200),
+                "a static name reference with the never-indexed bit at {never:#04x}"
+            );
+        }
+    }
+
+    /// How many of QPACK's four field-line patterns the status reader understands, one block per pattern, each naming a status the same way: the row in `scripts/method-counts.txt` is this number, and the number is read here rather than written down.
+    #[test]
+    fn the_status_reader_understands_every_pattern_the_edge_may_send() {
+        // The `1` pattern, an indexed line: the status is the table entry's own value.
+        let mut indexed = vec![0x00, 0x00];
+        integer(&mut indexed, 6, 0x80, 25);
+        // The `01` pattern, a literal line naming the field in the static table.
+        let mut named = vec![0x00, 0x00];
+        integer(&mut named, 4, 0x40 | 0x10, 24);
+        named.extend_from_slice(&[0x03, b'2', b'0', b'0']);
+        // The `001` pattern, a literal line spelling the name out.
+        let mut spelled = vec![0x00, 0x00, 0x20];
+        integer_into(&mut spelled, 3, 7);
+        spelled.extend_from_slice(b":status");
+        spelled.push(0x03);
+        spelled.extend_from_slice(b"200");
+        for (name, block) in [
+            ("the indexed pattern", indexed),
+            ("the static name reference", named),
+            ("the literal name", spelled),
+        ] {
+            assert_eq!(qpack_status(&block), Some(200), "{name}");
+        }
+        // The fourth pattern, a post-base name reference, names the dynamic table, which this lane never fills: the reader refuses it rather than answering a status it cannot know.
+        assert_eq!(
+            qpack_status(&[0x00, 0x00, 0x10, 0x03, b'2', b'0', b'0']),
+            None,
+            "a post-base name reference"
+        );
     }
 
     #[test]
