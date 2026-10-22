@@ -23723,6 +23723,26 @@ mod tests {
         }
     }
 
+    /// xray registers `tunnel` as another name for `dokodemo-door`: a config written with either serves the door.
+    #[test]
+    fn the_tunnel_inbound_is_the_dokodemo_front() {
+        let echo = echo_loop();
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let text = format!(
+            r#"{{"inbounds":[{{"protocol":"tunnel","listen":"127.0.0.1","port":{port},"settings":{{"network":"tcp","address":"127.0.0.1","port":{echo}}}}}]}}"#
+        );
+        let root = crate::json::parse(&text).expect("parses");
+        let (opened, _) = serve_inbounds("test", &root, Some(&Outbound::Freedom), None, false);
+        assert_eq!(opened, 1, "the tunnel inbound opens the door");
+        let mut client = connect_until(port);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
     /// The SOCKS5 client lane: the greeting, the request, and the tunnel that follows.
     #[test]
     fn a_socks_client_dials_the_front_and_carries_an_echo() {
@@ -25413,6 +25433,58 @@ mod tests {
             panic!("the sink is the only outbound");
         };
         assert_eq!(answer.bytes(), ferrox_core::blackhole::HTTP_403);
+    }
+
+    /// xray's `direct` outbound is the handler `freedom` names: a config with only that outbound serves the direct lane.
+    #[test]
+    fn the_direct_outbound_is_the_freedom_lane() {
+        let root = crate::json::parse(r#"{"outbounds":[{"protocol":"direct","settings":{}}]}"#)
+            .expect("parses");
+        assert!(
+            is_freedom(&root),
+            "`direct` is xray's other name for freedom"
+        );
+        assert!(
+            matches!(find_outbound(&root), Ok(Some(Outbound::Freedom))),
+            "the alias resolves to the direct dial"
+        );
+    }
+
+    /// A `block` outbound is the blackhole handler under xray's other name, both as the only lane and as a rule's tag.
+    #[test]
+    fn a_block_outbound_is_the_sink_under_either_name() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"block","settings":{"response":{"type":"http"}}}]}"#,
+        )
+        .expect("parses");
+        let Ok(Some(Outbound::Block(answer))) = find_outbound(&root) else {
+            panic!("the alias finds the sink");
+        };
+        assert_eq!(answer.bytes(), ferrox_core::blackhole::HTTP_403);
+
+        let echo_port = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"direct","settings":{}},{"tag":"b","protocol":"block","settings":{"response":{"type":"http"}}}],
+            "routing":{"rules":[{"type":"field","domain":["full:blocked.test"],"outboundTag":"b"}]}}"#;
+        let front = socks_front_with(route_outbound(config, Some("in"), true));
+        let mut blocked = socks_name_client(front, "blocked.test", echo_port);
+        let mut answer = Vec::new();
+        blocked.read_to_end(&mut answer).expect("closes");
+        assert_eq!(answer, ferrox_core::blackhole::HTTP_403);
+    }
+
+    /// A handler xray registers and this tree has not built serves as the direct lane rather than refusing the config.
+    #[test]
+    fn an_unbuilt_outbound_dials_direct_instead_of_refusing_the_config() {
+        for protocol in ["dns", "wireguard", "masque"] {
+            let text = format!(
+                r#"{{"outbounds":[{{"tag":"named","protocol":"{protocol}","settings":{{}}}}]}}"#
+            );
+            let root = crate::json::parse(&text).expect("parses");
+            assert!(
+                matches!(find_outbound(&root), Ok(Some(Outbound::Freedom))),
+                "`{protocol}` is named at its outbound and dials direct"
+            );
+        }
     }
 
     /// The sink answers the front's client with the reference's bytes and dials
