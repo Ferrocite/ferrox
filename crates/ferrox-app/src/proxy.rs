@@ -1541,7 +1541,7 @@ fn serve_vless_raw(mut stream: Connection, id: &[u8; 16], freedom: bool) {
     if stream.write_all(&[0, 0]).is_err() {
         return;
     }
-    relay(&stream, &uplink);
+    relay_handoff(&stream, &uplink);
 }
 
 fn mux_target_addr(target: &ferrox_core::mux::Target<'_>) -> Option<SocketAddr> {
@@ -3445,7 +3445,7 @@ fn dial_vless_rung(
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
-            relay(client, &uplink);
+            relay_handoff(client, &uplink);
             true
         }
     }
@@ -5173,7 +5173,7 @@ fn dial_trojan_rung(
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Dropped);
             }
             note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
-            relay(client, &uplink);
+            relay_handoff(client, &uplink);
             true
         }
         Rung::HttpUpgrade => {
@@ -6421,7 +6421,7 @@ fn serve_trojan(mut stream: Connection, key: &[u8; 56], freedom: bool) {
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
-    relay(&stream, &uplink);
+    relay_handoff(&stream, &uplink);
 }
 
 fn serve_trojan_udp(stream: Connection) {
@@ -6633,7 +6633,7 @@ fn serve_connect_freedom(client: &Connection, asked: &Destination, prefix: &[u8]
     if !prefix.is_empty() && upstream.write_all(prefix).is_err() {
         return;
     }
-    relay(client, &upstream);
+    relay_handoff(client, &upstream);
 }
 
 /// One tunnel request from either front, already resolved to its lane: the Foxy lane grants after its tunnel opens.
@@ -6808,7 +6808,7 @@ fn dial_socks_client(
     else {
         return;
     };
-    relay(client, &tunnel);
+    relay_handoff(client, &tunnel);
 }
 
 /// The split-tunnel list: targets this lane does not carry, which leave by the plain dial.
@@ -7282,7 +7282,7 @@ fn serve_foxy_front(
             if !prefix.is_empty() && upstream.write_all(prefix).is_err() {
                 return;
             }
-            relay(&client, &upstream);
+            relay_handoff(&client, &upstream);
         }
         FoxyOpen::Refused(code) => {
             let _ = client.write_all(&front.refusal(code));
@@ -9060,16 +9060,77 @@ fn relay(client: &Connection, target: &Connection) {
     let Ok(client_write) = client.try_clone() else {
         return;
     };
-    #[cfg(target_os = "linux")]
-    // Splice crosses descriptors without the mask, so a leg ending on a masked stream keeps the buffered copy.
-    if !target_write.masked() && !client_write.masked() && poll_relay::available() {
-        poll_relay::drive(client_read, target_write, target_read, client_write);
+    // A descriptor fast path cannot cross the mask, so a masked stream keeps the buffered copy.
+    if !target_write.masked() && !client_write.masked() && poll_available() {
+        let (first, second) = poll_handoff(client_read, target_write, target_read, client_write);
+        join(&first);
+        join(&second);
         return;
     }
-    let mut client_read = client_read;
-    let mut target_write = target_write;
-    let mut target_read = target_read;
-    let mut client_write = client_write;
+    relay_owned(client_read, target_write, target_read, client_write);
+}
+
+/// Hand a flow to the readiness workers and return: the accepted connection's thread is done
+/// with the flow once its socket descriptors belong to the workers, which is what keeps the
+/// thread count a property of the machine rather than of the flow count.
+fn relay_handoff(client: &Connection, target: &Connection) {
+    let Ok(client_read) = client.try_clone() else {
+        return;
+    };
+    let Ok(target_read) = target.try_clone() else {
+        return;
+    };
+    let Ok(target_write) = target.try_clone() else {
+        return;
+    };
+    let Ok(client_write) = client.try_clone() else {
+        return;
+    };
+    if !target_write.masked() && !client_write.masked() && poll_available() {
+        let _ends = poll_handoff(client_read, target_write, target_read, client_write);
+        return;
+    }
+    thread::spawn(move || {
+        relay_owned(client_read, target_write, target_read, client_write);
+    });
+}
+
+#[cfg(target_os = "linux")]
+fn poll_available() -> bool {
+    poll_relay::available()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn poll_available() -> bool {
+    poll_copy::available()
+}
+
+#[cfg(target_os = "linux")]
+fn poll_handoff(
+    client_read: Connection,
+    target_write: Connection,
+    target_read: Connection,
+    client_write: Connection,
+) -> (RelayEnd, RelayEnd) {
+    poll_relay::handoff(client_read, target_write, target_read, client_write)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn poll_handoff(
+    client_read: Connection,
+    target_write: Connection,
+    target_read: Connection,
+    client_write: Connection,
+) -> (RelayEnd, RelayEnd) {
+    poll_copy::handoff(client_read, target_write, target_read, client_write)
+}
+
+fn relay_owned(
+    mut client_read: Connection,
+    mut target_write: Connection,
+    mut target_read: Connection,
+    mut client_write: Connection,
+) {
     let forward = move || {
         copy_all(&mut client_read, &mut target_write);
         let _ = target_write.shutdown(Shutdown::Write);
@@ -9455,6 +9516,21 @@ impl RelayPool {
         if let Some(orphan) = task {
             self.spawn(orphan);
         }
+        done_rx
+    }
+
+    /// A one-shot direction: a task that exists for one startup window and then leaves. It does
+    /// not park, because a parked thread is a thread a peak census sees until the worker life ends.
+    fn run_once(self: &Arc<Self>, direction: impl FnOnce() + Send + 'static) -> RelayEnd {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(direction));
+            let clean = ended.is_ok();
+            let _ = done_tx.send(if clean { Ok(()) } else { Err(()) });
+            if !clean {
+                eprintln!("ferrox-app: a relay direction panicked");
+            }
+        });
         done_rx
     }
 
@@ -10586,7 +10662,7 @@ impl Pump {
     fn over(peer: &Connection, mut to_carrier: impl FnMut(&[u8]) -> bool + Send + 'static) -> Self {
         let (stop, stop_rx) = std::sync::mpsc::channel();
         let running = match peer.try_clone() {
-            Ok(reading) => Some(RelayPool::global().run(move || {
+            Ok(reading) => Some(RelayPool::global().run_once(move || {
                 use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
                 let mut reading = reading;
                 if !matches!(
@@ -26420,6 +26496,526 @@ mod tests {
     }
 }
 
+/// The readiness seam on the hosts without `splice`: the same fixed worker set and the same
+/// one-wake drives-both-legs shape as the Linux pump, with a buffered copy where the descriptor
+/// cannot cross a pipe. A leg parks in `poll`, not in `read`, so the thread a flow costs is the
+/// worker that has work, not one per direction.
+#[cfg(not(target_os = "linux"))]
+mod poll_copy {
+    use super::{Connection, RelayEnd, Shutdown};
+    use std::io::{self, Read, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{mpsc, Arc, Mutex, OnceLock};
+    use std::time::Duration;
+
+    const WINDOW: usize = 64 * 1024;
+
+    #[cfg(unix)]
+    type Row = libc::pollfd;
+    #[cfg(windows)]
+    type Row = windows_sys::Win32::Networking::WinSock::WSAPOLLFD;
+
+    #[cfg(unix)]
+    fn read_events() -> i16 {
+        libc::POLLIN
+    }
+
+    #[cfg(windows)]
+    fn read_events() -> i16 {
+        use windows_sys::Win32::Networking::WinSock::{POLLIN, POLLRDNORM};
+        POLLIN | POLLRDNORM
+    }
+
+    #[cfg(unix)]
+    fn write_events() -> i16 {
+        libc::POLLOUT
+    }
+
+    #[cfg(windows)]
+    fn write_events() -> i16 {
+        use windows_sys::Win32::Networking::WinSock::POLLOUT;
+        POLLOUT
+    }
+
+    #[cfg(unix)]
+    fn ready_mask() -> i16 {
+        libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL
+    }
+
+    #[cfg(windows)]
+    fn ready_mask() -> i16 {
+        use windows_sys::Win32::Networking::WinSock::{
+            POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLRDNORM,
+        };
+        POLLIN | POLLRDNORM | POLLHUP | POLLERR | POLLNVAL
+    }
+
+    #[cfg(unix)]
+    fn connection_row(connection: &Connection, events: i16) -> Row {
+        use std::os::fd::AsRawFd;
+        libc::pollfd {
+            fd: connection.as_raw_fd(),
+            events,
+            revents: 0,
+        }
+    }
+
+    #[cfg(windows)]
+    fn connection_row(connection: &Connection, events: i16) -> Row {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock::SOCKET;
+        windows_sys::Win32::Networking::WinSock::WSAPOLLFD {
+            fd: connection.as_raw_socket() as SOCKET,
+            events,
+            revents: 0,
+        }
+    }
+
+    #[cfg(unix)]
+    fn wait(rows: &mut [Row], timeout: libc::c_int) -> Option<usize> {
+        loop {
+            let answered =
+                unsafe { libc::poll(rows.as_mut_ptr(), rows.len() as libc::nfds_t, timeout) };
+            if answered >= 0 {
+                return Some(answered as usize);
+            }
+            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                return None;
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    fn wait(rows: &mut [Row], timeout: i32) -> Option<usize> {
+        use windows_sys::Win32::Networking::WinSock::WSAPoll;
+        let answered = unsafe { WSAPoll(rows.as_mut_ptr(), rows.len() as u32, timeout) };
+        (answered >= 0).then_some(answered as usize)
+    }
+
+    fn is_ready(row: &Row) -> bool {
+        row.revents & ready_mask() != 0
+    }
+
+    fn would_block(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+        )
+    }
+
+    #[cfg(unix)]
+    struct Wake {
+        read: libc::c_int,
+        write: libc::c_int,
+    }
+
+    #[cfg(unix)]
+    impl Wake {
+        fn new() -> Option<Self> {
+            let mut fds = [-1; 2];
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            for fd in fds {
+                if unsafe { libc::fcntl(fd, libc::F_SETFL, libc::O_NONBLOCK) } < 0
+                    || unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } < 0
+                {
+                    for fd in fds {
+                        unsafe {
+                            libc::close(fd);
+                        }
+                    }
+                    return None;
+                }
+            }
+            Some(Self {
+                read: fds[0],
+                write: fds[1],
+            })
+        }
+
+        fn row(&self) -> Row {
+            libc::pollfd {
+                fd: self.read,
+                events: libc::POLLIN,
+                revents: 0,
+            }
+        }
+
+        fn wake(&self) {
+            let byte = 1u8;
+            unsafe {
+                libc::write(self.write, std::ptr::addr_of!(byte).cast(), 1);
+            }
+        }
+
+        fn drain(&self) {
+            let mut scratch = [0u8; 64];
+            loop {
+                let got =
+                    unsafe { libc::read(self.read, scratch.as_mut_ptr().cast(), scratch.len()) };
+                if got <= 0 {
+                    return;
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for Wake {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.read);
+                libc::close(self.write);
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    struct Wake {
+        read: std::net::TcpStream,
+        write: std::net::TcpStream,
+    }
+
+    #[cfg(windows)]
+    impl Wake {
+        fn new() -> Option<Self> {
+            use std::net::{TcpListener, TcpStream};
+            let listener = TcpListener::bind(("127.0.0.1", 0)).ok()?;
+            let address = listener.local_addr().ok()?;
+            let write = TcpStream::connect(address).ok()?;
+            let (read, _) = listener.accept().ok()?;
+            read.set_nonblocking(true).ok()?;
+            write.set_nonblocking(true).ok()?;
+            Some(Self { read, write })
+        }
+
+        fn row(&self) -> Row {
+            use std::os::windows::io::AsRawSocket;
+            use windows_sys::Win32::Networking::WinSock::SOCKET;
+            windows_sys::Win32::Networking::WinSock::WSAPOLLFD {
+                fd: self.read.as_raw_socket() as SOCKET,
+                events: read_events(),
+                revents: 0,
+            }
+        }
+
+        fn wake(&self) {
+            let mut write = &self.write;
+            let _ = write.write(&[1]);
+        }
+
+        fn drain(&self) {
+            let mut scratch = [0u8; 64];
+            let mut read = &self.read;
+            loop {
+                match read.read(&mut scratch) {
+                    Ok(0) => return,
+                    Ok(_) => {}
+                    Err(error) if would_block(&error) => return,
+                    Err(_) => return,
+                }
+            }
+        }
+    }
+
+    struct Direction {
+        src: Connection,
+        dst: Connection,
+        bytes: Box<[u8]>,
+        filled: usize,
+        off: usize,
+        src_at_eof: bool,
+        ended: bool,
+        /// The first write that found no room, cleared by the next byte the destination takes.
+        stalled: Option<std::time::Instant>,
+    }
+
+    impl Direction {
+        fn new(src: Connection, dst: Connection) -> Self {
+            Self {
+                src,
+                dst,
+                bytes: vec![0u8; WINDOW].into_boxed_slice(),
+                filled: 0,
+                off: 0,
+                src_at_eof: false,
+                ended: false,
+                stalled: None,
+            }
+        }
+
+        fn can_ingest(&self) -> bool {
+            !self.ended && !self.src_at_eof && self.filled < self.bytes.len()
+        }
+
+        fn can_drain(&self) -> bool {
+            !self.ended && self.off < self.filled
+        }
+
+        fn advance(&mut self) {
+            if self.ended {
+                return;
+            }
+            if self.off == self.filled {
+                self.off = 0;
+                self.filled = 0;
+            } else if self.off > 0 && self.filled == self.bytes.len() {
+                self.bytes.copy_within(self.off..self.filled, 0);
+                self.filled -= self.off;
+                self.off = 0;
+            }
+            if self.can_ingest() {
+                match self.src.read(&mut self.bytes[self.filled..]) {
+                    Ok(0) => self.src_at_eof = true,
+                    Ok(n) => self.filled += n,
+                    Err(error) if would_block(&error) => {}
+                    Err(_) => {
+                        self.end();
+                        return;
+                    }
+                }
+            }
+            while self.off < self.filled {
+                match self.dst.write(&self.bytes[self.off..self.filled]) {
+                    Ok(0) => {
+                        self.end();
+                        return;
+                    }
+                    Ok(n) => {
+                        self.off += n;
+                        self.stalled = None;
+                    }
+                    Err(error) if would_block(&error) => {
+                        self.stalled.get_or_insert_with(std::time::Instant::now);
+                        break;
+                    }
+                    Err(_) => {
+                        self.end();
+                        return;
+                    }
+                }
+            }
+            if self.off == self.filled {
+                self.off = 0;
+                self.filled = 0;
+                self.stalled = None;
+            }
+            if self.src_at_eof && self.filled == 0 {
+                self.end();
+            }
+        }
+
+        fn stalled_for(&self, budget: Duration) -> bool {
+            self.stalled.is_some_and(|since| since.elapsed() >= budget)
+        }
+
+        /// A destination that has not taken a byte for the stall budget gives up both halves,
+        /// so the partner leg parked on that socket wakes and the flow ends together.
+        fn give_up(&mut self) {
+            let _ = self.dst.shutdown(Shutdown::Both);
+            self.end();
+        }
+
+        fn end(&mut self) {
+            if self.ended {
+                return;
+            }
+            self.ended = true;
+            self.stalled = None;
+            let _ = self.dst.shutdown(Shutdown::Write);
+        }
+    }
+
+    struct Flow {
+        directions: Vec<Direction>,
+        done: Vec<mpsc::Sender<Result<(), ()>>>,
+    }
+
+    impl Flow {
+        fn finished(&self) -> bool {
+            self.directions.iter().all(|d| d.ended)
+        }
+    }
+
+    impl Drop for Flow {
+        fn drop(&mut self) {
+            // Hand the sockets back blocking before the joiner wakes, because a duplicate
+            // shares the descriptor's status flags with the caller's handle.
+            for direction in &self.directions {
+                let _ = direction.src.set_nonblocking(false);
+                let _ = direction.dst.set_nonblocking(false);
+            }
+            for done in self.done.drain(..) {
+                let _ = done.send(Ok(()));
+            }
+        }
+    }
+
+    struct Worker {
+        queue: Mutex<Vec<Flow>>,
+        wake: Wake,
+    }
+
+    impl Worker {
+        fn spawn() -> Option<Arc<Self>> {
+            let wake = Wake::new()?;
+            let worker = Arc::new(Self {
+                queue: Mutex::new(Vec::new()),
+                wake,
+            });
+            let loop_worker = Arc::clone(&worker);
+            let _ = std::thread::Builder::new()
+                .name("ferrox-relay".into())
+                .spawn(move || run(&loop_worker));
+            Some(worker)
+        }
+
+        fn push(&self, flow: Flow) {
+            if let Ok(mut queue) = self.queue.lock() {
+                queue.push(flow);
+            }
+            self.wake.wake();
+        }
+
+        fn take(&self) -> Vec<Flow> {
+            let mut queue = match self.queue.lock() {
+                Ok(queue) => queue,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            std::mem::take(&mut *queue)
+        }
+    }
+
+    fn run(worker: &Worker) {
+        let mut flows: Vec<Flow> = Vec::new();
+        let mut rows: Vec<Row> = Vec::with_capacity(64);
+        let mut owners: Vec<(usize, usize)> = Vec::with_capacity(64);
+        loop {
+            flows.extend(worker.take());
+            if flows.iter().any(Flow::finished) {
+                flows.retain(|flow| !flow.finished());
+            }
+            rows.clear();
+            owners.clear();
+            rows.push(worker.wake.row());
+            owners.push((usize::MAX, usize::MAX));
+            for (flow_index, flow) in flows.iter().enumerate() {
+                for (direction_index, direction) in flow.directions.iter().enumerate() {
+                    if direction.can_ingest() {
+                        rows.push(connection_row(&direction.src, read_events()));
+                        owners.push((flow_index, direction_index));
+                    }
+                    if direction.can_drain() {
+                        rows.push(connection_row(&direction.dst, write_events()));
+                        owners.push((flow_index, direction_index));
+                    }
+                }
+            }
+            let budget = crate::budgets::relay_stall();
+            let mut timeout = -1;
+            for flow in &flows {
+                for direction in &flow.directions {
+                    if let Some(since) = direction.stalled {
+                        let left = budget.saturating_sub(since.elapsed());
+                        let millis = i32::try_from(left.as_millis()).unwrap_or(i32::MAX);
+                        timeout = if timeout < 0 {
+                            millis
+                        } else {
+                            timeout.min(millis)
+                        };
+                    }
+                }
+            }
+            if wait(&mut rows, timeout).is_none() {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+            for flow in &mut flows {
+                for direction in &mut flow.directions {
+                    if direction.stalled_for(budget) {
+                        direction.give_up();
+                    }
+                }
+            }
+            for index in 0..rows.len() {
+                if !is_ready(&rows[index]) {
+                    continue;
+                }
+                let (flow_index, direction_index) = owners[index];
+                if flow_index == usize::MAX {
+                    worker.wake.drain();
+                    continue;
+                }
+                if let Some(direction) = flows
+                    .get_mut(flow_index)
+                    .and_then(|flow| flow.directions.get_mut(direction_index))
+                {
+                    direction.advance();
+                }
+            }
+        }
+    }
+
+    fn worker_count() -> usize {
+        match std::thread::available_parallelism() {
+            Ok(count) => count.get().min(8),
+            Err(_) => 1,
+        }
+    }
+
+    fn workers() -> &'static Vec<Arc<Worker>> {
+        static WORKERS: OnceLock<Vec<Arc<Worker>>> = OnceLock::new();
+        WORKERS.get_or_init(|| {
+            (0..worker_count())
+                .filter_map(|_| Worker::spawn())
+                .collect()
+        })
+    }
+
+    fn next() -> &'static Worker {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let all = workers();
+        let index = NEXT.fetch_add(1, Ordering::Relaxed) % all.len();
+        &all[index]
+    }
+
+    pub(super) fn available() -> bool {
+        !workers().is_empty()
+    }
+
+    pub(super) fn handoff(
+        client_read: Connection,
+        target_write: Connection,
+        target_read: Connection,
+        client_write: Connection,
+    ) -> (RelayEnd, RelayEnd) {
+        let (first_tx, first_rx) = mpsc::channel::<Result<(), ()>>();
+        let (second_tx, second_rx) = mpsc::channel::<Result<(), ()>>();
+        for connection in [&client_read, &target_write, &target_read, &client_write] {
+            if connection.set_nonblocking(true).is_err() {
+                for connection in [&client_read, &target_write, &target_read, &client_write] {
+                    let _ = connection.set_nonblocking(false);
+                }
+                std::thread::spawn(move || {
+                    super::relay_owned(client_read, target_write, target_read, client_write);
+                    let _ = first_tx.send(Ok(()));
+                    let _ = second_tx.send(Ok(()));
+                });
+                return (first_rx, second_rx);
+            }
+        }
+        let worker = next();
+        let first = Direction::new(client_read, target_write);
+        let second = Direction::new(target_read, client_write);
+        worker.push(Flow {
+            directions: vec![first, second],
+            done: vec![first_tx, second_tx],
+        });
+        (first_rx, second_rx)
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod poll_relay {
     use super::{Connection, Shutdown, SplicePipe};
@@ -26516,11 +27112,10 @@ mod poll_relay {
         ingest_stalled: bool,
         src_at_eof: bool,
         ended: bool,
-        done: Option<mpsc::Sender<Result<(), ()>>>,
     }
 
     impl Direction {
-        fn new(src: Connection, dst: Connection, done: mpsc::Sender<Result<(), ()>>) -> Self {
+        fn new(src: Connection, dst: Connection) -> Self {
             Self {
                 src,
                 dst,
@@ -26529,7 +27124,6 @@ mod poll_relay {
                 ingest_stalled: false,
                 src_at_eof: false,
                 ended: false,
-                done: Some(done),
             }
         }
 
@@ -26610,25 +27204,49 @@ mod poll_relay {
             }
         }
 
+        fn stalled_for(&self, budget: Duration) -> bool {
+            self.stalled.is_some_and(|since| since.elapsed() >= budget)
+        }
+
+        /// A destination that has not taken a byte for the stall budget gives up both halves,
+        /// so the partner leg parked on that socket wakes and the flow ends together.
+        fn give_up(&mut self) {
+            let _ = self.dst.shutdown(Shutdown::Both);
+            self.end();
+        }
+
         fn end(&mut self) {
             if self.ended {
                 return;
             }
             self.ended = true;
+            self.stalled = None;
             let _ = self.dst.shutdown(Shutdown::Write);
-            if let Some(done) = self.done.take() {
-                let _ = done.send(Ok(()));
-            }
         }
     }
 
     struct Flow {
         directions: Vec<Direction>,
+        // The arm lives with the flow, not the hand-off: a detached hand-off returns while the
+        // workers still splice, so the flags can only be restored when both directions end.
+        guards: Option<[Option<SpliceGuard>; 4]>,
+        done: Vec<mpsc::Sender<Result<(), ()>>>,
     }
 
     impl Flow {
         fn finished(&self) -> bool {
             self.directions.iter().all(|d| d.ended)
+        }
+    }
+
+    impl Drop for Flow {
+        fn drop(&mut self) {
+            // Restore before the joiner wakes: a relay that has handed back is a relay whose
+            // sockets are blocking again, as the caller found them.
+            drop(self.guards.take());
+            for done in self.done.drain(..) {
+                let _ = done.send(Ok(()));
+            }
         }
     }
 
@@ -26782,23 +27400,24 @@ mod poll_relay {
         !workers().is_empty()
     }
 
-    pub(super) fn drive(
+    pub(super) fn handoff(
         client_read: Connection,
         target_write: Connection,
         target_read: Connection,
         client_write: Connection,
-    ) {
+    ) -> (super::RelayEnd, super::RelayEnd) {
         let worker = next();
         let (first_tx, first_rx) = mpsc::channel::<Result<(), ()>>();
         let (second_tx, second_rx) = mpsc::channel::<Result<(), ()>>();
-        let first = Direction::new(client_read, target_write, first_tx);
-        let second = Direction::new(target_read, client_write, second_tx);
-        let _guards = arm_flow(&first, &second);
+        let first = Direction::new(client_read, target_write);
+        let second = Direction::new(target_read, client_write);
+        let guards = arm_flow(&first, &second);
         worker.push(Flow {
             directions: vec![first, second],
+            guards: Some(guards),
+            done: vec![first_tx, second_tx],
         });
-        super::join(&first_rx);
-        super::join(&second_rx);
+        (first_rx, second_rx)
     }
 
     /// The arm's truth table, in the two units it mixes: `pending` counts bytes and the
@@ -26813,8 +27432,7 @@ mod poll_relay {
         let port = front.local_addr().expect("addr").port();
         let src = Connection::connect(("127.0.0.1", port)).expect("dials");
         let (dst, _) = front.accept().expect("accepts");
-        let (done, _keeper) = mpsc::channel();
-        let mut direction = Direction::new(src, dst, done);
+        let mut direction = Direction::new(src, dst);
         let Some(pipe) = direction.pipe.as_ref() else {
             panic!("a splice pipe is there to size the ring");
         };
