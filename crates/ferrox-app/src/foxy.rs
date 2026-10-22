@@ -1634,6 +1634,8 @@ pub(crate) struct H3 {
     quantum: Option<Duration>,
     /// How long a leg that has handed its lock back may wait on this lane's datagram socket for the next one: the quantum a relay armed. `None` until one arms it, because a caller that reads this lane alone has no lock to release.
     park: Option<Duration>,
+    /// Turns the lane has spent waiting for a datagram, so the trace says whether a slow open waited on the wire or on its own grain.
+    turns: u32,
 }
 
 /// A frame block the lane is still consuming: `rest` bytes to go, landing at the capsule buffer's tail from `mark`, and `keep` telling the reader's own capsules from a frame the lane only has to get past. It exists because a header is spent the moment it is parsed — a park that forgot the count would re-read the header and take the next frame's bytes as this one's.
@@ -1696,9 +1698,20 @@ impl H3 {
             head_wait,
             quantum: None,
             park: None,
+            turns: 0,
         };
-        let status = lane.request(target, &dial.pass.token)?;
-        opened(status)?;
+        let head = debug_on().then(Instant::now);
+        let status = lane.request(target, &dial.pass.token);
+        if let Some(at) = head {
+            eprintln!(
+                "foxy-debug: h3 stream {} head {}ms turns={} answered={}",
+                lane.quic.id,
+                at.elapsed().as_millis(),
+                lane.turns,
+                status.is_ok(),
+            );
+        }
+        opened(status?)?;
         Ok(lane)
     }
 
@@ -1764,6 +1777,7 @@ impl H3 {
             head_wait: HEADER_TIMEOUT,
             quantum: None,
             park: None,
+            turns: 0,
         };
         let status = lane.udp_request(dial, target_host, target_port)?;
         opened(status)?;
@@ -1789,6 +1803,7 @@ impl H3 {
             head_wait: HEADER_TIMEOUT,
             quantum: None,
             park: None,
+            turns: 0,
         };
         let edge = edge_authority(&dial.host, dial.port);
         let mut block = Vec::with_capacity(160 + dial.pass.token.len());
@@ -2100,6 +2115,7 @@ impl H3 {
     }
 
     fn pump(&mut self, wait: Duration) {
+        self.turns += 1;
         let local = self.quic.local;
         if let Ok(mut guard) = self.quic.conn.lock() {
             crate::quic::pump_once(&mut guard, &self.quic.sock, local, wait);
