@@ -307,6 +307,7 @@ carrier-foxy oversized-frame-buffer-bytes 0 ferrox-app-foxy::loopback::a_frame_w
 carrier-foxy foreign-stream-ends-that-end-this-lane 0 ferrox-app-foxy::loopback::a_foreign_stream_s_end_does_not_end_our_lane
 carrier-foxy midflow-settings-frames-wider-than-the-ask 0 ferrox-app-foxy::loopback::a_settings_that_arrives_mid_flow_bounds_the_frames_we_send
 carrier-foxy midflow-settings-read-without-an-answer 0 ferrox-app-foxy::loopback::a_settings_that_arrives_mid_flow_bounds_the_frames_we_send
+carrier-foxy ip-capsule-buffer-bytes-over-the-ceiling 0 ferrox-app-foxy::loopback::a_capsule_stream_that_never_parses_stops_at_the_lane_s_ceiling
 
 carrier-foxy dead-carrier-dials-per-connect-ip-packet 0 ferrox-app-proxy::tests::the_connect_ip_lane_leaves_a_dead_carrier_dead
 carrier-foxy carriers-dialled 3 ferrox-app-foxy::tests::the_carriers_are_ordered_by_what_the_edge_answers_best
