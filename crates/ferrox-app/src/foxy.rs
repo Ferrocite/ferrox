@@ -1198,6 +1198,20 @@ impl Tls2 {
         self.conn.take(len);
     }
 
+    /// HTTP/2 6.5.3 and 6.9.2: a `SETTINGS` bounds every frame sent after it, shifts the send windows it announces a delta for, and is owed an answer.
+    fn apply_settings(&mut self, payload: &[u8]) -> Result<(), Failure> {
+        let mut at = 0usize;
+        while let Some((id, value)) = frames::setting(payload, at) {
+            match id {
+                4 => self.set_initial_window(value),
+                5 => self.max_frame = (value as usize).clamp(16_384, MAX_FRAME),
+                _ => {}
+            }
+            at += 6;
+        }
+        self.ack(frames::SETTINGS, &[])
+    }
+
     fn ack(&mut self, kind: u8, payload: &[u8]) -> Result<(), Failure> {
         self.out.clear();
         h2_frame(kind, 0x1, 0, payload, &mut self.out);
@@ -1229,16 +1243,7 @@ impl Tls2 {
                             header_status(&mut block, more, frame.flags & frames::END_HEADERS != 0)
                         }
                         frames::H2Event::Settings { ack: false, .. } => {
-                            let mut at = 0usize;
-                            while let Some((id, value)) = frames::setting(payload, at) {
-                                match id {
-                                    4 => lane.set_initial_window(value),
-                                    5 => lane.max_frame = (value as usize).clamp(16_384, MAX_FRAME),
-                                    _ => {}
-                                }
-                                at += 6;
-                            }
-                            lane.ack(frames::SETTINGS, &[]).map(|()| None)
+                            lane.apply_settings(payload).map(|()| None)
                         }
                         // A DATA frame that arrives while the status is still out is payload the edge sent early: hold its credit like any other, and let the walk ignore the bytes until `END_STREAM` says the status itself is gone.
                         frames::H2Event::Data { end, wire, .. } => {
@@ -1395,6 +1400,10 @@ impl Tls2 {
                         lane.grant(stream, increment);
                         Ok(0)
                     }
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        lane.apply_settings(payload).map_err(io)?;
+                        Ok(0)
+                    }
                     frames::H2Event::Ping { ack: false, .. } => {
                         lane.ack(frames::PING, payload).map_err(io)?;
                         Ok(0)
@@ -1508,6 +1517,10 @@ impl Read for Tls2 {
                     }
                     frames::H2Event::Window { stream, increment } => {
                         lane.grant(stream, increment);
+                        Ok(0)
+                    }
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        lane.apply_settings(payload).map_err(io)?;
                         Ok(0)
                     }
                     frames::H2Event::Ping { ack: false, .. } => {
@@ -2834,6 +2847,10 @@ impl Tls2 {
                         lane.grant(stream, increment);
                         Ok(())
                     }
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        lane.apply_settings(payload).map_err(io)?;
+                        Ok(())
+                    }
                     frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
                         lane.fin = true;
                         Ok(())
@@ -2886,6 +2903,10 @@ impl Tls2 {
                     }
                     frames::H2Event::Window { stream, increment } => {
                         lane.grant(stream, increment);
+                        Ok(false)
+                    }
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        lane.apply_settings(payload).map_err(io)?;
                         Ok(false)
                     }
                     frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
@@ -4712,12 +4733,19 @@ pub(crate) mod loopback {
             .expect("writes the body");
         let mut sizes = Vec::new();
         let mut acked = false;
-        for _ in 0..8 {
-            match seen_rx.recv_timeout(Duration::from_secs(5)) {
+        let mut seen = 0usize;
+        for _ in 0..16 {
+            match seen_rx.recv_timeout(Duration::from_secs(2)) {
                 Ok((frames::SETTINGS, 0x1, 0)) => acked = true,
-                Ok((frames::DATA, _, len)) => sizes.push(len),
+                Ok((frames::DATA, _, len)) => {
+                    sizes.push(len);
+                    seen += len as usize;
+                }
                 Ok(_) => {}
                 Err(_) => break,
+            }
+            if acked && seen >= BODY {
+                break;
             }
         }
         assert!(acked, "a SETTINGS the lane read went unacknowledged");
