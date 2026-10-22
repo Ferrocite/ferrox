@@ -48,7 +48,9 @@ struct PooledState {
     sessions: HashMap<u64, Arc<Connection>>,
     opening: HashSet<u64>,
     next_id: u64,
-    /// When the lane's pump parked with no lease on it, or none while a pump thread owns it: the thread follows only the leases it can serve, so an idle edge and a flow that reads its own socket pin no thread and the next flow rides the same handshake.
+    /// The generation of the pump thread that owns the lane's read side, or zero: a thread clears only its own, so a lane a later lease has already re-armed is left untouched.
+    pump: u64,
+    /// When the lane's pump left and no thread owns it: the thread follows only the leases it can serve, so an idle edge and a flow that reads its own socket pin none and the next flow rides the same handshake.
     parked: Option<Instant>,
 }
 
@@ -2161,7 +2163,6 @@ fn pump(
                 return;
             };
             if conn.is_closed() {
-                let _ = park_if_idle(table);
                 return;
             }
             conn.timeout()
@@ -2227,7 +2228,6 @@ fn pump(
             flush_egress(&mut conn, sock);
             hand_off(&mut conn, table, &mut chunk, &mut ready);
             if conn.is_closed() {
-                let _ = park_if_idle(table);
                 return;
             }
             // A quiet socket and an empty lane ends the thread; the lease that follows it starts the next one on the same connection.
@@ -2287,8 +2287,17 @@ fn lend(pooled: &PooledConn, up: Option<Connection>) -> Option<u64> {
             table.parked = Some(Instant::now());
             return None;
         };
+        table.pump += 1;
+        let owner = PumpOwner {
+            table: Arc::clone(&pooled.table),
+            generation: table.pump,
+        };
         let (shared, leases) = (Arc::clone(&pooled.conn), Arc::clone(&pooled.table));
-        std::thread::spawn(move || pump(&shared, &leases, &pump_sock, local));
+        std::thread::spawn(move || {
+            // The owner moves with the thread: every exit from `pump` hands the lane back, so no return can leave it unowned.
+            let _owner = owner;
+            pump(&shared, &leases, &pump_sock, local);
+        });
     }
     let id = table.next_id;
     table.next_id += 4;
@@ -2299,15 +2308,33 @@ fn lend(pooled: &PooledConn, up: Option<Connection>) -> Option<u64> {
     Some(id)
 }
 
-/// Whether the pump in hand should end: a lane no lease rides parks with its thread gone, so an idle edge costs no thread and keeps its handshake.
+/// Whether the pump in hand should end: a lane no lease rides parks with its thread gone, so an idle edge costs no thread and keeps its handshake. The decision and the hand-back are one lock, so a lease landing on the lane either joins before it parks or starts the next pump after it.
 fn park_if_idle(table: &Arc<Mutex<PooledState>>) -> bool {
     table.lock().is_ok_and(|mut state| {
         if !state.sessions.is_empty() || !state.opening.is_empty() {
             return false;
         }
+        state.pump = 0;
         state.parked = Some(Instant::now());
         true
     })
+}
+
+/// A pump's ownership of its lane: cleared when the thread leaves, whichever exit it took, so a close or a socket error cannot leave the flag clear with no thread behind it.
+struct PumpOwner {
+    table: Arc<Mutex<PooledState>>,
+    generation: u64,
+}
+
+impl Drop for PumpOwner {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.table.lock() {
+            if state.pump == self.generation {
+                state.pump = 0;
+                state.parked = Some(Instant::now());
+            }
+        }
+    }
 }
 
 /// Hand the stream id back: the lane stays, and the pump parks itself once nothing else rides it, so the next flow rides the same handshake instead of paying for a new one.
@@ -2596,6 +2623,7 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
             sessions: HashMap::new(),
             opening: HashSet::new(),
             next_id: 0,
+            pump: 0,
             // No thread yet: only a lease whose bytes the pump can hand over starts one, so a connection nobody rode and a flow that reads its own socket cost none.
             parked: Some(Instant::now()),
         }));
@@ -3029,14 +3057,6 @@ pub(crate) fn server_accept(
         }
     }
     conn
-}
-
-/// The edge's ALPN, flow control and certificate settings, matching the lane's own so it is not a weaker peer.
-#[cfg(test)]
-pub(crate) fn server_config(alpn: &[u8]) -> quiche::Config {
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
-    assert!(tune(&mut config, alpn), "the lane tuning holds");
-    config
 }
 
 #[cfg(test)]
