@@ -147,7 +147,7 @@ jobs:
           fi
           flags=""
           [[ -n "$WANT_REPEATS" ]] && flags="$flags --repeats $WANT_REPEATS"
-          trees="xray-core,sing-box,zeronet,xray-rust"
+          trees="xray-core,sing-box,zeronet,xray-rust,leaf"
           if [[ -n "$WANT_ENGINES" ]]; then
             # A typed list is the caller's own, ferrox included or not.
             flags="$flags --engines $WANT_ENGINES"

@@ -50,7 +50,7 @@ ALWAYS_CHARTS = [
     "binary-size.png",
 ]
 SETUP_CHART = "setup-latency.png"
-THROUGHPUT_ENGINES = ["ferrox", "xray-core", "zeronet", "sing-box", "xray-rust"]
+THROUGHPUT_ENGINES = ["ferrox", "xray-core", "zeronet", "sing-box", "xray-rust", "leaf"]
 
 failures = []
 

@@ -47,13 +47,14 @@ except ImportError:
 
 import benchstats
 
-ENGINE_ORDER = ["xray-core", "ferrox", "zeronet", "sing-box", "xray-rust"]
+ENGINE_ORDER = ["xray-core", "ferrox", "zeronet", "sing-box", "xray-rust", "leaf"]
 PALETTE = {
     "xray-core": "#4C78A8",
     "ferrox": "#F58518",
     "zeronet": "#54A24B",
     "sing-box": "#E45756",
     "xray-rust": "#B279A2",
+    "leaf": "#B6992D",
 }
 MISSING = "#BBBBBB"
 STATUS_TEXT = {"pass": "\u2713", "fail": "\u2717", "empty": "\u2014"}
@@ -641,7 +642,7 @@ def format_cost(value):
 def update_readme(readme_path, results, charts_dir, runner):
     """Rewrite the README section between the benchmark-matrix markers.
 
-    One subsection per runner: a five-engine throughput table with the gated
+    One subsection per runner: a six-engine throughput table with the gated
     verdict, a cost table (CPU, RSS, threads, cold start), and every chart.
     The image paths carry the runner slug, so three runners' sections combine
     without colliding.
@@ -655,7 +656,7 @@ def update_readme(readme_path, results, charts_dir, runner):
     end = "<!-- benchmark-matrix:end -->"
     if start not in text or end not in text:
         sys.exit("README has no benchmark-matrix markers")
-    engines = ["ferrox", "xray-core", "zeronet", "sing-box", "xray-rust"]
+    engines = ["ferrox", "xray-core", "zeronet", "sing-box", "xray-rust", "leaf"]
     lines = [
         "",
         f"_Latest full matrix: {results['date']} on {results['runner']} "

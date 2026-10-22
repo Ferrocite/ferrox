@@ -848,6 +848,7 @@ fn dialect_cell(dialect: parity::Dialect) -> &'static str {
     match dialect {
         parity::Dialect::Xray => "(`protocol`, `port`)",
         parity::Dialect::SingBox => "(`type`, `listen_port`)",
+        parity::Dialect::Leaf => "(`protocol`, `address`, `port`)",
     }
 }
 

@@ -45,7 +45,7 @@ if [[ -z "$engines_list" ]]; then
   if [[ "$tier" == "smoke" ]]; then
     engines_list="ferrox,xray-core"
   else
-    engines_list="ferrox,xray-core,zeronet,sing-box,xray-rust"
+    engines_list="ferrox,xray-core,zeronet,sing-box,xray-rust,leaf"
   fi
 fi
 if [[ -z "$repeats" ]]; then
@@ -105,7 +105,7 @@ done
   echo "engines skipped: ${skipped[*]:-<none>}" >&2
 } || true
 ordered=()
-for want in xray-core ferrox zeronet sing-box xray-rust; do
+for want in xray-core ferrox zeronet sing-box xray-rust leaf; do
   for have in ${built[@]+"${built[@]}"}; do
     [[ "${have%%=*}" == "$want" ]] && ordered+=("$have")
   done
@@ -122,9 +122,8 @@ for have in "${engines[@]}"; do
   engine_args+=(--engine "$have")
   shape="$(config_arg_for "$label")"
   [[ "$shape" == "long" ]] || engine_args+=(--config-arg "$label=$shape")
-  if [[ "$label" == "sing-box" ]]; then
-    engine_args+=(--dialect "$label=sing-box")
-  fi
+  dialect="$(dialect_for "$label")"
+  [[ "$dialect" == "xray" ]] || engine_args+=(--dialect "$label=$dialect")
 done
 [[ "${engines[0]%%=*}" == "xray-core" ]] || fail "no xray-core reference: a comparison without one is not a comparison"
 ferrox_present=0
@@ -151,7 +150,7 @@ manifest() {
       label="${have%%=*}"
       echo "engine $label: ${have#*=} sha256=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "${have#*=}") mib=$(python3 -c 'import os,sys;print(f"{os.path.getsize(sys.argv[1]) / 1048576:.1f}")' "${have#*=}")"
     done
-    for pin in xray-core sing-box zeronet xray-rust; do
+    for pin in xray-core sing-box zeronet xray-rust leaf; do
       echo "pin $pin: $(pin_of "$pin")"
     done
   } >"$out/manifest.txt"
