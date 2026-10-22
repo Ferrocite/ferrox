@@ -2837,7 +2837,7 @@ impl<T> Grain<T> {
     fn empty(&self) {
         let _ = self
             .quiet
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |quiet| {
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |quiet| {
                 Some(quiet.saturating_add(1).min(RELAY_MOVING_READS))
             });
     }
@@ -13085,9 +13085,9 @@ mod tests {
         assert_eq!(&head, b"ping", "the hello reaches the origin");
     }
 
-    /// Two pumps share one session lock: a read that holds it for a whole idle grain stalls the opposite pump's write for that grain.
+    /// Two pumps share one session lock: an idle read must leave it after the relay grain, and a write must bring back the one-tick grain that keeps the opposite pump waiting.
     #[test]
-    fn a_server_relay_bounds_the_shared_session_to_one_tick() {
+    fn a_server_relay_moves_an_idle_shared_session_to_the_relay_grain() {
         let site = crate::conn::test_bind("127.0.0.1:0").expect("binds the site");
         let site_addr: SocketAddr = site.local_addr().expect("addr");
         let dialed = thread::spawn(move || {
@@ -13117,13 +13117,27 @@ mod tests {
         let mut answer = [0u8; 2];
         edge.read_exact(&mut answer).expect("answers");
         assert_eq!(answer, [0, 0], "the relay grants the tunnel");
-        // The grant is written after the SESSION_POLL arm and the relay returns early if arming fails, so it already proves the raw arm armed cross-platform; only a duplicated file description can reflect a later setsockopt, so the value witness is unix-only (WSADuplicateSocket gives Windows an independent handle).
+        // Only a duplicated file description reflects a setsockopt made on the raw clone, so the value witness is unix-only (WSADuplicateSocket gives Windows an independent handle).
         #[cfg(unix)]
-        assert_eq!(
-            probe.read_timeout().ok().flatten(),
-            Some(SESSION_POLL),
-            "the shared fd must poll at one tick, or a silent session read stalls the peer pump's write"
-        );
+        {
+            let idle = Instant::now() + Duration::from_secs(5);
+            while probe.read_timeout().ok().flatten() != Some(RELAY_POLL) {
+                assert!(
+                    Instant::now() < idle,
+                    "an idle shared read must arm the relay grain"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            edge.write_all(b"x").expect("moves the flow");
+            let moving = Instant::now() + Duration::from_secs(5);
+            while probe.read_timeout().ok().flatten() != Some(SESSION_POLL) {
+                assert!(
+                    Instant::now() < moving,
+                    "a write must return the shared read to one tick"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
         drop(edge);
         relay.join().expect("the relay ends");
         drop(dialed.join().expect("the site holds its connection"));

@@ -116,7 +116,7 @@ impl<S: Read + Write + RecordAlignment> RecordAlignment for Link<S> {
 
 impl<S: Read + Write + RecordAlignment> Link<S> {
     /// The direct switch reads the raw clone, so the grain a shared read needs is armed on the handle it reads.
-    pub(crate) fn arm_read_timeout(&self, grain: Duration) -> std::io::Result<()> {
+    pub(crate) fn arm_read_timeout(&self, grain: std::time::Duration) -> std::io::Result<()> {
         match &self.raw {
             Some(raw) => raw.set_read_timeout(Some(grain)),
             None => Ok(()),
