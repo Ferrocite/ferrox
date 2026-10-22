@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::budgets::{
     self, ACCOUNT_ATTEMPTS, CARRIER_DEAD_SECS, RELAY_HANDOFF_SPINS, RELAY_IDLE, RELAY_LOCK_TRIES,
-    RELAY_POLL, SESSION_POLL,
+    RELAY_MOVING_READS, RELAY_POLL, SESSION_POLL,
 };
 use crate::config::{
     inbound_carrier, inbound_reality_config, inbound_tls_identity, outbound_carrier, outbound_flow,
@@ -2728,7 +2728,9 @@ fn relay_vless<S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'sta
     };
     if flow == Flow::Vision {
         relay_stream(
-            Half::shared(crate::vision::Link::new(session, raw, id)),
+            Half::shared_armed(crate::vision::Link::new(session, raw, id), |link, grain| {
+                link.arm_read_timeout(grain)
+            }),
             Half::socket(uplink),
             &close,
         );
@@ -2753,7 +2755,9 @@ fn relay_vless_driven(
     };
     if flow == Flow::Vision {
         relay_stream(
-            Half::shared(crate::vision::Link::new(session, raw, id)),
+            Half::shared_armed(crate::vision::Link::new(session, raw, id), |link, grain| {
+                link.arm_read_timeout(grain)
+            }),
             Half::socket(uplink),
             &close,
         );
@@ -2798,7 +2802,45 @@ enum Half<T> {
     Split { read: Mutex<T>, write: Mutex<T> },
     /// One object behind one lock: a session's read and its write are the same bytes, so
     /// the lock is the only thing that can stand between them.
-    Shared { inner: Mutex<T>, wanted: AtomicBool },
+    Shared {
+        inner: Mutex<T>,
+        wanted: AtomicBool,
+        grain: Option<Grain<T>>,
+    },
+}
+
+type Arm<T> = Box<dyn Fn(&T, Duration) -> std::io::Result<()> + Send + Sync>;
+
+// The grain a shared read arms on the transport it waits in: re-armed only on a transition, never per read.
+struct Grain<T> {
+    quiet: AtomicU32,
+    arm: Arm<T>,
+}
+
+impl<T> std::fmt::Debug for Grain<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Grain")
+            .field("quiet", &self.quiet.load(Ordering::Relaxed))
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T> Grain<T> {
+    fn before_read(&self, value: &T, _wanted: bool) {
+        let _ = (self.arm)(value, SESSION_POLL);
+    }
+
+    fn moved(&self) {
+        self.quiet.store(0, Ordering::Relaxed);
+    }
+
+    fn empty(&self) {
+        let _ = self
+            .quiet
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |quiet| {
+                Some(quiet.saturating_add(1).min(RELAY_MOVING_READS))
+            });
+    }
 }
 
 impl<T> Half<T> {
@@ -2815,6 +2857,22 @@ impl<T> Half<T> {
         Self::Shared {
             inner: Mutex::new(value),
             wanted: AtomicBool::new(false),
+            grain: None,
+        }
+    }
+
+    /// A shared half whose transport can be re-armed: the relay's read moves the grain, and the transport the read parks in hears it.
+    fn shared_armed(
+        value: T,
+        arm: impl Fn(&T, Duration) -> std::io::Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self::Shared {
+            inner: Mutex::new(value),
+            wanted: AtomicBool::new(false),
+            grain: Some(Grain {
+                quiet: AtomicU32::new(0),
+                arm: Box::new(arm),
+            }),
         }
     }
 
@@ -2871,8 +2929,26 @@ impl<T: Read> Half<T> {
                 Ok(mut guard) => guard.read(buf),
                 Err(_) => Err(std::io::Error::other("relay half poisoned")),
             },
-            Self::Shared { inner, .. } => match inner.lock() {
-                Ok(mut guard) => guard.read(buf),
+            Self::Shared {
+                inner,
+                wanted,
+                grain,
+            } => match inner.lock() {
+                Ok(mut guard) => {
+                    if let Some(grain) = grain {
+                        grain.before_read(&guard, wanted.load(Ordering::Relaxed));
+                    }
+                    let result = guard.read(buf);
+                    if let Some(grain) = grain {
+                        match &result {
+                            Ok(0) => {}
+                            Ok(_) => grain.moved(),
+                            Err(error) if is_timeout(error) => grain.empty(),
+                            Err(_) => {}
+                        }
+                    }
+                    result
+                }
                 Err(_) => Err(std::io::Error::other("relay half poisoned")),
             },
         };
@@ -2888,13 +2964,20 @@ impl<T: Write> Half<T> {
         };
         // Buffered writers only send on flush; raw sockets treat it as a no-op.
         guard.write_all(buf)?;
-        guard.flush()
+        guard.flush()?;
+        if let Self::Shared {
+            grain: Some(grain), ..
+        } = self
+        {
+            grain.moved();
+        }
+        Ok(())
     }
 
     fn writer_lock(&self) -> Result<MutexGuard<'_, T>, ()> {
         match self {
             Self::Split { write, .. } => write.lock().map_err(|_| ()),
-            Self::Shared { inner, wanted } => {
+            Self::Shared { inner, wanted, .. } => {
                 wanted.store(true, Ordering::Relaxed);
                 let taken = Self::spin_lock(inner);
                 wanted.store(false, Ordering::Relaxed);
@@ -5645,12 +5728,21 @@ fn dial_vless_reality(
             if vless.flow == crate::vision::FLOW {
                 relay_stream(
                     Half::socket(downstream),
-                    Half::shared(crate::vision::Link::new(session, Some(raw), &vless.id)),
+                    Half::shared_armed(
+                        crate::vision::Link::new(session, Some(raw), &vless.id),
+                        |link, grain| link.arm_read_timeout(grain),
+                    ),
                     &close,
                 );
             } else {
                 session.disarm_record_alignment();
-                relay_stream(Half::socket(downstream), Half::shared(session), &close);
+                relay_stream(
+                    Half::socket(downstream),
+                    Half::shared_armed(session, |session, grain| {
+                        session.get_ref().get_ref().set_read_timeout(Some(grain))
+                    }),
+                    &close,
+                );
             }
         }
         _ => ride_carrier(server, session, vless, &header, client),
@@ -5689,7 +5781,13 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
                     let _ = downstream.shutdown(Shutdown::Both);
                 }
             });
-            relay_stream(Half::socket(downstream), Half::shared(session), &close);
+            relay_stream(
+                Half::socket(downstream),
+                Half::shared_armed(session, |session, grain| {
+                    session.get_ref().set_read_timeout(Some(grain))
+                }),
+                &close,
+            );
         }
         Carrier::Ws { path, ed } => {
             let Some((reader, writer)) = tls_ws(server, session, &trojan.host, path, *ed, header)
@@ -12767,6 +12865,56 @@ mod tests {
         };
         let gated = inner.lock().expect("reads back");
         assert_eq!(gated.sent, b"ping", "flush-gated bytes are sent, not held");
+    }
+
+    /// A leg that times out at once: the grain a shared read arms is counted without a socket's wait.
+    struct Silent;
+
+    impl Read for Silent {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+        }
+    }
+
+    impl Write for Silent {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_quiet_shared_read_arms_the_long_grain_and_a_write_brings_it_back() {
+        let arms = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&arms);
+        let half = Half::shared_armed(Silent, move |_: &Silent, grain| {
+            recorded.lock().expect("records").push(grain);
+            Ok(())
+        });
+        let mut buf = [0u8; 8];
+        for _ in 0..RELAY_MOVING_READS {
+            assert!(half.read_once(&mut buf).is_err());
+        }
+        assert!(
+            !arms.lock().expect("arms").contains(&RELAY_POLL),
+            "a moving flow keeps the short grain"
+        );
+        assert!(half.read_once(&mut buf).is_err());
+        assert_eq!(
+            arms.lock().expect("arms").last(),
+            Some(&RELAY_POLL),
+            "an idle flow arms the long grain"
+        );
+        half.write_once(b"ping").expect("writes");
+        assert!(half.read_once(&mut buf).is_err());
+        assert_eq!(
+            arms.lock().expect("arms").last(),
+            Some(&SESSION_POLL),
+            "a write returns the flow to the short grain"
+        );
     }
 
     #[test]
