@@ -2735,9 +2735,16 @@ fn relay_vless<S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'sta
             &close,
         );
     } else {
-        // No direct switch coming: the limiter stops bounding and tracking reads.
+        // No direct switch coming: the limiter stops bounding and tracking reads. The raw clone is the same socket on unix, so the grain it arms is the one the session's own read waits in.
         session.disarm_record_alignment();
-        relay_stream(Half::shared(session), Half::socket(uplink), &close);
+        relay_stream(
+            Half::shared_armed(session, move |_, grain| match &raw {
+                Some(raw) => raw.set_read_timeout(Some(grain)),
+                None => Ok(()),
+            }),
+            Half::socket(uplink),
+            &close,
+        );
     }
 }
 
@@ -2766,7 +2773,8 @@ fn relay_vless_driven(
     let Ok(cipher) = session.get_ref().get_ref().try_clone() else {
         return;
     };
-    if cipher.set_read_timeout(Some(SESSION_POLL)).is_err() {
+    // The transport wait holds no lock, so the idle leg arms the relay grain and a writer never waits on it.
+    if cipher.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
     }
     session.disarm_record_alignment();
@@ -2814,6 +2822,7 @@ type Arm<T> = Box<dyn Fn(&T, Duration) -> std::io::Result<()> + Send + Sync>;
 // The grain a shared read arms on the transport it waits in: re-armed only on a transition, never per read.
 struct Grain<T> {
     quiet: AtomicU32,
+    short: AtomicBool,
     arm: Arm<T>,
 }
 
@@ -2821,13 +2830,18 @@ impl<T> std::fmt::Debug for Grain<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Grain")
             .field("quiet", &self.quiet.load(Ordering::Relaxed))
+            .field("short", &self.short.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
 
 impl<T> Grain<T> {
-    fn before_read(&self, value: &T, _wanted: bool) {
-        let _ = (self.arm)(value, SESSION_POLL);
+    fn before_read(&self, value: &T, wanted: bool) {
+        let short = wanted || self.quiet.load(Ordering::Relaxed) < RELAY_MOVING_READS;
+        if short != self.short.load(Ordering::Relaxed) {
+            let _ = (self.arm)(value, if short { SESSION_POLL } else { RELAY_POLL });
+            self.short.store(short, Ordering::Relaxed);
+        }
     }
 
     fn moved(&self) {
@@ -2838,7 +2852,7 @@ impl<T> Grain<T> {
         let _ = self
             .quiet
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |quiet| {
-                Some(quiet.saturating_add(1).min(RELAY_MOVING_READS))
+                Some(quiet.saturating_add(1))
             });
     }
 }
@@ -2871,6 +2885,7 @@ impl<T> Half<T> {
             wanted: AtomicBool::new(false),
             grain: Some(Grain {
                 quiet: AtomicU32::new(0),
+                short: AtomicBool::new(true),
                 arm: Box::new(arm),
             }),
         }
@@ -5582,7 +5597,7 @@ fn dial_vless_tls(
     let Some(mut session) = dial_tls_session(server, cfg, vless.carrier.tcp_mask()) else {
         return;
     };
-    // The session is this relay's one shared half, so its read holds the lock the other direction's write wants: the shared grain is the one that keeps a writer from waiting out a wait.
+    // The session is this relay's one shared half: its read holds the lock the other direction's write wants, so it starts on the shared grain and the adaptive grain lengthens it once the flow is quiet.
     if session
         .get_ref()
         .set_read_timeout(Some(SESSION_POLL))
@@ -5610,11 +5625,11 @@ fn dial_vless_tls(
                     let _ = downstream.shutdown(Shutdown::Both);
                 }
             });
-            // The relay reads the session's transport itself: the idle leg's wait costs the busy leg's write nothing.
+            // The relay reads the session's transport itself: the idle leg's wait holds no lock, so it takes the relay grain itself.
             let Ok(cipher) = session.get_ref().try_clone() else {
                 return;
             };
-            if cipher.set_read_timeout(Some(SESSION_POLL)).is_err() {
+            if cipher.set_read_timeout(Some(RELAY_POLL)).is_err() {
                 return;
             }
             let session = Arc::new(Mutex::new(session));
@@ -5650,23 +5665,16 @@ fn dial_vless_reality(
         return;
     };
     let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
-    let mut session = match ferrox_core::tls::RealityClientSession::connect(
-        cfg,
-        now,
-        ferrox_core::tls::reality::RecordLimiter::new(uplink),
-    ) {
+    let limiter = ferrox_core::tls::reality::RecordLimiter::new(uplink);
+    let mut session = match ferrox_core::tls::RealityClientSession::connect(cfg, now, limiter) {
         Ok(session) => session,
         Err(error) => {
-            return note_dial_failure(
-                server,
-                Failure::new(
-                    Stage::SocketConnected,
-                    Kind::of(&std::io::Error::from(error)),
-                ),
-            );
+            let failure =
+                Failure::new(Stage::SocketConnected, Kind::of(&std::io::Error::from(error)));
+            return note_dial_failure(server, failure);
         }
     };
-    // Relay writes complete through reads: bound them to one tick or the first write waits out its answer.
+    // Relay writes complete through reads: the short grain bounds the first wait, and the adaptive grain lengthens it once the flow is quiet.
     if session
         .get_ref()
         .get_ref()
@@ -5726,12 +5734,10 @@ fn dial_vless_reality(
                 }
             });
             if vless.flow == crate::vision::FLOW {
+                let link = crate::vision::Link::new(session, Some(raw), &vless.id);
                 relay_stream(
                     Half::socket(downstream),
-                    Half::shared_armed(
-                        crate::vision::Link::new(session, Some(raw), &vless.id),
-                        |link, grain| link.arm_read_timeout(grain),
-                    ),
+                    Half::shared_armed(link, crate::vision::Link::arm_read_timeout),
                     &close,
                 );
             } else {
@@ -5756,7 +5762,7 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
     let Some(mut session) = dial_tls_session(server, cfg, trojan.carrier.tcp_mask()) else {
         return;
     };
-    // The session is this relay's one shared half, so its read holds the lock the other direction's write wants: the shared grain is the one that keeps a writer from waiting out a wait.
+    // The session is this relay's one shared half: its read holds the lock the other direction's write wants, so it starts on the shared grain and the adaptive grain lengthens it once the flow is quiet.
     if session
         .get_ref()
         .set_read_timeout(Some(SESSION_POLL))
