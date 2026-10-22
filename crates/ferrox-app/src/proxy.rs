@@ -13845,6 +13845,38 @@ mod tests {
         );
     }
 
+    /// A `recv` returns what is queued, not what was asked, so a busy leg's reads can stay short for the life of a flow: it must promote once it has moved a whole window, or every read of a bulk transfer stays at 16 KiB.
+    #[test]
+    fn a_relay_buffer_promotes_once_a_whole_window_has_moved() {
+        let mut buffer = RelayBuf::new();
+        let short = RELAY_SMALL_BUFFER - 1;
+        let window = (RELAY_BUFFER - 1) / short;
+        for _ in 0..window {
+            assert_eq!(buffer.filled(short).len(), short);
+        }
+        assert_eq!(
+            buffer.size(),
+            RELAY_SMALL_BUFFER,
+            "{window} short reads moved {} bytes, one short of a relay window",
+            window * short
+        );
+
+        assert_eq!(buffer.filled(short).len(), short);
+        assert_eq!(
+            buffer.size(),
+            RELAY_BUFFER,
+            "the read that moved a whole window did not promote"
+        );
+
+        let mut small = RelayBuf::new();
+        small.filled(1);
+        assert_eq!(
+            small.size(),
+            RELAY_SMALL_BUFFER,
+            "a one-byte flow paid for a relay window"
+        );
+    }
+
     #[test]
     fn a_relay_buffer_promotes_only_on_a_read_that_filled_it() {
         let mut buffer = RelayBuf::new();
