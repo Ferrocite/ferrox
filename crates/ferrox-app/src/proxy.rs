@@ -16463,6 +16463,59 @@ mod tests {
         let _ = release.send(());
     }
 
+    /// A read that parks in the transport, one owned by the driver: the session's lock must stay with the writer until a poll returns.
+    #[test]
+    fn a_parked_tls_read_leaves_the_lock_to_the_writer() {
+        use ferrox_core::tls::TlsProvider as _;
+        use std::io::Read as _;
+        use std::io::Write as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server: SocketAddr = listener.local_addr().expect("addr");
+        let (release, hold) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            // The served side stays silent: the only content is the read parked in the session.
+            let _ = hold.recv_timeout(Duration::from_secs(10));
+        });
+
+        let session = dial_tls_session(&server, &client_config, None).expect("dialled");
+        // A parked read that waits out a long timeout; before the split this park holds the session's lock.
+        session
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("arms the parked read");
+        let transport = session.get_ref().try_clone().expect("dups the transport");
+        let (reader, writer) = session_halves(session, transport);
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (wrote_tx, wrote_rx) = std::sync::mpsc::channel();
+        let reading = thread::spawn(move || {
+            let mut reader = reader;
+            started_tx.send(()).ok();
+            reader.read(&mut [0u8; 512]).ok();
+        });
+        started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the read starts");
+        // One beat: the read is inside the transport's wait by the time the writer arrives.
+        thread::sleep(Duration::from_millis(50));
+        let writing = thread::spawn(move || {
+            let mut writer = writer;
+            let ok = writer.write_all(b"ping").is_ok();
+            wrote_tx.send(ok).ok();
+        });
+        let wrote = wrote_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_default();
+        let _ = release.send(());
+        assert!(wrote, "a write waited on a session the parked read holds");
+        let _ = writing.join();
+        let _ = reading.join();
+    }
+
     fn tls_over_carrier(
         name: &str,
         accept: impl FnOnce(Connection) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)>
