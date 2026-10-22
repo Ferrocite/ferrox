@@ -23994,6 +23994,21 @@ mod tests {
         port
     }
 
+    /// One `socks` inbound built from its settings the way a config builds it, already answering on its port.
+    fn socks_inbound_from(settings: &str) -> u16 {
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let text = format!(
+            r#"{{"inbounds":[{{"protocol":"socks","listen":"127.0.0.1","port":{port},"settings":{settings}}}]}}"#
+        );
+        let root = crate::json::parse(&text).expect("parses");
+        let (opened, _) = serve_inbounds("test", &root, Some(&Outbound::Freedom), None, false);
+        assert_eq!(opened, 1, "the socks inbound opens");
+        drop(connect_until(port));
+        port
+    }
+
     /// A client that connects once the accept thread has bound; the inbound binds after the config is read.
     fn connect_until(port: u16) -> Connection {
         let until = Instant::now() + Duration::from_secs(10);
@@ -24101,6 +24116,24 @@ mod tests {
             .expect("gets");
         let head = read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("answers");
         assert_eq!(head, HTTP_AUTH_REQUIRED, "the http side asks the same");
+    }
+
+    /// The `users` alias xray's socks config also accepts: a front that names its account there admits the credential.
+    #[test]
+    fn socks_inbound_admits_the_users_spelling_of_its_accounts() {
+        let echo = echo_loop();
+        let port =
+            socks_inbound_from(r#"{"auth":"password","users":[{"user":"alice","pass":"s3cr3t"}]}"#);
+        let mut client = socks_ask_with_credential(
+            port,
+            format!("127.0.0.1:{echo}").parse().expect("an address"),
+            "alice",
+            "s3cr3t",
+        );
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
     }
 
     #[test]
