@@ -4607,11 +4607,9 @@ pub(crate) mod loopback {
         let sock =
             crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
         let edge_port = sock.local_addr().expect("addr").port();
-        let cert = crate::quic::der_to_pem(&server.cert_chain[0], "CERTIFICATE");
-        let key = crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY");
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
         let (uni_tx, uni_rx) = std::sync::mpsc::channel();
-        let edge = h3_edge(sock, cert, key, seen_tx, uni_tx, PAYLOAD.to_vec());
+        let edge = h3_edge(sock, server, seen_tx, uni_tx, PAYLOAD.to_vec());
         let proxy = socks_relay(edge_port);
         let (client, peer, local) = crate::quic::udp_to_server("127.0.0.1", edge_port)
             .expect("a socket the edge can be addressed from");
@@ -5925,14 +5923,7 @@ pub(crate) mod loopback {
             let port = sock.local_addr().expect("addr").port();
             let (seen_tx, seen_rx) = std::sync::mpsc::channel();
             let (uni_tx, _uni_rx) = std::sync::mpsc::channel();
-            let edge = h3_edge(
-                sock,
-                crate::quic::der_to_pem(&server.cert_chain[0], "CERTIFICATE"),
-                crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY"),
-                seen_tx,
-                uni_tx,
-                PAYLOAD.to_vec(),
-            );
+            let edge = h3_edge(sock, server, seen_tx, uni_tx, PAYLOAD.to_vec());
             let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
             let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
                 .expect("a connection");
@@ -7680,26 +7671,7 @@ pub(crate) mod loopback {
         seen: std::sync::mpsc::Sender<Vec<u8>>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos();
-            let tag = format!("ferrox-foxy-udp-{}-{stamp}", std::process::id());
-            let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
-            let key_path = std::env::temp_dir().join(format!("{tag}.key"));
-            let cert_pem = crate::quic::der_to_pem(&server.cert_chain[0], "CERTIFICATE");
-            let key_pem = crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY");
-            std::fs::write(&cert_path, &cert_pem).expect("stages cert");
-            std::fs::write(&key_path, &key_pem).expect("stages key");
-            let mut config = crate::quic::server_config(crate::quic::ALPN);
-            config
-                .load_cert_chain_from_pem_file(cert_path.to_str().expect("ascii"))
-                .expect("loads chain");
-            config
-                .load_priv_key_from_pem_file(key_path.to_str().expect("ascii"))
-                .expect("loads key");
-            let _ = std::fs::remove_file(&cert_path);
-            let _ = std::fs::remove_file(&key_path);
+            let mut config = crate::quic::serve_config(&server).expect("serves");
             let local = sock.local_addr().expect("addr");
             let mut conn = crate::quic::server_accept(&sock, local, &mut config);
             let mut buf = [0u8; 1350];
@@ -7817,26 +7789,7 @@ pub(crate) mod loopback {
         want: usize,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos();
-            let tag = format!("ferrox-foxy-ip-{}-{stamp}", std::process::id());
-            let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
-            let key_path = std::env::temp_dir().join(format!("{tag}.key"));
-            let cert_pem = crate::quic::der_to_pem(&server.cert_chain[0], "CERTIFICATE");
-            let key_pem = crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY");
-            std::fs::write(&cert_path, &cert_pem).expect("stages cert");
-            std::fs::write(&key_path, &key_pem).expect("stages key");
-            let mut config = crate::quic::server_config(crate::quic::ALPN);
-            config
-                .load_cert_chain_from_pem_file(cert_path.to_str().expect("ascii"))
-                .expect("loads chain");
-            config
-                .load_priv_key_from_pem_file(key_path.to_str().expect("ascii"))
-                .expect("loads key");
-            let _ = std::fs::remove_file(&cert_path);
-            let _ = std::fs::remove_file(&key_path);
+            let mut config = crate::quic::serve_config(&server).expect("serves");
             let local = sock.local_addr().expect("addr");
             let mut conn = crate::quic::server_accept(&sock, local, &mut config);
             let mut buf = [0u8; 1350];
@@ -8428,31 +8381,13 @@ pub(crate) mod loopback {
     /// The edge half of the QUIC carrier: a control stream, one HEADERS frame with a QPACK status, and DATA frames echoing the uplink back then streaming `downlink` — the proof the QUIC lane lacked: the wire request compared byte for byte with the lane's block, the status read through the QPACK decoder, and the bytes after the head travelling through the tunnel; a codec test answers none of those three.
     fn h3_edge(
         sock: crate::quic::Datagram,
-        cert_pem: Vec<u8>,
-        key_pem: Vec<u8>,
+        server: ferrox_core::tls::TlsServerConfig,
         seen: std::sync::mpsc::Sender<Vec<u8>>,
         uni: std::sync::mpsc::Sender<Vec<(u64, Vec<u8>, bool)>>,
         downlink: Vec<u8>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos();
-            let tag = format!("ferrox-foxy-h3-{}-{stamp}", std::process::id());
-            let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
-            let key_path = std::env::temp_dir().join(format!("{tag}.key"));
-            std::fs::write(&cert_path, &cert_pem).expect("stages cert");
-            std::fs::write(&key_path, &key_pem).expect("stages key");
-            let mut config = crate::quic::server_config(crate::quic::ALPN);
-            config
-                .load_cert_chain_from_pem_file(cert_path.to_str().expect("ascii"))
-                .expect("loads chain");
-            config
-                .load_priv_key_from_pem_file(key_path.to_str().expect("ascii"))
-                .expect("loads key");
-            let _ = std::fs::remove_file(&cert_path);
-            let _ = std::fs::remove_file(&key_path);
+            let mut config = crate::quic::serve_config(&server).expect("serves");
             let local = sock.local_addr().expect("addr");
             let mut conn = crate::quic::server_accept(&sock, local, &mut config);
             let mut buf = [0u8; 1350];
@@ -8638,17 +8573,9 @@ pub(crate) mod loopback {
         let sock =
             crate::quic::Datagram::plain(crate::quic::bind_datagram("127.0.0.1:0").expect("binds"));
         let port = sock.local_addr().expect("addr").port();
-        let key_pem = crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY");
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
         let (uni_tx, uni_rx) = std::sync::mpsc::channel();
-        let edge = h3_edge(
-            sock,
-            crate::quic::der_to_pem(&server.cert_chain[0], "CERTIFICATE"),
-            key_pem,
-            seen_tx,
-            uni_tx,
-            PAYLOAD.to_vec(),
-        );
+        let edge = h3_edge(sock, server, seen_tx, uni_tx, PAYLOAD.to_vec());
 
         let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
         let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
@@ -8707,14 +8634,7 @@ pub(crate) mod loopback {
         let (seen_tx, seen_rx) = std::sync::mpsc::channel();
         let (uni_tx, _uni_rx) = std::sync::mpsc::channel();
         let downlink: Vec<u8> = (0..DOWNLINK as u64).map(|i| (i % 251) as u8).collect();
-        let edge = h3_edge(
-            sock,
-            crate::quic::der_to_pem(&server.cert_chain[0], "CERTIFICATE"),
-            crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY"),
-            seen_tx,
-            uni_tx,
-            downlink.clone(),
-        );
+        let edge = h3_edge(sock, server, seen_tx, uni_tx, downlink.clone());
 
         let dial = dial_for(roots, port, Carrier::H3, foxy::pin::Pins::default());
         let quic = crate::quic::direct_stream("localhost", "127.0.0.1", port, &dial.roots)
@@ -8875,32 +8795,7 @@ pub(crate) mod loopback {
         pieces: Vec<(Vec<u8>, Duration)>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos();
-            let tag = format!("ferrox-foxy-script-{}-{stamp}", std::process::id());
-            let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
-            let key_path = std::env::temp_dir().join(format!("{tag}.key"));
-            std::fs::write(
-                &cert_path,
-                crate::quic::der_to_pem(&server.cert_chain[0], "CERTIFICATE"),
-            )
-            .expect("stages cert");
-            std::fs::write(
-                &key_path,
-                crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY"),
-            )
-            .expect("stages key");
-            let mut config = crate::quic::server_config(crate::quic::ALPN);
-            config
-                .load_cert_chain_from_pem_file(cert_path.to_str().expect("ascii"))
-                .expect("loads chain");
-            config
-                .load_priv_key_from_pem_file(key_path.to_str().expect("ascii"))
-                .expect("loads key");
-            let _ = std::fs::remove_file(&cert_path);
-            let _ = std::fs::remove_file(&key_path);
+            let mut config = crate::quic::serve_config(&server).expect("serves");
             let local = sock.local_addr().expect("addr");
             let mut conn = crate::quic::server_accept(&sock, local, &mut config);
             let mut buf = [0u8; 1350];
@@ -8967,32 +8862,7 @@ pub(crate) mod loopback {
         pieces: Vec<(Vec<u8>, Duration)>,
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
-            let stamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock")
-                .as_nanos();
-            let tag = format!("ferrox-foxy-fin-{}-{stamp}", std::process::id());
-            let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
-            let key_path = std::env::temp_dir().join(format!("{tag}.key"));
-            std::fs::write(
-                &cert_path,
-                crate::quic::der_to_pem(&server.cert_chain[0], "CERTIFICATE"),
-            )
-            .expect("stages cert");
-            std::fs::write(
-                &key_path,
-                crate::quic::der_to_pem(&server.key_der, "PRIVATE KEY"),
-            )
-            .expect("stages key");
-            let mut config = crate::quic::server_config(crate::quic::ALPN);
-            config
-                .load_cert_chain_from_pem_file(cert_path.to_str().expect("ascii"))
-                .expect("loads chain");
-            config
-                .load_priv_key_from_pem_file(key_path.to_str().expect("ascii"))
-                .expect("loads key");
-            let _ = std::fs::remove_file(&cert_path);
-            let _ = std::fs::remove_file(&key_path);
+            let mut config = crate::quic::serve_config(&server).expect("serves");
             let local = sock.local_addr().expect("addr");
             let mut conn = crate::quic::server_accept(&sock, local, &mut config);
             let mut buf = [0u8; 1350];
