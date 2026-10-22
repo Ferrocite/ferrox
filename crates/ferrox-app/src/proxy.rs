@@ -233,14 +233,8 @@ fn serve_inbounds(
             let protocol =
                 canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or(""));
             // The reference expands a port list and datagram carrier to one listener per port.
-            let addresses = if crate::tun::is_device(protocol) {
-                vec![String::new()]
-            } else {
-                let addresses = inbound_addresses(inbound);
-                if addresses.is_empty() {
-                    continue;
-                }
-                addresses
+            let Some(addresses) = serve_addresses(inbound, protocol) else {
+                continue;
             };
             if !inbound_served(protocol) {
                 refuse_inbound(protocol, label, inbound);
@@ -331,6 +325,16 @@ fn serve_inbounds(
         }
     }
     (inbounds, hysteria_served)
+}
+
+/// The listener lanes an inbound opens: the device's own (a tun names no socket), else one
+/// address per port the reference expands. `None` is an inbound that bound nothing, skipped.
+fn serve_addresses(inbound: &Json, protocol: &str) -> Option<Vec<String>> {
+    if crate::tun::is_device(protocol) {
+        return Some(vec![String::new()]);
+    }
+    let addresses = inbound_addresses(inbound);
+    (!addresses.is_empty()).then_some(addresses)
 }
 
 /// A device inbound is refused with the reason the device layer computes from the config; any other unserved inbound is refused by name.
@@ -12991,7 +12995,7 @@ mod tests {
             addresses(r#"{"port": "not-a-port, toronto, 400-401"}"#),
             ["0.0.0.0:400", "0.0.0.0:401"]
         );
-        assert!(addresses(r#"{"port": "402-401"}"#).is_empty());
+        assert_eq!(addresses(r#"{"port": "402-401"}"#), [] as [String; 0]);
         assert_eq!(
             addresses(r#"{"listen": "192.0.2.7", "port": "400,401"}"#),
             ["192.0.2.7:400", "192.0.2.7:401"]
@@ -13000,7 +13004,10 @@ mod tests {
             addresses(r#"{"listen": "", "port": "402"}"#),
             ["0.0.0.0:402"]
         );
-        assert!(addresses(r#"{"port": "env:FERROX_UNSET_PORT_PIECE"}"#).is_empty());
+        assert_eq!(
+            addresses(r#"{"port": "env:FERROX_UNSET_PORT_PIECE"}"#),
+            [] as [String; 0]
+        );
     }
 
     /// The census is a stall hunt's instrument: a release build's relay registers no wait
