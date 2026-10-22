@@ -1198,6 +1198,20 @@ impl Tls2 {
         self.conn.take(len);
     }
 
+    /// HTTP/2 6.5.3 and 6.9.2: a `SETTINGS` bounds every frame sent after it, shifts the send windows it announces a delta for, and is owed an answer.
+    fn apply_settings(&mut self, payload: &[u8]) -> Result<(), Failure> {
+        let mut at = 0usize;
+        while let Some((id, value)) = frames::setting(payload, at) {
+            match id {
+                4 => self.set_initial_window(value),
+                5 => self.max_frame = (value as usize).clamp(16_384, MAX_FRAME),
+                _ => {}
+            }
+            at += 6;
+        }
+        self.ack(frames::SETTINGS, &[])
+    }
+
     fn ack(&mut self, kind: u8, payload: &[u8]) -> Result<(), Failure> {
         self.out.clear();
         h2_frame(kind, 0x1, 0, payload, &mut self.out);
@@ -1229,16 +1243,7 @@ impl Tls2 {
                             header_status(&mut block, more, frame.flags & frames::END_HEADERS != 0)
                         }
                         frames::H2Event::Settings { ack: false, .. } => {
-                            let mut at = 0usize;
-                            while let Some((id, value)) = frames::setting(payload, at) {
-                                match id {
-                                    4 => lane.set_initial_window(value),
-                                    5 => lane.max_frame = (value as usize).clamp(16_384, MAX_FRAME),
-                                    _ => {}
-                                }
-                                at += 6;
-                            }
-                            lane.ack(frames::SETTINGS, &[]).map(|()| None)
+                            lane.apply_settings(payload).map(|()| None)
                         }
                         // A DATA frame that arrives while the status is still out is payload the edge sent early: hold its credit like any other, and let the walk ignore the bytes until `END_STREAM` says the status itself is gone.
                         frames::H2Event::Data { end, wire, .. } => {
@@ -1395,6 +1400,10 @@ impl Tls2 {
                         lane.grant(stream, increment);
                         Ok(0)
                     }
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        lane.apply_settings(payload).map_err(io)?;
+                        Ok(0)
+                    }
                     frames::H2Event::Ping { ack: false, .. } => {
                         lane.ack(frames::PING, payload).map_err(io)?;
                         Ok(0)
@@ -1508,6 +1517,10 @@ impl Read for Tls2 {
                     }
                     frames::H2Event::Window { stream, increment } => {
                         lane.grant(stream, increment);
+                        Ok(0)
+                    }
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        lane.apply_settings(payload).map_err(io)?;
                         Ok(0)
                     }
                     frames::H2Event::Ping { ack: false, .. } => {
@@ -2834,6 +2847,10 @@ impl Tls2 {
                         lane.grant(stream, increment);
                         Ok(())
                     }
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        lane.apply_settings(payload).map_err(io)?;
+                        Ok(())
+                    }
                     frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
                         lane.fin = true;
                         Ok(())
@@ -2886,6 +2903,10 @@ impl Tls2 {
                     }
                     frames::H2Event::Window { stream, increment } => {
                         lane.grant(stream, increment);
+                        Ok(false)
+                    }
+                    frames::H2Event::Settings { ack: false, .. } => {
+                        lane.apply_settings(payload).map_err(io)?;
                         Ok(false)
                     }
                     frames::H2Event::Reset { .. } | frames::H2Event::GoAway { .. } => {
@@ -4631,6 +4652,107 @@ pub(crate) mod loopback {
         }
         assert_eq!(back, b"tail", "a frame for another stream ended this lane");
         edge.join().expect("joins");
+    }
+
+    /// An edge that answers the open, sends one `SETTINGS` after the status has been handed back, and then reports every frame the lane writes as `(kind, flags, length)`.
+    fn midflow_settings_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+        settings: Vec<u8>,
+        seen_tx: std::sync::mpsc::Sender<(u8, u8, u32)>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) {
+                return;
+            }
+            let mut opening = Vec::new();
+            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut opening);
+            h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut opening);
+            h2_frame(frames::SETTINGS, 0, 0, &settings, &mut opening);
+            tls.write_all(&opening).expect("writes the script");
+            tls.flush().expect("flushes the script");
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let Some(frame) = frames::H2Frame::parse(&header) else {
+                    return;
+                };
+                let mut body = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut body) {
+                    return;
+                }
+                if seen_tx
+                    .send((frame.kind, frame.flags, frame.length))
+                    .is_err()
+                {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// HTTP/2 6.5.3 and 6.9.2: a `SETTINGS` frame arrives whenever the peer likes, bounds every frame sent after it, and is owed an answer.
+    #[test]
+    fn a_settings_that_arrives_mid_flow_bounds_the_frames_we_send() {
+        const BODY: usize = 48 * 1024;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen_tx, seen_rx) = std::sync::mpsc::channel();
+        let _edge = midflow_settings_edge(
+            listener,
+            server,
+            vec![0x00, 0x05, 0x00, 0x00, 0x40, 0x00],
+            seen_tx,
+        );
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        lane.set_read_quantum(Duration::from_millis(20))
+            .expect("arms a quantum");
+        let mut peek = [0u8; 16];
+        let _ = lane.read(&mut peek);
+        assert_eq!(
+            lane.max_frame,
+            16 * 1024,
+            "the ask that arrived after the status never moved the lane"
+        );
+        lane.write_all(&vec![0xa5u8; BODY])
+            .expect("writes the body");
+        let mut sizes = Vec::new();
+        let mut acked = false;
+        let mut seen = 0usize;
+        for _ in 0..16 {
+            match seen_rx.recv_timeout(Duration::from_secs(2)) {
+                Ok((frames::SETTINGS, 0x1, 0)) => acked = true,
+                Ok((frames::DATA, _, len)) => {
+                    sizes.push(len);
+                    seen += len as usize;
+                }
+                Ok(_) => {}
+                Err(_) => break,
+            }
+            if acked && seen >= BODY {
+                break;
+            }
+        }
+        assert!(acked, "a SETTINGS the lane read went unacknowledged");
+        assert!(
+            sizes.iter().all(|len| *len <= 16 * 1024),
+            "frames wider than the mid-flow ask: {sizes:?}"
+        );
     }
 
     /// The read quantum is what lets the writer behind the same mutex have a turn, so it must not cost the frame: a pause inside one DATA frame has to resume where it stopped, not abandon the bytes already promised to the header.
