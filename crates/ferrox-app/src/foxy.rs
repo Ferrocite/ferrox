@@ -5708,11 +5708,15 @@ pub(crate) mod loopback {
         };
         // The room takes every frame whole, so every frame's credit is owed when read.
         let wire = (FRAME + 1 + PAD) as u32;
-        let mut back = vec![0u8; (FRAME + 1 + PAD) * FRAMES];
+        let mut back = vec![0u8; FRAME * FRAMES];
         let mut at = 0usize;
         while at < back.len() {
             at += lane.read(&mut back[at..]).expect("reads");
         }
+        assert_eq!(
+            back, payload,
+            "the room took the four payloads, not four bodies with a pad byte and a pad tail"
+        );
         assert_eq!(
             lane.pending_credit, 0,
             "the frames crossed the floor and the grant took every octet of them"
@@ -5733,6 +5737,124 @@ pub(crate) mod loopback {
             vec![(1, FRAMES as u32 * wire), (0, FRAMES as u32 * wire)],
             "the grant is every frame's wire length, the pad byte and the pad tail included"
         );
+    }
+
+    /// The witness for `carrier-foxy padded-frame-payload-octets`: RFC 7540 6.1 keeps the Pad
+    /// Length octet and the Padding out of the payload, so a caller with room for the whole
+    /// frame gets the payload and never the padding around it.
+    #[test]
+    fn a_padded_frame_hands_back_only_its_payload() {
+        const FRAME: usize = 8 * 1024;
+        const PAD: usize = 7;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let payload: Vec<u8> = (0..FRAME).map(|i| (i % 251) as u8).collect();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let edge = downlink_edge(
+            listener,
+            server,
+            vec![(padded_data_frame(&payload, PAD), None)],
+            tx,
+        );
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        let mut back = vec![0u8; FRAME];
+        let mut at = 0usize;
+        while at < FRAME {
+            at += lane.read(&mut back[at..]).expect("reads");
+        }
+        assert_eq!(
+            back, payload,
+            "the delivery opened with the pad-length octet and closed on the pad tail"
+        );
+        drop(tunnel);
+        edge.join().expect("the edge finishes");
+    }
+
+    /// The other half of `carrier-foxy padded-frame-payload-octets`: the same padding read
+    /// through a buffer a fraction of the frame's size, so the bytes the caller gets do not
+    /// depend on how much room it had.
+    #[test]
+    fn a_padded_frame_read_in_pieces_hands_back_only_its_payload() {
+        const FRAME: usize = 8 * 1024;
+        const FRAMES: usize = 2;
+        const STEP: usize = 1000;
+        const PAD: usize = 200;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let payload: Vec<u8> = (0..FRAME * FRAMES).map(|i| (i % 251) as u8).collect();
+        let pieces = (0..FRAMES)
+            .map(|i| (padded_data_frame(&payload[i * FRAME..(i + 1) * FRAME], PAD), None))
+            .collect();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let edge = downlink_edge(listener, server, pieces, tx);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        let mut back = vec![0u8; FRAME * FRAMES];
+        let mut at = 0usize;
+        while at < back.len() {
+            let room = (back.len() - at).min(STEP);
+            let read = lane.read(&mut back[at..at + room]).expect("reads");
+            assert!(read > 0, "a padded frame that stops arriving");
+            at += read;
+        }
+        assert_eq!(
+            back, payload,
+            "the payload came out shifted by the octets that pad it, whatever the room"
+        );
+        drop(tunnel);
+        edge.join().expect("the edge finishes");
+    }
+
+    /// The witness for `carrier-foxy padding-only-frame-payload-octets`: a frame whose whole
+    /// body is padding carries no payload, so nothing reaches the caller and the window is
+    /// still owed every octet the frame spent.
+    #[test]
+    fn a_frame_of_only_padding_hands_the_caller_nothing_and_still_credits_its_wire() {
+        const PAD: usize = 5;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let edge = downlink_edge(
+            listener,
+            server,
+            vec![
+                (padded_data_frame(&[], PAD), None),
+                (data_frame(b"tail"), None),
+            ],
+            tx,
+        );
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        let mut back = [0u8; 64];
+        let mut got = 0usize;
+        while got < 4 {
+            got += lane.read(&mut back[got..]).expect("reads");
+        }
+        assert_eq!(
+            &back[..got],
+            b"tail",
+            "the pad-only frame's six octets were handed over as payload"
+        );
+        assert_eq!(
+            lane.pending_credit,
+            (PAD as u32 + 1) + 4,
+            "the frame that delivered nothing still spent six octets of window"
+        );
+        drop(tunnel);
+        edge.join().expect("the edge finishes");
     }
 
     /// Credit held below the floor never reaches the wire: a lane that has taken less than `CREDIT_FLOOR` owes the edge a number, not a write.
