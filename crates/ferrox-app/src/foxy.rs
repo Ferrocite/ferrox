@@ -6533,6 +6533,132 @@ pub(crate) mod loopback {
         edge.join().expect("joins");
     }
 
+    /// The one capsule header that never completes: a datagram capsule whose own length field names 16 MiB, so `capsule_split` wants bytes the tunnel never carries.
+    fn junk_capsule(len: usize) -> Vec<u8> {
+        let mut junk = vec![0xa5u8; len];
+        junk[..5].copy_from_slice(&[0x00, 0x80, 0xff, 0xff, 0xff]);
+        junk
+    }
+
+    /// A CONNECT-IP edge that answers the open and then streams capsules that never finish — with, or instead of, the assignment.
+    fn junk_ip_h2_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+        assign: bool,
+        frames: usize,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(crate::budgets::RELAY_QUANTUM))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut head = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut head) {
+                return;
+            }
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let frame = frames::H2Frame::parse(&header).expect("parses");
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                if let frames::H2Event::Headers { .. } = frames::h2_event(frame, &payload, 1) {
+                    break;
+                }
+            }
+            let mut out = Vec::new();
+            h2_frame(frames::HEADERS, 0x5, 1, &[0x88], &mut out);
+            tls.write_all(&out).expect("answers");
+            out.clear();
+            if assign {
+                ip_h2_assign(&mut tls);
+            }
+            let junk = junk_capsule(32 * 1024);
+            for _ in 0..frames {
+                out.clear();
+                h2_frame(frames::DATA, 0, 1, &junk, &mut out);
+                tls.write_all(&out)
+                    .expect("streams a capsule that never ends");
+            }
+            tls.flush().expect("flushes the stream");
+            // The edge stays until the lane goes quiet: an edge that hung up first would hand the read an EOF, and the buffer it is testing would never be looked at.
+            let until = std::time::Instant::now() + Duration::from_secs(30);
+            while std::time::Instant::now() < until {
+                let mut byte = [0u8; 1];
+                match tls.read(&mut byte) {
+                    Ok(0) => return,
+                    Ok(_) => {}
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::Interrupted
+                        ) => {}
+                    Err(_) => return,
+                }
+            }
+        })
+    }
+
+    /// HTTP/2 CONNECT-IP lanes stage the bytes behind a capsule in the lane's own buffer, so a peer that streams frames which never split into one has to be stopped at the ceiling the UDP reader already uses rather than at whatever the caller's patience is.
+    #[test]
+    fn a_capsule_stream_that_never_parses_stops_at_the_lane_s_ceiling() {
+        const FRAMES: usize = 12;
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let edge = junk_ip_h2_edge(listener, server, true, FRAMES);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let (mut lane, _) = Ip::open(&dial, None).expect("opens");
+        let Ip::H2(inner) = &mut lane else {
+            unreachable!("an h2 dial opens an h2 lane");
+        };
+        inner
+            .set_read_quantum(Duration::from_millis(200))
+            .expect("arms a quantum");
+        let mut named = None;
+        let mut packet = Vec::new();
+        for _ in 0..24 {
+            match lane.read(&mut packet) {
+                Ok(true) => panic!("a junk capsule reached the caller"),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) => {}
+                Err(error) => {
+                    named = Some(error.to_string());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let held = match &lane {
+            Ip::H2(inner) => inner.capsule_buf.len(),
+            _ => unreachable!("an h2 dial opens an h2 lane"),
+        };
+        assert!(
+            held <= DATAGRAM_BUF_MAX,
+            "the lane went on holding {held} bytes past its ceiling"
+        );
+        assert!(
+            named
+                .as_deref()
+                .is_some_and(|text| text.contains("never parses")),
+            "the lane never named the stream it could not parse: {named:?}"
+        );
+        drop(lane);
+        edge.join().expect("joins");
+    }
+
     /// A loopback HTTP/2 edge that speaks CONNECT-IP: it answers the request, sends an `ADDRESS_ASSIGN` for the tunnel's own address, then relays whichever destination the packet names — one stream carrying more than one destination, where a CONNECT-UDP edge answers only a single target.
     fn ip_h2_edge(
         listener: Listener,
