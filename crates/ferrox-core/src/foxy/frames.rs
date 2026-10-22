@@ -93,7 +93,10 @@ pub enum H2Event<'a> {
     GoAway {
         code: u32,
     },
-    Push,
+    /// A `PUSH_PROMISE` and the stream it promises: RFC 7540 8.2 refuses a push on *that* stream, not on the one the tunnel opened.
+    Push {
+        promised: u32,
+    },
     Other {
         kind: u8,
     },
@@ -144,7 +147,10 @@ pub enum H2Routed<'a> {
     GoAway {
         code: u32,
     },
-    Push,
+    /// A `PUSH_PROMISE` and the stream it promises: RFC 7540 8.2 refuses a push on *that* stream, not on the one the tunnel opened.
+    Push {
+        promised: u32,
+    },
     Other {
         kind: u8,
     },
@@ -225,7 +231,13 @@ pub fn h2_event(frame: H2Frame, payload: &[u8], ours: u32) -> H2Event<'_> {
         GOAWAY => H2Event::GoAway {
             code: be32(payload),
         },
-        PUSH_PROMISE => H2Event::Push,
+        // A promise short enough to name no stream cannot be refused on the stream it promised.
+        PUSH_PROMISE => match trimmed.filter(|body| body.len() >= 4) {
+            Some(body) => H2Event::Push {
+                promised: be32(body) & 0x7fff_ffff,
+            },
+            None => H2Event::Other { kind: frame.kind },
+        },
         _ => H2Event::Other { kind: frame.kind },
     }
 }
@@ -290,7 +302,13 @@ pub fn h2_routed(frame: H2Frame, payload: &[u8]) -> H2Routed<'_> {
         GOAWAY => H2Routed::GoAway {
             code: be32(payload),
         },
-        PUSH_PROMISE => H2Routed::Push,
+        // A promise short enough to name no stream cannot be refused on the stream it promised.
+        PUSH_PROMISE => match trimmed.filter(|body| body.len() >= 4) {
+            Some(body) => H2Routed::Push {
+                promised: be32(body) & 0x7fff_ffff,
+            },
+            None => H2Routed::Other { kind: frame.kind },
+        },
         _ => H2Routed::Other { kind: frame.kind },
     }
 }
@@ -722,11 +740,25 @@ mod tests {
 
     #[test]
     fn a_push_is_never_accepted() {
-        let (frame, raw) = frame_of(PUSH_PROMISE, 0, 0, b"x");
-        assert!(matches!(
+        let (frame, raw) = frame_of(PUSH_PROMISE, 0, 0, &[0, 0, 0, 2, 0x88]);
+        assert_eq!(
             h2_event(frame, &raw[H2_HEADER..], 1),
-            H2Event::Push
-        ));
+            H2Event::Push { promised: 2 }
+        );
+        assert_eq!(
+            h2_routed(frame, &raw[H2_HEADER..]),
+            H2Routed::Push { promised: 2 }
+        );
+        // A promise that names no stream is not a promise this lane can answer.
+        let (frame, raw) = frame_of(PUSH_PROMISE, 0, 0, b"x");
+        assert_eq!(
+            h2_event(frame, &raw[H2_HEADER..], 1),
+            H2Event::Other { kind: PUSH_PROMISE }
+        );
+        assert_eq!(
+            h2_routed(frame, &raw[H2_HEADER..]),
+            H2Routed::Other { kind: PUSH_PROMISE }
+        );
         let (frame, raw) = frame_of(0x10, 0, 1, b"x");
         assert_eq!(
             h2_event(frame, &raw[H2_HEADER..], 1),
