@@ -12,6 +12,8 @@ A from-scratch proxy core, **bit-identical to the implementations it replaces** 
 4. **Feature-complete where quiche, slipstream and aether are ahead** — QUIC/MASQUE, DNS-tunnel carriers, nested tunnels, multi-path schedulers, domain fronting.
 5. **Spoof SNI without root.** DPI circumvention by injecting a fake TLS ClientHello with an allowlisted SNI ahead of the real handshake, via `VpnService` TUN plus a userspace TCP stack.
 
+**The drop-in rule:** xray-core is the floor, not the ceiling. Anything a xray config can do must work here — and where xray has one way, we may have two (a cert path resolves against the working directory *and* against the executable's, as `xray-core` does). Ship more, refuse less, and never answer a config xray runs with a failure or a silently different verdict; when behaviour diverges, the fix is to accept both ways, faster and leaner, not to narrow.
+
 ## How it is built
 
 - **One algorithm, four widths.** The record layer is one generic function over a `Lanes` trait — portable, NEON, SSE2, AVX2 — so backends execute the *same source*. The portable path is safe Rust (Miri-interpretable); the SIMD modules stay tiny.
