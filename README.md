@@ -14,6 +14,8 @@ A from-scratch proxy core, **bit-identical to the implementations it replaces** 
 
 **The drop-in rule:** xray-core is the floor, not the ceiling. Anything a xray config can do must work here — and where xray has one way, we may have two (a cert path resolves against the working directory *and* against the executable's, as `xray-core` does). Ship more, refuse less, and never answer a config xray runs with a failure or a silently different verdict; when behaviour diverges, the fix is to accept both ways, faster and leaner, not to narrow.
 
+**The ratio rule:** a cell is read against the engines in that same cell, never against a local run. Ferrox is never slower than a comparator at the same work, and at least 1.2x faster wherever the cell measures the same thing; a ratio under 1.0 is a defect to root-cause — name the leg that lost, the operation behind it, and the row that gates its removal — not variance to note. Counts prove, durations suggest, and the durations that decide are CI's.
+
 ## How it is built
 
 - **One algorithm, four widths.** The record layer is one generic function over a `Lanes` trait — portable, NEON, SSE2, AVX2 — so backends execute the *same source*. The portable path is safe Rust (Miri-interpretable); the SIMD modules stay tiny.
