@@ -2161,6 +2161,7 @@ fn pump(
                 return;
             };
             if conn.is_closed() {
+                let _ = park_if_idle(table);
                 return;
             }
             conn.timeout()
@@ -2226,6 +2227,7 @@ fn pump(
             flush_egress(&mut conn, sock);
             hand_off(&mut conn, table, &mut chunk, &mut ready);
             if conn.is_closed() {
+                let _ = park_if_idle(table);
                 return;
             }
             // A quiet socket and an empty lane ends the thread; the lease that follows it starts the next one on the same connection.
