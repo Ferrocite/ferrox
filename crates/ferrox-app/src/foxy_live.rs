@@ -429,7 +429,12 @@ fn the_lane_carries_a_tunnel_on_the_carrier_the_edge_answers() {
         pass.token.len() > 32,
         "the pass is a token and not a refusal"
     );
-    println!("pass minted, quota left {:?}", pass.quota_remaining);
+    // The allowance in the shape `ferrox-cli status` prints, so a live run names the string the lane writes.
+    println!(
+        "pass minted, quota left {:?}: {:?}",
+        pass.quota_remaining,
+        pass.allowance_line()
+    );
 
     let edges = crate::foxy_catalog::edges(crate::quic::system_roots());
     let picked = ferrox_core::foxy::catalog::tier(&edges, &country, "", 3);
