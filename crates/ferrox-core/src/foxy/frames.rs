@@ -99,6 +99,57 @@ pub enum H2Event<'a> {
     },
 }
 
+/// A frame on a session that carries many streams: the same event, with the stream it belongs to still named.
+///
+/// `h2_event` drops the id of a frame that is not this lane's, because a lane that owns one stream has nowhere to put a second one. A session that carries many streams has to route by id, so this variant keeps it: the payload and the wire length are exactly what `h2_event` hands over, and the id is the only difference.
+#[derive(Debug, PartialEq, Eq)]
+pub enum H2Routed<'a> {
+    /// A DATA frame's payload, trimmed of its padding, and the frame's wire length.
+    Data {
+        stream: u32,
+        payload: &'a [u8],
+        end: bool,
+        wire: usize,
+    },
+    Headers {
+        stream: u32,
+        block: &'a [u8],
+        /// The frame's `END_STREAM`: nothing follows this block on the stream.
+        end: bool,
+        /// The frame's `END_HEADERS`: this block is whole, or a CONTINUATION follows.
+        end_headers: bool,
+    },
+    /// A CONTINUATION frame's block: it continues the header block of the stream it names, and `end` says that block is whole.
+    Continuation {
+        stream: u32,
+        block: &'a [u8],
+        end: bool,
+    },
+    Reset {
+        stream: u32,
+        code: u32,
+    },
+    Window {
+        stream: u32,
+        increment: u32,
+    },
+    Settings {
+        ack: bool,
+        payload: &'a [u8],
+    },
+    Ping {
+        ack: bool,
+        payload: &'a [u8],
+    },
+    GoAway {
+        code: u32,
+    },
+    Push,
+    Other {
+        kind: u8,
+    },
+}
+
 /// Reads a four-byte big-endian body, treating a short frame as zeroes.
 #[must_use]
 pub fn be32(payload: &[u8]) -> u32 {
@@ -176,6 +227,71 @@ pub fn h2_event(frame: H2Frame, payload: &[u8], ours: u32) -> H2Event<'_> {
         },
         PUSH_PROMISE => H2Event::Push,
         _ => H2Event::Other { kind: frame.kind },
+    }
+}
+
+/// Classifies one complete frame, keeping the stream it belongs to: a session that carries many streams routes by this id, and the payload and the wire length are the ones `h2_event` hands over.
+#[must_use]
+pub fn h2_routed(frame: H2Frame, payload: &[u8]) -> H2Routed<'_> {
+    let trimmed = if frame.flags & PADDED == 0 {
+        Some(payload)
+    } else {
+        unpadded(payload)
+    };
+    match frame.kind {
+        DATA => match trimmed {
+            Some(body) => H2Routed::Data {
+                stream: frame.stream,
+                payload: body,
+                end: frame.flags & END_STREAM != 0,
+                wire: payload.len(),
+            },
+            // A pad length that does not fit the frame has no payload to hand over, but its octets still spent the window.
+            None => H2Routed::Data {
+                stream: frame.stream,
+                payload: &[],
+                end: frame.flags & END_STREAM != 0,
+                wire: payload.len(),
+            },
+        },
+        HEADERS => match trimmed {
+            Some(body) => H2Routed::Headers {
+                stream: frame.stream,
+                block: body,
+                end: frame.flags & END_STREAM != 0,
+                end_headers: frame.flags & END_HEADERS != 0,
+            },
+            None => H2Routed::Other { kind: frame.kind },
+        },
+        CONTINUATION => match trimmed {
+            Some(body) => H2Routed::Continuation {
+                stream: frame.stream,
+                block: body,
+                end: frame.flags & END_HEADERS != 0,
+            },
+            None => H2Routed::Other { kind: frame.kind },
+        },
+        RST_STREAM => H2Routed::Reset {
+            stream: frame.stream,
+            code: be32(payload),
+        },
+        WINDOW_UPDATE => H2Routed::Window {
+            stream: frame.stream,
+            increment: be32(payload) & 0x7fff_ffff,
+        },
+        SETTINGS => H2Routed::Settings {
+            ack: frame.flags & FLAG_ACK != 0,
+            payload: trimmed.unwrap_or_default(),
+        },
+        PING => H2Routed::Ping {
+            ack: frame.flags & FLAG_ACK != 0,
+            payload: trimmed.unwrap_or_default(),
+        },
+        GOAWAY => H2Routed::GoAway {
+            code: be32(payload),
+        },
+        PUSH_PROMISE => H2Routed::Push,
+        _ => H2Routed::Other { kind: frame.kind },
     }
 }
 
@@ -542,6 +658,65 @@ mod tests {
         assert_eq!(
             h2_event(frame, &raw[H2_HEADER..], 1),
             H2Event::Other { kind: HEADERS }
+        );
+    }
+
+    /// The witness that a shared session can route by id: the classifier that keeps the id hands over the payload the one that drops it hands over, and names the stream the other one refuses.
+    #[test]
+    fn a_routed_frame_keeps_the_stream_the_lane_would_drop() {
+        let (frame, raw) = frame_of(DATA, 0, 3, b"hello");
+        assert_eq!(
+            h2_event(frame, &raw[H2_HEADER..], 1),
+            H2Event::Other { kind: DATA }
+        );
+        assert_eq!(
+            h2_routed(frame, &raw[H2_HEADER..]),
+            H2Routed::Data {
+                stream: 3,
+                payload: b"hello",
+                end: false,
+                wire: 5
+            }
+        );
+        let (frame, raw) = frame_of(HEADERS, END_STREAM, 5, b"\x88");
+        assert_eq!(
+            h2_routed(frame, &raw[H2_HEADER..]),
+            H2Routed::Headers {
+                stream: 5,
+                block: b"\x88",
+                end: true,
+                end_headers: false
+            }
+        );
+        let (frame, raw) = frame_of(HEADERS, END_HEADERS, 7, b"\x88");
+        assert_eq!(
+            h2_routed(frame, &raw[H2_HEADER..]),
+            H2Routed::Headers {
+                stream: 7,
+                block: b"\x88",
+                end: false,
+                end_headers: true
+            }
+        );
+        let (frame, raw) = frame_of(RST_STREAM, 0, 7, &[0, 0, 0, 8]);
+        assert_eq!(
+            h2_routed(frame, &raw[H2_HEADER..]),
+            H2Routed::Reset { stream: 7, code: 8 }
+        );
+    }
+
+    /// The pad comes off the payload and stays in the wire length, on the routed classifier as on the other one.
+    #[test]
+    fn a_routed_padded_frame_credits_its_whole_wire_payload() {
+        let (frame, raw) = frame_of(DATA, PADDED, 1, &[3, b'a', b'b', b'c', 9, 9, 9]);
+        assert_eq!(
+            h2_routed(frame, &raw[H2_HEADER..]),
+            H2Routed::Data {
+                stream: 1,
+                payload: b"abc",
+                end: false,
+                wire: 7
+            }
         );
     }
 

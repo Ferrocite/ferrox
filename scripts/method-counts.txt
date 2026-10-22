@@ -587,7 +587,7 @@ blackhole peer-reads-for-the-end 1 ferrox-app-blackhole::tests::the_peers_bytes_
 blackhole drain-allocations-per-flow 0 ferrox-app-blackhole::tests::the_peers_bytes_are_read_in_windows
 blackhole upstream-connections-per-flow 0 ferrox-app-proxy::tests::a_blackhole_front_answers_the_client_and_dials_nothing
 blackhole scenario-map-tests-passing 1 scripts/run-xray-scenario-map.sh
-carrier-foxy h2-connections-per-two-flows 1 ferrox-app-foxy::loopback::a_warm_flow_reuses_the_session_its_predecessor_left
+carrier-foxy h2-connections-per-two-flows 1 ferrox-app-foxy::loopback::two_live_flows_ride_one_session
 carrier-foxy dial-order-allocations-per-flow 0 ferrox-core-foxy::tests::a_dial_order_walks_without_touching_the_heap
 carrier-foxy ladder-walk-allocations-per-flow 0 ferrox-app-proxy::tests::a_flow_walks_the_ladder_without_touching_the_heap
 carrier-foxy edge-name-copies-per-flow 0 ferrox-core-foxy::tests::an_edge_name_is_shared_rather_than_copied
