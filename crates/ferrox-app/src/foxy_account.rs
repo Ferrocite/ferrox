@@ -1927,7 +1927,7 @@ mod loopback {
             let request = rx
                 .recv_timeout(std::time::Duration::from_secs(10))
                 .expect("the refresh arrives");
-            assert_eq!(request.path, "/oauth/token");
+            assert_eq!(request.path, "/v1/oauth/token");
             writer.save(
                 Some(&Auth {
                     access_token: "access-9".to_owned(),
