@@ -2376,24 +2376,32 @@ fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
     raw: Option<&Connection>,
 ) {
     if let Some(raw) = raw {
-        if raw.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        if raw.set_read_timeout(Some(budgets::handshake())).is_err() {
             return;
         }
     }
     let until = Instant::now() + budgets::handshake();
     let mut magic = [0u8; 24];
-    let mut bounded = HandshakeDeadline {
-        inner: &mut read,
-        until,
-    };
-    let got_magic = read_exact(&mut bounded, &mut magic);
+    let mut at = 0;
+    while at < magic.len() {
+        match read.read(&mut magic[at..]) {
+            Ok(0) => break,
+            Ok(n) => at += n,
+            Err(error) if is_timeout(&error) => {
+                if Instant::now() >= until {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
     if let Some(raw) = raw {
         let _ = raw.set_read_timeout(None);
     }
-    if got_magic.is_err() && Instant::now() >= until {
+    if at < magic.len() && Instant::now() >= until {
         return;
     }
-    if got_magic.is_ok() && magic == *crate::h2::MAGIC {
+    if at == magic.len() && magic == *crate::h2::MAGIC {
         return crate::xhttp_h2::serve_h2(read, write, settings, *id, freedom);
     }
     let chained = crate::xhttp::ChainReader::new(magic.to_vec(), read);
