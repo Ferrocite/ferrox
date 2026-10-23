@@ -128,7 +128,7 @@ pub(crate) fn generate(groups: &[u16], reuse: bool) -> Result<Vec<Share>, String
             X25519 => {
                 let secret = match reusable.clone() {
                     Some(secret) => secret,
-                    None => x25519_secret(&mut share_entropy(32)?)?,
+                    None => x25519_secret()?,
                 };
                 let public = PublicKey::from(&secret);
                 Share {
@@ -161,7 +161,7 @@ pub(crate) fn generate(groups: &[u16], reuse: bool) -> Result<Vec<Share>, String
             }
             X25519_MLKEM768 | X25519_MLKEM768_DRAFT => {
                 let (kyber, ek) = MlKem768::generate_keypair();
-                let ecdhe = x25519_secret(&mut share_entropy(32)?)?;
+                let ecdhe = x25519_secret()?;
                 let mut data = Vec::with_capacity(MLKEM_EK + 32);
                 if group == X25519_MLKEM768_DRAFT {
                     data.extend_from_slice(PublicKey::from(&ecdhe).as_bytes());
@@ -213,19 +213,26 @@ pub(crate) fn canonical(groups: &[u16]) -> Vec<Share> {
         .collect()
 }
 
-fn share_entropy(n: usize) -> Result<Vec<u8>, String> {
-    let mut out = vec![0u8; n];
-    getrandom::fill(&mut out).map_err(|e| format!("no entropy: {e}"))?;
-    Ok(out)
+fn x25519_secret() -> Result<StaticSecret, String> {
+    let mut seed = [0u8; 32];
+    getrandom::fill(&mut seed).map_err(|e| format!("no entropy: {e}"))?;
+    let secret = StaticSecret::from(seed);
+    seed.fill(0);
+    Ok(secret)
 }
 
-fn x25519_secret(seed: &mut [u8]) -> Result<StaticSecret, String> {
-    if seed.len() != 32 {
-        return Err("X25519 seed is 32 bytes".to_owned());
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An X25519 share is the share list and its public bytes: the seed is drawn on the stack
+    /// rather than in a heap buffer that is then wiped and copied.
+    #[test]
+    fn an_x25519_share_is_drawn_without_a_heap_buffer() {
+        let (shares, counts) = crate::alloc_count::measure(|| generate(&[X25519], false));
+        let shares = shares.expect("an X25519 share");
+        assert_eq!(shares.len(), 1);
+        assert_eq!(shares[0].data.len(), 32);
+        assert_eq!(counts.allocs, 2, "the list and the share: {counts:?}");
     }
-    let bytes: [u8; 32] = seed
-        .try_into()
-        .map_err(|_| "X25519 seed is 32 bytes".to_owned())?;
-    seed.fill(0);
-    Ok(StaticSecret::from(bytes))
 }

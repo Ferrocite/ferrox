@@ -18,7 +18,7 @@ pub(crate) struct Hello {
     pub shares: Vec<Share>,
     profile: &'static Profile,
     grease: [u16; 5],
-    alpn: Option<Vec<Vec<u8>>>,
+    alpn: Option<&'static [&'static [u8]]>,
     sni: Option<String>,
     ech: Option<Vec<u8>>,
     offer: Option<EchOffer>,
@@ -55,14 +55,13 @@ impl Hello {
         alpn: &[Vec<u8>],
         websocket: bool,
     ) -> Result<Self, TlsError> {
-        let mut random = [0u8; 32];
-        let mut session_id = [0u8; 32];
-        let mut grease_bytes = [0u8; 10];
-        getrandom::fill(&mut random).map_err(entropy)?;
-        getrandom::fill(&mut session_id).map_err(entropy)?;
-        getrandom::fill(&mut grease_bytes).map_err(entropy)?;
+        // One draw for the whole hello: its random, its session id, five GREASE pairs.
+        let mut seed = [0u8; 74];
+        getrandom::fill(&mut seed).map_err(entropy)?;
+        let (blocks, draws) = seed.as_chunks::<32>();
+        let (random, session_id) = (blocks[0], blocks[1]);
         let mut grease = [0u16; 5];
-        for (slot, pair) in grease.iter_mut().zip(grease_bytes.as_chunks::<2>().0) {
+        for (slot, pair) in grease.iter_mut().zip(draws.as_chunks::<2>().0) {
             *slot = u16::from_le_bytes(*pair);
         }
         let grease = distinct_grease(grease);
@@ -253,7 +252,7 @@ impl Hello {
             shares,
             profile: self.profile,
             grease: self.grease,
-            alpn: self.alpn.clone(),
+            alpn: self.alpn,
             sni: self.sni.clone(),
             ech: self.ech.clone(),
             offer,
@@ -323,17 +322,18 @@ impl Hello {
         self.shares.remove(at).agree(peer).map_err(TlsError::Other)
     }
 
-    /// The ALPN protocols this hello offers, so a server's pick can be checked against them.
-    pub(crate) fn alpn_offered(&self) -> Vec<Vec<u8>> {
-        if let Some(list) = &self.alpn {
-            return list.clone();
+    /// Whether the hello offered a protocol: a configured list or the preset's own table,
+    /// checked where either lies so a server's pick costs no copy.
+    pub(crate) fn offers_alpn(&self, pick: &[u8]) -> bool {
+        if let Some(list) = self.alpn {
+            return list.contains(&pick);
         }
         for ext in self.profile.exts {
             if let Body::Alpn(body) = &ext.body {
-                return parse_alpn(body);
+                return alpn_has(body, pick);
             }
         }
-        Vec::new()
+        false
     }
 
     /// The 16-byte sealed session id replaces the random one in place, at the
@@ -487,7 +487,7 @@ impl Hello {
         }
 
         // xray appends the forced ALPN after the preset's extensions, and patches it in place when the preset carries one.
-        if let Some(list) = &self.alpn {
+        if let Some(list) = self.alpn {
             if !entries.iter().any(|entry| entry.kind == ALPN) {
                 let source = Source::Alpn(list);
                 let len = self.width_of(&source, shares);
@@ -530,7 +530,7 @@ impl Hello {
             Body::Alpn(table) => (
                 ALPN,
                 false,
-                match &self.alpn {
+                match self.alpn {
                     Some(list) => Source::Alpn(list),
                     None => Source::Fixed(table),
                 },
@@ -652,7 +652,7 @@ enum Source<'a> {
     Groups(&'a [u16]),
     Sigalgs(&'a [u16]),
     Versions(&'a [u16]),
-    Alpn(&'a [Vec<u8>]),
+    Alpn(&'a [&'a [u8]]),
     Fixed(&'a [u8]),
     Shares,
     Cookie(&'a [u8]),
@@ -715,11 +715,8 @@ fn grease_or(value: u16, grease: &[u16; 5], slot: usize) -> u16 {
 }
 
 fn grease_value(grease: &[u16; 5], slot: usize) -> u16 {
-    let mut byte = (grease[slot] & 0x00f0) as u8 | 0x0a;
-    if byte == 0 {
-        byte = 0x0a;
-    }
-    let value = u16::from(byte);
+    // The masked nibble carries through and the fixed low nibble keeps the value nonzero.
+    let value = u16::from((grease[slot] & 0x00f0) as u8 | 0x0a);
     value | (value << 8)
 }
 
@@ -772,46 +769,53 @@ fn sni_name(name: &str) -> Option<&str> {
 }
 
 /// A protocol list as an ALPN body: the list's width, then each name behind its own length byte.
-fn alpn_body<W: Sink>(out: &mut W, list: &[Vec<u8>]) {
+fn alpn_body<W: Sink>(out: &mut W, list: &[&[u8]]) {
     let protocols: usize = list.iter().map(|proto| proto.len() + 1).sum();
     out.put(&(protocols as u16).to_be_bytes());
-    for proto in list {
+    for &proto in list {
         out.put(&[proto.len() as u8]);
         out.put(proto);
     }
 }
 
-fn parse_alpn(body: &[u8]) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
+/// Whether a wire ALPN body lists a protocol, walked where it lies so a pick costs no copy.
+fn alpn_has(body: &[u8], pick: &[u8]) -> bool {
     if body.len() < 2 {
-        return out;
+        return false;
     }
-    let end = 2 + usize::from(u16::from_be_bytes([body[0], body[1]]));
+    let end = (2 + usize::from(u16::from_be_bytes([body[0], body[1]]))).min(body.len());
     let mut at = 2;
-    while at < end && at < body.len() {
-        let len = usize::from(body[at]);
+    while at < end {
+        let Some(&len) = body.get(at) else {
+            return false;
+        };
+        let len = usize::from(len);
         at += 1;
-        if at + len > body.len() {
-            break;
+        let Some(name) = body.get(at..at + len) else {
+            return false;
+        };
+        if name == pick {
+            return true;
         }
-        out.push(body[at..at + len].to_vec());
         at += len;
     }
-    out
+    false
 }
 
 /// xray's rule for a WebSocket- or HTTPUpgrade-carried hello: force the outer
 /// ALPN to `http/1.1` unless the config named exactly `h2` then `http/1.1`.
 /// Every other carrier keeps the parrot's own ALPN list, as uTLS does.
-fn alpn_override(alpn: &[Vec<u8>], websocket: bool) -> Option<Vec<Vec<u8>>> {
+fn alpn_override(alpn: &[Vec<u8>], websocket: bool) -> Option<&'static [&'static [u8]]> {
+    const BOTH: [&[u8]; 2] = [b"h2", b"http/1.1"];
+    const HTTP11: [&[u8]; 1] = [b"http/1.1"];
     if !websocket {
         return None;
     }
-    let both = [b"h2".to_vec(), b"http/1.1".to_vec()];
-    if alpn == both {
-        Some(both.to_vec())
+    let both = alpn.len() == 2 && alpn[0].as_slice() == BOTH[0] && alpn[1].as_slice() == BOTH[1];
+    if both {
+        Some(&BOTH)
     } else {
-        Some(vec![b"http/1.1".to_vec()])
+        Some(&HTTP11)
     }
 }
 
@@ -875,14 +879,17 @@ fn ech_body(profile: &Profile, canonical: bool) -> Option<Vec<u8>> {
     let (suite, config_id, enc, payload_len) = if canonical {
         (suites[0], 0u8, [0u8; 32], usize::from(payloads[0]) + 16)
     } else {
-        let mut pick = [0u8; 5];
-        getrandom::fill(&mut pick).ok()?;
-        let suite = suites[usize::from(u16::from_le_bytes([pick[0], pick[1]])) % suites.len()];
-        let config_id = pick[2];
+        // One 37-byte read carries the suite pick, the config id, the length pick and the 32-byte encapsulation.
+        let mut draw = [0u8; 37];
+        getrandom::fill(&mut draw).ok()?;
+        let mut enc = [0u8; 32];
+        enc.copy_from_slice(&draw[5..]);
+        let suite = suites[usize::from(u16::from_le_bytes([draw[0], draw[1]])) % suites.len()];
+        let config_id = draw[2];
         let len = usize::from(
-            payloads[usize::from(u16::from_le_bytes([pick[3], pick[4]])) % payloads.len()],
+            payloads[usize::from(u16::from_le_bytes([draw[3], draw[4]])) % payloads.len()],
         ) + 16;
-        (suite, config_id, enc_random(), len)
+        (suite, config_id, enc, len)
     };
     // 42 = content type, suite and KEM, config id, encapsulation length and bytes, payload length.
     let mut body = Vec::with_capacity(42 + payload_len);
@@ -900,28 +907,26 @@ fn ech_body(profile: &Profile, canonical: bool) -> Option<Vec<u8>> {
     Some(body)
 }
 
-fn enc_random() -> [u8; 32] {
-    let mut enc = [0u8; 32];
-    if getrandom::fill(&mut enc).is_err() {
-        enc.fill(0);
-    }
-    enc
-}
-
 /// Chrome's positional shuffle: only the extensions between the fixed GREASE and
 /// padding ends move, so the invariant ends stay where the browser puts them.
+/// Two bytes per pick, from a stack pool that refills itself, so the order costs
+/// neither a heap buffer nor a draw per swap.
 fn shuffle(entries: &mut [Entry<'_>]) {
     let n = entries.len();
     if n < 2 {
         return;
     }
-    let mut draws = vec![0u8; 4 * n];
-    if getrandom::fill(&mut draws).is_err() {
-        return;
-    }
+    let mut picks = [0u8; 32];
+    let mut ready = picks.len();
     for i in (1..n).rev() {
-        let at = 4 * i;
-        let pick = usize::from(u16::from_le_bytes([draws[at], draws[at + 1]]));
+        if ready + 2 > picks.len() {
+            if getrandom::fill(&mut picks).is_err() {
+                return;
+            }
+            ready = 0;
+        }
+        let pick = usize::from(u16::from_le_bytes([picks[ready], picks[ready + 1]]));
+        ready += 2;
         let j = pick % (i + 1);
         if entries[i].invariant || entries[j].invariant {
             continue;
@@ -1209,6 +1214,53 @@ mod tests {
             counts.allocs, 2,
             "one list and one message for the hello: {counts:?}"
         );
+    }
+
+    /// Chrome's shuffle reads its picks off the stack, so a shuffled preset's order
+    /// costs no heap buffer between the width pass and the write pass.
+    #[test]
+    fn the_shuffle_draws_its_picks_without_a_heap_buffer() {
+        let profile = Fingerprint::resolve("hellochrome_106_shuffle")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        assert!(profile.shuffle, "the preset is one Chrome shuffles");
+        let hello = Hello::canonical(profile, "example.com");
+        let mut entries = hello.extension_entries(
+            &hello.shares,
+            None,
+            hello.sni.as_deref(),
+            hello.ech.as_deref(),
+            false,
+        );
+        let ((), counts) = crate::alloc_count::measure(|| shuffle(&mut entries));
+        assert_eq!(counts.allocs, 0, "the picks are a stack pool: {counts:?}");
+    }
+
+    /// A server's ALPN pick is checked where the offer lies, so neither a preset's table
+    /// nor a carrier's forced list is copied out to answer it.
+    #[test]
+    fn an_alpn_pick_is_checked_without_a_copy() {
+        let profile = Fingerprint::resolve("360")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let hello = Hello::canonical(profile, "example.com");
+        let (offered, counts) = crate::alloc_count::measure(|| hello.offers_alpn(b"spdy/3.1"));
+        assert!(offered, "the preset's table names the protocol");
+        assert!(!hello.offers_alpn(b"h2"), "and not one it omits");
+        assert_eq!(counts.allocs, 0, "the table is walked in place: {counts:?}");
+        let dial = Hello::build(profile, "example.com", &[b"h2".to_vec()], true)
+            .expect("a shaped dial hello");
+        let (offered, counts) = crate::alloc_count::measure(|| dial.offers_alpn(b"http/1.1"));
+        assert!(offered, "the carrier's forced list names the protocol");
+        assert!(!dial.offers_alpn(b"h2"), "and not the one it replaced");
+        assert_eq!(counts.allocs, 0, "the list is walked in place: {counts:?}");
+        let pair = [b"h2".to_vec(), b"http/1.1".to_vec()];
+        let (forced, counts) = crate::alloc_count::measure(|| alpn_override(&pair, true));
+        let forced = forced.expect("a websocket carrier forces a list");
+        assert_eq!(forced.len(), 2, "the caller's own pair is kept");
+        assert_eq!(counts.allocs, 0, "the forced list is a static: {counts:?}");
     }
 
     /// A dial's own hello — random draws, Chrome's shuffle, a carrier's forced ALPN and a retry's
