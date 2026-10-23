@@ -883,6 +883,11 @@ lane_running() {
 
 lane_pid() { cat "$PID_FILE" 2>/dev/null || true; }
 
+# Only a foxy lane has an allowance to report, and its own config says so without asking the plane.
+foxy_lane_configured() {
+  [ -f "$CFG" ] && grep -q '"protocol"[[:space:]]*:[[:space:]]*"foxy"' "$CFG" 2>/dev/null
+}
+
 port_open() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && exec 3>&- ; }
 
 wait_fronts() {
@@ -1304,7 +1309,13 @@ action_status() {
   chosen="$(sed -n 's/^foxy: carrier //p' "$LOG" 2>/dev/null | tail -n 1)"
   [ -n "$chosen" ] && say "carrier: $chosen"
   quota="$(sed -n 's/^foxy: allowance //p' "$LOG" 2>/dev/null | tail -n 1)"
-  [ -n "$quota" ] && say "quota left: $quota"
+  if [ -n "$quota" ]; then
+    say "quota left: $quota"
+  elif [ -n "$chosen" ]; then
+    say "quota: the plane named no allowance for the pass this lane carries: that is silence, not zero."
+  elif foxy_lane_configured; then
+    say "quota: this lane's binary names neither the carrier nor the allowance; 'down' then 'up' restarts it on the binary this script runs."
+  fi
   local front port mode answer
   front="${FRONTS%%,*}"
   case "$front" in
