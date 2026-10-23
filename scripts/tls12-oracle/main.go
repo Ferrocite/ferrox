@@ -47,6 +47,8 @@ var suites = []struct {
 	{0x003c, true},  // RSA-AES128-CBC-SHA256
 	{0x009c, true},  // RSA-AES128-GCM-SHA256
 	{0x009d, true},  // RSA-AES256-GCM-SHA384
+	{0x000a, true},  // RSA-3DES-EDE-CBC-SHA
+	{0xc012, true},  // ECDHE-RSA-3DES-EDE-CBC-SHA
 }
 
 const (
