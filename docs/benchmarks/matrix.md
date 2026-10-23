@@ -41,7 +41,7 @@ than a quiet baseline. The numbers come from the
 | client | `vless-raw-up-1` | 0.51x xray-core on the xray-core server (669 vs 1319 MiB/s) | [#465](https://github.com/FerroxCo/ferrox/issues/465) |
 | both | `vless-hysteria-down-8` | 0 MiB/s in both directions; xray-core server 111 MiB/s, ferrox server 5 MiB/s | [#466](https://github.com/FerroxCo/ferrox/issues/466) |
 | server | `vless-tls-grpc-down-8` | 0.61x (114 vs 187 MiB/s) | [#467](https://github.com/FerroxCo/ferrox/issues/467) |
-| server | `vless-reality-grpc-down-8` | 0.85x (125 vs 148 MiB/s) | [#468](https://github.com/FerroxCo/ferrox/issues/468) |
+| server | `vless-reality-grpc-down-8` | 0.71-0.85x (130 vs 184 MiB/s in the second run) | [#468](https://github.com/FerroxCo/ferrox/issues/468) |
 | client | `vless-tls-raw-up-1` | broken pipe after 2 MiB of 128 MiB | [#469](https://github.com/FerroxCo/ferrox/issues/469) |
 | server | `vmess-raw-down-8` | xray-core client reads 0 B; ferrox and xray-core-rust pass | [#470](https://github.com/FerroxCo/ferrox/issues/470) |
 | server | `vmess-tls-ws-down-8`, `vless-tls-ws-down-8` | every vmess client reads 0 B; vless truncates at 117/134 MiB | [#471](https://github.com/FerroxCo/ferrox/issues/471) |

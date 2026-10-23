@@ -5,7 +5,7 @@ vless-hysteria-down-8|client|0.00|466
 vless-hysteria-down-8|server|0.04|466
 vless-raw-up-1|client|0.51|465
 vless-raw-up-1|rust|0.56|465
-vless-reality-grpc-down-8|server|0.85|468
+vless-reality-grpc-down-8|server|0.71|468
 vless-reality-xhttp-down-8|client|0.00|472
 vless-reality-xhttp-down-8|server|0.00|472
 vless-tls-grpc-down-8|server|0.61|467
