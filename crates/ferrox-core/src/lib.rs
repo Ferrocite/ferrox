@@ -10,6 +10,7 @@ pub mod blackhole;
 pub mod blake2s;
 pub(crate) mod chacha;
 pub mod core;
+pub mod dns;
 pub mod failure;
 pub mod finalmask;
 pub mod foxy;
