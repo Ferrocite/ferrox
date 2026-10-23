@@ -78,14 +78,32 @@ impl Fingerprint {
         Self(None)
     }
 
-    /// The xray default: an empty name is Chrome, and an unknown one is refused
-    /// here rather than emitted as a hello no browser sends.
+    /// The xray default, widened to the spellings sing-box and zeronet accept: an empty
+    /// name is Chrome, and a name no table knows is refused here rather than dialed as a hello no browser sends.
     pub fn resolve(name: &str) -> Option<Self> {
-        let name = name.trim().to_ascii_lowercase();
-        if name.is_empty() || name == "chrome" {
+        let lower = name.trim().to_ascii_lowercase();
+        let name = if lower.contains(['-', '.']) {
+            lower.replace(['-', '.'], "_")
+        } else {
+            lower
+        };
+        if name.is_empty()
+            || name == "chrome"
+            || matches!(
+                name.as_str(),
+                "chrome_psk"
+                    | "chrome_psk_shuffle"
+                    | "chrome_padding_psk_shuffle"
+                    | "chrome_pq"
+                    | "chrome_pq_psk"
+            )
+        {
             return Some(Self::default());
         }
-        if name == "unsafe" || name == "hellogolang" {
+        if matches!(
+            name.as_str(),
+            "unsafe" | "hellogolang" | "none" | "unshaped"
+        ) {
             return Some(Self::stock());
         }
         if name == "random" {
@@ -106,7 +124,19 @@ impl Fingerprint {
         if name == "hellorandomizednoalpn" {
             return Some(Self(Some(randomized(Some(false)))));
         }
-        profiles::profile(&name).map(|profile| Self(Some(profile)))
+        if let Some(profile) = profiles::profile(&name) {
+            return Some(Self(Some(profile)));
+        }
+        // A preset's name without uTLS's `hello` prefix is the same preset, not a new shape.
+        if !name.starts_with("hello") {
+            let mut canonical = String::with_capacity(5 + name.len());
+            canonical.push_str("hello");
+            canonical.push_str(&name);
+            if let Some(profile) = profiles::profile(&canonical) {
+                return Some(Self(Some(profile)));
+            }
+        }
+        None
     }
 
     pub(crate) fn profile(self) -> Option<&'static Profile> {
@@ -382,4 +412,78 @@ impl Spec {
 /// The profile a config's fingerprint selects, or `None` for the stock hello.
 pub(crate) fn profile_of(cfg: &TlsConfig) -> Option<&'static Profile> {
     cfg.fingerprint.and_then(Fingerprint::profile)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every accepted spelling resolves to a preset the oracle replays by name, so
+    /// widening the vocabulary adds no bytes: this test holds the pointers, the oracle the preset.
+    #[test]
+    fn alternate_spellings_resolve_to_the_oracle_gated_profile() {
+        for name in [
+            " Chrome ",
+            "CHROME",
+            "chrome_psk",
+            "chrome_psk_shuffle",
+            "chrome_padding_psk_shuffle",
+            "chrome_pq",
+            "chrome_pq_psk",
+            "chrome-133",
+            "HelloChrome.133",
+        ] {
+            assert_eq!(
+                Fingerprint::resolve(name),
+                Some(Fingerprint::default()),
+                "{name}"
+            );
+        }
+        for (short, canonical) in [
+            ("chrome_120", "hellochrome_120"),
+            ("chrome_120_pq", "hellochrome_120_pq"),
+            ("chrome_106_shuffle", "hellochrome_106_shuffle"),
+            ("firefox_120", "hellofirefox_120"),
+            ("safari_16_0", "hellosafari_16_0"),
+            ("edge_106", "helloedge_106"),
+            ("ios_14", "helloios_14"),
+            ("qq_11_1", "helloqq_11_1"),
+            ("360_11_0", "hello360_11_0"),
+            ("android_11_okhttp", "helloandroid_11_okhttp"),
+        ] {
+            assert_eq!(
+                Fingerprint::resolve(short),
+                Fingerprint::resolve(canonical),
+                "{short}"
+            );
+        }
+    }
+
+    /// sing-box sends its PSK/PQ spellings as the plain Chrome hello, so this tree does too.
+    #[test]
+    fn sing_box_chrome_names_are_not_a_pq_preset() {
+        assert_eq!(
+            Fingerprint::resolve("chrome_pq"),
+            Some(Fingerprint::default())
+        );
+        assert_ne!(
+            Fingerprint::resolve("chrome_pq"),
+            Fingerprint::resolve("hellochrome_120_pq")
+        );
+    }
+
+    /// zeronet's stock spellings join uTLS's two, and an unknown name stays `None` so the
+    /// config boundary can choose the reference's stock fallback.
+    #[test]
+    fn stock_spellings_resolve_and_unknown_names_do_not() {
+        for name in ["none", "unshaped", "unsafe", "hellogolang"] {
+            assert_eq!(
+                Fingerprint::resolve(name),
+                Some(Fingerprint::stock()),
+                "{name}"
+            );
+        }
+        assert_eq!(Fingerprint::resolve("not-a-browser"), None);
+        assert_eq!(Fingerprint::resolve("hellofirefox_999"), None);
+    }
 }
