@@ -1182,6 +1182,50 @@ mod tests {
         ignore = "needs a loopback socket, and ring's assembly behind it"
     )]
     #[test]
+    fn a_shaped_chrome_handshake_serves_a_tls12_only_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let cert = rustls::pki_types::CertificateDer::from(ANCHOR.to_vec());
+            let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(ANCHOR_KEY.to_vec()),
+            );
+            let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_protocol_versions(&[&rustls::version::TLS12])
+            .expect("server versions")
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .expect("server cert");
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut conn = rustls::ServerConnection::new(Arc::new(config)).expect("server session");
+            let mut tls = rustls::Stream::new(&mut conn, &mut stream);
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf)
+                .unwrap_or_else(|e| panic!("server read: {e:?}"));
+            tls.write_all(&buf).expect("writes");
+        });
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut cfg = client("tls.test", &[]);
+        cfg.fingerprint = Some(crate::tls::Fingerprint::default());
+        let mut session = crate::tls::connect(&cfg, stream).expect("dials");
+        session.handshake().expect("handshakes");
+        assert_eq!(session.alpn(), Some(b"http/1.1".as_slice()));
+        session.write_all(b"ping").expect("writes");
+        session.flush().expect("flushes");
+        let mut buf = [0u8; 4];
+        session.read_exact(&mut buf).expect("reads");
+        assert_eq!(&buf, b"ping");
+        server.join().expect("joins");
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
     fn handshake_connects_and_echoes() {
         case(|stream| {
             let mut client = crate::tls::connect(&client("tls.test", &[b"test-only"]), stream)

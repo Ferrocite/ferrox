@@ -172,6 +172,22 @@ impl Direction {
             .open_in_place(nonce, Aad::from(aad), body)
             .map_err(|_| TlsError::Other("record failed authentication".to_owned()))
     }
+
+    /// A TLS 1.2 GCM record: the sender picks the explicit nonce, so the wire bytes complete the IV.
+    fn open_explicit<'a>(
+        &mut self,
+        aad: &[u8],
+        explicit: &[u8; 8],
+        body: &'a mut [u8],
+    ) -> Result<&'a mut [u8], TlsError> {
+        let mut nonce = self.iv;
+        nonce[4..].copy_from_slice(explicit);
+        let nonce = Nonce::assume_unique_for_key(nonce);
+        self.seq = self.seq.wrapping_add(1);
+        self.key
+            .open_in_place(nonce, Aad::from(aad), body)
+            .map_err(|_| TlsError::Other("record failed authentication".to_owned()))
+    }
 }
 
 fn keyed(suite: Suite, key: &[u8]) -> LessSafeKey {
@@ -279,7 +295,12 @@ pub(crate) fn open12(
     aad[8] = kind;
     aad[9..11].copy_from_slice(&[0x03, 0x03]);
     aad[11..].copy_from_slice(&((body.len() - explicit - 16) as u16).to_be_bytes());
-    let plain = keys.open(&aad, &mut body[explicit..])?;
+    let plain = if keys.gcm {
+        let explicit: [u8; 8] = body[..8].try_into().expect("eight-byte explicit nonce");
+        keys.open_explicit(&aad, &explicit, &mut body[explicit.len()..])?
+    } else {
+        keys.open(&aad, &mut body[explicit..])?
+    };
     out.extend_from_slice(plain);
     Ok(())
 }

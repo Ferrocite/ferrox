@@ -298,6 +298,15 @@ impl<S: Stream> Session<S> {
             .ok_or(TlsError::NoSharedCipher)?
             .to_vec();
         let shared = hello.agree(group, &peer)?;
+
+        let mut exchange = Vec::with_capacity(1 + public.len());
+        exchange.push(public.len() as u8);
+        exchange.extend_from_slice(&public);
+        let cke = message(16, &exchange);
+        self.send_plain(HANDSHAKE, &cke, [0x03, 0x03])?;
+        self.transcript.extend_from_slice(&cke);
+
+        // RFC 7627 hashes the ClientKeyExchange into the EMS transcript, as Go does after writing it.
         let hash = suite.hash();
         let session_hash = sh.ems.then(|| hash.hash(&self.transcript));
         let (master, block) = super::tls12::keys(
@@ -307,13 +316,6 @@ impl<S: Stream> Session<S> {
             &sh.random,
             session_hash.as_deref(),
         );
-
-        let mut exchange = Vec::with_capacity(1 + public.len());
-        exchange.push(public.len() as u8);
-        exchange.extend_from_slice(&public);
-        let cke = message(16, &exchange);
-        self.send_plain(HANDSHAKE, &cke, [0x03, 0x03])?;
-        self.transcript.extend_from_slice(&cke);
 
         self.client12 = Some(Direction::tls12(suite, &block.client_key, &block.client_iv));
         self.server12 = Some(Direction::tls12(suite, &block.server_key, &block.server_iv));
