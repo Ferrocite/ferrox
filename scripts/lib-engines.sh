@@ -3,6 +3,16 @@
 note() { echo "note: $*" >&2; }
 fail() { echo "::error::$*" >&2; exit 1; }
 
+release_of() {
+  awk -v want="$1" '
+    /^\[sources\./ { in_source = ($0 == "[sources." want "]") }
+    in_source && /^bench_release[[:space:]]*=/ {
+      gsub(/^bench_release[[:space:]]*=[[:space:]]*"|"[[:space:]]*$/, "")
+      print; exit
+    }
+  ' "$pins_file"
+}
+
 pin_of() {
   awk -v want="$1" '
     /^\[sources\./ { in_source = ($0 == "[sources." want "]") }
@@ -55,6 +65,8 @@ built() {
 
 build() {
   local name="$1" rev binary cached
+  # The reference trees are not held to this tree's lint gate: their vendored
+  # dependencies trip `-D warnings` in ways their own maintainers accept.
   rev="$(pin_of "$name")"
   binary="$engine_dir/$name$(exe_suffix)"
   if cached="$(built "$binary")"; then
@@ -84,7 +96,7 @@ build() {
       ;;
     zeronet)
       note "building the pinned ZeroNet (zray) at $rev"
-      (cd "upstream/$name" && cargo build --release -p zray-cli --bin zray) || return 1
+      (cd "upstream/$name" && env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo build --release -p zray-cli --bin zray) || return 1
       local zray
       zray="$(built "upstream/$name/target/release/zray")" || return 1
       cp "$zray" "$binary" || return 1
@@ -92,15 +104,37 @@ build() {
     xray-rust)
       note "building the pinned xray-rust at $rev (long: aws-lc-rs, quinn, prost)"
       (cd "upstream/$name" && CARGO_TARGET_DIR="$OLDPWD/$engine_dir/xray-rust-target" \
-        cargo build --release -p xray-cli --bin xray-rust) || return 1
+        env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo build --release -p xray-cli --bin xray-rust) || return 1
       local rust_cli
       rust_cli="$(built "$engine_dir/xray-rust-target/release/xray-rust")" || return 1
       cp "$rust_cli" "$binary" || return 1
       ;;
+    xray-core-rust)
+      # btls builds a patched BoringSSL with CMake, clang and a setup script; the
+      # project publishes that build for the runners this matrix has, so use it
+      # and keep the source checkout for reading rather than rebuilding it.
+      local release asset
+      release="$(release_of "$name")"
+      [[ -n "$release" ]] || { note "no bench_release pinned for $name"; return 1; }
+      case "$(uname -s)/$(uname -m)" in
+        Linux/x86_64) asset="xray-linux-amd64" ;;
+        Darwin/arm64 | Darwin/aarch64) asset="xray-macos-arm64" ;;
+        Darwin/x86_64) asset="xray-macos-amd64" ;;
+        MINGW*/x86_64 | MSYS*/x86_64 | CYGWIN*/x86_64) asset="xray-windows-amd64.exe" ;;
+        *)
+          note "no pinned xray-core-rust release for $(uname -s)/$(uname -m)"
+          return 1
+          ;;
+      esac
+      note "downloading xray-core-rust $release ($asset)"
+      curl -fsSL --retry 3 -o "$binary" \
+        "https://github.com/Be90nia/xray-core-rust/releases/download/$release/$asset" || return 1
+      chmod +x "$binary" 2>/dev/null || true
+      ;;
     leaf)
       note "building the pinned leaf at $rev (long: aws-lc-rs, quinn, tungstenite)"
       (cd "upstream/$name" && CARGO_TARGET_DIR="$OLDPWD/$engine_dir/leaf-target" \
-        cargo build --release -p leaf-cli --bin leaf) || return 1
+        env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo build --release -p leaf-cli --bin leaf) || return 1
       local leaf_cli
       leaf_cli="$(built "$engine_dir/leaf-target/release/leaf")" || return 1
       cp "$leaf_cli" "$binary" || return 1

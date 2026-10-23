@@ -202,6 +202,6 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/xhttp.rs, crates/ferrox-app/src/xhttp_h2.rs
 - symbols: xhttp, status_of
-- scenarios: vless-xhttp
+- scenarios: vless-xhttp, vless-reality-xhttp
 - go: ./transport/internet/splithttp/..., ./transport/internet/xdrive/...
 <!-- scope:end -->

@@ -40,6 +40,7 @@ pub struct Workload {
     pub payload_size: usize,
     pub warmup: bool,
     pub outbound_config: String,
+    pub outbound_configs: Vec<(String, String)>,
     pub scenario: String,
 }
 
@@ -56,10 +57,15 @@ impl Workload {
         (self.flow_bytes() * self.connections as u64).saturating_mul(directions)
     }
 
-    fn request(&self, engine: &Engine, output: &Path) -> String {
-        let mut root = Json::object();
-        root.insert("binary", Json::Str(engine.path.display().to_string()));
-        let config = if self.outbound_config.trim().is_empty() {
+    fn config_for(&self, engine: &Engine) -> String {
+        if let Some((_, config)) = self
+            .outbound_configs
+            .iter()
+            .find(|(label, _)| label == engine.name)
+        {
+            return config.clone();
+        }
+        if self.outbound_config.trim().is_empty() {
             engine
                 .dialect
                 .base_config()
@@ -67,8 +73,13 @@ impl Workload {
                 .expect("a document built from strings and counts always serialises")
         } else {
             self.outbound_config.clone()
-        };
-        root.insert("config", Json::Str(config));
+        }
+    }
+
+    fn request(&self, engine: &Engine, output: &Path) -> String {
+        let mut root = Json::object();
+        root.insert("binary", Json::Str(engine.path.display().to_string()));
+        root.insert("config", Json::Str(self.config_for(engine)));
         root.insert("path", Json::Str("socks".into()));
         root.insert("traffic", Json::Str(self.traffic.clone()));
         root.insert("connections", Json::Num(self.connections as f64));
@@ -921,6 +932,7 @@ const SCENARIO_PROTOCOLS: &[&str] = &[
     "vmess",
     "trojan",
     "shadowsocks",
+    "shadowsocks2022",
     "socks",
     "http",
     "tun",
@@ -931,6 +943,19 @@ fn protocol_of(scenario: &str) -> Option<&str> {
     SCENARIO_PROTOCOLS.contains(&rung).then_some(rung)
 }
 
+fn carrier_of(scenario: &str) -> Option<&'static str> {
+    ["kcp", "hysteria"]
+        .into_iter()
+        .find(|carrier| scenario.split('-').any(|rung| rung == *carrier))
+}
+
+fn carries(engine: &str, carrier: &str) -> bool {
+    !matches!(
+        (engine, carrier),
+        ("xray-rust" | "zeronet", "kcp") | ("zeronet", "hysteria")
+    )
+}
+
 fn participant_names(
     engines: &[Engine],
     workload: &Workload,
@@ -938,6 +963,7 @@ fn participant_names(
     let mut skipped = Vec::new();
     let custom = !workload.outbound_config.trim().is_empty();
     let protocol = protocol_of(&workload.scenario);
+    let carrier = carrier_of(&workload.scenario);
     let names = engines
         .iter()
         .filter(|e| {
@@ -963,6 +989,13 @@ fn participant_names(
                     ));
                     return false;
                 }
+            }
+            if let Some(carrier) = carrier.filter(|carrier| !carries(e.name, carrier)) {
+                skipped.push((
+                    e.name.to_owned(),
+                    format!("{carrier} is not a carrier {} has at its pin", e.name),
+                ));
+                return false;
             }
             true
         })
@@ -1600,6 +1633,7 @@ mod tests {
             payload_size: 1024,
             warmup: false,
             outbound_config: String::new(),
+            outbound_configs: Vec::new(),
             scenario: String::new(),
         }
     }
@@ -1772,6 +1806,41 @@ mod tests {
     }
 
     #[test]
+    fn a_per_engine_config_keeps_the_protocol_its_pin_lacks_out() {
+        let mut rust = dialect_engine("xray-rust", parity::Dialect::Xray);
+        rust.protocols = &["vless", "vmess", "trojan", "shadowsocks2022", "hysteria"];
+        let engines = vec![rust, dialect_engine("xray-core", parity::Dialect::Xray)];
+        let mut workload = scenario_workload("shadowsocks-raw-down-8");
+        workload.outbound_configs = vec![("xray-rust".into(), "{}".into())];
+        let (names, skipped) = participant_names(&engines, &workload);
+        assert_eq!(names, vec!["xray-core"]);
+        assert_eq!(skipped.len(), 1);
+        assert!(skipped[0].1.starts_with("shadowsocks"));
+        let mut workload = scenario_workload("shadowsocks2022-raw-down-8");
+        workload.outbound_configs = vec![("xray-rust".into(), "{}".into())];
+        let (names, _) = participant_names(&engines, &workload);
+        assert_eq!(names, vec!["xray-rust", "xray-core"]);
+    }
+
+    #[test]
+    fn an_engine_without_the_scenarios_carrier_sits_out_with_a_reason() {
+        let engines = vec![
+            dialect_engine("xray-rust", parity::Dialect::Xray),
+            dialect_engine("zeronet", parity::Dialect::Xray),
+            dialect_engine("xray-core", parity::Dialect::Xray),
+        ];
+        let (names, skipped) = participant_names(&engines, &scenario_workload("vless-kcp-down-8"));
+        assert_eq!(names, vec!["xray-core"]);
+        assert_eq!(skipped.len(), 2);
+        assert!(skipped.iter().all(|(_, reason)| reason.contains("kcp")));
+        let (names, skipped) =
+            participant_names(&engines, &scenario_workload("vless-hysteria-down-8"));
+        assert_eq!(names, vec!["xray-rust", "xray-core"]);
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].0, "zeronet");
+    }
+
+    #[test]
     fn a_scenario_that_names_no_protocol_never_sits_an_engine_out() {
         let engines = vec![protocol_limited_engine()];
         for id in ["gate5", ""] {
@@ -1821,11 +1890,12 @@ mod tests {
         }
     }
 
-    /// The window a cell may spend measuring is bounded by the CI job that runs it: a job cut off at its timeout prints no verdict and uploads no bundle, which is exactly what a per-measure budget of 240s did to macos-15 `vless-raw-duplex-8` - the cell ran 04:47:09 to 05:16:55 of a 30-minute job and was cancelled mid-run.
+    /// The window a cell may spend measuring is bounded by the CI job that runs it: a job cut off at its timeout prints no verdict and uploads no bundle, which is exactly what a per-measure budget of 240s did to macos-15 `vless-raw-duplex-8` - the cell ran 04:47:09 to 05:16:55 of a 30-minute job and was cancelled mid-run. The grid now runs both server passes in that job, so the bound doubles.
     #[test]
     fn the_cell_window_leaves_room_for_the_job_timeout_the_matrix_declares() {
         // What the job spends outside the harness. Measured on the macos-15 duplex-8 cell of run 39194705301: 27s from `Set up job` to the cell step, 4s from the step's end to `Complete job`, rounded up.
         const CELL_JOB_STEPS: Duration = Duration::from_secs(60);
+        const SERVER_PASSES: u32 = 2;
         let workflow = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../.github/workflows/benchmark-matrix.yml");
         let text = std::fs::read_to_string(&workflow)
@@ -1842,10 +1912,11 @@ mod tests {
                     .and_then(|value| value.trim().parse::<u64>().ok())
             })
             .unwrap_or_else(|| panic!("the cells job declares no timeout-minutes"));
-        // The last measure a cell starts can take its run cap and then the whole re-measure bound, and `fits` only admits it while the margin plus the cap are still left - so past the window the cell can cost the bound it kept back, once.
+        // The last measure a cell starts can take its run cap and then the whole re-measure bound, and `fits` only admits it while the margin plus the cap are still left - so past the window the cell can cost the bound it kept back, once per server pass.
         let worst = (parity::CELL_WINDOW + parity::REMEASURE_BUDGET)
             .checked_sub(parity::CELL_MARGIN)
-            .expect("the window plus the re-measure bound outlasts the margin");
+            .expect("the window plus the re-measure bound outlasts the margin")
+            * SERVER_PASSES;
         assert!(
             worst + CELL_JOB_STEPS <= Duration::from_secs(declared * 60),
             "a cell can cost {worst:?} at its worst and the job spends {CELL_JOB_STEPS:?} outside \

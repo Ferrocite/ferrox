@@ -7,7 +7,11 @@ on:
       - "crates/**/*.rs"
       - "crates/**/*.toml"
       - "scripts/run-benchmark-matrix.sh"
+      - "scripts/lib-matrix.sh"
+      - "scripts/lib-engines.sh"
       - "scripts/render-benchmark-charts.py"
+      - "scripts/validate-benchmark-matrix.py"
+      - "docs/benchmarks/matrix.md"
       - ".github/workflows/benchmark-matrix.yml"
   schedule:
     - cron: "41 3 * * *"
@@ -147,7 +151,7 @@ jobs:
           fi
           flags=""
           [[ -n "$WANT_REPEATS" ]] && flags="$flags --repeats $WANT_REPEATS"
-          trees="xray-core,sing-box,zeronet,xray-rust,leaf"
+          trees="xray-core,xray-core-rust,sing-box,zeronet,leaf"
           if [[ -n "$WANT_ENGINES" ]]; then
             # A typed list is the caller's own, ferrox included or not.
             flags="$flags --engines $WANT_ENGINES"
@@ -157,7 +161,7 @@ jobs:
             flags="$flags --engines ferrox,$planned_engines"
             trees="$planned_engines"
           elif [[ "$tier" == "smoke" ]]; then
-            trees="xray-core"
+            trees="xray-core,xray-core-rust"
           fi
           echo "tier=$tier" >> "$GITHUB_OUTPUT"
           echo "cells=$cells" >> "$GITHUB_OUTPUT"
@@ -210,6 +214,14 @@ jobs:
       - name: install the QUIC build tool
         if: runner.os == 'Windows'
         run: choco install nasm -y --no-progress || echo "nasm already installed"
+      - name: install protoc for xray-core-rust
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler ;;
+            macOS) brew install protobuf ;;
+            Windows) choco install protoc -y --no-progress || echo "protoc already installed" ;;
+          esac
       - uses: actions/download-artifact@v4
         with:
           name: upstream-trees
@@ -217,7 +229,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/parity-engines
-          key: matrix-engines-${{ matrix.os }}-${{ hashFiles('upstream/pins.toml') }}
+          key: matrix-engines-${{ matrix.os }}-${{ hashFiles('upstream/pins.toml', 'scripts/lib-engines.sh') }}
       - name: build every engine without moving traffic
         shell: bash
         env:
@@ -241,7 +253,7 @@ jobs:
     name: measure ${{ matrix.cell }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     needs: [setup, build]
-    timeout-minutes: 30
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -267,7 +279,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/parity-engines
-          key: matrix-engines-${{ matrix.os }}-${{ hashFiles('upstream/pins.toml') }}
+          key: matrix-engines-${{ matrix.os }}-${{ hashFiles('upstream/pins.toml', 'scripts/lib-engines.sh') }}
       - name: run one cell with handed-over binaries
         shell: bash
         env:
@@ -333,7 +345,9 @@ jobs:
           python3 scripts/validate-benchmark-matrix.py \
             --cells target/benchmark-matrix/cells \
             --results target/benchmark-matrix/matrix-results.json \
-            --charts target/benchmark-matrix/charts
+            --charts target/benchmark-matrix/charts \
+            --bundle-readme target/benchmark-matrix/README.md
+          python3 scripts/check-matrix-legs.py --cells target/benchmark-matrix/cells --baseline scripts/leg-gaps.txt
       - name: refuse a bundle that measured nothing
         shell: bash
         run: |
@@ -361,9 +375,12 @@ jobs:
     concurrency:
       group: benchmark-refresh
     permissions:
-      contents: read
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -386,21 +403,42 @@ jobs:
               exit 1
             fi
             dest="matrix-published/$STAMP/$slug"
-            charts="$dest/charts"
-            mkdir -p "$dest" "$charts"
-            cp "$bundle/matrix-results.json" "$bundle/manifest.txt" "$dest/"
+            results="docs/benchmarks/results/$STAMP/$slug"
+            charts="docs/benchmarks/charts/latest/$slug"
+            mkdir -p "$dest/charts" "$results" "$charts"
+            cp "$bundle/matrix-results.json" "$bundle/manifest.txt" "$bundle/README.md" "$results/"
+            cp "$results/matrix-results.json" "$results/manifest.txt" "$results/README.md" "$dest/"
             cp -r "$bundle/cells" "$dest/cells"
-            cp "$bundle"/charts/*.png "$charts/"
             python3 scripts/render-benchmark-charts.py \
               --input "$bundle" \
               --charts "$charts" \
-              --results "$dest/matrix-results.json" \
+              --results "$results/matrix-results.json" \
+              --readme docs/benchmarks/matrix.md \
               --runner "$slug"
+            cp -R "$charts"/. "$dest/charts/"
             python3 scripts/validate-benchmark-matrix.py \
               --cells "$dest/cells" \
-              --results "$dest/matrix-results.json" \
+              --results "$results/matrix-results.json" \
               --charts "$charts"
           done
+      - name: commit the refreshed matrix on a review branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C benchmark-matrix/auto
+          git add docs/benchmarks/matrix.md docs/benchmarks/charts/latest docs/benchmarks/results
+          if git diff --cached --quiet; then
+            echo "nothing to publish"
+            exit 0
+          fi
+          git commit -m "docs: refresh benchmark matrix ($STAMP)"
+          git push --force-with-lease origin benchmark-matrix/auto
+          existing="$(gh pr list --head benchmark-matrix/auto --state open --json number --jq '.[0].number // empty')"
+          [[ -n "$existing" ]] || gh pr create --base main --head benchmark-matrix/auto \
+            --title "docs: refresh benchmark matrix" \
+            --body "Automated refresh of docs/benchmarks/matrix.md and the latest charts from the scheduled matrix run."
       - uses: actions/upload-artifact@v4
         with:
           name: benchmark-matrix-published-${{ env.STAMP }}

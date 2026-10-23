@@ -219,12 +219,15 @@ fn read_head(stream: &mut Connection) -> Option<(Vec<u8>, usize)> {
 struct Shared {
     stream: Mutex<Box<dyn crate::proxy::FrameWrite + Send>>,
     closed: AtomicBool,
+    /// Whether this side masks what it writes: a client must, a server must not, and the reply to a control frame follows the side that sends it.
+    masked: bool,
 }
 
 impl std::fmt::Debug for Shared {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Shared")
             .field("closed", &self.closed)
+            .field("masked", &self.masked)
             .finish_non_exhaustive()
     }
 }
@@ -428,7 +431,7 @@ impl<R: Read> WsReader<R> {
         let Ok(mut stream) = self.shared.stream.lock() else {
             return;
         };
-        let _ = write_frame(&mut **stream, false, opcode, payload);
+        let _ = write_frame(&mut **stream, self.shared.masked, opcode, payload);
     }
 
     /// Syscalls spent: the header parses out of the window, so one read covers `READ_AHEAD` bytes.
@@ -738,6 +741,7 @@ fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
     let shared = Arc::new(Shared {
         stream: Mutex::new(Box::new(write) as Box<dyn crate::proxy::FrameWrite + Send>),
         closed: AtomicBool::new(false),
+        masked,
     });
     let reader = WsReader {
         read,
@@ -964,6 +968,7 @@ mod tests {
                     stream: Mutex::new(Box::new(stream.try_clone().expect("clones"))
                         as Box<dyn crate::proxy::FrameWrite + Send>),
                     closed: AtomicBool::new(false),
+                    masked: false,
                 });
                 let mut reader = WsReader {
                     read: stream,
@@ -999,6 +1004,7 @@ mod tests {
             shared: Arc::new(Shared {
                 stream: Mutex::new(Box::new(Sink::default())),
                 closed: AtomicBool::new(false),
+                masked: false,
             }),
             have: Vec::new(),
             at: 0,
@@ -1071,6 +1077,7 @@ mod tests {
             stream: Mutex::new(Box::new(stream.try_clone().expect("clones"))
                 as Box<dyn crate::proxy::FrameWrite + Send>),
             closed: AtomicBool::new(false),
+            masked: false,
         });
         let mut reader = WsReader {
             read: stream,
@@ -1109,6 +1116,7 @@ mod tests {
                 Box::new(server.join().expect("joins")) as Box<dyn crate::proxy::FrameWrite + Send>
             ),
             closed: AtomicBool::new(false),
+            masked: false,
         });
         let frames = 64usize;
         let mut wire = Vec::new();
