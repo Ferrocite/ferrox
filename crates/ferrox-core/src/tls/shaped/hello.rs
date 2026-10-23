@@ -1,6 +1,6 @@
 // The shaped ClientHello: a pinned parrot's ciphers, extension order and bodies, with the GREASE, key shares, ECH cover and padding a browser draws.
 use super::keys::{self, Share};
-use super::{Body, Profile, GREASE};
+use super::{Body, Ext, Profile, GREASE};
 use crate::tls::TlsError;
 
 const TLS12: u16 = 0x0303;
@@ -37,8 +37,8 @@ impl Hello {
         getrandom::fill(&mut session_id).map_err(entropy)?;
         getrandom::fill(&mut grease_bytes).map_err(entropy)?;
         let mut grease = [0u16; 5];
-        for (slot, pair) in grease.iter_mut().zip(grease_bytes.chunks_exact(2)) {
-            *slot = u16::from_le_bytes([pair[0], pair[1]]);
+        for (slot, pair) in grease.iter_mut().zip(grease_bytes.as_chunks::<2>().0) {
+            *slot = u16::from_le_bytes(*pair);
         }
         let grease = distinct_grease(grease);
         let (groups, reuse) = share_spec(profile);
@@ -149,149 +149,14 @@ impl Hello {
     }
 
     fn encode_with(&self, shares: &[Share], cookie: Option<&[u8]>) -> Vec<u8> {
-        let mut entries: Vec<Entry> = Vec::with_capacity(self.profile.exts.len() + 1);
-        let mut grease_exts = 0usize;
-        for ext in self.profile.exts {
-            let entry = match &ext.body {
-                Body::Grease => {
-                    let slot = grease_exts.min(1);
-                    grease_exts += 1;
-                    Entry {
-                        kind: grease_value(&self.grease, 2 + slot),
-                        body: if slot == 0 { Vec::new() } else { vec![0] },
-                        invariant: true,
-                    }
-                }
-                Body::Sni => match &self.sni {
-                    Some(name) => Entry {
-                        kind: 0x0000,
-                        body: sni_body(name),
-                        invariant: false,
-                    },
-                    None => continue,
-                },
-                Body::Pad => Entry {
-                    kind: PAD,
-                    body: Vec::new(),
-                    invariant: true,
-                },
-                Body::Groups(groups) => {
-                    let values: Vec<u16> = groups
-                        .iter()
-                        .map(|&g| grease_or(g, &self.grease, 1))
-                        .collect();
-                    Entry {
-                        kind: 0x000a,
-                        body: uint16_list(&values),
-                        invariant: false,
-                    }
-                }
-                Body::Sigalgs(values) => Entry {
-                    kind: 0x000d,
-                    body: uint16_list(values),
-                    invariant: false,
-                },
-                Body::Alpn(_) => {
-                    let body = match &self.alpn {
-                        Some(list) => alpn_body(list),
-                        None => alpn_table_body(ext),
-                    };
-                    Entry {
-                        kind: ALPN,
-                        body,
-                        invariant: false,
-                    }
-                }
-                Body::Versions(values) => {
-                    let values: Vec<u16> = values
-                        .iter()
-                        .map(|&v| grease_or(v, &self.grease, 4))
-                        .collect();
-                    Entry {
-                        kind: 0x002b,
-                        body: uint8_list(&values),
-                        invariant: false,
-                    }
-                }
-                Body::KeyShare { .. } => {
-                    if shares.is_empty() {
-                        continue;
-                    }
-                    Entry {
-                        kind: 0x0033,
-                        body: key_share_body(shares),
-                        invariant: false,
-                    }
-                }
-                Body::Ech { .. } => match &self.ech {
-                    Some(body) => Entry {
-                        kind: 0xfe0d,
-                        body: body.clone(),
-                        invariant: false,
-                    },
-                    None => continue,
-                },
-                Body::Raw(body) => Entry {
-                    kind: ext.kind,
-                    body: body.to_vec(),
-                    invariant: false,
-                },
-            };
-            entries.push(entry);
-        }
-        if let Some(cookie) = cookie {
-            let mut body = Vec::with_capacity(cookie.len() + 2);
-            body.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
-            body.extend_from_slice(cookie);
-            let at = entries.len().saturating_sub(1);
-            entries.insert(
-                at,
-                Entry {
-                    kind: 0x002c,
-                    body,
-                    invariant: false,
-                },
-            );
-        }
-
+        let mut entries = self.extension_entries(shares, cookie);
         let mut cipher_values: Vec<u16> = self
             .profile
             .ciphers
             .iter()
             .map(|&c| grease_or(c, &self.grease, 0))
             .collect();
-
-        if self.profile.shuffle && !self.canonical {
-            shuffle(&mut entries);
-        }
-
-        // xray appends the forced ALPN after the preset's extensions, and patches it in place when the preset carries one.
-        if let Some(list) = &self.alpn {
-            if !entries.iter().any(|entry| entry.kind == ALPN) {
-                entries.push(Entry {
-                    kind: ALPN,
-                    body: alpn_body(list),
-                    invariant: true,
-                });
-            }
-        }
-
-        let header = 2 + 32 + 1 + self.session_id.len() + 2 + 2 * cipher_values.len() + 1 + 1;
-        let unpadded = header
-            + 4
-            + entries
-                .iter()
-                .filter(|entry| entry.kind != PAD)
-                .map(|entry| 4 + entry.body.len())
-                .sum::<usize>()
-            + 2;
-        let pad = boring_padding(unpadded);
-        entries.retain(|entry| entry.kind != PAD || pad.is_some());
-        if let (Some(len), Some(entry)) = (pad, entries.iter_mut().find(|entry| entry.kind == PAD))
-        {
-            entry.body = vec![0; len];
-        }
-
+        let unpadded = self.pad_entries(&mut entries);
         let ext_len: usize = entries.iter().map(|entry| 4 + entry.body.len()).sum();
         let mut body = Vec::with_capacity(unpadded + ext_len);
         body.extend_from_slice(&TLS12.to_be_bytes());
@@ -315,6 +180,151 @@ impl Hello {
         msg.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
         msg.extend_from_slice(&body);
         msg
+    }
+
+    fn extension_entries(&self, shares: &[Share], cookie: Option<&[u8]>) -> Vec<Entry> {
+        let mut entries: Vec<Entry> = Vec::with_capacity(self.profile.exts.len() + 1);
+        let mut grease_exts = 0usize;
+        for ext in self.profile.exts {
+            if let Some(entry) = self.entry(ext, shares, &mut grease_exts) {
+                entries.push(entry);
+            }
+        }
+        if let Some(cookie) = cookie {
+            let mut body = Vec::with_capacity(cookie.len() + 2);
+            body.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
+            body.extend_from_slice(cookie);
+            let at = entries.len().saturating_sub(1);
+            entries.insert(
+                at,
+                Entry {
+                    kind: 0x002c,
+                    body,
+                    invariant: false,
+                },
+            );
+        }
+
+        if self.profile.shuffle && !self.canonical {
+            shuffle(&mut entries);
+        }
+
+        // xray appends the forced ALPN after the preset's extensions, and patches it in place when the preset carries one.
+        if let Some(list) = &self.alpn {
+            if !entries.iter().any(|entry| entry.kind == ALPN) {
+                entries.push(Entry {
+                    kind: ALPN,
+                    body: alpn_body(list),
+                    invariant: true,
+                });
+            }
+        }
+        entries
+    }
+
+    fn entry(&self, ext: &Ext, shares: &[Share], grease_exts: &mut usize) -> Option<Entry> {
+        Some(match &ext.body {
+            Body::Grease => {
+                let slot = (*grease_exts).min(1);
+                *grease_exts += 1;
+                Entry {
+                    kind: grease_value(&self.grease, 2 + slot),
+                    body: if slot == 0 { Vec::new() } else { vec![0] },
+                    invariant: true,
+                }
+            }
+            Body::Sni => {
+                let name = self.sni.as_ref()?;
+                Entry {
+                    kind: 0x0000,
+                    body: sni_body(name),
+                    invariant: false,
+                }
+            }
+            Body::Pad => Entry {
+                kind: PAD,
+                body: Vec::new(),
+                invariant: true,
+            },
+            Body::Groups(groups) => {
+                let values: Vec<u16> = groups
+                    .iter()
+                    .map(|&g| grease_or(g, &self.grease, 1))
+                    .collect();
+                Entry {
+                    kind: 0x000a,
+                    body: uint16_list(&values),
+                    invariant: false,
+                }
+            }
+            Body::Sigalgs(values) => Entry {
+                kind: 0x000d,
+                body: uint16_list(values),
+                invariant: false,
+            },
+            Body::Alpn(_) => {
+                let body = match &self.alpn {
+                    Some(list) => alpn_body(list),
+                    None => alpn_table_body(ext),
+                };
+                Entry {
+                    kind: ALPN,
+                    body,
+                    invariant: false,
+                }
+            }
+            Body::Versions(values) => {
+                let values: Vec<u16> = values
+                    .iter()
+                    .map(|&v| grease_or(v, &self.grease, 4))
+                    .collect();
+                Entry {
+                    kind: 0x002b,
+                    body: uint8_list(&values),
+                    invariant: false,
+                }
+            }
+            Body::KeyShare { .. } => {
+                if shares.is_empty() {
+                    return None;
+                }
+                Entry {
+                    kind: 0x0033,
+                    body: key_share_body(shares),
+                    invariant: false,
+                }
+            }
+            Body::Ech { .. } => Entry {
+                kind: 0xfe0d,
+                body: self.ech.clone()?,
+                invariant: false,
+            },
+            Body::Raw(body) => Entry {
+                kind: ext.kind,
+                body: body.to_vec(),
+                invariant: false,
+            },
+        })
+    }
+
+    fn pad_entries(&self, entries: &mut Vec<Entry>) -> usize {
+        let header =
+            2 + 32 + 1 + self.session_id.len() + 2 + 2 * self.profile.ciphers.len() + 1 + 1;
+        let unpadded = header
+            + 4
+            + entries
+                .iter()
+                .filter(|entry| entry.kind != PAD)
+                .map(|entry| 4 + entry.body.len())
+                .sum::<usize>()
+            + 2;
+        let pad = boring_padding(unpadded);
+        entries.retain(|entry| entry.kind != PAD || pad.is_some());
+        if let (Some(len), Some(entry)) = (pad, entries.iter_mut().find(|entry| entry.kind == PAD))
+        {
+            entry.body = vec![0; len];
+        }
+        unpadded
     }
 
     /// The table order as a canonical hello: zero random, session id, GREASE
@@ -559,7 +569,7 @@ fn shuffle(entries: &mut [Entry]) {
     }
 }
 
-/// BoringSSL's padding: only a hello that lands just past one byte and just short
+/// `BoringSSL`'s padding: only a hello that lands just past one byte and just short
 /// of 512 bytes is padded, to exactly 512.
 fn boring_padding(unpadded: usize) -> Option<usize> {
     if unpadded > 0xff && unpadded < 0x200 {
@@ -588,7 +598,7 @@ mod tests {
         text
     }
 
-    /// The extension TLVs of a ClientHello body, in wire order.
+    /// The extension TLVs of a `ClientHello` body, in wire order.
     fn extensions(body: &[u8]) -> Vec<&[u8]> {
         let at = 2 + 32;
         let mut at = at + 1 + usize::from(body[at]);

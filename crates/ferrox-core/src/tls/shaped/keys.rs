@@ -55,7 +55,7 @@ impl Share {
             Secret::X25519(secret) => agree_x25519(&secret, peer),
             Secret::Ecdh { algorithm, key } => {
                 let peer = ring::agreement::UnparsedPublicKey::new(algorithm, peer);
-                ring::agreement::agree_ephemeral(key, &peer, |shared| shared.to_vec())
+                ring::agreement::agree_ephemeral(key, &peer, <[u8]>::to_vec)
                     .map_err(|_| "server EC share is not a point".to_owned())
             }
             Secret::Hybrid {

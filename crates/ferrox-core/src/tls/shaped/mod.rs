@@ -10,6 +10,7 @@ mod tls12;
 pub use client::Session;
 
 use crate::tls::TlsConfig;
+use std::sync::OnceLock;
 
 /// The GREASE sentinel in a profile table: the builder draws a real value for it.
 pub(crate) const GREASE: u16 = 0x0a0a;
@@ -115,7 +116,6 @@ impl Fingerprint {
 
 /// The eleven browser shapes xray draws `random` from once per process.
 fn random_profile() -> &'static Profile {
-    use std::sync::OnceLock;
     static PICK: OnceLock<&'static Profile> = OnceLock::new();
     PICK.get_or_init(|| {
         const POOL: [&str; 11] = [
@@ -142,24 +142,58 @@ fn random_profile() -> &'static Profile {
 /// uTLS reseeds per connection, so a spec generated per dial would leak one profile
 /// per connection without making the hello any more random than its weights already do.
 fn randomized(with_alpn: Option<bool>) -> &'static Profile {
-    use std::sync::OnceLock;
-    static ALPN: OnceLock<&'static Profile> = OnceLock::new();
-    static NO_ALPN: OnceLock<&'static Profile> = OnceLock::new();
-    static AUTO: OnceLock<&'static Profile> = OnceLock::new();
-    match with_alpn {
-        Some(true) => ALPN.get_or_init(|| Box::leak(Box::new(spec(true)))),
-        Some(false) => NO_ALPN.get_or_init(|| Box::leak(Box::new(spec(false)))),
-        None => AUTO.get_or_init(|| Box::leak(Box::new(spec(Spec::new().chance(70))))),
-    }
+    let generated = match with_alpn {
+        Some(true) => &ALPN,
+        Some(false) => &NO_ALPN,
+        None => &AUTO,
+    };
+    generated.profile(with_alpn)
 }
 
-fn leak<T>(items: Vec<T>) -> &'static [T] {
-    Box::leak(items.into_boxed_slice())
+static ALPN: Generated = Generated::new();
+static NO_ALPN: Generated = Generated::new();
+static AUTO: Generated = Generated::new();
+
+/// The drawn tables a generated profile borrows, held for the process so its slices are `'static`.
+struct Drawn {
+    ciphers: Vec<u16>,
+    sigalgs: Vec<u16>,
+    curves: Vec<u16>,
+    shares: Vec<u16>,
+    exts: OnceLock<Vec<Ext>>,
+}
+
+struct Generated {
+    drawn: OnceLock<Drawn>,
+    profile: OnceLock<Profile>,
+}
+
+impl Generated {
+    const fn new() -> Self {
+        Self {
+            drawn: OnceLock::new(),
+            profile: OnceLock::new(),
+        }
+    }
+
+    fn profile(&'static self, mode: Option<bool>) -> &'static Profile {
+        self.profile.get_or_init(|| {
+            let with_alpn = mode.unwrap_or_else(|| Spec::new().chance(70));
+            let drawn = self.drawn.get_or_init(draw);
+            let exts = drawn.exts.get_or_init(|| build_exts(drawn, with_alpn));
+            Profile {
+                name: "randomized",
+                ciphers: drawn.ciphers.as_slice(),
+                shuffle: false,
+                exts: exts.as_slice(),
+            }
+        })
+    }
 }
 
 /// uTLS's randomized generator at the weights xray pins: TLS 1.3 always, X25519's
 /// share first, and every optional extension behind its own coin.
-fn spec(with_alpn: bool) -> Profile {
+fn draw() -> Drawn {
     let mut rng = Spec::new();
     let mut ciphers = vec![0x1301u16, 0x1302, 0x1303];
     rng.shuffle(&mut ciphers);
@@ -207,6 +241,18 @@ fn spec(with_alpn: bool) -> Profile {
         shares.insert(0, keys::X25519_MLKEM768);
     }
 
+    Drawn {
+        ciphers,
+        sigalgs,
+        curves,
+        shares,
+        exts: OnceLock::new(),
+    }
+}
+
+/// The extension list over a drawn table, its optional coins and shuffle included.
+fn build_exts(drawn: &'static Drawn, with_alpn: bool) -> Vec<Ext> {
+    let mut rng = Spec::new();
     let mut exts = vec![
         Ext {
             kind: 0x0000,
@@ -218,7 +264,7 @@ fn spec(with_alpn: bool) -> Profile {
         },
         Ext {
             kind: 0x000d,
-            body: Body::Sigalgs(leak(sigalgs)),
+            body: Body::Sigalgs(drawn.sigalgs.as_slice()),
         },
         Ext {
             kind: 0x000b,
@@ -226,13 +272,13 @@ fn spec(with_alpn: bool) -> Profile {
         },
         Ext {
             kind: 0x000a,
-            body: Body::Groups(leak(curves)),
+            body: Body::Groups(drawn.curves.as_slice()),
         },
     ];
     if with_alpn {
         exts.push(Ext {
             kind: 0x0010,
-            body: Body::Alpn(leak(b"\x00\x0c\x02h2\x08http/1.1".to_vec())),
+            body: Body::Alpn(b"\x00\x0c\x02h2\x08http/1.1"),
         });
     }
     exts.push(Ext {
@@ -256,7 +302,7 @@ fn spec(with_alpn: bool) -> Profile {
     exts.push(Ext {
         kind: 0x0033,
         body: Body::KeyShare {
-            groups: leak(shares),
+            groups: drawn.shares.as_slice(),
             reuse: false,
         },
     });
@@ -264,7 +310,7 @@ fn spec(with_alpn: bool) -> Profile {
         kind: 0x002d,
         body: Body::Raw(&[0x01, 0x01]),
     });
-    let versions: &[u16] = if rng.chance(50) {
+    let versions: &'static [u16] = if rng.chance(50) {
         &[0x0304, 0x0303, 0x0302, 0x0301]
     } else {
         &[0x0304, 0x0303]
@@ -280,13 +326,7 @@ fn spec(with_alpn: bool) -> Profile {
         });
     }
     rng.shuffle(&mut exts);
-
-    Profile {
-        name: "randomized",
-        ciphers: leak(ciphers),
-        shuffle: false,
-        exts: leak(exts),
-    }
+    exts
 }
 
 /// A SHAKE256 stream over a process seed, the same construction uTLS seeds its

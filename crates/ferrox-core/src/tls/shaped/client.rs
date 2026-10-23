@@ -17,7 +17,7 @@ const MAX_RECORD: usize = 16384 + 256;
 const MAX_HANDSHAKE: usize = 1 << 20;
 const MAX_PLAINTEXT: usize = 16384;
 
-/// The HelloRetryRequest random, which names the message without a new type.
+/// The `HelloRetryRequest` random, which names the message without a new type.
 const HRR_RANDOM: [u8; 32] = [
     0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
     0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
@@ -74,13 +74,10 @@ impl<S: Stream> Session<S> {
     /// Builds the shaped hello; the handshake that puts it on the wire runs when
     /// `handshake` is called, exactly as the stock provider's connection waits.
     pub(crate) fn connect(cfg: &TlsConfig, io: S) -> Result<Self, TlsError> {
-        let profile = match cfg.fingerprint.and_then(Fingerprint::profile) {
-            Some(profile) => profile,
-            None => {
-                return Err(TlsError::Other(
-                    "shaped: a stock fingerprint has no shaped session".to_owned(),
-                ))
-            }
+        let Some(profile) = cfg.fingerprint.and_then(Fingerprint::profile) else {
+            return Err(TlsError::Other(
+                "shaped: a stock fingerprint has no shaped session".to_owned(),
+            ));
         };
         let hello = Hello::build(profile, &cfg.server_name, &cfg.alpn, cfg.websocket)?;
         let verifier = crate::tls::rustls_backend::verifier(cfg)?;
@@ -371,21 +368,15 @@ impl<S: Stream> Session<S> {
 
     fn send_encrypted(&mut self, kind: u8, body: &[u8]) -> Result<(), TlsError> {
         let mut out = Vec::with_capacity(5 + body.len() + 16);
-        match self.version {
-            Some(Version::Tls12) => {
-                let keys = self
-                    .write_key
-                    .as_mut()
-                    .ok_or_else(|| TlsError::Other("no write keys".to_owned()))?;
-                record::seal12(keys, kind, body, &mut out)?;
-            }
-            _ => {
-                let keys = self
-                    .write_key
-                    .as_mut()
-                    .ok_or_else(|| TlsError::Other("no write keys".to_owned()))?;
-                record::seal13(keys, kind, body, &mut out)?;
-            }
+        let tls12 = self.version == Some(Version::Tls12);
+        let keys = self
+            .write_key
+            .as_mut()
+            .ok_or_else(|| TlsError::Other("no write keys".to_owned()))?;
+        if tls12 {
+            record::seal12(keys, kind, body, &mut out)?;
+        } else {
+            record::seal13(keys, kind, body, &mut out)?;
         }
         self.io.write_all(&out)?;
         Ok(())
@@ -405,10 +396,10 @@ impl<S: Stream> Session<S> {
         self.record.resize(len, 0);
         exact(&mut self.io, &mut self.record)?;
         let body = std::mem::take(&mut self.record);
-        self.decrypt(&header, body)
+        self.decrypt(header, body)
     }
 
-    fn decrypt(&mut self, header: &[u8; 5], body: Vec<u8>) -> Result<u8, TlsError> {
+    fn decrypt(&mut self, header: [u8; 5], body: Vec<u8>) -> Result<u8, TlsError> {
         self.decoded.clear();
         if header[0] == CCS {
             if self.version == Some(Version::Tls12) {
@@ -483,7 +474,7 @@ impl<S: Stream> Session<S> {
         Ok(())
     }
 
-    /// Checks a CertificateVerify (TLS 1.3) or ServerKeyExchange signature (TLS 1.2)
+    /// Checks a `CertificateVerify` (TLS 1.3) or `ServerKeyExchange` signature (TLS 1.2)
     /// against the leaf's key, over bytes the caller names.
     fn verify_certificate_verify(
         &self,
@@ -516,13 +507,7 @@ impl<S: Stream> Session<S> {
             let mut content = vec![0x20u8; 64];
             content.extend_from_slice(b"TLS 1.3, server CertificateVerify");
             content.push(0);
-            content.extend_from_slice(
-                &self
-                    .suite
-                    .map(|s| s.hash())
-                    .unwrap_or(Hash::Sha256)
-                    .hash(signed),
-            );
+            content.extend_from_slice(&self.suite.map_or(Hash::Sha256, Suite::hash).hash(signed));
             content
         } else {
             signed.to_vec()
@@ -636,7 +621,7 @@ impl<S: Stream> Session<S> {
             }
             let body = self.inbuf[at + 5..at + 5 + len].to_vec();
             self.in_at = at + 5 + len;
-            match self.decrypt(&header, body)? {
+            match self.decrypt(header, body)? {
                 APPLICATION => self.plain.extend_from_slice(&self.decoded),
                 HANDSHAKE => self.post_handshake()?,
                 ALERT => {
@@ -677,8 +662,8 @@ impl<S: Stream> Session<S> {
                     }
                     break;
                 }
-                let (head, tail) = rest.split_at(room);
-                chunk.push(head);
+                let (lead, tail) = rest.split_at(room);
+                chunk.push(lead);
                 self.seal_chunk(&chunk, out)?;
                 chunk.clear();
                 held = 0;
@@ -1064,7 +1049,7 @@ fn alert(body: &[u8]) -> TlsError {
     }
 }
 
-/// The leaf's SubjectPublicKeyInfo, reduced to what the signature schemes need.
+/// The leaf's `SubjectPublicKeyInfo`, reduced to what the signature schemes need.
 struct PublicKey<'a> {
     algorithm: &'a [u8],
     key: &'a [u8],

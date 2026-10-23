@@ -177,7 +177,7 @@ pub(crate) static P_CHROME: Profile = Profile {
         Ext {
             kind: 0xfe0d,
             body: Body::Ech {
-                suites: &[0x00010001],
+                suites: &[0x0001_0001],
                 payloads: &[128, 160, 192, 224],
             },
         },
@@ -353,7 +353,7 @@ static P_FIREFOX: Profile = Profile {
         Ext {
             kind: 0xfe0d,
             body: Body::Ech {
-                suites: &[0x00010001, 0x00010003],
+                suites: &[0x0001_0001, 0x0001_0003],
                 payloads: &[223],
             },
         },
@@ -798,7 +798,7 @@ static P_HELLOCHROME_120: Profile = Profile {
         Ext {
             kind: 0xfe0d,
             body: Body::Ech {
-                suites: &[0x00010001],
+                suites: &[0x0001_0001],
                 payloads: &[128, 160, 192, 224],
             },
         },
@@ -895,7 +895,7 @@ static P_HELLOCHROME_120_PQ: Profile = Profile {
         Ext {
             kind: 0xfe0d,
             body: Body::Ech {
-                suites: &[0x00010001],
+                suites: &[0x0001_0001],
                 payloads: &[128, 160, 192, 224],
             },
         },
@@ -988,7 +988,7 @@ static P_HELLOCHROME_131: Profile = Profile {
         Ext {
             kind: 0xfe0d,
             body: Body::Ech {
-                suites: &[0x00010001],
+                suites: &[0x0001_0001],
                 payloads: &[128, 160, 192, 224],
             },
         },
@@ -1571,7 +1571,7 @@ static P_HELLOFIREFOX_120: Profile = Profile {
         Ext {
             kind: 0xfe0d,
             body: Body::Ech {
-                suites: &[0x00010001, 0x00010003],
+                suites: &[0x0001_0001, 0x0001_0003],
                 payloads: &[223],
             },
         },
@@ -2221,57 +2221,34 @@ static P_HELLOSAFARI_26_3: Profile = Profile {
 
 pub(crate) fn profile(name: &str) -> Option<&'static Profile> {
     let p = match name {
-        "360" => &P_360,
-        "android" => &P_ANDROID,
-        "chrome" => &P_CHROME,
-        "edge" => &P_EDGE,
-        "firefox" => &P_FIREFOX,
+        "360" | "hello360_7_5" | "hello360_auto" => &P_360,
+        "android" | "helloandroid_11_okhttp" => &P_ANDROID,
+        "chrome" | "hellochrome_133" | "hellochrome_auto" => &P_CHROME,
+        "edge" | "hellochrome_83" | "hellochrome_87" | "helloedge_85" | "helloedge_auto" => &P_EDGE,
+        "firefox" | "hellofirefox_148" | "hellofirefox_auto" => &P_FIREFOX,
         "hello360_11_0" => &P_HELLO360_11_0,
-        "hello360_7_5" => &P_360,
-        "hello360_auto" => &P_360,
-        "helloandroid_11_okhttp" => &P_ANDROID,
-        "hellochrome_100" => &P_HELLOCHROME_100,
-        "hellochrome_102" => &P_HELLOCHROME_100,
+        "hellochrome_100" | "hellochrome_102" | "helloedge_106" => &P_HELLOCHROME_100,
         "hellochrome_106_shuffle" => &P_HELLOCHROME_106_SHUFFLE,
         "hellochrome_115_pq" => &P_HELLOCHROME_115_PQ,
         "hellochrome_120" => &P_HELLOCHROME_120,
         "hellochrome_120_pq" => &P_HELLOCHROME_120_PQ,
         "hellochrome_131" => &P_HELLOCHROME_131,
-        "hellochrome_133" => &P_CHROME,
-        "hellochrome_58" => &P_HELLOCHROME_58,
-        "hellochrome_62" => &P_HELLOCHROME_58,
+        "hellochrome_58" | "hellochrome_62" => &P_HELLOCHROME_58,
         "hellochrome_70" => &P_HELLOCHROME_70,
         "hellochrome_72" => &P_HELLOCHROME_72,
-        "hellochrome_83" => &P_EDGE,
-        "hellochrome_87" => &P_EDGE,
-        "hellochrome_96" => &P_HELLOCHROME_96,
-        "hellochrome_auto" => &P_CHROME,
-        "helloedge_106" => &P_HELLOCHROME_100,
-        "helloedge_85" => &P_EDGE,
-        "helloedge_auto" => &P_EDGE,
+        "hellochrome_96" | "helloqq_11_1" | "helloqq_auto" | "qq" => &P_HELLOCHROME_96,
         "hellofirefox_102" => &P_HELLOFIREFOX_102,
         "hellofirefox_105" => &P_HELLOFIREFOX_105,
         "hellofirefox_120" => &P_HELLOFIREFOX_120,
-        "hellofirefox_148" => &P_FIREFOX,
-        "hellofirefox_55" => &P_HELLOFIREFOX_55,
-        "hellofirefox_56" => &P_HELLOFIREFOX_55,
-        "hellofirefox_63" => &P_HELLOFIREFOX_63,
-        "hellofirefox_65" => &P_HELLOFIREFOX_63,
+        "hellofirefox_55" | "hellofirefox_56" => &P_HELLOFIREFOX_55,
+        "hellofirefox_63" | "hellofirefox_65" => &P_HELLOFIREFOX_63,
         "hellofirefox_99" => &P_HELLOFIREFOX_99,
-        "hellofirefox_auto" => &P_FIREFOX,
         "helloios_11_1" => &P_HELLOIOS_11_1,
         "helloios_12_1" => &P_HELLOIOS_12_1,
         "helloios_13" => &P_HELLOIOS_13,
-        "helloios_14" => &P_HELLOIOS_14,
-        "helloios_auto" => &P_HELLOIOS_14,
-        "helloqq_11_1" => &P_HELLOCHROME_96,
-        "helloqq_auto" => &P_HELLOCHROME_96,
+        "helloios_14" | "helloios_auto" | "ios" => &P_HELLOIOS_14,
         "hellosafari_16_0" => &P_HELLOSAFARI_16_0,
-        "hellosafari_26_3" => &P_HELLOSAFARI_26_3,
-        "hellosafari_auto" => &P_HELLOSAFARI_26_3,
-        "ios" => &P_HELLOIOS_14,
-        "qq" => &P_HELLOCHROME_96,
-        "safari" => &P_HELLOSAFARI_26_3,
+        "hellosafari_26_3" | "hellosafari_auto" | "safari" => &P_HELLOSAFARI_26_3,
         _ => return None,
     };
     Some(p)

@@ -30,7 +30,7 @@ pub struct TlsConfig {
     pub insecure: bool,
     /// The browser hello to shape, or `None` to keep the stock rustls hello.
     pub fingerprint: Option<shaped::Fingerprint>,
-    /// Whether the carrier is a WebSocket or HTTPUpgrade: xray's parrots then force
+    /// Whether the carrier is a WebSocket or `HTTPUpgrade`: xray's parrots then force
     /// the outer ALPN to `http/1.1` so the upgrade reads as an ordinary browser.
     pub websocket: bool,
 }
@@ -266,8 +266,8 @@ pub use shaped::Fingerprint;
 /// The client session a config names: a shaped hello under its own record layer when
 /// a fingerprint shapes it, the stock rustls connection otherwise.
 pub enum ClientSession<S: Stream> {
-    Stock(RustlsProvider<S>),
-    Shaped(shaped::Session<S>),
+    Stock(Box<RustlsProvider<S>>),
+    Shaped(Box<shaped::Session<S>>),
 }
 
 impl<S: Stream> std::fmt::Debug for ClientSession<S> {
@@ -405,8 +405,12 @@ pub fn connect<S: Stream + RecordAlignment>(
     io: S,
 ) -> Result<ClientSession<S>, TlsError> {
     match shaped::profile_of(cfg) {
-        Some(_) => Ok(ClientSession::Shaped(shaped::Session::connect(cfg, io)?)),
-        None => Ok(ClientSession::Stock(RustlsProvider::connect(cfg, io)?)),
+        Some(_) => Ok(ClientSession::Shaped(Box::new(shaped::Session::connect(
+            cfg, io,
+        )?))),
+        None => Ok(ClientSession::Stock(Box::new(RustlsProvider::connect(
+            cfg, io,
+        )?))),
     }
 }
 

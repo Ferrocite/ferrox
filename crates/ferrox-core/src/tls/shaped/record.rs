@@ -51,7 +51,7 @@ impl Suite {
         }
     }
 
-    /// The fixed IV a TLS 1.2 key block carries: four bytes for GCM's explicit nonce, twelve for ChaCha's XOR nonce.
+    /// The fixed IV a TLS 1.2 key block carries: four bytes for GCM's explicit nonce, twelve for `ChaCha`'s XOR nonce.
     pub(crate) fn fixed_iv_len(self) -> usize {
         match self {
             Self::EcdheAes128GcmSha256 | Self::EcdheAes256GcmSha384 => 4,
@@ -179,11 +179,11 @@ impl Direction {
     fn open_explicit<'a>(
         &mut self,
         aad: &[u8],
-        explicit: &[u8; 8],
+        explicit: [u8; 8],
         body: &'a mut [u8],
     ) -> Result<&'a mut [u8], TlsError> {
         let mut nonce = self.iv;
-        nonce[4..].copy_from_slice(explicit);
+        nonce[4..].copy_from_slice(&explicit);
         let nonce = Nonce::assume_unique_for_key(nonce);
         self.seq = self.seq.wrapping_add(1);
         self.key
@@ -231,11 +231,11 @@ pub(crate) fn seal13_parts(
 /// Opens one TLS 1.3 record body, appending the plaintext to `out` and returning its inner type.
 pub(crate) fn open13(
     keys: &mut Direction,
-    header: &[u8; 5],
+    header: [u8; 5],
     mut body: Vec<u8>,
     out: &mut Vec<u8>,
 ) -> Result<u8, TlsError> {
-    let plain = keys.open(header, &mut body)?;
+    let plain = keys.open(&header, &mut body)?;
     let at = plain
         .iter()
         .rposition(|&byte| byte != 0)
@@ -268,7 +268,7 @@ pub(crate) fn seal12_parts(
     aad[9..11].copy_from_slice(&[0x03, 0x03]);
     aad[11..].copy_from_slice(&(len as u16).to_be_bytes());
     let at = out.len();
-    let explicit = if !keys.gcm { 0 } else { 8 };
+    let explicit = if keys.gcm { 8 } else { 0 };
     out.push(kind);
     out.extend_from_slice(&[0x03, 0x03]);
     out.extend_from_slice(&((len + explicit + 16) as u16).to_be_bytes());
@@ -289,7 +289,7 @@ pub(crate) fn open12(
     out: &mut Vec<u8>,
 ) -> Result<(), TlsError> {
     let seq = keys.seq.to_be_bytes();
-    let explicit = if !keys.gcm { 0 } else { 8 };
+    let explicit = if keys.gcm { 8 } else { 0 };
     if body.len() < explicit + 16 {
         return Err(TlsError::Other("short TLS 1.2 record".to_owned()));
     }
@@ -300,7 +300,7 @@ pub(crate) fn open12(
     aad[11..].copy_from_slice(&((body.len() - explicit - 16) as u16).to_be_bytes());
     let plain = if keys.gcm {
         let explicit: [u8; 8] = body[..8].try_into().expect("eight-byte explicit nonce");
-        keys.open_explicit(&aad, &explicit, &mut body[explicit.len()..])?
+        keys.open_explicit(&aad, explicit, &mut body[explicit.len()..])?
     } else {
         keys.open(&aad, &mut body[explicit..])?
     };

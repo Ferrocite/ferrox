@@ -20,20 +20,19 @@ pub(super) fn keys(
 ) -> (Vec<u8>, KeyBlock) {
     let hash = suite.hash();
     let mut master = vec![0u8; 48];
-    match session_hash {
-        Some(transcript) => kdf::prf(
+    if let Some(transcript) = session_hash {
+        kdf::prf(
             hash,
             pre_master,
             b"extended master secret",
             transcript,
             &mut master,
-        ),
-        None => {
-            let mut seed = Vec::with_capacity(64);
-            seed.extend_from_slice(client_random);
-            seed.extend_from_slice(server_random);
-            kdf::prf(hash, pre_master, b"master secret", &seed, &mut master);
-        }
+        );
+    } else {
+        let mut seed = Vec::with_capacity(64);
+        seed.extend_from_slice(client_random);
+        seed.extend_from_slice(server_random);
+        kdf::prf(hash, pre_master, b"master secret", &seed, &mut master);
     }
     let key_len = suite.key_len();
     let iv_len = suite.fixed_iv_len();

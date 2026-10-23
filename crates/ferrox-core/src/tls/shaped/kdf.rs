@@ -96,7 +96,7 @@ fn mac(hash: Hash, key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
     ctx.sign().as_ref().to_vec()
 }
 
-/// TLS 1.2's PRF: P_hash over the seed with the two labels the version splits.
+/// TLS 1.2's PRF: `P_hash` over the seed with the two labels the version splits.
 pub(crate) fn prf(hash: Hash, secret: &[u8], label: &[u8], seed: &[u8], out: &mut [u8]) {
     let key = hmac::Key::new(hash.hmac(), secret);
     let mut full_seed = Vec::with_capacity(label.len() + seed.len());
