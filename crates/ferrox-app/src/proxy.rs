@@ -3820,6 +3820,49 @@ fn dial_vless_kcp(
     target: &Destination,
 ) {
     let header = vless_header(&vless.id, 1, target);
+    // KCP is the transport and the security rides it, as it does upstream: the session carries the header and both relay legs, not the connection.
+    if let Some(cfg) = vless.tls.as_deref() {
+        let transport = KcpIo {
+            conn: Arc::clone(conn),
+        };
+        let Ok(mut session) = ferrox_core::tls::RustlsProvider::connect(cfg, transport) else {
+            return;
+        };
+        if !shake_tls(&mut session) {
+            return;
+        }
+        if session.write_all(&header).is_err() || read_vless_response(&mut session).is_none() {
+            return;
+        }
+        let Ok(downstream) = client.try_clone() else {
+            return;
+        };
+        if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+            return;
+        }
+        let close: Arc<dyn Fn() + Send + Sync> = {
+            let conn = Arc::clone(conn);
+            let socket = downstream.try_clone().ok();
+            Arc::new(move || {
+                conn.close();
+                if let Some(socket) = &socket {
+                    let _ = socket.shutdown(Shutdown::Both);
+                }
+            })
+        };
+        let (reader, writer) = session_halves(
+            session,
+            KcpIo {
+                conn: Arc::clone(conn),
+            },
+        );
+        relay_stream(
+            Half::socket(downstream),
+            Half::split(reader, writer),
+            &close,
+        );
+        return;
+    }
     if conn.write(&header).is_err() {
         return;
     }
@@ -5764,6 +5807,12 @@ impl Drivable for ferrox_core::tls::RustlsProvider<Connection> {
     }
 }
 
+impl Drivable for ferrox_core::tls::RustlsProvider<KcpIo> {
+    fn transport(&self) -> Option<Connection> {
+        None
+    }
+}
+
 impl Drivable for ferrox_core::tls::RealityServer<Connection> {
     fn transport(&self) -> Option<Connection> {
         // The core accessor the inherent name would shadow: one explicit call, no recursion.
@@ -5798,6 +5847,9 @@ impl Drivable for KcpIo {
         None
     }
 }
+
+// A KCP window has no kernel read to bound at a record end, so the alignment hooks stay the default no-ops.
+impl ferrox_core::tls::RecordAlignment for KcpIo {}
 
 /// The record layer a driven reader drives: ciphertext in, plaintext out, and the
 /// seal that orders a write. `TlsProvider` sessions do both the way that trait
@@ -13449,7 +13501,7 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
         );
         // Mux frames ride above the session, so mux over TLS needs its own dial and stays refused.
         if security == "tls" && !quic_tls && !mux {
-            let Some((carrier, host, tls)) = tls_parts(outbound, &address) else {
+            let Some((carrier, host, tls)) = tls_carried_parts(outbound, &address) else {
                 continue;
             };
             return Some(VlessOut {
@@ -13608,6 +13660,20 @@ fn tls_parts(
     outbound_tls(outbound, address)
         .ok()
         .map(|tls| (carrier, host, tls))
+}
+
+/// KCP's session wraps the transport, as it does upstream, so the carrier and the TLS are one dial.
+fn tls_carried_parts(
+    outbound: &Json,
+    address: &str,
+) -> Option<(Carrier, String, Arc<ferrox_core::tls::TlsConfig>)> {
+    let (carrier, host) = outbound_carrier(outbound, address);
+    match carrier {
+        Carrier::Kcp(_) => outbound_tls(outbound, address)
+            .ok()
+            .map(|tls| (carrier, host, tls)),
+        _ => tls_parts(outbound, address),
+    }
 }
 
 fn x25519_pair() -> (String, String) {
@@ -18442,12 +18508,19 @@ mod tests {
                 r#""network": "{network}", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
             );
             let root = vnext_tls_root("vless", &stream);
-            if network == "quic" {
-                let out = find_vless_outbound(&root).expect("quic keeps its own dial");
-                assert!(matches!(out.carrier, Carrier::Quic));
-                assert!(out.tls.is_none());
-            } else {
-                assert!(find_vless_outbound(&root).is_none(), "{network}");
+            match network {
+                // The transports that carry their own session keep their own dial: quic handshakes above it, and KCP wraps the connection.
+                "quic" => {
+                    let out = find_vless_outbound(&root).expect("quic keeps its own dial");
+                    assert!(matches!(out.carrier, Carrier::Quic));
+                    assert!(out.tls.is_none());
+                }
+                "kcp" => {
+                    let out = find_vless_outbound(&root).expect("kcp wraps its transport");
+                    assert!(matches!(out.carrier, Carrier::Kcp(_)));
+                    assert!(out.tls.is_some(), "the kcp session carries tls");
+                }
+                _ => assert!(find_vless_outbound(&root).is_none(), "{network}"),
             }
         }
         let muxed = crate::json::parse(&format!(
@@ -24421,6 +24494,82 @@ mod tests {
         }
         assert_eq!(&back, b"ping");
         conn.close();
+        server.join().expect("joins");
+    }
+
+    /// The security sits above KCP, as it does upstream: a VLESS session that declares tls is served and dialled through the raw connection.
+    #[test]
+    fn a_vless_kcp_session_with_tls_echoes_over_loopback() {
+        let (cert, key, client) = tls_cert_json();
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vless", "settings": {{"clients": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}},
+                "streamSettings": {{"network": "kcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let server_cfg = inbound_tls_identity(&inbound).expect("identity");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut socket, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                let Ok(read) = socket.read(&mut buf) else {
+                    return;
+                };
+                if read == 0 || socket.write_all(&buf[..read]).is_err() {
+                    return;
+                }
+            }
+        });
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let kcp_port = listener.local_addr().port();
+        let server = thread::spawn(move || {
+            let conn = listener.accept().expect("accepts");
+            serve_vless_kcp_tls(&conn, &id, true, &server_cfg);
+        });
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: kcp_port,
+            id,
+            carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            host: "127.0.0.1".to_owned(),
+            mux: false,
+            quic_roots: None,
+            hysteria_roots: None,
+            tls: Some(Arc::clone(&client)),
+            flow: String::new(),
+            reality: None,
+        };
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let conn = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{kcp_port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_vless_kcp(&socket, &conn, &vless, &target);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "tls over kcp echoes");
+        // The relay ends when the client side closes; the server thread returns after that.
+        drop(sock);
         server.join().expect("joins");
     }
 
