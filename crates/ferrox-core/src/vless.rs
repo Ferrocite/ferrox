@@ -228,13 +228,17 @@ impl VlessLink {
                 return Support::Implemented { method };
             }
         }
-        if self.transport_kind() == TransportKind::Tcp
-            && security == Security::Tls
-            && matches!(self.flow(), "" | "none")
-        {
-            return Support::Implemented {
-                method: "vless-tcp-tls",
-            };
+        if self.transport_kind() == TransportKind::Tcp && security == Security::Tls {
+            if self.is_vision_flow() {
+                return Support::Implemented {
+                    method: "vless-tcp-tls-vision",
+                };
+            }
+            if matches!(self.flow(), "" | "none") {
+                return Support::Implemented {
+                    method: "vless-tcp-tls",
+                };
+            }
         }
         if security == Security::Tls && matches!(self.flow(), "" | "none") {
             let method = match self.transport_kind() {
@@ -780,7 +784,8 @@ fn planned_reason(link: &VlessLink, security: Security) -> &'static str {
     let kind = link.transport_kind();
     match kind {
         TransportKind::Tcp => match security {
-            Security::Tls => "vless-tcp-tls with vision: parses, vision framing over TLS is not wired",
+            // Only a flow the link names is left here: the plain and vision dials returned above.
+            Security::Tls => "vless-tcp-tls: parses, the flow it names is not one this tree dials",
             // A consented public cleartext link reaches here as `Security::None`; the unconsented gate already returned, so the same reason fits.
             Security::None | Security::NoneToPublic => {
                 "vless-tcp-none without encryption=none and no flow: parses, unsupported combination"
@@ -1232,10 +1237,20 @@ mod tests {
             }
         );
         let vision = VlessLink::parse(
-            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?security=tls&type=tcp&flow=xtls-rprx-vision#tls-vision",
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@127.0.0.1:443?security=tls&type=tcp&flow=xtls-rprx-vision#tls-vision",
         )
         .expect("parses");
-        assert!(matches!(vision.support(), Support::Planned { .. }));
+        assert_eq!(
+            vision.support(),
+            Support::Implemented {
+                method: "vless-tcp-tls-vision"
+            }
+        );
+        let unknown = VlessLink::parse(
+            "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?security=tls&type=tcp&flow=xtls-rprx-flow#unknown-flow",
+        )
+        .expect("parses");
+        assert!(matches!(unknown.support(), Support::Planned { .. }));
     }
 
     #[test]
