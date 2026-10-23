@@ -612,14 +612,16 @@ impl<S: Stream> std::fmt::Debug for RustlsServerProvider<S> {
 }
 
 impl<S: Stream> RustlsServerProvider<S> {
+    #[allow(clippy::needless_pass_by_value)]
     pub fn accept(cfg: super::TlsServerConfig, io: S) -> Result<Self, TlsError> {
-        let conn = rustls::ServerConnection::new(std::sync::Arc::new(server_config(cfg)?))
-            .map_err(|e| map_error(&e))?;
+        let conn =
+            rustls::ServerConnection::new(cfg.server_config()?).map_err(|e| map_error(&e))?;
         Ok(Self { conn, io })
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     pub fn accept_reality(cfg: super::TlsServerConfig, io: S) -> Result<Self, TlsError> {
-        let conn = rustls::ServerConnection::new(std::sync::Arc::new(reality_server_config(cfg)?))
+        let conn = rustls::ServerConnection::new(cfg.reality_server_config()?)
             .map_err(|e| map_error(&e))?;
         Ok(Self { conn, io })
     }
@@ -703,6 +705,21 @@ fn write_segments<W: Write + ?Sized>(
 }
 
 /// The rustls config an identity produces, so tests pin wire behavior here.
+#[derive(Default)]
+pub struct ServerConfigCacheInner {
+    pub plain: Option<std::sync::Arc<rustls::ServerConfig>>,
+    pub reality: Option<std::sync::Arc<rustls::ServerConfig>>,
+}
+
+impl std::fmt::Debug for ServerConfigCacheInner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerConfigCacheInner")
+            .finish_non_exhaustive()
+    }
+}
+
+pub type ServerConfigCache = std::sync::Arc<std::sync::Mutex<ServerConfigCacheInner>>;
+
 pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::ServerConfig, TlsError> {
     use super::ServerKeyKind as Kind;
     let certs: Vec<rustls::pki_types::CertificateDer<'_>> = cfg
@@ -732,6 +749,31 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
     // rustls sends two tickets by default; REALITY arrivals carry none.
     config.send_tls13_tickets = if cfg.send_tickets { 2 } else { 0 };
     Ok(config)
+}
+
+pub(crate) fn cached_server_config(
+    cfg: &super::TlsServerConfig,
+    reality: bool,
+) -> Result<std::sync::Arc<rustls::ServerConfig>, TlsError> {
+    let mut guard = cfg
+        .server_config_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let slot = if reality {
+        &mut guard.reality
+    } else {
+        &mut guard.plain
+    };
+    if let Some(cached) = slot.as_ref() {
+        return Ok(std::sync::Arc::clone(cached));
+    }
+    let built = std::sync::Arc::new(if reality {
+        reality_server_config(cfg.clone())?
+    } else {
+        server_config(cfg.clone())?
+    });
+    *slot = Some(std::sync::Arc::clone(&built));
+    Ok(built)
 }
 
 /// The signing key REALITY answers with: every reference forces `Ed25519` for
@@ -2188,8 +2230,8 @@ mod tests {
                     bytes: Arc::clone(&bytes),
                     sizes: Arc::clone(&sizes),
                 };
-                let mut server =
-                    RustlsServerProvider::accept(identity, counter).expect("accepts a session");
+                let mut server = RustlsServerProvider::accept(identity.clone(), counter)
+                    .expect("accepts a session");
                 server.handshake().expect("handshakes");
                 // The relay's own arm for a shared session, so a read inside the window costs one counted grain rather than a parked thread.
                 server
