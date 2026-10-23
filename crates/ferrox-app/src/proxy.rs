@@ -13395,10 +13395,11 @@ fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
                 tls: Some(tls),
             });
         }
-        if !matches!(stream_security(outbound), "" | "none") {
+        let stored = xdrive_carried(outbound, &address);
+        if !matches!(stream_security(outbound), "" | "none") && stored.is_none() {
             continue;
         }
-        let (carrier, host) = outbound_carrier(outbound, &address);
+        let (carrier, host) = stored.unwrap_or_else(|| outbound_carrier(outbound, &address));
         return Some(TrojanOut {
             address,
             port,
@@ -13617,7 +13618,8 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
             Some(Json::Bool(true))
         );
         // Mux frames ride above the session, so mux over TLS needs its own dial and stays refused.
-        if security == "tls" && !quic_tls && !mux {
+        let stored = xdrive_carried(outbound, &address);
+        if security == "tls" && !quic_tls && !mux && stored.is_none() {
             let Some((carrier, host, tls)) = tls_carried_parts(outbound, &address) else {
                 continue;
             };
@@ -13670,17 +13672,14 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
                 reality: Some(reality),
             });
         }
-        if !vless_security_supported(security) && !quic_tls {
+        if !vless_security_supported(security) && !quic_tls && (mux || stored.is_none()) {
             continue;
         }
-        let (carrier, host) = outbound_carrier(outbound, &address);
-        let quic_roots = match &carrier {
-            Carrier::Quic => tls_ca_roots(outbound),
-            _ => None,
-        };
-        let hysteria_roots = match &carrier {
-            Carrier::Hysteria(_) => tls_ca_roots(outbound),
-            _ => None,
+        let (carrier, host) = stored.unwrap_or_else(|| outbound_carrier(outbound, &address));
+        let (quic_roots, hysteria_roots) = match &carrier {
+            Carrier::Quic => (tls_ca_roots(outbound), None),
+            Carrier::Hysteria(_) => (None, tls_ca_roots(outbound)),
+            _ => (None, None),
         };
         return Some(VlessOut {
             address,
@@ -13733,10 +13732,11 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
             });
         }
         // A security the tree cannot dial is refused, never silently sent plain.
-        if !matches!(stream_security(outbound), "" | "none") {
+        let stored = xdrive_carried(outbound, &address);
+        if !matches!(stream_security(outbound), "" | "none") && stored.is_none() {
             return None;
         }
-        let (carrier, host) = outbound_carrier(outbound, &address);
+        let (carrier, host) = stored.unwrap_or_else(|| outbound_carrier(outbound, &address));
         return Some(VmessOut {
             address,
             port,
@@ -13791,6 +13791,15 @@ fn tls_carried_parts(
             .map(|tls| (carrier, host, tls)),
         _ => tls_parts(outbound, address),
     }
+}
+
+/// An xdrive row's `security: tls` names the handshake its own lanes speak, as upstream reads it, so the session above the store adds no second one; reality stays refused, as the store refuses it.
+fn xdrive_carried(outbound: &Json, address: &str) -> Option<(Carrier, String)> {
+    if stream_security(outbound) != "tls" {
+        return None;
+    }
+    let (carrier, host) = outbound_carrier(outbound, address);
+    matches!(carrier, Carrier::Xdrive { .. }).then_some((carrier, host))
 }
 
 fn x25519_pair() -> (String, String) {
@@ -18748,14 +18757,18 @@ mod tests {
                 .server_name,
             "store.test"
         );
-        let vless = find_vless_outbound(&vnext_tls_root("vless", &stream("tls")))
-            .expect("vless keeps the store");
-        assert!(matches!(vless.carrier, Carrier::Xdrive { .. }));
-        assert!(vless.tls.is_none());
-        let vmess = find_vmess_outbound(&vnext_tls_root("vmess", &stream("tls")))
-            .expect("vmess keeps the store");
-        assert!(matches!(vmess.carrier, Carrier::Xdrive { .. }));
-        assert!(vmess.tls.is_none());
+        {
+            let out = find_vless_outbound(&vnext_tls_root("vless", &stream("tls")))
+                .expect("vless keeps the store");
+            assert!(matches!(out.carrier, Carrier::Xdrive { .. }));
+            assert!(out.tls.is_none());
+        }
+        {
+            let out = find_vmess_outbound(&vnext_tls_root("vmess", &stream("tls")))
+                .expect("vmess keeps the store");
+            assert!(matches!(out.carrier, Carrier::Xdrive { .. }));
+            assert!(out.tls.is_none());
+        }
         assert!(find_trojan_outbound(&trojan_tls_root(&stream("reality"))).is_none());
         assert!(find_vless_outbound(&vnext_tls_root("vless", &stream("reality"))).is_none());
         assert!(find_vmess_outbound(&vnext_tls_root("vmess", &stream("reality"))).is_none());
