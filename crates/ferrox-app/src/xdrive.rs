@@ -243,6 +243,8 @@ fn transport_tls(stream: &Json, security: &str) -> Option<Arc<TlsConfig>> {
             pins: ferrox_core::foxy::pin::Pins::default(),
             cipher_suites: Vec::new(),
             insecure: tls.get("allowInsecure").and_then(Json::as_bool) == Some(true),
+            fingerprint: None,
+            websocket: false,
         })
     })
 }

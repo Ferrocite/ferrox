@@ -474,6 +474,8 @@ impl Endpoint {
             pins: ferrox_core::foxy::pin::Pins::default(),
             cipher_suites: Vec::new(),
             insecure: false,
+            fingerprint: None,
+            websocket: false,
         }
     }
 

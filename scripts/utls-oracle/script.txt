@@ -1,0 +1,59 @@
+# Cases for the utls-oracle: `<ferrox profile> <uTLS ClientHelloID>` per line.
+# The program builds that preset with pinned entropy (the hello-phase draws are
+# zeros, key material is erased) and prints the ClientHello body once.
+#
+# A preset whose extension order uTLS shuffles at spec creation is printed as
+# `SH <name> <sorted-extension-hex> <invariant-indices>`: the middle order is a
+# fresh crypto/rand draw in uTLS, so only the multiset of extension bytes and
+# the positions of the GREASE/padding/PSK entries are comparable. Every other
+# preset prints `CH <name> <exact-body-hex>`, which gates the byte for byte.
+
+360 Hello360_7_5
+android HelloAndroid_11_OkHttp
+chrome HelloChrome_133
+edge HelloEdge_85
+firefox HelloFirefox_148
+hello360_11_0 Hello360_11_0
+hellochrome_100 HelloChrome_100
+hellochrome_106_shuffle HelloChrome_106_Shuffle
+hellochrome_115_pq HelloChrome_115_PQ
+hellochrome_120 HelloChrome_120
+hellochrome_120_pq HelloChrome_120_PQ
+hellochrome_131 HelloChrome_131
+hellochrome_58 HelloChrome_58
+hellochrome_70 HelloChrome_70
+hellochrome_72 HelloChrome_72
+hellochrome_96 HelloChrome_96
+hellofirefox_102 HelloFirefox_102
+hellofirefox_105 HelloFirefox_105
+hellofirefox_120 HelloFirefox_120
+hellofirefox_55 HelloFirefox_55
+hellofirefox_63 HelloFirefox_63
+hellofirefox_99 HelloFirefox_99
+helloios_11_1 HelloIOS_11_1
+helloios_12_1 HelloIOS_12_1
+helloios_13 HelloIOS_13
+helloios_14 HelloIOS_14
+hellosafari_16_0 HelloSafari_16_0
+hellosafari_26_3 HelloSafari_26_3
+
+# The xray names that resolve to one of those presets, so the alias table is
+# gated by the same bytes rather than asserted.
+safari HelloSafari_26_3
+ios HelloIOS_14
+qq HelloChrome_96
+helloedge_106 HelloEdge_106
+helloqq_11_1 HelloQQ_11_1
+hellofirefox_auto HelloFirefox_148
+hellofirefox_56 HelloFirefox_55
+hellofirefox_65 HelloFirefox_63
+hellochrome_auto HelloChrome_133
+hellochrome_62 HelloChrome_58
+hellochrome_83 HelloEdge_85
+hellochrome_87 HelloEdge_85
+hellochrome_102 HelloChrome_100
+helloios_auto HelloIOS_14
+helloedge_auto HelloEdge_85
+hellosafari_auto HelloSafari_26_3
+hello360_auto Hello360_7_5
+helloqq_auto HelloChrome_96

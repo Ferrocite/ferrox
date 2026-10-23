@@ -28,6 +28,11 @@ pub struct TlsConfig {
     /// the tunnel relays through. `false` is the default because verifying is the ordinary
     /// case, and an unchecked chain is a deliberate, bounded exception rather than a mode.
     pub insecure: bool,
+    /// The browser hello to shape, or `None` to keep the stock rustls hello.
+    pub fingerprint: Option<shaped::Fingerprint>,
+    /// Whether the carrier is a WebSocket or `HTTPUpgrade`: xray's parrots then force
+    /// the outer ALPN to `http/1.1` so the upgrade reads as an ordinary browser.
+    pub websocket: bool,
 }
 
 pub trait TlsProvider: std::io::Read + std::io::Write {
@@ -255,6 +260,140 @@ pub mod cipher_suites;
 mod rustls_backend;
 pub use rustls_backend::{RustlsProvider, RustlsServerProvider};
 
+pub mod shaped;
+pub use shaped::Fingerprint;
+
+/// The client session a config names: a shaped hello under its own record layer when
+/// a fingerprint shapes it, the stock rustls connection otherwise.
+pub enum ClientSession<S: Stream> {
+    Stock(Box<RustlsProvider<S>>),
+    Shaped(Box<shaped::Session<S>>),
+}
+
+impl<S: Stream> std::fmt::Debug for ClientSession<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Stock(session) => std::fmt::Debug::fmt(session, f),
+            Self::Shaped(session) => std::fmt::Debug::fmt(session, f),
+        }
+    }
+}
+
+impl<S: Stream> ClientSession<S> {
+    pub fn get_ref(&self) -> &S {
+        match self {
+            Self::Stock(session) => session.get_ref(),
+            Self::Shaped(session) => session.get_ref(),
+        }
+    }
+}
+
+impl<S: Stream> TlsProvider for ClientSession<S> {
+    fn name() -> &'static str
+    where
+        Self: Sized,
+    {
+        "client"
+    }
+
+    fn suites(&self) -> Vec<String> {
+        match self {
+            Self::Stock(session) => session.suites(),
+            Self::Shaped(session) => session.suites(),
+        }
+    }
+
+    fn handshake(&mut self) -> Result<(), TlsError> {
+        match self {
+            Self::Stock(session) => session.handshake(),
+            Self::Shaped(session) => session.handshake(),
+        }
+    }
+
+    fn alpn(&self) -> Option<&[u8]> {
+        match self {
+            Self::Stock(session) => session.alpn(),
+            Self::Shaped(session) => session.alpn(),
+        }
+    }
+
+    fn peer_leaf(&self) -> Option<&[u8]> {
+        match self {
+            Self::Stock(session) => session.peer_leaf(),
+            Self::Shaped(session) => session.peer_leaf(),
+        }
+    }
+
+    fn open(&mut self, ciphertext: &[u8], buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
+        match self {
+            Self::Stock(session) => session.open(ciphertext, buf),
+            Self::Shaped(session) => session.open(ciphertext, buf),
+        }
+    }
+
+    fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+        match self {
+            Self::Stock(session) => session.seal_into(plaintext, out),
+            Self::Shaped(session) => session.seal_into(plaintext, out),
+        }
+    }
+
+    fn seal_slices_into(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> std::io::Result<()> {
+        match self {
+            Self::Stock(session) => session.seal_slices_into(parts, out),
+            Self::Shaped(session) => session.seal_slices_into(parts, out),
+        }
+    }
+}
+
+impl<S: Stream + RecordAlignment> RecordAlignment for ClientSession<S> {
+    fn engage_record_alignment(&mut self) {
+        match self {
+            Self::Stock(session) => session.engage_record_alignment(),
+            Self::Shaped(session) => session.engage_record_alignment(),
+        }
+    }
+
+    fn disarm_record_alignment(&mut self) {
+        match self {
+            Self::Stock(session) => session.disarm_record_alignment(),
+            Self::Shaped(session) => session.disarm_record_alignment(),
+        }
+    }
+
+    fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        match self {
+            Self::Stock(session) => session.write_all_slices(parts),
+            Self::Shaped(session) => session.write_all_slices(parts),
+        }
+    }
+}
+
+impl<S: Stream> std::io::Read for ClientSession<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Stock(session) => session.read(buf),
+            Self::Shaped(session) => session.read(buf),
+        }
+    }
+}
+
+impl<S: Stream> std::io::Write for ClientSession<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Stock(session) => session.write(buf),
+            Self::Shaped(session) => session.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Stock(session) => session.flush(),
+            Self::Shaped(session) => session.flush(),
+        }
+    }
+}
+
 pub mod reality;
 pub use reality::{
     Edges, Proxied, RateLimit, RealityAccept, RealityClientConfig, RealityClientSession,
@@ -264,8 +403,15 @@ pub use reality::{
 pub fn connect<S: Stream + RecordAlignment>(
     cfg: &TlsConfig,
     io: S,
-) -> Result<impl TlsProvider + RecordAlignment + use<S>, TlsError> {
-    RustlsProvider::connect(cfg, io)
+) -> Result<ClientSession<S>, TlsError> {
+    match shaped::profile_of(cfg) {
+        Some(_) => Ok(ClientSession::Shaped(Box::new(shaped::Session::connect(
+            cfg, io,
+        )?))),
+        None => Ok(ClientSession::Stock(Box::new(RustlsProvider::connect(
+            cfg, io,
+        )?))),
+    }
 }
 
 pub fn accept<S: Stream + Send>(

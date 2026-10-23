@@ -1,4 +1,3 @@
-use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
@@ -1027,7 +1026,7 @@ pub struct RealityClientConfig {
     pub server_name: String,
     pub public_key: [u8; 32],
     pub short_id: [u8; 8],
-    /// Accepted and ignored: the hello stays stock rustls, so no fingerprint is spoofed.
+    /// The parrot whose hello carries the seal, as `tlsSettings.fingerprint` names it.
     pub fingerprint: String,
 }
 
@@ -1036,7 +1035,7 @@ const CLIENT_VERSION: [u8; 3] = [26, 10, 10];
 
 /// An authenticated REALITY client session: the same stream shape as every other TLS provider.
 pub struct RealityClientSession<S: Stream> {
-    inner: crate::tls::RustlsProvider<S>,
+    inner: crate::tls::shaped::Session<S>,
 }
 
 impl<S: Stream> std::fmt::Debug for RealityClientSession<S> {
@@ -1051,62 +1050,51 @@ impl<S: Stream> RealityClientSession<S> {
         self.inner.get_ref()
     }
 
-    /// Seals the session id into a stock hello and runs the handshake. A peer
-    /// that answers with any other certificate is the cover origin, so the
+    /// Seals the session id into the named parrot's hello and runs the handshake.
+    /// A peer that answers with any other certificate is the cover origin, so the
     /// handshake fails and no proxy byte is ever sent into it. The clock rides
     /// along because the core stays deterministic: the caller owns time.
     pub fn connect(cfg: &RealityClientConfig, now: u32, io: S) -> Result<Self, TlsError> {
-        let name = rustls::pki_types::ServerName::try_from(cfg.server_name.clone())
-            .map_err(|e| TlsError::Other(format!("reality: server name: {e}")))?;
-        // One entropy fill arms the share, the random and the grease pair: one syscall where three ran, the same stream getrandom serves.
-        let mut entropy = [0u8; 66];
-        getrandom::fill(&mut entropy)
-            .map_err(|e| TlsError::Other(format!("reality: no entropy: {e}")))?;
-        let (secret, tail) = entropy.split_at(32);
-        let (grease, random) = tail.split_at(2);
-        let ephemeral: [u8; 32] = secret.try_into().expect("the x25519 secret is 32 bytes");
-        let grease: [u8; 2] = grease.try_into().expect("the grease pair is 2 bytes");
-        let random: [u8; 32] = random.try_into().expect("the hello random is 32 bytes");
-        let shared = x25519_dalek::x25519(ephemeral, cfg.public_key);
+        let profile = crate::tls::shaped::Fingerprint::resolve(&cfg.fingerprint)
+            .and_then(crate::tls::shaped::Fingerprint::profile)
+            .ok_or_else(|| {
+                TlsError::Other(format!(
+                    "reality: fingerprint {:?} shapes no TLS 1.3 hello",
+                    cfg.fingerprint
+                ))
+            })?;
+        let mut hello =
+            crate::tls::shaped::hello::Hello::build(profile, &cfg.server_name, &[], false)?;
+        let secret = hello.auth_secret().ok_or_else(|| {
+            TlsError::Other("reality: the hello carries no X25519 share".to_owned())
+        })?;
+        let shared = x25519_dalek::x25519(secret, cfg.public_key);
         if shared == [0u8; 32] {
             return Err(TlsError::Other(
                 "reality: shared secret was all zero".to_owned(),
             ));
         }
-        let auth_key = auth_key(&shared, &random)
+        let auth_key = auth_key(&shared, &hello.random)
             .ok_or_else(|| TlsError::Other("reality: hkdf expand failed".to_owned()))?;
-        // One config for both passes, so the probe and the flight cannot drift apart.
-        let verifier = std::sync::Arc::new(RealityVerifier::new(auth_key));
-        let mut config = rustls::ClientConfig::builder_with_provider(client_provider())
-            .with_safe_default_protocol_versions()
-            .map_err(|e| TlsError::Other(format!("reality: protocol versions: {e}")))?
-            .dangerous()
-            .with_custom_certificate_verifier(verifier)
-            .with_no_client_auth();
-        config.alpn_protocols = Vec::new();
-        let config = std::sync::Arc::new(config);
-        let _guard = MaterialGuard::hold(Material {
-            session_id: [0u8; 32],
-            grease,
-            random,
-            secret: ephemeral,
-            calls: 0,
-        });
-        let probe = hello_wire(&cfg.server_name, &config)?;
-        let message = handshake_message(&probe)?;
+        hello.zero_session();
         let sealed = seal_session_id(
             &auth_key,
-            &random,
+            &hello.random,
             CLIENT_VERSION,
             now,
             cfg.short_id,
-            message,
+            &hello.msg,
         );
-        MaterialGuard::seal(sealed);
-        let conn = rustls::ClientConnection::new(config, name)
-            .map_err(|e| TlsError::Other(format!("reality: client hello: {e:?}")))?;
+        hello.seal_session(sealed);
+        let verifier = std::sync::Arc::new(RealityVerifier::new(auth_key));
         let mut session = Self {
-            inner: crate::tls::RustlsProvider::from_connection(conn, io),
+            inner: crate::tls::shaped::Session::with_hello(
+                profile,
+                cfg.server_name.clone(),
+                verifier,
+                hello,
+                io,
+            )?,
         };
         session.handshake()?;
         Ok(session)
@@ -1115,7 +1103,7 @@ impl<S: Stream> RealityClientSession<S> {
 
 impl<S: Stream> TlsProvider for RealityClientSession<S> {
     fn name() -> &'static str {
-        "rustls"
+        "utls"
     }
 
     fn suites(&self) -> Vec<String> {
@@ -1132,6 +1120,10 @@ impl<S: Stream> TlsProvider for RealityClientSession<S> {
 
     fn alpn(&self) -> Option<&[u8]> {
         self.inner.alpn()
+    }
+
+    fn peer_leaf(&self) -> Option<&[u8]> {
+        self.inner.peer_leaf()
     }
 
     fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
@@ -1201,171 +1193,6 @@ fn seal_session_id(
     sealed
         .try_into()
         .expect("a 16-byte plaintext seals to 32 bytes")
-}
-
-/// Builds one hello off the thread-local material without touching the network.
-fn hello_wire(
-    server_name: &str,
-    config: &std::sync::Arc<rustls::ClientConfig>,
-) -> Result<Vec<u8>, TlsError> {
-    let name = rustls::pki_types::ServerName::try_from(server_name.to_owned())
-        .map_err(|e| TlsError::Other(format!("reality: server name: {e}")))?;
-    let mut conn = rustls::ClientConnection::new(config.clone(), name)
-        .map_err(|e| TlsError::Other(format!("reality: client hello: {e:?}")))?;
-    let mut out = Vec::new();
-    conn.write_tls(&mut out)
-        .map_err(|e| TlsError::Other(format!("reality: client hello: {e}")))?;
-    Ok(out)
-}
-
-/// The handshake message inside the first record: the bytes the seal covers.
-fn handshake_message(wire: &[u8]) -> Result<&[u8], TlsError> {
-    let bad = || TlsError::Other("reality: malformed client hello".to_owned());
-    if wire.first() != Some(&0x16) || wire.len() < 5 {
-        return Err(bad());
-    }
-    let len = usize::from(u16::from_be_bytes([wire[3], wire[4]]));
-    if wire.len() != 5 + len {
-        return Err(bad());
-    }
-    Ok(&wire[5..])
-}
-
-struct Material {
-    session_id: [u8; 32],
-    grease: [u8; 2],
-    random: [u8; 32],
-    secret: [u8; 32],
-    calls: usize,
-}
-
-thread_local! {
-    static MATERIAL: RefCell<Option<Material>> = const { RefCell::new(None) };
-}
-
-impl Drop for Material {
-    fn drop(&mut self) {
-        self.session_id.fill(0);
-        self.random.fill(0);
-        self.secret.fill(0);
-    }
-}
-
-struct MaterialGuard;
-
-impl MaterialGuard {
-    fn hold(material: Material) -> Self {
-        MATERIAL.with(|slot| *slot.borrow_mut() = Some(material));
-        Self
-    }
-
-    fn seal(session_id: [u8; 32]) {
-        MATERIAL.with(|slot| {
-            if let Some(material) = slot.borrow_mut().as_mut() {
-                material.session_id = session_id;
-                material.calls = 0;
-            }
-        });
-    }
-}
-
-impl Drop for MaterialGuard {
-    fn drop(&mut self) {
-        MATERIAL.with(|slot| *slot.borrow_mut() = None);
-    }
-}
-
-/// The scripted entropy both hello passes draw from: session id, one `GREASE`, the random.
-#[derive(Debug)]
-struct ScriptedRandom;
-
-impl rustls::crypto::SecureRandom for ScriptedRandom {
-    fn fill(&self, buf: &mut [u8]) -> Result<(), rustls::crypto::GetRandomFailed> {
-        MATERIAL
-            .try_with(|slot| {
-                let mut slot = slot.borrow_mut();
-                let material = slot.as_mut().ok_or(rustls::crypto::GetRandomFailed)?;
-                let n = material.calls;
-                material.calls += 1;
-                let src: &[u8] = match n {
-                    0 => &material.session_id,
-                    1 => &material.grease,
-                    _ => &material.random,
-                };
-                if buf.len() <= src.len() {
-                    buf.copy_from_slice(&src[..buf.len()]);
-                } else {
-                    let (head, tail) = buf.split_at_mut(src.len());
-                    head.copy_from_slice(src);
-                    tail.fill(0x55);
-                }
-                Ok(())
-            })
-            .map_err(|_| rustls::crypto::GetRandomFailed)?
-    }
-}
-
-/// The one ephemeral share: the secret lives thread-locally so no key is leaked per connection.
-#[derive(Debug)]
-struct FixedShare;
-
-impl rustls::crypto::SupportedKxGroup for FixedShare {
-    fn start(&self) -> Result<Box<dyn rustls::crypto::ActiveKeyExchange>, rustls::Error> {
-        struct Active {
-            secret: [u8; 32],
-            point: [u8; 32],
-        }
-        impl rustls::crypto::ActiveKeyExchange for Active {
-            fn complete(
-                self: Box<Self>,
-                peer: &[u8],
-            ) -> Result<rustls::crypto::SharedSecret, rustls::Error> {
-                let point: [u8; 32] = peer
-                    .try_into()
-                    .map_err(|_| rustls::Error::General("reality: bad peer share".to_owned()))?;
-                Ok(rustls::crypto::SharedSecret::from(
-                    &x25519_dalek::x25519(self.secret, point)[..],
-                ))
-            }
-
-            fn pub_key(&self) -> &[u8] {
-                &self.point
-            }
-
-            fn group(&self) -> rustls::NamedGroup {
-                rustls::NamedGroup::X25519
-            }
-        }
-        let secret = MATERIAL
-            .try_with(|slot| {
-                slot.borrow()
-                    .as_ref()
-                    .map(|material| material.secret)
-                    .ok_or(rustls::Error::General("reality: no handshake".to_owned()))
-            })
-            .map_err(|_| rustls::Error::General("reality: no handshake".to_owned()))??;
-        let point = x25519_dalek::x25519(secret, x25519_dalek::X25519_BASEPOINT_BYTES);
-        Ok(Box::new(Active { secret, point }))
-    }
-
-    fn name(&self) -> rustls::NamedGroup {
-        rustls::NamedGroup::X25519
-    }
-}
-
-fn client_provider() -> std::sync::Arc<rustls::crypto::CryptoProvider> {
-    static RANDOM: ScriptedRandom = ScriptedRandom;
-    static SHARE: FixedShare = FixedShare;
-    static PROVIDER: std::sync::OnceLock<std::sync::Arc<rustls::crypto::CryptoProvider>> =
-        std::sync::OnceLock::new();
-    PROVIDER
-        .get_or_init(|| {
-            let mut provider = rustls::crypto::ring::default_provider();
-            provider.secure_random = &RANDOM;
-            provider.kx_groups = vec![&SHARE];
-            std::sync::Arc::new(provider)
-        })
-        .clone()
 }
 
 /// The HMAC the bound leaf carries: anything else is the cover origin, never proxied.
@@ -2709,47 +2536,31 @@ mod tests {
     }
 
     #[test]
-    fn client_hellos_differ_only_in_the_session_id() {
-        fn hello(session_id: [u8; 32]) -> Vec<u8> {
-            let _guard = MaterialGuard::hold(Material {
-                session_id,
-                grease: [0x11, 0x22],
-                random: [0x33; 32],
-                secret: [0x44; 32],
-                calls: 0,
-            });
-            hello_wire(SNI, &test_config()).expect("builds")
-        }
-
-        fn test_config() -> std::sync::Arc<rustls::ClientConfig> {
-            let verifier = std::sync::Arc::new(RealityVerifier::new([0x55u8; 32]));
-            let mut config = rustls::ClientConfig::builder_with_provider(client_provider())
-                .with_safe_default_protocol_versions()
-                .expect("versions")
-                .dangerous()
-                .with_custom_certificate_verifier(verifier)
-                .with_no_client_auth();
-            config.alpn_protocols = Vec::new();
-            std::sync::Arc::new(config)
-        }
-        let first = hello([0u8; 32]);
-        let second = hello([0x77u8; 32]);
+    fn the_seal_replaces_only_the_session_id() {
+        let profile = crate::tls::shaped::Fingerprint::resolve("chrome")
+            .and_then(crate::tls::shaped::Fingerprint::profile)
+            .expect("chrome is a parrot");
+        let mut hello =
+            crate::tls::shaped::hello::Hello::build(profile, SNI, &[], false).expect("builds");
         assert_eq!(
-            first.len(),
-            second.len(),
-            "one scripted field moves no length"
+            &hello.msg[39..71],
+            &hello.session_id[..],
+            "the server reads the id at this offset"
         );
-        let diffs: Vec<usize> = first
-            .iter()
-            .zip(second.iter())
-            .enumerate()
-            .filter_map(|(i, (a, b))| (a != b).then_some(i))
-            .collect();
-        assert_eq!(diffs.len(), 32, "only the session id differs: {diffs:?}");
-        assert!(
-            diffs.windows(2).all(|w| w[1] == w[0] + 1),
-            "the session id is one run: {diffs:?}"
+        let before = hello.msg.clone();
+        hello.zero_session();
+        assert_eq!(
+            &hello.msg[39..71],
+            &[0u8; 32][..],
+            "the AAD carries a zeroed id"
         );
+        hello.seal_session([0x77u8; 32]);
+        assert_eq!(&hello.msg[39..71], &[0x77u8; 32][..]);
+        for (at, (old, new)) in before.iter().zip(hello.msg.iter()).enumerate() {
+            if !(39..71).contains(&at) {
+                assert_eq!(old, new, "byte {at} moved");
+            }
+        }
     }
 
     #[test]
