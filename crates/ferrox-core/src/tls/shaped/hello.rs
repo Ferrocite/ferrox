@@ -107,6 +107,28 @@ impl Hello {
             .map(|share| share.data.as_slice())
     }
 
+    /// The ECDHE point and secret for a TLS 1.2 `ClientKeyExchange` on a curve the hello committed
+    /// no `key_share` to, drawn only when that curve is in the hello's advertised groups.
+    pub(crate) fn ephemeral(
+        &self,
+        group: u16,
+        peer: &[u8],
+    ) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
+        let advertised = self
+            .profile
+            .exts
+            .iter()
+            .any(|ext| matches!(&ext.body, Body::Groups(groups) if groups.contains(&group)));
+        if !advertised {
+            return Err(TlsError::NoSharedCipher);
+        }
+        let mut pool = keys::generate(&[group], false).map_err(TlsError::Other)?;
+        let mut share = pool.pop().expect("one group");
+        let point = std::mem::take(&mut share.data);
+        let shared = share.agree(peer).map_err(TlsError::Other)?;
+        Ok((point, shared))
+    }
+
     /// The secret agreement for the group the server selected, consuming that share.
     pub(crate) fn agree(&mut self, group: u16, peer: &[u8]) -> Result<Vec<u8>, TlsError> {
         let at = self
