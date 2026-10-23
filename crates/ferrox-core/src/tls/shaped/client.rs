@@ -296,17 +296,21 @@ impl<S: Stream> Session<S> {
             Some((group, peer))
         };
         let mut msg = self.next_handshake()?;
-        if msg[0] == 13 {
+        let asked = msg[0] == 13;
+        if asked {
             self.transcript.extend_from_slice(&msg);
-            let empty = certificate_empty();
-            self.send_plain(HANDSHAKE, &empty, [0x03, 0x03])?;
-            self.transcript.extend_from_slice(&empty);
             msg = self.next_handshake()?;
         }
         if msg[0] != 14 {
             return Err(unexpected(msg[0]));
         }
         self.transcript.extend_from_slice(&msg);
+        if asked {
+            // The empty certificate a client-auth request draws hashes after the flight's ServerHelloDone.
+            let empty = certificate_empty();
+            self.send_plain(HANDSHAKE, &empty, [0x03, 0x03])?;
+            self.transcript.extend_from_slice(&empty);
+        }
 
         let (pre_master, exchange) = match share {
             Some((group, peer)) => {
