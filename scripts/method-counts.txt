@@ -252,6 +252,7 @@ carrier-xhttp received-header-blocks-copied 0 ferrox-app-xhttp_h2::tests::a_rece
 carrier-xhttp partly-read-frame-tail-copies 0 ferrox-app-xhttp_h2::tests::a_partly_read_frame_is_not_moved
 carrier-xhttp zero-filled-bytes-per-received-frame 0 ferrox-app-xhttp_h2::tests::a_received_frames_body_is_not_zero_filled
 carrier-xhttp response-head-field-allocations 0 ferrox-app-xhttp_h2::tests::a_response_head_is_split_without_allocating
+carrier-xhttp answer-head-allocations 1 ferrox-app-xhttp::tests::a_padded_answer_is_written_from_one_buffer
 carrier-xhttp dial-head-allocations-per-thread 1 ferrox-app-xhttp::tests::the_dial_head_is_staged_once_per_thread
 
 carrier-veepn ops-retired-instructions UNBLESSED scripts/count-ops.sh

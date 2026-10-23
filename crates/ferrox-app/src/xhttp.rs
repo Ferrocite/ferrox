@@ -1433,23 +1433,45 @@ impl Drop for SessionReader {
     }
 }
 
-fn downlink_headers(settings: &XhttpSettings) -> String {
-    if settings.no_sse {
-        String::new()
-    } else {
-        "Content-Type: text/event-stream\r\n".to_owned()
-    }
-}
-
+/// The answer head, opened once for the bytes it holds: the padding can be a kilobyte, so growing
+/// a seventeen-byte buffer into it cost a reallocation per doubling and a `String` for the
+/// downlink header that only ever got copied in.
 fn padded_response(stream: &mut impl Write, settings: &XhttpSettings, padded: &str, framing: &str) {
-    let mut head = String::from("HTTP/1.1 200 OK\r\n");
+    const OK: &str = "HTTP/1.1 200 OK\r\n";
+    const CRLF: &str = "\r\n";
+    const ACCEL: &str = "X-Accel-Buffering: no\r\n";
+    const CACHE: &str = "Cache-Control: no-store\r\n";
+    const SSE: &str = "Content-Type: text/event-stream\r\n";
+    const PAD: &str = "X-Padding: ";
+    let downlink = if settings.no_sse { "" } else { SSE };
+    let padding_line = if settings.x_padding_obfs {
+        match settings.x_padding_placement {
+            Placement::Header => {
+                settings.x_padding_header.len() + ": ".len() + padded.len() + CRLF.len()
+            }
+            Placement::Cookie => {
+                "Set-Cookie: ".len()
+                    + settings.x_padding_key.len()
+                    + "=".len()
+                    + padded.len()
+                    + "; Path=/\r\n".len()
+            }
+            _ => PAD.len() + padded.len() + CRLF.len(),
+        }
+    } else {
+        PAD.len() + padded.len() + CRLF.len()
+    };
+    let mut head = String::with_capacity(
+        OK.len() + padding_line + ACCEL.len() + CACHE.len() + downlink.len() + framing.len(),
+    );
+    head.push_str(OK);
     if settings.x_padding_obfs {
         match settings.x_padding_placement {
             Placement::Header => {
                 head.push_str(&settings.x_padding_header);
                 head.push_str(": ");
                 head.push_str(padded);
-                head.push_str("\r\n");
+                head.push_str(CRLF);
             }
             Placement::Cookie => {
                 head.push_str("Set-Cookie: ");
@@ -1459,19 +1481,19 @@ fn padded_response(stream: &mut impl Write, settings: &XhttpSettings, padded: &s
                 head.push_str("; Path=/\r\n");
             }
             _ => {
-                head.push_str("X-Padding: ");
+                head.push_str(PAD);
                 head.push_str(padded);
-                head.push_str("\r\n");
+                head.push_str(CRLF);
             }
         }
     } else {
-        head.push_str("X-Padding: ");
+        head.push_str(PAD);
         head.push_str(padded);
-        head.push_str("\r\n");
+        head.push_str(CRLF);
     }
-    head.push_str("X-Accel-Buffering: no\r\n");
-    head.push_str("Cache-Control: no-store\r\n");
-    head.push_str(&downlink_headers(settings));
+    head.push_str(ACCEL);
+    head.push_str(CACHE);
+    head.push_str(downlink);
     head.push_str(framing);
     let _ = stream.write_all(head.as_bytes());
 }
@@ -3005,6 +3027,45 @@ mod tests {
     fn settings_from(raw: &str) -> XhttpSettings {
         let node = crate::json::parse(raw).expect("parses");
         XhttpSettings::from_json(node.get("streamSettings")).expect("settings")
+    }
+
+    /// The answer head is opened once for the bytes it will hold: a padded answer used to start as
+    /// a seventeen-byte `String` and grow into a kilobyte, and it built the downlink header as its
+    /// own `String` only to copy it in.
+    #[test]
+    fn a_padded_answer_is_written_from_one_buffer() {
+        let mut settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/up/"}}}"#,
+        );
+        settings.x_padding_obfs = true;
+        settings.x_padding_method = PadMethod::RepeatX;
+        settings.x_padding_header = "X-Pad".to_owned();
+        settings.x_padding_key = "pad".to_owned();
+        let padded = "X".repeat(700);
+        let framing = "Content-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+        let tail = format!(
+            "X-Accel-Buffering: no\r\nCache-Control: no-store\r\nContent-Type: text/event-stream\r\n{framing}"
+        );
+        for (placement, line) in [
+            (Placement::Header, format!("X-Pad: {padded}\r\n")),
+            (
+                Placement::Cookie,
+                format!("Set-Cookie: pad={padded}; Path=/\r\n"),
+            ),
+            (Placement::Query, format!("X-Padding: {padded}\r\n")),
+        ] {
+            settings.x_padding_placement = placement;
+            let want = format!("HTTP/1.1 200 OK\r\n{line}{tail}");
+            let mut out = Vec::with_capacity(1024);
+            let ((), counts) = ferrox_core::alloc_count::measure(|| {
+                padded_response(&mut out, &settings, &padded, framing);
+            });
+            assert_eq!(
+                counts.allocs, 1,
+                "the head buffer is the answer's only allocation: {counts:?}"
+            );
+            assert_eq!(out, want.as_bytes(), "the bytes are the padded answer");
+        }
     }
 
     /// A missing or `auto` mode is the dialer's default, not a promise about what may arrive: the reference hub gates a shape only when the mode was written down (`hub.go:154`, `:199`, `:241` all read `Mode != "" && Mode != "auto" && Mode != <shape>`). Our own `xhttp::connect` writes the `stream-one` POST, so a hub resolved from `{"path": "/share"}` refusing it is a hub that answers no dial its own client can make — which is what left `vless-xhttp-down-8` with no flow at any connection count.

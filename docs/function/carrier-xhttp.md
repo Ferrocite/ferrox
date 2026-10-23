@@ -119,6 +119,7 @@ Both H1 handshakes — the `POST` a server reads and the `200` a dialer reads �
 | received-header-blocks-copied | 0 | ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into |
 | partly-read-frame-tail-copies | 0 | ferrox-app-xhttp_h2::tests::a_partly_read_frame_is_not_moved |
 | response-head-field-allocations | 0 | ferrox-app-xhttp_h2::tests::a_response_head_is_split_without_allocating |
+| answer-head-allocations | 1 | ferrox-app-xhttp::tests::a_padded_answer_is_written_from_one_buffer |
 | zero-filled-bytes-per-received-frame | 0 | ferrox-app-xhttp_h2::tests::a_received_frames_body_is_not_zero_filled |
 | dial-head-allocations-per-thread | 1 | ferrox-app-xhttp::tests::the_dial_head_is_staged_once_per_thread |
 <!-- counts:end -->
@@ -170,6 +171,8 @@ The count is gated by `a_chunk_costs_two_reads_not_three`, which drives an in-me
 
 - **A `String` per response header line, and a field list that grew.** `emit_headers` lowercased every name before comparing it against the four hop-by-hop fields, so every response this carrier wrote allocated a fresh `String` per header line just to be discarded, and pushed the survivors into a list that opened at one and doubled. The comparison is in place now (`eq_ignore_ascii_case`, no buffer), the list is opened once for `1 + lines`, and the name is trimmed once instead of twice. `a_response_head_is_split_without_allocating` measures the whole walk at **one allocation** — the list — where the old shape paid a `String` per line plus the list's growth; the same test keeps a `Content-Lengths` near miss, which the old lowercase compare also kept. What did not move: the field order, the `200` default when the status line is short, and every byte `block_encode` writes, since the fields reach it unchanged.
 - **A memmove of the tail on every short read.** The h2 body reader copied the caller's bytes and then `drain`ed them off the front of the queued frame, so a read shorter than the frame moved every byte still queued down to its base — a consumer that reads a frame in small pieces paid O(n²) in moves over that frame. The reader carries a cursor into the front frame instead, the shape `SessionReader` already had, and the frame is popped only when its last byte is taken. `a_partly_read_frame_is_not_moved` reads 16 of 64 bytes and finds the tail still at offset 16 of the same allocation; the drained shape leaves it at offset 0 of a 48-byte buffer, so the address assertions fail on it. No wire byte, credit or syscall moves.
+
+- **A padded answer that allocated once per doubling.** `padded_response` opened its head as a seventeen-byte `String` and pushed a kilobyte-sized pad onto it, reallocating at every doubling — eight allocations and about a kilobyte of copying per answered request — and it built the downlink header as its own `String` only to copy it in. The head's length is the sum of the parts it is about to write, so it is opened once and filled in place, and the downlink header is a `const` slice. `a_padded_answer_is_written_from_one_buffer` measures **one allocation** for the head across the header, cookie and default placements, and holds the bytes to the `format!` shape the old code wrote. What did not move: the pad itself is still drawn per request, and every byte, field order and framing line is the same.
 
 ## Open rows
 
