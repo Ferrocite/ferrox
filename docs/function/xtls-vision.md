@@ -13,10 +13,10 @@ graph TD
     W1["inner TLS writes, 8 buffers"] --> W2["frame: uuid once, then<br/>cmd | len | padLen | content | padding"]
     W2 --> W3["observe the record header<br/>budget 8 → 0 at the switch"]
     W3 --> W4{"switched?"}
-    W4 -- no --> W5["staged: socket → have → out → caller<br/>2 copies per byte"]
+    W4 -- no --> W5["framed write, handed by pointer:<br/>0 copies per written byte"]
     W4 -- yes --> W6["raw write straight to the socket<br/>0 further copies"]
     R1["socket read"] --> R2{"framing live?"}
-    R2 -- yes --> R3["have → out → caller<br/>2 copies per byte, bounded by the 8 buffers"]
+    R2 -- yes --> R3["peel: record → have → the caller's own pull<br/>1 copy per byte at a relay-window pull"]
     R2 -- no --> R4["read straight into the caller's buffer<br/>0 copies per byte"]
     R3 --> R5["command 1 or 2 ends the framing"]
     R4 --> R6(("caller"))
@@ -33,7 +33,7 @@ graph TD
 | first-frame-uuid-bytes | 16 | ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid |
 | largest-framed-block-bytes | 8171 | ferrox-app-vision::tests::a_bulk_write_frames_every_block_inside_the_bound |
 | tls-buffers-inspected-before-the-switch | 8 | ferrox-app-vision::tests::both_directions_spend_the_same_filter_budget |
-| user-space-copies-per-byte-while-framed | 2 | ferrox-app-vision::tests::the_framing_switch_ends_the_staging |
+| user-space-copies-per-byte-while-framed | 1 | ferrox-app-vision::tests::a_relay_window_pull_never_stages |
 | user-space-copies-per-byte-after-the-switch | 0 | ferrox-app-vision::tests::the_framing_switch_ends_the_staging |
 | user-space-copies-per-byte-written-while-framed | 0 | ferrox-app-vision::tests::the_writer_hands_the_callers_payload_by_pointer |
 | uuid-bytes-copied-per-link | 0 | ferrox-app-vision::tests::the_writer_hands_the_uuid_by_pointer_on_the_first_frame |
@@ -67,7 +67,7 @@ What the smaller window changes is the **read granularity of the framed pass**, 
 
 The gate is the capacity, held steady: `the_framed_staging_buffers_stay_at_one_record` drains 24 padded frames plus a 40 KiB tail, asserts the bytes round-trip, and asserts `have.capacity()` equals the 16 KiB window rather than the 256 KiB it used to reach — red at 262144 on the old size, green at 16384 on the new one.
 
-The two rows beside the renamed one are properly gated: both `user-space-copies-per-byte-while-framed` and `-after-the-switch` name `the_framing_switch_ends_the_staging`, which really does drive `Link`.
+The row that moved with the direct peel is gated honestly: `user-space-copies-per-byte-while-framed` names `a_relay_window_pull_never_stages`, which pulls whole relay-window reads through live frames, holds `staged` at zero and `out`'s capacity at zero, and rounds the bytes out; `-after-the-switch` still names `the_framing_switch_ends_the_staging`, which counts staged bytes and holds that not one byte after the switch went through a staging buffer.
 
 ## What we removed
 
@@ -107,7 +107,7 @@ Two more things were left, and both are named here rather than claimed as wins.
 
 - **The trailer is capped lower than the reference caps it.** The seed table is the reference's `{900, 500, 900, 256}` and the long case is the reference's `rand(0, 500) + 900 - contentLen`, but the cap that follows is not the reference's: the reference clamps the trailer to `buf.Size - 21 - contentLen` (`upstream/xray-core/proxy/proxy.go:520`, so 8171 less the content) while this tree clamps it to `BUFFER - SHORTEST_FRAME - content` (2048 less 21 less the content), because the static zero run it hands the socket is 2 KiB. The two agree while the content is under 1772 bytes, and above that the reference pads a frame by `rand(0, 256)` where this tree pads it by at most `2027 - content` — and by nothing at all past 2027. So the first paragraph's claim that the byte counts a DPI sees are the byte counts the reference produces does not hold for a frame over 1772 bytes, and the fix is a bigger zero run and the reference's cap. That fix changes the bytes on the wire, which is the one thing this repository does not trade, so it is named here and left for the slice that can weigh it. The Rust rewrite of xray-core carries the same lower cap and the same reason (`upstream/xray-core-rust/crates/xray-proxy-vless/src/encryption/vision.rs:33`, `BUF_SIZE = 2048`, with a comment that reads "Go `common/buf` `buf.go` 2048" — the pinned xray-core says `Size = 8192` at `common/buf/buffer.go:13`), so this tree and that port agree with each other and differ from the reference they both name.
 
-- **The framed bytes are still copied twice.** The reader stages each frame's content in a buffer of its own and then copies it into the caller's buffer, so a framed byte is written into user space twice, where the reference writes it once and Zray hands the content window over without a second copy. The staging is not a free choice: the TLS filter watches the *unframed* content of one read, which is the reference's own shape (`XtlsFilterTls` runs on the unpadded `MultiBuffer`, `upstream/xray-core/proxy/proxy.go:257`), and the content of one read is only contiguous while a buffer holds it. Removing the staging would move the filter's observation from one read's content to one frame's content, which changes when the switch lands, so the copy stays and the count `user-space-copies-per-byte-while-framed 2` stands. What the staging bought is now released at the switch rather than held for the connection's life.
+- **The staging copy on every framed byte is gone.** The reader used to peel each frame's content into `out` and then copy it into the caller's buffer, so a framed byte was written into user space twice, where the reference writes it once and Zray hands the content window over without a second copy. The peel now sinks each piece straight into the caller's pull, and `out` is only for the bytes one pull leaves behind: created on the first spill (`out: Vec::new()` until then, so no staging buffer exists unless one happens), drained first on the next read, never larger than one record. `a_relay_window_pull_never_stages` drives whole relay-window pulls against ten padded frames and holds `staged` at zero and `out`'s capacity at zero through live framing; a pull narrower than the record's leftovers still spills the overflow through `out`, one extra copy for exactly those bytes, which is the fallback the framing already had to survive and the only code left that names it. What was not removed: the uuid skip, the padding skip, the record boundary, the end-of-framing behavior, and the filter's observation. The last is why the staging was once defended as a free choice, and why the removal had to pay for it: the filter watches the *unframed* content in order, which the reference runs on the unpadded pieces of one read (`XtlsFilterTls`, `upstream/xray-core/proxy/proxy.go:257`). The pieces the peel writes are where the content went, so `observe_chunks` walks them through an indexed cursor that reads the very positions the pieces occupy, in the order the peel wrote them: the `ServerHello` head checks, the six-byte pattern walk and the `server_hello_left` budget arithmetic are all driven from the same positions they read when the same bytes sat in one staging buffer, at the same piece boundaries the peel itself created. `budget` still spends once per record, not once per piece. Both directions keep the same bytes in the same order, so the switch lands at the same moment; `the_framing_switch_ends_the_staging` and `both_directions_spend_the_same_filter_budget` say so on data that flows through the split, not through the cursor alone.
 
 ## Pins
 
