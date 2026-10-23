@@ -68,6 +68,7 @@ note          = "the same core's Hysteria v2 client against ferrox-app's `protoc
 [sources.xray-core-rust]
 repo          = "https://github.com/Be90nia/xray-core-rust"
 rev           = "06251b00f0cdbe0a535d7f3e299f2e4f5459f541"
+bench_release = "v26.10.11-rust.1"
 always        = true
 default_branch = "master"
 path          = "crates"

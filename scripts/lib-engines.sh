@@ -3,6 +3,16 @@
 note() { echo "note: $*" >&2; }
 fail() { echo "::error::$*" >&2; exit 1; }
 
+release_of() {
+  awk -v want="$1" '
+    /^\[sources\./ { in_source = ($0 == "[sources." want "]") }
+    in_source && /^bench_release[[:space:]]*=/ {
+      gsub(/^bench_release[[:space:]]*=[[:space:]]*"|"[[:space:]]*$/, "")
+      print; exit
+    }
+  ' "$pins_file"
+}
+
 pin_of() {
   awk -v want="$1" '
     /^\[sources\./ { in_source = ($0 == "[sources." want "]") }
@@ -100,12 +110,26 @@ build() {
       cp "$rust_cli" "$binary" || return 1
       ;;
     xray-core-rust)
-      note "building the pinned xray-core-rust at $rev"
-      (cd "upstream/$name" && CARGO_TARGET_DIR="$OLDPWD/$engine_dir/xray-core-rust-target" \
-        env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo build --release -p xray-cli --bin xray) || return 1
-      local rust_core_cli
-      rust_core_cli="$(built "$engine_dir/xray-core-rust-target/release/xray$(exe_suffix)")" || return 1
-      cp "$rust_core_cli" "$binary" || return 1
+      # btls builds a patched BoringSSL with CMake, clang and a setup script; the
+      # project publishes that build for the runners this matrix has, so use it
+      # and keep the source checkout for reading rather than rebuilding it.
+      local release asset
+      release="$(release_of "$name")"
+      [[ -n "$release" ]] || { note "no bench_release pinned for $name"; return 1; }
+      case "$(uname -s)/$(uname -m)" in
+        Linux/x86_64) asset="xray-linux-amd64" ;;
+        Darwin/arm64 | Darwin/aarch64) asset="xray-macos-arm64" ;;
+        Darwin/x86_64) asset="xray-macos-amd64" ;;
+        MINGW*/x86_64 | MSYS*/x86_64 | CYGWIN*/x86_64) asset="xray-windows-amd64.exe" ;;
+        *)
+          note "no pinned xray-core-rust release for $(uname -s)/$(uname -m)"
+          return 1
+          ;;
+      esac
+      note "downloading xray-core-rust $release ($asset)"
+      curl -fsSL --retry 3 -o "$binary" \
+        "https://github.com/Be90nia/xray-core-rust/releases/download/$release/$asset" || return 1
+      chmod +x "$binary" 2>/dev/null || true
       ;;
     leaf)
       note "building the pinned leaf at $rev (long: aws-lc-rs, quinn, tungstenite)"
