@@ -294,6 +294,13 @@ fn material(cfg: &TlsConfig) -> Result<Arc<Material>, TlsError> {
     drop(kept);
     let built = Arc::new(build_material(cfg)?);
     let mut kept = all.lock().expect("one build at a time");
+    // A dial that raced this build may have stored the same key first, and one key keeps one entry.
+    if let Some(at) = kept.iter().position(|(k, _)| *k == key) {
+        let entry = kept.remove(at);
+        let hit = Arc::clone(&entry.1);
+        kept.push(entry);
+        return Ok(hit);
+    }
     if kept.len() == MATERIALS_MAX {
         kept.remove(0);
     }
@@ -353,6 +360,12 @@ fn client_config(cfg: &TlsConfig) -> Result<Arc<rustls::ClientConfig>, TlsError>
     let material = material(cfg)?;
     let built = Arc::new(build_config(cfg, &material)?);
     let mut kept = all.lock().expect("one build at a time");
+    if let Some(at) = kept.iter().position(|(k, _)| *k == key) {
+        let entry = kept.remove(at);
+        let hit = Arc::clone(&entry.1);
+        kept.push(entry);
+        return Ok(hit);
+    }
     if kept.len() == MATERIALS_MAX {
         kept.remove(0);
     }
@@ -979,9 +992,14 @@ fn map_error(e: &rustls::Error) -> TlsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tls::shaped::record;
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
+
+    const HANDSHAKE: u8 = 22;
+    const CCS: u8 = 20;
+    const APPLICATION: u8 = 23;
 
     const ANCHOR: &[u8] = &[
         0x30, 0x82, 0x01, 0x6c, 0x30, 0x82, 0x01, 0x11, 0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x14,
@@ -1176,48 +1194,362 @@ mod tests {
         server.join().expect("joins");
     }
 
-    #[cfg_attr(
-        miri,
-        ignore = "needs a loopback socket, and ring's assembly behind it"
-    )]
-    #[test]
-    fn a_shaped_chrome_handshake_serves_a_tls12_only_server() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
-        let port = listener.local_addr().expect("addr").port();
-        let server = thread::spawn(move || {
-            let cert = rustls::pki_types::CertificateDer::from(ANCHOR.to_vec());
-            let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
-                rustls::pki_types::PrivatePkcs8KeyDer::from(ANCHOR_KEY.to_vec()),
+    /// A TLS 1.2 server on a byte queue rather than a socket, so the client's
+    /// extended-master-secret transcript is hashed by an independent side: it appends the
+    /// `ClientKeyExchange` before it hashes, and refuses a `Finished` that did not.
+    struct Tls12Server {
+        rng: ring::rand::SystemRandom,
+        signing: ring::signature::EcdsaKeyPair,
+        ephemeral: Option<ring::agreement::EphemeralPrivateKey>,
+        server_public: Vec<u8>,
+        server_random: [u8; 32],
+        client_random: [u8; 32],
+        session_id: Vec<u8>,
+        transcript: Vec<u8>,
+        master: Vec<u8>,
+        read_dir: Option<record::Direction>,
+        write_dir: Option<record::Direction>,
+        pending: Vec<u8>,
+        feed: Vec<u8>,
+    }
+
+    impl Tls12Server {
+        fn new() -> Self {
+            let rng = ring::rand::SystemRandom::new();
+            let signing = ring::signature::EcdsaKeyPair::from_pkcs8(
+                &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+                ANCHOR_KEY,
+                &rng,
+            )
+            .expect("signing key");
+            let ephemeral =
+                ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::X25519, &rng)
+                    .expect("ephemeral key");
+            let server_public = ephemeral
+                .compute_public_key()
+                .expect("public key")
+                .as_ref()
+                .to_vec();
+            Self {
+                rng,
+                signing,
+                ephemeral: Some(ephemeral),
+                server_public,
+                server_random: [0x42; 32],
+                client_random: [0u8; 32],
+                session_id: Vec::new(),
+                transcript: Vec::new(),
+                master: Vec::new(),
+                read_dir: None,
+                write_dir: None,
+                pending: Vec::new(),
+                feed: Vec::new(),
+            }
+        }
+
+        fn process(&mut self) {
+            let mut at = 0;
+            while self.pending.len() - at >= 5 {
+                let len = usize::from(u16::from_be_bytes([
+                    self.pending[at + 3],
+                    self.pending[at + 4],
+                ]));
+                if self.pending.len() - at - 5 < len {
+                    break;
+                }
+                let kind = self.pending[at];
+                let body = self.pending[at + 5..at + 5 + len].to_vec();
+                at += 5 + len;
+                self.record(kind, body);
+            }
+            self.pending.drain(..at);
+        }
+
+        fn record(&mut self, kind: u8, body: Vec<u8>) {
+            match kind {
+                CCS => {}
+                HANDSHAKE if self.read_dir.is_some() => {
+                    let mut plain = Vec::new();
+                    record::open12(
+                        self.read_dir.as_mut().expect("read keys"),
+                        kind,
+                        body,
+                        &mut plain,
+                    )
+                    .expect("client record opens");
+                    self.handshake(&plain);
+                }
+                HANDSHAKE => self.handshake(&body),
+                APPLICATION => {
+                    let mut plain = Vec::new();
+                    record::open12(
+                        self.read_dir.as_mut().expect("read keys"),
+                        kind,
+                        body,
+                        &mut plain,
+                    )
+                    .expect("application record opens");
+                    assert_eq!(plain, b"ping", "the client's frame opens whole");
+                    let mut out = Vec::new();
+                    record::seal12(
+                        self.write_dir.as_mut().expect("write keys"),
+                        APPLICATION,
+                        &plain,
+                        &mut out,
+                    )
+                    .expect("seals");
+                    self.feed.extend_from_slice(&out);
+                }
+                other => panic!("unexpected record {other}"),
+            }
+        }
+
+        fn handshake(&mut self, msg: &[u8]) {
+            match msg[0] {
+                1 => self.client_hello(msg),
+                16 => self.client_key_exchange(msg),
+                20 => self.client_finished(msg),
+                other => panic!("unexpected handshake message {other}"),
+            }
+        }
+
+        fn client_hello(&mut self, msg: &[u8]) {
+            let mut c = Cursor::new(&msg[4..]);
+            c.u16();
+            self.client_random.copy_from_slice(c.take(32));
+            self.session_id = c.vec8().to_vec();
+            let suites = c.vec16();
+            assert!(
+                suites.as_chunks::<2>().0.contains(&[0xc0, 0x2b]),
+                "the hello offers the ECDHE-ECDSA-GCM suite"
             );
-            let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_protocol_versions(&[&rustls::version::TLS12])
-            .expect("server versions")
-            .with_no_client_auth()
-            .with_single_cert(vec![cert], key)
-            .expect("server cert");
-            config.alpn_protocols = vec![b"http/1.1".to_vec()];
-            let (mut stream, _) = listener.accept().expect("accepts");
-            let mut conn = rustls::ServerConnection::new(Arc::new(config)).expect("server session");
-            let mut tls = rustls::Stream::new(&mut conn, &mut stream);
-            let mut buf = [0u8; 4];
-            tls.read_exact(&mut buf)
-                .unwrap_or_else(|e| panic!("server read: {e:?}"));
-            tls.write_all(&buf).expect("writes");
-        });
-        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            c.vec8();
+            let mut ems = false;
+            let mut alpn = false;
+            let mut ext = Cursor::new(c.vec16());
+            while ext.at < ext.bytes.len() {
+                let kind = ext.u16();
+                let value = ext.vec16();
+                match kind {
+                    0x0017 => ems = true,
+                    0x0010 => {
+                        let mut list = Cursor::new(value);
+                        let mut protos = Cursor::new(list.vec16());
+                        while protos.at < protos.bytes.len() {
+                            alpn |= protos.vec8() == b"http/1.1";
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            assert!(ems, "the hello offers extended master secret");
+            assert!(alpn, "the hello offers http/1.1");
+            self.transcript.extend_from_slice(msg);
+
+            let mut hello = Vec::new();
+            hello.extend_from_slice(&[0x03, 0x03]);
+            hello.extend_from_slice(&self.server_random);
+            hello.push(self.session_id.len() as u8);
+            hello.extend_from_slice(&self.session_id);
+            hello.extend_from_slice(&[0xc0, 0x2b]);
+            hello.push(0);
+            let mut ext = Vec::new();
+            ext.extend_from_slice(&[0x00, 0x17, 0x00, 0x00]);
+            ext.extend_from_slice(&[0x00, 0x10, 0x00, 0x0b, 0x00, 0x09, 0x08]);
+            ext.extend_from_slice(b"http/1.1");
+            hello.extend_from_slice(&(ext.len() as u16).to_be_bytes());
+            hello.extend_from_slice(&ext);
+            let hello = hs_message(2, &hello);
+
+            let mut cert = Vec::new();
+            cert.extend_from_slice(&(ANCHOR.len() as u32).to_be_bytes()[1..]);
+            cert.extend_from_slice(ANCHOR);
+            let mut chain = Vec::new();
+            chain.extend_from_slice(&(cert.len() as u32).to_be_bytes()[1..]);
+            chain.extend_from_slice(&cert);
+            let chain = hs_message(11, &chain);
+
+            let mut params = vec![3, 0x00, 0x1d, 32];
+            params.extend_from_slice(&self.server_public);
+            let mut signed = Vec::with_capacity(64 + params.len());
+            signed.extend_from_slice(&self.client_random);
+            signed.extend_from_slice(&self.server_random);
+            signed.extend_from_slice(&params);
+            let signature = self.signing.sign(&self.rng, &signed).expect("signs");
+            let mut exchange = params;
+            exchange.extend_from_slice(&[0x04, 0x03]);
+            exchange.extend_from_slice(&(signature.as_ref().len() as u16).to_be_bytes());
+            exchange.extend_from_slice(signature.as_ref());
+            let exchange = hs_message(12, &exchange);
+            let done = hs_message(14, &[]);
+
+            let mut flight = Vec::new();
+            for part in [&hello, &chain, &exchange, &done] {
+                self.transcript.extend_from_slice(part);
+                flight.extend_from_slice(part);
+            }
+            self.push_record(HANDSHAKE, &flight);
+        }
+
+        fn client_key_exchange(&mut self, msg: &[u8]) {
+            let mut c = Cursor::new(&msg[4..]);
+            assert_eq!(c.u8(), 32, "one X25519 share");
+            let peer = c.take(32).to_vec();
+            self.transcript.extend_from_slice(msg);
+            let private = self.ephemeral.take().expect("one key exchange");
+            let shared = ring::agreement::agree_ephemeral(
+                private,
+                &ring::agreement::UnparsedPublicKey::new(&ring::agreement::X25519, peer),
+                <[u8]>::to_vec,
+            )
+            .expect("agrees");
+            let suite = record::Suite::from_id(0xc02b).expect("suite");
+            let session_hash = suite.hash().hash(&self.transcript);
+            let (master, block) = crate::tls::shaped::tls12::keys(
+                suite,
+                &shared,
+                &self.client_random,
+                &self.server_random,
+                Some(&session_hash),
+            );
+            self.read_dir = Some(record::Direction::tls12(
+                suite,
+                &block.client_key,
+                &block.client_iv,
+            ));
+            self.write_dir = Some(record::Direction::tls12(
+                suite,
+                &block.server_key,
+                &block.server_iv,
+            ));
+            self.master = master;
+        }
+
+        fn client_finished(&mut self, msg: &[u8]) {
+            let suite = record::Suite::from_id(0xc02b).expect("suite");
+            let expected = crate::tls::shaped::tls12::finished(
+                suite,
+                &self.master,
+                b"client finished",
+                &self.transcript,
+            );
+            assert_eq!(
+                &msg[4..],
+                expected.as_slice(),
+                "the client hashed its ClientKeyExchange into the extended master secret"
+            );
+            self.transcript.extend_from_slice(msg);
+            let verify = crate::tls::shaped::tls12::finished(
+                suite,
+                &self.master,
+                b"server finished",
+                &self.transcript,
+            );
+            self.push_record(CCS, &[1]);
+            let mut out = Vec::new();
+            record::seal12(
+                self.write_dir.as_mut().expect("write keys"),
+                HANDSHAKE,
+                &hs_message(20, &verify),
+                &mut out,
+            )
+            .expect("seals");
+            self.feed.extend_from_slice(&out);
+        }
+
+        fn push_record(&mut self, kind: u8, body: &[u8]) {
+            self.feed.push(kind);
+            self.feed.extend_from_slice(&[0x03, 0x03]);
+            self.feed
+                .extend_from_slice(&(body.len() as u16).to_be_bytes());
+            self.feed.extend_from_slice(body);
+        }
+    }
+
+    impl std::io::Read for Tls12Server {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.feed.len().min(buf.len());
+            buf[..n].copy_from_slice(&self.feed[..n]);
+            self.feed.drain(..n);
+            Ok(n)
+        }
+    }
+
+    impl std::io::Write for Tls12Server {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.pending.extend_from_slice(buf);
+            self.process();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Frames one handshake message the way the shaped client's parser expects it.
+    fn hs_message(kind: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + body.len());
+        out.push(kind);
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        out.extend_from_slice(body);
+        out
+    }
+
+    /// The fixture's own reader: the shaped client's is private to its module.
+    struct Cursor<'a> {
+        bytes: &'a [u8],
+        at: usize,
+    }
+
+    impl<'a> Cursor<'a> {
+        fn new(bytes: &'a [u8]) -> Self {
+            Self { bytes, at: 0 }
+        }
+
+        fn take(&mut self, n: usize) -> &'a [u8] {
+            let end = self.at + n;
+            assert!(end <= self.bytes.len(), "truncated handshake");
+            let out = &self.bytes[self.at..end];
+            self.at = end;
+            out
+        }
+
+        fn u8(&mut self) -> u8 {
+            self.take(1)[0]
+        }
+
+        fn u16(&mut self) -> u16 {
+            let bytes = self.take(2);
+            u16::from_be_bytes([bytes[0], bytes[1]])
+        }
+
+        fn vec8(&mut self) -> &'a [u8] {
+            let len = usize::from(self.u8());
+            self.take(len)
+        }
+
+        fn vec16(&mut self) -> &'a [u8] {
+            let len = usize::from(self.u16());
+            self.take(len)
+        }
+    }
+
+    #[cfg_attr(miri, ignore = "assembles real handshake bytes through ring")]
+    #[test]
+    fn a_shaped_tls12_handshake_hashes_its_client_key_exchange() {
         let mut cfg = client("tls.test", &[]);
         cfg.fingerprint = Some(crate::tls::Fingerprint::default());
-        let mut session = crate::tls::connect(&cfg, stream).expect("dials");
+        let mut session =
+            crate::tls::shaped::Session::connect(&cfg, Tls12Server::new()).expect("builds");
         session.handshake().expect("handshakes");
         assert_eq!(session.alpn(), Some(b"http/1.1".as_slice()));
+        assert_eq!(session.peer_leaf(), Some(ANCHOR));
         session.write_all(b"ping").expect("writes");
         session.flush().expect("flushes");
         let mut buf = [0u8; 4];
         session.read_exact(&mut buf).expect("reads");
         assert_eq!(&buf, b"ping");
-        server.join().expect("joins");
     }
 
     #[cfg_attr(
