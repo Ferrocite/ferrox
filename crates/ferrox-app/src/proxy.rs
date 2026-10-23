@@ -4334,14 +4334,21 @@ fn serve_ss_xdrive(
     crate::shadowsocks::serve_kcp(session.clone(), session, password, method, freedom, &close);
 }
 
-fn serve_kcp_loop(address: &str, config: ferrox_core::kcp::Config, serve: &KcpServe) {
+/// Bind before answering, so a port already taken is the listener's refusal and not a thread's later accident.
+fn serve_kcp_bound(address: &str, config: ferrox_core::kcp::Config, serve: &KcpServe) -> bool {
     let Some(server) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
-        return;
+        return false;
     };
     let Ok(listener) = ferrox_core::kcp::Listener::bind(server, config) else {
-        return;
+        return false;
     };
-    serve_kcp_each(&listener, serve);
+    let serve = Arc::clone(serve);
+    thread::spawn(move || serve_kcp_each(&listener, &serve));
+    true
+}
+
+fn serve_kcp_loop(address: &str, config: ferrox_core::kcp::Config, serve: &KcpServe) {
+    let _ = serve_kcp_bound(address, config, serve);
 }
 
 fn serve_kcp_each(listener: &ferrox_core::kcp::Listener, serve: &KcpServe) {
@@ -4386,9 +4393,7 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
             } else {
                 Arc::new(move |conn| serve_trojan_kcp(conn, &key, freedom))
             };
-            let owned = address.to_owned();
-            thread::spawn(move || serve_kcp_loop(&owned, config, &serve));
-            true
+            serve_kcp_bound(address, config, &serve)
         }
         Carrier::Xdrive { settings } => {
             let accept: crate::xdrive::Accept =
@@ -19543,6 +19548,22 @@ mod tests {
             // Past RELAY_POLL, so an association that polls instead of parking is gone by the second datagram.
             thread::sleep(Duration::from_millis(250));
         }
+    }
+
+    /// A listener whose port is already taken is refused, not announced as served: the bind is the listener's verdict, not a thread's later accident.
+    #[test]
+    fn a_kcp_listener_that_cannot_bind_is_not_reported_served() {
+        let held = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = held.local_addr().expect("addr").port();
+        let inbound = crate::json::parse(
+            r#"{"protocol": "trojan", "settings": {"clients": [{"password": "secret"}]},
+                "streamSettings": {"network": "kcp"}}"#,
+        )
+        .expect("parses");
+        assert!(
+            !serve_trojan_inbound(&format!("127.0.0.1:{port}"), &inbound, true),
+            "a listener whose port is taken is not reported served"
+        );
     }
 
     /// A trojan listener that declares tls over KCP answers the session its config names: the request is read off the records, not the plaintext header.
