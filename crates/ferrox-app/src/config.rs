@@ -550,6 +550,14 @@ impl Carrier {
             _ => None,
         }
     }
+
+    /// The xHTTP dial settings, which carry the normalised request path.
+    pub(crate) fn xhttp_settings(&self) -> Option<&crate::xhttp::XhttpSettings> {
+        match self {
+            Carrier::Xhttp { settings } => Some(settings),
+            _ => None,
+        }
+    }
 }
 
 // One row per network this tree recognises; a new method adds a row, not a match arm.
