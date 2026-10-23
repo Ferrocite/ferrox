@@ -279,7 +279,7 @@ carrier-foxy read-buffer-bytes-per-staged-remainder 0 ferrox-app-foxy::loopback:
 carrier-foxy connect-request-allocations-per-open 0 ferrox-core-tls::rustls_backend::tests::the_connect_request_gathers_without_a_heap_buffer
 carrier-foxy write-calls-per-h1-open 1 ferrox-core-tls::rustls_backend::tests::the_connect_request_gathers_without_a_heap_buffer
 carrier-foxy qpack-connect-allocations-per-open 0 ferrox-core-foxy::hpack::tests::a_connect_block_is_written_without_touching_the_heap
-carrier-foxy qpack-status-patterns-understood 3 ferrox-core-foxy::hpack::tests::the_status_the_edge_sent_with_a_static_name_reference_is_read
+carrier-foxy qpack-status-patterns-understood 3 ferrox-core-foxy::hpack::tests::the_status_reader_understands_every_pattern_the_edge_may_send
 carrier-foxy head-read-calls-per-open 1 ferrox-app-foxy::tests::the_head_walk_reads_the_answer_in_one_call
 carrier-foxy head-tail-bytes-held-after-they-reach-the-caller 0 ferrox-app-foxy::tests::the_pipelined_tail_is_released_by_the_read_that_spends_it
 carrier-foxy hop-connect-allocations-per-open 0 ferrox-app-foxy::loopback::a_hop_connect_allocates_nothing

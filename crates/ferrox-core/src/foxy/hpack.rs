@@ -472,7 +472,10 @@ pub fn qpack_status(block: &[u8]) -> Option<u16> {
         let first = block[at];
         let name_is_status = if first & 0x80 != 0 {
             let index = read_integer(block, &mut at, 6)?;
-            status = Some(static_status(index, false)?);
+            // A field the lane does not read is walked past, the way the `h2` reader does: the status is what the block has, not the first line it met.
+            if let Some(code) = static_status(index, false) {
+                status = Some(code);
+            }
             continue;
         } else if first & 0xC0 == 0x40 {
             // The `01` pattern, a literal line naming a field the static table holds: the edge's own answer names `:status` this way, and a reader that does not know the pattern cannot read a status the edge sent.
@@ -1238,8 +1241,20 @@ mod tests {
         assert_eq!(qpack_fields(&[]), None);
         assert_eq!(qpack_fields(&[0x01, 0x00]), None);
         assert_eq!(qpack_fields(&[0x00, 0x00, 0x60, 0x00]), None);
+        // `0x10` is the `0001` form, an indexed field line with a post-base index; the `0000N` form is a block whose prefix byte is `0x00`.
         assert_eq!(qpack_fields(&[0x00, 0x00, 0x10]), None);
         assert_eq!(qpack_fields(&[0x00, 0x00, 0x00]), None);
+    }
+
+    /// An indexed line the lane does not read is walked past, not refused: a response that names its status and then `date` (`static` index 6) has a readable status, and the reader keeps whichever status the block carried.
+    #[test]
+    fn a_field_the_h3_lane_does_not_read_is_skipped_not_refused() {
+        assert_eq!(qpack_status(&[0x00, 0x00, 0x99]), Some(200));
+        assert_eq!(
+            qpack_status(&[0x00, 0x00, 0x99, 0x86]),
+            Some(200),
+            "the status survives an indexed `date` behind it"
+        );
     }
 
     /// The edge's own answer, taken off a live h3 lane: it names its status with the `01` pattern and a static name index, so a reader that does not know the pattern cannot read a status the edge sent. The block is the one the live lane refused, byte for byte.
@@ -1275,17 +1290,20 @@ mod tests {
         }
     }
 
-    /// How many of QPACK's four field-line patterns the status reader understands, one block per pattern, each naming a status the same way: the row in `scripts/method-counts.txt` is this number, and the number is read here rather than written down.
+    /// How many of RFC 9204 §4.5's five field-line forms the status reader understands, one
+    /// block per form: three read, the two post-base forms refused by their own names —
+    /// a block that names a dynamic table this lane never fills. The row in
+    /// `scripts/method-counts.txt` is this number, read here rather than written down.
     #[test]
     fn the_status_reader_understands_every_pattern_the_edge_may_send() {
-        // The `1` pattern, an indexed line: the status is the table entry's own value.
+        // The `1T` pattern, an indexed line: the status is the table entry's own value.
         let mut indexed = vec![0x00, 0x00];
         integer(&mut indexed, 6, 0x80, 25);
-        // The `01` pattern, a literal line naming the field in the static table.
+        // The `01NT` pattern, a literal line naming the field in the static table.
         let mut named = vec![0x00, 0x00];
         integer(&mut named, 4, 0x40 | 0x10, 24);
         named.extend_from_slice(&[0x03, b'2', b'0', b'0']);
-        // The `001` pattern, a literal line spelling the name out.
+        // The `001NH` pattern, a literal line spelling the name out.
         let mut spelled = vec![0x00, 0x00, 0x20];
         integer_into(&mut spelled, 3, 7);
         spelled.extend_from_slice(b":status");
@@ -1298,9 +1316,10 @@ mod tests {
         ] {
             assert_eq!(qpack_status(&block), Some(200), "{name}");
         }
-        // The fourth pattern, a post-base name reference, names the dynamic table, which this lane never fills: the reader refuses it rather than answering a status it cannot know.
+        // The `0001` form, an indexed field line with a post-base index, and the `0000N` form, a literal with a post-base name reference: both name the dynamic table this lane never fills, so they are refused, a status it cannot know is not a status it should guess.
+        assert_eq!(qpack_status(&[0x00, 0x00, 0x10]), None, "a post-base index");
         assert_eq!(
-            qpack_status(&[0x00, 0x00, 0x10, 0x03, b'2', b'0', b'0']),
+            qpack_status(&[0x00, 0x00, 0x00, 0x03, b'2', b'0', b'0']),
             None,
             "a post-base name reference"
         );
