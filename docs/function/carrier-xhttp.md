@@ -116,6 +116,7 @@ Both H1 handshakes — the `POST` a server reads and the `200` a dialer reads �
 | head-tail-read-syscalls | 0 | ferrox-app-xhttp::tests::a_chunk_that_rode_in_with_the_head_costs_no_syscall |
 | head-tail-allocations | 0 | ferrox-app-xhttp::tests::the_record_head_hands_over_the_buffer_it_filled |
 | path-segment-allocations | 0 | ferrox-app-xhttp::tests::the_path_placements_are_read_without_a_list |
+| connection-header-allocations | 0 | ferrox-app-xhttp::tests::a_connection_header_is_named_without_a_lowercase_copy |
 | received-data-frames-copied | 0 | ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into |
 | received-header-blocks-copied | 0 | ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into |
 | partly-read-frame-tail-copies | 0 | ferrox-app-xhttp_h2::tests::a_partly_read_frame_is_not_moved |
@@ -183,6 +184,9 @@ The count is gated by `a_chunk_costs_two_reads_not_three`, which drives an in-me
 - **A segment list per request in the default placement.** `extract_meta` collected the path's segments into a `Vec<&str>` and indexed them, so every request under the default `Path`/`Path` placement allocated a list to read its first two entries.
 The two placements now take the first and second segment from one borrowed split, in that order, with no list: `the_path_placements_are_read_without_a_list` measures **zero allocations** for the default walk, holds both segments, and keeps the seq-only placement on the first segment and the empty path on `None`.
 What did not move: the segment order, the query strip, and every query-, header- and cookie-placed read.
+- **A lowercased copy of the connection header per request.** `keeps_alive` lowered the whole `Connection` value into a fresh `String` before splitting it, so every request that named the field paid an allocation to answer whether the connection stays; the two list members are now compared in place with `eq_ignore_ascii_case`, which is the same ASCII fold the lowering did.
+`a_connection_header_is_named_without_a_lowercase_copy` measures **zero allocations** and keeps both verdicts — a `close` anywhere in the list still wins, and HTTP/1.0 still keeps alive only when told.
+What did not move: the two scans of the value, and the default a request with no `Connection` field gets.
 - **A zero pass over every request body.** `read_body` allocated a `Content-Length` body with `vec![0u8; n]`, so every uplink POST paid a zero pass over its whole body before the read that fills it in full — the same bytes written twice.
 The body is the read's own uninitialised room now, and the counting allocator's `zeroed` counter is the witness: `a_body_read_lands_in_room_it_never_zeroes` reads a 32-byte body in full off an in-memory stream, holds the bytes and the head-tail prefix, and fails if the buffer is zeroed again.
 What did not move: the body is still one allocation of exactly `n`, the head-tail bytes still land at its front, and the leftover tail is still copied into the next request's carry.
