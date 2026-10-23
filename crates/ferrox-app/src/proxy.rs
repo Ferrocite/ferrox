@@ -17028,6 +17028,7 @@ mod tests {
             let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
             tls.handshake().expect("handshakes");
             tls.get_ref()
+                .get_ref()
                 .set_read_timeout(Some(Duration::from_millis(20)))
                 .expect("times out");
             let mut buf = [0u8; 4096];
