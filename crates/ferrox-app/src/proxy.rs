@@ -13812,7 +13812,6 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
             outbound.get("mux").and_then(|mux| mux.get("enabled")),
             Some(Json::Bool(true))
         );
-        // A carried TLS session is one flow here, so mux has no session to ride above it.
         let stored = xdrive_carried(outbound, &address);
         if security == "tls" && !quic_tls && stored.is_none() {
             let Some((carrier, host, tls)) = tls_carried_parts(outbound, &address) else {
