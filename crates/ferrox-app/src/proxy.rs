@@ -5857,6 +5857,12 @@ impl Drivable for ferrox_core::tls::RustlsProvider<KcpIo> {
     }
 }
 
+impl Drivable for ferrox_core::tls::ClientSession<Connection> {
+    fn transport(&self) -> Option<Connection> {
+        self.get_ref().try_clone().ok()
+    }
+}
+
 impl Drivable for ferrox_core::tls::RealityServer<Connection> {
     fn transport(&self) -> Option<Connection> {
         // The core accessor the inherent name would shadow: one explicit call, no recursion.
@@ -18923,6 +18929,8 @@ mod tests {
             pins: ferrox_core::foxy::pin::Pins::default(),
             cipher_suites: Vec::new(),
             insecure: false,
+            fingerprint: None,
+            websocket: false,
         });
         (cert, key, client)
     }
