@@ -3946,10 +3946,9 @@ mod tests {
                 let mut name = String::with_capacity(key.len() + 4);
                 for i in 0.. {
                     name.clear();
-                    let _ = write!(
-                        name,
-                        "{key}{}{i}",
-                        if placement == "header" { '-' } else { '_' }
+                    let _ = std::fmt::write(
+                        &mut name,
+                        format_args!("{key}{}{i}", if placement == "header" { '-' } else { '_' }),
                     );
                     let hit = if placement == "header" {
                         crate::proxy::header_value(head.as_bytes(), &name)
