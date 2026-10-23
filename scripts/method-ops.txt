@@ -77,8 +77,8 @@ trojan  proxy::tests::the_trojan_header_costs_two_reads_not_seven  proxy::decode
 vless  vless::tests::first_method_header_is_stable  ferrox_core::vless::VlessLink::encode_into
 vless  vless::tests::the_request_parse_probe_costs_the_read_and_nothing_else  ferrox_core::vless::decode_request
 vless  vless::tests::the_flow_decision_probe_costs_the_walk_and_nothing_else  ferrox_core::vless::flow_of
-xtls-vision  vision::tests::the_framing_switch_ends_the_staging  vision::Link::read_direct
-xtls-vision  vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else  vision::Link::unpad
+xtls-vision  vision::tests::the_framing_switch_ends_the_staging  vision::Link::read
+xtls-vision  vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else  vision::Link::pump
 xtls-vision  vless::tests::the_command_validator_probe_costs_the_match_and_nothing_else  ferrox_core::vless::VisionCommand::from_byte
 carrier-foxy  foxy::loopback::the_http2_carrier_writes_one_literal_header_block_and_relays  foxy::read_frame
 carrier-foxy  foxy::loopback::the_h3_downlink_hands_the_caller_the_frame_without_staging_it  foxy::H3::read
