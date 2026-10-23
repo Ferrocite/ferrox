@@ -32,8 +32,8 @@ const ABORT_READ: usize = 512 << 10;
 const PAYLOAD_WAIT: Duration = Duration::from_secs(45);
 /// The whole crawl, so one dead host cannot spend the live job's clock.
 const PAYLOAD_TOTAL: Duration = Duration::from_secs(600);
-/// The plane's counter is another writer's arithmetic: give it a turn before the mint that reads it.
-const SETTLE: Duration = Duration::from_secs(10);
+/// The plane's counter is another writer's arithmetic: a charge showed up thirteen seconds after its transfer, so the first look comes later than that and a figure is taken only when two looks agree.
+const SETTLE: Duration = Duration::from_secs(15);
 /// Mints spent waiting on one charge, so a counter that never settles still ends the test.
 const SETTLE_MINTS: usize = 12;
 /// How long the lane sits connected with no flow, to read what an idle account is charged.
