@@ -649,6 +649,13 @@ impl<S: Stream> Session<S> {
             if self.eof {
                 return Ok(0);
             }
+            if self.inbuf.is_empty() && buf.len() >= RECORD_READ {
+                let filled = self.read_direct(buf)?;
+                if filled > 0 {
+                    return Ok(filled);
+                }
+                continue;
+            }
             let filled = self.process_inbuf(buf)?;
             if filled > 0 {
                 return Ok(filled);
@@ -668,6 +675,86 @@ impl<S: Stream> Session<S> {
                 Err(error) if TlsError::is_timeout(&error) => return Err(TlsError::Timeout),
                 Err(error) => return Err(TlsError::from(error)),
             }
+        }
+    }
+
+    /// Reads one record into the window that will hold it: a TLS 1.3 application body is decrypted
+    /// where the transport wrote it, so the plaintext the caller gets costs no second buffer.
+    fn read_direct(&mut self, buf: &mut [u8]) -> Result<usize, TlsError> {
+        let mut header = [0u8; 5];
+        match exact(&mut self.io, &mut header) {
+            Ok(()) => {}
+            Err(TlsError::Closed) => {
+                self.eof = true;
+                return Ok(0);
+            }
+            Err(error) => return Err(error),
+        }
+        let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+        if len > MAX_RECORD {
+            return Err(TlsError::Other(
+                "record exceeds the maximum length".to_owned(),
+            ));
+        }
+        self.plain_at = 0;
+        self.plain_end = 0;
+        let direct = header[0] == APPLICATION
+            && self.version == Some(Version::Tls13)
+            && self.read_key.is_some()
+            && len <= buf.len();
+        let (kind, start, bytes) = if direct {
+            exact(&mut self.io, &mut buf[..len])?;
+            let Self {
+                read_key,
+                server12,
+                version,
+                ..
+            } = self;
+            decrypt(read_key, server12, *version, header, &mut buf[..len])?
+        } else {
+            if self.plain.len() < len {
+                self.plain.resize(len, 0);
+            }
+            exact(&mut self.io, &mut self.plain[..len])?;
+            let Self {
+                read_key,
+                server12,
+                version,
+                plain,
+                ..
+            } = self;
+            decrypt(read_key, server12, *version, header, &mut plain[..len])?
+        };
+        let body = if direct {
+            &buf[start..start + bytes]
+        } else {
+            &self.plain[start..start + bytes]
+        };
+        match kind {
+            APPLICATION => {
+                if direct {
+                    return Ok(bytes);
+                }
+                self.plain_at = start;
+                self.plain_end = start + bytes;
+                Ok(0)
+            }
+            HANDSHAKE => {
+                self.hs.extend_from_slice(body);
+                self.post_handshake()?;
+                Ok(0)
+            }
+            ALERT => {
+                let error = alert(body);
+                if error == TlsError::Closed {
+                    self.eof = true;
+                    Ok(0)
+                } else {
+                    Err(error)
+                }
+            }
+            CCS => Ok(0),
+            other => Err(unexpected(other)),
         }
     }
 
@@ -1636,6 +1723,59 @@ mod tests {
         assert_eq!((got, consumed), (6, wire.len()));
         assert_eq!(&window[..6], b"onetwo");
         assert_eq!(session.plain_buffer(), [], "a roomy window stages nothing");
+    }
+
+    /// A TLS 1.3 record read through `Read` lands in the caller's window: the bytes past the
+    /// plaintext are the record's own decrypted tail, not the untouched window a staged copy leaves.
+    #[test]
+    fn a_tls13_record_is_read_where_it_lands() {
+        let suite = Suite::Aes128GcmSha256;
+        let secret = [9u8; 32];
+        let mut sender = Direction::tls13(suite, &secret);
+        let mut wire = Vec::new();
+        record::seal13(&mut sender, APPLICATION, b"in place", &mut wire).expect("seals");
+        let body = wire.len() - 5;
+        let mut session = session_on(
+            Server(wire, 0),
+            Version::Tls13,
+            suite,
+            Direction::tls13(suite, &secret),
+            Direction::tls13(suite, &secret),
+        );
+        let mut window = vec![0xabu8; RECORD_READ];
+        let got = session.read(&mut window).expect("reads");
+        assert_eq!((got, &window[..got]), (8, b"in place".as_slice()));
+        assert!(
+            window[got..body].iter().any(|&byte| byte != 0xab),
+            "the record was decrypted in the window, not copied out of a staging buffer"
+        );
+        assert_eq!(
+            session.plain_buffer(),
+            [],
+            "a body that fits stages nothing"
+        );
+    }
+
+    /// A window narrower than the record takes what it holds and leaves the rest pending.
+    #[test]
+    fn a_narrow_window_drains_the_record_from_the_staging_buffer() {
+        let suite = Suite::Aes128GcmSha256;
+        let secret = [9u8; 32];
+        let mut sender = Direction::tls13(suite, &secret);
+        let mut wire = Vec::new();
+        record::seal13(&mut sender, APPLICATION, b"in place", &mut wire).expect("seals");
+        let mut session = session_on(
+            Server(wire, 0),
+            Version::Tls13,
+            suite,
+            Direction::tls13(suite, &secret),
+            Direction::tls13(suite, &secret),
+        );
+        let mut window = [0u8; 4];
+        assert_eq!(session.read(&mut window).expect("reads"), 4);
+        assert_eq!(&window, b"in p");
+        assert_eq!(session.read(&mut window).expect("reads"), 4);
+        assert_eq!(&window, b"lace");
     }
 
     #[test]
