@@ -394,9 +394,9 @@ def scenario_throughput_chart(scenario, cell, path, foot):
     present = [
         name for name in ENGINE_ORDER if run_values(cell, name, "throughput_mib_s")
     ]
-    fig, ax = plt.subplots(figsize=(max(6.0, 1.3 * max(1, len(present))), 4.2))
+    base, _, server = scenario.partition("--srv-")
     if not present:
-        base, _, server = scenario.partition("--srv-")
+        fig, ax = plt.subplots(figsize=(7.2, 2.4))
         ax.text(
             0.5,
             0.5,
@@ -410,12 +410,12 @@ def scenario_throughput_chart(scenario, cell, path, foot):
         ax.set_axis_off()
         ax.set_title(f"{base} on {server}: no throughput measured", fontsize=11)
         fig.text(0.5, 0.01, foot, ha="center", fontsize=7, color="#666666")
-        fig.tight_layout(rect=(0, 0.06, 1, 1))
+        fig.tight_layout(rect=(0, 0.10, 1, 1))
         fig.savefig(path, dpi=110, bbox_inches="tight")
         plt.close(fig)
         return path
-    values, lower, upper, edges, labels = [], [], [], [], []
     reference = benchstats.median(run_values(cell, "xray-core", "throughput_mib_s")) if run_values(cell, "xray-core", "throughput_mib_s") else None
+    values, lower, upper, edges, labels = [], [], [], [], []
     for engine in present:
         samples = run_values(cell, engine, "throughput_mib_s")
         median = benchstats.median(samples)
@@ -424,35 +424,40 @@ def scenario_throughput_chart(scenario, cell, path, foot):
         lower.append(median - interval[0] if interval else 0.0)
         upper.append(interval[1] - median if interval else 0.0)
         verdict = gated_verdict(cell, engine, "throughput")
-        edges.append({"better": "#2CA02C", "worse": "#D62728"}.get(verdict, "black"))
+        edges.append({"better": "#2CA02C", "worse": "#D62728"}.get(verdict, "#555555"))
         if engine == "ferrox" and reference:
-            labels.append(f"ferrox {median:.0f}\n{median / reference:.2f}x xray-core")
+            labels.append(f"{median:.0f} MiB/s  ({median / reference:.2f}x xray-core)")
         else:
-            labels.append(f"{engine} {median:.0f}")
-    ax.bar(
+            labels.append(f"{median:.0f} MiB/s")
+    height = max(2.4, 0.52 * len(present) + 1.3)
+    fig, ax = plt.subplots(figsize=(7.6, height))
+    ax.barh(
         present,
         values,
-        yerr=[lower, upper],
-        capsize=3,
+        xerr=[lower, upper],
+        height=0.62,
         color=[PALETTE.get(name, MISSING) for name in present],
         edgecolor=edges,
         linewidth=1.2,
-        error_kw={"elinewidth": 1},
+        error_kw={"elinewidth": 1, "capsize": 3},
     )
-    for tick, label in enumerate(labels):
-        ax.text(tick, values[tick], label, ha="center", va="bottom", fontsize=8)
-    base, _, server = scenario.partition("--srv-")
-    ax.set_ylabel("MiB/s", fontsize=9)
-    ax.set_title(
-        f"{base} on {server}: throughput (MiB/s, higher is better)", fontsize=11
-    )
-    ax.grid(axis="y", linestyle=":", alpha=0.6)
+    span = max((value + upper for value, upper in zip(values, upper)), default=1.0)
+    for tick, (value, up, label) in enumerate(zip(values, upper, labels)):
+        ax.text(value + up + span * 0.02, tick, label, va="center", fontsize=8)
+    ax.set_xlim(0, span * 1.42)
+    ax.invert_yaxis()
+    ax.set_xlabel("MiB/s", fontsize=9)
+    ax.set_title(f"{base} on {server}", fontsize=11, loc="left")
+    ax.grid(axis="x", linestyle=":", alpha=0.6)
+    ax.set_axisbelow(True)
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.tick_params(axis="y", length=0)
     fig.text(0.5, 0.01, foot, ha="center", fontsize=7, color="#666666")
-    fig.tight_layout(rect=(0, 0.08, 1, 1))
+    fig.tight_layout(rect=(0, 0.10, 1, 1))
     fig.savefig(path, dpi=110, bbox_inches="tight")
     plt.close(fig)
     return path
-
 
 def coverage_table(results):
     """Markdown coverage grid: pass, fail, or the reason for a gap."""
