@@ -124,7 +124,8 @@ impl Mont {
     /// step that first writes it, so a stale word above `n`'s width would survive as the answer.
     fn mul(&self, left: &[u64], right: &[u64], wide: &mut [u64], out: &mut [u64]) {
         let size = self.n.len();
-        wide[..2 * size + 1].fill(0);
+        let top = 2 * size + 1;
+        wide[..top].fill(0);
         for (word_index, word) in right.iter().enumerate() {
             let mut carry = 0u128;
             for limb in 0..size {
@@ -134,7 +135,7 @@ impl Mont {
                 wide[limb + word_index] = sum as u64;
                 carry = sum >> 64;
             }
-            shift(&mut wide[..2 * size + 1], word_index + size, carry);
+            shift(&mut wide[..top], word_index + size, carry);
         }
         for limb_index in 0..size {
             let factor = wide[limb_index].wrapping_mul(self.inv);
@@ -146,7 +147,7 @@ impl Mont {
                 wide[limb + limb_index] = sum as u64;
                 carry = sum >> 64;
             }
-            shift(&mut wide[..2 * size + 1], limb_index + size, carry);
+            shift(&mut wide[..top], limb_index + size, carry);
         }
         out.copy_from_slice(&wide[size..2 * size]);
         if wide[2 * size] != 0 || order(out, &self.n) != Ordering::Less {

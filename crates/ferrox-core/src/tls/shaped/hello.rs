@@ -310,8 +310,7 @@ impl Hello {
     }
 
     fn pad_entries(&self, entries: &mut Vec<Entry>) {
-        let unpadded = self
-            .fixed_len()
+        let unpadded = self.fixed_len()
             + 4
             + entries
                 .iter()
@@ -698,7 +697,11 @@ mod tests {
         let hello = Hello::canonical(profile, "example.com");
         let (msg, counts) = crate::alloc_count::measure(|| hello.encode(None));
         assert_eq!(hex(&msg), hex(&hello.msg), "the replayed bytes");
-        assert_eq!(msg.len(), msg.capacity(), "no slack after the exact reserve");
+        assert_eq!(
+            msg.len(),
+            msg.capacity(),
+            "no slack after the exact reserve"
+        );
         assert_eq!(counts.allocs, 18, "one buffer for the hello: {counts:?}");
     }
 }
