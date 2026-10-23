@@ -6565,6 +6565,9 @@ pub(crate) mod loopback {
         // The edge pushes the truncated frame and leaves: its goodbye is what the lane must read as a break.
         let edge = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
             let mut tls =
                 ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
             tls.handshake().expect("handshakes");
@@ -6577,6 +6580,10 @@ pub(crate) mod loopback {
             h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut opening);
             tls.write_all(&opening).expect("answers the status");
             tls.write_all(&push).expect("pushes the fragment");
+            tls.flush().expect("flushes the fragment");
+            // The client's own frames are read before the goodbye: a close with them unread is an RST, and an RST can take the truncated frame down with it.
+            let mut byte = [0u8; 1];
+            while matches!(tls.read(&mut byte), Ok(read) if read > 0) {}
         });
         let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
         let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
