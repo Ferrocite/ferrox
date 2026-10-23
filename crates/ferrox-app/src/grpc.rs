@@ -5,8 +5,8 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use crate::h2::{
     block_encode, frame_head, read_head, write_frame, Decoder, E_REFUSED, FRAME_CAP, F_ACK, F_END,
-    F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_MAX_FRAME, S_WINDOW, T_CONT, T_DATA,
-    T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW, WINDOW_MAX,
+    F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_MAX_CONCURRENT, S_MAX_FRAME, S_WINDOW,
+    T_CONT, T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW, WINDOW_MAX,
 };
 
 const MSG_CAP: usize = 16 * 1024 * 1024;
@@ -26,25 +26,29 @@ const CREDIT_PAIR: [u8; 26] = {
 };
 
 /// What this lane advertises before any body arrives: the stream window is the setting, and the connection window is the RFC's `65_535` plus this top-up, so both equal `WINDOW` and a peer can send a whole window before it needs a credit.
-const PREFACE: [u8; 28] = {
-    let mut out = [0u8; 28];
-    out[2] = 6;
+const PREFACE: [u8; 34] = {
+    let mut out = [0u8; 34];
+    out[2] = 12;
     out[3] = T_SETTINGS;
-    let setting = S_WINDOW.to_be_bytes();
-    out[9] = setting[0];
-    out[10] = setting[1];
+    let window_setting = S_WINDOW.to_be_bytes();
+    out[9] = window_setting[0];
+    out[10] = window_setting[1];
     let window = WINDOW.to_be_bytes();
     out[11] = window[0];
     out[12] = window[1];
     out[13] = window[2];
     out[14] = window[3];
-    out[17] = 4;
-    out[18] = T_WINDOW;
+    let concurrent = S_MAX_CONCURRENT.to_be_bytes();
+    out[15] = concurrent[0];
+    out[16] = concurrent[1];
+    out[20] = 1;
+    out[23] = 4;
+    out[24] = T_WINDOW;
     let top_up = (WINDOW - 65_535).to_be_bytes();
-    out[24] = top_up[0];
-    out[25] = top_up[1];
-    out[26] = top_up[2];
-    out[27] = top_up[3];
+    out[30] = top_up[0];
+    out[31] = top_up[1];
+    out[32] = top_up[2];
+    out[33] = top_up[3];
     out
 };
 
@@ -1036,6 +1040,11 @@ pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
         return None;
     }
     reader.set_handshake_budget(None);
+    // One stream per connection: GOAWAY after the first keeps that shape while telling the peer to
+    // open its next flow on a fresh connection instead of hanging it on this one.
+    let mut last = [0u8; 8];
+    last[..4].copy_from_slice(&reader.stream.to_be_bytes());
+    let _ = reader.emit(T_GOAWAY, 0, 0, &last);
     let writer = GrpcWriter {
         shared,
         stream: reader.stream,
@@ -1736,9 +1745,11 @@ mod tests {
     /// The witness for `carrier-grpc connection-window-credit-at-preface 4128769`: the grant a batched credit rests on, because a peer that started at the RFC's connection window would have to wait for the first credit to send a second window's worth.
     #[test]
     fn the_preface_grants_the_peer_a_whole_window() {
-        let mut settings = Vec::with_capacity(8);
+        let mut settings = Vec::with_capacity(14);
         settings.extend_from_slice(&S_WINDOW.to_be_bytes());
         settings.extend_from_slice(&WINDOW.to_be_bytes());
+        settings.extend_from_slice(&S_MAX_CONCURRENT.to_be_bytes());
+        settings.extend_from_slice(&1u32.to_be_bytes());
         let mut want = frame(T_SETTINGS, 0, 0, &settings);
         want.extend_from_slice(&frame(T_WINDOW, 0, 0, &(WINDOW - 65_535).to_be_bytes()));
 
@@ -1780,6 +1791,43 @@ mod tests {
             served.lock().unwrap()[0],
             want,
             "the server grants the same window before it reads a body"
+        );
+    }
+
+    /// The witness that the peer is asked for one stream per connection: its next flow opens a
+    /// fresh connection instead of hanging on this one.
+    #[test]
+    fn an_accepted_connection_asks_for_one_stream_at_a_time() {
+        let served = Arc::new(Mutex::new(Vec::new()));
+        let mut wire = MAGIC.to_vec();
+        wire.extend_from_slice(&frame(
+            T_HEADERS,
+            F_END_HEADERS,
+            1,
+            &block_encode(&[
+                (":method", "POST"),
+                (":path", "/x"),
+                ("content-type", "application/grpc"),
+            ]),
+        ));
+        let (reader, writer) =
+            accept_split(std::io::Cursor::new(wire), Calls(Arc::clone(&served)), "/x")
+                .expect("serves");
+        drop((reader, writer));
+        let text = served.lock().unwrap().concat();
+        let mut setting = S_MAX_CONCURRENT.to_be_bytes().to_vec();
+        setting.extend_from_slice(&1u32.to_be_bytes());
+        assert!(
+            text.windows(setting.len())
+                .any(|part| part == setting.as_slice()),
+            "the server asks the peer for one stream at a time"
+        );
+        let mut last = [0u8; 8];
+        last[..4].copy_from_slice(&1u32.to_be_bytes());
+        assert!(
+            text.windows(17)
+                .any(|part| part == frame(T_GOAWAY, 0, 0, &last)),
+            "the first stream is the last this connection will take"
         );
     }
 
