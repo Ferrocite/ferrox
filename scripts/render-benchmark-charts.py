@@ -729,6 +729,8 @@ def leg_tables(results):
         "| ---- | ---------- | ---------- | ------------------------ |",
     ]
     for base in sorted({key[0] for key in by_key if key[0]}):
+        if "setup" in base:
+            continue
         xray_server = by_key.get((base, "xray-core"))
         ferrox_server = by_key.get((base, "ferrox"))
         if not xray_server or not ferrox_server:
@@ -776,6 +778,8 @@ def throughput_table(results):
         "| -------- | ------ | " + " | ".join(["--------"] * len(engines)) + " | ------- |",
     ]
     for scenario in results.get("scenarios", []):
+        if "setup" in scenario.get("id", ""):
+            continue
         medians = scenario.get("medians", {})
         cells = [format_median(medians.get(engine, {}).get("throughput_mib_s")) for engine in engines]
         verdicts = [
@@ -799,6 +803,8 @@ def cost_table(results):
         "| -------- | ------ | ------ | --- | --- | ------- | ----- |",
     ]
     for scenario in results.get("scenarios", []):
+        if "setup" in scenario.get("id", ""):
+            continue
         base, server = scenario_name(scenario)
         for engine in engines:
             values = scenario.get("medians", {}).get(engine, {})
