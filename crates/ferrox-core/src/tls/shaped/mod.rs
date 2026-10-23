@@ -10,6 +10,7 @@ pub(crate) mod tls12;
 pub use client::Session;
 
 use crate::tls::TlsConfig;
+use std::borrow::Cow;
 use std::sync::OnceLock;
 
 /// The GREASE sentinel in a profile table: the builder draws a real value for it.
@@ -81,26 +82,27 @@ impl Fingerprint {
     /// The xray default, widened to the spellings sing-box and zeronet accept: an empty
     /// name is Chrome, and a name no table knows is refused here rather than dialed as a hello no browser sends.
     pub fn resolve(name: &str) -> Option<Self> {
-        let lower = name.trim().to_ascii_lowercase();
+        let lower = name.trim();
+        let lower = if lower.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            Cow::Owned(lower.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(lower)
+        };
         let folded = if lower.contains(['-', '.']) {
-            lower.replace(['-', '.'], "_")
+            Cow::Owned(lower.replace(['-', '.'], "_"))
         } else {
             lower
         };
         // uTLS writes `hello<brand>`, so a separator after `hello` is the same name.
         let name = match folded.strip_prefix("hello_") {
-            Some(rest) => {
-                let mut canonical = String::with_capacity(4 + rest.len());
-                canonical.push_str("hello");
-                canonical.push_str(rest);
-                canonical
-            }
+            Some(rest) => Cow::Owned(format!("hello{rest}")),
             None => folded,
         };
+        let name = name.as_ref();
         if name.is_empty()
             || name == "chrome"
             || matches!(
-                name.as_str(),
+                name,
                 "chrome_psk"
                     | "chrome_psk_shuffle"
                     | "chrome_padding_psk_shuffle"
@@ -110,10 +112,7 @@ impl Fingerprint {
         {
             return Some(Self::default());
         }
-        if matches!(
-            name.as_str(),
-            "unsafe" | "hellogolang" | "none" | "unshaped"
-        ) {
+        if matches!(name, "unsafe" | "hellogolang" | "none" | "unshaped") {
             return Some(Self::stock());
         }
         if name == "random" {
@@ -134,14 +133,14 @@ impl Fingerprint {
         if name == "hellorandomizednoalpn" {
             return Some(Self(Some(randomized(Some(false)))));
         }
-        if let Some(profile) = profiles::profile(&name) {
+        if let Some(profile) = profiles::profile(name) {
             return Some(Self(Some(profile)));
         }
         // A preset's name without uTLS's `hello` prefix is the same preset, not a new shape.
         if !name.starts_with("hello") {
             let mut canonical = String::with_capacity(5 + name.len());
             canonical.push_str("hello");
-            canonical.push_str(&name);
+            canonical.push_str(name);
             if let Some(profile) = profiles::profile(&canonical) {
                 return Some(Self(Some(profile)));
             }
@@ -498,5 +497,16 @@ mod tests {
         }
         assert_eq!(Fingerprint::resolve("not-a-browser"), None);
         assert_eq!(Fingerprint::resolve("hellofirefox_999"), None);
+    }
+
+    /// A name already in the table's spelling is read in place: normalization allocates only for
+    /// input that has to change.
+    #[test]
+    fn a_table_spelling_resolves_without_a_heap_buffer() {
+        for name in ["chrome", "firefox", "safari", "ios", "android", "360", "qq"] {
+            let (resolved, counts) = crate::alloc_count::measure(|| Fingerprint::resolve(name));
+            assert!(resolved.is_some(), "{name} names a preset");
+            assert_eq!(counts.allocs, 0, "{name} resolves in place: {counts:?}");
+        }
     }
 }

@@ -1079,6 +1079,32 @@ mod tests {
         let _ = tls.write_all(&buf);
     }
 
+    /// A stock rustls server over one accepted stream that echoes `rounds` four-byte frames.
+    fn echo_rounds(listener: &TcpListener, rounds: usize) {
+        let cert = rustls::pki_types::CertificateDer::from(ANCHOR.to_vec());
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(ANCHOR_KEY.to_vec()),
+        );
+        let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .expect("server versions")
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .expect("server cert");
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let (mut stream, _) = listener.accept().expect("accepts");
+        let mut conn = rustls::ServerConnection::new(Arc::new(config)).expect("server session");
+        let mut tls = rustls::Stream::new(&mut conn, &mut stream);
+        for _ in 0..rounds {
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf)
+                .unwrap_or_else(|e| panic!("server read: {e:?}"));
+            tls.write_all(&buf).expect("writes");
+        }
+    }
+
     fn case(dial: impl FnOnce(TcpStream)) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
@@ -1202,30 +1228,7 @@ mod tests {
     fn a_shaped_record_relays_without_allocating_once_the_handshake_is_done() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
-        let server = thread::spawn(move || {
-            let cert = rustls::pki_types::CertificateDer::from(ANCHOR.to_vec());
-            let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
-                rustls::pki_types::PrivatePkcs8KeyDer::from(ANCHOR_KEY.to_vec()),
-            );
-            let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
-                rustls::crypto::ring::default_provider(),
-            ))
-            .with_safe_default_protocol_versions()
-            .expect("server versions")
-            .with_no_client_auth()
-            .with_single_cert(vec![cert], key)
-            .expect("server cert");
-            config.alpn_protocols = vec![b"http/1.1".to_vec()];
-            let (mut stream, _) = listener.accept().expect("accepts");
-            let mut conn = rustls::ServerConnection::new(Arc::new(config)).expect("server session");
-            let mut tls = rustls::Stream::new(&mut conn, &mut stream);
-            for _ in 0..3 {
-                let mut buf = [0u8; 4];
-                tls.read_exact(&mut buf)
-                    .unwrap_or_else(|e| panic!("server read: {e:?}"));
-                tls.write_all(&buf).expect("writes");
-            }
-        });
+        let server = thread::spawn(move || echo_rounds(&listener, 3));
         let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
         let mut cfg = client("tls.test", &[]);
         cfg.fingerprint = Some(crate::tls::Fingerprint::default());
@@ -1252,7 +1255,100 @@ mod tests {
         server.join().expect("joins");
     }
 
-    /// A TLS 1.2 server on a byte queue rather than a socket, so the client's
+    /// A carrier hands the session ciphertext and its own window: each record lands in that
+    /// window directly, its plaintext neither staged nor reallocated, however many relay.
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_carrier_record_lands_in_the_callers_window_without_a_stage() {
+        const WARM: usize = 8;
+        const MEASURED: usize = 8;
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || echo_rounds(&listener, WARM + MEASURED + 1));
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut cfg = client("tls.test", &[]);
+        cfg.fingerprint = Some(crate::tls::Fingerprint::default());
+        let crate::tls::ClientSession::Shaped(mut session) =
+            crate::tls::connect(&cfg, stream).expect("dials")
+        else {
+            panic!("a fingerprint dials the shaped session");
+        };
+        session.handshake().expect("handshakes");
+        let held = session.plain_buffer().to_vec();
+        let capacity = session.plain_capacity();
+        let mut sealed = Vec::new();
+        let mut scratch = [0u8; 1024];
+        let mut window = [0u8; 64];
+        let mut relay = |session: &mut crate::tls::shaped::Session<TcpStream>,
+                         sealed: &mut Vec<u8>| {
+            sealed.clear();
+            session.seal_into(b"ping", sealed).expect("seals");
+            session
+                .get_ref()
+                .write_all(sealed)
+                .expect("sends the record");
+            let mut got = 0;
+            while got < 4 {
+                let read = session.get_ref().read(&mut scratch).expect("reads");
+                assert!(read > 0, "the server answers every round");
+                let (plain, consumed) = session
+                    .open(&scratch[..read], &mut window[got..])
+                    .expect("opens");
+                assert_eq!(consumed, read, "a carrier chunk is consumed whole");
+                got += plain;
+            }
+            assert_eq!(&window[..4], b"ping", "the caller's window hears the frame");
+        };
+        for _ in 0..WARM {
+            relay(&mut session, &mut sealed);
+        }
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for _ in 0..MEASURED {
+                relay(&mut session, &mut sealed);
+            }
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "a carrier record takes no heap once its buffers are warm: {counts:?}"
+        );
+        assert_eq!(
+            session.plain_buffer(),
+            held.as_slice(),
+            "a carrier record with room in the window stages no plaintext"
+        );
+        assert_eq!(
+            session.plain_capacity(),
+            capacity,
+            "the plaintext buffer does not grow with the relay"
+        );
+        sealed.clear();
+        session.seal_into(b"ping", &mut sealed).expect("seals");
+        session
+            .get_ref()
+            .write_all(&sealed)
+            .expect("sends the record");
+        let read = session.get_ref().read(&mut scratch).expect("reads");
+        let (first, consumed) = session
+            .open(&scratch[..read], &mut window[..2])
+            .expect("opens");
+        assert_eq!(
+            (first, consumed),
+            (2, read),
+            "a window smaller than the record holds the rest"
+        );
+        let (second, consumed) = session.open(&[], &mut window[2..]).expect("opens");
+        assert_eq!(
+            (second, consumed),
+            (2, 0),
+            "the held half follows before any more ciphertext"
+        );
+        assert_eq!(&window[..4], b"ping", "the frame keeps its order");
+        server.join().expect("joins");
+    }
+
     /// extended-master-secret transcript is hashed by an independent side: it appends the
     /// `ClientKeyExchange` before it hashes, and refuses a `Finished` that did not.
     struct Tls12Server {
@@ -1327,22 +1423,26 @@ mod tests {
             match kind {
                 CCS => {}
                 HANDSHAKE if self.read_dir.is_some() => {
-                    let len =
+                    let (start, len) =
                         record::open12(self.read_dir.as_mut().expect("read keys"), kind, &mut body)
                             .expect("client record opens");
-                    self.handshake(&body[..len]);
+                    self.handshake(&body[start..start + len]);
                 }
                 HANDSHAKE => self.handshake(&body),
                 APPLICATION => {
-                    let len =
+                    let (start, len) =
                         record::open12(self.read_dir.as_mut().expect("read keys"), kind, &mut body)
                             .expect("application record opens");
-                    assert_eq!(&body[..len], b"ping", "the client's frame opens whole");
+                    assert_eq!(
+                        &body[start..start + len],
+                        b"ping",
+                        "the client's frame opens whole"
+                    );
                     let mut out = Vec::new();
                     record::seal12(
                         self.write_dir.as_mut().expect("write keys"),
                         APPLICATION,
-                        &body[..len],
+                        &body[start..start + len],
                         &mut out,
                     )
                     .expect("seals");

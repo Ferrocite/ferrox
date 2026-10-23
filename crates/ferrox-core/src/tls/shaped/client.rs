@@ -50,10 +50,10 @@ pub struct Session<S: Stream> {
     done: bool,
     eof: bool,
     ccs_sent: bool,
-    record: Vec<u8>,
     hs: Vec<u8>,
     plain: Vec<u8>,
     plain_at: usize,
+    plain_end: usize,
     inbuf: Vec<u8>,
     in_at: usize,
     reply: Vec<u8>,
@@ -113,10 +113,10 @@ impl<S: Stream> Session<S> {
             done: false,
             eof: false,
             ccs_sent: false,
-            record: Vec::new(),
             hs: Vec::new(),
             plain: Vec::new(),
             plain_at: 0,
+            plain_end: 0,
             inbuf: Vec::new(),
             in_at: 0,
             reply: Vec::new(),
@@ -126,6 +126,18 @@ impl<S: Stream> Session<S> {
 
     pub(crate) fn get_ref(&self) -> &S {
         &self.io
+    }
+
+    /// The plaintext buffer, which a carrier record with room in the caller's window never stages into.
+    #[cfg(test)]
+    pub(crate) fn plain_buffer(&self) -> &[u8] {
+        &self.plain
+    }
+
+    /// The plaintext buffer's capacity, which a relayed record must not grow.
+    #[cfg(test)]
+    pub(crate) fn plain_capacity(&self) -> usize {
+        self.plain.capacity()
     }
 
     fn run(&mut self) -> Result<(), TlsError> {
@@ -382,7 +394,7 @@ impl<S: Stream> Session<S> {
         Ok(())
     }
 
-    /// Reads one record and leaves its plaintext at the front of `record`, returning the content type.
+    /// Reads one record's body into `plain`, decrypts it in place, and leaves its content pending there.
     fn read_record(&mut self) -> Result<u8, TlsError> {
         let mut header = [0u8; 5];
         exact(&mut self.io, &mut header)?;
@@ -392,19 +404,45 @@ impl<S: Stream> Session<S> {
                 "record exceeds the maximum length".to_owned(),
             ));
         }
-        self.record.clear();
-        self.record.resize(len, 0);
-        exact(&mut self.io, &mut self.record)?;
+        self.plain_at = 0;
+        self.plain_end = 0;
+        if self.plain.len() < len {
+            self.plain.resize(len, 0);
+        }
+        exact(&mut self.io, &mut self.plain[..len])?;
         let Self {
             read_key,
             server12,
             version,
-            record,
+            plain,
             ..
         } = self;
-        let (kind, plain) = decrypt(read_key, server12, *version, header, record)?;
-        record.truncate(plain);
+        let (kind, start, bytes) =
+            decrypt(read_key, server12, *version, header, &mut plain[..len])?;
+        self.plain_at = start;
+        self.plain_end = start + bytes;
         Ok(kind)
+    }
+
+    /// The pending plaintext, which every record and carrier chunk leaves in `plain`.
+    fn pending(&self) -> &[u8] {
+        &self.plain[self.plain_at..self.plain_end]
+    }
+
+    fn take_pending(&mut self) {
+        self.plain_at = 0;
+        self.plain_end = 0;
+    }
+
+    /// Copies pending plaintext into `buf` and moves the cursor, reclaiming the buffer when drained.
+    fn deliver(&mut self, buf: &mut [u8]) -> usize {
+        let n = (self.plain_end - self.plain_at).min(buf.len());
+        buf[..n].copy_from_slice(&self.plain[self.plain_at..self.plain_at + n]);
+        self.plain_at += n;
+        if self.plain_at == self.plain_end {
+            self.take_pending();
+        }
+        n
     }
 
     fn next_handshake(&mut self) -> Result<Vec<u8>, TlsError> {
@@ -419,9 +457,13 @@ impl<S: Stream> Session<S> {
                 }
             }
             match self.read_record()? {
-                HANDSHAKE => self.hs.extend_from_slice(&self.record),
+                HANDSHAKE => {
+                    let (at, end) = (self.plain_at, self.plain_end);
+                    self.hs.extend_from_slice(&self.plain[at..end]);
+                    self.take_pending();
+                }
                 CCS => {}
-                ALERT => return Err(alert(&self.record)),
+                ALERT => return Err(alert(self.pending())),
                 other => return Err(unexpected(other)),
             }
         }
@@ -489,17 +531,11 @@ impl<S: Stream> Session<S> {
         verify_signature(leaf, scheme, &content, signature)
     }
 
-    fn alert_error(&self) -> TlsError {
-        alert(&self.record)
-    }
-
     fn pump(&mut self) -> Result<(), TlsError> {
         loop {
-            if self.plain_at < self.plain.len() {
+            if self.plain_at < self.plain_end {
                 return Ok(());
             }
-            self.plain.clear();
-            self.plain_at = 0;
             let kind = match self.read_record() {
                 Ok(kind) => kind,
                 Err(TlsError::Closed) => {
@@ -509,23 +545,23 @@ impl<S: Stream> Session<S> {
                 Err(error) => return Err(error),
             };
             match kind {
-                APPLICATION => {
-                    self.plain.clear();
-                    self.plain.extend_from_slice(&self.record);
-                    return Ok(());
-                }
+                APPLICATION => return Ok(()),
                 HANDSHAKE => {
-                    self.hs.extend_from_slice(&self.record);
+                    let (at, end) = (self.plain_at, self.plain_end);
+                    self.hs.extend_from_slice(&self.plain[at..end]);
+                    self.take_pending();
                     self.post_handshake()?;
                 }
                 ALERT => {
-                    if self.alert_error() == TlsError::Closed {
+                    let error = alert(self.pending());
+                    self.take_pending();
+                    if error == TlsError::Closed {
                         self.eof = true;
                         return Ok(());
                     }
-                    return Err(self.alert_error());
+                    return Err(error);
                 }
-                CCS => {}
+                CCS => self.take_pending(),
                 other => return Err(unexpected(other)),
             }
         }
@@ -573,19 +609,18 @@ impl<S: Stream> Session<S> {
         Ok(())
     }
 
-    fn process_inbuf(&mut self) -> Result<(), TlsError> {
+    /// Decrypts every whole record in `inbuf`, copying application data straight into `buf` and
+    /// staging only what does not fit, and returns the bytes delivered.
+    fn process_inbuf(&mut self, buf: &mut [u8]) -> Result<usize, TlsError> {
+        let mut filled = 0usize;
         loop {
             let at = self.in_at;
             if self.inbuf.len() - at < 5 {
                 break;
             }
-            let header = [
-                self.inbuf[at],
-                self.inbuf[at + 1],
-                self.inbuf[at + 2],
-                self.inbuf[at + 3],
-                self.inbuf[at + 4],
-            ];
+            let header: [u8; 5] = self.inbuf[at..at + 5]
+                .try_into()
+                .expect("five-byte record header");
             let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
             if len > MAX_RECORD {
                 return Err(TlsError::Other(
@@ -603,16 +638,34 @@ impl<S: Stream> Session<S> {
                 version,
                 ..
             } = self;
-            let (kind, plain) = decrypt(
+            let (kind, start, bytes) = decrypt(
                 read_key,
                 server12,
                 *version,
                 header,
                 &mut inbuf[at + 5..at + 5 + len],
             )?;
-            let plain = &inbuf[at + 5..at + 5 + plain];
+            let plain = &inbuf[at + 5 + start..at + 5 + start + bytes];
             match kind {
-                APPLICATION => self.plain.extend_from_slice(plain),
+                APPLICATION => {
+                    let room = buf.len() - filled;
+                    let take = plain.len().min(room);
+                    buf[filled..filled + take].copy_from_slice(&plain[..take]);
+                    filled += take;
+                    if take < plain.len() {
+                        if self.plain_at == self.plain_end {
+                            self.plain_at = 0;
+                            self.plain_end = 0;
+                        }
+                        let begin = self.plain_end;
+                        let end = begin + (plain.len() - take);
+                        if self.plain.len() < end {
+                            self.plain.resize(end, 0);
+                        }
+                        self.plain[begin..end].copy_from_slice(&plain[take..]);
+                        self.plain_end = end;
+                    }
+                }
                 HANDSHAKE => {
                     self.hs.extend_from_slice(plain);
                     self.post_handshake()?;
@@ -628,11 +681,14 @@ impl<S: Stream> Session<S> {
                 other => return Err(unexpected(other)),
             }
         }
-        if self.in_at > 0 {
+        if self.in_at == self.inbuf.len() {
+            self.inbuf.clear();
+            self.in_at = 0;
+        } else if self.in_at > 0 {
             self.inbuf.drain(..self.in_at);
             self.in_at = 0;
         }
-        Ok(())
+        Ok(filled)
     }
 
     fn seal_parts(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> Result<(), TlsError> {
@@ -724,23 +780,15 @@ impl<S: Stream> TlsProvider for Session<S> {
         if !self.done {
             return Err(std::io::Error::other("shaped: handshake incomplete"));
         }
-        if self.plain_at < self.plain.len() {
-            let avail = self.plain.len() - self.plain_at;
-            let n = avail.min(buf.len());
-            buf[..n].copy_from_slice(&self.plain[self.plain_at..self.plain_at + n]);
-            self.plain_at += n;
-            return Ok((n, 0));
+        if self.plain_at < self.plain_end {
+            return Ok((self.deliver(buf), 0));
         }
         if ciphertext.is_empty() {
             return Ok((0, 0));
         }
         self.inbuf.extend_from_slice(ciphertext);
-        self.process_inbuf().map_err(std::io::Error::other)?;
-        let avail = self.plain.len() - self.plain_at;
-        let n = avail.min(buf.len());
-        buf[..n].copy_from_slice(&self.plain[self.plain_at..self.plain_at + n]);
-        self.plain_at += n;
-        Ok((n, ciphertext.len()))
+        let filled = self.process_inbuf(buf).map_err(std::io::Error::other)?;
+        Ok((filled, ciphertext.len()))
     }
 
     fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
@@ -790,16 +838,10 @@ impl<S: Stream> Read for Session<S> {
             self.run().map_err(std::io::Error::other)?;
         }
         self.flush_reply()?;
-        if self.plain_at >= self.plain.len() {
+        if self.plain_at >= self.plain_end {
             self.pump().map_err(std::io::Error::other)?;
         }
-        if self.plain_at >= self.plain.len() {
-            return Ok(0);
-        }
-        let n = (self.plain.len() - self.plain_at).min(buf.len());
-        buf[..n].copy_from_slice(&self.plain[self.plain_at..self.plain_at + n]);
-        self.plain_at += n;
-        Ok(n)
+        Ok(self.deliver(buf))
     }
 }
 
@@ -1033,35 +1075,36 @@ fn unexpected(kind: u8) -> TlsError {
     TlsError::Other(format!("unexpected handshake message {kind}"))
 }
 
-/// Opens one record in place and returns its content type and the plaintext length at the front.
+/// Opens one record in place and returns its content type with the plaintext range inside `body`.
 fn decrypt(
     read_key: &mut Option<Direction>,
     server12: &mut Option<Direction>,
     version: Option<Version>,
     header: [u8; 5],
     body: &mut [u8],
-) -> Result<(u8, usize), TlsError> {
+) -> Result<(u8, usize, usize), TlsError> {
     if header[0] == CCS {
         if version == Some(Version::Tls12) {
             if let Some(keys) = server12.take() {
                 *read_key = Some(keys);
             }
         }
-        return Ok((CCS, 0));
+        return Ok((CCS, 0, 0));
     }
     let Some(keys) = read_key.as_mut() else {
-        return Ok((header[0], body.len()));
+        return Ok((header[0], 0, body.len()));
     };
     if version != Some(Version::Tls13) {
-        return record::open12(keys, header[0], body).map(|plain| (header[0], plain));
+        return record::open12(keys, header[0], body)
+            .map(|(start, bytes)| (header[0], start, bytes));
     }
     if header[0] == ALERT {
-        return Ok((ALERT, body.len()));
+        return Ok((ALERT, 0, body.len()));
     }
     if header[0] != APPLICATION {
         return Err(unexpected(header[0]));
     }
-    record::open13(keys, header, body)
+    record::open13(keys, header, body).map(|(kind, bytes)| (kind, 0, bytes))
 }
 
 /// Fills `buf` from the transport, but a poll-quantum expiry is the caller's timeout and

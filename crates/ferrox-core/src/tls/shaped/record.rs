@@ -281,9 +281,13 @@ pub(crate) fn seal12_parts(
     keys.seal(&aad, at + 5 + explicit, out)
 }
 
-/// Opens one TLS 1.2 AEAD record body, appending the plaintext to `out`.
-/// Decrypts in place and returns the plaintext length, leaving the plaintext at the front.
-pub(crate) fn open12(keys: &mut Direction, kind: u8, body: &mut [u8]) -> Result<usize, TlsError> {
+/// Opens one TLS 1.2 AEAD record body in place and returns the plaintext's offset and length:
+/// a GCM record leaves its explicit nonce in front rather than moving the plaintext over it.
+pub(crate) fn open12(
+    keys: &mut Direction,
+    kind: u8,
+    body: &mut [u8],
+) -> Result<(usize, usize), TlsError> {
     let seq = keys.seq.to_be_bytes();
     let explicit = if keys.gcm { 8 } else { 0 };
     if body.len() < explicit + 16 {
@@ -294,14 +298,36 @@ pub(crate) fn open12(keys: &mut Direction, kind: u8, body: &mut [u8]) -> Result<
     aad[8] = kind;
     aad[9..11].copy_from_slice(&[0x03, 0x03]);
     aad[11..].copy_from_slice(&((body.len() - explicit - 16) as u16).to_be_bytes());
-    let len = if keys.gcm {
+    let (start, len) = if keys.gcm {
         let nonce: [u8; 8] = body[..8].try_into().expect("eight-byte explicit nonce");
-        let len = keys.open_explicit(&aad, nonce, &mut body[8..])?.len();
-        // The explicit nonce sat ahead of the plaintext; close that gap in the same buffer.
-        body.copy_within(8..8 + len, 0);
-        len
+        (8, keys.open_explicit(&aad, nonce, &mut body[8..])?.len())
     } else {
-        keys.open(&aad, &mut body[..])?.len()
+        (0, keys.open(&aad, &mut body[..])?.len())
     };
-    Ok(len)
+    Ok((start, len))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tls12_gcm_record_opens_behind_its_explicit_nonce() {
+        let suite = Suite::EcdheAes128GcmSha256;
+        let (key, iv) = ([7u8; 16], [9u8; 4]);
+        let mut sender = Direction::tls12(suite, &key, &iv);
+        let mut receiver = Direction::tls12(suite, &key, &iv);
+        let mut wire = Vec::new();
+        seal12(&mut sender, 23, b"ping", &mut wire).expect("seals");
+        let (header, body) = wire.split_at_mut(5);
+        assert_eq!(&body[..8], &[0u8; 8], "the explicit nonce leads the body");
+        let (start, len) = open12(&mut receiver, header[0], body).expect("opens");
+        assert_eq!(
+            (start, len),
+            (8, 4),
+            "the plaintext stays where the nonce left it"
+        );
+        assert_eq!(&body[..8], &[0u8; 8], "the nonce is not written over");
+        assert_eq!(&body[start..start + len], b"ping");
+    }
 }

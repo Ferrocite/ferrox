@@ -27,6 +27,10 @@ graph TD
 | shaped-dials-that-complete-a-tls13-handshake | 1 | ferrox-core-tls::rustls_backend::tests::a_shaped_chrome_handshake_reaches_a_stock_server |
 | shaped-dials-that-complete-a-tls12-handshake | 1 | ferrox-core-tls::rustls_backend::tests::a_shaped_tls12_handshake_hashes_its_client_key_exchange |
 | relayed-records-that-allocate-once-warm | 0 | ferrox-core-tls::rustls_backend::tests::a_shaped_record_relays_without_allocating_once_the_handshake_is_done |
+| carrier-records-that-allocate-once-warm | 0 | ferrox-core-tls::rustls_backend::tests::a_carrier_record_lands_in_the_callers_window_without_a_stage |
+| carrier-records-staged-into-a-fitting-window | 0 | ferrox-core-tls::rustls_backend::tests::a_carrier_record_lands_in_the_callers_window_without_a_stage |
+| tls12-gcm-records-that-shift-their-plaintext | 0 | ferrox-core-tls::shaped::record::tests::a_tls12_gcm_record_opens_behind_its_explicit_nonce |
+| table-spelling-resolutions-that-allocate | 0 | ferrox-core-tls::shaped::tests::a_table_spelling_resolves_without_a_heap_buffer |
 <!-- counts:end -->
 
 The 46 cases are the 28 presets plus the 18 xray names that alias onto them, so the alias table is gated by the same bytes it resolves to rather than asserted. `scripts/utls-oracle` zeroes the hello-phase entropy (random, session id, both 32-byte reads and the 10 GREASE bytes), erases the key-share, ECH-payload and key material after the fact, and prints the remaining body; both seeds are fixed, so the golden is stable.
@@ -42,14 +46,17 @@ The 46 cases are the 28 presets plus the 18 xray names that alias onto them, so 
 
 ## Time
 
-**Not measured yet.** No matrix cell carries a fingerprint: `vless-tls-raw-*` measures the stock rustls client, and the shaped path is gated for completion by the two loopback handshakes above, not for rate. Durations come only from CI runners, and no `bench.yml`, `parity.yml` or `benchmark-matrix.yml` artefact for this path has been read.
+**Not measured yet.** No matrix cell carries a fingerprint: `vless-tls-raw-*` measures the stock rustls client, and the shaped path is gated for completion by the two loopback handshakes above, not for rate. The counts block gates the operations removed — a warm relayed record takes no heap, a carrier record stages no plaintext, and a TLS 1.2 GCM record moves none — but a copy count is not a duration, and no bench, parity or matrix artefact for this path has been read. Durations come only from CI runners.
 
 ## What we removed
 
 - **The extension object graph.** uTLS models a hello as a list of extension interfaces, each marshalling itself and each holding its own state. Here a preset is plain data — `Profile`, `Ext`, `Body` — and `Hello::encode_with` walks it in one pass into a single message buffer. There is no trait object per extension and no dynamic dispatch in the build.
 - **rustls's handshake on a shaped dial.** `crate::tls::connect` routes a config whose fingerprint resolves to a preset to `shaped::Session`, which owns the record layer, the transcript and the key schedule. rustls is still used, but only its certificate verifier: the shaped dial never constructs a `rustls::ClientConnection`.
 - **A second copy of the cipher table.** The shaped record layer accepts exactly the suites the presets advertise (TLS 1.3's trio and the ECDHE-AEAD TLS 1.2 six), keyed by `Suite::from_id`, so a negotiated suite is looked up once instead of being matched again per record.
-- **The per-record heap.** A record is opened where it arrived, `inbuf` on the carrier path and `record` on the pulled one, and the session's buffers keep their capacity, so a relayed record allocates nothing once warm; a write is sealed into one reused buffer, and a single-part write skips the staged segment list.
+- **The per-record heap.** A record is read into `plain` on the pulled path and decrypted where it lies, a carrier record is decrypted in `inbuf` and copied straight into the caller's window, and the session's buffers keep their capacity, so a relayed record allocates nothing once warm; a write is sealed into one reused buffer, and a single-part write skips the staged segment list. The staging buffer `plain` holds only what a window too small for one record cannot take, so a normal carrier relay never writes it.
+- **The record header's slot.** `read_record` used to lay the five header bytes ahead of the body in the same buffer, then decrypt from offset five. The header is passed to the decryptor by value and never needed after, so the body fills the buffer from offset zero: one fewer five-byte copy per record and five fewer bytes of high-water.
+- **The TLS 1.2 GCM shift.** A GCM record's explicit nonce leads the body, and the plaintext used to be moved eight bytes down over it. `open12` returns the plaintext's offset instead, so the nonce stays where it arrived and the plaintext is never moved; the record test asserts the plaintext opens at offset eight with the nonce bytes intact.
+- **The normalization copy.** A fingerprint name already written the way the preset table spells it is borrowed and looked up in place; only input that has to change (case, a `-`/`.` separator, a `hello_` prefix) is normalized into a new string. The test gates zero allocations for the seven table spellings.
 
 ## The parts that are not byte-identical, named
 
