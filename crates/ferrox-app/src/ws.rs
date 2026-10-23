@@ -329,9 +329,7 @@ impl<R: Read> WsReader<R> {
     /// Parse frames until a message ends: control frames answered on the spot, data unmasked where they lie.
     fn message(&mut self) -> bool {
         let mut open = false;
-        // Where the message being assembled starts, and where its next fragment's bytes belong:
-        // a continuation frame carries its own head, so its payload moves over it and the
-        // delivered span is the message's own bytes, not the wire's.
+        // Assembly coordinates: every fragment's bytes land at `filled`, so the span delivered is the message's.
         let mut whole = 0usize;
         let mut filled = 0usize;
         loop {
