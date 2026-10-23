@@ -1015,23 +1015,26 @@ fn huffman_len(s: &[u8]) -> usize {
 
 fn generate_tokenish(target_huffman_bytes: usize) -> String {
     let n = (target_huffman_bytes * 10).div_ceil(8);
-    let mut raw = vec![0u8; n.max(1)];
-    getrandom::fill(&mut raw).unwrap_or_default();
+    // The draw fills every byte, so the zero pass in front of it was work thrown away; a draw that fails still leaves the pad it always did.
+    let mut raw = crate::proxy::unfilled(n.max(1));
+    if getrandom::fill(&mut raw).is_err() {
+        raw.fill(0);
+    }
     tokenish_adjust(&raw, target_huffman_bytes)
 }
 
 /// Maps the random bytes into base62 and walks the padding to its target, but carries the code-length sum instead of re-scanning the whole string on every one of the 150 adjust steps: only the end the loop touches moves the sum.
 fn tokenish_adjust(raw: &[u8], target_huffman_bytes: usize) -> String {
     const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    let mut s: String = raw
-        .iter()
-        .map(|&b| BASE62[(b as usize) % 62] as char)
-        .collect();
+    const ADJUST_STEPS: usize = 150;
+    // One buffer for the pad and the steps it can grow by, so no push past the decoded length moves it.
+    let mut s = String::with_capacity(raw.len() + ADJUST_STEPS);
+    s.extend(raw.iter().map(|&b| BASE62[(b as usize) % 62] as char));
     let mut bits: usize = s
         .bytes()
         .map(|b| usize::from(HUFFMAN_CODE_LEN[usize::from(b)]))
         .sum();
-    for iter in 0..150 {
+    for iter in 0..ADJUST_STEPS {
         let cur = bits.div_ceil(8);
         if cur.abs_diff(target_huffman_bytes) <= 2 {
             return s;
@@ -2394,6 +2397,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The pad's buffer is opened once and drawn without a zero pass: `collect` reserved only the
+    /// decoded length, so the first adjust push moved the whole pad, and the draw overwrites every
+    /// byte of a buffer that was zeroed first.
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn a_tokenish_pad_is_one_buffer_drawn_without_zeroing() {
+        let raw = [0x5au8; 900];
+        let (pad, counts) = ferrox_core::alloc_count::measure(|| tokenish_adjust(&raw, 700));
+        assert_eq!(
+            counts.allocs, 1,
+            "the pad string and nothing else: {counts:?}"
+        );
+        assert_eq!(pad, tokenish_recompute(&raw, 700), "the same pad");
+        let (drawn, counts) = ferrox_core::alloc_count::measure(|| generate_tokenish(700));
+        assert!(!drawn.is_empty());
+        assert_eq!(counts.zeroed, 0, "the draw fills every byte: {counts:?}");
     }
 
     /// The same drain over a real socket asserts the *bytes* and nothing else: a socket may segment, so its read count moves with the scheduler and cannot gate a number — that claim belongs to `a_chunk_costs_two_reads_not_three`, on an in-memory stream that answers the whole buffer. The peer paces its sends 2048 bytes at a time, which segments the kernel's delivery the way load alone used to do at random.
