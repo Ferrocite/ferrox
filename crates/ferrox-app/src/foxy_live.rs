@@ -21,6 +21,21 @@ const PROBE_PATH: &str = "/";
 const TRACE_HOST: &str = "www.cloudflare.com";
 const TRACE_PATH: &str = "/cdn-cgi/trace";
 const READ: Duration = Duration::from_secs(20);
+/// Plain-HTTP payload hosts, so the bytes counted are the tunnel's and not a TLS handshake's.
+const PAYLOAD_HOSTS: [(&str, &str); 3] = [
+    ("speedtest.tele2.net", "/10MB.zip"),
+    ("proof.ovh.net", "/files/10Mb.dat"),
+    ("ipv4.download.thinkbroadband.com", "/5MB.zip"),
+];
+/// Enough payload that one handshake is noise and a doubled charge cannot hide in it.
+const PAYLOAD_READ: usize = 8 << 20;
+/// The smallest answer worth measuring: a redirect page is not a payload.
+const PAYLOAD_FLOOR: usize = 1 << 20;
+const PAYLOAD_WAIT: Duration = Duration::from_secs(45);
+/// The whole crawl across carriers and hosts, so one dead host cannot spend the live job's clock.
+const PAYLOAD_TOTAL: Duration = Duration::from_secs(300);
+/// The plane's counter is another writer's arithmetic: give it a turn before the mint that reads it.
+const SETTLE: Duration = Duration::from_secs(10);
 
 fn account() -> Option<Account> {
     let roots = crate::quic::system_roots();
@@ -68,13 +83,12 @@ fn opened<T: Read + Write>(tunnel: &mut T, country: &str) -> Option<String> {
     (seen.eq_ignore_ascii_case(country) || seen == "T1" || country == "REC").then_some(seen)
 }
 
-/// One carrier, one edge: CONNECT, a request through it, the exit country — refused edge vs unreachable network.
-fn try_carrier(
-    carrier: Carrier,
+/// One carrier on one edge, as the lane would dial it.
+fn dial(
     edge: &ferrox_core::foxy::Candidate,
+    carrier: Carrier,
     pass: &Pass,
-    country: &str,
-) -> Result<String, String> {
+) -> (FoxyDial, crate::quic::QuicDial) {
     let dial = FoxyDial {
         host: edge.host.clone(),
         port: edge.port,
@@ -93,6 +107,17 @@ fn try_carrier(
         upstream: None,
         roots: None,
     };
+    (dial, quic_dial)
+}
+
+/// One carrier, one edge: CONNECT, a request through it, the exit country — refused edge vs unreachable network.
+fn try_carrier(
+    carrier: Carrier,
+    edge: &ferrox_core::foxy::Candidate,
+    pass: &Pass,
+    country: &str,
+) -> Result<String, String> {
+    let (dial, quic_dial) = dial(edge, carrier, pass);
     let started = Instant::now();
     let quic = match carrier {
         Carrier::H3 => {
@@ -113,6 +138,123 @@ fn try_carrier(
         started.elapsed(),
         seen.unwrap_or_else(|| "unread".to_owned())
     ))
+}
+
+/// One request for a known payload, read back through the tunnel: what the exit carried, counted where it lands.
+fn carried(
+    carrier: Carrier,
+    edge: &ferrox_core::foxy::Candidate,
+    pass: &Pass,
+    host: &str,
+    path: &str,
+    want: usize,
+    until: Instant,
+) -> Result<usize, String> {
+    let (dial, quic_dial) = dial(edge, carrier, pass);
+    let quic = match carrier {
+        Carrier::H3 => {
+            crate::quic::pooled_stream_within(&quic_dial, crate::quic::HANDSHAKE_TIMEOUT)
+        }
+        _ => None,
+    };
+    let mut tunnel =
+        Tunnel::open(&dial, &format!("{host}:80"), quic).map_err(|failure| failure.to_string())?;
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: ferrox-live\r\nConnection: close\r\n\r\n"
+    );
+    tunnel
+        .write_all(request.as_bytes())
+        .map_err(|error| error.to_string())?;
+    tunnel.flush().map_err(|error| error.to_string())?;
+    let mut chunk = vec![0u8; 32 * 1024];
+    let mut got = 0usize;
+    while got < want && Instant::now() < until {
+        match tunnel.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => got += read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(got)
+}
+
+/// The plane charges what the exit carried: a mint before and after a known payload names the ratio.
+#[test]
+#[ignore = "needs a Firefox account and the network; run by foxy-live.yml"]
+fn the_allowance_charges_the_payload_the_tunnel_carried() {
+    let email = std::env::var("FOXY_EMAIL").unwrap_or_default();
+    let password = std::env::var("FOXY_PASS").unwrap_or_default();
+    let country = std::env::var("FOXY_COUNTRY").unwrap_or_else(|_| "US".to_owned());
+    assert!(
+        !email.is_empty(),
+        "FOXY_EMAIL is the account to sign in with"
+    );
+    assert!(!password.is_empty(), "FOXY_PASS is its password");
+
+    let Some(account) = account() else {
+        panic!("the account plane URLs are not the ones this tree knows");
+    };
+    account.sign_in(&email, &password).expect("signs in");
+    if account.needs_code() {
+        let code = std::env::var("FOXY_CODE").expect("FOXY_CODE is the emailed code");
+        account.verify_code(&code).expect("verifies");
+    }
+    account.renew().expect("mints a pass");
+    let before = account
+        .current()
+        .quota_remaining
+        .expect("the plane names an allowance; without one there is nothing to charge");
+    let pass = account.current();
+
+    let edges = crate::foxy_catalog::edges(crate::quic::system_roots());
+    let picked = ferrox_core::foxy::catalog::tier(&edges, &country, "", 3);
+    let edge = picked
+        .first()
+        .unwrap_or_else(|| panic!("the catalogue publishes no edge for {country}"));
+
+    let mut measured = None;
+    let total = Instant::now() + PAYLOAD_TOTAL;
+    'carrier: for carrier in crate::foxy::carrier("auto").order() {
+        for (host, path) in PAYLOAD_HOSTS {
+            if Instant::now() >= total {
+                break 'carrier;
+            }
+            let until = (Instant::now() + PAYLOAD_WAIT).min(total);
+            match carried(carrier, edge, &pass, host, path, PAYLOAD_READ, until) {
+                Ok(bytes) if bytes >= PAYLOAD_FLOOR => {
+                    println!("{carrier:?} carried {bytes} bytes from {host}{path}");
+                    measured = Some((carrier, host, bytes));
+                    break 'carrier;
+                }
+                Ok(bytes) => println!("{carrier:?} {host}{path}: {bytes} bytes is not a payload"),
+                Err(why) => println!("{carrier:?} {host}{path}: {why}"),
+            }
+        }
+    }
+    let (carrier, host, bytes) = measured.expect("no carrier carried a payload to measure");
+
+    std::thread::sleep(SETTLE);
+    account.renew().expect("mints a pass after the transfer");
+    let after = account
+        .current()
+        .quota_remaining
+        .expect("the plane names an allowance on every mint");
+    let charged = before.saturating_sub(after);
+    println!(
+        "allowance {before} -> {after}: {charged} bytes charged for {bytes} bytes carried through \
+         {carrier:?} from {host} ({:.3}x)",
+        charged as f64 / bytes as f64
+    );
+    // Framing and a retransmission are a tunnel's cost; a quarter of the payload more is the same bytes paid twice.
+    assert!(
+        charged <= bytes as u64 + bytes as u64 / 4 + (256 << 10),
+        "the allowance fell {charged} bytes for {bytes} carried: more than framing, so those bytes were paid for twice"
+    );
 }
 
 /// Every carrier in `auto`'s order on one pinned-country edge; all refused is a failure, not a green exit.
