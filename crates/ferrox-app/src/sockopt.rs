@@ -734,8 +734,11 @@ mod tests {
 
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
+        let (keep, held) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
-            let _ = listener.accept();
+            let (stream, _) = listener.accept().expect("accepts");
+            let _ = held.recv();
+            drop(stream);
         });
         let text = format!(
             r#"{{"tcpKeepAliveIdle":11,"tcpKeepAliveInterval":7,"customSockopt":[{{"system":"{}","network":"tcp","level":"{}","opt":"{}","type":"int","value":"1"}}]}}"#,
@@ -754,6 +757,7 @@ mod tests {
         assert_eq!(get_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE), 11);
         assert_eq!(get_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL), 7);
         assert_ne!(get_int(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY), 0);
+        keep.send(()).expect("releases the peer");
         worker.join().expect("accepts");
     }
 
