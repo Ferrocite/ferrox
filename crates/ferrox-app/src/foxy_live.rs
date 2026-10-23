@@ -185,6 +185,9 @@ fn carried(
             Err(error) => return Err(error.to_string()),
         }
     }
+    // The lane's own end of a flow, on every path: the client half ends, and a stream the edge was still filling is stopped rather than left open.
+    let _ = tunnel.finish();
+    tunnel.settle();
     Ok(got)
 }
 

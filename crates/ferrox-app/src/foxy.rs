@@ -1476,6 +1476,27 @@ impl Tls2 {
         inner.streams.remove(&self.stream);
     }
 
+    /// Resets a flow that ended before its stream did: an edge left unreset keeps fetching the response into a window nobody drains, charged to the account, and its stream entry would ride the session for the rest of the pool's life.
+    fn cancel(&mut self) {
+        let Ok(mut inner) = self.inner() else {
+            return;
+        };
+        if inner.gone {
+            return;
+        }
+        let mut reset = Vec::with_capacity(frames::H2_HEADER + 4);
+        h2_frame(
+            frames::RST_STREAM,
+            0,
+            self.stream,
+            &8u32.to_be_bytes(),
+            &mut reset,
+        );
+        let _ = inner.tls.write_all(&reset);
+        let _ = inner.tls.flush();
+        inner.streams.remove(&self.stream);
+    }
+
     /// Builds one IP packet into this stream's own scratch and writes it, under one lock: the scratch belongs to the stream, so a build and the write that empties it cannot be split by another flow's turn.
     fn write_ip(
         &mut self,
@@ -3456,22 +3477,34 @@ impl Tunnel {
     pub(crate) fn finish(&mut self) -> Result<(), Failure> {
         match self {
             Self::H2(lane) => lane.finish(),
-            Self::H1(_) | Self::H3(_) => Ok(()),
+            Self::H3(lane) => {
+                if lane.fin || lane.quic.fin() {
+                    Ok(())
+                } else {
+                    Err(Failure::Io)
+                }
+            }
+            Self::H1(_) => Ok(()),
         }
     }
 
-    /// Returns this flow's stream to the session and lets every other lane close: a flow whose stream did not end both ways is not a stream the session may carry again.
+    /// Returns this flow's stream to the session, or stops it: a flow whose stream did not end both ways is not a stream the session may carry again, and an edge still sending into it is charged for bytes nobody reads.
     pub(crate) fn settle(self) {
-        let Self::H2(mut lane) = self else {
-            return;
-        };
-        if !lane.reusable() {
-            return;
+        match self {
+            Self::H2(mut lane) => {
+                if !lane.reusable() {
+                    let _ = lane.flush_credit();
+                    lane.cancel();
+                    return;
+                }
+                if lane.flush_credit().is_err() {
+                    return;
+                }
+                lane.release();
+            }
+            Self::H3(lane) if !lane.closed && !lane.fin => lane.quic.cancel(),
+            Self::H3(_) | Self::H1(_) => {}
         }
-        if lane.flush_credit().is_err() {
-            return;
-        }
-        lane.release();
     }
 
     /// Bounds one blocking read on every carrier so a relay sharing one lane between its two directions stops holding its lock while idle: reads past the quantum answer `WouldBlock` and the relay retries instead of wedging.
@@ -5346,6 +5379,96 @@ pub(crate) mod loopback {
             refused,
             vec![(promised, 7)],
             "the push was not refused on the stream it promised, with `REFUSED_STREAM`"
+        );
+    }
+
+    /// An edge that answers the open with its status and a body it never ends, reporting every `RST_STREAM` the lane writes as `(stream, code)`.
+    fn abort_edge(
+        listener: Listener,
+        server: ferrox_core::tls::TlsServerConfig,
+        rst_tx: std::sync::mpsc::Sender<(u32, u32)>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
+            let mut tls =
+                ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut preface = vec![0u8; frames::PREFACE.len()];
+            if !read_exact_poll(&mut tls, &mut preface) {
+                return;
+            }
+            let mut opening = Vec::new();
+            h2_frame(frames::SETTINGS, 0x1, 0, &[], &mut opening);
+            h2_frame(frames::HEADERS, 0x4, 1, &[0x88], &mut opening);
+            opening.extend_from_slice(&data_frame(b"four"));
+            tls.write_all(&opening).expect("writes the script");
+            tls.flush().expect("flushes the script");
+            loop {
+                let mut header = [0u8; frames::H2_HEADER];
+                if !read_exact_poll(&mut tls, &mut header) {
+                    return;
+                }
+                let Some(frame) = frames::H2Frame::parse(&header) else {
+                    return;
+                };
+                let mut payload = vec![0u8; frame.length as usize];
+                if !read_exact_poll(&mut tls, &mut payload) {
+                    return;
+                }
+                if frame.kind == frames::RST_STREAM
+                    && rst_tx.send((frame.stream, frames::be32(&payload))).is_err()
+                {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// HTTP/2 8.1: a flow that stops before its stream ends is reset, because an edge left unreset keeps fetching the response into a window nobody drains, charged to the account.
+    #[test]
+    fn a_flow_abandoned_mid_response_resets_its_stream() {
+        let (roots, server) = minted(b"h2");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (rst_tx, rst_rx) = std::sync::mpsc::channel();
+        let _edge = abort_edge(listener, server, rst_tx);
+        let dial = dial_for(roots, port, Carrier::H2, foxy::pin::Pins::default());
+        let mut tunnel = Tunnel::open(&dial, "example.com:443", None).expect("opens");
+        let Tunnel::H2(lane) = &mut tunnel else {
+            panic!("an h2 lane");
+        };
+        lane.set_read_quantum(Duration::from_millis(20))
+            .expect("arms a quantum");
+        let mut buf = [0u8; 16];
+        let mut back = Vec::new();
+        for _ in 0..200 {
+            match lane.read(&mut buf) {
+                Ok(0) => break,
+                Ok(took) => {
+                    back.extend_from_slice(&buf[..took]);
+                    if back == b"four" {
+                        break;
+                    }
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => panic!("the lane said: {error}"),
+            }
+        }
+        assert_eq!(back, b"four", "the status body did not arrive");
+        tunnel.settle();
+        assert_eq!(
+            rst_rx.recv_timeout(Duration::from_secs(2)),
+            Ok((1, 8)),
+            "the abandoned flow left its stream open, so the edge keeps sending into it"
         );
     }
 

@@ -73,6 +73,32 @@ impl Drop for PooledStream {
     }
 }
 
+impl PooledStream {
+    /// Half-closes this stream: the peer reads what was sent, then the end. A FIN costs no flow-control credit, so one attempt is the whole wait.
+    pub(crate) fn fin(&self) -> bool {
+        let Ok(mut conn) = self.conn.lock() else {
+            return false;
+        };
+        let sent = conn.stream_send(self.id, &[], true).is_ok();
+        flush_egress(&mut conn, &self.sock);
+        sent
+    }
+
+    /// Stops this stream in both directions: an unreset flow keeps being filled into a window nobody drains, charged to the account.
+    pub(crate) fn cancel(&self) {
+        stop_stream(&self.conn, &self.sock, self.id);
+    }
+}
+
+/// Stops one stream in both directions: the connection itself is untouched and keeps carrying other flows.
+fn stop_stream(conn: &Mutex<quiche::Connection>, sock: &Datagram, id: u64) {
+    if let Ok(mut conn) = conn.lock() {
+        let _ = conn.stream_shutdown(id, quiche::Shutdown::Write, 0);
+        let _ = conn.stream_shutdown(id, quiche::Shutdown::Read, 0);
+        flush_egress(&mut conn, sock);
+    }
+}
+
 #[derive(Clone)]
 struct PooledConn {
     conn: Arc<Mutex<quiche::Connection>>,
@@ -2763,11 +2789,7 @@ impl QuicStream {
 
     /// Stop the stream in both directions; the connection itself is untouched.
     pub(crate) fn close(&self) {
-        if let Ok(mut conn) = self.conn.lock() {
-            let _ = conn.stream_shutdown(self.id, quiche::Shutdown::Write, 0);
-            let _ = conn.stream_shutdown(self.id, quiche::Shutdown::Read, 0);
-            flush_egress(&mut conn, &self.sock);
-        }
+        stop_stream(&self.conn, &self.sock, self.id);
     }
 }
 
