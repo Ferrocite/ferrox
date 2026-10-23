@@ -18,7 +18,7 @@ pub(crate) struct Hello {
     pub shares: Vec<Share>,
     profile: &'static Profile,
     grease: [u16; 5],
-    alpn: Option<Vec<Vec<u8>>>,
+    alpn: Option<&'static [&'static [u8]]>,
     sni: Option<String>,
     ech: Option<Vec<u8>>,
     offer: Option<EchOffer>,
@@ -252,7 +252,7 @@ impl Hello {
             shares,
             profile: self.profile,
             grease: self.grease,
-            alpn: self.alpn.clone(),
+            alpn: self.alpn,
             sni: self.sni.clone(),
             ech: self.ech.clone(),
             offer,
@@ -325,8 +325,8 @@ impl Hello {
     /// Whether the hello offered a protocol: a configured list or the preset's own table,
     /// checked where either lies so a server's pick costs no copy.
     pub(crate) fn offers_alpn(&self, pick: &[u8]) -> bool {
-        if let Some(list) = &self.alpn {
-            return list.iter().any(|proto| proto == pick);
+        if let Some(list) = self.alpn {
+            return list.iter().any(|proto| *proto == pick);
         }
         for ext in self.profile.exts {
             if let Body::Alpn(body) = &ext.body {
@@ -487,7 +487,7 @@ impl Hello {
         }
 
         // xray appends the forced ALPN after the preset's extensions, and patches it in place when the preset carries one.
-        if let Some(list) = &self.alpn {
+        if let Some(list) = self.alpn {
             if !entries.iter().any(|entry| entry.kind == ALPN) {
                 let source = Source::Alpn(list);
                 let len = self.width_of(&source, shares);
@@ -530,7 +530,7 @@ impl Hello {
             Body::Alpn(table) => (
                 ALPN,
                 false,
-                match &self.alpn {
+                match self.alpn {
                     Some(list) => Source::Alpn(list),
                     None => Source::Fixed(table),
                 },
@@ -652,7 +652,7 @@ enum Source<'a> {
     Groups(&'a [u16]),
     Sigalgs(&'a [u16]),
     Versions(&'a [u16]),
-    Alpn(&'a [Vec<u8>]),
+    Alpn(&'a [&'a [u8]]),
     Fixed(&'a [u8]),
     Shares,
     Cookie(&'a [u8]),
@@ -769,10 +769,10 @@ fn sni_name(name: &str) -> Option<&str> {
 }
 
 /// A protocol list as an ALPN body: the list's width, then each name behind its own length byte.
-fn alpn_body<W: Sink>(out: &mut W, list: &[Vec<u8>]) {
+fn alpn_body<W: Sink>(out: &mut W, list: &[&[u8]]) {
     let protocols: usize = list.iter().map(|proto| proto.len() + 1).sum();
     out.put(&(protocols as u16).to_be_bytes());
-    for proto in list {
+    for &proto in list {
         out.put(&[proto.len() as u8]);
         out.put(proto);
     }
@@ -805,15 +805,17 @@ fn alpn_has(body: &[u8], pick: &[u8]) -> bool {
 /// xray's rule for a WebSocket- or HTTPUpgrade-carried hello: force the outer
 /// ALPN to `http/1.1` unless the config named exactly `h2` then `http/1.1`.
 /// Every other carrier keeps the parrot's own ALPN list, as uTLS does.
-fn alpn_override(alpn: &[Vec<u8>], websocket: bool) -> Option<Vec<Vec<u8>>> {
+fn alpn_override(alpn: &[Vec<u8>], websocket: bool) -> Option<&'static [&'static [u8]]> {
+    const BOTH: [&[u8]; 2] = [b"h2", b"http/1.1"];
+    const HTTP11: [&[u8]; 1] = [b"http/1.1"];
     if !websocket {
         return None;
     }
-    let both = [b"h2".to_vec(), b"http/1.1".to_vec()];
-    if alpn == both {
-        Some(both.to_vec())
+    let both = alpn.len() == 2 && alpn[0].as_slice() == BOTH[0] && alpn[1].as_slice() == BOTH[1];
+    if both {
+        Some(&BOTH)
     } else {
-        Some(vec![b"http/1.1".to_vec()])
+        Some(&HTTP11)
     }
 }
 
@@ -1259,6 +1261,11 @@ mod tests {
         assert!(offered, "the carrier's forced list names the protocol");
         assert!(!dial.offers_alpn(b"h2"), "and not the one it replaced");
         assert_eq!(counts.allocs, 0, "the list is walked in place: {counts:?}");
+        let pair = [b"h2".to_vec(), b"http/1.1".to_vec()];
+        let (forced, counts) = crate::alloc_count::measure(|| alpn_override(&pair, true));
+        let forced = forced.expect("a websocket carrier forces a list");
+        assert_eq!(forced.len(), 2, "the caller's own pair is kept");
+        assert_eq!(counts.allocs, 0, "the forced list is a static: {counts:?}");
     }
 
     /// A dial's own hello — random draws, Chrome's shuffle, a carrier's forced ALPN and a retry's
