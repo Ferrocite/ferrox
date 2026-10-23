@@ -25,7 +25,7 @@ graph TD
 | oracle-cases-replayed-byte-identical | 46 | ferrox-core-tls::shaped::hello::tests::oracle_replay_matches_utls |
 | distinct-presets-behind-those-names | 28 | ferrox-core-tls::shaped::hello::tests::oracle_replay_matches_utls |
 | shaped-dials-that-complete-a-tls13-handshake | 1 | ferrox-core-tls::rustls_backend::tests::a_shaped_chrome_handshake_reaches_a_stock_server |
-| shaped-dials-that-complete-a-tls12-handshake | 1 | ferrox-core-tls::rustls_backend::tests::a_shaped_chrome_handshake_serves_a_tls12_only_server |
+| shaped-dials-that-complete-a-tls12-handshake | 1 | ferrox-core-tls::rustls_backend::tests::a_shaped_tls12_handshake_hashes_its_client_key_exchange |
 <!-- counts:end -->
 
 The 46 cases are the 28 presets plus the 18 xray names that alias onto them, so the alias table is gated by the same bytes it resolves to rather than asserted. `scripts/utls-oracle` zeroes the hello-phase entropy (random, session id, both 32-byte reads and the 10 GREASE bytes), erases the key-share, ECH-payload and key material after the fact, and prints the remaining body; both seeds are fixed, so the golden is stable.

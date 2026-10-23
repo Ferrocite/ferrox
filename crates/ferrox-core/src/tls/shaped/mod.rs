@@ -4,8 +4,8 @@ pub(crate) mod hello;
 mod kdf;
 mod keys;
 mod profiles;
-mod record;
-mod tls12;
+pub(crate) mod record;
+pub(crate) mod tls12;
 
 pub use client::Session;
 

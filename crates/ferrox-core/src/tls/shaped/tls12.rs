@@ -2,7 +2,7 @@
 use super::kdf;
 use super::record::Suite;
 
-pub(super) struct KeyBlock {
+pub(crate) struct KeyBlock {
     pub client_key: Vec<u8>,
     pub server_key: Vec<u8>,
     pub client_iv: Vec<u8>,
@@ -11,7 +11,7 @@ pub(super) struct KeyBlock {
 
 /// The master secret and both directions' keys: an extended-master-secret
 /// transcript when the server accepted the extension, the legacy seed otherwise.
-pub(super) fn keys(
+pub(crate) fn keys(
     suite: Suite,
     pre_master: &[u8],
     client_random: &[u8; 32],
@@ -50,7 +50,7 @@ pub(super) fn keys(
     (master, block)
 }
 
-pub(super) fn finished(suite: Suite, master: &[u8], label: &[u8], transcript: &[u8]) -> Vec<u8> {
+pub(crate) fn finished(suite: Suite, master: &[u8], label: &[u8], transcript: &[u8]) -> Vec<u8> {
     let hash = suite.hash();
     let hashed = hash.hash(transcript);
     let mut out = vec![0u8; 12];

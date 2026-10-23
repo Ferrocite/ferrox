@@ -483,7 +483,7 @@ security-utls ops-retired-instructions UNBLESSED scripts/count-ops.sh
 security-utls oracle-cases-replayed-byte-identical 46 ferrox-core-tls::shaped::hello::tests::oracle_replay_matches_utls
 security-utls distinct-presets-behind-those-names 28 ferrox-core-tls::shaped::hello::tests::oracle_replay_matches_utls
 security-utls shaped-dials-that-complete-a-tls13-handshake 1 ferrox-core-tls::rustls_backend::tests::a_shaped_chrome_handshake_reaches_a_stock_server
-security-utls shaped-dials-that-complete-a-tls12-handshake 1 ferrox-core-tls::rustls_backend::tests::a_shaped_chrome_handshake_serves_a_tls12_only_server
+security-utls shaped-dials-that-complete-a-tls12-handshake 1 ferrox-core-tls::rustls_backend::tests::a_shaped_tls12_handshake_hashes_its_client_key_exchange
 
 # --- loopback re-inject outbound --------------------------------------------
 loopback ops-retired-instructions UNBLESSED scripts/count-ops.sh
