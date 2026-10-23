@@ -144,17 +144,22 @@ fn try_carrier(
     ))
 }
 
+/// One request the probe carries: its method and path, and the most payload it may take.
+struct Ask<'a> {
+    method: &'a str,
+    path: &'a str,
+    cap: usize,
+}
+
 /// One request for a known payload, read back through the tunnel until its cap or its end: what the exit carried, counted where it lands.
 fn carried(
     carrier: Carrier,
     edge: &ferrox_core::foxy::Candidate,
     pass: &Pass,
-    method: &str,
-    host: &str,
-    path: &str,
-    cap: usize,
+    ask: Ask<'_>,
     until: Instant,
 ) -> Result<usize, String> {
+    let Ask { method, path, cap } = ask;
     let (dial, quic_dial) = dial(edge, carrier, pass);
     let quic = match carrier {
         Carrier::H3 => {
@@ -162,10 +167,10 @@ fn carried(
         }
         _ => None,
     };
-    let mut tunnel =
-        Tunnel::open(&dial, &format!("{host}:80"), quic).map_err(|failure| failure.to_string())?;
+    let mut tunnel = Tunnel::open(&dial, &format!("{PAYLOAD_HOST}:80"), quic)
+        .map_err(|failure| failure.to_string())?;
     let request = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: ferrox-live\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {PAYLOAD_HOST}\r\nUser-Agent: ferrox-live\r\nConnection: close\r\n\r\n"
     );
     tunnel
         .write_all(request.as_bytes())
@@ -241,10 +246,11 @@ fn brackets(
         carrier,
         edge,
         pass,
-        "HEAD",
-        PAYLOAD_HOST,
-        PAYLOAD_LARGE.0,
-        4096,
+        Ask {
+            method: "HEAD",
+            path: PAYLOAD_LARGE.0,
+            cap: 4096,
+        },
         until,
     )?;
     let now = settled(account, was);
@@ -260,32 +266,46 @@ fn brackets(
             return Err(format!("{path}: the crawl spent its clock"));
         }
         let until = (Instant::now() + PAYLOAD_WAIT).min(deadline);
-        let bytes = carried(carrier, edge, pass, "GET", PAYLOAD_HOST, path, cap, until)?;
+        let bytes = carried(
+            carrier,
+            edge,
+            pass,
+            Ask {
+                method: "GET",
+                path,
+                cap,
+            },
+            until,
+        )?;
         if bytes < PAYLOAD_FLOOR {
             return Err(format!("{path}: {bytes} bytes is not a payload"));
         }
+        let bytes = bytes as u64;
         let now = settled(account, was);
         let charged = was.saturating_sub(now);
+        let milli = charged.saturating_mul(1000).checked_div(bytes).unwrap_or(0);
+        let whole = milli / 1000;
+        let fraction = milli % 1000;
         println!(
-            "GET {PAYLOAD_HOST}{path}: {bytes} bytes carried, {charged} charged ({:.3}x)",
-            charged as f64 / bytes as f64
+            "GET {PAYLOAD_HOST}{path}: {bytes} bytes carried, {charged} charged ({whole}.{fraction:03}x)"
         );
         marks.push((bytes, charged));
         was = now;
     }
     let (small_bytes, small_charge) = marks[0];
     let (large_bytes, large_charge) = marks[1];
-    let slope = large_charge.saturating_sub(small_charge) as f64
-        / large_bytes.saturating_sub(small_bytes) as f64;
+    let delta_bytes = large_bytes.saturating_sub(small_bytes);
+    let delta_charge = large_charge.saturating_sub(small_charge);
+    let milli = delta_charge
+        .saturating_mul(1000)
+        .checked_div(delta_bytes)
+        .unwrap_or(0);
+    let whole = milli / 1000;
+    let fraction = milli % 1000;
     println!(
-        "{carrier:?}: {slope:.3} bytes charged per byte carried between {} and {} bytes; {fixed} bytes fixed per flow",
-        small_bytes, large_bytes
+        "{carrier:?}: {whole}.{fraction:03} bytes charged per byte carried between {small_bytes} and {large_bytes} bytes; {fixed} bytes fixed per flow"
     );
     // A tunnel that costs its payload spends one allowance byte per carried byte; a per-flow cost is the head's, and is not the slope.
-    assert!(
-        slope <= 1.25,
-        "{carrier:?} charged {slope:.3} bytes per carried byte between {small_bytes} and {large_bytes}: {large_charge} for {large_bytes} after {small_charge} for {small_bytes}, {fixed} fixed per flow"
-    );
     // Last, so a closing flow's fetch cannot be read as the large payload's: what a cancel costs is the window the edge was allowed to fill ahead of the caller.
     if Instant::now() < deadline {
         let until = (Instant::now() + PAYLOAD_WAIT).min(deadline);
@@ -293,20 +313,31 @@ fn brackets(
             carrier,
             edge,
             pass,
-            "GET",
-            PAYLOAD_HOST,
-            PAYLOAD_LARGE.0,
-            ABORT_READ,
+            Ask {
+                method: "GET",
+                path: PAYLOAD_LARGE.0,
+                cap: ABORT_READ,
+            },
             until,
         )?;
         std::thread::sleep(SETTLE);
         let now = settled(account, was);
+        let charged = was.saturating_sub(now);
+        let milli = charged
+            .saturating_mul(1000)
+            .checked_div(read as u64)
+            .unwrap_or(0);
+        let whole = milli / 1000;
+        let fraction = milli % 1000;
         println!(
-            "closed {PAYLOAD_HOST}{} after {read} bytes: {} charged for a canceled flow",
-            PAYLOAD_LARGE.0,
-            was.saturating_sub(now)
+            "closed {PAYLOAD_HOST}{} after {read} bytes: {charged} charged ({whole}.{fraction:03}x) for a canceled flow",
+            PAYLOAD_LARGE.0
         );
     }
+    assert!(
+        delta_charge.saturating_mul(4) <= delta_bytes.saturating_mul(5),
+        "{carrier:?} charged {whole}.{fraction:03} bytes per carried byte between {small_bytes} and {large_bytes}: {large_charge} for {large_bytes} after {small_charge} for {small_bytes}, {fixed} fixed per flow"
+    );
     Ok(())
 }
 
