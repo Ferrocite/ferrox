@@ -1131,6 +1131,12 @@ impl<'a> Reader<'a> {
         let len = usize::from(self.u16()?);
         self.take(len)
     }
+
+    /// A three-byte length prefix, as a certificate list carries.
+    fn vec24(&mut self) -> Result<&'a [u8], TlsError> {
+        let len = self.u24()?;
+        self.take(len)
+    }
 }
 
 /// The chain a TLS 1.3 `Certificate` carries, each entry borrowed from `body`; TLS 1.3 wraps every entry
@@ -1406,14 +1412,6 @@ fn verify_signature(
     ring::signature::UnparsedPublicKey::new(algorithm, key.key)
         .verify(content, signature)
         .map_err(|_| TlsError::BadCertificate("handshake signature did not verify".to_owned()))
-}
-
-impl Reader<'_> {
-    /// A three-byte length prefix, as a certificate list carries.
-    fn vec24(&mut self) -> Result<&[u8], TlsError> {
-        let len = self.u24()?;
-        self.take(len)
-    }
 }
 
 #[cfg(test)]
