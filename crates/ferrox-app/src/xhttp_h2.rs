@@ -91,6 +91,9 @@ struct H2StreamReader {
     conn: Arc<H2Conn>,
     stream: Arc<H2Stream>,
     id: u32,
+    /// How much of the front frame this reader has taken: the frame is popped when it is spent,
+    /// so a short read leaves the tail where the loop put it instead of moving it to the base.
+    at: usize,
 }
 
 impl Read for H2StreamReader {
@@ -104,13 +107,13 @@ impl Read for H2StreamReader {
                 .state
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if let Some(front) = st.body.front_mut() {
-                let n = front.len().min(buf.len());
-                buf[..n].copy_from_slice(&front[..n]);
-                if n == front.len() {
+            if let Some(front) = st.body.front() {
+                let n = (front.len() - self.at).min(buf.len());
+                buf[..n].copy_from_slice(&front[self.at..self.at + n]);
+                self.at += n;
+                if self.at == front.len() {
                     st.body.pop_front();
-                } else {
-                    front.drain(..n);
+                    self.at = 0;
                 }
                 drop(st);
                 self.conn.replenish(self.id, n);
@@ -148,37 +151,50 @@ struct H2StreamWriter {
     headed: bool,
 }
 
+/// The h1 fields a stream never forwards: the connection owns them.
+fn hop_by_hop(name: &str) -> bool {
+    [
+        "content-length",
+        "transfer-encoding",
+        "connection",
+        "keep-alive",
+    ]
+    .into_iter()
+    .any(|hop| hop.eq_ignore_ascii_case(name))
+}
+
+/// A response head's fields, status first: one pass and one list, and a hop-by-hop name is
+/// recognised in place where the lowercase form it replaces allocated a `String` per line.
+fn response_fields(head: &str) -> Vec<(&str, &str)> {
+    let mut fields = Vec::with_capacity(1 + head.matches("\r\n").count());
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .unwrap_or_default()
+        .split_ascii_whitespace()
+        .nth(1)
+        .unwrap_or("200");
+    fields.push((":status", status));
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if hop_by_hop(name) {
+            continue;
+        }
+        fields.push((name, value.trim()));
+    }
+    fields
+}
+
 impl H2StreamWriter {
     fn emit_headers(&mut self, head: &[u8]) -> bool {
         let text = std::str::from_utf8(head).unwrap_or_default();
-        let mut lines = text.split("\r\n");
-        let status = lines
-            .next()
-            .unwrap_or_default()
-            .split_ascii_whitespace()
-            .nth(1)
-            .unwrap_or("200");
-        let mut headers = vec![(":status", status)];
-        for line in lines {
-            if line.is_empty() {
-                break;
-            }
-            let Some((name, value)) = line.split_once(':') else {
-                continue;
-            };
-            let name = name.trim();
-            if [
-                "content-length",
-                "transfer-encoding",
-                "connection",
-                "keep-alive",
-            ]
-            .contains(&name.to_ascii_lowercase().as_str())
-            {
-                continue;
-            }
-            headers.push((name.trim(), value.trim()));
-        }
+        let headers = response_fields(text);
         let block = block_encode(&headers);
         let max = *self
             .conn
@@ -603,6 +619,7 @@ fn open_stream(
         conn: Arc::clone(conn),
         stream: Arc::clone(&state),
         id: sid,
+        at: 0,
     };
     let h2out = H2StreamOut {
         conn: Arc::clone(conn),
@@ -1278,6 +1295,106 @@ mod tests {
         drop(frag);
     }
 
+    /// A short read leaves the frame's tail where the loop put it: the reader carries a cursor
+    /// instead of draining its head, and the assertions read the address, which the drain moved.
+    #[test]
+    fn a_partly_read_frame_is_not_moved() {
+        let (conn, _, _) = bare_conn();
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                ended: false,
+                dead: false,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(65_535),
+            responded: AtomicBool::new(false),
+        });
+        conn.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(1, Arc::clone(&state));
+        let frame: Vec<u8> = (0u8..64).collect();
+        let base = frame.as_ptr();
+        state
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .body
+            .push_back(frame);
+        let mut reader = H2StreamReader {
+            conn,
+            stream: Arc::clone(&state),
+            id: 1,
+            at: 0,
+        };
+        let mut first = [0u8; 16];
+        assert_eq!(reader.read(&mut first).unwrap(), 16);
+        assert!(first.iter().copied().eq(0u8..16), "the head of the frame");
+        {
+            let st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+            let front = st.body.front().expect("still queued");
+            assert_eq!(front.as_ptr(), base, "the frame is its own allocation");
+            assert_eq!(front.len(), 64, "the frame was not shortened by the read");
+            assert_eq!(front[16], 16, "the tail sits at its own offset");
+        }
+        let mut rest = [0u8; 48];
+        assert_eq!(reader.read(&mut rest).unwrap(), 48);
+        assert!(rest.iter().copied().eq(16u8..64), "the tail of the frame");
+        assert!(
+            state
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .body
+                .is_empty(),
+            "the spent frame is popped"
+        );
+    }
+
+    /// The response head's fields come out of one list and one pass: a hop-by-hop name is
+    /// recognised in place, where the lowercase form it replaces allocated a `String` per line,
+    /// and the list is opened for the lines it will hold rather than grown into.
+    #[test]
+    fn a_response_head_is_split_without_allocating() {
+        let head = "HTTP/1.1 200 OK\r\n\
+                    Content-Length: 12\r\n\
+                    Transfer-Encoding: chunked\r\n\
+                    Connection: close\r\n\
+                    Keep-Alive: timeout=5\r\n\
+                    Content-Lengths: 12\r\n\
+                    Connectio: x\r\n\
+                    Content-Type: text/plain\r\n\
+                    Server: x\r\n\r\n";
+        let (fields, counts) = ferrox_core::alloc_count::measure(|| response_fields(head));
+        assert_eq!(
+            counts.allocs, 1,
+            "the field list, nothing per line: {counts:?}"
+        );
+        assert_eq!(
+            fields,
+            vec![
+                (":status", "200"),
+                ("Content-Lengths", "12"),
+                ("Connectio", "x"),
+                ("Content-Type", "text/plain"),
+                ("Server", "x"),
+            ],
+            "the connection's own fields are skipped in any spelling, and a near miss is kept"
+        );
+        assert_eq!(
+            block_encode(&fields),
+            block_encode(&[
+                (":status", "200"),
+                ("Content-Lengths", "12"),
+                ("Connectio", "x"),
+                ("Content-Type", "text/plain"),
+                ("Server", "x"),
+            ]),
+            "the block is the fields' own bytes"
+        );
+    }
+
     #[test]
     fn h2_stream_up_carries_bulk_both_ways() {
         let (echo_addr, echo) = echo_server();
@@ -1683,6 +1800,7 @@ mod tests {
             conn,
             stream: state,
             id: 2,
+            at: 0,
         };
         let (sender, receiver) = std::sync::mpsc::channel();
         thread::spawn(move || {
