@@ -7187,6 +7187,9 @@ fn start_renewal(account: std::sync::Arc<crate::foxy_account::Account>) {
             };
             // A refused token is the only end: a rate limit, a challenge or an unreachable plane is asked again on the plane's own pause, since the pass it stands over keeps expiring meanwhile.
             if denied.is_final() {
+                eprintln!(
+                    "foxy: the pass cannot be replaced ({denied}): restart the lane to sign in"
+                );
                 return;
             }
             let pause = crate::foxy_account::renewal_gap(&denied, attempt, account.pass_left());
@@ -12385,7 +12388,7 @@ fn retry_plane(
     loop {
         match ask() {
             Ok(()) => return Ok(()),
-            Err(denied) if attempt + 1 < ACCOUNT_ATTEMPTS && !denied.is_final() => {
+            Err(denied) if attempt + 1 < ACCOUNT_ATTEMPTS && denied.is_retryable() => {
                 let pause = crate::foxy_account::renewal_gap(&denied, attempt as u32, None);
                 attempt += 1;
                 eprintln!(
