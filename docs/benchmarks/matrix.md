@@ -28,7 +28,11 @@ bundle's `README.md` are generated from the same `matrix-results.json`.
 
 ## Known holes (2026-10-23, standard / ubuntu-latest)
 
-These are measured gaps in this tree, not variance. The numbers come from the
+These are measured gaps in this tree, not variance. `scripts/check-matrix-legs.py`
+reads the same list from `scripts/leg-gaps.txt`: a filed gap warns with its issue,
+while a new leg or one worse than its filed ratio by more than 0.05 fails the
+matrix. Remove a line when its issue closes, so the fix is a visible gate rather
+than a quiet baseline. The numbers come from the
 `benchmark-matrix-standard-ubuntu-latest` bundle of run
 [40006384452](https://github.com/FerroxCo/ferrox/actions/runs/40006384452).
 

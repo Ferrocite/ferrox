@@ -193,17 +193,16 @@ def bootstrap_interval(values, seed=0):
 
 
 def footer(meta):
-    """Provenance line on every chart: date, runner, host, tier, repeats."""
-    engines = ", ".join(
-        f"{name}@{info.get('sha256', '?')[:8]}"
-        for name, info in sorted(meta.get("engines", {}).items())
-    )
+    """One short provenance line, identical on every chart.
+
+    The host, full manifest and engine digests live in README.md and
+    matrix-results.json; repeating them under every plot makes the plot
+    unreadable on a narrow bundle page.
+    """
     return (
         f"ferrox benchmark matrix \u00b7 {meta.get('tier', '?')} \u00b7 "
         f"{meta.get('date', '?')} \u00b7 {meta.get('runner', '?')} \u00b7 "
-        f"{meta.get('host', '?')} \u00b7 "
-        f"N={meta.get('repeats', '?')} repeats \u00b7 whiskers 95% of own "
-        f"repeats where drawn \u00b7 {engines}"
+        f"N={meta.get('repeats', '?')} repeats \u00b7 whiskers 95% of own repeats"
     )
 
 
