@@ -1490,7 +1490,10 @@ fn serve_vless(stream: Connection, id: &[u8; 16], carrier: &Carrier, freedom: bo
             let Ok(read) = stream.try_clone() else {
                 return;
             };
-            serve_xhttp_stream(read, stream, settings, id, freedom);
+            let Ok(raw) = stream.try_clone() else {
+                return;
+            };
+            serve_xhttp_stream(read, stream, settings, id, freedom, Some(&raw));
         }
         Carrier::HttpHeader { path } => {
             let Some((mut reader, mut write)) = crate::httpheader::accept(stream, path) else {
@@ -2370,9 +2373,27 @@ fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
     settings: &crate::xhttp::XhttpSettings,
     id: &[u8; 16],
     freedom: bool,
+    raw: Option<&Connection>,
 ) {
+    if let Some(raw) = raw {
+        if raw.set_read_timeout(Some(RELAY_POLL)).is_err() {
+            return;
+        }
+    }
+    let until = Instant::now() + budgets::handshake();
     let mut magic = [0u8; 24];
-    if read_exact(&mut read, &mut magic).is_ok() && magic == *crate::h2::MAGIC {
+    let mut bounded = HandshakeDeadline {
+        inner: &mut read,
+        until,
+    };
+    let got_magic = read_exact(&mut bounded, &mut magic);
+    if let Some(raw) = raw {
+        let _ = raw.set_read_timeout(None);
+    }
+    if got_magic.is_err() && Instant::now() >= until {
+        return;
+    }
+    if got_magic.is_ok() && magic == *crate::h2::MAGIC {
         return crate::xhttp_h2::serve_h2(read, write, settings, *id, freedom);
     }
     let chained = crate::xhttp::ChainReader::new(magic.to_vec(), read);
@@ -2580,7 +2601,7 @@ fn serve_vless_tls(
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            serve_xhttp_stream(reader, writer, settings, id, freedom);
+            serve_xhttp_stream(reader, writer, settings, id, freedom, None);
         }
         Carrier::HttpUpgrade { path, .. } => {
             let Ok(raw) = stream.try_clone() else { return };
@@ -2679,7 +2700,7 @@ fn serve_vless_reality(
                     return;
                 }
                 let (reader, writer) = session_halves(session, out);
-                serve_xhttp_stream(reader, writer, settings, id, freedom);
+                serve_xhttp_stream(reader, writer, settings, id, freedom, None);
             });
         }
         Carrier::HttpUpgrade { path, .. } => {
