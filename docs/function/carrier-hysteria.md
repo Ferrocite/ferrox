@@ -141,6 +141,7 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 <!-- scope:begin -->
 - paths: crates/ferrox-core/src/hysteria.rs, crates/ferrox-app/src/hysteria.rs
 - symbols: hysteria
+- scenarios: vless-hysteria
 - oracle: xray-rust-hysteria=rejects_wrong_auth
 - go: ./transport/internet/hysteria/...
 <!-- scope:end -->

@@ -115,7 +115,7 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 - paths: crates/ferrox-app/src/vmess.rs
 - symbols: vmess, Replay
 - engines: xray-core, zeronet
-- scenarios: vmess-raw
+- scenarios: vmess-raw, vmess-tls-ws
 - oracle: vmess
 - go: ./proxy/vmess/..., ./common/crypto/...
 <!-- scope:end -->

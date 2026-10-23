@@ -570,7 +570,6 @@ impl<R: Read> GrpcReader<R> {
             }
             // A GOAWAY with this stream in its last-stream-id still carries the body; the
             // stream ends at END_STREAM, not at the control frame that closed the door to new ones.
-            T_GOAWAY => Some(()),
             _ => Some(()),
         };
         self.frame = frame;
