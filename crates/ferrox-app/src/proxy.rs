@@ -1652,6 +1652,15 @@ fn cached_lookup(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
     Some(entry.addrs.clone())
 }
 
+#[cfg(test)]
+pub(crate) fn lookup_is_remembered(host: &str, port: u16) -> bool {
+    RESOLVED
+        .lock()
+        .ok()
+        .and_then(|cache| cache.as_ref()?.get(&port)?.get(host).map(|_| ()))
+        .is_some()
+}
+
 fn remember_lookup(host: &str, port: u16, addrs: &[SocketAddr]) {
     let Ok(mut cache) = RESOLVED.lock() else {
         return;

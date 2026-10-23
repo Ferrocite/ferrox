@@ -573,6 +573,32 @@ mod tests {
         );
     }
 
+    /// A server may name the relay a UDP association uses; that name must take the bounded resolver, not a lookup that can park the flow forever.
+    #[test]
+    fn an_association_reply_name_takes_the_bounded_resolver() {
+        let (client, _written) = pair(|server, _seen| {
+            let mut greeting = [0u8; 3];
+            server.read_exact(&mut greeting).expect("the greeting");
+            server.write_all(&[5, 0]).expect("the method reply");
+            let mut request = [0u8; 10];
+            server.read_exact(&mut request).expect("the request");
+            let name = b"associate-cache.invalid";
+            let mut reply = vec![5, 0, 0, 3, name.len() as u8];
+            reply.extend_from_slice(name);
+            reply.extend_from_slice(&53u16.to_be_bytes());
+            server.write_all(&reply).expect("the reply");
+        });
+        let mut session = Session::open(client, &Credential::default()).expect("a session");
+        assert!(
+            session.associate().is_none(),
+            "the invalid name has no relay"
+        );
+        assert!(
+            crate::proxy::lookup_is_remembered("associate-cache.invalid", 53),
+            "the association took the bounded resolver"
+        );
+    }
+
     /// The three address types RFC 1928 gives the reply's bound address, read from one
     /// server that grants the tunnel with each: IPv4 and IPv6 stay the addresses they
     /// came as, and a name is read as a name — the reply is granted, the tunnel
