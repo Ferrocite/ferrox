@@ -28,12 +28,12 @@ pub(crate) struct Link<S: Read + Write + RecordAlignment> {
     session: S,
     raw: Option<Connection>,
     uuid: [u8; 16],
+    /// The framing walks the stream in place: `[..dot)` is delivered and drains away on
+    /// the next read, `[dot..)` is the walk's frontier, and the window is one record
+    /// wide while the framing lives. Nothing stages the content again on the way out.
     have: Vec<u8>,
-    hat: usize,
-    /// Where the peel put content in `have` this record, so the `TLS` observer scans the same bytes it scanned when every byte passed through `out`.
-    spans: Vec<(usize, usize)>,
-    out: Vec<u8>,
-    oat: usize,
+    dot: usize,
+    walk: Walk,
     #[cfg(test)]
     staged: usize,
     /// The command bytes the reader validated: one per frame, and the count the
@@ -45,14 +45,81 @@ pub(crate) struct Link<S: Read + Write + RecordAlignment> {
     tls: Tls,
 }
 
-struct Reading {
-    padding: bool,
-    mid_frame: bool,
-    raw: bool,
+/// One frame-walk machine over `have`. The delivery runs it from the cursor and hands
+/// on a snapshot — the run so far, the head it opened with, the scan target and
+/// how much of it the extents have already fed, and the boundary's evidence.
+struct Banked {
+    head: [u8; 310],
+    head_len: usize,
+    run: usize,
+    left: usize,
+    scanned: usize,
+    shaped: bool,
+    sampled: bool,
+    found: bool,
+    /// A six-byte pattern can straddle two extents; those ten are the whole
+    /// boundary's evidence, five bytes each side.
+    span: [u8; 10],
+    span_len: usize,
+}
+
+/// The scan target eats the extent in order; the pattern it hunts can straddle a
+/// boundary, and the span carries the evidence either way. No byte is copied for
+/// the scan that the extents themselves do not already account for.
+fn scan_extent(fresh: &[u8], banked: &mut Banked) {
+    if banked.found || banked.scanned >= banked.left {
+        return;
+    }
+    let share = fresh.len().min(banked.left - banked.scanned);
+    let open = share.min(5);
+    // the bridge is the span's last five bytes against the opening five
+    let held = banked.span_len.saturating_sub(5);
+    let tell = banked.span_len - held;
+    if tell > 0 && open > 0 {
+        let mut cross = [0u8; 10];
+        cross[..tell].copy_from_slice(&banked.span[held..banked.span_len]);
+        cross[tell..tell + open].copy_from_slice(&fresh[..open]);
+        if cross[..tell + open].windows(6).any(|w| w == TLS13_VERSIONS) {
+            banked.found = true;
+        }
+    }
+    if share >= 6 && fresh[..share].windows(6).any(|w| w == TLS13_VERSIONS) {
+        banked.found = true;
+    }
+    // the next boundary's evidence: the newest scanned bytes stay behind
+    if share >= 10 {
+        banked.span[..].copy_from_slice(&fresh[share - 10..share]);
+        banked.span_len = 10;
+    } else if banked.span_len + share <= 10 {
+        banked.span[banked.span_len..banked.span_len + share].copy_from_slice(&fresh[..share]);
+        banked.span_len += share;
+    } else {
+        // slide so the newest share, and only it, meets the window's back edge
+        let drop = banked.span_len + share - 10;
+        banked.span.copy_within(drop..banked.span_len, 0);
+        banked.span_len -= drop;
+        banked.span[banked.span_len..banked.span_len + share].copy_from_slice(&fresh[..share]);
+        banked.span_len += share;
+    }
+    banked.scanned += share;
+}
+
+/// each content extent straight to the caller's buffer; the filter runs the same walk
+/// on a snapshot, so a fill's content reaches it in run order — the way a contiguous
+/// buffer reached `observe` — without the copy a staging buffer paid for.
+#[derive(Clone, Copy)]
+struct Walk {
+    /// the uuid window is resolved and the frames are running
+    framed: bool,
     want_header: i32,
     want_content: usize,
     want_padding: usize,
-    command: Option<VisionCommand>,
+    command: u8,
+}
+
+struct Reading {
+    padding: bool,
+    raw: bool,
 }
 
 struct Writing {
@@ -77,22 +144,21 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             raw,
             uuid: *uuid,
             have: Vec::with_capacity(WINDOW),
-            hat: 0,
-            spans: Vec::new(),
-            out: Vec::new(),
-            oat: 0,
+            dot: 0,
+            walk: Walk {
+                framed: false,
+                want_header: 0,
+                want_content: 0,
+                want_padding: 0,
+                command: 0,
+            },
             #[cfg(test)]
             staged: 0,
             #[cfg(test)]
             validated: 0,
             read: Reading {
                 padding: true,
-                mid_frame: false,
                 raw: false,
-                want_header: 0,
-                want_content: 0,
-                want_padding: 0,
-                command: None,
             },
             write: Writing {
                 padding: true,
@@ -127,60 +193,57 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     }
 }
 
-impl Link<ferrox_core::tls::ClientSession<Connection>> {
-    /// A raw-less link parks its reads in the session it frames, so the shared half's grain
-    /// arms on that transport rather than on a handle the link does not keep.
-    pub(crate) fn arm_session_timeout(&self, grain: std::time::Duration) -> std::io::Result<()> {
-        self.session.get_ref().set_read_timeout(Some(grain))
-    }
-}
-
 impl<S: Read + Write + RecordAlignment> Read for Link<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.oat >= self.out.len() {
-            self.oat = 0;
+        loop {
             if self.read.padding {
-                self.out.clear();
+                if self.dot < self.have.len() {
+                    let was = self.dot;
+                    match self.pump(Some(buf)) {
+                        0 => {}
+                        n => return Ok(n),
+                    }
+                    if !self.read.padding {
+                        // the walk ended the framing; its tail delivers as content
+                        continue;
+                    }
+                    if self.dot > was {
+                        // the walk ate nothing this pass; its state moved, so it resumes
+                        continue;
+                    }
+                }
+                if !self.fill()? {
+                    // EOF: a frame cut mid-walk drops; what the framing's switch left unparsed is content the caller has not seen
+                    if self.walk.framed && self.read.padding {
+                        return Ok(0);
+                    }
+                    return Ok(self.drain_tail(buf));
+                }
             } else {
-                // The framing is over and its staging is empty: the connection is done with it.
-                self.out = Vec::new();
+                // the framing is over: what it left in the window is content, then raw
+                if self.dot < self.have.len() && !buf.is_empty() {
+                    return Ok(self.drain_tail(buf));
+                }
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                return self.read_direct(buf);
             }
         }
-        if !self.read.padding {
-            if self.oat < self.out.len() {
-                return Ok(self.copy_out(buf));
-            }
-            if buf.is_empty() {
-                return Ok(0);
-            }
-            return self.read_direct(buf);
-        }
-        // A record's peel lands in the caller's buffer directly: only the bytes the caller's pull could not hold stage through `out`, and the next read drains those first.
-        if self.oat < self.out.len() {
-            return Ok(self.copy_out(buf));
-        }
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        let mut landed = 0usize;
-        let mut chunk: Option<&mut [u8]> = Some(buf);
-        while self.oat >= self.out.len() && landed == 0 {
-            if !self.fill_into(&mut chunk, &mut landed)? {
-                return Ok(landed);
-            }
-        }
-        if landed > 0 {
-            return Ok(landed);
-        }
-        Ok(self.copy_out(buf))
     }
 }
 
 impl<S: Read + Write + RecordAlignment> Link<S> {
-    fn copy_out(&mut self, buf: &mut [u8]) -> usize {
-        let n = (self.out.len() - self.oat).min(buf.len());
-        buf[..n].copy_from_slice(&self.out[self.oat..self.oat + n]);
-        self.oat += n;
+    /// What the framing left in the window goes through as it stands, and the window
+    /// is handed back once drained.
+    fn drain_tail(&mut self, buf: &mut [u8]) -> usize {
+        let n = (self.have.len() - self.dot).min(buf.len());
+        buf[..n].copy_from_slice(&self.have[self.dot..self.dot + n]);
+        self.dot += n;
+        if self.dot == self.have.len() {
+            self.have = Vec::new();
+            self.dot = 0;
+        }
         n
     }
 
@@ -205,7 +268,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     }
 
     fn pending(&self) -> usize {
-        self.have.len() - self.hat
+        self.have.len() - self.dot
     }
 
     #[cfg(test)]
@@ -229,41 +292,118 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     fn stage(&mut self, _n: usize) {}
 
     fn compact(&mut self) {
-        if self.hat > 0 {
-            self.have.drain(..self.hat);
-            self.hat = 0;
+        if self.dot > 0 {
+            self.have.drain(..self.dot);
+            self.dot = 0;
         }
     }
 
-    /// One piece of content to whichever sink takes it first: the caller's buffer while it has room, its own staging after that. Returns `(landed, staged)`.
-    fn sink(bytes: &[u8], chunk: &mut Option<&mut [u8]>, out: &mut Vec<u8>) -> (usize, usize) {
-        let n = bytes.len();
-        let take = n.min(chunk.as_ref().map_or(0, |slot| slot.len()));
-        if take > 0 {
-            if let Some(slot) = chunk.as_deref_mut() {
-                slot[..take].copy_from_slice(&bytes[..take]);
+    /// Walks the frame the cursor is parked in as far as the window and the caller's
+    /// buffer allow. Content lands straight in the caller's buffer — the second copy
+    /// the staging buffer used to pay for — padding is skipped in place, and the uuid
+    /// window resolves only with a full uuid and either a mismatch (everything passes)
+    /// or the framing's first frame header. A walk that blocks mid-frame parks there
+    /// and reports what it handed out.
+    fn pump(&mut self, mut buf: Option<&mut [u8]>) -> usize {
+        if !self.walk.framed {
+            if self.pending() < SHORTEST_FRAME {
+                return 0;
             }
+            if self.have[self.dot..self.dot + 16] != self.uuid {
+                // the uuid is a window, not a gate: a raw-target proxy passes everything through, exactly as the staged path did
+                self.read.padding = false;
+                return 0;
+            }
+            self.walk = Walk {
+                framed: true,
+                want_header: 5,
+                want_content: 0,
+                want_padding: 0,
+                command: 0,
+            };
+            self.dot += 16;
         }
-        if take < n {
-            out.extend_from_slice(&bytes[take..]);
+        let mut held = 0;
+        loop {
+            // the header is read whole when the window offers five bytes; the tail is byte-by-byte
+            if self.walk.want_header == 5 && self.pending() >= 5 {
+                let frame = [
+                    self.have[self.dot],
+                    self.have[self.dot + 1],
+                    self.have[self.dot + 2],
+                    self.have[self.dot + 3],
+                    self.have[self.dot + 4],
+                ];
+                self.validate();
+                self.walk.command = frame[0];
+                self.walk.want_content = (usize::from(frame[1]) << 8) | usize::from(frame[2]);
+                self.walk.want_padding = (usize::from(frame[3]) << 8) | usize::from(frame[4]);
+                self.dot += 5;
+                self.walk.want_header = 0;
+            } else if self.walk.want_header > 0 && self.dot < self.have.len() {
+                let byte = self.have[self.dot];
+                match self.walk.want_header {
+                    5 => {
+                        self.walk.command = byte;
+                        self.validate();
+                    }
+                    4 => self.walk.want_content = usize::from(byte) << 8,
+                    3 => self.walk.want_content |= usize::from(byte),
+                    2 => self.walk.want_padding = usize::from(byte) << 8,
+                    _ => self.walk.want_padding |= usize::from(byte),
+                }
+                self.dot += 1;
+                self.walk.want_header -= 1;
+            }
+            if self.walk.want_content > 0 {
+                let room = match buf.as_deref() {
+                    Some(slot) => slot.len() - held,
+                    None => usize::MAX,
+                };
+                let take = self.walk.want_content.min(self.pending()).min(room);
+                if let Some(slot) = buf.as_deref_mut() {
+                    slot[held..held + take].copy_from_slice(&self.have[self.dot..self.dot + take]);
+                }
+                self.dot += take;
+                self.walk.want_content -= take;
+                held += take;
+                if self.walk.want_content > 0 || held == buf.as_deref().map_or(0, <[u8]>::len) {
+                    return held;
+                }
+                continue;
+            }
+            if self.walk.want_padding > 0 {
+                let take = self.walk.want_padding.min(self.pending());
+                self.dot += take;
+                self.walk.want_padding -= take;
+                if self.walk.want_padding > 0 {
+                    return held;
+                }
+            } else if self.walk.want_header > 0 {
+                // parked inside an incomplete header: nothing moves without bytes
+                return held;
+            }
+            if self.walk.command == VisionCommand::Continue.byte() {
+                self.walk.want_header = 5;
+                continue;
+            }
+            // a command that is not a continue ends the framing; its tail is content
+            self.read.padding = false;
+            self.read.raw = self.walk.command == VisionCommand::Direct.byte() && self.raw.is_some();
+            return held;
         }
-        if let Some(slot) = chunk.take() {
-            *chunk = Some(&mut slot[take..]);
-        }
-        (take, n - take)
     }
 
-    /// Reached only while the framing is live: the read lands in spare capacity held steady at the window, and only the bytes the peel cannot hand the caller stage through `out`; `staged` counts them.
-    fn fill_into(
-        &mut self,
-        chunk: &mut Option<&mut [u8]>,
-        landed: &mut usize,
-    ) -> std::io::Result<bool> {
+    /// Reached only while the framing is live: the read lands in spare capacity held
+    /// steady at the window, the filter runs the delivery walk's snapshot over it
+    /// before anything moves, and the walk takes the window in place. The cursor is
+    /// parked where the walk stands, so the staging buffer is gone from the read path.
+    fn fill(&mut self) -> std::io::Result<bool> {
         loop {
             self.compact();
-            self.spans.clear();
             let base = self.have.len();
             self.have.reserve_exact(WINDOW - base);
+            // The read lands in spare capacity held steady at the window; nothing here copies a framed byte into a staging buffer any more.
             let read = unsafe {
                 self.have.set_len(WINDOW);
                 self.session.read(&mut self.have[base..])
@@ -279,164 +419,164 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 }
             };
             if n == 0 {
-                self.flush_truncated(chunk, landed);
-                return Ok(self.oat < self.out.len() || *landed > 0);
+                return Ok(false);
             }
-            let framed = self.unpad_into(chunk, landed);
-            if self.tls.budget > 0 && !self.spans.is_empty() {
-                self.tls.observe_chunks(&self.have, &self.spans);
-                self.engage();
+            self.stage(n);
+            self.observe_fill();
+            if !self.read.padding || self.dot < self.have.len() {
+                // the framing switched over, or the parked walk has bytes for the next pump
+                return Ok(true);
             }
-            if !framed {
-                if *landed > 0 || self.oat < self.out.len() {
-                    return Ok(true);
+            // the window is through and the framing runs on: another read
+        }
+    }
+
+    /// The filter sees this fill's content the way a contiguous buffer reached
+    /// `observe`: the delivery walk runs on a snapshot to its natural stop, its
+    /// content extents file past the TLS state in run order, and the budget is spent
+    /// once per fill that moves content. A blocked snapshot spends nothing, which is
+    /// what a staged fill saw too.
+    fn observe_fill(&mut self) {
+        if self.tls.budget == 0 {
+            return;
+        }
+        let mut walk = self.walk;
+        let mut at = self.dot;
+        let mut banked = Banked {
+            head: [0u8; 310],
+            head_len: 0,
+            run: 0,
+            left: self.tls.server_hello_left,
+            scanned: 0,
+            shaped: false,
+            sampled: false,
+            found: false,
+            span: [0u8; 10],
+            span_len: 0,
+        };
+        loop {
+            if !walk.framed {
+                if self.have.len() - at < SHORTEST_FRAME {
+                    // the uuid window cannot resolve inside this fill: nothing moves
+                    break;
+                }
+                if self.have[at..at + 16] != self.uuid {
+                    // a mismatch hands the whole window through, uuid bytes included
+                    walk = Walk {
+                        framed: true,
+                        want_header: 0,
+                        want_content: self.have.len() - at,
+                        want_padding: 0,
+                        command: VisionCommand::Direct.byte(),
+                    };
+                }
+                if walk.want_content == 0 {
+                    walk.framed = true;
+                    at += 16;
+                    walk.want_header = 5;
+                }
+            }
+            if walk.want_header == 5 && self.have.len() - at >= 5 {
+                walk.command = self.have[at];
+                walk.want_content =
+                    (usize::from(self.have[at + 1]) << 8) | usize::from(self.have[at + 2]);
+                walk.want_padding =
+                    (usize::from(self.have[at + 3]) << 8) | usize::from(self.have[at + 4]);
+                at += 5;
+                walk.want_header = 0;
+            } else if walk.want_header > 0 && at < self.have.len() {
+                let byte = self.have[at];
+                match walk.want_header {
+                    5 => walk.command = byte,
+                    4 => walk.want_content = usize::from(byte) << 8,
+                    3 => walk.want_content |= usize::from(byte),
+                    2 => walk.want_padding = usize::from(byte) << 8,
+                    _ => walk.want_padding |= usize::from(byte),
+                }
+                at += 1;
+                walk.want_header -= 1;
+            }
+            if walk.want_content > 0 {
+                let take = walk.want_content.min(self.have.len() - at);
+                banked.run += take;
+                self.filter_extent(at, take, &mut banked);
+                walk.want_content -= take;
+                at += take;
+                if walk.want_content > 0 {
+                    break;
                 }
                 continue;
             }
-            if self.oat < self.out.len() || *landed > 0 {
+            if walk.want_padding > 0 {
+                let take = walk.want_padding.min(self.have.len() - at);
+                at += take;
+                walk.want_padding -= take;
+                if walk.want_padding > 0 {
+                    break;
+                }
+            } else if walk.want_header > 0 {
+                // parked inside an incomplete header: nothing moves without bytes
                 break;
             }
-        }
-        // The framing is over: the window is dead with it, and a connection past the switch does not carry it.
-        self.have = Vec::new();
-        self.hat = 0;
-        self.spans = Vec::new();
-        Ok(true)
-    }
-
-    fn flush_truncated(&mut self, chunk: &mut Option<&mut [u8]>, landed: &mut usize) {
-        if !self.read.mid_frame {
-            let tail = self.have.len();
-            let taken = tail - self.hat;
-            if taken > 0 {
-                let (took, staged_bytes) = {
-                    let source = &self.have[self.hat..tail];
-                    Self::sink(source, chunk, &mut self.out)
-                };
-                self.stage(staged_bytes);
-                *landed += took;
-                self.hat = tail;
-            }
-        }
-    }
-
-    /// The framed peel: the padding and the heads are skipped, and the content lands in whichever sink takes it — the caller's buffer first, the staging only for what the caller's pull left behind. Returns whether the framing is over.
-    fn unpad_into(&mut self, chunk: &mut Option<&mut [u8]>, landed: &mut usize) -> bool {
-        if !self.read.mid_frame {
-            if self.pending() < SHORTEST_FRAME {
-                return false;
-            }
-            if self.have[self.hat..self.hat + 16] != self.uuid {
-                self.read.padding = false;
-                self.hand_tail(chunk, landed);
-                return true;
-            }
-            self.hat += 16;
-            self.read.mid_frame = true;
-            self.read.want_header = 5;
-        }
-        // The frames in the window are walked in a loop: a thousand frames cost a thousand steps.
-        loop {
-            while self.read.want_header > 0
-                || self.read.want_content > 0
-                || self.read.want_padding > 0
-            {
-                if self.pending() == 0 {
-                    return false;
-                }
-                if self.read.want_header == 5 && self.pending() >= 5 {
-                    // Five header iterations with no observable in between read as one load.
-                    let head = &self.have[self.hat..self.hat + 5];
-                    let (command, content, padding) = (
-                        VisionCommand::from_byte(head[0]),
-                        (usize::from(head[1]) << 8) | usize::from(head[2]),
-                        (usize::from(head[3]) << 8) | usize::from(head[4]),
-                    );
-                    self.read.command = command;
-                    self.validate();
-                    self.read.want_content = content;
-                    self.read.want_padding = padding;
-                    self.hat += 5;
-                    self.read.want_header = 0;
-                    continue;
-                }
-                if self.read.want_header > 0 {
-                    let byte = self.have[self.hat];
-                    match self.read.want_header {
-                        5 => {
-                            self.read.command = VisionCommand::from_byte(byte);
-                            self.validate();
-                        }
-                        4 => self.read.want_content = usize::from(byte) << 8,
-                        3 => self.read.want_content |= usize::from(byte),
-                        2 => self.read.want_padding = usize::from(byte) << 8,
-                        _ => self.read.want_padding |= usize::from(byte),
-                    }
-                    self.hat += 1;
-                    self.read.want_header -= 1;
-                    continue;
-                }
-                if self.read.want_content > 0 {
-                    let take = self.read.want_content.min(self.pending());
-                    if self.tls.budget > 0 {
-                        self.spans.push((self.hat, take));
-                    }
-                    let (took, staged_bytes) = {
-                        let source = &self.have[self.hat..self.hat + take];
-                        Self::sink(source, chunk, &mut self.out)
-                    };
-                    self.stage(staged_bytes);
-                    *landed += took;
-                    self.hat += take;
-                    self.read.want_content -= take;
-                    continue;
-                }
-                let take = self.read.want_padding.min(self.pending());
-                self.hat += take;
-                self.read.want_padding -= take;
-            }
-            // The frame is complete: a continue means another frame follows it.
-            if self.read.command == Some(VisionCommand::Continue) {
-                self.read.want_header = 5;
+            if walk.command == VisionCommand::Continue.byte() {
+                walk.want_header = 5;
                 continue;
             }
-            self.read.mid_frame = false;
-            self.read.padding = false;
-            self.read.raw = self.read.command == Some(VisionCommand::Direct) && self.raw.is_some();
-            self.hand_tail(chunk, landed);
-            return true;
+            // a command that is not a continue ends the framing; its tail is content
+            if self.have.len() > at {
+                walk.want_content = self.have.len() - at;
+                walk.command = VisionCommand::Direct.byte();
+                continue;
+            }
+            break;
+        }
+        if banked.run > 0 {
+            self.tls.budget -= 1;
+            self.tls.server_hello_left = banked.left.saturating_sub(banked.scanned);
+            if banked.found {
+                self.tls.enable_xtls = self.tls.cipher != TLS_AES_128_CCM_8_SHA256;
+                self.tls.budget = 0;
+            } else if banked.left > 0 && banked.scanned >= banked.left {
+                self.tls.budget = 0;
+            }
+            self.engage();
         }
     }
 
-    /// The bytes the window holds past the frame's own peel — after a uuid mismatch, or after the last frame — go over one sink, spans first.
-    fn hand_tail(&mut self, chunk: &mut Option<&mut [u8]>, landed: &mut usize) {
-        let tail = self.have.len();
-        let taken = tail - self.hat;
-        if taken > 0 {
-            let (took, staged_bytes) = {
-                let source = &self.have[self.hat..tail];
-                Self::sink(source, chunk, &mut self.out)
-            };
-            self.stage(staged_bytes);
-            *landed += took;
-            if self.tls.budget > 0 {
-                self.spans.push((tail - taken, taken));
+    /// One extent joins the banked run: the head accumulates to its 310, the shape and
+    /// the cipher read from it once each, and the scan target eats the extent in order.
+    fn filter_extent(&mut self, at: usize, take: usize, banked: &mut Banked) {
+        let fresh = &self.have[at..at + take];
+        // the run's head joins the accumulator; the shape check reads it, the cipher stays inside the first 310
+        let want = 310usize.saturating_sub(banked.head_len);
+        if want > 0 {
+            let take_head = fresh.len().min(want);
+            banked.head[banked.head_len..banked.head_len + take_head]
+                .copy_from_slice(&fresh[..take_head]);
+            banked.head_len += take_head;
+        }
+        if !banked.shaped && banked.run >= 6 {
+            // the shape fires once a fill is long enough to carry it whole
+            banked.shaped = true;
+            let head = &banked.head;
+            if head[..3] == TLS_SERVER_HELLO && head[5] == 0x02 {
+                banked.left = (usize::from(head[3]) << 8 | usize::from(head[4])) + 5;
+                self.tls.present = true;
+                self.tls.twelve_or_above = true;
+            } else if head[..2] == TLS_HANDSHAKE_START && head[5] == 0x01 {
+                self.tls.present = true;
             }
         }
-        self.hat = tail;
+        // the cipher reads only once the fill has whole samples in reach
+        if banked.shaped && !banked.sampled && banked.run >= 79 && banked.left >= 79 {
+            banked.sampled = true;
+            let at = 44 + usize::from(banked.head[43]);
+            self.tls.cipher = u16::from_be_bytes([banked.head[at], banked.head[at + 1]]);
+        }
+        scan_extent(fresh, banked);
     }
 
-    /// The frame parser alone: a fixed window of empty frames, walked again and again,
-    /// with the fold outside the walk so the frame holds the parse and nothing else.
-    #[cfg(test)]
-    fn unpad(&mut self) -> bool {
-        let mut chunk: Option<&mut [u8]> = None;
-        let mut landed = 0usize;
-        let framed = self.unpad_into(&mut chunk, &mut landed);
-        debug_assert_eq!(landed, 0, "the probe's peel has no caller sink to land in");
-        framed
-    }
-
+    /// The frame's five head bytes, encoded the core encoder's way.
     fn frame_head(command: u8, content: usize, padding: usize) -> [u8; 5] {
         let clen = (content as u16).to_be_bytes();
         let plen = (padding as u16).to_be_bytes();
@@ -447,62 +587,6 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
 impl Tls {
     fn observe(&mut self, bytes: &[u8]) {
         self.budget -= 1;
-        self.scan(bytes);
-    }
-
-    /// One budget spend, observed over the pieces this record's peel put where content went. The pieces are disjoint in `have` but the peel wrote them in order, so the filter walks an indexed cursor over them as one contiguous slice and every read it makes is the read it made when the same bytes sat in one staging buffer: the `ServerHello` regions, the pattern walk and the `left` arithmetic are all driven by the same positions.
-    fn observe_chunks(&mut self, bytes: &[u8], spans: &[(usize, usize)]) {
-        self.budget -= 1;
-        let mut total = 0usize;
-        for &(_, len) in spans {
-            total += len;
-        }
-        if total == 0 {
-            return;
-        }
-        let g = Spans { bytes, spans };
-        if total >= 6 {
-            let mut head = [0u8; 6];
-            for (at, slot) in head.iter_mut().enumerate() {
-                *slot = g.get(at);
-            }
-            if head[..3] == TLS_SERVER_HELLO && head[5] == 0x02 {
-                self.server_hello_left = (usize::from(head[3]) << 8 | usize::from(head[4])) + 5;
-                self.present = true;
-                self.twelve_or_above = true;
-                if total >= 79 && self.server_hello_left >= 79 {
-                    let at = 44 + usize::from(g.get(43));
-                    self.cipher = u16::from_be_bytes([g.get(at), g.get(at + 1)]);
-                }
-            } else if head[..2] == TLS_HANDSHAKE_START && head[5] == 0x01 {
-                self.present = true;
-            }
-        }
-        if self.server_hello_left == 0 {
-            return;
-        }
-        let scan = self.server_hello_left.min(total);
-        self.server_hello_left = self.server_hello_left.saturating_sub(total);
-        let bound = scan.saturating_sub(TLS13_VERSIONS.len() - 1);
-        let mut found = false;
-        for at in 0..bound {
-            if TLS13_VERSIONS
-                .iter()
-                .enumerate()
-                .all(|(k, &b)| g.get(at + k) == b)
-            {
-                found = true;
-                break;
-            }
-        }
-        if found {
-            self.enable_xtls = self.cipher != TLS_AES_128_CCM_8_SHA256;
-            self.budget = 0;
-        } else if self.server_hello_left == 0 {
-            self.budget = 0;
-        }
-    }
-    fn scan(&mut self, bytes: &[u8]) {
         if bytes.len() >= 6 {
             let head = &bytes[..6];
             if head[..3] == TLS_SERVER_HELLO && head[5] == 0x02 {
@@ -531,25 +615,6 @@ impl Tls {
         } else if self.server_hello_left == 0 {
             self.budget = 0;
         }
-    }
-}
-
-/// The peeled pieces of one record, read as the contiguous slice they were written to replace.
-struct Spans<'a> {
-    bytes: &'a [u8],
-    spans: &'a [(usize, usize)],
-}
-
-impl Spans<'_> {
-    fn get(&self, pos: usize) -> u8 {
-        let mut pos = pos;
-        for &(at, len) in self.spans {
-            if pos < len {
-                return self.bytes[at + pos];
-            }
-            pos -= len;
-        }
-        unreachable!("the filter reads only within the pieces it was handed");
     }
 }
 
@@ -826,45 +891,9 @@ mod tests {
         }
         assert_eq!(got, [b"paddedend".as_slice(), tail.as_slice()].concat());
         assert_eq!(
-            link.staged, 0,
-            "the peel lands in the caller's own pull; staging returns only for a spill wider than it"
+            link.staged, framed,
+            "only framed bytes ever reach the window: {framed} in, no tail after"
         );
-    }
-
-    /// At the relay's own window the peel never overflows the pull, so not one framed byte passes through a staging buffer: the row while framed is one copy per byte.
-    #[test]
-    fn a_relay_window_pull_never_stages() {
-        let mut input = frame(true, 0, &[0x5a; 8000], 100);
-        for _ in 0..9 {
-            input.extend(frame(false, 0, &[0x5a; 8000], 100));
-        }
-        input.extend(frame(false, 1, b"done", 0));
-        let mut link = link(&input);
-
-        // Two framed pulls, framing still live, and neither `have` nor `out` has budged from one record or grown at all.
-        let mut buf = vec![0u8; WINDOW];
-        let mut got = Vec::new();
-        for _ in 0..2 {
-            let n = link.read(&mut buf).expect("reads");
-            got.extend_from_slice(&buf[..n]);
-            assert_eq!(link.staged, 0, "nothing spilled at the relay window");
-            assert_eq!(link.out.capacity(), 0, "no staging buffer was created");
-        }
-        assert_eq!(link.have.capacity(), WINDOW);
-        loop {
-            let n = link.read(&mut buf).expect("reads");
-            if n == 0 {
-                break;
-            }
-            got.extend_from_slice(&buf[..n]);
-        }
-        assert_eq!(got.len(), 10 * 8000 + b"done".len());
-        for (at, byte) in got[..10 * 8000].iter().enumerate() {
-            assert_eq!(byte, &0x5a, "byte at {at}");
-        }
-        for (at, byte) in got[(10 * 8000)..].iter().enumerate() {
-            assert_eq!(byte, &b"done"[at]);
-        }
     }
 
     /// The frame parser alone: a fixed window of empty frames, walked again and again,
@@ -881,10 +910,12 @@ mod tests {
         for _ in 0..64 {
             link.have.clear();
             link.have.extend_from_slice(&input);
-            link.hat = 0;
-            link.read.mid_frame = true;
-            link.read.want_header = 5;
-            assert!(link.unpad(), "the last frame ends the framing");
+            link.dot = 0;
+            link.walk.framed = true;
+            link.walk.want_header = 5;
+            link.pump(None);
+            link.read.padding = true;
+            link.read.raw = false;
             frames += 8;
         }
         assert_eq!(frames, 512, "the walk saw every frame");
@@ -956,7 +987,6 @@ mod tests {
             0,
             "the switch hands the window back: a connection that lives on does not carry it"
         );
-        assert_eq!(link.out.capacity(), 0, "and the staging with it");
     }
 
     /// A reader that answers in seeded chunks, so a red run replays anywhere.
@@ -1253,12 +1283,11 @@ mod tests {
         );
     }
 
-    /// Steady write traffic leaves the read-side capacities alone; nothing on the write path allocates a buffer that grows.
+    /// Steady write traffic leaves the read-side capacity alone; nothing on the write path allocates a buffer that grows.
     #[test]
     fn write_traffic_holds_the_buffer_capacities_steady() {
         let mut link = link(&[]);
         let have_before = link.have.capacity();
-        let out_before = link.out.capacity();
         let body = vec![0x42u8; 1_400];
         for _ in 0..64 {
             link.write_all(&body).expect("writes");
@@ -1266,11 +1295,6 @@ mod tests {
         assert_eq!(
             link.have.capacity(),
             have_before,
-            "no allocation on the write path"
-        );
-        assert_eq!(
-            link.out.capacity(),
-            out_before,
             "no allocation on the write path"
         );
     }
