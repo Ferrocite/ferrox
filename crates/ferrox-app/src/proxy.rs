@@ -5518,7 +5518,7 @@ fn dial_tls_session(
     server: &SocketAddr,
     cfg: &ferrox_core::tls::TlsConfig,
     mask: Option<&ferrox_core::finalmask::Chain>,
-) -> Option<ferrox_core::tls::RustlsProvider<Connection>> {
+) -> Option<ferrox_core::tls::ClientSession<Connection>> {
     let uplink = match dial(server) {
         Ok(uplink) => uplink.with_mask(mask),
         Err(failure) => {
@@ -5526,7 +5526,7 @@ fn dial_tls_session(
             return None;
         }
     };
-    let Ok(mut session) = ferrox_core::tls::RustlsProvider::connect(cfg, uplink) else {
+    let Ok(mut session) = ferrox_core::tls::connect(cfg, uplink) else {
         note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
         return None;
     };
@@ -5548,7 +5548,7 @@ fn dial_tls_session(
 
 // Splits one established session into halves the carrier cores accept, plus the raw socket their teardown needs.
 fn tls_halves(
-    session: ferrox_core::tls::RustlsProvider<Connection>,
+    session: ferrox_core::tls::ClientSession<Connection>,
 ) -> Option<(ClientHalf, ClientHalf, Arc<Connection>)> {
     let raw = Arc::new(session.get_ref().try_clone().ok()?);
     let out = Arc::new(Mutex::new(Sealed::new(session.get_ref().try_clone().ok()?)));
@@ -5618,7 +5618,7 @@ trait Dialed:
         Self: Sized;
 }
 
-impl Dialed for ferrox_core::tls::RustlsProvider<Connection> {
+impl Dialed for ferrox_core::tls::ClientSession<Connection> {
     fn into_halves(self) -> Option<(TlsHalf<Self>, TlsHalf<Self>, Arc<Connection>)> {
         tls_halves(self)
     }
@@ -5784,7 +5784,7 @@ impl<S> Clone for TlsHalf<S> {
     }
 }
 
-type ClientHalf = TlsHalf<ferrox_core::tls::RustlsProvider<Connection>>;
+type ClientHalf = TlsHalf<ferrox_core::tls::ClientSession<Connection>>;
 
 impl<S: ferrox_core::tls::TlsProvider> Read for TlsHalf<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -6421,7 +6421,7 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
 fn vmess_tls_raw(
     client: &Connection,
     server: &SocketAddr,
-    mut session: ferrox_core::tls::RustlsProvider<Connection>,
+    mut session: ferrox_core::tls::ClientSession<Connection>,
     vmess: &VmessOut,
     target: &Destination,
 ) {
@@ -6477,7 +6477,7 @@ fn vmess_tls_raw(
 fn vmess_tls_carried(
     client: &Connection,
     server: &SocketAddr,
-    session: ferrox_core::tls::RustlsProvider<Connection>,
+    session: ferrox_core::tls::ClientSession<Connection>,
     vmess: &VmessOut,
     target: &Destination,
 ) {
@@ -17528,6 +17528,8 @@ mod tests {
             pins: ferrox_core::foxy::pin::Pins::default(),
             cipher_suites: Vec::new(),
             insecure: false,
+            fingerprint: None,
+            websocket: false,
         };
         (server, client)
     }

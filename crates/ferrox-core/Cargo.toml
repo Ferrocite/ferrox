@@ -25,7 +25,9 @@ ring = "0.17"
 rustls = { workspace = true, features = ["std", "ring"] }
 sha2 = "0.11"
 sha1 = "0.11"
-x25519-dalek = "3"
+sha3 = "0.12"
+shake = "0.1"
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 ml-kem = { version = "0.3.3", features = ["getrandom"] }
 base64 = "0.23"
 rand = "0.10"

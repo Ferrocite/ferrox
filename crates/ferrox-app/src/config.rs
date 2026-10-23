@@ -340,6 +340,15 @@ pub(crate) fn outbound_tls(
             )
         }
     };
+    // xray's empty name is Chrome and a name it does not know returns nil, which dials stock.
+    let fingerprint = tls
+        .and_then(|s| s.get("fingerprint"))
+        .and_then(Json::as_str)
+        .map(|name| {
+            ferrox_core::tls::Fingerprint::resolve(name)
+                .unwrap_or_else(ferrox_core::tls::Fingerprint::stock)
+        })
+        .unwrap_or_default();
     Ok(Arc::new(ferrox_core::tls::TlsConfig {
         server_name,
         alpn: alpn.into(),
@@ -347,6 +356,11 @@ pub(crate) fn outbound_tls(
         pins: ferrox_core::foxy::pin::Pins::default(),
         cipher_suites: tls_cipher_suites(tls),
         insecure: false,
+        fingerprint: Some(fingerprint),
+        websocket: matches!(
+            settings.get("network").and_then(Json::as_str),
+            Some("ws" | "httpupgrade")
+        ),
     }))
 }
 
