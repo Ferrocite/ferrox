@@ -81,8 +81,15 @@ pub(crate) fn modexp(
     }
     let value = Mont::new(n).pow(base, exponent);
     out.clear();
-    out.extend_from_slice(&big_endian(&value, modulus.len()));
+    big_endian(&value, modulus.len(), out);
     Ok(())
+}
+
+/// Little-endian limbs written back as big-endian bytes, the modulus's own length: the stream of
+/// `len`-times-8 is the value's full width, so a shorter modulus drops the high bytes it cannot reach.
+fn big_endian(value: &[u64], len: usize, out: &mut Vec<u8>) {
+    out.extend(value.iter().rev().flat_map(|word| word.to_be_bytes()));
+    out.drain(..out.len() - len);
 }
 
 /// Montgomery arithmetic modulo an odd `n`: a value lives as `x·R mod n` with `R` the base past
@@ -112,10 +119,12 @@ impl Mont {
 
     /// `(a·b·R⁻¹) mod n` for two limb runs of `n`'s length, below `n`. Each step adds the multiple
     /// of `n` that zeroes limb `i`, so after `n`'s length in steps the low half is gone and the
-    /// high half, plus its carry word, is one subtraction from the answer.
-    fn mul(&self, left: &[u64], right: &[u64]) -> Vec<u64> {
+    /// high half, plus its carry word, is one subtraction from the answer. `wide` is the
+    /// accumulator, cleared here rather than reallocated: every limb of it is read before the
+    /// step that first writes it, so a stale word above `n`'s width would survive as the answer.
+    fn mul(&self, left: &[u64], right: &[u64], wide: &mut [u64], out: &mut [u64]) {
         let size = self.n.len();
-        let mut wide = vec![0u64; 2 * size + 1];
+        wide[..2 * size + 1].fill(0);
         for (word_index, word) in right.iter().enumerate() {
             let mut carry = 0u128;
             for limb in 0..size {
@@ -125,7 +134,7 @@ impl Mont {
                 wide[limb + word_index] = sum as u64;
                 carry = sum >> 64;
             }
-            shift(&mut wide, word_index + size, carry);
+            shift(&mut wide[..2 * size + 1], word_index + size, carry);
         }
         for limb_index in 0..size {
             let factor = wide[limb_index].wrapping_mul(self.inv);
@@ -137,41 +146,50 @@ impl Mont {
                 wide[limb + limb_index] = sum as u64;
                 carry = sum >> 64;
             }
-            shift(&mut wide, limb_index + size, carry);
+            shift(&mut wide[..2 * size + 1], limb_index + size, carry);
         }
-        let mut high = wide[size..2 * size].to_vec();
-        if wide[2 * size] != 0 || order(&high, &self.n) != Ordering::Less {
-            subtract(&mut high, &self.n);
+        out.copy_from_slice(&wide[size..2 * size]);
+        if wide[2 * size] != 0 || order(out, &self.n) != Ordering::Less {
+            subtract(out, &self.n);
         }
-        high
     }
 
     /// Square and multiply, most significant bit first: a public exponent is short, so a window
-    /// table costs more than the multiplies it saves.
+    /// table costs more than the multiplies it saves. One accumulator serves every step, and the
+    /// answer swaps into the scratch it came from.
     fn pow(&self, base: &[u8], exponent: u64) -> Vec<u64> {
         let k = self.n.len();
+        let mut wide = vec![0u64; 2 * k + 1];
         let mut one = vec![0u64; k];
         one[0] = 1;
-        let mut acc = self.mul(&one, &self.r2);
+        let mut acc = vec![0u64; k];
         let mut m = limbs(base);
         m.resize(k, 0);
-        m = self.mul(&m, &self.r2);
+        let mut scratch = vec![0u64; k];
+        self.mul(&one, &self.r2, &mut wide, &mut acc);
+        self.mul(&m, &self.r2, &mut wide, &mut scratch);
+        std::mem::swap(&mut m, &mut scratch);
         for bit in (0..(64 - exponent.leading_zeros())).rev() {
-            acc = self.mul(&acc, &acc);
+            self.mul(&acc, &acc, &mut wide, &mut scratch);
+            std::mem::swap(&mut acc, &mut scratch);
             if (exponent >> bit) & 1 == 1 {
-                acc = self.mul(&acc, &m);
+                self.mul(&acc, &m, &mut wide, &mut scratch);
+                std::mem::swap(&mut acc, &mut scratch);
             }
         }
-        self.mul(&acc, &one)
+        self.mul(&acc, &one, &mut wide, &mut scratch);
+        scratch
     }
 }
 
 /// `R² mod n` by doubling from one: a shift carries out at most one bit, and the doubled value is
-/// within one subtraction of `n` because it started below it.
+/// within one subtraction of `n` because it started below it. `n` occupies `k` limbs, so the first
+/// `64·(k − 1)` doublings hold a bare power of two below `n`'s own floor — that far is jumped to
+/// the top limb, and only the remaining shifts can wrap.
 fn expand(n: &[u64]) -> Vec<u64> {
     let mut v = vec![0u64; n.len()];
-    v[0] = 1;
-    for _ in 0..128 * n.len() {
+    v[n.len() - 1] = 1;
+    for _ in 0..64 * (n.len() + 1) {
         let mut carry = 0u64;
         for slot in &mut v {
             let next = *slot >> 63;
@@ -197,21 +215,6 @@ fn limbs(bytes: &[u8]) -> Vec<u64> {
         }
         out.push(word);
         at = start;
-    }
-    out
-}
-
-/// Little-endian limbs back to big-endian bytes, the modulus's own length.
-fn big_endian(value: &[u64], len: usize) -> Vec<u8> {
-    let mut out = vec![0u8; len];
-    for (i, word) in value.iter().enumerate() {
-        for b in 0..8 {
-            let high = i * 8 + b;
-            if high >= len {
-                break;
-            }
-            out[len - 1 - high] = (*word >> (8 * b)) as u8;
-        }
     }
     out
 }

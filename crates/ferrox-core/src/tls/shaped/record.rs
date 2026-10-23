@@ -393,13 +393,11 @@ impl Cbc {
         Ok((BLOCK, self.authenticate(kind, &body[BLOCK..])?))
     }
 
-    /// The same record opened into the caller's buffer, its IV left behind on the wire.
+    /// The same record opened straight off the wire into the caller's buffer: the IV and the
+    /// block behind each one stay where they are, so nothing is staged before it is decrypted.
     fn open_into(&mut self, kind: u8, body: &[u8], out: &mut [u8]) -> Result<usize, TlsError> {
         let content = self.content_len(body.len())?;
-        let mut iv = [0u8; BLOCK];
-        iv.copy_from_slice(&body[..BLOCK]);
-        out[..content].copy_from_slice(&body[BLOCK..]);
-        self.aes.decrypt(&iv, &mut out[..content]);
+        self.aes.decrypt_into(body, &mut out[..content]);
         self.authenticate(kind, &out[..content])
     }
 
@@ -446,6 +444,22 @@ enum Aes {
     Aes256(aes::Aes256),
 }
 
+/// A block as the AES backend takes it. Both widths share it, so one batch feeds either key.
+type Typed = aes::cipher::Block<aes::Aes128>;
+
+/// The blocks one backend call permutes: AES-NI and ARMv8 run this many `aesdec` chains side by
+/// side, and a decryption never waits for the block before it.
+const PAR: usize = 8;
+
+/// The CBC XOR of a permuted block with the wire block behind it.
+fn xor(left: &[u8], right: &[u8]) -> [u8; BLOCK] {
+    let mut out = [0u8; BLOCK];
+    for (slot, (got, mask)) in out.iter_mut().zip(left.iter().zip(right)) {
+        *slot = got ^ mask;
+    }
+    out
+}
+
 impl Aes {
     fn new(key: &[u8]) -> Self {
         use aes::cipher::KeyInit;
@@ -472,6 +486,15 @@ impl Aes {
         *block = typed.into();
     }
 
+    /// Up to `PAR` blocks through the backend in one call, the short tail inside the same call.
+    fn permutation(&self, typed: &mut [Typed; PAR], count: usize) {
+        use aes::cipher::BlockDecrypt;
+        match self {
+            Self::Aes128(key) => key.decrypt_blocks(&mut typed[..count]),
+            Self::Aes256(key) => key.decrypt_blocks(&mut typed[..count]),
+        }
+    }
+
     /// CBC over whole blocks: each one chains through the cipher, forward from the record's IV.
     fn encrypt(&self, iv: &[u8; BLOCK], body: &mut [u8]) {
         let mut prev = *iv;
@@ -487,18 +510,51 @@ impl Aes {
     }
 
     /// CBC over whole blocks: forward chains the ciphertext through the cipher, back chains the
-    /// wire block, not the one it just decrypted.
+    /// wire block, not the one it just decrypted. The batch permutes the stack copy, so the block
+    /// behind each result is still the wire — taken from the top down, the write never reaches it.
     fn decrypt(&self, iv: &[u8; BLOCK], body: &mut [u8]) {
+        let mut typed = std::array::from_fn(|_| Typed::from([0u8; BLOCK]));
         let mut prev = *iv;
-        for chunk in body.as_chunks_mut::<BLOCK>().0 {
-            let wire = *chunk;
-            let mut block = wire;
-            self.transform(&mut block, true);
-            for (slot, byte) in block.iter_mut().zip(prev) {
-                *slot ^= byte;
+        let mut blocks = body.as_chunks_mut::<BLOCK>().0;
+        while !blocks.is_empty() {
+            let count = blocks.len().min(PAR);
+            let (group, rest) = blocks.split_at_mut(count);
+            blocks = rest;
+            for (slot, src) in typed[..count].iter_mut().zip(group.iter()) {
+                *slot = (*src).into();
             }
-            *chunk = block;
-            prev = wire;
+            let carry = group[count - 1];
+            self.permutation(&mut typed, count);
+            for index in (1..count).rev() {
+                let (head, slot) = group.split_at_mut(index);
+                slot[0] = xor(&typed[index], &head[index - 1]);
+            }
+            group[0] = xor(&typed[0], &prev);
+            prev = carry;
+        }
+    }
+
+    /// The same chain read straight off the wire: the block behind each result stays where it is,
+    /// so a CBC record reaches the caller's buffer without its ciphertext being staged first.
+    fn decrypt_into(&self, wire: &[u8], dst: &mut [u8]) {
+        let mut typed = std::array::from_fn(|_| Typed::from([0u8; BLOCK]));
+        let blocks = dst.as_chunks_mut::<BLOCK>().0;
+        let cipher = wire[BLOCK..].as_chunks::<BLOCK>().0;
+        let masks = wire[..wire.len() - BLOCK].as_chunks::<BLOCK>().0;
+        let mut at = 0;
+        while at < blocks.len() {
+            let count = (blocks.len() - at).min(PAR);
+            for (slot, src) in typed[..count].iter_mut().zip(cipher[at..].iter()) {
+                *slot = (*src).into();
+            }
+            self.permutation(&mut typed, count);
+            for (slot, (plain, mask)) in blocks[at..][..count]
+                .iter_mut()
+                .zip(typed[..count].iter().zip(&masks[at..]))
+            {
+                *slot = xor(plain, mask);
+            }
+            at += count;
         }
     }
 }
@@ -716,5 +772,29 @@ mod tests {
             open12(&mut once, kind, body).is_err(),
             "a forged padding length fails the MAC, not a branch on the secret"
         );
+    }
+
+    #[test]
+    fn a_tls12_cbc_record_past_one_batch_opens_the_same_both_ways() {
+        let suite = Suite::EcdheAes256CbcSha;
+        let (key, mac_key, iv) = ([7u8; 32], [8u8; 20], [0u8; BLOCK]);
+        let plain = [0x5au8; 200];
+        let mut sender = Direction::tls12(suite, &key, &mac_key, &iv);
+        let mut wire = Vec::new();
+        seal12(&mut sender, 23, &plain, &mut wire).expect("seals");
+        // Payload, MAC and pad make fourteen blocks: one full batch and a tail, so every mask is
+        // taken from a block the same call has not written yet.
+        assert_eq!(wire.len(), 5 + BLOCK + 14 * BLOCK, "the record is that wide");
+        let (header, body) = wire.split_at(5);
+        let mut window = [0u8; 512];
+        let mut direct = Direction::tls12(suite, &key, &mac_key, &iv);
+        let got = open12_into(&mut direct, header[0], body, &mut window).expect("opens the window");
+        let mut staged = wire.clone();
+        let (header, body) = staged.split_at_mut(5);
+        let mut inplace = Direction::tls12(suite, &key, &mac_key, &iv);
+        let (start, same) = open12(&mut inplace, header[0], body).expect("opens in place");
+        assert_eq!((got, same), (plain.len(), plain.len()));
+        assert_eq!(&window[..got], &plain[..]);
+        assert_eq!(&body[start..start + same], &plain[..]);
     }
 }
