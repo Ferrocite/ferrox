@@ -252,6 +252,8 @@ struct ConfigKey {
     /// The `ALPN` list, shared rather than copied: the key is built on every dial, and copying the list into it allocated a vector of vectors per lookup for a list that never changes.
     alpn: std::sync::Arc<[Vec<u8>]>,
     insecure: bool,
+    /// The ECH config list, which rustls bakes into the built config rather than reading per connection.
+    ech: Option<std::sync::Arc<[u8]>>,
 }
 
 type Configs = Vec<(ConfigKey, Arc<rustls::ClientConfig>)>;
@@ -260,9 +262,23 @@ static CONFIGS: OnceLock<Mutex<Configs>> = OnceLock::new();
 
 /// The client config the cache above keeps one of: the material's provider and roots, the named `ALPN`, and the verifier the config forces.
 fn build_config(cfg: &TlsConfig, built: &Material) -> Result<rustls::ClientConfig, TlsError> {
-    let mut config = rustls::ClientConfig::builder_with_provider(Arc::clone(&built.provider))
-        .with_safe_default_protocol_versions()
-        .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?
+    let builder = rustls::ClientConfig::builder_with_provider(Arc::clone(&built.provider));
+    let builder = match cfg.ech_config_list.as_ref() {
+        Some(list) => {
+            let ech = rustls::client::EchConfig::new(
+                rustls::pki_types::EchConfigListBytes::from(list.as_ref()),
+                &super::hpke::SUITES,
+            )
+            .map_err(|e| TlsError::Other(format!("ech config: {e}")))?;
+            builder
+                .with_ech(rustls::client::EchMode::Enable(ech))
+                .map_err(|e| TlsError::Other(format!("ech: {e}")))?
+        }
+        None => builder
+            .with_safe_default_protocol_versions()
+            .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?,
+    };
+    let mut config = builder
         .with_root_certificates(Arc::clone(&built.roots))
         .with_no_client_auth();
     config.alpn_protocols.clear();
@@ -346,6 +362,7 @@ fn client_config(cfg: &TlsConfig) -> Result<Arc<rustls::ClientConfig>, TlsError>
         material: MaterialKey::of(cfg),
         alpn: std::sync::Arc::clone(&cfg.alpn),
         insecure: cfg.insecure,
+        ech: cfg.ech_config_list.clone(),
     };
     let all = CONFIGS.get_or_init(Default::default);
     let mut kept = all.lock().expect("one build at a time");
@@ -1094,6 +1111,7 @@ mod tests {
             cipher_suites: Vec::new(),
             insecure: false,
             fingerprint: None,
+            ech_config_list: None,
             websocket: false,
         }
     }
@@ -1186,6 +1204,82 @@ mod tests {
         let at = 2 + 32 + 1 + sid_len;
         let cs_len = usize::from(body[at]) << 8 | usize::from(body[at + 1]);
         &body[at..at + 2 + cs_len]
+    }
+
+    fn hello_extensions(record: &[u8]) -> Vec<(u16, &[u8])> {
+        assert_eq!(record[0], 0x16, "handshake record");
+        let record_len = usize::from(record[3]) << 8 | usize::from(record[4]);
+        let handshake = &record[5..5 + record_len];
+        assert_eq!(handshake[0], 0x01, "ClientHello");
+        let body_len = usize::from(handshake[1]) << 16
+            | usize::from(handshake[2]) << 8
+            | usize::from(handshake[3]);
+        let body = &handshake[4..4 + body_len];
+        let mut at = 2 + 32;
+        at += 1 + usize::from(body[at]);
+        at += 2 + (usize::from(body[at]) << 8 | usize::from(body[at + 1]));
+        at += 1 + usize::from(body[at]);
+        let ext_len = usize::from(body[at]) << 8 | usize::from(body[at + 1]);
+        at += 2;
+        let end = at + ext_len;
+        let mut out = Vec::new();
+        while at < end {
+            let kind = u16::from_be_bytes([body[at], body[at + 1]]);
+            let len = usize::from(body[at + 2]) << 8 | usize::from(body[at + 3]);
+            out.push((kind, &body[at + 4..at + 4 + len]));
+            at += 4 + len;
+        }
+        out
+    }
+
+    #[cfg_attr(miri, ignore = "assembles a real hello through ring")]
+    #[test]
+    fn a_configured_ech_list_carries_the_inner_name_only_in_the_payload() {
+        let (list, _keys) = crate::tls::ech::generate("public.test", 3).expect("generates");
+        let mut cfg = client("hidden.test", &[]);
+        cfg.ech_config_list = Some(list.into());
+        let config = client_config(&cfg).expect("builds");
+        let mut conn = rustls::ClientConnection::new(
+            config,
+            rustls::pki_types::ServerName::try_from("hidden.test").expect("name"),
+        )
+        .expect("session");
+        let mut record = Vec::new();
+        conn.write_tls(&mut record).expect("hello goes out");
+        assert_eq!(conn.ech_status(), rustls::client::EchStatus::Offered);
+        let extensions = hello_extensions(&record);
+        let (_, ech) = extensions
+            .iter()
+            .find(|(kind, _)| *kind == 0xfe0d)
+            .expect("ech extension");
+        assert_eq!(ech[0], 0, "ClientHelloOuter");
+        assert_eq!(ech[5], 3, "config id");
+        assert_eq!(
+            usize::from(ech[6]) << 8 | usize::from(ech[7]),
+            32,
+            "x25519 enc"
+        );
+        let (_, sni) = extensions
+            .iter()
+            .find(|(kind, _)| *kind == 0x0000)
+            .expect("sni extension");
+        assert!(
+            sni.windows(b"public.test".len())
+                .any(|window| window == b"public.test"),
+            "the outer name is the public one"
+        );
+        assert!(
+            !sni.windows(b"hidden.test".len())
+                .any(|window| window == b"hidden.test"),
+            "the inner name is not on the outside"
+        );
+    }
+
+    #[test]
+    fn a_malformed_ech_list_refuses_the_dial_instead_of_falling_back() {
+        let mut cfg = client("hidden.test", &[]);
+        cfg.ech_config_list = Some(vec![0, 1, 2].into());
+        assert!(client_config(&cfg).is_err());
     }
 
     #[cfg_attr(miri, ignore = "assembles a real hello through ring")]

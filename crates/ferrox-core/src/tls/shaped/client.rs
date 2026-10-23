@@ -79,7 +79,10 @@ impl<S: Stream> Session<S> {
                 "shaped: a stock fingerprint has no shaped session".to_owned(),
             ));
         };
-        let hello = Hello::build(profile, &cfg.server_name, &cfg.alpn, cfg.websocket)?;
+        let mut hello = Hello::build(profile, &cfg.server_name, &cfg.alpn, cfg.websocket)?;
+        if let Some(list) = &cfg.ech_config_list {
+            hello.enable_ech(list)?;
+        }
         let verifier = crate::tls::rustls_backend::verifier(cfg)?;
         Self::with_hello(profile, cfg.server_name.clone(), verifier, hello, io)
     }
@@ -148,9 +151,14 @@ impl<S: Stream> Session<S> {
             .hello
             .take()
             .ok_or_else(|| TlsError::Other("shaped: handshake already ran".to_owned()))?;
+        let ech = hello.ech_inner().is_some();
         self.client_random = hello.random;
         self.send_plain(HANDSHAKE, &hello.msg, [0x03, 0x01])?;
-        self.transcript.extend_from_slice(&hello.msg);
+        self.transcript.extend_from_slice(if ech {
+            hello.ech_inner().expect("checked")
+        } else {
+            &hello.msg
+        });
         let mut msg = self.next_handshake()?;
         if msg[0] != 2 {
             return Err(unexpected(msg[0]));
@@ -160,21 +168,25 @@ impl<S: Stream> Session<S> {
             let suite = Suite::from_id(sh.suite)
                 .filter(|suite| suite.is_tls13())
                 .ok_or(TlsError::NoSharedCipher)?;
-            let first = std::mem::take(&mut self.transcript);
-            let hashed = suite.hash().hash(&first);
-            let mut transcript = Vec::with_capacity(4 + hashed.len() + msg.len());
-            transcript.push(254);
-            transcript.extend_from_slice(&(hashed.len() as u32).to_be_bytes()[1..]);
-            transcript.extend_from_slice(&hashed);
-            transcript.extend_from_slice(&msg);
-            self.transcript = transcript;
+            if ech {
+                self.ech_retry_accepted(&hello, &sh, &msg, suite)?;
+            } else {
+                let first = std::mem::take(&mut self.transcript);
+                let mut transcript = message_hash(suite.hash(), &first);
+                transcript.extend_from_slice(&msg);
+                self.transcript = transcript;
+            }
             let group = sh
                 .hrr_group
                 .ok_or_else(|| TlsError::Other("retry request names no group".to_owned()))?;
             self.send_ccs()?;
             hello = hello.retry(group, sh.cookie.as_deref())?;
             self.send_plain(HANDSHAKE, &hello.msg, [0x03, 0x03])?;
-            self.transcript.extend_from_slice(&hello.msg);
+            self.transcript.extend_from_slice(if ech {
+                hello.ech_inner().expect("retry keeps the offer")
+            } else {
+                &hello.msg
+            });
             msg = self.next_handshake()?;
             if msg[0] != 2 {
                 return Err(unexpected(msg[0]));
@@ -186,6 +198,15 @@ impl<S: Stream> Session<S> {
                 ));
             }
         }
+        if ech {
+            if sh.version != 0x0304 {
+                return Err(ech_rejected(&hello));
+            }
+            let suite = Suite::from_id(sh.suite)
+                .filter(|suite| suite.is_tls13())
+                .ok_or(TlsError::NoSharedCipher)?;
+            self.ech_accepted(&hello, &msg, suite)?;
+        }
         self.transcript.extend_from_slice(&msg);
         self.suite = Suite::from_id(sh.suite);
         match sh.version {
@@ -195,6 +216,54 @@ impl<S: Stream> Session<S> {
         }?;
         self.check_alpn(&hello, &sh)?;
         self.done = true;
+        Ok(())
+    }
+
+    fn ech_retry_accepted(
+        &mut self,
+        hello: &Hello,
+        sh: &ServerHello,
+        msg: &[u8],
+        suite: Suite,
+    ) -> Result<(), TlsError> {
+        let confirmation = sh.ech.as_deref().ok_or_else(|| ech_rejected(hello))?;
+        if confirmation.len() != 8 {
+            return Err(TlsError::Other(
+                "ech: the retry confirmation is not eight bytes".to_owned(),
+            ));
+        }
+        let inner = hello.ech_inner().expect("checked");
+        let mut transcript = message_hash(suite.hash(), inner);
+        transcript.extend_from_slice(&hrr_without_confirmation(msg)?);
+        let derived = confirmation_secret(
+            suite.hash(),
+            &hello.ech_inner_random().expect("checked"),
+            &transcript,
+            b"hrr ech accept confirmation",
+        );
+        if derived != confirmation {
+            return Err(ech_rejected(hello));
+        }
+        let mut transcript = message_hash(suite.hash(), inner);
+        transcript.extend_from_slice(msg);
+        self.transcript = transcript;
+        Ok(())
+    }
+
+    fn ech_accepted(&self, hello: &Hello, msg: &[u8], suite: Suite) -> Result<(), TlsError> {
+        let mut transcript = self.transcript.clone();
+        let mut hello_conf = msg.to_vec();
+        hello_conf[30..38].fill(0);
+        transcript.extend_from_slice(&hello_conf);
+        let derived = confirmation_secret(
+            suite.hash(),
+            &hello.ech_inner_random().expect("checked"),
+            &transcript,
+            b"ech accept confirmation",
+        );
+        if derived != msg[30..38] {
+            return Err(ech_rejected(hello));
+        }
         Ok(())
     }
 
@@ -999,6 +1068,7 @@ struct ServerHello {
     hrr_group: Option<u16>,
     cookie: Option<Vec<u8>>,
     alpn: Option<Vec<u8>>,
+    ech: Option<Vec<u8>>,
     ems: bool,
     hrr: bool,
 }
@@ -1023,6 +1093,7 @@ impl ServerHello {
             hrr_group: None,
             cookie: None,
             alpn: None,
+            ech: None,
             ems: false,
             hrr,
         };
@@ -1059,6 +1130,7 @@ impl ServerHello {
                     out.alpn = Some(first.vec8()?.to_vec());
                 }
                 0x0017 => out.ems = true,
+                0xfe0d => out.ech = Some(value.to_vec()),
                 _ => {}
             }
         }
@@ -1187,6 +1259,66 @@ fn server_key_exchange(body: &[u8]) -> Result<(u16, Vec<u8>, usize), TlsError> {
     let peer = r.vec8()?.to_vec();
     let signed_at = r.at;
     Ok((group, peer, signed_at))
+}
+
+fn message_hash(hash: Hash, message: &[u8]) -> Vec<u8> {
+    let digest = hash.hash(message);
+    let mut out = Vec::with_capacity(4 + digest.len());
+    out.push(254);
+    out.extend_from_slice(&(digest.len() as u32).to_be_bytes()[1..]);
+    out.extend_from_slice(&digest);
+    out
+}
+
+fn confirmation_secret(hash: Hash, random: &[u8; 32], transcript: &[u8], label: &[u8]) -> [u8; 8] {
+    let secret = kdf::extract(hash, &[], random);
+    let mut out = [0u8; 8];
+    kdf::expand_label(hash, &secret, label, &hash.hash(transcript), &mut out);
+    out
+}
+
+fn hrr_without_confirmation(msg: &[u8]) -> Result<Vec<u8>, TlsError> {
+    let mut out = msg.to_vec();
+    if out.len() < 4 + 2 + 32 + 1 {
+        return Err(TlsError::Other("short retry request".to_owned()));
+    }
+    let mut at = 4 + 2 + 32;
+    let session = usize::from(out[at]);
+    at += 1 + session;
+    at += 2 + 1;
+    if out.len() < at + 2 {
+        return Err(TlsError::Other("short retry extensions".to_owned()));
+    }
+    let end = at + 2 + (usize::from(out[at]) << 8 | usize::from(out[at + 1]));
+    at += 2;
+    while at < end {
+        if out.len() < at + 4 {
+            return Err(TlsError::Other("short retry extension".to_owned()));
+        }
+        let kind = u16::from_be_bytes([out[at], out[at + 1]]);
+        let len = usize::from(out[at + 2]) << 8 | usize::from(out[at + 3]);
+        if kind == 0xfe0d {
+            let body = at + 4;
+            if len != 8 || out.len() < body + len {
+                return Err(TlsError::Other(
+                    "ech: the retry confirmation is not eight bytes".to_owned(),
+                ));
+            }
+            out[body..body + len].fill(0);
+            return Ok(out);
+        }
+        at += 4 + len;
+    }
+    Err(TlsError::Other(
+        "ech: the retry request carries no confirmation".to_owned(),
+    ))
+}
+
+fn ech_rejected(hello: &Hello) -> TlsError {
+    TlsError::Other(format!(
+        "ech: the server did not accept the offer for {}",
+        hello.ech_public_name().unwrap_or("its public name")
+    ))
 }
 
 fn certificate_empty() -> Vec<u8> {
@@ -1418,6 +1550,10 @@ fn verify_signature(
 mod tests {
     use super::*;
     use crate::tls::shaped::profiles;
+    use crate::tls::shaped::Fingerprint;
+    use rustls::client::danger::HandshakeSignatureValid;
+    use rustls::DigitallySignedStruct;
+    use rustls::SignatureScheme;
     use std::io::{Read, Write};
 
     struct Sink;
@@ -1651,5 +1787,207 @@ mod tests {
             body12[14..].as_ptr(),
             "and so does its issuer"
         );
+    }
+    #[derive(Debug)]
+    struct Unverified;
+
+    impl ServerCertVerifier for Unverified {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &CertificateDer<'_>,
+            _intermediates: &[CertificateDer<'_>],
+            _server_name: &ServerName<'_>,
+            _ocsp: &[u8],
+            _now: UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &CertificateDer<'_>,
+            _dss: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            Vec::new()
+        }
+    }
+
+    struct Server(Vec<u8>, usize);
+
+    impl Read for Server {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let left = &self.0[self.1..];
+            let take = left.len().min(out.len());
+            out[..take].copy_from_slice(&left[..take]);
+            self.1 += take;
+            Ok(take)
+        }
+    }
+
+    impl Write for Server {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn accepting_server_hello(hello: &Hello) -> Vec<u8> {
+        let inner = hello.ech_inner().expect("inner").to_vec();
+        let random = hello.ech_inner_random().expect("random");
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0x22; 32]);
+        body.push(0);
+        body.extend_from_slice(&[0x13, 0x01, 0]);
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
+        extensions.extend_from_slice(&[0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20]);
+        extensions.extend_from_slice(&[0x44; 32]);
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+
+        let mut zeroed = body.clone();
+        zeroed[2 + 24..2 + 32].fill(0);
+        let mut transcript = inner;
+        transcript.extend_from_slice(&message(2, &zeroed));
+        let confirmation = confirmation_secret(
+            Hash::Sha256,
+            &random,
+            &transcript,
+            b"ech accept confirmation",
+        );
+        body[2 + 24..2 + 32].copy_from_slice(&confirmation);
+        let message = message(2, &body);
+        let mut record = vec![HANDSHAKE, 0x03, 0x01];
+        record.extend_from_slice(&(message.len() as u16).to_be_bytes());
+        record.extend_from_slice(&message);
+        record
+    }
+
+    fn ech_session(list: &[u8], server: impl FnOnce(&Hello) -> Vec<u8>) -> Session<Server> {
+        let profile = Fingerprint::default().profile().expect("profile");
+        let mut hello = Hello::build(profile, "hidden.test", &[], false).expect("builds");
+        hello.enable_ech(list).expect("ech");
+        let server = server(&hello);
+        Session::with_hello(
+            profile,
+            "hidden.test".to_owned(),
+            Arc::new(Unverified),
+            hello,
+            Server(server, 0),
+        )
+        .expect("session")
+    }
+
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn an_accepted_offer_uses_the_inner_transcript() {
+        let (list, _) = crate::tls::ech::generate("public.test", 7).expect("generates");
+        let mut session = ech_session(&list, accepting_server_hello);
+        let error = session.handshake().unwrap_err().to_string();
+        assert!(
+            !error.contains("did not accept"),
+            "the confirming hello must be accepted: {error}"
+        );
+    }
+
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn a_non_confirming_offer_is_refused() {
+        let (list, _) = crate::tls::ech::generate("public.test", 7).expect("generates");
+        let mut session = ech_session(&list, |hello| {
+            let mut server = accepting_server_hello(hello);
+            let tail = server.len() - 8;
+            server[tail..].fill(0);
+            server
+        });
+        let error = session.handshake().unwrap_err().to_string();
+        assert!(
+            error.contains("did not accept"),
+            "a hello that does not confirm must be refused: {error}"
+        );
+    }
+
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn a_retry_without_a_confirmation_is_refused() {
+        let (list, _) = crate::tls::ech::generate("public.test", 7).expect("generates");
+        let mut session = ech_session(&list, |_| {
+            let mut body = vec![0x03, 0x03];
+            body.extend_from_slice(&HRR_RANDOM);
+            body.push(0);
+            body.extend_from_slice(&[0x13, 0x01, 0, 0, 0]);
+            let message = message(2, &body);
+            let mut record = vec![HANDSHAKE, 0x03, 0x01];
+            record.extend_from_slice(&(message.len() as u16).to_be_bytes());
+            record.extend_from_slice(&message);
+            record
+        });
+        let error = session.handshake().unwrap_err().to_string();
+        assert!(
+            error.contains("did not accept"),
+            "a retry that ignores the offer must be refused: {error}"
+        );
+    }
+
+    #[test]
+    fn the_ech_confirmation_matches_the_reference_schedule() {
+        let random = [0x11u8; 32];
+        let transcript = b"test transcript";
+        assert_eq!(
+            confirmation_secret(
+                Hash::Sha256,
+                &random,
+                transcript,
+                b"ech accept confirmation"
+            ),
+            [0x31, 0x5e, 0x4d, 0x20, 0x59, 0x21, 0x87, 0xf1]
+        );
+        assert_eq!(
+            confirmation_secret(
+                Hash::Sha256,
+                &random,
+                transcript,
+                b"hrr ech accept confirmation"
+            ),
+            [0xb3, 0xf3, 0xe4, 0x43, 0x38, 0x4f, 0x04, 0x30]
+        );
+    }
+
+    #[test]
+    fn a_retry_confirmation_is_zeroed_in_the_transcript() {
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&HRR_RANDOM);
+        body.push(0);
+        body.extend_from_slice(&[0x13, 0x01, 0]);
+        let mut extensions = vec![0xfe, 0x0d, 0x00, 0x08];
+        extensions.extend_from_slice(&[1u8; 8]);
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+        let msg = message(2, &body);
+        let zeroed = hrr_without_confirmation(&msg).expect("confirmation");
+        assert_eq!(&zeroed[zeroed.len() - 8..], &[0u8; 8]);
+        assert_eq!(&zeroed[..zeroed.len() - 8], &msg[..msg.len() - 8]);
+
+        let mut missing = msg.clone();
+        let at = missing.len() - 12;
+        missing[at..at + 2].copy_from_slice(&[0x00, 0x2c]);
+        assert!(hrr_without_confirmation(&missing).is_err());
     }
 }
