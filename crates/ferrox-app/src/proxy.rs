@@ -7133,12 +7133,26 @@ fn dial_socks_client(
 }
 
 /// The split-tunnel list: targets this lane does not carry, which leave by the plain dial.
-fn foxy_splits(foxy: &FoxyOut, asked: &Destination) -> bool {
-    foxy.direct_ports.contains(&asked.port())
-        || foxy
-            .direct_suffixes
-            .iter()
-            .any(|suffix| asked.host().to_ascii_lowercase().ends_with(suffix))
+fn foxy_splits(ports: &[u16], suffixes: &[String], asked: &Destination) -> bool {
+    if ports.contains(&asked.port()) {
+        return true;
+    }
+    // A domain list decides names only: an address leaves by a port or not at all.
+    let Destination::Name(host, _) = asked else {
+        return false;
+    };
+    suffixes.iter().any(|suffix| {
+        let suffix = suffix
+            .strip_prefix("*.")
+            .or_else(|| suffix.strip_prefix('.'))
+            .unwrap_or(suffix)
+            .trim_end_matches('.');
+        !suffix.is_empty()
+            && host.len() >= suffix.len()
+            && (host.len() == suffix.len()
+                || host.as_bytes()[host.len() - suffix.len() - 1] == b'.')
+            && host[host.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+    })
 }
 
 fn foxy_socks_reply(reply: u8) -> [u8; 10] {
@@ -7467,7 +7481,7 @@ fn foxy_open(foxy: &FoxyOut, asked: &Destination) -> FoxyOpen {
     if edge_limited(&foxy.limited_until, now_secs()) {
         return FoxyOpen::Refused(0x01);
     }
-    if foxy_splits(foxy, asked) {
+    if foxy_splits(&foxy.direct_ports, &foxy.direct_suffixes, asked) {
         let Some(target) = asked.socket() else {
             return FoxyOpen::Silent;
         };
@@ -11644,13 +11658,6 @@ impl Destination {
         }
     }
 
-    fn host(&self) -> String {
-        match self {
-            Self::Name(host, _) => host.clone(),
-            Self::Address(address) => address.ip().to_string(),
-        }
-    }
-
     pub(crate) fn port(&self) -> u16 {
         match self {
             Self::Name(_, port) => *port,
@@ -13502,7 +13509,7 @@ mod tests {
         .expect("parses");
         let dest = dokodemo_target(&inbound).expect("a rewrite target");
         assert_eq!(dest.port(), 8080);
-        assert_eq!(dest.host(), "127.0.0.1");
+        assert_eq!(dest.authority(), "127.0.0.1:8080");
         assert_eq!(dokodemo_networks(&inbound), ["tcp", "udp"]);
     }
 
@@ -29323,5 +29330,69 @@ mod foxy_ping_tests {
             r#"{"host":"us.m1.example","port":2499,"city":"SFO","country":"US","ms":null}"#,
             "an unanswered edge is still a row: silence is the reading"
         );
+    }
+}
+
+#[cfg(test)]
+mod foxy_split_tests {
+    use super::{foxy_splits, Destination};
+
+    fn named(host: &str, port: u16) -> Destination {
+        Destination::Name(host.to_owned(), port)
+    }
+
+    #[test]
+    fn an_excluded_domain_takes_its_own_name_and_its_subdomains_but_not_a_name_that_merely_ends_with_it(
+    ) {
+        let suffixes = vec!["example.com".to_owned()];
+        assert!(foxy_splits(&[], &suffixes, &named("example.com", 443)));
+        assert!(foxy_splits(&[], &suffixes, &named("a.example.com", 443)));
+        assert!(foxy_splits(&[], &suffixes, &named("A.Example.COM", 443)));
+        assert!(!foxy_splits(&[], &suffixes, &named("notexample.com", 443)));
+        assert!(!foxy_splits(
+            &[],
+            &suffixes,
+            &named("example.com.evil", 443)
+        ));
+    }
+
+    #[test]
+    fn a_starred_or_dotted_suffix_reads_as_the_same_exclusion() {
+        for spelling in ["*.example.com", ".example.com", "example.com."] {
+            let suffixes = vec![spelling.to_owned()];
+            assert!(
+                foxy_splits(&[], &suffixes, &named("a.example.com", 443)),
+                "{spelling} did not cover a subdomain"
+            );
+            assert!(
+                !foxy_splits(&[], &suffixes, &named("badexample.com", 443)),
+                "{spelling} leaked to a name that merely ends with the suffix"
+            );
+        }
+    }
+
+    #[test]
+    fn an_excluded_port_leaves_whatever_the_name() {
+        assert!(foxy_splits(
+            &[22, 53],
+            &[],
+            &Destination::Address("192.0.2.7:53".parse().expect("addr"))
+        ));
+        assert!(foxy_splits(&[22, 53], &[], &named("anything.example", 22)));
+        assert!(!foxy_splits(
+            &[22, 53],
+            &[],
+            &named("anything.example", 443)
+        ));
+    }
+
+    #[test]
+    fn a_domain_list_does_not_decide_an_address() {
+        let suffixes = vec!["0.2.7".to_owned()];
+        assert!(!foxy_splits(
+            &[],
+            &suffixes,
+            &Destination::Address("192.0.2.7:443".parse().expect("addr"))
+        ));
     }
 }

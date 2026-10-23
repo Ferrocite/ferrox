@@ -26,6 +26,7 @@ CASES = [
     ("up with an unknown carrier", ["up", "--carrier", "banana"], "h1, h2 or h3"),
     ("up with no lane", ["up"], "no outbound chosen"),
     ("ping outside locations", ["up", "--ping"], "--ping"),
+    ("exclusions outside foxy", ["up", "--exclude-ports", "22"], "--exclude-ports"),
 ]
 
 
