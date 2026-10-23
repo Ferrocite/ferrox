@@ -1,5 +1,5 @@
 // The shaped client handshake: a browser hello out, both TLS versions' flights back under keys this module owns.
-use super::hello::Hello;
+use super::hello::{Hello, TLS12};
 use super::kdf::{self, Hash};
 use super::record::{self, Direction, Suite};
 use super::{Fingerprint, Profile};
@@ -281,14 +281,20 @@ impl<S: Stream> Session<S> {
         self.verify_chain(&chain)?;
         self.transcript.extend_from_slice(&msg);
 
-        let msg = self.next_expect(12)?;
-        let (group, peer, signed_at) = server_key_exchange(&msg[4..])?;
-        let mut signed = Vec::with_capacity(64 + signed_at);
-        signed.extend_from_slice(&self.client_random);
-        signed.extend_from_slice(&sh.random);
-        signed.extend_from_slice(&msg[4..4 + signed_at]);
-        self.verify_certificate_verify(&msg[4 + signed_at..], &signed, false)?;
-        self.transcript.extend_from_slice(&msg);
+        // A static-RSA suite has no ServerKeyExchange: the leaf's own key carries the pre-master.
+        let share = if suite.is_rsa() {
+            None
+        } else {
+            let msg = self.next_expect(12)?;
+            let (group, peer, signed_at) = server_key_exchange(&msg[4..])?;
+            let mut signed = Vec::with_capacity(64 + signed_at);
+            signed.extend_from_slice(&self.client_random);
+            signed.extend_from_slice(&sh.random);
+            signed.extend_from_slice(&msg[4..4 + signed_at]);
+            self.verify_certificate_verify(&msg[4 + signed_at..], &signed, false)?;
+            self.transcript.extend_from_slice(&msg);
+            Some((group, peer))
+        };
         let mut msg = self.next_handshake()?;
         if msg[0] == 13 {
             self.transcript.extend_from_slice(&msg);
@@ -302,15 +308,24 @@ impl<S: Stream> Session<S> {
         }
         self.transcript.extend_from_slice(&msg);
 
-        let public = hello
-            .share_public(group)
-            .ok_or(TlsError::NoSharedCipher)?
-            .to_vec();
-        let shared = hello.agree(group, &peer)?;
-
-        let mut exchange = Vec::with_capacity(1 + public.len());
-        exchange.push(public.len() as u8);
-        exchange.extend_from_slice(&public);
+        let (pre_master, exchange) = match share {
+            Some((group, peer)) => {
+                let public = hello
+                    .share_public(group)
+                    .ok_or(TlsError::NoSharedCipher)?
+                    .to_vec();
+                let shared = hello.agree(group, &peer)?;
+                let mut exchange = Vec::with_capacity(1 + public.len());
+                exchange.push(public.len() as u8);
+                exchange.extend_from_slice(&public);
+                (shared, exchange)
+            }
+            None => rsa_exchange(
+                self.leaf
+                    .as_ref()
+                    .ok_or_else(|| TlsError::BadCertificate("no leaf to key".to_owned()))?,
+            )?,
+        };
         let cke = message(16, &exchange);
         self.send_plain(HANDSHAKE, &cke, [0x03, 0x03])?;
         self.transcript.extend_from_slice(&cke);
@@ -318,16 +333,16 @@ impl<S: Stream> Session<S> {
         // RFC 7627 hashes the ClientKeyExchange into the EMS transcript, as Go does after writing it.
         let hash = suite.hash();
         let session_hash = sh.ems.then(|| hash.hash(&self.transcript));
-        let (master, block) = super::tls12::keys(
+        let (master, directions) = super::tls12::keys(
             suite,
-            &shared,
+            &pre_master,
             &self.client_random,
             &sh.random,
             session_hash.as_deref(),
         );
 
-        self.client12 = Some(Direction::tls12(suite, &block.client_key, &block.client_iv));
-        self.server12 = Some(Direction::tls12(suite, &block.server_key, &block.server_iv));
+        self.client12 = Some(directions.client);
+        self.server12 = Some(directions.server);
         self.send_ccs()?;
         self.write_key = self.client12.take();
 
@@ -1145,6 +1160,34 @@ fn certificate_empty() -> Vec<u8> {
     message(11, &[0, 0, 0])
 }
 
+/// Random bytes, shaped as the reference's padding reader asks for: the caller re-rolls what it rejects.
+fn fill(buf: &mut [u8]) -> Result<(), TlsError> {
+    getrandom::fill(buf).map_err(|e| TlsError::Other(format!("random: {e}")))
+}
+
+/// The static-RSA pre-master and the exchange that carries it: no `ServerKeyExchange` sends a share,
+/// so the client draws the secret and encrypts it to the leaf's own key.
+fn rsa_exchange(leaf: &[u8]) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
+    let key = subject_public_key(leaf)?;
+    if key.algorithm != OID_RSA {
+        return Err(TlsError::BadCertificate(
+            "a static-RSA suite without an RSA leaf".to_owned(),
+        ));
+    }
+    let (modulus, exponent) = super::rsa::public_key(key.key)
+        .ok_or_else(|| TlsError::BadCertificate("malformed RSA key".to_owned()))?;
+    // RFC 5246 §7.4.7.1 repeats the hello's version, and the rest is random.
+    let mut secret = vec![0u8; 48];
+    secret[..2].copy_from_slice(&TLS12.to_be_bytes());
+    fill(&mut secret[2..])?;
+    let mut cipher = Vec::with_capacity(modulus.len());
+    super::rsa::encrypt(modulus, exponent, &secret, &mut fill, &mut cipher)?;
+    let mut exchange = Vec::with_capacity(2 + cipher.len());
+    exchange.extend_from_slice(&(cipher.len() as u16).to_be_bytes());
+    exchange.extend_from_slice(&cipher);
+    Ok((secret, exchange))
+}
+
 fn message(kind: u8, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + body.len());
     out.push(kind);
@@ -1260,7 +1303,7 @@ fn subject_public_key(der: &[u8]) -> Result<PublicKey<'_>, TlsError> {
     })
 }
 
-fn tlv(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
+pub(super) fn tlv(input: &[u8]) -> Option<(u8, &[u8], &[u8])> {
     let tag = *input.first()?;
     let first = *input.get(1)?;
     let (len, header) = if first & 0x80 == 0 {
@@ -1434,10 +1477,10 @@ mod tests {
         let mut session = session(
             Version::Tls12,
             suite,
-            Direction::tls12(suite, &key, &iv),
-            Direction::tls12(suite, &key, &iv),
+            Direction::tls12(suite, &key, &[], &iv),
+            Direction::tls12(suite, &key, &[], &iv),
         );
-        let mut sender = Direction::tls12(suite, &key, &iv);
+        let mut sender = Direction::tls12(suite, &key, &[], &iv);
         let mut wire = Vec::new();
         record::seal12(&mut sender, APPLICATION, b"one", &mut wire).expect("seals");
         record::seal12(&mut sender, APPLICATION, b"two", &mut wire).expect("seals");
@@ -1456,16 +1499,37 @@ mod tests {
         let mut session = session(
             Version::Tls12,
             suite,
-            Direction::tls12(suite, &key, &iv),
-            Direction::tls12(suite, &key, &iv),
+            Direction::tls12(suite, &key, &[], &iv),
+            Direction::tls12(suite, &key, &[], &iv),
         );
-        let mut sender = Direction::tls12(suite, &key, &iv);
+        let mut sender = Direction::tls12(suite, &key, &[], &iv);
         let mut wire = Vec::new();
         record::seal12(&mut sender, APPLICATION, b"four", &mut wire).expect("seals");
         let mut window = [0u8; 128];
         let (got, consumed) = session.open(&wire, &mut window).expect("opens");
         assert_eq!((got, consumed), (4, wire.len()));
         assert_eq!(&window[..4], b"four");
+        assert_eq!(session.plain_buffer(), []);
+    }
+
+    #[test]
+    fn a_roomy_tls12_cbc_chunk_opens_past_its_iv_and_mac() {
+        let suite = Suite::EcdheAes128CbcSha;
+        let (key, mac_key, iv) = ([3u8; 16], [4u8; 20], [0u8; 16]);
+        let mut session = session(
+            Version::Tls12,
+            suite,
+            Direction::tls12(suite, &key, &mac_key, &iv),
+            Direction::tls12(suite, &key, &mac_key, &iv),
+        );
+        let mut sender = Direction::tls12(suite, &key, &mac_key, &iv);
+        let mut wire = Vec::new();
+        record::seal12(&mut sender, APPLICATION, b"one", &mut wire).expect("seals");
+        record::seal12(&mut sender, APPLICATION, b"twoo", &mut wire).expect("seals");
+        let mut window = [0u8; 128];
+        let (got, consumed) = session.open(&wire, &mut window).expect("opens");
+        assert_eq!((got, consumed), (7, wire.len()));
+        assert_eq!(&window[..7], b"onetwoo");
         assert_eq!(session.plain_buffer(), []);
     }
 }

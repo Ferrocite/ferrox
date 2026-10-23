@@ -3,7 +3,8 @@ use super::keys::{self, Share};
 use super::{Body, Ext, Profile, GREASE};
 use crate::tls::TlsError;
 
-const TLS12: u16 = 0x0303;
+/// The version this hello's legacy field names, which a static-RSA premaster repeats.
+pub(super) const TLS12: u16 = 0x0303;
 const PAD: u16 = 0x0015;
 const ALPN: u16 = 0x0010;
 

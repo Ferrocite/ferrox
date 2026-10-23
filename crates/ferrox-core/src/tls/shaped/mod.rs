@@ -3,8 +3,11 @@ mod client;
 pub(crate) mod hello;
 mod kdf;
 mod keys;
+#[cfg(test)]
+mod oracle;
 mod profiles;
 pub(crate) mod record;
+mod rsa;
 pub(crate) mod tls12;
 
 pub use client::Session;
