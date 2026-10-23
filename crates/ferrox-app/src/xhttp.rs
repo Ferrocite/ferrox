@@ -1240,15 +1240,28 @@ pub(crate) fn end_session(id: &str) {
 }
 
 #[cfg(test)]
+pub(crate) fn start_session_for_probe(id: &str) {
+    let _ = get_or_create_session(id);
+}
+
+#[cfg(test)]
 pub(crate) fn session_is_carried(id: &str) -> bool {
     sessions().lock().expect("sessions lock").contains_key(id)
 }
 
 /// An h2 connection owns the sessions its streams opened, so its death can end them; a bare H1 request has no carrier to bind to.
-fn bound_session(sid: &str, h2: Option<&crate::xhttp_h2::H2StreamOut>) -> Arc<Session> {
+fn bound_session(
+    sid: &str,
+    h2: Option<&crate::xhttp_h2::H2StreamOut>,
+    downlink: bool,
+) -> Arc<Session> {
     let session = get_or_create_session(sid);
     if let Some(h2) = h2 {
-        h2.bind_session(sid);
+        if downlink {
+            h2.bind_session(sid);
+        } else {
+            h2.bind_upload(sid);
+        }
     }
     session
 }
@@ -1737,7 +1750,7 @@ pub(crate) fn accept_core<
                     emit_400(&mut write);
                     return Served::Closed;
                 }
-                let session = bound_session(sid, h2.as_ref());
+                let session = bound_session(sid, h2.as_ref(), true);
                 sse_ok(&mut write, settings, &padded);
                 let writer = writer_for(write, h2);
                 return Served::Session(
@@ -1755,7 +1768,7 @@ pub(crate) fn accept_core<
                 emit_400(&mut write);
                 return Served::Closed;
             }
-            let session = bound_session(sid, h2.as_ref());
+            let session = bound_session(sid, h2.as_ref(), false);
             if h2.is_some() {
                 session.set_upload(Box::new(read));
             } else {
@@ -1782,7 +1795,7 @@ pub(crate) fn accept_core<
                 emit_500(&mut write);
                 return Served::Closed;
             };
-            let session = bound_session(sid, h2.as_ref());
+            let session = bound_session(sid, h2.as_ref(), false);
             // The body arrives whatever the placement carries the packet in: an unread one would leave the next request's head sitting in its bytes.
             let mut body = Vec::new();
             let mut carry = Vec::new();

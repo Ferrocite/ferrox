@@ -39,11 +39,16 @@ impl H2StreamOut {
     }
 
     pub(crate) fn bind_session(&self, sid: &str) {
-        self.conn.bind_session(sid);
+        self.conn.bind_session(sid, Some(self.stream));
+    }
+
+    pub(crate) fn bind_upload(&self, sid: &str) {
+        self.conn.bind_session(sid, None);
     }
 
     pub(crate) fn end(&self) {
         self.conn.end_stream(self.stream);
+        self.conn.end_session_of(self.stream);
     }
 }
 
@@ -64,6 +69,7 @@ struct H2Conn {
     write: Mutex<Box<dyn crate::proxy::FrameWrite + Send>>,
     streams: Mutex<HashMap<u32, Arc<H2Stream>>>,
     sessions: Mutex<HashSet<String>>,
+    session_of: Mutex<HashMap<u32, String>>,
     send_conn: Mutex<u64>,
     wake: Condvar,
     decoder: Mutex<Decoder>,
@@ -348,6 +354,7 @@ impl H2Conn {
                 state.cv.notify_all();
             }
         }
+        self.end_session_of(stream);
         let _ = self.frame(T_RST, 0, stream, &E_REFUSED.to_be_bytes());
     }
 
@@ -379,7 +386,7 @@ impl H2Conn {
     }
 
     /// The session a stream of this connection waits on dies with the connection: past `dead` there is no frame left to post, so a waiter would park on a sequence no peer can ever send.
-    fn bind_session(&self, sid: &str) {
+    fn bind_session(&self, sid: &str, downlink: Option<u32>) {
         {
             let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
             // Every packet-up POST repeats its session's id, so the owned key is only made for a first bind.
@@ -387,9 +394,31 @@ impl H2Conn {
                 sessions.insert(sid.to_owned());
             }
         }
+        if let Some(stream) = downlink {
+            self.session_of
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(stream, sid.to_owned());
+        }
         // `kill` sets `dead` before it drains this set, so a bind that raced the drain ends its own session.
         if self.dead.load(Ordering::SeqCst) {
             crate::xhttp::end_session(sid);
+        }
+    }
+
+    /// A finished downlink ends the session its uploads wait on, so a packet-up POST parked in `wait_ended` is not left for the connection's death.
+    fn end_session_of(&self, stream: u32) {
+        let sid = self
+            .session_of
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&stream);
+        if let Some(sid) = sid {
+            self.sessions
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&sid);
+            crate::xhttp::end_session(&sid);
         }
     }
 }
@@ -564,6 +593,7 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
         write: Mutex::new(Box::new(write)),
         streams: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashSet::new()),
+        session_of: Mutex::new(HashMap::new()),
         send_conn: Mutex::new(65_535),
         wake: Condvar::new(),
         decoder: Mutex::new(Decoder::default()),
@@ -1545,6 +1575,25 @@ mod tests {
         server.join().expect("joins");
     }
 
+    /// A downlink that finishes ends its session: the packet-up upload's `wait_ended` is parked on that session, not on the stream.
+    #[test]
+    fn a_finished_downlink_ends_its_session() {
+        let sid = "h2-downlink-finish";
+        crate::xhttp::start_session_for_probe(sid);
+        assert!(
+            crate::xhttp::session_is_carried(sid),
+            "the session starts carried"
+        );
+        let (conn, _written, _slices) = bare_conn();
+        let out = H2StreamOut { conn, stream: 1 };
+        out.bind_session(sid);
+        out.end();
+        assert!(
+            !crate::xhttp::session_is_carried(sid),
+            "the finished downlink leaves no session parked"
+        );
+    }
+
     #[test]
     fn h2_refusals_carry_their_statuses() {
         let (addr, server) = serve_one(test_settings("packet-up"), [0xaau8; 16], 1);
@@ -1599,6 +1648,7 @@ mod tests {
             })),
             streams: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashSet::new()),
+            session_of: Mutex::new(HashMap::new()),
             send_conn: Mutex::new(65_535),
             wake: Condvar::new(),
             decoder: Mutex::new(Decoder::default()),
