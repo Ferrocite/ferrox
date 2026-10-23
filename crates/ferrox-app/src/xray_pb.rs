@@ -663,8 +663,7 @@ impl RealityFields {
             ));
         }
         if self.client {
-            const SERVER: [&str; 11] = [
-                "show",
+            const SERVER: [&str; 10] = [
                 "dest",
                 "xver",
                 "serverNames",
@@ -676,6 +675,8 @@ impl RealityFields {
                 "limitFallbackDownload",
                 "privateKey",
             ];
+            // A client's `show` is the reference's one handshake-debug print, which this tree's dial trace already names; the pair goes nowhere.
+            pairs.retain(|(name, _)| *name != "show");
             let named: Vec<&str> = SERVER
                 .iter()
                 .filter(|key| pairs.iter().any(|(name, _)| name == *key))
@@ -2599,6 +2600,7 @@ mod tests {
     #[test]
     fn a_vless_reality_client_names_its_own_key_and_id() {
         let reality = message(&[
+            varint_field(1, 1),
             bytes_field(21, b"chrome"),
             bytes_field(22, b"www.example.com"),
             bytes_field(23, &[0xcd; 32]),
@@ -2649,8 +2651,10 @@ mod tests {
         );
         assert_eq!(reality.get("shortId").and_then(Json::as_str), Some(""));
         assert!(
-            reality.get("dest").is_none() && reality.get("privateKey").is_none(),
-            "a client reality config carries no server field"
+            reality.get("dest").is_none()
+                && reality.get("privateKey").is_none()
+                && reality.get("show").is_none(),
+            "a client reality config carries no server field, and its debug print rides no dial"
         );
     }
 
