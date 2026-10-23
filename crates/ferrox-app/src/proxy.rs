@@ -4701,7 +4701,8 @@ fn spawn_vmess_udp_reader(
 }
 
 struct TrojanUdpUplink {
-    write: Connection,
+    write: Box<dyn Write>,
+    shutdown: Connection,
     done: RelayEnd,
 }
 
@@ -4715,28 +4716,45 @@ fn dial_trojan_udp_uplink(
         return None;
     }
     let server = resolve_outbound(&trojan.address, trojan.port)?;
+    let header = trojan_header(&trojan.key, 3, &Destination::from(*dest));
+    let udp_send = relay.try_clone().ok()?;
+    // The association rides whatever the outbound names: a terminated session splits into the reader and writer the pump needs, and the header goes inside it.
+    if let Some(cfg) = trojan.tls.as_deref() {
+        let mut session = dial_tls_session(&server, cfg, trojan.carrier.tcp_mask())?;
+        if session.write_all(&header).is_err() {
+            return None;
+        }
+        let out = session.get_ref().try_clone().ok()?;
+        let shutdown = out.try_clone().ok()?;
+        // A driven reader hands over one record's plaintext and withholds the rest until the next lands, and a datagram is read a field at a time: the pump reads through the shared session.
+        let (_driven, half) = session_halves(session, out);
+        let done = spawn_trojan_uplink_reader(Box::new(half.clone()), udp_send, source);
+        return Some(TrojanUdpUplink {
+            write: Box::new(half),
+            shutdown,
+            done,
+        });
+    }
     let mut uplink = dial_or_report(&server)?.with_mask(trojan.carrier.tcp_mask());
-    uplink
-        .write_all(&trojan_header(&trojan.key, 3, &Destination::from(*dest)))
-        .ok()?;
-    let Ok(read) = uplink.try_clone() else {
-        return None;
-    };
-    let Ok(udp_send) = relay.try_clone() else {
-        return None;
-    };
-    let done = spawn_trojan_uplink_reader(read, udp_send, source);
+    uplink.write_all(&header).ok()?;
+    let read = uplink.try_clone().ok()?;
+    let write = uplink.try_clone().ok()?;
+    let done = spawn_trojan_uplink_reader(Box::new(read), udp_send, source);
     Some(TrojanUdpUplink {
-        write: uplink,
+        write: Box::new(write),
+        shutdown: uplink,
         done,
     })
 }
 
-fn spawn_trojan_uplink_reader(
-    read: Connection,
+fn spawn_trojan_uplink_reader<R>(
+    read: R,
     udp: UdpSocket,
     source: Arc<Mutex<Option<SocketAddr>>>,
-) -> RelayEnd {
+) -> RelayEnd
+where
+    R: Read + Send + 'static,
+{
     RelayPool::global().run(move || {
         let mut read = read;
         let mut buf = udp_buffer();
@@ -6851,6 +6869,22 @@ fn serve_trojan_raw(mut stream: Connection, key: &[u8; 56], freedom: bool) {
 }
 
 fn serve_trojan_udp(stream: Connection) {
+    let Ok(read) = stream.try_clone() else {
+        return;
+    };
+    let Ok(close) = stream.try_clone() else {
+        return;
+    };
+    serve_trojan_udp_halves(read, stream, move || {
+        let _ = close.shutdown(Shutdown::Both);
+    });
+}
+
+fn serve_trojan_udp_halves<R, W>(read: R, mut write: W, close: impl FnOnce())
+where
+    R: Read + Send + 'static,
+    W: Write,
+{
     let Ok(udp4) = UdpSocket::bind("0.0.0.0:0") else {
         return;
     };
@@ -6860,28 +6894,24 @@ fn serve_trojan_udp(stream: Connection) {
             return;
         }
     }
-    let mut stream = stream;
-    let Ok(tcp_read) = stream.try_clone() else {
-        return;
-    };
     let Ok(udp4_send) = udp4.try_clone() else {
         return;
     };
     let udp6_send = match &udp6 {
         Some(sock) => {
-            let Ok(clone) = sock.try_clone() else {
+            let Ok(sender) = sock.try_clone() else {
                 return;
             };
-            Some(clone)
+            Some(sender)
         }
         None => None,
     };
     let done = Arc::new(AtomicBool::new(false));
     let done_in = Arc::clone(&done);
     let forward = move || {
-        let mut tcp_read = tcp_read;
+        let mut read = read;
         let mut buf = udp_buffer();
-        while let Some((dest, n)) = read_trojan_datagram(&mut tcp_read, &mut buf) {
+        while let Some((dest, n)) = read_trojan_datagram(&mut read, &mut buf) {
             let sent = if dest.is_ipv6() {
                 match &udp6_send {
                     Some(sock) => sock.send_to(&buf[..n], dest).is_ok(),
@@ -6903,22 +6933,22 @@ fn serve_trojan_udp(stream: Connection) {
         if done.load(Ordering::Relaxed) {
             break;
         }
-        let mut live = pump_trojan_replies(&udp4, &mut stream, &mut buf, &done, &mut trojan_head);
+        let mut live = pump_trojan_replies(&udp4, &mut write, &mut buf, &done, &mut trojan_head);
         if let Some(sock) = &udp6 {
-            live &= pump_trojan_replies(sock, &mut stream, &mut buf, &done, &mut trojan_head);
+            live &= pump_trojan_replies(sock, &mut write, &mut buf, &done, &mut trojan_head);
         }
         if !live {
             break;
         }
     }
     done.store(true, Ordering::Relaxed);
-    let _ = stream.shutdown(Shutdown::Both);
+    close();
     join(&replied);
 }
 
 fn pump_trojan_replies(
     udp: &UdpSocket,
-    stream: &mut Connection,
+    stream: &mut dyn Write,
     buf: &mut [u8],
     done: &AtomicBool,
     head: &mut Vec<u8>,
@@ -7091,6 +7121,7 @@ where
         + std::io::Write
         + Send
         + ferrox_core::tls::RecordAlignment
+        + ferrox_core::tls::TlsProvider
         + Drivable
         + CipherOpen
         + 'static,
@@ -7105,7 +7136,24 @@ where
     let Some((cmd, target)) = bounded else {
         return;
     };
-    if cmd != 1 || !freedom {
+    if !freedom {
+        return;
+    }
+    if cmd == 3 {
+        let Some(raw) = raw else {
+            return;
+        };
+        let Ok(close) = raw.try_clone() else {
+            return;
+        };
+        // A driven reader hands over one record's plaintext and withholds the rest until the next lands, and a datagram is read a field at a time: the pump reads through the shared session.
+        let (_driven, half) = session_halves(session, raw);
+        serve_trojan_udp_halves(half.clone(), half, move || {
+            let _ = close.shutdown(Shutdown::Both);
+        });
+        return;
+    }
+    if cmd != 1 {
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
@@ -9576,15 +9624,15 @@ fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
             uplink = dial_trojan_udp_uplink(trojan, &dest, relay, Arc::clone(&source));
         }
         if let Some(up) = &mut uplink {
-            if !write_trojan_datagram(&mut up.write, &dest, payload, &mut trojan_head) {
+            if !write_trojan_datagram(&mut *up.write, &dest, payload, &mut trojan_head) {
                 if let Some(old) = uplink.take() {
-                    let _ = old.write.shutdown(Shutdown::Both);
+                    let _ = old.shutdown.shutdown(Shutdown::Both);
                 }
             }
         }
     }
     if let Some(old) = uplink.take() {
-        let _ = old.write.shutdown(Shutdown::Both);
+        let _ = old.shutdown.shutdown(Shutdown::Both);
         join(&old.done);
     }
 }
@@ -10060,7 +10108,7 @@ fn write_udp_datagram(stream: &mut Connection, payload: &[u8]) -> bool {
 }
 
 fn write_trojan_datagram(
-    stream: &mut Connection,
+    stream: &mut dyn Write,
     dest: &SocketAddr,
     payload: &[u8],
     head: &mut Vec<u8>,
@@ -10075,7 +10123,7 @@ fn write_trojan_datagram(
     write_all_parts::<2>(stream, &[head.as_slice(), payload]).is_ok()
 }
 
-fn read_trojan_datagram(stream: &mut Connection, buf: &mut [u8]) -> Option<(SocketAddr, usize)> {
+fn read_trojan_datagram(stream: &mut dyn Read, buf: &mut [u8]) -> Option<(SocketAddr, usize)> {
     let dest = read_socks_addr(stream)?;
     let mut len = [0u8; 2];
     read_exact(stream, &mut len).ok()?;
@@ -18733,9 +18781,7 @@ mod tests {
         server.join().expect("joins");
     }
 
-    /// A trojan listener that declares tls answers the handshake its config names, on every carrier the outbound already dials.
-    #[test]
-    fn a_trojan_inbound_that_declares_tls_answers_every_carrier() {
+    fn tls_cert_json() -> (String, String, Arc<ferrox_core::tls::TlsConfig>) {
         let minted =
             rcgen::generate_simple_self_signed(vec!["carrier.test".to_owned()]).expect("mints");
         let pem_json = |pem: &str| -> String {
@@ -18754,6 +18800,13 @@ mod tests {
             cipher_suites: Vec::new(),
             insecure: false,
         });
+        (cert, key, client)
+    }
+
+    /// A trojan listener that declares tls answers the handshake its config names, on every carrier the outbound already dials.
+    #[test]
+    fn a_trojan_inbound_that_declares_tls_answers_every_carrier() {
+        let (cert, key, client) = tls_cert_json();
         let cases = [
             ("raw", r#""network": "tcp""#),
             ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
@@ -18836,6 +18889,68 @@ mod tests {
                 .expect("timeout");
             sock.write_all(b"ping").expect("writes");
             assert_eq!(&read_echo(&mut sock), b"ping", "{tag} over tls echoes");
+        }
+    }
+
+    #[test]
+    fn a_trojan_udp_association_crosses_the_tls_arm() {
+        let (cert, key, client) = tls_cert_json();
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                "streamSettings": {{"network": "tcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        serve_trojan_inbound(&address, &inbound, true);
+        let waited = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(10),
+                "listener never bound"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            while let Ok((n, src)) = echo.recv_from(&mut buf) {
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let trojan = TrojanOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            key: trojan_key("secret"),
+            carrier: inbound_carrier(&inbound),
+            host: "127.0.0.1".to_owned(),
+            tls: Some(client),
+        };
+        let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").expect("binds"));
+        let relay_addr = relay.local_addr().expect("addr");
+        let served = Arc::clone(&relay);
+        thread::spawn(move || serve_socks_udp_trojan(&served, &trojan));
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut back = vec![0u8; UDP_BUF];
+        let mut frame = Vec::new();
+        for payload in [&b"ping"[..], &b"pong"[..]] {
+            let datagram = socks_udp_frame(&mut frame, None, &target, payload);
+            udp.send_to(datagram, relay_addr).expect("sends");
+            let (n, _) = udp.recv_from(&mut back).expect("a tls association echoes");
+            let (source, echoed) = parse_socks_udp(&back[..n]).expect("splits");
+            assert_eq!(source, target);
+            assert_eq!(echoed, payload);
+            // Past RELAY_POLL, so an association that polls instead of parking is gone by the second datagram.
+            thread::sleep(Duration::from_millis(250));
         }
     }
 
