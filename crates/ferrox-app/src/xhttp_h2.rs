@@ -1836,6 +1836,31 @@ mod tests {
         assert_eq!(verdict, Ok(false), "a sender with no credit returned");
     }
 
+    /// A POST that never sends its body leaves the stream's reader parked on a request no peer will finish; the relay stall ends it, and the stream is reset instead of holding its thread for the life of the connection.
+    #[test]
+    fn a_post_with_no_body_ends_at_the_stall() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_millis(200)),
+            ..Default::default()
+        });
+        let (addr, server) = serve_one(test_settings("stream-one"), [0xaau8; 16], 1);
+        let mut client = H2Client::connect(addr);
+        let id = client.headers("POST", "/up/", &[("referer", padding().as_str())], false);
+        client
+            .stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let (kind, _, _, _) = client.next_frame(id, |kind| matches!(kind, T_RST | T_HEADERS));
+        crate::budgets::clear();
+        assert_eq!(
+            kind, T_RST,
+            "a body that never arrives must end the stream at the stall"
+        );
+        drop(client);
+        server.join().expect("joins");
+    }
+
     /// The last bytes the connection wrote are one credit for `sid` of `inc`: the pair of
     /// four-octet `WINDOW_UPDATE` frames, connection-level then stream-level, both saying `inc`.
     fn expect_one_credit(
