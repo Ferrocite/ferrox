@@ -422,6 +422,39 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
         return true;
     }
     match sec {
+        // Hysteria carries its own QUIC TLS, so xray's `security: tls` names that handshake rather than a second layer above it.
+        _ if matches!(carrier, Carrier::Hysteria(_)) => {
+            let Carrier::Hysteria(config) = carrier else {
+                return false;
+            };
+            let owned = address.to_owned();
+            let Some(settings) = inbound.get("streamSettings") else {
+                eprintln!("unreadable hysteria identity in {path}: serves nothing");
+                return false;
+            };
+            let Some((cert_path, key_path)) = tls_cert_paths(settings) else {
+                eprintln!("unreadable hysteria identity in {path}: serves nothing");
+                return false;
+            };
+            let (cert_path, key_path) = (cert_path.to_owned(), key_path.to_owned());
+            let masq = crate::config::masquerade_from_stream(Some(settings));
+            let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+                serve_vless_hysteria(flow, &id, freedom);
+            });
+            thread::spawn(move || {
+                crate::hysteria::serve_loop(
+                    &owned,
+                    &[config.auth],
+                    config.cc,
+                    &cert_path,
+                    &key_path,
+                    &config.obfs_password,
+                    &masq,
+                    &serve,
+                );
+            });
+            true
+        }
         "tls" => serve_vless_tls_inbound(address, inbound, &id, &carrier, freedom, path),
         "reality" => serve_vless_reality_inbound(address, inbound, &id, &carrier, freedom, path),
         _ if !vless_security_supported(sec) => {
@@ -435,35 +468,6 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
                     serve_vless_kcp(conn, &id, freedom);
                 });
                 return serve_kcp_bound(&owned, config, &serve);
-            }
-            if let Carrier::Hysteria(config) = carrier {
-                let config = config.clone();
-                let Some(settings) = inbound.get("streamSettings") else {
-                    eprintln!("unreadable hysteria identity in {path}: serves nothing");
-                    return false;
-                };
-                let Some((cert_path, key_path)) = tls_cert_paths(settings) else {
-                    eprintln!("unreadable hysteria identity in {path}: serves nothing");
-                    return false;
-                };
-                let (cert_path, key_path) = (cert_path.to_owned(), key_path.to_owned());
-                let masq = crate::config::masquerade_from_stream(Some(settings));
-                let serve: crate::hysteria::Serve = Arc::new(move |flow| {
-                    serve_vless_hysteria(flow, &id, freedom);
-                });
-                thread::spawn(move || {
-                    crate::hysteria::serve_loop(
-                        &owned,
-                        &[config.auth],
-                        config.cc,
-                        &cert_path,
-                        &key_path,
-                        &config.obfs_password,
-                        &masq,
-                        &serve,
-                    );
-                });
-                return true;
             }
             let role = Role::Vless {
                 id,
@@ -26348,6 +26352,48 @@ mod tests {
     fn hysteria_server_passes_a_hand_rolled_client() {
         let _serial = quic_serial();
         hysteria_server_once();
+    }
+
+    #[test]
+    fn hysteria_inbound_takes_tls_as_its_own_handshake() {
+        let _serial = quic_serial();
+        let echo_port = echo_loop();
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let id = uuid_bytes(uuid).expect("id");
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let tag = format!("ferrox-hysteria-inbound-{}-{stamp}", std::process::id());
+        let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
+        let key_path = std::env::temp_dir().join(format!("{tag}.key"));
+        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
+        std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
+        std::fs::write(&key_path, &key_pem).expect("stages key");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vless", "port": {port}, "settings": {{"clients": [{{"id": "{uuid}"}}]}}, "streamSettings": {{"network": "hysteria", "security": "tls", "hysteriaSettings": {{"version": 2, "auth": "inbound-auth"}}, "tlsSettings": {{"alpn": ["h3"], "certificates": [{{"certificateFile": "{}", "keyFile": "{}"}}]}}}}}}"#,
+            cert_path.to_str().expect("ascii"),
+            key_path.to_str().expect("ascii")
+        ))
+        .expect("parses");
+        assert!(serve_vless_inbound(
+            &format!("127.0.0.1:{port}"),
+            &inbound,
+            true,
+            "test"
+        ));
+        let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut client = hysteria_tcp_pair(port, roots, "inbound-auth", id, target, "");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
     }
 
     fn hysteria_server_once() {
