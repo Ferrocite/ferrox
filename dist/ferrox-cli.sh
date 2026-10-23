@@ -49,6 +49,8 @@ PROXY_PORTS="$CONF_DIR/system-proxy.ports"
 
 ACTION="up"
 OUTBOUND=""
+INSTANCE=""
+ALL=0
 VLESS=""
 VMESS=""
 VMESS_ID=""
@@ -84,6 +86,9 @@ FRONTS="socks,http,mixed"
 SOCKS_PORT="${FOXY_SOCKS_PORT:-10808}"
 HTTP_PORT="${FOXY_HTTP_PORT:-8080}"
 MIXED_PORT="${FOXY_MIXED_PORT:-10809}"
+SOCKS_SET=0; [ -n "${FOXY_SOCKS_PORT:-}" ] && SOCKS_SET=1
+HTTP_SET=0; [ -n "${FOXY_HTTP_PORT:-}" ] && HTTP_SET=1
+MIXED_SET=0; [ -n "${FOXY_MIXED_PORT:-}" ] && MIXED_SET=1
 WANT_VPN=0
 DEBUG=0
 
@@ -106,6 +111,16 @@ need_value() {
   die "$flag needs $hint; nothing was started (see --help)."
 }
 
+need_port() {
+  local flag="$1" have="$2" value="${3:-}"
+  need_value "$flag" "a port number" "$have" "$value"
+  case "$value" in
+    ''|*[!0-9]*) die "$flag wants a port number, got '$value'; nothing was started." ;;
+  esac
+  [ "$value" -ge 1 ] && [ "$value" -le 65535 ] ||
+    die "$flag wants a port between 1 and 65535, got '$value'; nothing was started."
+}
+
 usage() {
   cat <<EOF
 usage: ferrox-cli <command> [options]
@@ -118,8 +133,8 @@ commands
   location   remember an exit: location CC [CITY] (survives every up)
   up         start the lane in the background, print the port map (default)
   serve      start the lane in this terminal, until Ctrl-C
-  down       stop the lane and clear the system proxy it set
-  status     show the lane, then the exit IP through the SOCKS front
+  down       stop the lane and clear the system proxy it set (--all: every lane)
+  status     show the lane (--instance NAME for one of several), then its exit
   ports      print the port map and the macOS settings to type
   tun        what TUN mode would need, and why this binary refuses it
   version    print the release binary's version
@@ -139,6 +154,17 @@ so no password is asked again and FxA sends no new-sign-in mail.
 
 and from the same fresh package, with nothing to type in at all:
   ferrox-cli up --veepn --vpn                   # anonymous, no account, no server
+
+several lanes at once
+  ferrox-cli up --foxy --instance work --country DE
+  ferrox-cli up --foxy --instance home --country NL --socks 10818 --http 8088
+  ferrox-cli status --instance work
+  ferrox-cli down --all
+  A named instance keeps its own config, pid, log, ports and remembered exit;
+  the account and the edge catalogue are shared. Ports left unnamed are the
+  first free ones near the defaults, so a second lane never fights the first.
+  --vpn belongs to the unnamed lane: the system proxy is one machine-wide
+  setting, and an instance is reached by pointing the app at its fronts.
 
 outbound (choose one)
   --foxy                 Foxy lane; account from \$FOXY_CREDENTIALS
@@ -183,10 +209,15 @@ veepn options (nothing is required: the plane names the region and its edges)
 
 fronts
   --fronts LIST          socks,http,mixed (default all three)
-  --socks PORT           default $SOCKS_PORT
+  --socks PORT           default $SOCKS_PORT (a named instance takes the next free one)
   --http PORT            default $HTTP_PORT
   --mixed PORT           default $MIXED_PORT
-  --vpn                  also point the macOS system proxy at the fronts
+  --instance NAME        another lane beside the unnamed one: its config, pid,
+                         log, ports and remembered exit are its own; ports left
+                         unnamed are the first free ones near the defaults
+  --vpn                  also point the macOS system proxy at the fronts; the
+                         unnamed lane only (it is one machine-wide setting)
+  --all                  with down: stop every lane
   --debug                keep the lane's dial trace in the log (FOXY_DEBUG=1)
   --tun                  refused: this binary has no utun device
   -h, --help             this text
@@ -260,9 +291,9 @@ same_stored_account() {
 }
 
 action_logout() {
-  stop_lane 1
-  rm -f "$CFG" "$TOKEN_FILE" "$CREDS"
-  say "signed out: the stored session, the saved account and the lane config are gone."
+  stop_all_lanes
+  rm -f "$TOKEN_FILE" "$CREDS" "$CONF_DIR"/lane*.json
+  say "signed out: every lane is stopped, and the stored session, the saved account and the lane configs are gone."
   say "the remembered exit stays in $LOCATION_FILE; 'ferrox-cli login' signs in again."
 }
 
@@ -431,6 +462,66 @@ with open(cfg, "w") as handle:
     json.dump(doc, handle, indent=2)
 PY
   chmod 600 "$CFG"
+}
+
+# The ports this lane runs: the flags win, a lane's own config is adopted so a
+# restart keeps its fronts, and a named instance takes the next free ones so a
+# second lane never fights the first. Prints "socks http mixed".
+plan_ports() {
+  local scan="$1"
+  python3 - "$SOCKS_PORT" "$HTTP_PORT" "$MIXED_PORT" "$SOCKS_SET" "$HTTP_SET" \
+    "$MIXED_SET" "$FRONTS" "$scan" "$CFG" <<'PY'
+import json, socket, sys
+
+values = [int(a) for a in sys.argv[1:4]]
+explicit = [a == "1" for a in sys.argv[4:7]]
+fronts = {f.strip() for f in sys.argv[7].split(",") if f.strip()}
+scan = sys.argv[8] == "1"
+config = sys.argv[9]
+names = ["socks", "http", "mixed"]
+fixed = list(explicit)
+if config:
+    try:
+        with open(config, encoding="utf-8") as handle:
+            document = json.load(handle)
+    except (OSError, ValueError):
+        document = {}
+    for inbound in document.get("inbounds", []):
+        name = inbound.get("protocol")
+        port = inbound.get("port")
+        if name in names and name in fronts and not explicit[names.index(name)] and isinstance(port, int):
+            values[names.index(name)] = port
+            fixed[names.index(name)] = True
+taken = {values[i] for i, name in enumerate(names) if name in fronts and fixed[i]}
+if scan:
+    for i, name in enumerate(names):
+        if name not in fronts or fixed[i]:
+            continue
+        port = values[i]
+        while port <= 65535:
+            if port not in taken:
+                probe = socket.socket()
+                try:
+                    probe.bind(("127.0.0.1", port))
+                    break
+                except OSError:
+                    pass
+                finally:
+                    probe.close()
+            port += 1
+        values[i] = port
+        taken.add(port)
+print(" ".join(str(v) for v in values))
+PY
+}
+
+# The config a running lane is served is the truth about its fronts; status and
+# ports read it back instead of guessing the defaults.
+adopt_lane_ports() {
+  [ -f "$CFG" ] || return 1
+  local planned
+  planned="$(plan_ports 0 2>/dev/null)" || return 1
+  read -r SOCKS_PORT HTTP_PORT MIXED_PORT <<<"$planned"
 }
 
 foxy_outbound() {
@@ -772,6 +863,18 @@ system_proxy_off() {
 
 # ---------------------------------------------------------------------- lane
 
+# Every lane owns its config, pid, log and remembered exit; the account and the
+# edge catalogue stay shared. The unnamed lane keeps the names it always had.
+apply_instance() {
+  local suffix=""
+  [ -n "$INSTANCE" ] && suffix="-$INSTANCE"
+  CFG="$CONF_DIR/lane$suffix.json"
+  PID_FILE="$CONF_DIR/lane$suffix.pid"
+  LOG="$CONF_DIR/lane$suffix.log"
+  PROXY_PORTS="$CONF_DIR/system-proxy$suffix.ports"
+  LOCATION_FILE="$CONF_DIR/foxy-location$suffix"
+}
+
 lane_running() {
   [ -f "$PID_FILE" ] || return 1
   local pid; pid="$(cat "$PID_FILE" 2>/dev/null || true)"
@@ -905,7 +1008,7 @@ start_lane() {
   build_config
   require_bin
   if lane_running; then
-    say "a lane is already running (pid $(lane_pid)); stopping it first."
+    say "a lane${INSTANCE:+ '$INSTANCE'} is already running (pid $(lane_pid)); stopping it first."
     stop_lane 0
   fi
   if [ "$DEBUG" = 1 ]; then
@@ -932,6 +1035,33 @@ stop_lane() {
 stop_and_forget() {
   stop_lane 1
   [ "$OUTBOUND" = config ] || rm -f "$CFG"
+}
+
+# The account is shared, so signing out ends every lane; each owns its pid and config.
+stop_all_lanes() {
+  local pidfile base
+  for pidfile in "$CONF_DIR"/lane*.pid; do
+    [ -f "$pidfile" ] || continue
+    base="${pidfile##*/}"; base="${base#lane}"; base="${base%.pid}"
+    INSTANCE="${base#-}"
+    apply_instance
+    stop_lane 0
+    rm -f "$CFG"
+  done
+  INSTANCE=""
+  apply_instance
+  system_proxy_off
+}
+
+other_lanes() {
+  local pidfile base pid
+  for pidfile in "$CONF_DIR"/lane-*.pid; do
+    [ -f "$pidfile" ] || continue
+    pid="$(cat "$pidfile" 2>/dev/null || true)"
+    [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null || continue
+    base="${pidfile##*/}"; base="${base#lane-}"; base="${base%.pid}"
+    printf '  %s (pid %s)\n' "$base" "$pid"
+  done
 }
 
 # -------------------------------------------------------------------- actions
@@ -1091,7 +1221,7 @@ action_up() {
     say "the lane was stopped and its config removed; the log stays at $LOG."
     exit 1
   fi
-  say "lane up (pid $(lane_pid)), fronts:"
+  say "lane${INSTANCE:+ '$INSTANCE'} up (pid $(lane_pid)), fronts:"
   if [ "$OUTBOUND" = config ]; then
     say "  the ones $CONFIG_FILE names (served verbatim)"
   else
@@ -1124,7 +1254,7 @@ action_serve() {
     say "the lane was stopped and its config removed; the log stays at $LOG."
     exit 1
   fi
-  say "lane up, fronts:"
+  say "lane${INSTANCE:+ '$INSTANCE'} up, fronts:"
   if [ "$OUTBOUND" = config ]; then
     say "  the ones $CONFIG_FILE names (served verbatim)"
   else
@@ -1151,11 +1281,17 @@ action_serve() {
 
 action_status() {
   if ! lane_running; then
-    say "lane not running."
+    say "lane${INSTANCE:+ '$INSTANCE'} not running."
+    local others; others="$(other_lanes)"
+    if [ -n "$others" ]; then
+      say "instances running:"
+      printf '%s\n' "$others"
+      say "read one with: ferrox-cli status --instance NAME"
+    fi
     [ -f "$TOKEN_FILE" ] && say "foxy session stored in $TOKEN_FILE: the next up --foxy resumes it without a sign-in mail."
     return 1
   fi
-  say "lane pid $(lane_pid), fronts:"
+  say "lane${INSTANCE:+ '$INSTANCE'} pid $(lane_pid), fronts:"
   port_map
   local pid uptime chosen quota
   pid="$(lane_pid)"
@@ -1185,6 +1321,14 @@ action_ports() {
   rule
   say "local fronts (127.0.0.1 only):"
   port_map
+  if [ -n "$INSTANCE" ]; then
+    rule
+    [ -f "$CFG" ] || say "instance '$INSTANCE' has not started: these are the defaults it moves off if they are taken."
+    say "point the app you want at these fronts: the macOS system proxy is one"
+    say "machine-wide setting, so an instance never arms it (--vpn belongs to the"
+    say "unnamed lane)."
+    return 0
+  fi
   rule
   cat <<EOF
 macOS, System Settings > Network > <service> > Details... > Proxies:
@@ -1286,9 +1430,17 @@ while [ $# -gt 0 ]; do
     --exclude-domains) need_value --exclude-domains "comma-separated domain suffixes" "$#" "${2:-}"; EXCLUDE_DOMAINS="$2"; shift 2 ;;
     --exclude-ports) need_value --exclude-ports "comma-separated ports" "$#" "${2:-}"; EXCLUDE_PORTS="$2"; shift 2 ;;
     --fronts) need_value --fronts "a comma-separated front list" "$#" "${2:-}"; FRONTS="$2"; shift 2 ;;
-    --socks) need_value --socks "a port" "$#" "${2:-}"; SOCKS_PORT="$2"; shift 2 ;;
-    --http) need_value --http "a port" "$#" "${2:-}"; HTTP_PORT="$2"; shift 2 ;;
-    --mixed) need_value --mixed "a port" "$#" "${2:-}"; MIXED_PORT="$2"; shift 2 ;;
+    --socks) need_port --socks "$#" "${2:-}"; SOCKS_PORT="$2"; SOCKS_SET=1; shift 2 ;;
+    --http) need_port --http "$#" "${2:-}"; HTTP_PORT="$2"; HTTP_SET=1; shift 2 ;;
+    --mixed) need_port --mixed "$#" "${2:-}"; MIXED_PORT="$2"; MIXED_SET=1; shift 2 ;;
+    --instance)
+      need_value --instance "a name of letters, digits, - or _" "$#" "${2:-}"
+      case "$2" in
+        *[!A-Za-z0-9_-]*) die "--instance wants letters, digits, - or _, got '$2'; nothing was started." ;;
+      esac
+      [ "${#2}" -le 32 ] || die "an --instance name is at most 32 characters; nothing was started."
+      INSTANCE="$2"; shift 2 ;;
+    --all) ALL=1; shift ;;
     --vpn) WANT_VPN=1; shift ;;
     --debug) DEBUG=1; shift ;;
     --ping) LOC_PING=1; shift ;;
@@ -1308,6 +1460,38 @@ fi
 if [ -n "$EXCLUDE_DOMAINS$EXCLUDE_PORTS" ] && [ "$OUTBOUND" != foxy ]; then
   die "--exclude-domains and --exclude-ports belong to the foxy lane; nothing was started."
 fi
+
+if [ "$ALL" = 1 ]; then
+  [ "$ACTION" = down ] || die "--all belongs to 'down' (ferrox-cli down --all); nothing was started."
+  [ -z "$INSTANCE" ] || die "--all stops every lane, so it takes no --instance; nothing was started."
+fi
+
+# The macOS system proxy is one machine-wide setting: two lanes cannot share it.
+if [ -n "$INSTANCE" ] && [ "$WANT_VPN" = 1 ]; then
+  die "the system proxy points at one lane: run '$INSTANCE' without --vpn and point the app at its fronts (ferrox-cli ports --instance $INSTANCE), or arm --vpn on the unnamed lane; nothing was started."
+fi
+
+apply_instance
+case "$ACTION" in
+  up|serve)
+    if [ "$OUTBOUND" != config ]; then
+      scan=0; [ -n "$INSTANCE" ] && scan=1
+      planned="$(plan_ports "$scan")" || die "the lane's ports could not be chosen; nothing was started."
+      read -r SOCKS_PORT HTTP_PORT MIXED_PORT <<<"$planned"
+      seen=""
+      for front in ${FRONTS//,/ }; do
+        case "$front" in
+          socks) port="$SOCKS_PORT" ;;
+          http) port="$HTTP_PORT" ;;
+          mixed) port="$MIXED_PORT" ;;
+          *) continue ;;
+        esac
+        case " $seen " in *" $port "*) die "two fronts cannot share port $port; nothing was started." ;; esac
+        seen="$seen $port"
+      done
+    fi ;;
+  status|ports) adopt_lane_ports || true ;;
+esac
 
 # A VeePN flow pays a launch and a list before bytes move, so its first probe
 # waits longer than a lane that configures the server it dials.
@@ -1336,7 +1520,14 @@ case "$ACTION" in
   logout) action_logout ;;
   locations) action_locations ;;
   location) action_location ;;
-  down) stop_lane 1; rm -f "$CFG"; say "lane stopped; the lane config is removed. The stored foxy session is kept; 'ferrox-cli logout' forgets it." ;;
+  down)
+    if [ "$ALL" = 1 ]; then
+      stop_all_lanes
+      say "every lane is stopped and its config removed. The stored foxy session is kept; 'ferrox-cli logout' forgets it."
+    else
+      stop_lane 1; rm -f "$CFG"
+      say "lane${INSTANCE:+ '$INSTANCE'} stopped; the lane config is removed. The stored foxy session is kept; 'ferrox-cli logout' forgets it."
+    fi ;;
   status) action_status ;;
   ports) action_ports ;;
   tun) action_tun ;;
