@@ -135,7 +135,7 @@ impl Read for H2StreamReader {
             if wait.timed_out() {
                 drop(st);
                 self.conn.forget_upload(self.id);
-                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                return Err(std::io::Error::other("h2 body stalled"));
             }
         }
     }
