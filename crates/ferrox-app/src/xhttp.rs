@@ -1312,7 +1312,11 @@ impl Read for SessionReader {
         loop {
             let upload = {
                 let mut st = self.session.state.lock().expect("session lock");
-                st.upload.take()
+                if st.ended {
+                    None
+                } else {
+                    st.upload.take()
+                }
             };
             if let Some(mut upload) = upload {
                 let got = upload.read(buf);
@@ -3653,6 +3657,35 @@ mod tests {
             "the thirty-first is refused"
         );
         close_session(&session);
+    }
+
+    /// A finished downlink has already ended the session; a later read must not touch an upload whose peer is gone.
+    #[test]
+    fn an_ended_session_does_not_read_its_upload() {
+        struct Blocked;
+
+        impl std::io::Read for Blocked {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("read a finished session's upload");
+            }
+        }
+
+        let session = Arc::new(Session {
+            state: Mutex::new(SessionState {
+                upload: Some(Box::new(Blocked)),
+                packets: BTreeMap::new(),
+                next_seq: 0,
+                ended: true,
+            }),
+            cv: Condvar::new(),
+        });
+        let mut reader = SessionReader::new(session, String::new());
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            reader.read(&mut byte).expect("ends"),
+            0,
+            "a finished session ends its read"
+        );
     }
 
     /// A session with no upload and no packet must wake on the relay grain: a sibling that ended has no other way to end this leg.
