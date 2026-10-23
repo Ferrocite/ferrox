@@ -236,7 +236,16 @@ impl<S: Stream> Session<S> {
         self.transcript.extend_from_slice(&msg);
         sh.alpn = encrypted_extensions(&msg[4..])?;
 
-        let msg = self.next_expect(11)?;
+        // A TLS 1.3 server interleaves its CertificateRequest ahead of its own Certificate.
+        let mut asked = None;
+        let mut msg = self.next_handshake()?;
+        if msg[0] == 13 {
+            asked = Some(request_context(&msg[4..])?);
+            self.transcript.extend_from_slice(&msg);
+            msg = self.next_expect(11)?;
+        } else if msg[0] != 11 {
+            return Err(unexpected(msg[0]));
+        }
         let chain = certificates13(&msg[4..])?;
         self.verify_chain(&chain)?;
         self.transcript.extend_from_slice(&msg);
@@ -255,16 +264,23 @@ impl<S: Stream> Session<S> {
         }
         self.transcript.extend_from_slice(&msg);
 
-        let client_ap = kdf::derive(hash, &master, b"c ap traffic", &self.transcript);
         let server_ap = kdf::derive(hash, &master, b"s ap traffic", &self.transcript);
         self.read_key = Some(Direction::tls13(suite, &server_ap));
+        self.write_key = Some(Direction::tls13(suite, &client_hs));
 
+        if let Some(context) = &asked {
+            // The empty chain answers the request, and its bytes count in our own Finished hash.
+            let answer = certificate_answer13(context);
+            self.send_encrypted(HANDSHAKE, &answer)?;
+            self.transcript.extend_from_slice(&answer);
+        }
+
+        let client_ap = kdf::derive(hash, &master, b"c ap traffic", &self.transcript);
         let verify = kdf::verify_data(hash, &kdf::finished_key(hash, &client_hs), &self.transcript);
         let mut finished = Vec::with_capacity(4 + verify.len());
         finished.push(20);
         finished.extend_from_slice(&(verify.len() as u32).to_be_bytes()[1..]);
         finished.extend_from_slice(&verify);
-        self.write_key = Some(Direction::tls13(suite, &client_hs));
         self.send_encrypted(HANDSHAKE, &finished)?;
         self.transcript.extend_from_slice(&finished);
         self.write_key = Some(Direction::tls13(suite, &client_ap));
@@ -1164,6 +1180,29 @@ fn server_key_exchange(body: &[u8]) -> Result<(u16, Vec<u8>, usize), TlsError> {
 
 fn certificate_empty() -> Vec<u8> {
     message(11, &[0, 0, 0])
+}
+
+/// The `certificate_request_context` of a TLS 1.3 `CertificateRequest`, the bytes its answer echoes.
+fn request_context(body: &[u8]) -> Result<Vec<u8>, TlsError> {
+    let truncated = || TlsError::Other("truncated CertificateRequest".to_owned());
+    let (&len, rest) = body.split_first().ok_or_else(truncated)?;
+    let len = usize::from(len);
+    if rest.len() < len {
+        return Err(truncated());
+    }
+    Ok(rest[..len].to_vec())
+}
+
+/// The TLS 1.3 answer to a `CertificateRequest` when `TlsConfig` carries no client certificate: the
+/// request's own context ahead of a zero-length chain, so the server reads it as anonymous.
+fn certificate_answer13(context: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + context.len());
+    out.push(11);
+    out.extend_from_slice(&((4 + context.len()) as u32).to_be_bytes()[1..]);
+    out.push(context.len() as u8);
+    out.extend_from_slice(context);
+    out.extend_from_slice(&[0, 0, 0]);
+    out
 }
 
 /// Random bytes, shaped as the reference's padding reader asks for: the caller re-rolls what it rejects.
