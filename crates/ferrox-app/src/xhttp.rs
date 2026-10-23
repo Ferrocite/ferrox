@@ -2413,7 +2413,7 @@ mod tests {
         );
         assert_eq!(pad, tokenish_recompute(&raw, 700), "the same pad");
         let (drawn, counts) = ferrox_core::alloc_count::measure(|| generate_tokenish(700));
-        assert!(!drawn.is_empty());
+        assert_ne!(drawn, "");
         assert_eq!(counts.zeroed, 0, "the draw fills every byte: {counts:?}");
     }
 
