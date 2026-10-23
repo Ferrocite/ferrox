@@ -3995,6 +3995,7 @@ pub(crate) mod loopback {
             key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
             alpn: vec![alpn.to_vec()],
             send_tickets: true,
+            server_config_cache: std::sync::Arc::default(),
         };
         (roots, server)
     }
