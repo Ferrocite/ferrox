@@ -18323,6 +18323,112 @@ mod tests {
         server.join().expect("joins");
     }
 
+    /// A trojan listener that declares tls answers the handshake its config names, on every carrier the outbound already dials.
+    #[test]
+    fn a_trojan_inbound_that_declares_tls_answers_every_carrier() {
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["carrier.test".to_owned()]).expect("mints");
+        let pem_json = |pem: &str| -> String {
+            format!(
+                "\"{}\"",
+                pem.trim_end().replace('\r', "").replace('\n', "\\n")
+            )
+        };
+        let cert = pem_json(&minted.cert.pem());
+        let key = pem_json(&minted.signing_key.serialize_pem());
+        let client = Arc::new(ferrox_core::tls::TlsConfig {
+            server_name: "carrier.test".to_owned(),
+            alpn: std::sync::Arc::default(),
+            roots: vec![minted.cert.der().to_vec()].into(),
+            pins: ferrox_core::foxy::pin::Pins::default(),
+            cipher_suites: Vec::new(),
+            insecure: false,
+        });
+        let cases = [
+            ("raw", r#""network": "tcp""#),
+            ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
+            (
+                "httpupgrade",
+                r#""network": "httpupgrade", "httpupgradeSettings": {"path": "/u"}"#,
+            ),
+            (
+                "grpc",
+                r#""network": "grpc", "grpcSettings": {"serviceName": "/TunnelService/Tun"}"#,
+            ),
+            (
+                "xhttp",
+                r#""network": "xhttp", "xhttpSettings": {"path": "/x"}"#,
+            ),
+            (
+                "httpheader",
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/c"]}}}"#,
+            ),
+        ];
+        for (tag, stream) in cases {
+            let inbound = crate::json::parse(&format!(
+                r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                    "streamSettings": {{{stream}, "security": "tls",
+                        "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+            ))
+            .expect("parses");
+            // The inbound binds its own port, so the fixture reserves one and hands it over before the listener starts.
+            let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let port = probe.local_addr().expect("addr").port();
+            drop(probe);
+            let address = format!("127.0.0.1:{port}");
+            serve_trojan_inbound(&address, &inbound, true);
+            let waited = Instant::now();
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                assert!(
+                    waited.elapsed() < Duration::from_secs(10),
+                    "{tag} listener never bound"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let echo_port = echo.local_addr().expect("addr").port();
+            thread::spawn(move || {
+                let (mut socket, _) = echo.accept().expect("accepts");
+                let mut buf = [0u8; 1024];
+                loop {
+                    let Ok(read) = socket.read(&mut buf) else {
+                        return;
+                    };
+                    if read == 0 || socket.write_all(&buf[..read]).is_err() {
+                        return;
+                    }
+                }
+            });
+            let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let dport = downstream.local_addr().expect("addr").port();
+            let asked: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+            let trojan = TrojanOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                key: trojan_key("secret"),
+                carrier: inbound_carrier(&inbound),
+                host: "127.0.0.1".to_owned(),
+                tls: Some(Arc::clone(&client)),
+            };
+            let listener: SocketAddr = address.parse().expect("addr");
+            thread::spawn(move || {
+                let (socket, _) = downstream.accept().expect("accepts");
+                dial_trojan(
+                    &socket,
+                    &listener,
+                    &trojan,
+                    &Destination::from(asked),
+                    Ladder::global(),
+                );
+            });
+            let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+            sock.set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("timeout");
+            sock.write_all(b"ping").expect("writes");
+            assert_eq!(&read_echo(&mut sock), b"ping", "{tag} over tls echoes");
+        }
+    }
+
     #[test]
     fn vmess_over_tls_carries_an_echo() {
         use ferrox_core::tls::TlsProvider as _;
