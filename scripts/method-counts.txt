@@ -250,6 +250,7 @@ carrier-xhttp head-tail-allocations 0 ferrox-app-xhttp::tests::the_record_head_h
 carrier-xhttp path-segment-allocations 0 ferrox-app-xhttp::tests::the_path_placements_are_read_without_a_list
 carrier-xhttp connection-header-allocations 0 ferrox-app-xhttp::tests::a_connection_header_is_named_without_a_lowercase_copy
 carrier-xhttp data-part-decode-allocations 3 ferrox-app-xhttp::tests::the_data_parts_decode_off_one_walk_of_the_head
+carrier-xhttp carry-tail-allocations 0 ferrox-app-xhttp::tests::the_tail_a_body_read_leaves_stays_in_the_head_buffer
 carrier-xhttp received-data-frames-copied 0 ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into
 carrier-xhttp received-header-blocks-copied 0 ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into
 carrier-xhttp partly-read-frame-tail-copies 0 ferrox-app-xhttp_h2::tests::a_partly_read_frame_is_not_moved

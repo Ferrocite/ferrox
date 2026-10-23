@@ -1783,6 +1783,13 @@ fn read_body<R: Read>(read: &mut R, prefix: &[u8], n: usize) -> Option<(Vec<u8>,
     Some((buf, pre))
 }
 
+/// The bytes behind the body — the next request's head — moved down inside the head's own buffer, so the reuse keeps that room instead of paying a second allocation and a copy into it.
+fn carry_tail(mut prefix: Vec<u8>, pre: usize) -> Vec<u8> {
+    prefix.copy_within(pre.., 0);
+    prefix.truncate(prefix.len() - pre);
+    prefix
+}
+
 /// How reading a body that ends only when its stream ends turned out.
 enum Drained {
     Done(Vec<u8>),
@@ -1984,7 +1991,7 @@ pub(crate) fn accept_core<
                 let Some((buf, pre)) = read_body(&mut read, &prefix, n) else {
                     return Served::Closed;
                 };
-                carry = prefix[pre..].to_vec();
+                carry = carry_tail(prefix, pre);
                 body = buf;
             } else if crate::proxy::header_value(head, "transfer-encoding").is_some_and(has_chunked)
             {
@@ -3197,6 +3204,38 @@ mod tests {
         want.extend_from_slice(&wire[..23]);
         assert_eq!(body, want, "the bytes are the body");
         assert_eq!(counts.zeroed, 0, "the read fills every byte: {counts:?}");
+    }
+
+    /// What a body read leaves behind is the next request's head; it moves down inside the head's buffer, where the old shape copied it into a fresh one.
+    #[test]
+    fn the_tail_a_body_read_leaves_stays_in_the_head_buffer() {
+        let wire = b"NEXT-HEAD-payload".to_vec();
+        let base = wire.as_ptr();
+        let capacity = wire.capacity();
+        let pre = 10;
+        let (tail, counts) = ferrox_core::alloc_count::measure(move || carry_tail(wire, pre));
+        assert_eq!(
+            tail,
+            b"payload".to_vec(),
+            "the tail is the bytes behind the body"
+        );
+        assert_eq!(
+            tail.as_ptr(),
+            base,
+            "the tail moved down in the buffer, not into a new one"
+        );
+        assert_eq!(tail.capacity(), capacity, "the head's room is kept");
+        assert_eq!(
+            counts.allocs, 0,
+            "the carry is the head's buffer: {counts:?}"
+        );
+        let old = b"NEXT-HEAD-payload".to_vec();
+        let (copied, old_counts) = ferrox_core::alloc_count::measure(move || old[pre..].to_vec());
+        assert_eq!(copied, tail, "the carry is the same bytes");
+        assert_eq!(
+            old_counts.allocs, 1,
+            "the copy the carry used to pay: {old_counts:?}"
+        );
     }
 
     /// The connection header is compared where it lies: lowercasing the value first was a `String`
