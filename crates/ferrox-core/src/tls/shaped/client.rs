@@ -310,11 +310,10 @@ impl<S: Stream> Session<S> {
 
         let (pre_master, exchange) = match share {
             Some((group, peer)) => {
-                let public = hello
-                    .share_public(group)
-                    .ok_or(TlsError::NoSharedCipher)?
-                    .to_vec();
-                let shared = hello.agree(group, &peer)?;
+                let (public, shared) = match hello.share_public(group) {
+                    Some(public) => (public.to_vec(), hello.agree(group, &peer)?),
+                    None => hello.ephemeral(group, &peer)?,
+                };
                 let mut exchange = Vec::with_capacity(1 + public.len());
                 exchange.push(public.len() as u8);
                 exchange.extend_from_slice(&public);
