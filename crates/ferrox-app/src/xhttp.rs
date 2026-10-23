@@ -1015,23 +1015,26 @@ fn huffman_len(s: &[u8]) -> usize {
 
 fn generate_tokenish(target_huffman_bytes: usize) -> String {
     let n = (target_huffman_bytes * 10).div_ceil(8);
-    let mut raw = vec![0u8; n.max(1)];
-    getrandom::fill(&mut raw).unwrap_or_default();
+    // The draw fills every byte, so the zero pass in front of it was work thrown away; a draw that fails still leaves the pad it always did.
+    let mut raw = crate::proxy::unfilled(n.max(1));
+    if getrandom::fill(&mut raw).is_err() {
+        raw.fill(0);
+    }
     tokenish_adjust(&raw, target_huffman_bytes)
 }
 
 /// Maps the random bytes into base62 and walks the padding to its target, but carries the code-length sum instead of re-scanning the whole string on every one of the 150 adjust steps: only the end the loop touches moves the sum.
 fn tokenish_adjust(raw: &[u8], target_huffman_bytes: usize) -> String {
     const BASE62: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
-    let mut s: String = raw
-        .iter()
-        .map(|&b| BASE62[(b as usize) % 62] as char)
-        .collect();
+    const ADJUST_STEPS: usize = 150;
+    // One buffer for the pad and the steps it can grow by, so no push past the decoded length moves it.
+    let mut s = String::with_capacity(raw.len() + ADJUST_STEPS);
+    s.extend(raw.iter().map(|&b| BASE62[(b as usize) % 62] as char));
     let mut bits: usize = s
         .bytes()
         .map(|b| usize::from(HUFFMAN_CODE_LEN[usize::from(b)]))
         .sum();
-    for iter in 0..150 {
+    for iter in 0..ADJUST_STEPS {
         let cur = bits.div_ceil(8);
         if cur.abs_diff(target_huffman_bytes) <= 2 {
             return s;
@@ -1148,25 +1151,22 @@ fn extract_meta<'a>(
     target: &'a str,
     settings: &XhttpSettings,
 ) -> (Option<&'a str>, Option<&'a str>) {
-    // The path segments are read only by a `Path` placement; splitting and collecting them for a query-, header- or cookie-placed session is a needless allocation and scan, so build them only when one is asked for.
-    let need_path = matches!(settings.session_placement, Placement::Path)
-        || matches!(settings.seq_placement, Placement::Path);
-    let segments: Vec<&str> = if need_path {
+    // A `Path` placement asks for its segment by position, so the path is scanned rather than collected.
+    let segment = |n: usize| -> Option<&'a str> {
         let rest = target.strip_prefix(settings.path.as_str()).unwrap_or("");
-        let rest_path = rest.split_once('?').map_or(rest, |(r, _)| r);
-        rest_path.split('/').filter(|s| !s.is_empty()).collect()
-    } else {
-        Vec::new()
+        rest.split_once('?')
+            .map_or(rest, |(r, _)| r)
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .nth(n)
     };
     let mut sid = None;
     let mut seq = None;
-    let mut idx = 0;
     if settings.session_placement == Placement::Path {
-        sid = segments.get(idx).copied();
-        idx += 1;
+        sid = segment(0);
     }
     if settings.seq_placement == Placement::Path {
-        seq = segments.get(idx).copied();
+        seq = segment(usize::from(settings.session_placement == Placement::Path));
     }
     if settings.session_placement == Placement::Query {
         sid = query_param(target, &settings.session_key);
@@ -1433,23 +1433,45 @@ impl Drop for SessionReader {
     }
 }
 
-fn downlink_headers(settings: &XhttpSettings) -> String {
-    if settings.no_sse {
-        String::new()
-    } else {
-        "Content-Type: text/event-stream\r\n".to_owned()
-    }
-}
-
+/// The answer head, opened once for the bytes it holds: the padding can be a kilobyte, so growing
+/// a seventeen-byte buffer into it cost a reallocation per doubling and a `String` for the
+/// downlink header that only ever got copied in.
 fn padded_response(stream: &mut impl Write, settings: &XhttpSettings, padded: &str, framing: &str) {
-    let mut head = String::from("HTTP/1.1 200 OK\r\n");
+    const OK: &str = "HTTP/1.1 200 OK\r\n";
+    const CRLF: &str = "\r\n";
+    const ACCEL: &str = "X-Accel-Buffering: no\r\n";
+    const CACHE: &str = "Cache-Control: no-store\r\n";
+    const SSE: &str = "Content-Type: text/event-stream\r\n";
+    const PAD: &str = "X-Padding: ";
+    let downlink = if settings.no_sse { "" } else { SSE };
+    let padding_line = if settings.x_padding_obfs {
+        match settings.x_padding_placement {
+            Placement::Header => {
+                settings.x_padding_header.len() + ": ".len() + padded.len() + CRLF.len()
+            }
+            Placement::Cookie => {
+                "Set-Cookie: ".len()
+                    + settings.x_padding_key.len()
+                    + "=".len()
+                    + padded.len()
+                    + "; Path=/\r\n".len()
+            }
+            _ => PAD.len() + padded.len() + CRLF.len(),
+        }
+    } else {
+        PAD.len() + padded.len() + CRLF.len()
+    };
+    let mut head = String::with_capacity(
+        OK.len() + padding_line + ACCEL.len() + CACHE.len() + downlink.len() + framing.len(),
+    );
+    head.push_str(OK);
     if settings.x_padding_obfs {
         match settings.x_padding_placement {
             Placement::Header => {
                 head.push_str(&settings.x_padding_header);
                 head.push_str(": ");
                 head.push_str(padded);
-                head.push_str("\r\n");
+                head.push_str(CRLF);
             }
             Placement::Cookie => {
                 head.push_str("Set-Cookie: ");
@@ -1459,19 +1481,19 @@ fn padded_response(stream: &mut impl Write, settings: &XhttpSettings, padded: &s
                 head.push_str("; Path=/\r\n");
             }
             _ => {
-                head.push_str("X-Padding: ");
+                head.push_str(PAD);
                 head.push_str(padded);
-                head.push_str("\r\n");
+                head.push_str(CRLF);
             }
         }
     } else {
-        head.push_str("X-Padding: ");
+        head.push_str(PAD);
         head.push_str(padded);
-        head.push_str("\r\n");
+        head.push_str(CRLF);
     }
-    head.push_str("X-Accel-Buffering: no\r\n");
-    head.push_str("Cache-Control: no-store\r\n");
-    head.push_str(&downlink_headers(settings));
+    head.push_str(ACCEL);
+    head.push_str(CACHE);
+    head.push_str(downlink);
     head.push_str(framing);
     let _ = stream.write_all(head.as_bytes());
 }
@@ -1640,7 +1662,7 @@ fn keeps_alive(head: &[u8]) -> bool {
 
 /// The body of `n` bytes, and how much of the bytes already read as the head it used; the rest of those belong to the next request on this connection.
 fn read_body<R: Read>(read: &mut R, prefix: &[u8], n: usize) -> Option<(Vec<u8>, usize)> {
-    let mut buf = vec![0u8; n];
+    let mut buf = crate::proxy::unfilled(n);
     let pre = prefix.len().min(n);
     buf[..pre].copy_from_slice(&prefix[..pre]);
     let mut at = pre;
@@ -2374,6 +2396,24 @@ mod tests {
         }
     }
 
+    /// The pad's buffer is opened once and drawn without a zero pass: `collect` reserved only the
+    /// decoded length, so the first adjust push moved the whole pad, and the draw overwrites every
+    /// byte of a buffer that was zeroed first.
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn a_tokenish_pad_is_one_buffer_drawn_without_zeroing() {
+        let raw = [0x5au8; 900];
+        let (pad, counts) = ferrox_core::alloc_count::measure(|| tokenish_adjust(&raw, 700));
+        assert_eq!(
+            counts.allocs, 1,
+            "the pad string and nothing else: {counts:?}"
+        );
+        assert_eq!(pad, tokenish_recompute(&raw, 700), "the same pad");
+        let (drawn, counts) = ferrox_core::alloc_count::measure(|| generate_tokenish(700));
+        assert_ne!(drawn, "");
+        assert_eq!(counts.zeroed, 0, "the draw fills every byte: {counts:?}");
+    }
+
     /// The same drain over a real socket asserts the *bytes* and nothing else: a socket may segment, so its read count moves with the scheduler and cannot gate a number — that claim belongs to `a_chunk_costs_two_reads_not_three`, on an in-memory stream that answers the whole buffer. The peer paces its sends 2048 bytes at a time, which segments the kernel's delivery the way load alone used to do at random.
     #[test]
     fn a_real_socket_drains_the_same_bytes() {
@@ -2908,6 +2948,32 @@ mod tests {
         );
     }
 
+    /// The path placements read the segments in order without collecting them: the default
+    /// session-then-seq walk takes the same first two segments a list would index.
+    #[test]
+    fn the_path_placements_are_read_without_a_list() {
+        let mut settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/up/"}}}"#,
+        );
+        let (meta, counts) =
+            ferrox_core::alloc_count::measure(|| extract_meta(b"", "/up/abc/7", &settings));
+        assert_eq!(counts.allocs, 0, "the segments are borrowed: {counts:?}");
+        assert_eq!(meta, (Some("abc"), Some("7")));
+        settings.session_placement = Placement::Query;
+        settings.session_key = "x_session".to_owned();
+        settings.seq_placement = Placement::Path;
+        assert_eq!(
+            extract_meta(b"", "/up/abc/7?x_session=z", &settings),
+            (Some("z"), Some("abc")),
+            "a seq-only path takes the first segment"
+        );
+        assert_eq!(
+            extract_meta(b"", "/up/", &settings),
+            (None, None),
+            "a path with no segments names nothing"
+        );
+    }
+
     /// The reference reads its obfuscation knobs from `extra`, which replaces the whole settings block except host, path and mode.
     #[test]
     fn the_extra_block_replaces_every_knob_but_path_and_mode() {
@@ -3005,6 +3071,61 @@ mod tests {
     fn settings_from(raw: &str) -> XhttpSettings {
         let node = crate::json::parse(raw).expect("parses");
         XhttpSettings::from_json(node.get("streamSettings")).expect("settings")
+    }
+
+    /// The answer head is opened once for the bytes it will hold: a padded answer used to start as
+    /// a seventeen-byte `String` and grow into a kilobyte, and it built the downlink header as its
+    /// own `String` only to copy it in.
+    #[test]
+    fn a_padded_answer_is_written_from_one_buffer() {
+        let mut settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/up/"}}}"#,
+        );
+        settings.x_padding_obfs = true;
+        settings.x_padding_method = PadMethod::RepeatX;
+        settings.x_padding_header = "X-Pad".to_owned();
+        settings.x_padding_key = "pad".to_owned();
+        let padded = "X".repeat(700);
+        let framing = "Content-Length: 0\r\nConnection: keep-alive\r\n\r\n";
+        let tail = format!(
+            "X-Accel-Buffering: no\r\nCache-Control: no-store\r\nContent-Type: text/event-stream\r\n{framing}"
+        );
+        for (placement, line) in [
+            (Placement::Header, format!("X-Pad: {padded}\r\n")),
+            (
+                Placement::Cookie,
+                format!("Set-Cookie: pad={padded}; Path=/\r\n"),
+            ),
+            (Placement::Query, format!("X-Padding: {padded}\r\n")),
+        ] {
+            settings.x_padding_placement = placement;
+            let want = format!("HTTP/1.1 200 OK\r\n{line}{tail}");
+            let mut out = Vec::with_capacity(1024);
+            let ((), counts) = ferrox_core::alloc_count::measure(|| {
+                padded_response(&mut out, &settings, &padded, framing);
+            });
+            assert_eq!(
+                counts.allocs, 1,
+                "the head buffer is the answer's only allocation: {counts:?}"
+            );
+            assert_eq!(out, want.as_bytes(), "the bytes are the padded answer");
+        }
+    }
+
+    /// The body lands in uninitialised room: the read that owns every byte writes it before the
+    /// body is handed on, so zeroing the buffer first was a pass over bytes about to be overwritten.
+    #[test]
+    fn a_body_read_lands_in_room_it_never_zeroes() {
+        let wire = [0x5Au8; 64];
+        let mut source = std::io::Cursor::new(&wire[..]);
+        let (read, counts) =
+            ferrox_core::alloc_count::measure(|| read_body(&mut source, b"head-tail", 32));
+        let (body, pre) = read.expect("the body");
+        assert_eq!(pre, 9, "what the head left over is the body's own head");
+        let mut want = b"head-tail".to_vec();
+        want.extend_from_slice(&wire[..23]);
+        assert_eq!(body, want, "the bytes are the body");
+        assert_eq!(counts.zeroed, 0, "the read fills every byte: {counts:?}");
     }
 
     /// A missing or `auto` mode is the dialer's default, not a promise about what may arrive: the reference hub gates a shape only when the mode was written down (`hub.go:154`, `:199`, `:241` all read `Mode != "" && Mode != "auto" && Mode != <shape>`). Our own `xhttp::connect` writes the `stream-one` POST, so a hub resolved from `{"path": "/share"}` refusing it is a hub that answers no dial its own client can make — which is what left `vless-xhttp-down-8` with no flow at any connection count.
