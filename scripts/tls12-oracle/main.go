@@ -30,7 +30,7 @@ import (
 	"time"
 )
 
-// The CBC and static-RSA suites Go implements, each with the certificate its own
+// The CBC, GCM, 3DES and RC4 suites Go implements, each with the certificate its own
 // key agreement needs.
 var suites = []struct {
 	id  uint16
@@ -49,6 +49,9 @@ var suites = []struct {
 	{0x009d, true},  // RSA-AES256-GCM-SHA384
 	{0x000a, true},  // RSA-3DES-EDE-CBC-SHA
 	{0xc012, true},  // ECDHE-RSA-3DES-EDE-CBC-SHA
+	{0x0005, true},  // RSA-RC4-128-SHA
+	{0xc011, true},  // ECDHE-RSA-RC4-128-SHA
+	{0xc007, false}, // ECDHE-ECDSA-RC4-128-SHA
 }
 
 const (

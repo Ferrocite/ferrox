@@ -127,9 +127,10 @@ fn gate(id: u16, master: &[u8], c2s: &[u8], s2c: &[u8]) {
     let mut body = sealed(&s2c)[0][5..].to_vec();
     let (start, len) = record::open12(&mut keys.server, sealed(&s2c)[0][0], &mut body)
         .expect("opens the Finished");
+    let server_finished = body[start..start + len].to_vec();
     let verify = tls12::finished(suite, master, b"server finished", &transcript);
     assert_eq!(
-        &body[start..start + len],
+        server_finished,
         [&[20u8, 0, 0, 12][..], &verify].concat(),
         "Go's server Finished is the one this key block signs"
     );
@@ -154,30 +155,41 @@ fn gate(id: u16, master: &[u8], c2s: &[u8], s2c: &[u8]) {
     reseal(
         suite,
         master,
-        &client_random,
-        &server_random,
+        (&client_random, &server_random),
         sealed(&c2s),
         sealed(&s2c),
-        &finished,
+        [&finished, &server_finished],
     );
 }
 
 /// Re-seal over the session's own sequence numbers. The header carries the record's whole length,
-/// so matching Go's pins this suite's MAC length and padding count behind the random explicit IV.
+/// so matching Go's pins this suite's MAC length and padding count behind the random explicit IV,
+/// and a stream record — which has neither — pins its every byte.
 fn reseal(
     suite: Suite,
     master: &[u8],
-    client_random: &[u8; 32],
-    server_random: &[u8; 32],
+    randoms: (&[u8; 32], &[u8; 32]),
     c2s: &[&[u8]],
     s2c: &[&[u8]],
-    finished: &[u8],
+    finished: [&[u8]; 2],
 ) {
-    let mut seal = tls12::directions(suite, master, client_random, server_random);
-    let mut mirror = tls12::directions(suite, master, client_random, server_random);
-    for (ours, back, wire, payload) in [
-        (&mut seal.client, &mut mirror.client, c2s, CLIENT_PAYLOAD),
-        (&mut seal.server, &mut mirror.server, s2c, SERVER_PAYLOAD),
+    let mut seal = tls12::directions(suite, master, randoms.0, randoms.1);
+    let mut mirror = tls12::directions(suite, master, randoms.0, randoms.1);
+    for (ours, back, wire, finished, payload) in [
+        (
+            &mut seal.client,
+            &mut mirror.client,
+            c2s,
+            finished[0],
+            CLIENT_PAYLOAD,
+        ),
+        (
+            &mut seal.server,
+            &mut mirror.server,
+            s2c,
+            finished[1],
+            SERVER_PAYLOAD,
+        ),
     ] {
         for (kind, clear, header) in [(22u8, finished, wire[0]), (23u8, payload, wire[1])] {
             let mut ours_record = Vec::new();
@@ -187,6 +199,13 @@ fn reseal(
                 &header[..5],
                 "our record has Go's type, version and length"
             );
+            if suite.is_rc4() {
+                assert_eq!(
+                    &ours_record[..],
+                    header,
+                    "a stream record carries no IV and no padding, so it is Go's byte for byte"
+                );
+            }
             let wire_type = ours_record[0];
             let (start, len) =
                 record::open12(back, wire_type, &mut ours_record[5..]).expect("our record opens");

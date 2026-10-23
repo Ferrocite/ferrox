@@ -1,5 +1,6 @@
 // The shaped client's record layer: both versions' framing over ring's AEADs and TLS 1.2's MAC-then-encrypt.
 use super::kdf::{self, Hash, Mac};
+use crate::shadowsocks::Rc4 as Keystream;
 use crate::tls::TlsError;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey};
 use ring::hmac;
@@ -10,8 +11,8 @@ const BLOCK: usize = 16;
 /// A 3DES-CBC block, the width Go's two `3DES_EDE_CBC` rows pad and carry an IV at.
 const DES_BLOCK: usize = 8;
 
-/// The suites a shaped hello can key: three TLS 1.3 AEADs and TLS 1.2's AEAD, CBC and 3DES pairs,
-/// each TLS 1.2 name carrying the key exchange that fills its pre-master.
+/// The suites a shaped hello can key: three TLS 1.3 AEADs and TLS 1.2's AEAD, CBC, 3DES and RC4
+/// rows, each TLS 1.2 name carrying the key exchange that fills its pre-master.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Suite {
     Aes128GcmSha256,
@@ -24,12 +25,14 @@ pub(crate) enum Suite {
     EcdheAes256CbcSha,
     EcdheAes128CbcSha256,
     Ecdhe3DesCbcSha,
+    EcdheRc4Sha,
     RsaAes128GcmSha256,
     RsaAes256GcmSha384,
     RsaAes128CbcSha,
     RsaAes256CbcSha,
     RsaAes128CbcSha256,
     Rsa3DesCbcSha,
+    RsaRc4Sha,
 }
 
 impl Suite {
@@ -45,12 +48,14 @@ impl Suite {
             0xc00a | 0xc014 => Self::EcdheAes256CbcSha,
             0xc023 | 0xc027 => Self::EcdheAes128CbcSha256,
             0xc012 => Self::Ecdhe3DesCbcSha,
+            0xc007 | 0xc011 => Self::EcdheRc4Sha,
             0x009c => Self::RsaAes128GcmSha256,
             0x009d => Self::RsaAes256GcmSha384,
             0x002f => Self::RsaAes128CbcSha,
             0x0035 => Self::RsaAes256CbcSha,
             0x003c => Self::RsaAes128CbcSha256,
             0x000a => Self::Rsa3DesCbcSha,
+            0x0005 => Self::RsaRc4Sha,
             _ => return None,
         })
     }
@@ -72,12 +77,18 @@ impl Suite {
                 | Self::RsaAes256CbcSha
                 | Self::RsaAes128CbcSha256
                 | Self::Rsa3DesCbcSha
+                | Self::RsaRc4Sha
         )
     }
 
     /// The suite whose records pad and chain on an eight-byte block rather than a sixteen-byte one.
     pub(crate) fn is_des(self) -> bool {
         matches!(self, Self::Ecdhe3DesCbcSha | Self::Rsa3DesCbcSha)
+    }
+
+    /// The suite whose records are MAC-then-encrypt on a stream, so no IV in the key block or the record and no padding at all.
+    pub(crate) fn is_rc4(self) -> bool {
+        matches!(self, Self::EcdheRc4Sha | Self::RsaRc4Sha)
     }
 
     /// The PRF and handshake hash. The reference moves this to SHA-384 only for a suite flagged
@@ -99,7 +110,9 @@ impl Suite {
             | Self::EcdheAes128CbcSha256
             | Self::RsaAes128GcmSha256
             | Self::RsaAes128CbcSha
-            | Self::RsaAes128CbcSha256 => 16,
+            | Self::RsaAes128CbcSha256
+            | Self::EcdheRc4Sha
+            | Self::RsaRc4Sha => 16,
             Self::Ecdhe3DesCbcSha | Self::Rsa3DesCbcSha => 24,
             _ => 32,
         }
@@ -113,14 +126,16 @@ impl Suite {
             | Self::RsaAes128CbcSha
             | Self::RsaAes256CbcSha
             | Self::Ecdhe3DesCbcSha
-            | Self::Rsa3DesCbcSha => Some(Mac::Sha1),
+            | Self::Rsa3DesCbcSha
+            | Self::EcdheRc4Sha
+            | Self::RsaRc4Sha => Some(Mac::Sha1),
             Self::EcdheAes128CbcSha256 | Self::RsaAes128CbcSha256 => Some(Mac::Sha256),
             _ => None,
         }
     }
 
     /// A TLS 1.2 key block's per-direction IV: four bytes for GCM's explicit nonce, twelve for
-    /// `ChaCha`'s XOR nonce, a whole block for the IV a CBC record carries in the clear.
+    /// `ChaCha`'s XOR nonce, a whole block for the IV a CBC record carries in the clear, none for a stream.
     pub(crate) fn iv_len(self) -> usize {
         match self {
             Self::EcdheAes128GcmSha256
@@ -129,6 +144,7 @@ impl Suite {
             | Self::RsaAes256GcmSha384 => 4,
             Self::ChaCha20Sha256 | Self::EcdheChaCha20Sha256 => 12,
             Self::Ecdhe3DesCbcSha | Self::Rsa3DesCbcSha => DES_BLOCK,
+            Self::EcdheRc4Sha | Self::RsaRc4Sha => 0,
             _ => BLOCK,
         }
     }
@@ -155,6 +171,7 @@ pub(crate) enum Direction {
     Aead(Aead),
     Cbc(Cbc<Aes>),
     Tdes(Cbc<Tdes>),
+    Rc4(Rc4),
 }
 
 impl Direction {
@@ -168,6 +185,7 @@ impl Direction {
     /// and a CBC suite ignores the block's IV because every record carries its own in the clear.
     pub(crate) fn tls12(suite: Suite, key: &[u8], mac: &[u8], iv: &[u8]) -> Self {
         match suite.mac() {
+            Some(kind) if suite.is_rc4() => Self::Rc4(Rc4::new(kind, key, mac)),
             Some(kind) if suite.is_des() => Self::Tdes(Cbc::new(kind, key, mac)),
             Some(kind) => Self::Cbc(Cbc::new(kind, key, mac)),
             None => Self::Aead(Aead::tls12(suite, key, iv)),
@@ -440,20 +458,93 @@ impl<C: Chain> Cbc<C> {
         self.seq = self.seq.wrapping_add(1);
         let header = [kind, 0x03, 0x03, (plain >> 8) as u8, plain as u8];
         let expected = kdf::sign(&self.mac_key, &[&seq, &header, &content[..plain]]);
-        // Every MAC byte reaches the fold, so a wrong padding length fails it rather than branching on the secret.
-        let mut fold = 0u8;
-        for (got, want) in expected
-            .as_ref()
-            .iter()
-            .zip(&content[plain..plain + mac_len])
-        {
-            fold |= got ^ want;
-        }
-        if fold != 0 {
-            return Err(TlsError::Other("record failed authentication".to_owned()));
-        }
+        tag_is(expected.as_ref(), &content[plain..plain + mac_len])?;
         Ok(plain)
     }
+}
+
+/// A TLS 1.2 RC4-SHA direction: the keystream its records continue, the HMAC each carries at its tail, and the counter that signs it.
+pub(crate) struct Rc4 {
+    stream: Keystream,
+    mac: Mac,
+    mac_key: hmac::Key,
+    seq: u64,
+}
+
+impl Rc4 {
+    fn new(mac: Mac, key: &[u8], mac_key: &[u8]) -> Self {
+        Self {
+            stream: Keystream::new(key).expect("a TLS 1.2 stream key schedules"),
+            mac,
+            mac_key: mac.key(mac_key),
+            seq: 0,
+        }
+    }
+
+    /// MAC-then-encrypt as Go's stream case lays it out: payload and MAC through the keystream together, no IV ahead and no pad behind.
+    fn seal(&mut self, kind: u8, parts: &[&[u8]], out: &mut Vec<u8>) {
+        let len: usize = parts.iter().map(|part| part.len()).sum();
+        let at = out.len();
+        out.reserve(5 + len + self.mac.len());
+        out.extend_from_slice(&[kind, 0x03, 0x03, (len >> 8) as u8, len as u8]);
+        let body = out.len();
+        for part in parts {
+            out.extend_from_slice(part);
+        }
+        let seq = self.seq.to_be_bytes();
+        self.seq = self.seq.wrapping_add(1);
+        let tag = kdf::sign(&self.mac_key, &[&seq, &out[at..at + 5], &out[body..]]);
+        out.extend_from_slice(tag.as_ref());
+        let total = (out.len() - at - 5) as u16;
+        out[at + 3..at + 5].copy_from_slice(&total.to_be_bytes());
+        self.stream.crypt(&mut out[body..]);
+    }
+
+    /// Opens a stream record in place: the keystream runs over payload and MAC together, so the plaintext is what the MAC leaves behind.
+    fn open(&mut self, kind: u8, body: &mut [u8]) -> Result<(usize, usize), TlsError> {
+        self.content_len(body.len())?;
+        self.stream.crypt(body);
+        Ok((0, self.authenticate(kind, body)?))
+    }
+
+    /// The same record read off the wire into the caller's window, which one body copy fills before the keystream runs over it.
+    fn open_into(&mut self, kind: u8, body: &[u8], out: &mut [u8]) -> Result<usize, TlsError> {
+        self.content_len(body.len())?;
+        out[..body.len()].copy_from_slice(body);
+        self.stream.crypt(&mut out[..body.len()]);
+        self.authenticate(kind, &out[..body.len()])
+    }
+
+    /// A stream record is its payload and its MAC: the MAC's length is the only floor, and there is no block to be a multiple of.
+    fn content_len(&self, wire: usize) -> Result<(), TlsError> {
+        if wire < self.mac.len() {
+            return Err(TlsError::Other("short TLS 1.2 RC4 record".to_owned()));
+        }
+        Ok(())
+    }
+
+    /// The MAC read off the end of a decrypted record, returning the payload length.
+    fn authenticate(&mut self, kind: u8, content: &[u8]) -> Result<usize, TlsError> {
+        let plain = content.len() - self.mac.len();
+        let seq = self.seq.to_be_bytes();
+        self.seq = self.seq.wrapping_add(1);
+        let header = [kind, 0x03, 0x03, (plain >> 8) as u8, plain as u8];
+        let expected = kdf::sign(&self.mac_key, &[&seq, &header, &content[..plain]]);
+        tag_is(expected.as_ref(), &content[plain..])?;
+        Ok(plain)
+    }
+}
+
+/// Every MAC byte reaches this fold, so a wrong padding length or stream position fails the tag rather than branching on a secret.
+fn tag_is(got: &[u8], want: &[u8]) -> Result<(), TlsError> {
+    let mut fold = got.len() ^ want.len();
+    for (got, want) in got.iter().zip(want) {
+        fold |= usize::from(got ^ want);
+    }
+    if fold != 0 {
+        return Err(TlsError::Other("record failed authentication".to_owned()));
+    }
+    Ok(())
 }
 
 /// The block cipher of a MAC-then-encrypt direction: the width its records pad and chain on, and
@@ -694,11 +785,13 @@ fn keyed(suite: Suite, key: &[u8]) -> LessSafeKey {
     LessSafeKey::new(unbound)
 }
 
-/// The AEAD framing of a direction: TLS 1.3 has no CBC suite, so a CBC direction here is a bug, not a wire case.
+/// The AEAD framing of a direction: TLS 1.3 has no MAC-then-encrypt suite, so one here is a bug, not a wire case.
 fn aead(keys: &mut Direction) -> &mut Aead {
     match keys {
         Direction::Aead(keys) => keys,
-        Direction::Cbc(_) | Direction::Tdes(_) => unreachable!("TLS 1.3 frames no CBC record"),
+        Direction::Cbc(_) | Direction::Tdes(_) | Direction::Rc4(_) => {
+            unreachable!("TLS 1.3 frames no MAC-then-encrypt record")
+        }
     }
 }
 
@@ -790,6 +883,10 @@ pub(crate) fn seal12_parts(
         Direction::Aead(keys) => keys.seal12_parts(kind, parts, out),
         Direction::Cbc(keys) => keys.seal(kind, parts, out),
         Direction::Tdes(keys) => keys.seal(kind, parts, out),
+        Direction::Rc4(keys) => {
+            keys.seal(kind, parts, out);
+            Ok(())
+        }
     }
 }
 
@@ -805,6 +902,7 @@ pub(crate) fn open12(
         Direction::Aead(keys) => keys.open12(kind, body),
         Direction::Cbc(keys) => keys.open(kind, body),
         Direction::Tdes(keys) => keys.open(kind, body),
+        Direction::Rc4(keys) => keys.open(kind, body),
     }
 }
 
@@ -820,6 +918,7 @@ pub(crate) fn open12_into(
         Direction::Aead(keys) => keys.open12_into(kind, body, out),
         Direction::Cbc(keys) => keys.open_into(kind, body, out),
         Direction::Tdes(keys) => keys.open_into(kind, body, out),
+        Direction::Rc4(keys) => keys.open_into(kind, body, out),
     }
 }
 
@@ -954,6 +1053,83 @@ mod tests {
         assert!(
             open12(&mut once, kind, body).is_err(),
             "a forged padding length fails the MAC, not a branch on the secret"
+        );
+    }
+
+    #[test]
+    fn a_tls12_rc4_record_carries_its_mac_and_no_iv() {
+        let suite = Suite::EcdheRc4Sha;
+        let (key, mac_key) = ([7u8; 16], [8u8; 20]);
+        let plain = [0x5au8; 12];
+        let mut sender = Direction::tls12(suite, &key, &mac_key, &[]);
+        let mut wire = Vec::new();
+        seal12(&mut sender, 23, &plain, &mut wire).expect("seals");
+        // The body is the payload with its MAC behind it and nothing else: no IV in front, no padding.
+        assert_eq!(
+            wire.len(),
+            5 + plain.len() + 20,
+            "the record is the payload plus the MAC"
+        );
+        assert_eq!(
+            u16::from_be_bytes([wire[3], wire[4]]) as usize,
+            plain.len() + 20,
+            "and its header names that"
+        );
+
+        let mut mirror = Direction::tls12(suite, &key, &mac_key, &[]);
+        let mut again = Vec::new();
+        seal12(&mut mirror, 23, &plain, &mut again).expect("seals");
+        assert_eq!(
+            wire, again,
+            "at the same stream position the record is fixed"
+        );
+        let mut next = Vec::new();
+        seal12(&mut sender, 23, &plain, &mut next).expect("seals a second record");
+        assert_ne!(
+            wire[5..],
+            next[5..],
+            "the stream never restarts, so the same payload one record later is other bytes"
+        );
+
+        let (header, body) = wire.split_at(5);
+        let mut window = [0u8; 64];
+        let mut direct = Direction::tls12(suite, &key, &mac_key, &[]);
+        let got = open12_into(&mut direct, header[0], body, &mut window).expect("opens the window");
+        let mut staged = wire.clone();
+        let (header, body) = staged.split_at_mut(5);
+        let mut inplace = Direction::tls12(suite, &key, &mac_key, &[]);
+        let (start, same) = open12(&mut inplace, header[0], body).expect("opens in place");
+        assert_eq!(
+            (got, same),
+            (plain.len(), plain.len()),
+            "both walks read it"
+        );
+        assert_eq!(
+            start, 0,
+            "the plaintext is at the front, where the keystream ran"
+        );
+        assert_eq!(&window[..got], &plain[..]);
+        assert_eq!(&body[start..start + same], &plain[..]);
+
+        let mut counted = Vec::with_capacity(64);
+        let mut writer = Direction::tls12(suite, &key, &mac_key, &[]);
+        let ((), counts) = crate::alloc_count::measure(|| {
+            seal12(&mut writer, 23, &plain, &mut counted).expect("seals");
+        });
+        assert_eq!(&counted, &wire, "the counted seal writes the gated record");
+        assert_eq!(
+            counts.allocs, 0,
+            "a stream record takes no heap: {counts:?}"
+        );
+
+        let mut forged = wire.clone();
+        let kind = forged[0];
+        *forged.last_mut().expect("a MAC byte") ^= 0xff;
+        let (_, body) = forged.split_at_mut(5);
+        let mut once = Direction::tls12(suite, &key, &mac_key, &[]);
+        assert!(
+            open12(&mut once, kind, body).is_err(),
+            "the tail is the MAC, so a flip there fails it"
         );
     }
 }

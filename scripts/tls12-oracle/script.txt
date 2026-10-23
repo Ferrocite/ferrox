@@ -10,7 +10,7 @@
 # `shaped::oracle::tls12_sessions_match_go`: it expands the key block from the logged master
 # secret, opens and authenticates every encrypted record Go wrote, checks both Finished
 # messages, and re-seals them so a CBC record's header — explicit IV, MAC and padding count
-# included — matches Go's byte for byte.
+# included — matches Go's byte for byte, and an RC4 record matches whole behind its stream.
 
 # The six ECDHE-CBC suites, three with an ECDSA leaf and three with an RSA leaf. SHA-1 is what a
 # `-SHA` identifier names for the record MAC while the PRF stays SHA-256: the split this client
@@ -31,15 +31,24 @@
 0x009c TLS_RSA_WITH_AES_128_GCM_SHA256
 0x009d TLS_RSA_WITH_AES_256_GCM_SHA384
 
-# The two 3DES-EDE-CBC rows, which are the last TLS 1.2 suites whose record layer is
-# MAC-then-encrypt. Their block is eight bytes, not sixteen, so the explicit IV, the padding count
-# and every length in the header move with it.
+# The two 3DES-EDE-CBC rows, the last TLS 1.2 suites whose record layer is MAC-then-encrypt on a
+# block. Their block is eight bytes, not sixteen, so the explicit IV, the padding count and every
+# length in the header move with it.
 0x000a TLS_RSA_WITH_3DES_EDE_CBC_SHA
 0xc012 TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA
 
-# What this list deliberately stops at, measured against the same Go build (1.24.6): the three
-# RC4-SHA rows Go keeps in `InsecureCipherSuites()` are still negotiable when both sides name one,
-# so `0x0005 TLS_RSA_WITH_RC4_128_SHA`, `0xc007 TLS_ECDHE_ECDSA_WITH_RC4_128_SHA` and
-# `0xc011 TLS_ECDHE_RSA_WITH_RC4_128_SHA` each complete a capture and wait for their own
-# suites here. `0x003d` does not: the server alerts `handshake failure`, because no TLS 1.2 table
-# this client reads contains it — uTLS keeps it behind `EnableWeakCiphers()`, which xray never calls.
+# The three RC4-SHA rows, where the record layer is MAC-then-encrypt on a stream: the payload and
+# its 20-byte MAC go through `XORKeyStream` with no explicit IV and no padding, and the key block
+# carries no IV either. One stream runs across a session's records, so a re-seal that reaches the
+# right position matches Go's whole ciphertext — a byte gate CBC's random IV can never be.
+0x0005 TLS_RSA_WITH_RC4_128_SHA
+0xc011 TLS_ECDHE_RSA_WITH_RC4_128_SHA
+0xc007 TLS_ECDHE_ECDSA_WITH_RC4_128_SHA
+
+# What this list stops at, measured against the same Go build (1.24.6): the five rows
+# `InsecureCipherSuites()` names are all above, because both sides still negotiate one when it is
+# the only suite either end carries. `0x003d` is not: the server alerts `handshake failure`,
+# because no TLS 1.2 table this client reads contains it — uTLS keeps it behind
+# `EnableWeakCiphers()`, which xray never calls. The same is true of `0xc024`, `0xc028`, the DHE
+# and static-ECDH names and the SEED rows, which the `360`, `firefox_55/63` and iOS/Safari presets
+# advertise but no Go table implements.
