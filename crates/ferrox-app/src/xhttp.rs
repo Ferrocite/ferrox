@@ -1192,6 +1192,7 @@ fn extract_meta<'a>(
 struct Session {
     state: Mutex<SessionState>,
     cv: Condvar,
+    id: String,
 }
 
 struct SessionState {
@@ -1199,6 +1200,7 @@ struct SessionState {
     packets: BTreeMap<u64, Vec<u8>>,
     next_seq: u64,
     ended: bool,
+    downlink: bool,
 }
 
 type Sessions = Mutex<HashMap<String, Arc<Session>>>;
@@ -1218,8 +1220,10 @@ fn get_or_create_session(id: &str) -> Arc<Session> {
                     packets: BTreeMap::new(),
                     next_seq: 0,
                     ended: false,
+                    downlink: false,
                 }),
                 cv: Condvar::new(),
+                id: id.to_owned(),
             })
         })
         .clone()
@@ -1256,6 +1260,11 @@ fn bound_session(
     downlink: bool,
 ) -> Arc<Session> {
     let session = get_or_create_session(sid);
+    if downlink {
+        let mut st = session.state.lock().expect("session lock");
+        st.downlink = true;
+        session.cv.notify_all();
+    }
     if let Some(h2) = h2 {
         if downlink {
             h2.bind_session(sid);
@@ -1282,12 +1291,42 @@ impl Session {
         true
     }
     fn wait_ended(&self) {
-        self.wait_ended_for(std::time::Duration::from_secs(0));
+        self.wait_ended_for(crate::budgets::relay_stall());
     }
-    fn wait_ended_for(&self, _idle: std::time::Duration) {
+    fn wait_ended_for(&self, idle: std::time::Duration) {
+        let started = std::time::Instant::now();
+        let mut expired = false;
         let mut st = self.state.lock().expect("session lock");
         while !st.ended {
-            st = self.cv.wait(st).expect("session lock");
+            if st.downlink {
+                st = self.cv.wait(st).expect("session lock");
+                continue;
+            }
+            let remaining = idle.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                st.ended = true;
+                expired = true;
+                self.cv.notify_all();
+                break;
+            }
+            let (next, wait) = self.cv.wait_timeout(st, remaining).expect("session lock");
+            st = next;
+            if wait.timed_out() && !st.ended && !st.downlink && started.elapsed() >= idle {
+                st.ended = true;
+                expired = true;
+                self.cv.notify_all();
+                break;
+            }
+        }
+        drop(st);
+        if expired {
+            let mut map = sessions().lock().expect("sessions lock");
+            if map
+                .get(&self.id)
+                .is_some_and(|carried| std::ptr::eq(Arc::as_ptr(carried), self))
+            {
+                map.remove(&self.id);
+            }
         }
     }
 }
@@ -3449,6 +3488,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_stream_up_session_with_a_downlink_waits_for_it() {
+        let session = bound_session("post-with-downlink", None, true);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = {
+            let session = Arc::clone(&session);
+            thread::spawn(move || {
+                session.wait_ended_for(std::time::Duration::from_millis(200));
+                let _ = done_tx.send(());
+            })
+        };
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_millis(500))
+                .is_err(),
+            "a bound downlink keeps the session open past the idle budget"
+        );
+        end_session("post-with-downlink");
+        assert!(
+            done_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .is_ok(),
+            "ending the session wakes the post"
+        );
+        worker.join().expect("joins");
+    }
+
     /// Both parks — the uplink's `wait_ended` and the downlink's `Read::read` — wait on `session.cv`, and until a carrier owned the session the only thing that ever notified it was a `SessionReader`'s Drop. A client that opened one half and died left the other half's thread parked for the life of the process.
     #[test]
     fn a_carrier_death_lifts_both_parks() {
@@ -3708,8 +3774,10 @@ mod tests {
                 packets: BTreeMap::new(),
                 next_seq: 0,
                 ended: true,
+                downlink: false,
             }),
             cv: Condvar::new(),
+            id: String::new(),
         });
         let mut reader = SessionReader::new(session, String::new());
         let mut byte = [0u8; 1];
@@ -3729,8 +3797,10 @@ mod tests {
                 packets: BTreeMap::new(),
                 next_seq: 0,
                 ended: false,
+                downlink: false,
             }),
             cv: Condvar::new(),
+            id: String::new(),
         });
         let mut reader = SessionReader::new(session, String::new());
         let (sender, receiver) = std::sync::mpsc::channel();
