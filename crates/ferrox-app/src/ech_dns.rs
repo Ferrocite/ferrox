@@ -211,6 +211,7 @@ fn doh(
             server_name: host.to_owned(),
             alpn: vec![b"h2".to_vec()].into(),
             roots: crate::quic::system_roots(),
+            cert_pins: std::sync::Arc::default(),
             pins: ferrox_core::foxy::pin::Pins::default(),
             cipher_suites: Vec::new(),
             insecure: false,
