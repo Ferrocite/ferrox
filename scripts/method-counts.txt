@@ -401,6 +401,8 @@ reality-tls trust-anchor-bytes-copied-per-dial 0 ferrox-app-foxy::loopback::ever
 reality-tls handshakes-skipped-by-an-earlier-dials-ticket 0 ferrox-core-tls::rustls_backend::tests::a_second_dial_with_the_same_config_still_fetches_the_chain
 reality-tls untrusted-dials-counted-as-retryable 0 ferrox-app-proxy::tests::a_refused_chain_is_a_refusal_not_a_drop
 reality-tls session-writes-per-frame 1 ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call
+reality-tls session-sends-per-64KiB-window 1 ferrox-app-proxy::tests::a_window_leaves_the_session_in_one_send
+reality-tls session-sends-per-frame-wider-than-the-batch 2 ferrox-app-proxy::tests::a_frame_wider_than_the_batch_leaves_in_batches
 reality-tls transport-reads-per-flush 0 ferrox-core-tls::rustls_backend::tests::a_flush_does_not_read_the_transport
 reality-tls transport-reads-per-write 0 ferrox-core-tls::rustls_backend::tests::a_write_does_not_read_the_transport
 reality-tls transport-reads-per-answer-write 0 ferrox-core-tls::rustls_backend::tests::a_server_answer_write_does_not_read_the_transport
