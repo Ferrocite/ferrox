@@ -49,7 +49,8 @@ pub(crate) fn inbound_reality_config(
         limit_fallback_upload: reality.get("limitFallbackUpload").and_then(rate_limit),
         limit_fallback_download: reality.get("limitFallbackDownload").and_then(rate_limit),
         dest: reality
-            .get("dest")
+            .get("target")
+            .or_else(|| reality.get("dest"))
             .and_then(Json::as_str)
             .filter(|d| !d.is_empty())
             .map(str::to_owned),
@@ -90,33 +91,67 @@ fn as_uint(node: &Json) -> Option<u64> {
     None
 }
 
-/// Xray fills the eight bytes from the front and zero-pads the tail, so `a8` is `a8 00 ...`, never `00 ... a8`.
+/// Xray fills the eight bytes from the front and zero-pads the tail, so `a8` is `a8 00 ...`, never `00 ... a8`. An empty string is the all-zero short id.
 fn short_id(hex: &str) -> Option<[u8; 8]> {
     let mut out = [0u8; 8];
-    if hex.is_empty() || hex.len() > 16 || !hex.len().is_multiple_of(2) {
+    if hex.is_empty() {
+        return Some(out);
+    }
+    if hex.len() > 16 || !hex.len().is_multiple_of(2) {
         return None;
     }
     for (i, pair) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
-        out[i] = u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?;
+        out[i] = (hex_nibble(pair[0])? << 4) | hex_nibble(pair[1])?;
     }
     Some(out)
 }
 
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+const B64URL: [u8; 256] = {
+    let mut table = [0xff; 256];
+    let mut at = 0;
+    while at < 26 {
+        table[b'A' as usize + at] = at as u8;
+        table[b'a' as usize + at] = at as u8 + 26;
+        at += 1;
+    }
+    at = 0;
+    while at < 10 {
+        table[b'0' as usize + at] = at as u8 + 52;
+        at += 1;
+    }
+    table[b'-' as usize] = 62;
+    table[b'_' as usize] = 63;
+    table
+};
+
 fn key32(text: &str) -> Option<[u8; 32]> {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut word = 0u32;
     let mut bits = 0;
-    let mut out = Vec::with_capacity(32);
+    let mut out = [0u8; 32];
+    let mut at = 0;
     for byte in text.bytes() {
-        let value = ALPHABET.iter().position(|c| *c == byte)? as u32;
-        word = (word << 6) | value;
+        let value = B64URL[byte as usize];
+        if value == 0xff {
+            return None;
+        }
+        word = (word << 6) | u32::from(value);
         bits += 6;
         if bits >= 8 {
             bits -= 8;
-            out.push((word >> bits) as u8);
+            *out.get_mut(at)? = (word >> bits) as u8;
+            at += 1;
         }
     }
-    <[u8; 32]>::try_from(out).ok()
+    (at == 32).then_some(out)
 }
 
 fn as_millis(node: &Json) -> Option<u64> {
@@ -450,7 +485,12 @@ pub(crate) fn outbound_reality(
     }
     Some(Arc::new(ferrox_core::tls::RealityClientConfig {
         server_name,
-        public_key: reality.get("publicKey")?.as_str().and_then(key32)?,
+        public_key: reality
+            .get("password")
+            .and_then(Json::as_str)
+            .filter(|key| !key.is_empty())
+            .or_else(|| reality.get("publicKey").and_then(Json::as_str))
+            .and_then(key32)?,
         short_id: reality
             .get("shortId")
             .and_then(Json::as_str)
@@ -1351,8 +1391,44 @@ mod tests {
     fn a_short_id_hex_fills_from_the_front() {
         assert_eq!(short_id("a8"), Some([0xa8, 0, 0, 0, 0, 0, 0, 0]));
         assert_eq!(short_id("01020304"), Some([1, 2, 3, 4, 0, 0, 0, 0]));
-        assert_eq!(short_id(""), None);
+        assert_eq!(short_id(""), Some([0; 8]));
         assert_eq!(short_id("abc"), None);
+    }
+
+    #[test]
+    fn reality_reads_the_references_aliases_and_empty_short_id() {
+        let inbound = crate::json::parse(
+            r#"{"streamSettings":{"security":"reality","realitySettings":{"privateKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","target":"cover.test:443","shortIds":[""],"serverNames":["www.example.com"]}}}"#,
+        )
+        .expect("a server");
+        let server = inbound_reality_config(&inbound).expect("target and the empty short id");
+        assert_eq!(server.dest.as_deref(), Some("cover.test:443"));
+        assert_eq!(server.short_ids, vec![[0u8; 8]]);
+
+        let mixed = crate::json::parse(
+            r#"{"streamSettings":{"security":"reality","realitySettings":{"privateKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","shortIds":["","ab"],"serverNames":["www.example.com"]}}}"#,
+        )
+        .expect("a server with two short ids");
+        assert_eq!(
+            inbound_reality_config(&mixed)
+                .expect("both short ids")
+                .short_ids,
+            vec![[0u8; 8], [0xab, 0, 0, 0, 0, 0, 0, 0]]
+        );
+
+        let outbound = crate::json::parse(
+            r#"{"streamSettings":{"security":"reality","realitySettings":{"publicKey":"","password":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","serverName":"www.example.com","shortId":""}}}"#,
+        )
+        .expect("a client");
+        let client =
+            outbound_reality(&outbound, "127.0.0.1").expect("password and the empty short id");
+        assert_eq!(client.short_id, [0u8; 8]);
+
+        let (key, counts) = ferrox_core::alloc_count::measure(|| {
+            key32("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+        });
+        assert_eq!(key, Some([0u8; 32]));
+        assert_eq!(counts.allocs, 0, "the key is decoded into its array");
     }
 
     #[test]
