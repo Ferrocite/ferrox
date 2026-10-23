@@ -7,7 +7,7 @@ use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 
 use crate::conn::Connection;
 use base64::Engine as _;
-use ferrox_core::transport::url_decode;
+use ferrox_core::transport::url_decode_parts;
 
 const HEAD_LIMIT: usize = 64 * 1024;
 /// One chunk per relay window: a promoted read leaves as one chunked frame, not as a 16 KiB chunk per quarter of it.
@@ -1119,6 +1119,111 @@ fn header_cookie<'a>(head: &'a [u8], name: &str) -> Option<&'a str> {
     None
 }
 
+/// The head's field lines after the request line, up to the first line without a colon — where a field lookup stops.
+fn head_fields(text: &str) -> Vec<(&str, &str)> {
+    let mut fields = Vec::with_capacity(8);
+    for line in text.split("\r\n").skip(1) {
+        let Some((key, value)) = line.split_once(':') else {
+            break;
+        };
+        fields.push((key.trim(), value.trim()));
+    }
+    fields
+}
+
+/// Every cookie pair in the head, in the order a name lookup walks them.
+fn cookie_pairs(text: &str) -> Vec<(&str, &str)> {
+    let mut pairs = Vec::new();
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        if key.eq_ignore_ascii_case("cookie") {
+            for part in value.trim().split(';') {
+                if let Some((name, value)) = part.trim().split_once('=') {
+                    pairs.push((name, value));
+                }
+            }
+        }
+    }
+    pairs
+}
+
+/// Whether a name is `key`, `sep` and the canonical decimal `index`, compared as the lookup spells it: header names fold case, cookie names do not.
+fn names_part(name: &str, key: &str, sep: u8, index: usize, fold: bool) -> bool {
+    let name = name.as_bytes();
+    let key = key.as_bytes();
+    if name.len() <= key.len() {
+        return false;
+    }
+    let head = &name[..key.len()];
+    let matches = if fold {
+        head.eq_ignore_ascii_case(key)
+    } else {
+        head == key
+    };
+    if !matches {
+        return false;
+    }
+    let rest = &name[key.len()..];
+    let mut n = index;
+    let mut digits = 1;
+    while n >= 10 {
+        n /= 10;
+        digits += 1;
+    }
+    if rest.len() != digits + 1 || rest[0] != sep {
+        return false;
+    }
+    let mut n = index;
+    for &byte in rest[1..].iter().rev() {
+        if byte != b'0' + (n % 10) as u8 {
+            return false;
+        }
+        n /= 10;
+    }
+    true
+}
+
+/// The packet the data parts carry: one walk of the head answers every part name, and the parts decode as their join because the six-bit window crosses the cut.
+fn data_parts(head: &[u8], settings: &XhttpSettings) -> Option<Vec<u8>> {
+    let text = std::str::from_utf8(head).ok()?;
+    let (key, sep, fields, fold) = match settings.uplink_data_placement {
+        Placement::Header => (
+            if settings.uplink_data_key.is_empty() {
+                "X-Data"
+            } else {
+                settings.uplink_data_key.as_str()
+            },
+            b'-',
+            head_fields(text),
+            true,
+        ),
+        Placement::Cookie => (
+            if settings.uplink_data_key.is_empty() {
+                "x_data"
+            } else {
+                settings.uplink_data_key.as_str()
+            },
+            b'_',
+            cookie_pairs(text),
+            false,
+        ),
+        _ => return None,
+    };
+    let mut parts = Vec::with_capacity(fields.len());
+    for i in 0.. {
+        match fields
+            .iter()
+            .find(|(name, _)| names_part(name, key, sep, i, fold))
+        {
+            Some((_, value)) => parts.push(*value),
+            None => break,
+        }
+    }
+    url_decode_parts(&parts)
+}
+
 fn extract_padding<'a>(
     head: &'a [u8],
     target: &'a str,
@@ -1912,44 +2017,7 @@ pub(crate) fn accept_core<
                 carry = prefix;
             }
             let payload = match settings.uplink_data_placement {
-                Placement::Header => {
-                    let key = if settings.uplink_data_key.is_empty() {
-                        "X-Data".to_owned()
-                    } else {
-                        settings.uplink_data_key.clone()
-                    };
-                    let mut joined = String::new();
-                    // One reusable name buffer, so the loop does not hand a fresh allocation to every part — and the final miss that only ends the run costs nothing.
-                    let mut name = String::with_capacity(key.len() + 4);
-                    for i in 0.. {
-                        name.clear();
-                        let _ = write!(name, "{key}-{i}");
-                        match crate::proxy::header_value(head, &name) {
-                            Some(v) => joined.push_str(v),
-                            None => break,
-                        }
-                    }
-                    url_decode(&joined)
-                }
-                Placement::Cookie => {
-                    let key = if settings.uplink_data_key.is_empty() {
-                        "x_data".to_owned()
-                    } else {
-                        settings.uplink_data_key.clone()
-                    };
-                    let mut joined = String::new();
-                    // One reusable name buffer, so the loop does not hand a fresh allocation to every part — and the final miss that only ends the run costs nothing.
-                    let mut name = String::with_capacity(key.len() + 4);
-                    for i in 0.. {
-                        name.clear();
-                        let _ = write!(name, "{key}_{i}");
-                        match header_cookie(head, &name) {
-                            Some(v) => joined.push_str(v),
-                            None => break,
-                        }
-                    }
-                    url_decode(&joined)
-                }
+                Placement::Header | Placement::Cookie => data_parts(head, settings),
                 _ => Some(body),
             };
             let Some(payload) = payload else {
@@ -3829,6 +3897,84 @@ mod tests {
                 .read_exact(&mut got)
                 .unwrap_or_else(|_| panic!("{placement}: the parts reached no reader"));
             assert_eq!(got, packet, "{placement}: the joined parts decoded wrong");
+        }
+    }
+
+    /// The parts are read off one walk of the head and decoded across their cuts. The join is kept here as the oracle and measured beside the arm, because a per-part lookup re-splits the whole head and the join copies every part.
+    #[test]
+    fn the_data_parts_decode_off_one_walk_of_the_head() {
+        let packet: Vec<u8> = (0..200usize).map(|i| (i as u8).wrapping_mul(97)).collect();
+        let mut encoded = String::new();
+        ferrox_core::transport::early_encode_into(&mut encoded, &packet);
+        for placement in ["header", "cookie"] {
+            let settings = settings_from(&format!(
+                r#"{{"streamSettings": {{"network": "xhttp", "xhttpSettings": {{
+                    "path": "/up", "mode": "packet-up", "uplinkDataPlacement": "{placement}"}}}}}}"#
+            ));
+            let (first, second, third) = (&encoded[..41], &encoded[41..97], &encoded[97..]);
+            let parts = if placement == "header" {
+                format!("X-Data-0: {first}\r\nX-Data-1: {second}\r\nX-Data-2: {third}\r\n")
+            } else {
+                format!("Cookie: x_data_0={first};x_data_1={second};x_data_2={third}\r\n")
+            };
+            let referer = "http://127.0.0.1/up?x_padding=".to_owned() + &"X".repeat(500);
+            let head = format!(
+                "POST /up/one_walk/0 HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\n{parts}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let (decoded, counts) =
+                ferrox_core::alloc_count::measure(|| data_parts(head.as_bytes(), &settings));
+            assert_eq!(
+                decoded.as_deref(),
+                Some(&packet[..]),
+                "{placement}: the parts are the packet"
+            );
+            assert_eq!(
+                counts.allocs, 3,
+                "{placement}: the field list, the part list and the output are the only buffers: {counts:?}"
+            );
+            let (joined, join_counts) = ferrox_core::alloc_count::measure(|| {
+                let key = if settings.uplink_data_key.is_empty() {
+                    if placement == "header" {
+                        "X-Data".to_owned()
+                    } else {
+                        "x_data".to_owned()
+                    }
+                } else {
+                    settings.uplink_data_key.clone()
+                };
+                let mut joined = String::new();
+                let mut name = String::with_capacity(key.len() + 4);
+                for i in 0.. {
+                    name.clear();
+                    let _ = std::fmt::write(
+                        &mut name,
+                        format_args!("{key}{}{i}", if placement == "header" { '-' } else { '_' }),
+                    );
+                    let hit = if placement == "header" {
+                        crate::proxy::header_value(head.as_bytes(), &name)
+                    } else {
+                        header_cookie(head.as_bytes(), &name)
+                    };
+                    match hit {
+                        Some(v) => joined.push_str(v),
+                        None => break,
+                    }
+                }
+                ferrox_core::transport::url_decode(&joined)
+            });
+            assert_eq!(
+                joined.as_deref(),
+                Some(&packet[..]),
+                "{placement}: the oracle decodes the packet"
+            );
+            assert_eq!(
+                join_counts.allocs, 6,
+                "{placement}: the join's key, name, three growth steps and output: {join_counts:?}"
+            );
+            assert!(
+                counts.allocs < join_counts.allocs,
+                "{placement}: the join cost {join_counts:?} where one walk cost {counts:?}"
+            );
         }
     }
 
