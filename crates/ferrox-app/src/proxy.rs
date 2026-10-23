@@ -13808,10 +13808,7 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
             .and_then(|user| user.get("id"))
             .and_then(Json::as_str)
             .and_then(uuid_bytes)?;
-        let mux = matches!(
-            outbound.get("mux").and_then(|mux| mux.get("enabled")),
-            Some(Json::Bool(true))
-        );
+        let mux = outbound.get("mux").and_then(|mux| mux.get("enabled")) == Some(&Json::Bool(true));
         let stored = xdrive_carried(outbound, &address);
         if security == "tls" && !quic_tls && stored.is_none() {
             let Some((carrier, host, tls)) = tls_carried_parts(outbound, &address) else {
