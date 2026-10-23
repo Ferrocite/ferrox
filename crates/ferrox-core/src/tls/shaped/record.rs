@@ -143,14 +143,13 @@ impl Direction {
     }
 
     fn nonce(&self, seq: u64) -> [u8; 12] {
-        let bytes = seq.to_be_bytes();
         let mut nonce = self.iv;
         if self.tls13 || !self.gcm {
-            for (slot, byte) in nonce[4..].iter_mut().zip(bytes) {
-                *slot ^= byte;
-            }
+            // One big-endian XOR is the same bytes as eight, and a TLS 1.3 nonce is the IV under the counter.
+            let iv = u64::from_be_bytes(nonce[4..].try_into().expect("eight-byte IV tail"));
+            nonce[4..].copy_from_slice(&(iv ^ seq).to_be_bytes());
         } else {
-            nonce[4..].copy_from_slice(&bytes);
+            nonce[4..].copy_from_slice(&seq.to_be_bytes());
         }
         nonce
     }
@@ -217,9 +216,9 @@ pub(crate) fn seal13_parts(
 ) -> Result<(), TlsError> {
     let len: usize = parts.iter().map(|part| part.len()).sum();
     let at = out.len();
-    out.push(23);
-    out.extend_from_slice(&[0x03, 0x03]);
-    out.extend_from_slice(&((len + 1 + 16) as u16).to_be_bytes());
+    let total = (len + 1 + 16) as u16;
+    out.reserve(5 + len + 1 + 16);
+    out.extend_from_slice(&[23, 0x03, 0x03, (total >> 8) as u8, total as u8]);
     for part in parts {
         out.extend_from_slice(part);
     }
@@ -242,6 +241,25 @@ pub(crate) fn open13(
             .ok_or_else(|| TlsError::Other("record has no inner type".to_owned()))?
     };
     Ok((body[at], at))
+}
+
+/// The same open into a caller's buffer: the body lands at the front of `out` and the
+/// plaintext stays there, so a relay never stages the ciphertext and copies it again.
+pub(crate) fn open13_into(
+    keys: &mut Direction,
+    header: [u8; 5],
+    body: &[u8],
+    out: &mut [u8],
+) -> Result<(u8, usize), TlsError> {
+    out[..body.len()].copy_from_slice(body);
+    let at = {
+        let plain = keys.open(&header, &mut out[..body.len()])?;
+        plain
+            .iter()
+            .rposition(|&byte| byte != 0)
+            .ok_or_else(|| TlsError::Other("record has no inner type".to_owned()))?
+    };
+    Ok((out[at], at))
 }
 
 /// Seals one TLS 1.2 AEAD record of `kind`.
@@ -269,9 +287,9 @@ pub(crate) fn seal12_parts(
     aad[11..].copy_from_slice(&(len as u16).to_be_bytes());
     let at = out.len();
     let explicit = if keys.gcm { 8 } else { 0 };
-    out.push(kind);
-    out.extend_from_slice(&[0x03, 0x03]);
-    out.extend_from_slice(&((len + explicit + 16) as u16).to_be_bytes());
+    let total = (len + explicit + 16) as u16;
+    out.reserve(5 + explicit + len + 16);
+    out.extend_from_slice(&[kind, 0x03, 0x03, (total >> 8) as u8, total as u8]);
     if explicit == 8 {
         out.extend_from_slice(&seq);
     }
@@ -288,16 +306,11 @@ pub(crate) fn open12(
     kind: u8,
     body: &mut [u8],
 ) -> Result<(usize, usize), TlsError> {
-    let seq = keys.seq.to_be_bytes();
     let explicit = if keys.gcm { 8 } else { 0 };
     if body.len() < explicit + 16 {
         return Err(TlsError::Other("short TLS 1.2 record".to_owned()));
     }
-    let mut aad = [0u8; 13];
-    aad[..8].copy_from_slice(&seq);
-    aad[8] = kind;
-    aad[9..11].copy_from_slice(&[0x03, 0x03]);
-    aad[11..].copy_from_slice(&((body.len() - explicit - 16) as u16).to_be_bytes());
+    let aad = aad12(keys, kind, body.len() - explicit - 16);
     let (start, len) = if keys.gcm {
         let nonce: [u8; 8] = body[..8].try_into().expect("eight-byte explicit nonce");
         (8, keys.open_explicit(&aad, nonce, &mut body[8..])?.len())
@@ -305,6 +318,38 @@ pub(crate) fn open12(
         (0, keys.open(&aad, &mut body[..])?.len())
     };
     Ok((start, len))
+}
+
+/// The TLS 1.2 body opened to the front of `out`, over the explicit nonce that GCM carries on the wire.
+pub(crate) fn open12_into(
+    keys: &mut Direction,
+    kind: u8,
+    body: &[u8],
+    out: &mut [u8],
+) -> Result<usize, TlsError> {
+    let explicit = if keys.gcm { 8 } else { 0 };
+    if body.len() < explicit + 16 {
+        return Err(TlsError::Other("short TLS 1.2 record".to_owned()));
+    }
+    let aad = aad12(keys, kind, body.len() - explicit - 16);
+    let n = body.len() - explicit;
+    out[..n].copy_from_slice(&body[explicit..]);
+    let len = if explicit == 8 {
+        let nonce: [u8; 8] = body[..8].try_into().expect("eight-byte explicit nonce");
+        keys.open_explicit(&aad, nonce, &mut out[..n])?.len()
+    } else {
+        keys.open(&aad, &mut out[..n])?.len()
+    };
+    Ok(len)
+}
+
+fn aad12(keys: &Direction, kind: u8, plain_len: usize) -> [u8; 13] {
+    let mut aad = [0u8; 13];
+    aad[..8].copy_from_slice(&keys.seq.to_be_bytes());
+    aad[8] = kind;
+    aad[9..11].copy_from_slice(&[0x03, 0x03]);
+    aad[11..].copy_from_slice(&(plain_len as u16).to_be_bytes());
+    aad
 }
 
 #[cfg(test)]

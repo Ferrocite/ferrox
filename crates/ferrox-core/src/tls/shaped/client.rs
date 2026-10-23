@@ -609,6 +609,82 @@ impl<S: Stream> Session<S> {
         Ok(())
     }
 
+    /// Decrypts every whole record straight from the caller's chunk into the caller's window, so a
+    /// roomy window costs one body copy and no staged ciphertext, and returns the bytes delivered.
+    fn process_direct(&mut self, ciphertext: &[u8], buf: &mut [u8]) -> Result<usize, TlsError> {
+        let mut at = 0usize;
+        let mut filled = 0usize;
+        loop {
+            if ciphertext.len() - at < 5 {
+                break;
+            }
+            let header: [u8; 5] = ciphertext[at..at + 5]
+                .try_into()
+                .expect("five-byte record header");
+            let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+            if len > MAX_RECORD {
+                return Err(TlsError::Other(
+                    "record exceeds the maximum length".to_owned(),
+                ));
+            }
+            if ciphertext.len() - at - 5 < len {
+                break;
+            }
+            at += 5 + len;
+            let body = &ciphertext[at - len..at];
+            let (kind, bytes) = if header[0] == CCS {
+                if self.version == Some(Version::Tls12) {
+                    if let Some(keys) = self.server12.take() {
+                        self.read_key = Some(keys);
+                    }
+                }
+                (CCS, 0)
+            } else {
+                match self.read_key.as_mut() {
+                    None => {
+                        buf[filled..filled + len].copy_from_slice(body);
+                        (header[0], len)
+                    }
+                    Some(keys) if self.version == Some(Version::Tls13) => {
+                        if header[0] == ALERT {
+                            buf[filled..filled + len].copy_from_slice(body);
+                            (ALERT, len)
+                        } else if header[0] != APPLICATION {
+                            return Err(unexpected(header[0]));
+                        } else {
+                            record::open13_into(keys, header, body, &mut buf[filled..])?
+                        }
+                    }
+                    Some(keys) => (
+                        header[0],
+                        record::open12_into(keys, header[0], body, &mut buf[filled..])?,
+                    ),
+                }
+            };
+            match kind {
+                APPLICATION => filled += bytes,
+                HANDSHAKE => {
+                    self.hs.extend_from_slice(&buf[filled..filled + bytes]);
+                    self.post_handshake()?;
+                }
+                ALERT => {
+                    let error = alert(&buf[filled..filled + bytes]);
+                    if error == TlsError::Closed {
+                        self.eof = true;
+                    } else {
+                        return Err(error);
+                    }
+                }
+                CCS => {}
+                other => return Err(unexpected(other)),
+            }
+        }
+        if at < ciphertext.len() {
+            self.inbuf.extend_from_slice(&ciphertext[at..]);
+        }
+        Ok(filled)
+    }
+
     /// Decrypts every whole record in `inbuf`, copying application data straight into `buf` and
     /// staging only what does not fit, and returns the bytes delivered.
     fn process_inbuf(&mut self, buf: &mut [u8]) -> Result<usize, TlsError> {
@@ -785,6 +861,12 @@ impl<S: Stream> TlsProvider for Session<S> {
         }
         if ciphertext.is_empty() {
             return Ok((0, 0));
+        }
+        if self.inbuf.is_empty() && buf.len() >= ciphertext.len() {
+            let filled = self
+                .process_direct(ciphertext, buf)
+                .map_err(std::io::Error::other)?;
+            return Ok((filled, ciphertext.len()));
         }
         self.inbuf.extend_from_slice(ciphertext);
         let filled = self.process_inbuf(buf).map_err(std::io::Error::other)?;
@@ -1238,5 +1320,152 @@ impl Reader<'_> {
     fn vec24(&mut self) -> Result<&[u8], TlsError> {
         let len = self.u24()?;
         self.take(len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tls::shaped::profiles;
+    use std::io::{Read, Write};
+
+    struct Sink;
+
+    impl Read for Sink {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn session(version: Version, suite: Suite, read: Direction, write: Direction) -> Session<Sink> {
+        let cfg = TlsConfig {
+            insecure: true,
+            ..TlsConfig::default()
+        };
+        Session {
+            io: Sink,
+            verifier: crate::tls::rustls_backend::verifier(&cfg).expect("verifier"),
+            server_name: ServerName::try_from("tls.test".to_owned()).expect("name"),
+            profile: profiles::profile("chrome").expect("chrome profile"),
+            hello: None,
+            client_random: [0; 32],
+            transcript: Vec::new(),
+            version: Some(version),
+            suite: Some(suite),
+            read_key: Some(read),
+            write_key: Some(write),
+            server12: None,
+            client12: None,
+            alpn: None,
+            leaf: None,
+            done: true,
+            eof: false,
+            ccs_sent: false,
+            hs: Vec::new(),
+            plain: Vec::new(),
+            plain_at: 0,
+            plain_end: 0,
+            inbuf: Vec::new(),
+            in_at: 0,
+            reply: Vec::new(),
+            out: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_roomy_tls13_chunk_lands_record_by_record_in_the_callers_window() {
+        let suite = Suite::Aes128GcmSha256;
+        let secret = [9u8; 32];
+        let mut session = session(
+            Version::Tls13,
+            suite,
+            Direction::tls13(suite, &secret),
+            Direction::tls13(suite, &secret),
+        );
+        let mut sender = Direction::tls13(suite, &secret);
+        let mut wire = Vec::new();
+        record::seal13(&mut sender, APPLICATION, b"one", &mut wire).expect("seals");
+        record::seal13(&mut sender, APPLICATION, b"two", &mut wire).expect("seals");
+        let mut window = [0u8; 128];
+        let (got, consumed) = session.open(&wire, &mut window).expect("opens");
+        assert_eq!((got, consumed), (6, wire.len()));
+        assert_eq!(&window[..6], b"onetwo");
+        assert_eq!(session.plain_buffer(), [], "a roomy window stages nothing");
+    }
+
+    #[test]
+    fn a_tls13_record_split_across_chunks_is_staged_and_then_lands() {
+        let suite = Suite::ChaCha20Sha256;
+        let secret = [11u8; 32];
+        let mut session = session(
+            Version::Tls13,
+            suite,
+            Direction::tls13(suite, &secret),
+            Direction::tls13(suite, &secret),
+        );
+        let mut sender = Direction::tls13(suite, &secret);
+        let mut wire = Vec::new();
+        record::seal13(&mut sender, APPLICATION, b"three", &mut wire).expect("seals");
+        let cut = wire.len() - 3;
+        let mut window = [0u8; 128];
+        let (got, consumed) = session.open(&wire[..cut], &mut window).expect("opens");
+        assert_eq!((got, consumed), (0, cut));
+        let (got, consumed) = session.open(&wire[cut..], &mut window).expect("opens");
+        assert_eq!((got, consumed), (5, wire.len() - cut));
+        assert_eq!(&window[..5], b"three");
+        assert_eq!(session.plain_buffer(), []);
+    }
+
+    #[test]
+    fn a_roomy_tls12_gcm_chunk_opens_behind_its_explicit_nonce() {
+        let suite = Suite::EcdheAes128GcmSha256;
+        let key = [3u8; 16];
+        let iv = [5u8; 4];
+        let mut session = session(
+            Version::Tls12,
+            suite,
+            Direction::tls12(suite, &key, &iv),
+            Direction::tls12(suite, &key, &iv),
+        );
+        let mut sender = Direction::tls12(suite, &key, &iv);
+        let mut wire = Vec::new();
+        record::seal12(&mut sender, APPLICATION, b"one", &mut wire).expect("seals");
+        record::seal12(&mut sender, APPLICATION, b"two", &mut wire).expect("seals");
+        let mut window = [0u8; 128];
+        let (got, consumed) = session.open(&wire, &mut window).expect("opens");
+        assert_eq!((got, consumed), (6, wire.len()));
+        assert_eq!(&window[..6], b"onetwo");
+        assert_eq!(session.plain_buffer(), []);
+    }
+
+    #[test]
+    fn a_roomy_tls12_chacha_chunk_opens_without_an_explicit_nonce() {
+        let suite = Suite::EcdheChaCha20Sha256;
+        let key = [3u8; 32];
+        let iv = [5u8; 12];
+        let mut session = session(
+            Version::Tls12,
+            suite,
+            Direction::tls12(suite, &key, &iv),
+            Direction::tls12(suite, &key, &iv),
+        );
+        let mut sender = Direction::tls12(suite, &key, &iv);
+        let mut wire = Vec::new();
+        record::seal12(&mut sender, APPLICATION, b"four", &mut wire).expect("seals");
+        let mut window = [0u8; 128];
+        let (got, consumed) = session.open(&wire, &mut window).expect("opens");
+        assert_eq!((got, consumed), (4, wire.len()));
+        assert_eq!(&window[..4], b"four");
+        assert_eq!(session.plain_buffer(), []);
     }
 }
