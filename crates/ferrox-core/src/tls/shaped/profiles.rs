@@ -539,9 +539,268 @@ static P_HELLOCHROME_100: Profile = Profile {
         },
     ],
 };
+static P_HELLOCHROME_100_PSK: Profile = Profile {
+    name: "hellochrome_100_psk",
+    ciphers: &[
+        0x0a0a, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013,
+        0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
+    ],
+    shuffle: false,
+    exts: &[
+        Ext {
+            kind: 0x0a0a,
+            body: Body::Grease,
+        },
+        Ext {
+            kind: 0x0000,
+            body: Body::Sni,
+        },
+        Ext {
+            kind: 0x0017,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0xff01,
+            body: Body::Raw(&[0x00]),
+        },
+        Ext {
+            kind: 0x000a,
+            body: Body::Groups(&[0x0a0a, 0x001d, 0x0017, 0x0018]),
+        },
+        Ext {
+            kind: 0x000b,
+            body: Body::Raw(&[0x01, 0x00]),
+        },
+        Ext {
+            kind: 0x0023,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0x0010,
+            body: Body::Alpn(&[
+                0x00, 0x0c, 0x02, 0x68, 0x32, 0x08, 0x68, 0x74, 0x74, 0x70, 0x2f, 0x31, 0x2e, 0x31,
+            ]),
+        },
+        Ext {
+            kind: 0x0005,
+            body: Body::Raw(&[0x01, 0x00, 0x00, 0x00, 0x00]),
+        },
+        Ext {
+            kind: 0x000d,
+            body: Body::Sigalgs(&[
+                0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
+            ]),
+        },
+        Ext {
+            kind: 0x0012,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0x0033,
+            body: Body::KeyShare {
+                groups: &[0x0a0a, 0x001d],
+                reuse: false,
+            },
+        },
+        Ext {
+            kind: 0x002d,
+            body: Body::Raw(&[0x01, 0x01]),
+        },
+        Ext {
+            kind: 0x002b,
+            body: Body::Versions(&[0x0a0a, 0x0304, 0x0303]),
+        },
+        Ext {
+            kind: 0x001b,
+            body: Body::Raw(&[0x02, 0x00, 0x02]),
+        },
+        Ext {
+            kind: 0x4469,
+            body: Body::Raw(&[0x00, 0x03, 0x02, 0x68, 0x32]),
+        },
+        Ext {
+            kind: 0x0a0a,
+            body: Body::Grease,
+        },
+    ],
+};
 
 static P_HELLOCHROME_106_SHUFFLE: Profile = Profile {
     name: "hellochrome_106_shuffle",
+    ciphers: &[
+        0x0a0a, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013,
+        0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
+    ],
+    shuffle: true,
+    exts: &[
+        Ext {
+            kind: 0x0a0a,
+            body: Body::Grease,
+        },
+        Ext {
+            kind: 0x0000,
+            body: Body::Sni,
+        },
+        Ext {
+            kind: 0x0005,
+            body: Body::Raw(&[0x01, 0x00, 0x00, 0x00, 0x00]),
+        },
+        Ext {
+            kind: 0x000a,
+            body: Body::Groups(&[0x0a0a, 0x001d, 0x0017, 0x0018]),
+        },
+        Ext {
+            kind: 0x000b,
+            body: Body::Raw(&[0x01, 0x00]),
+        },
+        Ext {
+            kind: 0x000d,
+            body: Body::Sigalgs(&[
+                0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
+            ]),
+        },
+        Ext {
+            kind: 0x0010,
+            body: Body::Alpn(&[
+                0x00, 0x0c, 0x02, 0x68, 0x32, 0x08, 0x68, 0x74, 0x74, 0x70, 0x2f, 0x31, 0x2e, 0x31,
+            ]),
+        },
+        Ext {
+            kind: 0x0012,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0x0017,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0x001b,
+            body: Body::Raw(&[0x02, 0x00, 0x02]),
+        },
+        Ext {
+            kind: 0x0023,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0x002b,
+            body: Body::Versions(&[0x0a0a, 0x0304, 0x0303]),
+        },
+        Ext {
+            kind: 0x002d,
+            body: Body::Raw(&[0x01, 0x01]),
+        },
+        Ext {
+            kind: 0x0033,
+            body: Body::KeyShare {
+                groups: &[0x0a0a, 0x001d],
+                reuse: false,
+            },
+        },
+        Ext {
+            kind: 0x4469,
+            body: Body::Raw(&[0x00, 0x03, 0x02, 0x68, 0x32]),
+        },
+        Ext {
+            kind: 0xff01,
+            body: Body::Raw(&[0x00]),
+        },
+        Ext {
+            kind: 0x0a0a,
+            body: Body::Grease,
+        },
+        Ext {
+            kind: 0x0015,
+            body: Body::Pad,
+        },
+    ],
+};
+static P_HELLOCHROME_112_PSK_SHUF: Profile = Profile {
+    name: "hellochrome_112_psk_shuf",
+    ciphers: &[
+        0x0a0a, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013,
+        0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
+    ],
+    shuffle: true,
+    exts: &[
+        Ext {
+            kind: 0x0a0a,
+            body: Body::Grease,
+        },
+        Ext {
+            kind: 0x0000,
+            body: Body::Sni,
+        },
+        Ext {
+            kind: 0x0005,
+            body: Body::Raw(&[0x01, 0x00, 0x00, 0x00, 0x00]),
+        },
+        Ext {
+            kind: 0x000a,
+            body: Body::Groups(&[0x0a0a, 0x001d, 0x0017, 0x0018]),
+        },
+        Ext {
+            kind: 0x000b,
+            body: Body::Raw(&[0x01, 0x00]),
+        },
+        Ext {
+            kind: 0x000d,
+            body: Body::Sigalgs(&[
+                0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
+            ]),
+        },
+        Ext {
+            kind: 0x0010,
+            body: Body::Alpn(&[
+                0x00, 0x0c, 0x02, 0x68, 0x32, 0x08, 0x68, 0x74, 0x74, 0x70, 0x2f, 0x31, 0x2e, 0x31,
+            ]),
+        },
+        Ext {
+            kind: 0x0012,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0x0017,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0x001b,
+            body: Body::Raw(&[0x02, 0x00, 0x02]),
+        },
+        Ext {
+            kind: 0x0023,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0x002b,
+            body: Body::Versions(&[0x0a0a, 0x0304, 0x0303]),
+        },
+        Ext {
+            kind: 0x002d,
+            body: Body::Raw(&[0x01, 0x01]),
+        },
+        Ext {
+            kind: 0x0033,
+            body: Body::KeyShare {
+                groups: &[0x0a0a, 0x001d],
+                reuse: false,
+            },
+        },
+        Ext {
+            kind: 0x4469,
+            body: Body::Raw(&[0x00, 0x03, 0x02, 0x68, 0x32]),
+        },
+        Ext {
+            kind: 0xff01,
+            body: Body::Raw(&[0x00]),
+        },
+        Ext {
+            kind: 0x0a0a,
+            body: Body::Grease,
+        },
+    ],
+};
+static P_HELLOCHROME_114_PADDING_PSK_SHUF: Profile = Profile {
+    name: "hellochrome_114_padding_psk_shuf",
     ciphers: &[
         0x0a0a, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013,
         0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
@@ -716,6 +975,91 @@ static P_HELLOCHROME_115_PQ: Profile = Profile {
         Ext {
             kind: 0x0015,
             body: Body::Pad,
+        },
+    ],
+};
+static P_HELLOCHROME_115_PQ_PSK: Profile = Profile {
+    name: "hellochrome_115_pq_psk",
+    ciphers: &[
+        0x0a0a, 0x1301, 0x1302, 0x1303, 0xc02b, 0xc02f, 0xc02c, 0xc030, 0xcca9, 0xcca8, 0xc013,
+        0xc014, 0x009c, 0x009d, 0x002f, 0x0035,
+    ],
+    shuffle: true,
+    exts: &[
+        Ext {
+            kind: 0x0a0a,
+            body: Body::Grease,
+        },
+        Ext {
+            kind: 0x0000,
+            body: Body::Sni,
+        },
+        Ext {
+            kind: 0x0005,
+            body: Body::Raw(&[0x01, 0x00, 0x00, 0x00, 0x00]),
+        },
+        Ext {
+            kind: 0x000a,
+            body: Body::Groups(&[0x0a0a, 0x6399, 0x001d, 0x0017, 0x0018]),
+        },
+        Ext {
+            kind: 0x000b,
+            body: Body::Raw(&[0x01, 0x00]),
+        },
+        Ext {
+            kind: 0x000d,
+            body: Body::Sigalgs(&[
+                0x0403, 0x0804, 0x0401, 0x0503, 0x0805, 0x0501, 0x0806, 0x0601,
+            ]),
+        },
+        Ext {
+            kind: 0x0010,
+            body: Body::Alpn(&[
+                0x00, 0x0c, 0x02, 0x68, 0x32, 0x08, 0x68, 0x74, 0x74, 0x70, 0x2f, 0x31, 0x2e, 0x31,
+            ]),
+        },
+        Ext {
+            kind: 0x0012,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0x0017,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0x001b,
+            body: Body::Raw(&[0x02, 0x00, 0x02]),
+        },
+        Ext {
+            kind: 0x0023,
+            body: Body::Raw(&[]),
+        },
+        Ext {
+            kind: 0x002b,
+            body: Body::Versions(&[0x0a0a, 0x0304, 0x0303]),
+        },
+        Ext {
+            kind: 0x002d,
+            body: Body::Raw(&[0x01, 0x01]),
+        },
+        Ext {
+            kind: 0x0033,
+            body: Body::KeyShare {
+                groups: &[0x0a0a, 0x6399, 0x001d],
+                reuse: false,
+            },
+        },
+        Ext {
+            kind: 0x4469,
+            body: Body::Raw(&[0x00, 0x03, 0x02, 0x68, 0x32]),
+        },
+        Ext {
+            kind: 0xff01,
+            body: Body::Raw(&[0x00]),
+        },
+        Ext {
+            kind: 0x0a0a,
+            body: Body::Grease,
         },
     ],
 };
@@ -2228,8 +2572,12 @@ pub(crate) fn profile(name: &str) -> Option<&'static Profile> {
         "firefox" | "hellofirefox_148" | "hellofirefox_auto" => &P_FIREFOX,
         "hello360_11_0" => &P_HELLO360_11_0,
         "hellochrome_100" | "hellochrome_102" | "helloedge_106" => &P_HELLOCHROME_100,
+        "hellochrome_100_psk" => &P_HELLOCHROME_100_PSK,
         "hellochrome_106_shuffle" => &P_HELLOCHROME_106_SHUFFLE,
+        "hellochrome_112_psk_shuf" => &P_HELLOCHROME_112_PSK_SHUF,
+        "hellochrome_114_padding_psk_shuf" => &P_HELLOCHROME_114_PADDING_PSK_SHUF,
         "hellochrome_115_pq" => &P_HELLOCHROME_115_PQ,
+        "hellochrome_115_pq_psk" => &P_HELLOCHROME_115_PQ_PSK,
         "hellochrome_120" => &P_HELLOCHROME_120,
         "hellochrome_120_pq" => &P_HELLOCHROME_120_PQ,
         "hellochrome_131" => &P_HELLOCHROME_131,
