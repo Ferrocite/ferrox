@@ -504,24 +504,25 @@ impl<S: Stream> Session<S> {
         }
     }
 
-    fn verify_chain(&mut self, chain: &[Vec<u8>]) -> Result<(), TlsError> {
-        let leaf = chain
+    fn verify_chain(&mut self, chain: &[&[u8]]) -> Result<(), TlsError> {
+        let leaf = *chain
             .first()
             .ok_or_else(|| TlsError::BadCertificate("empty certificate chain".to_owned()))?;
         let intermediates: Vec<CertificateDer<'_>> = chain[1..]
             .iter()
-            .map(|der| CertificateDer::from(der.as_slice()))
+            .copied()
+            .map(CertificateDer::from)
             .collect();
         self.verifier
             .verify_server_cert(
-                &CertificateDer::from(leaf.as_slice()),
+                &CertificateDer::from(leaf),
                 &intermediates,
                 &self.server_name,
                 &[],
                 UnixTime::now(),
             )
             .map_err(|error| TlsError::BadCertificate(error.to_string()))?;
-        self.leaf = Some(leaf.clone());
+        self.leaf = Some(leaf.to_vec());
         Ok(())
     }
 
@@ -1132,7 +1133,9 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn certificates13(body: &[u8]) -> Result<Vec<Vec<u8>>, TlsError> {
+/// The chain a TLS 1.3 `Certificate` carries, each entry borrowed from `body`; TLS 1.3 wraps every entry
+/// in its own extensions, which the walk reads past.
+fn certificates13(body: &[u8]) -> Result<Vec<&[u8]>, TlsError> {
     let mut r = Reader::new(body);
     let context = r.u8()?;
     r.take(usize::from(context))?;
@@ -1140,7 +1143,7 @@ fn certificates13(body: &[u8]) -> Result<Vec<Vec<u8>>, TlsError> {
     let mut list = Reader::new(list);
     let mut chain = Vec::new();
     while !list.done() {
-        chain.push(list.vec24()?.to_vec());
+        chain.push(list.vec24()?);
         let _extensions = list.vec16()?;
     }
     if chain.is_empty() {
@@ -1151,13 +1154,14 @@ fn certificates13(body: &[u8]) -> Result<Vec<Vec<u8>>, TlsError> {
     Ok(chain)
 }
 
-fn certificates12(body: &[u8]) -> Result<Vec<Vec<u8>>, TlsError> {
+/// The chain a TLS 1.2 `Certificate` carries, borrowed the same way; TLS 1.2 has no per-entry extensions.
+fn certificates12(body: &[u8]) -> Result<Vec<&[u8]>, TlsError> {
     let mut r = Reader::new(body);
     let list = r.vec24()?;
     let mut list = Reader::new(list);
     let mut chain = Vec::new();
     while !list.done() {
-        chain.push(list.vec24()?.to_vec());
+        chain.push(list.vec24()?);
     }
     if chain.is_empty() {
         return Err(TlsError::BadCertificate(
@@ -1600,6 +1604,54 @@ mod tests {
         assert_eq!(
             counts.allocs, 0,
             "the flight is read where it lies: {counts:?}"
+        );
+    }
+
+    /// A `Certificate`'s chain is walked where it lies: every entry the parse returns is the record's own
+    /// byte range, so neither version copies a DER out to look at it.
+    #[test]
+    fn a_certificate_chain_is_read_where_the_record_lies() {
+        let leaf = [1u8, 2, 3, 4, 5];
+        let issuer = [6u8, 7, 8, 9, 10, 11, 12, 13, 14];
+        let mut body = vec![0];
+        body.extend_from_slice(&[0, 0, 24]);
+        body.extend_from_slice(&[0, 0, 5]);
+        body.extend_from_slice(&leaf);
+        body.extend_from_slice(&[0, 0]);
+        body.extend_from_slice(&[0, 0, 9]);
+        body.extend_from_slice(&issuer);
+        body.extend_from_slice(&[0, 0]);
+        let chain = certificates13(&body).expect("reads the chain");
+        assert_eq!(chain.len(), 2, "both entries are there");
+        assert_eq!(chain[0], leaf.as_slice(), "the leaf is first");
+        assert_eq!(
+            chain[0].as_ptr(),
+            body[7..].as_ptr(),
+            "the leaf is the record's own range"
+        );
+        assert_eq!(
+            chain[1].as_ptr(),
+            body[17..].as_ptr(),
+            "the issuer is the record's own range"
+        );
+
+        let mut body12 = Vec::new();
+        body12.extend_from_slice(&[0, 0, 20]);
+        body12.extend_from_slice(&[0, 0, 5]);
+        body12.extend_from_slice(&leaf);
+        body12.extend_from_slice(&[0, 0, 9]);
+        body12.extend_from_slice(&issuer);
+        let chain = certificates12(&body12).expect("reads the chain");
+        assert_eq!(chain[1], issuer.as_slice(), "1.2 needs no extensions");
+        assert_eq!(
+            chain[0].as_ptr(),
+            body12[6..].as_ptr(),
+            "1.2 reads in place too"
+        );
+        assert_eq!(
+            chain[1].as_ptr(),
+            body12[14..].as_ptr(),
+            "and so does its issuer"
         );
     }
 }
