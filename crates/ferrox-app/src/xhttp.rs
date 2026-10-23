@@ -2281,6 +2281,7 @@ impl crate::proxy::CarrierSink for XhttpWriter {
 mod tests {
     use super::*;
     use std::thread;
+    use std::time::Duration;
 
     /// The tokenish adjust as it was — the whole string re-summed on every one of the 150 steps — kept as the oracle the carried sum is compared against.
     fn tokenish_recompute(raw: &[u8], target: usize) -> String {
@@ -2331,7 +2332,7 @@ mod tests {
         }
     }
 
-    /// The same drain over a real socket asserts the *bytes* and nothing else: a socket may segment, so its read count moves with the scheduler and cannot gate a number — that claim belongs to `a_chunk_costs_two_reads_not_three`, on an in-memory stream that answers the whole buffer.
+    /// The same drain over a real socket asserts the *bytes* and nothing else: a socket may segment, so its read count moves with the scheduler and cannot gate a number — that claim belongs to `a_chunk_costs_two_reads_not_three`, on an in-memory stream that answers the whole buffer. The peer paces its sends 2048 bytes at a time, which segments the kernel's delivery the way load alone used to do at random.
     #[test]
     fn a_real_socket_drains_the_same_bytes() {
         let count = 16usize;
@@ -2351,7 +2352,11 @@ mod tests {
             assert!(n > 0);
             sock.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
                 .expect("replies");
-            sock.write_all(&wire).expect("sends");
+            const VANE: usize = 2048;
+            for burst in wire.chunks(VANE) {
+                sock.write_all(burst).expect("sends");
+                thread::sleep(Duration::from_millis(2));
+            }
             sock.shutdown(std::net::Shutdown::Write).ok();
         });
         let sock = Connection::connect(("127.0.0.1", port)).expect("connects");
