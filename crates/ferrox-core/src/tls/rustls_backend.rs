@@ -43,7 +43,6 @@ struct Pinned {
 /// whole contract.
 #[derive(Debug)]
 struct CertPinned {
-    inner: Arc<rustls::client::WebPkiServerVerifier>,
     cert_pins: Arc<[[u8; 32]]>,
 }
 
@@ -83,13 +82,19 @@ impl rustls::client::danger::ServerCertVerifier for CertPinned {
         ))
     }
 
+    // A pin needs no anchor, so the provider's own algorithms answer the messages the webpki path does.
     fn verify_tls12_signature(
         &self,
         message: &[u8],
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls12_signature(message, cert, dss)
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
@@ -98,11 +103,18 @@ impl rustls::client::danger::ServerCertVerifier for CertPinned {
         cert: &rustls::pki_types::CertificateDer<'_>,
         dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        self.inner.verify_tls13_signature(message, cert, dss)
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        self.inner.supported_verify_schemes()
+        provider()
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -116,7 +128,6 @@ fn anchored(
         .build()
         .map_err(|e| rustls::Error::General(format!("pinned anchor: {e}")))
 }
-
 impl rustls::client::danger::ServerCertVerifier for Pinned {
     fn verify_server_cert(
         &self,
@@ -301,10 +312,8 @@ fn build_material(cfg: &TlsConfig) -> Result<Material, TlsError> {
 
     let chain = OnceLock::new();
     let verifier = if !cfg.cert_pins.is_empty() {
-        let plain = build_chain(&roots, &provider)?;
-        let _ = chain.set(Ok(Arc::clone(&plain)));
+        // No anchor work: a cert-pin verdict never needs the webpki chain builder.
         Some(Arc::new(CertPinned {
-            inner: plain,
             cert_pins: Arc::clone(&cfg.cert_pins),
         })
             as Arc<dyn rustls::client::danger::ServerCertVerifier>)

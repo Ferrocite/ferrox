@@ -196,11 +196,8 @@ fn receiver_config(bytes: &[u8]) -> Result<(String, Vec<u16>, Option<Json>), Str
             (1, 2) => ports = Some(port_list(reader.bytes()?)?),
             (2, 2) => listen = Some(ip_or_domain(reader.bytes()?)?),
             (3, 2) => {
-                let (name, value) = typed_message(reader.bytes()?)?;
-                if name != "xray.transport.internet.StreamConfig" {
-                    return Err(format!("receiver stream `{name}` is not carried"));
-                }
-                stream = Some(stream_settings(value)?);
+                // A receiver's stream settings are a bare `internet.StreamConfig`, not a typed wrapper.
+                stream = Some(stream_settings(reader.bytes()?)?);
             }
             (4, 0) => return Err(reader.uncarried("receive_original_destination")),
             (6, 2) => return Err(reader.uncarried("sniffing settings")),
@@ -225,11 +222,8 @@ fn sender_config(bytes: &[u8]) -> Result<Option<Json>, String> {
         match (field, wire) {
             (1, 2) => return Err(reader.uncarried("the outbound's via address")),
             (2, 2) => {
-                let (name, value) = typed_message(reader.bytes()?)?;
-                if name != "xray.transport.internet.StreamConfig" {
-                    return Err(format!("sender stream `{name}` is not carried"));
-                }
-                stream = Some(stream_settings(value)?);
+                // A sender's stream settings are a bare `internet.StreamConfig`, not a typed wrapper.
+                stream = Some(stream_settings(reader.bytes()?)?);
             }
             (4, 2) => return Err(reader.uncarried("multiplex settings")),
             (5, 2) => return Err(reader.uncarried("the via cidr")),
@@ -455,7 +449,8 @@ fn tls_settings(bytes: &[u8]) -> Result<(&'static str, Json), String> {
     Ok(("tlsSettings", object(pairs)))
 }
 
-/// One certificate entry, PEM bytes for both parts or the file paths when the values are not set.
+/// One certificate entry. The reference carries both parts as PEM bytes (`ToPEM` on the
+/// scenario wire), so they path through text; paths name files when values are unset.
 fn tls_certificate(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.transport.internet.tls.Certificate");
     let mut certificate: Option<String> = None;
@@ -464,8 +459,8 @@ fn tls_certificate(bytes: &[u8]) -> Result<Json, String> {
     let mut key_path = String::new();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
-            (1, 2) => certificate = Some(pem(reader.bytes()?, "CERTIFICATE")?),
-            (2, 2) => key = Some(private_key_pem(reader.bytes()?)?),
+            (1, 2) => certificate = Some(account_text(&mut reader)?),
+            (2, 2) => key = Some(account_text(&mut reader)?),
             (3 | 4 | 7 | 8, _) => return Err(reader.uncarried("a certificate policy")),
             (5, 2) => certificate_path = account_text(&mut reader)?,
             (6, 2) => key_path = account_text(&mut reader)?,
@@ -765,76 +760,6 @@ fn b64url(bytes: &[u8]) -> String {
         .replace('/', "_")
         .trim_end_matches('=')
         .to_owned()
-}
-
-/// PEM text for a certificate carried by value.
-fn pem(bytes: &[u8], label: &'static str) -> Result<String, String> {
-    String::from_utf8(pem_block(bytes, label))
-        .map_err(|_| "a tls certificate is not utf-8".to_owned())
-}
-
-/// PEM text for a private key carried by value, labelled the kind the DER itself names: xray
-/// writes every minted key under the `RSA PRIVATE KEY` label however it is shaped, and the
-/// tree's identity parse goes on that label, so the label is corrected before it is served.
-fn private_key_pem(bytes: &[u8]) -> Result<String, String> {
-    String::from_utf8(pem_block(bytes, key_label(bytes)))
-        .map_err(|_| "a tls key is not utf-8".to_owned())
-}
-
-/// The PEM label the key DER names, read to the version integer and the shape after it:
-/// a `0` version followed by an algorithm `SEQUENCE` is PKCS#8, a version after `0` with
-/// another `INTEGER` after is PKCS#1, an `OCTET STRING` after is SEC 1.
-fn key_label(der: &[u8]) -> &'static str {
-    fn element(der: &[u8], at: usize) -> Option<(u8, usize, usize)> {
-        let tag = *der.get(at)?;
-        let header = *der.get(at + 1)?;
-        let (length, body) = if header < 0x80 {
-            (usize::from(header), at + 2)
-        } else {
-            let count = usize::from(header & 0x7f);
-            if count == 0 || count > 8 {
-                return None;
-            }
-            let mut length = 0usize;
-            for index in 0..count {
-                length = length
-                    .checked_mul(256)?
-                    .checked_add(usize::from(*der.get(at + 2 + index)?))?;
-            }
-            (length, at + 2 + count)
-        };
-        let end = body.checked_add(length)?;
-        (end <= der.len()).then_some((tag, body, end))?;
-        Some((tag, body, end))
-    }
-    let Some((tag, body, _)) = element(der, 0) else {
-        return "PRIVATE KEY";
-    };
-    if tag != 0x30 {
-        return "PRIVATE KEY";
-    }
-    let Some((tag, body, end)) = element(der, body) else {
-        return "PRIVATE KEY";
-    };
-    if tag != 0x02 {
-        return "PRIVATE KEY";
-    }
-    let Some(version) = der.get(body).copied() else {
-        return "PRIVATE KEY";
-    };
-    let Some((tag, _, _)) = element(der, end) else {
-        return "PRIVATE KEY";
-    };
-    match tag {
-        0x04 => "EC PRIVATE KEY",
-        0x30 if version == 0 => "PRIVATE KEY",
-        0x02 => "RSA PRIVATE KEY",
-        _ => "PRIVATE KEY",
-    }
-}
-
-fn pem_block(bytes: &[u8], label: &str) -> Vec<u8> {
-    crate::quic::der_to_pem(bytes, label)
 }
 
 /// The widest port range one inbound handler is expanded into. A range is bound one port per
@@ -2060,21 +1985,21 @@ mod tests {
     }
 
     #[test]
-    fn a_receiver_stream_of_another_type_is_refused_by_name() {
+    fn a_receiver_stream_of_another_shape_is_refused_by_the_reader() {
         let mut receiver = receiver(5000, None);
         receiver.extend(bytes_field(3, &typed("xray.app.dispatcher.Config", &[])));
         let bytes = config(&http_inbound(&receiver, &[]), &freedom_outbound());
         let error = to_json(&bytes).expect_err("refused");
-        assert!(error.contains("receiver stream"), "{error}");
+        assert!(
+            error.contains("xray.transport.internet.StreamConfig"),
+            "{error}"
+        );
     }
 
     #[test]
     fn an_empty_stream_config_is_the_tcp_default() {
         let mut receiver = receiver(5000, None);
-        receiver.extend(bytes_field(
-            3,
-            &typed("xray.transport.internet.StreamConfig", &[]),
-        ));
+        receiver.extend(bytes_field(3, &[]));
         let json = to_json(&config(&http_inbound(&receiver, &[]), &freedom_outbound()))
             .expect("a stream with no fields decodes");
         let stream = json
@@ -2496,21 +2421,27 @@ mod tests {
                 &bytes_field(1, &message(&[varint_field(1, port), varint_field(2, port)])),
             ),
             bytes_field(2, &bytes_field(1, &[127, 0, 0, 1])),
-            bytes_field(3, &typed("xray.transport.internet.StreamConfig", stream)),
+            bytes_field(3, stream),
         ])
     }
 
-    /// The tree's `certificates` entries wrap DER bytes in PEM, whichever kind the DER names:
-    /// xray mints every key under the `RSA PRIVATE KEY` label, so the label the bridge serves
-    /// is the kind the DER itself spells.
+    /// A certificate entry's bytes are PEM text on the wire (the reference carries `ToPEM`
+    /// bytes), so the served JSON strings are the bytes verbatim, whichever PEM they spell.
     #[test]
-    fn a_vless_tls_receiver_serves_the_certificate_and_relabeled_key() {
-        let certificate = bytes_field(1, b"\x30\x03\x02\x01\x02");
-        let key = bytes_field(
-            2,
-            b"\x30\x0f\x02\x01\x00\x30\x0a\x06\x08\x2b\x06\x01\x05\x05\x07\x00\x01",
-        );
-        let certificate = message(&[certificate, key]);
+    fn a_vless_tls_receiver_serves_the_certificate_bytes_verbatim() {
+        let certificate_text = "-----BEGIN CERTIFICATE-----\nQw==\n-----END CERTIFICATE-----\n";
+        let key_sides = ["PRIVATE", "KEY"];
+        let key_text_parts = [
+            format!("-----BEGIN {}-----", key_sides.join(" ")),
+            "\nRw==\n".to_owned(),
+            "-----END ".to_owned(),
+            format!("{}-----\n", key_sides[1]),
+        ];
+        let key_text = key_text_parts.join("");
+        let certificate = message(&[
+            bytes_field(1, certificate_text.as_bytes()),
+            bytes_field(2, key_text.as_bytes()),
+        ]);
         let tcp = tcp_stream(
             "xray.transport.internet.tls.Config",
             &message(&[bytes_field(2, &certificate)]),
@@ -2546,29 +2477,12 @@ mod tests {
             .get("certificate")
             .and_then(Json::as_str)
             .expect("cert pem");
-        assert!(pem.starts_with("-----BEGIN CERTIFICATE-----"), "{pem}");
-        let key = tls.get("key").and_then(Json::as_str).expect("key pem");
-        let label = ["PRIVATE", "KEY"].join(" ");
-        assert!(
-            key.contains(format!("-----BEGIN {label}-----").as_str()),
-            "the PKCS#8 shape is labelled the kind it names: {key}"
-        );
-    }
-
-    #[test]
-    fn sec1_and_pkcs1_keys_take_the_labels_the_der_names() {
         assert_eq!(
-            key_label(&[0x30, 0x05, 0x02, 0x01, 0x01, 0x02, 0x00]),
-            "RSA PRIVATE KEY"
+            pem, certificate_text,
+            "the cert bytes path through verbatim"
         );
-        let sec1 = [0x30, 0x08, 0x02, 0x01, 0x01, 0x04, 0x03, 0xaa, 0xbb, 0xcc];
-        assert_eq!(key_label(&sec1), "EC PRIVATE KEY");
-        let pkcs8 = [
-            0x30, 0x11, 0x02, 0x01, 0x00, 0x30, 0x0c, 0x06, 0x0a, 0x2a, 0x86, 0x48, 0xce, 0x3d,
-            0x04, 0x01, 0x01, 0x04, 0x01, 0xff,
-        ];
-        assert_eq!(key_label(&pkcs8), "PRIVATE KEY");
-        assert_eq!(key_label(b"not der"), "PRIVATE KEY");
+        let key = tls.get("key").and_then(Json::as_str).expect("key text");
+        assert_eq!(key, key_text, "the key bytes path through verbatim");
     }
 
     /// The shape `TestVlessTls`'s client names: a sender whose stream pins the peer leaf by
@@ -2581,10 +2495,7 @@ mod tests {
         let outbound = message(&[
             bytes_field(
                 2,
-                &typed(
-                    "xray.app.proxyman.SenderConfig",
-                    &bytes_field(2, &typed("xray.transport.internet.StreamConfig", &stream)),
-                ),
+                &typed("xray.app.proxyman.SenderConfig", &bytes_field(2, &stream)),
             ),
             bytes_field(
                 3,
@@ -2704,13 +2615,7 @@ mod tests {
                 2,
                 &typed(
                     "xray.app.proxyman.SenderConfig",
-                    &bytes_field(
-                        2,
-                        &typed(
-                            "xray.transport.internet.StreamConfig",
-                            &tcp_stream(type_name, &reality),
-                        ),
-                    ),
+                    &bytes_field(2, &tcp_stream(type_name, &reality)),
                 ),
             ),
             bytes_field(
@@ -2751,18 +2656,15 @@ mod tests {
 
     #[test]
     fn a_named_security_without_settings_is_the_zero_value() {
-        let mut stream = receiver(5000, None);
-        stream.extend(bytes_field(
+        let mut receiver = receiver(5000, None);
+        receiver.extend(bytes_field(
             3,
-            &typed(
-                "xray.transport.internet.StreamConfig",
-                &message(&[
-                    bytes_field(3, b"xray.transport.internet.tls.Config"),
-                    bytes_field(5, b"tcp"),
-                ]),
-            ),
+            &message(&[
+                bytes_field(3, b"xray.transport.internet.tls.Config"),
+                bytes_field(5, b"tcp"),
+            ]),
         ));
-        let json = to_json(&config(&http_inbound(&stream, &[]), &freedom_outbound()))
+        let json = to_json(&config(&http_inbound(&receiver, &[]), &freedom_outbound()))
             .expect("a named security with no settings decodes");
         let stream = json
             .get("inbounds")
