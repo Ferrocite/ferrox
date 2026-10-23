@@ -289,7 +289,14 @@ impl H2Conn {
                         }
                         break take as usize;
                     }
-                    conn = self.wake.wait(conn).unwrap_or_else(PoisonError::into_inner);
+                    let (guard, waited) = self
+                        .wake
+                        .wait_timeout(conn, crate::budgets::relay_stall())
+                        .unwrap_or_else(PoisonError::into_inner);
+                    conn = guard;
+                    if waited.timed_out() {
+                        return false;
+                    }
                 }
             };
             if !self.frame(T_DATA, 0, stream, &payload[..chunk]) {
@@ -1639,6 +1646,46 @@ mod tests {
             );
             at += 13;
         }
+    }
+
+    /// A sender the peer never credits gives up at the relay stall, so a downlink cannot park its thread on a window that never arrives.
+    #[test]
+    fn a_sender_with_no_credit_gives_up_at_the_stall() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_millis(500)),
+            ..Default::default()
+        });
+        let (conn, _written, _slices) = bare_conn();
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                ended: false,
+                dead: false,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(0),
+            responded: AtomicBool::new(false),
+        });
+        conn.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(1, state);
+        *conn
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = 0;
+        let (sent, got) = std::sync::mpsc::channel();
+        let sender = Arc::clone(&conn);
+        let running = thread::spawn(move || {
+            let _ = sent.send(sender.send_data(1, b"ping"));
+        });
+        let verdict = got.recv_timeout(Duration::from_secs(3));
+        conn.dead.store(true, Ordering::SeqCst);
+        conn.wake.notify_all();
+        running.join().expect("sender thread");
+        crate::budgets::clear();
+        assert_eq!(verdict, Ok(false), "a sender with no credit returned");
     }
 
     /// The last bytes the connection wrote are one credit for `sid` of `inc`: the pair of
