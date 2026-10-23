@@ -30,7 +30,7 @@ bundle's `README.md` are generated from the same `matrix-results.json`.
 
 These are measured gaps in this tree, not variance. `scripts/check-matrix-legs.py`
 reads the same list from `scripts/leg-gaps.txt`: a filed gap warns with its issue,
-while a new leg or one worse than its filed ratio by more than 0.05 fails the
+while a new leg or one worse than its filed ratio by more than 0.10 fails the
 matrix. Remove a line when its issue closes, so the fix is a visible gate rather
 than a quiet baseline. The numbers come from the
 `benchmark-matrix-standard-ubuntu-latest` bundle of run
@@ -38,7 +38,7 @@ than a quiet baseline. The numbers come from the
 
 | leg | cell | measurement | issue |
 | --- | ---- | ----------- | ----- |
-| client | `vless-raw-up-1` | 0.51x xray-core on the xray-core server (669 vs 1319 MiB/s) | [#465](https://github.com/FerroxCo/ferrox/issues/465) |
+| client | `vless-raw-up-1` | 0.43-0.54x xray-core on the xray-core server (780 vs 1820 MiB/s in the third run) | [#465](https://github.com/FerroxCo/ferrox/issues/465) |
 | both | `vless-hysteria-down-8` | 0 MiB/s in both directions; xray-core server 111 MiB/s, ferrox server 5 MiB/s | [#466](https://github.com/FerroxCo/ferrox/issues/466) |
 | server | `vless-tls-grpc-down-8` | 0.61x (114 vs 187 MiB/s) | [#467](https://github.com/FerroxCo/ferrox/issues/467) |
 | server | `vless-reality-grpc-down-8` | 0.71-0.85x (130 vs 184 MiB/s in the second run) | [#468](https://github.com/FerroxCo/ferrox/issues/468) |

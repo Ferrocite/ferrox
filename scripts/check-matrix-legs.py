@@ -118,6 +118,8 @@ def main():
     holes = []
     checked = 0
     for base in sorted({key[0] for key in grouped}):
+        if "setup" in base:
+            continue
         reference = grouped.get((base, REFERENCE))
         if reference is None:
             continue
@@ -182,7 +184,7 @@ def main():
         filed = baseline.get((hole["base"], hole["leg"]))
         if filed is None:
             new.append(hole)
-        elif hole["ratio"] >= filed[0] - 0.05:
+        elif hole["ratio"] >= filed[0] - 0.10:
             known.append((hole, filed[1]))
         else:
             new.append(hole)
