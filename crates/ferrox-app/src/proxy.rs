@@ -14111,6 +14111,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_env_name_supplies_an_address_and_port() {
+        std::env::set_var("FERROX_ENV_ADDRESS", "198.51.100.7");
+        std::env::set_var("FERROX_ENV_PORT", "8443");
+        let outbound = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vless", "settings": {"vnext": [{
+                "address": "env:FERROX_ENV_ADDRESS", "port": "env:FERROX_ENV_PORT",
+                "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]}}]}"#,
+        )
+        .expect("parses");
+        let Some(vless) = find_vless_outbound(&outbound) else {
+            panic!("the outbound reads its env-named address");
+        };
+        assert_eq!(vless.address, "198.51.100.7");
+        assert_eq!(vless.port, 8443);
+        let inbound = crate::json::parse(
+            r#"{"listen": "env:FERROX_ENV_ADDRESS", "port": "100, env:FERROX_ENV_PORT"}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            inbound_addresses(&inbound),
+            ["198.51.100.7:100", "198.51.100.7:8443"]
+        );
+        std::env::remove_var("FERROX_ENV_ADDRESS");
+        std::env::remove_var("FERROX_ENV_PORT");
+    }
+
     /// A naming refusal is not a silent drop: the lane that cannot build says the outbound,
     /// and the field the build stopped at is the refusal's own word.
     #[test]

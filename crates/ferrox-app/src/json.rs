@@ -121,12 +121,82 @@ pub(crate) fn parse(text: &str) -> Result<Json, String> {
         bytes: text.as_bytes(),
         pos: 0,
     };
-    let value = cursor.value(0)?;
+    let mut value = cursor.value(0)?;
     cursor.gap();
     if cursor.pos != cursor.bytes.len() {
         return Err(format!("trailing bytes at offset {}", cursor.pos));
     }
+    expand_env(&mut value);
     Ok(value)
+}
+
+/// Resolve `env:NAME` in the fields xray reads as an address or a port list, once at config load.
+fn expand_env(value: &mut Json) {
+    const FIELDS: [&str; 4] = ["address", "listen", "ip", "port"];
+    match value {
+        Json::Obj(pairs) => {
+            for (key, child) in pairs {
+                if FIELDS.contains(&key.as_str()) {
+                    if key == "port" {
+                        expand_port(child);
+                    } else {
+                        expand_strings(child);
+                    }
+                }
+                expand_env(child);
+            }
+        }
+        Json::Arr(items) => items.iter_mut().for_each(expand_env),
+        _ => {}
+    }
+}
+
+fn expand_strings(value: &mut Json) {
+    match value {
+        Json::Str(text) => *text = env_value(text),
+        Json::Arr(items) => {
+            for item in items {
+                if let Json::Str(text) = item {
+                    *text = env_value(text);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn expand_port(value: &mut Json) {
+    match value {
+        Json::Str(text) => {
+            let resolved = port_spec(text);
+            *value = match resolved.parse::<u16>() {
+                Ok(port) => Json::Num(f64::from(port)),
+                Err(_) => Json::Str(resolved),
+            };
+        }
+        Json::Arr(items) => {
+            for item in items {
+                if matches!(item, Json::Str(_)) {
+                    expand_port(item);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn port_spec(text: &str) -> String {
+    text.split(',')
+        .map(|piece| env_value(piece.trim()))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn env_value(text: &str) -> String {
+    text.strip_prefix("env:").map_or_else(
+        || text.to_owned(),
+        |name| std::env::var(name).unwrap_or_default(),
+    )
 }
 
 #[derive(Debug)]
