@@ -24825,7 +24825,7 @@ mod tests {
                 reality: None,
             };
             let target = Destination::from(
-                format!("127.0.0.1:{}", dport)
+                format!("127.0.0.1:{dport}")
                     .parse::<SocketAddr>()
                     .expect("addr"),
             );

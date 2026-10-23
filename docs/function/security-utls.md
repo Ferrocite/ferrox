@@ -46,7 +46,7 @@ The 46 cases are the 28 presets plus the 18 xray names that alias onto them, so 
 
 ## Time
 
-**Not measured yet.** No matrix cell carries a fingerprint: `vless-tls-raw-*` measures the stock rustls client, and the shaped path is gated for completion by the two loopback handshakes above, not for rate. The counts block gates the operations removed — a warm relayed record takes no heap, a carrier record stages no plaintext, and a TLS 1.2 GCM record moves none — but a copy count is not a duration, and no bench, parity or matrix artefact for this path has been read. Durations come only from CI runners.
+**Not measured yet.** No matrix cell carries a fingerprint: `vless-tls-raw-*` measures the stock rustls client, and the shaped path is gated for completion by the loopback handshakes and relays above, not for rate. The counts block gates the operations removed — a warm relayed record takes no heap, a carrier record stages no plaintext, and a TLS 1.2 GCM record moves none — but a copy count is not a duration, and no bench, parity or matrix artefact for this path has been read. Durations come only from CI runners.
 
 ## What we removed
 
@@ -67,7 +67,7 @@ The 46 cases are the 28 presets plus the 18 xray names that alias onto them, so 
 - **Chrome's shuffle.** Six presets (`chrome`, `hellochrome_106_shuffle`, `hellochrome_115_pq`, `hellochrome_120`, `hellochrome_120_pq`, `hellochrome_131`) reorder their middle extensions from fresh entropy in uTLS and here. The oracle therefore gates the sorted extension multiset plus the positions of the GREASE, padding and PSK entries, which the shuffle never moves, instead of a fixed order.
 - **TLS 1.2's CBC and static-RSA suites.** The presets advertise them, and the record layer keys only the ECDHE-AEAD suites (`0xc02b`/`0xc02f`, `0xc02c`/`0xc030`, `0xcca9`/`0xcca8`). A TLS 1.2 server that picks a CBC or static-RSA id makes the dial fail with `NoSharedCipher`, where uTLS would complete it. Adding those suites is a crypto-subsystem change, named rather than half-done.
 - **ECH, PSK and client certificates.** The ECH extension is a GREASE cover (row 39 is real ECH); there is no session resumption, no PSK mode and no client-certificate request, because no preset here negotiates one.
-- **Conformance.** No pinned suite injects `ferrox-app` as the fingerprinted client — uTLS ships library tests, and xray-core's scenario suite puts `ferrox-app` behind a `dokodemo` front whose TLS/REALITY siblings are still held by the pb `streamSettings` refusal (row 24's note). No `conformance.yml` job is owed for this method, and none was run; the oracle replay is the byte gate.
+- **Conformance is a completion gate, not a byte gate.** `upstream/xray-rust` injects `ferrox-app` as the dialing client through the `XRAY_VLESS_FULL_BINARY` seam, and its `local_xray_interop_tests` suite names the fingerprints: `rust_socks_client_reaches_echo_server_through_local_xray_vless_reality_vision_selected_fingerprints`, `rust_socks_clients_open_parallel_echo_flows_through_local_xray_vless_reality_vision_selected_fingerprints` and `xray_core_socks_clients_open_parallel_echo_flows_through_local_xray_vless_reality_vision_selected_fingerprints` each dial REALITY Vision once per name in `chrome`, `hellochrome_133`, `hellofirefox_148`, `hellosafari_26_3`, `helloios_13`, `hello360_11_0`, `hellochrome_120_pq` and `hellofirefox_99` — eight names per row, all eight of which this tree resolves to a preset. `conformance.yml` runs that suite unmodified; on this slice's own run all three rows are `ok` and the job records `PASS: xray-rust suite green against ferrox-app at 5834b86 (injected via XRAY_VLESS_FULL_BINARY)`. What that proves is that a shaped hello completes the reference's handshake, which a stock hello also does, so it cannot witness a byte: `oracle_replay_matches_utls` stays the byte gate. uTLS's own tests are in-package Go with no binary seam, and xray-core's scenario suite still holds its TLS/REALITY siblings at the pb `streamSettings` refusal (row 24's note), so no `conformance.yml` leg compares hello bytes against the reference.
 
 ## Pins
 
@@ -77,6 +77,7 @@ The 46 cases are the 28 presets plus the 18 xray names that alias onto them, so 
 | names refused at config parse | `upstream/xray-core/infra/conf/transport_security.go` |
 | sing-box's five Chrome spellings | `upstream/sing-box/common/tls/utls_client.go` (`uTLSClientHelloID`) |
 | zeronet's `none`/`unshaped` stock spellings | `upstream/zeronet/crates/zero-security/src/fingerprint.rs` |
+| the fourth name table, and the seam that dials eight names through this client | `upstream/xray-core-rust/crates/xray-tls/src/fingerprint.rs`, `upstream/xray-rust/crates/xray-core-rs/tests/local_xray_interop_tests.rs` (`selected_reality_interop_fingerprints`) |
 | preset bytes, GREASE draws, shuffle, ECH cover | uTLS `v1.8.3-0.20260301010127-aa6edf4b11af` (the revision in `upstream/xray-core/go.mod`) |
 | the presets as data | `crates/ferrox-core/src/tls/shaped/profiles.rs` |
 | the replay oracle | `scripts/utls-oracle` |
