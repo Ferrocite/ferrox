@@ -1575,12 +1575,22 @@ mod tests {
     }
 
     fn session(version: Version, suite: Suite, read: Direction, write: Direction) -> Session<Sink> {
+        session_on(Sink, version, suite, read, write)
+    }
+
+    fn session_on<S: Stream>(
+        io: S,
+        version: Version,
+        suite: Suite,
+        read: Direction,
+        write: Direction,
+    ) -> Session<S> {
         let cfg = TlsConfig {
             insecure: true,
             ..TlsConfig::default()
         };
         Session {
-            io: Sink,
+            io,
             verifier: crate::tls::rustls_backend::verifier(&cfg).expect("verifier"),
             server_name: ServerName::try_from("tls.test".to_owned()).expect("name"),
             profile: profiles::profile("chrome").expect("chrome profile"),
@@ -1989,5 +1999,72 @@ mod tests {
         let at = missing.len() - 12;
         missing[at..at + 2].copy_from_slice(&[0x00, 0x2c]);
         assert!(hrr_without_confirmation(&missing).is_err());
+    }
+
+    #[test]
+    fn a_record_split_by_a_timeout_is_resumed_not_lost() {
+        let suite = Suite::Aes128GcmSha256;
+        let secret = [7u8; 32];
+        let mut sender = Direction::tls13(suite, &secret);
+        let mut wire = Vec::new();
+        record::seal13(&mut sender, APPLICATION, b"hello", &mut wire).expect("seals");
+        let mut subject = session_on(
+            SplitRead {
+                wire,
+                at: 0,
+                stall_at: 3,
+                stalled: false,
+            },
+            Version::Tls13,
+            suite,
+            Direction::tls13(suite, &secret),
+            Direction::tls13(suite, &secret),
+        );
+
+        let mut buf = [0u8; 16];
+        let first = subject
+            .read(&mut buf)
+            .expect_err("the split record times out");
+        assert!(
+            TlsError::is_timeout(&first),
+            "the first read is the timeout"
+        );
+        let n = subject.read(&mut buf).expect("the record resumes");
+        assert_eq!(&buf[..n], b"hello");
+    }
+
+    struct SplitRead {
+        wire: Vec<u8>,
+        at: usize,
+        stall_at: usize,
+        stalled: bool,
+    }
+
+    impl Read for SplitRead {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.at == self.stall_at && !self.stalled {
+                self.stalled = true;
+                return Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, "poll"));
+            }
+            let end = if self.at < self.stall_at {
+                self.stall_at
+            } else {
+                self.wire.len()
+            };
+            let n = (end - self.at).min(buf.len());
+            buf[..n].copy_from_slice(&self.wire[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    impl Write for SplitRead {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
     }
 }
