@@ -28,6 +28,11 @@ pub struct TlsConfig {
     /// because verifying is the ordinary case, and an unchecked chain is a deliberate,
     /// bounded exception rather than a mode.
     pub insecure: bool,
+    /// SHA-256 digests over whole certificates (`pinnedPeerCertSha256`): a digest matching
+    /// the leaf's DER accepts the handshake on the pin alone, one matching an intermediate's
+    /// verifies the chain with that certificate as the only root and the server name alongside.
+    /// Empty pins nothing, so the ordinary chain verifier stands.
+    pub cert_pins: std::sync::Arc<[[u8; 32]]>,
     /// The browser hello to shape, or `None` to keep the stock rustls hello.
     pub fingerprint: Option<shaped::Fingerprint>,
     /// The ECH config list a client encrypts its inner hello with, fetched or decoded

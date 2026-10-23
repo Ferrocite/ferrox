@@ -472,6 +472,7 @@ impl Endpoint {
             alpn: Vec::new().into(),
             roots: std::sync::Arc::clone(&self.roots),
             pins: ferrox_core::foxy::pin::Pins::default(),
+            cert_pins: std::sync::Arc::from(Vec::new()),
             cipher_suites: Vec::new(),
             insecure: false,
             fingerprint: None,
