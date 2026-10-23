@@ -55,14 +55,13 @@ impl Hello {
         alpn: &[Vec<u8>],
         websocket: bool,
     ) -> Result<Self, TlsError> {
-        let mut random = [0u8; 32];
-        let mut session_id = [0u8; 32];
-        let mut grease_bytes = [0u8; 10];
-        getrandom::fill(&mut random).map_err(entropy)?;
-        getrandom::fill(&mut session_id).map_err(entropy)?;
-        getrandom::fill(&mut grease_bytes).map_err(entropy)?;
+        // One draw for the whole hello: its random, its session id, five GREASE pairs.
+        let mut seed = [0u8; 74];
+        getrandom::fill(&mut seed).map_err(entropy)?;
+        let (blocks, draws) = seed.as_chunks::<32>();
+        let (random, session_id) = (blocks[0], blocks[1]);
         let mut grease = [0u16; 5];
-        for (slot, pair) in grease.iter_mut().zip(grease_bytes.as_chunks::<2>().0) {
+        for (slot, pair) in grease.iter_mut().zip(draws.as_chunks::<2>().0) {
             *slot = u16::from_le_bytes(*pair);
         }
         let grease = distinct_grease(grease);
@@ -715,11 +714,8 @@ fn grease_or(value: u16, grease: &[u16; 5], slot: usize) -> u16 {
 }
 
 fn grease_value(grease: &[u16; 5], slot: usize) -> u16 {
-    let mut byte = (grease[slot] & 0x00f0) as u8 | 0x0a;
-    if byte == 0 {
-        byte = 0x0a;
-    }
-    let value = u16::from(byte);
+    // The masked nibble carries through and the fixed low nibble keeps the value nonzero.
+    let value = u16::from((grease[slot] & 0x00f0) as u8 | 0x0a);
     value | (value << 8)
 }
 
@@ -910,18 +906,24 @@ fn enc_random() -> [u8; 32] {
 
 /// Chrome's positional shuffle: only the extensions between the fixed GREASE and
 /// padding ends move, so the invariant ends stay where the browser puts them.
+/// Two bytes per pick, from a stack pool that refills itself, so the order costs
+/// neither a heap buffer nor a draw per swap.
 fn shuffle(entries: &mut [Entry<'_>]) {
     let n = entries.len();
     if n < 2 {
         return;
     }
-    let mut draws = vec![0u8; 4 * n];
-    if getrandom::fill(&mut draws).is_err() {
-        return;
-    }
+    let mut picks = [0u8; 32];
+    let mut ready = picks.len();
     for i in (1..n).rev() {
-        let at = 4 * i;
-        let pick = usize::from(u16::from_le_bytes([draws[at], draws[at + 1]]));
+        if ready + 2 > picks.len() {
+            if getrandom::fill(&mut picks).is_err() {
+                return;
+            }
+            ready = 0;
+        }
+        let pick = usize::from(u16::from_le_bytes([picks[ready], picks[ready + 1]]));
+        ready += 2;
         let j = pick % (i + 1);
         if entries[i].invariant || entries[j].invariant {
             continue;
@@ -1209,6 +1211,27 @@ mod tests {
             counts.allocs, 2,
             "one list and one message for the hello: {counts:?}"
         );
+    }
+
+    /// Chrome's shuffle reads its picks off the stack, so a shuffled preset's order
+    /// costs no heap buffer between the width pass and the write pass.
+    #[test]
+    fn the_shuffle_draws_its_picks_without_a_heap_buffer() {
+        let profile = Fingerprint::resolve("hellochrome_106_shuffle")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        assert!(profile.shuffle, "the preset is one Chrome shuffles");
+        let hello = Hello::canonical(profile, "example.com");
+        let mut entries = hello.extension_entries(
+            &hello.shares,
+            None,
+            hello.sni.as_deref(),
+            hello.ech.as_deref(),
+            false,
+        );
+        let ((), counts) = crate::alloc_count::measure(|| shuffle(&mut entries));
+        assert_eq!(counts.allocs, 0, "the picks are a stack pool: {counts:?}");
     }
 
     /// A dial's own hello — random draws, Chrome's shuffle, a carrier's forced ALPN and a retry's
