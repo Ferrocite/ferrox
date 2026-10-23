@@ -171,6 +171,10 @@ impl TokenFile {
         }
         let mut text = String::new();
         json::write(&Json::Obj(pairs), &mut text);
+        // A lane beside this one may read the file at any moment: a rename shows it the old grant or the new one, never half of either.
+        let mut temp = self.path.clone().into_os_string();
+        temp.push(format!(".{}.tmp", std::process::id()));
+        let temp = std::path::PathBuf::from(temp);
         let mut options = std::fs::OpenOptions::new();
         options.write(true).create(true).truncate(true);
         #[cfg(unix)]
@@ -178,18 +182,41 @@ impl TokenFile {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
-        let Ok(mut file) = options.open(&self.path) else {
+        let Ok(mut file) = options.open(&temp) else {
             eprintln!("foxy: cannot write the session to {}", self.path.display());
             return;
         };
         if file.write_all(text.as_bytes()).is_err() {
             eprintln!("foxy: cannot write the session to {}", self.path.display());
+            let _ = std::fs::remove_file(&temp);
             return;
         }
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
             let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
+        }
+        drop(file);
+        if std::fs::rename(&temp, &self.path).is_err() {
+            eprintln!("foxy: cannot write the session to {}", self.path.display());
+            let _ = std::fs::remove_file(&temp);
+        }
+    }
+
+    /// Another process refreshes a rotating grant in this file, so a token this launch loaded may already be spent; the pair the file names instead is the one to spend.
+    pub(crate) fn rotated_from(&self, access: &str) -> Option<Auth> {
+        self.load()
+            .and_then(|session| session.auth)
+            .filter(|fresh| fresh.access_token != access)
+    }
+
+    /// The refused grant only stops a future launch when the file still holds it; a grant another process rotated in since is left alone.
+    pub(crate) fn clear_if(&self, refused: &str) {
+        let same = self
+            .load()
+            .is_none_or(|session| session.auth.is_none_or(|auth| auth.access_token == refused));
+        if same {
+            self.clear();
         }
     }
 
@@ -1038,6 +1065,11 @@ impl Account {
 
     /// Forgets a grant the plane refused, so the next launch asks for the password instead of replaying a dead token.
     pub(crate) fn forget(&self) {
+        let refused = self
+            .auth
+            .lock()
+            .map(|auth| auth.access_token.clone())
+            .unwrap_or_default();
         if let Ok(mut auth) = self.auth.lock() {
             *auth = Auth {
                 access_token: String::new(),
@@ -1046,23 +1078,60 @@ impl Account {
             };
         }
         if let Some(tokens) = &self.tokens {
-            tokens.clear();
+            tokens.clear_if(&refused);
         }
     }
 
     /// Sets the new grant before minting so a refresh that is written but not yet used still renews the next launch.
     fn refresh(&self, stale: &Auth) -> Result<Auth, Denied> {
-        let fresh = token(
+        // Another lane may have rotated the file's grant since this launch loaded it: that refresh token is the live one, even when its access token has lapsed.
+        let base = self
+            .tokens
+            .as_ref()
+            .and_then(|tokens| tokens.rotated_from(&stale.access_token))
+            .unwrap_or_else(|| stale.clone());
+        if base.valid_at(epoch()) {
+            return Ok(self.adopt(base));
+        }
+        let fresh = match token(
             &self.fxa,
             &self.jar,
             None,
-            Some(&stale.refresh_token),
+            Some(&base.refresh_token),
             &nonce(),
             epoch(),
-        )?;
+        ) {
+            Ok(fresh) => fresh,
+            Err(Denied::Token) => {
+                // A refusal can mean another lane spent this rotating grant first: give its write a second before asking for a password.
+                let mut adopted = None;
+                for _ in 0..5 {
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    adopted = self
+                        .tokens
+                        .as_ref()
+                        .and_then(|tokens| tokens.rotated_from(&base.access_token))
+                        .filter(|fresh| fresh.valid_at(epoch()))
+                        .map(|fresh| self.adopt(fresh));
+                    if adopted.is_some() {
+                        break;
+                    }
+                }
+                adopted.ok_or(Denied::Token)?
+            }
+            Err(other) => return Err(other),
+        };
         *self.auth.lock().map_err(|_| Denied::Token)? = fresh.clone();
         self.persist();
         Ok(fresh)
+    }
+
+    /// The grant another lane rotated in, kept in memory so the pass and the next refresh use it.
+    fn adopt(&self, fresh: Auth) -> Auth {
+        if let Ok(mut auth) = self.auth.lock() {
+            *auth = fresh.clone();
+        }
+        fresh
     }
 
     fn persist(&self) {
@@ -1421,10 +1490,9 @@ mod loopback {
                 seen.authorization.is_none(),
                 "a refresh grant is not Hawk-signed"
             );
-            assert!(
-                body.contains(r#""refresh_token":"refresh-1""#),
-                "the stored refresh token is the grant: {body}"
-            );
+            if !body.contains(r#""refresh_token":"refresh-1""#) {
+                return reply(400, &[], r#"{"errno":110}"#);
+            }
             return reply(
                 200,
                 &[],
@@ -1756,6 +1824,129 @@ mod loopback {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A lane launched beside another reads the grant the other rotated in instead of spending a refresh token that was already used.
+    #[test]
+    fn a_grant_another_process_rotated_in_is_adopted_not_refreshed() {
+        let _turn = EDGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (address, roots, rx) = edge_with_log();
+        let path = token_path("handoff");
+        let tokens =
+            TokenFile::new(path.to_str().expect("utf-8"), "person@example.com").expect("bound");
+        let stale = Auth {
+            access_token: "access-1".to_owned(),
+            refresh_token: "refresh-1".to_owned(),
+            expires_at: 1,
+        };
+        tokens.save(Some(&stale), None);
+        let mut account = account(address, roots);
+        account.tokens = Some(tokens.clone());
+        tokens.save(
+            Some(&Auth {
+                access_token: "access-9".to_owned(),
+                refresh_token: "refresh-9".to_owned(),
+                expires_at: epoch() + 3_600,
+            }),
+            None,
+        );
+        let fresh = account.refresh(&stale).expect("adopts");
+        assert_eq!(
+            (fresh.access_token.as_str(), fresh.refresh_token.as_str()),
+            ("access-9", "refresh-9"),
+            "the other process's rotated pair is the one this lane keeps"
+        );
+        let log = seen(&rx);
+        assert!(
+            !log.iter().any(|line| line == "POST /v1/oauth/token"),
+            "an adopted grant is not spent again: {log:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A rotated-in grant whose access token has also lapsed still carries the live refresh token: that is the one spent, not the dead one this launch loaded.
+    #[test]
+    fn an_expired_grant_another_process_wrote_is_refreshed_with_its_own_token() {
+        let _turn = EDGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (address, roots, _rx) = edge_with_log();
+        let path = token_path("handoff-expired");
+        let tokens =
+            TokenFile::new(path.to_str().expect("utf-8"), "person@example.com").expect("bound");
+        let stale = Auth {
+            access_token: "access-1".to_owned(),
+            refresh_token: "refresh-dead".to_owned(),
+            expires_at: 1,
+        };
+        tokens.save(Some(&stale), None);
+        let mut account = account(address, roots);
+        account.tokens = Some(tokens.clone());
+        tokens.save(
+            Some(&Auth {
+                access_token: "access-9".to_owned(),
+                refresh_token: "refresh-1".to_owned(),
+                expires_at: 1,
+            }),
+            None,
+        );
+        let fresh = account
+            .refresh(&stale)
+            .expect("refreshes the adopted grant");
+        assert_eq!(
+            (fresh.access_token.as_str(), fresh.refresh_token.as_str()),
+            ("access-2", "refresh-2"),
+            "the adopted grant's live refresh token is the one spent"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A refresh refused because a lane beside this one spent the token first adopts what that lane wrote, rather than asking for a password.
+    #[test]
+    fn a_refused_refresh_adopts_the_grant_written_while_it_was_in_flight() {
+        let _turn = EDGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (address, roots, rx) = edge_with_log();
+        let path = token_path("handoff-refused");
+        let tokens =
+            TokenFile::new(path.to_str().expect("utf-8"), "person@example.com").expect("bound");
+        let stale = Auth {
+            access_token: "access-1".to_owned(),
+            refresh_token: "refresh-dead".to_owned(),
+            expires_at: 1,
+        };
+        tokens.save(Some(&stale), None);
+        let mut account = account(address, roots);
+        account.tokens = Some(tokens.clone());
+        let writer = tokens;
+        let wrote = std::thread::spawn(move || {
+            let request = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("the refresh arrives");
+            assert_eq!(request.path, "/v1/oauth/token");
+            writer.save(
+                Some(&Auth {
+                    access_token: "access-9".to_owned(),
+                    refresh_token: "refresh-9".to_owned(),
+                    expires_at: epoch() + 3_600,
+                }),
+                None,
+            );
+        });
+        let fresh = account.refresh(&stale).expect("adopts after the refusal");
+        wrote.join().expect("the writer finishes");
+        assert_eq!(
+            (fresh.access_token.as_str(), fresh.refresh_token.as_str()),
+            ("access-9", "refresh-9"),
+            "the refusal is another lane's rotation, not a dead account"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A launch that stopped at two-factor resumes the pending session: the code is the only thing it asks for.
     #[test]
     fn a_pending_two_factor_session_resumes_without_the_password() {
@@ -1822,6 +2013,73 @@ mod loopback {
         assert!(
             TokenFile::new(path.to_str().expect("utf-8"), " ").is_none(),
             "no account is no binding"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A refused grant is cleared, but one another process rotated in over it is not: forgetting is not allowed to erase a live session.
+    #[test]
+    fn forgetting_a_refused_grant_keeps_the_one_another_process_wrote() {
+        let path = token_path("clear-if");
+        let tokens =
+            TokenFile::new(path.to_str().expect("utf-8"), "person@example.com").expect("bound");
+        tokens.save(
+            Some(&Auth {
+                access_token: "access-9".to_owned(),
+                refresh_token: "refresh-9".to_owned(),
+                expires_at: epoch() + 3_600,
+            }),
+            None,
+        );
+        tokens.clear_if("access-1");
+        assert!(
+            tokens.load().is_some(),
+            "a grant rotated in since the refusal is left standing"
+        );
+        tokens.clear_if("access-9");
+        assert!(tokens.load().is_none(), "the refused grant is cleared");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A write is a rename: a handle already opened on the file keeps the grant it opened, and the path holds the new one whole.
+    #[test]
+    fn a_session_write_never_rewrites_the_file_a_reader_holds() {
+        use std::io::Read as _;
+        let path = token_path("atomic");
+        let _ = std::fs::remove_file(&path);
+        let tokens =
+            TokenFile::new(path.to_str().expect("utf-8"), "person@example.com").expect("bound");
+        tokens.save(
+            Some(&Auth {
+                access_token: "access-1".to_owned(),
+                refresh_token: "refresh-1".to_owned(),
+                expires_at: epoch() + 3_600,
+            }),
+            None,
+        );
+        let mut opened = std::fs::File::open(&path).expect("opens the first grant");
+        tokens.save(
+            Some(&Auth {
+                access_token: "access-2".to_owned(),
+                refresh_token: "refresh-2".to_owned(),
+                expires_at: epoch() + 3_600,
+            }),
+            None,
+        );
+        let mut before = String::new();
+        opened.read_to_string(&mut before).expect("reads");
+        assert!(
+            before.contains("access-1"),
+            "the handle a reader holds was rewritten in place: {before}"
+        );
+        let after = tokens
+            .load()
+            .expect("the path is readable")
+            .auth
+            .expect("a grant");
+        assert_eq!(
+            after.access_token, "access-2",
+            "the path names the grant the writer saved"
         );
         let _ = std::fs::remove_file(&path);
     }
