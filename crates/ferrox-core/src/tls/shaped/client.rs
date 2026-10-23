@@ -594,32 +594,35 @@ impl<S: Stream> Session<S> {
             if self.hs.len() < 4 + len {
                 return Ok(());
             }
-            let msg: Vec<u8> = self.hs.drain(..4 + len).collect();
-            match msg[0] {
+            let (kind, request) = (self.hs[0], self.hs.get(4).copied() == Some(1));
+            // A ticket's body is dropped unread; a KeyUpdate reads one byte. Neither needs a copy.
+            self.hs.drain(..4 + len);
+            match kind {
                 4 => {}
-                24 => self.key_update(&msg[4..])?,
+                24 => self.key_update(request)?,
                 other => return Err(unexpected(other)),
             }
         }
     }
 
-    fn key_update(&mut self, body: &[u8]) -> Result<(), TlsError> {
-        let request = body.first().copied().unwrap_or(0) == 1;
-        let read = self
-            .read_key
+    fn key_update(&mut self, request: bool) -> Result<(), TlsError> {
+        let Self {
+            read_key,
+            write_key,
+            reply,
+            ..
+        } = self;
+        read_key
             .as_mut()
-            .ok_or_else(|| TlsError::Other("key update before keys".to_owned()))?;
-        read.update();
+            .ok_or_else(|| TlsError::Other("key update before keys".to_owned()))?
+            .update();
         if request {
             let update = message(24, &[0]);
-            let mut out = Vec::new();
-            let write = self
-                .write_key
+            let write = write_key
                 .as_mut()
                 .ok_or_else(|| TlsError::Other("key update before keys".to_owned()))?;
             write.update();
-            record::seal13(write, HANDSHAKE, &update, &mut out)?;
-            self.reply.extend_from_slice(&out);
+            record::seal13(write, HANDSHAKE, &update, reply)?;
         }
         Ok(())
     }
@@ -1531,5 +1534,26 @@ mod tests {
         assert_eq!((got, consumed), (7, wire.len()));
         assert_eq!(&window[..7], b"onetwoo");
         assert_eq!(session.plain_buffer(), []);
+    }
+
+    /// A handshake flight past the handshake is walked where it lies and takes no heap: a ticket's
+    /// body is dropped unread and a `KeyUpdate` reads its one byte, so nothing is copied out to be
+    /// looked at.
+    #[test]
+    fn a_post_handshake_flight_is_read_where_it_lies() {
+        let suite = Suite::Aes128GcmSha256;
+        let secret = [9u8; 32];
+        let mut session = session(
+            Version::Tls13,
+            suite,
+            Direction::tls13(suite, &secret),
+            Direction::tls13(suite, &secret),
+        );
+        session.hs = std::hint::black_box(message(4, &[7u8; 40]));
+        let ((), counts) =
+            crate::alloc_count::measure(|| session.post_handshake().expect("drops the ticket"));
+        assert_eq!(session.hs.len(), 0, "the ticket is consumed");
+        assert_eq!(session.reply.len(), 0, "a ticket asks for no answer");
+        assert_eq!(counts.allocs, 0, "the flight is read where it lies: {counts:?}");
     }
 }

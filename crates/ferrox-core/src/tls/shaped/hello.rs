@@ -149,37 +149,38 @@ impl Hello {
         self.encode_with(&self.shares, cookie)
     }
 
+    /// The hello's own length ahead of its extensions: version, random, session id, cipher list
+    /// and the one compression method. The padding extension is sized from it, and the message
+    /// is reserved to it, so neither pass guesses at the width.
+    fn fixed_len(&self) -> usize {
+        2 + 32 + 1 + self.session_id.len() + 2 + 2 * self.profile.ciphers.len() + 1 + 1
+    }
+
+    /// One buffer, written front to back: the handshake header and both length fields are known
+    /// before the first byte, so no body is staged for the message to copy.
     fn encode_with(&self, shares: &[Share], cookie: Option<&[u8]>) -> Vec<u8> {
         let mut entries = self.extension_entries(shares, cookie);
-        let mut cipher_values: Vec<u16> = self
-            .profile
-            .ciphers
-            .iter()
-            .map(|&c| grease_or(c, &self.grease, 0))
-            .collect();
-        let unpadded = self.pad_entries(&mut entries);
+        self.pad_entries(&mut entries);
         let ext_len: usize = entries.iter().map(|entry| 4 + entry.body.len()).sum();
-        let mut body = Vec::with_capacity(unpadded + ext_len);
-        body.extend_from_slice(&TLS12.to_be_bytes());
-        body.extend_from_slice(&self.random);
-        body.push(self.session_id.len() as u8);
-        body.extend_from_slice(&self.session_id);
-        body.extend_from_slice(&(2 * cipher_values.len() as u16).to_be_bytes());
-        for cipher in cipher_values.drain(..) {
-            body.extend_from_slice(&cipher.to_be_bytes());
-        }
-        body.push(1);
-        body.push(0);
-        body.extend_from_slice(&(ext_len as u16).to_be_bytes());
-        for entry in &entries {
-            body.extend_from_slice(&entry.kind.to_be_bytes());
-            body.extend_from_slice(&(entry.body.len() as u16).to_be_bytes());
-            body.extend_from_slice(&entry.body);
-        }
-        let mut msg = Vec::with_capacity(body.len() + 4);
+        let body = self.fixed_len() + 2 + ext_len;
+        let mut msg = Vec::with_capacity(body + 4);
         msg.push(1);
-        msg.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
-        msg.extend_from_slice(&body);
+        msg.extend_from_slice(&(body as u32).to_be_bytes()[1..]);
+        msg.extend_from_slice(&TLS12.to_be_bytes());
+        msg.extend_from_slice(&self.random);
+        msg.push(self.session_id.len() as u8);
+        msg.extend_from_slice(&self.session_id);
+        msg.extend_from_slice(&(2 * self.profile.ciphers.len() as u16).to_be_bytes());
+        for &cipher in self.profile.ciphers {
+            msg.extend_from_slice(&grease_or(cipher, &self.grease, 0).to_be_bytes());
+        }
+        msg.extend_from_slice(&[1, 0]);
+        msg.extend_from_slice(&(ext_len as u16).to_be_bytes());
+        for entry in &entries {
+            msg.extend_from_slice(&entry.kind.to_be_bytes());
+            msg.extend_from_slice(&(entry.body.len() as u16).to_be_bytes());
+            msg.extend_from_slice(&entry.body);
+        }
         msg
     }
 
@@ -308,10 +309,9 @@ impl Hello {
         })
     }
 
-    fn pad_entries(&self, entries: &mut Vec<Entry>) -> usize {
-        let header =
-            2 + 32 + 1 + self.session_id.len() + 2 + 2 * self.profile.ciphers.len() + 1 + 1;
-        let unpadded = header
+    fn pad_entries(&self, entries: &mut Vec<Entry>) {
+        let unpadded = self
+            .fixed_len()
             + 4
             + entries
                 .iter()
@@ -325,7 +325,6 @@ impl Hello {
         {
             entry.body = vec![0; len];
         }
-        unpadded
     }
 
     /// The table order as a canonical hello: zero random, session id, GREASE
@@ -685,5 +684,21 @@ mod tests {
         }
         assert_eq!(cases.len(), 46, "every xray name is covered");
         assert_eq!(seen.len(), 28, "the names resolve to 28 distinct presets");
+    }
+
+    /// The hello's own bytes cost one heap buffer, reserved to their exact length before the first
+    /// write: 18 allocations for a Chrome hello are its 16 extension bodies, the entry list that
+    /// orders them, and the message. No body is staged for the message to copy.
+    #[test]
+    fn a_shaped_hello_writes_into_one_buffer() {
+        let profile = Fingerprint::resolve("chrome")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let hello = Hello::canonical(profile, "example.com");
+        let (msg, counts) = crate::alloc_count::measure(|| hello.encode(None));
+        assert_eq!(hex(&msg), hex(&hello.msg), "the replayed bytes");
+        assert_eq!(msg.len(), msg.capacity(), "no slack after the exact reserve");
+        assert_eq!(counts.allocs, 18, "one buffer for the hello: {counts:?}");
     }
 }
