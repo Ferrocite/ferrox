@@ -1324,6 +1324,15 @@ fn ech_server_context(
     cfg: &super::TlsServerConfig,
     keys: &[u8],
 ) -> Result<boring::ssl::SslContext, TlsError> {
+    Ok(ech_server_context_builder(cfg, keys)?.build())
+}
+
+/// The builder behind an ECH-serving context: a TLS listener builds it, and a QUIC lane hands
+/// it to quiche, so both answer the same key set and the same certificate.
+pub(crate) fn ech_server_context_builder(
+    cfg: &super::TlsServerConfig,
+    keys: &[u8],
+) -> Result<boring::ssl::SslContextBuilder, TlsError> {
     use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode, SslVersion};
     let mut chain = cfg.cert_chain.iter();
     let leaf = chain
@@ -1388,7 +1397,7 @@ fn ech_server_context(
     builder
         .set_ech_keys(&ech.build())
         .map_err(|error| boring_error(&error))?;
-    Ok(builder.build())
+    Ok(builder)
 }
 
 /// Whether an error is the socket's poll grain expiring with nothing in it,

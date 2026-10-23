@@ -2188,14 +2188,7 @@ fn quic_inbound_identity(inbound: &Json) -> Option<Arc<ferrox_core::tls::TlsServ
     if settings.get("security").and_then(Json::as_str) != Some("tls") {
         return None;
     }
-    let identity = inbound_tls_identity(inbound)?;
-    if identity.ech_server_keys.is_some() {
-        eprintln!(
-            "ech: quic server-side ECH (echServerKeys) has no backend here; the inbound is refused"
-        );
-        return None;
-    }
-    Some(identity)
+    inbound_tls_identity(inbound)
 }
 
 fn serve_vless_quic_inbound(

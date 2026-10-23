@@ -228,6 +228,16 @@ impl TlsServerConfig {
     pub fn reality_server_config(&self) -> Result<std::sync::Arc<rustls::ServerConfig>, TlsError> {
         crate::tls::rustls_backend::cached_server_config(self, true)
     }
+
+    /// The `BoringSSL` context an ECH listener answers with, unbuilt so a QUIC lane can hand it
+    /// to quiche: both carry the same certificate, key and ECH key set.
+    pub fn ech_server_context_builder(&self) -> Result<boring::ssl::SslContextBuilder, TlsError> {
+        let keys = self
+            .ech_server_keys
+            .as_deref()
+            .ok_or_else(|| TlsError::Other("ech server identity has no keys".to_owned()))?;
+        crate::tls::rustls_backend::ech_server_context_builder(self, keys)
+    }
 }
 
 pub fn parse_pem_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsServerConfig, TlsError> {

@@ -453,9 +453,17 @@ pub(crate) fn tune(config: &mut quiche::Config, alpn: &[u8]) -> bool {
 
 /// A serving identity: the lane's own tuning plus the certificate chain quiche reads at load time.
 pub(crate) fn serve_config(identity: &ferrox_core::tls::TlsServerConfig) -> Option<quiche::Config> {
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?;
+    let mut config = if identity.ech_server_keys.is_some() {
+        let builder = identity.ech_server_context_builder().ok()?;
+        quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder).ok()?
+    } else {
+        quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?
+    };
     if !tune(&mut config, ALPN) {
         return None;
+    }
+    if identity.ech_server_keys.is_some() {
+        return Some(config);
     }
     let label = match identity.key_kind {
         ferrox_core::tls::ServerKeyKind::Pkcs8 => "PRIVATE KEY",
@@ -3502,9 +3510,48 @@ mod tests {
         }
     }
 
+    /// The X25519 key behind `ECH_CONFIG`'s public half, shared with the TLS ECH test.
+    const ECH_PRIVATE_KEY: [u8; 32] = [
+        0x78, 0xb5, 0xc8, 0x5f, 0x0f, 0x03, 0x50, 0x06, 0x9b, 0x97, 0x32, 0x9f, 0x44, 0x8e, 0xbe,
+        0x95, 0x8e, 0x4b, 0x34, 0x77, 0x71, 0x3d, 0x5a, 0xc6, 0x51, 0x0c, 0x69, 0x51, 0x98, 0xd1,
+        0xe8, 0x78,
+    ];
+
+    /// An `ECHConfig` for `public.test` whose X25519 public half matches `ECH_PRIVATE_KEY`.
+    const ECH_CONFIG: &[u8] = &[
+        0xfe, 0x0d, 0x00, 0x3a, 0x07, 0x00, 0x20, 0x00, 0x20, 0x2a, 0xb0, 0xe0, 0x4c, 0x48, 0x44,
+        0x9d, 0xa1, 0x19, 0x81, 0x50, 0xc8, 0xf0, 0x45, 0xf0, 0x35, 0xd0, 0xb8, 0xb1, 0xca, 0xc4,
+        0x0c, 0x29, 0xcd, 0x46, 0x0b, 0xbf, 0xae, 0x95, 0xb8, 0xd7, 0x03, 0x00, 0x04, 0x00, 0x01,
+        0x00, 0x01, 0x00, 0x0b, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x2e, 0x74, 0x65, 0x73, 0x74,
+        0x00, 0x00,
+    ];
+
+    fn ech_server_key_tlv() -> Vec<u8> {
+        let mut keys = Vec::with_capacity(4 + ECH_PRIVATE_KEY.len() + ECH_CONFIG.len());
+        keys.extend_from_slice(&(ECH_PRIVATE_KEY.len() as u16).to_be_bytes());
+        keys.extend_from_slice(&ECH_PRIVATE_KEY);
+        keys.extend_from_slice(&(ECH_CONFIG.len() as u16).to_be_bytes());
+        keys.extend_from_slice(ECH_CONFIG);
+        keys
+    }
+
+    fn ech_identity() -> ferrox_core::tls::TlsServerConfig {
+        let mut identity = minted_identity();
+        identity.ech_server_keys = Some(ech_server_key_tlv().into());
+        identity
+    }
+
     #[test]
     fn serve_config_loads_a_minted_identity() {
         assert!(serve_config(&minted_identity()).is_some());
+    }
+
+    #[test]
+    fn serve_config_builds_the_ech_context() {
+        assert!(serve_config(&ech_identity()).is_some());
+        let mut broken = ech_identity();
+        broken.ech_server_keys = Some(vec![0, 1, 2].into());
+        assert!(serve_config(&broken).is_none());
     }
 
     #[test]
@@ -3748,8 +3795,11 @@ mod tests {
 
     /// Client and server handshaked over two real loopback sockets, because a batched sweep is only readable from the peer's side of the wire.
     fn lane_pair() -> (Lane, Lane) {
-        let identity = minted_identity();
-        let mut server_config = serve_config(&identity).expect("serves");
+        lane_pair_of(&minted_identity())
+    }
+
+    fn lane_pair_of(identity: &ferrox_core::tls::TlsServerConfig) -> (Lane, Lane) {
+        let mut server_config = serve_config(identity).expect("serves");
         let mut client_config = quiche_config(&identity.cert_chain, None).expect("trusts");
         let server_sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
         let server_addr = server_sock.local_addr().expect("addr");
@@ -3810,6 +3860,14 @@ mod tests {
             "the lane handshook over the very sweep under test"
         );
         (client, server)
+    }
+
+    /// An ECH-serving lane still completes a QUIC handshake from a client that offers no ECH:
+    /// the keys change the hello a server can open, never the fallback it answers.
+    #[test]
+    fn an_ech_serving_lane_answers_a_client_without_an_offer() {
+        let (client, server) = lane_pair_of(&ech_identity());
+        assert!(client.conn.is_established() && server.conn.is_established());
     }
 
     /// A sweep hands the socket every datagram quiche offered rather than one batch of slots, and the peer reads the same bytes in the same order: the connection is asked, right after the call, whether it still has a packet ready.
