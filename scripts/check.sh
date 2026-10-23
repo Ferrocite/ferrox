@@ -16,6 +16,9 @@ cargo clippy --workspace --all-targets --locked -- -D warnings -W clippy::perf -
 step "doc"
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --locked --no-deps
 
+step "worktree artifacts"
+./scripts/check-worktree-artifacts.sh
+
 step "leak surface"
 ./scripts/check-leak-surface.sh
 
