@@ -222,7 +222,9 @@ def check_readme(readme_path, charts_dir, results):
         for engine in THROUGHPUT_ENGINES:
             value = medians.get(engine, {}).get("throughput_mib_s")
             cells.append("\u2014" if value is None else f"{value:.0f}")
-        expected = f"| `{scenario['id']}` | " + " | ".join(cells) + " |"
+        base = scenario.get("base", scenario["id"])
+        server = scenario.get("server") or "\u2014"
+        expected = f"| `{base}` | {server} | " + " | ".join(cells) + " |"
         check(
             expected in section,
             f"README row for {scenario['id']} does not match "

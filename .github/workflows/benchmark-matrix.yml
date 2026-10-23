@@ -7,7 +7,11 @@ on:
       - "crates/**/*.rs"
       - "crates/**/*.toml"
       - "scripts/run-benchmark-matrix.sh"
+      - "scripts/lib-matrix.sh"
+      - "scripts/lib-engines.sh"
       - "scripts/render-benchmark-charts.py"
+      - "scripts/validate-benchmark-matrix.py"
+      - "docs/benchmarks/matrix.md"
       - ".github/workflows/benchmark-matrix.yml"
   schedule:
     - cron: "41 3 * * *"
@@ -241,7 +245,7 @@ jobs:
     name: measure ${{ matrix.cell }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     needs: [setup, build]
-    timeout-minutes: 30
+    timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
@@ -361,9 +365,12 @@ jobs:
     concurrency:
       group: benchmark-refresh
     permissions:
-      contents: read
+      contents: write
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
@@ -386,21 +393,42 @@ jobs:
               exit 1
             fi
             dest="matrix-published/$STAMP/$slug"
-            charts="$dest/charts"
-            mkdir -p "$dest" "$charts"
-            cp "$bundle/matrix-results.json" "$bundle/manifest.txt" "$dest/"
+            results="docs/benchmarks/results/$STAMP/$slug"
+            charts="docs/benchmarks/charts/latest/$slug"
+            mkdir -p "$dest/charts" "$results" "$charts"
+            cp "$bundle/matrix-results.json" "$bundle/manifest.txt" "$results/"
+            cp "$results/matrix-results.json" "$results/manifest.txt" "$dest/"
             cp -r "$bundle/cells" "$dest/cells"
-            cp "$bundle"/charts/*.png "$charts/"
             python3 scripts/render-benchmark-charts.py \
               --input "$bundle" \
               --charts "$charts" \
-              --results "$dest/matrix-results.json" \
+              --results "$results/matrix-results.json" \
+              --readme docs/benchmarks/matrix.md \
               --runner "$slug"
+            cp "$charts"/*.png "$dest/charts/"
             python3 scripts/validate-benchmark-matrix.py \
               --cells "$dest/cells" \
-              --results "$dest/matrix-results.json" \
+              --results "$results/matrix-results.json" \
               --charts "$charts"
           done
+      - name: commit the refreshed matrix on a review branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C benchmark-matrix/auto
+          git add docs/benchmarks/matrix.md docs/benchmarks/charts/latest docs/benchmarks/results
+          if git diff --cached --quiet; then
+            echo "nothing to publish"
+            exit 0
+          fi
+          git commit -m "docs: refresh benchmark matrix ($STAMP)"
+          git push --force-with-lease origin benchmark-matrix/auto
+          existing="$(gh pr list --head benchmark-matrix/auto --state open --json number --jq '.[0].number // empty')"
+          [[ -n "$existing" ]] || gh pr create --base main --head benchmark-matrix/auto \
+            --title "docs: refresh benchmark matrix" \
+            --body "Automated refresh of docs/benchmarks/matrix.md and the latest charts from the scheduled matrix run."
       - uses: actions/upload-artifact@v4
         with:
           name: benchmark-matrix-published-${{ env.STAMP }}

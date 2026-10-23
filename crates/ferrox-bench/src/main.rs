@@ -70,6 +70,7 @@ struct Args {
     iterations: usize,
     traffic: String,
     outbound_config: String,
+    outbound_configs: Vec<(String, String)>,
     output_dir: String,
     json_report: Option<String>,
     scenario: String,
@@ -85,7 +86,7 @@ const GATE5_ENGINE: &str = "ferrox";
 
 fn protocols_for(label: &str) -> &'static [&'static str] {
     match label {
-        "xray-rust" => &["socks", "http", "tun"],
+        "xray-rust" => &["vless", "vmess", "trojan", "shadowsocks2022", "hysteria"],
         _ => &[],
     }
 }
@@ -126,6 +127,7 @@ fn push_labeled_shape(
     into.push((label.to_owned(), shape.to_owned()));
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_args() -> Args {
     let mut args = std::env::args().skip(1);
     let mut declared = String::from("chacha20 0.9 (crates.io)");
@@ -139,6 +141,7 @@ fn parse_args() -> Args {
     let mut iterations = DEFAULT_ITERATIONS;
     let mut traffic = String::from("download");
     let mut outbound_config = String::new();
+    let mut outbound_configs: Vec<(String, String)> = Vec::new();
     let mut output_dir = String::from("target/parity");
     let mut json_report: Option<String> = None;
     let mut scenario = String::from("gate5");
@@ -186,6 +189,13 @@ fn parse_args() -> Args {
             "--payload-size" => payload_size = flag_count(&mut args, "--payload-size"),
             "--iterations" => iterations = flag_count(&mut args, "--iterations"),
             "--traffic" => traffic = flag_value(&mut args, "--traffic"),
+            "--outbound-config-for" => push_labeled_shape(
+                &mut outbound_configs,
+                "--outbound-config-for",
+                "json",
+                &flag_value(&mut args, "--outbound-config-for"),
+                |document| json::parse(document).map(|_| ()),
+            ),
             "--outbound-config" | "--output-dir" | "--json-report" | "--scenario" => {
                 parse_matrix_arg(
                     &mut outbound_config,
@@ -215,6 +225,7 @@ fn parse_args() -> Args {
         iterations,
         traffic,
         outbound_config,
+        outbound_configs,
         output_dir,
         json_report,
         scenario,
@@ -732,6 +743,7 @@ fn gate5_section(args: &Args) -> Result<Gate5, String> {
         payload_size: args.payload_size,
         warmup: false,
         outbound_config: args.outbound_config.clone(),
+        outbound_configs: args.outbound_configs.clone(),
         scenario: args.scenario.clone(),
     };
     let comparison = compare_process::run(

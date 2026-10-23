@@ -595,9 +595,12 @@ def assemble(cells_dir, meta):
             if values:
                 medians[name] = values
         ceiling = ceiling_values(cell)
+        base, _, server = scenario.partition("--srv-")
         scenarios.append(
             {
                 "id": scenario,
+                "base": base,
+                "server": server,
                 "workload": cell.get("workload", {}),
                 "reference": cell.get("reference"),
                 "gate_passed": cell.get("gate_passed"),
@@ -663,11 +666,12 @@ def update_readme(readme_path, results, charts_dir, runner):
         f"({results.get('cpu', '?')}), "
         f"tier {results['tier']}, reference `{results['reference']}`. "
         "Bars are medians with 95% intervals; empty cells name their reason in "
-        "`docs/benchmarks/matrix.md`. Full bundles with replay commands live "
-        "under `docs/benchmarks/results/`._",
+        "`docs/benchmarks/matrix.md`. Dated results and the replay commands live "
+        "under `docs/benchmarks/results/`; full cell bundles are workflow "
+        "artifacts._",
         "",
-        "| scenario | " + " | ".join(engines) + " | verdict |",
-        "| -------- | " + " | ".join(["--------"] * len(engines)) + " | ------- |",
+        "| scenario | server | " + " | ".join(engines) + " | verdict |",
+        "| -------- | ------ | " + " | ".join(["--------"] * len(engines)) + " | ------- |",
     ]
     for scenario in results["scenarios"]:
         medians = scenario["medians"]
@@ -679,21 +683,26 @@ def update_readme(readme_path, results, charts_dir, runner):
             if row.get("gates") and row["label"].startswith("throughput")
         ]
         verdict = verdicts[0] if verdicts else "unproven"
-        lines.append(f"| `{scenario['id']}` | " + " | ".join(cells) + f" | {verdict} |")
+        server = scenario.get("server") or "\u2014"
+        lines.append(
+            f"| `{scenario.get('base', scenario['id'])}` | {server} | "
+            + " | ".join(cells) + f" | {verdict} |"
+        )
     lines += [
         "",
         "Cost medians (CPU ms/GiB, peak RSS MiB, peak threads, cold start s):",
         "",
-        "| scenario | engine | cpu | rss | threads | start |",
-        "| -------- | ------ | --- | --- | ------- | ----- |",
+        "| scenario | server | engine | cpu | rss | threads | start |",
+        "| -------- | ------ | ------ | --- | --- | ------- | ----- |",
     ]
     for scenario in results["scenarios"]:
         for engine in engines:
             values = scenario["medians"].get(engine, {})
             if not values:
                 continue
+            server = scenario.get("server") or "\u2014"
             lines.append(
-                f"| `{scenario['id']}` | {engine} | "
+                f"| `{scenario.get('base', scenario['id'])}` | {server} | {engine} | "
                 f"{format_cost(values.get('cpu_millis_per_gib'))} | "
                 f"{format_cost(values.get('rss_mib'))} | "
                 f"{format_cost(values.get('threads_peak'))} | "
