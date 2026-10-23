@@ -16990,6 +16990,71 @@ mod tests {
     }
 
     #[test]
+    fn reality_vision_inner_tls_survives_rounds_through_the_window() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let pair = reality_pair(crate::vision::FLOW);
+        let (server_config, client_config) = carried_tls_configs();
+        let inner = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let inner_addr = inner.local_addr().expect("addr");
+        let echo = thread::spawn(move || {
+            let (stream, _) = inner.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut buf = [0u8; 4096];
+            loop {
+                match tls.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        tls.write_all(&buf[..n]).expect("echoes");
+                        tls.flush().expect("flushes");
+                    }
+                }
+            }
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let outbound = match &pair.outbound {
+            Outbound::Vless(vless) => vless.clone(),
+            _ => panic!("the pair dials VLESS"),
+        };
+        let server = pair.server;
+        let dialled = thread::spawn(move || {
+            let (client, _) = front.accept().expect("accepts");
+            tx.send(()).expect("signals");
+            dial_socks_outbound(
+                &client,
+                &Outbound::Vless(outbound),
+                &server,
+                &Destination::from(inner_addr),
+            );
+        });
+        let user = Connection::connect(addr).expect("connects");
+        user.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        rx.recv_timeout(Duration::from_secs(30)).expect("dials");
+        let mut inner = ferrox_core::tls::connect(&client_config, user).expect("inner configures");
+        inner.handshake().expect("inner handshakes");
+        let widths = [18usize, 511, 20_021];
+        for round in 0..180u32 {
+            let width = widths[round as usize % widths.len()];
+            let payload: Vec<u8> = (0..width)
+                .map(|index| (index as u8).wrapping_mul(37).wrapping_add(round as u8))
+                .collect();
+            inner.write_all(&payload).expect("writes");
+            inner.flush().expect("flushes");
+            let mut echoed = vec![0u8; width];
+            inner.read_exact(&mut echoed).expect("echoes");
+            assert_eq!(echoed, payload);
+        }
+        drop(inner);
+        dialled.join().expect("joins");
+        echo.join().expect("joins");
+        pair.front.join().expect("joins");
+    }
+
+    #[test]
     fn the_gauge_paces_only_past_the_burst_it_was_given() {
         let mut flat = Gauge::start(ferrox_core::tls::RateLimit {
             after_bytes: 4,
