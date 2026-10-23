@@ -1490,10 +1490,9 @@ fn serve_vless(stream: Connection, id: &[u8; 16], carrier: &Carrier, freedom: bo
             let Ok(read) = stream.try_clone() else {
                 return;
             };
-            let Ok(raw) = stream.try_clone() else {
-                return;
-            };
-            serve_xhttp_stream(read, stream, settings, id, freedom, Some(&raw));
+            serve_xhttp_stream(read, stream, settings, id, freedom, |read, timeout| {
+                read.set_read_timeout(timeout).is_ok()
+            });
         }
         Carrier::HttpHeader { path } => {
             let Some((mut reader, mut write)) = crate::httpheader::accept(stream, path) else {
@@ -2373,12 +2372,10 @@ fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
     settings: &crate::xhttp::XhttpSettings,
     id: &[u8; 16],
     freedom: bool,
-    raw: Option<&Connection>,
+    mut arm: impl FnMut(&R, Option<Duration>) -> bool,
 ) {
-    if let Some(raw) = raw {
-        if raw.set_read_timeout(Some(budgets::handshake())).is_err() {
-            return;
-        }
+    if !arm(&read, Some(budgets::handshake())) {
+        return;
     }
     let until = Instant::now() + budgets::handshake();
     let mut magic = [0u8; 24];
@@ -2395,9 +2392,7 @@ fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
             Err(_) => break,
         }
     }
-    if let Some(raw) = raw {
-        let _ = raw.set_read_timeout(None);
-    }
+    let _ = arm(&read, None);
     if at < magic.len() && Instant::now() >= until {
         return;
     }
@@ -2609,7 +2604,7 @@ fn serve_vless_tls(
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            serve_xhttp_stream(reader, writer, settings, id, freedom, None);
+            serve_xhttp_stream(reader, writer, settings, id, freedom, |_, _| true);
         }
         Carrier::HttpUpgrade { path, .. } => {
             let Ok(raw) = stream.try_clone() else { return };
@@ -2708,7 +2703,7 @@ fn serve_vless_reality(
                     return;
                 }
                 let (reader, writer) = session_halves(session, out);
-                serve_xhttp_stream(reader, writer, settings, id, freedom, None);
+                serve_xhttp_stream(reader, writer, settings, id, freedom, |_, _| true);
             });
         }
         Carrier::HttpUpgrade { path, .. } => {
