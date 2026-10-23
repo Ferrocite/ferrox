@@ -11,7 +11,10 @@ given a fake catalogue: the rows must order by latency, keep a silent edge as
 lists must reach the lane normalized, and a port outside 1-65535 must be refused
 before the lane config is written. A lane that binds its front but carries no
 flow must be stopped by `up` itself, with its pid file, config and proxy marker
-removed and its port free again.
+removed and its port free again. An attempt cut short by an interrupt must leave
+nothing either: the lane child, its pid file, its config and the proxy marker
+are all gone. The proxy is never armed or cleared on the machine running the
+gate: a fake `networksetup` records the calls instead.
 """
 
 from __future__ import annotations
@@ -22,10 +25,12 @@ import pathlib
 import pty
 import re
 import shutil
+import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CLI = ROOT / "dist" / "ferrox-cli.sh"
@@ -38,10 +43,30 @@ def free_port() -> int:
         return probe.getsockname()[1]
 
 
+def fake_networksetup(state: pathlib.Path) -> pathlib.Path:
+    bin_dir = state / "fake-bin"
+    bin_dir.mkdir(exist_ok=True)
+    tool = bin_dir / "networksetup"
+    tool.write_text(
+        """#!/bin/sh
+printf '%s\\n' "$*" >> "$FERROX_CONF_DIR/networksetup.calls"
+case "$1" in
+  -listallnetworkservices)
+    printf 'An asterisk (*) denotes that a network service is disabled.\\nWi-Fi\\n' ;;
+esac
+exit 0
+""",
+        encoding="utf-8",
+    )
+    tool.chmod(0o755)
+    return bin_dir
+
+
 def env_for(state: pathlib.Path) -> dict[str, str]:
     env = dict(os.environ)
     env["FERROX_CONF_DIR"] = str(state)
     env["FERROX_BIN"] = shutil.which("true") or "/bin/true"
+    env["PATH"] = f"{fake_networksetup(state)}:{env.get('PATH', '')}"
     return env
 
 
@@ -385,7 +410,13 @@ while True:
 
 
 def check_failed_lane_is_closed(state: pathlib.Path) -> int:
-    for stale in ("lane.json", "lane.pid", "fake-lane.pids", "system-proxy.ports"):
+    for stale in (
+        "lane.json",
+        "lane.pid",
+        "fake-lane.pids",
+        "system-proxy.ports",
+        "networksetup.calls",
+    ):
         (state / stale).unlink(missing_ok=True)
     (state / "system-proxy.ports").write_text("10808 8080\n", encoding="utf-8")
     port = free_port()
@@ -444,9 +475,144 @@ def check_failed_lane_is_closed(state: pathlib.Path) -> int:
                 "check-cli-lane: a failed lane left its port bound", file=sys.stderr
             )
             return 1
+    calls = state / "networksetup.calls"
+    recorded = calls.read_text(encoding="utf-8") if calls.exists() else ""
+    if "-setsocksfirewallproxystate Wi-Fi off" not in recorded:
+        print(
+            "check-cli-lane: a failed lane left the system proxy armed",
+            file=sys.stderr,
+        )
+        return 1
     print(
         "check-cli-lane: a lane that carries no flow is stopped, with its pid, config"
-        " and proxy marker removed and its port free"
+        " and proxy marker removed, the system proxy cleared and its port free"
+    )
+    return 0
+
+
+def stuck_lane_binary(state: pathlib.Path) -> pathlib.Path:
+    binary = state / "fake-stuck-lane"
+    binary.write_text(
+        """#!/usr/bin/env python3
+import os, time
+state = os.environ["FERROX_CONF_DIR"]
+with open(os.path.join(state, "fake-stuck-lane.pids"), "a", encoding="utf-8") as handle:
+    handle.write(f"{os.getpid()}\\n")
+while True:
+    time.sleep(3600)
+""",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    return binary
+
+
+def check_interrupted_attempt_leaves_nothing(state: pathlib.Path) -> int:
+    for stale in (
+        "lane.json",
+        "lane.pid",
+        "fake-stuck-lane.pids",
+        "system-proxy.ports",
+        "networksetup.calls",
+    ):
+        (state / stale).unlink(missing_ok=True)
+    (state / "system-proxy.ports").write_text("10808 8080\n", encoding="utf-8")
+    port = free_port()
+    env = env_for(state)
+    env["FERROX_BIN"] = str(stuck_lane_binary(state))
+    run = subprocess.Popen(
+        up_argv(port),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
+    recorded = state / "fake-stuck-lane.pids"
+    deadline = time.monotonic() + WATCH
+    while time.monotonic() < deadline:
+        if (state / "lane.pid").exists() and recorded.exists():
+            break
+        time.sleep(0.1)
+    else:
+        run.kill()
+        output, _ = run.communicate()
+        print(
+            "check-cli-lane: an interrupted attempt never started its lane:"
+            f"\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    time.sleep(0.3)
+    run.send_signal(signal.SIGINT)
+    try:
+        output, _ = run.communicate(timeout=WATCH)
+    except subprocess.TimeoutExpired:
+        run.kill()
+        output, _ = run.communicate()
+        print(
+            f"check-cli-lane: an interrupted attempt kept running:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if run.returncode != 130:
+        print(
+            "check-cli-lane: an interrupted attempt exited"
+            f" {run.returncode}, not 130:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if "interrupted:" not in output:
+        print(
+            f"check-cli-lane: an interrupted attempt did not say so:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    for gone in ("lane.pid", "lane.json", "system-proxy.ports"):
+        if (state / gone).exists():
+            print(
+                f"check-cli-lane: an interrupted attempt left {gone} behind:\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+    started = recorded.read_text(encoding="utf-8").split() if recorded.exists() else []
+    if not started:
+        print("check-cli-lane: the fake lane never ran", file=sys.stderr)
+        return 1
+    for pid in started:
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            continue
+        os.kill(int(pid), signal.SIGKILL)
+        print(
+            f"check-cli-lane: an interrupted attempt left process {pid} running:"
+            f"\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    with socket.socket() as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError:
+            print(
+                "check-cli-lane: an interrupted attempt left its port bound",
+                file=sys.stderr,
+            )
+            return 1
+    calls = state / "networksetup.calls"
+    recorded_calls = calls.read_text(encoding="utf-8") if calls.exists() else ""
+    if "-setsocksfirewallproxystate Wi-Fi off" not in recorded_calls:
+        print(
+            "check-cli-lane: an interrupted attempt left the system proxy armed",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "check-cli-lane: an interrupted attempt is stopped, with its pid, config and"
+        " proxy marker removed, the system proxy cleared and its port free"
     )
     return 0
 
@@ -629,6 +795,8 @@ def main() -> int:
     if check_splits(state) != 0:
         return 1
     if check_failed_lane_is_closed(state) != 0:
+        return 1
+    if check_interrupted_attempt_leaves_nothing(state) != 0:
         return 1
     if check_config_survives(state) != 0:
         return 1
