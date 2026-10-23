@@ -14,7 +14,7 @@ const HEADER: usize = 12;
 
 /// A message whose declared size the reference refuses: past this the
 /// connection ends, not the message. The reference's `buf.Size`.
-pub const MESSAGE_MAX: usize = 2048;
+pub const MESSAGE_MAX: usize = 8192;
 
 /// A name whose packed string the reference's parser weighs at this bound is a
 /// parse error there: the bound is checked while the last label is appended, so
