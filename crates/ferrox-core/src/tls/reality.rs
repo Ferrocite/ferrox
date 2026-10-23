@@ -152,6 +152,7 @@ impl<S: Stream> RealityServer<S> {
             key_der: ed25519_pkcs8(),
             key_kind: super::ServerKeyKind::Pkcs8,
             send_tickets: false,
+            server_config_cache: std::sync::Arc::default(),
         };
         replay.set_prefix(raw);
         Ok(RealityAccept::Session(Self {
@@ -2347,9 +2348,11 @@ mod tests {
             key_der: ed25519_pkcs8(),
             key_kind: super::super::ServerKeyKind::Pkcs8,
             send_tickets: false,
+            server_config_cache: std::sync::Arc::default(),
         };
         let plain = super::super::TlsServerConfig {
             send_tickets: true,
+            server_config_cache: std::sync::Arc::default(),
             ..forged()
         };
         let without = crate::tls::rustls_backend::server_config(forged()).expect("identity");

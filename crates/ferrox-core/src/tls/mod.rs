@@ -197,6 +197,8 @@ pub struct TlsServerConfig {
     /// Whether to send TLS 1.3 session tickets. REALITY declines them, as both
     /// references do, so an authenticated handshake is followed by no records.
     pub send_tickets: bool,
+    /// Memoised `rustls` server-config builds, one per identity kind.
+    pub server_config_cache: crate::tls::rustls_backend::ServerConfigCache,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,6 +206,18 @@ pub enum ServerKeyKind {
     Pkcs8,
     Sec1,
     Pkcs1,
+}
+
+impl TlsServerConfig {
+    /// The `rustls` server config for a plain TLS identity, built once per config.
+    pub fn server_config(&self) -> Result<std::sync::Arc<rustls::ServerConfig>, TlsError> {
+        crate::tls::rustls_backend::cached_server_config(self, false)
+    }
+
+    /// The `rustls` server config for a REALITY identity, built once per config.
+    pub fn reality_server_config(&self) -> Result<std::sync::Arc<rustls::ServerConfig>, TlsError> {
+        crate::tls::rustls_backend::cached_server_config(self, true)
+    }
 }
 
 pub fn parse_pem_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsServerConfig, TlsError> {
@@ -226,6 +240,7 @@ pub fn parse_pem_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsServerCo
                 key_der,
                 key_kind,
                 send_tickets: true,
+                server_config_cache: std::sync::Arc::default(),
             });
         }
     }

@@ -3497,6 +3497,7 @@ mod tests {
             key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
             alpn: Vec::new(),
             send_tickets: true,
+            server_config_cache: std::sync::Arc::default(),
         }
     }
 
@@ -3513,6 +3514,7 @@ mod tests {
             key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
             alpn: Vec::new(),
             send_tickets: true,
+            server_config_cache: std::sync::Arc::default(),
         };
         assert!(serve_config(&empty).is_none());
         let mut no_key = minted_identity();
