@@ -447,7 +447,7 @@ enum Aes {
 /// A block as the AES backend takes it. Both widths share it, so one batch feeds either key.
 type Typed = aes::cipher::Block<aes::Aes128>;
 
-/// The blocks one backend call permutes: AES-NI and ARMv8 run this many `aesdec` chains side by
+/// The blocks one backend call permutes: AES-NI and `ARMv8` run this many `aesdec` chains side by
 /// side, and a decryption never waits for the block before it.
 const PAR: usize = 8;
 
@@ -782,9 +782,12 @@ mod tests {
         let mut sender = Direction::tls12(suite, &key, &mac_key, &iv);
         let mut wire = Vec::new();
         seal12(&mut sender, 23, &plain, &mut wire).expect("seals");
-        // Payload, MAC and pad make fourteen blocks: one full batch and a tail, so every mask is
-        // taken from a block the same call has not written yet.
-        assert_eq!(wire.len(), 5 + BLOCK + 14 * BLOCK, "the record is that wide");
+        // Fourteen blocks: one full batch and a tail, so every mask comes from a block this call has not written.
+        assert_eq!(
+            wire.len(),
+            5 + BLOCK + 14 * BLOCK,
+            "the record is that wide"
+        );
         let (header, body) = wire.split_at(5);
         let mut window = [0u8; 512];
         let mut direct = Direction::tls12(suite, &key, &mac_key, &iv);

@@ -1554,6 +1554,9 @@ mod tests {
             crate::alloc_count::measure(|| session.post_handshake().expect("drops the ticket"));
         assert_eq!(session.hs.len(), 0, "the ticket is consumed");
         assert_eq!(session.reply.len(), 0, "a ticket asks for no answer");
-        assert_eq!(counts.allocs, 0, "the flight is read where it lies: {counts:?}");
+        assert_eq!(
+            counts.allocs, 0,
+            "the flight is read where it lies: {counts:?}"
+        );
     }
 }
