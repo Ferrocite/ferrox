@@ -391,24 +391,21 @@ def setup_medians(cell, engine, runs_dir, stage):
 
 def scenario_throughput_chart(scenario, cell, path, foot):
     """One scenario's throughput: engines side by side, never merged with another test."""
-    present = [name for name in engines_present({scenario: cell})]
+    present = [
+        name for name in ENGINE_ORDER if run_values(cell, name, "throughput_mib_s")
+    ]
     fig, ax = plt.subplots(figsize=(max(6.0, 1.3 * max(1, len(present))), 4.2))
     if not present:
         base, _, server = scenario.partition("--srv-")
         ax.text(
             0.5,
             0.5,
-            "no engine landed a number in this cell\n"
-            + "; ".join(
-                f"{failure.get('engine')}: {failure.get('reason', '')[:80]}"
-                for failure in cell.get("failures", [])[:4]
-            ),
+            "no engine landed a number in this cell\nsee the coverage table",
             transform=ax.transAxes,
             ha="center",
             va="center",
-            fontsize=8,
+            fontsize=9,
             color="#333333",
-            wrap=True,
         )
         ax.set_axis_off()
         ax.set_title(f"{base} on {server}: no throughput measured", fontsize=11)
@@ -450,21 +447,6 @@ def scenario_throughput_chart(scenario, cell, path, foot):
         f"{base} on {server}: throughput (MiB/s, higher is better)", fontsize=11
     )
     ax.grid(axis="y", linestyle=":", alpha=0.6)
-    failed = [name for name in ENGINE_ORDER if any(
-        failure.get("engine") == name for failure in cell.get("failures", [])
-    )]
-    if failed:
-        missing = [f"{name}: {fail_reason(cell, name)}" for name in failed]
-        ax.text(
-            0.0,
-            -0.18,
-            "not measured: " + "; ".join(missing),
-            transform=ax.transAxes,
-            fontsize=7,
-            color="#666666",
-            va="top",
-            ha="left",
-        )
     fig.text(0.5, 0.01, foot, ha="center", fontsize=7, color="#666666")
     fig.tight_layout(rect=(0, 0.08, 1, 1))
     fig.savefig(path, dpi=110, bbox_inches="tight")
