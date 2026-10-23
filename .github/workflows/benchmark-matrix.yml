@@ -214,6 +214,14 @@ jobs:
       - name: install the QUIC build tool
         if: runner.os == 'Windows'
         run: choco install nasm -y --no-progress || echo "nasm already installed"
+      - name: install protoc for xray-core-rust
+        shell: bash
+        run: |
+          case "$RUNNER_OS" in
+            Linux) sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler ;;
+            macOS) brew install protobuf ;;
+            Windows) choco install protoc -y --no-progress || echo "protoc already installed" ;;
+          esac
       - uses: actions/download-artifact@v4
         with:
           name: upstream-trees
@@ -221,7 +229,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/parity-engines
-          key: matrix-engines-${{ matrix.os }}-${{ hashFiles('upstream/pins.toml') }}
+          key: matrix-engines-${{ matrix.os }}-${{ hashFiles('upstream/pins.toml', 'scripts/lib-engines.sh') }}
       - name: build every engine without moving traffic
         shell: bash
         env:
@@ -271,7 +279,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/parity-engines
-          key: matrix-engines-${{ matrix.os }}-${{ hashFiles('upstream/pins.toml') }}
+          key: matrix-engines-${{ matrix.os }}-${{ hashFiles('upstream/pins.toml', 'scripts/lib-engines.sh') }}
       - name: run one cell with handed-over binaries
         shell: bash
         env:
