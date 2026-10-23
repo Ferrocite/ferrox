@@ -44,6 +44,8 @@ var presets = map[string]utls.ClientHelloID{
 	"HelloChrome_131":         utls.HelloChrome_131,
 	"HelloChrome_133":         utls.HelloChrome_133,
 	"HelloEdge_85":            utls.HelloEdge_85,
+	"HelloEdge_106":           utls.HelloEdge_106,
+	"HelloQQ_11_1":            utls.HelloQQ_11_1,
 	"HelloFirefox_55":         utls.HelloFirefox_55,
 	"HelloFirefox_63":         utls.HelloFirefox_63,
 	"HelloFirefox_99":         utls.HelloFirefox_99,

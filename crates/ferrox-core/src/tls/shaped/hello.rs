@@ -616,9 +616,7 @@ mod tests {
         kind & 0x0f0f == 0x0a0a || kind == 0x0015 || kind == 0x0029
     }
 
-    /// Replay the uTLS oracle: every pinned preset must emit the reference
-    /// ClientHello — byte for byte where uTLS fixes the order, and as the same
-    /// extension multiset plus invariant positions where Chrome's shuffle randomises it.
+    /// Replay the uTLS oracle: every xray name that shapes a hello must emit the reference's bytes, or its extension multiset plus invariant slots where Chrome shuffles.
     #[test]
     fn oracle_replay_matches_utls() {
         let script = include_str!("../../../../../scripts/utls-oracle/script.txt");
@@ -647,8 +645,9 @@ mod tests {
                 .profile()
                 .expect("a shaped profile");
             let pointer = std::ptr::from_ref(profile) as usize;
-            assert!(!seen.contains(&pointer), "{name} repeats a profile");
-            seen.push(pointer);
+            if !seen.contains(&pointer) {
+                seen.push(pointer);
+            }
             assert_eq!(profile.shuffle, fields[0] == "SH", "{name} shuffle flag");
             let hello = Hello::canonical(profile, "example.com");
             let body = &hello.msg[4..];
@@ -673,6 +672,7 @@ mod tests {
                 assert_eq!(hex(&joined), fields[2], "{name} ({id}) extension multiset");
             }
         }
-        assert_eq!(seen.len(), 28, "every preset is covered once");
+        assert_eq!(cases.len(), 46, "every xray name is covered");
+        assert_eq!(seen.len(), 28, "the names resolve to 28 distinct presets");
     }
 }

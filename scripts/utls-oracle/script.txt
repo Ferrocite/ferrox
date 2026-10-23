@@ -36,3 +36,24 @@ helloios_13 HelloIOS_13
 helloios_14 HelloIOS_14
 hellosafari_16_0 HelloSafari_16_0
 hellosafari_26_3 HelloSafari_26_3
+
+# The xray names that resolve to one of those presets, so the alias table is
+# gated by the same bytes rather than asserted.
+safari HelloSafari_26_3
+ios HelloIOS_14
+qq HelloChrome_96
+helloedge_106 HelloEdge_106
+helloqq_11_1 HelloQQ_11_1
+hellofirefox_auto HelloFirefox_148
+hellofirefox_56 HelloFirefox_55
+hellofirefox_65 HelloFirefox_63
+hellochrome_auto HelloChrome_133
+hellochrome_62 HelloChrome_58
+hellochrome_83 HelloEdge_85
+hellochrome_87 HelloEdge_85
+hellochrome_102 HelloChrome_100
+helloios_auto HelloIOS_14
+helloedge_auto HelloEdge_85
+hellosafari_auto HelloSafari_26_3
+hello360_auto Hello360_7_5
+helloqq_auto HelloChrome_96
