@@ -1630,9 +1630,87 @@ fn mux_target_addr(target: &ferrox_core::mux::Target<'_>) -> Option<SocketAddr> 
     }
 }
 
+/// A lookup is reused this long: a mux session must not ask per flow, a stuck name must not cost a thread per flow.
+const RESOLVE_TTL: Duration = Duration::from_secs(60);
+const RESOLVE_CACHE_CAP: usize = 256;
+
+struct Resolved {
+    at: Instant,
+    addrs: Vec<SocketAddr>,
+}
+
+static RESOLVED: Mutex<Option<HashMap<u16, HashMap<String, Resolved>>>> = Mutex::new(None);
+
+fn cached_lookup(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
+    let mut cache = RESOLVED.lock().ok()?;
+    let entries = cache.as_mut()?;
+    let per_port = entries.get_mut(&port)?;
+    let entry = per_port.get(host)?;
+    if entry.at.elapsed() >= RESOLVE_TTL {
+        per_port.remove(host);
+        return None;
+    }
+    Some(entry.addrs.clone())
+}
+
+fn remember_lookup(host: &str, port: u16, addrs: &[SocketAddr]) {
+    let Ok(mut cache) = RESOLVED.lock() else {
+        return;
+    };
+    let entries = cache.get_or_insert_with(HashMap::new);
+    if entries.len() >= RESOLVE_CACHE_CAP {
+        entries.clear();
+    }
+    let per_port = entries.entry(port).or_default();
+    if per_port.len() >= RESOLVE_CACHE_CAP {
+        per_port.clear();
+    }
+    per_port.insert(
+        host.to_owned(),
+        Resolved {
+            at: Instant::now(),
+            addrs: addrs.to_vec(),
+        },
+    );
+}
+
+/// A resolver has no deadline, so the flow waits its dial budget and a detached thread carries the lookup.
+fn resolve_bounded<F>(host: &str, port: u16, budget: Duration, lookup: F) -> Vec<SocketAddr>
+where
+    F: FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+    let owned = host.to_owned();
+    let Ok(_worker) = thread::Builder::new()
+        .name("ferrox-resolve".to_owned())
+        .spawn(move || {
+            let _ = sender.send(lookup(&owned, port));
+        })
+    else {
+        return Vec::new();
+    };
+    match receiver.recv_timeout(budget) {
+        Ok(Ok(addrs)) => addrs,
+        Ok(Err(_)) | Err(_) => Vec::new(),
+    }
+}
+
 pub(crate) fn resolve_endpoint(host: &str, port: u16) -> Option<SocketAddr> {
-    // The tuple asks the resolver for host and port directly: no `host:port` re-serialisation, no String, no port re-scan.
-    (host, port).to_socket_addrs().ok()?.next()
+    // An address literal takes the resolver's numeric path, with no cache key of its own.
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        return (host, port).to_socket_addrs().ok()?.next();
+    }
+    let addrs = cached_lookup(host, port).unwrap_or_else(|| {
+        let addrs = resolve_bounded(host, port, budgets::dial(), |host, port| {
+            // The tuple asks the resolver for host and port directly: no `host:port` re-serialisation, no String, no port re-scan.
+            (host, port)
+                .to_socket_addrs()
+                .map(std::iter::Iterator::collect)
+        });
+        remember_lookup(host, port, &addrs);
+        addrs
+    });
+    addrs.into_iter().next()
 }
 
 fn mux_target_of(addr: SocketAddr) -> ferrox_core::mux::Target<'static> {
@@ -3397,7 +3475,7 @@ fn resolve_outbound(address: &str, port: u16) -> Option<SocketAddr> {
     if let Ok(ip) = address.parse::<std::net::IpAddr>() {
         return Some(SocketAddr::new(ip, port));
     }
-    (address, port).to_socket_addrs().ok()?.next()
+    resolve_endpoint(address, port)
 }
 
 fn dial_vless(
@@ -19278,6 +19356,7 @@ mod tests {
     #[test]
     fn a_trojan_kcp_inbound_that_declares_tls_answers_the_session() {
         use ferrox_core::tls::TlsProvider as _;
+        let _guard = budgets::lock();
 
         let (cert, key, client) = tls_cert_json();
         let inbound = crate::json::parse(&format!(
@@ -30964,5 +31043,28 @@ mod foxy_split_tests {
             &suffixes,
             &Destination::Address("192.0.2.7:443".parse().expect("addr"))
         ));
+    }
+}
+
+#[cfg(test)]
+mod resolve_tests {
+    use super::resolve_bounded;
+    use std::time::{Duration, Instant};
+
+    /// `getaddrinfo` has no deadline of its own: a resolver that never answers must not park the
+    /// flow thread that asked, so the lookup is bounded by the dial budget and times out empty.
+    #[test]
+    fn a_name_lookup_that_never_answers_does_not_park_its_flow() {
+        let started = Instant::now();
+        let addrs = resolve_bounded("stalled.invalid", 443, Duration::from_millis(50), |_, _| {
+            std::thread::sleep(Duration::from_secs(3));
+            Ok(Vec::new())
+        });
+        assert!(addrs.is_empty(), "a timed-out lookup has no address");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the lookup waited out the stuck resolver instead of its budget: {}ms",
+            started.elapsed().as_millis()
+        );
     }
 }
