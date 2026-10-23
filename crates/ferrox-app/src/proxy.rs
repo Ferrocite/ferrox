@@ -2396,10 +2396,10 @@ fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
     if at < magic.len() && Instant::now() >= until {
         return;
     }
+    let chained = crate::xhttp::ChainReader::new(magic[..at].to_vec(), read);
     if at == magic.len() && magic == *crate::h2::MAGIC {
-        return crate::xhttp_h2::serve_h2(read, write, settings, *id, freedom);
+        return crate::xhttp_h2::serve_h2(chained, write, settings, *id, freedom);
     }
-    let chained = crate::xhttp::ChainReader::new(magic.to_vec(), read);
     serve_session_xhttp(chained, write, settings, id, freedom);
 }
 
