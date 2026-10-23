@@ -6,7 +6,9 @@ The header is `sha224_hex(password) | CRLF | command(1) | address | port | CRLF`
 
 A dial that was handed a name writes it as ATYP 3 with its own length, the form this method's reader already accepts, so the edge answers the lookup rather than the client's resolver.
 
-Two things are deliberately not implemented and are named rather than rounded off: there is no `trojan://` share-link parser (the link column in the README is empty for this row), and `security: tls` dials over every diallable carrier but not under mux or for UDP, so those rows are refused rather than sent plain. Both are capability statements, not performance ones.
+A listener that declares `security: tls` terminates the session its config names and reads the header off it, on each carrier the dial uses; `a_trojan_inbound_that_declares_tls_answers_every_carrier` dials all six and holds the echo.
+
+Two things are deliberately not implemented and are named rather than rounded off: there is no `trojan://` share-link parser (the link column in the README is empty for this row), and `security: tls` is neither dialled nor served under mux or for UDP, so those rows are refused rather than sent plain. Both are capability statements, not performance ones.
 
 ## Data path
 
@@ -50,7 +52,16 @@ graph TD
 
 ## Time
 
-**Not measured yet.** `.github/workflows/parity.yml` and `benchmark-matrix.yml` run a `trojan-raw` scenario. No CI artefact has been read, so no duration is quoted.
+Read from one CI run of one `benchmark-matrix.yml` cell, `trojan-tls-raw-down-8` (download, 8 connections, 16 384 × 65 536 B, standard tier, 3 repeats, `xray-core` as the reference) — the cell a plaintext listener used to fail with no byte moved. Each row is that runner's median over its three repeats, and no ratio is taken across two runners.
+
+| runner | throughput vs `xray-core` | ferrox MiB/s | `xray-core` MiB/s | cpu per GiB |
+| --- | --- | --- | --- | --- |
+| ubuntu-24.04 x86_64 | 2.12× | 2814.1 | 1325.2 | 1136.2 vs 2235.0 ms |
+| ubuntu-24.04-arm aarch64 | 1.45× | 2250.7 | 1552.3 | 1498.8 vs 1846.2 ms |
+| macos-15 aarch64 | 1.69× | 1762.6 | 1043.8 | 1053.8 vs 1715.0 ms |
+| windows-latest x86_64 | 2.81× | 1757.3 | 624.8 | 1851.6 vs 5146.5 ms |
+
+`zeronet` medians 2000.0, 1712.7, 1600.0 and 1524.1 MiB/s on those four runners, so the row is not a reference that alone ran badly. Peak RSS on ubuntu x86_64 reads 13.5 MiB against `xray-core`'s 58.9 MiB.
 
 ## What we removed
 
@@ -83,7 +94,7 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 <!-- scope:begin -->
 - paths: -
 - symbols: trojan
-- scenarios: trojan-raw
+- scenarios: trojan-raw, trojan-tls
 - oracle: trojan
 - go: ./proxy/trojan/...
 <!-- scope:end -->
