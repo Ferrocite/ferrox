@@ -51,13 +51,13 @@ pub struct Session<S: Stream> {
     eof: bool,
     ccs_sent: bool,
     record: Vec<u8>,
-    decoded: Vec<u8>,
     hs: Vec<u8>,
     plain: Vec<u8>,
     plain_at: usize,
     inbuf: Vec<u8>,
     in_at: usize,
     reply: Vec<u8>,
+    out: Vec<u8>,
 }
 
 impl<S: Stream> std::fmt::Debug for Session<S> {
@@ -114,13 +114,13 @@ impl<S: Stream> Session<S> {
             eof: false,
             ccs_sent: false,
             record: Vec::new(),
-            decoded: Vec::new(),
             hs: Vec::new(),
             plain: Vec::new(),
             plain_at: 0,
             inbuf: Vec::new(),
             in_at: 0,
             reply: Vec::new(),
+            out: Vec::new(),
         })
     }
 
@@ -382,7 +382,7 @@ impl<S: Stream> Session<S> {
         Ok(())
     }
 
-    /// Reads one record and leaves its plaintext in `decoded`, returning the content type.
+    /// Reads one record and leaves its plaintext at the front of `record`, returning the content type.
     fn read_record(&mut self) -> Result<u8, TlsError> {
         let mut header = [0u8; 5];
         exact(&mut self.io, &mut header)?;
@@ -395,42 +395,16 @@ impl<S: Stream> Session<S> {
         self.record.clear();
         self.record.resize(len, 0);
         exact(&mut self.io, &mut self.record)?;
-        let body = std::mem::take(&mut self.record);
-        self.decrypt(header, body)
-    }
-
-    fn decrypt(&mut self, header: [u8; 5], body: Vec<u8>) -> Result<u8, TlsError> {
-        self.decoded.clear();
-        if header[0] == CCS {
-            if self.version == Some(Version::Tls12) {
-                if let Some(keys) = self.server12.take() {
-                    self.read_key = Some(keys);
-                }
-            }
-            return Ok(CCS);
-        }
         let Self {
             read_key,
-            decoded,
+            server12,
             version,
+            record,
             ..
         } = self;
-        if let Some(keys) = read_key.as_mut() {
-            if *version == Some(Version::Tls13) {
-                if header[0] == ALERT {
-                    decoded.extend_from_slice(&body);
-                    return Ok(ALERT);
-                }
-                if header[0] != APPLICATION {
-                    return Err(unexpected(header[0]));
-                }
-                return record::open13(keys, header, body, decoded);
-            }
-            record::open12(keys, header[0], body, decoded)?;
-            return Ok(header[0]);
-        }
-        decoded.extend_from_slice(&body);
-        Ok(header[0])
+        let (kind, plain) = decrypt(read_key, server12, *version, header, record)?;
+        record.truncate(plain);
+        Ok(kind)
     }
 
     fn next_handshake(&mut self) -> Result<Vec<u8>, TlsError> {
@@ -445,9 +419,9 @@ impl<S: Stream> Session<S> {
                 }
             }
             match self.read_record()? {
-                HANDSHAKE => self.hs.extend_from_slice(&self.decoded),
+                HANDSHAKE => self.hs.extend_from_slice(&self.record),
                 CCS => {}
-                ALERT => return Err(alert(&self.decoded)),
+                ALERT => return Err(alert(&self.record)),
                 other => return Err(unexpected(other)),
             }
         }
@@ -516,7 +490,7 @@ impl<S: Stream> Session<S> {
     }
 
     fn alert_error(&self) -> TlsError {
-        alert(&self.decoded)
+        alert(&self.record)
     }
 
     fn pump(&mut self) -> Result<(), TlsError> {
@@ -536,10 +510,14 @@ impl<S: Stream> Session<S> {
             };
             match kind {
                 APPLICATION => {
-                    std::mem::swap(&mut self.plain, &mut self.decoded);
+                    self.plain.clear();
+                    self.plain.extend_from_slice(&self.record);
                     return Ok(());
                 }
-                HANDSHAKE => self.post_handshake()?,
+                HANDSHAKE => {
+                    self.hs.extend_from_slice(&self.record);
+                    self.post_handshake()?;
+                }
                 ALERT => {
                     if self.alert_error() == TlsError::Closed {
                         self.eof = true;
@@ -554,8 +532,6 @@ impl<S: Stream> Session<S> {
     }
 
     fn post_handshake(&mut self) -> Result<(), TlsError> {
-        self.hs.extend_from_slice(&self.decoded);
-        self.decoded.clear();
         loop {
             if self.hs.len() < 4 {
                 return Ok(());
@@ -619,16 +595,33 @@ impl<S: Stream> Session<S> {
             if self.inbuf.len() - at - 5 < len {
                 break;
             }
-            let body = self.inbuf[at + 5..at + 5 + len].to_vec();
             self.in_at = at + 5 + len;
-            match self.decrypt(header, body)? {
-                APPLICATION => self.plain.extend_from_slice(&self.decoded),
-                HANDSHAKE => self.post_handshake()?,
+            let Self {
+                inbuf,
+                read_key,
+                server12,
+                version,
+                ..
+            } = self;
+            let (kind, plain) = decrypt(
+                read_key,
+                server12,
+                *version,
+                header,
+                &mut inbuf[at + 5..at + 5 + len],
+            )?;
+            let plain = &inbuf[at + 5..at + 5 + plain];
+            match kind {
+                APPLICATION => self.plain.extend_from_slice(plain),
+                HANDSHAKE => {
+                    self.hs.extend_from_slice(plain);
+                    self.post_handshake()?;
+                }
                 ALERT => {
-                    if self.alert_error() == TlsError::Closed {
+                    if alert(plain) == TlsError::Closed {
                         self.eof = true;
                     } else {
-                        return Err(self.alert_error());
+                        return Err(alert(plain));
                     }
                 }
                 CCS => {}
@@ -645,6 +638,12 @@ impl<S: Stream> Session<S> {
     fn seal_parts(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> Result<(), TlsError> {
         if !self.reply.is_empty() {
             out.append(&mut self.reply);
+        }
+        if !parts.is_empty()
+            && parts.iter().all(|part| !part.is_empty())
+            && parts.iter().map(|part| part.len()).sum::<usize>() <= MAX_PLAINTEXT
+        {
+            return self.seal_chunk(parts, out);
         }
         let mut chunk: Vec<&[u8]> = Vec::new();
         let mut held = 0usize;
@@ -812,10 +811,14 @@ impl<S: Stream> Write for Session<S> {
         if !self.done {
             self.run().map_err(std::io::Error::other)?;
         }
-        let mut out = Vec::with_capacity(buf.len() + 5 + 16);
-        self.seal_parts(&[buf], &mut out)
-            .map_err(std::io::Error::other)?;
-        self.io.write_all(&out)?;
+        let mut out = std::mem::take(&mut self.out);
+        out.clear();
+        let sent = self
+            .seal_parts(&[buf], &mut out)
+            .map_err(std::io::Error::other)
+            .and_then(|()| self.io.write_all(&out));
+        self.out = out;
+        sent?;
         Ok(buf.len())
     }
 
@@ -1028,6 +1031,37 @@ fn message(kind: u8, body: &[u8]) -> Vec<u8> {
 
 fn unexpected(kind: u8) -> TlsError {
     TlsError::Other(format!("unexpected handshake message {kind}"))
+}
+
+/// Opens one record in place and returns its content type and the plaintext length at the front.
+fn decrypt(
+    read_key: &mut Option<Direction>,
+    server12: &mut Option<Direction>,
+    version: Option<Version>,
+    header: [u8; 5],
+    body: &mut [u8],
+) -> Result<(u8, usize), TlsError> {
+    if header[0] == CCS {
+        if version == Some(Version::Tls12) {
+            if let Some(keys) = server12.take() {
+                *read_key = Some(keys);
+            }
+        }
+        return Ok((CCS, 0));
+    }
+    let Some(keys) = read_key.as_mut() else {
+        return Ok((header[0], body.len()));
+    };
+    if version != Some(Version::Tls13) {
+        return record::open12(keys, header[0], body).map(|plain| (header[0], plain));
+    }
+    if header[0] == ALERT {
+        return Ok((ALERT, body.len()));
+    }
+    if header[0] != APPLICATION {
+        return Err(unexpected(header[0]));
+    }
+    record::open13(keys, header, body)
 }
 
 /// Fills `buf` from the transport, but a poll-quantum expiry is the caller's timeout and

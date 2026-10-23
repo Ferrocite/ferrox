@@ -26,6 +26,7 @@ graph TD
 | distinct-presets-behind-those-names | 28 | ferrox-core-tls::shaped::hello::tests::oracle_replay_matches_utls |
 | shaped-dials-that-complete-a-tls13-handshake | 1 | ferrox-core-tls::rustls_backend::tests::a_shaped_chrome_handshake_reaches_a_stock_server |
 | shaped-dials-that-complete-a-tls12-handshake | 1 | ferrox-core-tls::rustls_backend::tests::a_shaped_tls12_handshake_hashes_its_client_key_exchange |
+| relayed-records-that-allocate-once-warm | 0 | ferrox-core-tls::rustls_backend::tests::a_shaped_record_relays_without_allocating_once_the_handshake_is_done |
 <!-- counts:end -->
 
 The 46 cases are the 28 presets plus the 18 xray names that alias onto them, so the alias table is gated by the same bytes it resolves to rather than asserted. `scripts/utls-oracle` zeroes the hello-phase entropy (random, session id, both 32-byte reads and the 10 GREASE bytes), erases the key-share, ECH-payload and key material after the fact, and prints the remaining body; both seeds are fixed, so the golden is stable.
@@ -48,6 +49,7 @@ The 46 cases are the 28 presets plus the 18 xray names that alias onto them, so 
 - **The extension object graph.** uTLS models a hello as a list of extension interfaces, each marshalling itself and each holding its own state. Here a preset is plain data — `Profile`, `Ext`, `Body` — and `Hello::encode_with` walks it in one pass into a single message buffer. There is no trait object per extension and no dynamic dispatch in the build.
 - **rustls's handshake on a shaped dial.** `crate::tls::connect` routes a config whose fingerprint resolves to a preset to `shaped::Session`, which owns the record layer, the transcript and the key schedule. rustls is still used, but only its certificate verifier: the shaped dial never constructs a `rustls::ClientConnection`.
 - **A second copy of the cipher table.** The shaped record layer accepts exactly the suites the presets advertise (TLS 1.3's trio and the ECDHE-AEAD TLS 1.2 six), keyed by `Suite::from_id`, so a negotiated suite is looked up once instead of being matched again per record.
+- **The per-record heap.** A record is opened where it arrived, `inbuf` on the carrier path and `record` on the pulled one, and the session's buffers keep their capacity, so a relayed record allocates nothing once warm; a write is sealed into one reused buffer, and a single-part write skips the staged segment list.
 
 ## The parts that are not byte-identical, named
 

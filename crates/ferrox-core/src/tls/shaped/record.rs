@@ -228,20 +228,20 @@ pub(crate) fn seal13_parts(
     keys.seal(&aad, at + 5, out)
 }
 
-/// Opens one TLS 1.3 record body, appending the plaintext to `out` and returning its inner type.
+/// Decrypts in place and returns the inner type and the plaintext length at the front of `body`.
 pub(crate) fn open13(
     keys: &mut Direction,
     header: [u8; 5],
-    mut body: Vec<u8>,
-    out: &mut Vec<u8>,
-) -> Result<u8, TlsError> {
-    let plain = keys.open(&header, &mut body)?;
-    let at = plain
-        .iter()
-        .rposition(|&byte| byte != 0)
-        .ok_or_else(|| TlsError::Other("record has no inner type".to_owned()))?;
-    out.extend_from_slice(&plain[..at]);
-    Ok(plain[at])
+    body: &mut [u8],
+) -> Result<(u8, usize), TlsError> {
+    let at = {
+        let plain = keys.open(&header, body)?;
+        plain
+            .iter()
+            .rposition(|&byte| byte != 0)
+            .ok_or_else(|| TlsError::Other("record has no inner type".to_owned()))?
+    };
+    Ok((body[at], at))
 }
 
 /// Seals one TLS 1.2 AEAD record of `kind`.
@@ -282,12 +282,8 @@ pub(crate) fn seal12_parts(
 }
 
 /// Opens one TLS 1.2 AEAD record body, appending the plaintext to `out`.
-pub(crate) fn open12(
-    keys: &mut Direction,
-    kind: u8,
-    mut body: Vec<u8>,
-    out: &mut Vec<u8>,
-) -> Result<(), TlsError> {
+/// Decrypts in place and returns the plaintext length, leaving the plaintext at the front.
+pub(crate) fn open12(keys: &mut Direction, kind: u8, body: &mut [u8]) -> Result<usize, TlsError> {
     let seq = keys.seq.to_be_bytes();
     let explicit = if keys.gcm { 8 } else { 0 };
     if body.len() < explicit + 16 {
@@ -298,12 +294,14 @@ pub(crate) fn open12(
     aad[8] = kind;
     aad[9..11].copy_from_slice(&[0x03, 0x03]);
     aad[11..].copy_from_slice(&((body.len() - explicit - 16) as u16).to_be_bytes());
-    let plain = if keys.gcm {
-        let explicit: [u8; 8] = body[..8].try_into().expect("eight-byte explicit nonce");
-        keys.open_explicit(&aad, explicit, &mut body[explicit.len()..])?
+    let len = if keys.gcm {
+        let nonce: [u8; 8] = body[..8].try_into().expect("eight-byte explicit nonce");
+        let len = keys.open_explicit(&aad, nonce, &mut body[8..])?.len();
+        // The explicit nonce sat ahead of the plaintext; close that gap in the same buffer.
+        body.copy_within(8..8 + len, 0);
+        len
     } else {
-        keys.open(&aad, &mut body[explicit..])?
+        keys.open(&aad, &mut body[..])?.len()
     };
-    out.extend_from_slice(plain);
-    Ok(())
+    Ok(len)
 }

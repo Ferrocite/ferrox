@@ -1194,6 +1194,64 @@ mod tests {
         server.join().expect("joins");
     }
 
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_shaped_record_relays_without_allocating_once_the_handshake_is_done() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let cert = rustls::pki_types::CertificateDer::from(ANCHOR.to_vec());
+            let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(ANCHOR_KEY.to_vec()),
+            );
+            let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("server versions")
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .expect("server cert");
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut conn = rustls::ServerConnection::new(Arc::new(config)).expect("server session");
+            let mut tls = rustls::Stream::new(&mut conn, &mut stream);
+            for _ in 0..3 {
+                let mut buf = [0u8; 4];
+                tls.read_exact(&mut buf)
+                    .unwrap_or_else(|e| panic!("server read: {e:?}"));
+                tls.write_all(&buf).expect("writes");
+            }
+        });
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut cfg = client("tls.test", &[]);
+        cfg.fingerprint = Some(crate::tls::Fingerprint::default());
+        let mut session = crate::tls::connect(&cfg, stream).expect("dials");
+        session.handshake().expect("handshakes");
+        session.write_all(b"ping").expect("writes");
+        let mut buf = [0u8; 4];
+        session.read_exact(&mut buf).expect("reads");
+        assert_eq!(&buf, b"ping");
+        for _ in 0..2 {
+            let ((), counts) = crate::alloc_count::measure(|| {
+                session
+                    .write_all(std::hint::black_box(b"ping"))
+                    .expect("writes");
+                let mut buf = [0u8; 4];
+                session.read_exact(&mut buf).expect("reads");
+                assert_eq!(&buf, b"ping");
+            });
+            assert_eq!(
+                counts.allocs, 0,
+                "a relayed record takes no heap once its buffers are warm: {counts:?}"
+            );
+        }
+        server.join().expect("joins");
+    }
+
     /// A TLS 1.2 server on a byte queue rather than a socket, so the client's
     /// extended-master-secret transcript is hashed by an independent side: it appends the
     /// `ClientKeyExchange` before it hashes, and refuses a `Finished` that did not.
@@ -1265,36 +1323,26 @@ mod tests {
             self.pending.drain(..at);
         }
 
-        fn record(&mut self, kind: u8, body: Vec<u8>) {
+        fn record(&mut self, kind: u8, mut body: Vec<u8>) {
             match kind {
                 CCS => {}
                 HANDSHAKE if self.read_dir.is_some() => {
-                    let mut plain = Vec::new();
-                    record::open12(
-                        self.read_dir.as_mut().expect("read keys"),
-                        kind,
-                        body,
-                        &mut plain,
-                    )
-                    .expect("client record opens");
-                    self.handshake(&plain);
+                    let len =
+                        record::open12(self.read_dir.as_mut().expect("read keys"), kind, &mut body)
+                            .expect("client record opens");
+                    self.handshake(&body[..len]);
                 }
                 HANDSHAKE => self.handshake(&body),
                 APPLICATION => {
-                    let mut plain = Vec::new();
-                    record::open12(
-                        self.read_dir.as_mut().expect("read keys"),
-                        kind,
-                        body,
-                        &mut plain,
-                    )
-                    .expect("application record opens");
-                    assert_eq!(plain, b"ping", "the client's frame opens whole");
+                    let len =
+                        record::open12(self.read_dir.as_mut().expect("read keys"), kind, &mut body)
+                            .expect("application record opens");
+                    assert_eq!(&body[..len], b"ping", "the client's frame opens whole");
                     let mut out = Vec::new();
                     record::seal12(
                         self.write_dir.as_mut().expect("write keys"),
                         APPLICATION,
-                        &plain,
+                        &body[..len],
                         &mut out,
                     )
                     .expect("seals");
