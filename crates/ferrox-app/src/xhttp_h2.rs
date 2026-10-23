@@ -39,11 +39,11 @@ impl H2StreamOut {
     }
 
     pub(crate) fn bind_session(&self, sid: &str) {
-        self.conn.bind_session(sid, Some(self.stream));
+        self.conn.bind_session(sid, self.stream, true);
     }
 
     pub(crate) fn bind_upload(&self, sid: &str) {
-        self.conn.bind_session(sid, None);
+        self.conn.bind_session(sid, self.stream, false);
     }
 
     pub(crate) fn end(&self) {
@@ -70,6 +70,7 @@ struct H2Conn {
     streams: Mutex<HashMap<u32, Arc<H2Stream>>>,
     sessions: Mutex<HashSet<String>>,
     session_of: Mutex<HashMap<u32, String>>,
+    upload_of: Mutex<HashMap<u32, String>>,
     send_conn: Mutex<u64>,
     wake: Condvar,
     decoder: Mutex<Decoder>,
@@ -116,9 +117,13 @@ impl Read for H2StreamReader {
                 return Ok(n);
             }
             if st.ended {
+                drop(st);
+                self.conn.forget_upload(self.id);
                 return Ok(0);
             }
             if st.dead || self.conn.dead.load(Ordering::SeqCst) {
+                drop(st);
+                self.conn.forget_upload(self.id);
                 return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
             }
             st = self
@@ -346,6 +351,7 @@ impl H2Conn {
     }
 
     fn reset_stream(&self, stream: u32) {
+        self.forget_upload(stream);
         {
             let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(state) = streams.remove(&stream) {
@@ -386,7 +392,7 @@ impl H2Conn {
     }
 
     /// The session a stream of this connection waits on dies with the connection: past `dead` there is no frame left to post, so a waiter would park on a sequence no peer can ever send.
-    fn bind_session(&self, sid: &str, downlink: Option<u32>) {
+    fn bind_session(&self, sid: &str, stream: u32, downlink: bool) {
         {
             let mut sessions = self.sessions.lock().unwrap_or_else(PoisonError::into_inner);
             // Every packet-up POST repeats its session's id, so the owned key is only made for a first bind.
@@ -394,15 +400,56 @@ impl H2Conn {
                 sessions.insert(sid.to_owned());
             }
         }
-        if let Some(stream) = downlink {
-            self.session_of
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .insert(stream, sid.to_owned());
-        }
+        let owner = if downlink {
+            &self.session_of
+        } else {
+            &self.upload_of
+        };
+        owner
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(stream, sid.to_owned());
         // `kill` sets `dead` before it drains this set, so a bind that raced the drain ends its own session.
         if self.dead.load(Ordering::SeqCst) {
             crate::xhttp::end_session(sid);
+        }
+    }
+
+    fn forget_upload(&self, stream: u32) {
+        self.upload_of
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&stream);
+    }
+
+    /// The session is over, so the uploads that shared it are too: mark each one ended and wake its parked reader before the connection's death is the only way out.
+    fn end_uploads(&self, sid: &str) {
+        let streams: Vec<u32> = {
+            let mut uploads = self
+                .upload_of
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let owned: Vec<u32> = uploads
+                .iter()
+                .filter(|(_, owner)| owner.as_str() == sid)
+                .map(|(stream, _)| *stream)
+                .collect();
+            for stream in &owned {
+                uploads.remove(stream);
+            }
+            owned
+        };
+        for stream in streams {
+            let state = self
+                .streams
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .remove(&stream);
+            if let Some(state) = state {
+                let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+                st.ended = true;
+                state.cv.notify_all();
+            }
         }
     }
 
@@ -414,6 +461,7 @@ impl H2Conn {
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&stream);
         if let Some(sid) = sid {
+            self.end_uploads(&sid);
             self.sessions
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -594,6 +642,7 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
         streams: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashSet::new()),
         session_of: Mutex::new(HashMap::new()),
+        upload_of: Mutex::new(HashMap::new()),
         send_conn: Mutex::new(65_535),
         wake: Condvar::new(),
         decoder: Mutex::new(Decoder::default()),
@@ -1594,6 +1643,54 @@ mod tests {
         );
     }
 
+    /// An ended session wakes the upload it was relaying: a stream-up POST parked in `H2StreamReader::read` must not hold its worker until the connection dies.
+    #[test]
+    fn an_ended_session_wakes_its_upload_reader() {
+        let sid = "h2-ended-upload";
+        crate::xhttp::start_session_for_probe(sid);
+        let (conn, _written, _slices) = bare_conn();
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                ended: false,
+                dead: false,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(65_535),
+            responded: AtomicBool::new(false),
+        });
+        conn.streams
+            .lock()
+            .expect("streams")
+            .insert(2, Arc::clone(&state));
+        let downlink = H2StreamOut {
+            conn: Arc::clone(&conn),
+            stream: 1,
+        };
+        downlink.bind_session(sid);
+        let upload = H2StreamOut {
+            conn: Arc::clone(&conn),
+            stream: 2,
+        };
+        upload.bind_upload(sid);
+        let mut reader = H2StreamReader {
+            conn,
+            stream: state,
+            id: 2,
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut byte = [0u8; 1];
+            let _ = sender.send(reader.read(&mut byte).map_err(|error| error.kind()));
+        });
+        downlink.end();
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(2)),
+            Ok(Ok(0)),
+            "the ended session ends its parked upload"
+        );
+    }
+
     #[test]
     fn h2_refusals_carry_their_statuses() {
         let (addr, server) = serve_one(test_settings("packet-up"), [0xaau8; 16], 1);
@@ -1649,6 +1746,7 @@ mod tests {
             streams: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashSet::new()),
             session_of: Mutex::new(HashMap::new()),
+            upload_of: Mutex::new(HashMap::new()),
             send_conn: Mutex::new(65_535),
             wake: Condvar::new(),
             decoder: Mutex::new(Decoder::default()),
