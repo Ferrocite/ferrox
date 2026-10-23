@@ -606,15 +606,9 @@ impl Chain for Aes {
 
     /// CBC over whole blocks: each one chains through the cipher, forward from the record's IV.
     fn encrypt(&self, iv: &[u8], body: &mut [u8]) {
-        let mut prev = <[u8; BLOCK]>::try_from(iv).expect("a CBC record carries a whole-block IV");
-        for chunk in body.as_chunks_mut::<BLOCK>().0 {
-            let mut block = *chunk;
-            for (slot, byte) in block.iter_mut().zip(prev) {
-                *slot ^= byte;
-            }
-            self.transform(&mut block, false);
-            *chunk = block;
-            prev = block;
+        match self {
+            Self::Aes128(key) => forward(key, iv, body),
+            Self::Aes256(key) => forward(key, iv, body),
         }
     }
 
@@ -669,18 +663,6 @@ impl Chain for Aes {
 }
 
 impl Aes {
-    fn transform(&self, block: &mut [u8; BLOCK], decrypt: bool) {
-        use aes::cipher::{BlockDecrypt, BlockEncrypt};
-        let mut typed = (*block).into();
-        match (self, decrypt) {
-            (Self::Aes128(key), false) => key.encrypt_block(&mut typed),
-            (Self::Aes128(key), true) => key.decrypt_block(&mut typed),
-            (Self::Aes256(key), false) => key.encrypt_block(&mut typed),
-            (Self::Aes256(key), true) => key.decrypt_block(&mut typed),
-        }
-        *block = typed.into();
-    }
-
     /// Up to `PAR` blocks through the backend in one call, the short tail inside the same call.
     fn permutation(&self, typed: &mut [Typed; PAR], count: usize) {
         use aes::cipher::BlockDecrypt;
@@ -688,6 +670,25 @@ impl Aes {
             Self::Aes128(key) => key.decrypt_blocks(&mut typed[..count]),
             Self::Aes256(key) => key.decrypt_blocks(&mut typed[..count]),
         }
+    }
+}
+
+/// The forward CBC chain of one key width, so the key's arm is chosen once per record and no branch
+/// stands between the blocks of a write that must chain each ciphertext into the next.
+fn forward<C: aes::cipher::BlockEncrypt<BlockSize = aes::cipher::consts::U16>>(
+    cipher: &C,
+    iv: &[u8],
+    body: &mut [u8],
+) {
+    let mut prev = <[u8; BLOCK]>::try_from(iv).expect("a CBC record carries a whole-block IV");
+    for chunk in body.as_chunks_mut::<BLOCK>().0 {
+        let mut typed = Typed::from(*chunk);
+        for (slot, byte) in typed.iter_mut().zip(prev) {
+            *slot ^= byte;
+        }
+        cipher.encrypt_block(&mut typed);
+        *chunk = typed.into();
+        prev = *chunk;
     }
 }
 
