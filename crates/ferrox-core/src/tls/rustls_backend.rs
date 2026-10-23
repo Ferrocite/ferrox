@@ -1268,6 +1268,65 @@ mod tests {
         ignore = "needs a loopback socket, and ring's assembly behind it"
     )]
     #[test]
+    fn a_shaped_chrome_handshake_answers_a_client_certificate_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let mut roots = RootStore::empty();
+            roots
+                .add(rustls::pki_types::CertificateDer::from(ANCHOR.to_vec()))
+                .expect("root");
+            // Asks for a client certificate and accepts an anonymous client, Go's RequestCert policy.
+            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+                Arc::new(roots),
+                provider(),
+            )
+            .allow_unauthenticated()
+            .build()
+            .expect("client verifier");
+            let cert = rustls::pki_types::CertificateDer::from(ANCHOR.to_vec());
+            let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+                rustls::pki_types::PrivatePkcs8KeyDer::from(ANCHOR_KEY.to_vec()),
+            );
+            let mut config = rustls::ServerConfig::builder_with_provider(provider())
+                .with_safe_default_protocol_versions()
+                .expect("server versions")
+                .with_client_cert_verifier(verifier)
+                .with_single_cert(vec![cert], key)
+                .expect("server cert");
+            config.alpn_protocols = vec![b"http/1.1".to_vec()];
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut conn = rustls::ServerConnection::new(Arc::new(config)).expect("server session");
+            {
+                let mut tls = rustls::Stream::new(&mut conn, &mut stream);
+                let mut buf = [0u8; 4];
+                tls.read_exact(&mut buf)
+                    .unwrap_or_else(|e| panic!("server read: {e:?}"));
+                tls.write_all(&buf).expect("writes");
+                tls.flush().expect("flushes");
+            }
+            // Reading the ping means the dial's flight went through, with no certificate in it.
+            assert!(conn.peer_certificates().is_none());
+        });
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut cfg = client("tls.test", &[]);
+        cfg.fingerprint = Some(crate::tls::Fingerprint::default());
+        let mut session = crate::tls::connect(&cfg, stream).expect("dials");
+        session.handshake().expect("handshakes");
+        assert_eq!(session.alpn(), Some(b"http/1.1".as_slice()));
+        session.write_all(b"ping").expect("writes");
+        session.flush().expect("flushes");
+        let mut buf = [0u8; 4];
+        session.read_exact(&mut buf).expect("reads");
+        assert_eq!(&buf, b"ping");
+        server.join().expect("joins");
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
     fn a_shaped_record_relays_without_allocating_once_the_handshake_is_done() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
