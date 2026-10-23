@@ -203,11 +203,11 @@ impl TokenFile {
         }
     }
 
-    /// Another process refreshes a rotating grant in this file, so a token this launch loaded may already be spent; the file's newer grant is the one to use.
-    pub(crate) fn rotated_since(&self, stale: &Auth, now: u64) -> Option<Auth> {
+    /// Another process refreshes a rotating grant in this file, so a token this launch loaded may already be spent; the pair the file names instead is the one to spend.
+    pub(crate) fn rotated_from(&self, access: &str) -> Option<Auth> {
         self.load()
             .and_then(|session| session.auth)
-            .filter(|fresh| fresh.access_token != stale.access_token && fresh.valid_at(now))
+            .filter(|fresh| fresh.access_token != access)
     }
 
     /// The refused grant only stops a future launch when the file still holds it; a grant another process rotated in since is left alone.
@@ -1084,14 +1084,20 @@ impl Account {
 
     /// Sets the new grant before minting so a refresh that is written but not yet used still renews the next launch.
     fn refresh(&self, stale: &Auth) -> Result<Auth, Denied> {
-        if let Some(fresh) = self.adopt(stale) {
-            return Ok(fresh);
+        // Another lane may have rotated the file's grant since this launch loaded it: that refresh token is the live one, even when its access token has lapsed.
+        let base = self
+            .tokens
+            .as_ref()
+            .and_then(|tokens| tokens.rotated_from(&stale.access_token))
+            .unwrap_or_else(|| stale.clone());
+        if base.valid_at(epoch()) {
+            return Ok(self.adopt(base));
         }
         let fresh = match token(
             &self.fxa,
             &self.jar,
             None,
-            Some(&stale.refresh_token),
+            Some(&base.refresh_token),
             &nonce(),
             epoch(),
         ) {
@@ -1101,7 +1107,12 @@ impl Account {
                 let mut adopted = None;
                 for _ in 0..5 {
                     std::thread::sleep(std::time::Duration::from_millis(200));
-                    adopted = self.adopt(stale);
+                    adopted = self
+                        .tokens
+                        .as_ref()
+                        .and_then(|tokens| tokens.rotated_from(&base.access_token))
+                        .filter(|fresh| fresh.valid_at(epoch()))
+                        .map(|fresh| self.adopt(fresh));
                     if adopted.is_some() {
                         break;
                     }
@@ -1115,13 +1126,12 @@ impl Account {
         Ok(fresh)
     }
 
-    /// The grant the file's writer rotated in since this launch loaded `stale`, kept in memory so the pass and the next refresh use it.
-    fn adopt(&self, stale: &Auth) -> Option<Auth> {
-        let fresh = self.tokens.as_ref()?.rotated_since(stale, epoch())?;
+    /// The grant another lane rotated in, kept in memory so the pass and the next refresh use it.
+    fn adopt(&self, fresh: Auth) -> Auth {
         if let Ok(mut auth) = self.auth.lock() {
             *auth = fresh.clone();
         }
-        Some(fresh)
+        fresh
     }
 
     fn persist(&self) {
@@ -1851,6 +1861,44 @@ mod loopback {
         assert!(
             !log.iter().any(|line| line == "POST /v1/oauth/token"),
             "an adopted grant is not spent again: {log:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A rotated-in grant whose access token has also lapsed still carries the live refresh token: that is the one spent, not the dead one this launch loaded.
+    #[test]
+    fn an_expired_grant_another_process_wrote_is_refreshed_with_its_own_token() {
+        let _turn = EDGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (address, roots, _rx) = edge_with_log();
+        let path = token_path("handoff-expired");
+        let tokens =
+            TokenFile::new(path.to_str().expect("utf-8"), "person@example.com").expect("bound");
+        let stale = Auth {
+            access_token: "access-1".to_owned(),
+            refresh_token: "refresh-dead".to_owned(),
+            expires_at: 1,
+        };
+        tokens.save(Some(&stale), None);
+        let mut account = account(address, roots);
+        account.tokens = Some(tokens.clone());
+        tokens.save(
+            Some(&Auth {
+                access_token: "access-9".to_owned(),
+                refresh_token: "refresh-1".to_owned(),
+                expires_at: 1,
+            }),
+            None,
+        );
+        let fresh = account
+            .refresh(&stale)
+            .expect("refreshes the adopted grant");
+        assert_eq!(
+            (fresh.access_token.as_str(), fresh.refresh_token.as_str()),
+            ("access-2", "refresh-2"),
+            "the adopted grant's live refresh token is the one spent"
         );
         let _ = std::fs::remove_file(&path);
     }
