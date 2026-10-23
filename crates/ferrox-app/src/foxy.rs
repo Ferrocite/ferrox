@@ -1481,7 +1481,7 @@ impl Tls2 {
         let Ok(mut inner) = self.inner() else {
             return;
         };
-        if inner.gone {
+        if inner.gone || !inner.streams.contains_key(&self.stream) {
             return;
         }
         let mut reset = Vec::with_capacity(frames::H2_HEADER + 4);
@@ -3488,23 +3488,18 @@ impl Tunnel {
         }
     }
 
-    /// Returns this flow's stream to the session, or stops it: a flow whose stream did not end both ways is not a stream the session may carry again, and an edge still sending into it is charged for bytes nobody reads.
-    pub(crate) fn settle(self) {
-        match self {
-            Self::H2(mut lane) => {
-                if !lane.reusable() {
-                    let _ = lane.flush_credit();
-                    lane.cancel();
-                    return;
-                }
-                if lane.flush_credit().is_err() {
-                    return;
-                }
-                lane.release();
-            }
-            Self::H3(lane) if !lane.closed && !lane.fin => lane.quic.cancel(),
-            Self::H3(_) | Self::H1(_) => {}
+    /// Returns this flow's stream to the session when both halves ended; one that did not is left to the lane's drop, which resets it.
+    pub(crate) fn settle(mut self) {
+        let Self::H2(lane) = &mut self else {
+            return;
+        };
+        if !lane.reusable() {
+            return;
         }
+        if lane.flush_credit().is_err() {
+            return;
+        }
+        lane.release();
     }
 
     /// Bounds one blocking read on every carrier so a relay sharing one lane between its two directions stops holding its lock while idle: reads past the quantum answer `WouldBlock` and the relay retries instead of wedging.
@@ -3537,6 +3532,24 @@ impl Tunnel {
             Self::H1(lane) => lane.read_wait(),
             Self::H2(lane) => lane.read_wait(),
             Self::H3(lane) => lane.read_wait(),
+        }
+    }
+}
+
+impl Drop for Tunnel {
+    /// Ends a lane no settle handed back — a client gone before its grant, a failed write — because an h2 stream left open keeps the edge fetching into a window nobody drains, charged to the account, and an h3 stream half-open is still being filled.
+    fn drop(&mut self) {
+        match self {
+            Self::H2(lane) => {
+                if lane.reusable() {
+                    lane.release();
+                } else {
+                    let _ = lane.flush_credit();
+                    lane.cancel();
+                }
+            }
+            Self::H3(lane) if !lane.closed && !lane.fin => lane.quic.cancel(),
+            Self::H3(_) | Self::H1(_) => {}
         }
     }
 }
