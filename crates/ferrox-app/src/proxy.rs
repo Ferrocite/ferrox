@@ -17865,6 +17865,38 @@ mod tests {
         }
     }
 
+    /// The X25519 key behind `ECH_CONFIG`'s public half, for one loopback listener.
+    const ECH_PRIVATE_KEY: [u8; 32] = [
+        0x78, 0xb5, 0xc8, 0x5f, 0x0f, 0x03, 0x50, 0x06, 0x9b, 0x97, 0x32, 0x9f, 0x44, 0x8e, 0xbe,
+        0x95, 0x8e, 0x4b, 0x34, 0x77, 0x71, 0x3d, 0x5a, 0xc6, 0x51, 0x0c, 0x69, 0x51, 0x98, 0xd1,
+        0xe8, 0x78,
+    ];
+
+    /// An ECHConfig for `public.test` whose X25519 public half matches `ECH_PRIVATE_KEY`.
+    const ECH_CONFIG: &[u8] = &[
+        0xfe, 0x0d, 0x00, 0x3a, 0x07, 0x00, 0x20, 0x00, 0x20, 0x2a, 0xb0, 0xe0, 0x4c, 0x48, 0x44,
+        0x9d, 0xa1, 0x19, 0x81, 0x50, 0xc8, 0xf0, 0x45, 0xf0, 0x35, 0xd0, 0xb8, 0xb1, 0xca, 0xc4,
+        0x0c, 0x29, 0xcd, 0x46, 0x0b, 0xbf, 0xae, 0x95, 0xb8, 0xd7, 0x03, 0x00, 0x04, 0x00, 0x01,
+        0x00, 0x01, 0x00, 0x0b, 0x70, 0x75, 0x62, 0x6c, 0x69, 0x63, 0x2e, 0x74, 0x65, 0x73, 0x74,
+        0x00, 0x00,
+    ];
+
+    fn ech_config_list() -> Vec<u8> {
+        let mut list = Vec::with_capacity(2 + ECH_CONFIG.len());
+        list.extend_from_slice(&(ECH_CONFIG.len() as u16).to_be_bytes());
+        list.extend_from_slice(ECH_CONFIG);
+        list
+    }
+
+    fn ech_server_key_tlv() -> Vec<u8> {
+        let mut keys = Vec::with_capacity(4 + ECH_PRIVATE_KEY.len() + ECH_CONFIG.len());
+        keys.extend_from_slice(&(ECH_PRIVATE_KEY.len() as u16).to_be_bytes());
+        keys.extend_from_slice(&ECH_PRIVATE_KEY);
+        keys.extend_from_slice(&(ECH_CONFIG.len() as u16).to_be_bytes());
+        keys.extend_from_slice(ECH_CONFIG);
+        keys
+    }
+
     fn carried_tls_configs() -> (
         std::sync::Arc<ferrox_core::tls::TlsServerConfig>,
         ferrox_core::tls::TlsConfig,
@@ -19300,6 +19332,68 @@ mod tests {
         drop(sock);
         relay.join().expect("joins");
         server.join().expect("joins");
+    }
+
+    /// The listener's ECH path reaches the same VLESS relay as a plain TLS listener: the client's
+    /// offer is accepted, the inner name is the configured one, and the target still echoes.
+    #[test]
+    fn vless_over_ech_tls_carries_an_echo() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, mut client_config) = carried_tls_configs();
+        let mut server_config = (*server_config).clone();
+        server_config.ech_server_keys = Some(ech_server_key_tlv().into());
+        let server_config = std::sync::Arc::new(server_config);
+        client_config.ech_config_list = Some(ech_config_list().into());
+
+        let id = [0x4Au8; 16];
+        let target = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let target_addr = target.local_addr().expect("addr");
+        let filler = thread::spawn(move || {
+            let (mut stream, _) = target.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(120)))
+                .expect("timeout");
+            let mut buf = [0u8; 512];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        stream.write_all(&buf[..n]).expect("echoes");
+                        stream.flush().expect("flushes");
+                    }
+                }
+            }
+        });
+        let inbound = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = inbound.local_addr().expect("addr").port();
+        let proxy = thread::spawn(move || {
+            let (stream, _) = inbound.accept().expect("accepts");
+            serve_vless_tls(
+                stream,
+                &id,
+                true,
+                &Carrier::Raw(Chain::default()),
+                &server_config,
+            );
+        });
+        let mut session = ferrox_core::tls::RustlsProvider::connect(
+            &client_config,
+            Connection::connect(("127.0.0.1", port)).expect("connects"),
+        )
+        .expect("opens");
+        session.handshake().expect("handshakes");
+        let header = vless_header(&id, 1, &Destination::from(target_addr));
+        session.write_all(&header).expect("writes the request");
+        let mut answer = [0u8; 2];
+        session.read_exact(&mut answer).expect("reads the answer");
+        session.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        session.read_exact(&mut back).expect("reads the echo");
+        assert_eq!(&back, b"ping");
+        drop(session);
+        proxy.join().expect("joins");
+        filler.join().expect("joins");
     }
 
     #[test]
