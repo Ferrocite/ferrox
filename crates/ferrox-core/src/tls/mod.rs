@@ -30,6 +30,9 @@ pub struct TlsConfig {
     pub insecure: bool,
     /// The browser hello to shape, or `None` to keep the stock rustls hello.
     pub fingerprint: Option<shaped::Fingerprint>,
+    /// The ECH config list a client encrypts its inner hello with, fetched or decoded
+    /// before the dial; `None` keeps the hello plaintext.
+    pub ech_config_list: Option<std::sync::Arc<[u8]>>,
     /// Whether the carrier is a WebSocket or `HTTPUpgrade`: xray's parrots then force
     /// the outer ALPN to `http/1.1` so the upgrade reads as an ordinary browser.
     pub websocket: bool,
@@ -272,6 +275,19 @@ fn pem_blocks(pem: &[u8], label: &str) -> Vec<Vec<u8>> {
 }
 
 pub mod cipher_suites;
+mod ech;
+mod hpke;
+
+/// The ECH config list a client config names, decoded from base64 or a PEM `ECH CONFIGS` block.
+pub fn decode_ech_config(text: &str) -> Result<Vec<u8>, String> {
+    ech::decode_source(text, "ECH CONFIGS")
+}
+
+/// A single ECH config wrapped as the one-entry list every client expects.
+pub fn normalize_ech_config_list(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
+    ech::normalize_config_list(bytes)
+}
+
 mod rustls_backend;
 pub use rustls_backend::{RustlsProvider, RustlsServerProvider};
 
