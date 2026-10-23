@@ -14,6 +14,7 @@ const ALERT: u8 = 21;
 const CCS: u8 = 20;
 const APPLICATION: u8 = 23;
 const MAX_RECORD: usize = 16384 + 256;
+const RECORD_READ: usize = 16384;
 const MAX_HANDSHAKE: usize = 1 << 20;
 const MAX_PLAINTEXT: usize = 16384;
 
@@ -636,38 +637,27 @@ impl<S: Stream> Session<S> {
         verify_signature(leaf, scheme, &content, signature)
     }
 
-    fn pump(&mut self) -> Result<(), TlsError> {
+    fn pump(&mut self, buf: &mut [u8]) -> Result<usize, TlsError> {
         loop {
             if self.plain_at < self.plain_end {
-                return Ok(());
+                return Ok(self.deliver(buf));
             }
-            let kind = match self.read_record() {
-                Ok(kind) => kind,
-                Err(TlsError::Closed) => {
+            if self.eof {
+                return Ok(0);
+            }
+            let filled = self.process_inbuf(buf)?;
+            if filled > 0 {
+                return Ok(filled);
+            }
+            let mut chunk = [0u8; RECORD_READ];
+            match self.io.read(&mut chunk) {
+                Ok(0) => {
                     self.eof = true;
-                    return Ok(());
+                    return Ok(0);
                 }
-                Err(error) => return Err(error),
-            };
-            match kind {
-                APPLICATION => return Ok(()),
-                HANDSHAKE => {
-                    let (at, end) = (self.plain_at, self.plain_end);
-                    self.hs.extend_from_slice(&self.plain[at..end]);
-                    self.take_pending();
-                    self.post_handshake()?;
-                }
-                ALERT => {
-                    let error = alert(self.pending());
-                    self.take_pending();
-                    if error == TlsError::Closed {
-                        self.eof = true;
-                        return Ok(());
-                    }
-                    return Err(error);
-                }
-                CCS => self.take_pending(),
-                other => return Err(unexpected(other)),
+                Ok(n) => self.inbuf.extend_from_slice(&chunk[..n]),
+                Err(error) if TlsError::is_timeout(&error) => return Err(TlsError::Timeout),
+                Err(error) => return Err(TlsError::from(error)),
             }
         }
     }
@@ -1028,10 +1018,7 @@ impl<S: Stream> Read for Session<S> {
             self.run().map_err(std::io::Error::other)?;
         }
         self.flush_reply()?;
-        if self.plain_at >= self.plain_end {
-            self.pump().map_err(std::io::Error::other)?;
-        }
-        Ok(self.deliver(buf))
+        self.pump(buf).map_err(std::io::Error::other)
     }
 }
 
