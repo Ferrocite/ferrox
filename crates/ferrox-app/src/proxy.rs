@@ -9653,16 +9653,14 @@ fn xudp_datagram<'a>(
     (header.as_slice(), payload)
 }
 
-/// One SOCKS5 UDP reply as its two parts: the request head and the payload that arrived. The reply
-/// socket takes both by pointer, so a datagram is not gathered into a second buffer first.
-fn udp_reply_parts<'a>(
+/// One SOCKS5 UDP frame as its two parts: the head this tree builds and the payload that arrived.
+/// The socket takes both by pointer, so a datagram is not gathered into a second buffer first.
+pub(crate) fn socks_udp_parts<'a>(
     head: &'a mut Vec<u8>,
     target: &SocketAddr,
     payload: &'a [u8],
 ) -> (&'a [u8], &'a [u8]) {
-    head.clear();
-    head.extend_from_slice(&[0, 0, 0]);
-    push_socks_addr(head, target);
+    socks_udp_head(head, target);
     (head.as_slice(), payload)
 }
 
@@ -9700,7 +9698,7 @@ fn spawn_xudp_reader(
                         let Some(dest) = source.lock().ok().and_then(|slot| *slot) else {
                             continue;
                         };
-                        let (front, tail) = udp_reply_parts(&mut head, &target, data);
+                        let (front, tail) = socks_udp_parts(&mut head, &target, data);
                         let _ = send_to_two(&reply, front, tail, dest);
                     }
                 }
@@ -11463,24 +11461,44 @@ pub(crate) fn two_iovecs(first: &[u8], second: &[u8]) -> [libc::iovec; 2] {
     ]
 }
 
-/// One datagram as its two parts. `sendmsg` hands the head and the caller's payload to the kernel
-/// by pointer, so a reply is not gathered into a second buffer first; a platform without it joins
-/// the parts, which is the same datagram in the same one call. The pointer gate
-/// `a_udp_reply_hands_the_payload_over_by_pointer` is what can see the difference.
+/// One datagram as its two parts on a connected socket: `sendmsg` on unix and `WSASend` on
+/// windows hand the head and the caller's payload to the kernel by pointer, so the payload is
+/// never gathered into a second buffer. A platform without either joins the parts. The pointer
+/// gate `a_udp_reply_hands_the_payload_over_by_pointer` is what can see the difference.
+pub(crate) fn send_two(socket: &UdpSocket, first: &[u8], second: &[u8]) -> std::io::Result<usize> {
+    send_parts(socket, first, second, None)
+}
+
+/// One datagram as its two parts to `dest`. The server's answer socket is not connected, so the
+/// address rides the same call.
 fn send_to_two(
     socket: &UdpSocket,
     first: &[u8],
     second: &[u8],
     dest: SocketAddr,
 ) -> std::io::Result<usize> {
+    send_parts(socket, first, second, Some(dest))
+}
+
+/// The platform call behind `send_two` and `send_to_two`.
+fn send_parts(
+    socket: &UdpSocket,
+    first: &[u8],
+    second: &[u8],
+    dest: Option<SocketAddr>,
+) -> std::io::Result<usize> {
     #[cfg(unix)]
     {
         use std::os::fd::AsRawFd as _;
         let mut parts = two_iovecs(first, second);
-        let (storage, len) = sockaddr_of(dest);
+        let mut storage = std::mem::MaybeUninit::<libc::sockaddr_storage>::uninit();
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-        msg.msg_name = (&raw const storage).cast_mut().cast();
-        msg.msg_namelen = len;
+        if let Some(dest) = dest {
+            let (addr, len) = sockaddr_of(dest);
+            storage.write(addr);
+            msg.msg_name = storage.as_mut_ptr().cast();
+            msg.msg_namelen = len;
+        }
         msg.msg_iov = parts.as_mut_ptr();
         // glibc sizes `msg_iovlen` as a `usize`, every other unix in scope as a 32-bit count.
         #[cfg(target_os = "linux")]
@@ -11489,7 +11507,7 @@ fn send_to_two(
         let count: libc::c_int = parts.len().try_into().expect("two iovecs fit the field");
         msg.msg_iovlen = count;
         loop {
-            // SAFETY: `msg` names `parts` and `storage`, both live and sized as the call reads them.
+            // SAFETY: `msg` names `parts` and the `sockaddr` storage, both live and sized as the call reads them.
             let sent = unsafe { libc::sendmsg(socket.as_raw_fd(), &raw const msg, 0) };
             if sent >= 0 {
                 return Ok(sent as usize);
@@ -11500,12 +11518,61 @@ fn send_to_two(
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        if let Some(dest) = dest {
+            let mut one = Vec::with_capacity(first.len() + second.len());
+            one.extend_from_slice(first);
+            one.extend_from_slice(second);
+            return socket.send_to(&one, dest);
+        }
+        use std::os::windows::io::AsRawSocket as _;
+        use windows_sys::Win32::Networking::WinSock::{
+            WSAGetLastError, WSASend, SOCKET, SOCKET_ERROR, WSABUF,
+        };
+        let parts = [
+            WSABUF {
+                len: first.len() as u32,
+                buf: first.as_ptr().cast_mut(),
+            },
+            WSABUF {
+                len: second.len() as u32,
+                buf: second.as_ptr().cast_mut(),
+            },
+        ];
+        loop {
+            let mut sent = 0u32;
+            // SAFETY: `parts` describes the caller's buffers, live and read-only for the call; a blocking socket takes no overlapped or completion routine.
+            let code = unsafe {
+                WSASend(
+                    socket.as_raw_socket() as SOCKET,
+                    parts.as_ptr(),
+                    parts.len() as u32,
+                    &raw mut sent,
+                    0,
+                    std::ptr::null_mut(),
+                    None,
+                )
+            };
+            if code == SOCKET_ERROR {
+                let error = std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() });
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+                continue;
+            }
+            return Ok(sent as usize);
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let mut one = Vec::with_capacity(first.len() + second.len());
         one.extend_from_slice(first);
         one.extend_from_slice(second);
-        socket.send_to(&one, dest)
+        match dest {
+            Some(dest) => socket.send_to(&one, dest),
+            None => socket.send(&one),
+        }
     }
 }
 
@@ -11854,8 +11921,14 @@ pub(crate) fn push_socks_addr(out: &mut Vec<u8>, addr: &SocketAddr) {
     out.extend_from_slice(&addr.port().to_be_bytes());
 }
 
-/// The SOCKS5 UDP frame to send for a datagram: the reserved bytes, the fragment byte,
-/// the address and the payload.
+/// The head of a SOCKS5 UDP frame: the reserved bytes, the fragment byte and the address.
+fn socks_udp_head(out: &mut Vec<u8>, dest: &SocketAddr) {
+    out.clear();
+    out.extend_from_slice(&[0, 0, 0]);
+    push_socks_addr(out, dest);
+}
+
+/// The SOCKS5 UDP frame to send for a datagram: the head and the payload.
 ///
 /// `client` is the frame the datagram arrived in, where there is one. When the frame
 /// this tree would build is byte for byte that frame, the datagram is sent as it
@@ -11869,9 +11942,7 @@ pub(crate) fn socks_udp_frame<'a>(
     dest: &SocketAddr,
     payload: &'a [u8],
 ) -> &'a [u8] {
-    out.clear();
-    out.extend_from_slice(&[0, 0, 0]);
-    push_socks_addr(out, dest);
+    socks_udp_head(out, dest);
     let head = out.len();
     if let Some(client) = client {
         if client.len() == head + payload.len() && client[..head] == out[..head] {
@@ -21894,7 +21965,7 @@ mod tests {
         let target: SocketAddr = "198.51.100.7:5353".parse().expect("addr");
         let payload: Vec<u8> = (0..512).map(|i| (i as u8) ^ 0x0f).collect();
         let mut head = Vec::with_capacity(HEAD);
-        let (front, tail) = udp_reply_parts(&mut head, &target, &payload);
+        let (front, tail) = socks_udp_parts(&mut head, &target, &payload);
         assert_eq!(
             tail.as_ptr(),
             payload.as_ptr(),
@@ -21915,6 +21986,29 @@ mod tests {
             10,
             "three bytes, an ipv4 family, its body and a port"
         );
+    }
+
+    /// The two-part call delivers the head and the payload as one datagram, on every host: the
+    /// bytes are the same ones a gathered buffer would send.
+    #[test]
+    fn a_datagram_sent_as_two_parts_arrives_whole() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        sender
+            .connect(receiver.local_addr().expect("addr"))
+            .expect("connects");
+        let head = [0u8, 0, 0, 1, 127, 0, 0, 1, 0, 53];
+        let payload = b"query";
+        assert_eq!(
+            send_two(&sender, &head, payload).expect("sends"),
+            head.len() + payload.len()
+        );
+        let mut buf = [0u8; 64];
+        let (n, _) = receiver.recv_from(&mut buf).expect("receives");
+        assert_eq!(&buf[..n], b"\0\0\0\x01\x7f\0\0\x01\0\x35query");
     }
 
     /// What a framed write reached the session with: the call shape, which a byte test cannot see.
