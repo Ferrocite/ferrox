@@ -2,10 +2,11 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, LazyLock, Mutex, OnceLock};
 
 use crate::conn::Connection;
+use base64::Engine as _;
 use ferrox_core::transport::url_decode;
 
 const HEAD_LIMIT: usize = 64 * 1024;
@@ -169,6 +170,7 @@ pub(crate) struct Reader<R> {
     left: usize,
     ended: bool,
     reads: usize,
+    pending_head: bool,
 }
 
 pub(crate) type XhttpReader = Reader<Connection>;
@@ -228,6 +230,27 @@ impl<R: Read> Reader<R> {
 }
 
 impl<R: Read> Reader<R> {
+    /// The answer head is read on the first read, not at the dial: the reference dialer returns once the socket is up and lets the first body byte pull the response (client.go:97), and a hub that flushes only past the request body would otherwise deadlock the dial.
+    fn parse_head(&mut self) -> std::io::Result<()> {
+        if !self.pending_head {
+            return Ok(());
+        }
+        self.pending_head = false;
+        let Some((head, at)) = crate::proxy::read_exact_head(
+            &mut self.read,
+            HEAD_LIMIT,
+            crate::budgets::head_arrival(),
+        ) else {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        };
+        if check_response(&head[..at]).is_none() {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        }
+        self.prefix = head;
+        self.at = at;
+        Ok(())
+    }
+
     fn body(&mut self, buf: &mut [u8]) -> Option<usize> {
         if self.at < self.prefix.len() {
             let n = (self.prefix.len() - self.at).min(buf.len());
@@ -248,8 +271,90 @@ pub(crate) struct XhttpWriter {
     h2: OnceLock<crate::xhttp_h2::H2StreamOut>,
 }
 
+/// A carrier byte stream the packet frame also reads, so a POST's answer is consumed before the next shares the connection.
+trait FrameStream: crate::proxy::FrameWrite + Read {}
+
+impl<T: crate::proxy::FrameWrite + Read> FrameStream for T {}
+
+enum Body {
+    Stream(Mutex<Box<dyn crate::proxy::FrameWrite + Send>>),
+    Packets(Box<Packets>),
+}
+
+/// The packet-up upload: one POST per slice, each with its own seq and the answer read before the next.
+struct Packets {
+    stream: Mutex<Box<dyn FrameStream + Send>>,
+    host: String,
+    settings: XhttpSettings,
+    session: String,
+    seq: AtomicU64,
+    last: Mutex<Option<std::time::Instant>>,
+}
+
+impl Packets {
+    fn send(&self, data: &[u8]) -> bool {
+        let Ok(mut stream) = self.stream.lock() else {
+            return false;
+        };
+        let max = self.settings.sc_max_each_post.max(1);
+        let Ok(mut last) = self.last.lock() else {
+            return false;
+        };
+        for piece in data.chunks(max) {
+            if piece.is_empty() {
+                continue;
+            }
+            // The reference paces the posts from the second one (`dialer.go:520`), gated on the range's `from`.
+            if let Some(since) = *last {
+                let (from, to) = self.settings.sc_min_posts_interval_ms;
+                if from > 0 {
+                    let want = std::time::Duration::from_millis(
+                        u64::try_from(random_between(from as usize, to as usize)).unwrap_or(0),
+                    );
+                    if let Some(pause) = want.checked_sub(since.elapsed()) {
+                        std::thread::sleep(pause);
+                    }
+                }
+            }
+            *last = Some(std::time::Instant::now());
+            let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+            let (head, body) = packet_head(&self.host, &self.settings, &self.session, seq, piece);
+            let wrote = match body {
+                Some(body) => stream.write_slices(&[head.as_bytes(), body]),
+                None => stream.write_all(head.as_bytes()).is_ok(),
+            };
+            if !wrote || !drain_answer(&mut **stream as &mut dyn Read) {
+                return false;
+            }
+        }
+        true
+    }
+}
+
+/// A packet-up POST answers 200 with no body; anything else is a dead upload.
+fn drain_answer(stream: &mut dyn Read) -> bool {
+    let Some((head, at)) =
+        crate::proxy::read_exact_head(stream, HEAD_LIMIT, crate::budgets::head_arrival())
+    else {
+        return false;
+    };
+    if !ok_status(&head[..at]) {
+        return false;
+    }
+    let mut left = content_length(&head[..at]).unwrap_or(0);
+    let mut sink = [0u8; 256];
+    while left > 0 {
+        let want = left.min(sink.len());
+        match stream.read(&mut sink[..want]) {
+            Ok(0) | Err(_) => return false,
+            Ok(n) => left -= n,
+        }
+    }
+    true
+}
+
 struct Shared {
-    stream: Mutex<Box<dyn crate::proxy::FrameWrite + Send>>,
+    body: Body,
     finished: AtomicBool,
 }
 
@@ -266,6 +371,7 @@ impl<R: Read> Read for Reader<R> {
         if buf.is_empty() {
             return Ok(0);
         }
+        self.parse_head()?;
         loop {
             if self.ended {
                 return Ok(0);
@@ -335,7 +441,30 @@ impl XhttpWriter {
     pub(crate) fn new<W: crate::proxy::FrameWrite + Send + 'static>(w: W) -> Self {
         Self {
             shared: Arc::new(Shared {
-                stream: Mutex::new(Box::new(w) as Box<dyn crate::proxy::FrameWrite + Send>),
+                body: Body::Stream(Mutex::new(
+                    Box::new(w) as Box<dyn crate::proxy::FrameWrite + Send>
+                )),
+                finished: AtomicBool::new(false),
+            }),
+            h2: OnceLock::new(),
+        }
+    }
+    fn packets<W: crate::proxy::FrameWrite + Read + Send + 'static>(
+        w: W,
+        host: &str,
+        settings: &XhttpSettings,
+        session: String,
+    ) -> Self {
+        Self {
+            shared: Arc::new(Shared {
+                body: Body::Packets(Box::new(Packets {
+                    stream: Mutex::new(Box::new(w) as Box<dyn FrameStream + Send>),
+                    host: host.to_owned(),
+                    settings: settings.clone(),
+                    session,
+                    seq: AtomicU64::new(0),
+                    last: Mutex::new(None),
+                })),
                 finished: AtomicBool::new(false),
             }),
             h2: OnceLock::new(),
@@ -348,7 +477,11 @@ impl XhttpWriter {
         if let Some(h2) = self.h2.get() {
             return h2.data(data);
         }
-        let Ok(mut stream) = self.shared.stream.lock() else {
+        let stream = match &self.shared.body {
+            Body::Stream(stream) => stream,
+            Body::Packets(packets) => return packets.send(data),
+        };
+        let Ok(mut stream) = stream.lock() else {
             return false;
         };
         for piece in data.chunks(CHUNK) {
@@ -371,7 +504,11 @@ impl XhttpWriter {
             h2.end();
             return;
         }
-        let Ok(mut stream) = self.shared.stream.lock() else {
+        let Body::Stream(stream) = &self.shared.body else {
+            // A packet-up upload has no end frame: the downlink's close ends the session.
+            return;
+        };
+        let Ok(mut stream) = stream.lock() else {
             return;
         };
         let _ = stream.write_all(b"0\r\n\r\n");
@@ -413,10 +550,13 @@ fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
         left: 0,
         ended: false,
         reads: 0,
+        pending_head: false,
     };
     let writer = XhttpWriter {
         shared: Arc::new(Shared {
-            stream: Mutex::new(Box::new(write) as Box<dyn crate::proxy::FrameWrite + Send>),
+            body: Body::Stream(Mutex::new(
+                Box::new(write) as Box<dyn crate::proxy::FrameWrite + Send>
+            )),
             finished: AtomicBool::new(false),
         }),
         h2: OnceLock::new(),
@@ -508,6 +648,7 @@ pub(crate) enum PadMethod {
 #[derive(Debug, Clone)]
 pub(crate) struct XhttpSettings {
     pub path: String,
+    pub query: String,
     pub mode: XhttpMode,
     pub mode_source: ModeSource,
     pub session_placement: Placement,
@@ -516,7 +657,10 @@ pub(crate) struct XhttpSettings {
     pub seq_key: String,
     pub uplink_data_placement: Placement,
     pub uplink_data_key: String,
+    pub uplink_chunk: (usize, usize),
     pub uplink_method: String,
+    pub session_id_length: (usize, usize),
+    pub session_id_table: String,
     pub x_padding_bytes: (u32, u32),
     pub x_padding_obfs: bool,
     pub x_padding_placement: Placement,
@@ -525,15 +669,41 @@ pub(crate) struct XhttpSettings {
     pub x_padding_method: PadMethod,
     pub sc_max_each_post: usize,
     pub sc_max_buffered: usize,
-    pub sc_min_posts_interval_ms: u64,
+    pub sc_min_posts_interval_ms: (u64, u64),
     pub no_sse: bool,
     pub no_grpc_header: bool,
 }
 
 impl XhttpSettings {
+    /// `GenerateSessionID` (config.go:511): a named or literal table at a positive length draws the id, and anything else mints the UUID the reference's default uses.
+    fn session_id(&self) -> String {
+        let table = match self.session_id_table.as_str() {
+            "ALPHABET" => "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "Alphabet" => "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+            "BASE36" => "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+            "Base62" => "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz",
+            "HEX" => "0123456789ABCDEF",
+            "alphabet" => "abcdefghijklmnopqrstuvwxyz",
+            "base36" => "0123456789abcdefghijklmnopqrstuvwxyz",
+            "hex" => "0123456789abcdef",
+            "number" => "0123456789",
+            other => other,
+        };
+        let length = random_between(self.session_id_length.0, self.session_id_length.1);
+        if table.is_empty() || length == 0 {
+            return uuid_v4();
+        }
+        let mut raw = vec![0u8; length];
+        getrandom::fill(&mut raw).unwrap_or_default();
+        raw.iter()
+            .map(|byte| table.as_bytes()[usize::from(*byte) % table.len()] as char)
+            .collect()
+    }
+
     pub(crate) fn stream_one() -> Self {
         Self {
             path: "/".to_owned(),
+            query: String::new(),
             mode: XhttpMode::StreamOne,
             mode_source: ModeSource::Auto,
             session_placement: Placement::Path,
@@ -542,7 +712,10 @@ impl XhttpSettings {
             seq_key: String::new(),
             uplink_data_placement: Placement::Body,
             uplink_data_key: String::new(),
+            uplink_chunk: (1_000_000, 1_000_000),
             uplink_method: "POST".to_owned(),
+            session_id_length: (0, 0),
+            session_id_table: String::new(),
             x_padding_bytes: (100, 1000),
             x_padding_obfs: false,
             x_padding_placement: Placement::Header,
@@ -551,7 +724,7 @@ impl XhttpSettings {
             x_padding_method: PadMethod::RepeatX,
             sc_max_each_post: 1_000_000,
             sc_max_buffered: 30,
-            sc_min_posts_interval_ms: 30,
+            sc_min_posts_interval_ms: (30, 30),
             no_sse: false,
             no_grpc_header: false,
         }
@@ -574,15 +747,17 @@ impl XhttpSettings {
             };
         };
         let mut out = XhttpSettings::stream_one();
-        let mut path = xhttp
+        // The path is a path plus the query that rode with it (`config.go:20`, `:38`): a session or seq segment still lands under the path, and the query rides on every dial head.
+        let raw_path = xhttp
             .get("path")
             .and_then(crate::json::Json::as_str)
-            .unwrap_or("/")
-            .to_owned();
-        if !path.starts_with('/') {
-            path.insert(0, '/');
+            .unwrap_or("/");
+        let (path, query) = raw_path.split_once('?').unwrap_or((raw_path, ""));
+        query.clone_into(&mut out.query);
+        path.clone_into(&mut out.path);
+        if !out.path.starts_with('/') {
+            out.path.insert(0, '/');
         }
-        out.path = path;
         let raw = xhttp
             .get("mode")
             .and_then(crate::json::Json::as_str)
@@ -656,10 +831,16 @@ impl XhttpSettings {
         {
             return None;
         }
+        // `AnalogConfig`'s uplinkData key defaults (`config.go:65-97`): `x_data` on cookies, `X-Data` on headers.
+        let data_key = match out.uplink_data_placement {
+            Placement::Cookie => "x_data",
+            Placement::Header | Placement::Auto => "X-Data",
+            _ => "",
+        };
         xhttp
             .get("uplinkDataKey")
             .and_then(crate::json::Json::as_str)
-            .unwrap_or("")
+            .unwrap_or(data_key)
             .clone_into(&mut out.uplink_data_key);
         let mut method = xhttp
             .get("uplinkHTTPMethod")
@@ -727,6 +908,16 @@ impl XhttpSettings {
             .get("noSSEHeader")
             .and_then(crate::json::Json::as_bool)
             .unwrap_or(false);
+        // `GenerateSessionID` (config.go:511) draws from this table at this length, or mints a UUID when either is absent.
+        out.session_id_length = xhttp
+            .get("sessionIDLength")
+            .and_then(parse_range)
+            .map_or((0, 0), |(from, to)| (from as usize, to as usize));
+        xhttp
+            .get("sessionIDTable")
+            .and_then(crate::json::Json::as_str)
+            .unwrap_or("")
+            .clone_into(&mut out.session_id_table);
         out.sc_max_each_post = xhttp
             .get("scMaxEachPostBytes")
             .and_then(parse_range)
@@ -734,6 +925,21 @@ impl XhttpSettings {
         if out.sc_max_each_post == 0 {
             out.sc_max_each_post = 1_000_000;
         }
+        // `GetNormalizedUplinkChunkSize` (config.go:181) draws from a placement-sized range by default and floors a written `from` at 64.
+        out.uplink_chunk = match xhttp.get("uplinkChunkSize").and_then(parse_range) {
+            Some((from, to)) if to > 0 => {
+                if from < 64 {
+                    (64, usize::try_from(to).unwrap_or(usize::MAX).max(64))
+                } else {
+                    (from as usize, to as usize)
+                }
+            }
+            _ => match out.uplink_data_placement {
+                Placement::Cookie => (2 * 1024, 3 * 1024),
+                Placement::Header => (3 * 1000, 4 * 1000),
+                _ => (out.sc_max_each_post, out.sc_max_each_post),
+            },
+        };
         out.sc_max_buffered = xhttp
             .get("scMaxBufferedPosts")
             .and_then(crate::json::Json::as_u32)
@@ -742,9 +948,9 @@ impl XhttpSettings {
         out.sc_min_posts_interval_ms = xhttp
             .get("scMinPostsIntervalMs")
             .and_then(parse_range)
-            .map_or(30, |(_, to)| u64::from(to));
-        if out.sc_min_posts_interval_ms == 0 {
-            out.sc_min_posts_interval_ms = 30;
+            .map_or((30, 30), |(from, to)| (u64::from(from), u64::from(to)));
+        if out.sc_min_posts_interval_ms.1 == 0 {
+            out.sc_min_posts_interval_ms = (30, 30);
         }
         Some(out)
     }
@@ -1469,7 +1675,6 @@ pub(crate) fn accept_core<
         emit_400(&mut write);
         return Served::Closed;
     }
-
     let (sid, seq) = extract_meta(head, target, settings);
 
     match (sid, seq) {
@@ -1509,6 +1714,7 @@ pub(crate) fn accept_core<
                         left: 0,
                         ended: false,
                         reads: 0,
+                        pending_head: false,
                     })
                 };
                 let writer = writer_for(write, h2);
@@ -1531,7 +1737,7 @@ pub(crate) fn accept_core<
                     writer,
                 );
             }
-            if settings.mode != XhttpMode::StreamUp {
+            if settings.mode != XhttpMode::StreamUp && settings.mode_source == ModeSource::Stated {
                 emit_400(&mut write);
                 return Served::Closed;
             }
@@ -1552,6 +1758,7 @@ pub(crate) fn accept_core<
                     left: 0,
                     ended: false,
                     reads: 0,
+                    pending_head: false,
                 }));
             }
             plain_ok(&mut write, settings, &padded);
@@ -1597,6 +1804,7 @@ pub(crate) fn accept_core<
                         left: 0,
                         ended: false,
                         reads: 0,
+                        pending_head: false,
                     };
                     drain_body(&mut framed, settings.sc_max_each_post)
                 };
@@ -1653,6 +1861,7 @@ pub(crate) fn accept_core<
                 _ => Some(body),
             };
             let Some(payload) = payload else {
+                crate::proxy::echo_trace("serve packet undecodable");
                 emit_400(&mut write);
                 return Served::Closed;
             };
@@ -1730,6 +1939,270 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
     })
 }
 
+// The reference's `appendToPath` (config.go:529): a segment lands under the trailing slash, never beside it.
+fn append_segment(path: &mut String, value: &str) {
+    if !path.ends_with('/') {
+        path.push('/');
+    }
+    path.push_str(value);
+}
+
+fn push_param(query: &mut String, key: &str, value: &str) {
+    if !query.is_empty() {
+        query.push('&');
+    }
+    query.push_str(key);
+    query.push('=');
+    query.push_str(value);
+}
+
+/// The reference's `ApplyMetaToRequest` (config.go:264): a session and seq ride the path unless the config names another placement.
+fn meta_request(
+    settings: &XhttpSettings,
+    session: &str,
+    seq: Option<u64>,
+    target: &mut String,
+    query: &mut String,
+    extra: &mut String,
+) {
+    if !session.is_empty() {
+        match settings.session_placement {
+            Placement::Path => append_segment(target, session),
+            Placement::Query => push_param(query, &settings.session_key, session),
+            Placement::Header => {
+                let _ = write!(extra, "{}: {session}\r\n", settings.session_key);
+            }
+            Placement::Cookie => {
+                let _ = write!(extra, "Cookie: {}={session}\r\n", settings.session_key);
+            }
+            Placement::Auto | Placement::Body | Placement::QueryInHeader => {}
+        }
+    }
+    if let Some(seq) = seq {
+        let seq = seq.to_string();
+        match settings.seq_placement {
+            Placement::Path => append_segment(target, &seq),
+            Placement::Query => push_param(query, &settings.seq_key, &seq),
+            Placement::Header => {
+                let _ = write!(extra, "{}: {seq}\r\n", settings.seq_key);
+            }
+            Placement::Cookie => {
+                let _ = write!(extra, "Cookie: {}={seq}\r\n", settings.seq_key);
+            }
+            Placement::Auto | Placement::Body | Placement::QueryInHeader => {}
+        }
+    }
+}
+
+fn target_of(path: &str, query: &str) -> String {
+    if query.is_empty() {
+        path.to_owned()
+    } else {
+        format!("{path}?{query}")
+    }
+}
+
+/// The request target a dial writes: the configured path and the query that rode in with it (`config.go:20`).
+pub(crate) fn dial_path(settings: &XhttpSettings) -> String {
+    target_of(&settings.path, &settings.query)
+}
+
+/// The packet-up and stream-up dial's POST: one POST, chunked framing, the session under the head's own placement. `Connection: close` is the reference dialer's `DisableKeepAlives` (dialer.go:272).
+fn dial_head(host: &str, settings: &XhttpSettings, session: &str, seq: Option<u64>) -> String {
+    let mut target = settings.path.clone();
+    let mut query = settings.query.clone();
+    let mut extra = String::new();
+    meta_request(settings, session, seq, &mut target, &mut query, &mut extra);
+    let target = target_of(&target, &query);
+    let content_type = if settings.no_grpc_header {
+        "application/octet-stream"
+    } else {
+        "application/grpc"
+    };
+    format!("{} {target} HTTP/1.1\r\nHost: {host}\r\n{extra}Referer: http://{host}{}?x_padding={}\r\nTransfer-Encoding: chunked\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n", settings.uplink_method, settings.path, referer_pad_value(settings))
+}
+
+/// The downlink a packet-up or stream-up dial opens beside its upload (dialer.go:411).
+fn downlink_head(host: &str, settings: &XhttpSettings, session: &str) -> String {
+    let mut target = settings.path.clone();
+    let mut query = settings.query.clone();
+    let mut extra = String::new();
+    meta_request(settings, session, None, &mut target, &mut query, &mut extra);
+    let target = target_of(&target, &query);
+    format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n{extra}Referer: http://{host}{}?x_padding={}\r\nConnection: close\r\n\r\n", settings.path, referer_pad_value(settings))
+}
+
+/// The referer's pad the dial-side heads draw: a run in the configured range and method, the shape the hub's own check validates (`xpadding.go`'s `MakeXPadding`).
+fn referer_pad_value(settings: &XhttpSettings) -> String {
+    pad_value(settings.x_padding_method, pad_target_len(settings))
+}
+
+/// One packet-up POST. The packet rides the body by default, or `X-Data-{i}` headers / `x_data_{i}` cookies when `uplinkDataPlacement` says so: the reference encodes the whole packet as base64url and splits that one string at `uplinkChunkSize` points (`config.go:65-97`), so the hub joins the parts before it decodes.
+fn packet_head<'a>(
+    host: &str,
+    settings: &XhttpSettings,
+    session: &str,
+    seq: u64,
+    piece: &'a [u8],
+) -> (String, Option<&'a [u8]>) {
+    let mut target = settings.path.clone();
+    let mut query = settings.query.clone();
+    let mut extra = String::new();
+    meta_request(
+        settings,
+        session,
+        Some(seq),
+        &mut target,
+        &mut query,
+        &mut extra,
+    );
+    let target = target_of(&target, &query);
+    let method = settings.uplink_method.as_str();
+    let referer = format!(
+        "Referer: http://{host}{}?x_padding={}\r\n",
+        settings.path,
+        referer_pad_value(settings)
+    );
+    match settings.uplink_data_placement {
+        Placement::Header | Placement::Cookie => {
+            let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(piece);
+            let header = settings.uplink_data_placement == Placement::Header;
+            let separator = if header { "-" } else { "_" };
+            if header {
+                let mut at = 0;
+                for i in 0.. {
+                    if at >= encoded.len() {
+                        break;
+                    }
+                    let size = random_between(settings.uplink_chunk.0, settings.uplink_chunk.1)
+                        .min(encoded.len() - at);
+                    let _ = write!(
+                        extra,
+                        "{}{separator}{i}: {}\r\n",
+                        settings.uplink_data_key,
+                        &encoded[at..at + size]
+                    );
+                    at += size;
+                }
+            } else {
+                let _ = write!(extra, "Cookie: ");
+                let mut at = 0;
+                for i in 0.. {
+                    if at >= encoded.len() {
+                        break;
+                    }
+                    if i > 0 {
+                        extra.push_str("; ");
+                    }
+                    let size = random_between(settings.uplink_chunk.0, settings.uplink_chunk.1)
+                        .min(encoded.len() - at);
+                    let _ = write!(
+                        extra,
+                        "{}{separator}{i}={}",
+                        settings.uplink_data_key,
+                        &encoded[at..at + size]
+                    );
+                    at += size;
+                }
+                extra.push_str("\r\n");
+            }
+            // Go writes `Content-Length: 0` for a bodyless POST, and no length at all for a bodyless GET (`shouldSendContentLength`).
+            let zero = if matches!(method, "GET" | "HEAD") {
+                ""
+            } else {
+                "Content-Length: 0\r\n"
+            };
+            (
+                format!(
+                    "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{extra}{referer}{zero}Connection: keep-alive\r\n\r\n"
+                ),
+                None,
+            )
+        }
+        _ => (
+            format!(
+                "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{extra}Content-Length: {}\r\n{referer}Connection: keep-alive\r\n\r\n",
+                piece.len()
+            ),
+            Some(piece),
+        ),
+    }
+}
+
+fn pad_raw() -> [u8; 4] {
+    let mut raw = [0u8; 4];
+    getrandom::fill(&mut raw).unwrap_or_default();
+    raw
+}
+
+/// The reference redraws the part size per part (`GetNormalizedUplinkChunkSize().rand()`).
+fn random_between(from: usize, to: usize) -> usize {
+    let raw = pad_raw();
+    let span = to.saturating_sub(from);
+    from + (u32::from_le_bytes(raw) as usize % span.max(1))
+}
+
+/// The reference mints a UUID when no length or table is written (`GenerateSessionID`, config.go:511).
+fn uuid_v4() -> String {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).unwrap_or_default();
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    let mut out = String::with_capacity(36);
+    for (i, byte) in bytes.iter().enumerate() {
+        if matches!(i, 4 | 6 | 8 | 10) {
+            out.push('-');
+        }
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// The packet-up and stream-up dial: a GET downlink beside the upload half, both under one session id (dialer.go:411).
+pub(crate) fn connect_dual(
+    down: Connection,
+    up: Connection,
+    host: &str,
+    settings: &XhttpSettings,
+) -> Option<(XhttpReader, XhttpWriter)> {
+    let down_write = down.try_clone().ok()?;
+    connect_dual_split(down, down_write, up, host, settings)
+}
+
+pub(crate) fn connect_dual_split<
+    DR: Read,
+    DW: Write,
+    UW: crate::proxy::FrameWrite + Read + Send + 'static,
+>(
+    down: DR,
+    mut down_write: DW,
+    mut up: UW,
+    host: &str,
+    settings: &XhttpSettings,
+) -> Option<(Reader<DR>, XhttpWriter)> {
+    let session = settings.session_id();
+    down_write
+        .write_all(downlink_head(host, settings, &session).as_bytes())
+        .ok()?;
+    let writer = if settings.mode == XhttpMode::PacketUp {
+        XhttpWriter::packets(up, host, settings, session)
+    } else {
+        up.write_all(dial_head(host, settings, &session, None).as_bytes())
+            .ok()?;
+        XhttpWriter::new(up)
+    };
+    let reader = Reader {
+        read: down,
+        prefix: Vec::new(),
+        at: 0,
+        left: 0,
+        ended: false,
+        reads: 0,
+        pending_head: true,
+    };
+    Some((reader, writer))
+}
+
 pub(crate) fn connect(
     stream: Connection,
     host: &str,
@@ -1763,6 +2236,10 @@ impl crate::proxy::CarrierSink for XhttpWriter {
     }
     #[inline]
     fn close(&self) {
+        self.finish();
+    }
+    #[inline]
+    fn upload_done(&self) {
         self.finish();
     }
 }
@@ -2073,6 +2550,7 @@ mod tests {
                 left: 0,
                 ended: false,
                 reads: 0,
+                pending_head: false,
             };
             let mut got = Vec::new();
             let mut buf = vec![0u8; CHUNK];
@@ -2179,6 +2657,7 @@ mod tests {
             left: 0,
             ended: false,
             reads: 0,
+            pending_head: false,
         };
         let mut got = Vec::new();
         reader.read_to_end(&mut got).expect("drains");
@@ -2216,6 +2695,7 @@ mod tests {
             left: 0,
             ended: false,
             reads: 0,
+            pending_head: false,
         };
         let mut got = Vec::new();
         reader.read_to_end(&mut got).expect("drains");
@@ -2296,7 +2776,7 @@ mod tests {
         assert_eq!(settings.seq_placement, Placement::Path);
         assert_eq!(settings.uplink_data_placement, Placement::Body);
         assert_eq!(settings.sc_max_each_post, 4096);
-        assert_eq!(settings.sc_min_posts_interval_ms, 1);
+        assert_eq!(settings.sc_min_posts_interval_ms, (1, 1));
         assert_eq!(settings.x_padding_method, PadMethod::RepeatX);
         assert!(!settings.x_padding_obfs);
         assert!(!settings.no_sse);
@@ -2531,6 +3011,255 @@ mod tests {
     }
 
     /// The two halves of one process over a socket: `connect` writes the head its own random padding asks for, and the hub built from the same config has to answer it. Before this fix the hub answered `HTTP/1.1 400` to that head at every connection count, which is why `vless-xhttp-down-8` completed no flow.
+    /// `sessionIDTable` and `sessionIDLength` draw the session id from a table (`GenerateSessionID`, config.go:511); either missing keeps the UUID the reference mints by default.
+    #[test]
+    fn a_configured_session_id_table_shapes_the_id() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {
+                "path": "/up", "mode": "packet-up", "sessionIDTable": "hex", "sessionIDLength": 16}}}"#,
+        );
+        let id = settings.session_id();
+        assert_eq!(id.len(), 16, "the configured length: {id}");
+        assert!(
+            id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+            "the named table: {id}"
+        );
+        let uuid = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/up", "mode": "packet-up"}}}"#,
+        )
+        .session_id();
+        assert_eq!(uuid.len(), 36, "no table keeps the UUID: {uuid}");
+    }
+
+    fn packet_settings(mode: XhttpMode) -> XhttpSettings {
+        let mut settings = XhttpSettings::stream_one();
+        settings.path = "/share/".to_owned();
+        settings.mode = mode;
+        settings
+    }
+
+    /// One request head off the wire, with the target and body length its bytes name.
+    fn head_text(stream: &mut Connection) -> String {
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).expect("reads the head");
+            head.push(byte[0]);
+        }
+        String::from_utf8(head).expect("ascii head")
+    }
+
+    fn take_head(stream: &mut Connection) -> (String, usize) {
+        let text = head_text(stream);
+        let target = text
+            .split("\r\n")
+            .next()
+            .and_then(|line| line.split(' ').nth(1))
+            .expect("a request target")
+            .to_owned();
+        let length = text
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Length: "))
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        (target, length)
+    }
+
+    /// A packet-up dial posts each slice under its own seq on the upload socket, and the downlink GET carries the same session under the normalised path.
+    #[test]
+    fn a_packet_up_dial_posts_every_slice_under_one_session() {
+        let mut settings = packet_settings(XhttpMode::PacketUp);
+        settings.sc_max_each_post = 2;
+        let down_listener = crate::conn::test_bind("127.0.0.1:0").expect("binds downlink");
+        let up_listener = crate::conn::test_bind("127.0.0.1:0").expect("binds uplink");
+        let down_port = down_listener.local_addr().expect("addr").port();
+        let up_port = up_listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut down, _) = down_listener.accept().expect("accepts the downlink");
+            let (get, _) = take_head(&mut down);
+            down.write_all(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4\r\ndone\r\n0\r\n\r\n",
+            )
+            .expect("answers the downlink");
+            let (mut up, _) = up_listener.accept().expect("accepts the uplink");
+            let mut posts = Vec::new();
+            for _ in 0..2 {
+                let (target, length) = take_head(&mut up);
+                let mut body = vec![0u8; length];
+                up.read_exact(&mut body).expect("reads the packet");
+                posts.push((target, body));
+                up.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .expect("answers the packet");
+            }
+            (get, posts)
+        });
+        let down = Connection::connect(("127.0.0.1", down_port)).expect("connects the downlink");
+        let up = Connection::connect(("127.0.0.1", up_port)).expect("connects the uplink");
+        let (mut reader, writer) =
+            connect_dual(down, up, "127.0.0.1", &settings).expect("the dial is answered");
+        assert!(writer.send(b"abcd"));
+        let mut got = [0u8; 4];
+        reader.read_exact(&mut got).expect("reads the downlink");
+        assert_eq!(&got, b"done");
+        let (get, posts) = server.join().expect("joins");
+        let session = get
+            .strip_prefix("/share/")
+            .expect("the session rides the path");
+        assert_eq!(posts[0].0, format!("/share/{session}/0"));
+        assert_eq!(posts[1].0, format!("/share/{session}/1"));
+        assert_eq!(posts[0].1, b"ab");
+        assert_eq!(posts[1].1, b"cd");
+    }
+
+    /// A stream-up dial uploads the whole payload before the downlink carries a byte: the two halves are independent, and the upload's `0` terminator ends the session the downlink reads from.
+    #[test]
+    fn a_stream_up_dial_uploads_before_its_downlink() {
+        let settings = packet_settings(XhttpMode::StreamUp);
+        let down_listener = crate::conn::test_bind("127.0.0.1:0").expect("binds downlink");
+        let up_listener = crate::conn::test_bind("127.0.0.1:0").expect("binds uplink");
+        let down_port = down_listener.local_addr().expect("addr").port();
+        let up_port = up_listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut down, _) = down_listener.accept().expect("accepts the downlink");
+            let (get, _) = take_head(&mut down);
+            let (mut up, _) = up_listener.accept().expect("accepts the uplink");
+            let head = head_text(&mut up);
+            let mut body = Vec::new();
+            loop {
+                let mut line = Vec::new();
+                let mut byte = [0u8; 1];
+                while !line.ends_with(b"\r\n") {
+                    up.read_exact(&mut byte).expect("reads a chunk line");
+                    line.push(byte[0]);
+                }
+                let size = usize::from_str_radix(
+                    std::str::from_utf8(&line[..line.len() - 2])
+                        .expect("ascii size")
+                        .trim(),
+                    16,
+                )
+                .expect("a chunk size");
+                if size == 0 {
+                    break;
+                }
+                let mut data = vec![0u8; size + 2];
+                up.read_exact(&mut data).expect("reads the chunk");
+                body.extend_from_slice(&data[..size]);
+            }
+            let post_line = head
+                .lines()
+                .next()
+                .and_then(|l| l.split(' ').nth(1).map(String::from));
+            (get, post_line, body)
+        });
+        let down = Connection::connect(("127.0.0.1", down_port)).expect("connects the downlink");
+        let up = Connection::connect(("127.0.0.1", up_port)).expect("connects the uplink");
+        let (_reader, writer) =
+            connect_dual(down, up, "127.0.0.1", &settings).expect("the dial is answered");
+        assert!(writer.send(b"ping"));
+        writer.finish();
+        let (get, post, body) = server.join().expect("joins");
+        let session = get
+            .strip_prefix("/share/")
+            .expect("the session rides the path");
+        assert_eq!(
+            post,
+            Some(format!("/share/{session}")),
+            "the upload rides the downlink's own session"
+        );
+        assert_eq!(
+            body, b"ping",
+            "the upload carried the payload before the downlink spoke"
+        );
+    }
+
+    /// `uplinkDataPlacement`'s other two arms: the whole packet is one base64url string split at `uplinkChunkSize` points across `X-Data-{i}` headers or `x_data_{i}` cookies, the body stays empty, and `uplinkHTTPMethod` picks the request line.
+    #[test]
+    fn a_packet_up_dial_honours_header_and_cookie_placement() {
+        let payload: Vec<u8> = (0..200usize).map(|i| (i as u8).wrapping_mul(97)).collect();
+        for (placement, key, method) in [("header", "X-Data", "GET"), ("cookie", "x_data", "POST")]
+        {
+            let settings = settings_from(&format!(
+                r#"{{"streamSettings": {{"network": "xhttp", "xhttpSettings": {{
+                    "path": "/up", "mode": "packet-up", "uplinkDataPlacement": "{placement}",
+                    "uplinkChunkSize": 64, "uplinkHTTPMethod": "{method}"}}}}}}"#
+            ));
+            assert_eq!(settings.uplink_data_key, key);
+            assert_eq!(settings.uplink_chunk, (64, 64));
+            let down_listener = crate::conn::test_bind("127.0.0.1:0").expect("binds downlink");
+            let up_listener = crate::conn::test_bind("127.0.0.1:0").expect("binds uplink");
+            let down_port = down_listener.local_addr().expect("addr").port();
+            let up_port = up_listener.local_addr().expect("addr").port();
+            let server = thread::spawn(move || {
+                let (mut down, _) = down_listener.accept().expect("accepts the downlink");
+                let _ = head_text(&mut down);
+                down.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+                    .expect("answers the downlink");
+                let (mut up, _) = up_listener.accept().expect("accepts the uplink");
+                let head = head_text(&mut up);
+                up.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                    .expect("answers the packet");
+                head
+            });
+            let down =
+                Connection::connect(("127.0.0.1", down_port)).expect("connects the downlink");
+            let up = Connection::connect(("127.0.0.1", up_port)).expect("connects the uplink");
+            let (_reader, writer) =
+                connect_dual(down, up, "127.0.0.1", &settings).expect("the dial is answered");
+            assert!(writer.send(&payload), "{placement}: the packet left");
+            let head = server.join().expect("joins");
+            assert!(
+                head.starts_with(&format!("{method} /up/")),
+                "{placement}: the uplink method: {head}"
+            );
+            assert_eq!(
+                head.contains("Content-Length"),
+                method == "POST",
+                "{placement}: only a bodyless POST carries a zero length: {head}"
+            );
+            let (encoded, parts) = if placement == "header" {
+                let mut joined = String::new();
+                let mut parts = 0;
+                for i in 0.. {
+                    let name = format!("{key}-{i}: ");
+                    let Some(line) = head.lines().find(|line| line.starts_with(&name)) else {
+                        break;
+                    };
+                    joined.push_str(&line[name.len()..]);
+                    parts += 1;
+                }
+                (joined, parts)
+            } else {
+                let cookie = head
+                    .lines()
+                    .find(|line| line.starts_with("Cookie: ") && line.contains("x_data_0="))
+                    .expect("the data cookies ride one Cookie line");
+                let mut joined = String::new();
+                let mut parts = 0;
+                for i in 0.. {
+                    let name = format!("{key}_{i}=");
+                    let Some(part) = cookie[8..].split("; ").find(|part| part.starts_with(&name))
+                    else {
+                        break;
+                    };
+                    joined.push_str(&part[name.len()..]);
+                    parts += 1;
+                }
+                (joined, parts)
+            };
+            assert_eq!(
+                parts,
+                encoded.len().div_ceil(64),
+                "{placement}: the parts are not the configured size: {head}"
+            );
+            let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(&encoded)
+                .expect("base64url parts");
+            assert_eq!(decoded, payload, "{placement}: the parts decoded wrong");
+        }
+    }
+
+    /// The two halves of one process over a socket: `connect` writes the head its own random padding asks for, and the hub built from the same config has to answer it. Before this fix the hub answered `HTTP/1.1 400` to that head at every connection count, which is why `vless-xhttp-down-8` completed no flow.
     #[test]
     fn the_dialer_and_its_own_hub_complete_on_loopback() {
         let settings = settings_from(
@@ -2595,21 +3324,65 @@ mod tests {
         );
     }
 
-    /// Named, not fixed: the reference hub takes the stream-up shape under `auto` too, and we still answer 400. Accepting it would park the POST thread on `wait_ended` for a session whose upload no H1 carrier ever closes — the open row [`docs/function/carrier-xhttp.md`](../../../docs/function/carrier-xhttp.md) calls the missing carrier-side owner.
+    /// The carrier is the owner now: a relay's upload half-closes into `XhttpWriter::finish` (`0\r\n\r\n`), which ends the session and lifts the park, so an `auto` hub serves the stream-up shape like the reference (`hub.go:154` gates only a stated mode).
     #[test]
-    fn an_unstated_mode_still_refuses_the_shape_without_a_carrier_owner() {
+    fn an_unstated_mode_serves_the_shape_once_a_carrier_owns_the_upload() {
         let settings = settings_from(
             r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share"}}}"#,
         );
-        let head = format!(
-            "POST /share/autohub HTTP/1.1\r\nHost: h\r\nReferer: {}\r\nTransfer-Encoding: chunked\r\n\r\n",
-            "http://127.0.0.1/share?x_padding=".to_owned() + &"X".repeat(500)
+        let listener = Arc::new(crate::conn::test_bind("127.0.0.1:0").expect("binds"));
+        let port = listener.local_addr().expect("addr").port();
+        let referer = "http://127.0.0.1/share?x_padding=".to_owned() + &"X".repeat(500);
+
+        let serve = move |settings: XhttpSettings| {
+            let listener = Arc::clone(&listener);
+            thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accepts");
+                let Ok(read) = stream.try_clone() else {
+                    return;
+                };
+                let (mut head, at) = crate::proxy::read_exact_head(
+                    &mut stream,
+                    HEAD_LIMIT,
+                    crate::budgets::head_arrival(),
+                )
+                .expect("head");
+                let prefix = head.split_off(at);
+                if let Served::Session(mut reader, writer) =
+                    accept_core(&head, prefix, read, stream, &settings, None)
+                {
+                    let mut drained = Vec::new();
+                    let _ = reader.read_to_end(&mut drained);
+                    writer.finish();
+                }
+            })
+        };
+
+        let down = serve(settings.clone());
+        let up = serve(settings.clone());
+
+        let mut get = Connection::connect(("127.0.0.1", port)).expect("connects the downlink");
+        get.write_all(
+            format!("GET /share/autohub HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\n\r\n")
+                .as_bytes(),
+        )
+        .expect("writes the GET");
+
+        let mut uplink = Connection::connect(("127.0.0.1", port)).expect("connects the uplink");
+        uplink.write_all(
+            format!("POST /share/autohub HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r\n")
+                .as_bytes(),
+        )
+        .expect("writes the POST");
+
+        let mut answered = Vec::new();
+        uplink.read_to_end(&mut answered).expect("reads the answer");
+        assert!(
+            String::from_utf8_lossy(&answered[..answered.len().min(12)]).starts_with("HTTP/1.1 2"),
+            "an auto hub took the stream-up shape once a carrier owned the upload, wrote {answered:?}"
         );
-        assert_eq!(
-            status_through_core(&head, &settings),
-            400,
-            "the stream-up shape was accepted with no owner to end its park"
-        );
+        down.join().expect("joins the downlink service");
+        up.join().expect("joins the uplink service");
     }
 
     /// Both parks — the uplink's `wait_ended` and the downlink's `Read::read` — wait on `session.cv`, and until a carrier owned the session the only thing that ever notified it was a `SessionReader`'s Drop. A client that opened one half and died left the other half's thread parked for the life of the process.

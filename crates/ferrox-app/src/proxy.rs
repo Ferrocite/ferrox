@@ -3549,7 +3549,7 @@ fn dial_vless_rung(
         }
         Rung::Xhttp => {
             let Some((mut reader, writer)) =
-                crate::xhttp::connect(uplink, &vless.host, attempt.path)
+                xhttp_rung(uplink, &vless.host, &vless.carrier, attempt.path)
             else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
@@ -5245,7 +5245,7 @@ fn dial_vmess_rung(
         Rung::Xhttp => {
             let rung = attempt.rung;
             let Some((mut reader, writer)) =
-                crate::xhttp::connect(uplink, &vmess.host, attempt.path)
+                xhttp_rung(uplink, &vmess.host, &vmess.carrier, attempt.path)
             else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
@@ -5488,7 +5488,8 @@ fn dial_trojan_rung(
             true
         }
         Rung::Xhttp => {
-            let Some((reader, writer)) = crate::xhttp::connect(uplink, &trojan.host, attempt.path)
+            let Some((reader, writer)) =
+                xhttp_rung(uplink, &trojan.host, &trojan.carrier, attempt.path)
             else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
@@ -5704,11 +5705,50 @@ fn tls_grpc<S: Dialed>(
 fn tls_xhttp<S: Dialed>(
     server: &SocketAddr,
     session: S,
+    second: impl FnOnce() -> Option<ferrox_core::tls::RustlsProvider<Connection>>,
     host: &str,
-    path: &str,
-) -> Option<(crate::xhttp::Reader<TlsHalf<S>>, crate::xhttp::XhttpWriter)> {
+    settings: &crate::xhttp::XhttpSettings,
+) -> Option<(Box<dyn Read + Send>, crate::xhttp::XhttpWriter)> {
     let (reader, writer, _) = session.into_halves()?;
-    crate::xhttp::connect_split(reader, writer, host, path).or_else(|| tls_unreachable(server))
+    if settings.mode == crate::xhttp::XhttpMode::StreamOne {
+        let head = crate::xhttp::dial_path(settings);
+        return crate::xhttp::connect_split(reader, writer, host, &head)
+            .map(|(reader, writer)| (Box::new(reader) as Box<dyn Read + Send>, writer))
+            .or_else(|| tls_unreachable(server));
+    }
+    // The GET downlink dials its own session: one transport per direction, both under one session id (`dialer.go:411`).
+    let (down, down_write, _) = second()?.into_halves()?;
+    crate::xhttp::connect_dual_split(down, down_write, writer, host, settings)
+        .map(|(reader, writer)| (Box::new(reader) as Box<dyn Read + Send>, writer))
+        .or_else(|| tls_unreachable(server))
+}
+
+/// xHTTP outside TLS: stream-one replaces the whole session; the session shapes dial a second plain transport for the GET downlink (`dialer.go:411`).
+fn xhttp_pair(
+    uplink: Connection,
+    host: &str,
+    settings: &crate::xhttp::XhttpSettings,
+) -> Option<(crate::xhttp::Reader<Connection>, crate::xhttp::XhttpWriter)> {
+    if settings.mode == crate::xhttp::XhttpMode::StreamOne {
+        return crate::xhttp::connect(uplink, host, &crate::xhttp::dial_path(settings));
+    }
+    let down = dial(&uplink.peer_addr().ok()?).ok()?;
+    crate::xhttp::connect_dual(down, uplink, host, settings)
+}
+
+/// The xhttp rung of a ladder: a configured xhttp carrier dials its own settings, and a climb from another transport takes the default stream-one shape at the rung's path — the dial that rung made before the settings carried a mode.
+fn xhttp_rung(
+    uplink: Connection,
+    host: &str,
+    carrier: &Carrier,
+    path: &str,
+) -> Option<(crate::xhttp::Reader<Connection>, crate::xhttp::XhttpWriter)> {
+    if let Some(settings) = carrier.xhttp_settings() {
+        return xhttp_pair(uplink, host, settings);
+    }
+    let mut settings = crate::xhttp::XhttpSettings::stream_one();
+    path.clone_into(&mut settings.path);
+    xhttp_pair(uplink, host, &settings)
 }
 
 // The write side of a split session: one seal fills a buffer, and the lock keeps seals and sends in wire order.
@@ -6138,9 +6178,16 @@ fn ride_carrier<S: Dialed>(
             relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
         }
         Carrier::Xhttp { settings, .. } => {
-            let Some((mut reader, writer)) =
-                tls_xhttp(server, session, &vless.host, &settings.path)
-            else {
+            let Some(cfg) = vless.tls.as_deref() else {
+                return;
+            };
+            let Some((mut reader, writer)) = tls_xhttp(
+                server,
+                session,
+                || dial_tls_session(server, cfg, vless.carrier.tcp_mask()),
+                &vless.host,
+                settings,
+            ) else {
                 return;
             };
             if !writer.send(header) {
@@ -6389,8 +6436,13 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
             relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
         }
         Carrier::Xhttp { settings, .. } => {
-            let Some((reader, writer)) = tls_xhttp(server, session, &trojan.host, &settings.path)
-            else {
+            let Some((reader, writer)) = tls_xhttp(
+                server,
+                session,
+                || dial_tls_session(server, cfg, trojan.carrier.tcp_mask()),
+                &trojan.host,
+                settings,
+            ) else {
                 return;
             };
             if !writer.send(header) {
@@ -6537,8 +6589,13 @@ fn vmess_tls_carried(
             crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv, None);
         }
         Carrier::Xhttp { settings, .. } => {
-            let Some((reader, writer)) = tls_xhttp(server, session, &vmess.host, &settings.path)
-            else {
+            let Some((reader, writer)) = tls_xhttp(
+                server,
+                session,
+                || dial_tls_session(server, vmess.tls.as_deref()?, vmess.carrier.tcp_mask()),
+                &vmess.host,
+                settings,
+            ) else {
                 return;
             };
             if !writer.send(&request) {
@@ -6884,7 +6941,7 @@ fn dial_ss_xhttp(
     ladder: &Ladder,
 ) -> bool {
     let rung = attempt.rung;
-    let Some((reader, mut writer)) = crate::xhttp::connect(uplink, &ss.host, attempt.path) else {
+    let Some((reader, mut writer)) = xhttp_rung(uplink, &ss.host, &ss.carrier, attempt.path) else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
@@ -10951,6 +11008,8 @@ pub(crate) fn read_exact_head(
 pub(crate) trait CarrierSink: Clone + Send + 'static {
     fn send(&self, bytes: &[u8]) -> bool;
     fn close(&self);
+    /// Ends the request body when the app half-closes, before the carrier's own download ends; only a carrier whose response is gated on that body (xhttp) answers here.
+    fn upload_done(&self) {}
 }
 
 // Vectored write with and without a file descriptor: the socket packs into one `writev` or one `WSASend`, the session feeds its record batcher.
@@ -11113,6 +11172,8 @@ fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
             }
         }
         forward_ended.store(true, Ordering::Relaxed);
+        // The app's upload ended: a carrier whose answer is gated on that body ends it now, before the download leg does.
+        uplink.upload_done();
         if CLOSE_FIRST {
             uplink.close();
             let _ = peer_read.shutdown(Shutdown::Both);

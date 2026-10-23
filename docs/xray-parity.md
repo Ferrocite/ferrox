@@ -46,7 +46,7 @@ What runs against what: `xray-rust` interop (23 tests, seam `XRAY_VLESS_FULL_BIN
 | WebSocket (`?ed=` both roles) | done |
 | gRPC | done, own HTTP/2; the multi-mode dial (`multiMode`) and the reference's method-path derivation not carried ([carrier-grpc](function/carrier-grpc.md)) |
 | HTTPUpgrade | done, both roles, `?ed=N` carried (row 16) |
-| xHTTP / SplitHTTP modes (packet-up, stream-up, stream-one, padding/placement) | the hub serves all three modes, the dialer carries stream-one only (POST + chunked), and an app half-close does not end the request body ([carrier-xhttp](function/carrier-xhttp.md)) |
+| xHTTP / SplitHTTP modes (packet-up, stream-up, stream-one, padding/placement) | all three modes both roles: the dial resolves an unstated `mode` and mints the session the hub validates, packets split at `uplinkChunkSize` into body or `X-Data-{i}`/cookie parts, posts paced by `scMinPostsIntervalMs`, and a relay half-close ends the request body ([carrier-xhttp](function/carrier-xhttp.md)) |
 | KCP/mKCP + FinalMask (aes128gcm, header, original) | core done; finalmask `fragment` done (row 31), other mask types planned |
 | Hysteria v2 transport (network `hysteria`, masquerade surface) | done as `vless-hysteria` / `protocol: hysteria` over quiche, both roles (row 19); datagrams, salamander obfs, masquerade site |
 | MASQUE transport | CONNECT-IP client dialled (h2/h3); server transport planned (row 20) |
