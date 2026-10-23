@@ -27,6 +27,14 @@ on:
         required: false
         default: US
 
+# One account: a relay that downloads while the allowance probe brackets a
+# transfer charges the same counter, and the bracket would name the relay's
+# bytes as the transfer's. Serialized, a run that ends before the probe reads
+# its baseline is already inside the settled figure.
+concurrency:
+  group: foxy-account
+  cancel-in-progress: false
+
 permissions:
   contents: read
 

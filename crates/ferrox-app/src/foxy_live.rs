@@ -36,6 +36,8 @@ const SETTLE: Duration = Duration::from_secs(10);
 const SETTLE_MINTS: usize = 12;
 /// How long the lane sits connected with no flow, to read what an idle account is charged.
 const IDLE: Duration = Duration::from_secs(60);
+/// What an idle window may cost before the account is read as shared: anything under this is a counter's own digest, not a transfer.
+const IDLE_GRACE: u64 = 64 << 10;
 
 fn account() -> Option<Account> {
     let roots = crate::quic::system_roots();
@@ -217,10 +219,16 @@ fn brackets(
     was = settled(account, was);
     std::thread::sleep(IDLE);
     let idle = settled(account, was);
+    let drained = was.saturating_sub(idle);
     println!(
-        "idle {:.0}s through {carrier:?}: {} bytes charged with no flow",
-        IDLE.as_secs_f64(),
-        was.saturating_sub(idle)
+        "idle {:.0}s through {carrier:?}: {drained} bytes charged with no flow",
+        IDLE.as_secs_f64()
+    );
+    // A counter that moves with no flow is another client's traffic on the same account; bracketing a transfer over it would charge that client's bytes to the transfer.
+    assert!(
+        drained <= IDLE_GRACE,
+        "the allowance fell {drained} bytes over {} s with no flow: another client shares the account, so no transfer can be bracketed",
+        IDLE.as_secs_f64()
     );
     was = idle;
     let until = (Instant::now() + PAYLOAD_WAIT).min(deadline);

@@ -52,10 +52,13 @@ on:
         required: false
         default: US
 
-# A superseded push should not keep spending live-download quota or a runner slot; a manual dispatch keeps its run.
+# One account, so every relay and the allowance probe take turns: a second
+# client downloading while a transfer is bracketed is charged to the bracket.
+# A superseded push still queues one run behind instead of cancelling the
+# running one, because a cancel mid-download is quota already spent.
 concurrency:
-  group: foxy-relay-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: foxy-account
+  cancel-in-progress: false
 
 permissions:
   contents: read
