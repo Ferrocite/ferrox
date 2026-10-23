@@ -2339,12 +2339,39 @@ mod tests {
         )]);
         let error = Routing::parse_in(&root, vec![dir()]).expect_err("refused");
         assert!(error.contains("unix"), "{error}");
-        let root = object(vec![(
-            "routing",
-            routing(vec![rule("direct", vec![("port", text("env:PORT"))])]),
-        )]);
-        let error = Routing::parse_in(&root, vec![dir()]).expect_err("refused");
-        assert!(error.contains("env:"), "{error}");
+    }
+
+    #[test]
+    fn env_names_the_address_and_port_a_rule_reads() {
+        std::env::set_var("FERROX_ROUTING_ENV_IP", "198.51.100.7");
+        std::env::set_var("FERROX_ROUTING_ENV_PORT", "101-102");
+        let root = crate::json::parse(
+            r#"{"routing": {"rules": [{"outboundTag": "direct",
+                "ip": ["env:FERROX_ROUTING_ENV_IP"], "port": "100, env:FERROX_ROUTING_ENV_PORT"}]}}"#,
+        )
+        .expect("parses");
+        let parsed = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let mut flow = Flow {
+            network: Network::Tcp,
+            domain: None,
+            ip: Some("198.51.100.7".parse().expect("ip")),
+            port: Some(101),
+            source: None,
+            local: None,
+            inbound_tag: None,
+        };
+        assert_eq!(parsed.route(&flow), Some("direct"));
+        flow.port = Some(100);
+        assert_eq!(parsed.route(&flow), Some("direct"));
+        flow.port = Some(103);
+        assert_eq!(parsed.route(&flow), None);
+        flow.port = Some(101);
+        flow.ip = Some("198.51.100.8".parse().expect("ip"));
+        assert_eq!(parsed.route(&flow), None);
+        std::env::remove_var("FERROX_ROUTING_ENV_IP");
+        std::env::remove_var("FERROX_ROUTING_ENV_PORT");
     }
 
     #[test]
