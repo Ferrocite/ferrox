@@ -19027,6 +19027,116 @@ mod tests {
         }
     }
 
+    /// A trojan listener that declares tls over KCP answers the session its config names: the request is read off the records, not the plaintext header.
+    #[test]
+    fn a_trojan_kcp_inbound_that_declares_tls_answers_the_session() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (cert, key, client) = tls_cert_json();
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                "streamSettings": {{"network": "kcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        serve_trojan_inbound(&address, &inbound, true);
+        let echo_port = echo_loop();
+        let conn = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        let mut tls = ferrox_core::tls::RustlsProvider::connect(
+            &client,
+            KcpIo {
+                conn: Arc::clone(&conn),
+            },
+        )
+        .expect("opens");
+        tls.handshake().expect("handshakes");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        tls.write_all(&trojan_header(
+            &trojan_key("secret"),
+            1,
+            &Destination::from(target),
+        ))
+        .expect("writes the header");
+        tls.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        ferrox_core::tls::read_exact(&mut tls, &mut back).expect("echoes");
+        assert_eq!(&back, b"ping", "the tls arm over kcp echoes");
+        conn.close();
+    }
+
+    /// KCP is the transport and the security rides it, as it does upstream: the dial's header goes out inside the session, not before it.
+    #[test]
+    fn a_trojan_kcp_dial_under_tls_wraps_the_header_in_the_session() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let key = trojan_key("secret");
+        let echo_port = echo_loop();
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let kcp_port = listener.local_addr().port();
+        let server = thread::spawn(move || {
+            let conn = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(
+                &server_config,
+                KcpIo {
+                    conn: Arc::clone(&conn),
+                },
+            )
+            .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let (cmd, _asked) = decode_trojan_request(&mut tls, &key).expect("reads the header");
+            assert_eq!(cmd, 1);
+            let mut back = [0u8; 4];
+            ferrox_core::tls::read_exact(&mut tls, &mut back).expect("reads ping");
+            tls.write_all(&back).expect("echoes");
+        });
+        let trojan = TrojanOut {
+            address: "127.0.0.1".to_owned(),
+            port: kcp_port,
+            key,
+            carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            host: "127.0.0.1".to_owned(),
+            tls: Some(Arc::new(client_config)),
+        };
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let conn = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{kcp_port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_trojan_kcp(&socket, &conn, &trojan, &target);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "the header rides the session");
+        drop(sock);
+        server.join().expect("joins");
+    }
+
     #[test]
     fn vmess_over_tls_carries_an_echo() {
         use ferrox_core::tls::TlsProvider as _;
