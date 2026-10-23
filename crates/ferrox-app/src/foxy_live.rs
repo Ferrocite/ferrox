@@ -21,16 +21,21 @@ const PROBE_PATH: &str = "/";
 const TRACE_HOST: &str = "www.cloudflare.com";
 const TRACE_PATH: &str = "/cdn-cgi/trace";
 const READ: Duration = Duration::from_secs(20);
-/// One host, two exact payloads: a charge that is fixed per flow and a charge that is per byte separate across the pair.
+/// One host, one small and one large payload: a charge fixed per flow and a charge per byte separate across the pair.
 const PAYLOAD_HOST: &str = "speedtest.tele2.net";
-const PAYLOAD_SIZES: [(&str, usize); 2] = [("/1MB.zip", 1 << 20), ("/10MB.zip", 12 << 20)];
+const PAYLOAD_SMALL: (&str, usize) = ("/1MB.zip", 2 << 20);
+const PAYLOAD_LARGE: (&str, usize) = ("/10MB.zip", 12 << 20);
 /// The smallest answer worth measuring: a redirect page is not a payload.
 const PAYLOAD_FLOOR: usize = 512 << 10;
 const PAYLOAD_WAIT: Duration = Duration::from_secs(45);
 /// The whole crawl, so one dead host cannot spend the live job's clock.
-const PAYLOAD_TOTAL: Duration = Duration::from_secs(300);
+const PAYLOAD_TOTAL: Duration = Duration::from_secs(600);
 /// The plane's counter is another writer's arithmetic: give it a turn before the mint that reads it.
 const SETTLE: Duration = Duration::from_secs(10);
+/// Mints spent waiting on one charge, so a counter that never settles still ends the test.
+const SETTLE_MINTS: usize = 12;
+/// How long the lane sits connected with no flow, to read what an idle account is charged.
+const IDLE: Duration = Duration::from_secs(60);
 
 fn account() -> Option<Account> {
     let roots = crate::quic::system_roots();
@@ -135,14 +140,15 @@ fn try_carrier(
     ))
 }
 
-/// One request for a known payload, read back through the tunnel: what the exit carried, counted where it lands.
+/// One request for a known payload, read back through the tunnel until its cap or its end: what the exit carried, counted where it lands.
 fn carried(
     carrier: Carrier,
     edge: &ferrox_core::foxy::Candidate,
     pass: &Pass,
+    method: &str,
     host: &str,
     path: &str,
-    want: usize,
+    cap: usize,
     until: Instant,
 ) -> Result<usize, String> {
     let (dial, quic_dial) = dial(edge, carrier, pass);
@@ -155,7 +161,7 @@ fn carried(
     let mut tunnel =
         Tunnel::open(&dial, &format!("{host}:80"), quic).map_err(|failure| failure.to_string())?;
     let request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: ferrox-live\r\nConnection: close\r\n\r\n"
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: ferrox-live\r\nConnection: close\r\n\r\n"
     );
     tunnel
         .write_all(request.as_bytes())
@@ -163,7 +169,7 @@ fn carried(
     tunnel.flush().map_err(|error| error.to_string())?;
     let mut chunk = vec![0u8; 32 * 1024];
     let mut got = 0usize;
-    while got < want && Instant::now() < until {
+    while got < cap && Instant::now() < until {
         match tunnel.read(&mut chunk) {
             Ok(0) => break,
             Ok(read) => got += read,
@@ -176,6 +182,98 @@ fn carried(
         }
     }
     Ok(got)
+}
+
+/// The plane's counter after a charge has landed: mint until two mints agree, so a figure read before the plane wrote it is not read as the charge.
+fn settled(account: &Account, mut was: u64) -> u64 {
+    for _ in 0..SETTLE_MINTS {
+        std::thread::sleep(SETTLE);
+        account
+            .renew()
+            .expect("mints a pass while the counter settles");
+        let now = account
+            .current()
+            .quota_remaining
+            .expect("the plane names an allowance on every mint");
+        if now == was {
+            return now;
+        }
+        was = now;
+    }
+    was
+}
+
+/// One carrier's charge with every other cost held still: an idle window, a head, a small payload and a large one, each read only after the counter has stopped moving.
+fn brackets(
+    account: &Account,
+    carrier: Carrier,
+    edge: &ferrox_core::foxy::Candidate,
+    pass: &Pass,
+    deadline: Instant,
+) -> Result<(), String> {
+    let mut was = pass
+        .quota_remaining
+        .ok_or("the plane names no allowance; without one there is nothing to charge")?;
+    was = settled(account, was);
+    std::thread::sleep(IDLE);
+    let idle = settled(account, was);
+    println!(
+        "idle {:.0}s through {carrier:?}: {} bytes charged with no flow",
+        IDLE.as_secs_f64(),
+        was.saturating_sub(idle)
+    );
+    was = idle;
+    let until = (Instant::now() + PAYLOAD_WAIT).min(deadline);
+    let head = carried(
+        carrier,
+        edge,
+        pass,
+        "HEAD",
+        PAYLOAD_HOST,
+        PAYLOAD_LARGE.0,
+        4096,
+        until,
+    )?;
+    let now = settled(account, was);
+    let fixed = was.saturating_sub(now);
+    println!(
+        "HEAD {PAYLOAD_HOST}{}: {head} bytes carried, {fixed} charged",
+        PAYLOAD_LARGE.0
+    );
+    was = now;
+    let mut marks = Vec::new();
+    for (path, cap) in [PAYLOAD_SMALL, PAYLOAD_LARGE] {
+        if Instant::now() >= deadline {
+            return Err(format!("{path}: the crawl spent its clock"));
+        }
+        let until = (Instant::now() + PAYLOAD_WAIT).min(deadline);
+        let bytes = carried(carrier, edge, pass, "GET", PAYLOAD_HOST, path, cap, until)?;
+        if bytes < PAYLOAD_FLOOR {
+            return Err(format!("{path}: {bytes} bytes is not a payload"));
+        }
+        let now = settled(account, was);
+        let charged = was.saturating_sub(now);
+        println!(
+            "GET {PAYLOAD_HOST}{path}: {bytes} bytes carried, {charged} charged ({:.3}x)",
+            charged as f64 / bytes as f64
+        );
+        marks.push((bytes, charged));
+        was = now;
+    }
+    let (small_bytes, small_charge) = marks[0];
+    let (large_bytes, large_charge) = marks[1];
+    let slope = large_charge.saturating_sub(small_charge) as f64
+        / large_bytes.saturating_sub(small_bytes) as f64;
+    println!(
+        "{carrier:?}: {slope:.3} bytes charged per byte carried between {} and {} bytes; {fixed} bytes fixed per flow",
+        small_bytes, large_bytes
+    );
+    // A tunnel that costs its payload spends one allowance byte per carried byte; a per-flow cost is the head's, and is not the slope.
+    assert!(
+        slope <= 1.25,
+        "{carrier:?} charged {slope:.3} bytes per carried byte between {small_bytes} and {large_bytes}: {large_charge} for {large_bytes} after {small_charge} for {small_bytes}, {fixed} fixed per flow"
+    );
+    Ok(())
 }
 
 /// The plane charges what the exit carried: a mint before and after a known payload names the ratio.
@@ -201,6 +299,7 @@ fn the_allowance_charges_the_payload_the_tunnel_carried() {
     }
     account.renew().expect("mints a pass");
     let mut pass = account.current();
+    println!("the plane names its allowance: {:?}", pass.allowance_line());
 
     let edges = crate::foxy_catalog::edges(crate::quic::system_roots());
     let picked = ferrox_core::foxy::catalog::tier(&edges, &country, "", 3);
@@ -210,54 +309,20 @@ fn the_allowance_charges_the_payload_the_tunnel_carried() {
 
     let total = Instant::now() + PAYLOAD_TOTAL;
     let mut measured = 0usize;
-    'carrier: for carrier in crate::foxy::carrier("auto").order() {
+    for carrier in crate::foxy::carrier("auto").order() {
+        if Instant::now() >= total {
+            break;
+        }
         account
             .renew()
             .expect("mints a pass before the carrier's first payload");
         pass = account.current();
-        let mut was = pass
-            .quota_remaining
-            .expect("the plane names an allowance; without one there is nothing to charge");
-        let mut served = false;
-        for (path, want) in PAYLOAD_SIZES {
-            if Instant::now() >= total {
-                break 'carrier;
+        match brackets(&account, carrier, edge, &pass, total) {
+            Ok(()) => {
+                measured += 1;
+                break;
             }
-            let until = (Instant::now() + PAYLOAD_WAIT).min(total);
-            let bytes = match carried(carrier, edge, &pass, PAYLOAD_HOST, path, want, until) {
-                Ok(bytes) if bytes >= PAYLOAD_FLOOR => bytes,
-                Ok(bytes) => {
-                    println!("{carrier:?} {PAYLOAD_HOST}{path}: {bytes} bytes is not a payload");
-                    continue 'carrier;
-                }
-                Err(why) => {
-                    println!("{carrier:?} {PAYLOAD_HOST}{path}: {why}");
-                    continue 'carrier;
-                }
-            };
-            std::thread::sleep(SETTLE);
-            account.renew().expect("mints a pass after the transfer");
-            pass = account.current();
-            let after = pass
-                .quota_remaining
-                .expect("the plane names an allowance on every mint");
-            let charged = was.saturating_sub(after);
-            println!(
-                "allowance {was} -> {after}: {charged} bytes charged for {bytes} bytes carried \
-                 through {carrier:?} from {PAYLOAD_HOST}{path} ({:.3}x)",
-                charged as f64 / bytes as f64
-            );
-            // A fixed per-flow charge and a per-byte multiplier separate across the pair; a doubling is wrong either way.
-            assert!(
-                charged <= bytes as u64 * 7 / 4 + (256 << 10),
-                "the allowance fell {charged} bytes for {bytes} carried through {carrier:?}"
-            );
-            was = after;
-            served = true;
-        }
-        if served {
-            measured += 1;
-            break;
+            Err(why) => println!("{carrier:?}: {why}"),
         }
     }
     assert!(measured > 0, "no carrier carried a payload to measure");
