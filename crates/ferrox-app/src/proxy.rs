@@ -13164,6 +13164,14 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
                 .and_then(Json::as_str)
                 .unwrap_or("auto"),
         );
+        // The experiment dials with a sealed size field some day; until then the tree dials the framing every server reads and says so rather than answering nothing.
+        if user
+            .get("experiments")
+            .and_then(Json::as_str)
+            .is_some_and(|text| text.contains("AuthenticatedLength"))
+        {
+            eprintln!("vmess outbound dials without the authenticated-length experiment: the framing below is the default one either way");
+        }
         if let Some((carrier, host, tls)) = tls_parts(outbound, &address) {
             return Some(VmessOut {
                 address,
