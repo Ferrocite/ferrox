@@ -3115,7 +3115,7 @@ mod tests {
     /// body is handed on, so zeroing the buffer first was a pass over bytes about to be overwritten.
     #[test]
     fn a_body_read_lands_in_room_it_never_zeroes() {
-        let wire = vec![0x5Au8; 64];
+        let wire = [0x5Au8; 64];
         let mut source = std::io::Cursor::new(&wire[..]);
         let (read, counts) =
             ferrox_core::alloc_count::measure(|| read_body(&mut source, b"head-tail", 32));
