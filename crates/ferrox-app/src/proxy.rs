@@ -13376,7 +13376,7 @@ fn ca_roots(settings: Option<&Json>) -> ferrox_core::tls::Anchors {
     settings
         .and_then(|s| s.get("caCertFile"))
         .and_then(Json::as_str)
-        .and_then(|path| std::fs::read(path).ok())
+        .and_then(crate::config::read_cert_file)
         .map(|pem| ferrox_core::tls::Anchors::from(crate::quic::parse_ca_pem(&pem)))
         .filter(|roots: &ferrox_core::tls::Anchors| !roots.is_empty())
         .unwrap_or_else(crate::quic::system_roots)
