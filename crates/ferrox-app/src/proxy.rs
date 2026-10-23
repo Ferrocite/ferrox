@@ -17035,9 +17035,11 @@ mod tests {
                 match tls.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        tls.write_all(&buf[..n]).expect("echoes");
-                        tls.flush().expect("flushes");
+                        if tls.write_all(&buf[..n]).is_err() || tls.flush().is_err() {
+                            break;
+                        }
                     }
+                    Err(error) if is_timeout(&error) => continue,
                     Err(_) => break,
                 }
             }
