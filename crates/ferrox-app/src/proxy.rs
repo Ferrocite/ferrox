@@ -19566,6 +19566,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_vless_kcp_inbound_reports_a_taken_port() {
+        let held = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = held.local_addr().expect("addr").port();
+        let inbound = crate::json::parse(
+            r#"{"protocol": "vless", "settings": {"clients": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]},
+                "streamSettings": {"network": "kcp"}}"#,
+        )
+        .expect("parses");
+        assert!(
+            !serve_vless_inbound(&format!("127.0.0.1:{port}"), &inbound, true, "test"),
+            "a listener whose port is taken is not reported served"
+        );
+    }
+
     /// A trojan listener that declares tls over KCP answers the session its config names: the request is read off the records, not the plaintext header.
     #[test]
     fn a_trojan_kcp_inbound_that_declares_tls_answers_the_session() {
