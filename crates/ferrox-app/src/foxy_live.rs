@@ -145,6 +145,7 @@ fn try_carrier(
 }
 
 /// One request the probe carries: its method and path, and the most payload it may take.
+#[derive(Clone, Copy)]
 struct Ask<'a> {
     method: &'a str,
     path: &'a str,
@@ -215,6 +216,46 @@ fn settled(account: &Account, mut was: u64) -> u64 {
     was
 }
 
+/// The charge per carried byte, in thousandths: whole and three digits.
+fn per_byte(charged: u64, bytes: u64) -> (u64, u64) {
+    let milli = charged.saturating_mul(1000).checked_div(bytes).unwrap_or(0);
+    (milli / 1000, milli % 1000)
+}
+
+/// What a flow that ended before its response did costs: the payload it read and the window the edge was allowed to fill ahead of it.
+fn canceled(
+    account: &Account,
+    carrier: Carrier,
+    edge: &ferrox_core::foxy::Candidate,
+    pass: &Pass,
+    was: u64,
+    deadline: Instant,
+) -> Result<(), String> {
+    if Instant::now() >= deadline {
+        return Ok(());
+    }
+    let until = (Instant::now() + PAYLOAD_WAIT).min(deadline);
+    let read = carried(
+        carrier,
+        edge,
+        pass,
+        Ask {
+            method: "GET",
+            path: PAYLOAD_LARGE.0,
+            cap: ABORT_READ,
+        },
+        until,
+    )?;
+    std::thread::sleep(SETTLE);
+    let charged = was.saturating_sub(settled(account, was));
+    let (whole, fraction) = per_byte(charged, read as u64);
+    println!(
+        "closed {PAYLOAD_HOST}{} after {read} bytes: {charged} charged ({whole}.{fraction:03}x) for a canceled flow",
+        PAYLOAD_LARGE.0
+    );
+    Ok(())
+}
+
 /// One carrier's charge with every other cost held still: an idle window, a head, a small payload and a large one, each read only after the counter has stopped moving.
 fn brackets(
     account: &Account,
@@ -283,9 +324,7 @@ fn brackets(
         let bytes = bytes as u64;
         let now = settled(account, was);
         let charged = was.saturating_sub(now);
-        let milli = charged.saturating_mul(1000).checked_div(bytes).unwrap_or(0);
-        let whole = milli / 1000;
-        let fraction = milli % 1000;
+        let (whole, fraction) = per_byte(charged, bytes);
         println!(
             "GET {PAYLOAD_HOST}{path}: {bytes} bytes carried, {charged} charged ({whole}.{fraction:03}x)"
         );
@@ -296,44 +335,13 @@ fn brackets(
     let (large_bytes, large_charge) = marks[1];
     let delta_bytes = large_bytes.saturating_sub(small_bytes);
     let delta_charge = large_charge.saturating_sub(small_charge);
-    let milli = delta_charge
-        .saturating_mul(1000)
-        .checked_div(delta_bytes)
-        .unwrap_or(0);
-    let whole = milli / 1000;
-    let fraction = milli % 1000;
+    let (whole, fraction) = per_byte(delta_charge, delta_bytes);
     println!(
         "{carrier:?}: {whole}.{fraction:03} bytes charged per byte carried between {small_bytes} and {large_bytes} bytes; {fixed} bytes fixed per flow"
     );
     // A tunnel that costs its payload spends one allowance byte per carried byte; a per-flow cost is the head's, and is not the slope.
     // Last, so a closing flow's fetch cannot be read as the large payload's: what a cancel costs is the window the edge was allowed to fill ahead of the caller.
-    if Instant::now() < deadline {
-        let until = (Instant::now() + PAYLOAD_WAIT).min(deadline);
-        let read = carried(
-            carrier,
-            edge,
-            pass,
-            Ask {
-                method: "GET",
-                path: PAYLOAD_LARGE.0,
-                cap: ABORT_READ,
-            },
-            until,
-        )?;
-        std::thread::sleep(SETTLE);
-        let now = settled(account, was);
-        let charged = was.saturating_sub(now);
-        let milli = charged
-            .saturating_mul(1000)
-            .checked_div(read as u64)
-            .unwrap_or(0);
-        let whole = milli / 1000;
-        let fraction = milli % 1000;
-        println!(
-            "closed {PAYLOAD_HOST}{} after {read} bytes: {charged} charged ({whole}.{fraction:03}x) for a canceled flow",
-            PAYLOAD_LARGE.0
-        );
-    }
+    canceled(account, carrier, edge, pass, was, deadline)?;
     assert!(
         delta_charge.saturating_mul(4) <= delta_bytes.saturating_mul(5),
         "{carrier:?} charged {whole}.{fraction:03} bytes per carried byte between {small_bytes} and {large_bytes}: {large_charge} for {large_bytes} after {small_charge} for {small_bytes}, {fixed} fixed per flow"

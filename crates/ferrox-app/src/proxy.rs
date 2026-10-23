@@ -27686,7 +27686,7 @@ mod poll_copy {
         (answered >= 0).then_some(answered as usize)
     }
 
-    fn is_ready(row: &Row) -> bool {
+    fn is_ready(row: Row) -> bool {
         row.revents & ready_mask() != 0
     }
 
@@ -28050,7 +28050,7 @@ mod poll_copy {
                 continue;
             }
             for index in 0..rows.len() {
-                if !is_ready(&rows[index]) {
+                if !is_ready(rows[index]) {
                     continue;
                 }
                 let (flow_index, direction_index) = owners[index];
