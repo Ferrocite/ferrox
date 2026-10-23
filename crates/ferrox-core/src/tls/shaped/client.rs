@@ -1,5 +1,4 @@
-// The shaped client handshake: a browser hello out, and both TLS versions' server
-// flights read back through the record layer under keys this module owns.
+// The shaped client handshake: a browser hello out, both TLS versions' flights back under keys this module owns.
 use super::hello::Hello;
 use super::kdf::{self, Hash};
 use super::record::{self, Direction, Suite};
@@ -240,7 +239,8 @@ impl<S: Stream> Session<S> {
         self.transcript.extend_from_slice(&msg);
 
         let msg = self.next_expect(20)?;
-        let expected = kdf::verify_data(hash, &kdf::finished_key(hash, &server_hs), &self.transcript);
+        let expected =
+            kdf::verify_data(hash, &kdf::finished_key(hash, &server_hs), &self.transcript);
         if msg[4..] != expected[..] {
             return Err(TlsError::Other("server Finished did not verify".to_owned()));
         }
@@ -397,7 +397,9 @@ impl<S: Stream> Session<S> {
         exact(&mut self.io, &mut header)?;
         let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
         if len > MAX_RECORD {
-            return Err(TlsError::Other("record exceeds the maximum length".to_owned()));
+            return Err(TlsError::Other(
+                "record exceeds the maximum length".to_owned(),
+            ));
         }
         self.record.clear();
         self.record.resize(len, 0);
@@ -514,7 +516,13 @@ impl<S: Stream> Session<S> {
             let mut content = vec![0x20u8; 64];
             content.extend_from_slice(b"TLS 1.3, server CertificateVerify");
             content.push(0);
-            content.extend_from_slice(&self.suite.map(|s| s.hash()).unwrap_or(Hash::Sha256).hash(signed));
+            content.extend_from_slice(
+                &self
+                    .suite
+                    .map(|s| s.hash())
+                    .unwrap_or(Hash::Sha256)
+                    .hash(signed),
+            );
             content
         } else {
             signed.to_vec()
@@ -619,7 +627,9 @@ impl<S: Stream> Session<S> {
             ];
             let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
             if len > MAX_RECORD {
-                return Err(TlsError::Other("record exceeds the maximum length".to_owned()));
+                return Err(TlsError::Other(
+                    "record exceeds the maximum length".to_owned(),
+                ));
             }
             if self.inbuf.len() - at - 5 < len {
                 break;
@@ -762,8 +772,7 @@ impl<S: Stream> TlsProvider for Session<S> {
         if !self.done {
             return Err(std::io::Error::other("shaped: handshake incomplete"));
         }
-        self.seal_parts(parts, out)
-            .map_err(std::io::Error::other)
+        self.seal_parts(parts, out).map_err(std::io::Error::other)
     }
 }
 

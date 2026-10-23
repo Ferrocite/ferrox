@@ -2540,8 +2540,8 @@ mod tests {
         let profile = crate::tls::shaped::Fingerprint::resolve("chrome")
             .and_then(crate::tls::shaped::Fingerprint::profile)
             .expect("chrome is a parrot");
-        let mut hello = crate::tls::shaped::hello::Hello::build(profile, SNI, &[], false)
-            .expect("builds");
+        let mut hello =
+            crate::tls::shaped::hello::Hello::build(profile, SNI, &[], false).expect("builds");
         assert_eq!(
             &hello.msg[39..71],
             &hello.session_id[..],
@@ -2549,7 +2549,11 @@ mod tests {
         );
         let before = hello.msg.clone();
         hello.zero_session();
-        assert_eq!(&hello.msg[39..71], &[0u8; 32][..], "the AAD carries a zeroed id");
+        assert_eq!(
+            &hello.msg[39..71],
+            &[0u8; 32][..],
+            "the AAD carries a zeroed id"
+        );
         hello.seal_session([0x77u8; 32]);
         assert_eq!(&hello.msg[39..71], &[0x77u8; 32][..]);
         for (at, (old, new)) in before.iter().zip(hello.msg.iter()).enumerate() {

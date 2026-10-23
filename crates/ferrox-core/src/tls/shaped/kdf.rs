@@ -81,12 +81,7 @@ pub(crate) fn expand_label(
 }
 
 /// `Derive-Secret`: the transcript hash under the label the schedule names.
-pub(crate) fn derive(
-    hash: Hash,
-    secret: &[u8],
-    label: &[u8],
-    transcript: &[u8],
-) -> Vec<u8> {
+pub(crate) fn derive(hash: Hash, secret: &[u8], label: &[u8], transcript: &[u8]) -> Vec<u8> {
     let mut out = vec![0u8; hash.len()];
     expand_label(hash, secret, label, &hash.hash(transcript), &mut out);
     out

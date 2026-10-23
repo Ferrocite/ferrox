@@ -1,11 +1,10 @@
-// A ClientHello shaped like a real browser's: the pinned uTLS parrots as data, and the
-// handshake that carries them.
+// A ClientHello shaped like a real browser's: the pinned uTLS parrots as data, and the handshake that carries them.
+mod client;
 pub(crate) mod hello;
-mod keys;
 mod kdf;
+mod keys;
 mod profiles;
 mod record;
-mod client;
 mod tls12;
 
 pub use client::Session;

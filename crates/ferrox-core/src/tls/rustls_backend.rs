@@ -1155,8 +1155,7 @@ mod tests {
             .expect("server cert");
             config.alpn_protocols = vec![b"http/1.1".to_vec()];
             let (mut stream, _) = listener.accept().expect("accepts");
-            let mut conn =
-                rustls::ServerConnection::new(Arc::new(config)).expect("server session");
+            let mut conn = rustls::ServerConnection::new(Arc::new(config)).expect("server session");
             let mut tls = rustls::Stream::new(&mut conn, &mut stream);
             let mut buf = [0u8; 4];
             tls.read_exact(&mut buf)
@@ -1244,10 +1243,8 @@ mod tests {
     /// Parsing an anchor and building a verifier is work a config names, not a connection needs: two dials naming the same anchors, pins and suite order share one build, and any input that differs gets its own.
     #[test]
     fn the_parts_a_config_is_built_from_are_built_once() {
-        let built = material(&client("one.test", &[b"test-only"]))
-            .expect("builds");
-        let other_name =
-            material(&client("two.test", &[b"nope"])).expect("builds");
+        let built = material(&client("one.test", &[b"test-only"])).expect("builds");
+        let other_name = material(&client("two.test", &[b"nope"])).expect("builds");
         assert!(
             Arc::ptr_eq(&built, &other_name),
             "a new host or ALPN asks for no new anchors"

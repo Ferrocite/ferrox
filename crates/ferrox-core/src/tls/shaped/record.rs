@@ -36,7 +36,9 @@ impl Suite {
 
     pub(crate) fn hash(self) -> Hash {
         match self {
-            Self::Aes128GcmSha256 | Self::ChaCha20Sha256 | Self::EcdheAes128GcmSha256
+            Self::Aes128GcmSha256
+            | Self::ChaCha20Sha256
+            | Self::EcdheAes128GcmSha256
             | Self::EcdheChaCha20Sha256 => Hash::Sha256,
             Self::Aes256GcmSha384 | Self::EcdheAes256GcmSha384 => Hash::Sha384,
         }
@@ -191,7 +193,8 @@ impl Direction {
 }
 
 fn keyed(suite: Suite, key: &[u8]) -> LessSafeKey {
-    let unbound = UnboundKey::new(suite.algorithm(), key).expect("the key block names its own length");
+    let unbound =
+        UnboundKey::new(suite.algorithm(), key).expect("the key block names its own length");
     LessSafeKey::new(unbound)
 }
 

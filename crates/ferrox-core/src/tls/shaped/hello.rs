@@ -1,5 +1,4 @@
-// The shaped ClientHello: the pinned parrot's cipher list, extension order and bodies,
-// with the GREASE, key shares, ECH cover and padding a real browser draws per connection.
+// The shaped ClientHello: a pinned parrot's ciphers, extension order and bodies, with the GREASE, key shares, ECH cover and padding a browser draws.
 use super::keys::{self, Share};
 use super::{Body, Profile, GREASE};
 use crate::tls::TlsError;
@@ -41,10 +40,7 @@ impl Hello {
         for (slot, pair) in grease.iter_mut().zip(grease_bytes.chunks_exact(2)) {
             *slot = u16::from_le_bytes([pair[0], pair[1]]);
         }
-        // uTLS moves the second extension off the first when the two draws collide.
-        if grease_value(&grease, 2) == grease_value(&grease, 3) {
-            grease[3] ^= 0x1010;
-        }
+        let grease = distinct_grease(grease);
         let (groups, reuse) = share_spec(profile);
         let shares = keys::generate(groups, reuse).map_err(TlsError::Other)?;
         let mut hello = Self {
@@ -119,10 +115,7 @@ impl Hello {
             .ok_or_else(|| {
                 TlsError::Other(format!("server selected an unoffered group {group:#06x}"))
             })?;
-        self.shares
-            .remove(at)
-            .agree(peer)
-            .map_err(TlsError::Other)
+        self.shares.remove(at).agree(peer).map_err(TlsError::Other)
     }
 
     /// The ALPN protocols this hello offers, so a server's pick can be checked against them.
@@ -294,7 +287,8 @@ impl Hello {
             + 2;
         let pad = boring_padding(unpadded);
         entries.retain(|entry| entry.kind != PAD || pad.is_some());
-        if let (Some(len), Some(entry)) = (pad, entries.iter_mut().find(|entry| entry.kind == PAD)) {
+        if let (Some(len), Some(entry)) = (pad, entries.iter_mut().find(|entry| entry.kind == PAD))
+        {
             entry.body = vec![0; len];
         }
 
@@ -334,7 +328,7 @@ impl Hello {
             session_id: [0u8; 32],
             shares: keys::canonical(groups),
             profile,
-            grease: [0; 5],
+            grease: distinct_grease([0; 5]),
             alpn: None,
             sni: sni_name(server_name).map(str::to_owned),
             ech: ech_body(profile, true),
@@ -358,6 +352,14 @@ fn share_spec(profile: &Profile) -> (&'static [u16], bool) {
         }
     }
     (&[], false)
+}
+
+/// uTLS moves the second extension off the first when the two draws collide.
+fn distinct_grease(mut grease: [u16; 5]) -> [u16; 5] {
+    if grease_value(&grease, 2) == grease_value(&grease, 3) {
+        grease[3] ^= 0x1010;
+    }
+    grease
 }
 
 fn grease_or(value: u16, grease: &[u16; 5], slot: usize) -> u16 {
@@ -499,14 +501,15 @@ fn ech_body(profile: &Profile, canonical: bool) -> Option<Vec<u8>> {
     let mut body = Vec::new();
     body.push(0);
     let (suite, config_id, enc, payload_len) = if canonical {
-        (suites[0], 0u8, [0u8; 32], 128 + 16)
+        (suites[0], 0u8, [0u8; 32], usize::from(payloads[0]) + 16)
     } else {
         let mut pick = [0u8; 5];
         getrandom::fill(&mut pick).ok()?;
         let suite = suites[usize::from(u16::from_le_bytes([pick[0], pick[1]])) % suites.len()];
         let config_id = pick[2];
-        let len = usize::from(payloads[usize::from(u16::from_le_bytes([pick[3], pick[4]])) % payloads.len()])
-            + 16;
+        let len = usize::from(
+            payloads[usize::from(u16::from_le_bytes([pick[3], pick[4]])) % payloads.len()],
+        ) + 16;
         (suite, config_id, enc_random(), len)
     };
     let suite = suite.to_be_bytes();
@@ -569,4 +572,107 @@ fn boring_padding(unpadded: usize) -> Option<usize> {
 
 fn entropy(error: getrandom::Error) -> TlsError {
     TlsError::Other(format!("no entropy: {error}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tls::shaped::Fingerprint;
+
+    fn hex(bytes: &[u8]) -> String {
+        use std::fmt::Write as _;
+        let mut text = String::with_capacity(bytes.len() * 2);
+        for byte in bytes {
+            let _ = write!(text, "{byte:02x}");
+        }
+        text
+    }
+
+    /// The extension TLVs of a ClientHello body, in wire order.
+    fn extensions(body: &[u8]) -> Vec<&[u8]> {
+        let at = 2 + 32;
+        let mut at = at + 1 + usize::from(body[at]);
+        let ciphers = usize::from(u16::from_be_bytes([body[at], body[at + 1]]));
+        at += 2 + ciphers;
+        at += 1 + usize::from(body[at]);
+        let total = usize::from(u16::from_be_bytes([body[at], body[at + 1]]));
+        at += 2;
+        let end = at + total;
+        let mut out = Vec::new();
+        while at < end {
+            let len = usize::from(u16::from_be_bytes([body[at + 2], body[at + 3]]));
+            out.push(&body[at..at + 4 + len]);
+            at += 4 + len;
+        }
+        assert_eq!(at, end, "extension vector length");
+        out
+    }
+
+    fn kind(ext: &[u8]) -> u16 {
+        u16::from_be_bytes([ext[0], ext[1]])
+    }
+
+    fn invariant(kind: u16) -> bool {
+        kind & 0x0f0f == 0x0a0a || kind == 0x0015 || kind == 0x0029
+    }
+
+    /// Replay the uTLS oracle: every pinned preset must emit the reference
+    /// ClientHello — byte for byte where uTLS fixes the order, and as the same
+    /// extension multiset plus invariant positions where Chrome's shuffle randomises it.
+    #[test]
+    fn oracle_replay_matches_utls() {
+        let script = include_str!("../../../../../scripts/utls-oracle/script.txt");
+        let expected = include_str!("../../../../../scripts/utls-oracle/expected.txt");
+        let cases: Vec<(&str, &str)> = script
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with('#'))
+            .map(|line| {
+                let fields: Vec<&str> = line.split_whitespace().collect();
+                (fields[0], fields[1])
+            })
+            .collect();
+        let golden: Vec<&str> = expected
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .collect();
+        assert_eq!(cases.len(), golden.len(), "script and golden differ");
+        let mut seen: Vec<usize> = Vec::new();
+        for ((name, id), want) in cases.iter().zip(&golden) {
+            let fields: Vec<&str> = want.split_whitespace().collect();
+            assert_eq!(fields[1], *name, "golden order");
+            let profile = Fingerprint::resolve(name)
+                .expect("a preset name resolves")
+                .profile()
+                .expect("a shaped profile");
+            let pointer = std::ptr::from_ref(profile) as usize;
+            assert!(!seen.contains(&pointer), "{name} repeats a profile");
+            seen.push(pointer);
+            assert_eq!(profile.shuffle, fields[0] == "SH", "{name} shuffle flag");
+            let hello = Hello::canonical(profile, "example.com");
+            let body = &hello.msg[4..];
+            let exts = extensions(body);
+            if fields[0] == "CH" {
+                assert_eq!(hex(body), fields[2], "{name} ({id})");
+            } else {
+                let fixed: Vec<usize> = exts
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, ext)| invariant(kind(ext)))
+                    .map(|(at, _)| at)
+                    .collect();
+                let want_fixed: Vec<usize> = fields[3]
+                    .split(',')
+                    .map(|at| at.parse().expect("an index"))
+                    .collect();
+                assert_eq!(fixed, want_fixed, "{name} invariant positions");
+                let mut sorted = exts.clone();
+                sorted.sort();
+                let joined: Vec<u8> = sorted.iter().flat_map(|ext| ext.iter().copied()).collect();
+                assert_eq!(hex(&joined), fields[2], "{name} ({id}) extension multiset");
+            }
+        }
+        assert_eq!(seen.len(), 28, "every preset is covered once");
+    }
 }
