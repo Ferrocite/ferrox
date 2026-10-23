@@ -23,7 +23,7 @@
 //! no authentication.
 
 use std::io::{Read, Write};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, ToSocketAddrs};
 
 use crate::conn::Connection;
 use ferrox_core::socks;
@@ -91,6 +91,15 @@ impl<'a> Destination<'a> {
     }
 }
 
+/// The address a reply's type byte named: one edge the RFC gives the bound address.
+enum Bound {
+    /// An IP address and port, read as the server sent them.
+    Ip(SocketAddr),
+    /// A domain name and port; the association dials the name the way the
+    /// reference's dialer does, the TCP tunnel uses nothing it named.
+    Name(String, u16),
+}
+
 /// A SOCKS5 client session over one connection.
 pub(crate) struct Session {
     stream: Connection,
@@ -148,38 +157,43 @@ impl Session {
 
     /// Read the address the server bound, which the reply's type byte names.
     ///
-    /// A name is refused: the reference reads only an IP address here
-    /// (`hev_socks5_client_read_response` accepts the IPv4 and IPv6 types and refuses the
-    /// rest), and a relay or a session this tree addresses is always an IP. The name's
-    /// octets are still read, so the stream sits where the tunnel begins.
-    fn read_bound(&mut self, atyp: u8) -> Option<SocketAddr> {
+    /// RFC 1928 gives the bound address three forms and the reference reads all
+    /// three: `addrParser.ReadAddressPort` is the reader the request used, so the
+    /// reply accepts every type the request can carry a destination in. What the
+    /// caller makes of it differs: a TCP tunnel uses nothing the reply bound
+    /// (`proxy/socks/client.go` substitutes an address for UDP only), a UDP
+    /// association dials the relay — through the name, where the server bound one.
+    fn read_bound(&mut self, atyp: u8) -> Option<Bound> {
         match atyp {
             socks::ATYP_IPV4 => {
                 let mut body = [0u8; 6];
                 self.stream.read_exact(&mut body).ok()?;
                 let mut octets = [0u8; 4];
                 octets.copy_from_slice(&body[..4]);
-                Some(SocketAddr::from((
+                Some(Bound::Ip(SocketAddr::from((
                     octets,
                     u16::from_be_bytes([body[4], body[5]]),
-                )))
+                ))))
             }
             socks::ATYP_IPV6 => {
                 let mut body = [0u8; 18];
                 self.stream.read_exact(&mut body).ok()?;
                 let mut octets = [0u8; 16];
                 octets.copy_from_slice(&body[..16]);
-                Some(SocketAddr::from((
+                Some(Bound::Ip(SocketAddr::from((
                     octets,
                     u16::from_be_bytes([body[16], body[17]]),
-                )))
+                ))))
             }
             socks::ATYP_DOMAIN => {
                 let mut len = [0u8; 1];
                 self.stream.read_exact(&mut len).ok()?;
-                let mut body = vec![0u8; usize::from(len[0]) + 2];
+                let name_len = usize::from(len[0]);
+                let mut body = vec![0u8; name_len + 2];
                 self.stream.read_exact(&mut body).ok()?;
-                None
+                let name = String::from_utf8_lossy(&body[..name_len]).into_owned();
+                let port = u16::from_be_bytes([body[name_len], body[name_len + 1]]);
+                Some(Bound::Name(name, port))
             }
             _ => None,
         }
@@ -199,7 +213,11 @@ impl Session {
     pub(crate) fn associate(&mut self) -> Option<SocketAddr> {
         // RFC 1928's associate request names no destination: the address is `0.0.0.0:0` — `hev-socks5-core` sends the same all-zero IPv4 address, and `xray-core`'s `ClientHandshake` writes `{1, 0, 0, 0, 0, 0, 0}` for a UDP request.
         let atyp = self.send(socks::CMD_UDP_ASSOCIATE, &Destination::V4([0, 0, 0, 0], 0))?;
-        self.read_bound(atyp)
+        match self.read_bound(atyp)? {
+            Bound::Ip(relay) => Some(relay),
+            // The server's relay is dialled, not refused: the reference resolves the name its dialer is handed.
+            Bound::Name(name, port) => (name.as_str(), port).to_socket_addrs().ok()?.next(),
+        }
     }
 
     /// The socket the session runs on, once the request has been granted.
@@ -553,5 +571,67 @@ mod tests {
             octets(&written, 13),
             vec![5, 1, 0, 5, 3, 0, 1, 0, 0, 0, 0, 0, 0]
         );
+    }
+
+    /// The three address types RFC 1928 gives the reply's bound address, read from one
+    /// server that grants the tunnel with each: IPv4 and IPv6 stay the addresses they
+    /// came as, and a name is read as a name — the reply is granted, the tunnel
+    /// carries on, no refusal after a grant.
+    #[test]
+    fn a_tunnel_carries_a_reply_that_binds_any_rfc_edge() {
+        let probe = |reply: Vec<u8>| {
+            let (client, written) = pair(move |server, seen| {
+                let mut greeting = [0u8; 3];
+                server.read_exact(&mut greeting).expect("the greeting");
+                server.write_all(&[5, 0]).expect("the method reply");
+                let mut request = [0u8; 10];
+                server.read_exact(&mut request).expect("the request");
+                server.write_all(&reply).expect("the reply");
+                // The reply is the grant, so the client's next write is the tunnel's first bytes.
+                let mut after = [0u8; 4];
+                server.read_exact(&mut after).expect("the tunnel's bytes");
+                seen.lock().expect("the slot").extend_from_slice(&after);
+            });
+            let mut session = Session::open(client, &Credential::default()).expect("a session");
+            session
+                .connect(&Destination::Name(b"a.b", 80))
+                .expect("a granted tunnel");
+            session.stream.write_all(b"PING").expect("writes");
+            octets(&written, 4)
+        };
+        assert_eq!(probe(vec![5, 0, 0, 1, 1, 2, 3, 4, 0, 80]), b"PING");
+        assert_eq!(probe(vec![5, 0, 0, 3, 3, b'a', b'.', b'b', 0, 80]), b"PING");
+        assert_eq!(
+            probe(vec![
+                5, 0, 0, 4, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 80
+            ]),
+            b"PING"
+        );
+    }
+
+    /// The relay a server binds with a name is dialled, not refused: the reference
+    /// hands the bound address to its dialer, which resolves the name — `localhost`
+    /// answers here without a wire, so the association carries the loopback relay.
+    #[test]
+    fn an_association_dials_the_relay_the_server_bound_by_name() {
+        let (client, _written) = pair(|server, _seen| {
+            let mut greeting = [0u8; 3];
+            server.read_exact(&mut greeting).expect("the greeting");
+            server.write_all(&[5, 0]).expect("the method reply");
+            let mut request = [0u8; 10];
+            server.read_exact(&mut request).expect("the request");
+            server
+                .write_all(&[
+                    5, 0, 0, 3, 9, b'l', b'o', b'c', b'a', b'l', b'h', b'o', b's', b't', 0x1f, 0x90,
+                ])
+                .expect("the reply");
+        });
+        let mut session = Session::open(client, &Credential::default()).expect("a session");
+        let relay = session.associate().expect("an association");
+        assert!(
+            relay.ip().is_loopback(),
+            "the name dialled a loopback relay: {relay}"
+        );
+        assert_eq!(relay.port(), 8080);
     }
 }
