@@ -418,6 +418,7 @@ while read -r id traffic connections iterations payload; do
       --traffic "$traffic" --connections "$connections" \
       --iterations "$iterations" --payload-size "$payload" \
       --repeats "$repeats" \
+      --keep-going \
       "${client_args[@]}" \
       --output-dir "$celldir/runs" \
       --scenario "$cell" \

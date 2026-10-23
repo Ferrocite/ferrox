@@ -37,7 +37,6 @@ try:
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.colors import ListedColormap
     from matplotlib.patches import Patch
 except ImportError:
     sys.exit(
@@ -47,10 +46,19 @@ except ImportError:
 
 import benchstats
 
-ENGINE_ORDER = ["xray-core", "ferrox", "zeronet", "sing-box", "xray-rust", "leaf"]
+ENGINE_ORDER = [
+    "xray-core",
+    "ferrox",
+    "xray-core-rust",
+    "zeronet",
+    "sing-box",
+    "xray-rust",
+    "leaf",
+]
 PALETTE = {
     "xray-core": "#4C78A8",
     "ferrox": "#F58518",
+    "xray-core-rust": "#72B7B2",
     "zeronet": "#54A24B",
     "sing-box": "#E45756",
     "xray-rust": "#B279A2",
@@ -382,46 +390,127 @@ def setup_medians(cell, engine, runs_dir, stage):
     return values
 
 
-def coverage_chart(scenarios, cells, path, foot):
-    """Protocol-by-scenario grid: measured pass, measured fail, or named gap."""
-    present = engines_present(cells)
-    names = [s for s in scenarios if s in cells]
-    if not names or not present:
-        return None
-    grid = []
-    for scenario in names:
-        row = []
-        for engine in present:
-            status = cell_status(cells[scenario], engine)
-            row.append({"pass": 2, "fail": 1, "empty": 0}[status])
-        grid.append(row)
-    fig, ax = plt.subplots(
-        figsize=(max(7.0, 1.1 * len(present)), 0.7 * len(names) + 1.6)
+def scenario_throughput_chart(scenario, cell, path, foot):
+    """One scenario's throughput: engines side by side, never merged with another test."""
+    present = [name for name in engines_present({scenario: cell})]
+    fig, ax = plt.subplots(figsize=(max(6.0, 1.3 * max(1, len(present))), 4.2))
+    if not present:
+        base, _, server = scenario.partition("--srv-")
+        ax.text(
+            0.5,
+            0.5,
+            "no engine landed a number in this cell\n"
+            + "; ".join(
+                f"{failure.get('engine')}: {failure.get('reason', '')[:80]}"
+                for failure in cell.get("failures", [])[:4]
+            ),
+            transform=ax.transAxes,
+            ha="center",
+            va="center",
+            fontsize=8,
+            color="#333333",
+            wrap=True,
+        )
+        ax.set_axis_off()
+        ax.set_title(f"{base} on {server}: no throughput measured", fontsize=11)
+        fig.text(0.5, 0.01, foot, ha="center", fontsize=7, color="#666666")
+        fig.tight_layout(rect=(0, 0.06, 1, 1))
+        fig.savefig(path, dpi=110, bbox_inches="tight")
+        plt.close(fig)
+        return path
+    values, lower, upper, edges, labels = [], [], [], [], []
+    reference = benchstats.median(run_values(cell, "xray-core", "throughput_mib_s")) if run_values(cell, "xray-core", "throughput_mib_s") else None
+    for engine in present:
+        samples = run_values(cell, engine, "throughput_mib_s")
+        median = benchstats.median(samples)
+        values.append(median)
+        interval = bootstrap_interval(samples)
+        lower.append(median - interval[0] if interval else 0.0)
+        upper.append(interval[1] - median if interval else 0.0)
+        verdict = gated_verdict(cell, engine, "throughput")
+        edges.append({"better": "#2CA02C", "worse": "#D62728"}.get(verdict, "black"))
+        if engine == "ferrox" and reference:
+            labels.append(f"ferrox {median:.0f}\n{median / reference:.2f}x xray-core")
+        else:
+            labels.append(f"{engine} {median:.0f}")
+    ax.bar(
+        present,
+        values,
+        yerr=[lower, upper],
+        capsize=3,
+        color=[PALETTE.get(name, MISSING) for name in present],
+        edgecolor=edges,
+        linewidth=1.2,
+        error_kw={"elinewidth": 1},
     )
-    cmap = ListedColormap([MISSING, "#E45756", "#54A24B"])
-    ax.imshow(grid, cmap=cmap, vmin=0, vmax=2, aspect="auto")
-    ax.set_xticks(range(len(present)))
-    ax.set_xticklabels(present, fontsize=9)
-    ax.set_yticks(range(len(names)))
-    ax.set_yticklabels(names, fontsize=8)
-    for row, scenario in enumerate(names):
-        for col, engine in enumerate(present):
-            status = cell_status(cells[scenario], engine)
-            ax.text(
-                col,
-                row,
-                STATUS_TEXT[status],
-                ha="center",
-                va="center",
-                fontsize=10,
-                color="white" if status == "pass" else "#333333",
-            )
-    ax.set_title("coverage: measured cells by scenario and engine", fontsize=11)
+    for tick, label in enumerate(labels):
+        ax.text(tick, values[tick], label, ha="center", va="bottom", fontsize=8)
+    base, _, server = scenario.partition("--srv-")
+    ax.set_ylabel("MiB/s", fontsize=9)
+    ax.set_title(
+        f"{base} on {server}: throughput (MiB/s, higher is better)", fontsize=11
+    )
+    ax.grid(axis="y", linestyle=":", alpha=0.6)
+    failed = [name for name in ENGINE_ORDER if any(
+        failure.get("engine") == name for failure in cell.get("failures", [])
+    )]
+    if failed:
+        missing = [f"{name}: {fail_reason(cell, name)}" for name in failed]
+        ax.text(
+            0.0,
+            -0.18,
+            "not measured: " + "; ".join(missing),
+            transform=ax.transAxes,
+            fontsize=7,
+            color="#666666",
+            va="top",
+            ha="left",
+        )
     fig.text(0.5, 0.01, foot, ha="center", fontsize=7, color="#666666")
-    fig.tight_layout(rect=(0, 0.06, 1, 1))
+    fig.tight_layout(rect=(0, 0.08, 1, 1))
     fig.savefig(path, dpi=110, bbox_inches="tight")
     plt.close(fig)
     return path
+
+
+def coverage_table(results):
+    """Markdown coverage grid: pass, fail, or the reason for a gap."""
+    engines = [
+        name
+        for name in ENGINE_ORDER
+        if any(name in scenario.get("medians", {}) or any(
+            failure.get("engine") == name for failure in scenario.get("failures", [])
+        ) for scenario in results.get("scenarios", []))
+    ]
+    lines = [
+        "| scenario | server | " + " | ".join(engines) + " |",
+        "| -------- | ------ | " + " | ".join(["---"] * len(engines)) + " |",
+    ]
+    reasons = []
+    for scenario in results.get("scenarios", []):
+        marks = []
+        for engine in engines:
+            if engine in scenario.get("medians", {}):
+                marks.append("pass")
+            elif any(f.get("engine") == engine for f in scenario.get("failures", [])):
+                marks.append("fail")
+            else:
+                marks.append("\u2014")
+                skipped = next(
+                    (s for s in scenario.get("skipped", []) if s.get("engine") == engine),
+                    None,
+                )
+                reasons.append(
+                    f"`{scenario['id']}` / {engine}: "
+                    + (skipped.get("reason", "not attempted") if skipped else "not attempted")
+                )
+        lines.append(
+            f"| `{scenario.get('base', scenario['id'])}` | "
+            f"{scenario.get('server') or '\u2014'} | " + " | ".join(marks) + " |"
+        )
+    if reasons:
+        lines += ["", "Gaps:", ""] + [f"- {reason}" for reason in reasons]
+    return "\n".join(lines)
 
 
 def binary_size_chart(meta, path, foot):
@@ -642,14 +731,183 @@ def format_cost(value):
     return f"{value:.1f}"
 
 
-def update_readme(readme_path, results, charts_dir, runner):
-    """Rewrite the README section between the benchmark-matrix markers.
+def scenario_name(scenario):
+    """Base test name and server leg, for a heading or an axis."""
+    return scenario.get("base", scenario["id"]), scenario.get("server") or "\u2014"
 
-    One subsection per runner: a six-engine throughput table with the gated
-    verdict, a cost table (CPU, RSS, threads, cold start), and every chart.
-    The image paths carry the runner slug, so three runners' sections combine
-    without colliding.
-    """
+
+def leg_tables(results):
+    """Client and server leg ratios, computed from the same-cell reference."""
+    by_key = {
+        (scenario.get("base"), scenario.get("server")): scenario
+        for scenario in results.get("scenarios", [])
+    }
+    gap_lines = []
+    rows = [
+        "| test | client leg | server leg | client vs xray-core-rust |",
+        "| ---- | ---------- | ---------- | ------------------------ |",
+    ]
+    for base in sorted({key[0] for key in by_key if key[0]}):
+        xray_server = by_key.get((base, "xray-core"))
+        ferrox_server = by_key.get((base, "ferrox"))
+        if not xray_server or not ferrox_server:
+            continue
+        xray_ref = xray_server.get("medians", {}).get("xray-core", {}).get("throughput_mib_s")
+        ferrox_on_xray = xray_server.get("medians", {}).get("ferrox", {}).get("throughput_mib_s")
+        xray_on_ferrox = ferrox_server.get("medians", {}).get("xray-core", {}).get("throughput_mib_s")
+        rust_on_xray = xray_server.get("medians", {}).get("xray-core-rust", {}).get("throughput_mib_s")
+        client = ferrox_on_xray / xray_ref if ferrox_on_xray and xray_ref else None
+        server = xray_on_ferrox / xray_ref if xray_on_ferrox and xray_ref else None
+        rust = ferrox_on_xray / rust_on_xray if ferrox_on_xray and rust_on_xray else None
+        def cell(value, measured):
+            if value is None:
+                return "missing **gap**" if measured else "\u2014"
+            mark = " **gap**" if value < HARNESS_BOUND else ""
+            return f"{value:.2f}x{mark}"
+        rows.append(
+            f"| `{base}` | {cell(client, bool(xray_ref))} | "
+            f"{cell(server, bool(xray_ref))} | {cell(rust, bool(rust_on_xray))} |"
+        )
+        if client is None and xray_ref and not ferrox_on_xray:
+            gap_lines.append(f"`{base}` client leg: ferrox landed no number on the xray-core server")
+        elif client is not None and client < HARNESS_BOUND:
+            gap_lines.append(
+                f"`{base}` client leg {client:.2f}x: ferrox on xray-core "
+                f"{ferrox_on_xray:.0f} MiB/s vs xray-core {xray_ref:.0f} MiB/s"
+            )
+        if server is None and xray_ref and not xray_on_ferrox:
+            gap_lines.append(f"`{base}` server leg: xray-core landed no number on the ferrox server")
+        elif server is not None and server < HARNESS_BOUND:
+            gap_lines.append(
+                f"`{base}` server leg {server:.2f}x: xray-core on ferrox "
+                f"{xray_on_ferrox:.0f} MiB/s vs xray-core server {xray_ref:.0f} MiB/s"
+            )
+    return "\n".join(rows) + ("\n\nLeg gaps (below the 0.85 harness bound):\n\n" + "\n".join(f"- {line}" for line in gap_lines) if gap_lines else "")
+
+
+def throughput_table(results):
+    """Scenario-by-engine medians, the same table the README and bundle carry."""
+    engines = [name for name in ENGINE_ORDER if any(
+        name in scenario.get("medians", {}) for scenario in results.get("scenarios", [])
+    )]
+    lines = [
+        "| scenario | server | " + " | ".join(engines) + " | verdict |",
+        "| -------- | ------ | " + " | ".join(["--------"] * len(engines)) + " | ------- |",
+    ]
+    for scenario in results.get("scenarios", []):
+        medians = scenario.get("medians", {})
+        cells = [format_median(medians.get(engine, {}).get("throughput_mib_s")) for engine in engines]
+        verdicts = [
+            row["verdict"]
+            for row in scenario.get("rows", [])
+            if row.get("gates") and row["label"].startswith("throughput")
+        ]
+        verdict = verdicts[0] if verdicts else "unproven"
+        base, server = scenario_name(scenario)
+        lines.append(f"| `{base}` | {server} | " + " | ".join(cells) + f" | {verdict} |")
+    return "\n".join(lines)
+
+
+def cost_table(results):
+    """CPU, RSS, thread and startup medians per scenario and engine."""
+    engines = [name for name in ENGINE_ORDER if any(
+        name in scenario.get("medians", {}) for scenario in results.get("scenarios", {})
+    )]
+    lines = [
+        "| scenario | server | engine | cpu | rss | threads | start |",
+        "| -------- | ------ | ------ | --- | --- | ------- | ----- |",
+    ]
+    for scenario in results.get("scenarios", []):
+        base, server = scenario_name(scenario)
+        for engine in engines:
+            values = scenario.get("medians", {}).get(engine, {})
+            if not values:
+                continue
+            lines.append(
+                f"| `{base}` | {server} | {engine} | "
+                f"{format_cost(values.get('cpu_millis_per_gib'))} | "
+                f"{format_cost(values.get('rss_mib'))} | "
+                f"{format_cost(values.get('threads_peak'))} | "
+                f"{format_cost(values.get('startup_seconds'))} |"
+            )
+    return "\n".join(lines)
+
+
+def matrix_markdown(results, image_prefix):
+    """The complete bundle document: tables, one throughput plot per test, coverage text."""
+    lines = [
+        f"# ferrox benchmark matrix \u2014 {results.get('date', '?')} on {results.get('runner', '?')}",
+        "",
+        f"Tier `{results.get('tier', '?')}`, reference `{results.get('reference', 'xray-core')}`, "
+        f"{results.get('repeats', '?')} repeats, host `{results.get('host', '?')}`, "
+        f"CPU `{results.get('cpu', '?')}`, memory `{results.get('memory', '?')}`, "
+        f"load `{results.get('load', '?')}`. Bars are medians; whiskers are 95% bootstrap "
+        "intervals over the engine's own repeats.",
+        "",
+        "## Throughput by test",
+        "",
+        throughput_table(results),
+        "",
+        "## Ferrox against the reference, leg by leg",
+        "",
+        leg_tables(results),
+        "",
+        "The client leg compares ferrox and xray-core as clients of the xray-core server; "
+        "the server leg compares xray-core as a client of the ferrox and xray-core servers. "
+        "A value below 0.85 is marked `gap` and is a hole in this tree, not variance.",
+        "",
+        "## One plot per test",
+        "",
+    ]
+    for scenario in results.get("scenarios", []):
+        if "setup" in scenario.get("id", ""):
+            continue
+        base, server = scenario_name(scenario)
+        lines += [
+            f"### `{base}` on {server}",
+            "",
+            f"![{base} on {server}]({image_prefix}/throughput/{scenario['id']}.png)",
+            "",
+        ]
+    lines += [
+        "## Cost",
+        "",
+        cost_table(results),
+        "",
+        "## Coverage",
+        "",
+        coverage_table(results),
+        "",
+        "## Other charts",
+        "",
+        f"![CPU per GiB]({image_prefix}/cpu-per-gib.png)",
+        "",
+        f"![peak RSS]({image_prefix}/memory-rss.png)",
+        "",
+        f"![peak threads]({image_prefix}/threads.png)",
+        "",
+        f"![cold start]({image_prefix}/startup.png)",
+        "",
+        f"![share of ceiling]({image_prefix}/ceiling.png)",
+        "",
+        f"![setup latency]({image_prefix}/setup-latency.png)",
+        "",
+        f"![binary size]({image_prefix}/binary-size.png)",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def write_bundle_markdown(input_dir, results):
+    """Put the complete document in the bundle, beside the plots it embeds."""
+    path = Path(input_dir) / "README.md"
+    path.write_text(matrix_markdown(results, "charts"))
+    print(f"bundle document written to {path}")
+
+
+def update_readme(readme_path, results, charts_dir, runner):
+    """Rewrite one runner's README block from the same numbers as the charts."""
+    del charts_dir
     img = f"docs/benchmarks/charts/latest/{runner}"
     try:
         text = Path(readme_path).read_text()
@@ -659,69 +917,7 @@ def update_readme(readme_path, results, charts_dir, runner):
     end = "<!-- benchmark-matrix:end -->"
     if start not in text or end not in text:
         sys.exit("README has no benchmark-matrix markers")
-    engines = ["ferrox", "xray-core", "zeronet", "sing-box", "xray-rust", "leaf"]
-    lines = [
-        "",
-        f"_Latest full matrix: {results['date']} on {results['runner']} "
-        f"({results.get('cpu', '?')}), "
-        f"tier {results['tier']}, reference `{results['reference']}`. "
-        "Bars are medians with 95% intervals; empty cells name their reason in "
-        "`docs/benchmarks/matrix.md`. Dated results and the replay commands live "
-        "under `docs/benchmarks/results/`; full cell bundles are workflow "
-        "artifacts._",
-        "",
-        "| scenario | server | " + " | ".join(engines) + " | verdict |",
-        "| -------- | ------ | " + " | ".join(["--------"] * len(engines)) + " | ------- |",
-    ]
-    for scenario in results["scenarios"]:
-        medians = scenario["medians"]
-        cells = [format_median(medians.get(e, {}).get("throughput_mib_s"))
-                 for e in engines]
-        verdicts = [
-            row["verdict"]
-            for row in scenario["rows"]
-            if row.get("gates") and row["label"].startswith("throughput")
-        ]
-        verdict = verdicts[0] if verdicts else "unproven"
-        server = scenario.get("server") or "\u2014"
-        lines.append(
-            f"| `{scenario.get('base', scenario['id'])}` | {server} | "
-            + " | ".join(cells) + f" | {verdict} |"
-        )
-    lines += [
-        "",
-        "Cost medians (CPU ms/GiB, peak RSS MiB, peak threads, cold start s):",
-        "",
-        "| scenario | server | engine | cpu | rss | threads | start |",
-        "| -------- | ------ | ------ | --- | --- | ------- | ----- |",
-    ]
-    for scenario in results["scenarios"]:
-        for engine in engines:
-            values = scenario["medians"].get(engine, {})
-            if not values:
-                continue
-            server = scenario.get("server") or "\u2014"
-            lines.append(
-                f"| `{scenario.get('base', scenario['id'])}` | {server} | {engine} | "
-                f"{format_cost(values.get('cpu_millis_per_gib'))} | "
-                f"{format_cost(values.get('rss_mib'))} | "
-                f"{format_cost(values.get('threads_peak'))} | "
-                f"{format_cost(values.get('startup_seconds'))} |"
-            )
-    lines += [
-        "",
-        f"![bulk throughput]({img}/throughput.png)",
-        f"![CPU per GiB]({img}/cpu-per-gib.png)",
-        f"![peak RSS]({img}/memory-rss.png)",
-        f"![peak threads]({img}/threads.png)",
-        f"![cold start]({img}/startup.png)",
-        f"![share of ceiling]({img}/ceiling.png)",
-        f"![setup latency]({img}/setup-latency.png)",
-        f"![coverage]({img}/coverage.png)",
-        f"![binary size]({img}/binary-size.png)",
-        "",
-    ]
-    section = "\n".join(lines)
+    section = matrix_markdown(results, img)
     before, _, rest = text.partition(start)
     area, _, after = rest.partition(end)
     area = replace_runner_block(area, runner, section)
@@ -783,6 +979,7 @@ def main(argv=None):
     input_dir = Path(args.input)
     charts_dir = Path(args.charts)
     charts_dir.mkdir(parents=True, exist_ok=True)
+    (charts_dir / "throughput").mkdir(parents=True, exist_ok=True)
     meta = parse_manifest(input_dir / "manifest.txt")
     runner = args.runner or meta.get("runner", "unknown")
     cells = load_cells(input_dir / "cells")
@@ -795,12 +992,17 @@ def main(argv=None):
         handle.write("\n")
 
     bulk = sorted(s for s in cells if "setup" not in s)
-    made = [
-        metric_chart(
-            bulk, cells, "throughput_mib_s", "throughput", "MiB/s",
-            "bulk throughput by scenario (higher is better)",
-            str(charts_dir / "throughput.png"), foot,
-        ),
+    made = []
+    for scenario in bulk:
+        chart = scenario_throughput_chart(
+            scenario,
+            cells[scenario],
+            str(charts_dir / "throughput" / f"{scenario}.png"),
+            foot,
+        )
+        if chart:
+            made.append(chart)
+    made += [
         metric_chart(
             bulk, cells, "cpu_millis_per_gib", "cpu", "ms/GiB",
             "CPU per GiB by scenario (lower is better)",
@@ -817,15 +1019,13 @@ def main(argv=None):
         ),
         ceiling_chart(bulk, cells, str(charts_dir / "ceiling.png"), foot),
         setup_chart(cells, runs_dir, str(charts_dir / "setup-latency.png"), foot),
-        coverage_chart(
-            sorted(cells), cells, str(charts_dir / "coverage.png"), foot
-        ),
         binary_size_chart(meta, str(charts_dir / "binary-size.png"), foot),
     ]
     made = [path for path in made if path]
     print(f"charts: {len(made)} PNGs in {charts_dir}")
     for path in made:
         print(f"  {path}")
+    write_bundle_markdown(input_dir, results)
     if args.readme:
         update_readme(args.readme, results, str(charts_dir), runner)
     return 0

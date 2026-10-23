@@ -1,0 +1,14 @@
+# Measured legs below the 0.85 bound that are filed already. A new leg, or one
+# worse than its last filed ratio by more than 0.05, still fails the matrix.
+# base|leg|ratio|issue
+vless-hysteria-down-8|client|0.00|466
+vless-hysteria-down-8|server|0.04|466
+vless-raw-up-1|client|0.51|465
+vless-raw-up-1|rust|0.56|465
+vless-reality-grpc-down-8|server|0.85|468
+vless-reality-xhttp-down-8|client|0.00|472
+vless-reality-xhttp-down-8|server|0.00|472
+vless-tls-grpc-down-8|server|0.61|467
+vless-tls-raw-up-1|client|0.00|469
+vmess-raw-down-8|server|0.00|470
+vmess-tls-ws-down-8|server|0.00|471

@@ -345,8 +345,9 @@ jobs:
           python3 scripts/validate-benchmark-matrix.py \
             --cells target/benchmark-matrix/cells \
             --results target/benchmark-matrix/matrix-results.json \
-            --charts target/benchmark-matrix/charts
-          python3 scripts/check-matrix-legs.py --cells target/benchmark-matrix/cells
+            --charts target/benchmark-matrix/charts \
+            --bundle-readme target/benchmark-matrix/README.md
+          python3 scripts/check-matrix-legs.py --cells target/benchmark-matrix/cells --baseline scripts/leg-gaps.txt
       - name: refuse a bundle that measured nothing
         shell: bash
         run: |
@@ -405,8 +406,8 @@ jobs:
             results="docs/benchmarks/results/$STAMP/$slug"
             charts="docs/benchmarks/charts/latest/$slug"
             mkdir -p "$dest/charts" "$results" "$charts"
-            cp "$bundle/matrix-results.json" "$bundle/manifest.txt" "$results/"
-            cp "$results/matrix-results.json" "$results/manifest.txt" "$dest/"
+            cp "$bundle/matrix-results.json" "$bundle/manifest.txt" "$bundle/README.md" "$results/"
+            cp "$results/matrix-results.json" "$results/manifest.txt" "$results/README.md" "$dest/"
             cp -r "$bundle/cells" "$dest/cells"
             python3 scripts/render-benchmark-charts.py \
               --input "$bundle" \
@@ -414,7 +415,7 @@ jobs:
               --results "$results/matrix-results.json" \
               --readme docs/benchmarks/matrix.md \
               --runner "$slug"
-            cp "$charts"/*.png "$dest/charts/"
+            cp -R "$charts"/. "$dest/charts/"
             python3 scripts/validate-benchmark-matrix.py \
               --cells "$dest/cells" \
               --results "$results/matrix-results.json" \

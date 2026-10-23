@@ -40,17 +40,23 @@ REQUIRED_RESULTS_KEYS = {
     "manifest",
 }
 ALWAYS_CHARTS = [
-    "throughput.png",
     "cpu-per-gib.png",
     "memory-rss.png",
     "threads.png",
     "startup.png",
     "ceiling.png",
-    "coverage.png",
     "binary-size.png",
 ]
 SETUP_CHART = "setup-latency.png"
-THROUGHPUT_ENGINES = ["ferrox", "xray-core", "zeronet", "sing-box", "xray-rust", "leaf"]
+THROUGHPUT_ENGINES = [
+    "xray-core",
+    "ferrox",
+    "xray-core-rust",
+    "zeronet",
+    "sing-box",
+    "xray-rust",
+    "leaf",
+]
 
 failures = []
 
@@ -196,6 +202,13 @@ def check_charts(charts_dir, results):
         check(path.is_file(), f"missing chart {path}")
         if path.is_file():
             check(path.stat().st_size > 0, f"empty chart {path}")
+    for scenario in results.get("scenarios", []):
+        if "setup" in scenario.get("id", ""):
+            continue
+        path = Path(charts_dir) / "throughput" / f"{scenario['id']}.png"
+        check(path.is_file(), f"missing per-test throughput chart {path}")
+        if path.is_file():
+            check(path.stat().st_size > 0, f"empty chart {path}")
 
 
 def check_readme(readme_path, charts_dir, results):
@@ -216,10 +229,14 @@ def check_readme(readme_path, charts_dir, results):
         f"<!-- runner:{runner} -->" in section,
         f"README has no block for runner {runner}",
     )
+    engines = [
+        name for name in THROUGHPUT_ENGINES
+        if any(name in scenario.get("medians", {}) for scenario in results.get("scenarios", []))
+    ]
     for scenario in results.get("scenarios", []):
         medians = scenario.get("medians", {})
         cells = []
-        for engine in THROUGHPUT_ENGINES:
+        for engine in engines:
             value = medians.get(engine, {}).get("throughput_mib_s")
             cells.append("\u2014" if value is None else f"{value:.0f}")
         base = scenario.get("base", scenario["id"])
@@ -230,7 +247,29 @@ def check_readme(readme_path, charts_dir, results):
             f"README row for {scenario['id']} does not match "
             f"matrix-results.json ({'/'.join(cells)})",
         )
-    _ = charts_dir
+        if "setup" not in scenario.get("id", ""):
+            image = f"throughput/{scenario['id']}.png"
+            check(image in section, f"README has no per-test chart for {scenario['id']}")
+    check("## Coverage" in section, "README has no coverage table section")
+    check("| scenario | server |" in section, "README has no coverage table header")
+
+
+def check_bundle_readme(path, results):
+    """The bundle's own document names every measured test and every plot."""
+    try:
+        text = Path(path).read_text()
+    except OSError as exc:
+        fail(f"unreadable bundle document {path}: {exc}")
+        return
+    check("## Coverage" in text, "bundle document has no coverage table")
+    check("| scenario | server |" in text, "bundle document has no coverage header")
+    for scenario in results.get("scenarios", []):
+        if "setup" in scenario.get("id", ""):
+            continue
+        check(
+            f"throughput/{scenario['id']}.png" in text,
+            f"bundle document has no chart for {scenario['id']}",
+        )
 
 
 def main(argv=None):
@@ -241,6 +280,7 @@ def main(argv=None):
     parser.add_argument("--results", required=True, help="matrix-results.json path")
     parser.add_argument("--charts", required=True, help="charts directory")
     parser.add_argument("--readme", default=None, help="README path to cross-check")
+    parser.add_argument("--bundle-readme", default=None, help="bundle README path to check")
     args = parser.parse_args(argv)
 
     results_doc = load_json(args.results)
@@ -269,6 +309,8 @@ def main(argv=None):
     check_charts(args.charts, results_doc)
     if args.readme:
         check_readme(args.readme, args.charts, results_doc)
+    if args.bundle_readme:
+        check_bundle_readme(args.bundle_readme, results_doc)
     if failures:
         print("\n".join(failures))
         return 1
