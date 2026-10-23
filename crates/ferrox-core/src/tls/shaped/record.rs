@@ -7,7 +7,10 @@ use ring::hmac;
 /// An AES-CBC block: the width a CBC suite's explicit IV, its padding unit and its MAC floor share.
 const BLOCK: usize = 16;
 
-/// The suites a shaped hello can key: three TLS 1.3 AEADs and TLS 1.2's AEAD and CBC pairs,
+/// A 3DES-CBC block, the width Go's two `3DES_EDE_CBC` rows pad and carry an IV at.
+const DES_BLOCK: usize = 8;
+
+/// The suites a shaped hello can key: three TLS 1.3 AEADs and TLS 1.2's AEAD, CBC and 3DES pairs,
 /// each TLS 1.2 name carrying the key exchange that fills its pre-master.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Suite {
@@ -20,11 +23,13 @@ pub(crate) enum Suite {
     EcdheAes128CbcSha,
     EcdheAes256CbcSha,
     EcdheAes128CbcSha256,
+    Ecdhe3DesCbcSha,
     RsaAes128GcmSha256,
     RsaAes256GcmSha384,
     RsaAes128CbcSha,
     RsaAes256CbcSha,
     RsaAes128CbcSha256,
+    Rsa3DesCbcSha,
 }
 
 impl Suite {
@@ -39,11 +44,13 @@ impl Suite {
             0xc009 | 0xc013 => Self::EcdheAes128CbcSha,
             0xc00a | 0xc014 => Self::EcdheAes256CbcSha,
             0xc023 | 0xc027 => Self::EcdheAes128CbcSha256,
+            0xc012 => Self::Ecdhe3DesCbcSha,
             0x009c => Self::RsaAes128GcmSha256,
             0x009d => Self::RsaAes256GcmSha384,
             0x002f => Self::RsaAes128CbcSha,
             0x0035 => Self::RsaAes256CbcSha,
             0x003c => Self::RsaAes128CbcSha256,
+            0x000a => Self::Rsa3DesCbcSha,
             _ => return None,
         })
     }
@@ -64,7 +71,13 @@ impl Suite {
                 | Self::RsaAes128CbcSha
                 | Self::RsaAes256CbcSha
                 | Self::RsaAes128CbcSha256
+                | Self::Rsa3DesCbcSha
         )
+    }
+
+    /// The suite whose records pad and chain on an eight-byte block rather than a sixteen-byte one.
+    pub(crate) fn is_des(self) -> bool {
+        matches!(self, Self::Ecdhe3DesCbcSha | Self::Rsa3DesCbcSha)
     }
 
     /// The PRF and handshake hash. The reference moves this to SHA-384 only for a suite flagged
@@ -87,6 +100,7 @@ impl Suite {
             | Self::RsaAes128GcmSha256
             | Self::RsaAes128CbcSha
             | Self::RsaAes128CbcSha256 => 16,
+            Self::Ecdhe3DesCbcSha | Self::Rsa3DesCbcSha => 24,
             _ => 32,
         }
     }
@@ -97,7 +111,9 @@ impl Suite {
             Self::EcdheAes128CbcSha
             | Self::EcdheAes256CbcSha
             | Self::RsaAes128CbcSha
-            | Self::RsaAes256CbcSha => Some(Mac::Sha1),
+            | Self::RsaAes256CbcSha
+            | Self::Ecdhe3DesCbcSha
+            | Self::Rsa3DesCbcSha => Some(Mac::Sha1),
             Self::EcdheAes128CbcSha256 | Self::RsaAes128CbcSha256 => Some(Mac::Sha256),
             _ => None,
         }
@@ -112,6 +128,7 @@ impl Suite {
             | Self::RsaAes128GcmSha256
             | Self::RsaAes256GcmSha384 => 4,
             Self::ChaCha20Sha256 | Self::EcdheChaCha20Sha256 => 12,
+            Self::Ecdhe3DesCbcSha | Self::Rsa3DesCbcSha => DES_BLOCK,
             _ => BLOCK,
         }
     }
@@ -132,11 +149,12 @@ impl Suite {
 /// One direction's keys and record counter: a sequence number reused under one key loses the record layer's integrity.
 #[allow(
     clippy::large_enum_variant,
-    reason = "seal and open reach the key of every record; boxing either half puts a chase on that path"
+    reason = "seal and open reach the key of every record; boxing a half puts a chase on that path"
 )]
 pub(crate) enum Direction {
     Aead(Aead),
-    Cbc(Cbc),
+    Cbc(Cbc<Aes>),
+    Tdes(Cbc<Tdes>),
 }
 
 impl Direction {
@@ -150,6 +168,7 @@ impl Direction {
     /// and a CBC suite ignores the block's IV because every record carries its own in the clear.
     pub(crate) fn tls12(suite: Suite, key: &[u8], mac: &[u8], iv: &[u8]) -> Self {
         match suite.mac() {
+            Some(kind) if suite.is_des() => Self::Tdes(Cbc::new(kind, key, mac)),
             Some(kind) => Self::Cbc(Cbc::new(kind, key, mac)),
             None => Self::Aead(Aead::tls12(suite, key, iv)),
         }
@@ -340,17 +359,17 @@ impl Aead {
 }
 
 /// A TLS 1.2 CBC direction: the block cipher, the HMAC its record's front carries, and the counter both sign.
-pub(crate) struct Cbc {
-    aes: Aes,
+pub(crate) struct Cbc<C: Chain> {
+    block: C,
     mac: Mac,
     mac_key: hmac::Key,
     seq: u64,
 }
 
-impl Cbc {
+impl<C: Chain> Cbc<C> {
     fn new(mac: Mac, key: &[u8], mac_key: &[u8]) -> Self {
         Self {
-            aes: Aes::new(key),
+            block: C::new(key),
             mac,
             mac_key: mac.key(mac_key),
             seq: 0,
@@ -360,15 +379,17 @@ impl Cbc {
     /// MAC-then-encrypt as RFC 5246 lays it out: the header the MAC signs names the
     /// plaintext, and the wire header names that plus the MAC, the padding and the clear IV.
     fn seal(&mut self, kind: u8, parts: &[&[u8]], out: &mut Vec<u8>) -> Result<(), TlsError> {
+        let width = C::WIDTH;
         let len: usize = parts.iter().map(|part| part.len()).sum();
         let mac_len = self.mac.len();
-        let pad = BLOCK - (len + mac_len) % BLOCK;
+        let pad = width - (len + mac_len) % width;
         let at = out.len();
-        out.reserve(5 + BLOCK + len + mac_len + pad);
+        out.reserve(5 + width + len + mac_len + pad);
         out.extend_from_slice(&[kind, 0x03, 0x03, (len >> 8) as u8, len as u8]);
         let mut iv = [0u8; BLOCK];
-        getrandom::fill(&mut iv).map_err(|e| TlsError::Other(format!("record IV: {e}")))?;
-        out.extend_from_slice(&iv);
+        let iv = &mut iv[..width];
+        getrandom::fill(iv).map_err(|e| TlsError::Other(format!("record IV: {e}")))?;
+        out.extend_from_slice(iv);
         let body = out.len();
         for part in parts {
             out.extend_from_slice(part);
@@ -378,7 +399,7 @@ impl Cbc {
         let tag = kdf::sign(&self.mac_key, &[&seq, &out[at..at + 5], &out[body..]]);
         out.extend_from_slice(tag.as_ref());
         out.resize(out.len() + pad, (pad - 1) as u8);
-        self.aes.encrypt(&iv, &mut out[body..]);
+        self.block.encrypt(&iv[..], &mut out[body..]);
         let total = (out.len() - at - 5) as u16;
         out[at + 3..at + 5].copy_from_slice(&total.to_be_bytes());
         Ok(())
@@ -386,27 +407,28 @@ impl Cbc {
 
     /// Opens a CBC record body in place: the plaintext starts one block in, behind the clear IV.
     fn open(&mut self, kind: u8, body: &mut [u8]) -> Result<(usize, usize), TlsError> {
+        let width = C::WIDTH;
         self.content_len(body.len())?;
         let mut iv = [0u8; BLOCK];
-        iv.copy_from_slice(&body[..BLOCK]);
-        self.aes.decrypt(&iv, &mut body[BLOCK..]);
-        Ok((BLOCK, self.authenticate(kind, &body[BLOCK..])?))
+        iv[..width].copy_from_slice(&body[..width]);
+        self.block.decrypt(&iv[..width], &mut body[width..]);
+        Ok((width, self.authenticate(kind, &body[width..])?))
     }
 
     /// The same record opened straight off the wire into the caller's buffer: the IV and the
     /// block behind each one stay where they are, so nothing is staged before it is decrypted.
     fn open_into(&mut self, kind: u8, body: &[u8], out: &mut [u8]) -> Result<usize, TlsError> {
         let content = self.content_len(body.len())?;
-        self.aes.decrypt_into(body, &mut out[..content]);
+        self.block.decrypt_into(body, &mut out[..content]);
         self.authenticate(kind, &out[..content])
     }
 
     /// The blocks a CBC body carries past its IV: whole of them, and enough for an HMAC and a pad byte.
     fn content_len(&self, wire: usize) -> Result<usize, TlsError> {
-        if wire < BLOCK + self.mac.len() + 1 || !wire.is_multiple_of(BLOCK) {
+        if wire < C::WIDTH + self.mac.len() + 1 || !wire.is_multiple_of(C::WIDTH) {
             return Err(TlsError::Other("short TLS 1.2 CBC record".to_owned()));
         }
-        Ok(wire - BLOCK)
+        Ok(wire - C::WIDTH)
     }
 
     /// The padding-and-MAC tail read back off a decrypted record, returning the payload length.
@@ -434,12 +456,27 @@ impl Cbc {
     }
 }
 
+/// The block cipher of a MAC-then-encrypt direction: the width its records pad and chain on, and
+/// the three walks a body goes through. `Cbc` is monomorphized per implementor, so each width is a
+/// constant in the walk rather than a field read per record.
+pub(crate) trait Chain {
+    const WIDTH: usize;
+
+    fn new(key: &[u8]) -> Self;
+
+    fn encrypt(&self, iv: &[u8], body: &mut [u8]);
+
+    fn decrypt(&self, iv: &[u8], body: &mut [u8]);
+
+    fn decrypt_into(&self, wire: &[u8], dst: &mut [u8]);
+}
+
 /// The AES schedule of a CBC direction, expanded once for the session rather than per record.
 #[allow(
     clippy::large_enum_variant,
     reason = "every block of a record goes through this schedule; boxing the wider half puts a chase inside the cipher"
 )]
-enum Aes {
+pub(crate) enum Aes {
     Aes128(aes::Aes128),
     Aes256(aes::Aes256),
 }
@@ -460,7 +497,9 @@ fn xor(left: &[u8], right: &[u8]) -> [u8; BLOCK] {
     out
 }
 
-impl Aes {
+impl Chain for Aes {
+    const WIDTH: usize = BLOCK;
+
     fn new(key: &[u8]) -> Self {
         use aes::cipher::KeyInit;
         match key.len() {
@@ -474,30 +513,9 @@ impl Aes {
         }
     }
 
-    fn transform(&self, block: &mut [u8; BLOCK], decrypt: bool) {
-        use aes::cipher::{BlockDecrypt, BlockEncrypt};
-        let mut typed = (*block).into();
-        match (self, decrypt) {
-            (Self::Aes128(key), false) => key.encrypt_block(&mut typed),
-            (Self::Aes128(key), true) => key.decrypt_block(&mut typed),
-            (Self::Aes256(key), false) => key.encrypt_block(&mut typed),
-            (Self::Aes256(key), true) => key.decrypt_block(&mut typed),
-        }
-        *block = typed.into();
-    }
-
-    /// Up to `PAR` blocks through the backend in one call, the short tail inside the same call.
-    fn permutation(&self, typed: &mut [Typed; PAR], count: usize) {
-        use aes::cipher::BlockDecrypt;
-        match self {
-            Self::Aes128(key) => key.decrypt_blocks(&mut typed[..count]),
-            Self::Aes256(key) => key.decrypt_blocks(&mut typed[..count]),
-        }
-    }
-
     /// CBC over whole blocks: each one chains through the cipher, forward from the record's IV.
-    fn encrypt(&self, iv: &[u8; BLOCK], body: &mut [u8]) {
-        let mut prev = *iv;
+    fn encrypt(&self, iv: &[u8], body: &mut [u8]) {
+        let mut prev = <[u8; BLOCK]>::try_from(iv).expect("a CBC record carries a whole-block IV");
         for chunk in body.as_chunks_mut::<BLOCK>().0 {
             let mut block = *chunk;
             for (slot, byte) in block.iter_mut().zip(prev) {
@@ -512,9 +530,9 @@ impl Aes {
     /// CBC over whole blocks: forward chains the ciphertext through the cipher, back chains the
     /// wire block, not the one it just decrypted. The batch permutes the stack copy, so the block
     /// behind each result is still the wire — taken from the top down, the write never reaches it.
-    fn decrypt(&self, iv: &[u8; BLOCK], body: &mut [u8]) {
+    fn decrypt(&self, iv: &[u8], body: &mut [u8]) {
         let mut typed = std::array::from_fn(|_| Typed::from([0u8; BLOCK]));
-        let mut prev = *iv;
+        let mut prev = <[u8; BLOCK]>::try_from(iv).expect("a CBC record carries a whole-block IV");
         let mut blocks = body.as_chunks_mut::<BLOCK>().0;
         while !blocks.is_empty() {
             let count = blocks.len().min(PAR);
@@ -559,6 +577,93 @@ impl Aes {
     }
 }
 
+impl Aes {
+    fn transform(&self, block: &mut [u8; BLOCK], decrypt: bool) {
+        use aes::cipher::{BlockDecrypt, BlockEncrypt};
+        let mut typed = (*block).into();
+        match (self, decrypt) {
+            (Self::Aes128(key), false) => key.encrypt_block(&mut typed),
+            (Self::Aes128(key), true) => key.decrypt_block(&mut typed),
+            (Self::Aes256(key), false) => key.encrypt_block(&mut typed),
+            (Self::Aes256(key), true) => key.decrypt_block(&mut typed),
+        }
+        *block = typed.into();
+    }
+
+    /// Up to `PAR` blocks through the backend in one call, the short tail inside the same call.
+    fn permutation(&self, typed: &mut [Typed; PAR], count: usize) {
+        use aes::cipher::BlockDecrypt;
+        match self {
+            Self::Aes128(key) => key.decrypt_blocks(&mut typed[..count]),
+            Self::Aes256(key) => key.decrypt_blocks(&mut typed[..count]),
+        }
+    }
+}
+
+/// The 3DES-EDE schedule of a CBC direction whose block is eight bytes, as Go's two `3DES` rows take it.
+pub(crate) struct Tdes(des::TdesEde3);
+
+/// A block as the 3DES backend takes it: this cipher permutes one at a time, so no batch feeds it.
+type DesTyped = des::cipher::Block<des::TdesEde3>;
+
+impl Chain for Tdes {
+    const WIDTH: usize = DES_BLOCK;
+
+    fn new(key: &[u8]) -> Self {
+        use des::cipher::KeyInit;
+        Self(
+            des::TdesEde3::new_from_slice(key)
+                .expect("a twenty-four-byte key expands to three schedules"),
+        )
+    }
+
+    fn encrypt(&self, iv: &[u8], body: &mut [u8]) {
+        use des::cipher::BlockCipherEncrypt;
+        let mut prev =
+            <[u8; DES_BLOCK]>::try_from(iv).expect("a CBC record carries a whole-block IV");
+        for chunk in body.as_chunks_mut::<DES_BLOCK>().0 {
+            let mut typed: DesTyped = (*chunk).into();
+            for (slot, byte) in typed.iter_mut().zip(prev) {
+                *slot ^= byte;
+            }
+            self.0.encrypt_block(&mut typed);
+            *chunk = typed.into();
+            prev = *chunk;
+        }
+    }
+
+    fn decrypt(&self, iv: &[u8], body: &mut [u8]) {
+        use des::cipher::BlockCipherDecrypt;
+        let mut prev =
+            <[u8; DES_BLOCK]>::try_from(iv).expect("a CBC record carries a whole-block IV");
+        for chunk in body.as_chunks_mut::<DES_BLOCK>().0 {
+            let carry = *chunk;
+            let mut typed: DesTyped = carry.into();
+            self.0.decrypt_block(&mut typed);
+            chunk.copy_from_slice(&typed);
+            for (slot, byte) in chunk.iter_mut().zip(prev) {
+                *slot ^= byte;
+            }
+            prev = carry;
+        }
+    }
+
+    fn decrypt_into(&self, wire: &[u8], dst: &mut [u8]) {
+        use des::cipher::BlockCipherDecrypt;
+        let blocks = dst.as_chunks_mut::<DES_BLOCK>().0;
+        let cipher = wire[DES_BLOCK..].as_chunks::<DES_BLOCK>().0;
+        let masks = wire[..wire.len() - DES_BLOCK].as_chunks::<DES_BLOCK>().0;
+        for (slot, (src, mask)) in blocks.iter_mut().zip(cipher.iter().zip(masks)) {
+            let mut typed: DesTyped = (*src).into();
+            self.0.decrypt_block(&mut typed);
+            slot.copy_from_slice(&typed);
+            for (byte, prev) in slot.iter_mut().zip(mask) {
+                *byte ^= prev;
+            }
+        }
+    }
+}
+
 /// The padding a CBC record's last byte names, folded to none of it when any byte disagrees.
 /// The walk covers a public count — the record's own length — so the secret padding picks no branch.
 fn padding(content: &[u8], mac_len: usize) -> usize {
@@ -593,7 +698,7 @@ fn keyed(suite: Suite, key: &[u8]) -> LessSafeKey {
 fn aead(keys: &mut Direction) -> &mut Aead {
     match keys {
         Direction::Aead(keys) => keys,
-        Direction::Cbc(_) => unreachable!("TLS 1.3 frames no CBC record"),
+        Direction::Cbc(_) | Direction::Tdes(_) => unreachable!("TLS 1.3 frames no CBC record"),
     }
 }
 
@@ -684,6 +789,7 @@ pub(crate) fn seal12_parts(
     match keys {
         Direction::Aead(keys) => keys.seal12_parts(kind, parts, out),
         Direction::Cbc(keys) => keys.seal(kind, parts, out),
+        Direction::Tdes(keys) => keys.seal(kind, parts, out),
     }
 }
 
@@ -698,6 +804,7 @@ pub(crate) fn open12(
     match keys {
         Direction::Aead(keys) => keys.open12(kind, body),
         Direction::Cbc(keys) => keys.open(kind, body),
+        Direction::Tdes(keys) => keys.open(kind, body),
     }
 }
 
@@ -712,6 +819,7 @@ pub(crate) fn open12_into(
     match keys {
         Direction::Aead(keys) => keys.open12_into(kind, body, out),
         Direction::Cbc(keys) => keys.open_into(kind, body, out),
+        Direction::Tdes(keys) => keys.open_into(kind, body, out),
     }
 }
 
@@ -799,5 +907,53 @@ mod tests {
         assert_eq!((got, same), (plain.len(), plain.len()));
         assert_eq!(&window[..got], &plain[..]);
         assert_eq!(&body[start..start + same], &plain[..]);
+    }
+
+    #[test]
+    fn a_tls12_3des_record_pads_to_its_own_block_and_open_back() {
+        let suite = Suite::Ecdhe3DesCbcSha;
+        let (key, mac_key, iv) = ([7u8; 24], [8u8; 20], [0u8; DES_BLOCK]);
+        let plain = [0x5au8; 12];
+        let mut sender = Direction::tls12(suite, &key, &mac_key, &iv);
+        let mut wire = Vec::new();
+        seal12(&mut sender, 23, &plain, &mut wire).expect("seals");
+        // Twelve payload plus twenty MAC are four blocks at this width, so a whole pad follows and the body is 40 where AES's width makes it 48.
+        assert_eq!(
+            wire.len(),
+            5 + DES_BLOCK + 40,
+            "the record pads and carries an IV at the width this suite's block has"
+        );
+        assert_eq!(
+            u16::from_be_bytes([wire[3], wire[4]]) as usize,
+            DES_BLOCK + 40,
+            "and its header names that"
+        );
+
+        let (header, body) = wire.split_at(5);
+        let mut window = [0u8; 64];
+        let mut direct = Direction::tls12(suite, &key, &mac_key, &iv);
+        let got = open12_into(&mut direct, header[0], body, &mut window).expect("opens the window");
+        let mut staged = wire.clone();
+        let (header, body) = staged.split_at_mut(5);
+        let mut inplace = Direction::tls12(suite, &key, &mac_key, &iv);
+        let (start, same) = open12(&mut inplace, header[0], body).expect("opens in place");
+        assert_eq!(
+            (got, same),
+            (plain.len(), plain.len()),
+            "both walks read it"
+        );
+        assert_eq!(&window[..got], &plain[..]);
+        assert_eq!(&body[start..start + same], &plain[..]);
+        assert_eq!(start, DES_BLOCK, "the plaintext starts behind the IV");
+
+        let mut forged = wire.clone();
+        let kind = forged[0];
+        *forged.last_mut().expect("a whole block") ^= 0xff;
+        let (_, body) = forged.split_at_mut(5);
+        let mut once = Direction::tls12(suite, &key, &mac_key, &iv);
+        assert!(
+            open12(&mut once, kind, body).is_err(),
+            "a forged padding length fails the MAC, not a branch on the secret"
+        );
     }
 }

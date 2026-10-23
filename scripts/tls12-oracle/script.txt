@@ -31,10 +31,15 @@
 0x009c TLS_RSA_WITH_AES_128_GCM_SHA256
 0x009d TLS_RSA_WITH_AES_256_GCM_SHA384
 
-# What this list deliberately stops at, measured against the same Go build (1.24.6): the five
-# suites Go keeps in `InsecureCipherSuites()` are still negotiable when both sides name one, so
-# `0x0005 TLS_RSA_WITH_RC4_128_SHA`, `0x000a TLS_RSA_WITH_3DES_EDE_CBC_SHA`,
-# `0xc007 TLS_ECDHE_ECDSA_WITH_RC4_128_SHA`, `0xc011 TLS_ECDHE_RSA_WITH_RC4_128_SHA` and
-# `0xc012 TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA` each complete a capture and wait for their own
+# The two 3DES-EDE-CBC rows, which are the last TLS 1.2 suites whose record layer is
+# MAC-then-encrypt. Their block is eight bytes, not sixteen, so the explicit IV, the padding count
+# and every length in the header move with it.
+0x000a TLS_RSA_WITH_3DES_EDE_CBC_SHA
+0xc012 TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA
+
+# What this list deliberately stops at, measured against the same Go build (1.24.6): the three
+# RC4-SHA rows Go keeps in `InsecureCipherSuites()` are still negotiable when both sides name one,
+# so `0x0005 TLS_RSA_WITH_RC4_128_SHA`, `0xc007 TLS_ECDHE_ECDSA_WITH_RC4_128_SHA` and
+# `0xc011 TLS_ECDHE_RSA_WITH_RC4_128_SHA` each complete a capture and wait for their own
 # suites here. `0x003d` does not: the server alerts `handshake failure`, because no TLS 1.2 table
 # this client reads contains it — uTLS keeps it behind `EnableWeakCiphers()`, which xray never calls.
