@@ -1095,55 +1095,78 @@ fn hysteria_gecko(stream: Option<&Json>) -> Result<Option<ferrox_core::hysteria:
         .ok_or(())
 }
 
-/// The masquerade cover an inbound hysteria server answers a browser with, read from its `hysteriaSettings`. Absent, empty, or an unknown type falls back to the plain not-found — today's behavior — so only a configured cover ever changes what a browser sees. Field names accept both the camel and the snake spelling the reference's two JSON dialects use.
+/// The masquerade cover an inbound hysteria server answers a browser with, read from its `hysteriaSettings`. xray's JSON nests it under `masquerade`; the flat protobuf spellings stay as the second way. Absent, empty, or an unknown type falls back to the plain not-found, so only a configured cover ever changes what a browser sees.
 pub(crate) fn masquerade_from_stream(stream: Option<&Json>) -> ferrox_core::hysteria::Masquerade {
     use ferrox_core::hysteria::Masquerade;
     let Some(hy) = stream.and_then(|s| s.get("hysteriaSettings")) else {
         return Masquerade::NotFound;
     };
-    let field = |camel: &str, snake: &str| hy.get(camel).or_else(|| hy.get(snake));
-    let text = |camel: &str, snake: &str| field(camel, snake).and_then(Json::as_str);
-    let flag =
-        |camel: &str, snake: &str| field(camel, snake).and_then(Json::as_bool).unwrap_or(false);
-    match text("masqType", "masq_type").unwrap_or_default() {
-        "file" => {
-            text("masqFile", "masq_file").map_or(Masquerade::NotFound, |dir| Masquerade::File {
-                dir: dir.to_owned(),
+    let nested = hy.get("masquerade");
+    let field = |name: &str, camel: &str, snake: &str| {
+        nested
+            .and_then(|object| object.get(name))
+            .or_else(|| hy.get(camel))
+            .or_else(|| hy.get(snake))
+    };
+    let text =
+        |name: &str, camel: &str, snake: &str| field(name, camel, snake).and_then(Json::as_str);
+    let flag = |name: &str, camel: &str, snake: &str| {
+        field(name, camel, snake)
+            .and_then(Json::as_bool)
+            .unwrap_or(false)
+    };
+    let kind = text("type", "masqType", "masq_type").unwrap_or_default();
+    if kind.eq_ignore_ascii_case("file") {
+        text("dir", "masqFile", "masq_file").map_or(Masquerade::NotFound, |dir| Masquerade::File {
+            dir: dir.to_owned(),
+        })
+    } else if kind.eq_ignore_ascii_case("proxy") {
+        text("url", "masqUrl", "masq_url").map_or(Masquerade::NotFound, |url| Masquerade::Proxy {
+            url: url.to_owned(),
+            rewrite_host: flag("rewriteHost", "masqUrlRewriteHost", "masq_url_rewrite_host"),
+            x_forwarded: flag("xForwarded", "masqUrlXForwarded", "masq_url_x_forwarded"),
+            insecure: flag("insecure", "masqUrlInsecure", "masq_url_insecure"),
+        })
+    } else if kind.eq_ignore_ascii_case("string") || kind.eq_ignore_ascii_case("response") {
+        let status = field(
+            "statusCode",
+            "masqStringStatusCode",
+            "masq_string_status_code",
+        )
+        .and_then(Json::as_u32)
+        .filter(|code| *code != 0)
+        .map_or(200, |code| code as u16);
+        let body = text("content", "masqString", "masq_string")
+            .unwrap_or_default()
+            .as_bytes()
+            .to_vec();
+        let headers =
+            masquerade_headers(field("headers", "masqStringHeaders", "masq_string_headers"));
+        Masquerade::Response {
+            status,
+            headers,
+            body,
+        }
+    } else {
+        Masquerade::NotFound
+    }
+}
+
+/// A response's headers in either dialect: xray's object maps names to values, while the flat form carries `Name: value` lines.
+fn masquerade_headers(field: Option<&Json>) -> Vec<(String, String)> {
+    match field {
+        Some(Json::Obj(pairs)) => pairs
+            .iter()
+            .filter_map(|(name, value)| {
+                value.as_str().map(|value| (name.clone(), value.to_owned()))
             })
-        }
-        "proxy" => {
-            text("masqUrl", "masq_url").map_or(Masquerade::NotFound, |url| Masquerade::Proxy {
-                url: url.to_owned(),
-                rewrite_host: flag("masqUrlRewriteHost", "masq_url_rewrite_host"),
-                x_forwarded: flag("masqUrlXForwarded", "masq_url_x_forwarded"),
-                insecure: flag("masqUrlInsecure", "masq_url_insecure"),
-            })
-        }
-        "response" => {
-            let status = field("masqStringStatusCode", "masq_string_status_code")
-                .and_then(Json::as_u32)
-                .filter(|code| *code != 0)
-                .map_or(200, |code| code as u16);
-            let body = text("masqString", "masq_string")
-                .unwrap_or_default()
-                .as_bytes()
-                .to_vec();
-            let headers = field("masqStringHeaders", "masq_string_headers")
-                .and_then(Json::as_arr)
-                .map_or_else(Vec::new, |items| {
-                    items
-                        .iter()
-                        .filter_map(Json::as_str)
-                        .filter_map(header_line)
-                        .collect()
-                });
-            Masquerade::Response {
-                status,
-                headers,
-                body,
-            }
-        }
-        _ => Masquerade::NotFound,
+            .collect(),
+        Some(Json::Arr(items)) => items
+            .iter()
+            .filter_map(Json::as_str)
+            .filter_map(header_line)
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -1404,6 +1427,55 @@ mod tests {
             ),
             Carrier::Unknown { .. }
         ));
+    }
+
+    #[test]
+    fn a_hysteria_masquerade_reads_its_nested_json_object() {
+        use ferrox_core::hysteria::Masquerade;
+        let read = |json: &str| {
+            let root = crate::json::parse(json).expect("parses");
+            masquerade_from_stream(root.get("streamSettings"))
+        };
+        assert_eq!(
+            read(
+                r#"{"streamSettings": {"hysteriaSettings": {"masquerade": {"type": "FILE", "dir": "/var/www/cover"}}}}"#
+            ),
+            Masquerade::File {
+                dir: "/var/www/cover".to_owned()
+            }
+        );
+        assert_eq!(
+            read(
+                r#"{"streamSettings": {"hysteriaSettings": {"masquerade": {"type": "proxy", "url": "https://origin.example", "rewriteHost": true, "xForwarded": true, "insecure": true}}}}"#
+            ),
+            Masquerade::Proxy {
+                url: "https://origin.example".to_owned(),
+                rewrite_host: true,
+                x_forwarded: true,
+                insecure: true,
+            }
+        );
+        assert_eq!(
+            read(
+                r#"{"streamSettings": {"hysteriaSettings": {"masquerade": {"type": "string", "content": "<html>cover</html>", "headers": {"content-type": "text/html", "x-frame-options": "DENY"}, "statusCode": 418}}}}"#
+            ),
+            Masquerade::Response {
+                status: 418,
+                headers: vec![
+                    ("content-type".to_owned(), "text/html".to_owned()),
+                    ("x-frame-options".to_owned(), "DENY".to_owned()),
+                ],
+                body: b"<html>cover</html>".to_vec(),
+            }
+        );
+        assert_eq!(
+            read(
+                r#"{"streamSettings": {"hysteriaSettings": {"masqType": "file", "masqFile": "/tmp/cover"}}}"#
+            ),
+            Masquerade::File {
+                dir: "/tmp/cover".to_owned()
+            }
+        );
     }
 
     #[test]
