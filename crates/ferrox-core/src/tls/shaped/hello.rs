@@ -38,6 +38,16 @@ struct EchOffer {
     maximum_name_length: usize,
 }
 
+#[derive(Clone, Copy)]
+struct Prepared<'a> {
+    version: u16,
+    random: &'a [u8; 32],
+    session_id: &'a [u8],
+    ciphers: &'a [u16],
+    message_len: usize,
+    shares: &'a [Share],
+}
+
 impl Hello {
     pub(crate) fn build(
         profile: &'static Profile,
@@ -148,7 +158,14 @@ impl Hello {
         let cover = ech_cover(offer.suite, offer.config_id, enc, &placeholder);
         let entries =
             self.extension_entries(shares, cookie, self.sni.as_deref(), Some(&cover), true);
-        let mut outer = self.encode_body(TLS12, &self.random, &self.session_id, entries, false, shares);
+        let mut outer = self.encode_body(
+            TLS12,
+            &self.random,
+            &self.session_id,
+            entries,
+            false,
+            shares,
+        );
         let ciphertext = offer
             .sealer
             .seal(&outer, &encoded)
@@ -191,24 +208,22 @@ impl Hello {
             ));
         }
         let ciphers = self.cipher_values(true);
-        let unpadded = Self::pad_prepared(&mut entries, ciphers.len(), 0);
-        let transcript = self.encode_prepared(
-            TLS12,
-            &offer.inner_random,
-            &self.session_id,
-            &entries,
-            &ciphers,
-            unpadded,
+        let message_len = Self::pad_prepared(&mut entries, ciphers.len(), 0);
+        let head = Prepared {
+            version: TLS12,
+            random: &offer.inner_random,
+            session_id: &self.session_id,
+            ciphers: &ciphers,
+            message_len,
             shares,
-        );
+        };
+        let transcript = self.encode_prepared(head, &entries);
         let mut encoded = self.encode_prepared(
-            TLS12,
-            &offer.inner_random,
-            &[],
+            Prepared {
+                session_id: &[],
+                ..head
+            },
             &entries,
-            &ciphers,
-            unpadded,
-            shares,
         );
         let name_pad = match offer.inner_name.as_deref() {
             Some(name) => offer.maximum_name_length.saturating_sub(name.len()),
@@ -412,35 +427,26 @@ impl Hello {
     ) -> Vec<u8> {
         let ciphers = self.cipher_values(tls13_only);
         let message_len = Self::pad_prepared(&mut entries, ciphers.len(), session_id.len());
-        self.encode_prepared(
+        let head = Prepared {
             version,
             random,
             session_id,
-            &entries,
-            &ciphers,
+            ciphers: &ciphers,
             message_len,
             shares,
-        )
+        };
+        self.encode_prepared(head, &entries)
     }
 
-    fn encode_prepared(
-        &self,
-        version: u16,
-        random: &[u8; 32],
-        session_id: &[u8],
-        entries: &[Entry],
-        ciphers: &[u16],
-        message_len: usize,
-        shares: &[Share],
-    ) -> Vec<u8> {
+    fn encode_prepared(&self, head: Prepared<'_>, entries: &[Entry]) -> Vec<u8> {
         let ext_len: usize = entries.iter().map(|entry| 4 + entry.len).sum();
-        let mut body = Vec::with_capacity(message_len - 4);
-        body.extend_from_slice(&version.to_be_bytes());
-        body.extend_from_slice(random);
-        body.push(session_id.len() as u8);
-        body.extend_from_slice(session_id);
-        body.extend_from_slice(&(2 * ciphers.len() as u16).to_be_bytes());
-        for cipher in ciphers {
+        let mut body = Vec::with_capacity(head.message_len - 4);
+        body.extend_from_slice(&head.version.to_be_bytes());
+        body.extend_from_slice(head.random);
+        body.push(head.session_id.len() as u8);
+        body.extend_from_slice(head.session_id);
+        body.extend_from_slice(&(2 * head.ciphers.len() as u16).to_be_bytes());
+        for cipher in head.ciphers {
             body.extend_from_slice(&cipher.to_be_bytes());
         }
         body.push(1);
@@ -449,7 +455,7 @@ impl Hello {
         for entry in entries {
             body.extend_from_slice(&entry.kind.to_be_bytes());
             body.extend_from_slice(&(entry.len as u16).to_be_bytes());
-            self.write_body(&entry.source, shares, &mut body);
+            self.write_body(&entry.source, head.shares, &mut body);
         }
         body
     }
@@ -571,11 +577,7 @@ impl Hello {
     }
 
     fn pad_entries(&self, entries: &mut Vec<Entry<'_>>) -> usize {
-        Self::pad_prepared(
-            entries,
-            self.profile.ciphers.len(),
-            self.session_id.len(),
-        )
+        Self::pad_prepared(entries, self.profile.ciphers.len(), self.session_id.len())
     }
 
     fn pad_prepared(entries: &mut Vec<Entry<'_>>, ciphers: usize, session: usize) -> usize {
@@ -1212,7 +1214,7 @@ mod tests {
             .expect("a preset name resolves")
             .profile()
             .expect("a shaped profile");
-        let hello = Hello::build(profile, "example.com", &[b"http/1.1".to_vec()], true)
+        let mut hello = Hello::build(profile, "example.com", &[b"http/1.1".to_vec()], true)
             .expect("a shaped dial hello");
         let retry = hello
             .retry(keys::X25519, Some(&[7, 6, 5]))
