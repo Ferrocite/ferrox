@@ -879,14 +879,17 @@ fn ech_body(profile: &Profile, canonical: bool) -> Option<Vec<u8>> {
     let (suite, config_id, enc, payload_len) = if canonical {
         (suites[0], 0u8, [0u8; 32], usize::from(payloads[0]) + 16)
     } else {
-        let mut pick = [0u8; 5];
-        getrandom::fill(&mut pick).ok()?;
-        let suite = suites[usize::from(u16::from_le_bytes([pick[0], pick[1]])) % suites.len()];
-        let config_id = pick[2];
+        // One 37-byte read carries the suite pick, the config id, the length pick and the 32-byte encapsulation.
+        let mut draw = [0u8; 37];
+        getrandom::fill(&mut draw).ok()?;
+        let mut enc = [0u8; 32];
+        enc.copy_from_slice(&draw[5..]);
+        let suite = suites[usize::from(u16::from_le_bytes([draw[0], draw[1]])) % suites.len()];
+        let config_id = draw[2];
         let len = usize::from(
-            payloads[usize::from(u16::from_le_bytes([pick[3], pick[4]])) % payloads.len()],
+            payloads[usize::from(u16::from_le_bytes([draw[3], draw[4]])) % payloads.len()],
         ) + 16;
-        (suite, config_id, enc_random(), len)
+        (suite, config_id, enc, len)
     };
     // 42 = content type, suite and KEM, config id, encapsulation length and bytes, payload length.
     let mut body = Vec::with_capacity(42 + payload_len);
@@ -902,14 +905,6 @@ fn ech_body(profile: &Profile, canonical: bool) -> Option<Vec<u8>> {
         getrandom::fill(&mut body[at..]).ok()?;
     }
     Some(body)
-}
-
-fn enc_random() -> [u8; 32] {
-    let mut enc = [0u8; 32];
-    if getrandom::fill(&mut enc).is_err() {
-        enc.fill(0);
-    }
-    enc
 }
 
 /// Chrome's positional shuffle: only the extensions between the fixed GREASE and
