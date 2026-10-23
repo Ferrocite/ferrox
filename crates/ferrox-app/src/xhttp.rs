@@ -1282,6 +1282,9 @@ impl Session {
         true
     }
     fn wait_ended(&self) {
+        self.wait_ended_for(std::time::Duration::from_secs(0));
+    }
+    fn wait_ended_for(&self, _idle: std::time::Duration) {
         let mut st = self.state.lock().expect("session lock");
         while !st.ended {
             st = self.cv.wait(st).expect("session lock");
@@ -3420,6 +3423,30 @@ mod tests {
         );
         down.join().expect("joins the downlink service");
         up.join().expect("joins the uplink service");
+    }
+
+    #[test]
+    fn a_stream_up_session_with_no_downlink_ends_at_its_idle_budget() {
+        let session = get_or_create_session("post-only-idle");
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = {
+            let session = Arc::clone(&session);
+            thread::spawn(move || {
+                session.wait_ended_for(std::time::Duration::from_millis(200));
+                let _ = done_tx.send(());
+            })
+        };
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a post-only session returns instead of parking its handler");
+        worker.join().expect("joins");
+        assert!(
+            !sessions()
+                .lock()
+                .expect("sessions lock")
+                .contains_key("post-only-idle"),
+            "the idle session is removed"
+        );
     }
 
     /// Both parks — the uplink's `wait_ended` and the downlink's `Read::read` — wait on `session.cv`, and until a carrier owned the session the only thing that ever notified it was a `SessionReader`'s Drop. A client that opened one half and died left the other half's thread parked for the life of the process.
