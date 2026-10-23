@@ -45,17 +45,29 @@ pub(crate) struct Link<S: Read + Write + RecordAlignment> {
     tls: Tls,
 }
 
-/// One frame-walk machine over `have`. The delivery runs it from the cursor and hands
-/// on a snapshot — the run so far, the head it opened with, the scan target and
-/// how much of it the extents have already fed, and the boundary's evidence.
-struct Banked {
+/// The filter's feed, one caller buffer deep: the content the walk hands the caller
+/// within one read is the run it watches, exactly what a contiguous buffer reached
+/// `observe` with — the run's head, the scan target and how far it has scanned it,
+/// and the boundary's evidence. One copy per byte, and the walk parses the head once.
+/// How far the run's head shaped: nothing, the client handshake, the server one.
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Shaped {
+    Nothing,
+    Client,
+    Server,
+}
+
+struct Feeding {
     head: [u8; 310],
     head_len: usize,
     run: usize,
     left: usize,
     scanned: usize,
-    shaped: bool,
+    /// the shape the run's head resolved to; its arm carries the presence and
+    /// version rows over to the shared state at the unit's end
+    shaped: Shaped,
     sampled: bool,
+    cipher: u16,
     found: bool,
     /// A six-byte pattern can straddle two extents; those ten are the whole
     /// boundary's evidence, five bytes each side.
@@ -63,50 +75,93 @@ struct Banked {
     span_len: usize,
 }
 
+impl Feeding {
+    fn new(tls: &Tls) -> Self {
+        Self {
+            head: [0u8; 310],
+            head_len: 0,
+            run: 0,
+            left: tls.server_hello_left,
+            scanned: 0,
+            shaped: Shaped::Nothing,
+            sampled: false,
+            cipher: 0,
+            found: false,
+            span: [0u8; 10],
+            span_len: 0,
+        }
+    }
+}
+
+/// One extent joins the run: the head accumulates to its 310, the shape and the
+/// cipher read from it once each, and the scan target eats the extent in order.
+fn feed_extent(fresh: &[u8], feed: &mut Feeding) {
+    let want = 310usize.saturating_sub(feed.head_len);
+    if want > 0 {
+        let take_head = fresh.len().min(want);
+        feed.head[feed.head_len..feed.head_len + take_head].copy_from_slice(&fresh[..take_head]);
+        feed.head_len += take_head;
+    }
+    if feed.shaped == Shaped::Nothing && feed.run >= 6 {
+        // the shape fires once a read is long enough to carry it whole
+        let head = &feed.head;
+        if head[..3] == TLS_SERVER_HELLO && head[5] == 0x02 {
+            feed.left = (usize::from(head[3]) << 8 | usize::from(head[4])) + 5;
+            feed.shaped = Shaped::Server;
+        } else if head[..2] == TLS_HANDSHAKE_START && head[5] == 0x01 {
+            feed.shaped = Shaped::Client;
+        }
+    }
+    // the cipher reads only once the read has whole samples in reach
+    if feed.shaped != Shaped::Nothing && !feed.sampled && feed.run >= 79 && feed.left >= 79 {
+        feed.sampled = true;
+        let at = 44 + usize::from(feed.head[43]);
+        feed.cipher = u16::from_be_bytes([feed.head[at], feed.head[at + 1]]);
+    }
+    scan_extent(fresh, feed);
+}
+
 /// The scan target eats the extent in order; the pattern it hunts can straddle a
-/// boundary, and the span carries the evidence either way. No byte is copied for
-/// the scan that the extents themselves do not already account for.
-fn scan_extent(fresh: &[u8], banked: &mut Banked) {
-    if banked.found || banked.scanned >= banked.left {
+/// boundary, and the span carries the evidence either way.
+fn scan_extent(fresh: &[u8], feed: &mut Feeding) {
+    if feed.found || feed.scanned >= feed.left {
         return;
     }
-    let share = fresh.len().min(banked.left - banked.scanned);
+    let share = fresh.len().min(feed.left - feed.scanned);
     let open = share.min(5);
     // the bridge is the span's last five bytes against the opening five
-    let held = banked.span_len.saturating_sub(5);
-    let tell = banked.span_len - held;
+    let held = feed.span_len.saturating_sub(5);
+    let tell = feed.span_len - held;
     if tell > 0 && open > 0 {
         let mut cross = [0u8; 10];
-        cross[..tell].copy_from_slice(&banked.span[held..banked.span_len]);
+        cross[..tell].copy_from_slice(&feed.span[held..feed.span_len]);
         cross[tell..tell + open].copy_from_slice(&fresh[..open]);
         if cross[..tell + open].windows(6).any(|w| w == TLS13_VERSIONS) {
-            banked.found = true;
+            feed.found = true;
         }
     }
     if share >= 6 && fresh[..share].windows(6).any(|w| w == TLS13_VERSIONS) {
-        banked.found = true;
+        feed.found = true;
     }
     // the next boundary's evidence: the newest scanned bytes stay behind
     if share >= 10 {
-        banked.span[..].copy_from_slice(&fresh[share - 10..share]);
-        banked.span_len = 10;
-    } else if banked.span_len + share <= 10 {
-        banked.span[banked.span_len..banked.span_len + share].copy_from_slice(&fresh[..share]);
-        banked.span_len += share;
+        feed.span[..].copy_from_slice(&fresh[share - 10..share]);
+        feed.span_len = 10;
+    } else if feed.span_len + share <= 10 {
+        feed.span[feed.span_len..feed.span_len + share].copy_from_slice(&fresh[..share]);
+        feed.span_len += share;
     } else {
         // slide so the newest share, and only it, meets the window's back edge
-        let drop = banked.span_len + share - 10;
-        banked.span.copy_within(drop..banked.span_len, 0);
-        banked.span_len -= drop;
-        banked.span[banked.span_len..banked.span_len + share].copy_from_slice(&fresh[..share]);
-        banked.span_len += share;
+        let drop = feed.span_len + share - 10;
+        feed.span.copy_within(drop..feed.span_len, 0);
+        feed.span_len -= drop;
+        feed.span[feed.span_len..feed.span_len + share].copy_from_slice(&fresh[..share]);
+        feed.span_len += share;
     }
-    banked.scanned += share;
+    feed.scanned += share;
 }
 
-/// each content extent straight to the caller's buffer; the filter runs the same walk
-/// on a snapshot, so a fill's content reaches it in run order — the way a contiguous
-/// buffer reached `observe` — without the copy a staging buffer paid for.
+/// straight into the caller's buffer, with no staging buffer on the way out.
 #[derive(Clone, Copy)]
 struct Walk {
     /// the uuid window is resolved and the frames are running
@@ -194,12 +249,31 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
 }
 
 impl<S: Read + Write + RecordAlignment> Read for Link<S> {
+    /// The content the walk hands this caller buffer is one filter unit: it joins the
+    /// feeding spread through the run, and the machine spends at the unit's end.
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut feed = Feeding::new(&self.tls);
+        let n = self.drive_read(buf, &mut feed)?;
+        if feed.run > 0 && self.tls.budget > 0 {
+            self.spend(&feed);
+        }
+        Ok(n)
+    }
+}
+
+impl<S: Read + Write + RecordAlignment> Link<S> {
+    /// What the framing left in the window goes through as it stands, and the window
+    /// is handed back once drained.
+    /// The one caller buffer's walk: framed bytes pump in run order, the framing's
+    /// leftover delivers, and every extent that lands in the caller's buffer joins
+    /// the feeding. EOF mid-frame drops the frame; what the walk's switch left
+    /// unparsed is content the caller has not seen.
+    fn drive_read(&mut self, buf: &mut [u8], feed: &mut Feeding) -> std::io::Result<usize> {
         loop {
             if self.read.padding {
                 if self.dot < self.have.len() {
                     let was = self.dot;
-                    match self.pump(Some(buf)) {
+                    match self.pump(Some(buf), feed) {
                         0 => {}
                         n => return Ok(n),
                     }
@@ -213,16 +287,15 @@ impl<S: Read + Write + RecordAlignment> Read for Link<S> {
                     }
                 }
                 if !self.fill()? {
-                    // EOF: a frame cut mid-walk drops; what the framing's switch left unparsed is content the caller has not seen
                     if self.walk.framed && self.read.padding {
                         return Ok(0);
                     }
-                    return Ok(self.drain_tail(buf));
+                    return Ok(self.drain_tail(buf, feed));
                 }
             } else {
                 // the framing is over: what it left in the window is content, then raw
                 if self.dot < self.have.len() && !buf.is_empty() {
-                    return Ok(self.drain_tail(buf));
+                    return Ok(self.drain_tail(buf, feed));
                 }
                 if buf.is_empty() {
                     return Ok(0);
@@ -231,13 +304,36 @@ impl<S: Read + Write + RecordAlignment> Read for Link<S> {
             }
         }
     }
-}
 
-impl<S: Read + Write + RecordAlignment> Link<S> {
-    /// What the framing left in the window goes through as it stands, and the window
-    /// is handed back once drained.
-    fn drain_tail(&mut self, buf: &mut [u8]) -> usize {
+    /// One spent unit: budget once, the scan target's rest rides through, the verdict
+    /// hands its confirmed switch or its exhausted window over, and the idle switch
+    /// arms the alignment only when its verdict earned it.
+    fn spend(&mut self, feed: &Feeding) {
+        self.tls.budget -= 1;
+        self.tls.server_hello_left = feed.left.saturating_sub(feed.scanned);
+        if feed.shaped != Shaped::Nothing {
+            self.tls.present = true;
+        }
+        if feed.shaped == Shaped::Server {
+            self.tls.twelve_or_above = true;
+        }
+        if feed.sampled {
+            self.tls.cipher = feed.cipher;
+        }
+        if feed.found {
+            self.tls.enable_xtls = self.tls.cipher != TLS_AES_128_CCM_8_SHA256;
+            self.tls.budget = 0;
+        } else if feed.left > 0 && feed.scanned >= feed.left {
+            self.tls.budget = 0;
+        }
+        self.engage();
+    }
+
+    fn drain_tail(&mut self, buf: &mut [u8], feed: &mut Feeding) -> usize {
         let n = (self.have.len() - self.dot).min(buf.len());
+        if n > 0 && self.tls.budget > 0 {
+            feed_extent(&self.have[self.dot..self.dot + n], feed);
+        }
         buf[..n].copy_from_slice(&self.have[self.dot..self.dot + n]);
         self.dot += n;
         if self.dot == self.have.len() {
@@ -304,7 +400,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     /// window resolves only with a full uuid and either a mismatch (everything passes)
     /// or the framing's first frame header. A walk that blocks mid-frame parks there
     /// and reports what it handed out.
-    fn pump(&mut self, mut buf: Option<&mut [u8]>) -> usize {
+    fn pump(&mut self, mut buf: Option<&mut [u8]>, feed: &mut Feeding) -> usize {
         if !self.walk.framed {
             if self.pending() < SHORTEST_FRAME {
                 return 0;
@@ -361,8 +457,13 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                     None => usize::MAX,
                 };
                 let take = self.walk.want_content.min(self.pending()).min(room);
+                let fresh = &self.have[self.dot..self.dot + take];
+                if self.tls.budget > 0 {
+                    feed.run += take;
+                    feed_extent(fresh, feed);
+                }
                 if let Some(slot) = buf.as_deref_mut() {
-                    slot[held..held + take].copy_from_slice(&self.have[self.dot..self.dot + take]);
+                    slot[held..held + take].copy_from_slice(fresh);
                 }
                 self.dot += take;
                 self.walk.want_content -= take;
@@ -395,9 +496,8 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     }
 
     /// Reached only while the framing is live: the read lands in spare capacity held
-    /// steady at the window, the filter runs the delivery walk's snapshot over it
-    /// before anything moves, and the walk takes the window in place. The cursor is
-    /// parked where the walk stands, so the staging buffer is gone from the read path.
+    /// steady at the window, and the cursor is parked where the walk stands — no
+    /// staging buffer, no second pass over the frames on the read path.
     fn fill(&mut self) -> std::io::Result<bool> {
         loop {
             self.compact();
@@ -422,7 +522,6 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 return Ok(false);
             }
             self.stage(n);
-            self.observe_fill();
             if !self.read.padding || self.dot < self.have.len() {
                 // the framing switched over, or the parked walk has bytes for the next pump
                 return Ok(true);
@@ -431,152 +530,6 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         }
     }
 
-    /// The filter sees this fill's content the way a contiguous buffer reached
-    /// `observe`: the delivery walk runs on a snapshot to its natural stop, its
-    /// content extents file past the TLS state in run order, and the budget is spent
-    /// once per fill that moves content. A blocked snapshot spends nothing, which is
-    /// what a staged fill saw too.
-    fn observe_fill(&mut self) {
-        if self.tls.budget == 0 {
-            return;
-        }
-        let mut walk = self.walk;
-        let mut at = self.dot;
-        let mut banked = Banked {
-            head: [0u8; 310],
-            head_len: 0,
-            run: 0,
-            left: self.tls.server_hello_left,
-            scanned: 0,
-            shaped: false,
-            sampled: false,
-            found: false,
-            span: [0u8; 10],
-            span_len: 0,
-        };
-        loop {
-            if !walk.framed {
-                if self.have.len() - at < SHORTEST_FRAME {
-                    // the uuid window cannot resolve inside this fill: nothing moves
-                    break;
-                }
-                if self.have[at..at + 16] != self.uuid {
-                    // a mismatch hands the whole window through, uuid bytes included
-                    walk = Walk {
-                        framed: true,
-                        want_header: 0,
-                        want_content: self.have.len() - at,
-                        want_padding: 0,
-                        command: VisionCommand::Direct.byte(),
-                    };
-                }
-                if walk.want_content == 0 {
-                    walk.framed = true;
-                    at += 16;
-                    walk.want_header = 5;
-                }
-            }
-            if walk.want_header == 5 && self.have.len() - at >= 5 {
-                walk.command = self.have[at];
-                walk.want_content =
-                    (usize::from(self.have[at + 1]) << 8) | usize::from(self.have[at + 2]);
-                walk.want_padding =
-                    (usize::from(self.have[at + 3]) << 8) | usize::from(self.have[at + 4]);
-                at += 5;
-                walk.want_header = 0;
-            } else if walk.want_header > 0 && at < self.have.len() {
-                let byte = self.have[at];
-                match walk.want_header {
-                    5 => walk.command = byte,
-                    4 => walk.want_content = usize::from(byte) << 8,
-                    3 => walk.want_content |= usize::from(byte),
-                    2 => walk.want_padding = usize::from(byte) << 8,
-                    _ => walk.want_padding |= usize::from(byte),
-                }
-                at += 1;
-                walk.want_header -= 1;
-            }
-            if walk.want_content > 0 {
-                let take = walk.want_content.min(self.have.len() - at);
-                banked.run += take;
-                self.filter_extent(at, take, &mut banked);
-                walk.want_content -= take;
-                at += take;
-                if walk.want_content > 0 {
-                    break;
-                }
-                continue;
-            }
-            if walk.want_padding > 0 {
-                let take = walk.want_padding.min(self.have.len() - at);
-                at += take;
-                walk.want_padding -= take;
-                if walk.want_padding > 0 {
-                    break;
-                }
-            } else if walk.want_header > 0 {
-                // parked inside an incomplete header: nothing moves without bytes
-                break;
-            }
-            if walk.command == VisionCommand::Continue.byte() {
-                walk.want_header = 5;
-                continue;
-            }
-            // a command that is not a continue ends the framing; its tail is content
-            if self.have.len() > at {
-                walk.want_content = self.have.len() - at;
-                walk.command = VisionCommand::Direct.byte();
-                continue;
-            }
-            break;
-        }
-        if banked.run > 0 {
-            self.tls.budget -= 1;
-            self.tls.server_hello_left = banked.left.saturating_sub(banked.scanned);
-            if banked.found {
-                self.tls.enable_xtls = self.tls.cipher != TLS_AES_128_CCM_8_SHA256;
-                self.tls.budget = 0;
-            } else if banked.left > 0 && banked.scanned >= banked.left {
-                self.tls.budget = 0;
-            }
-            self.engage();
-        }
-    }
-
-    /// One extent joins the banked run: the head accumulates to its 310, the shape and
-    /// the cipher read from it once each, and the scan target eats the extent in order.
-    fn filter_extent(&mut self, at: usize, take: usize, banked: &mut Banked) {
-        let fresh = &self.have[at..at + take];
-        // the run's head joins the accumulator; the shape check reads it, the cipher stays inside the first 310
-        let want = 310usize.saturating_sub(banked.head_len);
-        if want > 0 {
-            let take_head = fresh.len().min(want);
-            banked.head[banked.head_len..banked.head_len + take_head]
-                .copy_from_slice(&fresh[..take_head]);
-            banked.head_len += take_head;
-        }
-        if !banked.shaped && banked.run >= 6 {
-            // the shape fires once a fill is long enough to carry it whole
-            banked.shaped = true;
-            let head = &banked.head;
-            if head[..3] == TLS_SERVER_HELLO && head[5] == 0x02 {
-                banked.left = (usize::from(head[3]) << 8 | usize::from(head[4])) + 5;
-                self.tls.present = true;
-                self.tls.twelve_or_above = true;
-            } else if head[..2] == TLS_HANDSHAKE_START && head[5] == 0x01 {
-                self.tls.present = true;
-            }
-        }
-        // the cipher reads only once the fill has whole samples in reach
-        if banked.shaped && !banked.sampled && banked.run >= 79 && banked.left >= 79 {
-            banked.sampled = true;
-            let at = 44 + usize::from(banked.head[43]);
-            self.tls.cipher = u16::from_be_bytes([banked.head[at], banked.head[at + 1]]);
-        }
-        scan_extent(fresh, banked);
-    }
-
-    /// The frame's five head bytes, encoded the core encoder's way.
     fn frame_head(command: u8, content: usize, padding: usize) -> [u8; 5] {
         let clen = (content as u16).to_be_bytes();
         let plen = (padding as u16).to_be_bytes();
@@ -913,7 +866,9 @@ mod tests {
             link.dot = 0;
             link.walk.framed = true;
             link.walk.want_header = 5;
-            link.pump(None);
+            let mut feed = Feeding::new(&link.tls);
+            let runs = link.pump(None, &mut feed);
+            assert_eq!(runs, 0);
             link.read.padding = true;
             link.read.raw = false;
             frames += 8;
