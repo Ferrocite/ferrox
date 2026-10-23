@@ -756,17 +756,18 @@ system_proxy_on() {
 
 system_proxy_off() {
   [ -f "$PROXY_PORTS" ] || return 0
-  command -v networksetup >/dev/null 2>&1 || return 0
   local svc
-  while IFS= read -r svc; do
-    [ -z "$svc" ] && continue
-    case "$svc" in *\**) continue ;; esac
-    networksetup -setsocksfirewallproxystate "$svc" off 2>/dev/null || true
-    networksetup -setwebproxystate "$svc" off 2>/dev/null || true
-    networksetup -setsecurewebproxystate "$svc" off 2>/dev/null || true
-  done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
+  if command -v networksetup >/dev/null 2>&1; then
+    while IFS= read -r svc; do
+      [ -z "$svc" ] && continue
+      case "$svc" in *\**) continue ;; esac
+      networksetup -setsocksfirewallproxystate "$svc" off 2>/dev/null || true
+      networksetup -setwebproxystate "$svc" off 2>/dev/null || true
+      networksetup -setsecurewebproxystate "$svc" off 2>/dev/null || true
+    done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
+    say "system proxy cleared."
+  fi
   rm -f "$PROXY_PORTS"
-  say "system proxy cleared."
 }
 
 # ---------------------------------------------------------------------- lane
@@ -927,6 +928,12 @@ stop_lane() {
   return 0
 }
 
+# The config is ours only when we generated it: a --config file belongs to its owner.
+stop_and_forget() {
+  stop_lane 1
+  [ "$OUTBOUND" = config ] || rm -f "$CFG"
+}
+
 # -------------------------------------------------------------------- actions
 
 # One trace through the first front: a lane that listens but cannot dial is not
@@ -1080,7 +1087,8 @@ action_up() {
   if [ "$OUTBOUND" != config ] && ! wait_fronts; then
     say "the lane did not open its fronts; last lines of $LOG:"
     tail -n 20 "$LOG" 2>/dev/null || true
-    stop_lane 0
+    stop_and_forget
+    say "the lane was stopped and its config removed; the log stays at $LOG."
     exit 1
   fi
   say "lane up (pid $(lane_pid)), fronts:"
@@ -1092,20 +1100,18 @@ action_up() {
   [ "$OUTBOUND" = foxy ] && say "carrier: $CARRIER"
   local ok=0
   if [ "$OUTBOUND" != config ]; then verify_flow || ok=1; fi
-  # Route the machine only at a lane that proved it carries a flow: an armed
-  # system proxy over a dead lane takes the network down with it.
-  if [ "$ok" = 0 ] && [ "$WANT_VPN" = 1 ]; then system_proxy_on; fi
-  say "log:  $LOG"
-  say "stop: ferrox-cli down"
   if [ "$ok" = 1 ]; then
-    if [ "$WANT_VPN" = 1 ]; then
-      say "the system proxy was left as it was: nothing is routed through a lane"
-      say "that carries no flow."
-    fi
-    say "the lane stays up so it can be inspected; nothing is routed until it"
-    say "carries a flow."
+    # A lane that carries no flow is a leftover, not a result: end it here.
+    stop_and_forget
+    say "the lane was stopped and its config removed; nothing is routed, and the"
+    say "log stays at $LOG."
     exit 3
   fi
+  # Route the machine only at a lane that proved it carries a flow: an armed
+  # system proxy over a dead lane takes the network down with it.
+  if [ "$WANT_VPN" = 1 ]; then system_proxy_on; fi
+  say "log:  $LOG"
+  say "stop: ferrox-cli down"
 }
 
 action_serve() {
@@ -1114,6 +1120,8 @@ action_serve() {
   if [ "$OUTBOUND" != config ] && ! wait_fronts; then
     say "the lane did not open its fronts; last lines of $LOG:"
     tail -n 20 "$LOG" 2>/dev/null || true
+    stop_and_forget
+    say "the lane was stopped and its config removed; the log stays at $LOG."
     exit 1
   fi
   say "lane up, fronts:"
@@ -1125,14 +1133,20 @@ action_serve() {
   [ "$OUTBOUND" = foxy ] && say "carrier: $CARRIER"
   local ok=0
   if [ "$OUTBOUND" != config ]; then verify_flow || ok=1; fi
-  if [ "$ok" = 0 ] && [ "$WANT_VPN" = 1 ]; then system_proxy_on; fi
+  if [ "$ok" = 1 ]; then
+    stop_and_forget
+    say "the lane was stopped and its config removed; nothing is routed, and the"
+    say "log stays at $LOG."
+    exit 3
+  fi
+  if [ "$WANT_VPN" = 1 ]; then system_proxy_on; fi
   say "Ctrl-C stops it."
-  trap 'stop_lane 1; exit 0' INT TERM
+  trap 'stop_and_forget; exit 0' INT TERM
   local pid; pid="$(lane_pid)"
   while [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; do sleep 2; done
   say "the lane exited; last lines of $LOG:"
   tail -n 15 "$LOG" 2>/dev/null || true
-  stop_lane 0
+  stop_and_forget
 }
 
 action_status() {

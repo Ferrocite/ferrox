@@ -62,7 +62,7 @@ The list prints one line per country and one per city with the number of publish
 ./dist/ferrox-cli.sh down                      # stop, clear the system proxy
 ```
 
-`up` prints the port map, then proves one flow through the first front. With `--vpn` it arms the macOS system proxy only after that flow answers, so a lane that carries nothing never takes the machine's traffic with it. If the fronts are open but no flow gets through, it says so and shows the lane log: that is a refused sign-in, an expired pass, or an edge that cannot be reached.
+`up` prints the port map, then proves one flow through the first front. With `--vpn` it arms the macOS system proxy only after that flow answers, so a lane that carries nothing never takes the machine's traffic with it. If the fronts are open but no flow gets through, it says so, shows the lane log, and stops the lane itself: the pid file and config are removed and the proxy cleared, so nothing needs a `down` and nothing is left behind except the log.
 
 On a terminal `up --foxy` also asks which carrier to use — `auto` (h2, then h1, then h3), `h2`, `h1` or `h3` — and an empty answer or a pipe takes `auto`, so nothing needs typing. `--carrier` skips the question. `h2` is the rung `auto` opens on because it outran `h3` on every CI runner, and `h3` is the only carrier that also carries UDP. A named `h3` is a preference rather than a pin: it leads, and `h2` and `h1` follow when the path drops QUIC, which is silence rather than a refusal. `status` reads back how long the lane has been up, the carrier it was given, the allowance the plane last named (bytes left of the plan, and when they reset), and the exit IP and country.
 
