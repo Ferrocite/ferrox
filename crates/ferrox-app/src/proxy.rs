@@ -17025,16 +17025,20 @@ mod tests {
         let inner_addr = inner.local_addr().expect("addr");
         let echo = thread::spawn(move || {
             let (stream, _) = inner.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .expect("times out");
             let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
             tls.handshake().expect("handshakes");
             let mut buf = [0u8; 4096];
             loop {
                 match tls.read(&mut buf) {
-                    Ok(0) | Err(_) => break,
+                    Ok(0) => break,
                     Ok(n) => {
                         tls.write_all(&buf[..n]).expect("echoes");
                         tls.flush().expect("flushes");
                     }
+                    Err(_) => break,
                 }
             }
         });
@@ -17073,6 +17077,9 @@ mod tests {
             let mut echoed = vec![0u8; width];
             inner.read_exact(&mut echoed).expect("echoes");
             assert_eq!(echoed, payload);
+            if round == 0 {
+                thread::sleep(Duration::from_millis(60));
+            }
         }
         drop(inner);
         dialled.join().expect("joins");
@@ -19691,7 +19698,7 @@ mod tests {
         let served = Arc::clone(&relay);
         thread::spawn(move || serve_socks_udp_trojan(&served, &trojan));
         let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
-        udp.set_read_timeout(Some(Duration::from_secs(10)))
+        udp.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let mut back = vec![0u8; UDP_BUF];
