@@ -6,7 +6,9 @@ Every expensive job in this repository measures against the pins in [`upstream/p
 
 **A page declares what its method owes; a changed file decides when it is owed.**
 
-[`docs/function/`](function) is the registry: one page per connection method, and each page carries a scope block between `<!-- scope:begin -->` and `<!-- scope:end -->`:
+[`docs/function/`](function) is the registry: one page per connection method, and each page carries a scope block between `
+<!-- scope:begin -->` and `
+<!-- scope:end -->`:
 
 | key | what it is | who reads it |
 | --- | --- | --- |

@@ -78,9 +78,7 @@ Three things on the read side are named because they are easy to get wrong rathe
 
 What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
 
-The record-lane gate sits in `ferrox-core`'s TLS framer, which `xtls-vision` also gates
-(`coalesce-segment-allocations`): `coalesce` stays shared infrastructure rather than joining this
-page's `paths`, so a change to it takes both rows' runs.
+The record-lane gate sits in `ferrox-core`'s TLS framer, which `xtls-vision` also gates (`coalesce-segment-allocations`): `coalesce` stays shared infrastructure rather than joining this page's `paths`, so a change to it takes both rows' runs.
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/httpheader.rs

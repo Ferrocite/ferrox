@@ -22,11 +22,11 @@ What runs against what: `xray-rust` interop (23 tests, seam `XRAY_VLESS_FULL_BIN
 | xray-core | ferrox state |
 | --- | --- |
 | VMess (AEAD) — full matrix: UDP over ws/grpc/xhttp/tls, all encodings | partial: no UDP except raw carrier; no auth-length framing bits (matches client default only) |
-| Trojan share-link `trojan://` parser | absent |
+| Trojan share-link `trojan://` parser | planned |
 | Dokodemo transparent inbound | tcp rewrite served (row 24); udp relay and the `SO_ORIGINAL_DST`/TPROXY transparent spelling planned |
 | Freedom — `domainStrategy`, fragment, dialer fields | direct dial (`Outbound::Freedom`); fragment/`domainStrategy`/`proxyProtocol`/dialer options planned (rows 121, 124) |
 | DNS proxy + fakeDNS + hosts + DoH/DoQ/local nameservers (`app/dns`) | planned (rows 26, 82) |
-| Blackhole outbound | done (row 25): the three answers, the 403's bytes the reference's own (an oracle drives the pinned handler and the comparison is octet for octet), the flow ending when the peer is done; the datagram lane refuses the association with `0x07` ([blackhole](function/blackhole.md)) |
+| Blackhole outbound | partial (row 25): the three answers, the 403's bytes the reference's own (an oracle drives the pinned handler and the comparison is octet for octet), the flow ending when the peer is done; the datagram lane refuses the association with `0x07` ([blackhole](function/blackhole.md)) |
 | Loopback | done (row 27) |
 | WireGuard proxy (`proxy/wireguard`, lightweight `netstack.go`) | planned (row 46) |
 | Hysteria v1 proxy (`proxy/hysteria`) | planned (only v2 as carrier today) |
