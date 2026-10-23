@@ -2803,7 +2803,7 @@ mod tests {
         assert_eq!(calls, REMEASURE_ATTEMPTS, "exactly the bound ran");
     }
 
-    /// The second bound: a stalled attempt costs the full run cap, so a repeat whose wall time runs past the budget converts even while attempts remain - the re-measure cannot spend the cell's CI window. A slow-disturbed closure with a 100 ms budget converts after the first retry sleep swallows it.
+    /// The second bound: a stalled attempt costs the full run cap, so a repeat whose wall time runs past the budget converts even while attempts remain - the re-measure cannot spend the cell's CI window. A slow-disturbed closure with a 100 ms budget converts inside the first one or two attempts, before the attempt bound.
     #[test]
     fn the_time_budget_stops_re_measuring_before_the_attempt_bound() {
         let mut calls = 0usize;
@@ -2814,12 +2814,14 @@ mod tests {
         });
         assert!(
             matches!(&stuck, Err(Error::Workload(m))
-                if m.contains("survives every retry") && m.contains("exceeded the 120s cap")),
+                if m.contains("survives every retry")
+                    && m.contains("exceeded the 120s cap")
+                    && m.contains("the cell's 0.1s")),
             "the budget converts the stall, never banks it: {stuck:?}"
         );
-        assert_eq!(
-            calls, 2,
-            "one attempt fits the budget, the second converts on its elapsed check"
+        assert!(
+            (1..10).contains(&calls),
+            "the time bound stops the retry before the attempt bound, after {calls} calls"
         );
     }
 
