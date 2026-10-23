@@ -271,6 +271,23 @@ fn rsa_key_transport_matches_go() {
         );
     }
 
+    // The walk holds its limb buffers for the whole exponentiation — five for the arithmetic, the
+    // modulus's limbs, `Mont`'s `R²` and the caller's output — and the same eight for every vector:
+    // a per-multiply accumulator would make the count follow the exponent's bit length and the
+    // modulus's width, and these sixteen span both.
+    for (modulus, exponent, em, cipher) in &exponentiations {
+        let mut counted = Vec::new();
+        let ((), counts) = crate::alloc_count::measure(|| {
+            rsa::modexp(em, *exponent, modulus, &mut counted).expect("exponentiates")
+        });
+        assert_eq!(&counted, cipher, "the counted walk is the gated one");
+        assert_eq!(
+            counts.allocs, 8,
+            "a {}-byte modulus under {exponent}: {counts:?}",
+            modulus.len()
+        );
+    }
+
     for (modulus, exponent, msg, cipher) in &encodings {
         let der = sequence(&[integer(modulus), integer(&exponent.to_be_bytes())].concat());
         let (n, e) = rsa::public_key(&der).expect("walks an RSAPublicKey");

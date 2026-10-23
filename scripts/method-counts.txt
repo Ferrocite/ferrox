@@ -492,6 +492,9 @@ security-utls tls12-cbc-records-that-shift-their-plaintext 0 ferrox-core-tls::sh
 security-utls tls12-sessions-replayed-byte-identical 11 ferrox-core-tls::shaped::oracle::tls12_sessions_match_go
 security-utls rsa-key-transport-vectors-replayed-byte-identical 20 ferrox-core-tls::shaped::oracle::rsa_key_transport_matches_go
 security-utls table-spelling-resolutions-that-allocate 0 ferrox-core-tls::shaped::tests::a_table_spelling_resolves_without_a_heap_buffer
+security-utls heap-buffers-for-a-chrome-hello 18 ferrox-core-tls::shaped::hello::tests::a_shaped_hello_writes_into_one_buffer
+security-utls heap-buffers-for-an-rsa-exponentiation 8 ferrox-core-tls::shaped::oracle::rsa_key_transport_matches_go
+security-utls heap-buffers-for-a-post-handshake-flight 0 ferrox-core-tls::shaped::client::tests::a_post_handshake_flight_is_read_where_it_lies
 
 # --- loopback re-inject outbound --------------------------------------------
 loopback ops-retired-instructions UNBLESSED scripts/count-ops.sh
