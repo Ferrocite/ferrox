@@ -771,11 +771,14 @@ impl<S: Stream + RecordAlignment> RecordAlignment for Session<S> {
     }
 
     fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
-        self.flush_reply()?;
-        for part in parts {
-            self.io.write_all(part)?;
+        if !self.done {
+            self.run().map_err(std::io::Error::other)?;
         }
-        Ok(())
+        self.flush_reply()?;
+        let mut out = Vec::new();
+        self.seal_parts(parts, &mut out)
+            .map_err(std::io::Error::other)?;
+        self.io.write_all(&out)
     }
 }
 
