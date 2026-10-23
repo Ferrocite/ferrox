@@ -1122,7 +1122,7 @@ mod tests {
         kind & 0x0f0f == 0x0a0a || kind == 0x0015 || kind == 0x0029
     }
 
-    /// Replay the uTLS oracle: every xray name that shapes a hello must emit the reference's bytes, or its extension multiset plus invariant slots where Chrome shuffles.
+    /// Replay the uTLS oracle: every xray name that shapes a hello must emit the reference's bytes, or where Chrome shuffles its extension multiset, invariant slots and the body ahead of them.
     #[test]
     fn oracle_replay_matches_utls() {
         let script = include_str!("../../../../../scripts/utls-oracle/script.txt");
