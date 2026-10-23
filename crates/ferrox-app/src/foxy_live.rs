@@ -27,6 +27,8 @@ const PAYLOAD_SMALL: (&str, usize) = ("/1MB.zip", 2 << 20);
 const PAYLOAD_LARGE: (&str, usize) = ("/10MB.zip", 12 << 20);
 /// The smallest answer worth measuring: a redirect page is not a payload.
 const PAYLOAD_FLOOR: usize = 512 << 10;
+/// What a canceled flow reads before it closes: a browser that drops a download after its first bytes.
+const ABORT_READ: usize = 512 << 10;
 const PAYLOAD_WAIT: Duration = Duration::from_secs(45);
 /// The whole crawl, so one dead host cannot spend the live job's clock.
 const PAYLOAD_TOTAL: Duration = Duration::from_secs(600);
@@ -281,6 +283,27 @@ fn brackets(
         slope <= 1.25,
         "{carrier:?} charged {slope:.3} bytes per carried byte between {small_bytes} and {large_bytes}: {large_charge} for {large_bytes} after {small_charge} for {small_bytes}, {fixed} fixed per flow"
     );
+    // Last, so a closing flow's fetch cannot be read as the large payload's: what a cancel costs is the window the edge was allowed to fill ahead of the caller.
+    if Instant::now() < deadline {
+        let until = (Instant::now() + PAYLOAD_WAIT).min(deadline);
+        let read = carried(
+            carrier,
+            edge,
+            pass,
+            "GET",
+            PAYLOAD_HOST,
+            PAYLOAD_LARGE.0,
+            ABORT_READ,
+            until,
+        )?;
+        std::thread::sleep(SETTLE);
+        let now = settled(account, was);
+        println!(
+            "closed {PAYLOAD_HOST}{} after {read} bytes: {} charged for a canceled flow",
+            PAYLOAD_LARGE.0,
+            was.saturating_sub(now)
+        );
+    }
     Ok(())
 }
 
