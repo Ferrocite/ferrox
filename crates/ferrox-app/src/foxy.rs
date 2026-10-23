@@ -6804,9 +6804,15 @@ pub(crate) mod loopback {
             vec![(1, CREDIT_FLOOR), (0, CREDIT_FLOOR)],
             "five frames cost one pair, not five"
         );
+        let held = (TOTAL - CREDIT_FLOOR as usize) as u32;
+        assert_eq!(
+            &tally[3..],
+            &[(1, held), (0, held)],
+            "the held remainder is returned once when the lane ends: {tally:?}"
+        );
         assert_eq!(
             tally.len(),
-            3,
+            5,
             "no other window update left the lane: {tally:?}"
         );
     }
