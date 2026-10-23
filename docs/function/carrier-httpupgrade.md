@@ -98,7 +98,7 @@ What the sweep does **not** claim: that the two sides are interchangeable. They 
 
 ## Time
 
-**Not measured yet, and no runner can measure it yet.** The matrix carries no httpupgrade scenario: `scripts/lib-matrix.sh`'s `scenarios` list names VLESS over raw, ws, gRPC and xHTTP plus vmess, trojan and shadowsocks, and `scripts/run-parity.sh` walks that same set, so neither `benchmark-matrix.yml` nor `parity.yml` has an HTTPUpgrade cell to produce a number from. The plan says it in one line — `plan the tier and its cells` prints `matrix=false` for a narrow change to this method and every measure job skips. The scope block below therefore declares no `scenarios:` key; a duration would need a scenario added to `scripts/lib-matrix.sh` first.
+The matrix carries a `vless-httpupgrade` cell, so a change here owes that comparison: `plan the tier and its cells` selects it from the scope block below, and the standard tier measures it against both servers. The parity walk reads the same `scenarios` list in `scripts/lib-matrix.sh`.
 
 ## What we removed
 
@@ -159,6 +159,7 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/httpupgrade.rs, scripts/httpupgrade-oracle/*
 - symbols: httpupgrade
+- scenarios: vless-httpupgrade
 - oracle: http_upgrade, httpupgrade
 - go: ./transport/internet/httpupgrade/...
 <!-- scope:end -->

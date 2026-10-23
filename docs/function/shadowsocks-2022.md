@@ -111,6 +111,7 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 <!-- scope:begin -->
 - paths: crates/ferrox-core/src/shadowsocks2022.rs, crates/ferrox-app/src/shadowsocks2022.rs
 - symbols: shadowsocks2022
+- scenarios: shadowsocks2022-raw
 - oracle: shadowsocks
 - go: ./proxy/shadowsocks_2022/...
 <!-- scope:end -->

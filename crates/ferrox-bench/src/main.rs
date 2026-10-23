@@ -70,10 +70,12 @@ struct Args {
     iterations: usize,
     traffic: String,
     outbound_config: String,
+    outbound_configs: Vec<(String, String)>,
     output_dir: String,
     json_report: Option<String>,
     scenario: String,
     no_ceiling: bool,
+    keep_going: bool,
 }
 
 const DEFAULT_REPEATS: usize = 3;
@@ -85,7 +87,7 @@ const GATE5_ENGINE: &str = "ferrox";
 
 fn protocols_for(label: &str) -> &'static [&'static str] {
     match label {
-        "xray-rust" => &["socks", "http", "tun"],
+        "xray-rust" => &["vless", "vmess", "trojan", "shadowsocks2022", "hysteria"],
         _ => &[],
     }
 }
@@ -126,6 +128,7 @@ fn push_labeled_shape(
     into.push((label.to_owned(), shape.to_owned()));
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_args() -> Args {
     let mut args = std::env::args().skip(1);
     let mut declared = String::from("chacha20 0.9 (crates.io)");
@@ -139,10 +142,12 @@ fn parse_args() -> Args {
     let mut iterations = DEFAULT_ITERATIONS;
     let mut traffic = String::from("download");
     let mut outbound_config = String::new();
+    let mut outbound_configs: Vec<(String, String)> = Vec::new();
     let mut output_dir = String::from("target/parity");
     let mut json_report: Option<String> = None;
     let mut scenario = String::from("gate5");
     let mut no_ceiling = false;
+    let mut keep_going = false;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--reference" => declared = flag_value(&mut args, "--reference"),
@@ -186,6 +191,13 @@ fn parse_args() -> Args {
             "--payload-size" => payload_size = flag_count(&mut args, "--payload-size"),
             "--iterations" => iterations = flag_count(&mut args, "--iterations"),
             "--traffic" => traffic = flag_value(&mut args, "--traffic"),
+            "--outbound-config-for" => push_labeled_shape(
+                &mut outbound_configs,
+                "--outbound-config-for",
+                "json",
+                &flag_value(&mut args, "--outbound-config-for"),
+                |document| json::parse(document).map(|_| ()),
+            ),
             "--outbound-config" | "--output-dir" | "--json-report" | "--scenario" => {
                 parse_matrix_arg(
                     &mut outbound_config,
@@ -197,6 +209,7 @@ fn parse_args() -> Args {
                 );
             }
             "--no-harness-ceiling" => no_ceiling = true,
+            "--keep-going" => keep_going = true,
             other => {
                 eprintln!("unknown argument: {other}");
                 std::process::exit(2);
@@ -215,10 +228,12 @@ fn parse_args() -> Args {
         iterations,
         traffic,
         outbound_config,
+        outbound_configs,
         output_dir,
         json_report,
         scenario,
         no_ceiling,
+        keep_going,
     }
 }
 
@@ -732,6 +747,7 @@ fn gate5_section(args: &Args) -> Result<Gate5, String> {
         payload_size: args.payload_size,
         warmup: false,
         outbound_config: args.outbound_config.clone(),
+        outbound_configs: args.outbound_configs.clone(),
         scenario: args.scenario.clone(),
     };
     let comparison = compare_process::run(
@@ -951,10 +967,10 @@ fn main() {
         best.ratio,
         best.len
     );
-    assert_gate5(&gate5, shapes);
+    assert_gate5(&gate5, shapes, args.keep_going);
 }
 
-fn assert_gate5(gate5: &Gate5, shapes: usize) {
+fn assert_gate5(gate5: &Gate5, shapes: usize, keep_going: bool) {
     if let Some(comparison) = &gate5.comparison {
         let gate = comparison.gate();
         // A lost repeat is not a measured regression: when rows are unproven because runs never landed, the panic names that, beside the rows, so the claim matches what ran.
@@ -976,12 +992,18 @@ fn assert_gate5(gate5: &Gate5, shapes: usize) {
                 ),
             );
         }
-        assert!(
-            gate.passed,
-            "PROCESS REGRESSION: the process-level comparison did not pass.\n{report}\n\
-             The table it failed on is in target/bench-report.md and every run's \
-             result.json is under target/parity/.",
-        );
+        if !gate.passed {
+            let message = format!(
+                "PROCESS REGRESSION: the process-level comparison did not pass.\n{report}\n\
+                 The table it failed on is in target/bench-report.md and every run's \
+                 result.json is under target/parity/."
+            );
+            if keep_going {
+                eprintln!("{message}\n--keep-going: the cell is reported, not aborted");
+            } else {
+                panic!("{message}");
+            }
+        }
         for line in &gate.lines {
             println!("gate 5: {line}");
         }

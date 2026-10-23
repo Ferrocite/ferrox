@@ -60,7 +60,7 @@ LIST_KEYS = ("methods", "scenarios", "go_packages", "suites_skipped", "engines")
 # leaves out are engines it has recorded as unable to serve the method, so a cell
 # need not build, fetch or probe them. `xray-core` is not optional: the harness
 # refuses a comparison without it.
-ENGINES = ("xray-core", "sing-box", "zeronet", "xray-rust", "leaf")
+ENGINES = ("xray-core", "sing-box", "zeronet", "xray-core-rust", "xray-rust", "leaf")
 REFERENCE = "xray-core"
 
 # The data files whose every row names its own page in the first column: a hunk
@@ -949,7 +949,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         failed += 0 if ok else 1
         print(f"selftest: {'ok  ' if ok else 'FAIL'} {label}")
     plan = build_plan(root, ["crates/ferrox-app/src/vmess.rs"])
-    ok = plan["scenarios"] == ["vmess-raw-down-8"] and len(plan["rows"]) == 2 \
+    ok = plan["scenarios"] == ["vmess-raw-down-8", "vmess-tls-ws-down-8"] and len(plan["rows"]) == 2 \
         and "vmess_over_raw_tcp_matches_the_oracle" in plan["suites"].get("zeronet", "") \
         and "vmess" not in plan["suites"].get("xray-rust", "") \
         and "rust_" not in plan["suites"].get("xray-rust", "") \

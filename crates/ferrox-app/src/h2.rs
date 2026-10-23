@@ -15,6 +15,7 @@ pub(crate) const F_ACK: u8 = 0x01;
 pub(crate) const F_END_HEADERS: u8 = 0x04;
 pub(crate) const F_PADDED: u8 = 0x08;
 pub(crate) const F_PRIORITY: u8 = 0x20;
+pub(crate) const S_MAX_CONCURRENT: u16 = 0x03;
 pub(crate) const S_WINDOW: u16 = 0x04;
 pub(crate) const S_MAX_FRAME: u16 = 0x05;
 pub(crate) const E_PROTOCOL: u32 = 0x01;
