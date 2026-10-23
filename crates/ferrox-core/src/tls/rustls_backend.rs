@@ -1595,23 +1595,15 @@ mod tests {
             .expect("agrees");
             let suite = record::Suite::from_id(0xc02b).expect("suite");
             let session_hash = suite.hash().hash(&self.transcript);
-            let (master, block) = crate::tls::shaped::tls12::keys(
+            let (master, directions) = crate::tls::shaped::tls12::keys(
                 suite,
                 &shared,
                 &self.client_random,
                 &self.server_random,
                 Some(&session_hash),
             );
-            self.read_dir = Some(record::Direction::tls12(
-                suite,
-                &block.client_key,
-                &block.client_iv,
-            ));
-            self.write_dir = Some(record::Direction::tls12(
-                suite,
-                &block.server_key,
-                &block.server_iv,
-            ));
+            self.read_dir = Some(directions.client);
+            self.write_dir = Some(directions.server);
             self.master = master;
         }
 

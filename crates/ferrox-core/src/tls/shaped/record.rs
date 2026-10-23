@@ -1,9 +1,14 @@
-// The shaped client's record layer: both versions' framing over ring's AEADs.
-use super::kdf::{self, Hash};
+// The shaped client's record layer: both versions' framing over ring's AEADs and TLS 1.2's MAC-then-encrypt.
+use super::kdf::{self, Hash, Mac};
 use crate::tls::TlsError;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey};
+use ring::hmac;
 
-/// The six AEAD suites a shaped hello names, three for each version.
+/// An AES-CBC block: the width a CBC suite's explicit IV, its padding unit and its MAC floor share.
+const BLOCK: usize = 16;
+
+/// The suites a shaped hello can key: three TLS 1.3 AEADs and TLS 1.2's AEAD and CBC pairs,
+/// each TLS 1.2 name carrying the key exchange that fills its pre-master.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Suite {
     Aes128GcmSha256,
@@ -12,6 +17,14 @@ pub(crate) enum Suite {
     EcdheAes128GcmSha256,
     EcdheAes256GcmSha384,
     EcdheChaCha20Sha256,
+    EcdheAes128CbcSha,
+    EcdheAes256CbcSha,
+    EcdheAes128CbcSha256,
+    RsaAes128GcmSha256,
+    RsaAes256GcmSha384,
+    RsaAes128CbcSha,
+    RsaAes256CbcSha,
+    RsaAes128CbcSha256,
 }
 
 impl Suite {
@@ -23,6 +36,14 @@ impl Suite {
             0xc02b | 0xc02f => Self::EcdheAes128GcmSha256,
             0xc02c | 0xc030 => Self::EcdheAes256GcmSha384,
             0xcca9 | 0xcca8 => Self::EcdheChaCha20Sha256,
+            0xc009 | 0xc013 => Self::EcdheAes128CbcSha,
+            0xc00a | 0xc014 => Self::EcdheAes256CbcSha,
+            0xc023 | 0xc027 => Self::EcdheAes128CbcSha256,
+            0x009c => Self::RsaAes128GcmSha256,
+            0x009d => Self::RsaAes256GcmSha384,
+            0x002f => Self::RsaAes128CbcSha,
+            0x0035 => Self::RsaAes256CbcSha,
+            0x003c => Self::RsaAes128CbcSha256,
             _ => return None,
         })
     }
@@ -34,36 +55,64 @@ impl Suite {
         )
     }
 
+    /// The suite whose pre-master the client encrypts to the leaf's key: no `ServerKeyExchange`, no share.
+    pub(crate) fn is_rsa(self) -> bool {
+        matches!(
+            self,
+            Self::RsaAes128GcmSha256
+                | Self::RsaAes256GcmSha384
+                | Self::RsaAes128CbcSha
+                | Self::RsaAes256CbcSha
+                | Self::RsaAes128CbcSha256
+        )
+    }
+
+    /// The PRF and handshake hash. The reference moves this to SHA-384 only for a suite flagged
+    /// `SHA384`, which no CBC suite is; a CBC suite's SHA-1 MAC is a separate choice.
     pub(crate) fn hash(self) -> Hash {
         match self {
-            Self::Aes128GcmSha256
-            | Self::ChaCha20Sha256
-            | Self::EcdheAes128GcmSha256
-            | Self::EcdheChaCha20Sha256 => Hash::Sha256,
-            Self::Aes256GcmSha384 | Self::EcdheAes256GcmSha384 => Hash::Sha384,
+            Self::Aes256GcmSha384 | Self::EcdheAes256GcmSha384 | Self::RsaAes256GcmSha384 => {
+                Hash::Sha384
+            }
+            _ => Hash::Sha256,
         }
     }
 
     pub(crate) fn key_len(self) -> usize {
         match self {
-            Self::Aes128GcmSha256 | Self::EcdheAes128GcmSha256 => 16,
+            Self::Aes128GcmSha256
+            | Self::EcdheAes128GcmSha256
+            | Self::EcdheAes128CbcSha
+            | Self::EcdheAes128CbcSha256
+            | Self::RsaAes128GcmSha256
+            | Self::RsaAes128CbcSha
+            | Self::RsaAes128CbcSha256 => 16,
             _ => 32,
         }
     }
 
-    /// The fixed IV a TLS 1.2 key block carries: four bytes for GCM's explicit nonce, twelve for `ChaCha`'s XOR nonce.
-    pub(crate) fn fixed_iv_len(self) -> usize {
+    /// The record MAC of a MAC-then-encrypt suite, and none for an AEAD one.
+    pub(crate) fn mac(self) -> Option<Mac> {
         match self {
-            Self::EcdheAes128GcmSha256 | Self::EcdheAes256GcmSha384 => 4,
-            _ => 12,
+            Self::EcdheAes128CbcSha
+            | Self::EcdheAes256CbcSha
+            | Self::RsaAes128CbcSha
+            | Self::RsaAes256CbcSha => Some(Mac::Sha1),
+            Self::EcdheAes128CbcSha256 | Self::RsaAes128CbcSha256 => Some(Mac::Sha256),
+            _ => None,
         }
     }
 
-    fn algorithm(self) -> &'static ring::aead::Algorithm {
+    /// A TLS 1.2 key block's per-direction IV: four bytes for GCM's explicit nonce, twelve for
+    /// `ChaCha`'s XOR nonce, a whole block for the IV a CBC record carries in the clear.
+    pub(crate) fn iv_len(self) -> usize {
         match self {
-            Self::Aes128GcmSha256 | Self::EcdheAes128GcmSha256 => &ring::aead::AES_128_GCM,
-            Self::Aes256GcmSha384 | Self::EcdheAes256GcmSha384 => &ring::aead::AES_256_GCM,
-            Self::ChaCha20Sha256 | Self::EcdheChaCha20Sha256 => &ring::aead::CHACHA20_POLY1305,
+            Self::EcdheAes128GcmSha256
+            | Self::EcdheAes256GcmSha384
+            | Self::RsaAes128GcmSha256
+            | Self::RsaAes256GcmSha384 => 4,
+            Self::ChaCha20Sha256 | Self::EcdheChaCha20Sha256 => 12,
+            _ => BLOCK,
         }
     }
 
@@ -74,12 +123,48 @@ impl Suite {
                 | Self::Aes256GcmSha384
                 | Self::EcdheAes128GcmSha256
                 | Self::EcdheAes256GcmSha384
+                | Self::RsaAes128GcmSha256
+                | Self::RsaAes256GcmSha384
         )
     }
 }
 
 /// One direction's keys and record counter: a sequence number reused under one key loses the record layer's integrity.
-pub(crate) struct Direction {
+#[allow(
+    clippy::large_enum_variant,
+    reason = "seal and open reach the key of every record; boxing either half puts a chase on that path"
+)]
+pub(crate) enum Direction {
+    Aead(Aead),
+    Cbc(Cbc),
+}
+
+impl Direction {
+    /// TLS 1.3 keys from a traffic secret: `HKDF-Expand-Label(secret, "key"/"iv", "", ...)`.
+    pub(crate) fn tls13(suite: Suite, secret: &[u8]) -> Self {
+        Self::Aead(Aead::tls13(suite, secret))
+    }
+
+    /// TLS 1.2 keys from one direction's slices of the expanded block. The MAC key is empty for
+    /// an AEAD suite, which puts its tag inside the record rather than in front of the padding,
+    /// and a CBC suite ignores the block's IV because every record carries its own in the clear.
+    pub(crate) fn tls12(suite: Suite, key: &[u8], mac: &[u8], iv: &[u8]) -> Self {
+        match suite.mac() {
+            Some(kind) => Self::Cbc(Cbc::new(kind, key, mac)),
+            None => Self::Aead(Aead::tls12(suite, key, iv)),
+        }
+    }
+
+    /// The next traffic secret of a TLS 1.3 direction; TLS 1.2 has no key update.
+    pub(crate) fn update(&mut self) {
+        if let Self::Aead(keys) = self {
+            keys.update();
+        }
+    }
+}
+
+/// An AEAD direction: the traffic key, the fixed half of its nonce, and the counter that tells two records apart.
+pub(crate) struct Aead {
     key: LessSafeKey,
     iv: [u8; 12],
     seq: u64,
@@ -89,9 +174,8 @@ pub(crate) struct Direction {
     secret: Vec<u8>,
 }
 
-impl Direction {
-    /// TLS 1.3 keys from a traffic secret: `HKDF-Expand-Label(secret, "key"/"iv", "", ...)`.
-    pub(crate) fn tls13(suite: Suite, secret: &[u8]) -> Self {
+impl Aead {
+    fn tls13(suite: Suite, secret: &[u8]) -> Self {
         let hash = suite.hash();
         let mut key = vec![0u8; suite.key_len()];
         kdf::expand_label(hash, secret, b"key", b"", &mut key);
@@ -108,8 +192,7 @@ impl Direction {
         }
     }
 
-    /// TLS 1.2 keys from the expanded key block.
-    pub(crate) fn tls12(suite: Suite, key: &[u8], iv: &[u8]) -> Self {
+    fn tls12(suite: Suite, key: &[u8], iv: &[u8]) -> Self {
         let mut fixed = [0u8; 12];
         fixed[..iv.len()].copy_from_slice(iv);
         Self {
@@ -123,8 +206,7 @@ impl Direction {
         }
     }
 
-    /// The next traffic secret of a TLS 1.3 direction, `HKDF-Expand-Label(secret, "traffic upd", "", ...)`.
-    pub(crate) fn update(&mut self) {
+    fn update(&mut self) {
         let mut next = vec![0u8; self.secret.len()];
         kdf::expand_label(self.hash, &self.secret, b"traffic upd", b"", &mut next);
         let suite = if next.len() == 48 {
@@ -189,12 +271,274 @@ impl Direction {
             .open_in_place(nonce, Aad::from(aad), body)
             .map_err(|_| TlsError::Other("record failed authentication".to_owned()))
     }
+
+    fn seal12_parts(
+        &mut self,
+        kind: u8,
+        parts: &[&[u8]],
+        out: &mut Vec<u8>,
+    ) -> Result<(), TlsError> {
+        let len: usize = parts.iter().map(|part| part.len()).sum();
+        let explicit = if self.gcm { 8 } else { 0 };
+        let aad = self.aad12(kind, len);
+        let seq = self.seq.to_be_bytes();
+        let at = out.len();
+        let total = (len + explicit + 16) as u16;
+        out.reserve(5 + explicit + len + 16);
+        out.extend_from_slice(&[kind, 0x03, 0x03, (total >> 8) as u8, total as u8]);
+        if explicit != 0 {
+            out.extend_from_slice(&seq);
+        }
+        for part in parts {
+            out.extend_from_slice(part);
+        }
+        self.seal(&aad, at + 5 + explicit, out)
+    }
+
+    fn open12(&mut self, kind: u8, body: &mut [u8]) -> Result<(usize, usize), TlsError> {
+        let explicit = if self.gcm { 8 } else { 0 };
+        if body.len() < explicit + 16 {
+            return Err(TlsError::Other("short TLS 1.2 record".to_owned()));
+        }
+        let aad = self.aad12(kind, body.len() - explicit - 16);
+        let (start, len) = if self.gcm {
+            let nonce: [u8; 8] = body[..8].try_into().expect("eight-byte explicit nonce");
+            (8, self.open_explicit(&aad, nonce, &mut body[8..])?.len())
+        } else {
+            (0, self.open(&aad, &mut body[..])?.len())
+        };
+        Ok((start, len))
+    }
+
+    /// The same record opened into the caller's buffer, its explicit nonce left behind on the wire.
+    fn open12_into(&mut self, kind: u8, body: &[u8], out: &mut [u8]) -> Result<usize, TlsError> {
+        let explicit = if self.gcm { 8 } else { 0 };
+        if body.len() < explicit + 16 {
+            return Err(TlsError::Other("short TLS 1.2 record".to_owned()));
+        }
+        let n = body.len() - explicit;
+        let aad = self.aad12(kind, n - 16);
+        out[..n].copy_from_slice(&body[explicit..]);
+        let len = if explicit == 8 {
+            let nonce: [u8; 8] = body[..8].try_into().expect("eight-byte explicit nonce");
+            self.open_explicit(&aad, nonce, &mut out[..n])?.len()
+        } else {
+            self.open(&aad, &mut out[..n])?.len()
+        };
+        Ok(len)
+    }
+
+    /// The additional data a TLS 1.2 record authenticates: its counter, type, version and plaintext length.
+    fn aad12(&self, kind: u8, plain_len: usize) -> [u8; 13] {
+        let mut aad = [0u8; 13];
+        aad[..8].copy_from_slice(&self.seq.to_be_bytes());
+        aad[8] = kind;
+        aad[9..11].copy_from_slice(&[0x03, 0x03]);
+        aad[11..].copy_from_slice(&(plain_len as u16).to_be_bytes());
+        aad
+    }
+}
+
+/// A TLS 1.2 CBC direction: the block cipher, the HMAC its record's front carries, and the counter both sign.
+pub(crate) struct Cbc {
+    aes: Aes,
+    mac: Mac,
+    mac_key: hmac::Key,
+    seq: u64,
+}
+
+impl Cbc {
+    fn new(mac: Mac, key: &[u8], mac_key: &[u8]) -> Self {
+        Self {
+            aes: Aes::new(key),
+            mac,
+            mac_key: mac.key(mac_key),
+            seq: 0,
+        }
+    }
+
+    /// MAC-then-encrypt as RFC 5246 §6.2.3.2 lays it out: the header the MAC signs names the
+    /// plaintext, and the wire header names that plus the MAC, the padding and the clear IV.
+    fn seal(&mut self, kind: u8, parts: &[&[u8]], out: &mut Vec<u8>) -> Result<(), TlsError> {
+        let len: usize = parts.iter().map(|part| part.len()).sum();
+        let mac_len = self.mac.len();
+        let pad = BLOCK - (len + mac_len) % BLOCK;
+        let at = out.len();
+        out.reserve(5 + BLOCK + len + mac_len + pad);
+        out.extend_from_slice(&[kind, 0x03, 0x03, (len >> 8) as u8, len as u8]);
+        let mut iv = [0u8; BLOCK];
+        getrandom::fill(&mut iv).map_err(|e| TlsError::Other(format!("record IV: {e}")))?;
+        out.extend_from_slice(&iv);
+        let body = out.len();
+        for part in parts {
+            out.extend_from_slice(part);
+        }
+        let seq = self.seq.to_be_bytes();
+        self.seq = self.seq.wrapping_add(1);
+        let tag = kdf::sign(&self.mac_key, &[&seq, &out[at..at + 5], &out[body..]]);
+        out.extend_from_slice(tag.as_ref());
+        out.resize(out.len() + pad, (pad - 1) as u8);
+        self.aes.encrypt(&iv, &mut out[body..]);
+        let total = (out.len() - at - 5) as u16;
+        out[at + 3..at + 5].copy_from_slice(&total.to_be_bytes());
+        Ok(())
+    }
+
+    /// Opens a CBC record body in place: the plaintext starts one block in, behind the clear IV.
+    fn open(&mut self, kind: u8, body: &mut [u8]) -> Result<(usize, usize), TlsError> {
+        self.content_len(body.len())?;
+        let mut iv = [0u8; BLOCK];
+        iv.copy_from_slice(&body[..BLOCK]);
+        self.aes.decrypt(&iv, &mut body[BLOCK..]);
+        Ok((BLOCK, self.authenticate(kind, &body[BLOCK..])?))
+    }
+
+    /// The same record opened into the caller's buffer, its IV left behind on the wire.
+    fn open_into(&mut self, kind: u8, body: &[u8], out: &mut [u8]) -> Result<usize, TlsError> {
+        let content = self.content_len(body.len())?;
+        let mut iv = [0u8; BLOCK];
+        iv.copy_from_slice(&body[..BLOCK]);
+        out[..content].copy_from_slice(&body[BLOCK..]);
+        self.aes.decrypt(&iv, &mut out[..content]);
+        self.authenticate(kind, &out[..content])
+    }
+
+    /// The blocks a CBC body carries past its IV: whole of them, and enough for an HMAC and a pad byte.
+    fn content_len(&self, wire: usize) -> Result<usize, TlsError> {
+        if wire < BLOCK + self.mac.len() + 1 || !wire.is_multiple_of(BLOCK) {
+            return Err(TlsError::Other("short TLS 1.2 CBC record".to_owned()));
+        }
+        Ok(wire - BLOCK)
+    }
+
+    /// The padding-and-MAC tail read back off a decrypted record, returning the payload length.
+    fn authenticate(&mut self, kind: u8, content: &[u8]) -> Result<usize, TlsError> {
+        let mac_len = self.mac.len();
+        let pad = padding(content, mac_len);
+        let plain = content.len() - mac_len - pad;
+        let seq = self.seq.to_be_bytes();
+        self.seq = self.seq.wrapping_add(1);
+        let header = [kind, 0x03, 0x03, (plain >> 8) as u8, plain as u8];
+        let expected = kdf::sign(&self.mac_key, &[&seq, &header, &content[..plain]]);
+        // Every MAC byte reaches the fold, so a wrong padding length fails it rather than branching on the secret.
+        let mut fold = 0u8;
+        for (got, want) in expected
+            .as_ref()
+            .iter()
+            .zip(&content[plain..plain + mac_len])
+        {
+            fold |= got ^ want;
+        }
+        if fold != 0 {
+            return Err(TlsError::Other("record failed authentication".to_owned()));
+        }
+        Ok(plain)
+    }
+}
+
+/// The AES schedule of a CBC direction, expanded once for the session rather than per record.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "every block of a record goes through this schedule; boxing the wider half puts a chase inside the cipher"
+)]
+enum Aes {
+    Aes128(aes::Aes128),
+    Aes256(aes::Aes256),
+}
+
+impl Aes {
+    fn new(key: &[u8]) -> Self {
+        use aes::cipher::KeyInit;
+        match key.len() {
+            16 => {
+                Self::Aes128(aes::Aes128::new_from_slice(key).expect("a sixteen-byte key expands"))
+            }
+            32 => Self::Aes256(
+                aes::Aes256::new_from_slice(key).expect("a thirty-two-byte key expands"),
+            ),
+            _ => panic!("the key block names its own length"),
+        }
+    }
+
+    fn transform(&self, block: &mut [u8; BLOCK], decrypt: bool) {
+        use aes::cipher::{BlockDecrypt, BlockEncrypt};
+        let mut typed = (*block).into();
+        match (self, decrypt) {
+            (Self::Aes128(key), false) => key.encrypt_block(&mut typed),
+            (Self::Aes128(key), true) => key.decrypt_block(&mut typed),
+            (Self::Aes256(key), false) => key.encrypt_block(&mut typed),
+            (Self::Aes256(key), true) => key.decrypt_block(&mut typed),
+        }
+        *block = typed.into();
+    }
+
+    /// CBC over whole blocks: each one chains through the cipher, forward from the record's IV.
+    fn encrypt(&self, iv: &[u8; BLOCK], body: &mut [u8]) {
+        let mut prev = *iv;
+        for chunk in body.as_chunks_mut::<BLOCK>().0 {
+            let mut block = *chunk;
+            for (slot, byte) in block.iter_mut().zip(prev) {
+                *slot ^= byte;
+            }
+            self.transform(&mut block, false);
+            *chunk = block;
+            prev = block;
+        }
+    }
+
+    /// CBC over whole blocks: forward chains the ciphertext through the cipher, back chains the
+    /// wire block, not the one it just decrypted.
+    fn decrypt(&self, iv: &[u8; BLOCK], body: &mut [u8]) {
+        let mut prev = *iv;
+        for chunk in body.as_chunks_mut::<BLOCK>().0 {
+            let wire = *chunk;
+            let mut block = wire;
+            self.transform(&mut block, true);
+            for (slot, byte) in block.iter_mut().zip(prev) {
+                *slot ^= byte;
+            }
+            *chunk = block;
+            prev = wire;
+        }
+    }
+}
+
+/// The padding a CBC record's last byte names, folded to none of it when any byte disagrees.
+/// The walk covers a public count — the record's own length — so the secret padding picks no branch.
+fn padding(content: &[u8], mac_len: usize) -> usize {
+    let pad = usize::from(*content.last().expect("a record at least one block long"));
+    let mut fold = 0u8;
+    for index in 0..256.min(content.len()) {
+        let mask = 0u8.wrapping_sub((index <= pad) as u8);
+        fold |= (content[content.len() - 1 - index] & mask) ^ ((pad as u8) & mask);
+    }
+    let mask = 0u8.wrapping_sub((content.len() - mac_len < pad + 1) as u8);
+    let wrong = fold | mask;
+    let ok = ((wrong | wrong.wrapping_neg()) >> 7) ^ 1;
+    (pad & usize::from(ok).wrapping_neg()) + 1
 }
 
 fn keyed(suite: Suite, key: &[u8]) -> LessSafeKey {
-    let unbound =
-        UnboundKey::new(suite.algorithm(), key).expect("the key block names its own length");
+    let algorithm = match suite {
+        Suite::Aes128GcmSha256 | Suite::EcdheAes128GcmSha256 | Suite::RsaAes128GcmSha256 => {
+            &ring::aead::AES_128_GCM
+        }
+        Suite::Aes256GcmSha384 | Suite::EcdheAes256GcmSha384 | Suite::RsaAes256GcmSha384 => {
+            &ring::aead::AES_256_GCM
+        }
+        Suite::ChaCha20Sha256 | Suite::EcdheChaCha20Sha256 => &ring::aead::CHACHA20_POLY1305,
+        suite => unreachable!("{suite:?} keys no AEAD"),
+    };
+    let unbound = UnboundKey::new(algorithm, key).expect("the key block names its own length");
     LessSafeKey::new(unbound)
+}
+
+/// The AEAD framing of a direction: TLS 1.3 has no CBC suite, so a CBC direction here is a bug, not a wire case.
+fn aead(keys: &mut Direction) -> &mut Aead {
+    match keys {
+        Direction::Aead(keys) => keys,
+        Direction::Cbc(_) => unreachable!("TLS 1.3 frames no CBC record"),
+    }
 }
 
 /// Frames and seals one TLS 1.3 record whose plaintext is `plain` with `kind` as its inner type.
@@ -214,6 +558,7 @@ pub(crate) fn seal13_parts(
     parts: &[&[u8]],
     out: &mut Vec<u8>,
 ) -> Result<(), TlsError> {
+    let keys = aead(keys);
     let len: usize = parts.iter().map(|part| part.len()).sum();
     let at = out.len();
     let total = (len + 1 + 16) as u16;
@@ -233,6 +578,7 @@ pub(crate) fn open13(
     header: [u8; 5],
     body: &mut [u8],
 ) -> Result<(u8, usize), TlsError> {
+    let keys = aead(keys);
     let at = {
         let plain = keys.open(&header, body)?;
         plain
@@ -251,6 +597,7 @@ pub(crate) fn open13_into(
     body: &[u8],
     out: &mut [u8],
 ) -> Result<(u8, usize), TlsError> {
+    let keys = aead(keys);
     out[..body.len()].copy_from_slice(body);
     let at = {
         let plain = keys.open(&header, &mut out[..body.len()])?;
@@ -262,7 +609,7 @@ pub(crate) fn open13_into(
     Ok((out[at], at))
 }
 
-/// Seals one TLS 1.2 AEAD record of `kind`.
+/// Seals one TLS 1.2 record of `kind`.
 pub(crate) fn seal12(
     keys: &mut Direction,
     kind: u8,
@@ -278,78 +625,38 @@ pub(crate) fn seal12_parts(
     parts: &[&[u8]],
     out: &mut Vec<u8>,
 ) -> Result<(), TlsError> {
-    let len: usize = parts.iter().map(|part| part.len()).sum();
-    let seq = keys.seq.to_be_bytes();
-    let mut aad = [0u8; 13];
-    aad[..8].copy_from_slice(&seq);
-    aad[8] = kind;
-    aad[9..11].copy_from_slice(&[0x03, 0x03]);
-    aad[11..].copy_from_slice(&(len as u16).to_be_bytes());
-    let at = out.len();
-    let explicit = if keys.gcm { 8 } else { 0 };
-    let total = (len + explicit + 16) as u16;
-    out.reserve(5 + explicit + len + 16);
-    out.extend_from_slice(&[kind, 0x03, 0x03, (total >> 8) as u8, total as u8]);
-    if explicit == 8 {
-        out.extend_from_slice(&seq);
+    match keys {
+        Direction::Aead(keys) => keys.seal12_parts(kind, parts, out),
+        Direction::Cbc(keys) => keys.seal(kind, parts, out),
     }
-    for part in parts {
-        out.extend_from_slice(part);
-    }
-    keys.seal(&aad, at + 5 + explicit, out)
 }
 
-/// Opens one TLS 1.2 AEAD record body in place and returns the plaintext's offset and length:
-/// a GCM record leaves its explicit nonce in front rather than moving the plaintext over it.
+/// Opens one TLS 1.2 record body in place and returns the plaintext's offset and length: a GCM
+/// record leaves its explicit nonce in front and a CBC record its IV and MAC, and in neither
+/// case does the plaintext move over them.
 pub(crate) fn open12(
     keys: &mut Direction,
     kind: u8,
     body: &mut [u8],
 ) -> Result<(usize, usize), TlsError> {
-    let explicit = if keys.gcm { 8 } else { 0 };
-    if body.len() < explicit + 16 {
-        return Err(TlsError::Other("short TLS 1.2 record".to_owned()));
+    match keys {
+        Direction::Aead(keys) => keys.open12(kind, body),
+        Direction::Cbc(keys) => keys.open(kind, body),
     }
-    let aad = aad12(keys, kind, body.len() - explicit - 16);
-    let (start, len) = if keys.gcm {
-        let nonce: [u8; 8] = body[..8].try_into().expect("eight-byte explicit nonce");
-        (8, keys.open_explicit(&aad, nonce, &mut body[8..])?.len())
-    } else {
-        (0, keys.open(&aad, &mut body[..])?.len())
-    };
-    Ok((start, len))
 }
 
-/// The TLS 1.2 body opened to the front of `out`, over the explicit nonce that GCM carries on the wire.
+/// The TLS 1.2 body opened to the front of `out`, over the explicit nonce or IV that the wire
+/// carries ahead of it: a relay gets the plaintext without staging the ciphertext a second time.
 pub(crate) fn open12_into(
     keys: &mut Direction,
     kind: u8,
     body: &[u8],
     out: &mut [u8],
 ) -> Result<usize, TlsError> {
-    let explicit = if keys.gcm { 8 } else { 0 };
-    if body.len() < explicit + 16 {
-        return Err(TlsError::Other("short TLS 1.2 record".to_owned()));
+    match keys {
+        Direction::Aead(keys) => keys.open12_into(kind, body, out),
+        Direction::Cbc(keys) => keys.open_into(kind, body, out),
     }
-    let aad = aad12(keys, kind, body.len() - explicit - 16);
-    let n = body.len() - explicit;
-    out[..n].copy_from_slice(&body[explicit..]);
-    let len = if explicit == 8 {
-        let nonce: [u8; 8] = body[..8].try_into().expect("eight-byte explicit nonce");
-        keys.open_explicit(&aad, nonce, &mut out[..n])?.len()
-    } else {
-        keys.open(&aad, &mut out[..n])?.len()
-    };
-    Ok(len)
-}
-
-fn aad12(keys: &Direction, kind: u8, plain_len: usize) -> [u8; 13] {
-    let mut aad = [0u8; 13];
-    aad[..8].copy_from_slice(&keys.seq.to_be_bytes());
-    aad[8] = kind;
-    aad[9..11].copy_from_slice(&[0x03, 0x03]);
-    aad[11..].copy_from_slice(&(plain_len as u16).to_be_bytes());
-    aad
 }
 
 #[cfg(test)]
@@ -360,8 +667,8 @@ mod tests {
     fn a_tls12_gcm_record_opens_behind_its_explicit_nonce() {
         let suite = Suite::EcdheAes128GcmSha256;
         let (key, iv) = ([7u8; 16], [9u8; 4]);
-        let mut sender = Direction::tls12(suite, &key, &iv);
-        let mut receiver = Direction::tls12(suite, &key, &iv);
+        let mut sender = Direction::tls12(suite, &key, &[], &iv);
+        let mut receiver = Direction::tls12(suite, &key, &[], &iv);
         let mut wire = Vec::new();
         seal12(&mut sender, 23, b"ping", &mut wire).expect("seals");
         let (header, body) = wire.split_at_mut(5);
@@ -374,5 +681,40 @@ mod tests {
         );
         assert_eq!(&body[..8], &[0u8; 8], "the nonce is not written over");
         assert_eq!(&body[start..start + len], b"ping");
+    }
+
+    #[test]
+    fn a_tls12_cbc_record_pads_to_the_rfc_length_and_open_back() {
+        let suite = Suite::EcdheAes128CbcSha;
+        let (key, mac_key, iv) = ([7u8; 16], [8u8; 20], [0u8; BLOCK]);
+        let mut sender = Direction::tls12(suite, &key, &mac_key, &iv);
+        let mut receiver = Direction::tls12(suite, &key, &mac_key, &iv);
+        let mut wire = Vec::new();
+        seal12(&mut sender, 23, b"ping", &mut wire).expect("seals");
+        // IV, payload and MAC need eight pad bytes to reach whole blocks, so the body is 48.
+        assert_eq!(
+            wire.len(),
+            5 + BLOCK + 24 + 8,
+            "the record is the length the reference gives it"
+        );
+        assert_eq!(
+            u16::from_be_bytes([wire[3], wire[4]]) as usize,
+            BLOCK + 24 + 8,
+            "and its header names that"
+        );
+        let (header, body) = wire.split_at_mut(5);
+        let (start, len) = open12(&mut receiver, header[0], body).expect("opens");
+        assert_eq!((start, len), (BLOCK, 4), "the IV leads the plaintext");
+        assert_eq!(&body[start..start + len], b"ping");
+
+        let mut forged = wire.clone();
+        let kind = forged[0];
+        *forged.last_mut().expect("a whole block") ^= 0xff;
+        let (_, body) = forged.split_at_mut(5);
+        let mut once = Direction::tls12(suite, &key, &mac_key, &iv);
+        assert!(
+            open12(&mut once, kind, body).is_err(),
+            "a forged padding length fails the MAC, not a branch on the secret"
+        );
     }
 }
