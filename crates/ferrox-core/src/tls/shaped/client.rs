@@ -1176,7 +1176,7 @@ fn rsa_exchange(leaf: &[u8]) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
     }
     let (modulus, exponent) = super::rsa::public_key(key.key)
         .ok_or_else(|| TlsError::BadCertificate("malformed RSA key".to_owned()))?;
-    // RFC 5246 §7.4.7.1 repeats the hello's version, and the rest is random.
+    // The pre-master repeats the hello's own version in its first two bytes, and the rest is random.
     let mut secret = vec![0u8; 48];
     secret[..2].copy_from_slice(&TLS12.to_be_bytes());
     fill(&mut secret[2..])?;

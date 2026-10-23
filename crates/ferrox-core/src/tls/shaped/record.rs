@@ -357,7 +357,7 @@ impl Cbc {
         }
     }
 
-    /// MAC-then-encrypt as RFC 5246 §6.2.3.2 lays it out: the header the MAC signs names the
+    /// MAC-then-encrypt as RFC 5246 lays it out: the header the MAC signs names the
     /// plaintext, and the wire header names that plus the MAC, the padding and the clear IV.
     fn seal(&mut self, kind: u8, parts: &[&[u8]], out: &mut Vec<u8>) -> Result<(), TlsError> {
         let len: usize = parts.iter().map(|part| part.len()).sum();
