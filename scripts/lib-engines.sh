@@ -97,6 +97,14 @@ build() {
       rust_cli="$(built "$engine_dir/xray-rust-target/release/xray-rust")" || return 1
       cp "$rust_cli" "$binary" || return 1
       ;;
+    xray-core-rust)
+      note "building the pinned xray-core-rust at $rev"
+      (cd "upstream/$name" && CARGO_TARGET_DIR="$OLDPWD/$engine_dir/xray-core-rust-target" \
+        cargo build --release -p xray-cli --bin xray) || return 1
+      local rust_core_cli
+      rust_core_cli="$(built "$engine_dir/xray-core-rust-target/release/xray$(exe_suffix)")" || return 1
+      cp "$rust_core_cli" "$binary" || return 1
+      ;;
     leaf)
       note "building the pinned leaf at $rev (long: aws-lc-rs, quinn, tungstenite)"
       (cd "upstream/$name" && CARGO_TARGET_DIR="$OLDPWD/$engine_dir/leaf-target" \

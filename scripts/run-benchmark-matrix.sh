@@ -43,9 +43,9 @@ mkdir -p "$out" "$engine_dir" "$out/cells"
 
 if [[ -z "$engines_list" ]]; then
   if [[ "$tier" == "smoke" ]]; then
-    engines_list="ferrox,xray-core"
+    engines_list="ferrox,xray-core,xray-core-rust"
   else
-    engines_list="ferrox,xray-core,zeronet,sing-box,xray-rust,leaf"
+    engines_list="ferrox,xray-core,xray-core-rust,zeronet,sing-box,leaf"
   fi
 fi
 if [[ -z "$repeats" ]]; then
@@ -105,7 +105,7 @@ done
   echo "engines skipped: ${skipped[*]:-<none>}" >&2
 } || true
 ordered=()
-for want in xray-core ferrox zeronet sing-box xray-rust leaf; do
+for want in xray-core ferrox xray-core-rust zeronet sing-box xray-rust leaf; do
   for have in ${built[@]+"${built[@]}"}; do
     [[ "${have%%=*}" == "$want" ]] && ordered+=("$have")
   done
@@ -150,7 +150,7 @@ manifest() {
       label="${have%%=*}"
       echo "engine $label: ${have#*=} sha256=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "${have#*=}") mib=$(python3 -c 'import os,sys;print(f"{os.path.getsize(sys.argv[1]) / 1048576:.1f}")' "${have#*=}")"
     done
-    for pin in xray-core sing-box zeronet xray-rust leaf; do
+    for pin in xray-core xray-core-rust sing-box zeronet xray-rust leaf; do
       echo "pin $pin: $(pin_of "$pin")"
     done
   } >"$out/manifest.txt"
@@ -354,7 +354,18 @@ while read -r id traffic connections iterations payload; do
     status=1
     continue
   }
-  config="$(scenario_config "$id" "$srvport")" || {
+  coverport=""
+  if [[ "$id" == *reality* ]]; then
+    coverport="$(matrix_srvport)" || {
+      cells_failed+=("$id (could not allocate a REALITY cover port)")
+      status=1
+      continue
+    }
+    export MATRIX_REALITY_DEST="127.0.0.1:$coverport"
+  else
+    unset MATRIX_REALITY_DEST
+  fi
+  config="$(scenario_config "$id" "$srvport" "$coverport")" || {
     cells_failed+=("$id (unknown scenario)")
     status=1
     continue

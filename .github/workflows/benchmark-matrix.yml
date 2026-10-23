@@ -151,7 +151,7 @@ jobs:
           fi
           flags=""
           [[ -n "$WANT_REPEATS" ]] && flags="$flags --repeats $WANT_REPEATS"
-          trees="xray-core,sing-box,zeronet,xray-rust,leaf"
+          trees="xray-core,xray-core-rust,sing-box,zeronet,leaf"
           if [[ -n "$WANT_ENGINES" ]]; then
             # A typed list is the caller's own, ferrox included or not.
             flags="$flags --engines $WANT_ENGINES"
@@ -161,7 +161,7 @@ jobs:
             flags="$flags --engines ferrox,$planned_engines"
             trees="$planned_engines"
           elif [[ "$tier" == "smoke" ]]; then
-            trees="xray-core"
+            trees="xray-core,xray-core-rust"
           fi
           echo "tier=$tier" >> "$GITHUB_OUTPUT"
           echo "cells=$cells" >> "$GITHUB_OUTPUT"
@@ -338,6 +338,7 @@ jobs:
             --cells target/benchmark-matrix/cells \
             --results target/benchmark-matrix/matrix-results.json \
             --charts target/benchmark-matrix/charts
+          python3 scripts/check-matrix-legs.py --cells target/benchmark-matrix/cells
       - name: refuse a bundle that measured nothing
         shell: bash
         run: |
