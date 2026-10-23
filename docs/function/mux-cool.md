@@ -42,7 +42,7 @@ graph TD
 | downlink-writes-per-read-batch | 1 | ferrox-app-proxy::tests::a_mux_downlink_hands_a_batch_of_frames_over_in_one_call |
 | codec-copies-per-byte-written | 1 | ferrox-core-mux::tests::a_header_plus_a_patched_length_is_the_whole_frame |
 | mux-frame-allocations | 0 | ferrox-bench-gate-6 |
-| live-session-cap | 8 | ferrox-core-mux::tests::the_concurrency_cap_counts_live_sessions_and_not_the_ids_used |
+| client-session-cap | 8 | ferrox-core-mux::tests::the_concurrency_cap_counts_live_sessions_and_not_the_ids_used |
 | xudp-frame-layout-matches-upstream | 1 | ferrox-app-proxy::tests::xudp_frames_match_the_upstream_layout |
 
 <!-- counts:end -->
@@ -70,7 +70,7 @@ The uplink reader polls its origin on `RELAY_POLL` rather than blocking, and a t
 
 `a_stalled_origin_does_not_park_the_mux_session` is the gate: an origin accepts and never reads, the client floods 32 MiB of `Keep`s past its loopback window, and the test requires the client's writes to keep landing and a second flow's ping to come back. Before this change the client's write times out with the session parked inside the first flow. `an_ended_mux_flow_releases_a_silent_origin` covers the poll: an origin that accepts and says nothing must not hold the session past its join budget once the client is gone.
 
-The cost is one more pooled thread per live TCP flow — a writer beside the reader, bounded by the 8-flow cap — and one `Vec` per queued frame, at most 128 KiB per flow at the cap. Both are the price of the session's read loop never touching an origin socket.
+The cost is one more pooled thread per live TCP flow — a writer beside the reader, bounded by the session's own demand rather than a fixed cap — and one `Vec` per queued frame, at most 128 KiB per flow. Both are the price of the session's read loop never touching an origin socket.
 
 ## What we removed
 
@@ -92,9 +92,9 @@ The server relay shared the same copy through `write_mux_frame`, which `encode_i
 **Two rows on this page were wrong and are corrected rather than kept.** Both `user-space-copies-per-byte-written 0` and `-read 1` named `ferrox-bench-gate-6`, which counts *allocations, bytes allocated and zero-fills* — not copies (`check_encode_allocs`, `muxframe.rs:234`). So the checker did not observe what the row claimed, and the written value was also wrong for the codec: `encode_into` copies the payload into the output buffer, so the codec's write side is **1** copy per byte, not 0. They are now `downlink-copies-per-byte-written 0` — gated by the pointer identity above — and `codec-copies-per-byte-written 1`, which is the floor for an in-place-serialised codec and what the decode side's borrowed subslice already achieves.
 - **The write-side payload copy.** Xray's `common/mux/writer.go:83` allocates a `MultiBuffer` per frame — `mb2 := make(buf.MultiBuffer, 0, len(data)+1)` — and appends the header buffer and the caller's payload buffers to it, so the payload is not copied but a slice is allocated per frame. sing-box, on the `smux` path, does `copy(buf[headerSize:], request.frame.data)` for every frame that is not vectorised, plus `result: make(chan writeResult, 1)` per frame and two goroutine handoffs. This tree appends into one buffer that exists for the connection, and gate 6 holds the allocation count at zero.
 - **The read-side double copy.** Xray's frame unmarshal (`common/mux/frame.go:114-130`) reads the metadata into a pooled buffer, parses it, and then the chunk reader copies the payload out of the `BufferedReader` into the caller's buffer — two copies for one byte. Zray's `read_frame` reads the payload through `spare_capacity_mut` + `set_len`, which is one copy and no zero-fill; that is the shape here.
-- **A 4 MiB receive buffer per session.** sing-box's smux defaults are `MaxReceiveBuffer = 4194304` and `MaxFrameSize = 32768` (`sagernet/smux/mux.go:62-71`), and `Allocator.Get` returns a `*[]byte`, so every frame costs a pool round trip plus one heap allocation for the head. The session cap here is 8, which is the smaller number that still gives one connection a handful of parallel streams.
+- **A 4 MiB receive buffer per session.** sing-box's smux defaults are `MaxReceiveBuffer = 4194304` and `MaxFrameSize = 32768` (`sagernet/smux/mux.go:62-71`), and `Allocator.Get` returns a `*[]byte`, so every frame costs a pool round trip plus one heap allocation for the head. The server here serves every `New` a peer sends, as xray's server does, so the receive side holds no per-session cap for a client to run into.
 
-XUDP now rides this mux. A `Network::Udp` target opens a UDP socket keyed by the frame's `global_id`; datagrams arrive as `Keep` frames carrying their own destination and replies return as `Keep` frames carrying their source, so one XUDP session serves every destination of a SOCKS association instead of dialling a carrier per destination. The client sends the mux request the way upstream does — command 3, no address — so a real peer agrees on the wire. `KeepAlive` is still a no-op, and the cap is still `DEFAULT_CAP` 8 live sessions.
+XUDP now rides this mux. A `Network::Udp` target opens a UDP socket keyed by the frame's `global_id`; datagrams arrive as `Keep` frames carrying their own destination and replies return as `Keep` frames carrying their source, so one XUDP session serves every destination of a SOCKS association instead of dialling a carrier per destination. The client sends the mux request the way upstream does — command 3, no address — so a real peer agrees on the wire. `KeepAlive` is still a no-op, and a session serves every live flow its peer opens.
 
 ## The open-ended pass
 

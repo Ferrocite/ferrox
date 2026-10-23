@@ -1994,13 +1994,6 @@ fn handle_mux_tcp_new(
     let Some(target) = frame.target.and_then(|t| mux_target_addr(&t)) else {
         return send_mux_end(shared, staging, frame.id);
     };
-    let live = match table.lock() {
-        Ok(table) => table.flows.len(),
-        Err(_) => return,
-    };
-    if live >= ferrox_core::mux::DEFAULT_CAP {
-        return send_mux_end(shared, staging, frame.id);
-    }
     let Some(mut uplink) = dial_or_report(&target) else {
         return send_mux_end(shared, staging, frame.id);
     };
@@ -2090,9 +2083,6 @@ fn handle_mux_udp_new(
         session.id.store(frame.id, Ordering::Relaxed);
         session
     } else {
-        if udp.len() >= ferrox_core::mux::DEFAULT_CAP {
-            return send_mux_end(shared, staging, frame.id);
-        }
         let bound = if dest.is_ipv6() {
             UdpSocket::bind("[::]:0")
         } else {
@@ -21968,6 +21958,72 @@ mod tests {
         assert_eq!(first_echo, b"ping");
         assert_eq!(second_echo, b"pong");
         assert!(saw_end);
+    }
+
+    #[test]
+    fn mux_serve_opens_every_flow_a_session_asks_for() {
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let echo = mux_test_echo();
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = tunnel.accept().expect("accepts");
+            serve_vless_raw(stream, &id, true);
+        });
+        let mut stream = mux_test_connect(&id, tunnel_port);
+        let flows = ferrox_core::mux::DEFAULT_CAP + 8;
+        for flow in 0..flows {
+            let id = u16::try_from(flow + 1).expect("flow id");
+            let new = ferrox_core::mux::Outgoing {
+                id,
+                status: ferrox_core::mux::Status::New,
+                options: 0,
+                target: Some(mux_test_target(echo)),
+                global_id: None,
+            };
+            mux_test_send(&mut stream, new, None);
+        }
+        for flow in 0..flows {
+            let id = u16::try_from(flow + 1).expect("flow id");
+            let keep = ferrox_core::mux::Outgoing {
+                id,
+                status: ferrox_core::mux::Status::Keep,
+                options: ferrox_core::mux::DATA,
+                target: None,
+                global_id: None,
+            };
+            mux_test_send(&mut stream, keep, Some(&[flow as u8]));
+        }
+        let mut echoed = vec![false; flows];
+        let mut open = 0;
+        for _ in 0..flows * 2 {
+            let (got, status, payload) = mux_test_recv(&mut stream);
+            assert_ne!(
+                status,
+                ferrox_core::mux::Status::End,
+                "flow {got} was refused instead of opened"
+            );
+            let at = usize::from(got) - 1;
+            if status == ferrox_core::mux::Status::Keep && at < flows {
+                assert_eq!(
+                    payload.as_slice(),
+                    &[at as u8][..],
+                    "flow {got} echoed another flow's byte"
+                );
+                if !echoed[at] {
+                    echoed[at] = true;
+                    open += 1;
+                }
+            }
+            if open == flows {
+                break;
+            }
+        }
+        assert!(
+            echoed.iter().all(|&seen| seen),
+            "every flow {flows} must reach its target, not just the first {}",
+            ferrox_core::mux::DEFAULT_CAP
+        );
     }
 
     #[test]
