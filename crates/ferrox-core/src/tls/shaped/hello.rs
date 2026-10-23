@@ -156,12 +156,13 @@ impl Hello {
         2 + 32 + 1 + self.session_id.len() + 2 + 2 * self.profile.ciphers.len() + 1 + 1
     }
 
-    /// One buffer, written front to back: the handshake header and both length fields are known
-    /// before the first byte, so no body is staged for the message to copy.
+    /// Two walks of one body rule and two buffers: the first runs every walk into a width, so the
+    /// message's total is known before its first byte, and the second runs the same walks into that
+    /// message. No extension body carries a buffer of its own and no body rule is written twice.
     fn encode_with(&self, shares: &[Share], cookie: Option<&[u8]>) -> Vec<u8> {
         let mut entries = self.extension_entries(shares, cookie);
         self.pad_entries(&mut entries);
-        let ext_len: usize = entries.iter().map(|entry| 4 + entry.body.len()).sum();
+        let ext_len: usize = entries.iter().map(|entry| 4 + entry.len).sum();
         let body = self.fixed_len() + 2 + ext_len;
         let mut msg = Vec::with_capacity(body + 4);
         msg.push(1);
@@ -178,14 +179,18 @@ impl Hello {
         msg.extend_from_slice(&(ext_len as u16).to_be_bytes());
         for entry in &entries {
             msg.extend_from_slice(&entry.kind.to_be_bytes());
-            msg.extend_from_slice(&(entry.body.len() as u16).to_be_bytes());
-            msg.extend_from_slice(&entry.body);
+            msg.extend_from_slice(&(entry.len as u16).to_be_bytes());
+            self.write_body(&entry.source, shares, &mut msg);
         }
         msg
     }
 
-    fn extension_entries(&self, shares: &[Share], cookie: Option<&[u8]>) -> Vec<Entry> {
-        let mut entries: Vec<Entry> = Vec::with_capacity(self.profile.exts.len() + 1);
+    fn extension_entries<'a>(
+        &'a self,
+        shares: &[Share],
+        cookie: Option<&'a [u8]>,
+    ) -> Vec<Entry<'a>> {
+        let mut entries: Vec<Entry<'a>> = Vec::with_capacity(self.profile.exts.len() + 1);
         let mut grease_exts = 0usize;
         for ext in self.profile.exts {
             if let Some(entry) = self.entry(ext, shares, &mut grease_exts) {
@@ -193,18 +198,10 @@ impl Hello {
             }
         }
         if let Some(cookie) = cookie {
-            let mut body = Vec::with_capacity(cookie.len() + 2);
-            body.extend_from_slice(&(cookie.len() as u16).to_be_bytes());
-            body.extend_from_slice(cookie);
             let at = entries.len().saturating_sub(1);
-            entries.insert(
-                at,
-                Entry {
-                    kind: 0x002c,
-                    body,
-                    invariant: false,
-                },
-            );
+            let source = Source::Cookie(cookie);
+            let len = self.width_of(&source, shares);
+            entries.insert(at, Entry::new(0x002c, len, false, source));
         }
 
         if self.profile.shuffle && !self.canonical {
@@ -214,115 +211,94 @@ impl Hello {
         // xray appends the forced ALPN after the preset's extensions, and patches it in place when the preset carries one.
         if let Some(list) = &self.alpn {
             if !entries.iter().any(|entry| entry.kind == ALPN) {
-                entries.push(Entry {
-                    kind: ALPN,
-                    body: alpn_body(list),
-                    invariant: true,
-                });
+                let source = Source::Alpn(list);
+                let len = self.width_of(&source, shares);
+                entries.push(Entry::new(ALPN, len, true, source));
             }
         }
         entries
     }
 
-    fn entry(&self, ext: &Ext, shares: &[Share], grease_exts: &mut usize) -> Option<Entry> {
-        Some(match &ext.body {
+    fn entry(&self, ext: &Ext, shares: &[Share], grease_exts: &mut usize) -> Option<Entry<'_>> {
+        let (kind, invariant, source) = match &ext.body {
             Body::Grease => {
                 let slot = (*grease_exts).min(1);
                 *grease_exts += 1;
-                Entry {
-                    kind: grease_value(&self.grease, 2 + slot),
-                    body: if slot == 0 { Vec::new() } else { vec![0] },
-                    invariant: true,
-                }
+                (
+                    grease_value(&self.grease, 2 + slot),
+                    true,
+                    Source::Zeros(slot),
+                )
             }
-            Body::Sni => {
-                let name = self.sni.as_ref()?;
-                Entry {
-                    kind: 0x0000,
-                    body: sni_body(name),
-                    invariant: false,
-                }
-            }
-            Body::Pad => Entry {
-                kind: PAD,
-                body: Vec::new(),
-                invariant: true,
-            },
-            Body::Groups(groups) => {
-                let values: Vec<u16> = groups
-                    .iter()
-                    .map(|&g| grease_or(g, &self.grease, 1))
-                    .collect();
-                Entry {
-                    kind: 0x000a,
-                    body: uint16_list(&values),
-                    invariant: false,
-                }
-            }
-            Body::Sigalgs(values) => Entry {
-                kind: 0x000d,
-                body: uint16_list(values),
-                invariant: false,
-            },
-            Body::Alpn(_) => {
-                let body = match &self.alpn {
-                    Some(list) => alpn_body(list),
-                    None => alpn_table_body(ext),
-                };
-                Entry {
-                    kind: ALPN,
-                    body,
-                    invariant: false,
-                }
-            }
-            Body::Versions(values) => {
-                let values: Vec<u16> = values
-                    .iter()
-                    .map(|&v| grease_or(v, &self.grease, 4))
-                    .collect();
-                Entry {
-                    kind: 0x002b,
-                    body: uint8_list(&values),
-                    invariant: false,
-                }
-            }
-            Body::KeyShare { .. } => {
-                if shares.is_empty() {
-                    return None;
-                }
-                Entry {
-                    kind: 0x0033,
-                    body: key_share_body(shares),
-                    invariant: false,
-                }
-            }
-            Body::Ech { .. } => Entry {
-                kind: 0xfe0d,
-                body: self.ech.clone()?,
-                invariant: false,
-            },
-            Body::Raw(body) => Entry {
-                kind: ext.kind,
-                body: body.to_vec(),
-                invariant: false,
-            },
-        })
+            Body::Sni => (0x0000, false, Source::Name(self.sni.as_deref()?)),
+            Body::Pad => (PAD, true, Source::Zeros(0)),
+            Body::Groups(groups) => (0x000a, false, Source::Groups(groups)),
+            Body::Sigalgs(values) => (0x000d, false, Source::Sigalgs(values)),
+            Body::Alpn(table) => (
+                ALPN,
+                false,
+                match &self.alpn {
+                    Some(list) => Source::Alpn(list),
+                    None => Source::Fixed(table),
+                },
+            ),
+            Body::Versions(values) => (0x002b, false, Source::Versions(values)),
+            Body::KeyShare { .. } if shares.is_empty() => return None,
+            Body::KeyShare { .. } => (0x0033, false, Source::Shares),
+            Body::Ech { .. } => (0xfe0d, false, Source::Fixed(self.ech.as_deref()?)),
+            Body::Raw(body) => (ext.kind, false, Source::Fixed(body)),
+        };
+        let len = self.width_of(&source, shares);
+        Some(Entry::new(kind, len, invariant, source))
     }
 
-    fn pad_entries(&self, entries: &mut Vec<Entry>) {
+    /// The width one body walk writes, so the message is reserved to its exact total before the
+    /// first byte and the bytes themselves land in the walk that follows.
+    fn width_of(&self, source: &Source<'_>, shares: &[Share]) -> usize {
+        let mut width = Width(0);
+        self.write_body(source, shares, &mut width);
+        width.0
+    }
+
+    /// The one rule for a body's bytes, run twice. A zeros body names its own count, so the GREASE
+    /// draw and the padding length carry through Chrome's shuffle without a second walk's state.
+    fn write_body<W: Sink>(&self, source: &Source<'_>, shares: &[Share], out: &mut W) {
+        match *source {
+            Source::Zeros(count) => out.zeros(count),
+            Source::Name(name) => sni_body(out, name),
+            Source::Groups(groups) => {
+                uint16_list(out, groups, |g| grease_or(g, &self.grease, 1));
+            }
+            Source::Sigalgs(values) => uint16_list(out, values, |v| v),
+            Source::Versions(values) => {
+                uint8_list(out, values, |v| grease_or(v, &self.grease, 4));
+            }
+            Source::Alpn(list) => alpn_body(out, list),
+            Source::Fixed(body) => out.put(body),
+            Source::Shares => key_share_body(out, shares),
+            Source::Cookie(value) => {
+                out.put(&(value.len() as u16).to_be_bytes());
+                out.put(value);
+            }
+        }
+    }
+
+    fn pad_entries(&self, entries: &mut Vec<Entry<'_>>) {
         let unpadded = self.fixed_len()
             + 4
             + entries
                 .iter()
                 .filter(|entry| entry.kind != PAD)
-                .map(|entry| 4 + entry.body.len())
+                .map(|entry| 4 + entry.len)
                 .sum::<usize>()
             + 2;
         let pad = boring_padding(unpadded);
         entries.retain(|entry| entry.kind != PAD || pad.is_some());
-        if let (Some(len), Some(entry)) = (pad, entries.iter_mut().find(|entry| entry.kind == PAD))
-        {
-            entry.body = vec![0; len];
+        if let Some(len) = pad {
+            if let Some(entry) = entries.iter_mut().find(|entry| entry.kind == PAD) {
+                entry.source = Source::Zeros(len);
+                entry.len = len;
+            }
         }
     }
 
@@ -348,10 +324,69 @@ impl Hello {
     }
 }
 
-struct Entry {
+/// One extension's place in the hello: its kind on the wire, the width its body measured, whether
+/// Chrome's shuffle may move it, and which bytes the second walk writes into the message.
+struct Entry<'a> {
     kind: u16,
-    body: Vec<u8>,
+    len: usize,
     invariant: bool,
+    source: Source<'a>,
+}
+
+impl<'a> Entry<'a> {
+    fn new(kind: u16, len: usize, invariant: bool, source: Source<'a>) -> Self {
+        Self {
+            kind,
+            len,
+            invariant,
+            source,
+        }
+    }
+}
+
+/// The bytes behind an entry, resolved from the table: a count of zeros the walk names itself, a
+/// value the hello holds, or one of the preset's lists.
+enum Source<'a> {
+    Zeros(usize),
+    Name(&'a str),
+    Groups(&'a [u16]),
+    Sigalgs(&'a [u16]),
+    Versions(&'a [u16]),
+    Alpn(&'a [Vec<u8>]),
+    Fixed(&'a [u8]),
+    Shares,
+    Cookie(&'a [u8]),
+}
+
+/// Where a body walk puts its bytes: the message, or a width that only adds up what the same walk
+/// writes, so no extension needs a buffer before the message has one.
+trait Sink {
+    fn put(&mut self, bytes: &[u8]);
+    fn zeros(&mut self, count: usize);
+}
+
+impl Sink for Vec<u8> {
+    fn put(&mut self, bytes: &[u8]) {
+        self.extend_from_slice(bytes);
+    }
+
+    fn zeros(&mut self, count: usize) {
+        self.resize(self.len() + count, 0);
+    }
+}
+
+/// The count a walk writes. Every body is measured by this sink and then written by the message
+/// sink, which is why the message can be reserved to its exact total before its first byte.
+struct Width(usize);
+
+impl Sink for Width {
+    fn put(&mut self, bytes: &[u8]) {
+        self.0 += bytes.len();
+    }
+
+    fn zeros(&mut self, count: usize) {
+        self.0 += count;
+    }
 }
 
 fn share_spec(profile: &Profile) -> (&'static [u16], bool) {
@@ -388,43 +423,35 @@ fn grease_value(grease: &[u16; 5], slot: usize) -> u16 {
     value | (value << 8)
 }
 
-fn uint16_list(values: &[u16]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(2 + values.len() * 2);
-    body.extend_from_slice(&((values.len() * 2) as u16).to_be_bytes());
+fn uint16_list<W: Sink>(out: &mut W, values: &[u16], each: impl Fn(u16) -> u16) {
+    out.put(&((values.len() * 2) as u16).to_be_bytes());
     for value in values {
-        body.extend_from_slice(&value.to_be_bytes());
+        out.put(&each(*value).to_be_bytes());
     }
-    body
 }
 
-fn uint8_list(values: &[u16]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(1 + values.len() * 2);
-    body.push((values.len() * 2) as u8);
+fn uint8_list<W: Sink>(out: &mut W, values: &[u16], each: impl Fn(u16) -> u16) {
+    out.put(&((values.len() * 2) as u8).to_be_bytes());
     for value in values {
-        body.extend_from_slice(&value.to_be_bytes());
+        out.put(&each(*value).to_be_bytes());
     }
-    body
 }
 
-fn key_share_body(shares: &[Share]) -> Vec<u8> {
+fn key_share_body<W: Sink>(out: &mut W, shares: &[Share]) {
     let total: usize = shares.iter().map(|share| 4 + share.data.len()).sum();
-    let mut body = Vec::with_capacity(2 + total);
-    body.extend_from_slice(&(total as u16).to_be_bytes());
+    out.put(&(total as u16).to_be_bytes());
     for share in shares {
-        body.extend_from_slice(&share.group.to_be_bytes());
-        body.extend_from_slice(&(share.data.len() as u16).to_be_bytes());
-        body.extend_from_slice(&share.data);
+        out.put(&share.group.to_be_bytes());
+        out.put(&(share.data.len() as u16).to_be_bytes());
+        out.put(&share.data);
     }
-    body
 }
 
-fn sni_body(name: &str) -> Vec<u8> {
-    let mut body = Vec::with_capacity(5 + name.len());
-    body.extend_from_slice(&((name.len() + 3) as u16).to_be_bytes());
-    body.push(0);
-    body.extend_from_slice(&(name.len() as u16).to_be_bytes());
-    body.extend_from_slice(name.as_bytes());
-    body
+fn sni_body<W: Sink>(out: &mut W, name: &str) {
+    out.put(&((name.len() + 3) as u16).to_be_bytes());
+    out.zeros(1);
+    out.put(&(name.len() as u16).to_be_bytes());
+    out.put(name.as_bytes());
 }
 
 fn sni_name(name: &str) -> Option<&str> {
@@ -444,22 +471,14 @@ fn sni_name(name: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
-fn alpn_table_body(ext: &super::Ext) -> Vec<u8> {
-    match &ext.body {
-        Body::Alpn(body) => body.to_vec(),
-        _ => Vec::new(),
-    }
-}
-
-fn alpn_body(list: &[Vec<u8>]) -> Vec<u8> {
+/// A protocol list as an ALPN body: the list's width, then each name behind its own length byte.
+fn alpn_body<W: Sink>(out: &mut W, list: &[Vec<u8>]) {
     let protocols: usize = list.iter().map(|proto| proto.len() + 1).sum();
-    let mut body = Vec::with_capacity(2 + protocols);
-    body.extend_from_slice(&(protocols as u16).to_be_bytes());
+    out.put(&(protocols as u16).to_be_bytes());
     for proto in list {
-        body.push(proto.len() as u8);
-        body.extend_from_slice(proto);
+        out.put(&[proto.len() as u8]);
+        out.put(proto);
     }
-    body
 }
 
 fn parse_alpn(body: &[u8]) -> Vec<Vec<u8>> {
@@ -548,7 +567,7 @@ fn enc_random() -> [u8; 32] {
 
 /// Chrome's positional shuffle: only the extensions between the fixed GREASE and
 /// padding ends move, so the invariant ends stay where the browser puts them.
-fn shuffle(entries: &mut [Entry]) {
+fn shuffle(entries: &mut [Entry<'_>]) {
     let n = entries.len();
     if n < 2 {
         return;
@@ -686,8 +705,8 @@ mod tests {
     }
 
     /// The hello's own bytes cost one heap buffer, reserved to their exact length before the first
-    /// write: 18 allocations for a Chrome hello are its 16 extension bodies, the entry list that
-    /// orders them, and the message. No body is staged for the message to copy.
+    /// write, beside the one list that orders the extensions: 2 allocations for a Chrome hello,
+    /// where a body buffer each cost 18. Every width comes from the same walk that writes the body.
     #[test]
     fn a_shaped_hello_writes_into_one_buffer() {
         let profile = Fingerprint::resolve("chrome")
@@ -702,6 +721,44 @@ mod tests {
             msg.capacity(),
             "no slack after the exact reserve"
         );
-        assert_eq!(counts.allocs, 18, "one buffer for the hello: {counts:?}");
+        assert_eq!(
+            counts.allocs, 2,
+            "one list and one message for the hello: {counts:?}"
+        );
+    }
+
+    /// A dial's own hello — random draws, Chrome's shuffle, a carrier's forced ALPN and a retry's
+    /// cookie — is the path no golden byte names, and its extension walk still closes exactly on the
+    /// vector, which is a measured width agreeing with the bytes written from it.
+    #[test]
+    fn a_shuffled_hello_with_a_cookie_and_a_forced_alpn_stays_exactly_sized() {
+        let profile = Fingerprint::resolve("chrome")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let hello = Hello::build(profile, "example.com", &[b"http/1.1".to_vec()], true)
+            .expect("a shaped dial hello");
+        let retry = hello
+            .retry(keys::X25519, Some(&[7, 6, 5]))
+            .expect("a retry hello");
+        let exts = extensions(&retry.msg[4..]);
+        let cookie = exts
+            .iter()
+            .find(|ext| kind(ext) == 0x002c)
+            .expect("the cookie echoes back");
+        assert_eq!(
+            cookie[2..],
+            [0, 5, 0, 3, 7, 6, 5],
+            "the cookie's width beside its bytes"
+        );
+        let alpn = exts
+            .iter()
+            .find(|ext| kind(ext) == ALPN)
+            .expect("the carrier names its protocol");
+        assert_eq!(
+            alpn[2..],
+            [0, 11, 0, 9, 8, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1'],
+            "the forced ALPN's width beside its bytes"
+        );
     }
 }
