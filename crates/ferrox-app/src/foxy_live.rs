@@ -339,9 +339,9 @@ fn brackets(
     println!(
         "{carrier:?}: {whole}.{fraction:03} bytes charged per byte carried between {small_bytes} and {large_bytes} bytes; {fixed} bytes fixed per flow"
     );
-    // A tunnel that costs its payload spends one allowance byte per carried byte; a per-flow cost is the head's, and is not the slope.
     // Last, so a closing flow's fetch cannot be read as the large payload's: what a cancel costs is the window the edge was allowed to fill ahead of the caller.
     canceled(account, carrier, edge, pass, was, deadline)?;
+    // A tunnel that costs its payload spends one allowance byte per carried byte; a per-flow cost is the head's, and is not the slope.
     assert!(
         delta_charge.saturating_mul(4) <= delta_bytes.saturating_mul(5),
         "{carrier:?} charged {whole}.{fraction:03} bytes per carried byte between {small_bytes} and {large_bytes}: {large_charge} for {large_bytes} after {small_charge} for {small_bytes}, {fixed} fixed per flow"
