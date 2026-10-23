@@ -517,6 +517,8 @@ fn alpn_override(alpn: &[Vec<u8>], websocket: bool) -> Option<Vec<Vec<u8>>> {
 
 /// uTLS's GREASE ECH cover: the picked suite, a random config id, 32 bytes of
 /// X25519 encapsulation and a payload one tag longer than a candidate length.
+/// The header and the payload are one buffer reserved to their sum, and the payload
+/// is randomised where it lies rather than staged in a zero-filled buffer beside it.
 fn ech_body(profile: &Profile, canonical: bool) -> Option<Vec<u8>> {
     let mut spec = None;
     for ext in profile.exts {
@@ -526,8 +528,6 @@ fn ech_body(profile: &Profile, canonical: bool) -> Option<Vec<u8>> {
         }
     }
     let (suites, payloads) = spec?;
-    let mut body = Vec::new();
-    body.push(0);
     let (suite, config_id, enc, payload_len) = if canonical {
         (suites[0], 0u8, [0u8; 32], usize::from(payloads[0]) + 16)
     } else {
@@ -540,19 +540,18 @@ fn ech_body(profile: &Profile, canonical: bool) -> Option<Vec<u8>> {
         ) + 16;
         (suite, config_id, enc_random(), len)
     };
-    let suite = suite.to_be_bytes();
-    body.extend_from_slice(&suite[..2]);
-    body.extend_from_slice(&suite[2..]);
+    // 42 = content type, suite and KEM, config id, encapsulation length and bytes, payload length.
+    let mut body = Vec::with_capacity(42 + payload_len);
+    body.push(0);
+    body.extend_from_slice(&suite.to_be_bytes());
     body.push(config_id);
     body.extend_from_slice(&(enc.len() as u16).to_be_bytes());
     body.extend_from_slice(&enc);
     body.extend_from_slice(&(payload_len as u16).to_be_bytes());
-    if payload_len > 0 {
-        let mut payload = vec![0u8; payload_len];
-        if !canonical {
-            getrandom::fill(&mut payload).ok()?;
-        }
-        body.extend_from_slice(&payload);
+    let at = body.len();
+    body.resize(at + payload_len, 0);
+    if !canonical {
+        getrandom::fill(&mut body[at..]).ok()?;
     }
     Some(body)
 }
@@ -728,8 +727,8 @@ mod tests {
     }
 
     /// A dial's own hello — random draws, Chrome's shuffle, a carrier's forced ALPN and a retry's
-    /// cookie — is the path no golden byte names, and its extension walk still closes exactly on the
-    /// vector, which is a measured width agreeing with the bytes written from it.
+    /// cookie — is the walk no golden byte names, and it still closes exactly on the vector it
+    /// measured: every width below is the one the same walk wrote its bytes into.
     #[test]
     fn a_shuffled_hello_with_a_cookie_and_a_forced_alpn_stays_exactly_sized() {
         let profile = Fingerprint::resolve("chrome")
@@ -759,6 +758,28 @@ mod tests {
             alpn[2..],
             [0, 11, 0, 9, 8, b'h', b't', b't', b'p', b'/', b'1', b'.', b'1'],
             "the forced ALPN's width beside its bytes"
+        );
+    }
+
+    /// The GREASE ECH cover a dial ships is one buffer reserved to its own length,
+    /// where a grown header beside a staged payload cost five.
+    #[test]
+    fn an_ech_cover_is_written_into_one_buffer() {
+        let profile = Fingerprint::resolve("chrome")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let (cover, counts) = crate::alloc_count::measure(|| ech_body(profile, false));
+        let cover = cover.expect("a profile that offers ECH builds a cover");
+        assert_eq!(counts.allocs, 1, "one buffer for the cover: {counts:?}");
+        assert_eq!(
+            counts.zeroed, 0,
+            "the payload is filled in place, not staged: {counts:?}"
+        );
+        assert_eq!(
+            cover.len(),
+            cover.capacity(),
+            "no slack after the exact reserve"
         );
     }
 }
