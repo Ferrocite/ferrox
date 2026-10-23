@@ -6328,37 +6328,10 @@ fn dial_vless_tls(
                     );
                 }
                 // A server may hold its answer until it has payload, and a TLS session cannot split, so the pump and the answer wait share the session behind one lock.
-                let Ok(out) = session.get_ref().try_clone() else {
-                    return;
-                };
-                let shared = Arc::new(Mutex::new(session));
-                let out = Arc::new(Mutex::new(Sealed::new(out)));
-                let mut reader = TlsHalf {
-                    session: Arc::clone(&shared),
-                    out: Arc::clone(&out),
-                    driven: None,
-                };
-                let pump = Pump::over_now(client, {
-                    let mut writer = TlsHalf {
-                        session: Arc::clone(&shared),
-                        out: Arc::clone(&out),
-                        driven: None,
-                    };
-                    move |bytes| writer.write_all(bytes).is_ok()
-                });
-                let answered = read_vless_response(&mut reader).is_some();
-                let _ = pump.end();
-                if !answered {
+                let Some(session) = pump_tls_answer(client, session) else {
                     return note_dial_failure(
                         server,
                         Failure::new(Stage::RequestSent, Kind::Dropped),
-                    );
-                }
-                drop(reader);
-                let Some(Ok(session)) = Arc::into_inner(shared).map(Mutex::into_inner) else {
-                    return note_dial_failure(
-                        server,
-                        Failure::new(Stage::RequestSent, Kind::Local),
                     );
                 };
                 let Ok(downstream) = client.try_clone() else {
@@ -6422,6 +6395,40 @@ fn dial_vless_tls(
         }
         _ => ride_carrier(server, session, vless, &header, client),
     }
+}
+
+/// Pumps the app's bytes through a TLS session while the answer is read, then hands the session back: a server that withholds its response until it sees payload cannot be allowed to stall the opening write.
+fn pump_tls_answer(
+    client: &Connection,
+    session: ferrox_core::tls::ClientSession<Connection>,
+) -> Option<ferrox_core::tls::ClientSession<Connection>> {
+    let Ok(out) = session.get_ref().try_clone() else {
+        return None;
+    };
+    let shared = Arc::new(Mutex::new(session));
+    let out = Arc::new(Mutex::new(Sealed::new(out)));
+    let mut reader = TlsHalf {
+        session: Arc::clone(&shared),
+        out: Arc::clone(&out),
+        driven: None,
+    };
+    let pump = Pump::over_now(client, {
+        let mut writer = TlsHalf {
+            session: Arc::clone(&shared),
+            out: Arc::clone(&out),
+            driven: None,
+        };
+        move |bytes| writer.write_all(bytes).is_ok()
+    });
+    let answered = read_vless_response(&mut reader).is_some();
+    let _ = pump.end();
+    if !answered {
+        return None;
+    }
+    drop(reader);
+    Arc::into_inner(shared)
+        .map(Mutex::into_inner)
+        .and_then(Result::ok)
 }
 
 /// One REALITY dial: TCP, the sealed handshake, the VLESS header, then the relay.
