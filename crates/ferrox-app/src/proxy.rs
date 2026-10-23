@@ -290,7 +290,9 @@ fn serve_inbounds(
                     }
                     "socks" | "http" | "mixed" => {
                         let Some(out) = routed(inbound, true) else {
-                            eprintln!("inbound `{protocol}` in {label} names no outbound to carry it");
+                            eprintln!(
+                                "inbound `{protocol}` in {label} names no outbound to carry it"
+                            );
                             continue;
                         };
                         // A front with no tcp carrier has no chain to arm, so the inbound is refused rather than served unmasked.
