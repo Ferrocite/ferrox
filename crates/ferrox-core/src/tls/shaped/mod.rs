@@ -82,10 +82,20 @@ impl Fingerprint {
     /// name is Chrome, and a name no table knows is refused here rather than dialed as a hello no browser sends.
     pub fn resolve(name: &str) -> Option<Self> {
         let lower = name.trim().to_ascii_lowercase();
-        let name = if lower.contains(['-', '.']) {
+        let folded = if lower.contains(['-', '.']) {
             lower.replace(['-', '.'], "_")
         } else {
             lower
+        };
+        // uTLS writes `hello<brand>`, so a separator after `hello` is the same name.
+        let name = match folded.strip_prefix("hello_") {
+            Some(rest) => {
+                let mut canonical = String::with_capacity(4 + rest.len());
+                canonical.push_str("hello");
+                canonical.push_str(rest);
+                canonical
+            }
+            None => folded,
         };
         if name.is_empty()
             || name == "chrome"
@@ -432,6 +442,7 @@ mod tests {
             "chrome_pq_psk",
             "chrome-133",
             "HelloChrome.133",
+            "hello_chrome_133",
         ] {
             assert_eq!(
                 Fingerprint::resolve(name),
@@ -441,6 +452,8 @@ mod tests {
         }
         for (short, canonical) in [
             ("chrome_120", "hellochrome_120"),
+            ("hello-chrome-120", "hellochrome_120"),
+            ("hello_randomized", "hellorandomized"),
             ("chrome_120_pq", "hellochrome_120_pq"),
             ("chrome_106_shuffle", "hellochrome_106_shuffle"),
             ("firefox_120", "hellofirefox_120"),
