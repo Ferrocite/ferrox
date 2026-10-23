@@ -18722,6 +18722,45 @@ mod tests {
         let _ = std::fs::remove_file(&ca);
     }
 
+    /// A store's `security: tls` names the handshake its own lanes speak, so the outbound keeps that config on the carrier and adds no second handshake; reality stays refused, as the store refuses it.
+    #[test]
+    fn an_xdrive_outbound_keeps_the_stores_lanes_tls() {
+        let folder = format!("/tmp/ferrox-xdrive-lanes-{}", std::process::id());
+        let stream = |security: &str| {
+            format!(
+                r#""network": "xdrive", "security": "{security}",
+                    "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}"}},
+                    "tlsSettings": {{"serverName": "store.test", "allowInsecure": true}}"#
+            )
+        };
+        let trojan = find_trojan_outbound(&trojan_tls_root(&stream("tls")))
+            .expect("the store carries the session");
+        let Carrier::Xdrive { settings } = &trojan.carrier else {
+            panic!("the carrier is the store");
+        };
+        assert!(trojan.tls.is_none(), "the store's lanes own the handshake");
+        assert_eq!(settings.security, "tls");
+        assert_eq!(
+            settings
+                .tls
+                .as_ref()
+                .expect("the lanes carry tls")
+                .server_name,
+            "store.test"
+        );
+        let vless = find_vless_outbound(&vnext_tls_root("vless", &stream("tls")))
+            .expect("vless keeps the store");
+        assert!(matches!(vless.carrier, Carrier::Xdrive { .. }));
+        assert!(vless.tls.is_none());
+        let vmess = find_vmess_outbound(&vnext_tls_root("vmess", &stream("tls")))
+            .expect("vmess keeps the store");
+        assert!(matches!(vmess.carrier, Carrier::Xdrive { .. }));
+        assert!(vmess.tls.is_none());
+        assert!(find_trojan_outbound(&trojan_tls_root(&stream("reality"))).is_none());
+        assert!(find_vless_outbound(&vnext_tls_root("vless", &stream("reality"))).is_none());
+        assert!(find_vmess_outbound(&vnext_tls_root("vmess", &stream("reality"))).is_none());
+    }
+
     /// The bulk download through the same relay: the session's own buffer is finite, and a
     /// relay that kept feeding it after the caller's window was full filled it.
     #[test]
@@ -19262,6 +19301,61 @@ mod tests {
         );
         drop(sock);
         server.join().expect("joins");
+    }
+
+    /// The store is the transport, so an xdrive row that declares tls parses and dials: both roles read the folder the config names.
+    #[test]
+    fn a_trojan_xdrive_dial_under_tls_reaches_the_store() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-xdrive-dial-{}-{stamp}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let folder = dir.to_str().expect("utf-8 folder").to_owned();
+        let settings = format!(
+            r#""network": "xdrive", "security": "tls",
+                "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
+                    "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 60}},
+                "tlsSettings": {{"allowInsecure": true}}"#
+        );
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        assert!(
+            serve_trojan_inbound("127.0.0.1:9", &inbound, true),
+            "the store listener arms"
+        );
+        let Outbound::Trojan(trojan) = find_outbound(&trojan_tls_root(&settings))
+            .expect("parses")
+            .expect("the config names a trojan outbound")
+        else {
+            panic!("the outbound dials trojan");
+        };
+        let echo_port = echo_loop();
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_trojan_xdrive(&socket, &trojan, &target);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "the store's session relays");
+        drop(sock);
+        relay.join().expect("joins");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
