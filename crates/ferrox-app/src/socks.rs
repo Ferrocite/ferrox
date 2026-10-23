@@ -23,7 +23,7 @@
 //! no authentication.
 
 use std::io::{Read, Write};
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::SocketAddr;
 
 use crate::conn::Connection;
 use ferrox_core::socks;
@@ -216,7 +216,7 @@ impl Session {
         match self.read_bound(atyp)? {
             Bound::Ip(relay) => Some(relay),
             // The server's relay is dialled, not refused: the reference resolves the name its dialer is handed.
-            Bound::Name(name, port) => (name.as_str(), port).to_socket_addrs().ok()?.next(),
+            Bound::Name(name, port) => crate::proxy::resolve_endpoint(name.as_str(), port),
         }
     }
 
