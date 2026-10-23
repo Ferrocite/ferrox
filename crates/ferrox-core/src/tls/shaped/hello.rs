@@ -1185,7 +1185,7 @@ mod tests {
             }
         }
         assert_eq!(cases.len(), 50, "every xray name is covered");
-        assert_eq!(seen.len(), 32, "the names resolve to 32 distinct presets");
+        assert_eq!(seen.len(), 31, "the names resolve to 31 distinct presets");
     }
 
     /// The hello's own bytes cost one heap buffer, reserved to their exact length before the first
