@@ -135,7 +135,7 @@ mux-cool xudp-reply-copies-per-byte-written 0 ferrox-app-proxy::tests::a_udp_rep
 mux-cool downlink-writes-per-read-batch 1 ferrox-app-proxy::tests::a_mux_downlink_hands_a_batch_of_frames_over_in_one_call
 mux-cool codec-copies-per-byte-written 1 ferrox-core-mux::tests::a_header_plus_a_patched_length_is_the_whole_frame
 mux-cool mux-frame-allocations 0 ferrox-bench-gate-6
-mux-cool live-session-cap 8 ferrox-core-mux::tests::the_concurrency_cap_counts_live_sessions_and_not_the_ids_used
+mux-cool client-session-cap 8 ferrox-core-mux::tests::the_concurrency_cap_counts_live_sessions_and_not_the_ids_used
 mux-cool xudp-frame-layout-matches-upstream 1 ferrox-app-proxy::tests::xudp_frames_match_the_upstream_layout
 
 # --- carriers ---------------------------------------------------------------
