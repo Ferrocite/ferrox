@@ -1399,6 +1399,7 @@ mod tests {
     struct Tls12Server {
         suite: u16,
         group: u16,
+        ask_cert: bool,
         rng: ring::rand::SystemRandom,
         signing: ring::signature::EcdsaKeyPair,
         ephemeral: Option<keys::Share>,
@@ -1415,7 +1416,7 @@ mod tests {
     }
 
     impl Tls12Server {
-        fn new(suite: u16, group: u16) -> Self {
+        fn new(suite: u16, group: u16, ask_cert: bool) -> Self {
             let rng = ring::rand::SystemRandom::new();
             let signing = ring::signature::EcdsaKeyPair::from_pkcs8(
                 &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
@@ -1427,6 +1428,7 @@ mod tests {
             Self {
                 suite,
                 group,
+                ask_cert,
                 rng,
                 signing,
                 ephemeral: Some(ephemeral.pop().expect("one group")),
@@ -1497,6 +1499,7 @@ mod tests {
         fn handshake(&mut self, msg: &[u8]) {
             match msg[0] {
                 1 => self.client_hello(msg),
+                11 => self.transcript.extend_from_slice(msg),
                 16 => self.client_key_exchange(msg),
                 20 => self.client_finished(msg),
                 other => panic!("unexpected handshake message {other}"),
@@ -1582,10 +1585,16 @@ mod tests {
             exchange.extend_from_slice(&(signature.as_ref().len() as u16).to_be_bytes());
             exchange.extend_from_slice(signature.as_ref());
             let exchange = hs_message(12, &exchange);
+            let request = hs_message(13, &[0x01, 0x40, 0x00, 0x00]);
             let done = hs_message(14, &[]);
 
+            let mut parts: Vec<&[u8]> = vec![&hello, &chain, &exchange];
+            if self.ask_cert {
+                parts.push(&request);
+            }
+            parts.push(&done);
             let mut flight = Vec::new();
-            for part in [&hello, &chain, &exchange, &done] {
+            for part in parts {
                 self.transcript.extend_from_slice(part);
                 flight.extend_from_slice(part);
             }
@@ -1724,22 +1733,25 @@ mod tests {
 
     /// One shaped dial per TLS 1.2 record shape — an AEAD, a CBC block, an RC4 stream — each relayed
     /// one frame both ways. The RC4 preset carries no `key_share`, so its point is drawn at the
-    /// curve the `ServerKeyExchange` names, from that hello's `supported_groups`.
+    /// curve the `ServerKeyExchange` names, from that hello's `supported_groups`, and the CBC dial
+    /// also asks for a client certificate, which the walk answers with an empty one.
     #[cfg_attr(miri, ignore = "assembles real handshake bytes through ring")]
     #[test]
     fn a_shaped_dial_finishes_every_tls12_record_shape() {
         let shapes = [
-            ("chrome", 0xc02bu16, keys::X25519),
-            ("helloios_13", 0xc009, keys::X25519),
-            ("360", 0xc007, keys::P256),
+            ("chrome", 0xc02bu16, keys::X25519, false),
+            ("helloios_13", 0xc009, keys::X25519, true),
+            ("360", 0xc007, keys::P256, false),
         ];
-        for (preset, suite, group) in shapes {
+        for (preset, suite, group, ask_cert) in shapes {
             let mut cfg = client("tls.test", &[]);
             cfg.fingerprint =
                 Some(crate::tls::Fingerprint::resolve(preset).expect("a preset name"));
-            let mut session =
-                crate::tls::shaped::Session::connect(&cfg, Tls12Server::new(suite, group))
-                    .unwrap_or_else(|e| panic!("{preset} at {suite:#06x}: {e}"));
+            let mut session = crate::tls::shaped::Session::connect(
+                &cfg,
+                Tls12Server::new(suite, group, ask_cert),
+            )
+            .unwrap_or_else(|e| panic!("{preset} at {suite:#06x}: {e}"));
             session
                 .handshake()
                 .unwrap_or_else(|e| panic!("{preset} at {suite:#06x} did not finish: {e}"));
