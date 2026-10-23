@@ -13,9 +13,10 @@ name: Foxy lane (live account check)
 # fails for their absence.
 #
 # Weekly plus on demand: the quota on a personal account is finite and one run
-# spends kilobytes, so the schedule is weekly rather than per-push. The unit
-# gates are not repeated here: `ci.yml` owns them, and a flaky QUIC loopback
-# test in another job must not be able to swallow a live measurement.
+# spends at most tens of megabytes on the payload measurement, so the schedule
+# is weekly rather than per-push. The unit gates are not repeated here: `ci.yml`
+# owns them, and a flaky QUIC loopback test in another job must not be able to
+# swallow a live measurement.
 on:
   schedule:
     - cron: "23 4 * * 1"
@@ -25,6 +26,14 @@ on:
         description: country code to pin the dial at
         required: false
         default: US
+
+# One account: a relay that downloads while the allowance probe brackets a
+# transfer charges the same counter, and the bracket would name the relay's
+# bytes as the transfer's. Serialized, a run that ends before the probe reads
+# its baseline is already inside the settled figure.
+concurrency:
+  group: foxy-account
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -93,7 +102,8 @@ jobs:
           ./scripts/watch-test.sh --quiet 600 --out target/ci/foxy-live.log -- \
             cargo test -p ferrox-app --locked -- --ignored --nocapture --test-threads=1 \
               foxy_live::the_lane_carries_a_tunnel_on_the_carrier_the_edge_answers \
-              foxy_live::the_quic_lane_reaches_the_edge_over_udp_or_says_why_not
+              foxy_live::the_quic_lane_reaches_the_edge_over_udp_or_says_why_not \
+              foxy_live::the_allowance_charges_the_payload_the_tunnel_carried
       # The UDP reachability report is a measurement, not a gate: whether an
       # edge answers QUIC is a fact about the edge, not about this tree, and a
       # network that filters udp/443 must not turn the lane red.
