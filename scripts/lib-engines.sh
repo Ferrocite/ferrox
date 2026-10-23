@@ -57,8 +57,6 @@ build() {
   local name="$1" rev binary cached
   # The reference trees are not held to this tree's lint gate: their vendored
   # dependencies trip `-D warnings` in ways their own maintainers accept.
-  local engine_rustflags="${RUSTFLAGS:-}"
-  engine_rustflags="${engine_rustflags//-D warnings/}"
   rev="$(pin_of "$name")"
   binary="$engine_dir/$name$(exe_suffix)"
   if cached="$(built "$binary")"; then
@@ -88,7 +86,7 @@ build() {
       ;;
     zeronet)
       note "building the pinned ZeroNet (zray) at $rev"
-      (cd "upstream/$name" && RUSTFLAGS="$engine_rustflags" cargo build --release -p zray-cli --bin zray) || return 1
+      (cd "upstream/$name" && env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo build --release -p zray-cli --bin zray) || return 1
       local zray
       zray="$(built "upstream/$name/target/release/zray")" || return 1
       cp "$zray" "$binary" || return 1
@@ -96,7 +94,7 @@ build() {
     xray-rust)
       note "building the pinned xray-rust at $rev (long: aws-lc-rs, quinn, prost)"
       (cd "upstream/$name" && CARGO_TARGET_DIR="$OLDPWD/$engine_dir/xray-rust-target" \
-        RUSTFLAGS="$engine_rustflags" cargo build --release -p xray-cli --bin xray-rust) || return 1
+        env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo build --release -p xray-cli --bin xray-rust) || return 1
       local rust_cli
       rust_cli="$(built "$engine_dir/xray-rust-target/release/xray-rust")" || return 1
       cp "$rust_cli" "$binary" || return 1
@@ -104,7 +102,7 @@ build() {
     xray-core-rust)
       note "building the pinned xray-core-rust at $rev"
       (cd "upstream/$name" && CARGO_TARGET_DIR="$OLDPWD/$engine_dir/xray-core-rust-target" \
-        RUSTFLAGS="$engine_rustflags" cargo build --release -p xray-cli --bin xray) || return 1
+        env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo build --release -p xray-cli --bin xray) || return 1
       local rust_core_cli
       rust_core_cli="$(built "$engine_dir/xray-core-rust-target/release/xray$(exe_suffix)")" || return 1
       cp "$rust_core_cli" "$binary" || return 1
@@ -112,7 +110,7 @@ build() {
     leaf)
       note "building the pinned leaf at $rev (long: aws-lc-rs, quinn, tungstenite)"
       (cd "upstream/$name" && CARGO_TARGET_DIR="$OLDPWD/$engine_dir/leaf-target" \
-        RUSTFLAGS="$engine_rustflags" cargo build --release -p leaf-cli --bin leaf) || return 1
+        env -u RUSTFLAGS -u CARGO_ENCODED_RUSTFLAGS cargo build --release -p leaf-cli --bin leaf) || return 1
       local leaf_cli
       leaf_cli="$(built "$engine_dir/leaf-target/release/leaf")" || return 1
       cp "$leaf_cli" "$binary" || return 1
