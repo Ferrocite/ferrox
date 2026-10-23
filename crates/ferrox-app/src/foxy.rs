@@ -328,6 +328,7 @@ fn tls_config(dial: &FoxyDial) -> ferrox_core::tls::TlsConfig {
         cipher_suites: Vec::new(),
         insecure: false,
         fingerprint: None,
+        ech_config_list: None,
         websocket: false,
     }
 }

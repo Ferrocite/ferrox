@@ -17905,6 +17905,7 @@ mod tests {
             cipher_suites: Vec::new(),
             insecure: false,
             fingerprint: None,
+            ech_config_list: None,
             websocket: false,
         };
         (server, client)

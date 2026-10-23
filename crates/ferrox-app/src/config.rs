@@ -133,6 +133,12 @@ pub(crate) fn inbound_tls_identity(
     if settings.get("security").and_then(Json::as_str) != Some("tls") {
         return None;
     }
+    if ech_server_keys(settings) {
+        eprintln!(
+            "ech: server-side ECH (echServerKeys) has no backend here; the inbound is refused, not served without it"
+        );
+        return None;
+    }
     let (cert_pem, key_pem) = tls_cert_pem(settings)?;
     ferrox_core::tls::parse_pem_identity(&cert_pem, &key_pem)
         .ok()
@@ -159,6 +165,17 @@ pub(crate) fn read_cert_file(path: &str) -> Option<Vec<u8>> {
         return Some(bytes);
     }
     std::fs::read(path).ok()
+}
+
+fn ech_server_keys(settings: &Json) -> bool {
+    settings
+        .get("tlsSettings")
+        .and_then(|tls| tls.get("echServerKeys"))
+        .is_some_and(|keys| {
+            !(matches!(keys, Json::Null)
+                || keys.as_arr().is_some_and(<[Json]>::is_empty)
+                || keys.as_str() == Some(""))
+        })
 }
 
 /// PEM for the first certificate entry, in either spelling xray accepts: `certificateFile`/`keyFile` paths, or an inline `certificate`/`key` given as a string or as an array of PEM lines. A peer that hands over a bare TLS listener (a REALITY decoy, say) uses the inline form, so refusing it here leaves the inbound serving nothing.
@@ -301,6 +318,23 @@ fn tls_cipher_suites(settings: Option<&Json>) -> Vec<u16> {
     ferrox_core::tls::cipher_suites::hello_ids(&parsed, min, max, true)
 }
 
+const INVALID_ECH: &[u8] = &[1, 1, 4, 5, 1, 4];
+
+fn tls_ech_config(settings: Option<&Json>, server_name: &str) -> Option<std::sync::Arc<[u8]>> {
+    let text = settings
+        .and_then(|s| s.get("echConfigList"))
+        .and_then(Json::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())?;
+    match crate::ech_dns::resolve(text, server_name) {
+        Ok(list) => Some(list.into()),
+        Err(why) => {
+            eprintln!("ech: {why}; the dial will fail");
+            Some(INVALID_ECH.into())
+        }
+    }
+}
+
 fn tls_version(settings: Option<&Json>, key: &str) -> Option<u16> {
     let text = settings.and_then(|s| s.get(key)).and_then(Json::as_str)?;
     match text.trim() {
@@ -358,6 +392,7 @@ pub(crate) fn outbound_tls(
             )
         }
     };
+    let ech_config_list = tls_ech_config(tls, &server_name);
     // xray's empty name is Chrome and a name it does not know returns nil, which dials stock.
     let fingerprint = tls
         .and_then(|s| s.get("fingerprint"))
@@ -375,6 +410,7 @@ pub(crate) fn outbound_tls(
         cipher_suites: tls_cipher_suites(tls),
         insecure,
         fingerprint: Some(fingerprint),
+        ech_config_list,
         websocket: matches!(
             settings.get("network").and_then(Json::as_str),
             Some("ws" | "httpupgrade")
@@ -1635,5 +1671,52 @@ mod tests {
             let error = budgets(&root).expect_err(because);
             assert!(error.contains("budget"), "{json}: {error}");
         }
+    }
+
+    #[test]
+    fn a_base64_ech_config_is_normalized_and_a_bad_one_fails_closed() {
+        use base64::Engine as _;
+        let list = {
+            let mut contents = vec![7u8, 0x00, 0x20, 0x00, 0x20];
+            contents.extend_from_slice(&[0x11; 32]);
+            contents.extend_from_slice(&4u16.to_be_bytes());
+            contents.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+            contents.push(0);
+            contents.push(b"public.test".len() as u8);
+            contents.extend_from_slice(b"public.test");
+            contents.extend_from_slice(&0u16.to_be_bytes());
+            let mut config = vec![0xfe, 0x0d];
+            config.extend_from_slice(&(contents.len() as u16).to_be_bytes());
+            config.extend_from_slice(&contents);
+            let mut list = Vec::new();
+            list.extend_from_slice(&(config.len() as u16).to_be_bytes());
+            list.extend_from_slice(&config);
+            list
+        };
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&list);
+        let settings =
+            crate::json::parse(&format!(r#"{{"echConfigList":"{encoded}"}}"#)).expect("parses");
+        let got = tls_ech_config(Some(&settings), "hidden.test").expect("resolves");
+        assert_eq!(got.as_ref(), list.as_slice());
+
+        let malformed = crate::json::parse(r#"{"echConfigList":"not base64"}"#).expect("parses");
+        let got = tls_ech_config(Some(&malformed), "hidden.test").expect("fails closed");
+        assert_eq!(got.as_ref(), [1, 1, 4, 5, 1, 4]);
+    }
+
+    #[test]
+    fn server_side_ech_keys_are_named_and_refused() {
+        let with_keys =
+            crate::json::parse(r#"{"streamSettings":{"tlsSettings":{"echServerKeys":["AAAA"]}}}"#)
+                .expect("parses");
+        assert!(ech_server_keys(
+            with_keys.get("streamSettings").expect("settings")
+        ));
+        let empty =
+            crate::json::parse(r#"{"streamSettings":{"tlsSettings":{"echServerKeys":[]}}}"#)
+                .expect("parses");
+        assert!(!ech_server_keys(
+            empty.get("streamSettings").expect("settings")
+        ));
     }
 }

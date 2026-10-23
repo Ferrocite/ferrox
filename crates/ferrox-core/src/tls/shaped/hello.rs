@@ -2,6 +2,7 @@
 use super::keys::{self, Share};
 use super::{Body, Ext, Profile, GREASE};
 use crate::tls::TlsError;
+use rustls::crypto::hpke::{Hpke as _, HpkePublicKey, HpkeSealer};
 
 /// The version this hello's legacy field names, which a static-RSA premaster repeats.
 pub(super) const TLS12: u16 = 0x0303;
@@ -20,8 +21,21 @@ pub(crate) struct Hello {
     alpn: Option<Vec<Vec<u8>>>,
     sni: Option<String>,
     ech: Option<Vec<u8>>,
+    offer: Option<EchOffer>,
     /// A fixture build: fixed entropy, table order, and a fixed ECH payload length.
     canonical: bool,
+}
+
+struct EchOffer {
+    config_id: u8,
+    suite: (u16, u16),
+    enc: Vec<u8>,
+    sealer: Box<dyn HpkeSealer>,
+    inner_random: [u8; 32],
+    inner_name: Option<String>,
+    public_name: String,
+    transcript: Vec<u8>,
+    maximum_name_length: usize,
 }
 
 impl Hello {
@@ -54,17 +68,169 @@ impl Hello {
             alpn: alpn_override(alpn, websocket),
             sni: sni_name(server_name).map(str::to_owned),
             ech: ech_body(profile, false),
+            offer: None,
             canonical: false,
         };
         hello.msg = hello.encode(None);
         Ok(hello)
     }
 
+    /// Replaces the GREASE cover with a real ECH offer sealed to the named config.
+    pub(crate) fn enable_ech(&mut self, list: &[u8]) -> Result<(), TlsError> {
+        use crate::tls::ech;
+        let configs = ech::parse_config_list(list).map_err(TlsError::Other)?;
+        let picked = configs.iter().find_map(|config| {
+            if config.kem_id != ech::KEM_X25519 || config.has_unknown_mandatory_extension() {
+                return None;
+            }
+            let name = std::str::from_utf8(&config.public_name).ok()?;
+            if name.is_empty()
+                || name.parse::<std::net::IpAddr>().is_ok()
+                || rustls::pki_types::DnsName::try_from(name.to_owned()).is_err()
+            {
+                return None;
+            }
+            config.cipher_suites.iter().find_map(|&suite| match suite {
+                (ech::KDF_SHA256, ech::AEAD_AES_128_GCM) => {
+                    Some((config, suite, &crate::tls::hpke::AES128_GCM))
+                }
+                (ech::KDF_SHA256, ech::AEAD_CHACHA20_POLY1305) => {
+                    Some((config, suite, &crate::tls::hpke::CHACHA20_POLY1305))
+                }
+                _ => None,
+            })
+        });
+        let (config, suite, hpke) =
+            picked.ok_or_else(|| TlsError::Other("ech: no supported config".to_owned()))?;
+        let public_name = std::str::from_utf8(&config.public_name)
+            .map_err(|_| TlsError::Other("ech: public name is not utf-8".to_owned()))?
+            .to_owned();
+        let mut info = Vec::with_capacity(8 + config.encode().len());
+        info.extend_from_slice(b"tls ech\0");
+        info.extend_from_slice(&config.encode());
+        let (enc, sealer) = hpke
+            .setup_sealer(&info, &HpkePublicKey(config.public_key.clone()))
+            .map_err(|e| TlsError::Other(format!("ech: hpke: {e}")))?;
+        let mut inner_random = [0u8; 32];
+        getrandom::fill(&mut inner_random).map_err(entropy)?;
+        let mut offer = EchOffer {
+            config_id: config.id,
+            suite,
+            enc: enc.0,
+            sealer,
+            inner_random,
+            inner_name: self.sni.clone(),
+            public_name: public_name.clone(),
+            transcript: Vec::new(),
+            maximum_name_length: match config.maximum_name_length {
+                0 => 255,
+                length => usize::from(length),
+            },
+        };
+        self.sni = Some(public_name);
+        let msg = self.seal_offer(&mut offer, &self.shares, None, false)?;
+        self.msg = msg;
+        self.offer = Some(offer);
+        Ok(())
+    }
+
+    fn seal_offer(
+        &self,
+        offer: &mut EchOffer,
+        shares: &[Share],
+        cookie: Option<&[u8]>,
+        retry: bool,
+    ) -> Result<Vec<u8>, TlsError> {
+        let (encoded, transcript) = self.inner_hello(offer, shares, cookie);
+        offer.transcript = handshake(1, &transcript);
+        let placeholder = vec![0u8; encoded.len() + 16];
+        let enc = if retry { &[][..] } else { offer.enc.as_slice() };
+        let cover = ech_cover(offer.suite, offer.config_id, enc, &placeholder);
+        let entries =
+            self.extension_entries(shares, cookie, self.sni.as_deref(), Some(&cover), true);
+        let mut outer = self.encode_body(TLS12, &self.random, &self.session_id, entries, false, shares);
+        let ciphertext = offer
+            .sealer
+            .seal(&outer, &encoded)
+            .map_err(|e| TlsError::Other(format!("ech: seal: {e}")))?;
+        let (at, len) = ech_payload(&outer);
+        if len != ciphertext.len() {
+            return Err(TlsError::Other("ech: payload length moved".to_owned()));
+        }
+        outer[at..at + len].copy_from_slice(&ciphertext);
+        Ok(handshake(1, &outer))
+    }
+
+    fn inner_hello(
+        &self,
+        offer: &EchOffer,
+        shares: &[Share],
+        cookie: Option<&[u8]>,
+    ) -> (Vec<u8>, Vec<u8>) {
+        const TLS13: [u8; 3] = [2, 0x03, 0x04];
+        const INNER_ECH: [u8; 1] = [1];
+        let mut entries = self.extension_entries(
+            shares,
+            cookie,
+            offer.inner_name.as_deref(),
+            Some(&INNER_ECH),
+            true,
+        );
+        for entry in &mut entries {
+            if entry.kind == 0x002b {
+                entry.source = Source::Fixed(&TLS13);
+                entry.len = TLS13.len();
+            }
+        }
+        if !entries.iter().any(|entry| entry.kind == 0x002b) {
+            entries.push(Entry::new(
+                0x002b,
+                TLS13.len(),
+                false,
+                Source::Fixed(&TLS13),
+            ));
+        }
+        let ciphers = self.cipher_values(true);
+        let unpadded = Self::pad_prepared(&mut entries, ciphers.len(), 0);
+        let transcript = self.encode_prepared(
+            TLS12,
+            &offer.inner_random,
+            &self.session_id,
+            &entries,
+            &ciphers,
+            unpadded,
+            shares,
+        );
+        let mut encoded = self.encode_prepared(
+            TLS12,
+            &offer.inner_random,
+            &[],
+            &entries,
+            &ciphers,
+            unpadded,
+            shares,
+        );
+        let name_pad = match offer.inner_name.as_deref() {
+            Some(name) => offer.maximum_name_length.saturating_sub(name.len()),
+            None => offer.maximum_name_length + 9,
+        };
+        encoded.extend(std::iter::repeat_n(0, name_pad));
+        let pad = 31 - ((encoded.len() - 1) % 32);
+        encoded.extend(std::iter::repeat_n(0, pad));
+        (encoded, transcript)
+    }
+
     /// The second hello a `HelloRetryRequest` asks for: one fresh share for the group
     /// the server named, and its cookie echoed when one came.
-    pub(crate) fn retry(&self, group: u16, cookie: Option<&[u8]>) -> Result<Self, TlsError> {
+    pub(crate) fn retry(&mut self, group: u16, cookie: Option<&[u8]>) -> Result<Self, TlsError> {
         let shares = keys::generate(&[group], false).map_err(TlsError::Other)?;
-        let msg = self.encode_with(&shares, cookie);
+        let (msg, offer) = match self.offer.take() {
+            Some(mut offer) => (
+                self.seal_offer(&mut offer, &shares, cookie, true)?,
+                Some(offer),
+            ),
+            None => (self.encode_with(&shares, cookie), None),
+        };
         Ok(Self {
             msg,
             random: self.random,
@@ -75,6 +241,7 @@ impl Hello {
             alpn: self.alpn.clone(),
             sni: self.sni.clone(),
             ech: self.ech.clone(),
+            offer,
             canonical: self.canonical,
         })
     }
@@ -167,6 +334,18 @@ impl Hello {
         self.msg[39..71].fill(0);
     }
 
+    pub(crate) fn ech_inner(&self) -> Option<&[u8]> {
+        self.offer.as_ref().map(|offer| offer.transcript.as_slice())
+    }
+
+    pub(crate) fn ech_inner_random(&self) -> Option<[u8; 32]> {
+        self.offer.as_ref().map(|offer| offer.inner_random)
+    }
+
+    pub(crate) fn ech_public_name(&self) -> Option<&str> {
+        self.offer.as_ref().map(|offer| offer.public_name.as_str())
+    }
+
     fn encode(&self, cookie: Option<&[u8]>) -> Vec<u8> {
         self.encode_with(&self.shares, cookie)
     }
@@ -182,7 +361,13 @@ impl Hello {
     /// message's total is known before its first byte, and the second runs the same walks into that
     /// message. No extension body carries a buffer of its own and no body rule is written twice.
     fn encode_with(&self, shares: &[Share], cookie: Option<&[u8]>) -> Vec<u8> {
-        let mut entries = self.extension_entries(shares, cookie);
+        let mut entries = self.extension_entries(
+            shares,
+            cookie,
+            self.sni.as_deref(),
+            self.ech.as_deref(),
+            false,
+        );
         self.pad_entries(&mut entries);
         let ext_len: usize = entries.iter().map(|entry| 4 + entry.len).sum();
         let body = self.fixed_len() + 2 + ext_len;
@@ -207,15 +392,80 @@ impl Hello {
         msg
     }
 
+    fn cipher_values(&self, tls13_only: bool) -> Vec<u16> {
+        self.profile
+            .ciphers
+            .iter()
+            .filter(|&&c| !tls13_only || matches!(c, 0x1301..=0x1303))
+            .map(|&c| grease_or(c, &self.grease, 0))
+            .collect()
+    }
+
+    fn encode_body(
+        &self,
+        version: u16,
+        random: &[u8; 32],
+        session_id: &[u8],
+        mut entries: Vec<Entry>,
+        tls13_only: bool,
+        shares: &[Share],
+    ) -> Vec<u8> {
+        let ciphers = self.cipher_values(tls13_only);
+        let message_len = Self::pad_prepared(&mut entries, ciphers.len(), session_id.len());
+        self.encode_prepared(
+            version,
+            random,
+            session_id,
+            &entries,
+            &ciphers,
+            message_len,
+            shares,
+        )
+    }
+
+    fn encode_prepared(
+        &self,
+        version: u16,
+        random: &[u8; 32],
+        session_id: &[u8],
+        entries: &[Entry],
+        ciphers: &[u16],
+        message_len: usize,
+        shares: &[Share],
+    ) -> Vec<u8> {
+        let ext_len: usize = entries.iter().map(|entry| 4 + entry.len).sum();
+        let mut body = Vec::with_capacity(message_len - 4);
+        body.extend_from_slice(&version.to_be_bytes());
+        body.extend_from_slice(random);
+        body.push(session_id.len() as u8);
+        body.extend_from_slice(session_id);
+        body.extend_from_slice(&(2 * ciphers.len() as u16).to_be_bytes());
+        for cipher in ciphers {
+            body.extend_from_slice(&cipher.to_be_bytes());
+        }
+        body.push(1);
+        body.push(0);
+        body.extend_from_slice(&(ext_len as u16).to_be_bytes());
+        for entry in entries {
+            body.extend_from_slice(&entry.kind.to_be_bytes());
+            body.extend_from_slice(&(entry.len as u16).to_be_bytes());
+            self.write_body(&entry.source, shares, &mut body);
+        }
+        body
+    }
+
     fn extension_entries<'a>(
         &'a self,
         shares: &[Share],
         cookie: Option<&'a [u8]>,
+        sni: Option<&'a str>,
+        ech: Option<&'a [u8]>,
+        ech_last: bool,
     ) -> Vec<Entry<'a>> {
         let mut entries: Vec<Entry<'a>> = Vec::with_capacity(self.profile.exts.len() + 1);
         let mut grease_exts = 0usize;
         for ext in self.profile.exts {
-            if let Some(entry) = self.entry(ext, shares, &mut grease_exts) {
+            if let Some(entry) = self.entry(ext, shares, &mut grease_exts, sni, ech) {
                 entries.push(entry);
             }
         }
@@ -238,10 +488,25 @@ impl Hello {
                 entries.push(Entry::new(ALPN, len, true, source));
             }
         }
+
+        // RFC 9849 makes real ECH the last extension; the uTLS GREASE cover keeps the preset's slot.
+        if ech_last {
+            if let Some(at) = entries.iter().position(|entry| entry.kind == 0xfe0d) {
+                let entry = entries.remove(at);
+                entries.push(entry);
+            }
+        }
         entries
     }
 
-    fn entry(&self, ext: &Ext, shares: &[Share], grease_exts: &mut usize) -> Option<Entry<'_>> {
+    fn entry<'a>(
+        &'a self,
+        ext: &'a Ext,
+        shares: &[Share],
+        grease_exts: &mut usize,
+        sni: Option<&'a str>,
+        ech: Option<&'a [u8]>,
+    ) -> Option<Entry<'a>> {
         let (kind, invariant, source) = match &ext.body {
             Body::Grease => {
                 let slot = (*grease_exts).min(1);
@@ -252,7 +517,7 @@ impl Hello {
                     Source::Zeros(slot),
                 )
             }
-            Body::Sni => (0x0000, false, Source::Name(self.sni.as_deref()?)),
+            Body::Sni => (0x0000, false, Source::Name(sni?)),
             Body::Pad => (PAD, true, Source::Zeros(0)),
             Body::Groups(groups) => (0x000a, false, Source::Groups(groups)),
             Body::Sigalgs(values) => (0x000d, false, Source::Sigalgs(values)),
@@ -267,7 +532,7 @@ impl Hello {
             Body::Versions(values) => (0x002b, false, Source::Versions(values)),
             Body::KeyShare { .. } if shares.is_empty() => return None,
             Body::KeyShare { .. } => (0x0033, false, Source::Shares),
-            Body::Ech { .. } => (0xfe0d, false, Source::Fixed(self.ech.as_deref()?)),
+            Body::Ech { .. } => (0xfe0d, false, Source::Fixed(ech?)),
             Body::Raw(body) => (ext.kind, false, Source::Fixed(body)),
         };
         let len = self.width_of(&source, shares);
@@ -305,8 +570,17 @@ impl Hello {
         }
     }
 
-    fn pad_entries(&self, entries: &mut Vec<Entry<'_>>) {
-        let unpadded = self.fixed_len()
+    fn pad_entries(&self, entries: &mut Vec<Entry<'_>>) -> usize {
+        Self::pad_prepared(
+            entries,
+            self.profile.ciphers.len(),
+            self.session_id.len(),
+        )
+    }
+
+    fn pad_prepared(entries: &mut Vec<Entry<'_>>, ciphers: usize, session: usize) -> usize {
+        let header = 2 + 32 + 1 + session + 2 + 2 * ciphers + 1 + 1;
+        let unpadded = header
             + 4
             + entries
                 .iter()
@@ -322,6 +596,7 @@ impl Hello {
                 entry.len = len;
             }
         }
+        unpadded
     }
 
     /// The table order as a canonical hello: zero random, session id, GREASE
@@ -339,6 +614,7 @@ impl Hello {
             alpn: None,
             sni: sni_name(server_name).map(str::to_owned),
             ech: ech_body(profile, true),
+            offer: None,
             canonical: true,
         };
         hello.msg = hello.encode(None);
@@ -537,6 +813,50 @@ fn alpn_override(alpn: &[Vec<u8>], websocket: bool) -> Option<Vec<Vec<u8>>> {
     }
 }
 
+fn handshake(kind: u8, body: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(body.len() + 4);
+    msg.push(kind);
+    msg.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+    msg.extend_from_slice(body);
+    msg
+}
+
+fn ech_cover(suite: (u16, u16), config_id: u8, enc: &[u8], payload: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(12 + enc.len() + payload.len());
+    body.push(0);
+    body.extend_from_slice(&suite.0.to_be_bytes());
+    body.extend_from_slice(&suite.1.to_be_bytes());
+    body.push(config_id);
+    body.extend_from_slice(&(enc.len() as u16).to_be_bytes());
+    body.extend_from_slice(enc);
+    body.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    body.extend_from_slice(payload);
+    body
+}
+
+/// The ECH payload range inside an encoded `ClientHelloOuter` body.
+fn ech_payload(body: &[u8]) -> (usize, usize) {
+    let mut at = 2 + 32;
+    at += 1 + usize::from(body[at]);
+    at += 2 + (usize::from(body[at]) << 8 | usize::from(body[at + 1]));
+    at += 1 + usize::from(body[at]);
+    let end = at + 2 + (usize::from(body[at]) << 8 | usize::from(body[at + 1]));
+    at += 2;
+    while at < end {
+        let kind = u16::from_be_bytes([body[at], body[at + 1]]);
+        let len = usize::from(body[at + 2]) << 8 | usize::from(body[at + 3]);
+        if kind == 0xfe0d {
+            let mut inner = at + 4 + 1 + 4 + 1;
+            let enc_len = usize::from(body[inner]) << 8 | usize::from(body[inner + 1]);
+            inner += 2 + enc_len;
+            let payload_len = usize::from(body[inner]) << 8 | usize::from(body[inner + 1]);
+            return (inner + 2, payload_len);
+        }
+        at += 4 + len;
+    }
+    (0, 0)
+}
+
 /// uTLS's GREASE ECH cover: the picked suite, a random config id, 32 bytes of
 /// X25519 encapsulation and a payload one tag longer than a candidate length.
 /// The header and the payload are one buffer reserved to their sum, and the payload
@@ -659,6 +979,141 @@ mod tests {
 
     fn kind(ext: &[u8]) -> u16 {
         u16::from_be_bytes([ext[0], ext[1]])
+    }
+
+    fn open_inner(body: &[u8], outer: &[u8], keys: &[u8]) -> Vec<u8> {
+        let enc_len = usize::from(outer[10]) << 8 | usize::from(outer[11]);
+        let enc = &outer[12..12 + enc_len];
+        let at = 12 + enc_len;
+        let payload_len = usize::from(outer[at]) << 8 | usize::from(outer[at + 1]);
+        let payload = &outer[at + 2..at + 2 + payload_len];
+        let mut aad = body.to_vec();
+        let payload_at = aad
+            .windows(payload.len())
+            .position(|window| window == payload)
+            .expect("payload");
+        aad[payload_at..payload_at + payload.len()].fill(0);
+        let server_key = crate::tls::ech::parse_server_keys(keys)
+            .expect("keys")
+            .remove(0);
+        let hpke = match u16::from_be_bytes([outer[7], outer[8]]) {
+            1 => &crate::tls::hpke::AES128_GCM,
+            3 => &crate::tls::hpke::CHACHA20_POLY1305,
+            other => panic!("unexpected suite {other}"),
+        };
+        let mut info = b"tls ech\0".to_vec();
+        info.extend_from_slice(&server_key.config);
+        hpke.open(
+            &rustls::crypto::hpke::EncapsulatedSecret(enc.to_vec()),
+            &info,
+            &aad,
+            payload,
+            &rustls::crypto::hpke::HpkePrivateKey::from(server_key.private_key),
+        )
+        .expect("opens")
+    }
+
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn a_real_ech_offer_hides_the_inner_name_under_the_public_one() {
+        let (list, keys) = crate::tls::ech::generate("public.test", 7).expect("generates");
+        let profile = Fingerprint::default().profile().expect("profile");
+        let mut hello = Hello::build(profile, "hidden.test", &[], false).expect("builds");
+        hello.enable_ech(&list).expect("ech");
+
+        let body = &hello.msg[4..];
+        let outer_exts = extensions(body);
+        let outer = outer_exts
+            .iter()
+            .find(|ext| kind(ext) == 0xfe0d)
+            .expect("ech extension");
+        assert_eq!(kind(outer_exts.last().expect("extensions")), 0xfe0d);
+        assert_eq!(outer[4], 0, "ClientHelloOuter");
+        assert_eq!(outer[9], 7, "config id");
+        let enc_len = usize::from(outer[10]) << 8 | usize::from(outer[11]);
+        assert_eq!(enc_len, 32, "x25519 encapsulation");
+        let sni = outer_exts
+            .iter()
+            .find(|ext| kind(ext) == 0x0000)
+            .expect("sni");
+        assert!(
+            sni.windows(b"public.test".len())
+                .any(|window| window == b"public.test"),
+            "the outer name is the public one"
+        );
+        assert!(
+            !sni.windows(b"hidden.test".len())
+                .any(|window| window == b"hidden.test"),
+            "the inner name is not on the outside"
+        );
+
+        let inner = open_inner(body, outer, &keys);
+        assert_eq!(inner[0], 0x03, "inner legacy version");
+        assert_eq!(inner[1], 0x03, "inner legacy version");
+        assert_eq!(inner[34], 0, "inner session id is empty");
+        let cipher_len = usize::from(inner[35]) << 8 | usize::from(inner[36]);
+        assert!(cipher_len > 0, "the inner hello offers TLS 1.3 ciphers");
+        for cipher in inner[37..37 + cipher_len].as_chunks::<2>().0 {
+            let id = u16::from_be_bytes(*cipher);
+            assert!(
+                matches!(id, 0x1301..=0x1303),
+                "the inner hello offers only TLS 1.3 ciphers"
+            );
+        }
+        assert!(
+            inner
+                .windows(b"hidden.test".len())
+                .any(|window| window == b"hidden.test"),
+            "the inner hello carries the real name"
+        );
+        let inner_exts = extensions(&inner);
+        assert_eq!(kind(inner_exts.last().expect("extensions")), 0xfe0d);
+        assert_eq!(inner_exts.last().expect("extensions")[4], 1, "ECH inner");
+        let versions = inner_exts
+            .iter()
+            .find(|ext| kind(ext) == 0x002b)
+            .expect("supported versions");
+        assert_eq!(
+            &versions[4..],
+            &[2, 0x03, 0x04],
+            "the inner hello offers 1.3 only"
+        );
+
+        assert_eq!(inner.len() % 32, 0, "the inner payload is padded");
+        let mut at = 2 + 32;
+        at += 1 + usize::from(inner[at]);
+        let ciphers = usize::from(u16::from_be_bytes([inner[at], inner[at + 1]]));
+        at += 2 + ciphers;
+        at += 1 + usize::from(inner[at]);
+        let exts = usize::from(u16::from_be_bytes([inner[at], inner[at + 1]]));
+        let body = at + 2 + exts;
+        let mut expected = inner[..34].to_vec();
+        expected.push(32);
+        expected.extend_from_slice(&hello.session_id);
+        expected.extend_from_slice(&inner[35..body]);
+        expected = handshake(1, &expected);
+        let transcript = hello.ech_inner().expect("inner transcript");
+        assert_eq!(
+            transcript, expected,
+            "the transcript is the inner hello under the outer id"
+        );
+        let inner_random = hello.ech_inner_random().expect("inner random");
+        let retry = hello
+            .retry(crate::tls::shaped::keys::X25519, None)
+            .expect("retries");
+        assert!(retry.ech_inner().is_some(), "a retry re-seals the offer");
+        assert_eq!(
+            retry.ech_inner_random().expect("retry random"),
+            inner_random,
+            "a retry keeps the inner random"
+        );
+        let retry_exts = extensions(&retry.msg[4..]);
+        let retry_ech = retry_exts
+            .iter()
+            .find(|ext| kind(ext) == 0xfe0d)
+            .expect("ech extension");
+        assert_eq!(retry_ech[10], 0, "a retry carries no encapsulation");
+        assert_eq!(retry_ech[11], 0, "a retry carries no encapsulation");
     }
 
     fn invariant(kind: u16) -> bool {
