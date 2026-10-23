@@ -24424,6 +24424,80 @@ mod tests {
         server.join().expect("joins");
     }
 
+    /// The security sits above KCP, as it does upstream: a VLESS session that declares tls is served and dialled through the raw connection.
+    #[test]
+    fn a_vless_kcp_session_with_tls_echoes_over_loopback() {
+        let (cert, key, client) = tls_cert_json();
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vless", "settings": {{"clients": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}},
+                "streamSettings": {{"network": "kcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let server_cfg = inbound_tls_identity(&inbound).expect("identity");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut socket, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                let Ok(read) = socket.read(&mut buf) else {
+                    return;
+                };
+                if read == 0 || socket.write_all(&buf[..read]).is_err() {
+                    return;
+                }
+            }
+        });
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let kcp_port = listener.local_addr().port();
+        let server = thread::spawn(move || {
+            let conn = listener.accept().expect("accepts");
+            serve_vless_kcp_tls(&conn, &id, true, &server_cfg);
+        });
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: kcp_port,
+            id,
+            carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            host: "127.0.0.1".to_owned(),
+            mux: false,
+            quic_roots: None,
+            hysteria_roots: None,
+            tls: Some(Arc::clone(&client)),
+            flow: String::new(),
+            reality: None,
+        };
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let conn = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{kcp_port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_vless_kcp(&socket, &conn, &vless, &target);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "tls over kcp echoes");
+        server.join().expect("joins");
+    }
+
     /// One half-lock, two directions: an empty window answers `WouldBlock` in a quantum, not by holding the lock.
     #[test]
     fn a_kcp_read_yields_the_lock_instead_of_wedging_a_shared_relay() {
