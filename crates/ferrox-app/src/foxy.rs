@@ -3999,6 +3999,7 @@ pub(crate) mod loopback {
             alpn: vec![alpn.to_vec()],
             send_tickets: true,
             server_config_cache: std::sync::Arc::default(),
+            ech_server_keys: None,
         };
         (roots, server)
     }

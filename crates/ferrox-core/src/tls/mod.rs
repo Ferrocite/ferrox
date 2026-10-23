@@ -200,8 +200,10 @@ pub struct TlsServerConfig {
     /// Whether to send TLS 1.3 session tickets. REALITY declines them, as both
     /// references do, so an authenticated handshake is followed by no records.
     pub send_tickets: bool,
-    /// Memoised `rustls` server-config builds, one per identity kind.
+    /// Memoised server-config builds, one per identity kind.
     pub server_config_cache: crate::tls::rustls_backend::ServerConfigCache,
+    /// ECH server keys as the xray TLV: `u16 key || u16 config`, repeated.
+    pub ech_server_keys: Option<std::sync::Arc<[u8]>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,6 +246,7 @@ pub fn parse_pem_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsServerCo
                 key_kind,
                 send_tickets: true,
                 server_config_cache: std::sync::Arc::default(),
+                ech_server_keys: None,
             });
         }
     }
@@ -286,6 +289,13 @@ pub fn decode_ech_config(text: &str) -> Result<Vec<u8>, String> {
 /// A single ECH config wrapped as the one-entry list every client expects.
 pub fn normalize_ech_config_list(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     ech::normalize_config_list(bytes)
+}
+
+/// The ECH server keys a listener config names, decoded from base64 or a PEM `ECH KEYS` block.
+pub fn decode_ech_keys(text: &str) -> Result<Vec<u8>, String> {
+    let bytes = ech::decode_source(text, "ECH KEYS")?;
+    ech::parse_server_keys(&bytes)?;
+    Ok(bytes)
 }
 
 mod rustls_backend;
@@ -453,5 +463,5 @@ pub fn accept<S: Stream + Send>(
 }
 
 pub fn active_backends() -> &'static [&'static str] {
-    &["rustls"]
+    &["rustls", "boring"]
 }

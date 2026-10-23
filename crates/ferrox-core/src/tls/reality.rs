@@ -153,6 +153,7 @@ impl<S: Stream> RealityServer<S> {
             key_kind: super::ServerKeyKind::Pkcs8,
             send_tickets: false,
             server_config_cache: std::sync::Arc::default(),
+            ech_server_keys: None,
         };
         replay.set_prefix(raw);
         Ok(RealityAccept::Session(Self {
@@ -2349,6 +2350,7 @@ mod tests {
             key_kind: super::super::ServerKeyKind::Pkcs8,
             send_tickets: false,
             server_config_cache: std::sync::Arc::default(),
+            ech_server_keys: None,
         };
         let plain = super::super::TlsServerConfig {
             send_tickets: true,

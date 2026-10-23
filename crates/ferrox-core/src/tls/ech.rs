@@ -180,14 +180,12 @@ pub(crate) fn normalize_config_list(bytes: Vec<u8>) -> Result<Vec<u8>, String> {
     Err("ech: neither a config list nor a config".to_owned())
 }
 
-#[cfg(test)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ServerKey {
     pub(crate) private_key: Vec<u8>,
     pub(crate) config: Vec<u8>,
 }
 
-#[cfg(test)]
 pub(crate) fn parse_server_keys(bytes: &[u8]) -> Result<Vec<ServerKey>, String> {
     let mut keys = Vec::new();
     let mut at = 0;
