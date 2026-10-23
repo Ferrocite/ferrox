@@ -94,13 +94,19 @@ pub(crate) fn derive(hash: Hash, secret: &[u8], label: &[u8], transcript: &[u8])
     out
 }
 
-fn mac(hash: Hash, key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
-    let key = hmac::Key::new(hash.hmac(), key);
-    let mut ctx = hmac::Context::with_key(&key);
+/// HMAC over the parts in order: one message the record layer splits rather than copies.
+pub(crate) fn sign(key: &hmac::Key, parts: &[&[u8]]) -> hmac::Tag {
+    let mut ctx = hmac::Context::with_key(key);
     for part in parts {
         ctx.update(part);
     }
-    ctx.sign().as_ref().to_vec()
+    ctx.sign()
+}
+
+fn mac(hash: Hash, secret: &[u8], parts: &[&[u8]]) -> Vec<u8> {
+    sign(&hmac::Key::new(hash.hmac(), secret), parts)
+        .as_ref()
+        .to_vec()
 }
 
 /// TLS 1.2's PRF: `P_hash` over the seed with the two labels the version splits.
@@ -146,4 +152,32 @@ pub(crate) fn verify_data(hash: Hash, finished_key: &[u8], transcript: &[u8]) ->
     let mut ctx = hmac::Context::with_key(&key);
     ctx.update(digest.as_ref());
     ctx.sign().as_ref().to_vec()
+}
+
+/// The record MAC of a TLS 1.2 CBC suite. SHA-1 is what the `-SHA` identifiers name, and it
+/// never reaches the PRF: only a suite's SHA384 flag moves that hash.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Mac {
+    Sha1,
+    Sha256,
+}
+
+impl Mac {
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::Sha1 => 20,
+            Self::Sha256 => 32,
+        }
+    }
+
+    fn algorithm(self) -> hmac::Algorithm {
+        match self {
+            Self::Sha1 => hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY,
+            Self::Sha256 => hmac::HMAC_SHA256,
+        }
+    }
+
+    pub(crate) fn key(self, secret: &[u8]) -> hmac::Key {
+        hmac::Key::new(self.algorithm(), secret)
+    }
 }
