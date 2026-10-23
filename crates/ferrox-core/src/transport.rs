@@ -208,6 +208,36 @@ const DIGIT_TABLE: [u8; 256] = digit_table(false);
 /// The same table with the standard alphabet's two characters left invalid, for a peer that must be refused where `RawURLEncoding` refuses.
 const URL_DIGIT_TABLE: [u8; 256] = digit_table(true);
 
+/// The three bytes four digits stand for, or `None` when any of them is outside the alphabet.
+fn group_word(table: &[u8; 256], group: [u8; 4]) -> Option<[u8; 3]> {
+    // Four independent lookups fill disjoint six-bit fields, so the word is a sum of fixed shifts rather than a serial shift-and-or chain: the four loads issue at once and the shift tree is not on a loop-carried dependency. One combined mask sees every invalid byte at once — a valid digit is under 64, so it leaves bits 6 and 7 clear, and only the 255 sentinel sets them.
+    let t0 = u32::from(table[usize::from(group[0])]);
+    let t1 = u32::from(table[usize::from(group[1])]);
+    let t2 = u32::from(table[usize::from(group[2])]);
+    let t3 = u32::from(table[usize::from(group[3])]);
+    if (t0 | t1 | t2 | t3) & 0xc0 != 0 {
+        return None;
+    }
+    let word = (t0 << 18) | (t1 << 12) | (t2 << 6) | t3;
+    let bytes = word.to_be_bytes();
+    Some([bytes[1], bytes[2], bytes[3]])
+}
+
+/// The bytes a partial group stands for, its digits left-aligned in the window; a two-digit tail keeps one byte.
+fn group_tail(table: &[u8; 256], rest: &[u8]) -> Option<[u8; 3]> {
+    let mut word = 0u32;
+    for &byte in rest {
+        let digit = table[usize::from(byte)];
+        if digit == 255 {
+            return None;
+        }
+        word = (word << 6) | u32::from(digit);
+    }
+    word <<= 6 * (4 - rest.len());
+    let bytes = word.to_be_bytes();
+    Some([bytes[1], bytes[2], bytes[3]])
+}
+
 /// One pass, four characters at a time: six bits per lookup fill a 24-bit window whose three low bytes are the three bytes they stand for.
 fn decode_groups(bytes: &[u8], table: &[u8; 256]) -> Option<Vec<u8>> {
     if bytes.is_empty() {
@@ -219,29 +249,10 @@ fn decode_groups(bytes: &[u8], table: &[u8; 256]) -> Option<Vec<u8>> {
     let (full, rest) = bytes.split_at(bytes.len() / 4 * 4);
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3 + 3);
     for group in full.as_chunks::<4>().0 {
-        // Four independent lookups fill disjoint six-bit fields, so the word is a sum of fixed shifts rather than a serial shift-and-or chain: the four loads issue at once and the shift tree is not on a loop-carried dependency. One combined mask sees every invalid byte at once — a valid digit is under 64, so it leaves bits 6 and 7 clear, and only the 255 sentinel sets them.
-        let t0 = u32::from(table[usize::from(group[0])]);
-        let t1 = u32::from(table[usize::from(group[1])]);
-        let t2 = u32::from(table[usize::from(group[2])]);
-        let t3 = u32::from(table[usize::from(group[3])]);
-        if (t0 | t1 | t2 | t3) & 0xc0 != 0 {
-            return None;
-        }
-        let word = (t0 << 18) | (t1 << 12) | (t2 << 6) | t3;
-        out.extend_from_slice(&word.to_be_bytes()[1..]);
+        out.extend_from_slice(&group_word(table, *group)?);
     }
     if !rest.is_empty() {
-        let mut word = 0u32;
-        for &byte in rest {
-            let digit = table[usize::from(byte)];
-            if digit == 255 {
-                return None;
-            }
-            word = (word << 6) | u32::from(digit);
-        }
-        word <<= 6 * (4 - rest.len());
-        let tail = word.to_be_bytes();
-        out.extend_from_slice(&tail[1..rest.len()]);
+        out.extend_from_slice(&group_tail(table, rest)?[..rest.len() - 1]);
     }
     Some(out)
 }
@@ -305,6 +316,34 @@ pub fn early_decode(text: &str) -> Option<Vec<u8>> {
 /// The URL form with no slack: `-` and `_` only, no padding, no surrounding whitespace, and a lone trailing character refused rather than dropped.
 pub fn url_decode(text: &str) -> Option<Vec<u8>> {
     decode_groups(text.as_bytes(), &URL_DIGIT_TABLE)
+}
+
+/// The same decode over parts cut anywhere: the six-bit window carries across a cut, so the parts decode as their concatenation without it being built.
+pub fn url_decode_parts(parts: &[&str]) -> Option<Vec<u8>> {
+    let total: usize = parts.iter().map(|part| part.len()).sum();
+    if total == 0 {
+        return Some(Vec::new());
+    }
+    if total % 4 == 1 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(total / 4 * 3 + 3);
+    let mut group = [0u8; 4];
+    let mut held = 0usize;
+    for part in parts {
+        for &byte in part.as_bytes() {
+            group[held] = byte;
+            held += 1;
+            if held == 4 {
+                out.extend_from_slice(&group_word(&URL_DIGIT_TABLE, group)?);
+                held = 0;
+            }
+        }
+    }
+    if held != 0 {
+        out.extend_from_slice(&group_tail(&URL_DIGIT_TABLE, &group[..held])?[..held - 1]);
+    }
+    Some(out)
 }
 
 /// The host's ASCII suffix, ignoring case, without a lowercase copy of the host.
@@ -672,5 +711,62 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_part_decode_matches_the_join_it_never_builds() {
+        for len in 0..=64usize {
+            let bytes: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(97)).collect();
+            let mut text = String::new();
+            early_encode_into(&mut text, &bytes);
+            for a in 0..=text.len() {
+                for b in a..=text.len() {
+                    assert_eq!(
+                        url_decode_parts(&[&text[..a], &text[a..b], &text[b..]]),
+                        url_decode(&text),
+                        "{len}: cut at {a} and {b}"
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            url_decode_parts(&[]),
+            Some(Vec::new()),
+            "no parts is no bytes"
+        );
+        assert_eq!(
+            url_decode_parts(&["", "Zm9v", ""]).as_deref(),
+            Some(&b"foo"[..]),
+            "empty parts do not move the window"
+        );
+        assert_eq!(
+            url_decode_parts(&["Zm9vY", "g"]).as_deref(),
+            Some(&b"foob"[..]),
+            "a two-digit remainder crosses the cut"
+        );
+        assert_eq!(
+            url_decode_parts(&["Zm9", "vY+="]),
+            None,
+            "a standard-alphabet digit is refused"
+        );
+        assert_eq!(
+            url_decode_parts(&["abc", "de"]),
+            None,
+            "five is not a base64 length"
+        );
+        let (decoded, counts) = crate::alloc_count::measure(|| url_decode_parts(&["Zm9", "vYg"]));
+        assert_eq!(
+            decoded.as_deref(),
+            Some(&b"foob"[..]),
+            "the parts decode as one stream"
+        );
+        assert_eq!(
+            counts.allocs, 1,
+            "only the output buffer is allocated: {counts:?}"
+        );
+        assert_eq!(
+            counts.zeroed, 0,
+            "the output is written as it is decoded: {counts:?}"
+        );
     }
 }
