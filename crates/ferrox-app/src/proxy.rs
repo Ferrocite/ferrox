@@ -11619,13 +11619,6 @@ impl Destination {
         }
     }
 
-    fn host(&self) -> String {
-        match self {
-            Self::Name(host, _) => host.clone(),
-            Self::Address(address) => address.ip().to_string(),
-        }
-    }
-
     pub(crate) fn port(&self) -> u16 {
         match self {
             Self::Name(_, port) => *port,
@@ -13446,7 +13439,7 @@ mod tests {
         .expect("parses");
         let dest = dokodemo_target(&inbound).expect("a rewrite target");
         assert_eq!(dest.port(), 8080);
-        assert_eq!(dest.host(), "127.0.0.1");
+        assert_eq!(dest.authority(), "127.0.0.1:8080");
         assert_eq!(dokodemo_networks(&inbound), ["tcp", "udp"]);
     }
 
@@ -29205,7 +29198,7 @@ mod foxy_split_tests {
 
     #[test]
     fn a_domain_list_does_not_decide_an_address() {
-        let suffixes = vec!["0.0.7".to_owned()];
+        let suffixes = vec!["0.2.7".to_owned()];
         assert!(!foxy_splits(
             &[],
             &suffixes,
