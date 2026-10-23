@@ -70,6 +70,9 @@ LOC_COUNTRY=""
 LOC_CITY=""
 LOC_FILTER=""
 LOC_PING=0
+# Targets that leave the tunnel instead of riding it: a domain suffix or a port is enough.
+EXCLUDE_DOMAINS=""
+EXCLUDE_PORTS=""
 UPSTREAM=""
 # VeePN has no account and no server: an empty region lets the plane pick, and
 # the device id is kept under $CONF_DIR so a restart is the same device.
@@ -159,6 +162,10 @@ foxy options (email + password is the whole setup; there is no server to name)
                          carrier UDP asks first, and a named h3 falls back to
                          h2 and h1 when the path drops QUIC
   --upstream URL         http:// or socks5(h):// hop to reach the edge through
+  --exclude-domains LIST domain suffixes that leave the tunnel and dial directly
+                         (comma-separated; example.com also covers its subdomains)
+  --exclude-ports LIST   destination ports that leave the tunnel and dial directly
+                         (comma-separated; 22,53 are the usual ones)
 
 locations
   ferrox-cli locations [--ping] [CC]   every country, and the cities each one has
@@ -427,10 +434,47 @@ PY
 }
 
 foxy_outbound() {
-  python3 - "$EMAIL" "$PASSWORD" "$CODE" "$COUNTRY" "$CITY" "$CARRIER" "$UPSTREAM" "$TOKEN_FILE" <<'PY'
+  python3 - "$EMAIL" "$PASSWORD" "$CODE" "$COUNTRY" "$CITY" "$CARRIER" "$UPSTREAM" "$TOKEN_FILE" "$EXCLUDE_DOMAINS" "$EXCLUDE_PORTS" <<'PY'
 import json, sys
 
-email, password, code, country, city, carrier, upstream, token_file = sys.argv[1:9]
+email, password, code, country, city, carrier, upstream, token_file, domains, ports = sys.argv[1:11]
+
+def split_domains(raw):
+    names = []
+    for item in raw.split(","):
+        name = item.strip().lower().rstrip(".")
+        # The starred and dotted spellings mean what they mean in a browser: this name and below it.
+        if name.startswith("*."):
+            name = name[2:]
+        if name.startswith("."):
+            name = name[1:]
+        if not name:
+            continue
+        if ("/" in name or ":" in name or "*" in name or ".." in name
+                or name.startswith(".") or any(ch.isspace() for ch in name)):
+            sys.exit(f"--exclude-domains wants domain suffixes like example.com, got '{item.strip()}'; nothing was started.")
+        names.append(name)
+    if not names:
+        sys.exit("--exclude-domains wants at least one domain suffix; nothing was started.")
+    return names
+
+def split_ports(raw):
+    numbers = []
+    for item in raw.split(","):
+        value = item.strip()
+        if not value:
+            continue
+        try:
+            port = int(value, 10)
+        except ValueError:
+            sys.exit(f"--exclude-ports wants ports 1-65535, got '{value}'; nothing was started.")
+        if not 0 < port < 65536:
+            sys.exit(f"--exclude-ports wants ports 1-65535, got '{value}'; nothing was started.")
+        numbers.append(port)
+    if not numbers:
+        sys.exit("--exclude-ports wants at least one port; nothing was started.")
+    return numbers
+
 # The account, not a minted pass: the pass the edge accepts lives 600 seconds,
 # so a lane handed a bare token cannot renew it and dies when it expires.
 settings = {"email": email, "password": password, "country": country.upper(), "carrier": carrier}
@@ -444,6 +488,10 @@ if upstream:
     settings["upstreamProxy"] = upstream
 if code:
     settings["code"] = code
+if domains:
+    settings["directDomains"] = split_domains(domains)
+if ports:
+    settings["directPorts"] = split_ports(ports)
 print(json.dumps({"protocol": "foxy", "settings": settings}))
 PY
 }
@@ -787,7 +835,7 @@ build_config() {
         say "account saved to $CREDS (owner-only); connecting."
         read_credentials
       fi
-      outbound="$(foxy_outbound)" || die "cannot build the foxy outbound"
+      outbound="$(build_outbound foxy)" || exit 1
       save_foxy_location
       ;;
     vless)
@@ -1221,6 +1269,8 @@ while [ $# -gt 0 ]; do
       esac
       CARRIER_SET=1; shift 2 ;;
     --upstream) need_value --upstream "an http:// or socks5:// URL" "$#" "${2:-}"; UPSTREAM="$2"; shift 2 ;;
+    --exclude-domains) need_value --exclude-domains "comma-separated domain suffixes" "$#" "${2:-}"; EXCLUDE_DOMAINS="$2"; shift 2 ;;
+    --exclude-ports) need_value --exclude-ports "comma-separated ports" "$#" "${2:-}"; EXCLUDE_PORTS="$2"; shift 2 ;;
     --fronts) need_value --fronts "a comma-separated front list" "$#" "${2:-}"; FRONTS="$2"; shift 2 ;;
     --socks) need_value --socks "a port" "$#" "${2:-}"; SOCKS_PORT="$2"; shift 2 ;;
     --http) need_value --http "a port" "$#" "${2:-}"; HTTP_PORT="$2"; shift 2 ;;
@@ -1238,6 +1288,11 @@ done
 # A measurement flag belongs to the listing: a lane started by a typo is not one.
 if [ "$LOC_PING" = 1 ] && [ "$ACTION" != locations ]; then
   die "--ping belongs to 'locations' (ferrox-cli locations --ping); nothing was started."
+fi
+
+# Excluded targets leave the tunnel unencrypted, so the lists are foxy-only and refused before a lane is touched.
+if [ -n "$EXCLUDE_DOMAINS$EXCLUDE_PORTS" ] && [ "$OUTBOUND" != foxy ]; then
+  die "--exclude-domains and --exclude-ports belong to the foxy lane; nothing was started."
 fi
 
 # A VeePN flow pays a launch and a list before bytes move, so its first probe

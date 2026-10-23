@@ -7,7 +7,9 @@ carrier, the allowance and the uptime back from the lane it was given: a fake
 pid and a synthetic log stand in for a live account, and the front refuses the
 trace immediately because nothing listens on its port. `locations --ping` is
 given a fake catalogue: the rows must order by latency, keep a silent edge as
-`no answer`, pin REC, and leave the readings out of the offline copy.
+`no answer`, pin REC, and leave the readings out of the offline copy. The split
+lists must reach the lane normalized, and a port outside 1-65535 must be refused
+before the lane config is written.
 """
 
 from __future__ import annotations
@@ -259,13 +261,94 @@ fi
     return 0
 
 
+def check_splits(state: pathlib.Path) -> int:
+    env = env_for(state)
+    (state / "lane.json").unlink(missing_ok=True)
+    subprocess.run(
+        [
+            *up_argv(free_port()),
+            "--exclude-domains",
+            "*.Example.com, printer.lan",
+            "--exclude-ports",
+            "22,53",
+        ],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH,
+        env=env,
+    )
+    settings = json.loads((state / "lane.json").read_text(encoding="utf-8"))[
+        "outbounds"
+    ][0]["settings"]
+    if settings.get("directDomains") != ["example.com", "printer.lan"]:
+        print(
+            f"check-cli-lane: the split domains reach the lane as "
+            f"{settings.get('directDomains')!r}",
+            file=sys.stderr,
+        )
+        return 1
+    if settings.get("directPorts") != [22, 53]:
+        print(
+            f"check-cli-lane: the split ports reach the lane as "
+            f"{settings.get('directPorts')!r}",
+            file=sys.stderr,
+        )
+        return 1
+    (state / "lane.json").unlink(missing_ok=True)
+    subprocess.run(
+        up_argv(free_port()),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH,
+        env=env,
+    )
+    settings = json.loads((state / "lane.json").read_text(encoding="utf-8"))[
+        "outbounds"
+    ][0]["settings"]
+    if "directDomains" in settings or "directPorts" in settings:
+        print(
+            "check-cli-lane: a lane with no split lists still carried one",
+            file=sys.stderr,
+        )
+        return 1
+    (state / "lane.json").unlink(missing_ok=True)
+    refused = subprocess.run(
+        [*up_argv(free_port()), "--exclude-ports", "70000"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH,
+        env=env,
+    )
+    spoken = refused.stdout + refused.stderr
+    if (
+        refused.returncode == 0
+        or "1-65535" not in spoken
+        or (state / "lane.json").exists()
+    ):
+        print(
+            f"check-cli-lane: a port outside 1-65535 was not refused before the "
+            f"config was written:\n{spoken}",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "check-cli-lane: split lists reach the lane normalized, and a bad port is refused"
+    )
+    return 0
+
+
 def main() -> int:
     state = pathlib.Path(tempfile.mkdtemp(prefix="ferrox-cli-lane-"))
     if check_picker(state) != 0:
         return 1
     if check_status(state) != 0:
         return 1
-    return check_locations(state)
+    if check_locations(state) != 0:
+        return 1
+    return check_splits(state)
 
 
 if __name__ == "__main__":
