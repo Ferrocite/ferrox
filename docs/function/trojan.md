@@ -6,9 +6,9 @@ The header is `sha224_hex(password) | CRLF | command(1) | address | port | CRLF`
 
 A dial that was handed a name writes it as ATYP 3 with its own length, the form this method's reader already accepts, so the edge answers the lookup rather than the client's resolver.
 
-A listener that declares `security: tls` terminates the session its config names and reads the header off it, on each carrier the dial uses; `a_trojan_inbound_that_declares_tls_answers_every_carrier` dials all six and holds the echo.
+A listener that declares `security: tls` terminates the session its config names and reads the header off it, on each carrier the dial uses; `a_trojan_inbound_that_declares_tls_answers_every_carrier` dials all six and holds the echo. A UDP association rides the same session in both directions — `a_trojan_udp_association_crosses_the_tls_arm` sends one through the listener and holds the reply.
 
-Two things are deliberately not implemented and are named rather than rounded off: there is no `trojan://` share-link parser (the link column in the README is empty for this row), and `security: tls` is neither dialled nor served under mux or for UDP, so those rows are refused rather than sent plain. Both are capability statements, not performance ones.
+Three things are deliberately not implemented and are named rather than rounded off: there is no `trojan://` share-link parser (the link column in the README is empty for this row); `security: tls` is neither dialled nor served under mux; and a UDP association is refused on both ends by every carried carrier — ws, grpc, httpupgrade, xhttp, httpheader — with or without tls, a gap that predates the TLS arm. The raw arm carries one, plaintext or under a terminated session. These are capability statements, not performance ones.
 
 ## Data path
 
