@@ -158,7 +158,7 @@ jobs:
         env:
           VERSION: ${{ needs.plan.outputs.version }}
           BODY: |-
-            ## Ferrox VERSION_PLACEHOLDER — pick your carrier: h1, h2 or h3
+            ## Ferrox VERSION_PLACEHOLDER — your allowance buys the bytes that reach you
 
             Unpack your platform's package and run the CLI beside the binary — no cargo, no repository:
 
@@ -184,7 +184,76 @@ jobs:
             | **SOCKS outbound** | a JSON config naming `socks` as the protocol | `--config`: the client role dials out SOCKS5, and `version: "4"` speaks SOCKS4 and SOCKS4a |
             | **Any served config** | a JSON config | `./ferrox-cli.sh up --config mine.json` |
 
-            ### Choosing the carrier on the Foxy lane (new in this release)
+            ### Your allowance buys the bytes that reach you (new in this release)
+
+            A flow the browser hangs up on used to leave its stream open at the
+            edge: the edge kept pulling the rest of the response into a
+            flow-control window nobody drained, and every one of those bytes was
+            charged to the account. A download canceled after its first
+            megabytes cost 1.95x what was read. The lane now ends the half its
+            carrier has and resets what the edge is still filling —
+            `RST_STREAM`/`CANCEL` over `h2`, a stop and a reset over `h3` — from
+            the settle, and from the tunnel's own `Drop` when a flow vanished
+            before it could settle. Measured against the plane's own
+            `X-Quota-Remaining` on a clean account (`foxy-live.yml`, runs
+            39896658437 and 39904632827):
+
+            | what the lane did | bytes carried | allowance charged |
+            | --- | --- | --- |
+            | an idle window, no flow at all | 0 | 0 |
+            | a `HEAD` of a 10 MB body | 240 | 0 |
+            | a 1 MB GET, read to the end | 1,048,815 | 1,049,249 (1.000x) |
+            | a 10 MB GET, read to the end | 10,486,000 | 10,486,097 (1.000x) |
+            | the whole session, one flow canceled mid-body | 12,061,503 | 12,178,099 (**1.0097x**) |
+
+            The plane writes its counter in lagging batches, so the four single
+            rows are the before-fix run and only the last row is a session
+            total; a per-bracket `0 charged` after the fix is the batch, not a
+            free download.
+
+            A flow costs nothing per flow, and what is left on a cancel — at
+            most 1.22x the bytes read, against 1.95x before — is data already in
+            flight when the reset leaves, which no reset can recall.
+            `a_flow_abandoned_mid_response_resets_its_stream` gates the reset
+            against a loopback edge that never ends its body.
+
+            `status` now names why an allowance line is missing instead of
+            printing nothing: either the plane sent no quota header for the pass
+            this lane carries, which is silence rather than zero, or the running
+            lane is a binary that writes neither line, and `down` then `up`
+            restarts it on the one this script runs. A lane that has no
+            allowance to report — a `--vless` lane, say — stays quiet.
+
+            ### Refusals that became behaviour
+
+            Three rows where this tree said no now do what the reference does: a
+            **dokodemo-door `portMap`** is a table the flow's own port indexes
+            (#434), a **SOCKS5** reply that binds a *name* grants the tunnel
+            instead of stalling at the reply (#432), and an **outbound that
+            cannot build the names it needs** is refused by name before the
+            inbounds rule on the flow (#424). The transparent redirect stays
+            refused — that one is the kernel's to give.
+
+            ### Lanes that could not connect, and now can
+
+            - **Trojan over TLS** armed the plaintext role, so its first 56
+              bytes were read as a key and every trojan-over-tls dial died at
+              the handshake; the listener answers with the session its config
+              names, on each carrier the dial uses, and a **UDP association
+              crosses that arm** too (#435, #441).
+            - **VLESS over KCP** carries TLS (#444).
+            - **VMess** reads an authenticated length as the second AEAD over
+              the size field that it is (#439).
+            - An **HTTP/3** response that names its status and then `date` was
+              reported as a broken frame: an indexed field line the lane never
+              reads walks on instead of aborting the block (#436).
+            - A **Foxy** pass the plane refused spent the password; it spends
+              the grant now, and a grant another lane rotated in is adopted
+              rather than re-spent (#438, #431). An interrupted connect leaves
+              no lane behind — no child, no pid file, no config, and the system
+              proxy untouched (#433).
+
+            ### Choosing the carrier on the Foxy lane
 
             A **carrier** is how the lane sends its flows to the edge. `--carrier`
             names one, and on a terminal `up --foxy` asks once — an empty answer
@@ -216,7 +285,7 @@ jobs:
             the same settings, carrier included — is read from a config with
             `--config`.
 
-            `status` now reads the lane back: how long it has been up, the
+            `status` reads the lane back: how long it has been up, the
             carrier it was given, the allowance the plane last named (bytes left
             of the plan and when they reset), and the exit IP and country.
 
@@ -296,7 +365,7 @@ jobs:
 
             ### Leaner where it counts
 
-            Since the last release the Foxy lane lost a handshake per
+            Between v0.0.2 and v0.0.3 the Foxy lane lost a handshake per
             flow — an ended flow lends its HTTP/2 session to the next — a
             buffer per datagram and a `recvfrom` per packet, and the lock its
             shared lane's idle poll held while it slept. The same grind reached
@@ -321,7 +390,7 @@ jobs:
             shorter than one. The pass stands where it was and the ladder still
             closes a record; both readings are on the record-layer page.
 
-            ### Fixed: a padded frame now credits its whole wire length
+            ### Fixed in v0.0.3: a padded frame credits its whole wire length
 
             RFC 7540 §6.9 puts a DATA frame's whole payload into the flow-control
             window, the `Pad Length` octet and the padding included. Both HTTP/2
@@ -336,7 +405,7 @@ jobs:
             direct delivery hands a padded frame's payload back with its pad
             still on it, so what a caller gets depends on how much room it had.
 
-            ### Also new under the hood
+            ### Under the hood
 
             **Routing rules** ride `--config` now: AND selectors over domain,
             ip, port, source and inbound tag, matched against `geosite.dat`
