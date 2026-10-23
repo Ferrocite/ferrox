@@ -1,12 +1,14 @@
 # Cases for the utls-oracle: `<ferrox profile> <uTLS ClientHelloID>` per line.
 # The program builds that preset with pinned entropy (the hello-phase draws are
-# zeros, key material is erased) and prints the ClientHello body once.
+# zeros, key material is erased) and prints the ClientHello body once. The four
+# `*_psk` rows go through `OmitEmptyPsk`, without which the pin drops the handshake.
 #
 # A preset whose extension order uTLS shuffles at spec creation is printed as
-# `SH <name> <sorted-extension-hex> <invariant-indices>`: the middle order is a
-# fresh crypto/rand draw in uTLS, so only the multiset of extension bytes and
-# the positions of the GREASE/padding/PSK entries are comparable. Every other
-# preset prints `CH <name> <exact-body-hex>`, which gates the byte for byte.
+# `SH <name> <sorted-extension-hex> <invariant-indices> <body-prefix-hex>`: the middle
+# order is a fresh crypto/rand draw in uTLS, so what is comparable is the multiset of
+# extension bytes, the positions of the GREASE/padding/PSK entries, and the body ahead of
+# the extensions, which carries the cipher list. Every other preset prints
+# `CH <name> <exact-body-hex>`, which gates the byte for byte.
 
 360 Hello360_7_5
 android HelloAndroid_11_OkHttp
@@ -15,8 +17,12 @@ edge HelloEdge_85
 firefox HelloFirefox_148
 hello360_11_0 Hello360_11_0
 hellochrome_100 HelloChrome_100
+hellochrome_100_psk HelloChrome_100_PSK
 hellochrome_106_shuffle HelloChrome_106_Shuffle
+hellochrome_112_psk_shuf HelloChrome_112_PSK_Shuf
+hellochrome_114_padding_psk_shuf HelloChrome_114_Padding_PSK_Shuf
 hellochrome_115_pq HelloChrome_115_PQ
+hellochrome_115_pq_psk HelloChrome_115_PQ_PSK
 hellochrome_120 HelloChrome_120
 hellochrome_120_pq HelloChrome_120_PQ
 hellochrome_131 HelloChrome_131

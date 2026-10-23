@@ -1122,7 +1122,7 @@ mod tests {
         kind & 0x0f0f == 0x0a0a || kind == 0x0015 || kind == 0x0029
     }
 
-    /// Replay the uTLS oracle: every xray name that shapes a hello must emit the reference's bytes, or its extension multiset plus invariant slots where Chrome shuffles.
+    /// Replay the uTLS oracle: every xray name that shapes a hello must emit the reference's bytes, or where Chrome shuffles its extension multiset, invariant slots and the body ahead of them.
     #[test]
     fn oracle_replay_matches_utls() {
         let script = include_str!("../../../../../scripts/utls-oracle/script.txt");
@@ -1172,14 +1172,20 @@ mod tests {
                     .map(|at| at.parse().expect("an index"))
                     .collect();
                 assert_eq!(fixed, want_fixed, "{name} invariant positions");
+                let tail: usize = exts.iter().map(|ext| ext.len()).sum();
+                assert_eq!(
+                    hex(&body[..body.len() - tail]),
+                    fields[4],
+                    "{name} ({id}) the body ahead of the extensions"
+                );
                 let mut sorted = exts.clone();
                 sorted.sort();
                 let joined: Vec<u8> = sorted.iter().flat_map(|ext| ext.iter().copied()).collect();
                 assert_eq!(hex(&joined), fields[2], "{name} ({id}) extension multiset");
             }
         }
-        assert_eq!(cases.len(), 46, "every xray name is covered");
-        assert_eq!(seen.len(), 28, "the names resolve to 28 distinct presets");
+        assert_eq!(cases.len(), 50, "every xray name is covered");
+        assert_eq!(seen.len(), 31, "the names resolve to 31 distinct presets");
     }
 
     /// The hello's own bytes cost one heap buffer, reserved to their exact length before the first

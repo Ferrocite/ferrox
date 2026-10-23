@@ -9,8 +9,9 @@
 // value is a fixed function of the draw and must match byte for byte.
 //
 // Chrome presets shuffle their middle extensions with a fresh crypto/rand seed at
-// spec creation, so for those the oracle prints the extension multiset and the
-// positions of the GREASE, padding and PSK entries, which the shuffle never moves.
+// spec creation, so for those the oracle prints the extension multiset, the positions
+// of the GREASE, padding and PSK entries the shuffle never moves, and the body ahead of
+// the extensions, which carries the cipher list the shuffle leaves alone.
 package main
 
 import (
@@ -29,36 +30,40 @@ import (
 )
 
 var presets = map[string]utls.ClientHelloID{
-	"Hello360_7_5":            utls.Hello360_7_5,
-	"Hello360_11_0":           utls.Hello360_11_0,
-	"HelloAndroid_11_OkHttp":  utls.HelloAndroid_11_OkHttp,
-	"HelloChrome_58":          utls.HelloChrome_58,
-	"HelloChrome_70":          utls.HelloChrome_70,
-	"HelloChrome_72":          utls.HelloChrome_72,
-	"HelloChrome_96":          utls.HelloChrome_96,
-	"HelloChrome_100":         utls.HelloChrome_100,
-	"HelloChrome_106_Shuffle": utls.HelloChrome_106_Shuffle,
-	"HelloChrome_115_PQ":      utls.HelloChrome_115_PQ,
-	"HelloChrome_120":         utls.HelloChrome_120,
-	"HelloChrome_120_PQ":      utls.HelloChrome_120_PQ,
-	"HelloChrome_131":         utls.HelloChrome_131,
-	"HelloChrome_133":         utls.HelloChrome_133,
-	"HelloEdge_85":            utls.HelloEdge_85,
-	"HelloEdge_106":           utls.HelloEdge_106,
-	"HelloQQ_11_1":            utls.HelloQQ_11_1,
-	"HelloFirefox_55":         utls.HelloFirefox_55,
-	"HelloFirefox_63":         utls.HelloFirefox_63,
-	"HelloFirefox_99":         utls.HelloFirefox_99,
-	"HelloFirefox_102":        utls.HelloFirefox_102,
-	"HelloFirefox_105":        utls.HelloFirefox_105,
-	"HelloFirefox_120":        utls.HelloFirefox_120,
-	"HelloFirefox_148":        utls.HelloFirefox_148,
-	"HelloIOS_11_1":           utls.HelloIOS_11_1,
-	"HelloIOS_12_1":           utls.HelloIOS_12_1,
-	"HelloIOS_13":             utls.HelloIOS_13,
-	"HelloIOS_14":             utls.HelloIOS_14,
-	"HelloSafari_16_0":        utls.HelloSafari_16_0,
-	"HelloSafari_26_3":        utls.HelloSafari_26_3,
+	"Hello360_7_5":                     utls.Hello360_7_5,
+	"Hello360_11_0":                    utls.Hello360_11_0,
+	"HelloAndroid_11_OkHttp":           utls.HelloAndroid_11_OkHttp,
+	"HelloChrome_58":                   utls.HelloChrome_58,
+	"HelloChrome_70":                   utls.HelloChrome_70,
+	"HelloChrome_72":                   utls.HelloChrome_72,
+	"HelloChrome_96":                   utls.HelloChrome_96,
+	"HelloChrome_100":                  utls.HelloChrome_100,
+	"HelloChrome_100_PSK":              utls.HelloChrome_100_PSK,
+	"HelloChrome_106_Shuffle":          utls.HelloChrome_106_Shuffle,
+	"HelloChrome_112_PSK_Shuf":         utls.HelloChrome_112_PSK_Shuf,
+	"HelloChrome_114_Padding_PSK_Shuf": utls.HelloChrome_114_Padding_PSK_Shuf,
+	"HelloChrome_115_PQ":               utls.HelloChrome_115_PQ,
+	"HelloChrome_115_PQ_PSK":           utls.HelloChrome_115_PQ_PSK,
+	"HelloChrome_120":                  utls.HelloChrome_120,
+	"HelloChrome_120_PQ":               utls.HelloChrome_120_PQ,
+	"HelloChrome_131":                  utls.HelloChrome_131,
+	"HelloChrome_133":                  utls.HelloChrome_133,
+	"HelloEdge_85":                     utls.HelloEdge_85,
+	"HelloEdge_106":                    utls.HelloEdge_106,
+	"HelloQQ_11_1":                     utls.HelloQQ_11_1,
+	"HelloFirefox_55":                  utls.HelloFirefox_55,
+	"HelloFirefox_63":                  utls.HelloFirefox_63,
+	"HelloFirefox_99":                  utls.HelloFirefox_99,
+	"HelloFirefox_102":                 utls.HelloFirefox_102,
+	"HelloFirefox_105":                 utls.HelloFirefox_105,
+	"HelloFirefox_120":                 utls.HelloFirefox_120,
+	"HelloFirefox_148":                 utls.HelloFirefox_148,
+	"HelloIOS_11_1":                    utls.HelloIOS_11_1,
+	"HelloIOS_12_1":                    utls.HelloIOS_12_1,
+	"HelloIOS_13":                      utls.HelloIOS_13,
+	"HelloIOS_14":                      utls.HelloIOS_14,
+	"HelloSafari_16_0":                 utls.HelloSafari_16_0,
+	"HelloSafari_26_3":                 utls.HelloSafari_26_3,
 }
 
 // helloRand zeroes the four hello-phase draws — random, session id, the ten GREASE
@@ -89,10 +94,12 @@ func readHello(id utls.ClientHelloID) []byte {
 
 	client, server := net.Pipe()
 	defer client.Close()
+	// A psk preset holds an empty psk extension, which the pin refuses to send; concealing it is the only way that preset's other bytes reach the wire.
 	cfg := &utls.Config{
 		ServerName:         "example.com",
 		InsecureSkipVerify: true,
 		Rand:               &helloRand{zeros: 106},
+		OmitEmptyPsk:       true,
 	}
 	uconn := utls.UClient(client, cfg, utls.HelloCustom)
 	if err := uconn.ApplyPreset(&spec); err != nil {
@@ -291,6 +298,6 @@ func main() {
 		for _, i := range fixed {
 			indices = append(indices, fmt.Sprint(i))
 		}
-		fmt.Printf("SH %s %s %s\n", parts[0], hex.EncodeToString(sorted), strings.Join(indices, ","))
+		fmt.Printf("SH %s %s %s %s\n", parts[0], hex.EncodeToString(sorted), strings.Join(indices, ","), hex.EncodeToString(prefix))
 	}
 }
