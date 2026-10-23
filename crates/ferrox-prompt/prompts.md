@@ -87,7 +87,7 @@ Implement {method} — matrix row {index} of table {section}, currently "{state}
 ## P2 · Make a shipped method faster and leaner
 
 **When to use:** A row is implemented — the standing hunt for maximum throughput and minimum CPU now applies to it.
-**Status:** todo
+**Status:** done
 **Leverage:** 5
 **Effort:** medium
 **Targets:** implemented
