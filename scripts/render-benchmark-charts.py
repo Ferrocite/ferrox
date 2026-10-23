@@ -234,78 +234,70 @@ def gated_verdict(cell, engine, metric_word):
     return None
 
 
-def metric_chart(scenarios, cells, metric, metric_word, unit, title, path, foot):
-    """Grouped bars of medians with own-repeat whiskers; gaps stay labeled."""
-    present = engines_present(cells)
-    names = [s for s in scenarios if s in cells]
-    if not names or not present:
+def summary_bars(series, unit, title, path, foot, suffix="", reference=None, percent=False):
+    """One horizontal bar per engine: the median of that engine's cell medians.
+
+    The per-test plots carry the scenario detail; a 56-group bar chart is wider
+    than a page and reads as noise, so the cost plots answer the one question a
+    reader has here: which engine is cheapest overall, and over how many cells.
+    """
+    present = [name for name in ENGINE_ORDER if series.get(name)]
+    if not present:
         return None
-    fig, ax = plt.subplots(figsize=(max(8.0, 1.6 * len(names)), 4.6))
-    bar_width = 0.8 / max(1, len(present))
-    missing = []
-    for index, engine in enumerate(present):
-        values, lower, upper, edges = [], [], [], []
-        for scenario in names:
-            samples = run_values(cells[scenario], engine, metric)
-            if not samples:
-                values.append(float("nan"))
-                lower.append(0.0)
-                upper.append(0.0)
-                edges.append("black")
-                missing.append(f"{scenario}/{engine}: {cell_reason(cells[scenario], engine)}")
-                continue
-            median = benchstats.median(samples)
-            values.append(median)
-            interval = bootstrap_interval(samples)
-            if interval:
-                lower.append(median - interval[0])
-                upper.append(interval[1] - median)
-            else:
-                lower.append(0.0)
-                upper.append(0.0)
-            verdict = gated_verdict(cells[scenario], engine, metric_word)
-            edges.append(
-                {"better": "#2CA02C", "worse": "#D62728"}.get(verdict, "black")
-            )
-        xs = [p + (index - (len(present) - 1) / 2) * bar_width for p in range(len(names))]
-        ax.bar(
-            xs,
-            values,
-            width=bar_width,
-            yerr=[lower, upper],
-            capsize=3,
-            label=engine,
-            color=PALETTE.get(engine, MISSING),
-            edgecolor=edges,
-            linewidth=1.2,
-            error_kw={"elinewidth": 1},
-        )
-        for x, value in zip(xs, values):
-            if value == value:  # not NaN: label the median on the bar
-                ax.text(x, value, f"{value:.0f}", ha="center", va="bottom", fontsize=7)
-    ax.set_xticks(list(range(len(names))))
-    ax.set_xticklabels(names, rotation=18, ha="right", fontsize=8)
-    ax.set_ylabel(unit, fontsize=9)
-    ax.set_title(title, fontsize=11)
-    ax.legend(fontsize=8, ncol=len(present))
-    ax.grid(axis="y", linestyle=":", alpha=0.6)
-    if missing:
+    values = [benchstats.median(series[name]) for name in present]
+    fig, ax = plt.subplots(figsize=(7.6, max(2.4, 0.5 * len(present) + 1.3)))
+    ax.barh(
+        present,
+        values,
+        height=0.62,
+        color=[PALETTE.get(name, MISSING) for name in present],
+        edgecolor="#555555",
+        linewidth=0.8,
+    )
+    span = max(values) if values else 1.0
+    for tick, (name, value) in enumerate(zip(present, values)):
         ax.text(
-            0.0,
-            -0.02,
-            "no data: " + "; ".join(sorted(set(missing))),
-            transform=ax.transAxes,
-            fontsize=7,
-            color="#666666",
-            va="top",
-            ha="left",
+            value + span * 0.02,
+            tick,
+            (f"{value:.0%}" if percent else f"{value:.1f}{suffix}")
+            + f"  ({len(series[name])} cells)",
+            va="center",
+            fontsize=8,
         )
+    ax.set_xlim(0, span * 1.45)
+    ax.invert_yaxis()
+    ax.set_xlabel(unit, fontsize=9)
+    ax.set_title(title, fontsize=11, loc="left")
+    ax.grid(axis="x", linestyle=":", alpha=0.6)
+    ax.set_axisbelow(True)
+    if reference is not None:
+        ax.axvline(reference, color="#999999", linestyle="--", linewidth=1)
+        ax.text(reference, -0.45, f" {reference:.0%} generator bound", fontsize=7,
+                color="#666666", va="top", ha="left")
+    for side in ("top", "right"):
+        ax.spines[side].set_visible(False)
+    ax.tick_params(axis="y", length=0)
     fig.text(0.5, 0.01, foot, ha="center", fontsize=7, color="#666666")
-    fig.tight_layout(rect=(0, 0.06, 1, 1))
+    fig.tight_layout(rect=(0, 0.10, 1, 1))
     fig.savefig(path, dpi=110, bbox_inches="tight")
     plt.close(fig)
     return path
 
+
+def metric_chart(scenarios, cells, metric, metric_word, unit, title, path, foot):
+    """Median cost per engine across the measured cells, never a merged bar per scenario."""
+    series = {}
+    for engine in ENGINE_ORDER:
+        values = []
+        for scenario in scenarios:
+            if scenario not in cells:
+                continue
+            samples = run_values(cells[scenario], engine, metric)
+            if samples:
+                values.append(benchstats.median(samples))
+        if values:
+            series[engine] = values
+    return summary_bars(series, unit, title, path, foot)
 
 def setup_chart(cells, runs_dir, path, foot):
     """Setup-stage medians for setup scenarios, milliseconds.
@@ -530,128 +522,64 @@ def binary_size_chart(meta, path, foot):
 
 
 def ceiling_chart(scenarios, cells, path, foot):
-    """Harness ceiling per scenario with each engine's share of it.
-
-    The ceiling is the same validated loop with no engine in the path,
-    measured per repeat beside the engines. A bar at the ceiling is the
-    generator saturating, not the engine beating physics; rows at or above
-    85% of it carry the HARNESS_BOUND mark. The spread line under each group
-    is the runner's own variance measured, not assumed.
-    """
-    names = [s for s in scenarios if s in cells]
-    present = engines_present(cells)
-    if not names or not present:
-        return None
-    fig, ax = plt.subplots(figsize=(max(8.0, 1.6 * len(names)), 4.6))
-    bar_width = 0.8 / max(1, len(present) + 1)
-    for index, engine in enumerate(present):
+    """Share of cells where each engine reached the harness ceiling."""
+    series = {}
+    for engine in ENGINE_ORDER:
         values = []
-        for scenario in names:
+        for scenario in scenarios:
+            if scenario not in cells:
+                continue
             samples = run_values(cells[scenario], engine, "throughput_mib_s")
             ceiling = ceiling_values(cells[scenario])
-            if not samples or not ceiling:
-                values.append(float("nan"))
-                continue
-            values.append(benchstats.median(samples) / benchstats.median(ceiling))
-        xs = [p + (index - len(present) / 2) * bar_width for p in range(len(names))]
-        bars = ax.bar(
-            xs, values, width=bar_width, label=engine,
-            color=PALETTE.get(engine, MISSING), edgecolor="black", linewidth=0.5,
-        )
-        for x, value in zip(xs, values):
-            if value == value:
-                mark = " \u25c6" if value >= HARNESS_BOUND else ""
-                ax.text(x, value, f"{value:.0%}{mark}", ha="center",
-                        va="bottom", fontsize=7)
-    ax.axhline(HARNESS_BOUND, color="#999999", linestyle="--", linewidth=1)
-    ax.text(len(names) - 1, HARNESS_BOUND, " generator-bound (85%)",
-            fontsize=7, color="#666666", va="bottom", ha="right")
-    ax.set_xticks(list(range(len(names))))
-    ax.set_xticklabels(names, rotation=18, ha="right", fontsize=8)
-    ax.set_ylabel("share of the one-hop ceiling", fontsize=9)
-    ax.set_title("throughput as a share of the harness ceiling (\u25c6 = generator-bound)", fontsize=11)
-    ax.legend(fontsize=8, ncol=len(present))
-    ax.grid(axis="y", linestyle=":", alpha=0.6)
-    spreads = []
-    for scenario in names:
-        ceiling = ceiling_values(cells[scenario])
-        if len(ceiling) >= 2:
-            spreads.append(f"{scenario}: ceiling spread "
-                           f"{max(ceiling) / min(ceiling):.2f}x over {len(ceiling)}")
-    if spreads:
-        ax.text(0.0, -0.02, "runner spread: " + "; ".join(sorted(spreads)),
-                transform=ax.transAxes, fontsize=7, color="#666666",
-                va="top", ha="left")
-    fig.text(0.5, 0.01, foot, ha="center", fontsize=7, color="#666666")
-    fig.tight_layout(rect=(0, 0.06, 1, 1))
-    fig.savefig(path, dpi=110, bbox_inches="tight")
-    plt.close(fig)
-    return path
-
+            if samples and ceiling:
+                share = benchstats.median(samples) / benchstats.median(ceiling)
+                values.append(1.0 if share >= HARNESS_BOUND else 0.0)
+        if values:
+            series[engine] = values
+    return summary_bars(
+        series,
+        "share of measured cells",
+        "cells at or above 85% of the harness ceiling (higher means generator-bound)",
+        path,
+        foot,
+        percent=True,
+    )
 
 def threads_chart(scenarios, cells, path, foot):
-    """Peak thread count per scenario, one bar per engine."""
-    names = [s for s in scenarios if s in cells]
-    present = engines_present(cells)
-    if not names or not present:
-        return None
-    fig, ax = plt.subplots(figsize=(max(8.0, 1.6 * len(names)), 4.2))
-    bar_width = 0.8 / max(1, len(present))
-    for index, engine in enumerate(present):
+    """Median peak thread count per engine across cells."""
+    series = {}
+    for engine in ENGINE_ORDER:
         values = []
-        for scenario in names:
+        for scenario in scenarios:
+            if scenario not in cells:
+                continue
             samples = run_values(cells[scenario], engine, "threads_peak")
-            values.append(benchstats.median(samples) if samples else float("nan"))
-        xs = [p + (index - (len(present) - 1) / 2) * bar_width for p in range(len(names))]
-        ax.bar(xs, values, width=bar_width, label=engine,
-               color=PALETTE.get(engine, MISSING), edgecolor="black", linewidth=0.5)
-        for x, value in zip(xs, values):
-            if value == value:
-                ax.text(x, value, f"{value:.0f}", ha="center", va="bottom", fontsize=7)
-    ax.set_xticks(list(range(len(names))))
-    ax.set_xticklabels(names, rotation=18, ha="right", fontsize=8)
-    ax.set_ylabel("peak threads", fontsize=9)
-    ax.set_title("peak thread count by scenario (lower is better)", fontsize=11)
-    ax.legend(fontsize=8, ncol=len(present))
-    ax.grid(axis="y", linestyle=":", alpha=0.6)
-    fig.text(0.5, 0.01, foot, ha="center", fontsize=7, color="#666666")
-    fig.tight_layout(rect=(0, 0.06, 1, 1))
-    fig.savefig(path, dpi=110, bbox_inches="tight")
-    plt.close(fig)
-    return path
-
+            if samples:
+                values.append(benchstats.median(samples))
+        if values:
+            series[engine] = values
+    return summary_bars(
+        series, "peak threads", "peak thread count (median over cells, lower is better)",
+        path, foot,
+    )
 
 def startup_chart(scenarios, cells, path, foot):
-    """Cold start to first listen per scenario, seconds."""
-    names = [s for s in scenarios if s in cells]
-    present = engines_present(cells)
-    if not names or not present:
-        return None
-    fig, ax = plt.subplots(figsize=(max(8.0, 1.6 * len(names)), 4.2))
-    bar_width = 0.8 / max(1, len(present))
-    for index, engine in enumerate(present):
+    """Median cold start per engine across cells."""
+    series = {}
+    for engine in ENGINE_ORDER:
         values = []
-        for scenario in names:
+        for scenario in scenarios:
+            if scenario not in cells:
+                continue
             samples = run_values(cells[scenario], engine, "startup_seconds")
-            values.append(benchstats.median(samples) if samples else float("nan"))
-        xs = [p + (index - (len(present) - 1) / 2) * bar_width for p in range(len(names))]
-        ax.bar(xs, values, width=bar_width, label=engine,
-               color=PALETTE.get(engine, MISSING), edgecolor="black", linewidth=0.5)
-        for x, value in zip(xs, values):
-            if value == value:
-                ax.text(x, value, f"{value:.2f}s", ha="center", va="bottom", fontsize=7)
-    ax.set_xticks(list(range(len(names))))
-    ax.set_xticklabels(names, rotation=18, ha="right", fontsize=8)
-    ax.set_ylabel("seconds", fontsize=9)
-    ax.set_title("cold start to first listen (lower is better)", fontsize=11)
-    ax.legend(fontsize=8, ncol=len(present))
-    ax.grid(axis="y", linestyle=":", alpha=0.6)
-    fig.text(0.5, 0.01, foot, ha="center", fontsize=7, color="#666666")
-    fig.tight_layout(rect=(0, 0.06, 1, 1))
-    fig.savefig(path, dpi=110, bbox_inches="tight")
-    plt.close(fig)
-    return path
-
+            if samples:
+                values.append(benchstats.median(samples))
+        if values:
+            series[engine] = values
+    return summary_bars(
+        series, "seconds", "cold start to first listen (median over cells, lower is better)",
+        path, foot, suffix=" s",
+    )
 
 def assemble(cells_dir, meta):
     """matrix-results.json: cells plus medians, verdicts, manifest."""
@@ -880,7 +808,7 @@ def matrix_markdown(results, image_prefix):
         "",
         f"![cold start]({image_prefix}/startup.png)",
         "",
-        f"![share of ceiling]({image_prefix}/ceiling.png)",
+        f"![cells at harness ceiling]({image_prefix}/ceiling.png)",
         "",
         f"![setup latency]({image_prefix}/setup-latency.png)",
         "",
@@ -997,12 +925,12 @@ def main(argv=None):
     made += [
         metric_chart(
             bulk, cells, "cpu_millis_per_gib", "cpu", "ms/GiB",
-            "CPU per GiB by scenario (lower is better)",
+            "CPU per GiB (median over cells, lower is better)",
             str(charts_dir / "cpu-per-gib.png"), foot,
         ),
         metric_chart(
             bulk, cells, "rss_mib", "rss", "MiB",
-            "peak RSS by scenario (lower is better)",
+            "peak RSS (median over cells, lower is better)",
             str(charts_dir / "memory-rss.png"), foot,
         ),
         threads_chart(bulk, cells, str(charts_dir / "threads.png"), foot),
