@@ -1857,11 +1857,12 @@ mod tests {
             .stream
             .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("timeout");
-        let (kind, _, _, _) = client.next_frame(id, |kind| matches!(kind, T_RST | T_HEADERS));
+        assert_eq!(client.response_head(id), 200, "the request is accepted");
+        let (kind, flags, _, _) = client.next_frame(id, |kind| matches!(kind, T_DATA | T_RST));
         crate::budgets::clear();
-        assert_eq!(
-            kind, T_RST,
-            "a body that never arrives must end the stream at the stall"
+        assert!(
+            kind == T_DATA && flags & F_END != 0,
+            "a body that never arrives must end the stream at the stall, got kind {kind} flags {flags}"
         );
         drop(client);
         server.join().expect("joins");
