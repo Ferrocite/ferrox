@@ -5,9 +5,11 @@ A terminal gets the four-way prompt and the answer is the carrier the lane is
 started with; a pipe is never prompted and takes auto. `status` reads the
 carrier, the allowance and the uptime back from the lane it was given: a fake
 pid and a synthetic log stand in for a live account, and the front refuses the
-trace immediately because nothing listens on its port. `locations --ping` is
-given a fake catalogue: the rows must order by latency, keep a silent edge as
-`no answer`, pin REC, and leave the readings out of the offline copy. The split
+trace immediately because nothing listens on its port. A missing allowance is
+reported rather than skipped, and which of the two reasons it is comes from what
+the log does hold. `locations --ping` is given a fake catalogue: the rows must
+order by latency, keep a silent edge as `no answer`, pin REC, and leave the
+readings out of the offline copy. The split
 lists must reach the lane normalized, and a port outside 1-65535 must be refused
 before the lane config is written. A lane that binds its front but carries no
 flow must be stopped by `up` itself, with its pid file, config and proxy marker
@@ -171,44 +173,81 @@ def check_picker(state: pathlib.Path) -> int:
 
 def check_status(state: pathlib.Path) -> int:
     lane = subprocess.Popen(["sleep", "30"])
-    try:
-        (state / "lane.pid").write_text(f"{lane.pid}\n", encoding="utf-8")
-        (state / "lane.log").write_text(
+    foxy = {"protocol": "foxy", "settings": {"email": "lane@example.com"}}
+    vless = {"protocol": "vless", "settings": {"vnext": []}}
+    cases = [
+        (
+            "status prints uptime, carrier and the last allowance",
+            foxy,
             "foxy: allowance 8.0 GiB of 10.0 GiB, resets in 3h 5m\n"
             "foxy: carrier h2\n"
             "foxy: allowance 4.0 GiB of 10.0 GiB, resets in 2h 5m\n",
-            encoding="utf-8",
-        )
-        run = subprocess.run(
-            [
-                str(CLI),
-                "status",
-                "--fronts",
-                "socks",
-                "--socks",
-                str(free_port()),
-            ],
-            capture_output=True,
-            text=True,
-            timeout=WATCH,
-            env=env_for(state),
-        )
+            ("up for 00:", "carrier: h2", "quota left: 4.0 GiB of 10.0 GiB"),
+            (),
+        ),
+        (
+            "a plane that named no allowance is reported as silence",
+            foxy,
+            "foxy: carrier h2\n",
+            ("quota: the plane named no allowance",),
+            ("quota left:",),
+        ),
+        (
+            "a lane that named nothing at all says to restart it",
+            foxy,
+            "",
+            ("quota: this lane's binary names neither the carrier nor the allowance",),
+            ("quota left:",),
+        ),
+        (
+            "a lane with no allowance to report stays quiet",
+            vless,
+            "",
+            (),
+            ("quota",),
+        ),
+    ]
+    try:
+        (state / "lane.pid").write_text(f"{lane.pid}\n", encoding="utf-8")
+        for label, outbound, log, wants, absent in cases:
+            (state / "lane.log").write_text(log, encoding="utf-8")
+            (state / "lane.json").write_text(
+                json.dumps({"outbounds": [outbound]}), encoding="utf-8"
+            )
+            run = subprocess.run(
+                [
+                    str(CLI),
+                    "status",
+                    "--fronts",
+                    "socks",
+                    "--socks",
+                    str(free_port()),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=WATCH,
+                env=env_for(state),
+            )
+            output = run.stdout + run.stderr
+            for want in wants:
+                if want not in output:
+                    print(
+                        f"check-cli-lane: status does not print {want!r}:\n{output}",
+                        file=sys.stderr,
+                    )
+                    return 1
+            for word in absent:
+                if word in output:
+                    print(
+                        f"check-cli-lane: status printed {word!r} where it should "
+                        f"have said nothing:\n{output}",
+                        file=sys.stderr,
+                    )
+                    return 1
+            print(f"check-cli-lane: {label}")
     finally:
         lane.terminate()
         lane.wait(timeout=WATCH)
-    output = run.stdout + run.stderr
-    for want in (
-        "up for 00:",
-        "carrier: h2",
-        "quota left: 4.0 GiB of 10.0 GiB, resets in 2h 5m",
-    ):
-        if want not in output:
-            print(
-                f"check-cli-lane: status does not print {want!r}:\n{output}",
-                file=sys.stderr,
-            )
-            return 1
-    print("check-cli-lane: status prints uptime, carrier and the last allowance")
     return 0
 
 
