@@ -205,11 +205,10 @@ fn the_allowance_charges_the_payload_the_tunnel_carried() {
         account.verify_code(&code).expect("verifies");
     }
     account.renew().expect("mints a pass");
-    let before = account
-        .current()
+    let mut pass = account.current();
+    let mut minted = pass
         .quota_remaining
         .expect("the plane names an allowance; without one there is nothing to charge");
-    let pass = account.current();
 
     let edges = crate::foxy_catalog::edges(crate::quic::system_roots());
     let picked = ferrox_core::foxy::catalog::tier(&edges, &country, "", 3);
@@ -217,9 +216,10 @@ fn the_allowance_charges_the_payload_the_tunnel_carried() {
         .first()
         .unwrap_or_else(|| panic!("the catalogue publishes no edge for {country}"));
 
-    let mut measured = None;
     let total = Instant::now() + PAYLOAD_TOTAL;
+    let mut measured = 0usize;
     'carrier: for carrier in crate::foxy::carrier("auto").order() {
+        let mut answer = None;
         for (host, path) in PAYLOAD_HOSTS {
             if Instant::now() >= total {
                 break 'carrier;
@@ -228,33 +228,41 @@ fn the_allowance_charges_the_payload_the_tunnel_carried() {
             match carried(carrier, edge, &pass, host, path, PAYLOAD_READ, until) {
                 Ok(bytes) if bytes >= PAYLOAD_FLOOR => {
                     println!("{carrier:?} carried {bytes} bytes from {host}{path}");
-                    measured = Some((carrier, host, bytes));
-                    break 'carrier;
+                    answer = Some((host, bytes));
+                    break;
                 }
                 Ok(bytes) => println!("{carrier:?} {host}{path}: {bytes} bytes is not a payload"),
                 Err(why) => println!("{carrier:?} {host}{path}: {why}"),
             }
         }
+        let Some((host, bytes)) = answer else {
+            continue;
+        };
+        std::thread::sleep(SETTLE);
+        account.renew().expect("mints a pass after the transfer");
+        pass = account.current();
+        let after = pass
+            .quota_remaining
+            .expect("the plane names an allowance on every mint");
+        let charged = minted.saturating_sub(after);
+        println!(
+            "allowance {minted} -> {after}: {charged} bytes charged for {bytes} bytes carried \
+             through {carrier:?} from {host} ({:.3}x)",
+            charged as f64 / bytes as f64
+        );
+        // Framing and a retransmission are a tunnel's cost; a quarter of the payload more is the same bytes paid twice.
+        assert!(
+            charged <= bytes as u64 + bytes as u64 / 4 + (256 << 10),
+            "the allowance fell {charged} bytes for {bytes} carried through {carrier:?}: those bytes were paid for twice"
+        );
+        minted = after;
+        measured += 1;
+        // Two carriers are the answer: the transport's own retransmissions, and the lane's first choice.
+        if measured == 2 {
+            break;
+        }
     }
-    let (carrier, host, bytes) = measured.expect("no carrier carried a payload to measure");
-
-    std::thread::sleep(SETTLE);
-    account.renew().expect("mints a pass after the transfer");
-    let after = account
-        .current()
-        .quota_remaining
-        .expect("the plane names an allowance on every mint");
-    let charged = before.saturating_sub(after);
-    println!(
-        "allowance {before} -> {after}: {charged} bytes charged for {bytes} bytes carried through \
-         {carrier:?} from {host} ({:.3}x)",
-        charged as f64 / bytes as f64
-    );
-    // Framing and a retransmission are a tunnel's cost; a quarter of the payload more is the same bytes paid twice.
-    assert!(
-        charged <= bytes as u64 + bytes as u64 / 4 + (256 << 10),
-        "the allowance fell {charged} bytes for {bytes} carried: more than framing, so those bytes were paid for twice"
-    );
+    assert!(measured > 0, "no carrier carried a payload to measure");
 }
 
 /// Every carrier in `auto`'s order on one pinned-country edge; all refused is a failure, not a green exit.

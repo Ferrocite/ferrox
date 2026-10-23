@@ -13,10 +13,10 @@ name: Foxy lane (live account check)
 # fails for their absence.
 #
 # Weekly plus on demand: the quota on a personal account is finite and one run
-# spends a few megabytes on the payload measurement, so the schedule is weekly
-# rather than per-push. The unit gates are not repeated here: `ci.yml` owns them,
-# and a flaky QUIC loopback test in another job must not be able to swallow a
-# live measurement.
+# spends at most tens of megabytes on the payload measurement, so the schedule
+# is weekly rather than per-push. The unit gates are not repeated here: `ci.yml`
+# owns them, and a flaky QUIC loopback test in another job must not be able to
+# swallow a live measurement.
 on:
   schedule:
     - cron: "23 4 * * 1"
