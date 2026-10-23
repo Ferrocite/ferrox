@@ -703,56 +703,6 @@ mod tests {
         }
     }
 
-    /// A writer thread that is not the leader has to land in the tally, and land in it once: the
-    /// upper bound is what a walk over `/proc/<pid>/task/` cannot reach and a shared-per-thread
-    /// reading of it would blow straight through.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_tally_counts_the_thread_that_made_the_writes() {
-        const WRITTEN: u64 = 16 << 20;
-        let pid = std::process::id();
-        let before = proc_io(pid).expect("a linux process has per-thread io counters");
-        let path = std::env::temp_dir().join(format!("ferrox-io-tally-{pid}"));
-        let file_path = path.clone();
-        let (done, wait_done) = std::sync::mpsc::channel::<()>();
-        let (release, wait_release) = std::sync::mpsc::channel::<()>();
-        let writer = std::thread::spawn(move || {
-            use std::io::Write;
-            let mut file = std::fs::File::create(&file_path).expect("a temp file to write into");
-            let zeroes = vec![0u8; 1 << 16];
-            let mut left = WRITTEN as usize;
-            while left > 0 {
-                let take = left.min(zeroes.len());
-                file.write_all(&zeroes[..take])
-                    .expect("a write reaches the kernel");
-                left -= take;
-            }
-            drop(file);
-            done.send(()).expect("the tally is taken while parked");
-            wait_release
-                .recv()
-                .expect("the parked writer thread is released");
-        });
-        wait_done
-            .recv()
-            .expect("the writer thread finishes its bytes");
-        let after = proc_io(pid).expect("the tally is still readable");
-        let delta = after.since(&before).expect("a counter only rises");
-        assert!(
-            delta.write_bytes >= WRITTEN,
-            "{WRITTEN} B written by a worker thread, the tally saw {} B",
-            delta.write_bytes
-        );
-        assert!(
-            delta.write_bytes < WRITTEN * 2,
-            "{WRITTEN} B written once, the tally reports {} B",
-            delta.write_bytes
-        );
-        release.send(()).expect("the writer thread is parked");
-        writer.join().expect("the writer thread ends");
-        let _ = std::fs::remove_file(&path);
-    }
-
     /// The engine is a *child* process, so the tally has to cross that boundary and land each byte
     /// once: a walk that reads `/proc/self` fine and a descendant's tasks not at all would bless the
     /// probe and then report a relay's run as zero, while a per-task file that already held the thread
@@ -1042,7 +992,7 @@ mod tests {
     /// The collapse the window exists for, measured on a thread this test really joined: exiting
     /// takes the counters out of the tally, so the last sample's delta reports the run as the idle
     /// leader's own bytes. That a live thread's writes reach the tally at all is
-    /// `a_tally_counts_the_thread_that_made_the_writes`; this is the half it cannot see.
+    /// `a_tally_counts_a_child_process_s_worker_thread`; this is the half it cannot see.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_joined_writer_thread_leaves_its_bytes_for_the_window_to_keep() {
