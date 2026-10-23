@@ -86,10 +86,14 @@ fn take_window(shared: &Shared, need: u64, wait: bool) -> bool {
             if shared.dead.load(Ordering::SeqCst) {
                 return false;
             }
-            send = shared
+            let (guard, waited) = shared
                 .wake
-                .wait(send)
+                .wait_timeout(send, crate::budgets::relay_stall())
                 .unwrap_or_else(PoisonError::into_inner);
+            send = guard;
+            if waited.timed_out() {
+                return false;
+            }
         }
     } else if send.conn < need || send.stream < need {
         return false;
@@ -1100,6 +1104,7 @@ mod tests {
     use super::*;
     use std::io::Write;
     use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn huffman_matches_the_rfc_example() {
@@ -1508,6 +1513,28 @@ mod tests {
         );
         assert_eq!(payload.as_ptr() as usize, base, "the caller's buffer moved");
         assert_eq!(payload.capacity(), capacity, "the caller's buffer grew");
+    }
+
+    /// A writer the peer never credits gives up at the relay stall, so a relay leg cannot park its thread on a window that never arrives.
+    #[test]
+    fn a_writer_with_no_credit_gives_up_at_the_stall() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_millis(500)),
+            ..Default::default()
+        });
+        let writer = writer_over(Recorder(Arc::new(Mutex::new(Peer::default()))), HUNK, 0);
+        let shared = Arc::clone(&writer.shared);
+        let (sent, got) = std::sync::mpsc::channel();
+        let running = thread::spawn(move || {
+            let _ = sent.send(writer.send(b"ping"));
+        });
+        let verdict = got.recv_timeout(Duration::from_secs(3));
+        shared.dead.store(true, Ordering::SeqCst);
+        shared.wake.notify_all();
+        running.join().expect("writer thread");
+        crate::budgets::clear();
+        assert_eq!(verdict, Ok(false), "a writer with no credit returned");
     }
 
     /// The witnesses for `carrier-grpc writes-per-relay-read 1`, `carrier-grpc segments-per-socket-write 16` and `carrier-grpc payload-runs-per-socket-write 8`: a relay read of four full `HUNK`s is eight DATA frames and leaves as one write of sixteen segments whose bytes are those frames in order, with eight of them still runs of the caller's own buffer — a gather holds heads and envelopes apart, it does not stage a byte of payload.
