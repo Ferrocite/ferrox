@@ -1214,6 +1214,8 @@ verify_flow() {
 action_up() {
   choose_carrier
   start_lane
+  # An attempt cut short is not a lane: Ctrl-C before it proves a flow removes what it started.
+  trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
   if [ "$OUTBOUND" != config ] && ! wait_fronts; then
     say "the lane did not open its fronts; last lines of $LOG:"
     tail -n 20 "$LOG" 2>/dev/null || true
@@ -1247,6 +1249,8 @@ action_up() {
 action_serve() {
   choose_carrier
   start_lane
+  # A serve that never proved a flow is an attempt too: the same interruption cleanup applies.
+  trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
   if [ "$OUTBOUND" != config ] && ! wait_fronts; then
     say "the lane did not open its fronts; last lines of $LOG:"
     tail -n 20 "$LOG" 2>/dev/null || true
