@@ -1034,6 +1034,7 @@ fn map_error(e: &rustls::Error) -> TlsError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tls::shaped::keys;
     use crate::tls::shaped::record;
     use std::net::{TcpListener, TcpStream};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1391,18 +1392,22 @@ mod tests {
         server.join().expect("joins");
     }
 
-    /// extended-master-secret transcript is hashed by an independent side: it appends the
-    /// `ClientKeyExchange` before it hashes, and refuses a `Finished` that did not.
+    /// A TLS 1.2 listener of our own, keyed to the suite its constructor names rather than only the
+    /// AEAD rows rustls serves. It hashes the extended master secret only when the hello offered it,
+    /// appends the `ClientKeyExchange` before hashing that transcript, and refuses a `Finished`
+    /// that did not.
     struct Tls12Server {
+        suite: u16,
+        group: u16,
         rng: ring::rand::SystemRandom,
         signing: ring::signature::EcdsaKeyPair,
-        ephemeral: Option<ring::agreement::EphemeralPrivateKey>,
-        server_public: Vec<u8>,
+        ephemeral: Option<keys::Share>,
         server_random: [u8; 32],
         client_random: [u8; 32],
         session_id: Vec<u8>,
         transcript: Vec<u8>,
         master: Vec<u8>,
+        ems: bool,
         read_dir: Option<record::Direction>,
         write_dir: Option<record::Direction>,
         pending: Vec<u8>,
@@ -1410,7 +1415,7 @@ mod tests {
     }
 
     impl Tls12Server {
-        fn new() -> Self {
+        fn new(suite: u16, group: u16) -> Self {
             let rng = ring::rand::SystemRandom::new();
             let signing = ring::signature::EcdsaKeyPair::from_pkcs8(
                 &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
@@ -1418,24 +1423,19 @@ mod tests {
                 &rng,
             )
             .expect("signing key");
-            let ephemeral =
-                ring::agreement::EphemeralPrivateKey::generate(&ring::agreement::X25519, &rng)
-                    .expect("ephemeral key");
-            let server_public = ephemeral
-                .compute_public_key()
-                .expect("public key")
-                .as_ref()
-                .to_vec();
+            let mut ephemeral = keys::generate(&[group], false).expect("an ephemeral key");
             Self {
+                suite,
+                group,
                 rng,
                 signing,
-                ephemeral: Some(ephemeral),
-                server_public,
+                ephemeral: Some(ephemeral.pop().expect("one group")),
                 server_random: [0x42; 32],
                 client_random: [0u8; 32],
                 session_id: Vec::new(),
                 transcript: Vec::new(),
                 master: Vec::new(),
+                ems: false,
                 read_dir: None,
                 write_dir: None,
                 pending: Vec::new(),
@@ -1510,8 +1510,11 @@ mod tests {
             self.session_id = c.vec8().to_vec();
             let suites = c.vec16();
             assert!(
-                suites.as_chunks::<2>().0.contains(&[0xc0, 0x2b]),
-                "the hello offers the ECDHE-ECDSA-GCM suite"
+                suites
+                    .as_chunks::<2>()
+                    .0
+                    .contains(&self.suite.to_be_bytes()),
+                "the hello offers the suite the server names"
             );
             c.vec8();
             let mut ems = false;
@@ -1532,8 +1535,8 @@ mod tests {
                     _ => {}
                 }
             }
-            assert!(ems, "the hello offers extended master secret");
             assert!(alpn, "the hello offers http/1.1");
+            self.ems = ems;
             self.transcript.extend_from_slice(msg);
 
             let mut hello = Vec::new();
@@ -1541,10 +1544,12 @@ mod tests {
             hello.extend_from_slice(&self.server_random);
             hello.push(self.session_id.len() as u8);
             hello.extend_from_slice(&self.session_id);
-            hello.extend_from_slice(&[0xc0, 0x2b]);
+            hello.extend_from_slice(&self.suite.to_be_bytes());
             hello.push(0);
             let mut ext = Vec::new();
-            ext.extend_from_slice(&[0x00, 0x17, 0x00, 0x00]);
+            if self.ems {
+                ext.extend_from_slice(&[0x00, 0x17, 0x00, 0x00]);
+            }
             ext.extend_from_slice(&[0x00, 0x10, 0x00, 0x0b, 0x00, 0x09, 0x08]);
             ext.extend_from_slice(b"http/1.1");
             hello.extend_from_slice(&(ext.len() as u16).to_be_bytes());
@@ -1559,8 +1564,14 @@ mod tests {
             chain.extend_from_slice(&cert);
             let chain = hs_message(11, &chain);
 
-            let mut params = vec![3, 0x00, 0x1d, 32];
-            params.extend_from_slice(&self.server_public);
+            let params = {
+                let share = self.ephemeral.as_ref().expect("one key exchange");
+                let mut params = vec![3];
+                params.extend_from_slice(&self.group.to_be_bytes());
+                params.push(share.data.len() as u8);
+                params.extend_from_slice(&share.data);
+                params
+            };
             let mut signed = Vec::with_capacity(64 + params.len());
             signed.extend_from_slice(&self.client_random);
             signed.extend_from_slice(&self.server_random);
@@ -1583,24 +1594,18 @@ mod tests {
 
         fn client_key_exchange(&mut self, msg: &[u8]) {
             let mut c = Cursor::new(&msg[4..]);
-            assert_eq!(c.u8(), 32, "one X25519 share");
-            let peer = c.take(32).to_vec();
+            let peer = c.vec8().to_vec();
             self.transcript.extend_from_slice(msg);
             let private = self.ephemeral.take().expect("one key exchange");
-            let shared = ring::agreement::agree_ephemeral(
-                private,
-                &ring::agreement::UnparsedPublicKey::new(&ring::agreement::X25519, peer),
-                <[u8]>::to_vec,
-            )
-            .expect("agrees");
-            let suite = record::Suite::from_id(0xc02b).expect("suite");
-            let session_hash = suite.hash().hash(&self.transcript);
+            let shared = private.agree(&peer).expect("agrees");
+            let suite = record::Suite::from_id(self.suite).expect("suite");
+            let session_hash = self.ems.then(|| suite.hash().hash(&self.transcript));
             let (master, directions) = crate::tls::shaped::tls12::keys(
                 suite,
                 &shared,
                 &self.client_random,
                 &self.server_random,
-                Some(&session_hash),
+                session_hash.as_deref(),
             );
             self.read_dir = Some(directions.client);
             self.write_dir = Some(directions.server);
@@ -1608,7 +1613,7 @@ mod tests {
         }
 
         fn client_finished(&mut self, msg: &[u8]) {
-            let suite = record::Suite::from_id(0xc02b).expect("suite");
+            let suite = record::Suite::from_id(self.suite).expect("suite");
             let expected = crate::tls::shaped::tls12::finished(
                 suite,
                 &self.master,
@@ -1717,21 +1722,37 @@ mod tests {
         }
     }
 
+    /// One shaped dial per TLS 1.2 record shape — an AEAD, a CBC block, an RC4 stream — each relayed
+    /// one frame both ways. The RC4 preset carries no `key_share`, so its point is drawn at the
+    /// curve the `ServerKeyExchange` names, from that hello's `supported_groups`.
     #[cfg_attr(miri, ignore = "assembles real handshake bytes through ring")]
     #[test]
-    fn a_shaped_tls12_handshake_hashes_its_client_key_exchange() {
-        let mut cfg = client("tls.test", &[]);
-        cfg.fingerprint = Some(crate::tls::Fingerprint::default());
-        let mut session =
-            crate::tls::shaped::Session::connect(&cfg, Tls12Server::new()).expect("builds");
-        session.handshake().expect("handshakes");
-        assert_eq!(session.alpn(), Some(b"http/1.1".as_slice()));
-        assert_eq!(session.peer_leaf(), Some(ANCHOR));
-        session.write_all(b"ping").expect("writes");
-        session.flush().expect("flushes");
-        let mut buf = [0u8; 4];
-        session.read_exact(&mut buf).expect("reads");
-        assert_eq!(&buf, b"ping");
+    fn a_shaped_dial_finishes_every_tls12_record_shape() {
+        let shapes = [
+            ("chrome", 0xc02bu16, keys::X25519),
+            ("helloios_13", 0xc009, keys::X25519),
+            ("360", 0xc007, keys::P256),
+        ];
+        for (preset, suite, group) in shapes {
+            let mut cfg = client("tls.test", &[]);
+            cfg.fingerprint =
+                Some(crate::tls::Fingerprint::resolve(preset).expect("a preset name"));
+            let mut session =
+                crate::tls::shaped::Session::connect(&cfg, Tls12Server::new(suite, group))
+                    .unwrap_or_else(|e| panic!("{preset} at {suite:#06x}: {e}"));
+            session
+                .handshake()
+                .unwrap_or_else(|e| panic!("{preset} at {suite:#06x} did not finish: {e}"));
+            assert_eq!(session.alpn(), Some(b"http/1.1".as_slice()));
+            assert_eq!(session.peer_leaf(), Some(ANCHOR));
+            session.write_all(b"ping").expect("writes");
+            session.flush().expect("flushes");
+            let mut buf = [0u8; 4];
+            session
+                .read_exact(&mut buf)
+                .unwrap_or_else(|e| panic!("{preset} at {suite:#06x} could not open a frame: {e}"));
+            assert_eq!(&buf, b"ping", "one frame each way behind {suite:#06x}");
+        }
     }
 
     #[cfg_attr(

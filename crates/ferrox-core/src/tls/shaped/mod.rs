@@ -2,7 +2,7 @@
 mod client;
 pub(crate) mod hello;
 mod kdf;
-mod keys;
+pub(crate) mod keys;
 #[cfg(test)]
 mod oracle;
 mod profiles;
