@@ -1,4 +1,5 @@
 use aes_gcm::aead::{Aead as _, Payload};
+use hkdf::{Hkdf, HkdfExtract};
 use rustls::crypto::hpke::{
     EncapsulatedSecret, Hpke, HpkeOpener, HpkePublicKey, HpkeSealer, HpkeSuite,
 };
@@ -106,54 +107,51 @@ fn general(why: &str) -> rustls::Error {
     rustls::Error::General(why.to_owned())
 }
 
-fn suite_id(kem: u16, kdf: u16, aead: u16) -> Vec<u8> {
-    let mut out = Vec::with_capacity(10);
-    out.extend_from_slice(b"HPKE");
-    out.extend_from_slice(&kem.to_be_bytes());
-    out.extend_from_slice(&kdf.to_be_bytes());
-    out.extend_from_slice(&aead.to_be_bytes());
-    out
+fn suite_id(kem: u16, kdf: u16, aead: u16) -> [u8; 10] {
+    [
+        b'H',
+        b'P',
+        b'K',
+        b'E',
+        (kem >> 8) as u8,
+        kem as u8,
+        (kdf >> 8) as u8,
+        kdf as u8,
+        (aead >> 8) as u8,
+        aead as u8,
+    ]
 }
 
-fn kem_suite_id() -> Vec<u8> {
-    let mut out = Vec::with_capacity(5);
-    out.extend_from_slice(b"KEM");
-    out.extend_from_slice(&KEM_ID.to_be_bytes());
-    out
+fn kem_suite_id() -> [u8; 5] {
+    [b'K', b'E', b'M', (KEM_ID >> 8) as u8, KEM_ID as u8]
 }
 
+/// The RFC 9180 labels are fed to the HMAC piece by piece, so the extract pays no concatenation.
 fn labeled_extract(salt: &[u8], label: &[u8], ikm: &[u8], suite: &[u8]) -> [u8; 32] {
-    let mut input = Vec::with_capacity(7 + suite.len() + label.len() + ikm.len());
-    input.extend_from_slice(b"HPKE-v1");
-    input.extend_from_slice(suite);
-    input.extend_from_slice(label);
-    input.extend_from_slice(ikm);
-    let salt = (!salt.is_empty()).then_some(salt);
-    let (prk, _) = hkdf::Hkdf::<Sha256>::extract(salt, &input);
+    let mut extract = HkdfExtract::<Sha256>::new((!salt.is_empty()).then_some(salt));
+    extract.input_ikm(b"HPKE-v1");
+    extract.input_ikm(suite);
+    extract.input_ikm(label);
+    extract.input_ikm(ikm);
+    let (prk, _) = extract.finalize();
     let mut out = [0u8; 32];
     out.copy_from_slice(&prk);
     out
 }
 
-fn labeled_expand(prk: &[u8; 32], label: &[u8], info: &[u8], len: usize, suite: &[u8]) -> Vec<u8> {
-    let mut labeled = Vec::with_capacity(2 + 7 + suite.len() + label.len() + info.len());
-    labeled.extend_from_slice(&(len as u16).to_be_bytes());
-    labeled.extend_from_slice(b"HPKE-v1");
-    labeled.extend_from_slice(suite);
-    labeled.extend_from_slice(label);
-    labeled.extend_from_slice(info);
-    let hk = hkdf::Hkdf::<Sha256>::from_prk(prk).expect("a 32-byte prk");
-    let mut out = vec![0u8; len];
-    hk.expand(&labeled, &mut out).expect("an expand that fits");
-    out
+/// The same components in the same order, expanded without building the concatenation.
+fn labeled_expand(prk: &[u8; 32], label: &[u8], info: &[u8], out: &mut [u8], suite: &[u8]) {
+    let hk = Hkdf::<Sha256>::from_prk(prk).expect("a 32-byte prk");
+    let len = (out.len() as u16).to_be_bytes();
+    hk.expand_multi_info(&[&len[..], b"HPKE-v1", suite, label, info], out)
+        .expect("an expand that fits");
 }
 
 fn extract_and_expand(dh: &[u8], kem_context: &[u8]) -> [u8; 32] {
     let suite = kem_suite_id();
     let eae_prk = labeled_extract(&[], b"eae_prk", dh, &suite);
-    let out = labeled_expand(&eae_prk, b"shared_secret", kem_context, SECRET_LEN, &suite);
-    let mut secret = [0u8; 32];
-    secret.copy_from_slice(&out);
+    let mut secret = [0u8; SECRET_LEN];
+    labeled_expand(&eae_prk, b"shared_secret", kem_context, &mut secret, &suite);
     secret
 }
 
@@ -166,7 +164,8 @@ fn dh(sk: &[u8; 32], pk: &[u8; 32]) -> [u8; 32] {
 #[derive(Debug)]
 struct Context {
     aead: Aead,
-    key: Vec<u8>,
+    /// The suite's key in a fixed slot: both lengths fit, and the derived bytes land here without a buffer.
+    key: [u8; 32],
     base_nonce: [u8; 12],
 }
 
@@ -175,38 +174,47 @@ impl Context {
         let suite = suite_id(KEM_ID, KDF_ID, aead.id());
         let psk_id_hash = labeled_extract(&[], b"psk_id_hash", &[], &suite);
         let info_hash = labeled_extract(&[], b"info_hash", info, &suite);
-        let mut context = Vec::with_capacity(1 + 64);
-        context.push(0);
-        context.extend_from_slice(&psk_id_hash);
-        context.extend_from_slice(&info_hash);
+        let mut context = [0u8; 1 + 64];
+        context[1..33].copy_from_slice(&psk_id_hash);
+        context[33..].copy_from_slice(&info_hash);
         let secret = labeled_extract(shared_secret, b"secret", &[], &suite);
-        let key = labeled_expand(&secret, b"key", &context, aead.key_len(), &suite);
-        let base_nonce = labeled_expand(&secret, b"base_nonce", &context, 12, &suite);
-        let mut nonce = [0u8; 12];
-        nonce.copy_from_slice(&base_nonce);
+        let mut key = [0u8; 32];
+        labeled_expand(
+            &secret,
+            b"key",
+            &context,
+            &mut key[..aead.key_len()],
+            &suite,
+        );
+        let mut base_nonce = [0u8; 12];
+        labeled_expand(&secret, b"base_nonce", &context, &mut base_nonce, &suite);
         Self {
             aead,
             key,
-            base_nonce: nonce,
+            base_nonce,
         }
     }
 
     fn nonce(&self, sequence: u64) -> [u8; 12] {
         let mut nonce = self.base_nonce;
-        for (slot, byte) in nonce[4..].iter_mut().zip(sequence.to_be_bytes()) {
-            *slot ^= byte;
-        }
+        let mut tail = [0u8; 8];
+        tail.copy_from_slice(&nonce[4..]);
+        nonce[4..].copy_from_slice(&(u64::from_be_bytes(tail) ^ sequence).to_be_bytes());
         nonce
+    }
+
+    fn key(&self) -> &[u8] {
+        &self.key[..self.aead.key_len()]
     }
 
     fn seal(&self, aad: &[u8], plaintext: &[u8], sequence: u64) -> Result<Vec<u8>, rustls::Error> {
         self.aead
-            .seal(&self.key, &self.nonce(sequence), aad, plaintext)
+            .seal(self.key(), &self.nonce(sequence), aad, plaintext)
     }
 
     fn open(&self, aad: &[u8], ciphertext: &[u8], sequence: u64) -> Result<Vec<u8>, rustls::Error> {
         self.aead
-            .open(&self.key, &self.nonce(sequence), aad, ciphertext)
+            .open(self.key(), &self.nonce(sequence), aad, ciphertext)
     }
 }
 
@@ -402,7 +410,10 @@ mod tests {
         assert_eq!(decapsulate(&pk_e, &sk_r).unwrap(), shared);
 
         let context = Context::new(&shared, &info, Aead::Aes128Gcm);
-        assert_eq!(context.key, hex("4531685d41d65f03dc48f6b8302c05b0"));
+        assert_eq!(
+            context.key(),
+            hex("4531685d41d65f03dc48f6b8302c05b0").as_slice()
+        );
         assert_eq!(
             context.base_nonce.as_slice(),
             hex("56d890e5accaaf011cff4b7d")
@@ -442,8 +453,8 @@ mod tests {
 
         let context = Context::new(&shared, &info, Aead::ChaCha20Poly1305);
         assert_eq!(
-            context.key,
-            hex("ad2744de8e17f4ebba575b3f5f5a8fa1f69c2a07f6e7500bc60ca6e3e3ec1c91")
+            context.key(),
+            hex("ad2744de8e17f4ebba575b3f5f5a8fa1f69c2a07f6e7500bc60ca6e3e3ec1c91").as_slice()
         );
         assert_eq!(
             context.base_nonce.as_slice(),
@@ -454,6 +465,21 @@ mod tests {
             context.seal(b"Count-0", &plaintext, 0).unwrap(),
             hex("1c5250d8034ec2b784ba2cfd69dbdb8af406cfe3ff938e131f0def8c8b60b4db21993c62ce81883d2dd1b51a28")
         );
+    }
+
+    /// The key schedule lands in fixed slots, so a dial's HPKE context touches the allocator not at all.
+    #[test]
+    fn a_context_costs_no_allocations() {
+        let secret = [7u8; 32];
+        let (context, counts) = crate::alloc_count::measure(|| {
+            Context::new(&secret, b"tls ech\0config", Aead::Aes128Gcm)
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes),
+            (0, 0),
+            "the suite ids, labels and keys are all stacks and arrays"
+        );
+        assert_eq!(context.key().len(), 16);
     }
 
     #[cfg_attr(miri, ignore = "uses the OS random source")]

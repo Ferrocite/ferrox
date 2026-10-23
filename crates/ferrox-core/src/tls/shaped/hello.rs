@@ -114,9 +114,10 @@ impl Hello {
         let public_name = std::str::from_utf8(&config.public_name)
             .map_err(|_| TlsError::Other("ech: public name is not utf-8".to_owned()))?
             .to_owned();
-        let mut info = Vec::with_capacity(8 + config.encode().len());
+        let encoded = config.encode();
+        let mut info = Vec::with_capacity(8 + encoded.len());
         info.extend_from_slice(b"tls ech\0");
-        info.extend_from_slice(&config.encode());
+        info.extend_from_slice(&encoded);
         let (enc, sealer) = hpke
             .setup_sealer(&info, &HpkePublicKey(config.public_key.clone()))
             .map_err(|e| TlsError::Other(format!("ech: hpke: {e}")))?;

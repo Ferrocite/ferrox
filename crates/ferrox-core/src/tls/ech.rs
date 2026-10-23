@@ -21,26 +21,36 @@ pub(crate) struct Config {
 
 impl Config {
     pub(crate) fn encode(&self) -> Vec<u8> {
-        let mut contents = Vec::new();
-        contents.push(self.id);
-        contents.extend_from_slice(&self.kem_id.to_be_bytes());
-        contents.extend_from_slice(&(self.public_key.len() as u16).to_be_bytes());
-        contents.extend_from_slice(&self.public_key);
-        contents.extend_from_slice(&((self.cipher_suites.len() * 4) as u16).to_be_bytes());
-        for (kdf, aead) in &self.cipher_suites {
-            contents.extend_from_slice(&kdf.to_be_bytes());
-            contents.extend_from_slice(&aead.to_be_bytes());
-        }
-        contents.push(self.maximum_name_length);
-        contents.push(self.public_name.len() as u8);
-        contents.extend_from_slice(&self.public_name);
-        contents.extend_from_slice(&(self.extensions.len() as u16).to_be_bytes());
-        contents.extend_from_slice(&self.extensions);
-
-        let mut out = Vec::with_capacity(4 + contents.len());
+        let suites = self.cipher_suites.len() * 4;
+        let contents = 1
+            + 2
+            + 2
+            + self.public_key.len()
+            + 2
+            + suites
+            + 1
+            + 1
+            + self.public_name.len()
+            + 2
+            + self.extensions.len();
+        // The length is known before the first byte, so the config lands in one buffer and no contents copy.
+        let mut out = Vec::with_capacity(4 + contents);
         out.extend_from_slice(&VERSION.to_be_bytes());
-        out.extend_from_slice(&(contents.len() as u16).to_be_bytes());
-        out.extend_from_slice(&contents);
+        out.extend_from_slice(&(contents as u16).to_be_bytes());
+        out.push(self.id);
+        out.extend_from_slice(&self.kem_id.to_be_bytes());
+        out.extend_from_slice(&(self.public_key.len() as u16).to_be_bytes());
+        out.extend_from_slice(&self.public_key);
+        out.extend_from_slice(&(suites as u16).to_be_bytes());
+        for (kdf, aead) in &self.cipher_suites {
+            out.extend_from_slice(&kdf.to_be_bytes());
+            out.extend_from_slice(&aead.to_be_bytes());
+        }
+        out.push(self.maximum_name_length);
+        out.push(self.public_name.len() as u8);
+        out.extend_from_slice(&self.public_name);
+        out.extend_from_slice(&(self.extensions.len() as u16).to_be_bytes());
+        out.extend_from_slice(&self.extensions);
         out
     }
 
@@ -317,6 +327,17 @@ mod tests {
         assert_eq!(parsed[0].private_key.len(), 32);
         assert_eq!(parsed[0].config, configs[0].encode());
         assert_eq!(encode_server_keys(&parsed), keys);
+    }
+
+    /// The configs are framed before the first byte is written: one buffer, no contents copy or regrowth.
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn an_encoded_config_is_one_buffer() {
+        let (list, _) = generate("example.com", 0).unwrap();
+        let config = parse_config_list(&list).unwrap().remove(0);
+        let (bytes, counts) = crate::alloc_count::measure(|| config.encode());
+        assert_eq!(counts.allocs, 1, "one reservation holds the whole config");
+        assert_eq!(bytes, config.encode(), "the bytes are unchanged");
     }
 
     #[cfg_attr(miri, ignore = "uses the OS random source")]
