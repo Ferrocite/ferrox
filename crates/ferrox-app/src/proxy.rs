@@ -3813,6 +3813,54 @@ fn hysteria_dial_session(vless: &VlessOut) -> Option<crate::hysteria::Dial> {
     })
 }
 
+/// KCP is the transport and the security rides it, as it does upstream: the session carries the header and both relay legs, not the connection.
+fn relay_kcp_under_tls(
+    client: &Connection,
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    cfg: &ferrox_core::tls::TlsConfig,
+    header: &[u8],
+    ready: impl FnOnce(&mut ferrox_core::tls::RustlsProvider<KcpIo>) -> bool,
+) {
+    let Ok(mut session) = ferrox_core::tls::RustlsProvider::connect(
+        cfg,
+        KcpIo {
+            conn: Arc::clone(conn),
+        },
+    ) else {
+        return;
+    };
+    if !shake_tls(&mut session) || session.write_all(header).is_err() || !ready(&mut session) {
+        return;
+    }
+    let Ok(downstream) = client.try_clone() else {
+        return;
+    };
+    if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
+    let close: Arc<dyn Fn() + Send + Sync> = {
+        let conn = Arc::clone(conn);
+        let socket = downstream.try_clone().ok();
+        Arc::new(move || {
+            conn.close();
+            if let Some(socket) = &socket {
+                let _ = socket.shutdown(Shutdown::Both);
+            }
+        })
+    };
+    let (reader, writer) = session_halves(
+        session,
+        KcpIo {
+            conn: Arc::clone(conn),
+        },
+    );
+    relay_stream(
+        Half::socket(downstream),
+        Half::split(reader, writer),
+        &close,
+    );
+}
+
 fn dial_vless_kcp(
     client: &Connection,
     conn: &Arc<ferrox_core::kcp::Connection>,
@@ -3820,47 +3868,10 @@ fn dial_vless_kcp(
     target: &Destination,
 ) {
     let header = vless_header(&vless.id, 1, target);
-    // KCP is the transport and the security rides it, as it does upstream: the session carries the header and both relay legs, not the connection.
     if let Some(cfg) = vless.tls.as_deref() {
-        let transport = KcpIo {
-            conn: Arc::clone(conn),
-        };
-        let Ok(mut session) = ferrox_core::tls::RustlsProvider::connect(cfg, transport) else {
-            return;
-        };
-        if !shake_tls(&mut session) {
-            return;
-        }
-        if session.write_all(&header).is_err() || read_vless_response(&mut session).is_none() {
-            return;
-        }
-        let Ok(downstream) = client.try_clone() else {
-            return;
-        };
-        if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
-            return;
-        }
-        let close: Arc<dyn Fn() + Send + Sync> = {
-            let conn = Arc::clone(conn);
-            let socket = downstream.try_clone().ok();
-            Arc::new(move || {
-                conn.close();
-                if let Some(socket) = &socket {
-                    let _ = socket.shutdown(Shutdown::Both);
-                }
-            })
-        };
-        let (reader, writer) = session_halves(
-            session,
-            KcpIo {
-                conn: Arc::clone(conn),
-            },
-        );
-        relay_stream(
-            Half::socket(downstream),
-            Half::split(reader, writer),
-            &close,
-        );
+        relay_kcp_under_tls(client, conn, cfg, &header, |session| {
+            read_vless_response(session).is_some()
+        });
         return;
     }
     if conn.write(&header).is_err() {
@@ -3925,6 +3936,26 @@ fn serve_trojan_kcp(conn: &Arc<ferrox_core::kcp::Connection>, key: &[u8; 56], fr
     kcp_relay(&uplink, conn);
 }
 
+fn serve_trojan_kcp_tls(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    key: &[u8; 56],
+    freedom: bool,
+    server: &ferrox_core::tls::TlsServerConfig,
+) {
+    let Ok(mut tls) = ferrox_core::tls::accept(
+        server,
+        KcpIo {
+            conn: Arc::clone(conn),
+        },
+    ) else {
+        return;
+    };
+    if !shake_tls(&mut tls) {
+        return;
+    }
+    relay_trojan(tls, None, key, freedom);
+}
+
 fn kcp_dial_session(
     carrier: &Carrier,
     address: &str,
@@ -3948,7 +3979,12 @@ fn dial_trojan_kcp(
     trojan: &TrojanOut,
     target: &Destination,
 ) {
-    if conn.write(&trojan_header(&trojan.key, 1, target)).is_err() {
+    let header = trojan_header(&trojan.key, 1, target);
+    if let Some(cfg) = trojan.tls.as_deref() {
+        relay_kcp_under_tls(client, conn, cfg, &header, |_| true);
+        return;
+    }
+    if conn.write(&header).is_err() {
         return;
     }
     kcp_relay(client, conn);
@@ -4273,7 +4309,15 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
     let sec = stream_security(inbound);
     match inbound_carrier(inbound) {
         Carrier::Kcp(config) => {
-            let serve: KcpServe = Arc::new(move |conn| serve_trojan_kcp(conn, &key, freedom));
+            let serve: KcpServe = if sec == "tls" {
+                let Some(server) = inbound_tls_identity(inbound) else {
+                    eprintln!("unreadable trojan tls identity on {address}: refused, not served");
+                    return false;
+                };
+                Arc::new(move |conn| serve_trojan_kcp_tls(conn, &key, freedom, &server))
+            } else {
+                Arc::new(move |conn| serve_trojan_kcp(conn, &key, freedom))
+            };
             let owned = address.to_owned();
             thread::spawn(move || serve_kcp_loop(&owned, config, &serve));
             true
@@ -13268,7 +13312,7 @@ fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
         let port = server.get("port").and_then(Json::as_port)?;
         let password = server.get("password").and_then(Json::as_str)?;
         let key = trojan_key(password);
-        if let Some((carrier, host, tls)) = tls_parts(outbound, &address) {
+        if let Some((carrier, host, tls)) = tls_carried_parts(outbound, &address) {
             return Some(TrojanOut {
                 address,
                 port,
@@ -18551,10 +18595,15 @@ mod tests {
             let stream = format!(
                 r#""network": "{network}", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
             );
-            assert!(
-                find_trojan_outbound(&trojan_tls_root(&stream)).is_none(),
-                "{network}"
-            );
+            let root = trojan_tls_root(&stream);
+            match network {
+                "kcp" => {
+                    let out = find_trojan_outbound(&root).expect("kcp wraps its transport");
+                    assert!(matches!(out.carrier, Carrier::Kcp(_)));
+                    assert!(out.tls.is_some(), "the kcp session carries tls");
+                }
+                _ => assert!(find_trojan_outbound(&root).is_none(), "{network}"),
+            }
         }
         let plain = crate::json::parse(
             r#"{"outbounds": [{"protocol": "trojan",
@@ -19025,6 +19074,120 @@ mod tests {
             // Past RELAY_POLL, so an association that polls instead of parking is gone by the second datagram.
             thread::sleep(Duration::from_millis(250));
         }
+    }
+
+    /// A trojan listener that declares tls over KCP answers the session its config names: the request is read off the records, not the plaintext header.
+    #[test]
+    fn a_trojan_kcp_inbound_that_declares_tls_answers_the_session() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (cert, key, client) = tls_cert_json();
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                "streamSettings": {{"network": "kcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        serve_trojan_inbound(&address, &inbound, true);
+        let echo_port = echo_loop();
+        let conn = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        let mut tls = ferrox_core::tls::RustlsProvider::connect(
+            &client,
+            KcpIo {
+                conn: Arc::clone(&conn),
+            },
+        )
+        .expect("opens");
+        tls.handshake().expect("handshakes");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        tls.write_all(&trojan_header(
+            &trojan_key("secret"),
+            1,
+            &Destination::from(target),
+        ))
+        .expect("writes the header");
+        tls.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        ferrox_core::tls::read_exact(&mut tls, &mut back).expect("echoes");
+        assert_eq!(&back, b"ping", "the tls arm over kcp echoes");
+        conn.close();
+    }
+
+    /// KCP is the transport and the security rides it, as it does upstream: the dial's header goes out inside the session, not before it.
+    #[test]
+    fn a_trojan_kcp_dial_under_tls_wraps_the_header_in_the_session() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let key = trojan_key("secret");
+        let echo_port = echo_loop();
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let kcp_port = listener.local_addr().port();
+        let server = thread::spawn(move || {
+            let conn = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(
+                &server_config,
+                KcpIo {
+                    conn: Arc::clone(&conn),
+                },
+            )
+            .expect("accepts");
+            tls.handshake().expect("handshakes");
+            let (cmd, _asked) = decode_trojan_request(&mut tls, &key).expect("reads the header");
+            assert_eq!(cmd, 1);
+            let mut back = [0u8; 4];
+            ferrox_core::tls::read_exact(&mut tls, &mut back).expect("reads ping");
+            tls.write_all(&back).expect("echoes");
+        });
+        let trojan = TrojanOut {
+            address: "127.0.0.1".to_owned(),
+            port: kcp_port,
+            key,
+            carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            host: "127.0.0.1".to_owned(),
+            tls: Some(Arc::new(client_config)),
+        };
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let conn = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{kcp_port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_trojan_kcp(&socket, &conn, &trojan, &target);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(
+            &read_echo(&mut sock),
+            b"ping",
+            "the header rides the session"
+        );
+        drop(sock);
+        server.join().expect("joins");
     }
 
     #[test]
