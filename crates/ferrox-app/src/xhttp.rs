@@ -2346,13 +2346,13 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let h = thread::spawn(move || {
+            const VANE: usize = 2048;
             let (mut sock, _) = listener.accept().expect("accepts");
             let mut head = [0u8; 4096];
             let n = sock.read(&mut head).expect("reads the request");
             assert!(n > 0);
             sock.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
                 .expect("replies");
-            const VANE: usize = 2048;
             for burst in wire.chunks(VANE) {
                 sock.write_all(burst).expect("sends");
                 thread::sleep(Duration::from_millis(2));
