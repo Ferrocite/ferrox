@@ -264,7 +264,9 @@ impl<S: Stream> Session<S> {
         }
         self.transcript.extend_from_slice(&msg);
 
+        // Both application secrets take the transcript only through the server's Finished.
         let server_ap = kdf::derive(hash, &master, b"s ap traffic", &self.transcript);
+        let client_ap = kdf::derive(hash, &master, b"c ap traffic", &self.transcript);
         self.read_key = Some(Direction::tls13(suite, &server_ap));
         self.write_key = Some(Direction::tls13(suite, &client_hs));
 
@@ -275,7 +277,6 @@ impl<S: Stream> Session<S> {
             self.transcript.extend_from_slice(&answer);
         }
 
-        let client_ap = kdf::derive(hash, &master, b"c ap traffic", &self.transcript);
         let verify = kdf::verify_data(hash, &kdf::finished_key(hash, &client_hs), &self.transcript);
         let mut finished = Vec::with_capacity(4 + verify.len());
         finished.push(20);
