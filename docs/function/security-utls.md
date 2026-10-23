@@ -141,6 +141,6 @@ CI's `benchmark-matrix` vision reality cell carries a fingerprint and times the 
 What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
 
 <!-- scope:begin -->
-- paths: crates/ferrox-core/src/tls/shaped/*, scripts/utls-oracle/*, scripts/tls12-oracle/*
+- paths: crates/ferrox-core/src/tls/shaped/*, crates/ferrox-core/src/tls/hpke.rs, crates/ferrox-core/src/tls/ech.rs, scripts/utls-oracle/*, scripts/tls12-oracle/*
 - go: ./transport/internet/tls/...
 <!-- scope:end -->
