@@ -10363,6 +10363,9 @@ impl FrameWrite for Connection {
 /// The plaintext one TLS record carries. A carrier frames what a relay handed it, and a window larger than this goes to the session as record-sized pieces rather than as one payload no session buffer holds.
 const SESSION_WINDOW: usize = 16 * 1024;
 
+/// The records one send carries: the relay window a carrier paces, plus the record its framing opens when the head pushes the payload past a record boundary. A frame of one window leaves as one send, and a frame larger than the batch — a peer that advertises a wide HTTP/2 frame size — is cut rather than staged whole.
+const SESSION_BATCH: usize = RELAY_BUFFER + SESSION_WINDOW;
+
 /// Offer `parts` to `write` in windows of at most [`SESSION_WINDOW`], in order and without a copy: a window is a run of subslices of the caller's parts, so a frame of any size leaves the session as the records it would have taken had each window been a frame of its own.
 fn write_windows<F>(parts: &[&[u8]], mut write: F) -> bool
 where
@@ -10395,23 +10398,24 @@ where
 impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send> FrameWrite
     for TlsHalf<S>
 {
-    // One seal per window, sent after the session's lock drops: every part of a window reaches the session as segments of one payload, so it seals one record where a write per part sealed one each, and a frame larger than a record is cut rather than handed over as a payload the session cannot hold.
+    // One seal per window, and the batch sent after the session's lock drops: every part of a window reaches the session as segments of one payload, so it seals one record where a write per part sealed one each, and a frame larger than a record is cut rather than handed over as a payload the session cannot hold. The records of a batch then leave in one send, so a 64 KiB relay window costs one write where a send per record cost it four.
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
         let Ok(mut out) = self.out.lock() else {
             return false;
         };
         let session = Arc::clone(&self.session);
-        write_windows(parts, |window| {
+        let sealed = write_windows(parts, |window| {
             let sealed = match session.lock() {
                 Ok(mut session) => session.seal_slices_into(window, &mut out.bytes).is_ok(),
                 Err(_) => false,
             };
-            if !sealed {
-                out.bytes.clear();
-                return false;
-            }
-            out.send().is_ok()
-        })
+            sealed && (out.bytes.len() < SESSION_BATCH || out.send().is_ok())
+        });
+        if !sealed {
+            out.bytes.clear();
+            return false;
+        }
+        out.send().is_ok()
     }
 }
 
@@ -20832,6 +20836,126 @@ mod tests {
         want.extend_from_slice(&body);
         want.extend_from_slice(&tail);
         assert_eq!(seam.out, want, "the same bytes, in the same order");
+    }
+
+    /// What the write side of the halves put on the wire: one entry per send, holding the bytes it
+    /// carried, which a session-side call count cannot see.
+    #[derive(Clone, Default)]
+    struct CountedTransport {
+        sizes: Arc<Mutex<Vec<usize>>>,
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for CountedTransport {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.sizes.lock().expect("sends").push(buf.len());
+            self.bytes.lock().expect("bytes").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// One window leaves the session as one send: a send per record is three more syscalls for
+    /// every 64 KiB the carrier paces, and the relay window is already the largest unit it has.
+    #[test]
+    fn a_window_leaves_the_session_in_one_send() {
+        let seam = Arc::new(Mutex::new(Seam::default()));
+        let transport = CountedTransport::default();
+        let (_reader, mut writer) = session_halves(
+            CountedSession {
+                seam: Arc::clone(&seam),
+            },
+            transport.clone(),
+        );
+        let window: Vec<u8> = (0..SESSION_WINDOW * 4).map(|i| (i as u8) ^ 0x3C).collect();
+
+        assert!(writer.write_slices(&[&window]));
+
+        assert_eq!(
+            seam.lock().expect("records").calls.len(),
+            4,
+            "one seal per record, four records"
+        );
+        assert_eq!(
+            *transport.sizes.lock().expect("sends"),
+            vec![window.len()],
+            "one send for the window, not one per record"
+        );
+        assert_eq!(
+            *transport.bytes.lock().expect("bytes"),
+            window,
+            "the records in order"
+        );
+
+        // A head written with the window it opens spills the payload into a fifth record, and the two still leave as one send.
+        let head = crate::h2::frame_head(window.len(), crate::h2::T_DATA, 0, 3);
+        assert!(writer.write_slices(&[&head, &window]));
+
+        {
+            let seam = seam.lock().expect("records");
+            assert_eq!(
+                seam.calls.len(),
+                9,
+                "four records, then the head and four more"
+            );
+            let parts: Vec<usize> = seam.calls[4..].iter().map(|&(parts, _)| parts).collect();
+            assert_eq!(
+                parts,
+                vec![2, 1, 1, 1, 1],
+                "the head and the payload share the first record"
+            );
+        }
+        assert_eq!(
+            *transport.sizes.lock().expect("sends"),
+            vec![window.len(), head.len() + window.len()],
+            "one send for the headed window too"
+        );
+        let mut want = window.clone();
+        want.extend_from_slice(&head);
+        want.extend_from_slice(&window);
+        assert_eq!(
+            *transport.bytes.lock().expect("bytes"),
+            want,
+            "both frames, in the order they were written"
+        );
+    }
+
+    /// A frame wider than one batch leaves as one send per batch: the buffer the records are sealed
+    /// into holds a relay window and its framing, never the frame size a peer advertised.
+    #[test]
+    fn a_frame_wider_than_the_batch_leaves_in_batches() {
+        let seam = Arc::new(Mutex::new(Seam::default()));
+        let transport = CountedTransport::default();
+        let (_reader, mut writer) = session_halves(
+            CountedSession {
+                seam: Arc::clone(&seam),
+            },
+            transport.clone(),
+        );
+        let frame: Vec<u8> = (0..SESSION_BATCH + SESSION_WINDOW)
+            .map(|i| (i as u8) ^ 0xA7)
+            .collect();
+
+        assert!(writer.write_slices(&[&frame]));
+
+        assert_eq!(
+            seam.lock().expect("records").calls.len(),
+            6,
+            "a record per window, six records"
+        );
+        assert_eq!(
+            *transport.sizes.lock().expect("sends"),
+            vec![SESSION_BATCH, frame.len() - SESSION_BATCH],
+            "a send per batch, and the batch is the cap"
+        );
+        assert_eq!(
+            *transport.bytes.lock().expect("bytes"),
+            frame,
+            "the records in order"
+        );
     }
 
     /// A two-byte length must never truncate, so an oversize payload is a panic, not a wrap.
