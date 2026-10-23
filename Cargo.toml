@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.3"
+version = "0.0.4"
 edition = "2021"
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
@@ -17,7 +17,7 @@ description = "A from-scratch proxy core, proven bit-identical to the implementa
 publish = false
 
 [workspace.dependencies]
-ferrox-core = { version = "0.0.3", path = "crates/ferrox-core" }
+ferrox-core = { version = "0.0.4", path = "crates/ferrox-core" }
 
 rustls = { version = "0.23", default-features = false }
 
