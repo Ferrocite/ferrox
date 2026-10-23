@@ -9,8 +9,9 @@ use ferrox_core::transport::early_decode;
 const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 const HEAD_LIMIT: usize = 16 * 1024;
 const FRAME_LIMIT: usize = 16 * 1024 * 1024;
-const OP_DATA: u8 = 0x02;
 const OP_CONT: u8 = 0x00;
+const OP_TEXT: u8 = 0x01;
+const OP_DATA: u8 = 0x02;
 const OP_CLOSE: u8 = 0x08;
 const OP_PING: u8 = 0x09;
 const OP_PONG: u8 = 0x0A;
@@ -328,6 +329,11 @@ impl<R: Read> WsReader<R> {
     /// Parse frames until a message ends: control frames answered on the spot, data unmasked where they lie.
     fn message(&mut self) -> bool {
         let mut open = false;
+        // Where the message being assembled starts, and where its next fragment's bytes belong:
+        // a continuation frame carries its own head, so its payload moves over it and the
+        // delivered span is the message's own bytes, not the wire's.
+        let mut whole = 0usize;
+        let mut filled = 0usize;
         loop {
             if !self.need(2) {
                 return false;
@@ -390,18 +396,26 @@ impl<R: Read> WsReader<R> {
                 }
                 OP_PING => self.reply(OP_PONG, &self.have[payload]),
                 OP_PONG => {}
-                OP_DATA | OP_CONT => {
+                // RFC 6455 has two data opcodes; the tunnel reads both and writes binary, the order the reference keeps.
+                OP_TEXT | OP_DATA | OP_CONT => {
                     if (opcode == OP_CONT) != open {
                         return false;
                     }
                     if let Some(mask) = mask {
                         apply_mask(&mut self.have[payload], mask);
                     }
+                    if !open {
+                        whole = start;
+                        filled = start;
+                    } else if filled != start {
+                        self.have.copy_within(start..start + len, filled);
+                    }
                     if fin {
-                        self.msg_end = self.at;
-                        self.at = start;
+                        self.msg_end = filled + len;
+                        self.at = whole;
                         return true;
                     }
+                    filled += len;
                     open = true;
                 }
                 _ => return false,
@@ -976,6 +990,113 @@ mod tests {
                 writer.join().expect("joins");
             }
         }
+    }
+
+    /// RFC 6455 has two data opcodes, and the tunnel reads both: a text frame answers like a binary one, a text message reassembles over a continuation, and a binary one reaches the reader unchanged.
+    #[test]
+    fn a_text_frame_carries_a_message_like_a_binary_one() {
+        let payload: Vec<u8> = (0..300u16).map(|i| (i % 251) as u8).collect();
+        let reader_for = |frames: Vec<u8>| WsReader {
+            read: std::io::Cursor::new(frames),
+            shared: Arc::new(Shared {
+                stream: Mutex::new(Box::new(Sink::default())),
+                closed: AtomicBool::new(false),
+            }),
+            have: Vec::new(),
+            at: 0,
+            msg_end: 0,
+            early: Vec::new(),
+            eat: 0,
+            eof: false,
+            handshake: None,
+            reads: 0,
+        };
+        let frame = |fin: bool, opcode: u8, payload: &[u8]| {
+            let mut wire = vec![u8::from(fin) * 0x80 + opcode];
+            if payload.len() < 126 {
+                wire.push(payload.len() as u8);
+            } else {
+                wire.push(126);
+                wire.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            }
+            wire.extend_from_slice(payload);
+            wire
+        };
+        let mut whole = Vec::new();
+        let mut buf = [0u8; 4096];
+        let mut reader = reader_for(frame(true, OP_TEXT, &payload));
+        loop {
+            let n = reader.read(&mut buf).expect("reads");
+            if n == 0 {
+                break;
+            }
+            whole.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(whole, payload, "text");
+        let mut whole = Vec::new();
+        let mut reader = reader_for(frame(true, OP_DATA, &payload));
+        loop {
+            let n = reader.read(&mut buf).expect("reads");
+            if n == 0 {
+                break;
+            }
+            whole.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(whole, payload, "binary");
+        let (first, second) = payload.split_at(37);
+        let mut wire = frame(false, OP_TEXT, first);
+        wire.extend(frame(true, OP_CONT, second));
+        let mut whole = Vec::new();
+        let mut reader = reader_for(wire);
+        loop {
+            let n = reader.read(&mut buf).expect("reads");
+            if n == 0 {
+                break;
+            }
+            whole.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(whole, payload, "text-then-continuation");
+    }
+
+    /// The loopback witness: a peer that answers in text and then in binary has both reach the reader, bytes for bytes.
+    #[test]
+    fn a_text_message_then_a_binary_one_reaches_the_reader() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            assert!(write_frame(&mut stream, true, OP_TEXT, b"TEXT-OK\n"));
+            assert!(write_frame(&mut stream, true, OP_DATA, b"BIN-OK\n"));
+        });
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let shared = Arc::new(Shared {
+            stream: Mutex::new(Box::new(stream.try_clone().expect("clones"))
+                as Box<dyn crate::proxy::FrameWrite + Send>),
+            closed: AtomicBool::new(false),
+        });
+        let mut reader = WsReader {
+            read: stream,
+            shared,
+            have: Vec::new(),
+            at: 0,
+            msg_end: 0,
+            early: Vec::new(),
+            eat: 0,
+            eof: false,
+            handshake: None,
+            reads: 0,
+        };
+        let mut whole = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = reader.read(&mut buf).expect("reads");
+            if n == 0 {
+                break;
+            }
+            whole.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(whole, b"TEXT-OK\nBIN-OK\n");
+        server.join().expect("joins");
     }
 
     /// A fixed source returns every byte asked for, so the syscall count is exact, not a race with the scheduler.
