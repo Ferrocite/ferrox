@@ -1665,7 +1665,7 @@ fn keeps_alive(head: &[u8]) -> bool {
 
 /// The body of `n` bytes, and how much of the bytes already read as the head it used; the rest of those belong to the next request on this connection.
 fn read_body<R: Read>(read: &mut R, prefix: &[u8], n: usize) -> Option<(Vec<u8>, usize)> {
-    let mut buf = vec![0u8; n];
+    let mut buf = crate::proxy::unfilled(n);
     let pre = prefix.len().min(n);
     buf[..pre].copy_from_slice(&prefix[..pre]);
     let mut at = pre;
@@ -3087,6 +3087,22 @@ mod tests {
             );
             assert_eq!(out, want.as_bytes(), "the bytes are the padded answer");
         }
+    }
+
+    /// The body lands in uninitialised room: the read that owns every byte writes it before the
+    /// body is handed on, so zeroing the buffer first was a pass over bytes about to be overwritten.
+    #[test]
+    fn a_body_read_lands_in_room_it_never_zeroes() {
+        let wire = vec![0x5Au8; 64];
+        let mut source = std::io::Cursor::new(&wire[..]);
+        let (read, counts) =
+            ferrox_core::alloc_count::measure(|| read_body(&mut source, b"head-tail", 32));
+        let (body, pre) = read.expect("the body");
+        assert_eq!(pre, 9, "what the head left over is the body's own head");
+        let mut want = b"head-tail".to_vec();
+        want.extend_from_slice(&wire[..23]);
+        assert_eq!(body, want, "the bytes are the body");
+        assert_eq!(counts.zeroed, 0, "the read fills every byte: {counts:?}");
     }
 
     /// A missing or `auto` mode is the dialer's default, not a promise about what may arrive: the reference hub gates a shape only when the mode was written down (`hub.go:154`, `:199`, `:241` all read `Mode != "" && Mode != "auto" && Mode != <shape>`). Our own `xhttp::connect` writes the `stream-one` POST, so a hub resolved from `{"path": "/share"}` refusing it is a hub that answers no dial its own client can make — which is what left `vless-xhttp-down-8` with no flow at any connection count.

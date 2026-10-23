@@ -255,6 +255,7 @@ carrier-xhttp response-head-field-allocations 0 ferrox-app-xhttp_h2::tests::a_re
 carrier-xhttp answer-head-allocations 1 ferrox-app-xhttp::tests::a_padded_answer_is_written_from_one_buffer
 carrier-xhttp tokenish-pad-buffer-allocations 1 ferrox-app-xhttp::tests::a_tokenish_pad_is_one_buffer_drawn_without_zeroing
 carrier-xhttp zero-filled-bytes-per-tokenish-pad 0 ferrox-app-xhttp::tests::a_tokenish_pad_is_one_buffer_drawn_without_zeroing
+carrier-xhttp zero-filled-bytes-per-request-body 0 ferrox-app-xhttp::tests::a_body_read_lands_in_room_it_never_zeroes
 carrier-xhttp dial-head-allocations-per-thread 1 ferrox-app-xhttp::tests::the_dial_head_is_staged_once_per_thread
 
 carrier-veepn ops-retired-instructions UNBLESSED scripts/count-ops.sh
