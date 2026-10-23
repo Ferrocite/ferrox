@@ -3498,6 +3498,7 @@ mod tests {
             alpn: Vec::new(),
             send_tickets: true,
             server_config_cache: std::sync::Arc::default(),
+            ech_server_keys: None,
         }
     }
 
@@ -3515,6 +3516,7 @@ mod tests {
             alpn: Vec::new(),
             send_tickets: true,
             server_config_cache: std::sync::Arc::default(),
+            ech_server_keys: None,
         };
         assert!(serve_config(&empty).is_none());
         let mut no_key = minted_identity();

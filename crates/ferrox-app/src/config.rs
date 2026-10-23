@@ -133,16 +133,17 @@ pub(crate) fn inbound_tls_identity(
     if settings.get("security").and_then(Json::as_str) != Some("tls") {
         return None;
     }
-    if ech_server_keys(settings) {
-        eprintln!(
-            "ech: server-side ECH (echServerKeys) has no backend here; the inbound is refused, not served without it"
-        );
-        return None;
-    }
+    let ech = match ech_server_keys(settings) {
+        Ok(keys) => keys,
+        Err(why) => {
+            eprintln!("ech: {why}; the inbound is refused, not served without it");
+            return None;
+        }
+    };
     let (cert_pem, key_pem) = tls_cert_pem(settings)?;
-    ferrox_core::tls::parse_pem_identity(&cert_pem, &key_pem)
-        .ok()
-        .map(Arc::new)
+    let mut identity = ferrox_core::tls::parse_pem_identity(&cert_pem, &key_pem).ok()?;
+    identity.ech_server_keys = ech;
+    Some(Arc::new(identity))
 }
 
 /// xray's certificate lookup: an absolute path is read as itself; a relative path is
@@ -167,15 +168,25 @@ pub(crate) fn read_cert_file(path: &str) -> Option<Vec<u8>> {
     std::fs::read(path).ok()
 }
 
-fn ech_server_keys(settings: &Json) -> bool {
-    settings
+fn ech_server_keys(settings: &Json) -> Result<Option<Arc<[u8]>>, String> {
+    let Some(keys) = settings
         .get("tlsSettings")
         .and_then(|tls| tls.get("echServerKeys"))
-        .is_some_and(|keys| {
-            !(matches!(keys, Json::Null)
-                || keys.as_arr().is_some_and(<[Json]>::is_empty)
-                || keys.as_str() == Some(""))
-        })
+    else {
+        return Ok(None);
+    };
+    if matches!(keys, Json::Null)
+        || keys.as_arr().is_some_and(<[Json]>::is_empty)
+        || keys.as_str() == Some("")
+    {
+        return Ok(None);
+    }
+    let Some(text) = keys.as_str() else {
+        return Err("echServerKeys is not a string".to_owned());
+    };
+    ferrox_core::tls::decode_ech_keys(text)
+        .map(Arc::from)
+        .map(Some)
 }
 
 /// PEM for the first certificate entry, in either spelling xray accepts: `certificateFile`/`keyFile` paths, or an inline `certificate`/`key` given as a string or as an array of PEM lines. A peer that hands over a bare TLS listener (a REALITY decoy, say) uses the inline form, so refusing it here leaves the inbound serving nothing.
@@ -1316,6 +1327,26 @@ fn duration(value: &Json, key: &str) -> Result<Duration, String> {
 mod tests {
     use super::*;
 
+    fn server_ech_key_tlv() -> Vec<u8> {
+        let mut config = vec![0xfe, 0x0d, 0x00, 0x00];
+        let mut contents = vec![7u8, 0x00, 0x20, 0x00, 0x20];
+        contents.extend_from_slice(&[0x11; 32]);
+        contents.extend_from_slice(&4u16.to_be_bytes());
+        contents.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        contents.push(0);
+        contents.push(b"public.test".len() as u8);
+        contents.extend_from_slice(b"public.test");
+        contents.extend_from_slice(&0u16.to_be_bytes());
+        config[2..4].copy_from_slice(&(contents.len() as u16).to_be_bytes());
+        config.extend_from_slice(&contents);
+        let mut keys = Vec::new();
+        keys.extend_from_slice(&32u16.to_be_bytes());
+        keys.extend_from_slice(&[0x22; 32]);
+        keys.extend_from_slice(&(config.len() as u16).to_be_bytes());
+        keys.extend_from_slice(&config);
+        keys
+    }
+
     #[test]
     fn a_short_id_hex_fills_from_the_front() {
         assert_eq!(short_id("a8"), Some([0xa8, 0, 0, 0, 0, 0, 0, 0]));
@@ -1590,8 +1621,11 @@ mod tests {
 
     #[test]
     fn inbound_tls_identity_reads_an_inline_certificate() {
+        use base64::Engine as _;
         let minted =
             rcgen::generate_simple_self_signed(vec!["tls.test".to_owned()]).expect("mints");
+        let keys = server_ech_key_tlv();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&keys);
         let lines_json = |pem: &str| -> String {
             pem.trim_end()
                 .lines()
@@ -1618,14 +1652,16 @@ mod tests {
         );
         // The single-string spelling resolves to the same identity.
         let string_form = crate::json::parse(&format!(
-            r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"certificates": [{{"certificate": {}, "key": {}}}]}}}}}}"#,
+            r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"echServerKeys": "{encoded}", "certificates": [{{"certificate": {}, "key": {}}}]}}}}}}"#,
             string_json(&minted.cert.pem()),
             string_json(&minted.signing_key.serialize_pem())
         ))
         .expect("parses");
-        assert!(
-            inbound_tls_identity(&string_form).is_some(),
-            "an inline certificate/key string loads too"
+        let identity = inbound_tls_identity(&string_form).expect("an inline string loads too");
+        assert_eq!(
+            identity.ech_server_keys.as_deref(),
+            Some(keys.as_slice()),
+            "the inbound carries the parsed ECH keys into its TLS identity"
         );
     }
 
@@ -1705,18 +1741,40 @@ mod tests {
     }
 
     #[test]
-    fn server_side_ech_keys_are_named_and_refused() {
-        let with_keys =
-            crate::json::parse(r#"{"streamSettings":{"tlsSettings":{"echServerKeys":["AAAA"]}}}"#)
-                .expect("parses");
-        assert!(ech_server_keys(
-            with_keys.get("streamSettings").expect("settings")
-        ));
+    fn server_side_ech_keys_are_parsed_and_malformed_forms_refused() {
+        use base64::Engine as _;
+        let keys = server_ech_key_tlv();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&keys);
+        let with_keys = crate::json::parse(&format!(
+            r#"{{"streamSettings":{{"tlsSettings":{{"echServerKeys":"{encoded}"}}}}}}"#
+        ))
+        .expect("parses");
+        assert!(
+            ech_server_keys(with_keys.get("streamSettings").expect("settings"))
+                .expect("parses")
+                .is_some()
+        );
         let empty =
             crate::json::parse(r#"{"streamSettings":{"tlsSettings":{"echServerKeys":[]}}}"#)
                 .expect("parses");
-        assert!(!ech_server_keys(
-            empty.get("streamSettings").expect("settings")
-        ));
+        assert!(
+            ech_server_keys(empty.get("streamSettings").expect("settings"))
+                .expect("empty is unset")
+                .is_none()
+        );
+        let array =
+            crate::json::parse(r#"{"streamSettings":{"tlsSettings":{"echServerKeys":["AAAA"]}}}"#)
+                .expect("parses");
+        assert!(
+            ech_server_keys(array.get("streamSettings").expect("settings")).is_err(),
+            "xray names a string, so an array is refused by name"
+        );
+        let malformed =
+            crate::json::parse(r#"{"streamSettings":{"tlsSettings":{"echServerKeys":"not TLV"}}}"#)
+                .expect("parses");
+        assert!(
+            ech_server_keys(malformed.get("streamSettings").expect("settings")).is_err(),
+            "a string that is not a server-key TLV refuses the inbound"
+        );
     }
 }

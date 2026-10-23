@@ -614,60 +614,202 @@ impl<S: Stream> Write for RustlsProvider<S> {
     }
 }
 
+enum ServerInner<S: Stream> {
+    Rustls {
+        conn: Box<rustls::ServerConnection>,
+        io: S,
+    },
+    Ech {
+        handshake: Option<boring::ssl::MidHandshakeSslStream<S>>,
+        stream: Option<boring::ssl::SslStream<S>>,
+        failure: Option<String>,
+    },
+}
+
 pub struct RustlsServerProvider<S: Stream> {
-    conn: rustls::ServerConnection,
-    io: S,
+    inner: ServerInner<S>,
 }
 
 impl<S: Stream> std::fmt::Debug for RustlsServerProvider<S> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("RustlsServerProvider")
-            .field("alpn", &self.conn.alpn_protocol())
-            .field("is_handshaking", &self.conn.is_handshaking())
-            .finish_non_exhaustive()
+        match &self.inner {
+            ServerInner::Rustls { conn, .. } => f
+                .debug_struct("RustlsServerProvider")
+                .field("alpn", &conn.alpn_protocol())
+                .field("is_handshaking", &conn.is_handshaking())
+                .finish_non_exhaustive(),
+            ServerInner::Ech {
+                stream, failure, ..
+            } => {
+                let alpn = stream
+                    .as_ref()
+                    .and_then(|stream| stream.ssl().selected_alpn_protocol());
+                f.debug_struct("RustlsServerProvider")
+                    .field("alpn", &alpn)
+                    .field("is_handshaking", &stream.is_none())
+                    .field("failure", failure)
+                    .finish_non_exhaustive()
+            }
+        }
     }
 }
 
 impl<S: Stream> RustlsServerProvider<S> {
     #[allow(clippy::needless_pass_by_value)]
     pub fn accept(cfg: super::TlsServerConfig, io: S) -> Result<Self, TlsError> {
-        let conn =
-            rustls::ServerConnection::new(cfg.server_config()?).map_err(|e| map_error(&e))?;
-        Ok(Self { conn, io })
+        if cfg.ech_server_keys.is_some() {
+            let ctx = cached_ech_server_context(&cfg)?;
+            let ssl = boring::ssl::Ssl::new(&ctx).map_err(|error| boring_error(&error))?;
+            return Ok(Self {
+                inner: ServerInner::Ech {
+                    handshake: Some(ssl.setup_accept(io)),
+                    stream: None,
+                    failure: None,
+                },
+            });
+        }
+        let conn = Box::new(
+            rustls::ServerConnection::new(cfg.server_config()?).map_err(|e| map_error(&e))?,
+        );
+        Ok(Self {
+            inner: ServerInner::Rustls { conn, io },
+        })
     }
 
     #[allow(clippy::needless_pass_by_value)]
     pub fn accept_reality(cfg: super::TlsServerConfig, io: S) -> Result<Self, TlsError> {
-        let conn = rustls::ServerConnection::new(cfg.reality_server_config()?)
-            .map_err(|e| map_error(&e))?;
-        Ok(Self { conn, io })
+        let conn = Box::new(
+            rustls::ServerConnection::new(cfg.reality_server_config()?)
+                .map_err(|e| map_error(&e))?,
+        );
+        Ok(Self {
+            inner: ServerInner::Rustls { conn, io },
+        })
     }
 
-    fn drive(&mut self) -> Result<(), TlsError> {
-        while self.conn.is_handshaking() {
-            if let Err(e) = self.conn.complete_io(&mut self.io) {
-                return Err(recover(e));
+    fn handshake(&mut self) -> Result<(), TlsError> {
+        match &mut self.inner {
+            ServerInner::Rustls { conn, io } => {
+                while conn.is_handshaking() {
+                    if let Err(e) = conn.complete_io(io) {
+                        return Err(recover(e));
+                    }
+                }
+                Ok(())
+            }
+            ServerInner::Ech {
+                handshake,
+                stream,
+                failure,
+            } => {
+                if let Some(why) = failure {
+                    return Err(TlsError::Other(why.clone()));
+                }
+                if stream.is_some() {
+                    return Ok(());
+                }
+                let Some(mid) = handshake.take() else {
+                    return Ok(());
+                };
+                match mid.handshake() {
+                    Ok(done) => {
+                        *stream = Some(done);
+                        Ok(())
+                    }
+                    Err(boring::ssl::HandshakeError::WouldBlock(mid)) => {
+                        *handshake = Some(mid);
+                        Err(TlsError::Timeout)
+                    }
+                    Err(boring::ssl::HandshakeError::Failure(mid)) => {
+                        let why = format!("boring tls handshake: {}", mid.error());
+                        *failure = Some(why.clone());
+                        Err(TlsError::Other(why))
+                    }
+                    Err(boring::ssl::HandshakeError::SetupFailure(error)) => {
+                        let why = format!("boring tls setup: {error}");
+                        *failure = Some(why.clone());
+                        Err(TlsError::Other(why))
+                    }
+                }
             }
         }
-        Ok(())
+    }
+
+    /// Whether this session is the `BoringSSL` path, which owns its transport.
+    pub fn is_ech(&self) -> bool {
+        matches!(self.inner, ServerInner::Ech { .. })
+    }
+
+    /// Whether the client offered ECH and the server accepted it.
+    pub fn ech_accepted(&self) -> bool {
+        match &self.inner {
+            ServerInner::Ech {
+                stream: Some(stream),
+                ..
+            } => stream.ssl().ech_accepted(),
+            _ => false,
+        }
     }
 }
 
 impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RustlsServerProvider<S> {
     fn engage_record_alignment(&mut self) {
-        self.io.engage_record_alignment();
+        match &mut self.inner {
+            ServerInner::Rustls { io, .. } => io.engage_record_alignment(),
+            ServerInner::Ech {
+                stream: Some(stream),
+                ..
+            } => stream.get_mut().engage_record_alignment(),
+            ServerInner::Ech {
+                handshake: Some(handshake),
+                ..
+            } => handshake.get_mut().engage_record_alignment(),
+            ServerInner::Ech { .. } => {}
+        }
     }
 
     fn disarm_record_alignment(&mut self) {
-        self.io.disarm_record_alignment();
+        match &mut self.inner {
+            ServerInner::Rustls { io, .. } => io.disarm_record_alignment(),
+            ServerInner::Ech {
+                stream: Some(stream),
+                ..
+            } => stream.get_mut().disarm_record_alignment(),
+            ServerInner::Ech {
+                handshake: Some(handshake),
+                ..
+            } => handshake.get_mut().disarm_record_alignment(),
+            ServerInner::Ech { .. } => {}
+        }
     }
 
     fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
-        self.drive()?;
-        let mut writer = self.conn.writer();
-        coalesce(&mut writer, parts)?;
-        self.send_pending()?;
-        Ok(())
+        self.handshake()?;
+        match &mut self.inner {
+            ServerInner::Rustls { conn, io } => {
+                coalesce(&mut conn.writer(), parts)?;
+                while conn.wants_write() {
+                    let wrote = conn.write_tls(&mut *io)?;
+                    if wrote == 0 {
+                        break;
+                    }
+                }
+                match io.flush() {
+                    Err(error) if !idle(&error) => Err(recover(error).into()),
+                    _ => Ok(()),
+                }
+            }
+            ServerInner::Ech {
+                stream: Some(stream),
+                ..
+            } => {
+                for part in parts {
+                    stream.write_all(part)?;
+                }
+                stream.flush()
+            }
+            ServerInner::Ech { .. } => Err(std::io::Error::other("ech handshake is not complete")),
+        }
     }
 }
 
@@ -726,6 +868,7 @@ fn write_segments<W: Write + ?Sized>(
 pub struct ServerConfigCacheInner {
     pub plain: Option<std::sync::Arc<rustls::ServerConfig>>,
     pub reality: Option<std::sync::Arc<rustls::ServerConfig>>,
+    pub ech: Option<std::sync::Arc<boring::ssl::SslContext>>,
 }
 
 impl std::fmt::Debug for ServerConfigCacheInner {
@@ -872,66 +1015,124 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
     }
 
     fn handshake(&mut self) -> Result<(), TlsError> {
-        self.drive()
+        self.handshake()
     }
 
     fn alpn(&self) -> Option<&[u8]> {
-        self.conn.alpn_protocol()
+        match &self.inner {
+            ServerInner::Rustls { conn, .. } => conn.alpn_protocol(),
+            ServerInner::Ech {
+                stream: Some(stream),
+                ..
+            } => stream.ssl().selected_alpn_protocol(),
+            ServerInner::Ech { .. } => None,
+        }
     }
 
     fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
-        self.drive()?;
-        let len = self.conn.writer().write(plaintext)?;
-        self.drain_into(out)?;
-        Ok(len)
+        self.handshake()?;
+        match &mut self.inner {
+            ServerInner::Rustls { conn, .. } => {
+                let len = conn.writer().write(plaintext)?;
+                while conn.wants_write() {
+                    let wrote = conn.write_tls(out)?;
+                    if wrote == 0 {
+                        break;
+                    }
+                }
+                Ok(len)
+            }
+            ServerInner::Ech {
+                stream: Some(stream),
+                ..
+            } => {
+                let len = std::io::Write::write(stream, plaintext)?;
+                stream.flush()?;
+                Ok(len)
+            }
+            ServerInner::Ech { .. } => Err(std::io::Error::other("ech handshake is not complete")),
+        }
     }
 
     fn seal_slices_into(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> std::io::Result<()> {
-        self.drive()?;
-        coalesce(&mut self.conn.writer(), parts)?;
-        self.drain_into(out)
+        self.handshake()?;
+        match &mut self.inner {
+            ServerInner::Rustls { conn, .. } => {
+                coalesce(&mut conn.writer(), parts)?;
+                while conn.wants_write() {
+                    let wrote = conn.write_tls(out)?;
+                    if wrote == 0 {
+                        break;
+                    }
+                }
+                Ok(())
+            }
+            ServerInner::Ech {
+                stream: Some(stream),
+                ..
+            } => {
+                for part in parts {
+                    stream.write_all(part)?;
+                }
+                stream.flush()
+            }
+            ServerInner::Ech { .. } => Err(std::io::Error::other("ech handshake is not complete")),
+        }
     }
 
     fn open(&mut self, ciphertext: &[u8], buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
-        let plain = match self.conn.reader().read(buf) {
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
-            outcome => outcome?,
-        };
-        if plain > 0 || ciphertext.is_empty() {
-            return Ok((plain, 0));
+        match &mut self.inner {
+            ServerInner::Rustls { conn, .. } => {
+                let plain = match conn.reader().read(buf) {
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+                    outcome => outcome?,
+                };
+                if plain > 0 || ciphertext.is_empty() {
+                    return Ok((plain, 0));
+                }
+                let mut cursor = std::io::Cursor::new(ciphertext);
+                let taken = conn.read_tls(&mut cursor).map_err(recover)?;
+                conn.process_new_packets()
+                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                // A key update waits for the next seal rather than a transport write under this lock.
+                let plain = match conn.reader().read(buf) {
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+                    outcome => outcome?,
+                };
+                Ok((plain, taken))
+            }
+            ServerInner::Ech { .. } => {
+                Err(std::io::Error::other("ech session reads its own transport"))
+            }
         }
-        let mut cursor = std::io::Cursor::new(ciphertext);
-        let taken = self.conn.read_tls(&mut cursor).map_err(recover)?;
-        self.conn
-            .process_new_packets()
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
-        // The client's `open`: a key update waits for the next seal rather than a transport write under this lock.
-        let plain = match self.conn.reader().read(buf) {
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
-            outcome => outcome?,
-        };
-        Ok((plain, taken))
     }
 }
 
 impl<S: Stream> Read for RustlsServerProvider<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            self.drive()?;
-            match self.conn.reader().read(buf) {
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if let Err(io_error) = self.conn.complete_io(&mut self.io) {
-                        if matches!(
-                            io_error.kind(),
-                            std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-                        ) {
-                            return Err(io_error);
+        self.handshake()?;
+        match &mut self.inner {
+            ServerInner::Rustls { conn, io } => loop {
+                match conn.reader().read(buf) {
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        if let Err(io_error) = conn.complete_io(&mut *io) {
+                            if matches!(
+                                io_error.kind(),
+                                std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                            ) {
+                                return Err(io_error);
+                            }
+                            return Err(recover(io_error).into());
                         }
-                        return Err(recover(io_error).into());
                     }
+                    outcome => return outcome,
                 }
-                outcome => return outcome,
-            }
+            },
+            ServerInner::Ech {
+                stream: Some(stream),
+                ..
+            } => stream.read(buf),
+            ServerInner::Ech { .. } => Err(std::io::Error::other("ech handshake is not complete")),
         }
     }
 }
@@ -939,55 +1140,163 @@ impl<S: Stream> Read for RustlsServerProvider<S> {
 impl<S: Stream> RustlsServerProvider<S> {
     /// The transport this session reads and writes, for a relay that would read it itself and hand the session only the ciphertext.
     pub fn get_ref(&self) -> &S {
-        &self.io
-    }
-
-    /// The client's `drain_into`: the queued records leave in wire order for the caller to send.
-    fn drain_into(&mut self, out: &mut Vec<u8>) -> std::io::Result<()> {
-        while self.conn.wants_write() {
-            let wrote = self.conn.write_tls(out)?;
-            if wrote == 0 {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    /// The ciphertext this session has queued goes out, and nothing comes in: the reason is
-    /// the client's `flush_pending`, and the wait it removed is the same wait.
-    fn flush_pending(&mut self) -> std::io::Result<()> {
-        while self.conn.wants_write() {
-            let wrote = self.conn.write_tls(&mut self.io)?;
-            if wrote == 0 {
-                break;
-            }
-        }
-        self.io.flush()
-    }
-
-    /// The client's `send_pending`: a write's ciphertext goes out and no record is waited for.
-    fn send_pending(&mut self) -> std::io::Result<()> {
-        match self.flush_pending() {
-            Err(error) if !idle(&error) => Err(recover(error).into()),
-            _ => Ok(()),
+        match &self.inner {
+            ServerInner::Rustls { io, .. } => io,
+            ServerInner::Ech {
+                stream: Some(stream),
+                ..
+            } => stream.get_ref(),
+            ServerInner::Ech {
+                handshake: Some(handshake),
+                ..
+            } => handshake.get_ref(),
+            ServerInner::Ech { .. } => unreachable!("an ech session always owns a transport"),
         }
     }
 }
 
 impl<S: Stream> Write for RustlsServerProvider<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.drive()?;
-        let len = self.conn.writer().write(buf)?;
-        self.send_pending()?;
-        Ok(len)
+        self.handshake()?;
+        match &mut self.inner {
+            ServerInner::Rustls { conn, io } => {
+                let len = conn.writer().write(buf)?;
+                while conn.wants_write() {
+                    let wrote = conn.write_tls(&mut *io)?;
+                    if wrote == 0 {
+                        break;
+                    }
+                }
+                match io.flush() {
+                    Err(error) if !idle(&error) => Err(recover(error).into()),
+                    _ => Ok(len),
+                }
+            }
+            ServerInner::Ech {
+                stream: Some(stream),
+                ..
+            } => stream.write(buf),
+            ServerInner::Ech { .. } => Err(std::io::Error::other("ech handshake is not complete")),
+        }
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.drive()?;
-        self.conn.writer().flush()?;
-        self.send_pending()?;
-        Ok(())
+        self.handshake()?;
+        match &mut self.inner {
+            ServerInner::Rustls { conn, io } => {
+                conn.writer().flush()?;
+                while conn.wants_write() {
+                    let wrote = conn.write_tls(&mut *io)?;
+                    if wrote == 0 {
+                        break;
+                    }
+                }
+                match io.flush() {
+                    Err(error) if !idle(&error) => Err(recover(error).into()),
+                    _ => Ok(()),
+                }
+            }
+            ServerInner::Ech {
+                stream: Some(stream),
+                ..
+            } => stream.flush(),
+            ServerInner::Ech { .. } => Err(std::io::Error::other("ech handshake is not complete")),
+        }
     }
+}
+
+fn boring_error(error: &boring::error::ErrorStack) -> TlsError {
+    TlsError::Other(format!("boring tls: {error}"))
+}
+
+fn cached_ech_server_context(
+    cfg: &super::TlsServerConfig,
+) -> Result<Arc<boring::ssl::SslContext>, TlsError> {
+    let mut guard = cfg
+        .server_config_cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(cached) = guard.ech.as_ref() {
+        return Ok(Arc::clone(cached));
+    }
+    let keys = cfg
+        .ech_server_keys
+        .as_deref()
+        .ok_or_else(|| TlsError::Other("ech server identity has no keys".to_owned()))?;
+    let built = Arc::new(ech_server_context(cfg, keys)?);
+    guard.ech = Some(Arc::clone(&built));
+    Ok(built)
+}
+
+fn ech_server_context(
+    cfg: &super::TlsServerConfig,
+    keys: &[u8],
+) -> Result<boring::ssl::SslContext, TlsError> {
+    use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode, SslVersion};
+    let mut chain = cfg.cert_chain.iter();
+    let leaf = chain
+        .next()
+        .ok_or_else(|| TlsError::Other("ech server identity has no certificate".to_owned()))?;
+    let mut builder =
+        SslContextBuilder::new(SslMethod::tls()).map_err(|error| boring_error(&error))?;
+    builder.set_verify(SslVerifyMode::NONE);
+    let leaf = boring::x509::X509::from_der(leaf).map_err(|error| boring_error(&error))?;
+    builder
+        .set_certificate(&leaf)
+        .map_err(|error| boring_error(&error))?;
+    for cert in chain {
+        builder
+            .add_extra_chain_cert(
+                boring::x509::X509::from_der(cert).map_err(|error| boring_error(&error))?,
+            )
+            .map_err(|error| boring_error(&error))?;
+    }
+    let key = boring::pkey::PKey::private_key_from_der(&cfg.key_der)
+        .map_err(|error| boring_error(&error))?;
+    builder
+        .set_private_key(&key)
+        .map_err(|error| boring_error(&error))?;
+    builder
+        .check_private_key()
+        .map_err(|error| boring_error(&error))?;
+    if !cfg.alpn.is_empty() {
+        let wanted = cfg.alpn.clone();
+        builder.set_alpn_select_callback(move |_, client| {
+            for want in &wanted {
+                let mut at = 0;
+                while at < client.len() {
+                    let len = usize::from(client[at]);
+                    let Some(protocol) = client.get(at + 1..at + 1 + len) else {
+                        return Err(boring::ssl::AlpnError::NOACK);
+                    };
+                    if protocol == want.as_slice() {
+                        return Ok(protocol);
+                    }
+                    at += 1 + len;
+                }
+            }
+            Err(boring::ssl::AlpnError::NOACK)
+        });
+    }
+    builder
+        .set_min_proto_version(Some(SslVersion::TLS1_3))
+        .map_err(|error| boring_error(&error))?;
+    if !cfg.send_tickets {
+        builder.set_options(boring::ssl::SslOptions::NO_TICKET);
+    }
+    let parsed = crate::tls::ech::parse_server_keys(keys).map_err(TlsError::Other)?;
+    let mut ech = boring::ssl::SslEchKeys::builder().map_err(|error| boring_error(&error))?;
+    for key in parsed {
+        let hpke = boring::hpke::HpkeKey::dhkem_p256_sha256(&key.private_key)
+            .map_err(|error| boring_error(&error))?;
+        // BoringSSL refuses a set with no retry config; every xray key can answer a rejected offer.
+        ech.add_key(true, &key.config, hpke)
+            .map_err(|error| boring_error(&error))?;
+    }
+    builder
+        .set_ech_keys(&ech.build())
+        .map_err(|error| boring_error(&error))?;
+    Ok(builder.build())
 }
 
 /// Whether an error is the socket's poll grain expiring with nothing in it,
@@ -2203,6 +2512,85 @@ mod tests {
         ignore = "needs a loopback socket, and ring's assembly behind it"
     )]
     #[test]
+    fn ech_server_accepts_the_offer_and_echoes() {
+        let (list, keys) = crate::tls::ech::generate("public.test", 3).expect("generates");
+        let cert_pem = anchor_pem("CERTIFICATE", ANCHOR);
+        let key_pem = anchor_pem("PRIVATE KEY", ANCHOR_KEY);
+        let mut identity = crate::tls::parse_pem_identity(&cert_pem, &key_pem).expect("parses");
+        identity.ech_server_keys = Some(keys.into());
+        identity.alpn = vec![b"http/1.1".to_vec(), b"h2".to_vec()];
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let (stream, _) = listener.accept().expect("accepts");
+                let mut server = crate::tls::accept(&identity, stream).expect("accepts");
+                server.handshake().expect("handshakes");
+                assert!(server.ech_accepted(), "the offer was accepted");
+                assert_eq!(
+                    server.alpn(),
+                    Some(&b"http/1.1"[..]),
+                    "the server's list wins when the client offers both"
+                );
+                let mut buf = [0u8; 4];
+                server.read_exact(&mut buf).expect("reads");
+                server.write_all(&buf).expect("writes");
+                server.flush().expect("flushes");
+            });
+            let mut cfg = client("tls.test", &[b"h2", b"http/1.1"]);
+            cfg.ech_config_list = Some(list.into());
+            let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut client = crate::tls::connect(&cfg, stream).expect("configures");
+            client.handshake().expect("handshakes");
+            client.write_all(b"ping").expect("writes");
+            client.flush().expect("flushes");
+            let mut buf = [0u8; 4];
+            client.read_exact(&mut buf).expect("reads");
+            assert_eq!(&buf, b"ping");
+        });
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn ech_server_still_answers_a_client_that_does_not_offer_it() {
+        let (_, keys) = crate::tls::ech::generate("public.test", 3).expect("generates");
+        let cert_pem = anchor_pem("CERTIFICATE", ANCHOR);
+        let key_pem = anchor_pem("PRIVATE KEY", ANCHOR_KEY);
+        let mut identity = crate::tls::parse_pem_identity(&cert_pem, &key_pem).expect("parses");
+        identity.ech_server_keys = Some(keys.into());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let (stream, _) = listener.accept().expect("accepts");
+                let mut server = crate::tls::accept(&identity, stream).expect("accepts");
+                server.handshake().expect("handshakes");
+                assert!(!server.ech_accepted(), "no offer means no acceptance");
+                let mut buf = [0u8; 4];
+                server.read_exact(&mut buf).expect("reads");
+                server.write_all(&buf).expect("writes");
+                server.flush().expect("flushes");
+            });
+            let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut client =
+                crate::tls::connect(&client("tls.test", &[]), stream).expect("configures");
+            client.handshake().expect("handshakes");
+            client.write_all(b"ping").expect("writes");
+            client.flush().expect("flushes");
+            let mut buf = [0u8; 4];
+            client.read_exact(&mut buf).expect("reads");
+            assert_eq!(&buf, b"ping");
+        });
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
     fn an_idle_peer_refuses_the_handshake_instead_of_spinning_it() {
         let cert_pem = anchor_pem("CERTIFICATE", ANCHOR);
         let key_pem = anchor_pem("PRIVATE KEY", ANCHOR_KEY);
@@ -2413,7 +2801,7 @@ mod tests {
                 server.handshake().expect("handshakes");
                 // The relay's own arm for a shared session, so a read inside the window costs one counted grain rather than a parked thread.
                 server
-                    .io
+                    .get_ref()
                     .inner
                     .set_read_timeout(Some(std::time::Duration::from_millis(1)))
                     .expect("arms a grain");

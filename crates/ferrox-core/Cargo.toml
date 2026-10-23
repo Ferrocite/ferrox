@@ -31,6 +31,7 @@ shake = "0.1"
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 ml-kem = { version = "0.3.3", features = ["getrandom"] }
 base64 = "0.23"
+boring = "5.3"
 rand = "0.10"
 ctr = "0.9"
 zeroize = "1"

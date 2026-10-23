@@ -59,7 +59,7 @@ fn split<'a>(text: &'a str, server_name: &str) -> Result<(String, &'a str), Stri
     };
     if name.is_empty() || name.parse::<std::net::IpAddr>().is_ok() {
         return Err(
-            "Using DNS for ECH Config needs serverName or use Server format example.com+https://1.1.1.1/dns-query"
+            "Using DNS for ECH Config needs serverName or use Server format example.com+https://192.0.2.53/dns-query"
                 .to_owned(),
         );
     }
@@ -514,13 +514,14 @@ mod tests {
 
     #[test]
     fn the_server_form_separates_the_query_name() {
-        let (name, server) = split("example.com+https://1.1.1.1/dns-query", "edge.test").unwrap();
+        let (name, server) =
+            split("example.com+https://192.0.2.53/dns-query", "edge.test").unwrap();
         assert_eq!(name, "example.com");
-        assert_eq!(server, "https://1.1.1.1/dns-query");
-        let (name, server) = split("https://1.1.1.1/dns-query", "edge.test").unwrap();
+        assert_eq!(server, "https://192.0.2.53/dns-query");
+        let (name, server) = split("https://192.0.2.53/dns-query", "edge.test").unwrap();
         assert_eq!(name, "edge.test");
-        assert_eq!(server, "https://1.1.1.1/dns-query");
-        assert!(split("https://1.1.1.1/dns-query", "1.1.1.1").is_err());
+        assert_eq!(server, "https://192.0.2.53/dns-query");
+        assert!(split("https://192.0.2.53/dns-query", "192.0.2.53").is_err());
     }
 
     #[test]
