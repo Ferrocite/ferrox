@@ -2960,6 +2960,7 @@ mod tests {
         assert_eq!(counts.allocs, 0, "the segments are borrowed: {counts:?}");
         assert_eq!(meta, (Some("abc"), Some("7")));
         settings.session_placement = Placement::Query;
+        settings.session_key = "x_session".to_owned();
         settings.seq_placement = Placement::Path;
         assert_eq!(
             extract_meta(b"", "/up/abc/7?x_session=z", &settings),
