@@ -34,7 +34,7 @@ pub mod reference {
 }
 
 pub fn active_backends() -> &'static [&'static str] {
-    &["rustls"]
+    &["rustls", "boring"]
 }
 
 pub fn chacha_backend() -> &'static str {

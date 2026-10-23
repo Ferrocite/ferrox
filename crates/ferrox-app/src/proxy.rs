@@ -2155,7 +2155,14 @@ fn quic_inbound_identity(inbound: &Json) -> Option<Arc<ferrox_core::tls::TlsServ
     if settings.get("security").and_then(Json::as_str) != Some("tls") {
         return None;
     }
-    inbound_tls_identity(inbound)
+    let identity = inbound_tls_identity(inbound)?;
+    if identity.ech_server_keys.is_some() {
+        eprintln!(
+            "ech: quic server-side ECH (echServerKeys) has no backend here; the inbound is refused"
+        );
+        return None;
+    }
+    Some(identity)
 }
 
 fn serve_vless_quic_inbound(
@@ -2544,7 +2551,7 @@ fn serve_vless_tls(
             if !shake_tls(&mut tls) {
                 return;
             }
-            relay_vless_driven(tls, Some(raw), id, freedom);
+            relay_vless(tls, Some(raw), id, freedom);
         }
         Carrier::Ws { path, .. } => {
             let Ok(out) = stream.try_clone() else { return };
@@ -2998,36 +3005,6 @@ where
                 );
             }
         }
-    }
-}
-
-/// The served raw `TLS` session driven by the relay: the download's writer is the busy leg here, so a read parked in the transport must not hold the session's lock — the ciphertext comes off the socket with no lock held and only the decryption is under it.
-fn relay_vless_driven(
-    mut session: ferrox_core::tls::RustlsServerProvider<
-        ferrox_core::tls::reality::RecordLimiter<Connection>,
-    >,
-    raw: Option<Connection>,
-    id: &[u8; 16],
-    freedom: bool,
-) {
-    let Some((flow, uplink, close)) = open_vless(&mut session, raw.as_ref(), id, freedom) else {
-        return;
-    };
-    if flow == Flow::Vision {
-        // The Link reads its own transport, so the split is not its shape: the quiet grain stops at the tick instead, and a park never outlasts a writer.
-        relay_stream(
-            Half::shared_armed_capped(
-                crate::vision::Link::new(session, raw, id),
-                super::vision::Link::arm_read_timeout,
-                SESSION_POLL,
-            ),
-            Half::socket(uplink),
-            &close,
-        );
-        return;
-    }
-    if let Ok(half) = driven_halves(session, RELAY_POLL) {
-        relay_stream(half, Half::socket(uplink), &close);
     }
 }
 
@@ -5939,6 +5916,9 @@ impl Drivable
     for ferrox_core::tls::RustlsServerProvider<ferrox_core::tls::reality::RecordLimiter<Connection>>
 {
     fn transport(&self) -> Option<Connection> {
+        if self.is_ech() {
+            return None;
+        }
         self.get_ref().get_ref().try_clone().ok()
     }
 }
@@ -17896,6 +17876,7 @@ mod tests {
             key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
             send_tickets: true,
             server_config_cache: std::sync::Arc::default(),
+            ech_server_keys: None,
         });
         let client = ferrox_core::tls::TlsConfig {
             server_name: "carrier.test".to_owned(),
@@ -17928,6 +17909,7 @@ mod tests {
             cipher_suites: Vec::new(),
             insecure: true,
             fingerprint: None,
+            ech_config_list: None,
             websocket: false,
         };
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
