@@ -19355,7 +19355,6 @@ mod tests {
     /// A trojan listener that declares tls over KCP answers the session its config names: the request is read off the records, not the plaintext header.
     #[test]
     fn a_trojan_kcp_inbound_that_declares_tls_answers_the_session() {
-        use ferrox_core::tls::TlsProvider as _;
         let _guard = budgets::lock();
 
         let (cert, key, client) = tls_cert_json();
@@ -19384,7 +19383,7 @@ mod tests {
             },
         )
         .expect("opens");
-        tls.handshake().expect("handshakes");
+        assert!(shake_tls(&mut tls), "handshakes");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         tls.write_all(&trojan_header(
             &trojan_key("secret"),
