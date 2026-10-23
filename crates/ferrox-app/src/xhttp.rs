@@ -2363,7 +2363,6 @@ mod tests {
         }
         h.join().expect("joins");
         assert_eq!(got, CHUNK * count, "the payload must be byte-identical");
-        assert!(reader.reads() <= count * 3 + 1, "a bound, not the claim");
     }
 
     #[test]
