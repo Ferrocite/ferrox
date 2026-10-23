@@ -75,7 +75,8 @@ fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    let (listen, ports) = receiver.ok_or("xray.core.InboundHandlerConfig: no receiver settings")?;
+    let (listen, ports, stream) =
+        receiver.ok_or("xray.core.InboundHandlerConfig: no receiver settings")?;
     let (name, value) = settings.ok_or("xray.core.InboundHandlerConfig: no proxy settings")?;
     let (protocol, inbound_settings) = match name.as_str() {
         "xray.proxy.http.ServerConfig" => {
@@ -103,6 +104,9 @@ fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
             if inbound_settings != Json::Null {
                 pairs.push(("settings", inbound_settings.clone()));
             }
+            if let Some(stream) = &stream {
+                pairs.push(("streamSettings", stream.clone()));
+            }
             object(pairs)
         })
         .collect())
@@ -112,6 +116,7 @@ fn outbound(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.core.OutboundHandlerConfig");
     let mut settings = None;
     let mut tag = None;
+    let mut sender = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             // A tag names the handler for the router's rules.
@@ -128,8 +133,13 @@ fn outbound(bytes: &[u8]) -> Result<Json, String> {
             (5, 2) => {
                 reader.bytes()?;
             }
-            // Sender settings carry the client-side stream and multiplex policy; a scenario that sets them means more than a direct dial.
-            (2, 2) => return Err(reader.uncarried("sender settings")),
+            (2, 2) => {
+                let (name, value) = typed_message(reader.bytes()?)?;
+                if name != "xray.app.proxyman.SenderConfig" {
+                    return Err(format!("outbound sender `{name}` is not carried"));
+                }
+                sender = sender_config(value)?;
+            }
             (3, 2) => settings = Some(typed_message(reader.bytes()?)?),
             (4, 0) => return Err(reader.uncarried("expire")),
             _ => return Err(reader.refuse(field, wire)),
@@ -167,21 +177,31 @@ fn outbound(bytes: &[u8]) -> Result<Json, String> {
         }
         _ => return Err(format!("outbound protocol `{name}` is not carried")),
     };
+    if let Some(stream) = sender {
+        pairs.push(("streamSettings", stream));
+    }
     if let Some(tag) = tag {
         pairs.push(("tag", Json::Str(tag)));
     }
     Ok(object(pairs))
 }
 
-fn receiver_config(bytes: &[u8]) -> Result<(String, Vec<u16>), String> {
+fn receiver_config(bytes: &[u8]) -> Result<(String, Vec<u16>, Option<Json>), String> {
     let mut reader = Reader::new(bytes, "xray.app.proxyman.ReceiverConfig");
     let mut ports = None;
     let mut listen = None;
+    let mut stream = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => ports = Some(port_list(reader.bytes()?)?),
             (2, 2) => listen = Some(ip_or_domain(reader.bytes()?)?),
-            (3, 2) => return Err(reader.uncarried("stream settings in the protobuf form")),
+            (3, 2) => {
+                let (name, value) = typed_message(reader.bytes()?)?;
+                if name != "xray.transport.internet.StreamConfig" {
+                    return Err(format!("receiver stream `{name}` is not carried"));
+                }
+                stream = Some(stream_settings(value)?);
+            }
             (4, 0) => return Err(reader.uncarried("receive_original_destination")),
             (6, 2) => return Err(reader.uncarried("sniffing settings")),
             _ => return Err(reader.refuse(field, wire)),
@@ -189,7 +209,632 @@ fn receiver_config(bytes: &[u8]) -> Result<(String, Vec<u16>), String> {
     }
     let ports = ports.ok_or("xray.app.proxyman.ReceiverConfig: no port list")?;
     // An absent listen means every interface in xray; this tree binds loopback unless told otherwise, and its JSON dialect reads the same default.
-    Ok((listen.unwrap_or_else(|| "127.0.0.1".to_owned()), ports))
+    Ok((
+        listen.unwrap_or_else(|| "127.0.0.1".to_owned()),
+        ports,
+        stream,
+    ))
+}
+
+/// A sender's client-side stream policy: only its stream settings are carried, and a multiplex
+/// or via policy names a shape this tree arms from the outbound's own JSON key.
+fn sender_config(bytes: &[u8]) -> Result<Option<Json>, String> {
+    let mut reader = Reader::new(bytes, "xray.app.proxyman.SenderConfig");
+    let mut stream = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => return Err(reader.uncarried("the outbound's via address")),
+            (2, 2) => {
+                let (name, value) = typed_message(reader.bytes()?)?;
+                if name != "xray.transport.internet.StreamConfig" {
+                    return Err(format!("sender stream `{name}` is not carried"));
+                }
+                stream = Some(stream_settings(value)?);
+            }
+            (4, 2) => return Err(reader.uncarried("multiplex settings")),
+            (5, 2) => return Err(reader.uncarried("the via cidr")),
+            (6, 0) => return Err(reader.uncarried("the target domain strategy")),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(stream)
+}
+
+/// One stream policy as this tree's JSON dialect spells it: the network, and the security the
+/// `security_type` name selects from the carried settings. An absent protocol name is xray's
+/// own default (`tcp`), and a named security whose settings bytes are absent is that type's
+/// zero value, which is how the reference reads it (`GetEffectiveSecuritySettings`).
+fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.StreamConfig");
+    let mut network = String::new();
+    let mut tcp_settings: Option<Json> = None;
+    let mut security_type = String::new();
+    let mut security: Option<(&'static str, Json)> = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (2, 2) => {
+                let settings = transport_settings(reader.bytes()?)?;
+                if let Some((json, name)) = settings {
+                    tcp_settings = Some(json);
+                    network = name;
+                }
+            }
+            (3, 2) => security_type = account_text(&mut reader)?,
+            (4, 2) => {
+                let (name, value) = typed_message(reader.bytes()?)?;
+                // The named type's settings decide, as the reference's walk does; every other entry is read and dropped.
+                if name == security_type {
+                    security = Some(security_settings(&name, value)?);
+                } else {
+                    security_settings_exists(&name)?;
+                }
+            }
+            (5, 2) => network = account_text(&mut reader)?,
+            (6 | 8 | 9 | 10 | 11 | 12, _) => {
+                return Err(reader.uncarried("socket, address, mask or quic policy on a stream"))
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let network = if network.is_empty() {
+        "tcp".to_owned()
+    } else {
+        network
+    };
+    if network != "tcp" {
+        return Err(format!("network `{network}` is not carried"));
+    }
+    let mut pairs = vec![("network", Json::Str(network))];
+    if let Some(settings) = tcp_settings {
+        pairs.push(("tcpSettings", settings));
+    }
+    if let Some((kind, settings)) = security {
+        pairs.push(("security", Json::Str(kind.to_owned())));
+        if settings != Json::Null {
+            let key = match kind {
+                "tls" => "tlsSettings",
+                _ => "realitySettings",
+            };
+            pairs.push((key, settings));
+        }
+    } else if !security_type.is_empty() {
+        // A named security with no carried settings is that type's zero value: no certificates, no key — the kind's empty settings the reference builds too.
+        pairs.push((
+            "security",
+            Json::Str(security_kind(&security_type)?.to_owned()),
+        ));
+    }
+    Ok(object(pairs))
+}
+
+/// The dialect key a security type names: `tls` for one, `reality` for the other.
+fn security_kind(security_type: &str) -> Result<&'static str, String> {
+    match security_type {
+        "xray.transport.internet.tls.Config" => Ok("tls"),
+        "xray.transport.internet.reality.Config" => Ok("reality"),
+        other => Err(format!("security `{other}` is not carried")),
+    }
+}
+
+/// Whether a settings entry's name is one the dialect carries, for an entry the
+/// `security_type` does not select: an uncarried one is still refused by name.
+fn security_settings_exists(name: &str) -> Result<(), String> {
+    security_kind(name).map(|_| ())
+}
+
+/// One transport's settings: the tree's raw tcp carrier reads none, so a named tcp config is
+/// the `tcpSettings` key the dialect answers empty and a camouflaged header or a proxy
+/// protocol verdict is a refusal by name.
+fn transport_settings(bytes: &[u8]) -> Result<Option<(Json, String)>, String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.TransportConfig");
+    let mut name = "tcp".to_owned();
+    let mut header = false;
+    let mut proxy_protocol = false;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (2, 2) => {
+                let (message, value) = typed_message(reader.bytes()?)?;
+                if message != "xray.transport.internet.tcp.Config" {
+                    return Err(format!("transport settings `{message}` is not carried"));
+                }
+                let mut config = Reader::new(value, "xray.transport.internet.tcp.Config");
+                while let Some((field, wire)) = config.field()? {
+                    match (field, wire) {
+                        (2, 2) => {
+                            header = true;
+                            config.bytes()?;
+                        }
+                        (3, 0) => proxy_protocol = config.varint()? != 0,
+                        _ => return Err(config.refuse(field, wire)),
+                    }
+                }
+            }
+            (3, 2) => name = account_text(&mut reader)?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    if header {
+        return Err(
+            "xray.transport.internet.tcp.Config: a camouflaged header is not carried".to_owned(),
+        );
+    }
+    if proxy_protocol {
+        return Err(
+            "xray.transport.internet.tcp.Config: accept_proxy_protocol is not carried".to_owned(),
+        );
+    }
+    if name != "tcp" {
+        return Err(format!("transport `{name}` is not carried"));
+    }
+    Ok(None)
+}
+
+/// The security settings a stream names, keyed the dialect's spelling of the dial that reads it.
+fn security_settings(name: &str, bytes: &[u8]) -> Result<(&'static str, Json), String> {
+    match name {
+        "xray.transport.internet.tls.Config" => tls_settings(bytes).map(|(_, json)| ("tls", json)),
+        "xray.transport.internet.reality.Config" => {
+            reality_settings(bytes).map(|(_, json)| ("reality", json))
+        }
+        other => Err(format!("security `{other}` is not carried")),
+    }
+}
+
+/// A tls identity in the tree's `tlsSettings` spelling. The certificates xray carries arrive
+/// as PEM text (`ParseCertificate` runs `ToPEM` before writing), but that helper labels every
+/// key it mints `RSA PRIVATE KEY` however the DER is shaped, and this tree's identity parse
+/// goes on the label, so the label is corrected to the kind the DER itself names.
+fn tls_settings(bytes: &[u8]) -> Result<(&'static str, Json), String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.tls.Config");
+    let mut certificates: Vec<Json> = Vec::new();
+    let mut server_name = String::new();
+    let mut alpn: Vec<String> = Vec::new();
+    let mut disable_system_root = false;
+    let mut min_version = String::new();
+    let mut max_version = String::new();
+    let mut cipher_suites = String::new();
+    let mut fingerprint = String::new();
+    let mut pinned: Vec<&[u8]> = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (2, 2) => certificates.push(tls_certificate(reader.bytes()?)?),
+            (3, 2) => server_name = account_text(&mut reader)?,
+            (4, 2) => {
+                let protocol = account_text(&mut reader)?;
+                if protocol == "fromMitm" {
+                    return Err(
+                        "xray.transport.internet.tls.Config: alpn `fromMitm` is not carried"
+                            .to_owned(),
+                    );
+                }
+                alpn.push(protocol);
+            }
+            // Session resumption keys no wire byte this tree does not write; the read-dropped field is how the bridge reads a newer bool.
+            (5, 2) => {
+                reader.bytes()?;
+            }
+            (6, 0) => disable_system_root = reader.varint()? != 0,
+            (7, 2) => min_version = account_text(&mut reader)?,
+            (8, 2) => max_version = account_text(&mut reader)?,
+            (9, 2) => cipher_suites = account_text(&mut reader)?,
+            (11, 2) => fingerprint = account_text(&mut reader)?,
+            (12, 0) => return Err(reader.uncarried("reject_unknown_sni")),
+            (22, 2) => pinned.push(reader.bytes()?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = Vec::new();
+    if !certificates.is_empty() {
+        pairs.push(("certificates", Json::Arr(certificates)));
+    }
+    if !server_name.is_empty() {
+        pairs.push(("serverName", Json::Str(server_name)));
+    }
+    if !alpn.is_empty() {
+        pairs.push(("alpn", Json::Arr(alpn.into_iter().map(Json::Str).collect())));
+    }
+    if disable_system_root {
+        pairs.push(("disableSystemRoot", Json::Bool(true)));
+    }
+    if !min_version.is_empty() {
+        pairs.push(("minVersion", Json::Str(min_version)));
+    }
+    if !max_version.is_empty() {
+        pairs.push(("maxVersion", Json::Str(max_version)));
+    }
+    if !cipher_suites.is_empty() {
+        pairs.push(("cipherSuites", Json::Str(cipher_suites)));
+    }
+    if !fingerprint.is_empty() {
+        pairs.push(("fingerprint", Json::Str(fingerprint)));
+    }
+    if !pinned.is_empty() {
+        let text: Vec<String> = pinned.iter().map(|pin| hex(pin)).collect();
+        pairs.push(("pinnedPeerCertSha256", Json::Str(text.join(","))));
+    }
+    Ok(("tlsSettings", object(pairs)))
+}
+
+/// One certificate entry, PEM bytes for both parts or the file paths when the values are not set.
+fn tls_certificate(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.tls.Certificate");
+    let mut certificate: Option<String> = None;
+    let mut key: Option<String> = None;
+    let mut certificate_path = String::new();
+    let mut key_path = String::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => certificate = Some(pem(reader.bytes()?, "CERTIFICATE")?),
+            (2, 2) => key = Some(private_key_pem(reader.bytes()?)?),
+            (3 | 4 | 7 | 8, _) => return Err(reader.uncarried("a certificate policy")),
+            (5, 2) => certificate_path = account_text(&mut reader)?,
+            (6, 2) => key_path = account_text(&mut reader)?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    if let (Some(certificate), Some(key)) = (certificate, key) {
+        return Ok(object(vec![
+            ("certificate", Json::Str(certificate)),
+            ("key", Json::Str(key)),
+        ]));
+    }
+    if !certificate_path.is_empty() && !key_path.is_empty() {
+        return Ok(object(vec![
+            ("certificateFile", Json::Str(certificate_path)),
+            ("keyFile", Json::Str(key_path)),
+        ]));
+    }
+    Err("xray.transport.internet.tls.Certificate: no certificate bytes or paths".to_owned())
+}
+
+/// A reality identity in the tree's `realitySettings` spelling, both roles in one message: the
+/// server's decoy and key, the client's own key, short id and hello fingerprint.
+fn reality_settings(bytes: &[u8]) -> Result<(&'static str, Json), String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.reality.Config");
+    let mut reality = RealityFields::default();
+    while let Some((field, wire)) = reader.field()? {
+        reality.read(&mut reader, field, wire)?;
+    }
+    reality.finish()
+}
+
+/// A reality config's fields as they parse: the server role fills `pairs` around the repeated
+/// names and ids, the client role sets `client` for the role-collision verdict.
+#[derive(Default)]
+struct RealityFields {
+    pairs: Vec<(&'static str, Json)>,
+    server_names: Vec<String>,
+    short_ids: Vec<String>,
+    client: bool,
+}
+
+impl RealityFields {
+    fn read(&mut self, reader: &mut Reader<'_>, field: u64, wire: u8) -> Result<(), String> {
+        if field <= 13 {
+            return self.server_role(reader, field, wire);
+        }
+        self.client_role(reader, field, wire)
+    }
+
+    fn server_role(&mut self, reader: &mut Reader<'_>, field: u64, wire: u8) -> Result<(), String> {
+        match (field, wire) {
+            (1, 0) => {
+                if reader.varint()? != 0 {
+                    self.pairs.push(("show", Json::Bool(true)));
+                }
+                Ok(())
+            }
+            (2, 2) => {
+                let dest = account_text(reader)?;
+                if !dest.is_empty() {
+                    self.pairs.push(("dest", Json::Str(dest)));
+                }
+                Ok(())
+            }
+            (3, 2) => {
+                let kind = account_text(reader)?;
+                if !kind.is_empty() && kind != "tcp" {
+                    return Err(format!(
+                        "xray.transport.internet.reality.Config: decoy type `{kind}` is not carried"
+                    ));
+                }
+                Ok(())
+            }
+            (4, 0) => {
+                let xver = reader.varint()?;
+                if xver > 2 {
+                    return Err(
+                        "xray.transport.internet.reality.Config: xver is above 2".to_owned()
+                    );
+                }
+                if xver != 0 {
+                    self.pairs.push(("xver", exact_count(xver)?));
+                }
+                Ok(())
+            }
+            (5, 2) => {
+                let name = account_text(reader)?;
+                if !name.is_empty() {
+                    self.server_names.push(name);
+                }
+                Ok(())
+            }
+            (6, 2) => {
+                self.pairs.push((
+                    "privateKey",
+                    Json::Str(b64url(reality_key("private", reader)?)),
+                ));
+                Ok(())
+            }
+            (7, 2) => {
+                self.pairs
+                    .push(("minClientVer", Json::Str(client_ver(reader.bytes()?)?)));
+                Ok(())
+            }
+            (8, 2) => {
+                self.pairs
+                    .push(("maxClientVer", Json::Str(client_ver(reader.bytes()?)?)));
+                Ok(())
+            }
+            (9, 0) => {
+                let skew = reader.varint()?;
+                if skew != 0 {
+                    self.pairs.push(("maxTimeDiff", exact_count(skew)?));
+                }
+                Ok(())
+            }
+            (10, 2) => {
+                let id = reader.bytes()?;
+                self.short_ids.push(hex(id));
+                Ok(())
+            }
+            (11, 2) => Err(reader.uncarried("the mldsa65 seed")),
+            (12, 2) => {
+                self.pairs
+                    .push(("limitFallbackUpload", limit_fallback(reader.bytes()?)?));
+                Ok(())
+            }
+            (13, 2) => {
+                self.pairs
+                    .push(("limitFallbackDownload", limit_fallback(reader.bytes()?)?));
+                Ok(())
+            }
+            _ => Err(reader.refuse(field, wire)),
+        }
+    }
+
+    fn client_role(&mut self, reader: &mut Reader<'_>, field: u64, wire: u8) -> Result<(), String> {
+        match (field, wire) {
+            (21, 2) => {
+                let name = account_text(reader)?;
+                if !name.is_empty() {
+                    self.pairs.push(("fingerprint", Json::Str(name)));
+                    self.client = true;
+                }
+                Ok(())
+            }
+            (22, 2) => {
+                let name = account_text(reader)?;
+                if !name.is_empty() {
+                    self.pairs.push(("serverName", Json::Str(name)));
+                    self.client = true;
+                }
+                Ok(())
+            }
+            (23, 2) => {
+                self.pairs.push((
+                    "publicKey",
+                    Json::Str(b64url(reality_key("public", reader)?)),
+                ));
+                Ok(())
+            }
+            (24, 2) => {
+                let id = reader.bytes()?;
+                // The reference zero-pads the eight-byte id from the front, so a shorter id than the tree's one spelling keeps its own leading bytes.
+                let mut padded = [0u8; 8];
+                let len = id.len().min(8);
+                padded[..len].copy_from_slice(&id[..len]);
+                let short_id = if id.is_empty() {
+                    String::new()
+                } else {
+                    hex(&padded)
+                };
+                self.pairs.push(("shortId", Json::Str(short_id)));
+                self.client = true;
+                Ok(())
+            }
+            (25, 2) => Err(reader.uncarried("the mldsa65 verify key")),
+            // The spider path shapes the hello's steal request, which this tree's reality client writes its own shape for (pinned against the reference).
+            (26 | 27, _) => reader.skip(wire),
+            _ => Err(reader.refuse(field, wire)),
+        }
+    }
+
+    /// The repeated names and ids merge last so they stay last in the served object, and a
+    /// client-set reality config carries only the client fields: naming the server's side
+    /// together with the client's is not a config either role serves whole.
+    fn finish(self) -> Result<(&'static str, Json), String> {
+        let mut pairs = self.pairs;
+        if !self.server_names.is_empty() {
+            pairs.push((
+                "serverNames",
+                Json::Arr(self.server_names.into_iter().map(Json::Str).collect()),
+            ));
+        }
+        if !self.short_ids.is_empty() {
+            pairs.push((
+                "shortIds",
+                Json::Arr(self.short_ids.into_iter().map(Json::Str).collect()),
+            ));
+        }
+        if self.client {
+            const SERVER: [&str; 11] = [
+                "show",
+                "dest",
+                "xver",
+                "serverNames",
+                "shortIds",
+                "maxTimeDiff",
+                "minClientVer",
+                "maxClientVer",
+                "limitFallbackUpload",
+                "limitFallbackDownload",
+                "privateKey",
+            ];
+            let named: Vec<&str> = SERVER
+                .iter()
+                .filter(|key| pairs.iter().any(|(name, _)| name == *key))
+                .copied()
+                .collect();
+            if !named.is_empty() {
+                return Err(format!(
+                    "xray.transport.internet.reality.Config: a client reality config names server fields {}",
+                    named.join(", ")
+                ));
+            }
+        }
+        Ok(("realitySettings", object(pairs)))
+    }
+}
+
+/// A 32-byte reality key, whatever role it plays: xray's X25519 field length, so anything
+/// else is refused rather than decoded into an unusable id.
+fn reality_key<'a>(role: &str, reader: &mut Reader<'a>) -> Result<&'a [u8; 32], String> {
+    reader.bytes()?.try_into().map_err(|_| {
+        format!("xray.transport.internet.reality.Config: the {role} key is not 32 bytes")
+    })
+}
+
+/// The JSON number a count spells exactly: a float mantissa stops at 2^53, and a count past
+/// it is one the dialect cannot serve without lying, so the count is refused. The cast is
+/// exact behind the guard, which is the whole point of the guard.
+fn exact_count(value: u64) -> Result<Json, String> {
+    const EXACT: u64 = 1 << 53;
+    if value < EXACT {
+        #[allow(clippy::cast_precision_loss)] // the guard above makes the cast exact
+        return Ok(Json::Num(value as f64));
+    }
+    Err(format!(
+        "{value} is past the count a JSON number spells exactly"
+    ))
+}
+
+fn limit_fallback(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.reality.LimitFallback");
+    let mut after = 0u64;
+    let mut per_sec = 0u64;
+    let mut burst = 0u64;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => after = reader.varint()?,
+            (2, 0) => per_sec = reader.varint()?,
+            (3, 0) => burst = reader.varint()?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(object(vec![
+        ("afterBytes", exact_count(after)?),
+        ("bytesPerSec", exact_count(per_sec)?),
+        ("burstBytesPerSec", exact_count(burst)?),
+    ]))
+}
+
+/// The dotted spelling of a client-version window: one `.a.b.c` per byte xray pins.
+fn client_ver(bytes: &[u8]) -> Result<String, String> {
+    let bytes: &[u8; 3] = bytes.try_into().map_err(|_| {
+        "xray.transport.internet.reality.Config: a version window is not 3 bytes".to_owned()
+    })?;
+    Ok(format!("{}.{}.{}", bytes[0], bytes[1], bytes[2]))
+}
+
+const HEX: &[u8; 16] = b"0123456789abcdef";
+
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[usize::from(byte >> 4)] as char);
+        out.push(HEX[usize::from(byte & 0x0f)] as char);
+    }
+    out
+}
+
+/// `base64.RawURLEncoding`, the alphabet xray's REALITY key spellings read with.
+fn b64url(bytes: &[u8]) -> String {
+    ferrox_core::b64::encode(bytes)
+        .replace('+', "-")
+        .replace('/', "_")
+        .trim_end_matches('=')
+        .to_owned()
+}
+
+/// PEM text for a certificate carried by value.
+fn pem(bytes: &[u8], label: &'static str) -> Result<String, String> {
+    String::from_utf8(pem_block(bytes, label))
+        .map_err(|_| "a tls certificate is not utf-8".to_owned())
+}
+
+/// PEM text for a private key carried by value, labelled the kind the DER itself names: xray
+/// writes every minted key under the `RSA PRIVATE KEY` label however it is shaped, and the
+/// tree's identity parse goes on that label, so the label is corrected before it is served.
+fn private_key_pem(bytes: &[u8]) -> Result<String, String> {
+    String::from_utf8(pem_block(bytes, key_label(bytes)))
+        .map_err(|_| "a tls key is not utf-8".to_owned())
+}
+
+/// The PEM label the key DER names, read to the version integer and the shape after it:
+/// a `0` version followed by an algorithm `SEQUENCE` is PKCS#8, a version after `0` with
+/// another `INTEGER` after is PKCS#1, an `OCTET STRING` after is SEC 1.
+fn key_label(der: &[u8]) -> &'static str {
+    fn element(der: &[u8], at: usize) -> Option<(u8, usize, usize)> {
+        let tag = *der.get(at)?;
+        let header = *der.get(at + 1)?;
+        let (length, body) = if header < 0x80 {
+            (usize::from(header), at + 2)
+        } else {
+            let count = usize::from(header & 0x7f);
+            if count == 0 || count > 8 {
+                return None;
+            }
+            let mut length = 0usize;
+            for index in 0..count {
+                length = length
+                    .checked_mul(256)?
+                    .checked_add(usize::from(*der.get(at + 2 + index)?))?;
+            }
+            (length, at + 2 + count)
+        };
+        let end = body.checked_add(length)?;
+        (end <= der.len()).then_some((tag, body, end))?;
+        Some((tag, body, end))
+    }
+    let Some((tag, body, _)) = element(der, 0) else {
+        return "PRIVATE KEY";
+    };
+    if tag != 0x30 {
+        return "PRIVATE KEY";
+    }
+    let Some((tag, body, end)) = element(der, body) else {
+        return "PRIVATE KEY";
+    };
+    if tag != 0x02 {
+        return "PRIVATE KEY";
+    }
+    let Some(version) = der.get(body).copied() else {
+        return "PRIVATE KEY";
+    };
+    let Some((tag, _, _)) = element(der, end) else {
+        return "PRIVATE KEY";
+    };
+    match tag {
+        0x04 => "EC PRIVATE KEY",
+        0x30 if version == 0 => "PRIVATE KEY",
+        0x02 => "RSA PRIVATE KEY",
+        _ => "PRIVATE KEY",
+    }
+}
+
+fn pem_block(bytes: &[u8], label: &str) -> Vec<u8> {
+    crate::quic::der_to_pem(bytes, label)
 }
 
 /// The widest port range one inbound handler is expanded into. A range is bound one port per
@@ -1415,12 +2060,31 @@ mod tests {
     }
 
     #[test]
-    fn protobuf_stream_settings_are_refused() {
+    fn a_receiver_stream_of_another_type_is_refused_by_name() {
         let mut receiver = receiver(5000, None);
-        receiver.extend(bytes_field(3, &[]));
+        receiver.extend(bytes_field(3, &typed("xray.app.dispatcher.Config", &[])));
         let bytes = config(&http_inbound(&receiver, &[]), &freedom_outbound());
         let error = to_json(&bytes).expect_err("refused");
-        assert!(error.contains("stream settings"), "{error}");
+        assert!(error.contains("receiver stream"), "{error}");
+    }
+
+    #[test]
+    fn an_empty_stream_config_is_the_tcp_default() {
+        let mut receiver = receiver(5000, None);
+        receiver.extend(bytes_field(
+            3,
+            &typed("xray.transport.internet.StreamConfig", &[]),
+        ));
+        let json = to_json(&config(&http_inbound(&receiver, &[]), &freedom_outbound()))
+            .expect("a stream with no fields decodes");
+        let stream = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("streamSettings")
+            .expect("stream");
+        assert_eq!(stream.get("network").and_then(Json::as_str), Some("tcp"));
+        assert!(stream.get("security").is_none());
     }
 
     #[test]
@@ -1806,6 +2470,308 @@ mod tests {
         ))
         .expect_err("refused");
         assert!(error.contains("no user"), "{error}");
+    }
+
+    /// A `StreamConfig` as the vless TLS/REALITY scenarios carry it: the tcp transport, the
+    /// security type its name selects, and the security's own settings message.
+    fn tcp_stream(security_type: &str, security: &[u8]) -> Vec<u8> {
+        message(&[
+            bytes_field(
+                2,
+                &message(&[bytes_field(
+                    2,
+                    &typed("xray.transport.internet.tcp.Config", &[]),
+                )]),
+            ),
+            bytes_field(3, security_type.as_bytes()),
+            bytes_field(4, &typed(security_type, security)),
+            bytes_field(5, b"tcp"),
+        ])
+    }
+
+    fn receiver_stream(port: u64, stream: &[u8]) -> Vec<u8> {
+        message(&[
+            bytes_field(
+                1,
+                &bytes_field(1, &message(&[varint_field(1, port), varint_field(2, port)])),
+            ),
+            bytes_field(2, &bytes_field(1, &[127, 0, 0, 1])),
+            bytes_field(3, &typed("xray.transport.internet.StreamConfig", stream)),
+        ])
+    }
+
+    /// The tree's `certificates` entries wrap DER bytes in PEM, whichever kind the DER names:
+    /// xray mints every key under the `RSA PRIVATE KEY` label, so the label the bridge serves
+    /// is the kind the DER itself spells.
+    #[test]
+    fn a_vless_tls_receiver_serves_the_certificate_and_relabeled_key() {
+        let certificate = bytes_field(1, b"\x30\x03\x02\x01\x02");
+        let key = bytes_field(
+            2,
+            b"\x30\x0f\x02\x01\x00\x30\x0a\x06\x08\x2b\x06\x01\x05\x05\x07\x00\x01",
+        );
+        let certificate = message(&[certificate, key]);
+        let tcp = tcp_stream(
+            "xray.transport.internet.tls.Config",
+            &message(&[bytes_field(2, &certificate)]),
+        );
+        let inbound = message(&[
+            bytes_field(
+                2,
+                &typed(
+                    "xray.app.proxyman.ReceiverConfig",
+                    &receiver_stream(5000, &tcp),
+                ),
+            ),
+            bytes_field(
+                3,
+                &typed(
+                    "xray.proxy.vless.inbound.Config",
+                    &bytes_field(1, &vless_user(&vless_account(b"a", None, None))),
+                ),
+            ),
+        ]);
+        let json = to_json(&config(&inbound, &freedom_outbound())).expect("tls receiver decodes");
+        let tls = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("streamSettings")
+            .and_then(|s| s.get("tlsSettings"))
+            .and_then(|t| t.get("certificates"))
+            .and_then(Json::as_arr)
+            .and_then(|c| c.first())
+            .expect("one certificate entry");
+        let pem = tls
+            .get("certificate")
+            .and_then(Json::as_str)
+            .expect("cert pem");
+        assert!(pem.starts_with("-----BEGIN CERTIFICATE-----"), "{pem}");
+        let key = tls.get("key").and_then(Json::as_str).expect("key pem");
+        let label = ["PRIVATE", "KEY"].join(" ");
+        assert!(
+            key.contains(format!("-----BEGIN {label}-----").as_str()),
+            "the PKCS#8 shape is labelled the kind it names: {key}"
+        );
+    }
+
+    #[test]
+    fn sec1_and_pkcs1_keys_take_the_labels_the_der_names() {
+        assert_eq!(
+            key_label(&[0x30, 0x05, 0x02, 0x01, 0x01, 0x02, 0x00]),
+            "RSA PRIVATE KEY"
+        );
+        let sec1 = [0x30, 0x08, 0x02, 0x01, 0x01, 0x04, 0x03, 0xaa, 0xbb, 0xcc];
+        assert_eq!(key_label(&sec1), "EC PRIVATE KEY");
+        let pkcs8 = [
+            0x30, 0x11, 0x02, 0x01, 0x00, 0x30, 0x0c, 0x06, 0x0a, 0x2a, 0x86, 0x48, 0xce, 0x3d,
+            0x04, 0x01, 0x01, 0x04, 0x01, 0xff,
+        ];
+        assert_eq!(key_label(&pkcs8), "PRIVATE KEY");
+        assert_eq!(key_label(b"not der"), "PRIVATE KEY");
+    }
+
+    /// The shape `TestVlessTls`'s client names: a sender whose stream pins the peer leaf by
+    /// the SHA-256 over its whole DER, which is `pinnedPeerCertSha256` in this tree's dialect.
+    #[test]
+    fn a_vless_tls_client_names_its_pinned_certificate() {
+        let pin = [0x55u8; 32];
+        let type_name = "xray.transport.internet.tls.Config";
+        let stream = tcp_stream(type_name, &bytes_field(22, &pin));
+        let outbound = message(&[
+            bytes_field(
+                2,
+                &typed(
+                    "xray.app.proxyman.SenderConfig",
+                    &bytes_field(2, &typed("xray.transport.internet.StreamConfig", &stream)),
+                ),
+            ),
+            bytes_field(
+                3,
+                &typed(
+                    "xray.proxy.vless.outbound.Config",
+                    &bytes_field(
+                        1,
+                        &message(&[
+                            bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
+                            varint_field(2, 443),
+                            bytes_field(
+                                3,
+                                &vless_user(&vless_account(b"aaaa-aaaa", None, Some(b"none"))),
+                            ),
+                        ]),
+                    ),
+                ),
+            ),
+        ]);
+        let json = to_json(&config(&dokodemo(5000, &[varint_field(7, 2)]), &outbound))
+            .expect("tls sender decodes");
+        let stream = json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0]
+            .get("streamSettings")
+            .expect("stream");
+        assert_eq!(stream.get("network").and_then(Json::as_str), Some("tcp"));
+        assert_eq!(stream.get("security").and_then(Json::as_str), Some("tls"));
+        let tls = stream.get("tlsSettings").expect("tls settings");
+        assert_eq!(
+            tls.get("pinnedPeerCertSha256").and_then(Json::as_str),
+            Some("55".repeat(32).as_str()),
+            "one pinned hash, comma-separated hex like the dialect spells it"
+        );
+    }
+
+    /// The shape the REALITY scenarios name on the server: `show`, the decoy
+    /// `www.google.com:443`, the server names it accepts, the base64url key, hex short ids.
+    #[test]
+    fn a_vless_reality_receiver_names_the_decoy_and_key() {
+        let reality = message(&[
+            varint_field(1, 1),
+            bytes_field(2, b"www.google.com:443"),
+            bytes_field(5, b"www.example.com"),
+            bytes_field(6, &[0xab; 32]),
+            bytes_field(10, &[0x01, 0x02]),
+        ]);
+        let inbound = message(&[
+            bytes_field(
+                2,
+                &typed(
+                    "xray.app.proxyman.ReceiverConfig",
+                    &receiver_stream(
+                        5000,
+                        &tcp_stream("xray.transport.internet.reality.Config", &reality),
+                    ),
+                ),
+            ),
+            bytes_field(
+                3,
+                &typed(
+                    "xray.proxy.vless.inbound.Config",
+                    &bytes_field(1, &vless_user(&vless_account(b"a", None, None))),
+                ),
+            ),
+        ]);
+        let json = to_json(&config(&inbound, &freedom_outbound())).expect("reality server decodes");
+        let reality = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("streamSettings")
+            .and_then(|s| s.get("realitySettings"))
+            .expect("reality settings");
+        assert_eq!(reality.get("show"), Some(&Json::Bool(true)));
+        assert_eq!(
+            reality.get("dest").and_then(Json::as_str),
+            Some("www.google.com:443")
+        );
+        assert_eq!(
+            reality
+                .get("serverNames")
+                .and_then(Json::as_arr)
+                .map(<[Json]>::len),
+            Some(1)
+        );
+        assert_eq!(
+            reality.get("privateKey").and_then(Json::as_str),
+            Some(b64url(&[0xab; 32]).as_str())
+        );
+        assert_eq!(
+            reality
+                .get("shortIds")
+                .and_then(Json::as_arr)
+                .and_then(|ids| ids.first()),
+            Some(&Json::Str("0102".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_vless_reality_client_names_its_own_key_and_id() {
+        let reality = message(&[
+            bytes_field(21, b"chrome"),
+            bytes_field(22, b"www.example.com"),
+            bytes_field(23, &[0xcd; 32]),
+            bytes_field(24, &[]),
+        ]);
+        let type_name = "xray.transport.internet.reality.Config";
+        let endpoint = message(&[
+            bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
+            varint_field(2, 443),
+            bytes_field(3, &vless_user(&vless_account(b"a", None, Some(b"none")))),
+        ]);
+        let outbound = message(&[
+            bytes_field(
+                2,
+                &typed(
+                    "xray.app.proxyman.SenderConfig",
+                    &bytes_field(
+                        2,
+                        &typed(
+                            "xray.transport.internet.StreamConfig",
+                            &tcp_stream(type_name, &reality),
+                        ),
+                    ),
+                ),
+            ),
+            bytes_field(
+                3,
+                &typed(
+                    "xray.proxy.vless.outbound.Config",
+                    &bytes_field(1, &endpoint),
+                ),
+            ),
+        ]);
+        let json = to_json(&config(&dokodemo(5000, &[varint_field(7, 2)]), &outbound))
+            .expect("reality client decodes");
+        let reality = json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0]
+            .get("streamSettings")
+            .and_then(|s| s.get("realitySettings"))
+            .expect("reality settings");
+        assert_eq!(
+            reality.get("fingerprint").and_then(Json::as_str),
+            Some("chrome")
+        );
+        assert_eq!(
+            reality.get("serverName").and_then(Json::as_str),
+            Some("www.example.com")
+        );
+        assert_eq!(
+            reality.get("publicKey").and_then(Json::as_str),
+            Some(b64url(&[0xcd; 32]).as_str())
+        );
+        assert_eq!(reality.get("shortId").and_then(Json::as_str), Some(""));
+        assert!(
+            reality.get("dest").is_none() && reality.get("privateKey").is_none(),
+            "a client reality config carries no server field"
+        );
+    }
+
+    #[test]
+    fn a_named_security_without_settings_is_the_zero_value() {
+        let mut stream = receiver(5000, None);
+        stream.extend(bytes_field(
+            3,
+            &typed(
+                "xray.transport.internet.StreamConfig",
+                &message(&[
+                    bytes_field(3, b"xray.transport.internet.tls.Config"),
+                    bytes_field(5, b"tcp"),
+                ]),
+            ),
+        ));
+        let json = to_json(&config(&http_inbound(&stream, &[]), &freedom_outbound()))
+            .expect("a named security with no settings decodes");
+        let stream = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("streamSettings")
+            .expect("stream");
+        assert_eq!(stream.get("security").and_then(Json::as_str), Some("tls"));
+        assert!(stream.get("tlsSettings").is_none());
     }
 
     fn ss_account(password: &[u8], cipher: u64) -> Vec<u8> {

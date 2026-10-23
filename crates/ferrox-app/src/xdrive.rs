@@ -241,6 +241,7 @@ fn transport_tls(stream: &Json, security: &str) -> Option<Arc<TlsConfig>> {
                 .map(|pem| ferrox_core::tls::Anchors::from(crate::quic::parse_ca_pem(&pem)))
                 .unwrap_or_default(),
             pins: ferrox_core::foxy::pin::Pins::default(),
+            cert_pins: std::sync::Arc::from(Vec::new()),
             cipher_suites: Vec::new(),
             insecure: tls.get("allowInsecure").and_then(Json::as_bool) == Some(true),
             fingerprint: None,
