@@ -2002,6 +2002,15 @@ fn target_of(path: &str, query: &str) -> String {
     }
 }
 
+/// The same target from a path the caller already owns, so a per-packet head does not copy it twice.
+fn combine_target(mut path: String, query: &str) -> String {
+    if !query.is_empty() {
+        path.push('?');
+        path.push_str(query);
+    }
+    path
+}
+
 /// The request target a dial writes: the configured path and the query that rode in with it (`config.go:20`).
 pub(crate) fn dial_path(settings: &XhttpSettings) -> String {
     target_of(&settings.path, &settings.query)
@@ -2056,13 +2065,9 @@ fn packet_head<'a>(
         &mut query,
         &mut extra,
     );
-    let target = target_of(&target, &query);
+    let target = combine_target(target, &query);
     let method = settings.uplink_method.as_str();
-    let referer = format!(
-        "Referer: http://{host}{}?x_padding={}\r\n",
-        settings.path,
-        referer_pad_value(settings)
-    );
+    let pad = referer_pad_value(settings);
     match settings.uplink_data_placement {
         Placement::Header | Placement::Cookie => {
             let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(piece);
@@ -2114,15 +2119,17 @@ fn packet_head<'a>(
             };
             (
                 format!(
-                    "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{extra}{referer}{zero}Connection: keep-alive\r\n\r\n"
+                    "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{extra}Referer: http://{host}{}?x_padding={pad}\r\n{zero}Connection: keep-alive\r\n\r\n",
+                    settings.path
                 ),
                 None,
             )
         }
         _ => (
             format!(
-                "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{extra}Content-Length: {}\r\n{referer}Connection: keep-alive\r\n\r\n",
-                piece.len()
+                "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{extra}Content-Length: {}\r\nReferer: http://{host}{}?x_padding={pad}\r\nConnection: keep-alive\r\n\r\n",
+                piece.len(),
+                settings.path
             ),
             Some(piece),
         ),
@@ -2153,7 +2160,8 @@ fn uuid_v4() -> String {
         if matches!(i, 4 | 6 | 8 | 10) {
             out.push('-');
         }
-        let _ = write!(out, "{byte:02x}");
+        out.push(b"0123456789abcdef"[usize::from(byte >> 4)] as char);
+        out.push(b"0123456789abcdef"[usize::from(byte & 0xf)] as char);
     }
     out
 }
