@@ -1653,9 +1653,12 @@ fn keeps_alive(head: &[u8]) -> bool {
         if !name.trim().eq_ignore_ascii_case("connection") {
             continue;
         }
-        let value = value.to_ascii_lowercase();
-        keep = value.split(',').any(|part| part.trim() == "keep-alive")
-            && !value.split(',').any(|part| part.trim() == "close");
+        keep = value
+            .split(',')
+            .any(|part| part.trim().eq_ignore_ascii_case("keep-alive"))
+            && !value
+                .split(',')
+                .any(|part| part.trim().eq_ignore_ascii_case("close"));
     }
     keep
 }
@@ -3126,6 +3129,25 @@ mod tests {
         want.extend_from_slice(&wire[..23]);
         assert_eq!(body, want, "the bytes are the body");
         assert_eq!(counts.zeroed, 0, "the read fills every byte: {counts:?}");
+    }
+
+    /// The connection header is compared where it lies: lowercasing the value first was a `String`
+    /// per request that said whether the connection stays.
+    #[test]
+    fn a_connection_header_is_named_without_a_lowercase_copy() {
+        let head = b"POST /up HTTP/1.1\r\nHost: h\r\nConnection: Keep-Alive\r\n\r\n";
+        let (keep, counts) = ferrox_core::alloc_count::measure(|| keeps_alive(head));
+        assert!(keep, "HTTP/1.1 keeps alive when told to");
+        assert_eq!(counts.allocs, 0, "the field is read in place: {counts:?}");
+        assert!(
+            !keeps_alive(b"POST /up HTTP/1.1\r\nConnection: keep-alive, CLOSE\r\n\r\n"),
+            "a close in the list wins"
+        );
+        assert!(
+            keeps_alive(b"POST /up HTTP/1.0\r\nConnection: KEEP-ALIVE\r\n\r\n"),
+            "HTTP/1.0 keeps alive only when told"
+        );
+        assert!(!keeps_alive(b"POST /up HTTP/1.0\r\n\r\n"));
     }
 
     /// A missing or `auto` mode is the dialer's default, not a promise about what may arrive: the reference hub gates a shape only when the mode was written down (`hub.go:154`, `:199`, `:241` all read `Mode != "" && Mode != "auto" && Mode != <shape>`). Our own `xhttp::connect` writes the `stream-one` POST, so a hub resolved from `{"path": "/share"}` refusing it is a hub that answers no dial its own client can make — which is what left `vless-xhttp-down-8` with no flow at any connection count.
