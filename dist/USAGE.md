@@ -58,8 +58,11 @@ The list prints one line per country and one per city with the number of publish
 ./dist/ferrox-cli.sh up --foxy --country DE --carrier h2
 ./dist/ferrox-cli.sh up --foxy --exclude-domains printer.lan --exclude-ports 22,53
 ./dist/ferrox-cli.sh up --foxy --socks 1080 --http 8081 --mixed 1082
+./dist/ferrox-cli.sh up --foxy --instance work --country DE   # a second lane, own ports
 ./dist/ferrox-cli.sh status                    # uptime, carrier, quota, exit IP and country
+./dist/ferrox-cli.sh status --instance work    # the same, for the named lane
 ./dist/ferrox-cli.sh down                      # stop, clear the system proxy
+./dist/ferrox-cli.sh down --all                # stop every lane
 ```
 
 `up` prints the port map, then proves one flow through the first front. With `--vpn` it arms the macOS system proxy only after that flow answers, so a lane that carries nothing never takes the machine's traffic with it. If the fronts are open but no flow gets through, it says so, shows the lane log, and stops the lane itself: the pid file and config are removed and the proxy cleared, so nothing needs a `down` and nothing is left behind except the log.
@@ -79,6 +82,20 @@ An `up` that cannot start the lane it names fails before anything starts: `--vle
 | mixed | `127.0.0.1:10809` | sniffs the first byte, serves SOCKS5 or HTTP on one port |
 
 All three bind loopback only. Change them with `--socks`, `--http`, `--mixed`, or serve a subset with `--fronts socks,http`.
+
+### Several lanes at once
+
+`--instance NAME` starts a second lane beside the unnamed one: its config, pid, log, ports and remembered exit are its own, while the account and the edge catalogue stay shared. Ports left unnamed are the first free ones near the defaults, so a second lane never fights the first; `--socks`, `--http` and `--mixed` still pin them, and a port outside 1-65535 or two fronts on one port is refused before anything starts.
+
+```bash
+./dist/ferrox-cli.sh up --foxy --instance work --country DE
+./dist/ferrox-cli.sh up --foxy --instance home --country NL --socks 10818 --http 8088
+./dist/ferrox-cli.sh status --instance work
+./dist/ferrox-cli.sh down --instance work
+./dist/ferrox-cli.sh down --all
+```
+
+`--vpn` belongs to the unnamed lane: the macOS system proxy is one machine-wide setting, so point the app you want at the instance's fronts (`ferrox-cli ports --instance work`). `status` with no instance names the other running lanes when the unnamed one is down, and `logout` stops every lane.
 
 ### macOS system proxy
 

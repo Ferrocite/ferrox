@@ -8,9 +8,12 @@ non-zero inside the watchdog and name the thing it is missing.
 
 from __future__ import annotations
 
+import os
 import pathlib
+import shutil
 import subprocess
 import sys
+import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CLI = ROOT / "dist" / "ferrox-cli.sh"
@@ -27,14 +30,29 @@ CASES = [
     ("up with no lane", ["up"], "no outbound chosen"),
     ("ping outside locations", ["up", "--ping"], "--ping"),
     ("exclusions outside foxy", ["up", "--exclude-ports", "22"], "--exclude-ports"),
+    ("a port outside 1-65535", ["up", "--foxy", "--socks", "70000"], "1 and 65535"),
+    ("a port that is not a number", ["up", "--foxy", "--http", "http"], "port number"),
+    ("two fronts on one port", ["up", "--foxy", "--socks", "1080", "--http", "1080"], "two fronts"),
+    ("an instance named like a path", ["up", "--foxy", "--instance", "a/b"], "--instance"),
+    ("--vpn on a named instance", ["up", "--foxy", "--instance", "work", "--vpn"], "system proxy"),
+    ("--all outside down", ["status", "--all"], "--all"),
 ]
 
 
 def main() -> int:
+    state = pathlib.Path(tempfile.mkdtemp(prefix="ferrox-cli-args-"))
+    env = dict(os.environ)
+    env["FERROX_CONF_DIR"] = str(state)
+    env["FERROX_BIN"] = shutil.which("true") or "/bin/true"
     for label, args, want in CASES:
         try:
             run = subprocess.run(
-                [CLI, *args], capture_output=True, text=True, timeout=WATCH
+                [CLI, *args],
+                capture_output=True,
+                text=True,
+                timeout=WATCH,
+                stdin=subprocess.DEVNULL,
+                env=env,
             )
         except subprocess.TimeoutExpired:
             print(
@@ -56,6 +74,13 @@ def main() -> int:
                 file=sys.stderr,
             )
             print(output, file=sys.stderr)
+            return 1
+        if list(state.iterdir()):
+            print(
+                f"check-cli-args: {label}: a refusal left state behind:"
+                f" {sorted(p.name for p in state.iterdir())}",
+                file=sys.stderr,
+            )
             return 1
         print(f"check-cli-args: {label} refused")
     print(f"check-cli-args: {len(CASES)} refusal(s), no hang")
