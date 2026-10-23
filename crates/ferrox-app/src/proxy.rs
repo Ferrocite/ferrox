@@ -271,8 +271,9 @@ fn serve_inbounds(
                         }
                     }
                     "trojan" => {
-                        serve_trojan_inbound(address, inbound, freedom);
-                        inbounds += 1;
+                        if serve_trojan_inbound(address, inbound, freedom) {
+                            inbounds += 1;
+                        }
                     }
                     "vmess" => {
                         serve_vmess_inbound(address, inbound, freedom);
@@ -732,6 +733,12 @@ enum Role {
         carrier: Carrier,
         freedom: bool,
     },
+    TrojanTls {
+        key: [u8; 56],
+        carrier: Carrier,
+        freedom: bool,
+        server: Arc<ferrox_core::tls::TlsServerConfig>,
+    },
     Vmess {
         id: [u8; 16],
         carrier: Carrier,
@@ -767,6 +774,7 @@ impl Role {
             | Role::VlessTls { carrier, .. }
             | Role::VlessReality { carrier, .. }
             | Role::Trojan { carrier, .. }
+            | Role::TrojanTls { carrier, .. }
             | Role::Vmess { carrier, .. }
             | Role::Shadowsocks { carrier, .. } => carrier.tcp_mask(),
             // A front with no tcp carrier has nowhere to arm a chain, so its inbound refuses one.
@@ -1268,25 +1276,13 @@ fn accept_loop(address: &str, role: &Role) {
                     key,
                     carrier,
                     freedom,
-                } => match carrier {
-                    Carrier::Raw(_) => serve_trojan(stream, &key, freedom),
-                    Carrier::Ws { path, .. } => {
-                        serve_trojan_ws(stream, &key, path.as_str(), freedom);
-                    }
-                    Carrier::HttpUpgrade { path, .. } => {
-                        serve_trojan_httpupgrade(stream, &key, path.as_str(), freedom);
-                    }
-                    Carrier::Grpc { path } => {
-                        serve_trojan_grpc(stream, &key, path.as_str(), freedom);
-                    }
-                    Carrier::Xhttp { settings, .. } => {
-                        serve_trojan_xhttp(stream, &key, settings.path.as_str(), freedom);
-                    }
-                    Carrier::HttpHeader { path } => {
-                        serve_trojan_httpheader(stream, &key, path.as_str(), freedom);
-                    }
-                    refused_carriers!() => {}
-                },
+                } => serve_trojan(stream, &key, &carrier, freedom),
+                Role::TrojanTls {
+                    key,
+                    carrier,
+                    freedom,
+                    server,
+                } => serve_trojan_tls(stream, &key, &carrier, freedom, &server),
                 Role::Vmess {
                     id,
                     carrier,
@@ -4214,27 +4210,50 @@ fn kcp_parts(conn: &Arc<ferrox_core::kcp::Connection>) -> (KcpIo, KcpIo, KcpClos
     (reader, writer, close)
 }
 
-fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) {
+fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
     let key = trojan_key(&inbound_password(inbound));
+    let sec = stream_security(inbound);
     match inbound_carrier(inbound) {
         Carrier::Kcp(config) => {
             let serve: KcpServe = Arc::new(move |conn| serve_trojan_kcp(conn, &key, freedom));
             let owned = address.to_owned();
             thread::spawn(move || serve_kcp_loop(&owned, config, &serve));
+            true
         }
         Carrier::Xdrive { settings } => {
             let accept: crate::xdrive::Accept =
                 Arc::new(move |session| serve_trojan_xdrive(session, &key, freedom));
             serve_xdrive_loop(&settings, address, accept);
+            true
         }
-        other => spawn_role(
-            address,
-            Role::Trojan {
-                key,
-                carrier: other,
-                freedom,
-            },
-        ),
+        // A listener that declares tls answers the session its config names; an identity it cannot load is refused, never served as plaintext.
+        carrier if sec == "tls" => {
+            let Some(server) = inbound_tls_identity(inbound) else {
+                eprintln!("unreadable trojan tls identity on {address}: refused, not served");
+                return false;
+            };
+            spawn_role(
+                address,
+                Role::TrojanTls {
+                    key,
+                    carrier,
+                    freedom,
+                    server,
+                },
+            );
+            true
+        }
+        carrier => {
+            spawn_role(
+                address,
+                Role::Trojan {
+                    key,
+                    carrier,
+                    freedom,
+                },
+            );
+            true
+        }
     }
 }
 
@@ -6724,7 +6743,25 @@ fn dial_ss_xhttp(
     true
 }
 
-fn serve_trojan(mut stream: Connection, key: &[u8; 56], freedom: bool) {
+fn serve_trojan(stream: Connection, key: &[u8; 56], carrier: &Carrier, freedom: bool) {
+    match carrier {
+        Carrier::Raw(_) => serve_trojan_raw(stream, key, freedom),
+        Carrier::Ws { path, .. } => serve_trojan_ws(stream, key, path.as_str(), freedom),
+        Carrier::HttpUpgrade { path, .. } => {
+            serve_trojan_httpupgrade(stream, key, path.as_str(), freedom);
+        }
+        Carrier::Grpc { path } => serve_trojan_grpc(stream, key, path.as_str(), freedom),
+        Carrier::Xhttp { settings, .. } => {
+            serve_trojan_xhttp(stream, key, settings.path.as_str(), freedom);
+        }
+        Carrier::HttpHeader { path } => {
+            serve_trojan_httpheader(stream, key, path.as_str(), freedom);
+        }
+        refused_carriers!() => {}
+    }
+}
+
+fn serve_trojan_raw(mut stream: Connection, key: &[u8; 56], freedom: bool) {
     // Bound only the opening request read to a wall-clock budget, then restore the blocking relay reads behind it.
     let budget = budgets::handshake();
     let _ = stream.set_read_timeout(Some(budget));
@@ -6918,6 +6955,298 @@ fn serve_trojan_httpheader(stream: Connection, key: &[u8; 56], path: &str, freed
         return;
     };
     crate::proxy::relay_carried(reader, &write, &uplink);
+}
+
+/// The session a trojan listener that declares `security: tls` answers: the raw carrier reads its request off the records, and every other carrier parses the stream the session already is.
+fn serve_trojan_tls(
+    stream: Connection,
+    key: &[u8; 56],
+    carrier: &Carrier,
+    freedom: bool,
+    server: &ferrox_core::tls::TlsServerConfig,
+) {
+    if stream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
+    match carrier {
+        Carrier::Raw(_) => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(mut tls) = ferrox_core::tls::accept(server, stream) else {
+                return;
+            };
+            if !shake_tls(&mut tls) {
+                return;
+            }
+            relay_trojan(tls, Some(raw), key, freedom);
+        }
+        Carrier::Ws { path, .. } => {
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            serve_session_trojan_ws(reader, writer, path, key, freedom);
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            serve_session_trojan_xhttp(reader, writer, settings, key, freedom);
+        }
+        Carrier::HttpUpgrade { path, .. } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            serve_session_trojan_httpupgrade(reader, writer, raw, path, key, freedom);
+        }
+        Carrier::HttpHeader { path } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            serve_session_trojan_httpheader(reader, writer, raw, path, key, freedom);
+        }
+        Carrier::Grpc { path } => {
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            serve_session_trojan_grpc(reader, writer, path, key, freedom);
+        }
+        refused_carriers!() => {}
+    }
+}
+
+/// The served trojan session: the request is read under the handshake clock, then the relay drives the session's transport, so a read parked in the socket holds no lock its writer asks for.
+fn relay_trojan<S>(mut session: S, raw: Option<Connection>, key: &[u8; 56], freedom: bool)
+where
+    S: std::io::Read
+        + std::io::Write
+        + Send
+        + ferrox_core::tls::RecordAlignment
+        + Drivable
+        + CipherOpen
+        + 'static,
+{
+    let bounded = {
+        let mut deadline = HandshakeDeadline {
+            inner: &mut session,
+            until: Instant::now() + budgets::handshake(),
+        };
+        decode_trojan_request(&mut deadline, key)
+    };
+    let Some((cmd, target)) = bounded else {
+        return;
+    };
+    if cmd != 1 || !freedom {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    if uplink.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
+    let close = shutdown_pair(
+        uplink.try_clone().ok(),
+        raw.as_ref().and_then(|raw| raw.try_clone().ok()),
+    );
+    match driven_halves(session, RELAY_POLL) {
+        Ok(half) => relay_stream(half, Half::socket(uplink), &close),
+        Err(session) => relay_stream(
+            Half::shared_armed(session, move |_, grain| match &raw {
+                Some(raw) => raw.set_read_timeout(Some(grain)),
+                None => Ok(()),
+            }),
+            Half::socket(uplink),
+            &close,
+        ),
+    }
+}
+
+fn serve_session_trojan_ws<R: Read, W: FrameWrite + 'static>(
+    read: R,
+    write: W,
+    path: &str,
+    key: &[u8; 56],
+    freedom: bool,
+) {
+    let Some((mut creader, cwriter)) = crate::ws::accept_split(read, write, path) else {
+        echo_trace("session ws trojan accept refused");
+        return;
+    };
+    creader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
+    let decoded = decode_trojan_request(&mut creader, key);
+    creader.set_handshake_budget(None);
+    let Some((cmd, target)) = decoded else {
+        echo_trace("session ws trojan decode refused");
+        return;
+    };
+    if cmd != 1 || !freedom {
+        echo_trace("session ws trojan cmd refused");
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session ws uplink refused");
+        return;
+    };
+    echo_trace("session ws relaying");
+    relay_sink(creader, &cwriter, &uplink, |_| {});
+}
+
+fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+    read: R,
+    write: W,
+    settings: &crate::xhttp::XhttpSettings,
+    key: &[u8; 56],
+    freedom: bool,
+) {
+    let Some((mut creader, cwriter)) =
+        crate::xhttp::accept_split_with_settings(read, write, settings)
+    else {
+        echo_trace("session xhttp trojan accept refused");
+        return;
+    };
+    // Every refusal ends the carrier's stream: a session that answers nothing leaves its reader parked on a reply that will never come.
+    let Some((cmd, target)) = decode_trojan_request(&mut creader, key) else {
+        echo_trace("session xhttp trojan decode refused");
+        cwriter.finish();
+        return;
+    };
+    if cmd != 1 || !freedom {
+        echo_trace("session xhttp trojan cmd refused");
+        cwriter.finish();
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session xhttp uplink refused");
+        cwriter.finish();
+        return;
+    };
+    echo_trace("session xhttp relaying");
+    relay_sink_drained(creader, &cwriter, &uplink);
+}
+
+fn serve_session_trojan_httpupgrade<R: Read, W: Write + Clone + Send + 'static>(
+    read: R,
+    write: W,
+    raw: Connection,
+    path: &str,
+    key: &[u8; 56],
+    freedom: bool,
+) {
+    let raw = Arc::new(raw);
+    let Some((mut creader, cwriter)) = crate::httpupgrade::accept_split(read, write, path) else {
+        echo_trace("session httpupgrade trojan accept refused");
+        crate::httpupgrade::quiet(&raw);
+        return;
+    };
+    let bounded = {
+        let mut deadline = HandshakeDeadline {
+            inner: &mut creader,
+            until: Instant::now() + budgets::handshake(),
+        };
+        decode_trojan_request(&mut deadline, key)
+    };
+    let Some((cmd, target)) = bounded else {
+        echo_trace("session httpupgrade trojan decode refused");
+        crate::httpupgrade::quiet(&raw);
+        return;
+    };
+    if cmd != 1 || !freedom {
+        echo_trace("session httpupgrade trojan cmd refused");
+        crate::httpupgrade::quiet(&raw);
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session httpupgrade uplink refused");
+        crate::httpupgrade::quiet(&raw);
+        return;
+    };
+    let sink = SessionSink {
+        half: cwriter,
+        raw: Arc::clone(&raw),
+    };
+    echo_trace("session httpupgrade relaying");
+    relay_sink(creader, &sink, &uplink, |_| {});
+    crate::httpupgrade::quiet(&raw);
+}
+
+fn serve_session_trojan_httpheader<R: Read, W: Write + Clone + Send + 'static>(
+    read: R,
+    write: W,
+    raw: Connection,
+    path: &str,
+    key: &[u8; 56],
+    freedom: bool,
+) {
+    let Some((mut creader, cwriter)) = crate::httpheader::accept_split(read, write, path) else {
+        echo_trace("session httpheader trojan accept refused");
+        return;
+    };
+    let bounded = {
+        let mut deadline = HandshakeDeadline {
+            inner: &mut creader,
+            until: Instant::now() + budgets::handshake(),
+        };
+        decode_trojan_request(&mut deadline, key)
+    };
+    let Some((cmd, target)) = bounded else {
+        echo_trace("session httpheader trojan decode refused");
+        return;
+    };
+    if cmd != 1 || !freedom {
+        echo_trace("session httpheader trojan cmd refused");
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session httpheader uplink refused");
+        return;
+    };
+    let sink = SessionSink {
+        half: cwriter,
+        raw: Arc::new(raw),
+    };
+    echo_trace("session httpheader relaying");
+    relay_sink(creader, &sink, &uplink, |_| {});
+}
+
+fn serve_session_trojan_grpc<R: Read, W: FrameWrite + 'static>(
+    read: R,
+    write: W,
+    path: &str,
+    key: &[u8; 56],
+    freedom: bool,
+) {
+    let Some((mut creader, cwriter)) = crate::grpc::accept_split(read, write, path) else {
+        echo_trace("session grpc trojan accept refused");
+        return;
+    };
+    creader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
+    let decoded = decode_trojan_request(&mut creader, key);
+    creader.set_handshake_budget(None);
+    let Some((cmd, target)) = decoded else {
+        echo_trace("session grpc trojan decode refused");
+        return;
+    };
+    if cmd != 1 || !freedom {
+        echo_trace("session grpc trojan cmd refused");
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        echo_trace("session grpc uplink refused");
+        return;
+    };
+    echo_trace("session grpc relaying");
+    relay_sink(creader, &cwriter, &uplink, crate::grpc::mark_reader_dead);
 }
 
 fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) {
@@ -15327,7 +15656,7 @@ mod tests {
             for stream in server.incoming().take(2) {
                 let Ok(stream) = stream else { continue };
                 thread::spawn(move || {
-                    serve_trojan(stream, &trojan_key("an-example-shared-password"), true);
+                    serve_trojan_raw(stream, &trojan_key("an-example-shared-password"), true);
                 });
             }
         });
@@ -17229,7 +17558,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_trojan(stream, &key, true);
+            serve_trojan_raw(stream, &key, true);
             let _ = done_tx.send(());
         });
         let _peer = Connection::connect(addr).expect("connects");
@@ -17564,7 +17893,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_trojan(stream, &key, true);
+            serve_trojan_raw(stream, &key, true);
             let _ = done_tx.send(());
         });
         let mut peer = Connection::connect(addr).expect("connects");
@@ -19990,7 +20319,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
-            serve_trojan(stream, &key, true);
+            serve_trojan_raw(stream, &key, true);
         });
         let mut stream = Connection::connect(("127.0.0.1", tunnel_port)).expect("connects");
         stream
@@ -20036,7 +20365,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
-            serve_trojan(stream, &trojan_key("secret"), true);
+            serve_trojan_raw(stream, &trojan_key("secret"), true);
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
