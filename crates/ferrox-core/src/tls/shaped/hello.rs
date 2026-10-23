@@ -326,7 +326,7 @@ impl Hello {
     /// checked where either lies so a server's pick costs no copy.
     pub(crate) fn offers_alpn(&self, pick: &[u8]) -> bool {
         if let Some(list) = self.alpn {
-            return list.iter().any(|proto| *proto == pick);
+            return list.contains(&pick);
         }
         for ext in self.profile.exts {
             if let Body::Alpn(body) = &ext.body {
