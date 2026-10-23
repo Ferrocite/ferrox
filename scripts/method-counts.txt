@@ -480,8 +480,8 @@ tls-cipher-suites dialer-hello-cipher-field-equals-reference 1 ferrox-core-tls::
 
 # --- uTLS-shaped ClientHello (matrix row 38) --------------------------------
 security-utls ops-retired-instructions UNBLESSED scripts/count-ops.sh
-security-utls oracle-cases-replayed-byte-identical 46 ferrox-core-tls::shaped::hello::tests::oracle_replay_matches_utls
-security-utls distinct-presets-behind-those-names 28 ferrox-core-tls::shaped::hello::tests::oracle_replay_matches_utls
+security-utls oracle-cases-replayed-byte-identical 50 ferrox-core-tls::shaped::hello::tests::oracle_replay_matches_utls
+security-utls distinct-presets-behind-those-names 31 ferrox-core-tls::shaped::hello::tests::oracle_replay_matches_utls
 security-utls shaped-dials-that-complete-a-tls13-handshake 1 ferrox-core-tls::rustls_backend::tests::a_shaped_chrome_handshake_reaches_a_stock_server
 security-utls shaped-dials-that-answer-a-tls13-client-auth-request 1 ferrox-core-tls::rustls_backend::tests::a_shaped_chrome_handshake_answers_a_client_certificate_request
 security-utls shaped-dials-that-complete-a-tls12-handshake 3 ferrox-core-tls::rustls_backend::tests::a_shaped_dial_finishes_every_tls12_record_shape
