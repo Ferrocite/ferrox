@@ -211,10 +211,10 @@ impl<S: Stream> Session<S> {
         self.suite = Suite::from_id(sh.suite);
         match sh.version {
             0x0304 => self.run13(&mut hello, &mut sh),
-            0x0303 => self.run12(&mut hello, &sh),
+            0x0303 => self.run12(&mut hello, &mut sh),
             _ => Err(TlsError::NoSharedCipher),
         }?;
-        self.check_alpn(&hello, &sh)?;
+        self.check_alpn(&hello, &mut sh)?;
         self.done = true;
         Ok(())
     }
@@ -267,14 +267,14 @@ impl<S: Stream> Session<S> {
         Ok(())
     }
 
-    fn check_alpn(&mut self, hello: &Hello, sh: &ServerHello) -> Result<(), TlsError> {
-        if let Some(pick) = &sh.alpn {
-            if !hello.alpn_offered().iter().any(|proto| proto == pick) {
+    fn check_alpn(&mut self, hello: &Hello, sh: &mut ServerHello) -> Result<(), TlsError> {
+        if let Some(pick) = sh.alpn.take() {
+            if !hello.offers_alpn(&pick) {
                 return Err(TlsError::Other(
                     "server selected an ALPN protocol we did not offer".to_owned(),
                 ));
             }
-            self.alpn = Some(pick.clone());
+            self.alpn = Some(pick);
         }
         Ok(())
     }
@@ -357,7 +357,7 @@ impl<S: Stream> Session<S> {
         Ok(())
     }
 
-    fn run12(&mut self, hello: &mut Hello, sh: &ServerHello) -> Result<(), TlsError> {
+    fn run12(&mut self, hello: &mut Hello, sh: &mut ServerHello) -> Result<(), TlsError> {
         self.version = Some(Version::Tls12);
         let suite = Suite::from_id(sh.suite)
             .filter(|suite| !suite.is_tls13())
