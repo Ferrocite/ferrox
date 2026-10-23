@@ -26,6 +26,8 @@ pub(crate) enum Denied {
     Challenged(u16),
     /// The plane could not be reached at all, with the phase that gave up.
     Unreachable(String),
+    /// The grant was accepted but the pass minted from it was refused: an entitlement or device refusal, not a dead session.
+    Pass,
     /// Anything else, with the status it came back as.
     Other(u16),
 }
@@ -40,6 +42,9 @@ impl std::fmt::Display for Denied {
                 write!(f, "the edge answered {status} and asked for a challenge")
             }
             Self::Unreachable(why) => write!(f, "the account plane is unreachable: {why}"),
+            Self::Pass => {
+                f.write_str("the pass was refused for an accepted grant: check the VPN entitlement or device list")
+            }
             Self::Other(status) => write!(f, "the account plane answered {status}"),
         }
     }
@@ -57,10 +62,16 @@ impl Denied {
         }
     }
 
-    /// The one refusal a second ask cannot change: the credential itself, not the plane's mood.
+    /// The one refusal that makes the stored grant dead: the credential itself, not the plane's mood.
     #[must_use]
     pub(crate) fn is_final(&self) -> bool {
         matches!(self, Self::Token)
+    }
+
+    /// Whether asking again can change the answer: a dead credential and a pass refused for an accepted grant cannot.
+    #[must_use]
+    pub(crate) fn is_retryable(&self) -> bool {
+        !matches!(self, Self::Token | Self::Pass)
     }
 
     /// The seconds the plane asked to wait before answering again, when it named any.
@@ -855,6 +866,16 @@ mod tests {
     #[test]
     fn a_refused_credential_is_the_only_answer_a_second_ask_cannot_change() {
         assert!(Denied::Token.is_final());
+        assert!(
+            !Denied::Token.is_retryable(),
+            "the credential itself is the end"
+        );
+        let refused_pass = Denied::Pass;
+        assert!(!refused_pass.is_final(), "a refused pass keeps the grant");
+        assert!(
+            !refused_pass.is_retryable(),
+            "and a second ask with the same account cannot change it"
+        );
         for slow in [
             Denied::Quota(0),
             Denied::Quota(37),
@@ -863,6 +884,7 @@ mod tests {
             Denied::Other(500),
         ] {
             assert!(!slow.is_final(), "{slow}");
+            assert!(slow.is_retryable(), "{slow}");
         }
         assert_eq!(Denied::Quota(37).retry_after(), 37);
         assert_eq!(
@@ -1051,13 +1073,16 @@ impl Account {
         };
         if auth.valid_at(epoch()) {
             match self.mint(&auth.access_token) {
+                // A clock-valid token the plane refuses is not a dead session until a refresh says so: spend the grant, not the password.
                 Err(Denied::Token) if !auth.refresh_token.is_empty() => {
-                    self.mint(&self.refresh(&auth)?.access_token)
+                    let fresh = self.refresh(&auth, true)?;
+                    self.mint(&fresh.access_token).map_err(refused_pass)
                 }
                 other => other,
             }
         } else if !auth.refresh_token.is_empty() {
-            self.mint(&self.refresh(&auth)?.access_token)
+            let fresh = self.refresh(&auth, false)?;
+            self.mint(&fresh.access_token).map_err(refused_pass)
         } else {
             Err(Denied::Token)
         }
@@ -1082,15 +1107,16 @@ impl Account {
         }
     }
 
-    /// Sets the new grant before minting so a refresh that is written but not yet used still renews the next launch.
-    fn refresh(&self, stale: &Auth) -> Result<Auth, Denied> {
+    /// Sets the new grant before minting so a refresh that is written but not yet used still renews the next launch; `forced` stops trusting a clock the plane has already refused.
+    fn refresh(&self, stale: &Auth, forced: bool) -> Result<Auth, Denied> {
         // Another lane may have rotated the file's grant since this launch loaded it: that refresh token is the live one, even when its access token has lapsed.
         let base = self
             .tokens
             .as_ref()
             .and_then(|tokens| tokens.rotated_from(&stale.access_token))
             .unwrap_or_else(|| stale.clone());
-        if base.valid_at(epoch()) {
+        // The forced grant was refused, but a rotation another lane wrote since is untried: adopting it spends nothing.
+        if base.valid_at(epoch()) && (!forced || base.access_token != stale.access_token) {
             return Ok(self.adopt(base));
         }
         let fresh = match token(
@@ -1209,21 +1235,20 @@ impl Account {
 
     /// Refreshes a stale token and mints a new pass, rotated in place so no tunnel is rebuilt to carry it.
     pub(crate) fn renew(&self) -> Result<(), Denied> {
-        let stale = self
-            .auth
-            .lock()
-            .map_or(true, |auth| !auth.valid_at(epoch()));
-        let access_token = if stale {
-            let current = self.auth.lock().map_err(|_| Denied::Token)?.clone();
-            self.refresh(&current)?.access_token
+        let auth = self.auth.lock().map_err(|_| Denied::Token)?.clone();
+        let auth = if auth.valid_at(epoch()) {
+            auth
         } else {
-            self.auth
-                .lock()
-                .map_err(|_| Denied::Token)?
-                .access_token
-                .clone()
+            self.refresh(&auth, false)?
         };
-        self.mint(&access_token)
+        match self.mint(&auth.access_token) {
+            // The plane refused a token FxA still calls live: one forced refresh tells a revoked token from a refused account.
+            Err(Denied::Token) if !auth.refresh_token.is_empty() => {
+                let fresh = self.refresh(&auth, true)?;
+                self.mint(&fresh.access_token).map_err(refused_pass)
+            }
+            other => other,
+        }
     }
 
     /// Whether a renewal has anything to renew with: a pasted pass alone does not.
@@ -1263,6 +1288,14 @@ impl Account {
             },
             |pass| pass.clone(),
         )
+    }
+}
+
+/// A pass refused after `FxA` accepted the grant is an entitlement refusal, not a dead session: keeping the grant avoids a password and its mail.
+fn refused_pass(denied: Denied) -> Denied {
+    match denied {
+        Denied::Token => Denied::Pass,
+        other => other,
     }
 }
 
@@ -1490,14 +1523,16 @@ mod loopback {
                 seen.authorization.is_none(),
                 "a refresh grant is not Hawk-signed"
             );
-            if !body.contains(r#""refresh_token":"refresh-1""#) {
+            let minted = if body.contains(r#""refresh_token":"refresh-1""#) {
+                r#"{"access_token":"access-2","refresh_token":"refresh-2","expires_in":3600}"#
+            } else if body.contains(r#""refresh_token":"refresh-7""#) {
+                r#"{"access_token":"access-9","refresh_token":"refresh-9","expires_in":3600}"#
+            } else if body.contains(r#""refresh_token":"refresh-8""#) {
+                r#"{"access_token":"access-10","refresh_token":"refresh-10","expires_in":3600}"#
+            } else {
                 return reply(400, &[], r#"{"errno":110}"#);
-            }
-            return reply(
-                200,
-                &[],
-                r#"{"access_token":"access-2","refresh_token":"refresh-2","expires_in":3600}"#,
-            );
+            };
+            return reply(200, &[], minted);
         }
         let auth = seen.authorization.as_deref().unwrap_or_default();
         assert!(auth.starts_with("Hawk id=\""), "{auth}");
@@ -1578,11 +1613,15 @@ mod loopback {
             }
             ("GET", "/api/v1/fpn/token") => {
                 let bearer = seen.authorization.as_deref().unwrap_or_default();
-                assert!(
-                    bearer == "Bearer access-1" || bearer == "Bearer access-2",
-                    "a resumed grant mints with the token it carries: {bearer:?}"
-                );
-                reply(200, &PASS_HEADERS, PASS_BODY)
+                match bearer {
+                    "Bearer access-1" | "Bearer access-2" | "Bearer access-9" => {
+                        reply(200, &PASS_HEADERS, PASS_BODY)
+                    }
+                    // A clock-valid grant the plane has revoked: refreshable, but not mintable until it is.
+                    "Bearer access-6" | "Bearer access-7" | "Bearer access-8"
+                    | "Bearer access-10" => reply(401, &[], ""),
+                    other => panic!("a resumed grant mints with the token it carries: {other:?}"),
+                }
             }
             _ => reply(404, &[], "{}"),
         }
@@ -1851,7 +1890,7 @@ mod loopback {
             }),
             None,
         );
-        let fresh = account.refresh(&stale).expect("adopts");
+        let fresh = account.refresh(&stale, false).expect("adopts");
         assert_eq!(
             (fresh.access_token.as_str(), fresh.refresh_token.as_str()),
             ("access-9", "refresh-9"),
@@ -1893,7 +1932,7 @@ mod loopback {
             None,
         );
         let fresh = account
-            .refresh(&stale)
+            .refresh(&stale, false)
             .expect("refreshes the adopted grant");
         assert_eq!(
             (fresh.access_token.as_str(), fresh.refresh_token.as_str()),
@@ -1937,12 +1976,162 @@ mod loopback {
                 None,
             );
         });
-        let fresh = account.refresh(&stale).expect("adopts after the refusal");
+        let fresh = account
+            .refresh(&stale, false)
+            .expect("adopts after the refusal");
         wrote.join().expect("the writer finishes");
         assert_eq!(
             (fresh.access_token.as_str(), fresh.refresh_token.as_str()),
             ("access-9", "refresh-9"),
             "the refusal is another lane's rotation, not a dead account"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A clock-valid grant the plane refuses is refreshed before the password: the sign-in mail is what a resume must never spend.
+    #[test]
+    fn a_refused_live_grant_is_refreshed_before_the_password() {
+        let _turn = EDGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (address, roots, rx) = edge_with_log();
+        let path = token_path("refused-live");
+        let tokens =
+            TokenFile::new(path.to_str().expect("utf-8"), "person@example.com").expect("bound");
+        tokens.save(
+            Some(&Auth {
+                access_token: "access-7".to_owned(),
+                refresh_token: "refresh-7".to_owned(),
+                expires_at: epoch() + 3_600,
+            }),
+            None,
+        );
+        let session = tokens.load().expect("reads");
+        let mut account = account(address, roots);
+        account.tokens = Some(tokens);
+        account
+            .resume(session)
+            .expect("refreshes the refused grant");
+        assert!(
+            account.current().token.starts_with("eyJ"),
+            "the pass comes from the refreshed grant"
+        );
+        let log = seen(&rx);
+        assert!(
+            log.iter().any(|line| line == "POST /v1/oauth/token"),
+            "a refused clock-valid token is refreshed, not replayed: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|line| line == "POST /v1/account/login"),
+            "the refresh is what spares the sign-in mail: {log:?}"
+        );
+        let stored = account
+            .tokens
+            .as_ref()
+            .expect("the file rides the account")
+            .load()
+            .expect("the rotation is written")
+            .auth
+            .expect("and it is a grant");
+        assert_eq!(
+            (stored.access_token.as_str(), stored.refresh_token.as_str()),
+            ("access-9", "refresh-9"),
+            "the rotated pair is the one the next launch spends"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A pass still refused after the rotation is an entitlement refusal: the grant is kept, and no retry turns it into a password.
+    #[test]
+    fn a_refused_pass_after_a_refresh_keeps_the_stored_grant() {
+        let _turn = EDGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (address, roots, rx) = edge_with_log();
+        let path = token_path("refused-pass");
+        let tokens =
+            TokenFile::new(path.to_str().expect("utf-8"), "person@example.com").expect("bound");
+        tokens.save(
+            Some(&Auth {
+                access_token: "access-8".to_owned(),
+                refresh_token: "refresh-8".to_owned(),
+                expires_at: epoch() + 3_600,
+            }),
+            None,
+        );
+        let session = tokens.load().expect("reads");
+        let mut account = account(address, roots);
+        account.tokens = Some(tokens);
+        let denied = account.resume(session).expect_err("the pass is refused");
+        assert_eq!(denied, Denied::Pass);
+        assert!(!denied.is_final(), "the grant is not dead");
+        assert!(
+            !denied.is_retryable(),
+            "asking again with the same account cannot change it"
+        );
+        assert!(account.can_renew(), "the stored grant stays");
+        let log = seen(&rx);
+        assert!(
+            log.iter().any(|line| line == "POST /v1/oauth/token"),
+            "the refusal was reached after a refresh: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|line| line == "POST /v1/account/login"),
+            "a refused pass never reaches the password: {log:?}"
+        );
+        let stored = account
+            .tokens
+            .as_ref()
+            .expect("the file rides the account")
+            .load()
+            .expect("the rotation was written")
+            .auth
+            .expect("and it is a grant");
+        assert_eq!(
+            (stored.access_token.as_str(), stored.refresh_token.as_str()),
+            ("access-10", "refresh-10"),
+            "the rotated grant is kept for the next launch"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Only a refresh the plane refuses makes the grant dead: then, and only then, is the password the next step.
+    #[test]
+    fn a_refused_grant_with_a_dead_refresh_is_still_a_sign_in() {
+        let _turn = EDGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (address, roots, rx) = edge_with_log();
+        let path = token_path("dead-refresh");
+        let tokens =
+            TokenFile::new(path.to_str().expect("utf-8"), "person@example.com").expect("bound");
+        tokens.save(
+            Some(&Auth {
+                access_token: "access-6".to_owned(),
+                refresh_token: "refresh-dead".to_owned(),
+                expires_at: epoch() + 3_600,
+            }),
+            None,
+        );
+        let session = tokens.load().expect("reads");
+        let mut account = account(address, roots);
+        account.tokens = Some(tokens);
+        let denied = account.resume(session).expect_err("the grant is dead");
+        assert!(
+            denied.is_final(),
+            "only a refused refresh spends the password: {denied}"
+        );
+        let log = seen(&rx);
+        assert!(
+            log.iter().any(|line| line == "POST /v1/oauth/token"),
+            "the dead grant is spent before it is called dead: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|line| line == "POST /v1/account/login"),
+            "resume itself never signs in: {log:?}"
         );
         let _ = std::fs::remove_file(&path);
     }
