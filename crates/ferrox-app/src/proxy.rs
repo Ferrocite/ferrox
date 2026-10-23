@@ -3622,10 +3622,14 @@ fn dial_vless_rung(
             if uplink.write_all(header).is_err() {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Dropped);
             }
-            let pump = Pump::to_stream(client, &uplink);
+            let pump = Pump::to_stream_now(client, &uplink);
             let answered = read_vless_response(&mut uplink).is_some();
-            pump.end();
+            let sent = pump.end();
             if !answered {
+                // The pump may have handed the edge bytes before it refused; another rung could only carry the rest of the stream.
+                if sent {
+                    return true;
+                }
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
@@ -11830,37 +11834,55 @@ pub(crate) fn write_all_runs<const N: usize>(
 pub(crate) struct Pump {
     stop: std::sync::mpsc::Sender<()>,
     running: Option<RelayEnd>,
+    sent: Arc<AtomicBool>,
 }
 
 impl Pump {
     /// Pumps the app's bytes through `to_carrier` once the answer is overdue; the leg is the only reader of the app's socket until `end` joins it.
-    fn over(peer: &Connection, mut to_carrier: impl FnMut(&[u8]) -> bool + Send + 'static) -> Self {
+    fn over(peer: &Connection, to_carrier: impl FnMut(&[u8]) -> bool + Send + 'static) -> Self {
+        Self::start(peer, to_carrier, true)
+    }
+
+    /// Pumps from the first byte, without waiting out the grace: a server that holds its answer until it sees payload would otherwise idle the opening write for the whole grace. The caller must stop climbing once [`Pump::end`] reports bytes sent, because those bytes are spent and cannot be replayed to another rung.
+    fn over_now(peer: &Connection, to_carrier: impl FnMut(&[u8]) -> bool + Send + 'static) -> Self {
+        Self::start(peer, to_carrier, false)
+    }
+
+    fn start(
+        peer: &Connection,
+        mut to_carrier: impl FnMut(&[u8]) -> bool + Send + 'static,
+        wait: bool,
+    ) -> Self {
         let (stop, stop_rx) = std::sync::mpsc::channel();
+        let sent = Arc::new(AtomicBool::new(false));
+        let pumped = Arc::clone(&sent);
         let running = match peer.try_clone() {
             Ok(reading) => Some(RelayPool::run_once(move || {
                 use std::sync::mpsc::{RecvTimeoutError, TryRecvError};
                 let mut reading = reading;
-                if !matches!(
-                    stop_rx.recv_timeout(budgets::payload_grace()),
-                    Err(RecvTimeoutError::Timeout)
-                ) {
+                if wait
+                    && !matches!(
+                        stop_rx.recv_timeout(budgets::payload_grace()),
+                        Err(RecvTimeoutError::Timeout)
+                    )
+                {
                     return;
                 }
                 let _ = reading.set_read_timeout(Some(RELAY_POLL));
                 // The same reused, uninitialised buffer the relay uses: no 16 KiB memset for bytes the first read overwrites.
                 let mut buffer = RelayBuf::new();
                 loop {
+                    if !matches!(stop_rx.try_recv(), Err(TryRecvError::Empty)) {
+                        break;
+                    }
                     match reading.read(buffer.as_mut()) {
                         Ok(size) if size > 0 => {
+                            pumped.store(true, Ordering::Relaxed);
                             if !to_carrier(buffer.filled(size)) {
                                 break;
                             }
                         }
-                        Err(error) if is_timeout(&error) => {
-                            if !matches!(stop_rx.try_recv(), Err(TryRecvError::Empty)) {
-                                break;
-                            }
-                        }
+                        Err(error) if is_timeout(&error) => {}
                         _ => break,
                     }
                 }
@@ -11869,7 +11891,11 @@ impl Pump {
             })),
             Err(_) => None,
         };
-        Self { stop, running }
+        Self {
+            stop,
+            running,
+            sent,
+        }
     }
 
     fn to_sink<W: CarrierSink>(peer: &Connection, writer: &W) -> Self {
@@ -11884,21 +11910,30 @@ impl Pump {
         Self::over(peer, move |bytes| uplink.write_all(bytes).is_ok())
     }
 
+    fn to_stream_now(peer: &Connection, write: &Connection) -> Self {
+        let Ok(mut uplink) = write.try_clone() else {
+            return Self::idle();
+        };
+        Self::over_now(peer, move |bytes| uplink.write_all(bytes).is_ok())
+    }
+
     /// A pump with nothing to pump: a socket whose descriptor cannot be duplicated again.
     fn idle() -> Self {
         let (stop, _) = std::sync::mpsc::channel();
         Self {
             stop,
             running: None,
+            sent: Arc::new(AtomicBool::new(false)),
         }
     }
 
-    /// Stops the leg and waits for it, so the session's own upload leg is the only reader afterwards.
-    fn end(self) {
+    /// Stops the leg and waits for it, so the session's own upload leg is the only reader afterwards, and reports whether it spent any of the app's bytes.
+    fn end(self) -> bool {
         let _ = self.stop.send(());
         if let Some(running) = self.running {
             join(&running);
         }
+        self.sent.load(Ordering::Relaxed)
     }
 }
 
@@ -18662,6 +18697,76 @@ mod tests {
         drop(client);
         server.join().expect("joins");
         relaying.join().expect("joins");
+    }
+
+    /// The payload grace is a ceiling on a refusal, not a delay before the upload: a raw client that already has bytes must hand them to a response-withholding edge at once, or the first write of every upload waits out the grace while the edge waits for that write.
+    #[test]
+    fn vless_raw_client_pumps_the_upload_before_the_payload_grace_expires() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            payload_grace: Some(Duration::from_millis(500)),
+            ..Default::default()
+        });
+        let id = [0x28u8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let Some((got, _flow, cmd, _target)) = decode_request(&mut stream) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(cmd, 1);
+            stream
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .expect("timeout");
+            let mut payload = [0u8; 4];
+            if stream.read_exact(&mut payload).is_err() {
+                return;
+            }
+            stream.write_all(&[0, 0]).expect("answers");
+            stream.write_all(&payload).expect("echoes");
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Raw(Chain::default()),
+            host: String::new(),
+            mux: false,
+            quic_roots: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+        };
+        let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let relaying = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_vless(
+                &stream,
+                &server_addr,
+                &vless,
+                &Destination::from(target),
+                Ladder::global(),
+            );
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        let echoed = client.read_exact(&mut back).is_ok();
+        budgets::clear();
+        drop(client);
+        server.join().expect("joins");
+        relaying.join().expect("joins");
+        assert!(echoed, "the first write did not wait out the payload grace");
+        assert_eq!(&back, b"ping");
     }
 
     /// The edge has to see the name the client was given: a client that looks it up first sends an address for a host it never kept, and the lookup itself is visible to whoever watches its resolver.
