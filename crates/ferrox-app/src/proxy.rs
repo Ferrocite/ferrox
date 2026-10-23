@@ -18733,9 +18733,7 @@ mod tests {
         server.join().expect("joins");
     }
 
-    /// A trojan listener that declares tls answers the handshake its config names, on every carrier the outbound already dials.
-    #[test]
-    fn a_trojan_inbound_that_declares_tls_answers_every_carrier() {
+    fn tls_cert_json() -> (String, String, Arc<ferrox_core::tls::TlsConfig>) {
         let minted =
             rcgen::generate_simple_self_signed(vec!["carrier.test".to_owned()]).expect("mints");
         let pem_json = |pem: &str| -> String {
@@ -18754,6 +18752,13 @@ mod tests {
             cipher_suites: Vec::new(),
             insecure: false,
         });
+        (cert, key, client)
+    }
+
+    /// A trojan listener that declares tls answers the handshake its config names, on every carrier the outbound already dials.
+    #[test]
+    fn a_trojan_inbound_that_declares_tls_answers_every_carrier() {
+        let (cert, key, client) = tls_cert_json();
         let cases = [
             ("raw", r#""network": "tcp""#),
             ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
@@ -18837,6 +18842,64 @@ mod tests {
             sock.write_all(b"ping").expect("writes");
             assert_eq!(&read_echo(&mut sock), b"ping", "{tag} over tls echoes");
         }
+    }
+
+    #[test]
+    fn a_trojan_udp_association_crosses_the_tls_arm() {
+        let (cert, key, client) = tls_cert_json();
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                "streamSettings": {{"network": "tcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        serve_trojan_inbound(&address, &inbound, true);
+        let waited = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(10),
+                "listener never bound"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            while let Ok((n, src)) = echo.recv_from(&mut buf) {
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let trojan = TrojanOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            key: trojan_key("secret"),
+            carrier: inbound_carrier(&inbound),
+            host: "127.0.0.1".to_owned(),
+            tls: Some(client),
+        };
+        let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").expect("binds"));
+        let relay_addr = relay.local_addr().expect("addr");
+        let served = Arc::clone(&relay);
+        thread::spawn(move || serve_socks_udp_trojan(&served, &trojan));
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut frame = Vec::new();
+        let datagram = socks_udp_frame(&mut frame, None, &target, b"ping");
+        udp.send_to(datagram, relay_addr).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = udp.recv_from(&mut back).expect("a tls association echoes");
+        let (source, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(source, target);
+        assert_eq!(payload, b"ping");
     }
 
     #[test]
