@@ -17025,11 +17025,11 @@ mod tests {
         let inner_addr = inner.local_addr().expect("addr");
         let echo = thread::spawn(move || {
             let (stream, _) = inner.accept().expect("accepts");
-            stream
-                .set_read_timeout(Some(Duration::from_millis(20)))
-                .expect("times out");
             let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            tls.get_ref()
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .expect("times out");
             let mut buf = [0u8; 4096];
             loop {
                 match tls.read(&mut buf) {
@@ -17039,7 +17039,7 @@ mod tests {
                             break;
                         }
                     }
-                    Err(error) if is_timeout(&error) => continue,
+                    Err(error) if is_timeout(&error) => {}
                     Err(_) => break,
                 }
             }
