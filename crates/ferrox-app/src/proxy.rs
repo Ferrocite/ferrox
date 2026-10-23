@@ -5702,10 +5702,10 @@ fn tls_grpc<S: Dialed>(
     crate::grpc::connect_split(reader, writer, host, path).or_else(|| tls_unreachable(server))
 }
 
-fn tls_xhttp<S: Dialed>(
+fn tls_xhttp<S: Dialed, D: Dialed>(
     server: &SocketAddr,
     session: S,
-    second: impl FnOnce() -> Option<ferrox_core::tls::RustlsProvider<Connection>>,
+    second: impl FnOnce() -> Option<D>,
     host: &str,
     settings: &crate::xhttp::XhttpSettings,
 ) -> Option<(Box<dyn Read + Send>, crate::xhttp::XhttpWriter)> {
