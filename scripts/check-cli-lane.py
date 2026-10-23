@@ -9,7 +9,9 @@ trace immediately because nothing listens on its port. `locations --ping` is
 given a fake catalogue: the rows must order by latency, keep a silent edge as
 `no answer`, pin REC, and leave the readings out of the offline copy. The split
 lists must reach the lane normalized, and a port outside 1-65535 must be refused
-before the lane config is written.
+before the lane config is written. A lane that binds its front but carries no
+flow must be stopped by `up` itself, with its pid file, config and proxy marker
+removed and its port free again.
 """
 
 from __future__ import annotations
@@ -86,18 +88,31 @@ def under_a_terminal(answer: bytes, env: dict[str, str]) -> str:
 
 
 def chosen_carrier(state: pathlib.Path) -> str:
-    document = json.loads((state / "lane.json").read_text(encoding="utf-8"))
+    document = json.loads((state / "lane-snapshot.json").read_text(encoding="utf-8"))
     return document["outbounds"][0]["settings"]["carrier"]
+
+
+def snapshot_binary(state: pathlib.Path) -> pathlib.Path:
+    binary = state / "fake-carrier-lane"
+    binary.write_text(
+        """#!/bin/sh
+cp "$3" "$FERROX_CONF_DIR/lane-snapshot.json"
+""",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    return binary
 
 
 def check_picker(state: pathlib.Path) -> int:
     env = env_for(state)
+    env["FERROX_BIN"] = str(snapshot_binary(state))
     cases = [
         ("a typed h3 starts the lane on h3", b"4\n", "h3"),
         ("an empty answer takes auto", b"\n", "auto"),
     ]
     for label, answer, want in cases:
-        (state / "lane.json").unlink(missing_ok=True)
+        (state / "lane-snapshot.json").unlink(missing_ok=True)
         output = under_a_terminal(answer, env)
         if chosen_carrier(state) != want:
             print(
@@ -107,7 +122,7 @@ def check_picker(state: pathlib.Path) -> int:
             )
             return 1
         print(f"check-cli-lane: {label}")
-    (state / "lane.json").unlink(missing_ok=True)
+    (state / "lane-snapshot.json").unlink(missing_ok=True)
     piped = subprocess.run(
         up_argv(free_port()),
         stdin=subprocess.DEVNULL,
@@ -263,7 +278,9 @@ fi
 
 def check_splits(state: pathlib.Path) -> int:
     env = env_for(state)
-    (state / "lane.json").unlink(missing_ok=True)
+    env["FERROX_BIN"] = str(snapshot_binary(state))
+    snapshot = state / "lane-snapshot.json"
+    snapshot.unlink(missing_ok=True)
     subprocess.run(
         [
             *up_argv(free_port()),
@@ -278,9 +295,9 @@ def check_splits(state: pathlib.Path) -> int:
         timeout=WATCH,
         env=env,
     )
-    settings = json.loads((state / "lane.json").read_text(encoding="utf-8"))[
-        "outbounds"
-    ][0]["settings"]
+    settings = json.loads(snapshot.read_text(encoding="utf-8"))["outbounds"][0][
+        "settings"
+    ]
     if settings.get("directDomains") != ["example.com", "printer.lan"]:
         print(
             f"check-cli-lane: the split domains reach the lane as "
@@ -295,7 +312,7 @@ def check_splits(state: pathlib.Path) -> int:
             file=sys.stderr,
         )
         return 1
-    (state / "lane.json").unlink(missing_ok=True)
+    snapshot.unlink(missing_ok=True)
     subprocess.run(
         up_argv(free_port()),
         stdin=subprocess.DEVNULL,
@@ -304,16 +321,16 @@ def check_splits(state: pathlib.Path) -> int:
         timeout=WATCH,
         env=env,
     )
-    settings = json.loads((state / "lane.json").read_text(encoding="utf-8"))[
-        "outbounds"
-    ][0]["settings"]
+    settings = json.loads(snapshot.read_text(encoding="utf-8"))["outbounds"][0][
+        "settings"
+    ]
     if "directDomains" in settings or "directPorts" in settings:
         print(
             "check-cli-lane: a lane with no split lists still carried one",
             file=sys.stderr,
         )
         return 1
-    (state / "lane.json").unlink(missing_ok=True)
+    snapshot.unlink(missing_ok=True)
     refused = subprocess.run(
         [*up_argv(free_port()), "--exclude-ports", "70000"],
         stdin=subprocess.DEVNULL,
@@ -327,6 +344,7 @@ def check_splits(state: pathlib.Path) -> int:
         refused.returncode == 0
         or "1-65535" not in spoken
         or (state / "lane.json").exists()
+        or snapshot.exists()
     ):
         print(
             f"check-cli-lane: a port outside 1-65535 was not refused before the "
@@ -340,6 +358,133 @@ def check_splits(state: pathlib.Path) -> int:
     return 0
 
 
+def dead_lane_binary(state: pathlib.Path) -> pathlib.Path:
+    binary = state / "fake-dead-lane"
+    binary.write_text(
+        """#!/usr/bin/env python3
+import json, os, socket, sys
+config = sys.argv[sys.argv.index("-c") + 1]
+with open(config, encoding="utf-8") as handle:
+    document = json.load(handle)
+port = document["inbounds"][0]["port"]
+state = os.environ["FERROX_CONF_DIR"]
+with open(os.path.join(state, "fake-lane.pids"), "a", encoding="utf-8") as handle:
+    handle.write(f"{os.getpid()}\\n")
+server = socket.socket()
+server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+server.bind(("127.0.0.1", port))
+server.listen(16)
+while True:
+    conn, _ = server.accept()
+    conn.close()
+""",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    return binary
+
+
+def check_failed_lane_is_closed(state: pathlib.Path) -> int:
+    for stale in ("lane.json", "lane.pid", "fake-lane.pids", "system-proxy.ports"):
+        (state / stale).unlink(missing_ok=True)
+    (state / "system-proxy.ports").write_text("10808 8080\n", encoding="utf-8")
+    port = free_port()
+    env = env_for(state)
+    env["FERROX_BIN"] = str(dead_lane_binary(state))
+    run = subprocess.run(
+        up_argv(port),
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH * 2,
+        env=env,
+    )
+    output = run.stdout + run.stderr
+    if run.returncode != 3:
+        print(
+            f"check-cli-lane: a lane that carries no flow exited {run.returncode},"
+            f" not 3:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if "NOT CONNECTED" not in output:
+        print(
+            f"check-cli-lane: a lane that carries no flow did not say so:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    for gone in ("lane.pid", "lane.json", "system-proxy.ports"):
+        if (state / gone).exists():
+            print(
+                f"check-cli-lane: a failed lane left {gone} behind:\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+    pids = (state / "fake-lane.pids")
+    started = pids.read_text(encoding="utf-8").split() if pids.exists() else []
+    if not started:
+        print("check-cli-lane: the fake lane never ran", file=sys.stderr)
+        return 1
+    for pid in started:
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            continue
+        print(
+            f"check-cli-lane: a failed lane left process {pid} running:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    with socket.socket() as probe:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            probe.bind(("127.0.0.1", port))
+        except OSError:
+            print(
+                "check-cli-lane: a failed lane left its port bound", file=sys.stderr
+            )
+            return 1
+    print(
+        "check-cli-lane: a lane that carries no flow is stopped, with its pid, config"
+        " and proxy marker removed and its port free"
+    )
+    return 0
+
+
+def check_config_survives(state: pathlib.Path) -> int:
+    user = state / "user-config.json"
+    user.write_text('{"inbounds": [], "outbounds": []}\n', encoding="utf-8")
+    run = subprocess.run(
+        [str(CLI), "serve", "--config", str(user)],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH,
+        env=env_for(state),
+    )
+    output = run.stdout + run.stderr
+    if run.returncode != 0:
+        print(
+            f"check-cli-lane: serve --config exited {run.returncode}:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if not user.exists():
+        print(
+            f"check-cli-lane: a lane exit removed the user's --config file:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if (state / "lane.pid").exists():
+        print(
+            f"check-cli-lane: serve --config left its pid file behind:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    print("check-cli-lane: a lane exit clears its pid but never the user's --config file")
+    return 0
+
+
 def main() -> int:
     state = pathlib.Path(tempfile.mkdtemp(prefix="ferrox-cli-lane-"))
     if check_picker(state) != 0:
@@ -348,7 +493,11 @@ def main() -> int:
         return 1
     if check_locations(state) != 0:
         return 1
-    return check_splits(state)
+    if check_splits(state) != 0:
+        return 1
+    if check_failed_lane_is_closed(state) != 0:
+        return 1
+    return check_config_survives(state)
 
 
 if __name__ == "__main__":

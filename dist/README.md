@@ -40,7 +40,7 @@ Pick an exit before connecting — the catalogue is public, so this needs no acc
 ./ferrox-cli.sh up --foxy --exclude-ports 22 --exclude-domains printer.lan   # these leave the tunnel
 ```
 
-`up` prints the port map, then proves one real flow through a front before it routes anything: a lane that carries nothing never takes the machine's traffic with it. If it says NOT CONNECTED it also prints why, from the lane's own log, with the fix to run. `--exclude-domains`/`--exclude-ports` take targets out of the lane for that launch: they dial directly and unencrypted.
+`up` prints the port map, then proves one real flow through a front before it routes anything: a lane that carries nothing never takes the machine's traffic with it. If it says NOT CONNECTED it also prints why, from the lane's own log, with the fix to run, and stops the lane it started so nothing is left running and no `down` is needed. `--exclude-domains`/`--exclude-ports` take targets out of the lane for that launch: they dial directly and unencrypted.
 
 ## 30-second start — the VeePN lane
 
