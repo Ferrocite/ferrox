@@ -568,8 +568,7 @@ impl<R: Read> GrpcReader<R> {
                 self.window(id, &frame);
                 Some(())
             }
-            // A GOAWAY with this stream in its last-stream-id still carries the body; the
-            // stream ends at END_STREAM, not at the control frame that closed the door to new ones.
+            // A GOAWAY still carries this stream's body; END_STREAM ends it.
             _ => Some(()),
         };
         self.frame = frame;
@@ -1038,8 +1037,7 @@ pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
         return None;
     }
     reader.set_handshake_budget(None);
-    // One stream per connection: GOAWAY after the first keeps that shape while telling the peer to
-    // open its next flow on a fresh connection instead of hanging it on this one.
+    // One stream per connection: GOAWAY tells the peer to open its next flow elsewhere.
     let mut last = [0u8; 8];
     last[..4].copy_from_slice(&reader.stream.to_be_bytes());
     let _ = reader.emit(T_GOAWAY, 0, 0, &last);

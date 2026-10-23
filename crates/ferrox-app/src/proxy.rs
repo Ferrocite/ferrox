@@ -26377,8 +26377,8 @@ mod tests {
         drop(probe);
         let inbound = crate::json::parse(&format!(
             r#"{{"protocol": "vless", "port": {port}, "settings": {{"clients": [{{"id": "{uuid}"}}]}}, "streamSettings": {{"network": "hysteria", "security": "tls", "hysteriaSettings": {{"version": 2, "auth": "inbound-auth"}}, "tlsSettings": {{"alpn": ["h3"], "certificates": [{{"certificateFile": "{}", "keyFile": "{}"}}]}}}}}}"#,
-            cert_path.to_str().expect("ascii"),
-            key_path.to_str().expect("ascii")
+            cert_path.to_str().expect("ascii").replace('\\', "\\\\"),
+            key_path.to_str().expect("ascii").replace('\\', "\\\\")
         ))
         .expect("parses");
         assert!(serve_vless_inbound(

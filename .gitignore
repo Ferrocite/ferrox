@@ -1,4 +1,5 @@
 /target
+/.build/
 
 # Pinned reading copies, not source: `scripts/fetch-upstream.sh` re-derives
 # `upstream/<name>/` from `upstream/pins.toml` alone, so committing a checkout
