@@ -33,7 +33,7 @@ What runs against what: `xray-rust` interop (23 tests, seam `XRAY_VLESS_FULL_BIN
 | MASQUE proxy (`proxy/masque`) | planned; CONNECT-IP client dials on the Foxy `h3` lane (row 20) |
 | TUN inbound (`proxy/tun`) | done (row 29) |
 | uTLS fingerprints per connection | planned (row 38) |
-| ECH | client done; TLS server done; QUIC server keys wired, acceptance over QUIC unproven (row 39) |
+| ECH | client done, `echSockopt` applied to the DNS query socket; TLS server done; QUIC server keys wired, acceptance over QUIC unproven (row 39) |
 | VLESS stream encryption (`encryption` field, XOR/MLKEM) | planned (row 34) |
 | XTLS Vision UDP-over-443 flow | planned (row 35) |
 | REALITY ML-DSA-65 binding (`mldsa65Seed` / `mldsa65Verify`) | planned (row 122; the ZeroNet oracle row `reality_with_the_mldsa65_binding_matches_the_oracle` is waiting on it) |
