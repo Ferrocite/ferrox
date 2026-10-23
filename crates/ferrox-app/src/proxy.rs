@@ -6321,7 +6321,11 @@ fn dial_vless_tls(
     let Some(cfg) = vless.tls.as_deref() else {
         return;
     };
-    let header = vless_header(&vless.id, 1, target);
+    let header = if vless.flow == crate::vision::FLOW {
+        vless_vision_header(&vless.id, 1, target)
+    } else {
+        vless_header(&vless.id, 1, target)
+    };
     let Some(mut session) = dial_tls_session(server, cfg, vless.carrier.tcp_mask()) else {
         return;
     };
@@ -6335,12 +6339,63 @@ fn dial_vless_tls(
     }
     match &vless.carrier {
         Carrier::Raw(_) => {
+            if vless.flow != crate::vision::FLOW {
+                if session.write_all(&header).is_err() {
+                    return note_dial_failure(
+                        server,
+                        Failure::new(Stage::RequestSent, Kind::Dropped),
+                    );
+                }
+                if read_vless_response(&mut session).is_none() {
+                    return note_dial_failure(
+                        server,
+                        Failure::new(Stage::RequestSent, Kind::Dropped),
+                    );
+                }
+                let Ok(downstream) = client.try_clone() else {
+                    return;
+                };
+                if downstream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+                    return;
+                }
+                let close = shutdown_pair(downstream.try_clone().ok(), None);
+                // The relay reads the session's transport itself: the idle leg's wait holds no lock, so it takes the relay grain itself.
+                if let Ok(half) = driven_halves(session, RELAY_POLL) {
+                    relay_stream(Half::socket(downstream), half, &close);
+                }
+                return;
+            }
+            // A server may hold its answer until it has payload to send, so the upload runs through the pump while this leg waits, as on every other carrier; a TLS session cannot split, so both legs share it behind one lock until the pump's owner joins and hands it back.
             if session.write_all(&header).is_err() {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            if read_vless_response(&mut session).is_none() {
+            let Ok(out) = session.get_ref().try_clone() else {
+                return;
+            };
+            let shared = Arc::new(Mutex::new(session));
+            let out = Arc::new(Mutex::new(Sealed::new(out)));
+            let mut reader = TlsHalf {
+                session: Arc::clone(&shared),
+                out: Arc::clone(&out),
+                driven: None,
+            };
+            let pump = Pump::over(client, {
+                let mut writer = TlsHalf {
+                    session: Arc::clone(&shared),
+                    out: Arc::clone(&out),
+                    driven: None,
+                };
+                move |bytes| writer.write_all(bytes).is_ok()
+            });
+            let answered = read_vless_response(&mut reader).is_some();
+            pump.end();
+            if !answered {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
+            drop(reader);
+            let Some(Ok(session)) = Arc::into_inner(shared).map(Mutex::into_inner) else {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Local));
+            };
             let Ok(downstream) = client.try_clone() else {
                 return;
             };
@@ -6348,10 +6403,13 @@ fn dial_vless_tls(
                 return;
             }
             let close = shutdown_pair(downstream.try_clone().ok(), None);
-            // The relay reads the session's transport itself: the idle leg's wait holds no lock, so it takes the relay grain itself.
-            if let Ok(half) = driven_halves(session, RELAY_POLL) {
-                relay_stream(Half::socket(downstream), half, &close);
-            }
+            // The Link frames its writes over this session, so the quiet grain arms on the transport it reads.
+            let half = Half::shared_armed_capped(
+                crate::vision::Link::new(session, None, &vless.id),
+                crate::vision::Link::arm_session_timeout,
+                SESSION_POLL,
+            );
+            relay_stream(Half::socket(downstream), half, &close);
         }
         _ => ride_carrier(server, session, vless, &header, client),
     }
@@ -14070,12 +14128,6 @@ mod tests {
         let diagnose = |text: &str| diagnose_outbounds(&crate::json::parse(text).expect("parses"));
         assert_eq!(
             diagnose(
-                r#"{"outbounds":[{"tag":"proxy","protocol":"vless","settings":{"vnext":[{"address":"192.0.2.6","port":443,"users":[{"id":"0d3f5bd4-0e22-45a4-bb8c-838b3a5aa3d6"}]}]},"streamSettings":{"security":"tls","tlsSettings":{"allowInsecure":true}}}]}"#,
-            ),
-            ["outbound `proxy` (vless) cannot be built: allowInsecure is removed; use pinnedPeerCertSha256 or verifyPeerCertByName"]
-        );
-        assert_eq!(
-            diagnose(
                 r#"{"outbounds":[{"tag":"t","protocol":"trojan","settings":{"servers":[{"address":"192.0.2.6","port":443}]}}]}"#,
             ),
             ["outbound `t` (trojan) cannot be built: no password in the server entry"]
@@ -17766,6 +17818,50 @@ mod tests {
         (server, client)
     }
 
+    /// `allowInsecure` dials with no root at all: the handshake still completes against a
+    /// certificate no store holds, and the session speaks both ways.
+    #[test]
+    fn an_insecure_dial_speaks_the_whole_session() {
+        use ferrox_core::tls::TlsProvider as _;
+        use std::io::Read as _;
+        use std::io::Write as _;
+
+        let (server_config, _client_config) = carried_tls_configs();
+        let insecure = ferrox_core::tls::TlsConfig {
+            server_name: "anything.test".to_owned(),
+            alpn: std::sync::Arc::default(),
+            roots: std::sync::Arc::from(Vec::new()),
+            pins: ferrox_core::foxy::pin::Pins::default(),
+            cipher_suites: Vec::new(),
+            insecure: true,
+            fingerprint: None,
+            websocket: false,
+        };
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf).expect("reads");
+            tls.write_all(&buf).expect("echoes");
+            tls.flush().expect("flushes");
+        });
+        let mut session = ferrox_core::tls::RustlsProvider::connect(
+            &insecure,
+            Connection::connect(("127.0.0.1", port)).expect("connects"),
+        )
+        .expect("opens");
+        session.handshake().expect("handshakes");
+        session.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        session.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        drop(session);
+        server.join().expect("joins");
+    }
+
     /// Two pumps share one session: a read waiting under the lock strangles the writer for the peer's silence.
     #[test]
     fn a_shared_tls_session_yields_the_lock_between_polls() {
@@ -18777,10 +18873,17 @@ mod tests {
         assert_eq!(tls.server_name, "tls.test");
         assert_eq!(&*tls.alpn, &[b"h2".to_vec()]);
         assert_eq!(tls.roots.len(), 1);
+        assert!(!tls.insecure, "raw honors allowInsecure=false by default");
+        for (want, stream) in tls_stream_cases(&ca_json) {
+            let out = find_vless_outbound(&vnext_tls_root("vless", &stream)).expect("finds {want}");
+            assert!(!out.tls.as_ref().expect("carries tls").insecure, "{want}");
+        }
         let insecure = format!(
             r#""network": "tcp", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}", "allowInsecure": true}}"#
         );
-        assert!(find_vless_outbound(&vnext_tls_root("vless", &insecure)).is_none());
+        let insecure = find_vless_outbound(&vnext_tls_root("vless", &insecure))
+            .expect("allowInsecure builds the outbound");
+        assert!(insecure.tls.expect("carries tls").insecure, "allowInsecure");
         for network in ["quic", "kcp", "hysteria"] {
             let stream = format!(
                 r#""network": "{network}", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
@@ -19120,6 +19223,79 @@ mod tests {
         drop(sock);
         relay.join().expect("joins");
         server.join().expect("joins");
+    }
+
+    #[test]
+    fn vless_over_tls_vision_carries_an_echo() {
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x46u8; 16];
+        let target = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let target_addr = target.local_addr().expect("addr");
+        let filler = thread::spawn(move || {
+            let (mut stream, _) = target.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(120)))
+                .expect("timeout");
+            let mut buf = [0u8; 512];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        stream.write_all(&buf[..n]).expect("echoes");
+                        stream.flush().expect("flushes");
+                    }
+                }
+            }
+        });
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_tls(
+                stream,
+                &id,
+                true,
+                &Carrier::Raw(Chain::default()),
+                &server_config,
+            );
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let vless = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                carrier: Carrier::Raw(Chain::default()),
+                host: String::new(),
+                mux: false,
+                quic_roots: None,
+                hysteria_roots: None,
+                tls: Some(Arc::new(client_config)),
+                flow: crate::vision::FLOW.to_owned(),
+                reality: None,
+            };
+            echo_trace(&format!("cli {port} dialing"));
+            dial_vless(
+                &client,
+                &server,
+                &vless,
+                &Destination::from(target_addr),
+                Ladder::global(),
+            );
+            echo_trace(&format!("cli {port} relay over"));
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(120)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping");
+        drop(sock);
+        relay.join().expect("joins");
+        server.join().expect("joins");
+        filler.join().expect("joins");
     }
 
     #[test]

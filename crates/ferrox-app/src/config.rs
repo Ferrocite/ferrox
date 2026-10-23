@@ -304,14 +304,11 @@ pub(crate) fn outbound_tls(
         return Err("security is not tls".to_owned());
     }
     let tls = settings.get("tlsSettings");
-    if matches!(
+    // xray honors `allowInsecure`, so we read the same field and dial the same verdict.
+    let insecure = matches!(
         tls.and_then(|s| s.get("allowInsecure")),
         Some(Json::Bool(true))
-    ) {
-        return Err(
-            "allowInsecure is removed; use pinnedPeerCertSha256 or verifyPeerCertByName".to_owned(),
-        );
-    }
+    );
     let server_name = tls
         .and_then(|s| s.get("serverName"))
         .and_then(Json::as_str)
@@ -327,12 +324,14 @@ pub(crate) fn outbound_tls(
         Some(Json::Bool(true))
     );
     let roots = tls_ca_roots(outbound).or_else(|| {
-        system_only
+        (!insecure && system_only)
             .then(crate::quic::system_roots)
             .filter(|r| !r.is_empty())
     });
     let roots = match roots {
         Some(roots) if !roots.is_empty() => roots,
+        // The skip verifier reads no anchor, so an insecure dial needs none and loads none.
+        _ if insecure => std::sync::Arc::from(Vec::new()),
         _ => {
             return Err(
                 "no certificate authorities: no caCertFile and the system roots are empty"
@@ -355,7 +354,7 @@ pub(crate) fn outbound_tls(
         roots,
         pins: ferrox_core::foxy::pin::Pins::default(),
         cipher_suites: tls_cipher_suites(tls),
-        insecure: false,
+        insecure,
         fingerprint: Some(fingerprint),
         websocket: matches!(
             settings.get("network").and_then(Json::as_str),
