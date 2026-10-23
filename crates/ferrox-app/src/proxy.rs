@@ -11832,9 +11832,7 @@ fn inbound_password(inbound: &Json) -> String {
         .to_owned()
 }
 
-// A lane the tree can carry when its fields are honest; the field it lacks is the refusal's
-// word, so a config that cannot build names what it named wrong before the inbounds' verdict
-// says only that nothing served.
+// A lane the tree can carry when its fields are honest: the field it lacks is the refusal's word.
 fn outbound_refusal(outbound: &Json, protocol: &str) -> Option<String> {
     let settings = outbound.get("settings");
     let tls_reason = |outbound: &Json, address: &str| {
