@@ -28,8 +28,8 @@ use ferrox_core::foxy::connectip::{
 };
 
 const DEFAULT_MTU: usize = 1500;
-/// The association's framed datagram: the relay's largest payload plus the RSV/FRAG prefix and an address.
-const FRAME_CAP: usize = crate::proxy::UDP_BUF + 3 + 19;
+/// The head of a framed datagram: the RSV/FRAG prefix and the widest address (IPv6 plus its port). The payload stays the device's buffer and is handed to the socket by pointer.
+const FRAME_CAP: usize = 3 + 1 + 16 + 2;
 const TCP_PROTO: u8 = 6;
 const ICMP_PROTO: u8 = 1;
 /// An ICMP echo request is type 8; its answer flips that to type 0 and carries the message back.
@@ -537,8 +537,8 @@ impl Handler {
             )?),
         };
         let mut frame = std::mem::take(&mut self.frame);
-        let out = crate::proxy::socks_udp_frame(&mut frame, None, &target, payload);
-        let sent = leg.send(out);
+        let (front, tail) = crate::proxy::socks_udp_parts(&mut frame, &target, payload);
+        let sent = crate::proxy::send_two(leg, front, tail);
         self.frame = frame;
         if sent.is_err() {
             self.legs.remove(&key);
@@ -958,6 +958,30 @@ mod tests {
             &mut out,
         ));
         out
+    }
+
+    /// The device's datagram leaves as a head this handler builds and the device's own payload:
+    /// the payload pointer is the tail, and the head's capacity is held over a push/drain cycle.
+    #[test]
+    fn a_device_datagram_hands_the_payload_over_by_pointer() {
+        let target: SocketAddr = "[2001:db8::7]:53".parse().expect("addr");
+        let payload = b"query";
+        let mut head = Vec::with_capacity(FRAME_CAP);
+        let base = head.as_ptr() as usize;
+        let capacity = head.capacity();
+        for _ in 0..2 {
+            let (front, tail) = crate::proxy::socks_udp_parts(&mut head, &target, payload);
+            assert_eq!(tail.as_ptr(), payload.as_ptr(), "no payload copy");
+            assert_eq!(front.len(), 22, "the widest head is an IPv6 address");
+            assert_eq!(head.as_ptr() as usize, base, "the head does not move");
+            assert_eq!(head.capacity(), capacity, "the head does not grow");
+        }
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            let (front, tail) = crate::proxy::socks_udp_parts(&mut head, &target, payload);
+            assert_eq!(front.len(), 22);
+            assert_eq!(tail.len(), payload.len());
+        });
+        assert_eq!(counts.allocs, 0, "the warm head costs no heap buffer");
     }
 
     #[test]

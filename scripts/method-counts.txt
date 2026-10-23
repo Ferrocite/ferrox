@@ -569,6 +569,9 @@ socks datagram-payload-copies-per-forwarded-datagram 0 ferrox-app-proxy::tests::
 socks datagram-frame-allocations-per-frame 0 ferrox-app-proxy::tests::a_forwarded_datagram_is_the_frame_the_client_framed
 socks front-name-zero-filled-bytes 0 ferrox-app-proxy::tests::a_socks_front_reads_no_buffer_it_zeroed
 socks datagram-rebuild-copies-per-reframed-datagram 1 ferrox-app-proxy::tests::a_datagram_naming_a_host_is_reframed_around_its_payload
+socks device-datagram-payload-copies 0 ferrox-app-tun::tests::a_device_datagram_hands_the_payload_over_by_pointer
+socks device-datagram-head-reallocations-after-the-first 0 ferrox-app-tun::tests::a_device_datagram_hands_the_payload_over_by_pointer
+socks device-datagram-head-bytes 22 ferrox-app-tun::tests::a_device_datagram_hands_the_payload_over_by_pointer
 socks datagram-frames-the-client-framed 1 ferrox-app-proxy::tests::a_forwarded_datagram_is_the_frame_the_client_framed
 socks datagram-ipv6-literal-destinations-answered 1 ferrox-app-proxy::tests::a_destination_naming_an_ipv6_literal_is_the_address_it_named
 socks credentialed-tunnels-through-the-front 1 ferrox-app-proxy::tests::a_socks_client_offers_the_credential_the_front_asks_for
