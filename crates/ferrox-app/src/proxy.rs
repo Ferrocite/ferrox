@@ -3819,9 +3819,9 @@ fn relay_kcp_under_tls(
     conn: &Arc<ferrox_core::kcp::Connection>,
     cfg: &ferrox_core::tls::TlsConfig,
     header: &[u8],
-    ready: impl FnOnce(&mut ferrox_core::tls::RustlsProvider<KcpIo>) -> bool,
+    ready: impl FnOnce(&mut ferrox_core::tls::ClientSession<KcpIo>) -> bool,
 ) {
-    let Ok(mut session) = ferrox_core::tls::RustlsProvider::connect(
+    let Ok(mut session) = ferrox_core::tls::connect(
         cfg,
         KcpIo {
             conn: Arc::clone(conn),
@@ -5519,7 +5519,7 @@ fn dial_tls_session(
     server: &SocketAddr,
     cfg: &ferrox_core::tls::TlsConfig,
     mask: Option<&ferrox_core::finalmask::Chain>,
-) -> Option<ferrox_core::tls::RustlsProvider<Connection>> {
+) -> Option<ferrox_core::tls::ClientSession<Connection>> {
     let uplink = match dial(server) {
         Ok(uplink) => uplink.with_mask(mask),
         Err(failure) => {
@@ -5527,7 +5527,7 @@ fn dial_tls_session(
             return None;
         }
     };
-    let Ok(mut session) = ferrox_core::tls::RustlsProvider::connect(cfg, uplink) else {
+    let Ok(mut session) = ferrox_core::tls::connect(cfg, uplink) else {
         note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
         return None;
     };
@@ -5549,7 +5549,7 @@ fn dial_tls_session(
 
 // Splits one established session into halves the carrier cores accept, plus the raw socket their teardown needs.
 fn tls_halves(
-    session: ferrox_core::tls::RustlsProvider<Connection>,
+    session: ferrox_core::tls::ClientSession<Connection>,
 ) -> Option<(ClientHalf, ClientHalf, Arc<Connection>)> {
     let raw = Arc::new(session.get_ref().try_clone().ok()?);
     let out = Arc::new(Mutex::new(Sealed::new(session.get_ref().try_clone().ok()?)));
@@ -5619,7 +5619,7 @@ trait Dialed:
         Self: Sized;
 }
 
-impl Dialed for ferrox_core::tls::RustlsProvider<Connection> {
+impl Dialed for ferrox_core::tls::ClientSession<Connection> {
     fn into_halves(self) -> Option<(TlsHalf<Self>, TlsHalf<Self>, Arc<Connection>)> {
         tls_halves(self)
     }
@@ -5824,7 +5824,7 @@ impl<S> Clone for TlsHalf<S> {
     }
 }
 
-type ClientHalf = TlsHalf<ferrox_core::tls::RustlsProvider<Connection>>;
+type ClientHalf = TlsHalf<ferrox_core::tls::ClientSession<Connection>>;
 
 impl<S: ferrox_core::tls::TlsProvider> Read for TlsHalf<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -5892,6 +5892,18 @@ impl Drivable for ferrox_core::tls::RustlsProvider<Connection> {
 }
 
 impl Drivable for ferrox_core::tls::RustlsProvider<KcpIo> {
+    fn transport(&self) -> Option<Connection> {
+        None
+    }
+}
+
+impl Drivable for ferrox_core::tls::ClientSession<Connection> {
+    fn transport(&self) -> Option<Connection> {
+        self.get_ref().try_clone().ok()
+    }
+}
+
+impl Drivable for ferrox_core::tls::ClientSession<KcpIo> {
     fn transport(&self) -> Option<Connection> {
         None
     }
@@ -6473,7 +6485,7 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
 fn vmess_tls_raw(
     client: &Connection,
     server: &SocketAddr,
-    mut session: ferrox_core::tls::RustlsProvider<Connection>,
+    mut session: ferrox_core::tls::ClientSession<Connection>,
     vmess: &VmessOut,
     target: &Destination,
 ) {
@@ -6529,7 +6541,7 @@ fn vmess_tls_raw(
 fn vmess_tls_carried(
     client: &Connection,
     server: &SocketAddr,
-    session: ferrox_core::tls::RustlsProvider<Connection>,
+    session: ferrox_core::tls::ClientSession<Connection>,
     vmess: &VmessOut,
     target: &Destination,
 ) {
@@ -17589,6 +17601,8 @@ mod tests {
             pins: ferrox_core::foxy::pin::Pins::default(),
             cipher_suites: Vec::new(),
             insecure: false,
+            fingerprint: None,
+            websocket: false,
         };
         (server, client)
     }
@@ -18980,8 +18994,7 @@ mod tests {
             alpn: std::sync::Arc::default(),
             roots: vec![minted.cert.der().to_vec()].into(),
             pins: ferrox_core::foxy::pin::Pins::default(),
-            cipher_suites: Vec::new(),
-            insecure: false,
+            ..Default::default()
         });
         (cert, key, client)
     }
@@ -24722,9 +24735,12 @@ mod tests {
     }
 
     /// The security sits above KCP, as it does upstream: a VLESS session that declares tls is served and dialled through the raw connection.
-    #[test]
-    fn a_vless_kcp_session_with_tls_echoes_over_loopback() {
-        let (cert, key, client) = tls_cert_json();
+    fn vless_kcp_tls_echoes(fingerprint: Option<ferrox_core::tls::Fingerprint>) {
+        let (cert, key, base) = tls_cert_json();
+        let client = Arc::new(ferrox_core::tls::TlsConfig {
+            fingerprint,
+            ..base.as_ref().clone()
+        });
         let inbound = crate::json::parse(&format!(
             r#"{{"protocol": "vless", "settings": {{"clients": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}},
                 "streamSettings": {{"network": "kcp", "security": "tls",
@@ -24795,6 +24811,109 @@ mod tests {
         // The relay ends when the client side closes; the server thread returns after that.
         drop(sock);
         server.join().expect("joins");
+    }
+
+    #[test]
+    fn a_vless_kcp_session_with_tls_echoes_over_loopback() {
+        vless_kcp_tls_echoes(None);
+    }
+
+    /// A fingerprint reaches the session a kcp carrier carries: the shaped hello handshakes and
+    /// relays over KCP, not only over a socket.
+    #[test]
+    fn a_fingerprinted_vless_kcp_session_echoes_over_loopback() {
+        vless_kcp_tls_echoes(Some(ferrox_core::tls::Fingerprint::default()));
+    }
+
+    /// A `fingerprint` on a kcp-carried tls outbound shapes the hello that goes on the wire; the
+    /// stock name on the same carrier writes rustls's. The peer captures the first record and
+    /// refuses it, so this gates the dial's bytes rather than a handshake.
+    #[test]
+    fn a_fingerprint_shapes_the_hello_a_kcp_session_dials() {
+        let first_suite = |fingerprint: ferrox_core::tls::Fingerprint| {
+            let (_cert, _key, base) = tls_cert_json();
+            let client = Arc::new(ferrox_core::tls::TlsConfig {
+                fingerprint: Some(fingerprint),
+                ..base.as_ref().clone()
+            });
+            let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+            let listener = ferrox_core::kcp::Listener::bind(
+                "127.0.0.1:0".parse().expect("addr"),
+                ferrox_core::kcp::Config::default(),
+            )
+            .expect("binds");
+            let kcp_port = listener.local_addr().port();
+            let peer = thread::spawn(move || {
+                let conn = listener.accept().expect("accepts");
+                conn.set_read_deadline(std::time::Instant::now() + Duration::from_secs(5));
+                let mut seen = Vec::new();
+                let mut buf = [0u8; 256];
+                while seen.len() < 96 {
+                    let Ok(read) = conn.read(&mut buf) else {
+                        break;
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    seen.extend_from_slice(&buf[..read]);
+                }
+                // A close_notify ends the dial instead of leaving it parked on its handshake deadline.
+                let _ = conn.write(b"\x15\x03\x01\x00\x02\x02\x00");
+                conn.close();
+                seen
+            });
+            let conn = ferrox_core::kcp::dial(
+                format!("127.0.0.1:{kcp_port}").parse().expect("addr"),
+                ferrox_core::kcp::Config::default(),
+                ferrox_core::kcp::fresh_conversation(),
+            )
+            .expect("dials");
+            let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let dport = downstream.local_addr().expect("addr").port();
+            let uplink = Connection::connect(("127.0.0.1", dport)).expect("connects");
+            let (_accepted, _) = downstream.accept().expect("accepts");
+            let vless = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port: kcp_port,
+                id,
+                carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+                host: "127.0.0.1".to_owned(),
+                mux: false,
+                quic_roots: None,
+                hysteria_roots: None,
+                tls: Some(client),
+                flow: String::new(),
+                reality: None,
+            };
+            let target = Destination::from(
+                format!("127.0.0.1:{dport}")
+                    .parse::<SocketAddr>()
+                    .expect("addr"),
+            );
+            dial_vless_kcp(&uplink, &conn, &vless, &target);
+            let seen = peer.join().expect("captures");
+            assert_eq!(seen[0], 0x16, "a handshake record");
+            assert_eq!(seen[5], 0x01, "a ClientHello");
+            let body = &seen[9..];
+            let sid_len = usize::from(body[2 + 32]);
+            let at = 2 + 32 + 1 + sid_len;
+            body[at + 2..at + 4].to_vec()
+        };
+        let chrome = first_suite(ferrox_core::tls::Fingerprint::default());
+        assert_eq!(
+            chrome[0], chrome[1],
+            "the shaped hello leads with a GREASE code point: {chrome:?}"
+        );
+        assert_eq!(
+            chrome[0] & 0x0f,
+            0x0a,
+            "and that repeated code point is GREASE's: {chrome:?}"
+        );
+        let stock = first_suite(ferrox_core::tls::Fingerprint::stock());
+        assert_ne!(
+            stock[0], stock[1],
+            "the stock hello leads with a real suite, so the gate can tell them: {stock:?}"
+        );
     }
 
     /// One half-lock, two directions: an empty window answers `WouldBlock` in a quantum, not by holding the lock.

@@ -478,6 +478,18 @@ tls-cipher-suites oracle-cases-replayed-byte-identical 10 ferrox-core-tls::ciphe
 tls-cipher-suites cipher-suite-ids-reachable-by-the-backend 3 ferrox-core-tls::rustls_backend::tests::a_crafted_list_reorders_the_dialer_hello_to_the_reference
 tls-cipher-suites dialer-hello-cipher-field-equals-reference 1 ferrox-core-tls::rustls_backend::tests::a_crafted_list_reorders_the_dialer_hello_to_the_reference
 
+# --- uTLS-shaped ClientHello (matrix row 38) --------------------------------
+security-utls ops-retired-instructions UNBLESSED scripts/count-ops.sh
+security-utls oracle-cases-replayed-byte-identical 46 ferrox-core-tls::shaped::hello::tests::oracle_replay_matches_utls
+security-utls distinct-presets-behind-those-names 28 ferrox-core-tls::shaped::hello::tests::oracle_replay_matches_utls
+security-utls shaped-dials-that-complete-a-tls13-handshake 1 ferrox-core-tls::rustls_backend::tests::a_shaped_chrome_handshake_reaches_a_stock_server
+security-utls shaped-dials-that-complete-a-tls12-handshake 1 ferrox-core-tls::rustls_backend::tests::a_shaped_tls12_handshake_hashes_its_client_key_exchange
+security-utls relayed-records-that-allocate-once-warm 0 ferrox-core-tls::rustls_backend::tests::a_shaped_record_relays_without_allocating_once_the_handshake_is_done
+security-utls carrier-records-that-allocate-once-warm 0 ferrox-core-tls::rustls_backend::tests::a_carrier_record_lands_in_the_callers_window_without_a_stage
+security-utls carrier-records-staged-into-a-fitting-window 0 ferrox-core-tls::rustls_backend::tests::a_carrier_record_lands_in_the_callers_window_without_a_stage
+security-utls tls12-gcm-records-that-shift-their-plaintext 0 ferrox-core-tls::shaped::record::tests::a_tls12_gcm_record_opens_behind_its_explicit_nonce
+security-utls table-spelling-resolutions-that-allocate 0 ferrox-core-tls::shaped::tests::a_table_spelling_resolves_without_a_heap_buffer
+
 # --- loopback re-inject outbound --------------------------------------------
 loopback ops-retired-instructions UNBLESSED scripts/count-ops.sh
 loopback tcp-echo-bytes-preserved 65536 ferrox-app-proxy::tests::a_re_injected_tcp_stream_carries_an_echo
