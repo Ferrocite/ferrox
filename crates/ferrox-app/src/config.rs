@@ -139,6 +139,28 @@ pub(crate) fn inbound_tls_identity(
         .map(Arc::new)
 }
 
+/// xray's certificate lookup: an absolute path is read as itself; a relative path is
+/// resolved under `$XRAY_LOCATION_CERT` / `xray.location.cert`, defaulting to the
+/// executable's directory, then under the working directory this tree has always served.
+pub(crate) fn read_cert_file(path: &str) -> Option<Vec<u8>> {
+    let path = std::path::Path::new(path);
+    if path.is_absolute() {
+        return std::fs::read(path).ok();
+    }
+    let location = std::env::var_os("XRAY_LOCATION_CERT")
+        .or_else(|| std::env::var_os("xray.location.cert"))
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+        });
+    if let Some(bytes) = location.and_then(|dir| std::fs::read(dir.join(path)).ok()) {
+        return Some(bytes);
+    }
+    std::fs::read(path).ok()
+}
+
 /// PEM for the first certificate entry, in either spelling xray accepts: `certificateFile`/`keyFile` paths, or an inline `certificate`/`key` given as a string or as an array of PEM lines. A peer that hands over a bare TLS listener (a REALITY decoy, say) uses the inline form, so refusing it here leaves the inbound serving nothing.
 fn tls_cert_pem(settings: &Json) -> Option<(Vec<u8>, Vec<u8>)> {
     let first = settings
@@ -150,10 +172,7 @@ fn tls_cert_pem(settings: &Json) -> Option<(Vec<u8>, Vec<u8>)> {
         first.get("certificateFile").and_then(Json::as_str),
         first.get("keyFile").and_then(Json::as_str),
     ) {
-        return Some((
-            std::fs::read(cert_path).ok()?,
-            std::fs::read(key_path).ok()?,
-        ));
+        return Some((read_cert_file(cert_path)?, read_cert_file(key_path)?));
     }
     let inline = |field: &str| -> Option<Vec<u8>> {
         let value = first.get(field)?;
@@ -238,7 +257,7 @@ pub(crate) fn tls_ca_roots(outbound: &Json) -> Option<ferrox_core::tls::Anchors>
         .and_then(|s| s.get("tlsSettings"))
         .and_then(|s| s.get("caCertFile"))
         .and_then(Json::as_str)
-        .and_then(|path| std::fs::read(path).ok())
+        .and_then(read_cert_file)
         .map(|pem| ferrox_core::tls::Anchors::from(crate::quic::parse_ca_pem(&pem)))
         .filter(|roots| !roots.is_empty())
 }
@@ -1420,6 +1439,45 @@ mod tests {
             crate::json::parse(r#"{"streamSettings": {"network": "tcp"}}"#).expect("parses");
         let settings = plain.get("streamSettings").expect("settings");
         assert_eq!(tls_cert_paths(settings), None);
+    }
+
+    #[test]
+    fn a_relative_certificate_resolves_under_xray_location_cert() {
+        static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = ENV
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let minted = rcgen::generate_simple_self_signed(vec!["cert-location.test".to_owned()])
+            .expect("mints");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-cert-location-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let cert = format!("cert-location-{stamp}.pem");
+        let key = format!("key-location-{stamp}.pem");
+        std::fs::write(dir.join(&cert), minted.cert.pem()).expect("cert");
+        std::fs::write(dir.join(&key), minted.signing_key.serialize_pem()).expect("key");
+        let previous = std::env::var_os("XRAY_LOCATION_CERT");
+        std::env::set_var("XRAY_LOCATION_CERT", &dir);
+        let config = crate::json::parse(&format!(
+            r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"certificates": [{{"certificateFile": "{cert}", "keyFile": "{key}"}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let identity = inbound_tls_identity(&config);
+        match previous {
+            Some(value) => std::env::set_var("XRAY_LOCATION_CERT", value),
+            None => std::env::remove_var("XRAY_LOCATION_CERT"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            identity.is_some(),
+            "a relative certificateFile must resolve under XRAY_LOCATION_CERT"
+        );
     }
 
     #[test]

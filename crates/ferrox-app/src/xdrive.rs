@@ -237,7 +237,7 @@ fn transport_tls(stream: &Json, security: &str) -> Option<Arc<TlsConfig>> {
             roots: tls
                 .get("caCertFile")
                 .and_then(Json::as_str)
-                .and_then(|path| std::fs::read(path).ok())
+                .and_then(crate::config::read_cert_file)
                 .map(|pem| ferrox_core::tls::Anchors::from(crate::quic::parse_ca_pem(&pem)))
                 .unwrap_or_default(),
             pins: ferrox_core::foxy::pin::Pins::default(),
