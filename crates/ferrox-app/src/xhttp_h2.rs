@@ -126,11 +126,17 @@ impl Read for H2StreamReader {
                 self.conn.forget_upload(self.id);
                 return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
             }
-            st = self
+            let (next, wait) = self
                 .stream
                 .cv
-                .wait(st)
+                .wait_timeout(st, crate::budgets::relay_stall())
                 .unwrap_or_else(PoisonError::into_inner);
+            st = next;
+            if wait.timed_out() {
+                drop(st);
+                self.conn.forget_upload(self.id);
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+            }
         }
     }
 }
