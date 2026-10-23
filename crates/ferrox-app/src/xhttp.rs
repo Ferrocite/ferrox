@@ -1151,23 +1151,22 @@ fn extract_meta<'a>(
     target: &'a str,
     settings: &XhttpSettings,
 ) -> (Option<&'a str>, Option<&'a str>) {
-    // A `Path` placement reads the segments in order, so the two `next` calls take what the indexed list took.
-    let mut segments = if matches!(settings.session_placement, Placement::Path)
-        || matches!(settings.seq_placement, Placement::Path)
-    {
+    // A `Path` placement asks for its segment by position, so the path is scanned rather than collected.
+    let segment = |n: usize| -> Option<&'a str> {
         let rest = target.strip_prefix(settings.path.as_str()).unwrap_or("");
-        let rest_path = rest.split_once('?').map_or(rest, |(r, _)| r);
-        Some(rest_path.split('/').filter(|s| !s.is_empty()))
-    } else {
-        None
+        rest.split_once('?')
+            .map_or(rest, |(r, _)| r)
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .nth(n)
     };
     let mut sid = None;
     let mut seq = None;
     if settings.session_placement == Placement::Path {
-        sid = segments.as_mut().and_then(|it| it.next());
+        sid = segment(0);
     }
     if settings.seq_placement == Placement::Path {
-        seq = segments.as_mut().and_then(|it| it.next());
+        seq = segment(usize::from(settings.session_placement == Placement::Path));
     }
     if settings.session_placement == Placement::Query {
         sid = query_param(target, &settings.session_key);
