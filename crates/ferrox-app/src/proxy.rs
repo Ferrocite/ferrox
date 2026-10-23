@@ -19326,7 +19326,8 @@ mod tests {
         let dir =
             std::env::temp_dir().join(format!("ferrox-xdrive-dial-{}-{stamp}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let folder = dir.to_str().expect("utf-8 folder").to_owned();
+        // A windows temp path reaches the config with backslashes, and a JSON string takes none of them raw.
+        let folder = dir.to_str().expect("utf-8 folder").replace('\\', "\\\\");
         let settings = format!(
             r#""network": "xdrive", "security": "tls",
                 "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
