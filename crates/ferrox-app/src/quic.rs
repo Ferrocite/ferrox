@@ -3541,6 +3541,13 @@ mod tests {
         identity
     }
 
+    fn ech_client_list() -> Vec<u8> {
+        let mut list = Vec::with_capacity(2 + ECH_CONFIG.len());
+        list.extend_from_slice(&(ECH_CONFIG.len() as u16).to_be_bytes());
+        list.extend_from_slice(ECH_CONFIG);
+        list
+    }
+
     #[test]
     fn serve_config_loads_a_minted_identity() {
         assert!(serve_config(&minted_identity()).is_some());
@@ -3799,6 +3806,13 @@ mod tests {
     }
 
     fn lane_pair_of(identity: &ferrox_core::tls::TlsServerConfig) -> (Lane, Lane) {
+        lane_pair_of_offer(identity, None)
+    }
+
+    fn lane_pair_of_offer(
+        identity: &ferrox_core::tls::TlsServerConfig,
+        offer: Option<&[u8]>,
+    ) -> (Lane, Lane) {
         let mut server_config = serve_config(identity).expect("serves");
         let mut client_config = quiche_config(&identity.cert_chain, None).expect("trusts");
         let server_sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
@@ -3818,7 +3832,7 @@ mod tests {
         .expect("accepts");
         getrandom::fill(&mut bytes).expect("random");
         let client_id = quiche::ConnectionId::from_ref(&bytes);
-        let client = quiche::connect(
+        let mut client = quiche::connect(
             Some("quic.test"),
             &client_id,
             client_addr,
@@ -3826,6 +3840,12 @@ mod tests {
             &mut client_config,
         )
         .expect("connects");
+        if let Some(offer) = offer {
+            client
+                .as_mut()
+                .set_ech_config_list(offer)
+                .expect("offers ech");
+        }
         let mut client = Lane {
             sock: client_sock,
             addr: client_addr,
@@ -3866,8 +3886,27 @@ mod tests {
     /// the keys change the hello a server can open, never the fallback it answers.
     #[test]
     fn an_ech_serving_lane_answers_a_client_without_an_offer() {
-        let (client, server) = lane_pair_of(&ech_identity());
+        let (mut client, mut server) = lane_pair_of(&ech_identity());
         assert!(client.conn.is_established() && server.conn.is_established());
+        assert!(!client.conn.as_mut().ech_accepted());
+        assert!(!server.conn.as_mut().ech_accepted());
+    }
+
+    /// An ECH-serving lane opens the inner hello and both ends confirm it: the client knows
+    /// the offer was taken, and the server read the name from the sealed half.
+    #[test]
+    fn an_ech_serving_lane_accepts_an_offer() {
+        let list = ech_client_list();
+        let (mut client, mut server) = lane_pair_of_offer(&ech_identity(), Some(&list));
+        assert!(client.conn.is_established() && server.conn.is_established());
+        assert!(
+            client.conn.as_mut().ech_accepted(),
+            "the client saw acceptance"
+        );
+        assert!(
+            server.conn.as_mut().ech_accepted(),
+            "the server opened the inner hello"
+        );
     }
 
     /// A sweep hands the socket every datagram quiche offered rather than one batch of slots, and the peer reads the same bytes in the same order: the connection is asked, right after the call, whether it still has a packet ready.
