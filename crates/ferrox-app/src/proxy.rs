@@ -13811,25 +13811,10 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
         let mux = outbound.get("mux").and_then(|mux| mux.get("enabled")) == Some(&Json::Bool(true));
         let stored = xdrive_carried(outbound, &address);
         if security == "tls" && !quic_tls && stored.is_none() {
-            let Some((carrier, host, tls)) = tls_carried_parts(outbound, &address) else {
+            let Some(out) = tls_carried_vless(outbound, server, address, port, id, mux) else {
                 continue;
             };
-            if mux {
-                eprintln!("vless: mux is ignored over tls; every flow dials its own session");
-            }
-            return Some(VlessOut {
-                address,
-                port,
-                id,
-                carrier,
-                host,
-                mux: false,
-                quic_roots: None,
-                hysteria_roots: None,
-                tls: Some(tls),
-                flow: outbound_flow(server),
-                reality: None,
-            });
+            return Some(out);
         }
         // REALITY dials raw TCP and every carried carrier the client reaches; the rest stay refused.
         if security == "reality" && !mux {
@@ -13890,6 +13875,34 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
         });
     }
     None
+}
+
+/// The outbound a carried TLS session names: one flow per dial, so a config that also asked for mux is read, warned about, and left without it.
+fn tls_carried_vless(
+    outbound: &Json,
+    server: &Json,
+    address: String,
+    port: u16,
+    id: [u8; 16],
+    mux: bool,
+) -> Option<VlessOut> {
+    let (carrier, host, tls) = tls_carried_parts(outbound, &address)?;
+    if mux {
+        eprintln!("vless: mux is ignored over tls; every flow dials its own session");
+    }
+    Some(VlessOut {
+        address,
+        port,
+        id,
+        carrier,
+        host,
+        mux: false,
+        quic_roots: None,
+        hysteria_roots: None,
+        tls: Some(tls),
+        flow: outbound_flow(server),
+        reality: None,
+    })
 }
 
 fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
