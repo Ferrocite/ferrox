@@ -220,6 +220,80 @@ jobs:
             carrier it was given, the allowance the plane last named (bytes left
             of the plan and when they reset), and the exit IP and country.
 
+            ### One sign-in, then every launch resumes the session
+
+            The first `up --foxy` signs in — password, and the browser challenge
+            solved locally — and saves the FxA grant to
+            `~/.config/ferrox/foxy-token.json` (0600, outside every repository).
+            Every launch after it resumes that grant instead of signing in
+            again, so Mozilla sends one new-sign-in mail, not one per connect.
+            The password is asked for again only when the plane refuses the
+            grant. `login` saves the account up front (a hidden prompt, or
+            `--password` for a script), and `logout` stops the lane, forgets the
+            account and removes the stored session:
+
+            ```bash
+            ./ferrox-cli.sh login --email you@example.com
+            ./ferrox-cli.sh logout
+            ```
+
+            ### Choose your exit
+
+            `locations` lists every country and its cities from Mozilla's
+            catalogue — public, so it needs no account. `locations --ping`
+            measures one handshake per edge and orders the nearest first; a
+            silent edge reads `no answer`, and the readings are not cached.
+            `location DE` remembers an exit for every later `up`, `location US
+            SFO` pins a city, and `--country`/`--city` override it once. The
+            list is kept in `foxy-locations.jsonl`, so it still answers when
+            Mozilla is unreachable:
+
+            ```bash
+            ./ferrox-cli.sh locations           # countries and cities, the remembered one marked *
+            ./ferrox-cli.sh locations --ping    # nearest exit first: one handshake per edge, in ms
+            ./ferrox-cli.sh locations US        # one country in detail
+            ./ferrox-cli.sh location DE         # remember Germany for every up
+            ./ferrox-cli.sh location US SFO     # remember a country and a city
+            ```
+
+            ### Targets that should not ride the lane
+
+            `--exclude-domains` and `--exclude-ports` take a comma-separated
+            list out of the Foxy lane for that launch: those targets dial
+            directly, unencrypted. The lists reach the lane normalized, and a
+            port outside 1-65535 is refused before a lane is started:
+
+            ```bash
+            ./ferrox-cli.sh up --foxy --exclude-ports 22 --exclude-domains printer.lan,*.internal
+            ```
+
+            ### A lane that carries nothing stops itself
+
+            `up` proves one real flow through a front before it routes anything.
+            When the fronts open but no flow gets through, it prints the lane's
+            own log and the fix to run, then stops the lane it started — pid
+            file, generated config and proxy marker removed, its port free — and
+            exits 3, so nothing is left running and no `down` is needed. A
+            `--config` file you supplied is never deleted.
+
+            ### More than one lane at once
+
+            `--instance NAME` gives a lane its own config, pid, log, proxy
+            marker, ports and remembered exit, while the account and catalogue
+            stay shared, so two exits can run side by side. Fronts left unnamed
+            in a named lane take the first free ports near the defaults;
+            `--socks`, `--http` and `--mixed` still choose them. `--vpn` stays
+            with the unnamed lane, because the system proxy points at one lane.
+            `down --all` stops every lane, and `logout` does too before
+            forgetting the account:
+
+            ```bash
+            ./ferrox-cli.sh up --foxy --instance work --country DE
+            ./ferrox-cli.sh status --instance work
+            ./ferrox-cli.sh ports --instance work
+            ./ferrox-cli.sh down --all
+            ```
+
             ### Leaner where it counts
 
             Since the last release the Foxy lane lost a handshake per
