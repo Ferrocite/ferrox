@@ -755,8 +755,13 @@ enum Role {
         out: Outbound,
         accounts: Arc<SocksAccounts>,
     },
-    /// dokodemo-door: a raw stream to the address its config rewrites every flow to.
-    Dokodemo { out: Outbound, dest: Destination },
+    /// dokodemo-door: a raw stream to the address its config rewrites every flow to,
+    /// where a `portMap` entry for the flow's own port replaces the address.
+    Dokodemo {
+        out: Outbound,
+        dest: Destination,
+        port_map: HashMap<u16, Destination>,
+    },
 }
 
 impl Role {
@@ -1319,9 +1324,19 @@ fn accept_loop(address: &str, role: &Role) {
                 Role::Socks { out, accounts } => serve_socks(stream, &out, &accounts),
                 Role::Http { out, accounts } => serve_http(stream, &out, &accounts),
                 Role::Mixed { out, accounts } => serve_mixed(stream, &out, &accounts),
-                Role::Dokodemo { out, dest } => {
-                    let target = out.resolved(&dest, crate::router::Network::Tcp, Some(&stream));
-                    serve_connect(stream, target, &dest, Front::Socks, &[]);
+                Role::Dokodemo {
+                    out,
+                    dest,
+                    port_map,
+                } => {
+                    // The flow's own port is the map's key: xray indexes by the flow's original port, which for a raw front is the listener's.
+                    let port = stream
+                        .local_addr()
+                        .map(|bound| bound.port())
+                        .unwrap_or_default();
+                    let dest = port_map.get(&port).unwrap_or(&dest);
+                    let target = out.resolved(dest, crate::router::Network::Tcp, Some(&stream));
+                    serve_connect(stream, target, dest, Front::Socks, &[]);
                 }
             }
         });
@@ -4285,17 +4300,22 @@ fn serve_dokodemo(address: &str, inbound: &Json, out: &Outbound, label: &str) ->
         eprintln!("dokodemo-door in {label} asks for a finalmask tcp chain it cannot arm");
         return 0;
     }
-    // The transparent redirect is the kernel's to give: the original destination lives in a socket option this tree asks for nothing. The device front is the tree's transparent path, and a config naming either setting is refused rather than served as if the rewrite had been asked for.
-    for setting in ["followRedirect", "portMap"] {
-        if inbound
-            .get("settings")
-            .and_then(|settings| settings.get(setting))
-            .is_some()
-        {
-            eprintln!("dokodemo-door in {label} asks for `{setting}`, which this tree cannot carry: refused, not served");
+    // The transparent redirect is the kernel's to give: the original destination lives in a socket option this tree asks for nothing. A portMap is not that — it is a table the flow's own port indexes, and the reference replaces the rewrite with a hit (`proxy/dokodemo/dokodemo.go`), so it is carried.
+    if inbound
+        .get("settings")
+        .and_then(|settings| settings.get("followRedirect"))
+        .is_some()
+    {
+        eprintln!("dokodemo-door in {label} asks for `followRedirect`, which this tree cannot carry: refused, not served");
+        return 0;
+    }
+    let port_map = match dokodemo_port_map(inbound) {
+        Ok(map) => map,
+        Err(reason) => {
+            eprintln!("dokodemo-door portMap in {label}: {reason}");
             return 0;
         }
-    }
+    };
     let mut armed = 0;
     if networks.contains(&"tcp") {
         spawn_role(
@@ -4303,6 +4323,7 @@ fn serve_dokodemo(address: &str, inbound: &Json, out: &Outbound, label: &str) ->
             Role::Dokodemo {
                 out: out.clone(),
                 dest: dest.clone(),
+                port_map: port_map.clone(),
             },
         );
         armed += 1;
@@ -4314,11 +4335,49 @@ fn serve_dokodemo(address: &str, inbound: &Json, out: &Outbound, label: &str) ->
             return armed;
         };
         let door = out.clone();
-        let target = dest.clone();
-        thread::spawn(move || dokodemo_udp_door(&socket, &target, &door));
+        thread::spawn(move || dokodemo_udp_door(&socket, &dest, &port_map, &door));
         armed += 1;
     }
     armed
+}
+
+/// The per-port rewrite table a dokodemo inbound names: the flow's own port is the key and the
+/// value is where that flow is rewritten to, and a table entry that is not host:port is the
+/// refusal the reference's Build makes (`infra/conf/dokodemo.go`). A flow whose port has no
+/// entry keeps the config's own destination.
+fn dokodemo_port_map(inbound: &Json) -> Result<HashMap<u16, Destination>, String> {
+    let Some(map) = inbound
+        .get("settings")
+        .and_then(|settings| settings.get("portMap"))
+    else {
+        return Ok(HashMap::new());
+    };
+    let Json::Obj(pairs) = map else {
+        return Ok(HashMap::new());
+    };
+    let mut rewritten = HashMap::new();
+    for (port, value) in pairs {
+        let Ok(port) = port.parse::<u16>() else {
+            return Err(format!("key `{port}` is not a port"));
+        };
+        let Some(text) = value.as_str() else {
+            return Err(format!("the entry for {port} is not host:port"));
+        };
+        let Some((host, port_text)) = text.rsplit_once(':') else {
+            return Err(format!("`{text}` is not host:port"));
+        };
+        let Ok(mapped) = port_text.parse::<u16>() else {
+            return Err(format!("`{text}` is not host:port"));
+        };
+        rewritten.insert(
+            port,
+            match host.parse::<std::net::IpAddr>() {
+                Ok(ip) => Destination::Address(SocketAddr::new(ip, mapped)),
+                Err(_) => Destination::Name(host.to_owned(), mapped),
+            },
+        );
+    }
+    Ok(rewritten)
 }
 
 fn inbound_ss_destinations(inbound: &Json, method: &str) -> Vec<(Vec<u8>, SocketAddr)> {
@@ -7996,7 +8055,18 @@ pub(crate) fn relay_leg(relay: SocketAddr) -> std::io::Result<UdpSocket> {
 /// The socket is the one the front bound, so the port is held from the moment the
 /// inbound is armed, and a datagram that arrives before the door reads it waits in the
 /// kernel rather than in a refusal.
-fn dokodemo_udp_door(socket: &UdpSocket, dest: &Destination, out: &Outbound) {
+fn dokodemo_udp_door(
+    socket: &UdpSocket,
+    dest: &Destination,
+    port_map: &HashMap<u16, Destination>,
+    out: &Outbound,
+) {
+    // The door's own port is the map's key, the same key the reference indexes by: a hit is this flow's rewrite, a miss the config's address.
+    let port = socket
+        .local_addr()
+        .map(|bound| bound.port())
+        .unwrap_or_default();
+    let dest = port_map.get(&port).unwrap_or(dest);
     let Some(target) = dest.socket() else {
         eprintln!("dokodemo-door udp: rewrite target unusable, refused");
         return;
@@ -25457,7 +25527,8 @@ mod tests {
         let door = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let port = door.local_addr().expect("addr").port();
         let dest = Destination::Address(target_addr);
-        thread::spawn(move || dokodemo_udp_door(&door, &dest, &Outbound::Freedom));
+        let port_map: HashMap<u16, Destination> = HashMap::new();
+        thread::spawn(move || dokodemo_udp_door(&door, &dest, &port_map, &Outbound::Freedom));
         let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
         client
             .connect(SocketAddr::from(([127, 0, 0, 1], port)))
@@ -25470,25 +25541,80 @@ mod tests {
     }
 
     /// The transparent redirect is refused by name: the original destination lives in a
-    /// socket option this tree asks for nothing, and a config naming either setting
-    /// must not read as served.
+    /// socket option this tree asks for nothing, so a config naming it must not read
+    /// as served. A portMap is not that — the table is carried, the flow's port indexes it.
     #[test]
     fn a_dokodemo_front_refuses_the_transparent_settings() {
-        for (setting, value) in [("followRedirect", "true"), ("portMap", "{}")] {
-            let text = format!(
-                r#"{{"inbounds":[{{"protocol":"dokodemo-door","settings":{{"address":"127.0.0.1","port":80,"network":"tcp","{setting}":{value}}}}}]}}"#
-            );
-            let root = crate::json::parse(&text).expect("parses");
-            let inbound = &root
-                .get("inbounds")
-                .and_then(Json::as_arr)
-                .expect("inbounds")[0];
-            assert_eq!(
-                serve_dokodemo("127.0.0.1:0", inbound, &Outbound::Freedom, "test"),
-                0,
-                "`{setting}` is refused, not served as if the rewrite had been asked for"
-            );
-        }
+        let text = r#"{"inbounds":[{"protocol":"dokodemo-door","settings":{"address":"127.0.0.1","port":80,"network":"tcp","followRedirect":true}}]}"#;
+        let root = crate::json::parse(text).expect("parses");
+        let inbound = &root
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0];
+        assert_eq!(
+            serve_dokodemo("127.0.0.1:0", inbound, &Outbound::Freedom, "test"),
+            0,
+            "`followRedirect` is refused, not served as if the rewrite had been asked for"
+        );
+    }
+
+    /// The rewrite table a `portMap` names: the flow's own port is the key and a hit
+    /// replaces the address the config set — the banner the mapped target writes is
+    /// the one the flow reads, while a key that names no entry keeps the config's address.
+    #[test]
+    fn a_dokodemo_port_table_rewrites_the_flow_its_port_maps() {
+        let echo = echo_loop();
+        let other = echo_loop();
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let door = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let text = format!(
+            r#"{{"inbounds":[{{"protocol":"dokodemo-door","listen":"127.0.0.1","port":{door},"settings":{{"network":"tcp","address":"127.0.0.1","port":{other},"portMap":{{"{door}":"127.0.0.1:{echo}"}}}}}}]}}"#
+        );
+        let root = crate::json::parse(&text).expect("parses");
+        let (opened, _) = serve_inbounds("test", &root, Some(&Outbound::Freedom), None, false);
+        assert_eq!(opened, 1, "the mapped door opens");
+        let mut client = connect_until(door);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client
+            .read_exact(&mut back)
+            .expect("the mapped echo answers");
+        assert_eq!(&back, b"ping", "the map won over the configured address");
+    }
+
+    /// An entry that is not host:port is refused with the reference's verdict, and a flow whose port names no entry keeps the config's own address.
+    #[test]
+    fn a_dokodemo_port_table_refuses_a_bad_entry_and_a_miss_keeps_the_address() {
+        let bad = r#"{"inbounds":[{"protocol":"dokodemo-door","settings":{"address":"127.0.0.1","port":80,"network":"tcp","portMap":{"80":"127.0.0.1:not-a-port"}}}]}"#;
+        let root = crate::json::parse(bad).expect("parses");
+        let inbound = &root
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0];
+        assert_eq!(
+            serve_dokodemo("127.0.0.1:0", inbound, &Outbound::Freedom, "test"),
+            0,
+            "a bad entry is the Build's refusal"
+        );
+        let echo = echo_loop();
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let door = probe.local_addr().expect("addr").port();
+        drop(probe);
+        // The table names a port no flow arrives on, so the miss keeps the config's address.
+        let text = format!(
+            r#"{{"inbounds":[{{"protocol":"dokodemo-door","listen":"127.0.0.1","port":{door},"settings":{{"network":"tcp","address":"127.0.0.1","port":{echo},"portMap":{{"1337":"127.0.0.1:80"}}}}}}]}}"#
+        );
+        let root = crate::json::parse(&text).expect("parses");
+        let (opened, _) = serve_inbounds("test", &root, Some(&Outbound::Freedom), None, false);
+        assert_eq!(opened, 1, "the door opens with a table that misses");
+        let mut client = connect_until(door);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client
+            .read_exact(&mut back)
+            .expect("the configured echo answers");
+        assert_eq!(&back, b"ping", "a miss keeps the config's own address");
     }
 
     /// xray registers `tunnel` as another name for `dokodemo-door`: a config written with either serves the door.
