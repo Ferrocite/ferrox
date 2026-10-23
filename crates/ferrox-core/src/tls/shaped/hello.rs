@@ -322,17 +322,18 @@ impl Hello {
         self.shares.remove(at).agree(peer).map_err(TlsError::Other)
     }
 
-    /// The ALPN protocols this hello offers, so a server's pick can be checked against them.
-    pub(crate) fn alpn_offered(&self) -> Vec<Vec<u8>> {
+    /// Whether the hello offered a protocol: a configured list or the preset's own table,
+    /// checked where either lies so a server's pick costs no copy.
+    pub(crate) fn offers_alpn(&self, pick: &[u8]) -> bool {
         if let Some(list) = &self.alpn {
-            return list.clone();
+            return list.iter().any(|proto| proto == pick);
         }
         for ext in self.profile.exts {
             if let Body::Alpn(body) = &ext.body {
-                return parse_alpn(body);
+                return alpn_has(body, pick);
             }
         }
-        Vec::new()
+        false
     }
 
     /// The 16-byte sealed session id replaces the random one in place, at the
@@ -777,23 +778,28 @@ fn alpn_body<W: Sink>(out: &mut W, list: &[Vec<u8>]) {
     }
 }
 
-fn parse_alpn(body: &[u8]) -> Vec<Vec<u8>> {
-    let mut out = Vec::new();
+/// Whether a wire ALPN body lists a protocol, walked where it lies so a pick costs no copy.
+fn alpn_has(body: &[u8], pick: &[u8]) -> bool {
     if body.len() < 2 {
-        return out;
+        return false;
     }
-    let end = 2 + usize::from(u16::from_be_bytes([body[0], body[1]]));
+    let end = (2 + usize::from(u16::from_be_bytes([body[0], body[1]]))).min(body.len());
     let mut at = 2;
-    while at < end && at < body.len() {
-        let len = usize::from(body[at]);
+    while at < end {
+        let Some(&len) = body.get(at) else {
+            return false;
+        };
+        let len = usize::from(len);
         at += 1;
-        if at + len > body.len() {
-            break;
+        let Some(name) = body.get(at..at + len) else {
+            return false;
+        };
+        if name == pick {
+            return true;
         }
-        out.push(body[at..at + len].to_vec());
         at += len;
     }
-    out
+    false
 }
 
 /// xray's rule for a WebSocket- or HTTPUpgrade-carried hello: force the outer
@@ -1232,6 +1238,27 @@ mod tests {
         );
         let ((), counts) = crate::alloc_count::measure(|| shuffle(&mut entries));
         assert_eq!(counts.allocs, 0, "the picks are a stack pool: {counts:?}");
+    }
+
+    /// A server's ALPN pick is checked where the offer lies, so neither a preset's table
+    /// nor a carrier's forced list is copied out to answer it.
+    #[test]
+    fn an_alpn_pick_is_checked_without_a_copy() {
+        let profile = Fingerprint::resolve("360")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let hello = Hello::canonical(profile, "example.com");
+        let (offered, counts) = crate::alloc_count::measure(|| hello.offers_alpn(b"spdy/3.1"));
+        assert!(offered, "the preset's table names the protocol");
+        assert!(!hello.offers_alpn(b"h2"), "and not one it omits");
+        assert_eq!(counts.allocs, 0, "the table is walked in place: {counts:?}");
+        let dial = Hello::build(profile, "example.com", &[b"h2".to_vec()], true)
+            .expect("a shaped dial hello");
+        let (offered, counts) = crate::alloc_count::measure(|| dial.offers_alpn(b"http/1.1"));
+        assert!(offered, "the carrier's forced list names the protocol");
+        assert!(!dial.offers_alpn(b"h2"), "and not the one it replaced");
+        assert_eq!(counts.allocs, 0, "the list is walked in place: {counts:?}");
     }
 
     /// A dial's own hello — random draws, Chrome's shuffle, a carrier's forced ALPN and a retry's

@@ -269,7 +269,7 @@ impl<S: Stream> Session<S> {
 
     fn check_alpn(&mut self, hello: &Hello, sh: &ServerHello) -> Result<(), TlsError> {
         if let Some(pick) = &sh.alpn {
-            if !hello.alpn_offered().iter().any(|proto| proto == pick) {
+            if !hello.offers_alpn(pick) {
                 return Err(TlsError::Other(
                     "server selected an ALPN protocol we did not offer".to_owned(),
                 ));

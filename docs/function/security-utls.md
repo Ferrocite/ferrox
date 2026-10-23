@@ -41,6 +41,7 @@ graph TD
 | heap-buffers-for-an-ech-cover | 1 | ferrox-core-tls::shaped::hello::tests::an_ech_cover_is_written_into_one_buffer |
 | heap-buffers-for-an-x25519-share | 2 | ferrox-core-tls::shaped::keys::tests::an_x25519_share_is_drawn_without_a_heap_buffer |
 | heap-buffers-for-a-shuffled-hello-order | 0 | ferrox-core-tls::shaped::hello::tests::the_shuffle_draws_its_picks_without_a_heap_buffer |
+| alpn-picks-that-allocate | 0 | ferrox-core-tls::shaped::hello::tests::an_alpn_pick_is_checked_without_a_copy |
 | heap-buffers-for-an-rsa-exponentiation | 8 | ferrox-core-tls::shaped::oracle::rsa_key_transport_matches_go |
 | heap-buffers-for-a-post-handshake-flight | 0 | ferrox-core-tls::shaped::client::tests::a_post_handshake_flight_is_read_where_it_lies |
 | certificate-entries-copied-out-of-the-record | 0 | ferrox-core-tls::shaped::client::tests::a_certificate_chain_is_read_where_the_record_lies |
@@ -68,6 +69,8 @@ The 50 cases are the 31 presets plus the 19 names that alias onto them, so the a
 - **The hello's entropy round trips and its wiping buffers.** A build used to reach the system pool three times before it wrote a byte, and to draw each key-share seed into a heap buffer it then wiped and copied.
   One 74-byte read now carries the random, the session id and the five GREASE pairs, the X25519 seed is drawn where it is turned into a secret, and Chrome's shuffle picks come off a stack pool that refills itself instead of a `4n`-byte heap buffer.
   The bytes are random either way, so the oracle's goldens and the dial tests read the same.
+- **The ALPN offer's copy.** Answering a server's pick used to parse the offer into a `Vec<Vec<u8>>` first, one heap buffer per protocol.
+  The check now walks the configured list or the preset's table where it lies, so a pick allocates nothing and compares against the bytes the hello offered; `an_alpn_pick_is_checked_without_a_copy` gates both sources.
 - **The extension object graph.** uTLS models a hello as a list of extension interfaces, each marshalling itself and each holding its own state. Here a preset is plain data — `Profile`, `Ext`, `Body` — and `Hello::encode_with` walks it in one pass into a single message buffer. There is no trait object per extension and no dynamic dispatch in the build.
 - **rustls's handshake on a shaped dial.** `crate::tls::connect` routes a config whose fingerprint resolves to a preset to `shaped::Session`, which owns the record layer, the transcript and the key schedule. rustls is still used, but only its certificate verifier: the shaped dial never constructs a `rustls::ClientConnection`.
 - **A second copy of the cipher table.** The shaped record layer accepts every TLS 1.2 suite Go's `crypto/tls` keys for a shaped dial — the AEAD names, the ECDHE-CBC six, the static-RSA five, the two 3DES rows and the three RC4 ones — through `Suite::from_id`, so a negotiated suite is looked up once instead of being matched again per record, and the `{key, mac, iv}` lengths, the PRF hash, the record MAC, the block width and the record's framing (AEAD, CBC or stream) each come from that one table rather than from a second switch per site.

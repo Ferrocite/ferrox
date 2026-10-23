@@ -499,6 +499,7 @@ security-utls heap-buffers-for-a-chrome-hello 2 ferrox-core-tls::shaped::hello::
 security-utls heap-buffers-for-an-ech-cover 1 ferrox-core-tls::shaped::hello::tests::an_ech_cover_is_written_into_one_buffer
 security-utls heap-buffers-for-an-x25519-share 2 ferrox-core-tls::shaped::keys::tests::an_x25519_share_is_drawn_without_a_heap_buffer
 security-utls heap-buffers-for-a-shuffled-hello-order 0 ferrox-core-tls::shaped::hello::tests::the_shuffle_draws_its_picks_without_a_heap_buffer
+security-utls alpn-picks-that-allocate 0 ferrox-core-tls::shaped::hello::tests::an_alpn_pick_is_checked_without_a_copy
 security-utls heap-buffers-for-an-rsa-exponentiation 8 ferrox-core-tls::shaped::oracle::rsa_key_transport_matches_go
 security-utls heap-buffers-for-a-post-handshake-flight 0 ferrox-core-tls::shaped::client::tests::a_post_handshake_flight_is_read_where_it_lies
 security-utls certificate-entries-copied-out-of-the-record 0 ferrox-core-tls::shaped::client::tests::a_certificate_chain_is_read_where_the_record_lies
