@@ -115,6 +115,7 @@ Both H1 handshakes — the `POST` a server reads and the `200` a dialer reads �
 | head-buffer-reallocations-per-request-head | 0 | ferrox-app-xhttp_h2::tests::the_synthesized_head_is_sized_for_its_bytes |
 | head-tail-read-syscalls | 0 | ferrox-app-xhttp::tests::a_chunk_that_rode_in_with_the_head_costs_no_syscall |
 | head-tail-allocations | 0 | ferrox-app-xhttp::tests::the_record_head_hands_over_the_buffer_it_filled |
+| path-segment-allocations | 0 | ferrox-app-xhttp::tests::the_path_placements_are_read_without_a_list |
 | received-data-frames-copied | 0 | ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into |
 | received-header-blocks-copied | 0 | ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into |
 | partly-read-frame-tail-copies | 0 | ferrox-app-xhttp_h2::tests::a_partly_read_frame_is_not_moved |
@@ -179,6 +180,9 @@ The count is gated by `a_chunk_costs_two_reads_not_three`, which drives an in-me
 
 - **A zero pass and a reallocation in every tokenish pad.** `generate_tokenish` drew its random bytes into `vec![0u8; n]`, where n is 10/8 of the pad's Huffman target — so a kilobyte target zeroed 1.25 KB that the draw then overwrote in full — and `tokenish_adjust` collected the base62 string into exactly its decoded length, so the first adjust push moved the whole pad into a second allocation. The raw buffer is `unfilled` now (the draw writes every byte, and a failed draw still fills zeros, so a failure leaves the pad it always did), and the string is opened for its decoded length plus the 150 steps it can grow by. `a_tokenish_pad_is_one_buffer_drawn_without_zeroing` measures **one allocation** for the adjust and **zero zeroed bytes** for the draw, and holds the pad to `tokenish_recompute`. `repeat-x`, the default, never reaches this code.
 
+- **A segment list per request in the default placement.** `extract_meta` collected the path's segments into a `Vec<&str>` and indexed them, so every request under the default `Path`/`Path` placement allocated a list to read its first two entries.
+The two placements now take the first and second segment from one borrowed split, in that order, with no list: `the_path_placements_are_read_without_a_list` measures **zero allocations** for the default walk, holds both segments, and keeps the seq-only placement on the first segment and the empty path on `None`.
+What did not move: the segment order, the query strip, and every query-, header- and cookie-placed read.
 - **A zero pass over every request body.** `read_body` allocated a `Content-Length` body with `vec![0u8; n]`, so every uplink POST paid a zero pass over its whole body before the read that fills it in full — the same bytes written twice.
 The body is the read's own uninitialised room now, and the counting allocator's `zeroed` counter is the witness: `a_body_read_lands_in_room_it_never_zeroes` reads a 32-byte body in full off an in-memory stream, holds the bytes and the head-tail prefix, and fails if the buffer is zeroed again.
 What did not move: the body is still one allocation of exactly `n`, the head-tail bytes still land at its front, and the leftover tail is still copied into the next request's carry.
