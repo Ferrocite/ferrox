@@ -485,6 +485,139 @@ def check_config_survives(state: pathlib.Path) -> int:
     return 0
 
 
+def check_instance_ports(state: pathlib.Path) -> int:
+    held = socket.socket()
+    held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        held.bind(("127.0.0.1", 10808))
+        held.listen(1)
+    except OSError:
+        held.close()
+        held = None
+    snapshot = state / "lane-snapshot.json"
+    snapshot.unlink(missing_ok=True)
+    try:
+        env = env_for(state)
+        env["FERROX_BIN"] = str(snapshot_binary(state))
+        run = subprocess.run(
+            [
+                str(CLI),
+                "up",
+                "--foxy",
+                "--email",
+                "lane@example.com",
+                "--password",
+                "not-a-secret",
+                "--fronts",
+                "socks",
+                "--instance",
+                "two",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env,
+        )
+    finally:
+        if held is not None:
+            held.close()
+    output = run.stdout + run.stderr
+    if not snapshot.exists():
+        print(
+            f"check-cli-lane: a named instance never started (exit {run.returncode}):\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    port = json.loads(snapshot.read_text(encoding="utf-8"))["inbounds"][0]["port"]
+    if port == 10808:
+        print(
+            f"check-cli-lane: a named instance took the busy default port {port}:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    for gone in ("lane-two.pid", "lane-two.json"):
+        if (state / gone).exists():
+            print(
+                f"check-cli-lane: a failed named instance left {gone} behind:\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+    print(f"check-cli-lane: a named instance moved off the busy default to {port}")
+    return 0
+
+
+def check_instance_lifecycle(state: pathlib.Path) -> int:
+    unnamed = subprocess.Popen(["sleep", "60"])
+    named = subprocess.Popen(["sleep", "60"])
+    port = free_port()
+    (state / "lane.pid").write_text(f"{unnamed.pid}\n", encoding="utf-8")
+    (state / "lane.json").write_text(
+        '{"inbounds": [], "outbounds": []}\n', encoding="utf-8"
+    )
+    (state / "lane-two.pid").write_text(f"{named.pid}\n", encoding="utf-8")
+    (state / "lane-two.json").write_text(
+        json.dumps(
+            {
+                "inbounds": [
+                    {"protocol": "socks", "listen": "127.0.0.1", "port": port}
+                ],
+                "outbounds": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    try:
+        status = subprocess.run(
+            [str(CLI), "status", "--instance", "two"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env_for(state),
+        )
+        output = status.stdout + status.stderr
+        if f"lane 'two' pid {named.pid}" not in output or str(port) not in output:
+            print(
+                f"check-cli-lane: status --instance lost the lane or its ports:\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+        down = subprocess.run(
+            [str(CLI), "down", "--instance", "two"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env_for(state),
+        )
+        output += down.stdout + down.stderr
+        named.wait(timeout=WATCH)
+        if (state / "lane-two.json").exists() or (state / "lane-two.pid").exists():
+            print(
+                f"check-cli-lane: down --instance left its lane behind:\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+        if not (state / "lane.pid").exists() or not (state / "lane.json").exists():
+            print(
+                f"check-cli-lane: down --instance touched the unnamed lane:\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+    finally:
+        for lane in (unnamed, named):
+            if lane.poll() is None:
+                lane.terminate()
+            lane.wait(timeout=WATCH)
+        (state / "lane.pid").unlink(missing_ok=True)
+        (state / "lane.json").unlink(missing_ok=True)
+    print(
+        "check-cli-lane: a named lane reports its own ports and down takes only that lane"
+    )
+    return 0
+
+
 def main() -> int:
     state = pathlib.Path(tempfile.mkdtemp(prefix="ferrox-cli-lane-"))
     if check_picker(state) != 0:
@@ -497,7 +630,11 @@ def main() -> int:
         return 1
     if check_failed_lane_is_closed(state) != 0:
         return 1
-    return check_config_survives(state)
+    if check_config_survives(state) != 0:
+        return 1
+    if check_instance_ports(state) != 0:
+        return 1
+    return check_instance_lifecycle(state)
 
 
 if __name__ == "__main__":
