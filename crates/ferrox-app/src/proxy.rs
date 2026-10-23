@@ -17494,6 +17494,36 @@ mod tests {
         }
     }
 
+    /// A peer that opens the carrier and sends nothing must release its thread at the handshake budget; the magic read cannot sit on a socket that will never answer.
+    #[test]
+    fn a_silent_xhttp_peer_releases_its_thread() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(200)),
+            ..Default::default()
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let carrier = Carrier::Xhttp {
+            settings: xhttp_settings("/up/"),
+        };
+        let (done, waited) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_vless(stream, &[0xaau8; 16], &carrier, true);
+            let _ = done.send(());
+        });
+        let peer = Connection::connect(addr).expect("connects");
+        let verdict = waited.recv_timeout(Duration::from_secs(2));
+        drop(peer);
+        crate::budgets::clear();
+        assert!(
+            verdict.is_ok(),
+            "a silent xhttp peer pinned its thread past the handshake budget"
+        );
+        serving.join().expect("joins");
+    }
+
     fn xhttp_vless_header(echo_port: u16) -> Vec<u8> {
         let link = ferrox_core::vless::VlessLink::parse(
             "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?security=none&encryption=none&type=tcp#x",
