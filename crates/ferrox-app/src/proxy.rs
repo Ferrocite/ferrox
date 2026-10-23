@@ -17548,6 +17548,37 @@ mod tests {
         serving.join().expect("joins");
     }
 
+    /// An HTTP/2 xhttp client sends its preface once; the carrier's probe must hand those bytes to the h2 loop rather than consume them and read the next frame as a second preface.
+    #[test]
+    fn an_h2_xhttp_client_is_served_after_the_preface() {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let carrier = Carrier::Xhttp {
+            settings: xhttp_settings("/up/"),
+        };
+        let serving = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_vless(stream, &[0xaau8; 16], &carrier, true);
+        });
+        let mut peer = Connection::connect(addr).expect("connects");
+        peer.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        peer.write_all(crate::h2::MAGIC).expect("preface");
+        let mut settings = Vec::new();
+        settings.extend_from_slice(&crate::h2::S_WINDOW.to_be_bytes());
+        settings.extend_from_slice(&crate::h2::WINDOW.to_be_bytes());
+        crate::h2::write_frame(&mut peer, crate::h2::T_SETTINGS, 0, 0, &settings);
+        peer.flush().expect("flushes");
+        let (_, kind, _, _) = crate::h2::read_head(&mut peer).expect("the server preface");
+        assert_eq!(
+            kind,
+            crate::h2::T_SETTINGS,
+            "an h2 carrier answered its settings, not the next frame's bytes"
+        );
+        drop(peer);
+        serving.join().expect("joins");
+    }
+
     fn xhttp_vless_header(echo_port: u16) -> Vec<u8> {
         let link = ferrox_core::vless::VlessLink::parse(
             "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?security=none&encryption=none&type=tcp#x",
