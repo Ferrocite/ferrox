@@ -13812,19 +13812,22 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
             outbound.get("mux").and_then(|mux| mux.get("enabled")),
             Some(Json::Bool(true))
         );
-        // Mux frames ride above the session, so mux over TLS needs its own dial and stays refused.
+        // A carried TLS session is one flow here, so mux has no session to ride above it.
         let stored = xdrive_carried(outbound, &address);
-        if security == "tls" && !quic_tls && !mux && stored.is_none() {
+        if security == "tls" && !quic_tls && stored.is_none() {
             let Some((carrier, host, tls)) = tls_carried_parts(outbound, &address) else {
                 continue;
             };
+            if mux {
+                eprintln!("vless: mux is ignored over tls; every flow dials its own session");
+            }
             return Some(VlessOut {
                 address,
                 port,
                 id,
                 carrier,
                 host,
-                mux,
+                mux: false,
                 quic_roots: None,
                 hysteria_roots: None,
                 tls: Some(tls),
@@ -18992,7 +18995,9 @@ mod tests {
                     "tlsSettings": {{"caCertFile": "{ca_json}"}}}}}}]}}"#
         ))
         .expect("parses");
-        assert!(find_vless_outbound(&muxed).is_none());
+        let muxed = find_vless_outbound(&muxed).expect("tls carries the muxed outbound");
+        assert!(muxed.tls.is_some(), "the session is still tls");
+        assert!(!muxed.mux, "the mux a tls dial cannot carry is ignored");
         let _ = std::fs::remove_file(&ca);
     }
 
