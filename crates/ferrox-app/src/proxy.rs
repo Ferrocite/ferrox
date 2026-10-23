@@ -434,8 +434,7 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
                 let serve: KcpServe = Arc::new(move |conn: &Arc<ferrox_core::kcp::Connection>| {
                     serve_vless_kcp(conn, &id, freedom);
                 });
-                thread::spawn(move || serve_kcp_loop(&owned, config, &serve));
-                return true;
+                return serve_kcp_bound(&owned, config, &serve);
             }
             if let Carrier::Hysteria(config) = carrier {
                 let config = config.clone();
@@ -2251,8 +2250,7 @@ fn serve_vless_tls_inbound(
         let serve: KcpServe = Arc::new(move |conn: &Arc<ferrox_core::kcp::Connection>| {
             serve_vless_kcp_tls(conn, &id, freedom, &server);
         });
-        thread::spawn(move || serve_kcp_loop(&owned, config, &serve));
-        return true;
+        return serve_kcp_bound(&owned, config, &serve);
     }
     let role = Role::VlessTls {
         id: *id,
@@ -2284,8 +2282,7 @@ fn serve_vless_reality_inbound(
         let serve: KcpServe = Arc::new(move |conn: &Arc<ferrox_core::kcp::Connection>| {
             serve_vless_kcp_reality(conn, &id, freedom, &server);
         });
-        thread::spawn(move || serve_kcp_loop(&owned, config, &serve));
-        return true;
+        return serve_kcp_bound(&owned, config, &serve);
     }
     let role = Role::VlessReality {
         id: *id,
@@ -4347,10 +4344,6 @@ fn serve_kcp_bound(address: &str, config: ferrox_core::kcp::Config, serve: &KcpS
     true
 }
 
-fn serve_kcp_loop(address: &str, config: ferrox_core::kcp::Config, serve: &KcpServe) {
-    let _ = serve_kcp_bound(address, config, serve);
-}
-
 fn serve_kcp_each(listener: &ferrox_core::kcp::Listener, serve: &KcpServe) {
     loop {
         let Ok(session) = listener.accept() else {
@@ -4441,7 +4434,7 @@ fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
                 crate::vmess::serve_kcp(reader, writer, &id, freedom, &close);
             });
             let owned = address.to_owned();
-            thread::spawn(move || serve_kcp_loop(&owned, config, &serve));
+            let _ = serve_kcp_bound(&owned, config, &serve);
         }
         Carrier::Xdrive { settings } => {
             let accept: crate::xdrive::Accept =
@@ -4658,7 +4651,7 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
                 }
             });
             let owned = address.to_owned();
-            thread::spawn(move || serve_kcp_loop(&owned, config, &serve));
+            let _ = serve_kcp_bound(&owned, config, &serve);
         }
         Carrier::Xdrive { settings } => {
             let password = password.clone();
