@@ -138,9 +138,10 @@ pub(crate) fn accept(stream: Connection, path: &str) -> Option<(UpReader, Connec
         return None;
     };
     let mut write = write;
-    match key {
-        Some(key) => write.write_all(&switch_answer(key)).ok()?,
-        None => write.write_all(SWITCH).ok()?,
+    if key.is_empty() {
+        write.write_all(SWITCH).ok()?;
+    } else {
+        write.write_all(&switch_answer(key)).ok()?;
     }
     Some((
         UpReader {
@@ -205,7 +206,8 @@ fn hex_digit(byte: u8) -> Option<u8> {
     }
 }
 
-fn check_request<'a>(head: &'a [u8], path: &str) -> Option<Option<&'a str>> {
+/// The key the accepted request carried, or an empty slice when it carried none.
+fn check_request<'a>(head: &'a [u8], path: &str) -> Option<&'a str> {
     // One UTF-8 pass and one line scan answers the whole request; the fanout re-validated and rescanned for each field.
     let text = std::str::from_utf8(head).ok()?;
     let mut lines = text
@@ -236,7 +238,7 @@ fn check_request<'a>(head: &'a [u8], path: &str) -> Option<Option<&'a str>> {
         }
     }
     if upgrade == Some(true) && connection == Some(true) {
-        Some(key.filter(|key| !key.is_empty()))
+        Some(key.unwrap_or_default())
     } else {
         None
     }
@@ -250,9 +252,10 @@ pub(crate) fn accept_split<R: Read, W: Write>(
 ) -> Option<(UpReader<R>, W)> {
     let (head, at) = read_upgrade_head(&mut read, HEAD_LIMIT)?;
     let key = check_request(&head[..at], path)?;
-    match key {
-        Some(key) => write.write_all(&switch_answer(key)).ok()?,
-        None => write.write_all(SWITCH).ok()?,
+    if key.is_empty() {
+        write.write_all(SWITCH).ok()?;
+    } else {
+        write.write_all(&switch_answer(key)).ok()?;
     }
     Some((
         UpReader {
