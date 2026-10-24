@@ -132,4 +132,10 @@ append_pem 591
 # test join the same ferrox-core lib test binary, and the thin-LTO layout moves
 # the decide probe's frame by 98 Ir; dns.rs is untouched.
 ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 47810894 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+# Re-blessed 16896 by the Vision walk's local state: the parser probe (512
+# empty frames) read and wrote every Walk field through self each turn and
+# loaded the five header bytes one at a time. It now keeps the cursor and the
+# Walk in registers and writes them back once, and parses the header as one
+# slice; the bytes, commands and frames are unchanged.
+vision::Linkferrox_app::vision::tests::Fake::pump 16896 vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else
 
