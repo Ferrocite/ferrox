@@ -1,6 +1,6 @@
 # KCP / mKCP
 
-The core rung is real, bit-identical and proved against the pinned Go, and the carrier is now wired: VLESS, VMess, Trojan and Shadowsocks all serve and dial over plaintext KCP, plus VLESS and Trojan over KCP under TLS — both roles, the session above the connection as it is upstream — REALITY (served only) and the legacy mKCP header stack — the `mkcp-legacy` finalmask families, both roles, oracle-proven like the framer beneath them. UDP and Mux stay raw-carrier-only tree-wide, so they refuse KCP like every other carrier.
+The core rung is real, bit-identical and proved against the pinned Go, and the carrier is now wired: VLESS, VMess, Trojan and Shadowsocks all serve and dial over plaintext KCP, plus VLESS and Trojan over KCP under TLS — both roles, the session above the connection as it is upstream — REALITY (served only) and the legacy mKCP header stack — the `mkcp-legacy` finalmask families, both roles, oracle-proven like the framer beneath them. Mux stays raw-carrier-only tree-wide, and VMess UDP refuses KCP as it refuses xdrive; every other carrier carries it.
 
 The proof is `kcp::oracle::the_scripted_core_matches_the_pinned_go`: a scripted clock drives the sending window's queue/flush/fast-ack behaviour, the ack list, and the RTO estimator — including the cap probe and peer-RTO adoption — and the segments it produces are compared against `scripts/kcp-oracle/expected.txt`, which was recorded from `xray-core/transport/internet/kcp` at the pin in `upstream/pins.toml`. That is the strongest claim in this tree: not "looks right", but byte-for-byte equal to the implementation it replaces, over a script that deliberately probes the estimator's edges.
 
@@ -112,7 +112,7 @@ The oracle is the gate for all of it: the wire format is fixed by the pinned Go,
 ## What is not removed
 
 - **A fresh 8 KiB buffer per received segment** is gone too: the payload buffer is reused across a segment's lifetime and the ACK path reuses one staging buffer, which is what the `app-rows-serving-over-kcp` row above is measuring the consequence of — four proxy rows now reach a target over KCP that had no KCP carrier at all.
-- **UDP over KCP is refused**, like UDP over every other carrier. Mux too. The refusal is tree-wide and is not a KCP-specific gap; `crates/ferrox-core/src/transport.rs` parses the `kcp`/`mkcp` spelling and the app serves it, but UDP and Mux are raw-carrier-only, so a config asking for them over KCP is refused by name.
+- **UDP over KCP is refused**, and Mux too. VMess UDP rides raw, ws, xhttp, http header, httpUpgrade and gRPC both roles, but KCP and xdrive serve VMess command 1 only, so a config asking for VMess UDP over KCP is refused by name; VLESS, Trojan and Shadowsocks UDP still ride only the raw carrier. `crates/ferrox-core/src/transport.rs` parses the `kcp`/`mkcp` spelling and the app serves the TCP session above it.
 
 ## Open rows
 
