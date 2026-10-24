@@ -24,7 +24,8 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| offer-seals-retired-instructions | 1044716 | scripts/count-ops.sh |
+| retry-offers-retired-instructions | 234034 | scripts/count-ops.sh |
 | ech-offers-accepted-by-the-stock-lane | 1 | ferrox-app-proxy::tests::vless_over_ech_tls_carries_an_echo |
 | rejected-ech-offers-retried-once | 1 | ferrox-app-proxy::tests::a_rejected_ech_offer_retries_once_with_the_servers_list |
 | ech-offers-built-by-the-shaped-lane | 1 | ferrox-core-tls::shaped::hello::tests::a_real_ech_offer_hides_the_inner_name_under_the_public_one |
@@ -40,10 +41,12 @@ The stock test is the relay path: a VLESS flow over a TLS listener whose ECH key
 
 ```bash
 ./scripts/count-ops.sh report \
-  vless_over_ech_tls_carries_an_echo 'proxy'
+  tls::shaped::hello::tests::a_real_ech_offer_hides_the_inner_name_under_the_public_one \
+  'ferrox_core::tls::shaped::hello::Hello::enable_ech' \
+  'ferrox_core::tls::shaped::hello::Hello::retry'
 ```
 
-`UNBLESSED`. This host is macOS/aarch64, where valgrind has no build, so `scripts/count-ops.sh` cannot run locally; `ops.yml` is the only checker and its artefact has not been read for this path. The exact-count gate in `./scripts/check.sh` is therefore CI-only for this row.
+The offer that seals the inner hello costs 1,044,716 retired instructions in that test, and the retry that re-seals it from the server's list costs 234,034. `ops.yml` re-reads both rows on every run. This host is macOS/aarch64, where valgrind has no build, so the exact-count gate in `./scripts/check.sh` is CI-only for them.
 
 ## Time
 
