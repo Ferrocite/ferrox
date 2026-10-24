@@ -1845,17 +1845,12 @@ struct MuxFlow {
 struct MuxControl {
     stop: Mutex<Option<Connection>>,
     cancelled: AtomicBool,
-    ended: AtomicBool,
 }
 
 impl MuxControl {
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
         self.shut();
-    }
-
-    fn end(&self) {
-        self.ended.store(true, Ordering::Relaxed);
     }
 
     fn set_stop(&self, stop: Connection) {
@@ -2062,9 +2057,7 @@ fn handle_mux_frame<D>(
             }
             if let Ok(mut table) = table.lock() {
                 // Dropping the sender lets the writer drain what the client already sent, then half-close.
-                if let Some(flow) = table.flows.remove(&frame.id) {
-                    flow.control.end();
-                }
+                table.flows.remove(&frame.id);
             }
         }
         Status::KeepAlive => {}
@@ -2089,7 +2082,6 @@ fn handle_mux_tcp_new<D>(
     let control = Arc::new(MuxControl {
         stop: Mutex::new(None),
         cancelled: AtomicBool::new(false),
-        ended: AtomicBool::new(false),
     });
     let flow = Arc::new(MuxFlow {
         control: Arc::clone(&control),
@@ -2145,22 +2137,20 @@ fn handle_mux_tcp_new<D>(
         let writer = RelayPool::global().run(writer);
         let mut chunk = [0u8; 8192];
         let mut scratch = Vec::with_capacity(8192);
-        if !control.ended.load(Ordering::Relaxed) {
-            loop {
-                match read_half.read(&mut chunk) {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if !write_mux_keep(&task_shared, &mut scratch, task_id, &chunk[..n]) {
-                            break;
-                        }
+        loop {
+            match read_half.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if !write_mux_keep(&task_shared, &mut scratch, task_id, &chunk[..n]) {
+                        break;
                     }
-                    Err(error) if is_timeout(&error) => {
-                        if mux_done(&task_table) || control.ended.load(Ordering::Relaxed) {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
                 }
+                Err(error) if is_timeout(&error) => {
+                    if mux_done(&task_table) {
+                        break;
+                    }
+                }
+                Err(_) => break,
             }
         }
         let _ = read_half.shutdown(Shutdown::Both);
