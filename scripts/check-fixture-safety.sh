@@ -23,6 +23,9 @@ def allowed(a, b, c, d):
         return True
     if a == 192 and b == 168:
         return True
+    if a == 198 and b in (18, 19):
+        # RFC 2544 benchmarking space, the reference FakeDNS pool's default.
+        return True
     if (a, b) in ((192, 0), (198, 51), (203, 0)) and (
         (c == 2 and a == 192) or (c == 100 and a == 198) or (c == 113 and a == 203)):
         return True

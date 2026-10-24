@@ -497,6 +497,16 @@ pub(crate) fn serve_config(identity: &ferrox_core::tls::TlsServerConfig) -> Opti
 }
 
 pub(crate) fn quiche_config(roots: &[Vec<u8>], cc: Option<&str>) -> Option<quiche::Config> {
+    quiche_config_alpn(roots, cc, &[ALPN])
+}
+
+/// The same staged trust bundle and tuning under another ALPN, for a client
+/// whose protocol is not this tree's own transport (`doq` is DNS-over-QUIC).
+pub(crate) fn quiche_config_alpn(
+    roots: &[Vec<u8>],
+    cc: Option<&str>,
+    alpn: &[&[u8]],
+) -> Option<quiche::Config> {
     if roots.is_empty() {
         return None;
     }
@@ -514,7 +524,7 @@ pub(crate) fn quiche_config(roots: &[Vec<u8>], cc: Option<&str>) -> Option<quich
         .ok()
         .and_then(|mut config| {
             config.verify_peer(true);
-            config.set_application_protos(&[ALPN]).ok()?;
+            config.set_application_protos(alpn).ok()?;
             if let Some(name) = cc {
                 config.set_cc_algorithm_name(name).ok()?;
             }

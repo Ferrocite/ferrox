@@ -1,11 +1,5 @@
-use crate::h2::{
-    block_encode, frame_head, read_head, Decoder, F_ACK, F_END, F_END_HEADERS, T_CONT, T_DATA,
-    T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS,
-};
 use crate::sockopt::SocketOptions;
-use ferrox_core::tls::TlsProvider as _;
 use std::collections::HashMap;
-use std::io::{Read, Write};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -162,15 +156,7 @@ fn udp(
 ) -> Result<(Vec<u8>, u32), String> {
     let id = random_id()?;
     let packet = question(name, id, false)?;
-    let socket = crate::sockopt::datagram(options, host, port, TIMEOUT)?;
-    socket
-        .send(&packet)
-        .map_err(|e| format!("ech: udp send: {e}"))?;
-    let mut response = vec![0u8; 4096];
-    let read = socket
-        .recv(&mut response)
-        .map_err(|e| format!("ech: udp receive: {e}"))?;
-    response.truncate(read);
+    let response = crate::dnsnet::udp(host, port, &packet, options, TIMEOUT, true)?;
     parse_response(&response, Some(id), name)
 }
 
@@ -182,21 +168,7 @@ fn tcp(
 ) -> Result<(Vec<u8>, u32), String> {
     let id = random_id()?;
     let packet = question(name, id, false)?;
-    let mut stream = crate::sockopt::connect(options, host, port, TIMEOUT)?;
-    stream
-        .write_all(&(packet.len() as u16).to_be_bytes())
-        .map_err(|e| format!("ech: tcp send: {e}"))?;
-    stream
-        .write_all(&packet)
-        .map_err(|e| format!("ech: tcp send: {e}"))?;
-    let mut length = [0u8; 2];
-    stream
-        .read_exact(&mut length)
-        .map_err(|e| format!("ech: tcp receive: {e}"))?;
-    let mut response = vec![0u8; usize::from(u16::from_be_bytes(length))];
-    stream
-        .read_exact(&mut response)
-        .map_err(|e| format!("ech: tcp receive: {e}"))?;
+    let response = crate::dnsnet::tcp(host, port, &packet, options, TIMEOUT, true)?;
     parse_response(&response, Some(id), name)
 }
 
@@ -208,126 +180,9 @@ fn doh(
     cleartext: bool,
     options: Option<&SocketOptions>,
 ) -> Result<(Vec<u8>, u32), String> {
-    let default_port = if cleartext { 80 } else { 443 };
-    let authority = if port == default_port {
-        host.to_owned()
-    } else {
-        format!("{host}:{port}")
-    };
-    let scheme = if cleartext { "http" } else { "https" };
-    let stream = crate::sockopt::connect(options, host, port, TIMEOUT)?;
-    if cleartext {
-        let mut stream = stream;
-        exchange(&mut stream, &authority, scheme, path, name)
-    } else {
-        let cfg = std::sync::Arc::new(ferrox_core::tls::TlsConfig {
-            server_name: host.to_owned(),
-            alpn: vec![b"h2".to_vec()].into(),
-            roots: crate::quic::system_roots(),
-            cert_pins: std::sync::Arc::default(),
-            pins: ferrox_core::foxy::pin::Pins::default(),
-            cipher_suites: std::sync::Arc::default(),
-            insecure: false,
-            fingerprint: None,
-            ech_config_list: None,
-            websocket: false,
-        });
-        let mut tls = ferrox_core::tls::RustlsProvider::connect(&cfg, stream)
-            .map_err(|e| format!("ech: doh tls: {e}"))?;
-        tls.handshake()
-            .map_err(|e| format!("ech: doh handshake: {e}"))?;
-        exchange(&mut tls, &authority, scheme, path, name)
-    }
-}
-
-fn exchange(
-    stream: &mut (impl Read + Write),
-    authority: &str,
-    scheme: &str,
-    path: &str,
-    name: &str,
-) -> Result<(Vec<u8>, u32), String> {
     let packet = question(name, 0, true)?;
-    stream
-        .write_all(crate::h2::MAGIC)
-        .map_err(|e| format!("ech: doh preface: {e}"))?;
-    frame(stream, T_SETTINGS, 0, 0, &[])?;
-    let length = packet.len().to_string();
-    let headers = [
-        (":method", "POST"),
-        (":scheme", scheme),
-        (":path", path),
-        (":authority", authority),
-        ("content-type", "application/dns-message"),
-        ("accept", "application/dns-message"),
-        ("content-length", length.as_str()),
-    ];
-    frame(stream, T_HEADERS, F_END_HEADERS, 1, &block_encode(&headers))?;
-    frame(stream, T_DATA, F_END, 1, &packet)?;
-    stream.flush().map_err(|e| format!("ech: doh flush: {e}"))?;
-    let mut decoder = Decoder::default();
-    let mut block = Vec::new();
-    let mut body = Vec::new();
-    let mut status = None;
-    loop {
-        let (len, kind, flags, id) = read_head(stream).ok_or("ech: doh closed")?;
-        let mut payload = vec![0u8; len];
-        stream
-            .read_exact(&mut payload)
-            .map_err(|e| format!("ech: doh read: {e}"))?;
-        match kind {
-            T_SETTINGS => {
-                if flags & F_ACK == 0 {
-                    frame(stream, T_SETTINGS, F_ACK, 0, &[])?;
-                }
-            }
-            T_PING => {
-                if flags & F_ACK == 0 {
-                    frame(stream, T_PING, F_ACK, 0, &payload)?;
-                }
-            }
-            T_HEADERS | T_CONT => {
-                block.extend_from_slice(&payload);
-                if flags & F_END_HEADERS != 0 {
-                    decoder
-                        .decode(&block, &mut |name, value| {
-                            if name == b":status" {
-                                status = Some(String::from_utf8_lossy(value).into_owned());
-                            }
-                        })
-                        .ok_or("ech: doh headers")?;
-                    block.clear();
-                }
-                if flags & F_END != 0 {
-                    break;
-                }
-            }
-            T_DATA => {
-                if id == 1 {
-                    body.extend_from_slice(&payload);
-                }
-                if flags & F_END != 0 {
-                    break;
-                }
-            }
-            T_RST => return Err("ech: doh stream reset".to_owned()),
-            T_GOAWAY => break,
-            _ => {}
-        }
-    }
-    match status.as_deref() {
-        Some("200") => {}
-        Some(other) => return Err(format!("ech: doh answered {other}")),
-        None => return Err("ech: doh answered no status".to_owned()),
-    }
+    let body = crate::dnsnet::doh(host, port, path, cleartext, &packet, options, TIMEOUT, true)?;
     parse_response(&body, None, name)
-}
-
-fn frame(stream: &mut impl Write, kind: u8, flags: u8, id: u32, body: &[u8]) -> Result<(), String> {
-    stream
-        .write_all(&frame_head(body.len(), kind, flags, id))
-        .and_then(|()| stream.write_all(body))
-        .map_err(|e| format!("ech: doh write: {e}"))
 }
 
 fn parse_response(packet: &[u8], id: Option<u16>, name: &str) -> Result<(Vec<u8>, u32), String> {

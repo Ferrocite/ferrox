@@ -683,3 +683,7 @@ dns-outbound allocations-per-eight-stream-messages 1 ferrox-app-proxy::dns_lane_
 dns-outbound stream-answer-bytes-per-query 38 ferrox-app-proxy::dns_lane_tests::the_dns_stream_lane_relays_a_direct_query_byte_for_byte
 dns-outbound datagram-query-bytes-per-datagram 43 ferrox-app-proxy::dns_lane_tests::the_dns_datagram_lane_relays_a_direct_datagram_byte_for_byte
 dns-outbound datagram-answer-bytes-per-datagram 58 ferrox-app-proxy::dns_lane_tests::the_dns_datagram_lane_relays_a_direct_datagram_byte_for_byte
+engine-dns ops-retired-instructions UNBLESSED scripts/count-ops.sh
+engine-dns syscalls-per-udp-exchange UNBLESSED scripts/count-ops.sh
+engine-dns allocations-per-cached-lookup 4 ferrox-app-dnsapp::resolver_tests::a_cache_hit_copies_only_the_answer_vector
+engine-dns seconds-per-lookup UNBLESSED CI bench.yml (no cell yet)
