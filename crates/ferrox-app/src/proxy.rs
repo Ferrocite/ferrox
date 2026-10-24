@@ -4798,6 +4798,40 @@ fn inbound_ss_destinations(inbound: &Json, method: &str) -> Vec<(Vec<u8>, Socket
     out
 }
 
+fn serve_ss_kcp_listener(
+    address: &str,
+    inbound: &Json,
+    config: ferrox_core::kcp::Config,
+    password: &str,
+    method: &str,
+    freedom: bool,
+    is_2022: bool,
+) -> bool {
+    let password = password.to_owned();
+    let method = method.to_owned();
+    let serve: KcpServe = if stream_security(inbound) == "tls" {
+        let Some(server) = inbound_tls_identity(inbound) else {
+            eprintln!("unreadable shadowsocks tls identity on {address}: refused, not served");
+            return false;
+        };
+        Arc::new(move |conn| {
+            serve_ss_kcp_tls(conn, &password, &method, freedom, is_2022, &server);
+        })
+    } else {
+        Arc::new(move |conn| {
+            let (reader, writer, close) = kcp_parts(conn);
+            if is_2022 {
+                crate::shadowsocks2022::serve_kcp(
+                    reader, writer, &password, &method, freedom, &close,
+                );
+            } else {
+                crate::shadowsocks::serve_kcp(reader, writer, &password, &method, freedom, &close);
+            }
+        })
+    };
+    serve_kcp_bound(address, config, &serve)
+}
+
 fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
     let password = inbound_ss_password(inbound);
     let method = inbound_method(inbound);
@@ -4844,32 +4878,11 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
     }
     match carrier {
         Carrier::Kcp(config) => {
-            let serve: KcpServe = if stream_security(inbound) == "tls" {
-                let Some(server) = inbound_tls_identity(inbound) else {
-                    eprintln!(
-                        "unreadable shadowsocks tls identity on {address}: refused, not served"
-                    );
-                    return;
-                };
-                Arc::new(move |conn| {
-                    serve_ss_kcp_tls(conn, &password, &method, freedom, is_2022, &server)
-                })
-            } else {
-                Arc::new(move |conn| {
-                    let (reader, writer, close) = kcp_parts(conn);
-                    if is_2022 {
-                        crate::shadowsocks2022::serve_kcp(
-                            reader, writer, &password, &method, freedom, &close,
-                        );
-                    } else {
-                        crate::shadowsocks::serve_kcp(
-                            reader, writer, &password, &method, freedom, &close,
-                        );
-                    }
-                })
-            };
-            let owned = address.to_owned();
-            let _ = serve_kcp_bound(&owned, config, &serve);
+            if !serve_ss_kcp_listener(
+                address, inbound, config, &password, &method, freedom, is_2022,
+            ) {
+                return;
+            }
         }
         Carrier::Xdrive { settings } => {
             let password = password.clone();
@@ -13648,6 +13661,37 @@ fn hysteria_transport(outbound: &Json) -> bool {
         == Some("hysteria")
 }
 
+// A shadowsocks row's own fields, and the one security this lane dials: tls rides KCP or the store's lanes, never a carrier it would speak plaintext.
+fn ss_outbound_refusal(outbound: &Json, server: &Json) -> Option<String> {
+    if server.get("method").and_then(Json::as_str).is_none() {
+        return Some("no cipher method in the server entry".to_owned());
+    }
+    if server.get("password").and_then(Json::as_str).is_none() {
+        return Some("no password in the server entry".to_owned());
+    }
+    let security = stream_security(outbound);
+    if matches!(security, "" | "none") {
+        return None;
+    }
+    let network = outbound
+        .get("streamSettings")
+        .and_then(|s| s.get("network"))
+        .and_then(Json::as_str)
+        .unwrap_or("tcp");
+    match (security, network) {
+        (_, "xdrive") => None,
+        ("tls", "kcp") => outbound_tls(
+            outbound,
+            server
+                .get("address")
+                .and_then(Json::as_str)
+                .unwrap_or_default(),
+        )
+        .err(),
+        (security, network) => Some(format!("security `{security}` does not ride `{network}`")),
+    }
+}
+
 // A lane the tree can carry when its fields are honest: the field it lacks is the refusal's word.
 fn outbound_refusal(outbound: &Json, protocol: &str) -> Option<String> {
     let settings = outbound.get("settings");
@@ -13712,37 +13756,8 @@ fn outbound_refusal(outbound: &Json, protocol: &str) -> Option<String> {
                 return Some(field);
             }
             if protocol == "shadowsocks" {
-                if server.get("method").and_then(Json::as_str).is_none() {
-                    return Some("no cipher method in the server entry".to_owned());
-                }
-                if server.get("password").and_then(Json::as_str).is_none() {
-                    return Some("no password in the server entry".to_owned());
-                }
-                let security = stream_security(outbound);
-                if !matches!(security, "" | "none") {
-                    let network = outbound
-                        .get("streamSettings")
-                        .and_then(|s| s.get("network"))
-                        .and_then(Json::as_str)
-                        .unwrap_or("tcp");
-                    // The store's lanes speak their own handshake, so a tls xdrive row builds here as find_shadowsocks_outbound builds it.
-                    match (security, network) {
-                        (_, "xdrive") => {}
-                        ("tls", "kcp") => {
-                            let address = server
-                                .get("address")
-                                .and_then(Json::as_str)
-                                .unwrap_or_default();
-                            if let Err(reason) = outbound_tls(outbound, address) {
-                                return Some(reason);
-                            }
-                        }
-                        (security, network) => {
-                            return Some(format!(
-                                "security `{security}` does not ride `{network}`"
-                            ));
-                        }
-                    }
+                if let Some(reason) = ss_outbound_refusal(outbound, server) {
+                    return Some(reason);
                 }
             }
             if protocol == "socks" {
