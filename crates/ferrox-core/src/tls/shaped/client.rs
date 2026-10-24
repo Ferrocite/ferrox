@@ -729,8 +729,7 @@ impl<S: Stream> Session<S> {
                 ));
             }
             if got - body_at < len {
-                // The first record's body is completed in the window the transport already wrote
-                // to; a later record's tail is staged so the plaintext ahead of it is not held back.
+                // The first record completes where it lies; a later record's tail is staged.
                 if filled != 0 || body_at != 0 || len > buf.len() {
                     self.inbuf.extend_from_slice(&header);
                     self.inbuf.extend_from_slice(&buf[body_at..got]);
