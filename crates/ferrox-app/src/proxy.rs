@@ -4958,6 +4958,7 @@ fn open_vmess_udp_plain(
                 vmess_udp_request(vmess, dest)?;
             uplink.write_all(&request).ok()?;
             let mut reader = uplink.try_clone().ok()?;
+            reader.set_read_timeout(Some(RELAY_POLL)).ok()?;
             if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
                 return None;
             }
@@ -4974,6 +4975,7 @@ fn open_vmess_udp_plain(
                 vmess_udp_request(vmess, dest)?;
             let (mut reader, writer) =
                 crate::ws::connect(uplink, &vmess.host, path, *ed, &request)?;
+            reader.set_poll(Some(RELAY_POLL));
             if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
                 return None;
             }
@@ -4993,6 +4995,7 @@ fn open_vmess_udp_plain(
         }
         Carrier::Grpc { path } => {
             let (mut reader, writer) = crate::grpc::connect(uplink, &vmess.host, path)?;
+            reader.set_poll(Some(RELAY_POLL));
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
             if !writer.send(&request) {
@@ -5018,6 +5021,7 @@ fn open_vmess_udp_plain(
         Carrier::Xhttp { settings, .. } => {
             let (mut reader, writer) =
                 xhttp_rung(uplink, &vmess.host, &vmess.carrier, settings.path.as_str())?;
+            reader.set_poll(Some(RELAY_POLL));
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
             if !writer.send(&request) {
@@ -5042,6 +5046,7 @@ fn open_vmess_udp_plain(
         }
         Carrier::HttpHeader { path } => {
             let (mut reader, mut writer) = crate::httpheader::connect(uplink, &vmess.host, path)?;
+            reader.set_poll(Some(RELAY_POLL));
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
             if writer.write_all(&request).is_err() {
@@ -5063,6 +5068,7 @@ fn open_vmess_udp_plain(
                 vmess_udp_request(vmess, dest)?;
             let (mut reader, writer) =
                 crate::httpupgrade::connect(uplink, &vmess.host, path, *ed, &request)?;
+            reader.set_poll(Some(RELAY_POLL));
             if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
                 return None;
             }
