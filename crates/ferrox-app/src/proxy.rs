@@ -815,6 +815,8 @@ pub(crate) enum Outbound {
     Route(Arc<RoutePlan>),
     /// The rules drop the flow after the front has granted it.
     Block(ferrox_core::blackhole::Response),
+    /// The wire carries DNS queries; the lane answers, drops, and forwards them.
+    Dns(DnsOut),
 }
 
 impl Outbound {
@@ -827,9 +829,12 @@ impl Outbound {
             Self::Shadowsocks(ss) => resolve_outbound(&ss.address, ss.port),
             Self::Socks(socks) => resolve_outbound(&socks.address, socks.port),
             Self::Http(http) => resolve_outbound(&http.address, http.port),
-            Self::Foxy(_) | Self::Veepn(_) | Self::Freedom | Self::Route(_) | Self::Block(_) => {
-                None
-            }
+            Self::Foxy(_)
+            | Self::Veepn(_)
+            | Self::Freedom
+            | Self::Route(_)
+            | Self::Block(_)
+            | Self::Dns(_) => None,
         }
     }
 
@@ -8119,6 +8124,9 @@ fn serve_connect(
         let _ = client.write_all(b"HTTP/1.1 405 Method Not Allowed\r\nConnection: close\r\n\r\n");
         return;
     }
+    if let Outbound::Dns(dns) = out {
+        return serve_dns_tcp(client, dns, asked);
+    }
     if let Outbound::Vless(vless) = out {
         if matches!(vless.carrier, Carrier::Quic) {
             if !vless.mux {
@@ -8229,7 +8237,8 @@ fn dial_socks_outbound(
         | Outbound::Veepn(_)
         | Outbound::Freedom
         | Outbound::Route(_)
-        | Outbound::Block(_) => {}
+        | Outbound::Block(_)
+        | Outbound::Dns(_) => {}
     }
 }
 
@@ -9258,6 +9267,7 @@ fn serve_socks_udp(mut client: Connection, out: &Outbound) {
         },
         Outbound::Freedom => serve_socks_udp_freedom(&relay),
         Outbound::Socks(socks) => serve_socks_udp_socks(&relay, socks),
+        Outbound::Dns(dns) => serve_dns_udp(&relay, dns),
         _ => {}
     }
 }
@@ -9416,6 +9426,321 @@ const UDP_POLL: Duration = Duration::from_millis(10);
 
 /// Datagrams one side may take per pass, so a burst is served in one pass and neither direction starves the other.
 const UDP_BURST: usize = 64;
+
+/// The DNS lane's idle: the reference's session-default `ConnectionIdle`; the tree carries no policy app to name another.
+const DNS_IDLE: Duration = Duration::from_secs(300);
+
+/// The upstream lane the direct half rides: a stream the DNS framing carries, or a socket that answers each datagram.
+enum DnsUpstream {
+    Tcp(Connection),
+    Udp(UdpSocket),
+}
+
+/// One message the source network's own frame carries: a length-prefixed read on a stream, one recv on a socket.
+fn read_dns_source(stream: &mut Connection) -> Option<Vec<u8>> {
+    let mut head = [0u8; 2];
+    stream.read_exact(&mut head).ok()?;
+    let size = usize::from(u16::from_be_bytes(head));
+    if size > ferrox_core::dns::MESSAGE_MAX {
+        return None;
+    }
+    let mut body = vec![0u8; size];
+    stream.read_exact(&mut body).ok()?;
+    Some(body)
+}
+
+/// The machine's own resolver, the way the reference's localdns answers: the addrs of the
+/// resolved name, the empty response when the name carries none, and the hard error otherwise.
+fn dns_lookup(name: &[u8]) -> ferrox_core::dns::Resolve {
+    let Some(host) = name
+        .strip_suffix(b".")
+        .and_then(|name| std::str::from_utf8(name).ok())
+    else {
+        return ferrox_core::dns::Resolve::ErrHard;
+    };
+    if host.parse::<std::net::IpAddr>().is_ok() {
+        // A literal needs no resolver: its one adder is the lookup.
+        let Ok(literal) = (host, 0).to_socket_addrs() else {
+            return ferrox_core::dns::Resolve::ErrHard;
+        };
+        return ferrox_core::dns::Resolve::Records {
+            rdata: literal
+                .map(|addr| match addr.ip() {
+                    std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+                    std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+                })
+                .collect(),
+            ttl: 300,
+        };
+    }
+    let addrs = cached_lookup(host, 0).unwrap_or_else(|| {
+        let addrs = resolve_bounded(host, 0, budgets::dial(), |host, port| {
+            (host, port)
+                .to_socket_addrs()
+                .map(std::iter::Iterator::collect)
+        });
+        remember_lookup(host, 0, &addrs);
+        addrs
+    });
+    if addrs.is_empty() {
+        return ferrox_core::dns::Resolve::AnsweredEmpty;
+    }
+    ferrox_core::dns::Resolve::Records {
+        rdata: addrs
+            .iter()
+            .map(|addr| match addr.ip() {
+                std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+                std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+            })
+            .collect(),
+        ttl: 300,
+    }
+}
+
+/// The destination one query rides: the rewrite overlays the destination the flow named, field by field.
+fn dns_dest(dns: &DnsOut, asked: &Destination) -> Destination {
+    let port = if dns.port != 0 {
+        dns.port
+    } else {
+        asked.port()
+    };
+    match &dns.address {
+        Some(address) => Destination::Name(address.clone(), port),
+        None => match asked {
+            Destination::Name(host, _) => Destination::Name(host.clone(), port),
+            Destination::Address(address) => {
+                Destination::Address(SocketAddr::new(address.ip(), port))
+            }
+        },
+    }
+}
+
+/// The lane a direct side rides: dialed once on the rewritten destination's own
+/// network, its idle the reference's session default on both handles.
+fn dial_dns(target: &SocketAddr, tcp: bool) -> Option<DnsUpstream> {
+    if tcp {
+        let stream = dial_or_report(target)?;
+        let _ = stream.set_read_timeout(Some(DNS_IDLE));
+        Some(DnsUpstream::Tcp(stream))
+    } else {
+        let Ok(socket) = UdpSocket::bind(SocketAddr::new(
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            0,
+        )) else {
+            return None;
+        };
+        let Ok(()) = socket.connect(target) else {
+            return None;
+        };
+        let _ = socket.set_read_timeout(Some(DNS_IDLE));
+        Some(DnsUpstream::Udp(socket))
+    }
+}
+
+/// The answers leg's handle of the dialed lane: a reader of its own, so the queries' writes and the answers' reads never block each other.
+fn answer_handle(up: &DnsUpstream) -> Option<DnsUpstream> {
+    match up {
+        DnsUpstream::Tcp(stream) => stream.try_clone().ok().map(DnsUpstream::Tcp),
+        DnsUpstream::Udp(socket) => socket.try_clone().ok().map(DnsUpstream::Udp),
+    }
+}
+
+/// The stream framing: the length then the message, gathered into one `writev`. An empty message rides nothing, the way the reference's writer answers one.
+fn write_dns_frame(stream: &mut Connection, message: &[u8]) -> bool {
+    if message.is_empty() {
+        return true;
+    }
+    let head = (message.len() as u16).to_be_bytes();
+    write_all_parts::<2>(stream, &[&head, message]).is_ok()
+}
+
+/// One query onto the lane the rewrite named: the stream carries the framing, the socket one datagram.
+fn send_dns_query(up: &mut DnsUpstream, message: &[u8]) -> bool {
+    match up {
+        DnsUpstream::Tcp(stream) => write_dns_frame(stream, message),
+        DnsUpstream::Udp(socket) => socket.send(message).is_ok(),
+    }
+}
+
+/// The DNS outbound's stream lane: the client's framed queries decide one by
+/// one, a hijack answers with the resolver in place, a direct query rides the
+/// rewritten lane, and the upstream's answers relay back framed the way the
+/// client framed them. The queries leg owns the client's read side; the
+/// answers leg its own write handle and reader.
+fn serve_dns_tcp(mut client: Connection, dns: &DnsOut, asked: &Destination) {
+    let _ = client.set_read_timeout(Some(DNS_IDLE));
+    let dest = dns_dest(dns, asked);
+    let Ok(to_client) = client.try_clone() else {
+        return;
+    };
+    let (ready, reader_at) = std::sync::mpsc::sync_channel::<DnsUpstream>(1);
+    let Ok(leg) = thread::Builder::new()
+        .name("ferrox-dns-answer".to_owned())
+        .spawn(move || {
+            // The answers leg waits on the lane's dial, the readiness the reference's own conn waits on; a closed channel is the queries leg's end.
+            let Ok(mut reader) = reader_at.recv() else {
+                return;
+            };
+            let mut sink = to_client;
+            let mut back = udp_buffer();
+            loop {
+                let wrote = match &mut reader {
+                    DnsUpstream::Tcp(stream) => match read_dns_source(stream) {
+                        Some(message) => write_dns_frame(&mut sink, &message),
+                        None => return,
+                    },
+                    DnsUpstream::Udp(socket) => match socket.recv(&mut back) {
+                        Ok(read) => write_dns_frame(&mut sink, &back[..read]),
+                        Err(_) => return,
+                    },
+                };
+                if !wrote {
+                    return;
+                }
+            }
+        })
+    else {
+        return;
+    };
+    let mut lane: Option<DnsUpstream> = None;
+    while let Some(message) = read_dns_source(&mut client) {
+        match ferrox_core::dns::decide(&message, &dns.rules, &dns_lookup) {
+            ferrox_core::dns::Step::Quiet => {}
+            ferrox_core::dns::Step::Reply(answer) => {
+                if !write_dns_frame(&mut client, &answer) {
+                    return;
+                }
+            }
+            ferrox_core::dns::Step::Forward => {
+                if lane.is_none() {
+                    let Some(target) = dest.socket() else {
+                        return;
+                    };
+                    let Some(up) = dial_dns(&target, dns.tcp.unwrap_or(true)) else {
+                        return;
+                    };
+                    let Some(reader) = answer_handle(&up) else {
+                        return;
+                    };
+                    if ready.send(reader).is_err() {
+                        return;
+                    }
+                    lane = Some(up);
+                }
+                let Some(up) = lane.as_mut() else {
+                    continue;
+                };
+                if !send_dns_query(up, &message) {
+                    return;
+                }
+            }
+        }
+    }
+    let _ = leg;
+}
+
+/// The DNS outbound's datagram lane: the association's queries decide one by
+/// one, a hijack answers the source in place, and a direct datagram rides the
+/// rewritten lane the first one named. Each answer goes back framed to the
+/// socket the datagram came from.
+fn serve_dns_udp(relay: &UdpSocket, dns: &DnsOut) {
+    let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let mut lanes: HashMap<SocketAddr, (DnsUpstream, thread::JoinHandle<()>)> = HashMap::new();
+    let mut buf = udp_buffer();
+    let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
+    while let Ok((n, src)) = relay.recv_from(&mut buf) {
+        let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+            continue;
+        };
+        if let Ok(mut slot) = source.lock() {
+            *slot = Some(src);
+        }
+        match ferrox_core::dns::decide(payload, &dns.rules, &dns_lookup) {
+            ferrox_core::dns::Step::Quiet => {}
+            ferrox_core::dns::Step::Reply(answer) => {
+                let out = socks_udp_frame(&mut frame, None, &dest, &answer);
+                if relay.send_to(out, src).is_err() {
+                    break;
+                }
+            }
+            ferrox_core::dns::Step::Forward => {
+                let target = dns_dest(dns, &Destination::Address(dest));
+                let Some(up_addr) = target.socket() else {
+                    continue;
+                };
+                if let Some((lane, _)) = lanes.get_mut(&up_addr) {
+                    let _ = send_dns_query(lane, payload);
+                    continue;
+                }
+                let Some(up) = dial_dns(&up_addr, dns.tcp.unwrap_or(false)) else {
+                    continue;
+                };
+                let Some(reader) = answer_handle(&up) else {
+                    continue;
+                };
+                let named = dest;
+                let peer = source.clone();
+                let Ok(relay_write) = relay.try_clone() else {
+                    continue;
+                };
+                let Ok(done) = thread::Builder::new()
+                    .name("ferrox-dns-answer".to_owned())
+                    .spawn(move || {
+                        let mut to_up = reader;
+                        let mut back = udp_buffer();
+                        let mut framed = Vec::with_capacity(HEAD + UDP_BUF);
+                        loop {
+                            let wrote = match &mut to_up {
+                                DnsUpstream::Tcp(stream) => match read_dns_source(stream) {
+                                    Some(message) => {
+                                        let out =
+                                            socks_udp_frame(&mut framed, None, &named, &message);
+                                        let Some(src) = peer.lock().ok().and_then(|slot| *slot)
+                                        else {
+                                            continue;
+                                        };
+                                        relay_write.send_to(out, src).is_ok()
+                                    }
+                                    None => false,
+                                },
+                                DnsUpstream::Udp(socket) => match socket.recv(&mut back) {
+                                    Ok(read) => {
+                                        let out = socks_udp_frame(
+                                            &mut framed,
+                                            None,
+                                            &named,
+                                            &back[..read],
+                                        );
+                                        let Some(src) = peer.lock().ok().and_then(|slot| *slot)
+                                        else {
+                                            continue;
+                                        };
+                                        relay_write.send_to(out, src).is_ok()
+                                    }
+                                    Err(_) => false,
+                                },
+                            };
+                            if !wrote {
+                                break;
+                            }
+                        }
+                    })
+                else {
+                    continue;
+                };
+                lanes.insert(up_addr, (up, done));
+                // The datagram that opened the lane is its first payload; a hop must not drop it.
+                if let Some((lane, _)) = lanes.get_mut(&up_addr) {
+                    let _ = send_dns_query(lane, payload);
+                }
+            }
+        }
+    }
+    for (_, (_, handle)) in lanes {
+        // The relayed datagrams are on their own sockets, so this exit is their idle timeout.
+        let _ = handle.join();
+    }
+}
 
 /// Foxy UDP: one CONNECT-UDP stream per destination, HTTP/2 then HTTP/3; the configured carrier does not apply.
 fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connection) {
@@ -13032,7 +13357,7 @@ fn canonical_protocol(protocol: &str) -> &str {
 }
 
 /// The protocols xray registers with no handler here: a config naming one dials direct and says so at the outbound.
-const UNBUILT_OUTBOUNDS: [&str; 3] = ["dns", "wireguard", "masque"];
+const UNBUILT_OUTBOUNDS: [&str; 2] = ["wireguard", "masque"];
 
 /// The first outbound naming an unbuilt protocol, with its tag and that name.
 fn find_unbuilt_outbound(root: &Json) -> Option<(&str, &str)> {
@@ -13278,6 +13603,9 @@ fn find_outbound(root: &Json) -> Result<Option<Outbound>, String> {
     // The sink is the last resort: a config that names a dial takes the dial.
     if let Some(answer) = find_blackhole_outbound(root)? {
         return Ok(Some(Outbound::Block(answer)));
+    }
+    if let Some(dns) = find_dns_outbound(root)? {
+        return Ok(Some(Outbound::Dns(dns)));
     }
     if let Some((tag, protocol)) = find_unbuilt_outbound(root) {
         eprintln!("outbound `{tag}` protocol `{protocol}` is not carried; dialing direct");
@@ -14139,6 +14467,309 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
         });
     }
     None
+}
+
+/// The DNS outbound's decoded lane: the reference's `proxy/dns` at this pin. The
+/// rewrite overlays the destination the flow named, field by field, and the rules
+/// decide per query in order.
+#[derive(Debug, Clone)]
+pub(crate) struct DnsOut {
+    /// The upstream lane the direct half rides; none keeps the asked network.
+    tcp: Option<bool>,
+    /// The upstream address the rewrite names; none keeps the asked one.
+    address: Option<String>,
+    /// The upstream port the rewrite names; zero keeps the asked one.
+    port: u16,
+    rules: Vec<ferrox_core::dns::Rule>,
+}
+
+/// The DNS outbound's config, the way the reference's own builder reads it: the
+/// legacy `network`/`address`/`port` forms fill the rewrite they alias, a rule
+/// refusing by name, and the budget the lane runs on.
+fn find_dns_outbound(root: &Json) -> Result<Option<DnsOut>, String> {
+    let empty = Vec::new();
+    let outbounds = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty);
+    for outbound in outbounds {
+        if outbound.get("protocol").and_then(Json::as_str) != Some("dns") {
+            continue;
+        }
+        return build_dns_outbound(outbound);
+    }
+    Ok(None)
+}
+
+fn build_dns_outbound(outbound: &Json) -> Result<Option<DnsOut>, String> {
+    let settings = outbound.get("settings");
+    // The rewrite form wins; the legacy alias fills the field the rewrite skips.
+    let tcp = match settings
+        .and_then(|s| s.get("rewriteNetwork"))
+        .and_then(Json::as_str)
+    {
+        Some(name) => decode_dns_network(name),
+        None => settings
+            .and_then(|s| s.get("network"))
+            .and_then(Json::as_str)
+            .filter(|name| !name.is_empty())
+            .and_then(decode_dns_network),
+    };
+    let address = match settings
+        .and_then(|s| s.get("rewriteAddress"))
+        .and_then(Json::as_str)
+    {
+        Some(name) => Some(name.to_owned()),
+        None => settings
+            .and_then(|s| s.get("address"))
+            .and_then(Json::as_str)
+            .map(str::to_owned),
+    };
+    let port = match settings
+        .and_then(|s| s.get("rewritePort"))
+        .and_then(Json::as_port)
+    {
+        Some(port) if port != 0 => port,
+        _ => settings
+            .and_then(|s| s.get("port"))
+            .and_then(Json::as_port)
+            .unwrap_or(0),
+    };
+    let rules = decode_dns_rules(settings)?;
+    Ok(Some(DnsOut {
+        tcp,
+        address,
+        port,
+        rules,
+    }))
+}
+
+/// A lane the rewrite names: `tcp` or `udp` rides it, and anything else leaves
+/// the asked network where it is, the way the reference's unknown builds.
+fn decode_dns_network(name: &str) -> Option<bool> {
+    match name.to_ascii_lowercase().as_str() {
+        "tcp" => Some(true),
+        "udp" => Some(false),
+        _ => None,
+    }
+}
+
+/// The rules the DNS outbound carries, in order; the legacy `nonIPQuery` and
+/// `blockTypes` forms build as the reference's own three rules.
+fn decode_dns_rules(settings: Option<&Json>) -> Result<Vec<ferrox_core::dns::Rule>, String> {
+    let Some(settings) = settings.filter(|settings| !matches!(settings, Json::Null)) else {
+        return Ok(Vec::new());
+    };
+    let non_ip = settings.get("nonIPQuery");
+    let block_types = settings.get("blockTypes");
+    if non_ip.is_some() || block_types.is_some() {
+        if settings.get("rules").is_some() {
+            return Err("legacy nonIPQuery and blockTypes cannot be mixed with rules".into());
+        }
+        eprintln!("nonIPQuery and blockTypes are deprecated; rules is the form");
+        return decode_dns_legacy(
+            non_ip.and_then(Json::as_str),
+            block_types.and_then(Json::as_arr),
+        );
+    }
+    let mut rules = Vec::new();
+    for rule in settings.get("rules").and_then(Json::as_arr).unwrap_or(&[]) {
+        rules.push(decode_dns_rule(rule)?);
+    }
+    Ok(rules)
+}
+
+/// One rule: the action refused by name, the qType expanded the way a port list
+/// is, the domains through the same tree the router builds its matches with, and
+/// an rCode the reference parses at its own 16-bit bound.
+fn decode_dns_rule(rule: &Json) -> Result<ferrox_core::dns::Rule, String> {
+    let name = rule.get("action").and_then(Json::as_str);
+    let Some(action) = name.and_then(ferrox_core::dns::Action::from_name) else {
+        return Err(format!("unknown action: {}", name.unwrap_or_default()));
+    };
+    let qtypes = match rule.get("qType") {
+        None | Some(Json::Null) => Vec::new(),
+        Some(qtype @ (Json::Num(_) | Json::Str(_))) => inbound_ports(qtype),
+        Some(_) => return Err("qType is a port list: a number or a string names it".into()),
+    };
+    let mut domains = crate::router::DomainMatcher::new();
+    if let Some(list) = rule
+        .get("domain")
+        .filter(|list| !matches!(list, Json::Null))
+    {
+        let items = if let Some(text) = list.as_str() {
+            text.split(',').map(str::to_owned).collect::<Vec<_>>()
+        } else if let Some(items) = list.as_arr() {
+            items
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .ok_or_else(|| "domain has a value that is not a string".to_owned())
+                        .map(str::to_owned)
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            return Err("domain is not a string or array".into());
+        };
+        let mut assets = crate::router::Assets::new(crate::router::asset_dirs());
+        for item in items {
+            crate::router::add_domain(&mut domains, &item, &mut assets)?;
+        }
+        domains.finish()?;
+    }
+    let rcode = match rule.get("rCode").and_then(Json::as_u32) {
+        Some(rcode) if rcode > 65535 => {
+            return Err(format!("rCode out of range: {rcode}"));
+        }
+        Some(rcode) => rcode as u16,
+        None => 0,
+    };
+    Ok(ferrox_core::dns::Rule {
+        qtypes,
+        domains: Some(ferrox_core::dns::Matcher::new(move |name| {
+            domains.matches(name, name)
+        })),
+        action,
+        rcode,
+    })
+}
+
+/// The three rules the legacy forms build: the blocked types, the A/AAAA
+/// hijack, and the catch-all that the non-`reject` modes widen.
+fn decode_dns_legacy(
+    non_ip: Option<&str>,
+    block_types: Option<&[Json]>,
+) -> Result<Vec<ferrox_core::dns::Rule>, String> {
+    let mode = non_ip.filter(|mode| !mode.is_empty()).unwrap_or("reject");
+    if !matches!(mode, "reject" | "drop" | "skip") {
+        return Err(format!("unknown nonIPQuery: {mode}"));
+    }
+    let mut rules = Vec::new();
+    if let Some(types) = block_types {
+        let mut qtypes = Vec::new();
+        for qtype in types {
+            let named = qtype
+                .as_u32()
+                .ok_or_else(|| "legacy blockTypes qType is not a number".to_owned())?;
+            u16::try_from(named)
+                .map_err(|_| format!("legacy blockTypes qType out of range: {named}"))?;
+            qtypes.push(named as u16);
+        }
+        if !qtypes.is_empty() {
+            rules.push(ferrox_core::dns::Rule {
+                qtypes,
+                domains: None,
+                action: match mode {
+                    "reject" => ferrox_core::dns::Action::Return,
+                    _ => ferrox_core::dns::Action::Drop,
+                },
+                rcode: u16::from(mode == "reject") * 5,
+            });
+        }
+    }
+    rules.push(ferrox_core::dns::Rule {
+        qtypes: vec![1, 28],
+        domains: None,
+        action: ferrox_core::dns::Action::Hijack,
+        rcode: 0,
+    });
+    let (action, rcode) = match mode {
+        "reject" => (ferrox_core::dns::Action::Return, 5),
+        "drop" => (ferrox_core::dns::Action::Drop, 0),
+        "skip" => (ferrox_core::dns::Action::Direct, 0),
+        _ => unreachable!(),
+    };
+    rules.push(ferrox_core::dns::Rule {
+        qtypes: Vec::new(),
+        domains: None,
+        action,
+        rcode,
+    });
+    Ok(rules)
+}
+
+#[cfg(test)]
+mod dns_config_tests {
+    use super::*;
+
+    fn dns_probe(settings: &str) -> Result<Option<DnsOut>, String> {
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds":[{{"protocol":"dns","settings":{settings}}}]}}"#
+        ))
+        .expect("parses");
+        find_dns_outbound(&root)
+    }
+
+    fn dns_outbound(settings: &str) -> DnsOut {
+        dns_probe(settings)
+            .expect("the outbound's own settings read")
+            .expect("a DNS outbound in the config")
+    }
+
+    #[test]
+    fn an_empty_settings_dns_outbound_carries_no_rule() {
+        let dns = dns_outbound("{}");
+        assert_eq!(dns.tcp, None);
+        assert_eq!(dns.address, None);
+        assert_eq!(dns.port, 0);
+        assert!(dns.rules.is_empty());
+    }
+
+    #[test]
+    fn the_rewrite_fields_are_the_lane_the_outbound_rides() {
+        let dns = dns_outbound(
+            r#"{"rewriteNetwork":"tcp","rewriteAddress":"192.0.2.9","rewritePort":5353,"rules":[{"action":"return","rCode":5}]}"#,
+        );
+        assert_eq!(dns.tcp, Some(true));
+        assert_eq!(dns.address.as_deref(), Some("192.0.2.9"));
+        assert_eq!(dns.port, 5353);
+        assert_eq!(dns.rules[0].rcode, 5);
+        assert_eq!(dns.rules[0].action, ferrox_core::dns::Action::Return);
+    }
+
+    #[test]
+    fn the_legacy_aliases_fill_the_fields_the_rewrite_skips() {
+        let dns = dns_outbound(r#"{"network":"udp","address":"ns.test","port":53}"#);
+        assert_eq!(dns.tcp, Some(false));
+        assert_eq!(dns.address.as_deref(), Some("ns.test"));
+        assert_eq!(dns.port, 53);
+        // A network name the reference does not build keeps the asked lane.
+        let dns = dns_outbound(r#"{"network":"unix"}"#);
+        assert_eq!(dns.tcp, None);
+    }
+
+    #[test]
+    fn a_rule_refused_by_name_and_a_qtype_out_of_form_are_build_errors() {
+        assert!(dns_probe(r#"{"rules":[{"action":"quux"}]}"#).is_err());
+        assert!(
+            dns_probe(r#"{"rules":[]}"#).is_ok(),
+            "no rules is a rule set of none"
+        );
+        assert!(dns_probe(r#"{"rules":[{"action":"return","qType":[1,28]}]}"#).is_err());
+        assert!(dns_probe(r#"{"rules":[{"action":"return","rCode":70000}]}"#).is_err());
+    }
+
+    #[test]
+    fn a_qtype_port_list_expands() {
+        let dns = dns_outbound(r#"{"rules":[{"action":"return","qType":"1,28"}]}"#);
+        assert_eq!(dns.rules[0].qtypes, vec![1, 28]);
+    }
+
+    #[test]
+    fn the_legacy_form_builds_the_three_rules_the_reference_main() {
+        let dns = dns_outbound(r#"{"nonIPQuery":"skip","blockTypes":[]}"#);
+        assert_eq!(dns.rules.len(), 2);
+        assert_eq!(
+            dns.rules[0].action,
+            ferrox_core::dns::Action::Hijack,
+            "A and AAAA are hijacked before the catch-all"
+        );
+        assert_eq!(dns.rules[1].action, ferrox_core::dns::Action::Direct);
+        let dns = dns_outbound(r#"{"nonIPQuery":"drop","blockTypes":[16]}"#);
+        assert_eq!(dns.rules[0].qtypes, vec![16]);
+        assert_eq!(dns.rules[0].action, ferrox_core::dns::Action::Drop);
+        assert!(dns_probe(r#"{"nonIPQuery":"skip","rules":[]}"#).is_err());
+    }
 }
 
 fn find_http_outbound(root: &Json) -> Option<HttpOut> {
@@ -29993,7 +30624,7 @@ mod tests {
     /// A handler xray registers and this tree has not built serves as the direct lane rather than refusing the config.
     #[test]
     fn an_unbuilt_outbound_dials_direct_instead_of_refusing_the_config() {
-        for protocol in ["dns", "wireguard", "masque"] {
+        for protocol in ["wireguard", "masque"] {
             let text = format!(
                 r#"{{"outbounds":[{{"tag":"named","protocol":"{protocol}","settings":{{}}}}]}}"#
             );
@@ -32354,6 +32985,153 @@ mod resolve_tests {
             started.elapsed() < Duration::from_secs(1),
             "the lookup waited out the stuck resolver instead of its budget: {}ms",
             started.elapsed().as_millis()
+        );
+    }
+}
+
+#[cfg(test)]
+mod dns_lane_tests {
+    use super::*;
+
+    /// The question the lane answers to: the id, one question, the name, the type,
+    /// class IN.
+    fn dns_question(name: &str, qtype: u16) -> Vec<u8> {
+        let mut query = vec![0x12, 0x34, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        for label in name.split('.').filter(|label| !label.is_empty()) {
+            query.push(label.len() as u8);
+            query.extend_from_slice(label.as_bytes());
+        }
+        query.push(0);
+        query.extend(&qtype.to_be_bytes());
+        query.extend([0, 1]);
+        query
+    }
+
+    fn direct_rule() -> Vec<ferrox_core::dns::Rule> {
+        vec![ferrox_core::dns::Rule {
+            qtypes: Vec::new(),
+            domains: None,
+            action: ferrox_core::dns::Action::Direct,
+            rcode: 0,
+        }]
+    }
+
+    #[test]
+    fn the_dns_stream_lane_relays_a_direct_query_byte_for_byte() {
+        let query = dns_question("nameserver.test.", 16);
+        let reply = b"the relay must relay these bytes whole".as_slice();
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("front binds");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("nameserver binds");
+        let up_port = listener.local_addr().expect("addr").port();
+        let up_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), up_port);
+        let dns = DnsOut {
+            tcp: None,
+            address: None,
+            port: 0,
+            rules: direct_rule(),
+        };
+        let client = Connection::connect(("127.0.0.1", front.local_addr().expect("addr").port()))
+            .expect("dials");
+        let (mut app_side, _) = front.accept().expect("accepts");
+        let head = (query.len() as u16).to_be_bytes();
+        std::thread::scope(|scope| {
+            scope.spawn(|| serve_dns_tcp(client, &dns, &Destination::Address(up_addr)));
+            let received = query.clone();
+            let nameserver = scope.spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accepts");
+                let mut head = [0u8; 2];
+                read_exact(&mut stream, &mut head).expect("the length arrives");
+                let size = usize::from(u16::from_be_bytes(head));
+                let mut body = vec![0u8; size];
+                read_exact(&mut stream, &mut body).expect("the query arrives");
+                assert_eq!(body, received);
+                let own = (reply.len() as u16).to_be_bytes();
+                let parts = [&own[..], reply];
+                write_all_parts::<2>(&mut stream, parts.as_slice()).expect("the answer leaves");
+            });
+            std::io::Write::write_all(&mut app_side, &head).expect("query length leaves");
+            std::io::Write::write_all(&mut app_side, &query).expect("query leaves");
+            let mut read = [0u8; 2];
+            read_exact(&mut app_side, &mut read).expect("answer length arrives");
+            let mut answer = vec![0u8; usize::from(u16::from_be_bytes(read))];
+            read_exact(&mut app_side, &mut answer).expect("answer arrives");
+            assert_eq!(answer, reply);
+            drop(app_side);
+            nameserver.join().expect("nameserver leg");
+        });
+    }
+
+    #[test]
+    fn the_dns_datagram_lane_relays_a_direct_datagram_byte_for_byte() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").expect("nameserver binds");
+        let up_addr = upstream.local_addr().expect("addr");
+        let relay: &'static UdpSocket = Box::leak(Box::new(
+            UdpSocket::bind("127.0.0.1:0").expect("relay binds"),
+        ));
+        let dns: &'static DnsOut = Box::leak(Box::new(DnsOut {
+            tcp: Some(false),
+            address: None,
+            port: 0,
+            rules: direct_rule(),
+        }));
+        let app = UdpSocket::bind("127.0.0.1:0").expect("app binds");
+        std::thread::spawn(move || serve_dns_udp(relay, dns));
+        let mut packet = Vec::new();
+        let query = dns_question("nameserver.test.", 16);
+        {
+            let mut frame = Vec::new();
+            let framed = socks_udp_frame(&mut frame, None, &up_addr, &query);
+            packet.extend_from_slice(framed);
+        }
+        let relay_token = relay.local_addr().expect("addr");
+        app.send_to(&packet, relay_token).expect("sends");
+        let mut back = udp_buffer();
+        let (read, lane) = upstream.recv_from(&mut back).expect("query arrives");
+        assert_eq!(&back[..read], &query);
+        // The answer's bytes are whatever the nameserver writes back: the relay is byte-neutral.
+        let answer = b"a name in the wire is a name regardless of width";
+        // The reply goes to the source the query named, the way any server answers.
+        upstream.send_to(answer, lane).expect("answers");
+        let mut back = udp_buffer();
+        let (read, _) = app.recv_from(&mut back).expect("answer arrives");
+        let mut expected = Vec::new();
+        let framed = socks_udp_frame(&mut expected, None, &up_addr, answer);
+        assert_eq!(&back[..read], framed);
+    }
+
+    #[test]
+    fn the_dns_datagram_lane_answers_a_hijack_from_the_resolver() {
+        let relay: &'static UdpSocket = Box::leak(Box::new(
+            UdpSocket::bind("127.0.0.1:0").expect("relay binds"),
+        ));
+        let dns: &'static DnsOut = Box::leak(Box::new(DnsOut {
+            tcp: None,
+            address: None,
+            port: 0,
+            rules: Vec::new(),
+        }));
+        let app = UdpSocket::bind("127.0.0.1:0").expect("app binds");
+        std::thread::spawn(move || serve_dns_udp(relay, dns));
+        let mut packet = Vec::new();
+        let query = dns_question("localhost.", 1);
+        let up_addr = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 53);
+        {
+            let mut frame = Vec::new();
+            let framed = socks_udp_frame(&mut frame, None, &up_addr, &query);
+            packet.extend_from_slice(framed);
+        }
+        let relay_token = relay.local_addr().expect("addr");
+        app.send_to(&packet, relay_token).expect("sends");
+        let mut back = udp_buffer();
+        let (read, _) = app.recv_from(&mut back).expect("answer arrives");
+        // The frame names the destination the datagram itself asked: RSV, FRAG, the v4 ATYP, the port, the address, then the answer whole.
+        assert_eq!(&back[..10], &[0, 0, 0, 1, 127, 0, 0, 1, 0, 53]);
+        let answer = &back[10..read];
+        assert_eq!(&answer[..2], &[0x12, 0x34], "the id echoes");
+        assert!(answer[2] & 0x80 == 0x80, "the header marks the response");
+        assert!(
+            answer.windows(4).any(|piece| piece == [127, 0, 0, 1]),
+            "the resolver's loopback record rides the answer"
         );
     }
 }
