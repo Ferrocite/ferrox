@@ -573,32 +573,33 @@ pub(crate) fn client_send_handshake(
     let final_psk = list.last()?.clone();
     let key_len = method.key_len();
     let salt = fresh_salt(key_len)?;
-    uplink.write_all(&salt).ok()?;
+    let pad_len = padding_for(0);
+    let variable_len = target.addr_len() + 2 + 2 + pad_len;
+    let eih_count = list.len().saturating_sub(1);
+    let mut staging =
+        Vec::with_capacity(salt.len() + eih_count * BLOCK_LEN + 11 + variable_len + 2 * TAG_LEN);
+    staging.extend_from_slice(&salt);
     if list.len() > 1 {
         if method.is_chacha() {
             return None;
         }
         for i in 0..list.len() - 1 {
             let eih = shadowsocks2022::encrypt_eih(method, &list[i], &salt, &list[i + 1])?;
-            uplink.write_all(&eih).ok()?;
+            staging.extend_from_slice(&eih);
         }
     }
     let mut send = Cipher::from_psk(method, &final_psk, &salt)?;
-    let mut addr = Vec::with_capacity(2 + target.addr_len());
-    target.push_addr(&mut addr, 4, 3);
-    addr.extend_from_slice(&target.port().to_be_bytes());
-    let pad_len = padding_for(0);
-    let mut variable = Vec::with_capacity(addr.len() + 2 + pad_len);
-    variable.extend_from_slice(&addr);
-    variable.extend_from_slice(&(pad_len as u16).to_be_bytes());
-    variable.resize(variable.len() + pad_len, 0);
-    let mut fixed = Vec::with_capacity(11);
-    fixed.push(0);
-    fixed.extend_from_slice(&now_secs().to_be_bytes());
-    fixed.extend_from_slice(&(variable.len() as u16).to_be_bytes());
-    let mut staging = Vec::with_capacity(salt.len() + fixed.len() + variable.len() + 2 * TAG_LEN);
-    send.seal_into(&fixed, &mut staging)?;
-    send.seal_into(&variable, &mut staging)?;
+    let at = staging.len();
+    staging.push(0);
+    staging.extend_from_slice(&now_secs().to_be_bytes());
+    staging.extend_from_slice(&(variable_len as u16).to_be_bytes());
+    send.seal_tail_in_place(&mut staging, at)?;
+    let at = staging.len();
+    target.push_addr(&mut staging, 4, 3);
+    staging.extend_from_slice(&target.port().to_be_bytes());
+    staging.extend_from_slice(&(pad_len as u16).to_be_bytes());
+    staging.resize(staging.len() + pad_len, 0);
+    send.seal_tail_in_place(&mut staging, at)?;
     uplink.write_all(&staging).ok()?;
     Some((send, Recv::Waiting(method, final_psk, salt)))
 }
@@ -2092,6 +2093,70 @@ mod tests {
         let got = cipher.open_in_place(&mut chunk).expect("opens first");
         assert_eq!(&chunk[..got], b"first");
         let _ = s;
+    }
+
+    #[test]
+    fn a_client_handshake_leaves_in_one_write() {
+        let method = Method::Aes256Gcm;
+        let name = "2022-blake3-aes-256-gcm";
+        let password = psk_b64(method.key_len());
+        let target: SocketAddr = "127.0.0.1:443".parse().expect("addr");
+        let mut seen = Vec::new();
+        let (send, recv) = {
+            let mut out = Vectored {
+                seen: &mut seen,
+                writes: 0,
+                bases: Vec::new(),
+            };
+            let got = client_send_handshake(
+                &mut out,
+                &password,
+                name,
+                &crate::proxy::Destination::from(target),
+            )
+            .expect("handshake builds");
+            assert_eq!(out.writes, 1, "the whole handshake leaves in one write");
+            assert_eq!(out.bases.len(), 1, "one write means one base");
+            got
+        };
+        assert_eq!(send.method(), method);
+        let Recv::Waiting(m, p, s) = recv else {
+            panic!("the client waits for a server salt");
+        };
+        assert_eq!(m, method);
+        let mut cipher = Cipher::from_psk(m, &p, &s).expect("derives");
+        let (got, early) = open_handshake(&mut std::io::Cursor::new(&seen[s.len()..]), &mut cipher)
+            .expect("the one-write handshake parses");
+        assert_eq!(got, target);
+        assert!(early.is_empty());
+    }
+
+    #[test]
+    fn a_multi_psk_handshake_leaves_in_one_write() {
+        let method = Method::Aes256Gcm;
+        let name = "2022-blake3-aes-256-gcm";
+        let password = format!(
+            "{}:{}",
+            psk_b64(method.key_len()),
+            psk_b64(method.key_len())
+        );
+        let target: SocketAddr = "127.0.0.1:443".parse().expect("addr");
+        let mut seen = Vec::new();
+        let mut out = Vectored {
+            seen: &mut seen,
+            writes: 0,
+            bases: Vec::new(),
+        };
+        let _ = client_send_handshake(
+            &mut out,
+            &password,
+            name,
+            &crate::proxy::Destination::from(target),
+        )
+        .expect("handshake builds");
+        assert_eq!(out.writes, 1, "the EIH chain rides the same write");
+        assert_eq!(out.bases.len(), 1);
+        assert!(seen.len() > method.key_len() + BLOCK_LEN);
     }
 
     #[test]
