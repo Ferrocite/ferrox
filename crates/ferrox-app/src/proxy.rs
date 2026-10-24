@@ -21484,6 +21484,77 @@ mod tests {
         server.join().expect("joins");
     }
 
+    /// A shadowsocks listener that declares tls over KCP answers the session its config names: the salt and the request ride the records, not the plaintext datagram.
+    #[test]
+    fn a_shadowsocks_kcp_inbound_that_declares_tls_answers_the_session() {
+        let _guard = budgets::lock();
+        let (cert, key, client) = tls_cert_json();
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "shadowsocks", "settings": {{"password": "an-example-shared-password", "method": "aes-256-gcm"}},
+                "streamSettings": {{"network": "kcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        serve_shadowsocks_inbound(&address, &inbound, true);
+        let echo_port = echo_loop();
+        let conn = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        let mut tls = ferrox_core::tls::RustlsProvider::connect(
+            &client,
+            KcpIo {
+                conn: Arc::clone(&conn),
+            },
+        )
+        .expect("opens");
+        assert!(shake_tls(&mut tls), "handshakes");
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let (send, recv) = crate::shadowsocks::client_send_handshake(
+            &mut tls,
+            "an-example-shared-password",
+            "aes-256-gcm",
+            &target,
+        )
+        .expect("writes the header");
+        let (reader, writer) = session_halves(
+            tls,
+            KcpIo {
+                conn: Arc::clone(&conn),
+            },
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let closer = Arc::clone(&conn);
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+        let pump = thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            crate::shadowsocks::pump_relay_carried(&socket, reader, writer, &close, send, recv);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(
+            &read_echo(&mut sock),
+            b"ping",
+            "the tls arm over kcp echoes"
+        );
+        drop(sock);
+        let _ = pump.join();
+        conn.close();
+    }
+
     /// The store is the transport, so an xdrive row that declares tls parses and dials: both roles read the folder the config names.
     #[test]
     fn a_trojan_xdrive_dial_under_tls_reaches_the_store() {
