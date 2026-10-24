@@ -2584,10 +2584,13 @@ fn handle_mux_udp_new(
         out.handles.push(reader);
         session
     };
+    if let Some(old) = udp.insert(frame.id, Arc::clone(&session)) {
+        old.done.store(true, Ordering::Relaxed);
+    }
+    global.retain(|_, id| *id != frame.id);
     if let Some(identity) = identity {
         global.insert(identity, frame.id);
     }
-    udp.insert(frame.id, Arc::clone(&session));
     if let Some(data) = frame.data {
         let _ = session.socket.send_to(data, dest);
     }
@@ -25213,6 +25216,52 @@ mod tests {
         assert_eq!(got, 8);
         assert_eq!(status, ferrox_core::mux::Status::Keep);
         assert_eq!(data, b"ping");
+    }
+
+    #[test]
+    fn a_repeated_udp_new_id_stops_the_session_it_replaces() {
+        let first = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let second = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let first_port = first.local_addr().expect("addr").port();
+        let second_port = second.local_addr().expect("addr").port();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let client = Connection::connect(listener.local_addr().expect("addr")).expect("connects");
+        let (_server, _) = listener.accept().expect("accepts");
+        let shared = Arc::new(Mutex::new(client));
+        let mut udp: UdpTable = HashMap::new();
+        let mut global: UdpGlobal = HashMap::new();
+        let mut staging = Vec::new();
+        let mut handles = Vec::new();
+        let new = |port| ferrox_core::mux::Incoming {
+            id: 7,
+            status: ferrox_core::mux::Status::New,
+            options: 0,
+            target: Some(mux_test_udp_target(port)),
+            global_id: None,
+            reflection: None,
+            data: None,
+        };
+        {
+            let mut out = MuxOut {
+                shared: &shared,
+                staging: &mut staging,
+                handles: &mut handles,
+            };
+            handle_mux_udp_new(new(first_port), &mut udp, &mut global, &mut out);
+        }
+        let old = Arc::clone(udp.get(&7).expect("first session"));
+        {
+            let mut out = MuxOut {
+                shared: &shared,
+                staging: &mut staging,
+                handles: &mut handles,
+            };
+            handle_mux_udp_new(new(second_port), &mut udp, &mut global, &mut out);
+        }
+        assert!(
+            old.done.load(Ordering::Relaxed),
+            "the session the new one replaced is told to stop"
+        );
     }
 
     #[test]
