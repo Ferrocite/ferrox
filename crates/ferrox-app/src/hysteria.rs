@@ -603,7 +603,7 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
             match tcp_read.read(buf.as_mut()) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if up.write_all(buf.filled(n)).is_err() {
+                    if up.write_all(&buf.as_mut()[..n]).is_err() {
                         break;
                     }
                 }
@@ -617,7 +617,7 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
         match back.read(buf.as_mut()) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if tcp_write.write_all(buf.filled(n)).is_err() {
+                if tcp_write.write_all(&buf.as_mut()[..n]).is_err() {
                     break;
                 }
             }
