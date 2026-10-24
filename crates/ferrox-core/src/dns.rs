@@ -32,6 +32,7 @@ const POINTER_HIGH: u8 = 0xC0;
 /// spelled it — trailing dot, case and every byte kept — so the builder packs
 /// what its `dnsmessage.Name` packs. The name rides the question: the longest a
 /// parse accepts is `NAME_MAX`, so every message decides without a heap buffer.
+#[derive(Debug)]
 pub struct Question {
     pub id: u16,
     pub qtype: u16,
