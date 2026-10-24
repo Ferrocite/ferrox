@@ -83,6 +83,8 @@ vmess frame-buffer-allocations-per-relay-write 0 ferrox-app-vmess::tests::frames
 vmess frames-per-plain-write 16 ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write
 vmess plain-write-syscalls-per-16-frame-batch 1 ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write
 vmess pump-buffer-allocations-per-batch 0 ferrox-app-vmess::tests::the_pump_gathers_into_its_own_buffer_and_never_moves_it
+vmess web-socket-staging-copies-per-batch 0 ferrox-app-vmess::tests::a_sealed_batch_reaches_a_web_socket_carrier_where_it_lies
+vmess web-socket-carrier-bytes-opened-at-most 1024 ferrox-app-vmess::tests::a_web_socket_carrier_opens_no_batch_buffer
 vmess counters-per-frame 1 ferrox-app-vmess::tests::counters_advance_one_per_frame_at_any_offset
 vmess replay-keys-held-at-most 131072 ferrox-app-vmess::tests::the_window_holds_two_rotations_at_most
 vmess zero-filled-bytes-per-flow 0 ferrox-app-vmess::tests::the_flows_windows_are_not_zero_filled
