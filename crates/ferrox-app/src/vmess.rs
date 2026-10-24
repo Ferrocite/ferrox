@@ -3662,7 +3662,7 @@ mod tests {
             read_frame(&mut server, &mut uploader, &mut scratch).expect("the upload survives");
         assert_eq!(upload, b"ping");
         let end = read_frame(&mut server, &mut uploader, &mut scratch).expect("the upload marker");
-        assert!(end.is_empty());
+        assert_eq!(end, b"");
         relay.join().expect("joins");
     }
 }
