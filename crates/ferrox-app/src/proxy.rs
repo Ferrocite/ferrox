@@ -18333,7 +18333,7 @@ mod tests {
             inner.write_all(&payload).expect("writes");
             inner.flush().expect("flushes");
             let mut echoed = vec![0u8; width];
-            inner.read_exact(&mut echoed).expect("echoes");
+            ferrox_core::tls::read_exact(&mut inner, &mut echoed).expect("echoes");
             assert_eq!(echoed, payload);
         }
         drop(inner);
