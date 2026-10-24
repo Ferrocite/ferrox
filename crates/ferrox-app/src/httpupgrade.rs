@@ -1,10 +1,11 @@
 use crate::conn::Connection;
 use std::cell::RefCell;
 use std::io::{Read, Write};
+use std::time::Instant;
 
 pub(crate) const HEAD_LIMIT: usize = 64 * 1024;
 
-/// The answer every role of this carrier writes: a status line and the two upgrade headers, and nothing else.
+/// The answer this carrier writes when the request carries no key: a status line and the two upgrade headers.
 pub(crate) const SWITCH: &[u8] =
     b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
 
@@ -66,15 +67,82 @@ fn read_head(stream: &mut Connection) -> Option<(Vec<u8>, usize)> {
     crate::proxy::read_http_head_kept(stream, HEAD_LIMIT, crate::budgets::head_arrival())
 }
 
+/// Where an HTTP/1.1 head ends: the first empty line, whether it is closed with CRLF or a bare LF.
+fn upgrade_head_end(head: &[u8]) -> Option<usize> {
+    if let Some(at) = ferrox_core::foxy::head_end(head) {
+        return Some(at + 4);
+    }
+    let mut at = 0;
+    while at + 1 < head.len() {
+        if head[at] == b'\n' && head[at + 1] == b'\n' {
+            return Some(at + 2);
+        }
+        at += 1;
+    }
+    None
+}
+
+/// The request head the reference's parser reads: any method, any line ending, and the decoded path.
+fn read_upgrade_head<R: Read>(read: &mut R, limit: usize) -> Option<(Vec<u8>, usize)> {
+    const ROUND: usize = 512;
+    let mut head = Vec::with_capacity(ROUND);
+    let until = Instant::now() + crate::budgets::head_arrival();
+    loop {
+        if head.len() >= limit {
+            return None;
+        }
+        let base = head.len();
+        let want = ROUND.min(limit - base);
+        head.resize(base + want, 0);
+        let n = match read.read(&mut head[base..]) {
+            Ok(n) => n,
+            Err(error) if crate::proxy::is_timeout(&error) => {
+                head.truncate(base);
+                if Instant::now() >= until {
+                    return None;
+                }
+                continue;
+            }
+            Err(_) => {
+                head.truncate(base);
+                return None;
+            }
+        };
+        head.truncate(base + n);
+        if n == 0 {
+            return None;
+        }
+        let from = base.saturating_sub(3);
+        if let Some(at) = upgrade_head_end(&head[from..]).map(|hit| hit + from) {
+            return Some((head, at));
+        }
+    }
+}
+
+fn read_request_head(stream: &mut Connection) -> Option<(Vec<u8>, usize)> {
+    let previous = stream.read_timeout().ok().flatten();
+    let poll = previous.map_or(crate::budgets::RELAY_POLL, |armed| {
+        armed.min(crate::budgets::RELAY_POLL)
+    });
+    stream.set_read_timeout(Some(poll)).ok()?;
+    let got = read_upgrade_head(stream, HEAD_LIMIT);
+    let _ = stream.set_read_timeout(previous);
+    got
+}
+
 pub(crate) fn accept(stream: Connection, path: &str) -> Option<(UpReader, Connection)> {
     let mut read = stream;
-    let (head, at) = read_head(&mut read)?;
-    check_request(&head[..at], path)?;
+    let (head, at) = read_request_head(&mut read)?;
+    let key = check_request(&head[..at], path)?;
     let Ok(write) = read.try_clone() else {
         return None;
     };
     let mut write = write;
-    write.write_all(SWITCH).ok()?;
+    if key.is_empty() {
+        write.write_all(SWITCH).ok()?;
+    } else {
+        write.write_all(&switch_answer(key)).ok()?;
+    }
     Some((
         UpReader {
             read,
@@ -85,35 +153,92 @@ pub(crate) fn accept(stream: Connection, path: &str) -> Option<(UpReader, Connec
     ))
 }
 
-fn check_request(head: &[u8], path: &str) -> Option<()> {
-    // One UTF-8 pass and one line scan answers the whole request; the fanout re-validated and rescanned for each field.
-    let text = std::str::from_utf8(head).ok()?;
-    let mut lines = text.split("\r\n");
-    let request_line = lines.next()?;
-    let mut parts = request_line.split_whitespace();
-    if parts.next()? != "GET" {
-        return None;
-    }
-    let target = parts.next()?;
-    if target.split_once('?').map_or(target, |(base, _)| base) != path {
-        return None;
-    }
-    let mut upgrade = false;
-    let mut connection = false;
-    for line in lines {
-        // A colon-less line (the trailing empty one after `\r\n\r\n`, or a stray octet line) is skipped, as the references do.
-        let Some((key, value)) = line.split_once(':') else {
-            continue;
+/// The answer the reference derives: the key it was given, hashed with the WebSocket GUID, answers the accept header.
+fn switch_answer(key: &str) -> Vec<u8> {
+    const GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+    use sha1::Digest as _;
+    let mut hash = sha1::Sha1::new();
+    hash.update(key.as_bytes());
+    hash.update(GUID.as_bytes());
+    let accept = ferrox_core::b64::encode(&hash.finalize());
+    let mut answer = Vec::with_capacity(SWITCH.len() + accept.len() + 64);
+    answer.extend_from_slice(
+        b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nSec-Websocket-Accept: ",
+    );
+    answer.extend_from_slice(accept.as_bytes());
+    answer.extend_from_slice(b"\r\nUpgrade: websocket\r\n\r\n");
+    answer
+}
+
+/// The path the reference compares: the query is stripped and every percent escape is decoded.
+fn path_matches(target: &str, path: &str) -> bool {
+    let base = target.split_once('?').map_or(target, |(base, _)| base);
+    let bytes = base.as_bytes();
+    let mut want = path.as_bytes().iter();
+    let mut at = 0;
+    while at < bytes.len() {
+        let byte = if bytes[at] == b'%' {
+            let Some(hi) = bytes.get(at + 1).copied().and_then(hex_digit) else {
+                return false;
+            };
+            let Some(lo) = bytes.get(at + 2).copied().and_then(hex_digit) else {
+                return false;
+            };
+            at += 3;
+            hi << 4 | lo
+        } else {
+            at += 1;
+            bytes[at - 1]
         };
-        let (key, value) = (key.trim(), value.trim());
-        if key.eq_ignore_ascii_case("upgrade") {
-            upgrade = value.eq_ignore_ascii_case("websocket");
-        } else if key.eq_ignore_ascii_case("connection") {
-            connection = value.eq_ignore_ascii_case("upgrade");
+        if want.next() != Some(&byte) {
+            return false;
         }
     }
-    if upgrade && connection {
-        Some(())
+    want.next().is_none()
+}
+
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// The key the accepted request carried, or an empty slice when it carried none.
+fn check_request<'a>(head: &'a [u8], path: &str) -> Option<&'a str> {
+    // One UTF-8 pass and one line scan answers the whole request; the fanout re-validated and rescanned for each field.
+    let text = std::str::from_utf8(head).ok()?;
+    let mut lines = text
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line));
+    let request_line = lines.next()?;
+    let mut parts = request_line.split_whitespace();
+    let _method = parts.next()?;
+    let target = parts.next()?;
+    if !path_matches(target, path) {
+        return None;
+    }
+    let mut upgrade = None;
+    let mut connection = None;
+    let mut key = None;
+    for line in lines {
+        // A colon-less line (the trailing empty one after the terminator, or a stray octet line) is skipped, as the references do.
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let (name, value) = (name.trim(), value.trim());
+        if name.eq_ignore_ascii_case("upgrade") && upgrade.is_none() {
+            upgrade = Some(value.eq_ignore_ascii_case("websocket"));
+        } else if name.eq_ignore_ascii_case("connection") && connection.is_none() {
+            connection = Some(value.eq_ignore_ascii_case("upgrade"));
+        } else if name.eq_ignore_ascii_case("sec-websocket-key") && key.is_none() {
+            key = Some(value);
+        }
+    }
+    if upgrade == Some(true) && connection == Some(true) {
+        Some(key.unwrap_or_default())
     } else {
         None
     }
@@ -125,10 +250,13 @@ pub(crate) fn accept_split<R: Read, W: Write>(
     mut write: W,
     path: &str,
 ) -> Option<(UpReader<R>, W)> {
-    let (head, at) =
-        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
-    check_request(&head[..at], path)?;
-    write.write_all(SWITCH).ok()?;
+    let (head, at) = read_upgrade_head(&mut read, HEAD_LIMIT)?;
+    let key = check_request(&head[..at], path)?;
+    if key.is_empty() {
+        write.write_all(SWITCH).ok()?;
+    } else {
+        write.write_all(&switch_answer(key)).ok()?;
+    }
     Some((
         UpReader {
             read,
@@ -415,6 +543,48 @@ mod tests {
         server.join().expect("joins");
     }
 
+    #[test]
+    fn check_request_accepts_every_method_a_decoded_path_and_a_bare_lf_head() {
+        let upgrade = "Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        let post = format!("POST /tunnel HTTP/1.1\r\n{upgrade}");
+        assert!(
+            check_request(post.as_bytes(), "/tunnel").is_some(),
+            "the reference reads any method"
+        );
+        let decoded = format!("GET /tun%6Eel HTTP/1.1\r\n{upgrade}");
+        assert!(
+            check_request(decoded.as_bytes(), "/tunnel").is_some(),
+            "the reference compares the decoded path"
+        );
+        let bare_lf = "GET /tunnel HTTP/1.1\nConnection: Upgrade\nUpgrade: websocket\n\n";
+        assert!(
+            check_request(bare_lf.as_bytes(), "/tunnel").is_some(),
+            "the reference reads a bare line feed"
+        );
+    }
+
+    #[test]
+    fn a_bare_lf_head_reaches_the_reader() {
+        let head = b"GET /tunnel HTTP/1.1\nHost: oracle.example\nConnection: Upgrade\nUpgrade: websocket\n\n";
+        assert!(
+            accept_split(std::io::Cursor::new(head.to_vec()), Vec::new(), "/tunnel").is_some(),
+            "the shared head read ends on \\n\\n as the reference does"
+        );
+    }
+
+    #[test]
+    fn a_keyed_request_is_answered_with_the_accept_the_reference_derives() {
+        let head = b"GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+        let (_, answer) = accept_split(std::io::Cursor::new(head.to_vec()), Vec::new(), "/tunnel")
+            .expect("upgrades");
+        let accept = b"Sec-Websocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n";
+        assert!(
+            answer.windows(accept.len()).any(|window| window == accept),
+            "the answer carries the reference's accept header: {}",
+            String::from_utf8_lossy(&answer)
+        );
+    }
+
     /// One UTF-8 pass and one line scan answers the whole request; every byte-level decision matches the previous three-helper fanout.
     #[test]
     fn check_request_accepts_and_refuses_the_vectors_it_did() {
@@ -431,16 +601,17 @@ mod tests {
             "/tunnel"
         )
         .is_some());
-        // Each rejection the previous parse produced, the fused one still produces.
-        assert!(check_request(ok, "/other").is_none(), "wrong path");
+        // A method other than GET is not a rejection: the reference reads any method.
         assert!(
             check_request(
                 b"POST /tunnel HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
                 "/tunnel"
             )
-            .is_none(),
-            "non-GET"
+            .is_some(),
+            "the reference reads any method"
         );
+        // Each rejection the previous parse produced, the fused one still produces.
+        assert!(check_request(ok, "/other").is_none(), "wrong path");
         assert!(
             check_request(
                 b"GET /tunnel HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: gzip\r\n\r\n",
@@ -1087,8 +1258,7 @@ mod tests {
                 at: 0,
                 split,
             };
-            crate::proxy::read_exact_head(&mut reader, HEAD_LIMIT, crate::budgets::head_arrival())
-                .map(|(_, at)| at)
+            read_upgrade_head(&mut reader, HEAD_LIMIT).map(|(_, at)| at)
         }
 
         /// Every offset a short head can be split at, and the offsets that matter for a
@@ -1468,7 +1638,7 @@ mod tests {
             assert_eq!(lengths, 93, "the head lengths the script names");
             assert_eq!(cases, 108, "the head cases the script names");
             assert_eq!(
-                verdicts_differing, 22,
+                verdicts_differing, 21,
                 "the heads the two sides read differently"
             );
             assert_eq!(offsets_differing, 0, "the head ends that differ");
@@ -1500,10 +1670,10 @@ mod tests {
             }
             assert_eq!(cases, 13, "the served cases the script names");
             assert_eq!(
-                verdicts_differing, 4,
+                verdicts_differing, 1,
                 "the verdicts the two sides give differently"
             );
-            assert_eq!(answers_differing, 6, "the answers that differ");
+            assert_eq!(answers_differing, 1, "the answers that differ");
             assert_eq!(dropped, 2, "the tails the reference dropped");
         }
 
