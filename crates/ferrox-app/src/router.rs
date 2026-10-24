@@ -338,7 +338,9 @@ impl Routing {
                     .ok_or_else(|| "routing rules is not an array".to_owned())?;
                 let mut tags = HashSet::new();
                 for item in items {
-                    let rule = Rule::parse(item, &mut assets)?;
+                    let Some(rule) = Rule::parse(item, &mut assets)? else {
+                        continue;
+                    };
                     if let Some(tag) = &rule.tag {
                         if !tags.insert(tag.clone()) {
                             return Err(format!("duplicate ruleTag `{tag}`"));
@@ -626,7 +628,7 @@ fn rule_field_target(field: &Json, name: &str) -> Result<Option<String>, String>
 }
 
 impl Rule {
-    fn parse(value: &Json, assets: &mut Assets) -> Result<Self, String> {
+    fn parse(value: &Json, assets: &mut Assets) -> Result<Option<Self>, String> {
         let pairs = object(value, "routing rule")?;
         let mut target = None;
         let mut balancing_target = None;
@@ -645,6 +647,7 @@ impl Rule {
         let mut source_value = None;
         let mut source_ip_value = None;
         let mut local_ips = None;
+        let mut unread = None;
         for (key, field) in pairs {
             match key.as_str() {
                 "outboundTag" => target = rule_field_target(field, "outboundTag")?,
@@ -658,7 +661,10 @@ impl Rule {
                     }
                 }
                 "ruleTag" => {
-                    tag = field.as_str().filter(|tag| !tag.is_empty()).map(str::to_owned);
+                    tag = field
+                        .as_str()
+                        .filter(|tag| !tag.is_empty())
+                        .map(str::to_owned);
                 }
                 "domain" => domain_value = Some(field),
                 "domains" => domains_list = Some(field),
@@ -673,9 +679,7 @@ impl Rule {
                 "inboundTag" => inbound_tags = string_list(field, "inboundTag")?,
                 "localOS" => local_os = string_list(field, "localOS")?,
                 "protocol" | "attrs" | "user" | "vlessRoute" | "process" | "webhook" => {
-                    return Err(format!(
-                        "routing rule selector `{key}` needs the engine sniffer, users or a webhook this tree does not carry"
-                    ))
+                    unread = Some(key);
                 }
                 other => return Err(format!("routing rule field `{other}` is not carried")),
             }
@@ -684,6 +688,10 @@ impl Rule {
         let target = target
             .or(balancing_target)
             .ok_or_else(|| "routing rule names neither outboundTag nor balancerTag".to_owned())?;
+        if let Some(selector) = unread {
+            eprintln!("routing rule selector `{selector}` is not carried; the rule is skipped");
+            return Ok(None);
+        }
         let domain_json = domains_list.or(domain_value);
         if let Some(field) = domain_json {
             domains = Some(domain_matcher(field, assets)?);
@@ -692,7 +700,7 @@ impl Rule {
         if let Some(field) = source_json {
             source_ips = Some(ip_matcher(field, assets, "routing sourceIP")?);
         }
-        let rule = Self {
+        Ok(Some(Self {
             target,
             balancer: balancing,
             tag,
@@ -706,24 +714,7 @@ impl Rule {
             ips,
             source_ips,
             local_ips,
-        };
-        if !rule.has_selector() {
-            return Err("routing rule has no effective fields".into());
-        }
-        Ok(rule)
-    }
-
-    fn has_selector(&self) -> bool {
-        self.inbound_tags.is_some()
-            || self.networks.is_some()
-            || self.local_os.is_some()
-            || self.ports.is_some()
-            || self.source_ports.is_some()
-            || self.local_ports.is_some()
-            || self.domains.is_some()
-            || self.ips.is_some()
-            || self.source_ips.is_some()
-            || self.local_ips.is_some()
+        }))
     }
 
     fn association_stable(&self) -> bool {
@@ -2511,7 +2502,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fields_and_empty_rules_are_refused_by_name() {
+    fn unknown_routing_fields_are_refused_by_name() {
         let root = object(vec![(
             "routing",
             object(vec![("script", text("x")), ("rules", array(Vec::new()))]),
@@ -2520,19 +2511,50 @@ mod tests {
         assert!(error.contains("script"), "{error}");
         let root = object(vec![(
             "routing",
-            routing(vec![rule(
-                "direct",
-                vec![("protocol", array(vec![text("http")]))],
-            )]),
+            routing(vec![rule("direct", vec![("notAField", text("x"))])]),
         )]);
         let error = Routing::parse_in(&root, vec![dir()]).expect_err("refused");
-        assert!(error.contains("protocol"), "{error}");
+        assert!(error.contains("notAField"), "{error}");
+    }
+
+    #[test]
+    fn a_catch_all_rule_matches_every_flow_and_a_sniffer_rule_is_skipped() {
         let root = object(vec![(
             "routing",
-            routing(vec![object(vec![("outboundTag", text("direct"))])]),
+            routing(vec![
+                rule(
+                    "block",
+                    vec![
+                        ("domain", array(vec![text("x.com")])),
+                        ("protocol", array(vec![text("http")])),
+                    ],
+                ),
+                rule("direct", Vec::new()),
+            ]),
         )]);
-        let error = Routing::parse_in(&root, vec![dir()]).expect_err("refused");
-        assert!(error.contains("no effective fields"), "{error}");
+        let parsed = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let named = Flow {
+            network: Network::Tcp,
+            domain: Some("x.com"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: None,
+        };
+        assert_eq!(parsed.route(&named), Some("direct"));
+        let bare = Flow {
+            network: Network::Udp,
+            domain: None,
+            ip: None,
+            port: None,
+            source: None,
+            local: None,
+            inbound_tag: None,
+        };
+        assert_eq!(parsed.route(&bare), Some("direct"));
     }
 
     #[test]
