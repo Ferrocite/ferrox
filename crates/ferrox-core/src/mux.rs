@@ -611,13 +611,15 @@ impl<T> Sessions<T> {
     pub fn open(&mut self, id: u16, value: T) -> Option<Option<T>> {
         let (found, free) = self.probe(id);
         if let Some(at) = found {
-            let replaced = std::mem::replace(&mut self.slots[at], Slot::Live(id, value));
-            return Some(if let Slot::Live(_, old) = replaced {
-                Some(old)
-            } else {
-                self.live += 1;
-                None
-            });
+            if let Slot::Live(_, old) = &mut self.slots[at] {
+                return Some(Some(std::mem::replace(old, value)));
+            }
+            if self.live >= self.cap {
+                return None;
+            }
+            self.slots[at] = Slot::Live(id, value);
+            self.live += 1;
+            return Some(None);
         }
         if self.live >= self.cap {
             return None;
@@ -1410,6 +1412,31 @@ mod tests {
             assert_eq!(sessions.live(), 0, "round {round}");
         }
         assert_eq!(sessions.slot_count(), slots, "1000 rounds and no growth");
+    }
+
+    #[test]
+    fn a_tombstone_does_not_open_past_the_cap() {
+        let mut sessions = Sessions::with_cap(2);
+        assert_eq!(sessions.open(1, 'a'), Some(None));
+        assert_eq!(sessions.open(2, 'b'), Some(None));
+        assert_eq!(sessions.close(1), Some('a'));
+        assert_eq!(
+            sessions.open(3, 'c'),
+            Some(None),
+            "a free slot, not the tombstone"
+        );
+        assert_eq!(sessions.live(), 2);
+        assert_eq!(
+            sessions.open(1, 'd'),
+            None,
+            "reusing a tombstone is a third live session"
+        );
+        assert_eq!(sessions.live(), 2);
+        assert_eq!(
+            sessions.get(1),
+            None,
+            "and the refused session left no slot"
+        );
     }
 
     #[test]
