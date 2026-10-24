@@ -992,6 +992,8 @@ pub(crate) struct Wire<R> {
     /// A frame whose length is drawn but whose bytes have not all arrived.
     waiting: Option<(usize, usize)>,
     last: bool,
+    /// The last frame opened was the zero-length marker, not a carrier end.
+    marker: bool,
 }
 
 impl<R: Read> Wire<R> {
@@ -1004,7 +1006,14 @@ impl<R: Read> Wire<R> {
             plain: 0,
             waiting: None,
             last: false,
+            marker: false,
         }
+    }
+
+    /// Whether the peer said this direction is over with its marker frame, rather than the
+    /// carrier ending under it.
+    fn ended_by_marker(&self) -> bool {
+        self.marker
     }
 
     /// Open up to `FRAMES_PER_WRITE` frames, waiting only for the first, and hand back their
@@ -1110,6 +1119,7 @@ impl<R: Read> Wire<R> {
         };
         self.start = body + total;
         if len == 0 {
+            self.marker = true;
             return Frame::Last;
         }
         // Every earlier frame left more bytes than it took, so gathering never reaches forward.
@@ -1365,9 +1375,10 @@ pub(crate) fn pump_relay_carried<R, W>(
             return;
         };
         let mut first = true;
+        let mut ended = false;
         while let Ok(read) = plain_read.read(&mut buf) {
             if read == 0 {
-                let _ = write_frame(&mut writer, &mut send, &[], &mut staging, &mut pad);
+                ended = write_frame(&mut writer, &mut send, &[], &mut staging, &mut pad);
                 break;
             }
             let traced = crate::proxy::echo_trace_on() && first;
@@ -1402,8 +1413,10 @@ pub(crate) fn pump_relay_carried<R, W>(
                 break;
             }
         }
-        thread_close();
-        let _ = plain_read.shutdown(Shutdown::Both);
+        // A clean end tells the peer this direction is done; the other direction keeps relaying.
+        if !ended {
+            thread_close();
+        }
     });
 
     let mut recv = recv;
@@ -1427,9 +1440,18 @@ pub(crate) fn pump_relay_carried<R, W>(
             break;
         }
     }
+    if reader.ended_by_marker() {
+        // The marker ends this direction only: half-close its peer and keep the other direction.
+        let _ = plain_write.shutdown(Shutdown::Write);
+        let _ = done.join();
+    } else {
+        close();
+        let _ = plain_write.shutdown(Shutdown::Both);
+        let _ = done.join();
+        return;
+    }
     close();
     let _ = plain_write.shutdown(Shutdown::Both);
-    let _ = done.join();
 }
 
 pub(crate) fn serve_ws(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
@@ -3323,5 +3345,127 @@ mod tests {
             "the two frames that came first are not lost to the marker"
         );
         assert_eq!(got, plain);
+    }
+
+    #[test]
+    fn only_the_marker_marks_a_stream_as_ended_by_its_peer() {
+        let (sealed, plain, mut recv) = frames(&[4]);
+        let mut wire = Wire::new(Sealed {
+            held: sealed,
+            at: 0,
+            grain: usize::MAX,
+            reads: 0,
+        });
+        let (_, got) = drain(&mut wire, &mut recv);
+        assert_eq!(got, plain);
+        assert!(
+            !wire.ended_by_marker(),
+            "a carrier that ends is not the peer's marker"
+        );
+
+        let key = [0x55u8; 16];
+        let iv = [0x66u8; 16];
+        let options = OPT_STREAM | OPT_MASK | OPT_PAD;
+        let mut sender = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+        let mut pad = PadSource::fresh().expect("entropy");
+        let mut marker = Vec::new();
+        assert!(
+            stage_frame(&mut sender, &[], &mut marker, &mut pad),
+            "seals the marker"
+        );
+        let mut recv = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("recvs");
+        let mut wire = Wire::new(Sealed {
+            held: marker,
+            at: 0,
+            grain: usize::MAX,
+            reads: 0,
+        });
+        assert_eq!(drain(&mut wire, &mut recv).1, Vec::<u8>::new());
+        assert!(
+            wire.ended_by_marker(),
+            "the zero-length frame is the peer's end"
+        );
+    }
+
+    /// A write half the relay seals into, kept so the test can open it after the pump returns.
+    struct Collected(std::sync::Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Collected {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("lock").extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_peer_that_ends_its_upload_with_the_marker_still_gets_the_download() {
+        let key = [0x55u8; 16];
+        let iv = [0x66u8; 16];
+        let options = OPT_STREAM | OPT_MASK | OPT_PAD;
+        let mut sender = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+        let mut pad = PadSource::fresh().expect("entropy");
+        let mut marker = Vec::new();
+        assert!(
+            stage_frame(&mut sender, &[], &mut marker, &mut pad),
+            "seals the upload marker"
+        );
+        let send = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+        let recv = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("recvs");
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let target = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accepts");
+            let mut buf = [0u8; 16];
+            let mut uploaded = 0usize;
+            loop {
+                match socket.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(read) => uploaded += read,
+                    Err(error) => panic!("target read: {error:?}"),
+                }
+            }
+            assert_eq!(
+                uploaded, 0,
+                "the upload ended at its marker, not with bytes"
+            );
+            socket.write_all(b"pong").expect("writes");
+            let _ = socket.shutdown(std::net::Shutdown::Write);
+        });
+
+        let uplink = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let out = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let carrier = Sealed {
+            held: marker,
+            at: 0,
+            grain: usize::MAX,
+            reads: 0,
+        };
+        let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(|| {});
+        pump_relay_carried(
+            &uplink,
+            carrier,
+            Collected(std::sync::Arc::clone(&out)),
+            &close,
+            send,
+            recv,
+            None,
+        );
+        target.join().expect("joins");
+
+        let mut answer = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("answers");
+        let mut wire = Wire::new(Cursor::new(out.lock().expect("lock").clone()));
+        let mut got = Vec::new();
+        while let Some(batch) = wire.batch(&mut answer) {
+            got.extend_from_slice(batch);
+        }
+        assert_eq!(
+            got, b"pong",
+            "the download survives the upload's marker and arrives after it"
+        );
     }
 }
