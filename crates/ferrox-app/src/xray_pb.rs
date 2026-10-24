@@ -1097,9 +1097,12 @@ fn dns_settings(bytes: &[u8]) -> Result<Json, String> {
                 }
             }
             (4, 2) => hosts.push(dns_host_mapping(reader.bytes()?)?),
-            // The client's inbound tag scopes a policy; this tree's resolver dials directly.
             (6, 2) => {
-                reader.bytes()?;
+                let tag = std::str::from_utf8(reader.bytes()?)
+                    .map_err(|_| "xray.app.dns.Config: the tag is not utf-8".to_owned())?;
+                if !tag.is_empty() {
+                    pairs.push(("tag", Json::Str(tag.to_owned())));
+                }
             }
             (8, 0) => pairs.push(("disableCache", Json::Bool(reader.varint()? != 0))),
             (12, 0) => pairs.push(("serveStale", Json::Bool(reader.varint()? != 0))),
@@ -1153,6 +1156,8 @@ fn dns_name_server(bytes: &[u8]) -> Result<Json, String> {
     let mut act_unprior = false;
     let mut final_query = false;
     let mut query_strategy = 0;
+    let mut tag = None;
+    let mut policy_id = None;
     let mut timeout = None;
     let mut disable_cache = None;
     let mut serve_stale = None;
@@ -1177,12 +1182,22 @@ fn dns_name_server(bytes: &[u8]) -> Result<Json, String> {
             (7, 0) => query_strategy = reader.varint()?,
             (8, 0) => act_prior = reader.varint()? != 0,
             (14, 0) => act_unprior = reader.varint()? != 0,
-            // A tag names a policy, a policy ID bounds a script and an id labels the server.
-            (9 | 18, 2) => {
+            // An id labels the server for a script; a tag scopes the policy a parallel group shares.
+            (9, 2) => {
+                let found = std::str::from_utf8(reader.bytes()?)
+                    .map_err(|_| "xray.app.dns.NameServer: the tag is not utf-8".to_owned())?;
+                if !found.is_empty() {
+                    tag = Some(found.to_owned());
+                }
+            }
+            (18, 2) => {
                 reader.bytes()?;
             }
             (17, 0) => {
-                reader.varint()?;
+                policy_id = Some(u32_value(
+                    reader.varint()?,
+                    "xray.app.dns.NameServer: policyID",
+                )?);
             }
             (10, 0) => {
                 timeout = Some(u32_value(
@@ -1230,6 +1245,12 @@ fn dns_name_server(bytes: &[u8]) -> Result<Json, String> {
     }
     if final_query {
         pairs.push(("finalQuery", Json::Bool(true)));
+    }
+    if let Some(tag) = tag {
+        pairs.push(("tag", Json::Str(tag)));
+    }
+    if let Some(policy_id) = policy_id {
+        pairs.push(("policyID", Json::Num(f64::from(policy_id))));
     }
     pairs.push((
         "queryStrategy",
@@ -2644,6 +2665,8 @@ mod tests {
         let server = message(&[
             bytes_field(1, &endpoint(&bytes_field(1, &[192, 0, 2, 8]), 53, 3)),
             bytes_field(2, &domain_rule(3, b"example.com")),
+            bytes_field(9, b"server-in"),
+            varint_field(17, 7),
             bytes_field(5, &[192, 0, 2, 4]),
             varint_field(6, 1),
             varint_field(7, 1),
@@ -2664,6 +2687,7 @@ mod tests {
         let settings = message(&[
             bytes_field(5, &server),
             bytes_field(3, &[192, 0, 2, 9]),
+            bytes_field(6, b"dns-in"),
             bytes_field(4, &mapped),
             bytes_field(4, &proxy),
             varint_field(8, 1),

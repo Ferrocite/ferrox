@@ -2380,7 +2380,11 @@ fn install_dns_route(route: Option<Arc<RouteShared>>, outbound: Option<&Outbound
 
 /// The outbound a DNS server address takes, resolved once through the same rules every other
 /// flow uses. A missing route means the resolver's own dial.
-fn dns_outbound(dest: &Destination, network: crate::router::Network) -> Option<Outbound> {
+fn dns_outbound(
+    dest: &Destination,
+    network: crate::router::Network,
+    tag: Option<&str>,
+) -> Option<Outbound> {
     let (route, outbound) = {
         let held = DNS_ROUTE.lock().ok()?;
         let stored = held.as_ref()?;
@@ -2388,7 +2392,7 @@ fn dns_outbound(dest: &Destination, network: crate::router::Network) -> Option<O
     };
     match route {
         Some(shared) => {
-            let plan = RoutePlan::new(shared, None, false);
+            let plan = RoutePlan::new(shared, tag.map(str::to_owned), false);
             Some(plan.pick(dest, network, None).clone())
         }
         None => outbound,
@@ -2396,9 +2400,11 @@ fn dns_outbound(dest: &Destination, network: crate::router::Network) -> Option<O
 }
 
 fn dns_socket(host: &str, port: u16) -> Option<SocketAddr> {
-    host.parse::<std::net::IpAddr>()
-        .ok()
-        .map(|ip| SocketAddr::new(ip, port))
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Some(SocketAddr::new(ip, port));
+    }
+    // The SOCKS datagram frame carries an address, so a name resolves before the route sees it.
+    (host, port).to_socket_addrs().ok()?.next()
 }
 
 fn dns_destination(host: &str, port: u16) -> Destination {
@@ -2411,9 +2417,14 @@ fn dns_destination(host: &str, port: u16) -> Destination {
 /// A stream to a DNS server, carried by the route's chosen outbound over a loopback pair.
 /// The outbound sees the literal or the name the config gave, the same destination the
 /// reference hands its dispatcher.
-pub(crate) fn dns_stream(host: &str, port: u16, timeout: Duration) -> Option<Connection> {
+pub(crate) fn dns_stream(
+    host: &str,
+    port: u16,
+    tag: Option<&str>,
+    timeout: Duration,
+) -> Option<Connection> {
     let dest = dns_destination(host, port);
-    let out = dns_outbound(&dest, crate::router::Network::Tcp)?;
+    let out = dns_outbound(&dest, crate::router::Network::Tcp, tag)?;
     // Freedom is the system dial under another name, so the direct path is shorter and the same.
     if matches!(out, Outbound::Freedom) {
         return None;
@@ -2444,11 +2455,17 @@ fn dns_stream_with(out: &Outbound, dest: Destination, timeout: Duration) -> Opti
 }
 
 /// One DNS datagram through the route's chosen outbound. The SOCKS UDP frame needs the
-/// resolved address, so a hostname takes the system dial; a literal rides the chosen lane.
-pub(crate) fn dns_udp(host: &str, port: u16, query: &[u8], timeout: Duration) -> Option<Vec<u8>> {
+/// resolved address, so a hostname resolves through the system before the chosen lane sees it.
+pub(crate) fn dns_udp(
+    host: &str,
+    port: u16,
+    tag: Option<&str>,
+    query: &[u8],
+    timeout: Duration,
+) -> Option<Vec<u8>> {
     let target = dns_socket(host, port)?;
     let dest = Destination::Address(target);
-    let out = dns_outbound(&dest, crate::router::Network::Udp)?;
+    let out = dns_outbound(&dest, crate::router::Network::Udp, tag)?;
     if matches!(out, Outbound::Freedom) {
         return None;
     }

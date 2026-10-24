@@ -13,7 +13,8 @@ use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU16, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const DEFAULT_TTL: u32 = 300;
@@ -73,6 +74,8 @@ struct Server {
     local_dial: bool,
     skip_fallback: bool,
     final_query: bool,
+    policy_id: u32,
+    tag: Option<String>,
     timeout: Duration,
     cache: CachePolicy,
     client_ip: Option<IpAddr>,
@@ -210,6 +213,7 @@ pub(crate) struct Resolver {
     strategy: Strategy,
     disable_fallback: bool,
     disable_fallback_if_match: bool,
+    parallel: bool,
     cache: Vec<Mutex<HashMap<String, CacheEntry>>>,
     fake: Option<FakePools>,
 }
@@ -227,27 +231,21 @@ impl Resolver {
         }
         let strategy = parse_strategy(dns.get("queryStrategy").and_then(Json::as_str));
         let client_ip = parse_ip(dns.get("clientIp").and_then(Json::as_str))?;
-        let disable_cache = dns
-            .get("disableCache")
-            .and_then(Json::as_bool)
-            .unwrap_or(false);
-        let serve_stale = dns
-            .get("serveStale")
-            .and_then(Json::as_bool)
-            .unwrap_or(false);
+        let disable_cache = flag(dns, "disableCache");
+        let serve_stale = flag(dns, "serveStale");
         let serve_expired = Duration::from_secs(
             dns.get("serveExpiredTTL")
                 .and_then(Json::as_u32)
                 .unwrap_or(0) as u64,
         );
-        let disable_fallback = dns
-            .get("disableFallback")
-            .and_then(Json::as_bool)
-            .unwrap_or(false);
-        let disable_fallback_if_match = dns
-            .get("disableFallbackIfMatch")
-            .and_then(Json::as_bool)
-            .unwrap_or(false);
+        let disable_fallback = flag(dns, "disableFallback");
+        let disable_fallback_if_match = flag(dns, "disableFallbackIfMatch");
+        let parallel = flag(dns, "enableParallelQuery");
+        let tag = dns
+            .get("tag")
+            .and_then(Json::as_str)
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_owned);
         warn_unsupported(dns);
         let mut assets = Assets::new(asset_dirs());
         let mut servers = Vec::new();
@@ -260,6 +258,7 @@ impl Resolver {
                     disable_cache,
                     serve_stale,
                     serve_expired,
+                    tag.as_deref(),
                     &mut assets,
                 )?);
             }
@@ -274,6 +273,8 @@ impl Resolver {
                 local_dial: true,
                 skip_fallback: false,
                 final_query: false,
+                policy_id: 0,
+                tag: tag.clone(),
                 timeout: DEFAULT_TIMEOUT,
                 cache: CachePolicy {
                     disable: disable_cache,
@@ -314,29 +315,30 @@ impl Resolver {
             strategy,
             disable_fallback,
             disable_fallback_if_match,
+            parallel,
             cache,
             fake,
         }))
     }
 
-    pub(crate) fn lookup(&self, name: &str) -> Option<(Vec<IpAddr>, u32)> {
+    pub(crate) fn lookup(self: &Arc<Self>, name: &str) -> Option<(Vec<IpAddr>, u32)> {
         self.lookup_inner(name, false, false).records()
     }
 
     /// The relay's own outbound addresses resolve through the local dial: a routed DNS query
     /// for the proxy's own name would ask the proxy it is trying to open.
-    pub(crate) fn lookup_local(&self, name: &str) -> Option<(Vec<IpAddr>, u32)> {
+    pub(crate) fn lookup_local(self: &Arc<Self>, name: &str) -> Option<(Vec<IpAddr>, u32)> {
         self.lookup_inner(name, false, true).records()
     }
 
     /// The same lookup with the answer's kind kept: the DNS lane answers an empty
     /// response and an rcode as themselves instead of calling both a hard error.
-    pub(crate) fn lookup_result(&self, name: &str) -> Lookup {
+    pub(crate) fn lookup_result(self: &Arc<Self>, name: &str) -> Lookup {
         self.lookup_inner(name, false, false)
     }
 
     #[allow(dead_code)]
-    pub(crate) fn lookup_fake(&self, name: &str) -> Option<(Vec<IpAddr>, u32)> {
+    pub(crate) fn lookup_fake(self: &Arc<Self>, name: &str) -> Option<(Vec<IpAddr>, u32)> {
         self.lookup_inner(name, true, false).records()
     }
 
@@ -345,7 +347,7 @@ impl Resolver {
         self.fake.as_ref().and_then(|fake| fake.domain_of(ip))
     }
 
-    fn lookup_inner(&self, name: &str, fake_enabled: bool, force_local: bool) -> Lookup {
+    fn lookup_inner(self: &Arc<Self>, name: &str, fake_enabled: bool, force_local: bool) -> Lookup {
         let mut name = Cow::Borrowed(name.trim_end_matches('.'));
         if name.is_empty() {
             return Lookup::Failed;
@@ -411,6 +413,23 @@ impl Resolver {
 
     #[allow(clippy::fn_params_excessive_bools)]
     fn ask(
+        self: &Arc<Self>,
+        order: &[usize],
+        name: &str,
+        v4: bool,
+        v6: bool,
+        fake_enabled: bool,
+        force_local: bool,
+    ) -> Lookup {
+        if self.parallel {
+            self.ask_parallel(order, name, v4, v6, fake_enabled, force_local)
+        } else {
+            self.ask_serial(order, name, v4, v6, fake_enabled, force_local)
+        }
+    }
+
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn ask_serial(
         &self,
         order: &[usize],
         name: &str,
@@ -419,54 +438,130 @@ impl Resolver {
         fake_enabled: bool,
         force_local: bool,
     ) -> Lookup {
+        let mut last_rcode = None;
         let mut empty = false;
         for &index in order {
-            let server = &self.servers[index];
-            if server.transport == Transport::Fake && !fake_enabled {
-                continue;
+            match self.query_server(index, name, v4, v6, fake_enabled, force_local) {
+                Lookup::Records(ips, ttl) if !ips.is_empty() => return Lookup::Records(ips, ttl),
+                Lookup::Records(_, _) | Lookup::Empty => empty = true,
+                Lookup::Rcode(code) => last_rcode = Some(code),
+                Lookup::Failed => {}
             }
-            let mut ips = Vec::new();
-            let mut ttl = u32::MAX;
-            let mut families = 0u8;
-            let mut rcode = None;
-            if v4 && server.v4 {
-                match self.family(index, name, Family::A, force_local) {
-                    Lookup::Records(mut found, found_ttl) => {
-                        ttl = ttl.min(found_ttl);
-                        ips.append(&mut found);
-                        families += 1;
+        }
+        last_rcode
+            .map(Lookup::Rcode)
+            .unwrap_or(if empty { Lookup::Empty } else { Lookup::Failed })
+    }
+
+    /// One group races its servers and the next group starts only when this one answered nothing.
+    /// The reference groups adjacent servers by `policyID`; a group's first non-empty answer wins.
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn ask_parallel(
+        self: &Arc<Self>,
+        order: &[usize],
+        name: &str,
+        v4: bool,
+        v6: bool,
+        fake_enabled: bool,
+        force_local: bool,
+    ) -> Lookup {
+        let mut last_rcode = None;
+        let mut empty = false;
+        let mut start = 0;
+        while start < order.len() {
+            let policy = self.servers[order[start]].policy_id;
+            let mut end = start + 1;
+            while end < order.len() && self.servers[order[end]].policy_id == policy {
+                end += 1;
+            }
+            let (sender, receiver) = mpsc::channel();
+            for &index in &order[start..end] {
+                let resolver = Arc::clone(self);
+                let name = name.to_owned();
+                let sender = sender.clone();
+                thread::spawn(move || {
+                    let result =
+                        resolver.query_server(index, &name, v4, v6, fake_enabled, force_local);
+                    let _ = sender.send(result);
+                });
+            }
+            drop(sender);
+            for _ in start..end {
+                let Ok(result) = receiver.recv() else {
+                    break;
+                };
+                match result {
+                    Lookup::Records(ips, ttl) if !ips.is_empty() => {
+                        return Lookup::Records(ips, ttl);
                     }
-                    Lookup::Rcode(code) => rcode = Some(code),
-                    Lookup::Empty => empty = true,
+                    Lookup::Records(_, _) | Lookup::Empty => empty = true,
+                    Lookup::Rcode(code) => last_rcode = Some(code),
                     Lookup::Failed => {}
                 }
             }
-            if v6 && server.v6 {
-                match self.family(index, name, Family::Aaaa, force_local) {
-                    Lookup::Records(mut found, found_ttl) => {
-                        ttl = ttl.min(found_ttl);
-                        ips.append(&mut found);
-                        families += 1;
-                    }
-                    Lookup::Rcode(code) => rcode = Some(code),
-                    Lookup::Empty => empty = true,
-                    Lookup::Failed => {}
+            start = end;
+        }
+        last_rcode
+            .map(Lookup::Rcode)
+            .unwrap_or(if empty { Lookup::Empty } else { Lookup::Failed })
+    }
+
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn query_server(
+        &self,
+        index: usize,
+        name: &str,
+        v4: bool,
+        v6: bool,
+        fake_enabled: bool,
+        force_local: bool,
+    ) -> Lookup {
+        let server = &self.servers[index];
+        if server.transport == Transport::Fake && !fake_enabled {
+            return Lookup::Empty;
+        }
+        let mut ips = Vec::new();
+        let mut ttl = u32::MAX;
+        let mut families = 0u8;
+        let mut rcode = None;
+        let mut empty = false;
+        if v4 && server.v4 {
+            match self.family(index, name, Family::A, force_local) {
+                Lookup::Records(mut found, found_ttl) => {
+                    ttl = ttl.min(found_ttl);
+                    ips.append(&mut found);
+                    families += 1;
                 }
+                Lookup::Rcode(code) => rcode = Some(code),
+                Lookup::Empty => empty = true,
+                Lookup::Failed => {}
             }
+        }
+        if v6 && server.v6 {
+            match self.family(index, name, Family::Aaaa, force_local) {
+                Lookup::Records(mut found, found_ttl) => {
+                    ttl = ttl.min(found_ttl);
+                    ips.append(&mut found);
+                    families += 1;
+                }
+                Lookup::Rcode(code) => rcode = Some(code),
+                Lookup::Empty => empty = true,
+                Lookup::Failed => {}
+            }
+        }
+        if !ips.is_empty() {
+            let ips = self.filter(index, ips);
             if !ips.is_empty() {
-                let ips = self.filter(index, ips);
-                if !ips.is_empty() {
-                    let ttl = if families > 1 {
-                        ttl.min(DEFAULT_TTL)
-                    } else {
-                        ttl
-                    };
-                    return Lookup::Records(ips, ttl);
-                }
+                let ttl = if families > 1 {
+                    ttl.min(DEFAULT_TTL)
+                } else {
+                    ttl
+                };
+                return Lookup::Records(ips, ttl);
             }
-            if let Some(code) = rcode {
-                return Lookup::Rcode(code);
-            }
+        }
+        if let Some(code) = rcode {
+            return Lookup::Rcode(code);
         }
         if empty {
             Lookup::Empty
@@ -611,6 +706,7 @@ impl Resolver {
                     &endpoint.host,
                     endpoint.port,
                     &query,
+                    server.tag.as_deref(),
                     None,
                     server.timeout,
                     server.local_dial || force_local,
@@ -622,6 +718,7 @@ impl Resolver {
                         &endpoint.host,
                         endpoint.port,
                         &query,
+                        server.tag.as_deref(),
                         None,
                         server.timeout,
                         server.local_dial || force_local,
@@ -638,6 +735,7 @@ impl Resolver {
                     &endpoint.host,
                     endpoint.port,
                     &query,
+                    server.tag.as_deref(),
                     None,
                     server.timeout,
                     server.local_dial || force_local,
@@ -651,6 +749,7 @@ impl Resolver {
                     &endpoint.host,
                     endpoint.port,
                     &query,
+                    server.tag.as_deref(),
                     None,
                     server.timeout,
                     server.local_dial || force_local,
@@ -665,6 +764,7 @@ impl Resolver {
                 &server.path,
                 *cleartext,
                 &query,
+                server.tag.as_deref(),
                 None,
                 server.timeout,
                 server.local_dial || force_local,
@@ -800,14 +900,11 @@ fn parse_strategy(text: Option<&str>) -> Strategy {
     }
 }
 
+fn flag(dns: &Json, key: &str) -> bool {
+    dns.get(key).and_then(Json::as_bool).unwrap_or(false)
+}
+
 fn warn_unsupported(dns: &Json) {
-    if dns
-        .get("enableParallelQuery")
-        .and_then(Json::as_bool)
-        .unwrap_or(false)
-    {
-        eprintln!("dns: enableParallelQuery is not carried; querying servers in order");
-    }
     if dns
         .get("script")
         .and_then(Json::as_str)
@@ -873,6 +970,7 @@ fn parse_ip(text: Option<&str>) -> Result<Option<IpAddr>, String> {
     }
 }
 
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn parse_server(
     item: &Json,
     strategy: Strategy,
@@ -880,6 +978,7 @@ fn parse_server(
     disable_cache: bool,
     serve_stale: bool,
     serve_expired: Duration,
+    default_tag: Option<&str>,
     assets: &mut Assets,
 ) -> Result<Server, String> {
     let (
@@ -888,6 +987,7 @@ fn parse_server(
         domains,
         skip_fallback,
         final_query,
+        policy_id,
         own_strategy,
         own_client,
         timeout,
@@ -901,6 +1001,7 @@ fn parse_server(
             None,
             false,
             false,
+            0,
             strategy,
             client_ip,
             DEFAULT_TIMEOUT,
@@ -923,6 +1024,7 @@ fn parse_server(
                 item.get("finalQuery")
                     .and_then(Json::as_bool)
                     .unwrap_or(false),
+                item.get("policyID").and_then(Json::as_u32).unwrap_or(0),
                 parse_strategy(item.get("queryStrategy").and_then(Json::as_str)),
                 parse_ip(item.get("clientIp").and_then(Json::as_str))?.or(client_ip),
                 Duration::from_millis(
@@ -944,6 +1046,12 @@ fn parse_server(
         _ => return Err("dns: nameserver is not a string or object".into()),
     };
     let (transport, endpoint, path, implicit_local, local_dial) = parse_address(address, port)?;
+    let tag = item
+        .get("tag")
+        .and_then(Json::as_str)
+        .filter(|tag| !tag.is_empty())
+        .or(default_tag)
+        .map(str::to_owned);
     let mut matcher = DomainMatcher::new();
     let any_domain = parse_domains(domains, &mut matcher, assets)?;
     let (own_v4, own_v6) = own_strategy.families();
@@ -964,6 +1072,8 @@ fn parse_server(
         local_dial,
         skip_fallback,
         final_query,
+        policy_id,
+        tag,
         timeout,
         cache: CachePolicy {
             disable: own_cache,
@@ -1437,11 +1547,13 @@ mod resolver_tests {
                 socket.send_to(&answer, peer).expect("reply");
             }
         });
-        let resolver = Resolver::from_root(&root(&format!(
-            r#"{{"dns":{{"servers":["udp://127.0.0.1:{port}"]}}}}"#
-        )))
-        .expect("resolver")
-        .expect("configured");
+        let resolver = Arc::new(
+            Resolver::from_root(&root(&format!(
+                r#"{{"dns":{{"servers":["udp://127.0.0.1:{port}"]}}}}"#
+            )))
+            .expect("resolver")
+            .expect("configured"),
+        );
         let (first, ttl) = resolver.lookup("example.com").expect("first");
         assert_eq!(ttl, 120);
         assert_eq!(first.len(), 2);
@@ -1464,11 +1576,13 @@ mod resolver_tests {
             let answer = ip_answer(&question, 0, 120, &[vec![192, 0, 2, 1]]).expect("answer");
             socket.send_to(&answer, peer).expect("reply");
         });
-        let resolver = Resolver::from_root(&root(&format!(
-            r#"{{"dns":{{"queryStrategy":"UseIP4","servers":["udp://127.0.0.1:{port}"]}}}}"#
-        )))
-        .expect("resolver")
-        .expect("configured");
+        let resolver = Arc::new(
+            Resolver::from_root(&root(&format!(
+                r#"{{"dns":{{"queryStrategy":"UseIP4","servers":["udp://127.0.0.1:{port}"]}}}}"#
+            )))
+            .expect("resolver")
+            .expect("configured"),
+        );
         resolver.lookup("example.com").expect("warm");
         let (answer, counts) = ferrox_core::alloc_count::measure(|| resolver.lookup("example.com"));
         assert_eq!(
@@ -1483,11 +1597,13 @@ mod resolver_tests {
 
     #[test]
     fn hosts_answer_without_a_network_query() {
-        let resolver = Resolver::from_root(&root(
+        let resolver = Arc::new(
+            Resolver::from_root(&root(
             r#"{"dns":{"servers":["localhost"],"hosts":{"example.com":["10.0.0.1","2001:db8::1"]}}}"#,
         ))
-        .expect("resolver")
-        .expect("configured");
+                .expect("resolver")
+                .expect("configured"),
+        );
         let (ips, ttl) = resolver.lookup("example.com").expect("hosts");
         assert_eq!(ttl, 10);
         assert_eq!(ips.len(), 2);
@@ -1496,11 +1612,13 @@ mod resolver_tests {
 
     #[test]
     fn fake_pools_allocate_and_reverse_both_families() {
-        let resolver = Resolver::from_root(&root(
+        let resolver = Arc::new(
+            Resolver::from_root(&root(
             r#"{"dns":{"servers":["fakedns"],"queryStrategy":"UseIP"},"fakeDns":{"ipPool":"198.18.0.0/15","poolSize":32768}}"#,
         ))
-        .expect("resolver")
-        .expect("configured");
+                .expect("resolver")
+                .expect("configured"),
+        );
         let (ips, ttl) = resolver.lookup_fake("example.com").expect("fake");
         assert_eq!(ttl, 1);
         assert!(ips.iter().all(std::net::IpAddr::is_ipv4));
@@ -1511,11 +1629,13 @@ mod resolver_tests {
 
     #[test]
     fn hosts_rcode_is_an_answer_and_is_not_sent_to_a_server() {
-        let resolver = Resolver::from_root(&root(
+        let resolver = Arc::new(
+            Resolver::from_root(&root(
             r##"{"dns":{"servers":["localhost"],"hosts":{"blocked.test":"#3","empty.test":"#0"}}}"##,
         ))
-        .expect("resolver")
-        .expect("configured");
+                .expect("resolver")
+                .expect("configured"),
+        );
         assert_eq!(resolver.lookup_result("blocked.test"), Lookup::Rcode(3));
         assert_eq!(resolver.lookup_result("empty.test"), Lookup::Empty);
         assert!(resolver.lookup("blocked.test").is_none());
@@ -1523,11 +1643,13 @@ mod resolver_tests {
 
     #[test]
     fn hosts_replace_a_domain_then_answer_its_ips() {
-        let resolver = Resolver::from_root(&root(
+        let resolver = Arc::new(
+            Resolver::from_root(&root(
             r#"{"dns":{"servers":["localhost"],"hosts":{"alias.test":"target.test","target.test":["10.0.0.9"]}}}"#,
         ))
-        .expect("resolver")
-        .expect("configured");
+                .expect("resolver")
+                .expect("configured"),
+        );
         let (ips, ttl) = resolver.lookup("alias.test").expect("alias");
         assert_eq!(ttl, 10);
         assert_eq!(ips, vec!["10.0.0.9".parse::<IpAddr>().unwrap()]);
@@ -1554,14 +1676,16 @@ mod resolver_tests {
         }
         let first_port = first.local_addr().expect("first addr").port();
         let second_port = second.local_addr().expect("second addr").port();
-        let resolver = Resolver::from_root(&root(&format!(
-            r#"{{"dns":{{"queryStrategy":"UseIP4","servers":[
+        let resolver = Arc::new(
+            Resolver::from_root(&root(&format!(
+                r#"{{"dns":{{"queryStrategy":"UseIP4","servers":[
                 {{"address":"udp://127.0.0.1:{first_port}","expectedIPs":["198.51.100.0/24"]}},
                 {{"address":"udp://127.0.0.1:{second_port}","expectedIPs":["198.51.100.0/24"]}}
             ]}}}}"#
-        )))
-        .expect("resolver")
-        .expect("configured");
+            )))
+            .expect("resolver")
+            .expect("configured"),
+        );
         let (ips, _) = resolver.lookup("example.com").expect("filtered");
         assert_eq!(ips, vec!["198.51.100.1".parse::<IpAddr>().unwrap()]);
     }
@@ -1586,13 +1710,15 @@ mod resolver_tests {
             .expect("answer");
             socket.send_to(&answer, peer).expect("reply");
         });
-        let resolver = Resolver::from_root(&root(&format!(
-            r#"{{"dns":{{"queryStrategy":"UseIP4","servers":[
+        let resolver = Arc::new(
+            Resolver::from_root(&root(&format!(
+                r#"{{"dns":{{"queryStrategy":"UseIP4","servers":[
                 {{"address":"udp://127.0.0.1:{port}","expectedIPs":["*","198.51.100.0/24"]}}
             ]}}}}"#
-        )))
-        .expect("resolver")
-        .expect("configured");
+            )))
+            .expect("resolver")
+            .expect("configured"),
+        );
         let (ips, _) = resolver.lookup("example.com").expect("prior");
         assert_eq!(ips, vec!["198.51.100.1".parse::<IpAddr>().unwrap()]);
     }
@@ -1614,11 +1740,13 @@ mod resolver_tests {
             let answer = ip_answer(&question, 3, 60, &[]).expect("answer");
             socket.send_to(&answer, peer).expect("reply");
         });
-        let resolver = Resolver::from_root(&root(&format!(
-            r#"{{"dns":{{"queryStrategy":"UseIP4","servers":["udp://127.0.0.1:{port}"]}}}}"#
-        )))
-        .expect("resolver")
-        .expect("configured");
+        let resolver = Arc::new(
+            Resolver::from_root(&root(&format!(
+                r#"{{"dns":{{"queryStrategy":"UseIP4","servers":["udp://127.0.0.1:{port}"]}}}}"#
+            )))
+            .expect("resolver")
+            .expect("configured"),
+        );
         assert_eq!(resolver.lookup_result("missing.test"), Lookup::Rcode(3));
         assert_eq!(resolver.lookup_result("missing.test"), Lookup::Rcode(3));
         assert_eq!(seen.load(Ordering::SeqCst), 1);
@@ -1626,16 +1754,140 @@ mod resolver_tests {
 
     #[test]
     fn hosts_plain_keys_are_full_and_tagged_keys_reach_subdomains() {
-        let resolver = Resolver::from_root(&root(
+        let resolver = Arc::new(
+            Resolver::from_root(&root(
             r#"{"dns":{"servers":["localhost"],"hosts":{"example.com":["10.0.0.2"],"domain:sub.test":["10.0.0.3"]}}}"#,
         ))
-        .expect("resolver")
-        .expect("configured");
+                .expect("resolver")
+                .expect("configured"),
+        );
         assert!(resolver.lookup("example.com").is_some());
         assert!(resolver
             .host_lookup("www.example.com", true, true)
             .is_none());
         assert!(resolver.lookup("a.sub.test").is_some());
+    }
+
+    fn answer_ip(socket: &std::net::UdpSocket, ip: [u8; 4]) {
+        let mut buf = [0u8; 512];
+        let (len, peer) = socket.recv_from(&mut buf).expect("query");
+        let question = parse_query(&buf[..len]).expect("question");
+        let answer = ip_answer(&question, 0, 60, &[ip.to_vec()]).expect("answer");
+        socket.send_to(&answer, peer).expect("reply");
+    }
+
+    #[test]
+    fn an_rcode_falls_through_to_the_next_server() {
+        let first = std::net::UdpSocket::bind("127.0.0.1:0").expect("first bind");
+        let second = std::net::UdpSocket::bind("127.0.0.1:0").expect("second bind");
+        let first_port = first.local_addr().expect("first addr").port();
+        let second_port = second.local_addr().expect("second addr").port();
+        let first_server = first.try_clone().expect("first clone");
+        let second_server = second.try_clone().expect("second clone");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (len, peer) = first_server.recv_from(&mut buf).expect("query");
+            let question = parse_query(&buf[..len]).expect("question");
+            let answer = ip_answer(&question, 3, 60, &[]).expect("answer");
+            first_server.send_to(&answer, peer).expect("reply");
+        });
+        std::thread::spawn(move || answer_ip(&second_server, [198, 51, 100, 1]));
+        let resolver = Arc::new(
+            Resolver::from_root(&root(&format!(
+                r#"{{"dns":{{"queryStrategy":"UseIP4","servers":[
+                    "udp://127.0.0.1:{first_port}",
+                    "udp://127.0.0.1:{second_port}"
+                ]}}}}"#
+            )))
+            .expect("resolver")
+            .expect("configured"),
+        );
+        assert_eq!(
+            resolver.lookup("example.com"),
+            Some((vec!["198.51.100.1".parse().unwrap()], 60))
+        );
+    }
+
+    #[test]
+    fn a_parallel_query_takes_the_first_answer() {
+        let slow = std::net::UdpSocket::bind("127.0.0.1:0").expect("slow bind");
+        let fast = std::net::UdpSocket::bind("127.0.0.1:0").expect("fast bind");
+        let slow_port = slow.local_addr().expect("slow addr").port();
+        let fast_port = fast.local_addr().expect("fast addr").port();
+        let slow_server = slow.try_clone().expect("slow clone");
+        let fast_server = fast.try_clone().expect("fast clone");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (len, peer) = slow_server.recv_from(&mut buf).expect("query");
+            std::thread::sleep(Duration::from_secs(1));
+            let question = parse_query(&buf[..len]).expect("question");
+            let answer = ip_answer(&question, 0, 60, &[vec![192, 0, 2, 1]]).expect("answer");
+            slow_server.send_to(&answer, peer).expect("reply");
+        });
+        std::thread::spawn(move || answer_ip(&fast_server, [198, 51, 100, 1]));
+        let resolver = Arc::new(
+            Resolver::from_root(&root(&format!(
+                r#"{{"dns":{{"enableParallelQuery":true,"queryStrategy":"UseIP4","servers":[
+                    "udp://127.0.0.1:{slow_port}",
+                    "udp://127.0.0.1:{fast_port}"
+                ]}}}}"#
+            )))
+            .expect("resolver")
+            .expect("configured"),
+        );
+        assert_eq!(
+            resolver.lookup("example.com"),
+            Some((vec!["198.51.100.1".parse().unwrap()], 60))
+        );
+    }
+
+    #[test]
+    fn a_later_policy_waits_for_the_group_before_it() {
+        let first = std::net::UdpSocket::bind("127.0.0.1:0").expect("first bind");
+        let second = std::net::UdpSocket::bind("127.0.0.1:0").expect("second bind");
+        let first_port = first.local_addr().expect("first addr").port();
+        let second_port = second.local_addr().expect("second addr").port();
+        let first_server = first.try_clone().expect("first clone");
+        let second_server = second.try_clone().expect("second clone");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (len, peer) = first_server.recv_from(&mut buf).expect("query");
+            std::thread::sleep(Duration::from_millis(300));
+            let question = parse_query(&buf[..len]).expect("question");
+            let answer = ip_answer(&question, 0, 60, &[vec![192, 0, 2, 1]]).expect("answer");
+            first_server.send_to(&answer, peer).expect("reply");
+        });
+        std::thread::spawn(move || answer_ip(&second_server, [198, 51, 100, 1]));
+        let resolver = Arc::new(
+            Resolver::from_root(&root(&format!(
+                r#"{{"dns":{{"enableParallelQuery":true,"queryStrategy":"UseIP4","servers":[
+                    {{"address":"udp://127.0.0.1:{first_port}","policyID":1}},
+                    {{"address":"udp://127.0.0.1:{second_port}","policyID":2}}
+                ]}}}}"#
+            )))
+            .expect("resolver")
+            .expect("configured"),
+        );
+        assert_eq!(
+            resolver.lookup("example.com"),
+            Some((vec!["192.0.2.1".parse().unwrap()], 60))
+        );
+    }
+
+    #[test]
+    fn a_nameserver_tag_overrides_the_config_tag() {
+        let resolver = Arc::new(
+            Resolver::from_root(&root(
+                r#"{"dns":{"tag":"dns-in","servers":[
+                    {"address":"udp://192.0.2.1","tag":"server-in"},
+                    {"address":"udp://192.0.2.2"}
+                ]}}"#,
+            ))
+            .expect("resolver")
+            .expect("configured"),
+        );
+        assert_eq!(resolver.servers[0].tag.as_deref(), Some("server-in"));
+        assert_eq!(resolver.servers[1].tag.as_deref(), Some("dns-in"));
     }
 
     #[test]
