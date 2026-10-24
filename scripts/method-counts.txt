@@ -110,6 +110,7 @@ trojan ops-retired-instructions UNBLESSED scripts/count-ops.sh
 trojan password-bytes-on-the-wire 56 ferrox-app-proxy::tests::trojan_key_is_sha224_hex
 trojan framing-bytes-added-after-the-header 0 ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers
 trojan udp-framing-bytes-per-datagram 2 ferrox-app-proxy::tests::trojan_udp_frames_carry
+trojan udp-carriers-holding-an-association 7 ferrox-app-proxy::tests::a_trojan_udp_association_crosses_every_carrier
 
 # --- XTLS Vision ------------------------------------------------------------
 xtls-vision ops-retired-instructions UNBLESSED scripts/count-ops.sh

@@ -4631,7 +4631,14 @@ fn serve_trojan_kcp(conn: &Arc<ferrox_core::kcp::Connection>, key: &[u8; 56], fr
     let Some((cmd, target)) = decode_trojan_request(&mut io, key) else {
         return;
     };
-    if !freedom || cmd != 1 {
+    if !freedom {
+        return;
+    }
+    if cmd == 3 {
+        let (reader, writer, close) = kcp_parts(conn);
+        return serve_trojan_udp_halves(reader, writer, move || close());
+    }
+    if cmd != 1 {
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
@@ -4657,7 +4664,7 @@ fn serve_trojan_kcp_tls(
     if !shake_tls(&mut tls) {
         return;
     }
-    relay_trojan(tls, None, key, freedom);
+    relay_trojan(tls, None, Some(Arc::clone(conn)), key, freedom);
 }
 
 fn kcp_dial_session(
@@ -5112,6 +5119,11 @@ fn kcp_parts(conn: &Arc<ferrox_core::kcp::Connection>) -> (KcpIo, KcpIo, KcpClos
 fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
     let key = trojan_key(&inbound_password(inbound));
     let sec = stream_security(inbound);
+    // A REALITY inbound has no Trojan arm yet, and reading only `tls` here would serve it as plaintext.
+    if sec == "reality" {
+        eprintln!("trojan reality inbound on {address}: refused, not served as plaintext");
+        return false;
+    }
     match inbound_carrier(inbound) {
         Carrier::Kcp(config) => {
             let serve: KcpServe = if sec == "tls" {
@@ -6094,8 +6106,25 @@ where
 
 struct TrojanUdpUplink {
     write: Box<dyn Write>,
-    shutdown: Connection,
+    close: Box<dyn Fn() + Send>,
     done: RelayEnd,
+}
+
+/// The reader, writer and teardown of an association carried inside one carrier session.
+type TrojanUdpParts = (Box<dyn Read + Send>, Box<dyn Write>, Box<dyn Fn() + Send>);
+
+/// The carriers an association rides: the stream carriers frame the datagrams, and KCP carries them over its own session.
+fn trojan_udp_carried(carrier: &Carrier) -> bool {
+    matches!(
+        carrier,
+        Carrier::Raw(_)
+            | Carrier::Ws { .. }
+            | Carrier::HttpUpgrade { .. }
+            | Carrier::Grpc { .. }
+            | Carrier::Xhttp { .. }
+            | Carrier::HttpHeader { .. }
+            | Carrier::Kcp(_)
+    )
 }
 
 fn dial_trojan_udp_uplink(
@@ -6104,39 +6133,227 @@ fn dial_trojan_udp_uplink(
     relay: &UdpSocket,
     source: Arc<Mutex<Option<SocketAddr>>>,
 ) -> Option<TrojanUdpUplink> {
-    if !matches!(trojan.carrier, Carrier::Raw(_)) {
-        return None;
-    }
     let server = resolve_outbound(&trojan.address, trojan.port)?;
     let header = trojan_header(&trojan.key, 3, &Destination::from(*dest));
     let udp_send = relay.try_clone().ok()?;
     // The association rides whatever the outbound names: a terminated session splits into the reader and writer the pump needs, and the header goes inside it.
-    if let Some(cfg) = trojan.tls.as_deref() {
-        let mut session = dial_tls_session(&server, cfg, trojan.carrier.tcp_mask())?;
-        if session.write_all(&header).is_err() {
-            return None;
+    let (read, write, close): TrojanUdpParts = match (&trojan.carrier, trojan.tls.as_deref()) {
+        (Carrier::Raw(_), None) => {
+            let mut uplink = dial_or_report(&server)?.with_mask(trojan.carrier.tcp_mask());
+            uplink.write_all(&header).ok()?;
+            let read = uplink.try_clone().ok()?;
+            let write = uplink.try_clone().ok()?;
+            let close = move || {
+                let _ = uplink.shutdown(Shutdown::Both);
+            };
+            (Box::new(read), Box::new(write), Box::new(close))
         }
-        let out = session.get_ref().try_clone().ok()?;
-        let shutdown = out.try_clone().ok()?;
-        // A driven reader hands over one record's plaintext and withholds the rest until the next lands, and a datagram is read a field at a time: the pump reads through the shared session.
-        let (_driven, half) = session_halves(session, out);
-        let done = spawn_trojan_uplink_reader(Box::new(half.clone()), udp_send, source);
-        return Some(TrojanUdpUplink {
-            write: Box::new(half),
-            shutdown,
-            done,
-        });
+        (Carrier::Raw(_), Some(cfg)) => {
+            let mut session = dial_tls_session(&server, cfg, trojan.carrier.tcp_mask())?;
+            if session.write_all(&header).is_err() {
+                return None;
+            }
+            let out = session.get_ref().try_clone().ok()?;
+            let socket = out.try_clone().ok()?;
+            // A driven reader hands over one record's plaintext and withholds the rest until the next lands, and a datagram is read a field at a time: the pump reads through the shared session.
+            let (_driven, half) = session_halves(session, out);
+            let close = move || {
+                let _ = socket.shutdown(Shutdown::Both);
+            };
+            (Box::new(half.clone()), Box::new(half), Box::new(close))
+        }
+        (Carrier::Kcp(_), None) => {
+            let conn = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port)?;
+            if conn.write(&header).is_err() {
+                return None;
+            }
+            let (read, write, closed) = kcp_parts(&conn);
+            let close = move || closed();
+            (Box::new(read), Box::new(write), Box::new(close))
+        }
+        (Carrier::Kcp(_), Some(cfg)) => {
+            let conn = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port)?;
+            let mut session = ferrox_core::tls::connect(
+                cfg,
+                KcpIo {
+                    conn: Arc::clone(&conn),
+                },
+            )
+            .ok()?;
+            if !shake_tls(&mut session) || session.write_all(&header).is_err() {
+                return None;
+            }
+            let (read, write) = session_halves(
+                session,
+                KcpIo {
+                    conn: Arc::clone(&conn),
+                },
+            );
+            let close = move || conn.close();
+            (Box::new(read), Box::new(write), Box::new(close))
+        }
+        (carrier, None) => {
+            let uplink = dial_or_report(&server)?.with_mask(trojan.carrier.tcp_mask());
+            trojan_udp_plain(uplink, carrier, trojan, &header)?
+        }
+        (carrier, Some(cfg)) => {
+            let session = dial_tls_session(&server, cfg, trojan.carrier.tcp_mask())?;
+            trojan_udp_tls(&server, session, cfg, carrier, trojan, &header)?
+        }
+    };
+    let done = spawn_trojan_uplink_reader(read, udp_send, source);
+    Some(TrojanUdpUplink { write, close, done })
+}
+
+fn trojan_udp_plain(
+    uplink: Connection,
+    carrier: &Carrier,
+    trojan: &TrojanOut,
+    header: &[u8],
+) -> Option<TrojanUdpParts> {
+    let raw = uplink.try_clone().ok()?;
+    let host = &trojan.host;
+    match carrier {
+        Carrier::Ws { path, ed } => {
+            let (reader, writer) = crate::ws::connect(uplink, host, path, *ed, header)?;
+            let closer = writer.clone();
+            let close = move || {
+                closer.close();
+                let _ = raw.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+        }
+        Carrier::HttpUpgrade { path, ed } => {
+            let (reader, writer) = crate::httpupgrade::connect(uplink, host, path, *ed, header)?;
+            let socket = writer.try_clone().ok()?;
+            let close = move || {
+                let _ = socket.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+        }
+        Carrier::Grpc { path } => {
+            let (reader, writer) = crate::grpc::connect(uplink, host, path)?;
+            if !writer.send(header) {
+                return None;
+            }
+            let closer = writer.clone();
+            let close = move || {
+                closer.close();
+                let _ = raw.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+        }
+        Carrier::Xhttp { .. } => {
+            let (reader, writer) = xhttp_rung(uplink, host, carrier, "")?;
+            if !writer.send(header) {
+                return None;
+            }
+            let closer = writer.clone();
+            let close = move || {
+                closer.finish();
+                let _ = raw.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+        }
+        Carrier::HttpHeader { path } => {
+            let (reader, mut writer) = crate::httpheader::connect(uplink, host, path)?;
+            writer.write_all(header).ok()?;
+            let socket = writer.try_clone().ok()?;
+            let close = move || {
+                let _ = socket.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+        }
+        _ => None,
     }
-    let mut uplink = dial_or_report(&server)?.with_mask(trojan.carrier.tcp_mask());
-    uplink.write_all(&header).ok()?;
-    let read = uplink.try_clone().ok()?;
-    let write = uplink.try_clone().ok()?;
-    let done = spawn_trojan_uplink_reader(Box::new(read), udp_send, source);
-    Some(TrojanUdpUplink {
-        write: Box::new(write),
-        shutdown: uplink,
-        done,
-    })
+}
+
+fn trojan_udp_tls<S: Dialed>(
+    server: &SocketAddr,
+    session: S,
+    cfg: &ferrox_core::tls::TlsConfig,
+    carrier: &Carrier,
+    trojan: &TrojanOut,
+    header: &[u8],
+) -> Option<TrojanUdpParts> {
+    let host = &trojan.host;
+    match carrier {
+        Carrier::Ws { path, ed } => {
+            let (reader, writer, raw) = session.into_halves()?;
+            let (reader, writer) =
+                crate::ws::connect_split(reader, writer, host, path, *ed, header)?;
+            let closer = writer.clone();
+            let close = move || {
+                closer.close();
+                let _ = raw.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+        }
+        Carrier::HttpUpgrade { path, ed } => {
+            let (reader, writer, raw) = session.into_halves()?;
+            let (reader, writer) =
+                crate::httpupgrade::connect_split(reader, writer, host, path, *ed, header)?;
+            let close = move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+        }
+        Carrier::Grpc { path } => {
+            let (reader, writer, raw) = session.into_halves()?;
+            let (reader, writer) = crate::grpc::connect_split(reader, writer, host, path)?;
+            if !writer.send(header) {
+                return None;
+            }
+            let closer = writer.clone();
+            let close = move || {
+                closer.close();
+                let _ = raw.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+        }
+        Carrier::Xhttp { settings } => {
+            let (first, up, raw) = session.into_halves()?;
+            if settings.mode == crate::xhttp::XhttpMode::StreamOne {
+                let head = crate::xhttp::dial_path(settings);
+                let (reader, writer) = crate::xhttp::connect_split(first, up, host, &head)?;
+                if !writer.send(header) {
+                    return None;
+                }
+                let closer = writer.clone();
+                let close = move || {
+                    closer.finish();
+                    let _ = raw.shutdown(Shutdown::Both);
+                };
+                return Some((Box::new(reader), Box::new(writer), Box::new(close)));
+            }
+            // The GET downlink dials its own session: one transport per direction, both under one session id (`dialer.go:411`).
+            let (down, down_write, down_raw) =
+                dial_tls_session(server, cfg, carrier.tcp_mask())?.into_halves()?;
+            let (reader, writer) =
+                crate::xhttp::connect_dual_split(down, down_write, up, host, settings)?;
+            if !writer.send(header) {
+                return None;
+            }
+            let closer = writer.clone();
+            let close = move || {
+                closer.finish();
+                let _ = raw.shutdown(Shutdown::Both);
+                let _ = down_raw.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+        }
+        Carrier::HttpHeader { path } => {
+            let (reader, writer, raw) = session.into_halves()?;
+            let (reader, writer) = crate::httpheader::connect_split(reader, writer, host, path)?;
+            let mut writer = writer;
+            writer.write_all(header).ok()?;
+            let close = move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            };
+            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+        }
+        _ => None,
+    }
 }
 
 fn spawn_trojan_uplink_reader<R>(
@@ -8548,7 +8765,14 @@ fn serve_trojan_ws(stream: Connection, key: &[u8; 56], path: &str, freedom: bool
     let Some((cmd, target)) = decode_trojan_request(&mut reader, key) else {
         return;
     };
-    if cmd != 1 || !freedom {
+    if !freedom {
+        return;
+    }
+    if cmd == 3 {
+        let closer = writer.clone();
+        return serve_trojan_udp_halves(reader, writer, move || closer.close());
+    }
+    if cmd != 1 {
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
@@ -8564,7 +8788,18 @@ fn serve_trojan_httpupgrade(stream: Connection, key: &[u8; 56], path: &str, free
     let Some((cmd, target)) = decode_trojan_request(&mut reader, key) else {
         return;
     };
-    if cmd != 1 || !freedom {
+    if !freedom {
+        return;
+    }
+    if cmd == 3 {
+        let close = write.try_clone().ok();
+        return serve_trojan_udp_halves(reader, write, move || {
+            if let Some(stream) = close {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        });
+    }
+    if cmd != 1 {
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
@@ -8581,7 +8816,14 @@ fn serve_trojan_grpc(stream: Connection, key: &[u8; 56], path: &str, freedom: bo
     else {
         return;
     };
-    if cmd != 1 || !freedom {
+    if !freedom {
+        return;
+    }
+    if cmd == 3 {
+        let closer = writer.clone();
+        return serve_trojan_udp_halves(reader, writer, move || closer.close());
+    }
+    if cmd != 1 {
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
@@ -8597,7 +8839,14 @@ fn serve_trojan_xhttp(stream: Connection, key: &[u8; 56], path: &str, freedom: b
     let Some((cmd, target)) = decode_trojan_request(&mut reader, key) else {
         return;
     };
-    if cmd != 1 || !freedom {
+    if !freedom {
+        return;
+    }
+    if cmd == 3 {
+        let closer = writer.clone();
+        return serve_trojan_udp_halves(reader, writer, move || closer.finish());
+    }
+    if cmd != 1 {
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
@@ -8613,7 +8862,18 @@ fn serve_trojan_httpheader(stream: Connection, key: &[u8; 56], path: &str, freed
     let Some((cmd, target)) = decode_trojan_request(&mut reader, key) else {
         return;
     };
-    if cmd != 1 || !freedom {
+    if !freedom {
+        return;
+    }
+    if cmd == 3 {
+        let close = write.try_clone().ok();
+        return serve_trojan_udp_halves(reader, write, move || {
+            if let Some(stream) = close {
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+        });
+    }
+    if cmd != 1 {
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
@@ -8642,7 +8902,7 @@ fn serve_trojan_tls(
             if !shake_tls(&mut tls) {
                 return;
             }
-            relay_trojan(tls, Some(raw), key, freedom);
+            relay_trojan(tls, Some(raw), None, key, freedom);
         }
         Carrier::Ws { path, .. } => {
             let Ok(out) = stream.try_clone() else { return };
@@ -8691,8 +8951,13 @@ fn serve_trojan_tls(
 }
 
 /// The served trojan session: the request is read under the handshake clock, then the relay drives the session's transport, so a read parked in the socket holds no lock its writer asks for.
-fn relay_trojan<S>(mut session: S, raw: Option<Connection>, key: &[u8; 56], freedom: bool)
-where
+fn relay_trojan<S>(
+    mut session: S,
+    raw: Option<Connection>,
+    kcp: Option<Arc<ferrox_core::kcp::Connection>>,
+    key: &[u8; 56],
+    freedom: bool,
+) where
     S: std::io::Read
         + std::io::Write
         + Send
@@ -8716,17 +8981,26 @@ where
         return;
     }
     if cmd == 3 {
-        let Some(raw) = raw else {
+        if let Some(raw) = raw {
+            let Ok(close) = raw.try_clone() else {
+                return;
+            };
+            // A driven reader hands over one record's plaintext and withholds the rest until the next lands, and a datagram is read a field at a time: the pump reads through the shared session.
+            let (_driven, half) = session_halves(session, raw);
+            serve_trojan_udp_halves(half.clone(), half, move || {
+                let _ = close.shutdown(Shutdown::Both);
+            });
             return;
-        };
-        let Ok(close) = raw.try_clone() else {
-            return;
-        };
-        // A driven reader hands over one record's plaintext and withholds the rest until the next lands, and a datagram is read a field at a time: the pump reads through the shared session.
-        let (_driven, half) = session_halves(session, raw);
-        serve_trojan_udp_halves(half.clone(), half, move || {
-            let _ = close.shutdown(Shutdown::Both);
-        });
+        }
+        if let Some(kcp) = kcp {
+            let (reader, writer) = session_halves(
+                session,
+                KcpIo {
+                    conn: Arc::clone(&kcp),
+                },
+            );
+            serve_trojan_udp_halves(reader, writer, move || kcp.close());
+        }
         return;
     }
     if cmd != 1 {
@@ -8738,10 +9012,22 @@ where
     if uplink.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
     }
-    let close = shutdown_pair(
-        uplink.try_clone().ok(),
-        raw.as_ref().and_then(|raw| raw.try_clone().ok()),
-    );
+    let close: Arc<dyn Fn() + Send + Sync> = match &kcp {
+        Some(kcp) => {
+            let kcp = Arc::clone(kcp);
+            let socket = uplink.try_clone().ok();
+            Arc::new(move || {
+                kcp.close();
+                if let Some(socket) = &socket {
+                    let _ = socket.shutdown(Shutdown::Both);
+                }
+            })
+        }
+        None => shutdown_pair(
+            uplink.try_clone().ok(),
+            raw.as_ref().and_then(|raw| raw.try_clone().ok()),
+        ),
+    };
     match driven_halves(session, RELAY_POLL) {
         Ok(half) => relay_stream(half, Half::socket(uplink), &close),
         Err(session) => relay_stream(
@@ -8755,7 +9041,7 @@ where
     }
 }
 
-fn serve_session_trojan_ws<R: Read, W: FrameWrite + 'static>(
+fn serve_session_trojan_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
     read: R,
     write: W,
     path: &str,
@@ -8773,7 +9059,15 @@ fn serve_session_trojan_ws<R: Read, W: FrameWrite + 'static>(
         echo_trace("session ws trojan decode refused");
         return;
     };
-    if cmd != 1 || !freedom {
+    if !freedom {
+        echo_trace("session ws trojan cmd refused");
+        return;
+    }
+    if cmd == 3 {
+        let closer = cwriter.clone();
+        return serve_trojan_udp_halves(creader, cwriter, move || closer.close());
+    }
+    if cmd != 1 {
         echo_trace("session ws trojan cmd refused");
         return;
     }
@@ -8804,7 +9098,16 @@ fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + '
         cwriter.finish();
         return;
     };
-    if cmd != 1 || !freedom {
+    if !freedom {
+        echo_trace("session xhttp trojan cmd refused");
+        cwriter.finish();
+        return;
+    }
+    if cmd == 3 {
+        let closer = cwriter.clone();
+        return serve_trojan_udp_halves(creader, cwriter, move || closer.finish());
+    }
+    if cmd != 1 {
         echo_trace("session xhttp trojan cmd refused");
         cwriter.finish();
         return;
@@ -8818,7 +9121,7 @@ fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + '
     relay_sink_drained(creader, &cwriter, &uplink);
 }
 
-fn serve_session_trojan_httpupgrade<R: Read, W: Write + Clone + Send + 'static>(
+fn serve_session_trojan_httpupgrade<R: Read + Send + 'static, W: Write + Clone + Send + 'static>(
     read: R,
     write: W,
     raw: Connection,
@@ -8844,7 +9147,18 @@ fn serve_session_trojan_httpupgrade<R: Read, W: Write + Clone + Send + 'static>(
         crate::httpupgrade::quiet(&raw);
         return;
     };
-    if cmd != 1 || !freedom {
+    if !freedom {
+        echo_trace("session httpupgrade trojan cmd refused");
+        crate::httpupgrade::quiet(&raw);
+        return;
+    }
+    if cmd == 3 {
+        let raw = Arc::clone(&raw);
+        return serve_trojan_udp_halves(creader, cwriter, move || {
+            let _ = raw.shutdown(Shutdown::Both);
+        });
+    }
+    if cmd != 1 {
         echo_trace("session httpupgrade trojan cmd refused");
         crate::httpupgrade::quiet(&raw);
         return;
@@ -8863,7 +9177,7 @@ fn serve_session_trojan_httpupgrade<R: Read, W: Write + Clone + Send + 'static>(
     crate::httpupgrade::quiet(&raw);
 }
 
-fn serve_session_trojan_httpheader<R: Read, W: Write + Clone + Send + 'static>(
+fn serve_session_trojan_httpheader<R: Read + Send + 'static, W: Write + Clone + Send + 'static>(
     read: R,
     write: W,
     raw: Connection,
@@ -8886,7 +9200,16 @@ fn serve_session_trojan_httpheader<R: Read, W: Write + Clone + Send + 'static>(
         echo_trace("session httpheader trojan decode refused");
         return;
     };
-    if cmd != 1 || !freedom {
+    if !freedom {
+        echo_trace("session httpheader trojan cmd refused");
+        return;
+    }
+    if cmd == 3 {
+        return serve_trojan_udp_halves(creader, cwriter, move || {
+            let _ = raw.shutdown(Shutdown::Both);
+        });
+    }
+    if cmd != 1 {
         echo_trace("session httpheader trojan cmd refused");
         return;
     }
@@ -8902,7 +9225,7 @@ fn serve_session_trojan_httpheader<R: Read, W: Write + Clone + Send + 'static>(
     relay_sink(creader, &sink, &uplink, |_| {});
 }
 
-fn serve_session_trojan_grpc<R: Read, W: FrameWrite + 'static>(
+fn serve_session_trojan_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
     read: R,
     write: W,
     path: &str,
@@ -8920,7 +9243,15 @@ fn serve_session_trojan_grpc<R: Read, W: FrameWrite + 'static>(
         echo_trace("session grpc trojan decode refused");
         return;
     };
-    if cmd != 1 || !freedom {
+    if !freedom {
+        echo_trace("session grpc trojan cmd refused");
+        return;
+    }
+    if cmd == 3 {
+        let closer = cwriter.clone();
+        return serve_trojan_udp_halves(creader, cwriter, move || closer.close());
+    }
+    if cmd != 1 {
         echo_trace("session grpc trojan cmd refused");
         return;
     }
@@ -10164,9 +10495,7 @@ fn serve_udp_lane(relay: &UdpSocket, out: &Outbound, associate: Option<&Connecti
                 crate::hysteria::serve_udp(relay, &dial);
             }
         }
-        Outbound::Trojan(trojan)
-            if matches!(trojan.carrier, Carrier::Raw(_)) && trojan.tls.is_none() =>
-        {
+        Outbound::Trojan(trojan) if trojan_udp_carried(&trojan.carrier) => {
             serve_socks_udp_trojan(relay, trojan);
         }
         Outbound::Vmess(vmess)
@@ -11636,13 +11965,13 @@ fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
         if let Some(up) = &mut uplink {
             if !write_trojan_datagram(&mut *up.write, &dest, payload, &mut trojan_head) {
                 if let Some(old) = uplink.take() {
-                    let _ = old.shutdown.shutdown(Shutdown::Both);
+                    (old.close)();
                 }
             }
         }
     }
     if let Some(old) = uplink.take() {
-        let _ = old.shutdown.shutdown(Shutdown::Both);
+        (old.close)();
         join(&old.done);
     }
 }
@@ -21171,6 +21500,38 @@ mod tests {
         }
     }
 
+    /// The link parser's encoder and the dial's encoder are two routes to one wire: same key, same family numbering, same bytes for every destination and both commands.
+    #[test]
+    fn the_link_encoder_and_the_dial_encoder_write_one_header() {
+        let password = "an-example-shared-password";
+        let link = ferrox_core::trojan::TrojanLink::parse(&format!(
+            "trojan://{password}@example.com:443?security=tls"
+        ))
+        .expect("parses");
+        assert_eq!(link.key(), &trojan_key(password), "one key derivation");
+        for target in [
+            Destination::from("192.0.2.53:8080".parse::<SocketAddr>().expect("IPv4")),
+            Destination::from("[2001:db8::1]:443".parse::<SocketAddr>().expect("IPv6")),
+            Destination::Name("www.example.com".to_owned(), 8443),
+            Destination::Name("a".repeat(255), 53),
+        ] {
+            let host = match &target {
+                Destination::Name(host, _) => host.clone(),
+                Destination::Address(address) => address.ip().to_string(),
+            };
+            for (command, byte) in [
+                (ferrox_core::trojan::Command::Connect, 1u8),
+                (ferrox_core::trojan::Command::Udp, 3),
+            ] {
+                assert_eq!(
+                    link.encode_header(command, &host, target.port()),
+                    &trojan_header(link.key(), byte, &target)[..],
+                    "{host} cmd {byte}"
+                );
+            }
+        }
+    }
+
     /// The pump belongs to the carrier, not to the socket: a WebSocket server that holds its `[0, 0]` until the first frame arrives must not deadlock either.
     #[test]
     fn vless_websocket_client_pumps_the_upload_before_reading_the_response() {
@@ -22291,28 +22652,13 @@ mod tests {
         }
     }
 
-    #[test]
-    fn a_trojan_udp_association_crosses_the_tls_arm() {
-        let (cert, key, client) = tls_cert_json();
-        let inbound = crate::json::parse(&format!(
-            r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
-                "streamSettings": {{"network": "tcp", "security": "tls",
-                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
-        ))
-        .expect("parses");
-        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let port = probe.local_addr().expect("addr").port();
-        drop(probe);
-        let address = format!("127.0.0.1:{port}");
-        serve_trojan_inbound(&address, &inbound, true);
-        let waited = Instant::now();
-        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
-            assert!(
-                waited.elapsed() < Duration::from_secs(10),
-                "listener never bound"
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
+    /// One UDP echo answers two datagrams through a carrier, with the header inside the session the carrier names.
+    fn assert_trojan_udp_echo(
+        tag: &str,
+        inbound: &Json,
+        port: u16,
+        client: Option<&Arc<ferrox_core::tls::TlsConfig>>,
+    ) {
         let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
@@ -22327,9 +22673,9 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port,
             key: trojan_key("secret"),
-            carrier: inbound_carrier(&inbound),
+            carrier: inbound_carrier(inbound),
             host: "127.0.0.1".to_owned(),
-            tls: Some(client),
+            tls: client.cloned(),
         };
         let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").expect("binds"));
         let relay_addr = relay.local_addr().expect("addr");
@@ -22344,13 +22690,87 @@ mod tests {
         for payload in [&b"ping"[..], &b"pong"[..]] {
             let datagram = socks_udp_frame(&mut frame, None, &target, payload);
             udp.send_to(datagram, relay_addr).expect("sends");
-            let (n, _) = udp.recv_from(&mut back).expect("a tls association echoes");
+            let (n, _) = udp
+                .recv_from(&mut back)
+                .unwrap_or_else(|error| panic!("{tag} association echoes: {error}"));
             let (source, echoed) = parse_socks_udp(&back[..n]).expect("splits");
-            assert_eq!(source, target);
-            assert_eq!(echoed, payload);
+            assert_eq!(source, target, "{tag}");
+            assert_eq!(echoed, payload, "{tag}");
             // Past RELAY_POLL, so an association that polls instead of parking is gone by the second datagram.
             thread::sleep(Duration::from_millis(250));
         }
+    }
+
+    /// Every carrier the outbound dials carries the association, plain and under TLS.
+    #[test]
+    fn a_trojan_udp_association_crosses_every_carrier() {
+        let (cert, key, client) = tls_cert_json();
+        let carriers = [
+            ("raw", r#""network": "tcp""#),
+            ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
+            (
+                "httpupgrade",
+                r#""network": "httpupgrade", "httpupgradeSettings": {"path": "/u"}"#,
+            ),
+            (
+                "grpc",
+                r#""network": "grpc", "grpcSettings": {"serviceName": "/TunnelService/Tun"}"#,
+            ),
+            (
+                "xhttp",
+                r#""network": "xhttp", "xhttpSettings": {"path": "/x", "mode": "stream-one"}"#,
+            ),
+            (
+                "httpheader",
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/c"]}}}"#,
+            ),
+            ("kcp", r#""network": "kcp""#),
+        ];
+        for (tag, stream) in carriers {
+            for tls in [false, true] {
+                let security = if tls {
+                    format!(
+                        r#", "security": "tls",
+                            "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}"#
+                    )
+                } else {
+                    String::new()
+                };
+                let inbound = crate::json::parse(&format!(
+                    r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                        "streamSettings": {{{stream}{security}}}}}"#
+                ))
+                .expect("parses");
+                let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+                let port = probe.local_addr().expect("addr").port();
+                drop(probe);
+                let address = format!("127.0.0.1:{port}");
+                assert!(serve_trojan_inbound(&address, &inbound, true), "{tag}");
+                // A KCP listener binds before it returns; a stream listener binds on its own thread.
+                if tag != "kcp" {
+                    let waited = Instant::now();
+                    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                        assert!(
+                            waited.elapsed() < Duration::from_secs(10),
+                            "{tag} listener never bound"
+                        );
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                }
+                assert_trojan_udp_echo(tag, &inbound, port, tls.then_some(&client));
+            }
+        }
+    }
+
+    /// A trojan listener that declares reality is refused by name: serving it as plaintext would be a silent downgrade.
+    #[test]
+    fn a_trojan_reality_inbound_is_refused_not_downgraded() {
+        let inbound = crate::json::parse(
+            r#"{"protocol": "trojan", "settings": {"clients": [{"password": "secret"}]},
+                "streamSettings": {"network": "tcp", "security": "reality"}}"#,
+        )
+        .expect("parses");
+        assert!(!serve_trojan_inbound("127.0.0.1:9", &inbound, true));
     }
 
     /// A listener whose port is already taken is refused, not announced as served: the bind is the listener's verdict, not a thread's later accident.

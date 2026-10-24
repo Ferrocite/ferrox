@@ -557,8 +557,6 @@ pub(crate) fn tls_cert_paths(settings: &Json) -> Option<(&str, &str)> {
     ))
 }
 
-const HEX: &[u8; 16] = b"0123456789abcdef";
-
 /// The eight hex digits per group of an inbound id or an outbound server uuid, dashes optional.
 pub(crate) fn uuid_bytes(text: &str) -> Option<[u8; 16]> {
     let mut out = [0u8; 16];
@@ -592,16 +590,9 @@ pub(crate) fn uuid_bytes(text: &str) -> Option<[u8; 16]> {
     }
 }
 
-/// The 56-byte hex SHA-224 of the password that Trojan speaks on the wire.
+/// The 56-byte hex SHA-224 of the password that Trojan speaks on the wire, from the one derivation the link parser also reads.
 pub(crate) fn trojan_key(password: &str) -> [u8; 56] {
-    use sha2::Digest as _;
-    let digest = sha2::Sha224::digest(password.as_bytes());
-    let mut out = [0u8; 56];
-    for (i, byte) in digest.iter().enumerate() {
-        out[2 * i] = HEX[(byte >> 4) as usize];
-        out[2 * i + 1] = HEX[(byte & 0x0F) as usize];
-    }
-    out
+    ferrox_core::trojan::key(password)
 }
 
 pub(crate) fn tls_ca_roots(outbound: &Json) -> Option<ferrox_core::tls::Anchors> {
