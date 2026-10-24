@@ -503,8 +503,7 @@ mod tests {
                         "ips" => case.lookup = Some(canned(value)),
                         "rule" => case.rule = Some(rule(value)),
                         "feed" => case.feed = unhex(value),
-                        // The tunnel's own dest the direct case named; the
-                        // replay never dials it.
+                        // The tunnel's own dest the direct case named; the replay never dials it.
                         "dest" => {}
                         "ttl" => {
                             let ttl = value.parse::<u32>().expect("ttl");
@@ -549,8 +548,7 @@ mod tests {
         let lookup = |_: &[u8]| case.lookup.clone().unwrap_or(Resolve::AnsweredEmpty);
         let decision = match case.kind {
             "direct" => Step::Forward,
-            // Dropped, and oversized: the lane's own frame read refuses the
-            // size before any decision.
+            // Dropped, and oversized: the lane's own frame read refuses the size before any decision.
             "drop" | "oversize" => Step::Quiet,
             _ => decide(&case.message, &rules, &lookup),
         };
@@ -606,8 +604,7 @@ mod tests {
         assert!(parse_query(&[0u8; 11]).is_none());
         // The full header with a zero question count has nothing to read.
         assert!(parse_query(&[0u8; 12]).is_none());
-        // A zero count with a question block waiting behind it: the header's
-        // own count serves the read, so the block is not.
+        // A zero count with a question block waiting behind it: the header's own count serves the read, so the block is not.
         assert!(parse_query(&unhex("00010100000000000000000001610000010001")).is_none());
 
         // A label whose bytes end in a dot.
@@ -625,11 +622,9 @@ mod tests {
     /// pointer hops, and past it the name refuses.
     #[test]
     fn the_pointer_loop_refuses_at_the_cap() {
-        // The pointer reads its own offset: every hop counts one, and the
-        // eleventh refuses.
+        // The pointer reads its own offset: every hop counts one, and the eleventh refuses.
         assert!(parse_query(&unhex("000101000001000000000000c00c")).is_none());
-        // A pair of pointers bouncing between their own offsets: the cap
-        // catches it before the name's bound does.
+        // A pair of pointers bouncing between their own offsets: the cap catches it before the name's bound does.
         assert!(parse_query(&unhex("000101000001000000000000c00ec00c")).is_none());
     }
 
@@ -637,8 +632,7 @@ mod tests {
     /// bytes is the longest the parse takes, one byte more refuses.
     #[test]
     fn the_name_bound_matches_the_reference() {
-        // Five labels of 42 bytes and a dot, then one more label: its dot
-        // closes the name at the bound.
+        // Five labels of 42 bytes and a dot, then one more label: its dot closes the name at the bound.
         let build = |last: usize| {
             let mut message = vec![0u8; 12];
             message[0] = 1;
