@@ -129,6 +129,8 @@ pub enum TlsError {
     BadCertificate(String),
     Closed,
     NoSharedCipher,
+    /// The server refused the ECH offer and named the list to offer next.
+    EchRetry(std::sync::Arc<[u8]>),
     Other(String),
 }
 
@@ -139,6 +141,7 @@ impl fmt::Display for TlsError {
             Self::BadCertificate(why) => write!(f, "certificate did not verify: {why}"),
             Self::Closed => f.write_str("connection closed by peer"),
             Self::NoSharedCipher => f.write_str("no shared cipher suite"),
+            Self::EchRetry(_) => f.write_str("the server asked for another ECH config"),
             Self::Other(why) => write!(f, "backend error: {why}"),
         }
     }

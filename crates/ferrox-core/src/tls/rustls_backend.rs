@@ -1424,6 +1424,17 @@ fn recover(e: std::io::Error) -> TlsError {
 
 fn map_error(e: &rustls::Error) -> TlsError {
     use rustls::Error as E;
+    if let E::PeerIncompatible(rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(
+        Some(configs),
+    )) = e
+    {
+        if !configs.is_empty() {
+            use rustls::internal::msgs::codec::Codec as _;
+            let mut list = Vec::new();
+            configs.encode(&mut list);
+            return TlsError::EchRetry(list.into());
+        }
+    }
     match e {
         // An untrusted chain, a name that does not match and an expired certificate are three different problems and the caller can act on each; the why rides with the kind, so matching the kind does not cost the why.
         E::InvalidCertificate(why) => TlsError::BadCertificate(format!("{why:?}")),

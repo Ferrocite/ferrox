@@ -258,6 +258,18 @@ fn custom(node: Option<&Json>) -> Result<Vec<CustomSockopt>, String> {
     Ok(out)
 }
 
+/// xray's `dice.Roll`: one allowed address, not the resolver's first, so a family with
+/// several answers is not pinned to one machine.
+fn roll(addresses: &[SocketAddr]) -> Option<SocketAddr> {
+    if addresses.is_empty() {
+        return None;
+    }
+    let mut raw = [0u8; 4];
+    getrandom::fill(&mut raw).ok()?;
+    let at = usize::try_from(u32::from_le_bytes(raw)).ok()? % addresses.len();
+    addresses.get(at).copied()
+}
+
 impl SocketOptions {
     /// The DNS cache key differs whenever an option that changes the query socket differs.
     pub(crate) fn cache_key(&self) -> String {
@@ -268,31 +280,47 @@ impl SocketOptions {
         if let Ok(ip) = host.parse::<std::net::IpAddr>() {
             return Ok(SocketAddr::new(ip, port));
         }
+        let mut all = Vec::new();
         let mut v4 = Vec::new();
         let mut v6 = Vec::new();
         for addr in (host, port)
             .to_socket_addrs()
             .map_err(|e| format!("ech: resolve {host}: {e}"))?
         {
+            all.push(addr);
             if addr.is_ipv4() {
                 v4.push(addr);
             } else {
                 v6.push(addr);
             }
         }
-        let pick = match self.domain {
-            DomainStrategy::AsIs | DomainStrategy::UseIp => v4.first().or_else(|| v6.first()),
-            DomainStrategy::UseIp4 | DomainStrategy::ForceIp4 => v4.first(),
-            DomainStrategy::UseIp6 | DomainStrategy::ForceIp6 => v6.first(),
+        let set = match self.domain {
+            // AsIs leaves the order to the resolver, as xray's system dialer does.
+            DomainStrategy::AsIs => {
+                return all
+                    .first()
+                    .copied()
+                    .ok_or_else(|| format!("ech: {host} resolved to nothing this strategy allows"))
+            }
+            DomainStrategy::UseIp => all,
+            DomainStrategy::UseIp4 | DomainStrategy::ForceIp4 => v4,
+            DomainStrategy::UseIp6 | DomainStrategy::ForceIp6 => v6,
             DomainStrategy::UseIp46 | DomainStrategy::ForceIp46 => {
-                v4.first().or_else(|| v6.first())
+                if v4.is_empty() {
+                    v6
+                } else {
+                    v4
+                }
             }
             DomainStrategy::UseIp64 | DomainStrategy::ForceIp64 => {
-                v6.first().or_else(|| v4.first())
+                if v6.is_empty() {
+                    v4
+                } else {
+                    v6
+                }
             }
         };
-        pick.copied()
-            .ok_or_else(|| format!("ech: {host} resolved to nothing this strategy allows"))
+        roll(&set).ok_or_else(|| format!("ech: {host} resolved to nothing this strategy allows"))
     }
 
     fn apply(&self, socket: &Socket, addr: SocketAddr, tcp: bool) -> io::Result<()> {

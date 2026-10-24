@@ -16,6 +16,8 @@ pub(crate) struct QuicDial {
     /// A pooled connection through a hop is its own connection, never reused for a direct dial.
     pub(crate) upstream: Option<crate::foxy::UpstreamProxy>,
     pub(crate) roots: Option<ferrox_core::tls::Anchors>,
+    /// The sealed client hello a server can open; it belongs to the connection, so a lane that offered one is never lent to a dial that did not.
+    pub(crate) ech_config_list: Option<std::sync::Arc<[u8]>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -25,6 +27,7 @@ struct QuicServer {
     host: std::sync::Arc<str>,
     upstream: Option<crate::foxy::UpstreamProxy>,
     roots: Option<ferrox_core::tls::Anchors>,
+    ech_config_list: Option<std::sync::Arc<[u8]>>,
 }
 
 impl QuicServer {
@@ -36,6 +39,7 @@ impl QuicServer {
             host: dial.host.clone(),
             upstream: dial.upstream.clone(),
             roots: dial.roots.clone(),
+            ech_config_list: dial.ech_config_list.clone(),
         }
     }
 }
@@ -2139,6 +2143,7 @@ pub(crate) fn handshake_within(
     local: SocketAddr,
     server_name: &str,
     roots: &[Vec<u8>],
+    ech_config_list: Option<&[u8]>,
     budget: Duration,
 ) -> Option<quiche::Connection> {
     let mut scid = [0u8; SCID_LEN];
@@ -2147,6 +2152,9 @@ pub(crate) fn handshake_within(
     let mut conn = with_config(roots, |config| {
         quiche::connect(Some(server_name), &cid, local, peer, config).ok()
     })?;
+    if let Some(list) = ech_config_list {
+        conn.as_mut().set_ech_config_list(list).ok()?;
+    }
     drive_handshake_by(&mut conn, sock, local, budget)?;
     Some(conn)
 }
@@ -2646,7 +2654,15 @@ fn build_pooled_within(dial: &QuicDial, budget: Duration) -> Option<PooledConn> 
             None => Datagram::plain(sock),
         };
         let bound = resolved.map(|_| Instant::now());
-        let Some(mut conn) = handshake_within(&sock, peer, local, &dial.host, roots, budget) else {
+        let Some(mut conn) = handshake_within(
+            &sock,
+            peer,
+            local,
+            &dial.host,
+            roots,
+            dial.ech_config_list.as_deref(),
+            budget,
+        ) else {
             continue;
         };
         let handed = bound.map(|_| Instant::now());
@@ -3004,7 +3020,7 @@ pub(crate) fn direct_stream_on(
     host: &str,
     roots: &[Vec<u8>],
 ) -> Option<PooledStream> {
-    let mut conn = handshake_within(&sock, peer, local, host, roots, HANDSHAKE_TIMEOUT)?;
+    let mut conn = handshake_within(&sock, peer, local, host, roots, None, HANDSHAKE_TIMEOUT)?;
     if !send_h3_opening(&mut conn, &sock) {
         return None;
     }
@@ -3907,6 +3923,38 @@ mod tests {
             server.conn.as_mut().ech_accepted(),
             "the server opened the inner hello"
         );
+    }
+
+    /// The production dial hands the offer to the connection before its first packet, not only the
+    /// test helper: a config that names ECH is what makes both ends report acceptance.
+    #[test]
+    fn a_client_dial_offers_the_configured_ech_list() {
+        let identity = ech_identity();
+        let server_sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
+        let server_addr = server_sock.local_addr().expect("addr");
+        let mut server_config = serve_config(&identity).expect("serves");
+        let server = std::thread::spawn(move || {
+            let mut conn = server_accept(&server_sock, server_addr, &mut server_config);
+            conn.as_mut().ech_accepted()
+        });
+        let client_sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
+        let local = client_sock.local_addr().expect("addr");
+        let list = ech_client_list();
+        let mut client = handshake_within(
+            &client_sock,
+            server_addr,
+            local,
+            "quic.test",
+            &identity.cert_chain,
+            Some(&list),
+            Duration::from_secs(5),
+        )
+        .expect("handshakes");
+        assert!(
+            client.as_mut().ech_accepted(),
+            "the dial offered and the server accepted"
+        );
+        assert!(server.join().expect("joins"), "the server opened it");
     }
 
     /// A sweep hands the socket every datagram quiche offered rather than one batch of slots, and the peer reads the same bytes in the same order: the connection is asked, right after the call, whether it still has a packet ready.

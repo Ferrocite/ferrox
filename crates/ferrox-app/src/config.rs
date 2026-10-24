@@ -390,6 +390,22 @@ fn tls_ech_config(
     }
 }
 
+/// The ECH config a QUIC dial offers: xray has no QUIC transport, so this reads the TLS field it would have used and hands it to quiche's `BoringSSL` handshake.
+pub(crate) fn quic_ech_config(
+    outbound: &Json,
+    address: &str,
+) -> Result<Option<std::sync::Arc<[u8]>>, String> {
+    let tls = outbound
+        .get("streamSettings")
+        .and_then(|s| s.get("tlsSettings"));
+    let server_name = tls
+        .and_then(|s| s.get("serverName"))
+        .and_then(Json::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(address);
+    tls_ech_config(tls, server_name)
+}
+
 fn tls_version(settings: Option<&Json>, key: &str) -> Option<u16> {
     let text = settings.and_then(|s| s.get(key)).and_then(Json::as_str)?;
     match text.trim() {
@@ -1898,6 +1914,26 @@ mod tests {
         .expect("parses");
         let error = tls_ech_config(Some(&bad), "hidden.test").expect_err("refuses");
         assert!(error.contains("domainStrategy"), "{error}");
+    }
+
+    #[test]
+    fn a_quic_outbound_reads_the_ech_list_from_its_tls_settings() {
+        let outbound = crate::json::parse(
+            r#"{"streamSettings":{"network":"quic","security":"tls",
+                "tlsSettings":{"echConfigList":"not base64"}}}"#,
+        )
+        .expect("parses");
+        let got = quic_ech_config(&outbound, "hidden.test")
+            .expect("parses options")
+            .expect("names a list");
+        assert_eq!(got.as_ref(), [1, 1, 4, 5, 1, 4]);
+        let absent = crate::json::parse(
+            r#"{"streamSettings":{"network":"quic","security":"tls","tlsSettings":{}}}"#,
+        )
+        .expect("parses");
+        assert!(quic_ech_config(&absent, "hidden.test")
+            .expect("parses options")
+            .is_none());
     }
 
     #[test]
