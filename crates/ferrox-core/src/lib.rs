@@ -25,6 +25,7 @@ pub mod shadowsocks2022;
 pub mod socks;
 pub mod tls;
 pub mod transport;
+pub mod trojan;
 pub mod veepn;
 pub mod vless;
 pub mod wireguard;

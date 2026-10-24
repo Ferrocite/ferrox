@@ -22,7 +22,7 @@ What runs against what: `xray-rust` interop (23 tests, seam `XRAY_VLESS_FULL_BIN
 | xray-core | ferrox state |
 | --- | --- |
 | VMess (AEAD) — full matrix: UDP over ws/grpc/xhttp/tls, all encodings | partial: no UDP except raw carrier; no auth-length framing bits (matches client default only) |
-| Trojan share-link `trojan://` parser | planned |
+| Trojan share-link `trojan://` parser | implemented (`ferrox_core::trojan::TrojanLink`; `check`/`run` accept it beside `vless://`) |
 | Dokodemo transparent inbound | tcp rewrite served (row 24); udp relay and the `SO_ORIGINAL_DST`/TPROXY transparent spelling planned |
 | Freedom — `domainStrategy`, fragment, dialer fields | direct dial (`Outbound::Freedom`); fragment/`domainStrategy`/`proxyProtocol`/dialer options planned (rows 121, 124) |
 | DNS proxy + fakeDNS + hosts + DoH/DoQ/local nameservers (`app/dns`) | `proxy/dns` outbound done (row 26); the resolver app planned (row 82) |
