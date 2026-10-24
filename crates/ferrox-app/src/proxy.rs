@@ -9696,18 +9696,14 @@ fn dns_lookup(name: &[u8]) -> ferrox_core::dns::Resolve {
     else {
         return ferrox_core::dns::Resolve::ErrHard;
     };
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        // A literal needs no resolver: its one adder is the lookup.
-        let Ok(literal) = (host, 0).to_socket_addrs() else {
-            return ferrox_core::dns::Resolve::ErrHard;
+    if let Ok(literal) = host.parse::<std::net::IpAddr>() {
+        // A literal needs no resolver: the parse is the whole lookup.
+        let octets = match literal {
+            std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+            std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
         };
         return ferrox_core::dns::Resolve::Records {
-            rdata: literal
-                .map(|addr| match addr.ip() {
-                    std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
-                    std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
-                })
-                .collect(),
+            rdata: vec![octets],
             ttl: 300,
         };
     }
@@ -33896,6 +33892,18 @@ mod dns_lane_tests {
             action: ferrox_core::dns::Action::Direct,
             rcode: 0,
         }]
+    }
+
+    /// A literal name is the lookup's own answer: the address it parsed and the record list around it.
+    #[test]
+    fn a_literal_lookup_answers_without_a_socket_addr_buffer() {
+        let (resolve, counts) = ferrox_core::alloc_count::measure(|| dns_lookup(b"192.0.2.9."));
+        let ferrox_core::dns::Resolve::Records { rdata, ttl } = resolve else {
+            panic!("a literal is a record list");
+        };
+        assert_eq!(rdata, vec![vec![192, 0, 2, 9]]);
+        assert_eq!(ttl, 300);
+        assert_eq!(counts.allocs, 2, "the record list and its one address");
     }
 
     #[test]
