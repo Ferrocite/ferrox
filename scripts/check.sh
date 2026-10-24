@@ -7,6 +7,9 @@ export RUSTFLAGS="${RUSTFLAGS:--D warnings --cfg aes_armv8 --cfg polyval_armv8}"
 
 step() { printf '\n=== %s ===\n' "$1"; }
 
+step "worktree target"
+./scripts/claim-target.sh
+
 step "fmt"
 cargo fmt --all -- --check
 

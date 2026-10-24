@@ -17,12 +17,20 @@ esac
 
 # shellcheck source=scripts/lib-shared-target.sh
 source "$(dirname "${BASH_SOURCE[0]}")/lib-shared-target.sh"
-# No override: a per-slice target dir defeats the point, which is that the
-# dependencies are compiled once for every branch.
+# The seed is only read: each worktree gets a copy-on-write clone, so its build
+# holds a lock nobody else wants and shares the seed's blocks on disk.
 shared="$(ferrox_shared_target)"
 ferrox_require_shared_writable "$shared"
 
 if [[ -e "$dest" ]]; then
+  # A retry, or a worktree another agent's session left behind: repair it rather
+  # than refuse, because a stranded worktree is what grows a private target.
+  if git -C "$top" worktree list --porcelain | sed -n 's/^worktree //p' | grep -Fxq "$dest"; then
+    ferrox_link_worktree "$dest" "$top" "$shared" >/dev/null
+    echo "worktree: $dest (already exists, pointers and target repaired)"
+    echo "seed: $shared"
+    exit 0
+  fi
   echo "::error::$dest already exists" >&2
   exit 1
 fi
@@ -30,19 +38,10 @@ fi
 git -C "$top" worktree add "$dest" -b "$name" "$base"
 
 ferrox_write_cargo_config "$dest" "$shared"
-ferrox_link_target "$dest" "$shared"
-
-linked=0
-for checkout in "$top"/upstream/*/; do
-  checkout="${checkout%/}"
-  base_name="$(basename "$checkout")"
-  if [[ -d "$checkout/.git" && ! -e "$dest/upstream/$base_name" ]]; then
-    ln -s "$checkout" "$dest/upstream/$base_name"
-    linked=$((linked + 1))
-  fi
-done
+ferrox_claim_target "$dest" "$shared"
+linked="$(ferrox_link_upstream "$dest" "$top")"
 
 echo "worktree: $dest (branch $name)"
-echo "target-dir: $shared"
+echo "target: own copy-on-write clone of $shared"
 echo "upstream checkouts linked: $linked"
 echo "next: ./scripts/fetch-upstream.sh (only what the links missed), then ./scripts/check.sh"

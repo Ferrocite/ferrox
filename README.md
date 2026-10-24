@@ -365,7 +365,10 @@ cargo run -p ferrox-prompt -- rows        # the matrix rows a slice can be about
 ## Contributing
 
 ```bash
-./scripts/new-worktree.sh <name>      # isolated worktree: shared build cache, linked upstreams
+./scripts/new-worktree.sh <name>      # worktree with its own copy-on-write warm target
+./scripts/claim-target.sh             # claim/re-clone this worktree's target from the seed
+./scripts/link-shared-target.sh       # repair config/upstream links (--all claims every worktree)
+./scripts/gc-target.sh --apply        # reclaim dead incremental sessions and stranded target dirs
 ./scripts/fetch-upstream.sh           # only what the links missed
 cargo run -p ferrox-prompt -- next    # the slice
 ./scripts/check.sh                    # everything ci.yml runs, before the push
