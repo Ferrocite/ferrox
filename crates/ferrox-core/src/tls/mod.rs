@@ -54,6 +54,13 @@ pub trait TlsProvider: std::io::Read + std::io::Write {
 
     fn alpn(&self) -> Option<&[u8]>;
 
+    /// The server name the front's hello named, once the handshake has read
+    /// it: a fallback row that names its fronts is routed by it. A provider
+    /// that heard no name, or one on the client side, answers `None`.
+    fn sni(&self) -> Option<&[u8]> {
+        None
+    }
+
     /// The leaf certificate the peer presented, once the handshake has
     /// completed. A provider that cannot reach it answers `None` rather than
     /// failing, because a lane with pins needs it and one without does not.
