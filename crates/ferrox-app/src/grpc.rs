@@ -745,7 +745,8 @@ impl<'a> Gather<'a> {
 impl GrpcWriter {
     pub(crate) fn send(&self, data: &[u8]) -> bool {
         let max = self.max_frame();
-        let payload = message_payload(max).max(1);
+        // Four frames of the 16 KiB the peer advertises are one byte over the default 65_535-byte stream window, so the fourth waits for a credit; a body one byte under the frame fits all four.
+        let payload = message_payload(max.saturating_sub(1)).max(1);
         let mut batch = Gather::new();
         for piece in data.chunks(payload) {
             if !self.message(piece, max, false, &mut batch) {
@@ -1308,7 +1309,7 @@ mod tests {
     /// every frame — the reference a gathered batch is compared frame by frame against.
     fn frames(payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        for piece in payload.chunks(message_payload(HUNK)) {
+        for piece in payload.chunks(message_payload(HUNK - 1)) {
             out.extend_from_slice(&frame(T_DATA, 0, 1, &message(piece)));
         }
         out
@@ -1569,7 +1570,7 @@ mod tests {
         let data: Vec<u8> = (0..FRAMES_PER_WRITE / 2 * HUNK)
             .map(|i| (i % 251) as u8)
             .collect();
-        let hunks = data.len().div_ceil(message_payload(HUNK));
+        let hunks = data.len().div_ceil(message_payload(HUNK - 1));
         let base = data.as_ptr() as usize;
         let capacity = data.capacity();
         let peer = Arc::new(Mutex::new(Peer::default()));
@@ -1967,7 +1968,7 @@ mod tests {
                     let writer = GrpcWriter { shared, stream: 1 };
                     let mut batch = Gather::new();
                     assert!(
-                        writer.message(&data, true, &mut batch),
+                        writer.message(&data, max, true, &mut batch),
                         "max {max} len {len}"
                     );
                     assert!(batch.flush(&writer.shared), "max {max} len {len}");
@@ -2065,11 +2066,17 @@ mod tests {
     /// from a frame of its own. The reference's client reassembles every message that crosses one.
     #[test]
     fn a_hunk_fits_the_frame_that_carries_it() {
+        let fit = message_payload(HUNK - 1);
         assert_eq!(
-            message_payload(HUNK),
-            16_376,
-            "the envelope and the tag leave this much of a 16 KiB frame to the payload"
+            fit, 16_375,
+            "the envelope and the tag leave this much of a frame one byte under the width the window packs"
         );
+        assert_eq!(fit + 8, HUNK - 1);
+        assert!(
+            4 * (HUNK - 1) <= 65_535,
+            "four hunks fill the default stream window"
+        );
+        assert!(4 * HUNK > 65_535, "four full frames do not fit it");
         let data: Vec<u8> = (0..4 * HUNK).map(|i| (i % 251) as u8).collect();
         let peer = Arc::new(Mutex::new(Peer::default()));
         let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, u64::MAX);
@@ -2087,6 +2094,10 @@ mod tests {
             assert!(wire.len() - at - 9 >= len, "a frame body was cut short");
             let body = &wire[at + 9..at + 9 + len];
             assert!(body.len() >= 5, "a DATA frame opens no message");
+            assert!(
+                body.len() <= HUNK - 1,
+                "a hunk is wider than the window packs"
+            );
             let announced = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
             assert_eq!(announced + 5, body.len(), "a hunk crossed a frame boundary");
             let (_, payload) = hunk_decode(&body[5..]).expect("the hunk decodes");
