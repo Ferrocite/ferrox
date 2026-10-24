@@ -1875,6 +1875,13 @@ fn remove_mux_session(
 }
 
 fn serve_vless_mux(stream: Connection) {
+    serve_vless_mux_with(stream, dial_or_report);
+}
+
+fn serve_vless_mux_with<D>(stream: Connection, dial: D)
+where
+    D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
+{
     let Ok(mut read) = stream.try_clone() else {
         return;
     };
@@ -1921,6 +1928,7 @@ fn serve_vless_mux(stream: Connection) {
                         &shared,
                         &mut staging,
                         &mut handles,
+                        dial.clone(),
                     );
                 }
             }
@@ -1956,7 +1964,7 @@ fn teardown_mux(table: &MuxTable, udp: &UdpTable, handles: &[RelayEnd], control:
     }
 }
 
-fn handle_mux_frame(
+fn handle_mux_frame<D>(
     frame: ferrox_core::mux::Incoming<'_>,
     table: &MuxTable,
     udp: &mut UdpTable,
@@ -1964,14 +1972,17 @@ fn handle_mux_frame(
     shared: &Arc<Mutex<Connection>>,
     staging: &mut Vec<u8>,
     handles: &mut Vec<RelayEnd>,
-) {
+    dial: D,
+) where
+    D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
+{
     use ferrox_core::mux::{Network, Status};
     match frame.status {
         Status::New => {
             if frame.target.is_some_and(|t| t.network == Network::Udp) {
                 handle_mux_udp_new(frame, udp, global, shared, staging, handles);
             } else {
-                handle_mux_tcp_new(frame, table, shared, staging, handles);
+                handle_mux_tcp_new(frame, table, shared, staging, handles, dial);
             }
         }
         Status::Keep => {
@@ -2018,17 +2029,20 @@ fn handle_mux_frame(
     }
 }
 
-fn handle_mux_tcp_new(
+fn handle_mux_tcp_new<D>(
     frame: ferrox_core::mux::Incoming<'_>,
     table: &MuxTable,
     shared: &Arc<Mutex<Connection>>,
     staging: &mut Vec<u8>,
     handles: &mut Vec<RelayEnd>,
-) {
+    dial: D,
+) where
+    D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
+{
     let Some(target) = frame.target.and_then(|t| mux_target_addr(&t)) else {
         return send_mux_end(shared, staging, frame.id);
     };
-    let Some(mut uplink) = dial_or_report(&target) else {
+    let Some(mut uplink) = dial(&target) else {
         return send_mux_end(shared, staging, frame.id);
     };
     let (Ok(mut read_half), Ok(stop)) = (uplink.try_clone(), uplink.try_clone()) else {
@@ -24514,6 +24528,69 @@ mod tests {
             "every flow {flows} must reach its target, not just the first {}",
             ferrox_core::mux::DEFAULT_CAP
         );
+    }
+
+    #[test]
+    fn a_slow_mux_dial_does_not_park_the_session() {
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let echo_port = mux_test_echo();
+        let slow = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let slow_port = slow.local_addr().expect("addr").port();
+        let dial = move |target: &SocketAddr| {
+            if target.port() == slow_port {
+                thread::sleep(Duration::from_millis(1500));
+                return None;
+            }
+            Connection::connect(("127.0.0.1", target.port())).ok()
+        };
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = tunnel.accept().expect("accepts");
+            serve_vless_mux_with(stream, dial);
+        });
+        let mut stream = mux_test_connect(&id, tunnel_port);
+        mux_test_send(
+            &mut stream,
+            ferrox_core::mux::Outgoing {
+                id: 1,
+                status: ferrox_core::mux::Status::New,
+                options: 0,
+                target: Some(mux_test_target(slow_port)),
+                global_id: None,
+            },
+            None,
+        );
+        mux_test_send(
+            &mut stream,
+            ferrox_core::mux::Outgoing {
+                id: 2,
+                status: ferrox_core::mux::Status::New,
+                options: 0,
+                target: Some(mux_test_target(echo_port)),
+                global_id: None,
+            },
+            None,
+        );
+        mux_test_send(
+            &mut stream,
+            ferrox_core::mux::Outgoing {
+                id: 2,
+                status: ferrox_core::mux::Status::Keep,
+                options: ferrox_core::mux::DATA,
+                target: None,
+                global_id: None,
+            },
+            Some(b"x"),
+        );
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("timeout");
+        let (got, status, data) = mux_test_recv(&mut stream);
+        assert_eq!(got, 2, "the second flow's answer is the one read");
+        assert_eq!(status, ferrox_core::mux::Status::Keep);
+        assert_eq!(data, b"x");
+        drop(slow);
     }
 
     #[test]
