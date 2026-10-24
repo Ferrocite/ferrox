@@ -148,23 +148,11 @@ fn serve_single(stream: &mut Connection, method: Method, psk: &[u8], freedom: bo
     let Some(server_salt) = fresh_salt(key_len) else {
         return;
     };
-    let Some(mut send) = Cipher::from_psk(method, psk, &server_salt) else {
+    let Some(send) = Cipher::from_psk(method, psk, &server_salt) else {
         return;
     };
-    let mut fixed_resp = Vec::with_capacity(1 + 8 + key_len + 2);
-    fixed_resp.push(1);
-    fixed_resp.extend_from_slice(&now_secs().to_be_bytes());
-    fixed_resp.extend_from_slice(&salt);
-    fixed_resp.extend_from_slice(&0u16.to_be_bytes());
-    let mut out = Vec::with_capacity(server_salt.len() + fixed_resp.len() + TAG_LEN);
-    out.extend_from_slice(&server_salt);
-    if send.seal_into(&fixed_resp, &mut out).is_none() {
-        return;
-    }
-    if stream.write_all(&out).is_err() {
-        return;
-    }
-    pump_relay(&uplink, stream, send, Recv::Ready(recv));
+    let response = Response::new(send, server_salt, salt);
+    pump_relay_with_response(&uplink, stream, response, Recv::Ready(recv));
 }
 
 fn serve_multi(stream: &mut Connection, method: Method, list: &[Vec<u8>], freedom: bool) {
@@ -225,23 +213,11 @@ fn serve_multi(stream: &mut Connection, method: Method, list: &[Vec<u8>], freedo
     let Some(server_salt) = fresh_salt(key_len) else {
         return;
     };
-    let Some(mut send) = Cipher::from_psk(method, &psk, &server_salt) else {
+    let Some(send) = Cipher::from_psk(method, &psk, &server_salt) else {
         return;
     };
-    let mut fixed_resp = Vec::with_capacity(1 + 8 + key_len + 2);
-    fixed_resp.push(1);
-    fixed_resp.extend_from_slice(&now_secs().to_be_bytes());
-    fixed_resp.extend_from_slice(&salt);
-    fixed_resp.extend_from_slice(&0u16.to_be_bytes());
-    let mut out = Vec::with_capacity(server_salt.len() + fixed_resp.len() + TAG_LEN);
-    out.extend_from_slice(&server_salt);
-    if send.seal_into(&fixed_resp, &mut out).is_none() {
-        return;
-    }
-    if stream.write_all(&out).is_err() {
-        return;
-    }
-    pump_relay(&uplink, stream, send, Recv::Ready(recv));
+    let response = Response::new(send, server_salt, salt);
+    pump_relay_with_response(&uplink, stream, response, Recv::Ready(recv));
 }
 
 pub(crate) fn serve_relay(
@@ -340,11 +316,10 @@ fn relay_raw(a: &mut Connection, b: &mut Connection) {
 
 fn accept_on(
     reader: &mut dyn Read,
-    writer: &mut dyn Write,
     password: &str,
     method: &str,
     freedom: bool,
-) -> Option<(Connection, Cipher, Recv)> {
+) -> Option<(Connection, Response, Recv)> {
     let method = Method::parse(method)?;
     if !freedom {
         return None;
@@ -373,17 +348,9 @@ fn accept_on(
         let mut uplink = crate::conn::dial_tcp(&target.0, Duration::from_secs(8)).ok()?;
         uplink.write_all(&target.1).ok()?;
         let server_salt = fresh_salt(method.key_len())?;
-        let mut send = Cipher::from_psk(method, &user, &server_salt)?;
-        let mut fixed_resp = Vec::with_capacity(1 + 8 + method.key_len() + 2);
-        fixed_resp.push(1);
-        fixed_resp.extend_from_slice(&now_secs().to_be_bytes());
-        fixed_resp.extend_from_slice(&salt_probe);
-        fixed_resp.extend_from_slice(&0u16.to_be_bytes());
-        let mut out = Vec::with_capacity(server_salt.len() + fixed_resp.len() + TAG_LEN);
-        out.extend_from_slice(&server_salt);
-        send.seal_into(&fixed_resp, &mut out)?;
-        writer.write_all(&out).ok()?;
-        return Some((uplink, send, Recv::Ready(recv)));
+        let send = Cipher::from_psk(method, &user, &server_salt)?;
+        let response = Response::new(send, server_salt, salt_probe);
+        return Some((uplink, response, Recv::Ready(recv)));
     };
     let _ = eih_len;
     let key_len = method.key_len();
@@ -397,17 +364,9 @@ fn accept_on(
     let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
     uplink.write_all(&early).ok()?;
     let server_salt = fresh_salt(key_len)?;
-    let mut send = Cipher::from_psk(method, &psk, &server_salt)?;
-    let mut fixed_resp = Vec::with_capacity(1 + 8 + key_len + 2);
-    fixed_resp.push(1);
-    fixed_resp.extend_from_slice(&now_secs().to_be_bytes());
-    fixed_resp.extend_from_slice(&salt);
-    fixed_resp.extend_from_slice(&0u16.to_be_bytes());
-    let mut out = Vec::with_capacity(server_salt.len() + fixed_resp.len() + TAG_LEN);
-    out.extend_from_slice(&server_salt);
-    send.seal_into(&fixed_resp, &mut out)?;
-    writer.write_all(&out).ok()?;
-    Some((uplink, send, Recv::Ready(recv)))
+    let send = Cipher::from_psk(method, &psk, &server_salt)?;
+    let response = Response::new(send, server_salt, salt);
+    Some((uplink, response, Recv::Ready(recv)))
 }
 
 fn open_handshake(reader: &mut dyn Read, recv: &mut Cipher) -> Option<(SocketAddr, Vec<u8>)> {
@@ -451,13 +410,12 @@ pub(crate) fn serve_ws(
     let Some((mut reader, mut writer)) = crate::ws::accept(stream, path) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, password, method, freedom)
-    else {
+    let Some((uplink, response, recv)) = accept_on(&mut reader, password, method, freedom) else {
         return;
     };
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
 pub(crate) fn serve_httpupgrade(
@@ -470,8 +428,7 @@ pub(crate) fn serve_httpupgrade(
     let Some((mut reader, mut writer)) = crate::httpupgrade::accept(stream, path) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, password, method, freedom)
-    else {
+    let Some((uplink, response, recv)) = accept_on(&mut reader, password, method, freedom) else {
         return;
     };
     let Ok(closer) = writer.try_clone() else {
@@ -480,7 +437,7 @@ pub(crate) fn serve_httpupgrade(
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(std::net::Shutdown::Both);
     });
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
 pub(crate) fn serve_grpc(
@@ -493,14 +450,14 @@ pub(crate) fn serve_grpc(
     let Some((mut reader, mut writer)) = crate::grpc::accept(stream, path) else {
         return;
     };
-    let Some((uplink, send, recv)) = under_handshake(&mut reader, |read| {
-        accept_on(read, &mut writer, password, method, freedom)
+    let Some((uplink, response, recv)) = under_handshake(&mut reader, |read| {
+        accept_on(read, password, method, freedom)
     }) else {
         return;
     };
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
 pub(crate) fn serve_xhttp(
@@ -513,14 +470,13 @@ pub(crate) fn serve_xhttp(
     let Some((mut reader, mut writer)) = crate::xhttp::accept(stream, path) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, password, method, freedom)
-    else {
+    let Some((uplink, response, recv)) = accept_on(&mut reader, password, method, freedom) else {
         return;
     };
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> =
         std::sync::Arc::new(move || closer.finish());
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
 pub(crate) fn serve_httpheader(
@@ -533,8 +489,7 @@ pub(crate) fn serve_httpheader(
     let Some((mut reader, mut writer)) = crate::httpheader::accept(stream, path) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, password, method, freedom)
-    else {
+    let Some((uplink, response, recv)) = accept_on(&mut reader, password, method, freedom) else {
         return;
     };
     let Ok(closer) = writer.try_clone() else {
@@ -543,7 +498,7 @@ pub(crate) fn serve_httpheader(
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(std::net::Shutdown::Both);
     });
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
 pub(crate) fn serve_kcp<R, W>(
@@ -557,16 +512,12 @@ pub(crate) fn serve_kcp<R, W>(
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    let Some((uplink, send, recv)) = accept_on(
-        &mut reader as &mut dyn Read,
-        &mut writer as &mut dyn Write,
-        password,
-        method,
-        freedom,
-    ) else {
+    let Some((uplink, response, recv)) =
+        accept_on(&mut reader as &mut dyn Read, password, method, freedom)
+    else {
         return;
     };
-    pump_relay_carried(&uplink, reader, writer, close, send, recv);
+    pump_relay_carried_with_response(&uplink, reader, writer, close, response, recv);
 }
 
 pub(crate) fn client_send_handshake(
@@ -615,7 +566,81 @@ pub(crate) enum Recv {
     Waiting(Method, Vec<u8>, Vec<u8>),
 }
 
+struct Response {
+    send: Cipher,
+    server_salt: Vec<u8>,
+    request_salt: Vec<u8>,
+    first_owed: bool,
+}
+
+impl Response {
+    fn new(send: Cipher, server_salt: Vec<u8>, request_salt: Vec<u8>) -> Self {
+        Self {
+            send,
+            server_salt,
+            request_salt,
+            first_owed: true,
+        }
+    }
+
+    fn seal_first(&mut self, buf: &mut [u8], n: usize, out: &mut dyn Write) -> std::io::Result<()> {
+        let invalid = || std::io::Error::from(std::io::ErrorKind::InvalidData);
+        let first = u16::try_from(n).map_err(|_| invalid())?;
+        let key_len = self.request_salt.len();
+        let mut fixed = [0u8; 1 + 8 + 32 + 2];
+        fixed[0] = 1;
+        fixed[1..9].copy_from_slice(&now_secs().to_be_bytes());
+        fixed[9..9 + key_len].copy_from_slice(&self.request_salt);
+        fixed[9 + key_len..11 + key_len].copy_from_slice(&first.to_be_bytes());
+        let mut fixed_wire = [0u8; 1 + 8 + 32 + 2 + TAG_LEN];
+        fixed_wire[..11 + key_len].copy_from_slice(&fixed[..11 + key_len]);
+        let tag = self
+            .send
+            .seal_piece_in_place(&mut fixed_wire[..11 + key_len])
+            .ok_or_else(invalid)?;
+        fixed_wire[11 + key_len..11 + key_len + TAG_LEN].copy_from_slice(&tag);
+        let payload_wire = if n == 0 {
+            &[][..]
+        } else {
+            let end = SEAL_HEAD + n;
+            let tag = self
+                .send
+                .seal_piece_in_place(&mut buf[SEAL_HEAD..end])
+                .ok_or_else(invalid)?;
+            buf[end..end + TAG_LEN].copy_from_slice(&tag);
+            &buf[SEAL_HEAD..end + TAG_LEN]
+        };
+        self.first_owed = false;
+        crate::proxy::write_all_parts::<3>(
+            out,
+            &[
+                self.server_salt.as_slice(),
+                &fixed_wire[..11 + key_len + TAG_LEN],
+                payload_wire,
+            ],
+        )
+    }
+}
+
+enum Outbound {
+    Client(Cipher),
+    Server(Response),
+}
+
 pub(crate) fn pump_relay(plain: &Connection, sealed: &Connection, send: Cipher, recv: Recv) {
+    pump_relay_outbound(plain, sealed, Outbound::Client(send), recv);
+}
+
+fn pump_relay_with_response(
+    plain: &Connection,
+    sealed: &Connection,
+    response: Response,
+    recv: Recv,
+) {
+    pump_relay_outbound(plain, sealed, Outbound::Server(response), recv);
+}
+
+fn pump_relay_outbound(plain: &Connection, sealed: &Connection, outbound: Outbound, recv: Recv) {
     let Ok(sealed_read) = sealed.try_clone() else {
         return;
     };
@@ -628,15 +653,50 @@ pub(crate) fn pump_relay(plain: &Connection, sealed: &Connection, send: Cipher, 
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(std::net::Shutdown::Both);
     });
-    pump_relay_carried(plain, sealed_read, sealed_write, &close, send, recv);
+    pump_relay_carried_inner(plain, sealed_read, sealed_write, &close, outbound, recv);
 }
 
 pub(crate) fn pump_relay_carried<R, W>(
     plain: &Connection,
     reader: R,
-    mut writer: W,
+    writer: W,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
     send: Cipher,
+    recv: Recv,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    pump_relay_carried_inner(plain, reader, writer, close, Outbound::Client(send), recv);
+}
+
+fn pump_relay_carried_with_response<R, W>(
+    plain: &Connection,
+    reader: R,
+    writer: W,
+    close: &std::sync::Arc<dyn Fn() + Send + Sync>,
+    response: Response,
+    recv: Recv,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    pump_relay_carried_inner(
+        plain,
+        reader,
+        writer,
+        close,
+        Outbound::Server(response),
+        recv,
+    );
+}
+
+fn pump_relay_carried_inner<R, W>(
+    plain: &Connection,
+    reader: R,
+    mut writer: W,
+    close: &std::sync::Arc<dyn Fn() + Send + Sync>,
+    mut outbound: Outbound,
     recv: Recv,
 ) where
     R: Read + Send + 'static,
@@ -650,15 +710,29 @@ pub(crate) fn pump_relay_carried<R, W>(
     };
     let mut plain_read = plain_read;
     let mut plain_write = plain_write;
-    let mut send = send;
     let thread_close = std::sync::Arc::clone(close);
     let done = thread::spawn(move || {
         let mut buf = crate::proxy::RelayBuf::with_len(SEAL_HEAD + READ_CHUNK + TAG_LEN);
         while let Ok(read) = plain_read.read(&mut buf.as_mut()[SEAL_HEAD..SEAL_HEAD + READ_CHUNK]) {
             if read == 0 {
+                if let Outbound::Server(response) = &mut outbound {
+                    if response.first_owed {
+                        let _ = response.seal_first(buf.as_mut(), 0, &mut writer);
+                    }
+                }
                 break;
             }
-            if seal_all(&mut send, buf.as_mut(), read, &mut writer).is_err() {
+            let sealed = match &mut outbound {
+                Outbound::Client(send) => seal_all(send, buf.as_mut(), read, &mut writer),
+                Outbound::Server(response) => {
+                    if response.first_owed {
+                        response.seal_first(buf.as_mut(), read, &mut writer)
+                    } else {
+                        seal_all(&mut response.send, buf.as_mut(), read, &mut writer)
+                    }
+                }
+            };
+            if sealed.is_err() {
                 break;
             }
         }
@@ -2041,12 +2115,24 @@ mod tests {
                     let mut fixed = vec![0u8; fixed_len];
                     read_exact(&mut uplink, &mut fixed).expect("fixed");
                     cipher.open_in_place(&mut fixed).expect("opens");
+                    let first = usize::from(u16::from_be_bytes([
+                        fixed[9 + m.key_len()],
+                        fixed[10 + m.key_len()],
+                    ]));
+                    assert_eq!(first, 4, "{name}: the head carries the first payload");
+                    let mut chunk = vec![0u8; first + TAG_LEN];
+                    read_exact(&mut uplink, &mut chunk).expect("first");
+                    let got = cipher.open_in_place(&mut chunk).expect("opens first");
+                    assert_eq!(&chunk[..got], b"ping", "{name}");
                     let _ = s;
                     cipher
                 }
             };
+            let mut ping = [0u8; SEAL_HEAD + 4 + TAG_LEN];
+            ping[SEAL_HEAD..SEAL_HEAD + 4].copy_from_slice(b"ping");
+            seal_all(&mut send, &mut ping, 4, &mut uplink).expect("seals");
             let mut buf = wire_buffer();
-            let back = open_chunk(&mut uplink, &mut recv, &mut buf).expect("opens");
+            let back = open_chunk(&mut uplink, &mut recv, &mut buf).expect("opens body");
             assert_eq!(back, &b"ping"[..], "{name}");
         }
     }
@@ -2510,7 +2596,7 @@ mod tests {
         let mut ping = [0u8; SEAL_HEAD + 4 + TAG_LEN];
         ping[SEAL_HEAD..SEAL_HEAD + 4].copy_from_slice(b"ping");
         seal_all(&mut send, &mut ping, 4, &mut uplink).expect("seals");
-        let mut recv = match recv {
+        let _cipher = match recv {
             Recv::Ready(cipher) => cipher,
             Recv::Waiting(m, p, s) => {
                 let mut peer = vec![0u8; m.key_len()];
@@ -2520,13 +2606,19 @@ mod tests {
                 let mut fixed = vec![0u8; fixed_len];
                 read_exact(&mut uplink, &mut fixed).expect("fixed");
                 cipher.open_in_place(&mut fixed).expect("opens");
+                let first = usize::from(u16::from_be_bytes([
+                    fixed[9 + m.key_len()],
+                    fixed[10 + m.key_len()],
+                ]));
+                assert_eq!(first, 4, "the head carries the first payload");
+                let mut chunk = vec![0u8; first + TAG_LEN];
+                read_exact(&mut uplink, &mut chunk).expect("first");
+                let got = cipher.open_in_place(&mut chunk).expect("opens first");
+                assert_eq!(&chunk[..got], b"ping");
                 let _ = s;
                 cipher
             }
         };
-        let mut buf = wire_buffer();
-        let back = open_chunk(&mut uplink, &mut recv, &mut buf).expect("opens");
-        assert_eq!(back, &b"ping"[..]);
     }
 
     /// What a stage between the carrier and the codec asks for: its own capacity.
