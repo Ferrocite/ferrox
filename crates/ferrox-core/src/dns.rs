@@ -265,7 +265,7 @@ impl Rule {
         folded.copy_from_slice(matchable.as_bytes());
         folded.make_ascii_lowercase();
         let folded = std::str::from_utf8(folded).expect("folding ascii bytes keeps utf-8");
-        domains.matches(folded, folded)
+        domains.matches(folded)
     }
 }
 
