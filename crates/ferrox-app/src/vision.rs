@@ -40,6 +40,9 @@ pub(crate) struct Link<S: Read + Write + RecordAlignment> {
     /// validator's row is read from.
     #[cfg(test)]
     validated: usize,
+    /// The feed a read built: a steady read spends no scan, so it must build none.
+    #[cfg(test)]
+    feeds: usize,
     read: Reading,
     write: Writing,
     tls: Tls,
@@ -211,6 +214,8 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             staged: 0,
             #[cfg(test)]
             validated: 0,
+            #[cfg(test)]
+            feeds: 0,
             read: Reading {
                 padding: true,
                 raw: false,
@@ -259,10 +264,16 @@ impl<S: Read + Write + RecordAlignment> Read for Link<S> {
     /// The content the walk hands this caller buffer is one filter unit: it joins the
     /// feeding spread through the run, and the machine spends at the unit's end.
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let mut feed = Feeding::new(&self.tls);
-        let n = self.drive_read(buf, &mut feed)?;
-        if feed.run > 0 && self.tls.budget > 0 {
-            self.spend(&feed);
+        let mut feed = (self.tls.budget > 0).then(|| Feeding::new(&self.tls));
+        #[cfg(test)]
+        if feed.is_some() {
+            self.feeds += 1;
+        }
+        let n = self.drive_read(buf, feed.as_mut())?;
+        if let Some(feed) = feed {
+            if feed.run > 0 && self.tls.budget > 0 {
+                self.spend(&feed);
+            }
         }
         Ok(n)
     }
@@ -275,12 +286,16 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     /// leftover delivers, and every extent that lands in the caller's buffer joins
     /// the feeding. EOF mid-frame drops the frame; what the walk's switch left
     /// unparsed is content the caller has not seen.
-    fn drive_read(&mut self, buf: &mut [u8], feed: &mut Feeding) -> std::io::Result<usize> {
+    fn drive_read(
+        &mut self,
+        buf: &mut [u8],
+        mut feed: Option<&mut Feeding>,
+    ) -> std::io::Result<usize> {
         loop {
             if self.read.padding {
                 if self.dot < self.have.len() {
                     let was = self.dot;
-                    match self.pump(Some(buf), feed) {
+                    match self.pump(Some(buf), feed.as_deref_mut()) {
                         0 => {}
                         n => return Ok(n),
                     }
@@ -297,12 +312,12 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                     if self.walk.framed && self.read.padding {
                         return Ok(0);
                     }
-                    return Ok(self.drain_tail(buf, feed));
+                    return Ok(self.drain_tail(buf, feed.as_deref_mut()));
                 }
             } else {
                 // the framing is over: what it left in the window is content, then raw
                 if self.dot < self.have.len() && !buf.is_empty() {
-                    return Ok(self.drain_tail(buf, feed));
+                    return Ok(self.drain_tail(buf, feed.as_deref_mut()));
                 }
                 if buf.is_empty() {
                     return Ok(0);
@@ -336,10 +351,12 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         self.engage();
     }
 
-    fn drain_tail(&mut self, buf: &mut [u8], feed: &mut Feeding) -> usize {
+    fn drain_tail(&mut self, buf: &mut [u8], feed: Option<&mut Feeding>) -> usize {
         let n = (self.have.len() - self.dot).min(buf.len());
         if n > 0 && self.tls.budget > 0 {
-            feed_extent(&self.have[self.dot..self.dot + n], feed);
+            if let Some(feed) = feed {
+                feed_extent(&self.have[self.dot..self.dot + n], feed);
+            }
         }
         buf[..n].copy_from_slice(&self.have[self.dot..self.dot + n]);
         self.dot += n;
@@ -403,7 +420,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     /// window resolves only with a full uuid and either a mismatch (everything passes)
     /// or the framing's first frame header. A walk that blocks mid-frame parks there
     /// and reports what it handed out.
-    fn pump(&mut self, mut buf: Option<&mut [u8]>, feed: &mut Feeding) -> usize {
+    fn pump(&mut self, mut buf: Option<&mut [u8]>, mut feed: Option<&mut Feeding>) -> usize {
         let end = self.have.len();
         let mut dot = self.dot;
         let mut walk = self.walk;
@@ -459,8 +476,10 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 let take = walk.want_content.min(end - dot).min(room);
                 let fresh = &self.have[dot..dot + take];
                 if self.tls.budget > 0 {
-                    feed.run += take;
-                    feed_extent(fresh, feed);
+                    if let Some(feed) = feed.as_deref_mut() {
+                        feed.run += take;
+                        feed_extent(fresh, feed);
+                    }
                 }
                 if let Some(slot) = buf.as_deref_mut() {
                     slot[held..held + take].copy_from_slice(fresh);
@@ -870,13 +889,26 @@ mod tests {
             link.walk.framed = true;
             link.walk.want_header = 5;
             let mut feed = Feeding::new(&link.tls);
-            let runs = link.pump(None, &mut feed);
+            let runs = link.pump(None, Some(&mut feed));
             assert_eq!(runs, 0);
             link.read.padding = true;
             link.read.raw = false;
             frames += 8;
         }
         assert_eq!(frames, 512, "the walk saw every frame");
+    }
+
+    /// The scan budget is spent after the handshake; a steady read must not build the
+    /// 320-byte feed the scan alone needs.
+    #[test]
+    fn a_steady_read_builds_no_feed() {
+        let input = frame(true, 0, b"body", 0);
+        let mut link = link(&input);
+        link.tls.budget = 0;
+        let mut out = [0u8; 16];
+        let n = link.read(&mut out).expect("reads");
+        assert_eq!(&out[..n], b"body");
+        assert_eq!(link.feeds, 0, "the scan is over, so no feed is built");
     }
 
     /// The command byte is validated once per frame, and a command the reference does

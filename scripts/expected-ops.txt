@@ -137,5 +137,9 @@ ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_n
 # loaded the five header bytes one at a time. It now keeps the cursor and the
 # Walk in registers and writes them back once, and parses the header as one
 # slice; the bytes, commands and frames are unchanged.
-vision::Linkferrox_app::vision::tests::Fake::pump 16896 vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else
+# Re-blessed 17152 by the steady-read feed: pump now takes the feed as an
+# Option so a post-budget read builds none of its 320 bytes. The probe's
+# empty-frame loop pays 256 more instructions for the check (0.5 per frame),
+# while a steady read removes the 320-byte feed construction per read.
+vision::Linkferrox_app::vision::tests::Fake::pump 17152 vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else
 
