@@ -6,6 +6,8 @@ pub const TCP_FRAME: u64 = 0x401;
 
 pub const AUTH_STATUS: u16 = 233;
 
+pub const AUTH_AUTHORITY: &str = "hysteria";
+
 pub const AUTH_PATH: &str = "/auth";
 
 pub const AUTH_HEADER: &str = "hysteria-auth";
@@ -692,12 +694,12 @@ impl Gecko {
     }
 }
 
-pub fn build_auth_request(host: &str, auth: &str, out: &mut Vec<u8>) {
+pub fn build_auth_request(auth: &str, out: &mut Vec<u8>) {
     hpack::qpack_literal_many(
         &[
             (":method", "POST"),
             (":scheme", "https"),
-            (":authority", host),
+            (":authority", AUTH_AUTHORITY),
             (":path", AUTH_PATH),
             (AUTH_HEADER, auth),
             (CC_RX_HEADER, "0"),
@@ -1239,13 +1241,14 @@ mod tests {
     #[test]
     fn an_auth_request_carries_post_auth_and_no_brutal_cap() {
         let mut block = Vec::new();
-        build_auth_request("edge.example:443", "s3cret", &mut block);
+        build_auth_request("s3cret", &mut block);
         assert!(verify_auth_request(&block, "s3cret"));
         assert!(!verify_auth_request(&block, "wrong"));
         assert!(!verify_auth_request(&block, ""));
         let fields = hpack::qpack_fields(&block).expect("reads");
         assert_eq!(fields.len(), 6);
         assert!(fields.contains(&(b":method".to_vec(), b"POST".to_vec())));
+        assert!(fields.contains(&(b":authority".to_vec(), b"hysteria".to_vec())));
         assert!(fields.contains(&(b":path".to_vec(), b"/auth".to_vec())));
         assert!(fields.contains(&(b"hysteria-cc-rx".to_vec(), b"0".to_vec())));
     }

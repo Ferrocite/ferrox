@@ -1731,12 +1731,26 @@ pub(crate) fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, Stri
         Carrier::Xdrive { .. } => "xdriveSettings",
         Carrier::Unknown { .. } | Carrier::Raw(_) | Carrier::Http => "",
     };
-    let host = settings
-        .and_then(|s| s.get(key))
-        .and_then(|s| s.get("host"))
-        .and_then(Json::as_str)
-        .unwrap_or(address)
-        .to_owned();
+    let host = match &carrier {
+        // Hysteria's QUIC handshake carries `tlsSettings.serverName` as both SNI and the auth request's authority; `hysteriaSettings.host` is the fallback xray's own dialect never writes.
+        Carrier::Hysteria(_) => settings
+            .and_then(|s| s.get("tlsSettings"))
+            .and_then(|s| s.get("serverName"))
+            .and_then(Json::as_str)
+            .or_else(|| {
+                settings
+                    .and_then(|s| s.get(key))
+                    .and_then(|s| s.get("host"))
+                    .and_then(Json::as_str)
+            })
+            .unwrap_or(address),
+        _ => settings
+            .and_then(|s| s.get(key))
+            .and_then(|s| s.get("host"))
+            .and_then(Json::as_str)
+            .unwrap_or(address),
+    }
+    .to_owned();
     (carrier, host)
 }
 

@@ -206,9 +206,9 @@ fn control_settings(session: &Session) -> bool {
     send_all(session, 2, &settings, true)
 }
 
-fn post_auth(session: &Session, host: &str, auth: &str) -> Option<bool> {
-    let mut block = Vec::with_capacity(64 + host.len() + auth.len());
-    hysteria::build_auth_request(host, auth, &mut block);
+fn post_auth(session: &Session, auth: &str) -> Option<bool> {
+    let mut block = Vec::with_capacity(64 + auth.len());
+    hysteria::build_auth_request(auth, &mut block);
     let mut frame = Vec::with_capacity(16 + block.len());
     frames::quic_varint(&mut frame, frames::H3_HEADERS);
     frames::quic_varint(&mut frame, block.len() as u64);
@@ -284,7 +284,7 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     if !control_settings(&session) {
         return None;
     }
-    let udp = post_auth(&session, &dial.host, &dial.config.auth)?;
+    let udp = post_auth(&session, &dial.config.auth)?;
     session.udp_supported = udp;
     Some(session)
 }
@@ -603,7 +603,7 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
             match tcp_read.read(buf.as_mut()) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if up.write_all(&buf.as_mut()[..n]).is_err() {
+                    if up.write_all(buf.filled(n)).is_err() {
                         break;
                     }
                 }
@@ -617,7 +617,7 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
         match back.read(buf.as_mut()) {
             Ok(0) | Err(_) => break,
             Ok(n) => {
-                if tcp_write.write_all(&buf.as_mut()[..n]).is_err() {
+                if tcp_write.write_all(buf.filled(n)).is_err() {
                     break;
                 }
             }
