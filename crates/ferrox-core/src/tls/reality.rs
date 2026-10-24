@@ -630,10 +630,7 @@ pub(crate) fn read_to_fill<R: Read>(io: &mut R, buf: &mut [u8]) -> usize {
 }
 
 fn waiting(error: &std::io::Error) -> bool {
-    matches!(
-        error.kind(),
-        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
-    )
+    TlsError::is_timeout(error)
 }
 
 fn hello_is_whole(bytes: &[u8]) -> Option<usize> {

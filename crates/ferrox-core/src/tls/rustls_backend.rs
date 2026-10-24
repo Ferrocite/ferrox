@@ -1403,14 +1403,7 @@ pub(crate) fn ech_server_context_builder(
 /// Whether an error is the socket's poll grain expiring with nothing in it,
 /// which `complete_io` reports because it reads as well as it writes.
 fn idle(error: &std::io::Error) -> bool {
-    use std::io::ErrorKind::{TimedOut, WouldBlock};
-    matches!(error.kind(), TimedOut | WouldBlock)
-        || matches!(
-            error
-                .get_ref()
-                .and_then(|inner| inner.downcast_ref::<TlsError>()),
-            Some(TlsError::Timeout)
-        )
+    TlsError::is_timeout(error)
 }
 
 fn recover(e: std::io::Error) -> TlsError {

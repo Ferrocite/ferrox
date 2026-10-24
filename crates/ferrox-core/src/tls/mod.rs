@@ -171,6 +171,8 @@ impl TlsError {
 fn a_pending_overlapped_read_is_an_idle_wait_on_windows() {
     let pending = std::io::Error::from_raw_os_error(997);
     assert_eq!(TlsError::is_timeout(&pending), cfg!(windows));
+    #[cfg(windows)]
+    assert_eq!(TlsError::from(pending), TlsError::Timeout);
 }
 
 /// Fills `buf` from `stream`: a `dyn Read` may answer short, and a poll quantum the
@@ -195,6 +197,9 @@ impl From<TlsError> for std::io::Error {
 
 impl From<std::io::Error> for TlsError {
     fn from(e: std::io::Error) -> Self {
+        if TlsError::is_timeout(&e) {
+            return Self::Timeout;
+        }
         match e.kind() {
             std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock => Self::Timeout,
             std::io::ErrorKind::UnexpectedEof
