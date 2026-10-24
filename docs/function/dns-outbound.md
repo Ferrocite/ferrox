@@ -44,14 +44,14 @@ Nothing here is timed by a local run — every dial through this outbound is a c
 
 ## Gated counts
 
-The decision's retired instructions are the decide probe's frame — `ferrox-core-dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else`, walked 4096 times so the frame is the method and not the caller that inlined it — read by `scripts/count-ops.sh` under the probe's own filter, the row the count gate now accepts per test.
+The decision's retired instructions are `decide`'s own frame, reached by the `ferrox-core-dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else` probe's 20 480 calls and read by `scripts/count-ops.sh` under that probe's filter. The test-only `#[cfg_attr(test, inline(never))]` keeps the method out of the test binary's inliner: before it, the row measured the probe's frame, and a sibling test that grew the core test binary moved that frame 55 544 745 → 60 123 580 without touching `dns.rs`. The shipped build's inlining is unchanged.
 
 ## Measured
 
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 55544745 | scripts/count-ops.sh |
+| ops-retired-instructions | 28648037 | scripts/count-ops.sh |
 | answer-cases-replayed | 21 | ferrox-core-dns::tests::the_answer_is_the_bytes_the_pinned_go_writes |
 | parse-refusals-replayed | 8 | ferrox-core-dns::tests::the_parse_refuses_what_the_reference_refuses |
 | pointer-hop-cap | 10 | ferrox-core-dns::tests::the_pointer_loop_refuses_at_the_cap |

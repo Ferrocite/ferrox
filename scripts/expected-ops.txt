@@ -128,8 +128,8 @@ append_pem 591
 # probe test's whole frame under 4096 walks of one direct forward, one rule
 # return, two hijacks and one malformed name, and the diff that moved it is
 # the DNS codec and decode landing in c6099e2.
-# Re-blessed by dns-probe-frame: the row measures decide's own frame, kept out of
-# the test binary's inliner by the test-only attribute, so a sibling test cannot
-# move it by growing the core test binary (a KCP witness moved the probe's frame
-# 55544745 -> 60123580 without touching dns.rs).
-ferrox_core::dns::decide UNBLESSED dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+# Re-blessed 28648037 by dns-probe-frame: the row now names decide itself, not the
+# probe's frame, which a sibling test moved 55544745 -> 60123580 by growing the core
+# test binary without touching dns.rs. The test-only inline(never) keeps decide out
+# of that inliner; the shipped build's inlining is unchanged.
+ferrox_core::dns::decide 28648037 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
