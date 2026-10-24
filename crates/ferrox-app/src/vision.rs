@@ -370,10 +370,6 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         }
     }
 
-    fn pending(&self) -> usize {
-        self.have.len() - self.dot
-    }
-
     #[cfg(test)]
     fn stage(&mut self, n: usize) {
         self.staged += n;
@@ -408,63 +404,60 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     /// or the framing's first frame header. A walk that blocks mid-frame parks there
     /// and reports what it handed out.
     fn pump(&mut self, mut buf: Option<&mut [u8]>, feed: &mut Feeding) -> usize {
-        if !self.walk.framed {
-            if self.pending() < SHORTEST_FRAME {
+        let end = self.have.len();
+        let mut dot = self.dot;
+        let mut walk = self.walk;
+        if !walk.framed {
+            if end - dot < SHORTEST_FRAME {
                 return 0;
             }
-            if self.have[self.dot..self.dot + 16] != self.uuid {
+            if self.have[dot..dot + 16] != self.uuid {
                 // the uuid is a window, not a gate: a raw-target proxy passes everything through, exactly as the staged path did
                 self.read.padding = false;
                 return 0;
             }
-            self.walk = Walk {
+            walk = Walk {
                 framed: true,
                 want_header: 5,
                 want_content: 0,
                 want_padding: 0,
                 command: 0,
             };
-            self.dot += 16;
+            dot += 16;
         }
         let mut held = 0;
-        loop {
+        let result = loop {
             // the header is read whole when the window offers five bytes; the tail is byte-by-byte
-            if self.walk.want_header == 5 && self.pending() >= 5 {
-                let frame = [
-                    self.have[self.dot],
-                    self.have[self.dot + 1],
-                    self.have[self.dot + 2],
-                    self.have[self.dot + 3],
-                    self.have[self.dot + 4],
-                ];
+            if walk.want_header == 5 && end - dot >= 5 {
+                let frame = &self.have[dot..dot + 5];
+                walk.command = frame[0];
+                walk.want_content = usize::from(u16::from_be_bytes([frame[1], frame[2]]));
+                walk.want_padding = usize::from(u16::from_be_bytes([frame[3], frame[4]]));
                 self.validate();
-                self.walk.command = frame[0];
-                self.walk.want_content = (usize::from(frame[1]) << 8) | usize::from(frame[2]);
-                self.walk.want_padding = (usize::from(frame[3]) << 8) | usize::from(frame[4]);
-                self.dot += 5;
-                self.walk.want_header = 0;
-            } else if self.walk.want_header > 0 && self.dot < self.have.len() {
-                let byte = self.have[self.dot];
-                match self.walk.want_header {
+                dot += 5;
+                walk.want_header = 0;
+            } else if walk.want_header > 0 && dot < end {
+                let byte = self.have[dot];
+                match walk.want_header {
                     5 => {
-                        self.walk.command = byte;
+                        walk.command = byte;
                         self.validate();
                     }
-                    4 => self.walk.want_content = usize::from(byte) << 8,
-                    3 => self.walk.want_content |= usize::from(byte),
-                    2 => self.walk.want_padding = usize::from(byte) << 8,
-                    _ => self.walk.want_padding |= usize::from(byte),
+                    4 => walk.want_content = usize::from(byte) << 8,
+                    3 => walk.want_content |= usize::from(byte),
+                    2 => walk.want_padding = usize::from(byte) << 8,
+                    _ => walk.want_padding |= usize::from(byte),
                 }
-                self.dot += 1;
-                self.walk.want_header -= 1;
+                dot += 1;
+                walk.want_header -= 1;
             }
-            if self.walk.want_content > 0 {
+            if walk.want_content > 0 {
                 let room = match buf.as_deref() {
                     Some(slot) => slot.len() - held,
                     None => usize::MAX,
                 };
-                let take = self.walk.want_content.min(self.pending()).min(room);
-                let fresh = &self.have[self.dot..self.dot + take];
+                let take = walk.want_content.min(end - dot).min(room);
+                let fresh = &self.have[dot..dot + take];
                 if self.tls.budget > 0 {
                     feed.run += take;
                     feed_extent(fresh, feed);
@@ -472,34 +465,37 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 if let Some(slot) = buf.as_deref_mut() {
                     slot[held..held + take].copy_from_slice(fresh);
                 }
-                self.dot += take;
-                self.walk.want_content -= take;
+                dot += take;
+                walk.want_content -= take;
                 held += take;
-                if self.walk.want_content > 0 || held == buf.as_deref().map_or(0, <[u8]>::len) {
-                    return held;
+                if walk.want_content > 0 || held == buf.as_deref().map_or(0, <[u8]>::len) {
+                    break held;
                 }
                 continue;
             }
-            if self.walk.want_padding > 0 {
-                let take = self.walk.want_padding.min(self.pending());
-                self.dot += take;
-                self.walk.want_padding -= take;
-                if self.walk.want_padding > 0 {
-                    return held;
+            if walk.want_padding > 0 {
+                let take = walk.want_padding.min(end - dot);
+                dot += take;
+                walk.want_padding -= take;
+                if walk.want_padding > 0 {
+                    break held;
                 }
-            } else if self.walk.want_header > 0 {
+            } else if walk.want_header > 0 {
                 // parked inside an incomplete header: nothing moves without bytes
-                return held;
+                break held;
             }
-            if self.walk.command == VisionCommand::Continue.byte() {
-                self.walk.want_header = 5;
+            if walk.command == VisionCommand::Continue.byte() {
+                walk.want_header = 5;
                 continue;
             }
             // a command that is not a continue ends the framing; its tail is content
             self.read.padding = false;
-            self.read.raw = self.walk.command == VisionCommand::Direct.byte() && self.raw.is_some();
-            return held;
-        }
+            self.read.raw = walk.command == VisionCommand::Direct.byte() && self.raw.is_some();
+            break held;
+        };
+        self.dot = dot;
+        self.walk = walk;
+        result
     }
 
     /// Reached only while the framing is live: the read lands in spare capacity held
