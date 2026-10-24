@@ -515,6 +515,8 @@ security-utls forced-alpn-lists-that-allocate 0 ferrox-core-tls::shaped::hello::
 security-utls heap-buffers-for-an-rsa-exponentiation 8 ferrox-core-tls::shaped::oracle::rsa_key_transport_matches_go
 security-utls heap-buffers-for-a-post-handshake-flight 0 ferrox-core-tls::shaped::client::tests::a_post_handshake_flight_is_read_where_it_lies
 security-utls certificate-entries-copied-out-of-the-record 0 ferrox-core-tls::shaped::client::tests::a_certificate_chain_is_read_where_the_record_lies
+security-utls pulled-record-reads-outside-the-inbuf 0 ferrox-core-tls::shaped::client::tests::a_record_read_fills_the_inbuf_it_decrypts_from
+security-utls inbuf-reallocations-per-record-cycle 0 ferrox-core-tls::shaped::client::tests::a_record_read_fills_the_inbuf_it_decrypts_from
 
 # --- loopback re-inject outbound --------------------------------------------
 loopback ops-retired-instructions UNBLESSED scripts/count-ops.sh
