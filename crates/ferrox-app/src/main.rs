@@ -16,6 +16,8 @@ mod census;
 mod blackhole;
 mod config;
 mod conn;
+mod dnsapp;
+mod dnsnet;
 mod ech_dns;
 mod foxy;
 mod foxy_account;

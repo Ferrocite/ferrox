@@ -176,6 +176,8 @@ fn serve_root(label: &str, root: &Json) -> ! {
         &crate::config::budgets(root)
             .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}"))),
     );
+    crate::dnsapp::install(root)
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     let freedom =
         has_protocol(root, "outbounds", "freedom") || find_unbuilt_outbound(root).is_some();
     let outbound =
@@ -201,6 +203,7 @@ fn serve_root(label: &str, root: &Json) -> ! {
         route_shared(root, routing)
             .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")))
     });
+    install_dns_route(route.clone(), outbound.as_ref());
     let (inbounds, hysteria_served) =
         serve_inbounds(label, root, outbound.as_ref(), route.as_ref(), freedom);
     if inbounds == 0 {
@@ -2220,10 +2223,158 @@ where
     }
 }
 
+/// The route and default outbound the DNS app's own server dials go through. Set once a root
+/// config has built both; a resolver built without it keeps the system dial.
+#[derive(Clone)]
+struct DnsRoute {
+    route: Option<Arc<RouteShared>>,
+    outbound: Option<Outbound>,
+}
+
+static DNS_ROUTE: Mutex<Option<DnsRoute>> = Mutex::new(None);
+
+fn install_dns_route(route: Option<Arc<RouteShared>>, outbound: Option<&Outbound>) {
+    if let Ok(mut held) = DNS_ROUTE.lock() {
+        *held = Some(DnsRoute {
+            route,
+            outbound: outbound.cloned(),
+        });
+    }
+}
+
+/// The outbound a DNS server address takes, resolved once through the same rules every other
+/// flow uses. A missing route means the resolver's own dial.
+fn dns_outbound(dest: &Destination, network: crate::router::Network) -> Option<Outbound> {
+    let (route, outbound) = {
+        let held = DNS_ROUTE.lock().ok()?;
+        let stored = held.as_ref()?;
+        (stored.route.clone(), stored.outbound.clone())
+    };
+    match route {
+        Some(shared) => {
+            let plan = RoutePlan::new(shared, None, false);
+            Some(plan.pick(dest, network, None).clone())
+        }
+        None => outbound,
+    }
+}
+
+fn dns_socket(host: &str, port: u16) -> Option<SocketAddr> {
+    host.parse::<std::net::IpAddr>()
+        .ok()
+        .map(|ip| SocketAddr::new(ip, port))
+}
+
+fn dns_destination(host: &str, port: u16) -> Destination {
+    match host.parse::<std::net::IpAddr>() {
+        Ok(ip) => Destination::Address(SocketAddr::new(ip, port)),
+        Err(_) => Destination::Name(host.to_owned(), port),
+    }
+}
+
+/// A stream to a DNS server, carried by the route's chosen outbound over a loopback pair.
+/// The outbound sees the literal or the name the config gave, the same destination the
+/// reference hands its dispatcher.
+pub(crate) fn dns_stream(host: &str, port: u16, timeout: Duration) -> Option<Connection> {
+    let dest = dns_destination(host, port);
+    let out = dns_outbound(&dest, crate::router::Network::Tcp)?;
+    // Freedom is the system dial under another name, so the direct path is shorter and the same.
+    if matches!(out, Outbound::Freedom) {
+        return None;
+    }
+    dns_stream_with(&out, dest, timeout)
+}
+
+fn dns_stream_with(out: &Outbound, dest: Destination, timeout: Duration) -> Option<Connection> {
+    let listener = std::net::TcpListener::bind(SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        0,
+    ))
+    .ok()?;
+    let address = listener.local_addr().ok()?;
+    let client = std::net::TcpStream::connect(address).ok()?;
+    let (server, _) = listener.accept().ok()?;
+    let _ = client.set_nodelay(true);
+    let _ = client.set_read_timeout(Some(timeout));
+    let _ = client.set_write_timeout(Some(timeout));
+    thread::Builder::new()
+        .name("ferrox-dns".to_owned())
+        .spawn({
+            let out = out.clone();
+            move || serve_connect(Connection::Tcp(server), &out, &dest, Front::Socks, &[])
+        })
+        .ok()?;
+    Some(Connection::Tcp(client))
+}
+
+/// One DNS datagram through the route's chosen outbound. The SOCKS UDP frame needs the
+/// resolved address, so a hostname takes the system dial; a literal rides the chosen lane.
+pub(crate) fn dns_udp(host: &str, port: u16, query: &[u8], timeout: Duration) -> Option<Vec<u8>> {
+    let target = dns_socket(host, port)?;
+    let dest = Destination::Address(target);
+    let out = dns_outbound(&dest, crate::router::Network::Udp)?;
+    if matches!(out, Outbound::Freedom) {
+        return None;
+    }
+    dns_udp_with(&out, target, query, timeout)
+}
+
+fn dns_udp_with(
+    out: &Outbound,
+    target: SocketAddr,
+    query: &[u8],
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    if matches!(out, Outbound::Block(_)) {
+        return Some(Vec::new());
+    }
+    let lane = UdpSocket::bind(SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        0,
+    ))
+    .ok()?;
+    let lane_addr = lane.local_addr().ok()?;
+    let _ = lane.set_read_timeout(Some(timeout));
+    let client = UdpSocket::bind(SocketAddr::new(
+        std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        0,
+    ))
+    .ok()?;
+    client.connect(lane_addr).ok()?;
+    let _ = client.set_read_timeout(Some(timeout));
+    let _ = client.set_write_timeout(Some(timeout));
+    thread::Builder::new()
+        .name("ferrox-dns".to_owned())
+        .spawn({
+            let out = out.clone();
+            move || serve_udp_lane(&lane, &out, None)
+        })
+        .ok()?;
+    let mut framed = Vec::with_capacity(3 + 1 + 4 + 2 + query.len());
+    let frame = socks_udp_frame(&mut framed, None, &target, query);
+    client.send(frame).ok()?;
+    let mut response = vec![0u8; ferrox_core::dns::MESSAGE_MAX + 32];
+    let read = client.recv(&mut response).ok()?;
+    let (_, payload) = parse_socks_udp(&response[..read])?;
+    Some(payload.to_vec())
+}
+
 pub(crate) fn resolve_endpoint(host: &str, port: u16) -> Option<SocketAddr> {
+    resolve_name(host, port, false)
+}
+
+fn resolve_name(host: &str, port: u16, local: bool) -> Option<SocketAddr> {
     // An address literal takes the resolver's numeric path, with no cache key of its own.
     if host.parse::<std::net::IpAddr>().is_ok() {
         return (host, port).to_socket_addrs().ok()?.next();
+    }
+    if let Some(resolver) = crate::dnsapp::installed() {
+        let (ips, _) = if local {
+            resolver.lookup_local(host)?
+        } else {
+            resolver.lookup(host)?
+        };
+        return ips.first().map(|ip| SocketAddr::new(*ip, port));
     }
     let addrs = cached_lookup(host, port).unwrap_or_else(|| {
         let addrs = resolve_bounded(host, port, budgets::dial(), |host, port| {
@@ -4277,7 +4428,7 @@ fn resolve_outbound(address: &str, port: u16) -> Option<SocketAddr> {
     if let Ok(ip) = address.parse::<std::net::IpAddr>() {
         return Some(SocketAddr::new(ip, port));
     }
-    resolve_endpoint(address, port)
+    resolve_name(address, port, true)
 }
 
 fn dial_vless(
@@ -10989,6 +11140,23 @@ fn dns_lookup(name: &[u8]) -> ferrox_core::dns::Resolve {
         return ferrox_core::dns::Resolve::Records {
             rdata: vec![octets],
             ttl: 300,
+        };
+    }
+    if let Some(resolver) = crate::dnsapp::installed() {
+        return match resolver.lookup_result(host) {
+            crate::dnsapp::Lookup::Records(ips, ttl) => ferrox_core::dns::Resolve::Records {
+                rdata: ips
+                    .iter()
+                    .map(|ip| match ip {
+                        std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+                        std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+                    })
+                    .collect(),
+                ttl,
+            },
+            crate::dnsapp::Lookup::Empty => ferrox_core::dns::Resolve::AnsweredEmpty,
+            crate::dnsapp::Lookup::Rcode(code) => ferrox_core::dns::Resolve::Refused(code),
+            crate::dnsapp::Lookup::Failed => ferrox_core::dns::Resolve::ErrHard,
         };
     }
     let addrs = cached_lookup(host, 0).unwrap_or_else(|| {
@@ -35995,6 +36163,7 @@ mod dns_lane_tests {
     #[test]
     fn a_cached_lookup_answers_without_a_copy_of_the_cache() {
         remember_lookup("cached.test", 0, &[SocketAddr::from(([192, 0, 2, 7], 0))]);
+        let _ = crate::dnsapp::installed();
         let (resolve, counts) = ferrox_core::alloc_count::measure(|| dns_lookup(b"cached.test."));
         let ferrox_core::dns::Resolve::Records { rdata, ttl } = resolve else {
             panic!("a cached name is a record list");
@@ -36045,6 +36214,70 @@ mod dns_lane_tests {
         );
         assert_eq!(body.as_ptr() as usize, base, "the buffer never moves");
         assert_eq!(body.capacity(), capacity, "nor grows for them");
+    }
+
+    #[test]
+    fn a_dns_datagram_rides_the_route_s_lane() {
+        let query = dns_question("nameserver.test.", 16);
+        let answer = b"an answer the lane carries back".to_vec();
+        let upstream = UdpSocket::bind("127.0.0.1:0").expect("nameserver binds");
+        let target = upstream.local_addr().expect("addr");
+        let seen = query.clone();
+        let sent = answer.clone();
+        let server = std::thread::spawn(move || {
+            let mut buf = udp_buffer();
+            let (read, from) = upstream.recv_from(&mut buf).expect("query arrives");
+            assert_eq!(&buf[..read], seen);
+            upstream.send_to(&sent, from).expect("answer leaves");
+        });
+        let dns = Outbound::Dns(DnsOut {
+            tcp: Some(false),
+            address: None,
+            port: 0,
+            rules: direct_rule(),
+        });
+        let got = dns_udp_with(&dns, target, &query, Duration::from_secs(2)).expect("lane answers");
+        server.join().expect("server ends");
+        assert_eq!(got, answer);
+    }
+
+    #[test]
+    fn a_dns_stream_rides_the_route_s_lane() {
+        let query = dns_question("nameserver.test.", 16);
+        let answer = b"a framed answer the lane carries".to_vec();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("nameserver binds");
+        let target = listener.local_addr().expect("addr");
+        let seen = query.clone();
+        let sent = answer.clone();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut head = [0u8; 2];
+            std::io::Read::read_exact(&mut stream, &mut head).expect("length arrives");
+            let mut body = vec![0u8; usize::from(u16::from_be_bytes(head))];
+            std::io::Read::read_exact(&mut stream, &mut body).expect("query arrives");
+            assert_eq!(body, seen);
+            let out = (sent.len() as u16).to_be_bytes();
+            std::io::Write::write_all(&mut stream, &out).expect("length leaves");
+            std::io::Write::write_all(&mut stream, &sent).expect("answer leaves");
+        });
+        let dns = Outbound::Dns(DnsOut {
+            tcp: Some(true),
+            address: None,
+            port: 0,
+            rules: direct_rule(),
+        });
+        let mut stream =
+            dns_stream_with(&dns, Destination::Address(target), Duration::from_secs(2))
+                .expect("lane opens");
+        let head = (query.len() as u16).to_be_bytes();
+        std::io::Write::write_all(&mut stream, &head).expect("length leaves");
+        std::io::Write::write_all(&mut stream, &query).expect("query leaves");
+        let mut back = [0u8; 2];
+        std::io::Read::read_exact(&mut stream, &mut back).expect("answer length arrives");
+        let mut body = vec![0u8; usize::from(u16::from_be_bytes(back))];
+        std::io::Read::read_exact(&mut stream, &mut body).expect("answer arrives");
+        server.join().expect("server ends");
+        assert_eq!(body, answer);
     }
 
     #[test]

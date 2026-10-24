@@ -856,3 +856,245 @@ mod tests {
         );
     }
 }
+
+/// The EDNS0 settings a query carries: the client subnet the reference puts in
+/// option 8 with its fixed masks (24 for IPv4, 96 for IPv6), and the zero
+/// padding option 12 whose length the `DoH` lane randomises.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Edns {
+    pub client_ip: Option<std::net::IpAddr>,
+    pub padding: usize,
+}
+
+impl Edns {
+    /// Whether the query carries an OPT record at all: the reference emits one
+    /// only when it has a subnet or padding to put in it.
+    pub fn is_some(&self) -> bool {
+        self.client_ip.is_some() || self.padding != 0
+    }
+}
+
+/// One question packed the way the reference's `dnsmessage.Message.Pack`
+/// packs it: recursion desired, one question, and an OPT record whose class is
+/// the UDP payload size 1350, whose extended rcode is 0xfe and whose DNSSEC-OK
+/// bit is set. The name is the FQDN form the reference's `Fqdn` keeps, trailing
+/// dot included, so `pack_name` drops the final dot as the reference does.
+pub fn build_query(id: u16, name: &[u8], qtype: u16, edns: Option<Edns>) -> Option<Vec<u8>> {
+    if name.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(HEADER + name.len() + 16);
+    out.extend_from_slice(&id.to_be_bytes());
+    out.extend_from_slice(&0x0100u16.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes());
+    out.extend_from_slice(&[0; 6]);
+    pack_name(&mut out, name)?;
+    out.extend_from_slice(&qtype.to_be_bytes());
+    out.extend_from_slice(&1u16.to_be_bytes());
+    let Some(edns) = edns.filter(Edns::is_some) else {
+        return Some(out);
+    };
+    out[10..12].copy_from_slice(&1u16.to_be_bytes());
+    out.push(0);
+    out.extend_from_slice(&41u16.to_be_bytes());
+    out.extend_from_slice(&1350u16.to_be_bytes());
+    out.extend_from_slice(&0xfe00_8000u32.to_be_bytes());
+    let mut body = Vec::new();
+    if let Some(ip) = edns.client_ip {
+        body.extend_from_slice(&8u16.to_be_bytes());
+        let (family, bytes, mask) = match ip {
+            std::net::IpAddr::V4(ip) => (1u16, ip.octets().to_vec(), 24u8),
+            std::net::IpAddr::V6(ip) => (2u16, ip.octets().to_vec(), 96u8),
+        };
+        let need = usize::from(mask).div_ceil(8);
+        let mut data = Vec::with_capacity(4 + need);
+        data.extend_from_slice(&family.to_be_bytes());
+        data.push(mask);
+        data.push(0);
+        data.extend_from_slice(&bytes[..need]);
+        body.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        body.extend_from_slice(&data);
+    }
+    if edns.padding != 0 {
+        body.extend_from_slice(&12u16.to_be_bytes());
+        body.extend_from_slice(&(edns.padding as u16).to_be_bytes());
+        body.resize(body.len() + edns.padding, 0);
+    }
+    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    out.extend_from_slice(&body);
+    Some(out)
+}
+
+/// One answer record as the reference's response parser reads it: the type,
+/// the TTL, and the raw rdata. The lane keeps whatever section the response
+/// carried; filtering to A and AAAA is the resolver's own choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnswerRecord {
+    pub kind: u16,
+    pub ttl: u32,
+    pub rdata: Vec<u8>,
+}
+
+/// The response fields the resolver reads: the header's id, rcode and
+/// truncation bit, and every answer record in wire order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Answer {
+    pub id: u16,
+    pub rcode: u16,
+    pub truncated: bool,
+    pub records: Vec<AnswerRecord>,
+}
+
+/// Parse the header, the question section and the answers of a response. A
+/// message too short to hold its own counts, a name that hops more than ten
+/// pointers, a label that refuses a dot byte, and a record that runs past the
+/// message all refuse the parse, the way the reference's parser does.
+pub fn parse_answer(msg: &[u8]) -> Option<Answer> {
+    if msg.len() < HEADER {
+        return None;
+    }
+    let id = u16::from_be_bytes([msg[0], msg[1]]);
+    let flags = u16::from_be_bytes([msg[2], msg[3]]);
+    let questions = usize::from(u16::from_be_bytes([msg[4], msg[5]]));
+    let answers = usize::from(u16::from_be_bytes([msg[6], msg[7]]));
+    let mut at = HEADER;
+    for _ in 0..questions {
+        skip_wire_name(msg, &mut at)?;
+        at = at.checked_add(4).filter(|end| *end <= msg.len())?;
+    }
+    let mut records = Vec::with_capacity(answers);
+    for _ in 0..answers {
+        skip_wire_name(msg, &mut at)?;
+        let kind = read_u16(msg, at)?;
+        read_u16(msg, at.checked_add(2)?)?;
+        let ttl = u32::from_be_bytes([
+            *msg.get(at.checked_add(4)?)?,
+            *msg.get(at.checked_add(5)?)?,
+            *msg.get(at.checked_add(6)?)?,
+            *msg.get(at.checked_add(7)?)?,
+        ]);
+        let length = usize::from(read_u16(msg, at.checked_add(8)?)?);
+        let start = at.checked_add(10)?;
+        let end = start.checked_add(length).filter(|end| *end <= msg.len())?;
+        records.push(AnswerRecord {
+            kind,
+            ttl,
+            rdata: msg[start..end].to_vec(),
+        });
+        at = end;
+    }
+    Some(Answer {
+        id,
+        rcode: flags & 0x000f,
+        truncated: flags & 0x0200 != 0,
+        records,
+    })
+}
+
+/// The offset just past the name at `*at`; a pointer ends the name there and
+/// is then followed only to validate the labels it names.
+fn skip_wire_name(msg: &[u8], at: &mut usize) -> Option<()> {
+    let next = *at;
+    let mut cursor = next;
+    let mut after = None;
+    let mut pointers = 0u32;
+    loop {
+        let start = *msg.get(cursor)?;
+        if start & POINTER_HIGH == POINTER_HIGH {
+            let low = *msg.get(cursor.checked_add(1)?)?;
+            pointers += 1;
+            if pointers > POINTERS_MAX {
+                return None;
+            }
+            after.get_or_insert(cursor + 2);
+            let target = (((start & 0x3F) as usize) << 8) | usize::from(low);
+            if target >= msg.len() {
+                return None;
+            }
+            cursor = target;
+            continue;
+        }
+        if start & 0x3F != start {
+            return None;
+        }
+        let span = usize::from(start);
+        if span == 0 {
+            *at = after.unwrap_or(cursor + 1);
+            return Some(());
+        }
+        let end = cursor.checked_add(span + 1)?;
+        if end > msg.len() || msg[cursor + 1..end].contains(&b'.') {
+            return None;
+        }
+        cursor = end;
+    }
+}
+
+#[cfg(test)]
+mod resolver_wire_tests {
+    use super::*;
+
+    #[test]
+    fn a_query_is_the_references_pack() {
+        let query = build_query(0x1234, b"example.com.", 1, None).expect("packs");
+        assert_eq!(
+            query,
+            [
+                0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 7, b'e',
+                b'x', b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0x00, 0x01, 0x00, 0x01,
+            ]
+        );
+    }
+
+    #[test]
+    fn an_edns_query_carries_the_references_opt_record() {
+        let query = build_query(
+            0,
+            b"example.com.",
+            28,
+            Some(Edns {
+                client_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 1))),
+                padding: 3,
+            }),
+        )
+        .expect("packs");
+        let root = query.len() - 29;
+        assert_eq!(
+            &query[root..root + 11],
+            &[0, 0, 41, 0x05, 0x46, 0xfe, 0x00, 0x80, 0x00, 0, 18]
+        );
+        assert_eq!(
+            &query[root + 11..],
+            &[0, 8, 0, 7, 0, 1, 24, 0, 192, 0, 2, 0, 12, 0, 3, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn a_response_reads_its_answers_in_wire_order() {
+        let answer = [
+            0x12, 0x34, 0x81, 0x80, 0x00, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 7, b'e', b'x',
+            b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0x00, 0x01, 0x00, 0x01, 0xc0,
+            0x0c, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x04, 192, 0, 2, 1, 0xc0,
+            0x0c, 0x00, 0x1c, 0x00, 0x01, 0x00, 0x00, 0x00, 0x3c, 0x00, 0x10, 0x20, 0x01, 0x0d,
+            0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+        ];
+        let parsed = parse_answer(&answer).expect("parses");
+        assert_eq!(parsed.id, 0x1234);
+        assert_eq!(parsed.rcode, 0);
+        assert!(!parsed.truncated);
+        assert_eq!(parsed.records.len(), 2);
+        assert_eq!(parsed.records[0].kind, 1);
+        assert_eq!(parsed.records[0].rdata, vec![192, 0, 2, 1]);
+        assert_eq!(parsed.records[1].kind, 28);
+        assert_eq!(parsed.records[1].ttl, 60);
+    }
+
+    #[test]
+    fn a_message_that_runs_past_its_length_refuses() {
+        let mut answer = vec![0u8; HEADER];
+        answer[4..6].copy_from_slice(&1u16.to_be_bytes());
+        answer[6..8].copy_from_slice(&1u16.to_be_bytes());
+        answer.extend_from_slice(&[0, 0, 1, 0, 1]);
+        assert!(parse_answer(&answer).is_none());
+    }
+}

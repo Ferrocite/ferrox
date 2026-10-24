@@ -14,6 +14,7 @@ pub(crate) fn to_json(bytes: &[u8]) -> Result<Json, String> {
     let mut inbounds = Vec::new();
     let mut outbounds = Vec::new();
     let mut routing = None;
+    let mut dns = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => inbounds.extend(inbound(reader.bytes()?)?),
@@ -21,11 +22,20 @@ pub(crate) fn to_json(bytes: &[u8]) -> Result<Json, String> {
             // The router's rules say which tagged outbound a flow goes to; every other app is xray's own object graph.
             (4, 2) => {
                 let (name, value) = typed_message(reader.bytes()?)?;
-                if name == "xray.app.router.Config" {
-                    if routing.is_some() {
-                        return Err("xray.core.Config: two router apps".to_owned());
+                match name.as_str() {
+                    "xray.app.router.Config" => {
+                        if routing.is_some() {
+                            return Err("xray.core.Config: two router apps".to_owned());
+                        }
+                        routing = Some(router_settings(value)?);
                     }
-                    routing = Some(router_settings(value)?);
+                    "xray.app.dns.Config" => {
+                        if dns.is_some() {
+                            return Err("xray.core.Config: two DNS apps".to_owned());
+                        }
+                        dns = Some(dns_settings(value)?);
+                    }
+                    _ => {}
                 }
             }
             // Extensions wire xray's own object graph; nothing below reads them.
@@ -41,6 +51,9 @@ pub(crate) fn to_json(bytes: &[u8]) -> Result<Json, String> {
     ];
     if let Some(routing) = routing {
         pairs.push(("routing", routing));
+    }
+    if let Some(dns) = dns {
+        pairs.push(("dns", dns));
     }
     Ok(object(pairs))
 }
@@ -1049,6 +1062,469 @@ fn blackhole_response(bytes: &[u8]) -> Result<Json, String> {
     Ok(object(pairs))
 }
 
+/// `xray.app.dns.Config` in the root dialect `dnsapp` reads: the name servers
+/// in rule order, the static hosts, and the policy each scope carries.
+fn dns_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.app.dns.Config");
+    let mut servers = Vec::new();
+    let mut hosts = Vec::new();
+    let mut pairs = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (5, 2) => servers.push(dns_name_server(reader.bytes()?)?),
+            (3, 2) => {
+                let ip = reader.bytes()?;
+                if !ip.is_empty() {
+                    pairs.push(("clientIp", Json::Str(ip_text(ip, "xray.app.dns.Config")?)));
+                }
+            }
+            (4, 2) => hosts.push(dns_host_mapping(reader.bytes()?)?),
+            // The client's inbound tag scopes a policy; this tree's resolver dials directly.
+            (6, 2) => {
+                reader.bytes()?;
+            }
+            (8, 0) => pairs.push(("disableCache", Json::Bool(reader.varint()? != 0))),
+            (12, 0) => pairs.push(("serveStale", Json::Bool(reader.varint()? != 0))),
+            (13, 0) => {
+                let value = reader.varint()?;
+                pairs.push((
+                    "serveExpiredTTL",
+                    Json::Num(f64::from(u32_value(
+                        value,
+                        "xray.app.dns.Config: serveExpiredTTL",
+                    )?)),
+                ));
+            }
+            (9, 0) => pairs.push((
+                "queryStrategy",
+                Json::Str(strategy(reader.varint()?)?.to_owned()),
+            )),
+            (10, 0) => pairs.push(("disableFallback", Json::Bool(reader.varint()? != 0))),
+            (11, 0) => pairs.push(("disableFallbackIfMatch", Json::Bool(reader.varint()? != 0))),
+            (14, 0) => pairs.push(("enableParallelQuery", Json::Bool(reader.varint()? != 0))),
+            (15, 2) => {
+                let script = std::str::from_utf8(reader.bytes()?)
+                    .map_err(|_| "xray.app.dns.Config: the script is not utf-8".to_owned())?;
+                pairs.push(("script", Json::Str(script.to_owned())));
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut root = Vec::new();
+    if !servers.is_empty() {
+        root.push(("servers", Json::Arr(servers)));
+    }
+    if !hosts.is_empty() {
+        root.push(("hosts", Json::Obj(hosts)));
+    }
+    root.extend(pairs);
+    Ok(object(root))
+}
+
+#[allow(clippy::too_many_lines)]
+fn dns_name_server(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.app.dns.NameServer");
+    let mut address = None;
+    let mut port = None;
+    let mut domains = Vec::new();
+    let mut expected = Vec::new();
+    let mut unexpected = Vec::new();
+    let mut client_ip = None;
+    let mut skip_fallback = false;
+    let mut act_prior = false;
+    let mut act_unprior = false;
+    let mut final_query = false;
+    let mut query_strategy = 0;
+    let mut timeout = None;
+    let mut disable_cache = None;
+    let mut serve_stale = None;
+    let mut serve_expired = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => {
+                let (host, embedded) = endpoint_parts(reader.bytes()?)?;
+                address = Some(host);
+                port = embedded;
+            }
+            (2, 2) => domains.push(Json::Str(domain_rule(reader.bytes()?)?)),
+            (3, 2) => expected.push(Json::Str(ip_rule(reader.bytes()?)?)),
+            (13, 2) => unexpected.push(Json::Str(ip_rule(reader.bytes()?)?)),
+            (5, 2) => {
+                let ip = reader.bytes()?;
+                if !ip.is_empty() {
+                    client_ip = Some(ip_text(ip, "xray.app.dns.NameServer")?);
+                }
+            }
+            (6, 0) => skip_fallback = reader.varint()? != 0,
+            (7, 0) => query_strategy = reader.varint()?,
+            (8, 0) => act_prior = reader.varint()? != 0,
+            (14, 0) => act_unprior = reader.varint()? != 0,
+            // A tag names a policy, a policy ID bounds a script and an id labels the server.
+            (9 | 18, 2) => {
+                reader.bytes()?;
+            }
+            (17, 0) => {
+                reader.varint()?;
+            }
+            (10, 0) => {
+                timeout = Some(u32_value(
+                    reader.varint()?,
+                    "xray.app.dns.NameServer: timeoutMs",
+                )?);
+            }
+            (11, 0) => disable_cache = Some(reader.varint()? != 0),
+            (15, 0) => serve_stale = Some(reader.varint()? != 0),
+            (16, 0) => {
+                serve_expired = Some(u32_value(
+                    reader.varint()?,
+                    "xray.app.dns.NameServer: serveExpiredTTL",
+                )?);
+            }
+            (12, 0) => final_query = reader.varint()? != 0,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let address = address.ok_or("xray.app.dns.NameServer: no address")?;
+    let mut pairs = vec![("address", Json::Str(address))];
+    if let Some(port) = port {
+        pairs.push(("port", Json::Num(f64::from(port))));
+    }
+    if !domains.is_empty() {
+        pairs.push(("domains", Json::Arr(domains)));
+    }
+    if act_prior || !expected.is_empty() {
+        if act_prior {
+            expected.push(Json::Str("*".to_owned()));
+        }
+        pairs.push(("expectedIPs", Json::Arr(expected)));
+    }
+    if act_unprior || !unexpected.is_empty() {
+        if act_unprior {
+            unexpected.push(Json::Str("*".to_owned()));
+        }
+        pairs.push(("unexpectedIPs", Json::Arr(unexpected)));
+    }
+    if let Some(client_ip) = client_ip {
+        pairs.push(("clientIp", Json::Str(client_ip)));
+    }
+    if skip_fallback {
+        pairs.push(("skipFallback", Json::Bool(true)));
+    }
+    if final_query {
+        pairs.push(("finalQuery", Json::Bool(true)));
+    }
+    pairs.push((
+        "queryStrategy",
+        Json::Str(strategy(query_strategy)?.to_owned()),
+    ));
+    if let Some(timeout) = timeout.filter(|timeout| *timeout != 0) {
+        pairs.push(("timeoutMs", Json::Num(f64::from(timeout))));
+    }
+    if let Some(disable_cache) = disable_cache {
+        pairs.push(("disableCache", Json::Bool(disable_cache)));
+    }
+    if let Some(serve_stale) = serve_stale {
+        pairs.push(("serveStale", Json::Bool(serve_stale)));
+    }
+    if let Some(serve_expired) = serve_expired {
+        pairs.push(("serveExpiredTTL", Json::Num(f64::from(serve_expired))));
+    }
+    Ok(object(pairs))
+}
+
+/// `xray.common.net.Endpoint`: a network, an address and a port. A plain
+/// address keeps its transport in the scheme this tree's loader reads.
+fn endpoint_parts(bytes: &[u8]) -> Result<(String, Option<u16>), String> {
+    let mut reader = Reader::new(bytes, "xray.common.net.Endpoint");
+    let mut network = 0;
+    let mut address = None;
+    let mut port = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => network = reader.varint()?,
+            (2, 2) => address = Some(ip_or_domain(reader.bytes()?)?),
+            (3, 0) => {
+                let value = reader.varint()?;
+                port = Some(u16::try_from(value).map_err(|_| {
+                    format!("xray.common.net.Endpoint: port {value} is above 65535")
+                })?);
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let address = address.ok_or("xray.common.net.Endpoint: no address")?;
+    let address = match network {
+        0 | 3 => address,
+        2 => {
+            if !address.contains("://") && address != "localhost" && address != "fakedns" {
+                format!("tcp://{address}")
+            } else {
+                address
+            }
+        }
+        other => {
+            return Err(format!(
+                "xray.common.net.Endpoint: network {other} is not carried"
+            ))
+        }
+    };
+    Ok((address, port.filter(|port| *port != 0)))
+}
+
+/// `xray.common.geodata.DomainRule` as the `type:value` spelling `dnsapp`
+/// parses, whether it names a geosite code or one custom rule.
+fn domain_rule(bytes: &[u8]) -> Result<String, String> {
+    let mut reader = Reader::new(bytes, "xray.common.geodata.DomainRule");
+    let mut text = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => text = Some(geosite_rule(reader.bytes()?)?),
+            (2, 2) => text = Some(domain_rule_custom(reader.bytes()?)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    text.ok_or_else(|| "xray.common.geodata.DomainRule: no value".to_owned())
+}
+
+fn geosite_rule(bytes: &[u8]) -> Result<String, String> {
+    let mut reader = Reader::new(bytes, "xray.common.geodata.GeoSiteRule");
+    let mut file = None;
+    let mut code = None;
+    let mut attrs = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => {
+                file = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| {
+                            "xray.common.geodata.GeoSiteRule: the file is not utf-8".to_owned()
+                        })?
+                        .to_owned(),
+                );
+            }
+            (2, 2) => {
+                code = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| {
+                            "xray.common.geodata.GeoSiteRule: the code is not utf-8".to_owned()
+                        })?
+                        .to_owned(),
+                );
+            }
+            (3, 2) => {
+                attrs = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| {
+                            "xray.common.geodata.GeoSiteRule: the attrs are not utf-8".to_owned()
+                        })?
+                        .to_owned(),
+                );
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let code = code.ok_or("xray.common.geodata.GeoSiteRule: no code")?;
+    let text = match file.as_deref() {
+        None | Some("") => format!("geosite:{code}"),
+        Some(file) => format!("ext:{file}:{code}"),
+    };
+    Ok(match attrs {
+        Some(attrs) if !attrs.is_empty() => format!("{text}@{attrs}"),
+        _ => text,
+    })
+}
+
+fn domain_rule_custom(bytes: &[u8]) -> Result<String, String> {
+    let mut reader = Reader::new(bytes, "xray.common.geodata.Domain");
+    let mut kind = 0;
+    let mut value = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => kind = reader.varint()?,
+            (2, 2) => {
+                value = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| {
+                            "xray.common.geodata.Domain: the value is not utf-8".to_owned()
+                        })?
+                        .to_owned(),
+                );
+            }
+            // An attribute filters a geosite entry this tree does not read.
+            (3, 2) => {
+                reader.bytes()?;
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let value = value.ok_or("xray.common.geodata.Domain: no value")?;
+    let prefix = match kind {
+        0 => "keyword:",
+        1 => "regexp:",
+        2 => "domain:",
+        3 => "full:",
+        other => {
+            return Err(format!(
+                "xray.common.geodata.Domain: type {other} is not carried"
+            ))
+        }
+    };
+    Ok(format!("{prefix}{value}"))
+}
+
+fn dns_host_mapping(bytes: &[u8]) -> Result<(String, Json), String> {
+    let mut reader = Reader::new(bytes, "xray.app.dns.Config.HostMapping");
+    let mut domain = None;
+    let mut ips = Vec::new();
+    let mut proxied = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (2, 2) => domain = Some(domain_rule(reader.bytes()?)?),
+            (3, 2) => ips.push(Json::Str(ip_text(
+                reader.bytes()?,
+                "xray.app.dns.Config.HostMapping",
+            )?)),
+            (4, 2) => {
+                proxied = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| {
+                            "xray.app.dns.Config.HostMapping: the domain is not utf-8".to_owned()
+                        })?
+                        .to_owned(),
+                );
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let domain = domain.ok_or("xray.app.dns.Config.HostMapping: no domain")?;
+    let value = match proxied {
+        Some(domain) if !domain.is_empty() => Json::Str(domain),
+        _ => match ips.len() {
+            0 => Json::Arr(Vec::new()),
+            1 => ips.remove(0),
+            _ => Json::Arr(ips),
+        },
+    };
+    Ok((domain, value))
+}
+
+fn strategy(value: u64) -> Result<&'static str, String> {
+    match value {
+        0 => Ok("UseIP"),
+        1 => Ok("UseIP4"),
+        2 => Ok("UseIP6"),
+        3 => Ok("UseSys"),
+        other => Err(format!(
+            "xray.app.dns: query strategy {other} is not carried"
+        )),
+    }
+}
+
+fn u32_value(value: u64, message: &'static str) -> Result<u32, String> {
+    u32::try_from(value).map_err(|_| format!("{message}: {value} is above 4294967295"))
+}
+
+fn ip_text(bytes: &[u8], message: &'static str) -> Result<String, String> {
+    match bytes.len() {
+        4 => Ok(std::net::Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]).to_string()),
+        16 => {
+            let octets: [u8; 16] = bytes
+                .try_into()
+                .map_err(|_| format!("{message}: a 16-byte address"))?;
+            Ok(std::net::Ipv6Addr::from(octets).to_string())
+        }
+        len => Err(format!(
+            "{message}: an address of {len} bytes is neither IPv4 nor IPv6"
+        )),
+    }
+}
+
+fn ip_rule(bytes: &[u8]) -> Result<String, String> {
+    let mut reader = Reader::new(bytes, "xray.common.geodata.IPRule");
+    let mut geoip = None;
+    let mut custom = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => geoip = Some(geoip_rule(reader.bytes()?)?),
+            (2, 2) => custom = Some(cidr_rule(reader.bytes()?)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    geoip
+        .or(custom)
+        .ok_or_else(|| "xray.common.geodata.IPRule: no rule".to_owned())
+}
+
+fn geoip_rule(bytes: &[u8]) -> Result<String, String> {
+    let mut reader = Reader::new(bytes, "xray.common.geodata.GeoIPRule");
+    let mut file = None;
+    let mut code = None;
+    let mut reverse = false;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => {
+                file = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| {
+                            "xray.common.geodata.GeoIPRule: the file is not utf-8".to_owned()
+                        })?
+                        .to_owned(),
+                );
+            }
+            (2, 2) => {
+                code = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| {
+                            "xray.common.geodata.GeoIPRule: the code is not utf-8".to_owned()
+                        })?
+                        .to_owned(),
+                );
+            }
+            (3, 0) => reverse = reader.varint()? != 0,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let code = code.ok_or("xray.common.geodata.GeoIPRule: no code")?;
+    let text = match file.as_deref() {
+        None | Some("") => format!("geoip:{code}"),
+        Some(file) => format!("ext:{file}:{code}"),
+    };
+    Ok(if reverse { format!("!{text}") } else { text })
+}
+
+fn cidr_rule(bytes: &[u8]) -> Result<String, String> {
+    let mut reader = Reader::new(bytes, "xray.common.geodata.CIDRRule");
+    let mut cidr = None;
+    let mut reverse = false;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => cidr = Some(cidr_text(reader.bytes()?)?),
+            (2, 0) => reverse = reader.varint()? != 0,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let cidr = cidr.ok_or("xray.common.geodata.CIDRRule: no cidr")?;
+    Ok(if reverse { format!("!{cidr}") } else { cidr })
+}
+
+fn cidr_text(bytes: &[u8]) -> Result<String, String> {
+    let mut reader = Reader::new(bytes, "xray.common.geodata.CIDR");
+    let mut ip = None;
+    let mut prefix = 0u32;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => ip = Some(ip_text(reader.bytes()?, "xray.common.geodata.CIDR")?),
+            (2, 0) => {
+                prefix = u32::try_from(reader.varint()?)
+                    .map_err(|_| "xray.common.geodata.CIDR: prefix is above u32".to_owned())?;
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let ip = ip.ok_or("xray.common.geodata.CIDR: no address")?;
+    Ok(format!("{ip}/{prefix}"))
+}
+
 /// The router app: the rules that send a flow to a tagged outbound, in the
 /// shape this tree's own router reads.
 fn router_settings(bytes: &[u8]) -> Result<Json, String> {
@@ -1180,169 +1656,6 @@ fn network_name(value: u64) -> Result<&'static str, String> {
             "xray.common.net.Network: network {other} is not carried"
         )),
     }
-}
-
-/// `xray.common.geodata.DomainRule`: an asset code or one custom domain, in the
-/// spelling the JSON router's `domain` list reads.
-fn domain_rule(bytes: &[u8]) -> Result<String, String> {
-    let mut reader = Reader::new(bytes, "xray.common.geodata.DomainRule");
-    let mut value = None;
-    while let Some((field, wire)) = reader.field()? {
-        match (field, wire) {
-            (1, 2) => value = Some(geosite_rule(reader.bytes()?)?),
-            (2, 2) => value = Some(custom_domain(reader.bytes()?)?),
-            _ => return Err(reader.refuse(field, wire)),
-        }
-    }
-    value.ok_or("xray.common.geodata.DomainRule: no value".to_owned())
-}
-
-fn geosite_rule(bytes: &[u8]) -> Result<String, String> {
-    let mut reader = Reader::new(bytes, "xray.common.geodata.GeoSiteRule");
-    let mut file = None;
-    let mut code = None;
-    let mut attrs = None;
-    while let Some((field, wire)) = reader.field()? {
-        match (field, wire) {
-            (1, 2) => file = Some(account_text(&mut reader)?),
-            (2, 2) => code = Some(account_text(&mut reader)?),
-            (3, 2) => attrs = Some(account_text(&mut reader)?),
-            _ => return Err(reader.refuse(field, wire)),
-        }
-    }
-    let code = code.ok_or("xray.common.geodata.GeoSiteRule: no code")?;
-    if code.is_empty() {
-        return Err("xray.common.geodata.GeoSiteRule: an empty code".to_owned());
-    }
-    let mut value = match file.as_deref() {
-        None | Some("" | "geosite.dat") => format!("geosite:{code}"),
-        Some(file) => format!("ext-site:{file}:{code}"),
-    };
-    if let Some(attrs) = attrs.filter(|attrs| !attrs.is_empty()) {
-        value.push('@');
-        value.push_str(&attrs);
-    }
-    Ok(value)
-}
-
-fn custom_domain(bytes: &[u8]) -> Result<String, String> {
-    let mut reader = Reader::new(bytes, "xray.common.geodata.Domain");
-    let mut kind = 0;
-    let mut value = None;
-    while let Some((field, wire)) = reader.field()? {
-        match (field, wire) {
-            (1, 0) => kind = reader.varint()?,
-            (2, 2) => value = Some(account_text(&mut reader)?),
-            _ => return Err(reader.refuse(field, wire)),
-        }
-    }
-    let value = value.ok_or("xray.common.geodata.Domain: no value")?;
-    if value.is_empty() {
-        return Err("xray.common.geodata.Domain: an empty value".to_owned());
-    }
-    match kind {
-        0 => Ok(format!("keyword:{value}")),
-        1 => Ok(format!("regexp:{value}")),
-        2 => Ok(format!("domain:{value}")),
-        3 => Ok(format!("full:{value}")),
-        other => Err(format!(
-            "xray.common.geodata.Domain: type {other} is not carried"
-        )),
-    }
-}
-
-/// `xray.common.geodata.IPRule`: an asset code or one CIDR, in the spelling the
-/// JSON router's `ip`, `sourceIP` and `localIP` lists read.
-fn ip_rule(bytes: &[u8]) -> Result<String, String> {
-    let mut reader = Reader::new(bytes, "xray.common.geodata.IPRule");
-    let mut value = None;
-    while let Some((field, wire)) = reader.field()? {
-        match (field, wire) {
-            (1, 2) => value = Some(geoip_rule(reader.bytes()?)?),
-            (2, 2) => value = Some(cidr_rule(reader.bytes()?)?),
-            _ => return Err(reader.refuse(field, wire)),
-        }
-    }
-    value.ok_or("xray.common.geodata.IPRule: no value".to_owned())
-}
-
-fn geoip_rule(bytes: &[u8]) -> Result<String, String> {
-    let mut reader = Reader::new(bytes, "xray.common.geodata.GeoIPRule");
-    let mut file = None;
-    let mut code = None;
-    let mut reverse = false;
-    while let Some((field, wire)) = reader.field()? {
-        match (field, wire) {
-            (1, 2) => file = Some(account_text(&mut reader)?),
-            (2, 2) => code = Some(account_text(&mut reader)?),
-            (3, 0) => reverse = reader.varint()? != 0,
-            _ => return Err(reader.refuse(field, wire)),
-        }
-    }
-    let code = code.ok_or("xray.common.geodata.GeoIPRule: no code")?;
-    if code.is_empty() {
-        return Err("xray.common.geodata.GeoIPRule: an empty code".to_owned());
-    }
-    let value = match file.as_deref() {
-        None | Some("" | "geoip.dat") => format!("geoip:{code}"),
-        Some(file) => format!("ext-ip:{file}:{code}"),
-    };
-    Ok(if reverse { format!("!{value}") } else { value })
-}
-
-fn cidr_rule(bytes: &[u8]) -> Result<String, String> {
-    let mut reader = Reader::new(bytes, "xray.common.geodata.CIDRRule");
-    let mut value = None;
-    let mut reverse = false;
-    while let Some((field, wire)) = reader.field()? {
-        match (field, wire) {
-            (1, 2) => value = Some(cidr_value(reader.bytes()?)?),
-            (2, 0) => reverse = reader.varint()? != 0,
-            _ => return Err(reader.refuse(field, wire)),
-        }
-    }
-    let value = value.ok_or("xray.common.geodata.CIDRRule: no cidr")?;
-    Ok(if reverse { format!("!{value}") } else { value })
-}
-
-fn cidr_value(bytes: &[u8]) -> Result<String, String> {
-    let mut reader = Reader::new(bytes, "xray.common.geodata.CIDR");
-    let mut ip = None;
-    let mut prefix = 0u32;
-    while let Some((field, wire)) = reader.field()? {
-        match (field, wire) {
-            (1, 2) => ip = Some(reader.bytes()?),
-            (2, 0) => {
-                prefix = u32::try_from(reader.varint()?)
-                    .map_err(|_| "xray.common.geodata.CIDR: a prefix overflows".to_owned())?;
-            }
-            _ => return Err(reader.refuse(field, wire)),
-        }
-    }
-    let ip = ip.ok_or("xray.common.geodata.CIDR: no address")?;
-    let (address, max) = match ip.len() {
-        4 => (
-            std::net::Ipv4Addr::new(ip[0], ip[1], ip[2], ip[3]).to_string(),
-            32,
-        ),
-        16 => {
-            let bytes: [u8; 16] = ip
-                .try_into()
-                .map_err(|_| "xray.common.geodata.CIDR: a 16-byte address".to_owned())?;
-            (std::net::Ipv6Addr::from(bytes).to_string(), 128)
-        }
-        len => {
-            return Err(format!(
-                "xray.common.geodata.CIDR: an address of {len} bytes is neither IPv4 nor IPv6"
-            ))
-        }
-    };
-    if prefix > max {
-        return Err(format!(
-            "xray.common.geodata.CIDR: prefix {prefix} exceeds {max}"
-        ));
-    }
-    Ok(format!("{address}/{prefix}"))
 }
 
 /// `xray.common.net.PortList` in the shape this tree's router reads: a range is
@@ -2254,6 +2567,192 @@ mod tests {
                 .map(<[Json]>::len),
             Some(1)
         );
+    }
+
+    fn endpoint(address: &[u8], port: u64, network: u64) -> Vec<u8> {
+        message(&[
+            varint_field(1, network),
+            bytes_field(2, address),
+            varint_field(3, port),
+        ])
+    }
+
+    fn domain_rule(kind: u64, value: &[u8]) -> Vec<u8> {
+        bytes_field(2, &message(&[varint_field(1, kind), bytes_field(2, value)]))
+    }
+
+    fn dns_app(settings: &[u8]) -> Vec<u8> {
+        let mut bytes = http_scenario(5000);
+        bytes.extend(bytes_field(4, &typed("xray.app.dns.Config", settings)));
+        bytes
+    }
+
+    fn dns_config() -> Json {
+        let server = message(&[
+            bytes_field(1, &endpoint(&bytes_field(1, &[192, 0, 2, 8]), 53, 3)),
+            bytes_field(2, &domain_rule(3, b"example.com")),
+            bytes_field(5, &[192, 0, 2, 4]),
+            varint_field(6, 1),
+            varint_field(7, 1),
+            varint_field(10, 500),
+            varint_field(11, 0),
+            varint_field(12, 1),
+            varint_field(15, 1),
+            varint_field(16, 60),
+        ]);
+        let mapped = message(&[
+            bytes_field(2, &domain_rule(3, b"host.test")),
+            bytes_field(3, &[127, 0, 0, 1]),
+        ]);
+        let proxy = message(&[
+            bytes_field(2, &domain_rule(3, b"alias.test")),
+            bytes_field(4, b"real.test"),
+        ]);
+        let settings = message(&[
+            bytes_field(5, &server),
+            bytes_field(3, &[192, 0, 2, 9]),
+            bytes_field(4, &mapped),
+            bytes_field(4, &proxy),
+            varint_field(8, 1),
+            varint_field(12, 1),
+            varint_field(13, 60),
+            varint_field(9, 3),
+            varint_field(10, 1),
+            varint_field(11, 1),
+            varint_field(14, 1),
+        ]);
+        to_json(&dns_app(&settings)).expect("the DNS app decodes")
+    }
+
+    #[test]
+    fn the_dns_app_decodes_to_the_resolver_this_tree_builds() {
+        let json = dns_config();
+        let dns = json.get("dns").expect("dns");
+        assert_eq!(
+            dns.get("clientIp").and_then(Json::as_str),
+            Some("192.0.2.9")
+        );
+        assert_eq!(dns.get("serveExpiredTTL").and_then(Json::as_u32), Some(60));
+        assert_eq!(
+            dns.get("queryStrategy").and_then(Json::as_str),
+            Some("UseSys")
+        );
+        assert_eq!(
+            dns.get("disableFallback").and_then(Json::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            dns.get("enableParallelQuery").and_then(Json::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            dns.get("hosts")
+                .and_then(|hosts| hosts.get("full:host.test"))
+                .and_then(Json::as_str),
+            Some("127.0.0.1")
+        );
+        assert_eq!(
+            dns.get("hosts")
+                .and_then(|hosts| hosts.get("full:alias.test"))
+                .and_then(Json::as_str),
+            Some("real.test")
+        );
+        crate::dnsapp::Resolver::from_root(&json)
+            .expect("the bridge's JSON builds a resolver")
+            .expect("the resolver is present");
+    }
+
+    #[test]
+    fn the_dns_name_server_decodes_to_the_fields_the_loader_reads() {
+        let json = dns_config();
+        let server = &json
+            .get("dns")
+            .and_then(|dns| dns.get("servers"))
+            .and_then(Json::as_arr)
+            .expect("servers")[0];
+        assert_eq!(
+            server.get("address").and_then(Json::as_str),
+            Some("192.0.2.8")
+        );
+        assert_eq!(server.get("port").and_then(Json::as_port), Some(53));
+        assert_eq!(
+            server.get("clientIp").and_then(Json::as_str),
+            Some("192.0.2.4")
+        );
+        assert_eq!(
+            server.get("queryStrategy").and_then(Json::as_str),
+            Some("UseIP4")
+        );
+        assert_eq!(server.get("timeoutMs").and_then(Json::as_u32), Some(500));
+        assert_eq!(
+            server.get("disableCache").and_then(Json::as_bool),
+            Some(false)
+        );
+        assert_eq!(server.get("serveStale").and_then(Json::as_bool), Some(true));
+        assert_eq!(
+            server.get("serveExpiredTTL").and_then(Json::as_u32),
+            Some(60)
+        );
+        assert_eq!(
+            server.get("skipFallback").and_then(Json::as_bool),
+            Some(true)
+        );
+        assert_eq!(server.get("finalQuery").and_then(Json::as_bool), Some(true));
+        assert_eq!(
+            server
+                .get("domains")
+                .and_then(Json::as_arr)
+                .expect("domains")[0]
+                .as_str(),
+            Some("full:example.com")
+        );
+    }
+
+    #[test]
+    fn a_dns_scheme_stays_in_the_address_the_loader_reads() {
+        let settings = message(&[bytes_field(
+            5,
+            &message(&[bytes_field(
+                1,
+                &endpoint(&bytes_field(2, b"https://dns.google/dns-query"), 0, 3),
+            )]),
+        )]);
+        let json = to_json(&dns_app(&settings)).expect("the DNS app decodes");
+        let server = &json
+            .get("dns")
+            .and_then(|dns| dns.get("servers"))
+            .and_then(Json::as_arr)
+            .expect("servers")[0];
+        assert_eq!(
+            server.get("address").and_then(Json::as_str),
+            Some("https://dns.google/dns-query")
+        );
+        assert!(server.get("port").is_none());
+    }
+
+    #[test]
+    fn a_dns_ip_filter_decodes_with_its_prior_flag() {
+        let cidr = message(&[bytes_field(1, &[198, 51, 100, 0]), varint_field(2, 24)]);
+        let custom = message(&[bytes_field(1, &cidr)]);
+        let rule = message(&[bytes_field(2, &custom)]);
+        let server = message(&[
+            bytes_field(1, &endpoint(&bytes_field(1, &[192, 0, 2, 8]), 53, 3)),
+            bytes_field(3, &rule),
+            varint_field(8, 1),
+        ]);
+        let json =
+            to_json(&dns_app(&message(&[bytes_field(5, &server)]))).expect("the DNS app decodes");
+        let expected = json
+            .get("dns")
+            .and_then(|dns| dns.get("servers"))
+            .and_then(Json::as_arr)
+            .expect("servers")[0]
+            .get("expectedIPs")
+            .and_then(Json::as_arr)
+            .expect("expectedIPs");
+        assert_eq!(expected.len(), 2);
+        assert_eq!(expected[0].as_str(), Some("198.51.100.0/24"));
+        assert_eq!(expected[1].as_str(), Some("*"));
     }
 
     #[test]

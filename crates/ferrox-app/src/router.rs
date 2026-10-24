@@ -662,13 +662,13 @@ impl Rule {
                 }
                 "domain" => domain_value = Some(field),
                 "domains" => domains_list = Some(field),
-                "ip" => ips = Some(ip_matcher(field, assets, "ip")?),
+                "ip" => ips = Some(ip_matcher(field, assets, "routing ip")?),
                 "port" => ports = port_set(field, "port")?,
                 "network" => networks = network_list(field)?,
                 "source" => source_value = Some(field),
                 "sourceIP" => source_ip_value = Some(field),
                 "sourcePort" => source_ports = port_set(field, "sourcePort")?,
-                "localIP" => local_ips = Some(ip_matcher(field, assets, "localIP")?),
+                "localIP" => local_ips = Some(ip_matcher(field, assets, "routing localIP")?),
                 "localPort" => local_ports = port_set(field, "localPort")?,
                 "inboundTag" => inbound_tags = string_list(field, "inboundTag")?,
                 "localOS" => local_os = string_list(field, "localOS")?,
@@ -690,7 +690,7 @@ impl Rule {
         }
         let source_json = source_ip_value.or(source_value);
         if let Some(field) = source_json {
-            source_ips = Some(ip_matcher(field, assets, "sourceIP")?);
+            source_ips = Some(ip_matcher(field, assets, "routing sourceIP")?);
         }
         let rule = Self {
             target,
@@ -1017,12 +1017,12 @@ enum DomainKind {
 }
 
 #[derive(Debug)]
-struct IpMatcher {
+pub(crate) struct IpMatcher {
     sets: Vec<(RangeSet, bool)>,
 }
 
 impl IpMatcher {
-    fn matches(&self, ip: IpAddr) -> bool {
+    pub(crate) fn matches(&self, ip: IpAddr) -> bool {
         self.sets
             .iter()
             .any(|(set, reverse)| set.matches(ip, *reverse))
@@ -1355,9 +1355,13 @@ fn add_geosite(
     Ok(())
 }
 
-fn ip_matcher(value: &Json, assets: &mut Assets, field: &str) -> Result<IpMatcher, String> {
+pub(crate) fn ip_matcher(
+    value: &Json,
+    assets: &mut Assets,
+    field: &str,
+) -> Result<IpMatcher, String> {
     let Some(items) = string_list(value, field)? else {
-        return Err(format!("routing {field} is null"));
+        return Err(format!("{field} is null"));
     };
     let mut positive = RangeSet::default();
     let mut negative = RangeSet::default();
@@ -1374,7 +1378,7 @@ fn ip_matcher(value: &Json, assets: &mut Assets, field: &str) -> Result<IpMatche
         sets.push((negative, true));
     }
     if sets.is_empty() {
-        return Err(format!("routing {field} names no address"));
+        return Err(format!("{field} names no address"));
     }
     Ok(IpMatcher { sets })
 }
