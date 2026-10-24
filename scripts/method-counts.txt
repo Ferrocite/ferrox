@@ -705,7 +705,7 @@ engine-dns allocations-per-cached-lookup 4 ferrox-app-dnsapp::resolver_tests::a_
 engine-dns seconds-per-lookup UNBLESSED CI bench.yml (no cell yet)
 
 # --- the reverse tunnel -----------------------------------------------------
-reverse ops-retired-instructions 80534 scripts/count-ops.sh
+reverse ops-retired-instructions 80066 scripts/count-ops.sh
 reverse tcp-echo-bytes-preserved 5 ferrox-app-proxy::reverse_tests::a_portal_flow_reaches_the_bridge_and_comes_back
 
 # --- health observatory and healthcheck inbound -----------------------------

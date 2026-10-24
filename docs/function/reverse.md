@@ -30,7 +30,7 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 80534 | scripts/count-ops.sh |
+| ops-retired-instructions | 80066 | scripts/count-ops.sh |
 | tcp-echo-bytes-preserved | 5 | ferrox-app-proxy::reverse_tests::a_portal_flow_reaches_the_bridge_and_comes_back |
 <!-- counts:end -->
 
@@ -45,7 +45,7 @@ Copies: a whole downlink frame is parsed where the read landed it and copied onc
   proxy::reverse_tests::a_sixteen_kib_downlink_is_echoed_whole 'reverse::Session::read_loop'
 ```
 
-**80,534 retired instructions** for a 16 KiB downlink (two 8 KiB mux frames) on the merged head, from CI `ops` run 40133035316; the same downlink cost **109,108** before the read loop parsed it in place (run 40130833832), so the copy and the common drain removal is **-28,574 instructions (-26.2%)**. The first after run was 80,066, so the socket's frame split moves this informational row by about 0.6%; it is not a blessed gate. The 5-byte echo is correctness, not a priced downlink.
+**80,066 retired instructions** for a 16 KiB downlink (two 8 KiB mux frames), from CI `ops` run 40137286906; the same downlink cost **109,108** before the read loop parsed it in place (run 40130833832), so the copy and the common drain removal is **-29,042 instructions (-26.6%)**. Three after runs read 79,952, 80,066 and 80,534: the socket's frame split moves this informational row by about 0.7%, so it is not a blessed gate. The 5-byte echo is correctness, not a priced downlink.
 
 ## Time
 
@@ -53,7 +53,7 @@ Copies: a whole downlink frame is parsed where the read landed it and copied onc
 
 ## What we removed
 
-**The downlink's second copy of a whole frame.** `read_loop` read into a 32 KiB `chunk`, extended a `buf` with the whole chunk, parsed it, then `drain`ed the consumed prefix — so a whole frame crossed user space twice before the flow queue copied its payload. The loop now parses the read where it landed; only a frame that straddles two reads is copied into a carry. A 16 KiB downlink (two 8 KiB mux frames) costs **80,534 Ir** on the merged head, down from **109,108** (**-28,574, -26.2%**), in CI `ops` runs 40133035316 and 40130833832; the 16 KiB echo test holds the bytes, and the 5-byte flow still passes.
+**The downlink's second copy of a whole frame.** `read_loop` read into a 32 KiB `chunk`, extended a `buf` with the whole chunk, parsed it, then `drain`ed the consumed prefix — so a whole frame crossed user space twice before the flow queue copied its payload. The loop now parses the read where it landed; only a frame that straddles two reads is copied into a carry. A 16 KiB downlink (two 8 KiB mux frames) costs **80,066 Ir**, down from **109,108** (**-29,042, -26.6%**), in CI `ops` runs 40137286906 and 40130833832; the 16 KiB echo test holds the bytes, and the 5-byte flow still passes.
 
 The reference's separate dispatcher and its own mux client. Xray used to serve reverse through `app/reverse`'s inbound/outbound pair and, in ZeroNet, through a `reverse.rs` that implemented Mux.cool framing again. Here the portal registers one `Outbound::ReversePortal` inside the route registry the config already built, the session is a mux client used by nothing else, and the bridge serves the portal's flows through the same `serve_mux_wire` a VLESS mux inbound uses. The three command-4 checks (header, user, flow) live in one `reverse_ask`, so no carrier can grow its own.
 
