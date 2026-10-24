@@ -34,6 +34,7 @@ mod hysteria;
 mod json;
 mod proxy;
 mod quic;
+mod reverse;
 mod router;
 mod shadowsocks;
 mod shadowsocks2022;

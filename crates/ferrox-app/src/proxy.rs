@@ -14,7 +14,7 @@ use crate::budgets::{
     RELAY_MOVING_READS, RELAY_POLL, SESSION_POLL,
 };
 use crate::config::{
-    inbound_carrier, inbound_reality_config, inbound_tls_identity, outbound_carrier, outbound_flow,
+    inbound_carrier, inbound_reality_config, inbound_tls_identity, outbound_carrier,
     outbound_reality, outbound_tls, server_fallbacks, stream_security, tls_ca_roots,
     tls_cert_paths, trojan_key, uuid_bytes, vless_security_supported, Carrier, Fallback,
     FallbackNetwork,
@@ -197,15 +197,23 @@ fn serve_root(label: &str, root: &Json) -> ! {
     };
     // Named only when no outbound was built, so the reason behind an exit that names nothing is on its own line first.
     let refused = outbound.is_none().then(|| diagnose_outbounds(root));
+    let portals = reverse_portals(root);
     let routing = crate::router::Routing::parse(root)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     let route = routing.map(|routing| {
-        route_shared(root, routing)
+        route_shared(root, routing, &portals)
             .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")))
     });
     install_dns_route(route.clone(), outbound.as_ref());
-    let (inbounds, hysteria_served) =
-        serve_inbounds(label, root, outbound.as_ref(), route.as_ref(), freedom);
+    start_bridges(root, outbound.as_ref(), route.as_ref());
+    let (inbounds, hysteria_served) = serve_inbounds(
+        label,
+        root,
+        outbound.as_ref(),
+        route.as_ref(),
+        freedom,
+        &portals,
+    );
     if inbounds == 0 {
         match refused.as_deref().unwrap_or(&[]).first() {
             Some(reason) => exit(&format!("bad config {label}: {reason}")),
@@ -247,6 +255,7 @@ fn serve_inbounds(
     outbound: Option<&Outbound>,
     route: Option<&Arc<RouteShared>>,
     freedom: bool,
+    portals: &crate::reverse::Portals,
 ) -> (usize, bool) {
     let routed =
         |inbound: &Json, source_known: bool| routed_out(outbound, route, inbound, source_known);
@@ -270,7 +279,7 @@ fn serve_inbounds(
             for address in &addresses {
                 match protocol {
                     "vless" => {
-                        if serve_vless_inbound(address, inbound, freedom, label) {
+                        if serve_vless_inbound(address, inbound, freedom, label, portals) {
                             inbounds += 1;
                         }
                     }
@@ -406,8 +415,14 @@ fn spawn_role(address: &str, role: Role) {
     thread::spawn(move || accept_loop(&address, &role));
 }
 
-fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str) -> bool {
-    let users = inbound_users(inbound);
+fn serve_vless_inbound(
+    address: &str,
+    inbound: &Json,
+    freedom: bool,
+    path: &str,
+    portals: &crate::reverse::Portals,
+) -> bool {
+    let users = inbound_users(inbound, portals);
     let carrier = inbound_carrier(inbound);
     let sec = stream_security(inbound);
     // QUIC arrives on UDP with its own handshake, so it never reaches the TCP accept loop.
@@ -835,6 +850,9 @@ pub(crate) enum Outbound {
     Block(ferrox_core::blackhole::Response),
     /// The wire carries DNS queries; the lane answers, drops, and forwards them.
     Dns(DnsOut),
+    /// A reverse portal, named by an inbound user's tag: its flows ride a mux session the bridge
+    /// opened, and the portal answers them from its own side.
+    ReversePortal(Arc<crate::reverse::Portal>),
 }
 
 impl Outbound {
@@ -852,7 +870,8 @@ impl Outbound {
             | Self::Freedom
             | Self::Route(_)
             | Self::Block(_)
-            | Self::Dns(_) => None,
+            | Self::Dns(_)
+            | Self::ReversePortal(_) => None,
         }
     }
 
@@ -1035,7 +1054,53 @@ fn build_outbound(config: &Json, tag: &str) -> Result<Outbound, String> {
 
 /// The routing table the inbounds share: the default is the first configured outbound, and every tag
 /// a rule names is built once here rather than per flow.
-fn route_shared(root: &Json, routing: crate::router::Routing) -> Result<Arc<RouteShared>, String> {
+/// The portals the config names: one per reverse tag an inbound user carries. The same registry
+/// both builds the users and answers the routes that name a portal tag.
+fn reverse_portals(root: &Json) -> Arc<crate::reverse::Portals> {
+    let mut portals = crate::reverse::Portals::default();
+    for inbound in root.get("inbounds").and_then(Json::as_arr).unwrap_or(&[]) {
+        if canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or(""))
+            != "vless"
+        {
+            continue;
+        }
+        for client in inbound
+            .get("settings")
+            .and_then(|settings| settings.get("clients"))
+            .and_then(Json::as_arr)
+            .unwrap_or(&[])
+        {
+            let Some(tag) = client
+                .get("reverse")
+                .and_then(|reverse| reverse.get("tag"))
+                .and_then(Json::as_str)
+            else {
+                continue;
+            };
+            if tag.is_empty() {
+                eprintln!("vless: an inbound reverse tag is empty, so the user forwards nothing");
+                continue;
+            }
+            if client
+                .get("flow")
+                .and_then(Json::as_str)
+                .is_some_and(|flow| flow == ferrox_core::vless::VISION_FLOW)
+            {
+                eprintln!(
+                    "vless: reverse user `{tag}` names the vision flow; a reverse session carries the unframed stream only"
+                );
+            }
+            portals.insert(tag);
+        }
+    }
+    Arc::new(portals)
+}
+
+fn route_shared(
+    root: &Json,
+    routing: crate::router::Routing,
+    portals: &crate::reverse::Portals,
+) -> Result<Arc<RouteShared>, String> {
     let list = root.get("outbounds").and_then(Json::as_arr).unwrap_or(&[]);
     let Some(first) = list.first() else {
         return Err("routing has no outbound to fall back to".into());
@@ -1067,6 +1132,11 @@ fn route_shared(root: &Json, routing: crate::router::Routing) -> Result<Arc<Rout
         }
         if Some(target) == default_tag.as_deref() {
             tagged.insert(target.to_owned(), default.clone());
+            continue;
+        }
+        // A portal tag is not an outbound entry: the inbound user's reverse tag registers it at start.
+        if let Some(portal) = portals.get(target) {
+            tagged.insert(target.to_owned(), Outbound::ReversePortal(portal));
             continue;
         }
         let Some(config) = configs.get(target) else {
@@ -1488,67 +1558,9 @@ fn serve_vless(
 ) {
     match carrier {
         Carrier::Raw(_) => serve_vless_raw(stream, users, freedom, fallbacks),
-        Carrier::Ws { path, .. } => {
-            let Some((mut reader, writer)) = crate::ws::accept(stream, path) else {
-                return;
-            };
-            // Past the upgrade the frame layer retries timeouts itself, so bound it by wall clock and poll the socket.
-            let decoded = under_handshake(&mut reader, decode_request);
-            let Some((got, flow, cmd, target)) = decoded else {
-                return;
-            };
-            if !vless_user_allows(users, &got, flow, cmd, freedom) {
-                return;
-            }
-            let Some(uplink) = dial_or_report(&target) else {
-                return;
-            };
-            if !writer.send(&[0, 0]) {
-                return;
-            }
-            crate::proxy::relay_sink(reader, &writer, &uplink, |_| {});
-        }
-        Carrier::HttpUpgrade { path, .. } => {
-            let Some((mut reader, mut write)) = crate::httpupgrade::accept(stream, path) else {
-                return;
-            };
-            reader.set_poll(Some(RELAY_POLL));
-            let decoded = decode_request_bounded(&mut reader);
-            reader.set_poll(None);
-            let Some((got, flow, cmd, target)) = decoded else {
-                return;
-            };
-            if !vless_user_allows(users, &got, flow, cmd, freedom) {
-                return;
-            }
-            let Some(uplink) = dial_or_report(&target) else {
-                return;
-            };
-            if write.write_all(&[0, 0]).is_err() {
-                return;
-            }
-            crate::proxy::relay_carried(reader, &write, &uplink);
-        }
-        Carrier::Grpc { path } => {
-            let Some((mut reader, writer)) = crate::grpc::accept(stream, path) else {
-                return;
-            };
-            // Past the preface the reader retries timeouts itself, so the opening request is polled at the relay's grain and bounded by the handshake budget, the way the websocket arm bounds its frames.
-            let decoded = under_handshake(&mut reader, decode_request);
-            let Some((got, flow, cmd, target)) = decoded else {
-                return;
-            };
-            if !vless_user_allows(users, &got, flow, cmd, freedom) {
-                return;
-            }
-            let Some(uplink) = dial_or_report(&target) else {
-                return;
-            };
-            if !writer.send(&[0, 0]) {
-                return;
-            }
-            crate::proxy::relay_sink(reader, &writer, &uplink, crate::grpc::mark_reader_dead);
-        }
+        Carrier::Ws { path, .. } => serve_vless_ws(stream, users, path, freedom),
+        Carrier::HttpUpgrade { path, .. } => serve_vless_httpupgrade(stream, users, path, freedom),
+        Carrier::Grpc { path } => serve_vless_grpc(stream, users, path, freedom),
         Carrier::Xhttp { settings, .. } => {
             let Ok(read) = stream.try_clone() else {
                 return;
@@ -1557,29 +1569,131 @@ fn serve_vless(
                 read.set_read_timeout(timeout).is_ok()
             });
         }
-        Carrier::HttpHeader { path } => {
-            let Some((mut reader, mut write)) = crate::httpheader::accept(stream, path) else {
-                return;
-            };
-            reader.set_poll(Some(RELAY_POLL));
-            let decoded = decode_request_bounded(&mut reader);
-            reader.set_poll(None);
-            let Some((got, flow, cmd, target)) = decoded else {
-                return;
-            };
-            if !vless_user_allows(users, &got, flow, cmd, freedom) {
-                return;
-            }
-            let Some(uplink) = dial_or_report(&target) else {
-                return;
-            };
-            if write.write_all(&[0, 0]).is_err() {
-                return;
-            }
-            crate::proxy::relay_carried(reader, &write, &uplink);
-        }
+        Carrier::HttpHeader { path } => serve_vless_httpheader(stream, users, path, freedom),
         refused_carriers!() => {}
     }
+}
+
+/// The reverse branch every stream arm shares: attach the portal and report whether the request
+/// was one, so the forward path never runs beside it.
+fn reverse_carried(
+    ask: ReverseAsk<'_>,
+    reader: impl Read + Send + 'static,
+    writer: impl Write + Send + 'static,
+    closer: Arc<dyn Fn() + Send + Sync>,
+) -> bool {
+    match ask {
+        ReverseAsk::Allowed(portal) => attach_reverse(portal, reader, writer, closer),
+        ReverseAsk::Refused | ReverseAsk::NotReverse => false,
+    }
+}
+
+fn serve_vless_ws(stream: Connection, users: &[VlessUser], path: &str, freedom: bool) {
+    let Some((mut reader, writer)) = crate::ws::accept(stream, path) else {
+        return;
+    };
+    // Past the upgrade the frame layer retries timeouts itself, so bound it by wall clock and poll the socket.
+    let Some((got, flow, cmd, target)) = under_handshake(&mut reader, decode_request) else {
+        return;
+    };
+    let ask = reverse_ask(users, &got, flow, cmd);
+    if !matches!(ask, ReverseAsk::NotReverse) {
+        let closer_writer = writer.clone();
+        reverse_carried(ask, reader, writer, Arc::new(move || closer_writer.close()));
+        return;
+    }
+    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    if !writer.send(&[0, 0]) {
+        return;
+    }
+    crate::proxy::relay_sink(reader, &writer, &uplink, |_| {});
+}
+
+fn serve_vless_httpupgrade(stream: Connection, users: &[VlessUser], path: &str, freedom: bool) {
+    let Some((mut reader, mut write)) = crate::httpupgrade::accept(stream, path) else {
+        return;
+    };
+    reader.set_poll(Some(RELAY_POLL));
+    let decoded = decode_request_bounded(&mut reader);
+    reader.set_poll(None);
+    let Some((got, flow, cmd, target)) = decoded else {
+        return;
+    };
+    let ask = reverse_ask(users, &got, flow, cmd);
+    if !matches!(ask, ReverseAsk::NotReverse) {
+        let closer = connection_closer(&write);
+        reverse_carried(ask, reader, write, closer);
+        return;
+    }
+    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    if write.write_all(&[0, 0]).is_err() {
+        return;
+    }
+    crate::proxy::relay_carried(reader, &write, &uplink);
+}
+
+fn serve_vless_grpc(stream: Connection, users: &[VlessUser], path: &str, freedom: bool) {
+    let Some((mut reader, writer)) = crate::grpc::accept(stream, path) else {
+        return;
+    };
+    // Past the preface the reader retries timeouts itself, so the opening request is polled at the relay's grain and bounded by the handshake budget, the way the websocket arm bounds its frames.
+    let Some((got, flow, cmd, target)) = under_handshake(&mut reader, decode_request) else {
+        return;
+    };
+    let ask = reverse_ask(users, &got, flow, cmd);
+    if !matches!(ask, ReverseAsk::NotReverse) {
+        let closer_writer = writer.clone();
+        reverse_carried(ask, reader, writer, Arc::new(move || closer_writer.close()));
+        return;
+    }
+    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    if !writer.send(&[0, 0]) {
+        return;
+    }
+    crate::proxy::relay_sink(reader, &writer, &uplink, crate::grpc::mark_reader_dead);
+}
+
+fn serve_vless_httpheader(stream: Connection, users: &[VlessUser], path: &str, freedom: bool) {
+    let Some((mut reader, mut write)) = crate::httpheader::accept(stream, path) else {
+        return;
+    };
+    reader.set_poll(Some(RELAY_POLL));
+    let decoded = decode_request_bounded(&mut reader);
+    reader.set_poll(None);
+    let Some((got, flow, cmd, target)) = decoded else {
+        return;
+    };
+    let ask = reverse_ask(users, &got, flow, cmd);
+    if !matches!(ask, ReverseAsk::NotReverse) {
+        let closer = connection_closer(&write);
+        reverse_carried(ask, reader, write, closer);
+        return;
+    }
+    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    if write.write_all(&[0, 0]).is_err() {
+        return;
+    }
+    crate::proxy::relay_carried(reader, &write, &uplink);
 }
 
 /// Turns silence past an absolute deadline into a hard read error, so `read_exact`'s timeout-retry — right for a poll quantum that a sibling thread eventually breaks — cannot spin forever on a handshake that has no sibling yet.
@@ -1729,6 +1843,19 @@ fn vless_raw_reply<D, R>(
         let Some(rows) = fallbacks else { return };
         return seize_fallback(stream, rows, window, &carried);
     };
+    match reverse_ask(users, &got, flow, cmd) {
+        ReverseAsk::Allowed(portal) => {
+            if stream.write_all(&[0, 0]).is_err() {
+                return;
+            }
+            if let Some(tunnel) = crate::reverse::Tunnel::from_connection(&stream) {
+                portal.attach(tunnel);
+            }
+            return;
+        }
+        ReverseAsk::Refused => return,
+        ReverseAsk::NotReverse => {}
+    }
     if !freedom || !vless_flow_ok(user, flow, cmd, false) {
         return;
     }
@@ -2156,37 +2283,6 @@ struct MuxIo<D, R> {
     resolve: R,
 }
 
-enum MuxTarget {
-    Ready(SocketAddr),
-    Name(Vec<u8>, u16),
-}
-
-fn mux_target_owned(target: &ferrox_core::mux::Target<'_>) -> MuxTarget {
-    let port = target.port;
-    match target.addr {
-        ferrox_core::addr::Addr::V4(octets) => {
-            MuxTarget::Ready(SocketAddr::new(std::net::IpAddr::V4(octets.into()), port))
-        }
-        ferrox_core::addr::Addr::V6(octets) => {
-            MuxTarget::Ready(SocketAddr::new(std::net::IpAddr::V6(octets.into()), port))
-        }
-        ferrox_core::addr::Addr::Name(bytes) => MuxTarget::Name(bytes.to_vec(), port),
-    }
-}
-
-fn mux_target_resolve<R>(target: &MuxTarget, resolve: &R) -> Option<SocketAddr>
-where
-    R: Fn(&str, u16) -> Option<SocketAddr>,
-{
-    match target {
-        MuxTarget::Ready(addr) => Some(*addr),
-        MuxTarget::Name(bytes, port) => {
-            let host = std::str::from_utf8(bytes).ok()?;
-            resolve(host, *port)
-        }
-    }
-}
-
 /// A lookup is reused this long: a mux session must not ask per flow, a stuck name must not cost a thread per flow.
 const RESOLVE_TTL: Duration = Duration::from_secs(60);
 const RESOLVE_CACHE_CAP: usize = 256;
@@ -2486,17 +2582,12 @@ fn write_mux_two(shared: &Arc<Mutex<Connection>>, first: &[u8], second: &[u8]) -
     }
 }
 
-fn send_mux_end(shared: &Arc<Mutex<Connection>>, staging: &mut Vec<u8>, id: u16) {
+fn send_mux_end(wire: &MuxWire, staging: &mut Vec<u8>, id: u16) {
     let end = ferrox_core::mux::Outgoing::bare(id, ferrox_core::mux::Status::End, 0);
-    let _ = write_mux_frame(shared, staging, end, None);
+    let _ = wire.write_frame(staging, end, None);
 }
 
-fn write_mux_keep(
-    shared: &Arc<Mutex<Connection>>,
-    staging: &mut Vec<u8>,
-    id: u16,
-    payload: &[u8],
-) -> bool {
+fn write_mux_keep(wire: &MuxWire, staging: &mut Vec<u8>, id: u16, payload: &[u8]) -> bool {
     let keep = ferrox_core::mux::Outgoing {
         id,
         status: ferrox_core::mux::Status::Keep,
@@ -2504,7 +2595,7 @@ fn write_mux_keep(
         target: None,
         global_id: None,
     };
-    write_mux_frame(shared, staging, keep, Some(payload))
+    wire.write_frame(staging, keep, Some(payload))
 }
 
 /// Frames one flow may have waiting before its origin is treated as stalled: a slow reader costs its own flow, and the session keeps reading for every other.
@@ -2556,10 +2647,214 @@ struct MuxState {
 
 type MuxTable = Arc<Mutex<MuxState>>;
 
+/// What one mux `New` names: an address literal, or a name the lane resolves against its own
+/// view of the world (a bridge routes it, a direct mux dials it).
+#[derive(Clone, Debug)]
+pub(crate) enum MuxTarget {
+    Address(SocketAddr),
+    Name(String, u16),
+}
+
+impl MuxTarget {
+    fn of(target: &ferrox_core::mux::Target<'_>) -> Option<Self> {
+        let port = target.port;
+        match target.addr {
+            ferrox_core::addr::Addr::V4(octets) => Some(Self::Address(SocketAddr::new(
+                std::net::IpAddr::V4(octets.into()),
+                port,
+            ))),
+            ferrox_core::addr::Addr::V6(octets) => Some(Self::Address(SocketAddr::new(
+                std::net::IpAddr::V6(octets.into()),
+                port,
+            ))),
+            ferrox_core::addr::Addr::Name(bytes) => {
+                let host = std::str::from_utf8(bytes).ok()?;
+                Some(Self::Name(host.to_owned(), port))
+            }
+        }
+    }
+
+    fn destination(&self) -> Destination {
+        match self {
+            Self::Address(address) => Destination::Address(*address),
+            Self::Name(host, port) => Destination::Name(host.clone(), *port),
+        }
+    }
+
+    fn is_control(&self) -> bool {
+        matches!(self, Self::Name(host, _) if host == crate::reverse::CONTROL_DOMAIN)
+    }
+}
+
+type MuxDial = Arc<dyn Fn(&MuxTarget) -> Option<Connection> + Send + Sync>;
+type MuxUdpOk = Arc<dyn Fn(&MuxTarget) -> bool + Send + Sync>;
+
+/// The session's stream: a socket this server already owns, or a reverse tunnel whose writer
+/// every flow shares. A direct mux keeps the socket's vectored write; a bridge writes the two
+/// parts under the tunnel's own lock.
+#[derive(Clone)]
+enum MuxWire {
+    Conn(Arc<Mutex<Connection>>),
+    Tunnel(crate::reverse::Tunnel),
+}
+
+impl MuxWire {
+    fn reader(&self) -> Option<Box<dyn Read + Send>> {
+        match self {
+            Self::Conn(conn) => {
+                let conn = conn.lock().ok()?;
+                Some(Box::new(conn.try_clone().ok()?))
+            }
+            Self::Tunnel(tunnel) => Some(Box::new(tunnel.reader())),
+        }
+    }
+
+    fn write_frame(
+        &self,
+        staging: &mut Vec<u8>,
+        frame: ferrox_core::mux::Outgoing<'_>,
+        data: Option<&[u8]>,
+    ) -> bool {
+        match self {
+            Self::Conn(conn) => write_mux_frame(conn, staging, frame, data),
+            Self::Tunnel(tunnel) => {
+                if let Some(payload) = data {
+                    assert!(
+                        payload.len() <= ferrox_core::mux::CHUNK_MAX,
+                        "mux chunk longer than a length field"
+                    );
+                    let at = frame.encode_header_into(staging);
+                    frame.patch_payload_len(staging, at, payload.len());
+                    tunnel.write_frame_parts(staging, payload)
+                } else {
+                    resize_scratch(staging, frame.frame_len(0));
+                    let written = frame.encode_into(None, staging);
+                    staging.truncate(written);
+                    tunnel.write_all(staging)
+                }
+            }
+        }
+    }
+
+    fn set_write_timeout(&self, timeout: Duration) {
+        if let Self::Conn(conn) = self {
+            if let Ok(conn) = conn.lock() {
+                let _ = conn.set_write_timeout(Some(timeout));
+            }
+        }
+    }
+
+    fn shutdown(&self) {
+        match self {
+            Self::Conn(conn) => {
+                if let Ok(conn) = conn.lock() {
+                    let _ = conn.shutdown(Shutdown::Both);
+                }
+            }
+            Self::Tunnel(tunnel) => tunnel.close(),
+        }
+    }
+}
+
+/// Where a bridge's returned flows leave this host: the route plan when the config carries rules,
+/// else the one configured outbound. The portal's own tag is a lane the plan may name, and a flow
+/// that lands on anything but freedom is refused rather than sent back through this bridge.
+struct BridgeLane {
+    plan: Option<Arc<RoutePlan>>,
+    fixed: Option<Outbound>,
+    tag: String,
+}
+
+impl BridgeLane {
+    fn of(tag: &str, route: Option<&Arc<RouteShared>>, outbound: Option<&Outbound>) -> Self {
+        Self {
+            plan: route.map(|shared| Arc::new(RoutePlan::new(Arc::clone(shared), None, false))),
+            fixed: outbound.cloned(),
+            tag: tag.to_owned(),
+        }
+    }
+
+    fn pick(&self, asked: &Destination, network: crate::router::Network) -> Option<&Outbound> {
+        match &self.plan {
+            Some(plan) => Some(plan.pick(asked, network, None)),
+            None => self.fixed.as_ref(),
+        }
+    }
+
+    fn tcp(&self, target: &MuxTarget) -> Option<Connection> {
+        let asked = target.destination();
+        match self.pick(&asked, crate::router::Network::Tcp) {
+            Some(Outbound::Freedom) => asked.socket().and_then(|address| dial_or_report(&address)),
+            Some(Outbound::Block(_)) => None,
+            _ => {
+                refuse_bridge_lane(&self.tag);
+                None
+            }
+        }
+    }
+
+    fn udp(&self, target: &MuxTarget) -> bool {
+        let asked = target.destination();
+        match self.pick(&asked, crate::router::Network::Udp) {
+            Some(Outbound::Freedom) => true,
+            Some(Outbound::Block(_)) => false,
+            _ => {
+                refuse_bridge_lane(&self.tag);
+                false
+            }
+        }
+    }
+}
+
+fn refuse_bridge_lane(tag: &str) {
+    static SAID: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let said = SAID.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut said) = said.lock() else { return };
+    if said.insert(tag.to_owned()) {
+        eprintln!("reverse: bridge `{tag}` routed a flow to an outbound that is not freedom; it is dropped");
+    }
+}
+
+/// Serves one bridge session: the portal's flows arrive as mux frames over `wire`, and each leaves
+/// along its own lane. The worker state is what the monitor counts and the idle sweep closes.
+fn serve_bridge_mux(
+    wire: &MuxWire,
+    lane: Arc<BridgeLane>,
+    state: &Arc<crate::reverse::WorkerState>,
+) {
+    let udp_lane = Arc::clone(&lane);
+    let udp: MuxUdpOk = Arc::new(move |target| udp_lane.udp(target));
+    let dial: MuxDial = Arc::new(move |target| lane.tcp(target));
+    serve_mux_wire(wire, &dial, &udp, Some(state), &[]);
+}
+
+/// Starts every bridge the config names; each monitor keeps one session per portal tag alive.
+fn start_bridges(root: &Json, outbound: Option<&Outbound>, route: Option<&Arc<RouteShared>>) {
+    for (tag, vless) in find_bridges(root) {
+        let lane = Arc::new(BridgeLane::of(&tag, route, outbound));
+        crate::reverse::monitor(&tag, move |_| {
+            let (client, server) = crate::reverse::loopback_pair()?;
+            let tunnel = crate::reverse::Tunnel::from_connection(&server)?;
+            let state = crate::reverse::WorkerState::new();
+            let edge = resolve_outbound(&vless.address, vless.port)?;
+            let dial = vless.clone();
+            thread::spawn(move || {
+                dial_vless(&client, &edge, &dial, None, Ladder::global());
+            });
+            let worker_state = Arc::clone(&state);
+            let worker_lane = Arc::clone(&lane);
+            let wire = MuxWire::Tunnel(tunnel.clone());
+            thread::spawn(move || serve_bridge_mux(&wire, worker_lane, &worker_state));
+            Some(crate::reverse::BridgeHandle { tunnel, state })
+        });
+    }
+}
+
 struct MuxOut<'a> {
-    shared: &'a Arc<Mutex<Connection>>,
+    wire: &'a MuxWire,
     staging: &'a mut Vec<u8>,
     handles: &'a mut Vec<RelayEnd>,
+    worker: Option<&'a Arc<crate::reverse::WorkerState>>,
 }
 
 struct UdpMux {
@@ -2567,6 +2862,7 @@ struct UdpMux {
     dest: SocketAddr,
     id: Arc<AtomicU16>,
     done: Arc<AtomicBool>,
+    wire: MuxWire,
 }
 
 type UdpTable = HashMap<u16, Arc<UdpMux>>;
@@ -2584,13 +2880,18 @@ fn mux_done(table: &MuxTable) -> bool {
 fn remove_mux_session(
     table: &MuxTable,
     id: u16,
-    shared: &Arc<Mutex<Connection>>,
+    wire: &MuxWire,
     staging: &mut Vec<u8>,
+    worker: Option<&crate::reverse::WorkerState>,
 ) {
     if let Ok(mut table) = table.lock() {
-        table.flows.remove(&id);
+        if table.flows.remove(&id).is_some() {
+            if let Some(worker) = worker {
+                worker.release_connection();
+            }
+        }
     }
-    send_mux_end(shared, staging, id);
+    send_mux_end(wire, staging, id);
 }
 
 fn serve_vless_mux_with<D, R>(stream: Connection, io: &MuxIo<D, R>, carried: &[u8])
@@ -2598,15 +2899,36 @@ where
     D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
     R: Fn(&str, u16) -> Option<SocketAddr> + Send + Sync + Clone + 'static,
 {
-    let Ok(mut read) = stream.try_clone() else {
-        return;
-    };
-    let Ok(control) = stream.try_clone() else {
+    let _ = stream.set_write_timeout(Some(budgets::relay_stall()));
+    let wire = MuxWire::Conn(Arc::new(Mutex::new(stream)));
+    let io = io.clone();
+    let dial: MuxDial = Arc::new(move |target: &MuxTarget| {
+        let address = match target {
+            MuxTarget::Address(address) => Some(*address),
+            MuxTarget::Name(host, port) => (io.resolve)(host, *port),
+        }?;
+        (io.dial)(&address)
+    });
+    let udp: MuxUdpOk = Arc::new(|_| true);
+    serve_mux_wire(&wire, &dial, &udp, None, carried);
+}
+
+/// One mux session over a wire, whoever dialed it: a VLESS inbound's own socket, or the bridge's
+/// reverse tunnel. `worker`, when present, is what makes the internal control stream meaningful:
+/// its `New` is intercepted, its `Control` messages are decoded, and its live flow count feeds the
+/// bridge's monitor.
+fn serve_mux_wire(
+    wire: &MuxWire,
+    dial: &MuxDial,
+    udp_ok: &MuxUdpOk,
+    worker: Option<&Arc<crate::reverse::WorkerState>>,
+    carried: &[u8],
+) {
+    let Some(mut read) = wire.reader() else {
         return;
     };
     // A client that stops reading must park a write, not the session: the deadline turns it into an error the loop unwinds on.
-    let _ = stream.set_write_timeout(Some(budgets::relay_stall()));
-    let shared = Arc::new(Mutex::new(stream));
+    wire.set_write_timeout(budgets::relay_stall());
     let table: MuxTable = Arc::new(Mutex::new(MuxState {
         flows: HashMap::new(),
         done: false,
@@ -2631,18 +2953,19 @@ where
             match ferrox_core::mux::decode(&buf[at..], ferrox_core::mux::NewTail::Forward) {
                 Err(ferrox_core::mux::Error::Short { .. }) => break,
                 Err(_) => {
-                    teardown_mux(&table, &udp, &handles, &control);
+                    teardown_mux(&table, &udp, &handles, wire, worker);
                     return;
                 }
                 Ok((frame, used)) => {
                     at += used;
                     progressed = true;
                     let mut out = MuxOut {
-                        shared: &shared,
+                        wire,
                         staging: &mut staging,
                         handles: &mut handles,
+                        worker,
                     };
-                    handle_mux_frame(frame, &table, &mut udp, &mut global, &mut out, io);
+                    handle_mux_frame(frame, &table, &mut udp, &mut global, &mut out, dial, udp_ok);
                 }
             }
         }
@@ -2653,10 +2976,16 @@ where
             }
         }
     }
-    teardown_mux(&table, &udp, &handles, &control);
+    teardown_mux(&table, &udp, &handles, wire, worker);
 }
 
-fn teardown_mux(table: &MuxTable, udp: &UdpTable, handles: &[RelayEnd], control: &Connection) {
+fn teardown_mux(
+    table: &MuxTable,
+    udp: &UdpTable,
+    handles: &[RelayEnd],
+    wire: &MuxWire,
+    worker: Option<&Arc<crate::reverse::WorkerState>>,
+) {
     let flows: Vec<Arc<MuxFlow>> = match table.lock() {
         Ok(mut state) => {
             state.done = true;
@@ -2665,36 +2994,44 @@ fn teardown_mux(table: &MuxTable, udp: &UdpTable, handles: &[RelayEnd], control:
         Err(_) => Vec::new(),
     };
     // The session's own socket goes first: a flow parked in a Keep to a client that stopped reading wakes here instead of at its deadline.
-    let _ = control.shutdown(Shutdown::Both);
+    wire.shutdown();
     for flow in flows {
         flow.control.cancel();
     }
     for session in udp.values() {
         session.done.store(true, Ordering::Relaxed);
     }
+    if let Some(worker) = worker {
+        worker.closed();
+    }
     for done in handles {
         join(done);
     }
 }
 
-fn handle_mux_frame<D, R>(
+fn handle_mux_frame(
     frame: ferrox_core::mux::Incoming<'_>,
     table: &MuxTable,
     udp: &mut UdpTable,
     global: &mut UdpGlobal,
     out: &mut MuxOut<'_>,
-    io: &MuxIo<D, R>,
-) where
-    D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
-    R: Fn(&str, u16) -> Option<SocketAddr> + Send + Sync + Clone + 'static,
-{
+    dial: &MuxDial,
+    udp_ok: &MuxUdpOk,
+) {
     use ferrox_core::mux::{Network, Status};
     match frame.status {
         Status::New => {
-            if frame.target.is_some_and(|t| t.network == Network::Udp) {
-                handle_mux_udp_new(frame, udp, global, out);
+            let target = frame.target.and_then(|target| MuxTarget::of(&target));
+            if out.worker.is_some() && target.as_ref().is_some_and(MuxTarget::is_control) {
+                handle_mux_control_new(frame, table, out);
+            } else if frame.target.is_some_and(|t| t.network == Network::Udp) {
+                if target.as_ref().is_none_or(|target| udp_ok(target)) {
+                    handle_mux_udp_new(frame, udp, global, out);
+                } else {
+                    send_mux_end(out.wire, out.staging, frame.id);
+                }
             } else {
-                handle_mux_tcp_new(frame, table, out, io.clone());
+                handle_mux_tcp_new(frame, table, out, dial);
             }
         }
         Status::Keep => {
@@ -2731,27 +3068,72 @@ fn handle_mux_frame<D, R>(
             if let Some(session) = udp.remove(&frame.id) {
                 session.done.store(true, Ordering::Relaxed);
                 global.retain(|_, id| *id != frame.id);
+                if let Some(worker) = out.worker {
+                    worker.release_connection();
+                }
             }
             if let Ok(mut table) = table.lock() {
                 // Dropping the sender lets the writer drain what the client already sent, then half-close.
-                table.flows.remove(&frame.id);
+                if table.flows.remove(&frame.id).is_some() {
+                    if let Some(worker) = out.worker {
+                        worker.release_connection();
+                    }
+                }
             }
         }
         Status::KeepAlive => {}
     }
 }
 
-fn handle_mux_tcp_new<D, R>(
+/// The internal control stream: a flow whose origin is not a socket but the bridge's own state.
+/// Each chunk the portal writes is one `Control` message; nothing is ever written back.
+fn handle_mux_control_new(
     frame: ferrox_core::mux::Incoming<'_>,
     table: &MuxTable,
     out: &mut MuxOut<'_>,
-    io: MuxIo<D, R>,
-) where
-    D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
-    R: Fn(&str, u16) -> Option<SocketAddr> + Send + Sync + Clone + 'static,
-{
-    let Some(target) = frame.target.map(|t| mux_target_owned(&t)) else {
-        return send_mux_end(out.shared, out.staging, frame.id);
+) {
+    let Some(worker) = out.worker else {
+        return;
+    };
+    let (pending, queued) = std::sync::mpsc::sync_channel(MUX_PENDING);
+    let control = Arc::new(MuxControl {
+        stop: Mutex::new(None),
+        cancelled: AtomicBool::new(false),
+    });
+    let flow = Arc::new(MuxFlow { control, pending });
+    let refused = match table.lock() {
+        Ok(mut table) => match table.flows.entry(frame.id) {
+            std::collections::hash_map::Entry::Occupied(_) => true,
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(flow);
+                false
+            }
+        },
+        Err(_) => true,
+    };
+    if refused {
+        return;
+    }
+    worker.note_connection();
+    let state = Arc::clone(worker);
+    out.handles.push(RelayPool::global().run(move || {
+        while let Ok(message) = queued.recv() {
+            state.control(&message);
+            if !state.active() {
+                break;
+            }
+        }
+    }));
+}
+
+fn handle_mux_tcp_new(
+    frame: ferrox_core::mux::Incoming<'_>,
+    table: &MuxTable,
+    out: &mut MuxOut<'_>,
+    dial: &MuxDial,
+) {
+    let Some(target) = frame.target.and_then(|t| MuxTarget::of(&t)) else {
+        return send_mux_end(out.wire, out.staging, frame.id);
     };
     let (pending, queued) = std::sync::mpsc::sync_channel(MUX_PENDING);
     if let Some(data) = frame.data {
@@ -2776,34 +3158,62 @@ fn handle_mux_tcp_new<D, R>(
         Err(_) => true,
     };
     if refused {
-        return send_mux_end(out.shared, out.staging, frame.id);
+        return send_mux_end(out.wire, out.staging, frame.id);
+    }
+    let worker = out.worker.cloned();
+    if let Some(worker) = &worker {
+        worker.note_connection();
     }
     // The session keeps reading while this flow dials; the first Keep is already queued and the writer drains it once the origin answers.
-    let task_table = Arc::clone(table);
-    let task_shared = Arc::clone(out.shared);
-    let task_id = frame.id;
-    let task = move || {
-        let Some(target) = mux_target_resolve(&target, &io.resolve) else {
-            let mut scratch = Vec::with_capacity(8192);
-            remove_mux_session(&task_table, task_id, &task_shared, &mut scratch);
-            return;
-        };
-        let Some(mut uplink) = (io.dial)(&target) else {
-            let mut scratch = Vec::with_capacity(8192);
-            remove_mux_session(&task_table, task_id, &task_shared, &mut scratch);
-            return;
+    let flow = MuxTcpFlow {
+        target,
+        dial: Arc::clone(dial),
+        table: Arc::clone(table),
+        wire: out.wire.clone(),
+        id: frame.id,
+        control,
+        worker: out.worker.cloned(),
+    };
+    out.handles
+        .push(RelayPool::global().run(move || flow.run(queued)));
+    out.handles.retain(|done| done.try_recv().is_err());
+}
+
+/// One bridged TCP flow: dial, pump the queued uplink into the origin, frame the origin's reads
+/// back, and remove the session's side whichever way it ends.
+struct MuxTcpFlow {
+    target: MuxTarget,
+    dial: MuxDial,
+    table: MuxTable,
+    wire: MuxWire,
+    id: u16,
+    control: Arc<MuxControl>,
+    worker: Option<Arc<crate::reverse::WorkerState>>,
+}
+
+impl MuxTcpFlow {
+    fn remove(&self, scratch: &mut Vec<u8>) {
+        remove_mux_session(
+            &self.table,
+            self.id,
+            &self.wire,
+            scratch,
+            self.worker.as_deref(),
+        );
+    }
+
+    fn run(self, queued: std::sync::mpsc::Receiver<Vec<u8>>) {
+        let mut scratch = Vec::with_capacity(8192);
+        let Some(mut uplink) = (self.dial)(&self.target) else {
+            return self.remove(&mut scratch);
         };
         let (Ok(mut read_half), Ok(stop)) = (uplink.try_clone(), uplink.try_clone()) else {
-            let mut scratch = Vec::with_capacity(8192);
-            remove_mux_session(&task_table, task_id, &task_shared, &mut scratch);
-            return;
+            return self.remove(&mut scratch);
         };
-        control.set_stop(stop);
-        if control.cancelled.load(Ordering::Relaxed) || mux_done(&task_table) {
+        self.control.set_stop(stop);
+        if self.control.cancelled.load(Ordering::Relaxed) || mux_done(&self.table) {
             let _ = uplink.shutdown(Shutdown::Both);
-            let mut scratch = Vec::with_capacity(8192);
-            remove_mux_session(&task_table, task_id, &task_shared, &mut scratch);
-            return;
+            return self.remove(&mut scratch);
         }
         // Each direction owns its own handle: the writer drains the queue into the origin, and the reader polls so a session teardown is noticed without waiting on a silent peer.
         let _ = uplink.set_write_timeout(Some(budgets::relay_stall()));
@@ -2819,17 +3229,16 @@ fn handle_mux_tcp_new<D, R>(
         };
         let writer = RelayPool::global().run(writer);
         let mut chunk = [0u8; 8192];
-        let mut scratch = Vec::with_capacity(8192);
         loop {
             match read_half.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => {
-                    if !write_mux_keep(&task_shared, &mut scratch, task_id, &chunk[..n]) {
+                    if !write_mux_keep(&self.wire, &mut scratch, self.id, &chunk[..n]) {
                         break;
                     }
                 }
                 Err(error) if is_timeout(&error) => {
-                    if mux_done(&task_table) {
+                    if mux_done(&self.table) {
                         break;
                     }
                 }
@@ -2837,11 +3246,9 @@ fn handle_mux_tcp_new<D, R>(
             }
         }
         let _ = read_half.shutdown(Shutdown::Both);
-        remove_mux_session(&task_table, task_id, &task_shared, &mut scratch);
+        self.remove(&mut scratch);
         join(&writer);
-    };
-    out.handles.push(RelayPool::global().run(task));
-    out.handles.retain(|done| done.try_recv().is_err());
+    }
 }
 
 fn handle_mux_udp_new(
@@ -2851,7 +3258,7 @@ fn handle_mux_udp_new(
     out: &mut MuxOut<'_>,
 ) {
     let Some(dest) = frame.target.and_then(|t| mux_target_addr(&t)) else {
-        return send_mux_end(out.shared, out.staging, frame.id);
+        return send_mux_end(out.wire, out.staging, frame.id);
     };
     let empty = [0u8; ferrox_core::mux::GLOBAL_ID];
     let identity = frame.global_id.filter(|identity| *identity != empty);
@@ -2860,7 +3267,7 @@ fn handle_mux_udp_new(
         .and_then(|id| udp.remove(&id).map(|session| (id, session)));
     let session = if let Some((old, session)) = reused {
         if old != frame.id {
-            send_mux_end(out.shared, out.staging, old);
+            send_mux_end(out.wire, out.staging, old);
         }
         session.id.store(frame.id, Ordering::Relaxed);
         session
@@ -2871,18 +3278,22 @@ fn handle_mux_udp_new(
             UdpSocket::bind("0.0.0.0:0")
         };
         let Ok(socket) = bound else {
-            return send_mux_end(out.shared, out.staging, frame.id);
+            return send_mux_end(out.wire, out.staging, frame.id);
         };
         let session = Arc::new(UdpMux {
             socket: Arc::new(socket),
             dest,
             id: Arc::new(AtomicU16::new(frame.id)),
             done: Arc::new(AtomicBool::new(false)),
+            wire: out.wire.clone(),
         });
-        let Some(reader) = spawn_mux_udp_reader(&session.socket, out.shared, &session) else {
-            return send_mux_end(out.shared, out.staging, frame.id);
+        let Some(reader) = spawn_mux_udp_reader(&session) else {
+            return send_mux_end(out.wire, out.staging, frame.id);
         };
         out.handles.push(reader);
+        if let Some(worker) = out.worker {
+            worker.note_connection();
+        }
         session
     };
     if let Some(old) = udp.insert(frame.id, Arc::clone(&session)) {
@@ -2897,14 +3308,10 @@ fn handle_mux_udp_new(
     }
 }
 
-fn spawn_mux_udp_reader(
-    socket: &UdpSocket,
-    shared: &Arc<Mutex<Connection>>,
-    session: &Arc<UdpMux>,
-) -> Option<RelayEnd> {
-    let read = socket.try_clone().ok()?;
+fn spawn_mux_udp_reader(session: &Arc<UdpMux>) -> Option<RelayEnd> {
+    let read = session.socket.try_clone().ok()?;
     read.set_read_timeout(Some(RELAY_POLL)).ok()?;
-    let shared = Arc::clone(shared);
+    let wire = session.wire.clone();
     let id = Arc::clone(&session.id);
     let done = Arc::clone(&session.done);
     Some(RelayPool::global().run(move || {
@@ -2920,7 +3327,7 @@ fn spawn_mux_udp_reader(
                         target: Some(mux_target_of(source)),
                         global_id: None,
                     };
-                    if !write_mux_frame(&shared, &mut staging, keep, Some(&buf[..n])) {
+                    if !wire.write_frame(&mut staging, keep, Some(&buf[..n])) {
                         return;
                     }
                 }
@@ -3898,7 +4305,7 @@ fn relay_vless_reply<S>(
 {
     let header = match probe {
         Probe::Decoded(header) => {
-            if !matches!(header.2, 1..=3) {
+            if !matches!(header.2, 1..=4) {
                 // The reference's decoder refuses a command past the id without falling back.
                 return;
             }
@@ -3920,6 +4327,14 @@ fn relay_vless_reply<S>(
         let Some(raw) = raw else { return };
         return seize_fallback_tls(session, &raw, rows, window, &carried, front);
     };
+    match reverse_ask(users, &header.0, header.1, header.2) {
+        ReverseAsk::Allowed(portal) => {
+            attach_reverse_session(portal, session, raw);
+            return;
+        }
+        ReverseAsk::Refused => return,
+        ReverseAsk::NotReverse => {}
+    }
     if !vless_flow_ok(user, header.1, header.2, vision) {
         return;
     }
@@ -4034,6 +4449,40 @@ impl<T> Grain<T> {
 }
 
 impl<T> Half<T> {
+    /// The two directions as a reverse tunnel: the reader owns one handle and the writers share
+    /// the other, so a flow parked in a read still does not block its sibling's write.
+    fn into_tunnel(self, closer: Arc<dyn Fn() + Send + Sync>) -> crate::reverse::Tunnel
+    where
+        T: std::io::Read + std::io::Write + Send + 'static,
+    {
+        match self {
+            Self::Split { read, write } => crate::reverse::Tunnel::new(
+                Box::new(
+                    read.into_inner()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                ),
+                Box::new(
+                    write
+                        .into_inner()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                ),
+                closer,
+            ),
+            Self::Shared { inner, .. } => {
+                let shared = Arc::new(Mutex::new(
+                    inner
+                        .into_inner()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                ));
+                crate::reverse::Tunnel::new(
+                    Box::new(SharedRead(Arc::clone(&shared))),
+                    Box::new(SharedWrite(shared)),
+                    closer,
+                )
+            }
+        }
+    }
+
     /// Two handles of one direction pair: the read and the write never touch each other,
     /// so a read parked in the kernel never makes the write wait for it.
     fn split(read: T, write: T) -> Self {
@@ -4444,6 +4893,29 @@ pub(crate) fn vless_mux_header(id: &[u8; 16]) -> Vec<u8> {
     header
 }
 
+/// The reverse request: command 4 names no address, so the header ends after the command, as the
+/// reference's own encoder writes it.
+pub(crate) fn vless_reverse_header(id: &[u8; 16]) -> Vec<u8> {
+    let mut header = Vec::with_capacity(19);
+    header.push(0);
+    header.extend_from_slice(id);
+    header.push(0);
+    header.push(4);
+    header
+}
+
+/// The header a vless outbound opens with: a forward request names its target, the bridge's
+/// monitor names none and asks the portal for a reverse session instead.
+fn vless_request_header(vless: &VlessOut, target: Option<&Destination>) -> Vec<u8> {
+    match target {
+        None => vless_reverse_header(&vless.id),
+        Some(target) if vless.flow == crate::vision::FLOW => {
+            vless_vision_header(&vless.id, 1, target)
+        }
+        Some(target) => vless_header(&vless.id, 1, target),
+    }
+}
+
 // Records a rung failure and reports whether the session stops here.
 fn climb_or_hold(ladder: &Ladder, rung: Rung, stage: Stage, kind: Kind) -> bool {
     let failure = Failure::new(stage, kind);
@@ -4483,10 +4955,10 @@ fn dial_vless(
     client: &Connection,
     server: &SocketAddr,
     vless: &VlessOut,
-    target: &Destination,
+    target: Option<&Destination>,
     ladder: &Ladder,
 ) {
-    let header = vless_header(&vless.id, 1, target);
+    let header = vless_request_header(vless, target);
     if vless.tls.is_some() {
         dial_vless_tls(client, server, vless, target);
         return;
@@ -8181,16 +8653,12 @@ fn dial_vless_tls(
     client: &Connection,
     server: &SocketAddr,
     vless: &VlessOut,
-    target: &Destination,
+    target: Option<&Destination>,
 ) {
     let Some(cfg) = vless.tls.as_deref() else {
         return;
     };
-    let header = if vless.flow == crate::vision::FLOW {
-        vless_vision_header(&vless.id, 1, target)
-    } else {
-        vless_header(&vless.id, 1, target)
-    };
+    let header = vless_request_header(vless, target);
     let Some(mut session) = dial_tls_session(server, cfg, vless.carrier.tcp_mask()) else {
         return;
     };
@@ -8320,7 +8788,7 @@ fn dial_vless_reality(
     client: &Connection,
     server: &SocketAddr,
     vless: &VlessOut,
-    target: &Destination,
+    target: Option<&Destination>,
 ) {
     let Some(cfg) = vless.reality.as_deref() else {
         return;
@@ -8357,11 +8825,7 @@ fn dial_vless_reality(
     if raw.set_read_timeout(Some(SESSION_POLL)).is_err() {
         return note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
     }
-    let header = if vless.flow == crate::vision::FLOW {
-        vless_vision_header(&vless.id, 1, target)
-    } else {
-        vless_header(&vless.id, 1, target)
-    };
+    let header = vless_request_header(vless, target);
     match &vless.carrier {
         Carrier::Raw(_) => {
             if session.write_all(&header).is_err() {
@@ -9723,6 +10187,70 @@ pub(crate) fn serve_device_flow(client: Connection, out: &Outbound, dest: &Desti
     serve_connect(client, lane, dest, Front::Socks, &[]);
 }
 
+/// One mux `New` target for a flow the portal carries.
+fn mux_destination(
+    asked: &Destination,
+    network: ferrox_core::mux::Network,
+) -> ferrox_core::mux::Target<'_> {
+    let addr = match asked {
+        Destination::Name(host, _) => ferrox_core::addr::Addr::Name(host.as_bytes()),
+        Destination::Address(address) => match address.ip() {
+            std::net::IpAddr::V4(ip) => ferrox_core::addr::Addr::V4(ip.octets()),
+            std::net::IpAddr::V6(ip) => ferrox_core::addr::Addr::V6(ip.octets()),
+        },
+    };
+    ferrox_core::mux::Target {
+        network,
+        port: asked.port(),
+        addr,
+    }
+}
+
+/// A flow the rules routed to a portal: it rides one mux session the bridge opened, and the
+/// portal never sees a socket for it.
+fn serve_reverse_tcp(client: &Connection, portal: &crate::reverse::Portal, asked: &Destination) {
+    let Some(session) = portal.pick() else {
+        eprintln!(
+            "reverse: portal `{}` has no live session, so the flow is closed",
+            portal.tag()
+        );
+        return;
+    };
+    let target = mux_destination(asked, ferrox_core::mux::Network::Tcp);
+    let Some((id, flow)) = session.open(target, ferrox_core::mux::DEFAULT_CAP as u32) else {
+        return;
+    };
+    let (Ok(mut down), Ok(mut up)) = (client.try_clone(), client.try_clone()) else {
+        session.end(id);
+        return;
+    };
+    let sender = Arc::clone(&session);
+    let reader = thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        loop {
+            match up.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if !sender.send(id, &chunk[..n]) {
+                        break;
+                    }
+                }
+                Err(error) if is_timeout(&error) => {}
+                Err(_) => break,
+            }
+        }
+        sender.end(id);
+    });
+    while let Ok((data, _)) = flow.down.recv() {
+        if down.write_all(&data).is_err() {
+            break;
+        }
+    }
+    let _ = down.shutdown(Shutdown::Both);
+    session.end(id);
+    let _ = reader.join();
+}
+
 /// Nothing carries the destination onward, so this lane is the one that has to look it up.
 fn serve_connect_freedom(client: &Connection, asked: &Destination, prefix: &[u8]) {
     let Some(target) = asked.socket() else {
@@ -9767,6 +10295,9 @@ fn serve_connect(
     }
     if let Outbound::Dns(dns) = out {
         return serve_dns_tcp(client, dns, asked);
+    }
+    if let Outbound::ReversePortal(portal) = out {
+        return serve_reverse_tcp(&client, portal, asked);
     }
     if let Outbound::Vless(vless) = out {
         if matches!(vless.carrier, Carrier::Quic) {
@@ -9861,7 +10392,7 @@ fn dial_socks_outbound(
                 };
                 dial_vless_mux(client, uplink, vless, target);
             } else {
-                dial_vless(client, server, vless, target, ladder);
+                dial_vless(client, server, vless, Some(target), ladder);
             }
         }
         Outbound::Vmess(vmess) => dial_vmess(client, server, vmess, target, ladder),
@@ -9880,7 +10411,8 @@ fn dial_socks_outbound(
         | Outbound::Freedom
         | Outbound::Route(_)
         | Outbound::Block(_)
-        | Outbound::Dns(_) => {}
+        | Outbound::Dns(_)
+        | Outbound::ReversePortal(_) => {}
     }
 }
 
@@ -10914,7 +11446,79 @@ fn serve_udp_lane(relay: &UdpSocket, out: &Outbound, associate: Option<&Connecti
         Outbound::Freedom => serve_socks_udp_freedom(relay),
         Outbound::Socks(socks) => serve_socks_udp_socks(relay, socks),
         Outbound::Dns(dns) => serve_dns_udp(relay, dns),
+        Outbound::ReversePortal(portal) => serve_socks_udp_portal(relay, portal),
         _ => {}
+    }
+}
+
+/// A datagram flow the rules routed to a portal: one mux UDP flow per destination, its replies
+/// framed back to the client that sent the datagram.
+fn serve_socks_udp_portal(relay: &UdpSocket, portal: &crate::reverse::Portal) {
+    struct Lane {
+        dest: SocketAddr,
+        session: Arc<crate::reverse::Session>,
+        id: u16,
+    }
+    let mut lanes: Vec<Lane> = Vec::new();
+    let mut buf = udp_buffer();
+    while let Ok((n, src)) = relay.recv_from(&mut buf) {
+        let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+            continue;
+        };
+        if payload.is_empty() {
+            continue;
+        }
+        if !lanes.iter().any(|lane| lane.dest == dest) {
+            let Some(session) = portal.pick() else {
+                eprintln!(
+                    "reverse: portal `{}` has no live session, so the datagram is dropped",
+                    portal.tag()
+                );
+                continue;
+            };
+            let target = ferrox_core::mux::Target {
+                network: ferrox_core::mux::Network::Udp,
+                port: dest.port(),
+                addr: match dest.ip() {
+                    std::net::IpAddr::V4(ip) => ferrox_core::addr::Addr::V4(ip.octets()),
+                    std::net::IpAddr::V6(ip) => ferrox_core::addr::Addr::V6(ip.octets()),
+                },
+            };
+            let Some((id, flow)) = session.open(target, ferrox_core::mux::DEFAULT_CAP as u32)
+            else {
+                continue;
+            };
+            let Ok(output) = relay.try_clone() else {
+                session.end(id);
+                continue;
+            };
+            let replies = session.clone();
+            let client_addr = src;
+            thread::spawn(move || {
+                let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
+                while let Ok((data, from)) = flow.down.recv() {
+                    // The header names the sender the bridge saw, so the datagram reads as coming from the address that answered.
+                    let frame = socks_udp_frame(&mut frame, None, &from.unwrap_or(dest), &data);
+                    if output.send_to(frame, client_addr).is_err() {
+                        break;
+                    }
+                }
+                replies.end(id);
+            });
+            lanes.push(Lane { dest, session, id });
+        }
+        let Some(lane) = lanes.iter().find(|lane| lane.dest == dest) else {
+            continue;
+        };
+        if !lane.session.send(lane.id, payload) {
+            let session = Arc::clone(&lane.session);
+            let id = lane.id;
+            session.end(id);
+            lanes.retain(|lane| lane.id != id);
+        }
+    }
+    for lane in lanes {
+        lane.session.end(lane.id);
     }
 }
 
@@ -15033,6 +15637,7 @@ impl Destination {
         }
     }
 
+    /// The address to connect to directly: only a lane that carries no destination answers the name itself.
     pub(crate) fn port(&self) -> u16 {
         match self {
             Self::Name(_, port) => *port,
@@ -15143,10 +15748,13 @@ fn inbound_id(inbound: &Json) -> [u8; 16] {
 }
 
 /// One client a vless inbound serves: the id the wire names and the flow its account is bound to.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct VlessUser {
     pub(crate) id: [u8; 16],
     pub(crate) flow: Flow,
+    /// The portal a user's reverse tag names: a reverse account forwards nothing itself, it only
+    /// lends the portal's sessions to the flows routed to that tag.
+    pub(crate) reverse: Option<Arc<crate::reverse::Portal>>,
 }
 
 /// The clients one vless inbound serves; lookup keys the id the way the reference's validator
@@ -15159,6 +15767,7 @@ pub(crate) fn one_user(id: [u8; 16]) -> VlessUsers {
     Arc::from([VlessUser {
         id,
         flow: Flow::None,
+        reverse: None,
     }])
 }
 
@@ -15167,6 +15776,7 @@ fn one_vless_user(id: &[u8; 16]) -> [VlessUser; 1] {
     [VlessUser {
         id: *id,
         flow: Flow::None,
+        reverse: None,
     }]
 }
 
@@ -15174,7 +15784,7 @@ fn same_vless_user(a: &[u8; 16], b: &[u8; 16]) -> bool {
     a[..6] == b[..6] && a[8..] == b[8..]
 }
 
-fn inbound_users(inbound: &Json) -> VlessUsers {
+fn inbound_users(inbound: &Json, portals: &crate::reverse::Portals) -> VlessUsers {
     let mut users: Vec<VlessUser> = Vec::new();
     let clients = inbound
         .get("settings")
@@ -15189,7 +15799,13 @@ fn inbound_users(inbound: &Json) -> VlessUsers {
             "" => Flow::None,
             _ => Flow::Other,
         };
-        let user = VlessUser { id, flow };
+        let reverse = client
+            .get("reverse")
+            .and_then(|reverse| reverse.get("tag"))
+            .and_then(Json::as_str)
+            .filter(|tag| !tag.is_empty())
+            .and_then(|tag| portals.get(tag));
+        let user = VlessUser { id, flow, reverse };
         match users.iter_mut().find(|seen| same_vless_user(&seen.id, &id)) {
             Some(seen) => *seen = user,
             None => users.push(user),
@@ -15199,6 +15815,7 @@ fn inbound_users(inbound: &Json) -> VlessUsers {
         users.push(VlessUser {
             id: inbound_id(inbound),
             flow: Flow::None,
+            reverse: None,
         });
     }
     Arc::from(users)
@@ -15222,11 +15839,171 @@ fn vless_user_allows(
     cmd: u8,
     freedom: bool,
 ) -> bool {
-    freedom
-        && cmd == 1
+    if cmd == 4
         && users
             .iter()
-            .any(|user| same_vless_user(&user.id, got) && vless_flow_ok(user, flow, cmd, false))
+            .any(|user| same_vless_user(&user.id, got) && user.reverse.is_some())
+    {
+        static SAID: OnceLock<()> = OnceLock::new();
+        if SAID.set(()).is_ok() {
+            eprintln!(
+                "vless: a reverse session rides raw, tls, reality, ws, grpc, httpupgrade and httpheader only; this carrier's request is refused"
+            );
+        }
+    }
+    freedom
+        && cmd == 1
+        && users.iter().any(|user| {
+            same_vless_user(&user.id, got)
+                && user.reverse.is_none()
+                && vless_flow_ok(user, flow, cmd, false)
+        })
+}
+
+/// What a request means for the user it names: a reverse account forwards nothing and a forward
+/// account opens no reverse session, so the two commands never share a user.
+#[derive(Clone, Copy)]
+enum ReverseAsk<'a> {
+    NotReverse,
+    Allowed(&'a Arc<crate::reverse::Portal>),
+    Refused,
+}
+
+fn reverse_ask<'a>(users: &'a [VlessUser], got: &[u8; 16], flow: Flow, cmd: u8) -> ReverseAsk<'a> {
+    let Some(user) = users.iter().find(|user| same_vless_user(&user.id, got)) else {
+        return ReverseAsk::NotReverse;
+    };
+    match &user.reverse {
+        None if cmd == 4 => {
+            eprintln!("vless: a reverse request named a user with no reverse tag; refused");
+            ReverseAsk::Refused
+        }
+        None => ReverseAsk::NotReverse,
+        Some(portal) => {
+            if cmd != 4 {
+                eprintln!(
+                    "vless: reverse user `{}` may not forward; refused",
+                    portal.tag()
+                );
+                return ReverseAsk::Refused;
+            }
+            if flow != user.flow || user.flow != Flow::None {
+                eprintln!(
+                    "vless: reverse user `{}` opens the unframed stream only; refused",
+                    portal.tag()
+                );
+                return ReverseAsk::Refused;
+            }
+            ReverseAsk::Allowed(portal)
+        }
+    }
+}
+
+/// The reverse session a stream front hands the portal: the response header goes out on the same
+/// writer the mux will use, then both directions become the tunnel's.
+fn attach_reverse<R, W>(
+    portal: &Arc<crate::reverse::Portal>,
+    reader: R,
+    mut writer: W,
+    closer: Arc<dyn Fn() + Send + Sync>,
+) -> bool
+where
+    R: std::io::Read + Send + 'static,
+    W: std::io::Write + Send + 'static,
+{
+    if writer.write_all(&[0, 0]).is_err() {
+        return false;
+    }
+    portal
+        .attach(crate::reverse::Tunnel::new(
+            Box::new(reader),
+            Box::new(writer),
+            closer,
+        ))
+        .is_some()
+}
+
+/// The close that wakes a session parked in a read: the socket behind the carrier, shut down.
+fn connection_closer(connection: &Connection) -> Arc<dyn Fn() + Send + Sync> {
+    let close = connection.try_clone().ok();
+    Arc::new(move || {
+        if let Some(close) = close.as_ref() {
+            let _ = close.shutdown(Shutdown::Both);
+        }
+    })
+}
+
+/// The two halves of a TLS session as a reverse tunnel: the reader owns one handle and the writers
+/// share the other, exactly the split the forward relay makes.
+fn attach_reverse_session<S>(
+    portal: &Arc<crate::reverse::Portal>,
+    mut session: S,
+    raw: Option<Connection>,
+) -> bool
+where
+    S: std::io::Read
+        + std::io::Write
+        + Send
+        + ferrox_core::tls::RecordAlignment
+        + Drivable
+        + CipherOpen
+        + 'static,
+{
+    if session.write_all(&[0, 0]).is_err() {
+        return false;
+    }
+    let close = raw.and_then(|raw| raw.try_clone().ok());
+    let closer: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        if let Some(close) = close.as_ref() {
+            let _ = close.shutdown(Shutdown::Both);
+        }
+    });
+    let tunnel = match driven_halves(session, RELAY_POLL) {
+        Ok(half) => half.into_tunnel(closer),
+        Err(session) => {
+            let shared = Arc::new(Mutex::new(session));
+            crate::reverse::Tunnel::new(
+                Box::new(SharedRead(Arc::clone(&shared))),
+                Box::new(SharedWrite(shared)),
+                closer,
+            )
+        }
+    };
+    portal.attach(tunnel).is_some()
+}
+
+/// A session's two directions behind the one lock its transport needs: the fallback for a session
+/// whose transport cannot be cloned.
+struct SharedRead<S>(Arc<Mutex<S>>);
+
+impl<S: std::io::Read> std::io::Read for SharedRead<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut inner = self
+            .0
+            .lock()
+            .map_err(|_| std::io::Error::other("session"))?;
+        inner.read(buf)
+    }
+}
+
+struct SharedWrite<S>(Arc<Mutex<S>>);
+
+impl<S: std::io::Write> std::io::Write for SharedWrite<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut inner = self
+            .0
+            .lock()
+            .map_err(|_| std::io::Error::other("session"))?;
+        inner.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut inner = self
+            .0
+            .lock()
+            .map_err(|_| std::io::Error::other("session"))?;
+        inner.flush()
+    }
 }
 
 /// xray registers each handler under more than one name; the alias resolves to the one protocol this tree builds.
@@ -16797,93 +17574,123 @@ fn vnext_servers<'a>(
         })
 }
 
-fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
-    for (outbound, server) in vnext_servers(root, "vless") {
-        let security = stream_security(outbound);
-        let quic_tls = outbound
-            .get("streamSettings")
-            .and_then(|s| s.get("network"))
-            .and_then(Json::as_str)
-            == Some("quic")
-            && security == "tls";
-        // Hysteria carries its own QUIC TLS, so xray's `security: tls` names that handshake rather than a second layer above it.
-        let hysteria_tls = hysteria_transport(outbound) && security == "tls";
-        let transport_tls = quic_tls || hysteria_tls;
-        let address = server.get("address").and_then(Json::as_str)?.to_owned();
+/// One vless outbound's dial fields, from either the simplified style the reference's own reverse
+/// configs use (`settings.address/port/id/flow`) or the `vnext[0].users[0]` shape.
+struct VlessServer<'a> {
+    address: &'a str,
+    port: u16,
+    id: [u8; 16],
+    flow: String,
+    /// The reverse tag a bridge names; the monitor dials command 4 and carries the portal's flows.
+    reverse: Option<&'a str>,
+}
+
+fn vless_server(settings: &Json) -> Option<VlessServer<'_>> {
+    let reverse = settings
+        .get("reverse")
+        .and_then(|reverse| reverse.get("tag"))
+        .and_then(Json::as_str);
+    if let Some(server) = settings
+        .get("vnext")
+        .and_then(Json::as_arr)
+        .and_then(|servers| servers.first())
+    {
+        let address = server.get("address").and_then(Json::as_str)?;
         let port = server.get("port").and_then(Json::as_port)?;
-        let id = server
+        let user = server
             .get("users")
             .and_then(Json::as_arr)
-            .and_then(|users| users.first())
+            .and_then(|users| users.first());
+        let id = user
             .and_then(|user| user.get("id"))
             .and_then(Json::as_str)
             .and_then(uuid_bytes)?;
-        let mux = outbound.get("mux").and_then(|mux| mux.get("enabled")) == Some(&Json::Bool(true));
-        let stored = xdrive_carried(outbound, &address);
-        if security == "tls" && !transport_tls && stored.is_none() {
-            let Some(out) = tls_carried_vless(outbound, server, address, port, id, mux) else {
-                continue;
-            };
-            return Some(out);
+        let flow = user
+            .and_then(|user| user.get("flow"))
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_owned();
+        return Some(VlessServer {
+            address,
+            port,
+            id,
+            flow,
+            reverse,
+        });
+    }
+    let address = settings.get("address").and_then(Json::as_str)?;
+    let port = settings.get("port").and_then(Json::as_port)?;
+    let id = settings
+        .get("id")
+        .and_then(Json::as_str)
+        .and_then(uuid_bytes)?;
+    let flow = settings
+        .get("flow")
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_owned();
+    Some(VlessServer {
+        address,
+        port,
+        id,
+        flow,
+        reverse,
+    })
+}
+
+fn vless_outbounds(root: &Json) -> impl Iterator<Item = (&Json, VlessServer<'_>)> {
+    let outbounds: &[Json] = root.get("outbounds").and_then(Json::as_arr).unwrap_or(&[]);
+    outbounds
+        .iter()
+        .filter(|outbound| outbound.get("protocol").and_then(Json::as_str) == Some("vless"))
+        .filter_map(|outbound| {
+            let server = vless_server(outbound.get("settings")?)?;
+            Some((outbound, server))
+        })
+}
+
+fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
+    vless_outbounds(root).find_map(|(outbound, server)| vless_outbound(outbound, server))
+}
+
+fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> {
+    let security = stream_security(outbound);
+    let quic_tls = outbound
+        .get("streamSettings")
+        .and_then(|s| s.get("network"))
+        .and_then(Json::as_str)
+        == Some("quic")
+        && security == "tls";
+    // Hysteria carries its own QUIC TLS, so xray's `security: tls` names that handshake rather than a second layer above it.
+    let hysteria_tls = hysteria_transport(outbound) && security == "tls";
+    let transport_tls = quic_tls || hysteria_tls;
+    let address = server.address.to_owned();
+    let port = server.port;
+    let id = server.id;
+    let mux = outbound.get("mux").and_then(|mux| mux.get("enabled")) == Some(&Json::Bool(true));
+    let stored = xdrive_carried(outbound, &address);
+    if security == "tls" && !transport_tls && stored.is_none() {
+        let out = tls_carried_vless(outbound, address, port, id, &server.flow, mux)?;
+        return Some(out);
+    }
+    // REALITY dials raw TCP and every carried carrier the client reaches; the rest stay refused.
+    if security == "reality" && !mux {
+        let (carrier, host) = outbound_carrier(outbound, &address);
+        if !matches!(
+            carrier,
+            Carrier::Raw(_)
+                | Carrier::Ws { .. }
+                | Carrier::HttpUpgrade { .. }
+                | Carrier::Grpc { .. }
+                | Carrier::Xhttp { .. }
+                | Carrier::HttpHeader { .. }
+        ) {
+            return None;
         }
-        // REALITY dials raw TCP and every carried carrier the client reaches; the rest stay refused.
-        if security == "reality" && !mux {
-            let (carrier, host) = outbound_carrier(outbound, &address);
-            if !matches!(
-                carrier,
-                Carrier::Raw(_)
-                    | Carrier::Ws { .. }
-                    | Carrier::HttpUpgrade { .. }
-                    | Carrier::Grpc { .. }
-                    | Carrier::Xhttp { .. }
-                    | Carrier::HttpHeader { .. }
-            ) {
-                continue;
-            }
-            let Some(reality) = outbound_reality(outbound, &address) else {
-                continue;
-            };
-            let flow = outbound_flow(server);
-            if !matches!(flow.as_str(), "" | "none" | crate::vision::FLOW) {
-                continue;
-            }
-            return Some(VlessOut {
-                address,
-                port,
-                id,
-                carrier,
-                host,
-                mux,
-                quic_roots: None,
-                quic_ech: None,
-                hysteria_roots: None,
-                tls: None,
-                flow,
-                reality: Some(reality),
-            });
+        let reality = outbound_reality(outbound, &address)?;
+        if !matches!(server.flow.as_str(), "" | "none" | crate::vision::FLOW) {
+            return None;
         }
-        if !vless_security_supported(security) && !transport_tls && (mux || stored.is_none()) {
-            continue;
-        }
-        let (carrier, host) = stored.unwrap_or_else(|| outbound_carrier(outbound, &address));
-        let (quic_roots, quic_ech, hysteria_roots) = match &carrier {
-            Carrier::Quic => {
-                let ech = if security == "tls" {
-                    match crate::config::quic_ech_config(outbound, &address) {
-                        Ok(ech) => ech,
-                        Err(why) => {
-                            eprintln!("vless: {why}; the quic dial will fail");
-                            continue;
-                        }
-                    }
-                } else {
-                    None
-                };
-                (tls_ca_roots(outbound), ech, None)
-            }
-            Carrier::Hysteria(_) => (None, None, tls_ca_roots(outbound)),
-            _ => (None, None, None),
-        };
         return Some(VlessOut {
             address,
             port,
@@ -16891,24 +17698,98 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
             carrier,
             host,
             mux,
-            quic_roots,
-            quic_ech,
-            hysteria_roots,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
             tls: None,
-            flow: outbound_flow(server),
-            reality: None,
+            flow: server.flow,
+            reality: Some(reality),
         });
     }
-    None
+    if !vless_security_supported(security) && !transport_tls && (mux || stored.is_none()) {
+        return None;
+    }
+    let (carrier, host) = stored.unwrap_or_else(|| outbound_carrier(outbound, &address));
+    let (quic_roots, quic_ech, hysteria_roots) = match &carrier {
+        Carrier::Quic => {
+            let ech = if security == "tls" {
+                match crate::config::quic_ech_config(outbound, &address) {
+                    Ok(ech) => ech,
+                    Err(why) => {
+                        eprintln!("vless: {why}; the quic dial will fail");
+                        return None;
+                    }
+                }
+            } else {
+                None
+            };
+            (tls_ca_roots(outbound), ech, None)
+        }
+        Carrier::Hysteria(_) => (None, None, tls_ca_roots(outbound)),
+        _ => (None, None, None),
+    };
+    Some(VlessOut {
+        address,
+        port,
+        id,
+        carrier,
+        host,
+        mux,
+        quic_roots,
+        quic_ech,
+        hysteria_roots,
+        tls: None,
+        flow: server.flow,
+        reality: None,
+    })
+}
+
+/// The bridges the config names: a vless outbound with a reverse tag opens its own session to the
+/// portal and serves whatever the portal routes back under that tag.
+fn find_bridges(root: &Json) -> Vec<(String, VlessOut)> {
+    vless_outbounds(root)
+        .filter_map(|(outbound, server)| {
+            let tag = server.reverse.filter(|tag| !tag.is_empty())?;
+            if server.flow != crate::vision::FLOW && !server.flow.is_empty() && server.flow != "none"
+            {
+                eprintln!(
+                    "vless: reverse bridge `{tag}` names an unknown flow `{}`; not started",
+                    server.flow
+                );
+                return None;
+            }
+            if server.flow == crate::vision::FLOW {
+                eprintln!(
+                    "vless: reverse bridge `{tag}` names the vision flow; a reverse session carries the unframed stream only"
+                );
+            }
+            let vless = vless_outbound(outbound, server)?;
+            if !matches!(
+                vless.carrier,
+                Carrier::Raw(_)
+                    | Carrier::Ws { .. }
+                    | Carrier::HttpUpgrade { .. }
+                    | Carrier::Grpc { .. }
+                    | Carrier::HttpHeader { .. }
+                    | Carrier::Xhttp { .. }
+            ) {
+                eprintln!(
+                    "vless: reverse bridge `{tag}` names a carrier that cannot carry a reverse session"
+                );
+                return None;
+            }
+            Some((tag.to_owned(), vless))
+        })
+        .collect()
 }
 
 /// The outbound a carried TLS session names: one flow per dial, so a config that also asked for mux is read, warned about, and left without it.
 fn tls_carried_vless(
     outbound: &Json,
-    server: &Json,
     address: String,
     port: u16,
     id: [u8; 16],
+    flow: &str,
     mux: bool,
 ) -> Option<VlessOut> {
     let (carrier, host, tls) = tls_carried_parts(outbound, &address)?;
@@ -16926,7 +17807,7 @@ fn tls_carried_vless(
         quic_ech: None,
         hysteria_roots: None,
         tls: Some(tls),
-        flow: outbound_flow(server),
+        flow: flow.to_owned(),
         reality: None,
     })
 }
@@ -19854,7 +20735,11 @@ mod tests {
             let (stream, _) = front.accept().expect("accepts");
             serve_vless_reality(
                 stream,
-                &[VlessUser { id, flow: account }],
+                &[VlessUser {
+                    id,
+                    flow: account,
+                    reverse: None,
+                }],
                 true,
                 &carrier,
                 &server_config,
@@ -21839,7 +22724,7 @@ mod tests {
                 &stream,
                 &server_addr,
                 &vless,
-                &Destination::from(target),
+                Some(&Destination::from(target)),
                 Ladder::global(),
             );
         });
@@ -21910,7 +22795,7 @@ mod tests {
                 &stream,
                 &server_addr,
                 &vless,
-                &Destination::from(target),
+                Some(&Destination::from(target)),
                 Ladder::global(),
             );
         });
@@ -21975,7 +22860,13 @@ mod tests {
         let asked = Destination::Name(HOST.to_owned(), 8443);
         let relaying = thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            dial_vless(&stream, &server_addr, &vless, &asked, Ladder::global());
+            dial_vless(
+                &stream,
+                &server_addr,
+                &vless,
+                Some(&asked),
+                Ladder::global(),
+            );
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -22117,7 +23008,7 @@ mod tests {
                 &stream,
                 &server_addr,
                 &vless,
-                &Destination::from(target),
+                Some(&Destination::from(target)),
                 Ladder::global(),
             );
         });
@@ -22190,7 +23081,7 @@ mod tests {
                 &stream,
                 &server_addr,
                 &vless,
-                &Destination::from(target),
+                Some(&Destination::from(target)),
                 Ladder::global(),
             );
         });
@@ -22514,7 +23405,7 @@ mod tests {
                 &client,
                 &server,
                 &vless,
-                &Destination::from(target),
+                Some(&Destination::from(target)),
                 Ladder::global(),
             );
         });
@@ -22650,7 +23541,7 @@ mod tests {
                 &client,
                 &server,
                 &vless,
-                &Destination::from(target),
+                Some(&Destination::from(target)),
                 Ladder::global(),
             );
             echo_trace(&format!("cli {port} relay over"));
@@ -22723,7 +23614,7 @@ mod tests {
                 &client,
                 &server,
                 &vless,
-                &Destination::from(target),
+                Some(&Destination::from(target)),
                 Ladder::global(),
             );
         });
@@ -22873,6 +23764,7 @@ mod tests {
                 &[VlessUser {
                     id,
                     flow: Flow::Vision,
+                    reverse: None,
                 }],
                 true,
                 &Carrier::Raw(Chain::default()),
@@ -22904,7 +23796,7 @@ mod tests {
                 &client,
                 &server,
                 &vless,
-                &Destination::from(target_addr),
+                Some(&Destination::from(target_addr)),
                 Ladder::global(),
             );
             echo_trace(&format!("cli {port} relay over"));
@@ -23337,7 +24229,13 @@ mod tests {
         )
         .expect("parses");
         assert!(
-            !serve_vless_inbound(&format!("127.0.0.1:{port}"), &inbound, true, "test"),
+            !serve_vless_inbound(
+                &format!("127.0.0.1:{port}"),
+                &inbound,
+                true,
+                "test",
+                &crate::reverse::Portals::default()
+            ),
             "a listener whose port is taken is not reported served"
         );
     }
@@ -23979,7 +24877,14 @@ mod tests {
             r#"{{"inbounds":[{{"protocol":"vmess","listen":"127.0.0.1","port":{port},"settings":{{"clients":[{{"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}},"streamSettings":{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificateFile":"{cert}","keyFile":"{key}"}}]}}}}}}]}}"#
         );
         let root = crate::json::parse(&text).expect("parses");
-        let (opened, _) = serve_inbounds("test", &root, Some(&Outbound::Freedom), None, true);
+        let (opened, _) = serve_inbounds(
+            "test",
+            &root,
+            Some(&Outbound::Freedom),
+            None,
+            true,
+            &crate::reverse::Portals::default(),
+        );
         assert_eq!(opened, 1, "a vmess inbound that names tls is served");
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let tls = carried_tls_configs();
@@ -25178,10 +26083,12 @@ mod tests {
             VlessUser {
                 id: first,
                 flow: Flow::None,
+                reverse: None,
             },
             VlessUser {
                 id: second,
                 flow: Flow::None,
+                reverse: None,
             },
         ];
         let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -25221,6 +26128,7 @@ mod tests {
         let users = [VlessUser {
             id,
             flow: Flow::None,
+            reverse: None,
         }];
         let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_addr = echo.local_addr().expect("addr");
@@ -25257,7 +26165,7 @@ mod tests {
             ]}}"#,
         )
         .expect("parses");
-        let users = inbound_users(&inbound);
+        let users = inbound_users(&inbound, &crate::reverse::Portals::default());
         assert_eq!(users.len(), 2, "a masked duplicate replaces its row");
         assert_eq!(users[0].flow, Flow::Vision, "the last entry wins");
         assert_eq!(users[1].flow, Flow::Vision);
@@ -25272,10 +26180,12 @@ mod tests {
         let vision = VlessUser {
             id: [0x33u8; 16],
             flow: Flow::Vision,
+            reverse: None,
         };
         let plain = VlessUser {
             id: [0x44u8; 16],
             flow: Flow::None,
+            reverse: None,
         };
         assert!(vless_flow_ok(&vision, Flow::Vision, 1, true));
         assert!(!vless_flow_ok(&vision, Flow::None, 1, true));
@@ -26303,6 +27213,7 @@ mod tests {
         let client = Connection::connect(listener.local_addr().expect("addr")).expect("connects");
         let (_server, _) = listener.accept().expect("accepts");
         let shared = Arc::new(Mutex::new(client));
+        let wire = MuxWire::Conn(Arc::clone(&shared));
         let mut udp: UdpTable = HashMap::new();
         let mut global: UdpGlobal = HashMap::new();
         let mut staging = Vec::new();
@@ -26318,18 +27229,20 @@ mod tests {
         };
         {
             let mut out = MuxOut {
-                shared: &shared,
+                wire: &wire,
                 staging: &mut staging,
                 handles: &mut handles,
+                worker: None,
             };
             handle_mux_udp_new(new(first_port), &mut udp, &mut global, &mut out);
         }
         let old = Arc::clone(udp.get(&7).expect("first session"));
         {
             let mut out = MuxOut {
-                shared: &shared,
+                wire: &wire,
                 staging: &mut staging,
                 handles: &mut handles,
+                worker: None,
             };
             handle_mux_udp_new(new(second_port), &mut udp, &mut global, &mut out);
         }
@@ -28778,7 +29691,7 @@ mod tests {
                 &stream,
                 &server_addr,
                 &vless,
-                &Destination::from(target),
+                Some(&Destination::from(target)),
                 &dial_ladder,
             );
         });
@@ -30632,7 +31545,8 @@ mod tests {
             &format!("127.0.0.1:{port}"),
             &inbound,
             true,
-            "test"
+            "test",
+            &crate::reverse::Portals::default()
         ));
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
@@ -31911,7 +32825,14 @@ mod tests {
             r#"{{"inbounds":[{{"protocol":"dokodemo-door","listen":"127.0.0.1","port":{door},"settings":{{"network":"tcp","address":"127.0.0.1","port":{other},"portMap":{{"{door}":"127.0.0.1:{echo}"}}}}}}]}}"#
         );
         let root = crate::json::parse(&text).expect("parses");
-        let (opened, _) = serve_inbounds("test", &root, Some(&Outbound::Freedom), None, false);
+        let (opened, _) = serve_inbounds(
+            "test",
+            &root,
+            Some(&Outbound::Freedom),
+            None,
+            false,
+            &crate::reverse::Portals::default(),
+        );
         assert_eq!(opened, 1, "the mapped door opens");
         let mut client = connect_until(door);
         client.write_all(b"ping").expect("writes");
@@ -31945,7 +32866,14 @@ mod tests {
             r#"{{"inbounds":[{{"protocol":"dokodemo-door","listen":"127.0.0.1","port":{door},"settings":{{"network":"tcp","address":"127.0.0.1","port":{echo},"portMap":{{"1337":"127.0.0.1:80"}}}}}}]}}"#
         );
         let root = crate::json::parse(&text).expect("parses");
-        let (opened, _) = serve_inbounds("test", &root, Some(&Outbound::Freedom), None, false);
+        let (opened, _) = serve_inbounds(
+            "test",
+            &root,
+            Some(&Outbound::Freedom),
+            None,
+            false,
+            &crate::reverse::Portals::default(),
+        );
         assert_eq!(opened, 1, "the door opens with a table that misses");
         let mut client = connect_until(door);
         client.write_all(b"ping").expect("writes");
@@ -31967,7 +32895,14 @@ mod tests {
             r#"{{"inbounds":[{{"protocol":"tunnel","listen":"127.0.0.1","port":{port},"settings":{{"network":"tcp","address":"127.0.0.1","port":{echo}}}}}]}}"#
         );
         let root = crate::json::parse(&text).expect("parses");
-        let (opened, _) = serve_inbounds("test", &root, Some(&Outbound::Freedom), None, false);
+        let (opened, _) = serve_inbounds(
+            "test",
+            &root,
+            Some(&Outbound::Freedom),
+            None,
+            false,
+            &crate::reverse::Portals::default(),
+        );
         assert_eq!(opened, 1, "the tunnel inbound opens the door");
         let mut client = connect_until(port);
         client.write_all(b"ping").expect("writes");
@@ -32241,7 +33176,14 @@ mod tests {
             r#"{{"inbounds":[{{"protocol":"http","listen":"127.0.0.1","port":{port},"settings":{settings}}}]}}"#
         );
         let root = crate::json::parse(&text).expect("parses");
-        let (opened, _) = serve_inbounds("test", &root, Some(&Outbound::Freedom), None, false);
+        let (opened, _) = serve_inbounds(
+            "test",
+            &root,
+            Some(&Outbound::Freedom),
+            None,
+            false,
+            &crate::reverse::Portals::default(),
+        );
         assert_eq!(opened, 1, "the http inbound opens");
         port
     }
@@ -32255,7 +33197,14 @@ mod tests {
             r#"{{"inbounds":[{{"protocol":"socks","listen":"127.0.0.1","port":{port},"settings":{settings}}}]}}"#
         );
         let root = crate::json::parse(&text).expect("parses");
-        let (opened, _) = serve_inbounds("test", &root, Some(&Outbound::Freedom), None, false);
+        let (opened, _) = serve_inbounds(
+            "test",
+            &root,
+            Some(&Outbound::Freedom),
+            None,
+            false,
+            &crate::reverse::Portals::default(),
+        );
         assert_eq!(opened, 1, "the socks inbound opens");
         drop(connect_until(port));
         port
@@ -33629,7 +34578,8 @@ mod tests {
         let routing = crate::router::Routing::parse_in(&root, Vec::new())
             .expect("parses")
             .expect("routing");
-        let shared = route_shared(&root, routing).expect("builds");
+        let shared =
+            route_shared(&root, routing, &crate::reverse::Portals::default()).expect("builds");
         Outbound::Route(Arc::new(RoutePlan::new(
             shared,
             tag.map(str::to_owned),
@@ -33991,7 +34941,8 @@ mod tests {
         let routing = crate::router::Routing::parse_in(&missing, Vec::new())
             .expect("parses")
             .expect("routing");
-        let error = route_shared(&missing, routing).expect_err("refused");
+        let error = route_shared(&missing, routing, &crate::reverse::Portals::default())
+            .expect_err("refused");
         assert!(error.contains("nope"), "{error}");
 
         let twice = crate::json::parse(
@@ -34001,7 +34952,8 @@ mod tests {
         let routing = crate::router::Routing::parse_in(&twice, Vec::new())
             .expect("parses")
             .expect("routing");
-        let error = route_shared(&twice, routing).expect_err("refused");
+        let error = route_shared(&twice, routing, &crate::reverse::Portals::default())
+            .expect_err("refused");
         assert!(
             error.contains("twice") || error.contains("named twice"),
             "{error}"
@@ -34014,7 +34966,8 @@ mod tests {
         let routing = crate::router::Routing::parse_in(&response, Vec::new())
             .expect("parses")
             .expect("routing");
-        let error = route_shared(&response, routing).expect_err("refused");
+        let error = route_shared(&response, routing, &crate::reverse::Portals::default())
+            .expect_err("refused");
         assert!(error.contains("teapot"), "{error}");
 
         let response = crate::json::parse(
@@ -34024,7 +34977,8 @@ mod tests {
         let routing = crate::router::Routing::parse_in(&response, Vec::new())
             .expect("parses")
             .expect("routing");
-        let error = route_shared(&response, routing).expect_err("refused");
+        let error = route_shared(&response, routing, &crate::reverse::Portals::default())
+            .expect_err("refused");
         assert!(error.contains("object"), "{error}");
     }
 
@@ -36936,5 +37890,106 @@ fn front_dispatch(stream: Connection, role: Role) {
             let target = out.resolved(dest, crate::router::Network::Tcp, Some(&stream));
             serve_connect(stream, target, dest, Front::Socks, &[]);
         }
+    }
+}
+
+#[cfg(test)]
+mod reverse_tests {
+    use super::*;
+
+    #[test]
+    fn a_reverse_request_names_no_target_and_a_forward_one_never_uses_a_reverse_user() {
+        let id = [7u8; 16];
+        assert_eq!(
+            vless_reverse_header(&id),
+            [&[0u8][..], &id[..], &[0, 4][..]].concat()
+        );
+        let portal = crate::reverse::Portal::new("portal");
+        let reverse = [VlessUser {
+            id,
+            flow: Flow::None,
+            reverse: Some(Arc::clone(&portal)),
+        }];
+        let forward = one_vless_user(&id);
+        assert!(matches!(
+            reverse_ask(&reverse, &id, Flow::None, 4),
+            ReverseAsk::Allowed(_)
+        ));
+        assert!(matches!(
+            reverse_ask(&reverse, &id, Flow::None, 1),
+            ReverseAsk::Refused
+        ));
+        assert!(matches!(
+            reverse_ask(&reverse, &id, Flow::Vision, 4),
+            ReverseAsk::Refused
+        ));
+        assert!(matches!(
+            reverse_ask(&forward, &id, Flow::None, 4),
+            ReverseAsk::Refused
+        ));
+        assert!(matches!(
+            reverse_ask(&forward, &[9u8; 16], Flow::None, 4),
+            ReverseAsk::NotReverse
+        ));
+        assert!(!vless_user_allows(&reverse, &id, Flow::None, 4, true));
+        assert!(vless_user_allows(&forward, &id, Flow::None, 1, true));
+    }
+
+    #[test]
+    fn a_portal_flow_reaches_the_bridge_and_comes_back() {
+        let echo = crate::conn::Listener::bind(&crate::conn::Target::Ip(
+            "127.0.0.1:0".parse().expect("address"),
+        ))
+        .expect("echo listener");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = echo.accept() {
+                let mut buf = [0u8; 5];
+                if stream.read_exact(&mut buf).is_ok() {
+                    let _ = stream.write_all(&buf);
+                }
+            }
+        });
+
+        let (mut bridge_side, mut portal_side) = crate::reverse::loopback_pair().expect("pair");
+        portal_side.write_all(&[0, 0]).expect("portal reply");
+        let mut reply = [0u8; 2];
+        bridge_side.read_exact(&mut reply).expect("portal reply");
+        let portal_tunnel = crate::reverse::Tunnel::from_connection(&portal_side).expect("tunnel");
+
+        let state = crate::reverse::WorkerState::new();
+        let worker = Arc::clone(&state);
+        let wire =
+            MuxWire::Tunnel(crate::reverse::Tunnel::from_connection(&bridge_side).expect("tunnel"));
+        let dial: MuxDial = Arc::new(|target| {
+            target
+                .destination()
+                .socket()
+                .and_then(|address| Connection::connect(address).ok())
+        });
+        let udp: MuxUdpOk = Arc::new(|_| true);
+        thread::spawn(move || serve_mux_wire(&wire, &dial, &udp, Some(&worker), &[]));
+
+        let portal = crate::reverse::Portal::new("portal");
+        portal.attach(portal_tunnel).expect("session");
+
+        let (mut user, server) = crate::reverse::loopback_pair().expect("pair");
+        let portal_for_flow = Arc::clone(&portal);
+        thread::spawn(move || {
+            serve_reverse_tcp(&server, &portal_for_flow, &Destination::Address(echo_addr));
+        });
+        user.write_all(b"hello").expect("writes");
+        user.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut echoed = [0u8; 5];
+        user.read_exact(&mut echoed).expect("reads");
+        assert_eq!(&echoed, b"hello");
+
+        thread::sleep(Duration::from_millis(2200));
+        assert!(
+            !state.stale(Duration::from_secs(1)),
+            "the portal heartbeats the worker it attached to"
+        );
+        assert!(state.active());
     }
 }
