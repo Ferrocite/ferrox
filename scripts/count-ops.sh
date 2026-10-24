@@ -202,9 +202,12 @@ if [ "$mode" = "check" ]; then
     bin=""
     bin="$(find_bin "$filter" "$first_symbol")" || bin=""
     failed=0
-    while read -r symbol want _; do
+    while read -r symbol want row_filter _; do
         case "$symbol" in ''|'#'*) continue ;; esac
-        got="$(ir_of "$filter" "$symbol")"
+        # A row may gate under its own test filter: the invocation filter is
+        # the one symbol's test, and a method whose probe lives in another
+        # test carries that test's filter as a third column.
+        got="$(ir_of "${row_filter:-$filter}" "$symbol")"
         if [ "$got" != "$want" ]; then
             echo "count-ops: $symbol Ir=$got, expected $want" >&2
             failed=1

@@ -657,7 +657,7 @@ carrier-foxy edge-strike-lookup-allocations 0 ferrox-core-foxy::tests::an_edge_s
 carrier-foxy carrier-alpn-allocations-per-dial 0 ferrox-app-foxy::tests::a_carriers_alpn_list_is_shared_rather_than_built_per_dial
 
 # --- the DNS outbound -------------------------------------------------------
-dns-outbound ops-retired-instructions UNBLESSED scripts/count-ops.sh
+dns-outbound ops-retired-instructions 55544745 scripts/count-ops.sh
 dns-outbound answer-cases-replayed 21 ferrox-core-dns::tests::the_answer_is_the_bytes_the_pinned_go_writes
 dns-outbound parse-refusals-replayed 8 ferrox-core-dns::tests::the_parse_refuses_what_the_reference_refuses
 dns-outbound pointer-hop-cap 10 ferrox-core-dns::tests::the_pointer_loop_refuses_at_the_cap
