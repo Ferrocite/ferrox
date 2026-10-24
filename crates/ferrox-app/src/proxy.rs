@@ -1658,8 +1658,10 @@ fn serve_vless_raw(
         users,
         freedom,
         fallbacks,
-        dial_or_report,
-        resolve_endpoint,
+        MuxIo {
+            dial: dial_or_report,
+            resolve: resolve_endpoint,
+        },
     );
 }
 
@@ -1668,8 +1670,7 @@ fn serve_vless_raw_with<D, R>(
     users: &[VlessUser],
     freedom: bool,
     fallbacks: Option<&[Fallback]>,
-    dial: D,
-    resolve: R,
+    io: MuxIo<D, R>,
 ) where
     D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
     R: Fn(&str, u16) -> Option<SocketAddr> + Send + Sync + Clone + 'static,
@@ -1689,8 +1690,7 @@ fn serve_vless_raw_with<D, R>(
                 fallbacks,
                 &window[..consumed],
                 (probe, carried),
-                dial,
-                resolve,
+                io,
             );
         }
         None => (
@@ -1702,16 +1702,7 @@ fn serve_vless_raw_with<D, R>(
         ),
     };
     let _ = stream.set_read_timeout(None);
-    vless_raw_reply(
-        stream,
-        users,
-        freedom,
-        fallbacks,
-        &[],
-        (probe, carried),
-        dial,
-        resolve,
-    );
+    vless_raw_reply(stream, users, freedom, fallbacks, &[], (probe, carried), io);
 }
 
 fn vless_raw_reply<D, R>(
@@ -1721,8 +1712,7 @@ fn vless_raw_reply<D, R>(
     fallbacks: Option<&[Fallback]>,
     window: &[u8],
     (probe, carried): (Probe, Vec<u8>),
-    dial: D,
-    resolve: R,
+    io: MuxIo<D, R>,
 ) where
     D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
     R: Fn(&str, u16) -> Option<SocketAddr> + Send + Sync + Clone + 'static,
@@ -1749,13 +1739,13 @@ fn vless_raw_reply<D, R>(
         if stream.write_all(&[0, 0]).is_err() {
             return;
         }
-        return serve_vless_mux_with(stream, dial, resolve, &carried);
+        return serve_vless_mux_with(stream, io, &carried);
     }
     if cmd != 1 {
         // The reference's decoder refuses a command past the id without falling back.
         return;
     }
-    let Some(mut uplink) = dial(&target) else {
+    let Some(mut uplink) = (io.dial)(&target) else {
         return;
     };
     if stream.write_all(&[0, 0]).is_err() {
@@ -2160,16 +2150,40 @@ fn mux_target_addr(target: &ferrox_core::mux::Target<'_>) -> Option<SocketAddr> 
     }
 }
 
-fn mux_target_addr_with<R>(target: &ferrox_core::mux::Target<'_>, resolve: &R) -> Option<SocketAddr>
+#[derive(Clone)]
+struct MuxIo<D, R> {
+    dial: D,
+    resolve: R,
+}
+
+enum MuxTarget {
+    Ready(SocketAddr),
+    Name(Vec<u8>, u16),
+}
+
+fn mux_target_owned(target: &ferrox_core::mux::Target<'_>) -> MuxTarget {
+    let port = target.port;
+    match target.addr {
+        ferrox_core::addr::Addr::V4(octets) => {
+            MuxTarget::Ready(SocketAddr::new(std::net::IpAddr::V4(octets.into()), port))
+        }
+        ferrox_core::addr::Addr::V6(octets) => {
+            MuxTarget::Ready(SocketAddr::new(std::net::IpAddr::V6(octets.into()), port))
+        }
+        ferrox_core::addr::Addr::Name(bytes) => MuxTarget::Name(bytes.to_vec(), port),
+    }
+}
+
+fn mux_target_resolve<R>(target: &MuxTarget, resolve: &R) -> Option<SocketAddr>
 where
     R: Fn(&str, u16) -> Option<SocketAddr>,
 {
-    match target.addr {
-        ferrox_core::addr::Addr::Name(bytes) => {
+    match target {
+        MuxTarget::Ready(addr) => Some(*addr),
+        MuxTarget::Name(bytes, port) => {
             let host = std::str::from_utf8(bytes).ok()?;
-            resolve(host, target.port)
+            resolve(host, *port)
         }
-        _ => mux_target_addr(target),
     }
 }
 
@@ -2579,7 +2593,7 @@ fn remove_mux_session(
     send_mux_end(shared, staging, id);
 }
 
-fn serve_vless_mux_with<D, R>(stream: Connection, dial: D, resolve: R, carried: &[u8])
+fn serve_vless_mux_with<D, R>(stream: Connection, io: MuxIo<D, R>, carried: &[u8])
 where
     D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
     R: Fn(&str, u16) -> Option<SocketAddr> + Send + Sync + Clone + 'static,
@@ -2628,15 +2642,7 @@ where
                         staging: &mut staging,
                         handles: &mut handles,
                     };
-                    handle_mux_frame(
-                        frame,
-                        &table,
-                        &mut udp,
-                        &mut global,
-                        &mut out,
-                        dial.clone(),
-                        resolve.clone(),
-                    );
+                    handle_mux_frame(frame, &table, &mut udp, &mut global, &mut out, io.clone());
                 }
             }
         }
@@ -2677,8 +2683,7 @@ fn handle_mux_frame<D, R>(
     udp: &mut UdpTable,
     global: &mut UdpGlobal,
     out: &mut MuxOut<'_>,
-    dial: D,
-    resolve: R,
+    io: MuxIo<D, R>,
 ) where
     D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
     R: Fn(&str, u16) -> Option<SocketAddr> + Send + Sync + Clone + 'static,
@@ -2689,7 +2694,7 @@ fn handle_mux_frame<D, R>(
             if frame.target.is_some_and(|t| t.network == Network::Udp) {
                 handle_mux_udp_new(frame, udp, global, out);
             } else {
-                handle_mux_tcp_new(frame, table, out, dial, resolve);
+                handle_mux_tcp_new(frame, table, out, io);
             }
         }
         Status::Keep => {
@@ -2740,16 +2745,12 @@ fn handle_mux_tcp_new<D, R>(
     frame: ferrox_core::mux::Incoming<'_>,
     table: &MuxTable,
     out: &mut MuxOut<'_>,
-    dial: D,
-    resolve: R,
+    io: MuxIo<D, R>,
 ) where
     D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
     R: Fn(&str, u16) -> Option<SocketAddr> + Send + Sync + Clone + 'static,
 {
-    let Some(target) = frame
-        .target
-        .and_then(|t| mux_target_addr_with(&t, &resolve))
-    else {
+    let Some(target) = frame.target.map(|t| mux_target_owned(&t)) else {
         return send_mux_end(out.shared, out.staging, frame.id);
     };
     let (pending, queued) = std::sync::mpsc::sync_channel(MUX_PENDING);
@@ -2782,7 +2783,12 @@ fn handle_mux_tcp_new<D, R>(
     let task_shared = Arc::clone(out.shared);
     let task_id = frame.id;
     let task = move || {
-        let Some(mut uplink) = dial(&target) else {
+        let Some(target) = mux_target_resolve(&target, &io.resolve) else {
+            let mut scratch = Vec::with_capacity(8192);
+            remove_mux_session(&task_table, task_id, &task_shared, &mut scratch);
+            return;
+        };
+        let Some(mut uplink) = (io.dial)(&target) else {
             let mut scratch = Vec::with_capacity(8192);
             remove_mux_session(&task_table, task_id, &task_shared, &mut scratch);
             return;
@@ -26594,8 +26600,10 @@ mod tests {
                 &one_vless_user(&id),
                 true,
                 None,
-                dial,
-                resolve_endpoint,
+                MuxIo {
+                    dial,
+                    resolve: resolve_endpoint,
+                },
             );
         });
         let mut stream = mux_test_connect(&id, tunnel_port);
@@ -26658,7 +26666,13 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
-            serve_vless_raw_with(stream, &one_vless_user(&id), true, None, dial, resolve);
+            serve_vless_raw_with(
+                stream,
+                &one_vless_user(&id),
+                true,
+                None,
+                MuxIo { dial, resolve },
+            );
         });
         let mut stream = mux_test_connect(&id, tunnel_port);
         mux_test_send(
@@ -36730,8 +36744,10 @@ mod dns_lane_tests {
                 Probe::Decoded((id, Flow::None, 1, echo_addr)),
                 payload.to_vec(),
             ),
-            dial,
-            resolve_endpoint,
+            MuxIo {
+                dial,
+                resolve: resolve_endpoint,
+            },
         );
 
         let (read, buf) = got
