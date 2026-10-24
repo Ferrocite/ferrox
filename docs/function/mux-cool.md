@@ -24,7 +24,7 @@ graph TD
         T -- keep --> U["copy the payload once<br/>into the flow's queue"]
         U --> Q["the flow's writer owns the origin:<br/>16 pending, then that flow ends"]
         Q --> O(("origin"))
-        T -- new --> V["dial the target,<br/>then queue its first data"]
+        T -- new --> V["queue its first data,<br/>dial in the flow's task"]
         V --> O
     end
 ```
@@ -67,6 +67,8 @@ The session thread used to write every client `Keep` straight to its origin unde
 Each TCP flow is now two directions with their own handles. The session never writes to an origin: it copies the payload into the flow's `sync_channel(MUX_PENDING = 16)` and goes back to reading. The writer owns the origin socket, arms `relay_stall` once before its loop, and half-closes after the queue drains, so a client `End` still sends FIN behind every byte that was queued. A full queue is a stalled origin: that flow is removed and its socket shut down, and the session keeps reading — the flow's next `Keep` finds no entry and is dropped. The origin-bound copy is what buys that, and it is prose rather than a row because a pointer gate witnesses a copy removed, not one paid deliberately.
 
 The uplink reader polls its origin on `RELAY_POLL` rather than blocking, and a timeout asks the session's table whether it is done; teardown sets that flag, drains the flows, shuts each socket and then joins, so a silent origin costs one poll instead of the whole join budget. The session's client-bound writes carry the same `relay_stall` deadline as a relay leg: a client that stops reading makes its write error and the session unwind, and a flow parked writing to it is woken by the session's own shutdown rather than waiting out the deadline.
+
+`New` no longer dials on the session thread: the flow is in the table before its dial starts, its first payload is already queued, and a pooled task owns the dial, the writer and the reader. A dial that takes the whole 8 s budget therefore parks only its own flow, and the session keeps decoding and serving the others. `a_slow_mux_dial_does_not_park_the_session` is the gate: one `New` names a port whose injected dial sleeps 1.5 s, a second `New` names the echo port and sends its `Keep`, and the echo must come back within one second. Before this change the session was inside the first dial and the read timed out.
 
 `a_stalled_origin_does_not_park_the_mux_session` is the gate: an origin accepts and never reads, the client floods 32 MiB of `Keep`s past its loopback window, and the test requires the client's writes to keep landing and a second flow's ping to come back. Before this change the client's write times out with the session parked inside the first flow. `an_ended_mux_flow_releases_a_silent_origin` covers the poll: an origin that accepts and says nothing must not hold the session past its join budget once the client is gone.
 
