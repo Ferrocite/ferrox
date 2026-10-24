@@ -1829,10 +1829,47 @@ fn write_mux_keep(
 /// Frames one flow may have waiting before its origin is treated as stalled: a slow reader costs its own flow, and the session keeps reading for every other.
 const MUX_PENDING: usize = 16;
 
-/// One TCP flow's origin: `stop` wakes both directions without waiting on a parked write, and `pending` is the only way the session reaches the socket.
+/// One TCP flow's origin: `control` wakes both directions without waiting on a parked write, and `pending` is the only way the session reaches the socket.
 struct MuxFlow {
-    stop: Connection,
+    control: Arc<MuxControl>,
     pending: std::sync::mpsc::SyncSender<Vec<u8>>,
+}
+
+struct MuxControl {
+    stop: Mutex<Option<Connection>>,
+    cancelled: AtomicBool,
+    ended: AtomicBool,
+}
+
+impl MuxControl {
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+        self.shut();
+    }
+
+    fn end(&self) {
+        self.ended.store(true, Ordering::Relaxed);
+    }
+
+    fn set_stop(&self, stop: Connection) {
+        let Ok(mut held) = self.stop.lock() else {
+            return;
+        };
+        *held = Some(stop);
+        if self.cancelled.load(Ordering::Relaxed) {
+            if let Some(stop) = held.as_ref() {
+                let _ = stop.shutdown(Shutdown::Both);
+            }
+        }
+    }
+
+    fn shut(&self) {
+        if let Ok(stop) = self.stop.lock() {
+            if let Some(stop) = stop.as_ref() {
+                let _ = stop.shutdown(Shutdown::Both);
+            }
+        }
+    }
 }
 
 /// The flows on a session and whether the session is still reading: a stalled flow's poll asks the same lock its teardown takes.
@@ -1842,6 +1879,12 @@ struct MuxState {
 }
 
 type MuxTable = Arc<Mutex<MuxState>>;
+
+struct MuxOut<'a> {
+    shared: &'a Arc<Mutex<Connection>>,
+    staging: &'a mut Vec<u8>,
+    handles: &'a mut Vec<RelayEnd>,
+}
 
 struct UdpMux {
     socket: Arc<UdpSocket>,
@@ -1920,16 +1963,12 @@ where
                 Ok((frame, used)) => {
                     at += used;
                     progressed = true;
-                    handle_mux_frame(
-                        frame,
-                        &table,
-                        &mut udp,
-                        &mut global,
-                        &shared,
-                        &mut staging,
-                        &mut handles,
-                        dial.clone(),
-                    );
+                    let mut out = MuxOut {
+                        shared: &shared,
+                        staging: &mut staging,
+                        handles: &mut handles,
+                    };
+                    handle_mux_frame(frame, &table, &mut udp, &mut global, &mut out, dial.clone());
                 }
             }
         }
@@ -1954,7 +1993,7 @@ fn teardown_mux(table: &MuxTable, udp: &UdpTable, handles: &[RelayEnd], control:
     // The session's own socket goes first: a flow parked in a Keep to a client that stopped reading wakes here instead of at its deadline.
     let _ = control.shutdown(Shutdown::Both);
     for flow in flows {
-        let _ = flow.stop.shutdown(Shutdown::Both);
+        flow.control.cancel();
     }
     for session in udp.values() {
         session.done.store(true, Ordering::Relaxed);
@@ -1969,9 +2008,7 @@ fn handle_mux_frame<D>(
     table: &MuxTable,
     udp: &mut UdpTable,
     global: &mut UdpGlobal,
-    shared: &Arc<Mutex<Connection>>,
-    staging: &mut Vec<u8>,
-    handles: &mut Vec<RelayEnd>,
+    out: &mut MuxOut<'_>,
     dial: D,
 ) where
     D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
@@ -1980,9 +2017,9 @@ fn handle_mux_frame<D>(
     match frame.status {
         Status::New => {
             if frame.target.is_some_and(|t| t.network == Network::Udp) {
-                handle_mux_udp_new(frame, udp, global, shared, staging, handles);
+                handle_mux_udp_new(frame, udp, global, out);
             } else {
-                handle_mux_tcp_new(frame, table, shared, staging, handles, dial);
+                handle_mux_tcp_new(frame, table, out, dial);
             }
         }
         Status::Keep => {
@@ -2012,7 +2049,7 @@ fn handle_mux_frame<D>(
                 if let Ok(mut table) = table.lock() {
                     table.flows.remove(&frame.id);
                 }
-                let _ = flow.stop.shutdown(Shutdown::Both);
+                flow.control.cancel();
             }
         }
         Status::End => {
@@ -2022,7 +2059,9 @@ fn handle_mux_frame<D>(
             }
             if let Ok(mut table) = table.lock() {
                 // Dropping the sender lets the writer drain what the client already sent, then half-close.
-                table.flows.remove(&frame.id);
+                if let Some(flow) = table.flows.remove(&frame.id) {
+                    flow.control.end();
+                }
             }
         }
         Status::KeepAlive => {}
@@ -2032,27 +2071,27 @@ fn handle_mux_frame<D>(
 fn handle_mux_tcp_new<D>(
     frame: ferrox_core::mux::Incoming<'_>,
     table: &MuxTable,
-    shared: &Arc<Mutex<Connection>>,
-    staging: &mut Vec<u8>,
-    handles: &mut Vec<RelayEnd>,
+    out: &mut MuxOut<'_>,
     dial: D,
 ) where
     D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
 {
     let Some(target) = frame.target.and_then(|t| mux_target_addr(&t)) else {
-        return send_mux_end(shared, staging, frame.id);
-    };
-    let Some(mut uplink) = dial(&target) else {
-        return send_mux_end(shared, staging, frame.id);
-    };
-    let (Ok(mut read_half), Ok(stop)) = (uplink.try_clone(), uplink.try_clone()) else {
-        return send_mux_end(shared, staging, frame.id);
+        return send_mux_end(out.shared, out.staging, frame.id);
     };
     let (pending, queued) = std::sync::mpsc::sync_channel(MUX_PENDING);
     if let Some(data) = frame.data {
         let _ = pending.try_send(data.to_vec());
     }
-    let flow = Arc::new(MuxFlow { stop, pending });
+    let control = Arc::new(MuxControl {
+        stop: Mutex::new(None),
+        cancelled: AtomicBool::new(false),
+        ended: AtomicBool::new(false),
+    });
+    let flow = Arc::new(MuxFlow {
+        control: Arc::clone(&control),
+        pending,
+    });
     let refused = match table.lock() {
         Ok(mut table) => match table.flows.entry(frame.id) {
             std::collections::hash_map::Entry::Occupied(_) => true,
@@ -2064,60 +2103,79 @@ fn handle_mux_tcp_new<D>(
         Err(_) => true,
     };
     if refused {
-        return send_mux_end(shared, staging, frame.id);
+        return send_mux_end(out.shared, out.staging, frame.id);
     }
-    // Each direction owns its own handle: the writer drains the queue into the origin, and the reader polls so a session teardown is noticed without waiting on a silent peer.
-    let _ = uplink.set_write_timeout(Some(budgets::relay_stall()));
-    let _ = read_half.set_read_timeout(Some(RELAY_POLL));
-    let writer = move || {
-        while let Ok(data) = queued.recv() {
-            if uplink.write_all(&data).is_err() {
-                let _ = uplink.shutdown(Shutdown::Both);
-                return;
-            }
-        }
-        let _ = uplink.shutdown(Shutdown::Write);
-    };
+    // The session keeps reading while this flow dials; the first Keep is already queued and the writer drains it once the origin answers.
     let task_table = Arc::clone(table);
-    let task_shared = Arc::clone(shared);
+    let task_shared = Arc::clone(out.shared);
     let task_id = frame.id;
     let task = move || {
+        let Some(mut uplink) = dial(&target) else {
+            let mut scratch = Vec::with_capacity(8192);
+            remove_mux_session(&task_table, task_id, &task_shared, &mut scratch);
+            return;
+        };
+        let (Ok(mut read_half), Ok(stop)) = (uplink.try_clone(), uplink.try_clone()) else {
+            let mut scratch = Vec::with_capacity(8192);
+            remove_mux_session(&task_table, task_id, &task_shared, &mut scratch);
+            return;
+        };
+        control.set_stop(stop);
+        if control.cancelled.load(Ordering::Relaxed) || mux_done(&task_table) {
+            let _ = uplink.shutdown(Shutdown::Both);
+            let mut scratch = Vec::with_capacity(8192);
+            remove_mux_session(&task_table, task_id, &task_shared, &mut scratch);
+            return;
+        }
+        // Each direction owns its own handle: the writer drains the queue into the origin, and the reader polls so a session teardown is noticed without waiting on a silent peer.
+        let _ = uplink.set_write_timeout(Some(budgets::relay_stall()));
+        let _ = read_half.set_read_timeout(Some(RELAY_POLL));
+        let writer = move || {
+            while let Ok(data) = queued.recv() {
+                if uplink.write_all(&data).is_err() {
+                    let _ = uplink.shutdown(Shutdown::Both);
+                    return;
+                }
+            }
+            let _ = uplink.shutdown(Shutdown::Write);
+        };
+        let writer = RelayPool::global().run(writer);
         let mut chunk = [0u8; 8192];
         let mut scratch = Vec::with_capacity(8192);
-        loop {
-            match read_half.read(&mut chunk) {
-                Ok(0) => break,
-                Ok(n) => {
-                    if !write_mux_keep(&task_shared, &mut scratch, task_id, &chunk[..n]) {
-                        break;
+        if !control.ended.load(Ordering::Relaxed) {
+            loop {
+                match read_half.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if !write_mux_keep(&task_shared, &mut scratch, task_id, &chunk[..n]) {
+                            break;
+                        }
                     }
-                }
-                Err(error) if is_timeout(&error) => {
-                    if mux_done(&task_table) {
-                        break;
+                    Err(error) if is_timeout(&error) => {
+                        if mux_done(&task_table) || control.ended.load(Ordering::Relaxed) {
+                            break;
+                        }
                     }
+                    Err(_) => break,
                 }
-                Err(_) => break,
             }
         }
         let _ = read_half.shutdown(Shutdown::Both);
         remove_mux_session(&task_table, task_id, &task_shared, &mut scratch);
+        join(&writer);
     };
-    handles.push(RelayPool::global().run(writer));
-    handles.push(RelayPool::global().run(task));
-    handles.retain(|done| done.try_recv().is_err());
+    out.handles.push(RelayPool::global().run(task));
+    out.handles.retain(|done| done.try_recv().is_err());
 }
 
 fn handle_mux_udp_new(
     frame: ferrox_core::mux::Incoming<'_>,
     udp: &mut UdpTable,
     global: &mut UdpGlobal,
-    shared: &Arc<Mutex<Connection>>,
-    staging: &mut Vec<u8>,
-    handles: &mut Vec<RelayEnd>,
+    out: &mut MuxOut<'_>,
 ) {
     let Some(dest) = frame.target.and_then(|t| mux_target_addr(&t)) else {
-        return send_mux_end(shared, staging, frame.id);
+        return send_mux_end(out.shared, out.staging, frame.id);
     };
     let empty = [0u8; ferrox_core::mux::GLOBAL_ID];
     let identity = frame.global_id.filter(|identity| *identity != empty);
@@ -2126,7 +2184,7 @@ fn handle_mux_udp_new(
         .and_then(|id| udp.remove(&id).map(|session| (id, session)));
     let session = if let Some((old, session)) = reused {
         if old != frame.id {
-            send_mux_end(shared, staging, old);
+            send_mux_end(out.shared, out.staging, old);
         }
         session.id.store(frame.id, Ordering::Relaxed);
         session
@@ -2137,7 +2195,7 @@ fn handle_mux_udp_new(
             UdpSocket::bind("0.0.0.0:0")
         };
         let Ok(socket) = bound else {
-            return send_mux_end(shared, staging, frame.id);
+            return send_mux_end(out.shared, out.staging, frame.id);
         };
         let session = Arc::new(UdpMux {
             socket: Arc::new(socket),
@@ -2145,10 +2203,10 @@ fn handle_mux_udp_new(
             id: Arc::new(AtomicU16::new(frame.id)),
             done: Arc::new(AtomicBool::new(false)),
         });
-        let Some(reader) = spawn_mux_udp_reader(&session.socket, shared, &session) else {
-            return send_mux_end(shared, staging, frame.id);
+        let Some(reader) = spawn_mux_udp_reader(&session.socket, out.shared, &session) else {
+            return send_mux_end(out.shared, out.staging, frame.id);
         };
-        handles.push(reader);
+        out.handles.push(reader);
         session
     };
     if let Some(identity) = identity {
