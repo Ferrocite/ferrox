@@ -1,4 +1,5 @@
 use super::{Stream, TlsConfig, TlsError, TlsProvider};
+use sha2::Digest;
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -35,6 +36,88 @@ struct Pinned {
     pins: crate::foxy::pin::Pins,
 }
 
+/// The reference's `pinnedPeerCertSha256` verifier: a digest matching the leaf's DER accepts
+/// the handshake on the pin alone, one matching an intermediate's stands the pinned
+/// certificate in as the only trust root and the chain and server name still verify — the
+/// same gate `verifyChain` draws, with the standard verifier skipped because the pin is the
+/// whole contract.
+#[derive(Debug)]
+struct CertPinned {
+    cert_pins: Arc<[[u8; 32]]>,
+}
+
+impl CertPinned {
+    fn holds(&self, certificate: &rustls::pki_types::CertificateDer<'_>) -> bool {
+        let digest: [u8; 32] = sha2::Sha256::digest(certificate.as_ref()).into();
+        self.cert_pins.contains(&digest)
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for CertPinned {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        if self.holds(end_entity) {
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        }
+        for intermediate in intermediates {
+            if !self.holds(intermediate) {
+                continue;
+            }
+            // The pinned certificate acts as the only root, exactly as the reference's pinned-CA path does; the chain and the name still check, and a certificate that cannot anchor is refused rather than retried.
+            let anchor = anchored(intermediate)?;
+            return anchor
+                .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+                .or(Err(rustls::Error::InvalidCertificate(
+                    rustls::CertificateError::ApplicationVerificationFailure,
+                )));
+        }
+        Err(rustls::Error::InvalidCertificate(
+            rustls::CertificateError::ApplicationVerificationFailure,
+        ))
+    }
+
+    // A pin needs no anchor, so the provider's own algorithms answer the messages the webpki path does.
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &provider().signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
 /// The leaf as the only trust anchor, so a pinned edge still gets the name and validity checks a chain this device cannot build would otherwise skip.
 fn anchored(
     leaf: &rustls::pki_types::CertificateDer<'_>,
@@ -45,7 +128,6 @@ fn anchored(
         .build()
         .map_err(|e| rustls::Error::General(format!("pinned anchor: {e}")))
 }
-
 impl rustls::client::danger::ServerCertVerifier for Pinned {
     fn verify_server_cert(
         &self,
@@ -167,6 +249,7 @@ struct Material {
 struct MaterialKey {
     roots: crate::tls::Anchors,
     pins: crate::foxy::pin::Pins,
+    cert_pins: Arc<[[u8; 32]]>,
     cipher_suites: Vec<u16>,
 }
 
@@ -179,6 +262,7 @@ impl PartialEq for MaterialKey {
     fn eq(&self, other: &Self) -> bool {
         same_roots(&self.roots, &other.roots)
             && self.pins == other.pins
+            && self.cert_pins.as_ref() == other.cert_pins.as_ref()
             && self.cipher_suites == other.cipher_suites
     }
 }
@@ -188,6 +272,7 @@ impl MaterialKey {
         Self {
             roots: Arc::clone(&cfg.roots),
             pins: cfg.pins.clone(),
+            cert_pins: Arc::clone(&cfg.cert_pins),
             cipher_suites: cfg.cipher_suites.clone(),
         }
     }
@@ -226,9 +311,13 @@ fn build_material(cfg: &TlsConfig) -> Result<Material, TlsError> {
     let provider = Arc::new(provider);
 
     let chain = OnceLock::new();
-    let verifier = if cfg.pins.is_empty() {
-        None
-    } else {
+    let verifier = if !cfg.cert_pins.is_empty() {
+        // No anchor work: a cert-pin verdict never needs the webpki chain builder.
+        Some(Arc::new(CertPinned {
+            cert_pins: Arc::clone(&cfg.cert_pins),
+        })
+            as Arc<dyn rustls::client::danger::ServerCertVerifier>)
+    } else if !cfg.pins.is_empty() {
         let plain = build_chain(&roots, &provider)?;
         let _ = chain.set(Ok(Arc::clone(&plain)));
         Some(Arc::new(Pinned {
@@ -236,6 +325,8 @@ fn build_material(cfg: &TlsConfig) -> Result<Material, TlsError> {
             pins: cfg.pins.clone(),
         })
             as Arc<dyn rustls::client::danger::ServerCertVerifier>)
+    } else {
+        None
     };
     Ok(Material {
         roots,
@@ -283,14 +374,14 @@ fn build_config(cfg: &TlsConfig, built: &Material) -> Result<rustls::ClientConfi
         .with_no_client_auth();
     config.alpn_protocols.clear();
     config.alpn_protocols.extend(cfg.alpn.iter().cloned());
-    if cfg.insecure {
-        config
-            .dangerous()
-            .set_certificate_verifier(Arc::new(Unverified));
-    } else if let Some(verifier) = &built.verifier {
+    if let Some(verifier) = &built.verifier {
         config
             .dangerous()
             .set_certificate_verifier(Arc::clone(verifier));
+    } else if cfg.insecure {
+        config
+            .dangerous()
+            .set_certificate_verifier(Arc::new(Unverified));
     }
     Ok(config)
 }
@@ -328,12 +419,13 @@ fn material(cfg: &TlsConfig) -> Result<Arc<Material>, TlsError> {
 pub(crate) fn verifier(
     cfg: &TlsConfig,
 ) -> Result<Arc<dyn rustls::client::danger::ServerCertVerifier>, TlsError> {
-    if cfg.insecure {
-        return Ok(Arc::new(Unverified));
-    }
+    // A certificate pin is the whole contract, so it outranks `allowInsecure`: the pin check runs and the skip is only what remains of it.
     let built = material(cfg)?;
     if let Some(verifier) = &built.verifier {
         return Ok(Arc::clone(verifier));
+    }
+    if cfg.insecure {
+        return Ok(Arc::new(Unverified));
     }
     let chain = built.chain.get_or_init(|| {
         build_chain(&built.roots, &built.provider).map_err(|error| error.to_string())
@@ -1417,6 +1509,7 @@ mod tests {
             alpn: std::sync::Arc::from(alpn.iter().map(|p| p.to_vec()).collect::<Vec<_>>()),
             roots: vec![ANCHOR.to_vec()].into(),
             pins: crate::foxy::pin::Pins::default(),
+            cert_pins: std::sync::Arc::default(),
             cipher_suites: Vec::new(),
             insecure: false,
             fingerprint: None,
