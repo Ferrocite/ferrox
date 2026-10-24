@@ -42468,7 +42468,7 @@ mod reverse_tests {
     }
 
     #[test]
-    fn a_sixteen_kib_downlink_frame_is_echoed_whole() {
+    fn a_sixteen_kib_downlink_is_echoed_whole() {
         let payload = vec![0x5a; 16 * 1024];
         portal_echo(&payload);
     }

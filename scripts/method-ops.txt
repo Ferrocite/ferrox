@@ -128,7 +128,7 @@ finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configure
 finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths  ferrox_core::finalmask::Fragment::write_hello
 finalmask  finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lies  ferrox_core::finalmask::write_record
 finalmask  finalmask::tests::the_last_configured_width_governs_every_later_segment  ferrox_core::finalmask::Fragment::write_pieces
-reverse  proxy::reverse_tests::a_sixteen_kib_downlink_frame_is_echoed_whole  reverse::Session::read_loop
+reverse  proxy::reverse_tests::a_sixteen_kib_downlink_is_echoed_whole  reverse::Session::read_loop
 http-proxy  proxy::tests::the_connect_request_builds_in_one_buffer  proxy::http_connect_request
 http-proxy  proxy::tests::http_request_parses_connect_and_both_get_forms  proxy::http_proxy_request
 front-tun  tun::tests::an_emitted_packet_reuses_its_render_buffer  ferrox_app::tun::render_tcp_packet
