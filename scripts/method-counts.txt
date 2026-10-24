@@ -519,6 +519,16 @@ security-utls pulled-record-reads-outside-the-inbuf 0 ferrox-core-tls::shaped::c
 security-utls inbuf-reallocations-per-record-cycle 0 ferrox-core-tls::shaped::client::tests::a_record_read_fills_the_inbuf_it_decrypts_from
 security-utls heap-buffers-for-a-warm-relay-write 0 ferrox-core-tls::shaped::client::tests::a_warm_write_seals_into_the_buffer_it_already_owns
 
+# --- ECH -------------------------------------------------------------------
+security-ech ops-retired-instructions UNBLESSED scripts/count-ops.sh
+security-ech ech-offers-accepted-by-the-stock-lane 1 ferrox-app-proxy::tests::vless_over_ech_tls_carries_an_echo
+security-ech rejected-ech-offers-retried-once 1 ferrox-app-proxy::tests::a_rejected_ech_offer_retries_once_with_the_servers_list
+security-ech ech-offers-built-by-the-shaped-lane 1 ferrox-core-tls::shaped::hello::tests::a_real_ech_offer_hides_the_inner_name_under_the_public_one
+security-ech quic-ech-offers-accepted 1 ferrox-app-quic::tests::an_ech_serving_lane_accepts_an_offer
+security-ech quic-dials-that-offer-the-configured-list 1 ferrox-app-quic::tests::a_client_dial_offers_the_configured_ech_list
+security-ech quic-lanes-that-fall-back-without-an-offer 1 ferrox-app-quic::tests::an_ech_serving_lane_answers_a_client_without_an_offer
+security-ech heap-buffers-for-an-ech-cover 1 ferrox-core-tls::shaped::hello::tests::an_ech_cover_is_written_into_one_buffer
+
 # --- loopback re-inject outbound --------------------------------------------
 loopback ops-retired-instructions UNBLESSED scripts/count-ops.sh
 loopback tcp-echo-bytes-preserved 65536 ferrox-app-proxy::tests::a_re_injected_tcp_stream_carries_an_echo

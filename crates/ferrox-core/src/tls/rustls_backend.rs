@@ -1324,6 +1324,15 @@ fn ech_server_context(
     cfg: &super::TlsServerConfig,
     keys: &[u8],
 ) -> Result<boring::ssl::SslContext, TlsError> {
+    Ok(ech_server_context_builder(cfg, keys)?.build())
+}
+
+/// The builder behind an ECH-serving context: a TLS listener builds it, and a QUIC lane hands
+/// it to quiche, so both answer the same key set and the same certificate.
+pub(crate) fn ech_server_context_builder(
+    cfg: &super::TlsServerConfig,
+    keys: &[u8],
+) -> Result<boring::ssl::SslContextBuilder, TlsError> {
     use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode, SslVersion};
     let mut chain = cfg.cert_chain.iter();
     let leaf = chain
@@ -1388,7 +1397,7 @@ fn ech_server_context(
     builder
         .set_ech_keys(&ech.build())
         .map_err(|error| boring_error(&error))?;
-    Ok(builder.build())
+    Ok(builder)
 }
 
 /// Whether an error is the socket's poll grain expiring with nothing in it,
@@ -1415,6 +1424,17 @@ fn recover(e: std::io::Error) -> TlsError {
 
 fn map_error(e: &rustls::Error) -> TlsError {
     use rustls::Error as E;
+    if let E::PeerIncompatible(rustls::PeerIncompatible::ServerRejectedEncryptedClientHello(
+        Some(configs),
+    )) = e
+    {
+        if !configs.is_empty() {
+            use rustls::internal::msgs::codec::Codec as _;
+            let mut list = Vec::new();
+            configs.encode(&mut list);
+            return TlsError::EchRetry(list.into());
+        }
+    }
     match e {
         // An untrusted chain, a name that does not match and an expired certificate are three different problems and the caller can act on each; the why rides with the kind, so matching the kind does not cost the why.
         E::InvalidCertificate(why) => TlsError::BadCertificate(format!("{why:?}")),
@@ -2631,6 +2651,51 @@ mod tests {
                 server.flush().expect("flushes");
             });
             let mut cfg = client("tls.test", &[b"h2", b"http/1.1"]);
+            cfg.ech_config_list = Some(list.into());
+            let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut client = crate::tls::connect(&cfg, stream).expect("configures");
+            client.handshake().expect("handshakes");
+            client.write_all(b"ping").expect("writes");
+            client.flush().expect("flushes");
+            let mut buf = [0u8; 4];
+            client.read_exact(&mut buf).expect("reads");
+            assert_eq!(&buf, b"ping");
+        });
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn ech_server_accepts_an_aes_256_only_offer() {
+        let (list, keys) = crate::tls::ech::generate_with_suites(
+            "public.test",
+            4,
+            &[(
+                crate::tls::ech::KDF_SHA256,
+                crate::tls::ech::AEAD_AES_256_GCM,
+            )],
+        )
+        .expect("generates");
+        let cert_pem = anchor_pem("CERTIFICATE", ANCHOR);
+        let key_pem = anchor_pem("PRIVATE KEY", ANCHOR_KEY);
+        let mut identity = crate::tls::parse_pem_identity(&cert_pem, &key_pem).expect("parses");
+        identity.ech_server_keys = Some(keys.into());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let (stream, _) = listener.accept().expect("accepts");
+                let mut server = crate::tls::accept(&identity, stream).expect("accepts");
+                server.handshake().expect("handshakes");
+                assert!(server.ech_accepted(), "the aes-256 offer was accepted");
+                let mut buf = [0u8; 4];
+                server.read_exact(&mut buf).expect("reads");
+                server.write_all(&buf).expect("writes");
+                server.flush().expect("flushes");
+            });
+            let mut cfg = client("tls.test", &[]);
             cfg.ech_config_list = Some(list.into());
             let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
             let mut client = crate::tls::connect(&cfg, stream).expect("configures");

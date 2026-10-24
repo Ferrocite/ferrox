@@ -2,10 +2,10 @@ use crate::h2::{
     block_encode, frame_head, read_head, Decoder, F_ACK, F_END, F_END_HEADERS, T_CONT, T_DATA,
     T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS,
 };
+use crate::sockopt::SocketOptions;
 use ferrox_core::tls::TlsProvider as _;
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -19,13 +19,20 @@ type Cache = HashMap<String, (Instant, Vec<u8>)>;
 
 static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
 
-pub(crate) fn resolve(text: &str, server_name: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn resolve(
+    text: &str,
+    server_name: &str,
+    options: Option<&SocketOptions>,
+) -> Result<Vec<u8>, String> {
     if !text.contains("://") {
         let bytes = ferrox_core::tls::decode_ech_config(text)?;
         return ferrox_core::tls::normalize_ech_config_list(bytes);
     }
     let (name, server) = split(text, server_name)?;
-    let key = format!("{server}|{name}");
+    let key = match options {
+        Some(options) => format!("{server}|{name}|{}", options.cache_key()),
+        None => format!("{server}|{name}"),
+    };
     let cache = CACHE.get_or_init(Default::default);
     let stale = {
         let kept = cache.lock().map_err(|_| "ech: cache poisoned")?;
@@ -36,7 +43,7 @@ pub(crate) fn resolve(text: &str, server_name: &str) -> Result<Vec<u8>, String> 
             return Ok(bytes.clone());
         }
     }
-    let queried = query(&name, server).and_then(|(bytes, ttl)| {
+    let queried = query(&name, server, options).and_then(|(bytes, ttl)| {
         ferrox_core::tls::normalize_ech_config_list(bytes).map(|list| (list, ttl))
     });
     match queried {
@@ -66,14 +73,18 @@ fn split<'a>(text: &'a str, server_name: &str) -> Result<(String, &'a str), Stri
     Ok((name.to_owned(), server))
 }
 
-fn query(name: &str, server: &str) -> Result<(Vec<u8>, u32), String> {
+fn query(
+    name: &str,
+    server: &str,
+    options: Option<&SocketOptions>,
+) -> Result<(Vec<u8>, u32), String> {
     if let Some(rest) = server.strip_prefix("https://") {
         let (authority_text, path) = rest
             .split_once('/')
             .map(|(authority, path)| (authority, format!("/{path}")))
             .unwrap_or((rest, "/dns-query".to_owned()));
         let (host, port) = authority(authority_host(authority_text), 443);
-        return doh(&host, port, &path, name, false);
+        return doh(&host, port, &path, name, false, options);
     }
     if let Some(rest) = server.strip_prefix("h2c://") {
         let (authority_text, path) = rest
@@ -81,15 +92,15 @@ fn query(name: &str, server: &str) -> Result<(Vec<u8>, u32), String> {
             .map(|(authority, path)| (authority, format!("/{path}")))
             .unwrap_or((rest, "/dns-query".to_owned()));
         let (host, port) = authority(authority_host(authority_text), 80);
-        return doh(&host, port, &path, name, true);
+        return doh(&host, port, &path, name, true, options);
     }
     if let Some(rest) = server.strip_prefix("udp://") {
         let (host, port) = authority(authority_host(rest), 53);
-        return udp(&host, port, name);
+        return udp(&host, port, name, options);
     }
     if let Some(rest) = server.strip_prefix("tcp://") {
         let (host, port) = authority(authority_host(rest), 53);
-        return tcp(&host, port, name);
+        return tcp(&host, port, name, options);
     }
     Err(format!("unsupported ECH DNS server {server}"))
 }
@@ -143,21 +154,17 @@ fn random_id() -> Result<u16, String> {
     Ok(u16::from_be_bytes(raw))
 }
 
-fn udp(host: &str, port: u16, name: &str) -> Result<(Vec<u8>, u32), String> {
+fn udp(
+    host: &str,
+    port: u16,
+    name: &str,
+    options: Option<&SocketOptions>,
+) -> Result<(Vec<u8>, u32), String> {
     let id = random_id()?;
     let packet = question(name, id, false)?;
-    let addr = resolve_addr(host, port)?;
-    let bind = if addr.is_ipv6() {
-        "[::]:0"
-    } else {
-        "0.0.0.0:0"
-    };
-    let socket = UdpSocket::bind(bind).map_err(|e| format!("ech: udp bind: {e}"))?;
+    let socket = crate::sockopt::datagram(options, host, port, TIMEOUT)?;
     socket
-        .set_read_timeout(Some(TIMEOUT))
-        .map_err(|e| format!("ech: udp timeout: {e}"))?;
-    socket
-        .send_to(&packet, addr)
+        .send(&packet)
         .map_err(|e| format!("ech: udp send: {e}"))?;
     let mut response = vec![0u8; 4096];
     let read = socket
@@ -167,10 +174,15 @@ fn udp(host: &str, port: u16, name: &str) -> Result<(Vec<u8>, u32), String> {
     parse_response(&response, Some(id), name)
 }
 
-fn tcp(host: &str, port: u16, name: &str) -> Result<(Vec<u8>, u32), String> {
+fn tcp(
+    host: &str,
+    port: u16,
+    name: &str,
+    options: Option<&SocketOptions>,
+) -> Result<(Vec<u8>, u32), String> {
     let id = random_id()?;
     let packet = question(name, id, false)?;
-    let mut stream = connect(host, port)?;
+    let mut stream = crate::sockopt::connect(options, host, port, TIMEOUT)?;
     stream
         .write_all(&(packet.len() as u16).to_be_bytes())
         .map_err(|e| format!("ech: tcp send: {e}"))?;
@@ -194,6 +206,7 @@ fn doh(
     path: &str,
     name: &str,
     cleartext: bool,
+    options: Option<&SocketOptions>,
 ) -> Result<(Vec<u8>, u32), String> {
     let default_port = if cleartext { 80 } else { 443 };
     let authority = if port == default_port {
@@ -202,7 +215,7 @@ fn doh(
         format!("{host}:{port}")
     };
     let scheme = if cleartext { "http" } else { "https" };
-    let stream = connect(host, port)?;
+    let stream = crate::sockopt::connect(options, host, port, TIMEOUT)?;
     if cleartext {
         let mut stream = stream;
         exchange(&mut stream, &authority, scheme, path, name)
@@ -315,19 +328,6 @@ fn frame(stream: &mut impl Write, kind: u8, flags: u8, id: u32, body: &[u8]) -> 
         .write_all(&frame_head(body.len(), kind, flags, id))
         .and_then(|()| stream.write_all(body))
         .map_err(|e| format!("ech: doh write: {e}"))
-}
-
-fn connect(host: &str, port: u16) -> Result<TcpStream, String> {
-    let addr = resolve_addr(host, port)?;
-    TcpStream::connect_timeout(&addr, TIMEOUT).map_err(|e| format!("ech: connect {addr}: {e}"))
-}
-
-fn resolve_addr(host: &str, port: u16) -> Result<std::net::SocketAddr, String> {
-    (host, port)
-        .to_socket_addrs()
-        .map_err(|e| format!("ech: resolve {host}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("ech: {host} resolved to nothing"))
 }
 
 fn parse_response(packet: &[u8], id: Option<u16>, name: &str) -> Result<(Vec<u8>, u32), String> {
@@ -465,8 +465,8 @@ fn take_u32(packet: &[u8], at: &mut usize) -> Result<u32, String> {
 mod tests {
     use super::*;
 
-    fn response(packet: &mut Vec<u8>, name: &str, ech: &[u8]) {
-        packet.extend_from_slice(&0u16.to_be_bytes());
+    fn response(packet: &mut Vec<u8>, name: &str, ech: &[u8], id: u16) {
+        packet.extend_from_slice(&id.to_be_bytes());
         packet.extend_from_slice(&0x8180u16.to_be_bytes());
         packet.extend_from_slice(&1u16.to_be_bytes());
         packet.extend_from_slice(&1u16.to_be_bytes());
@@ -496,7 +496,7 @@ mod tests {
     #[test]
     fn an_https_answer_carries_the_ech_parameter() {
         let mut packet = Vec::new();
-        response(&mut packet, "example.com", &[1, 2, 3, 4]);
+        response(&mut packet, "example.com", &[1, 2, 3, 4], 0);
         let (ech, ttl) = parse_response(&packet, Some(0), "example.com").unwrap();
         assert_eq!(ech, [1, 2, 3, 4]);
         assert_eq!(ttl, 300);
@@ -534,5 +534,27 @@ mod tests {
         let mut at = 12;
         assert_eq!(read_name(&packet, &mut at).unwrap(), "example.com");
         assert_eq!(at, packet.len());
+    }
+
+    #[test]
+    fn an_ech_query_carries_the_socket_options() {
+        let server = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let worker = std::thread::spawn(move || {
+            let mut packet = [0u8; 512];
+            let (read, from) = server.recv_from(&mut packet).unwrap();
+            let id = u16::from_be_bytes([packet[0], packet[1]]);
+            let mut answer = Vec::new();
+            response(&mut answer, "example.test", &[9, 8, 7], id);
+            server.send_to(&answer, from).unwrap();
+            read
+        });
+        let settings =
+            crate::json::parse(r#"{"domainStrategy":"useipv4","tcpFastOpen":false}"#).unwrap();
+        let options = crate::sockopt::parse(Some(&settings)).unwrap();
+        let (ech, ttl) = udp("127.0.0.1", addr.port(), "example.test", options.as_ref()).unwrap();
+        assert_eq!(ech, [9, 8, 7]);
+        assert_eq!(ttl, 300);
+        assert!(worker.join().unwrap() > 2);
     }
 }

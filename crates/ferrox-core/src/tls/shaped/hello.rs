@@ -103,6 +103,9 @@ impl Hello {
                 (ech::KDF_SHA256, ech::AEAD_AES_128_GCM) => {
                     Some((config, suite, &crate::tls::hpke::AES128_GCM))
                 }
+                (ech::KDF_SHA256, ech::AEAD_AES_256_GCM) => {
+                    Some((config, suite, &crate::tls::hpke::AES256_GCM))
+                }
                 (ech::KDF_SHA256, ech::AEAD_CHACHA20_POLY1305) => {
                     Some((config, suite, &crate::tls::hpke::CHACHA20_POLY1305))
                 }
@@ -1005,6 +1008,7 @@ mod tests {
             .remove(0);
         let hpke = match u16::from_be_bytes([outer[7], outer[8]]) {
             1 => &crate::tls::hpke::AES128_GCM,
+            2 => &crate::tls::hpke::AES256_GCM,
             3 => &crate::tls::hpke::CHACHA20_POLY1305,
             other => panic!("unexpected suite {other}"),
         };
@@ -1018,6 +1022,37 @@ mod tests {
             &rustls::crypto::hpke::HpkePrivateKey::from(server_key.private_key),
         )
         .expect("opens")
+    }
+
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn an_aes_256_only_config_seals_the_inner_hello() {
+        let (list, keys) = crate::tls::ech::generate_with_suites(
+            "public.test",
+            8,
+            &[(
+                crate::tls::ech::KDF_SHA256,
+                crate::tls::ech::AEAD_AES_256_GCM,
+            )],
+        )
+        .expect("generates");
+        let profile = Fingerprint::default().profile().expect("profile");
+        let mut hello = Hello::build(profile, "hidden.test", &[], false).expect("builds");
+        hello.enable_ech(&list).expect("ech");
+
+        let body = &hello.msg[4..];
+        let outer = extensions(body)
+            .into_iter()
+            .find(|ext| kind(ext) == 0xfe0d)
+            .expect("ech extension");
+        assert_eq!(u16::from_be_bytes([outer[7], outer[8]]), 2, "aes-256-gcm");
+        let inner = open_inner(body, outer, &keys);
+        assert!(
+            inner
+                .windows(b"hidden.test".len())
+                .any(|window| window == b"hidden.test"),
+            "the inner hello carries the real name"
+        );
     }
 
     #[cfg_attr(miri, ignore = "uses the OS random source")]

@@ -8160,6 +8160,7 @@ pub(crate) mod loopback {
             port,
             upstream: None,
             roots: Some(roots.clone().into()),
+            ech_config_list: None,
         };
         let first = crate::quic::pooled_stream_within(&dial, crate::quic::HANDSHAKE_TIMEOUT)
             .expect("a pooled stream");
@@ -8228,6 +8229,7 @@ pub(crate) mod loopback {
             port,
             upstream: None,
             roots: Some(roots.clone().into()),
+            ech_config_list: None,
         };
         let mut last = None;
         for flow in 1..=crate::quic::MAX_FLOWS_ON_LANE {

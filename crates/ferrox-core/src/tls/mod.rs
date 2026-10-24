@@ -129,6 +129,8 @@ pub enum TlsError {
     BadCertificate(String),
     Closed,
     NoSharedCipher,
+    /// The server refused the ECH offer and named the list to offer next.
+    EchRetry(std::sync::Arc<[u8]>),
     Other(String),
 }
 
@@ -139,6 +141,7 @@ impl fmt::Display for TlsError {
             Self::BadCertificate(why) => write!(f, "certificate did not verify: {why}"),
             Self::Closed => f.write_str("connection closed by peer"),
             Self::NoSharedCipher => f.write_str("no shared cipher suite"),
+            Self::EchRetry(_) => f.write_str("the server asked for another ECH config"),
             Self::Other(why) => write!(f, "backend error: {why}"),
         }
     }
@@ -227,6 +230,16 @@ impl TlsServerConfig {
     /// The `rustls` server config for a REALITY identity, built once per config.
     pub fn reality_server_config(&self) -> Result<std::sync::Arc<rustls::ServerConfig>, TlsError> {
         crate::tls::rustls_backend::cached_server_config(self, true)
+    }
+
+    /// The `BoringSSL` context an ECH listener answers with, unbuilt so a QUIC lane can hand it
+    /// to quiche: both carry the same certificate, key and ECH key set.
+    pub fn ech_server_context_builder(&self) -> Result<boring::ssl::SslContextBuilder, TlsError> {
+        let keys = self
+            .ech_server_keys
+            .as_deref()
+            .ok_or_else(|| TlsError::Other("ech server identity has no keys".to_owned()))?;
+        crate::tls::rustls_backend::ech_server_context_builder(self, keys)
     }
 }
 

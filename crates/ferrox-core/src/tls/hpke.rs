@@ -14,6 +14,7 @@ const SECRET_LEN: usize = 32;
 #[derive(Clone, Copy, Debug)]
 enum Aead {
     Aes128Gcm,
+    Aes256Gcm,
     ChaCha20Poly1305,
 }
 
@@ -21,6 +22,7 @@ impl Aead {
     fn id(self) -> u16 {
         match self {
             Self::Aes128Gcm => 0x0001,
+            Self::Aes256Gcm => 0x0002,
             Self::ChaCha20Poly1305 => 0x0003,
         }
     }
@@ -28,13 +30,14 @@ impl Aead {
     fn key_len(self) -> usize {
         match self {
             Self::Aes128Gcm => 16,
-            Self::ChaCha20Poly1305 => 32,
+            Self::Aes256Gcm | Self::ChaCha20Poly1305 => 32,
         }
     }
 
     fn key_id(self) -> HpkeAead {
         match self {
             Self::Aes128Gcm => HpkeAead::AES_128_GCM,
+            Self::Aes256Gcm => HpkeAead::AES_256_GCM,
             Self::ChaCha20Poly1305 => HpkeAead::CHACHA20_POLY_1305,
         }
     }
@@ -58,6 +61,14 @@ impl Aead {
                 cipher
                     .encrypt(aes_gcm::Nonce::from_slice(nonce), payload)
                     .map_err(|_| general("hpke: aes-128-gcm seal"))
+            }
+            Self::Aes256Gcm => {
+                use aes_gcm::{Aes256Gcm, KeyInit as _};
+                let cipher = Aes256Gcm::new_from_slice(key)
+                    .map_err(|_| general("hpke: aes-256-gcm key length"))?;
+                cipher
+                    .encrypt(aes_gcm::Nonce::from_slice(nonce), payload)
+                    .map_err(|_| general("hpke: aes-256-gcm seal"))
             }
             Self::ChaCha20Poly1305 => {
                 use chacha20poly1305::{ChaCha20Poly1305, KeyInit as _};
@@ -89,6 +100,14 @@ impl Aead {
                 cipher
                     .decrypt(aes_gcm::Nonce::from_slice(nonce), payload)
                     .map_err(|_| general("hpke: aes-128-gcm open"))
+            }
+            Self::Aes256Gcm => {
+                use aes_gcm::{Aes256Gcm, KeyInit as _};
+                let cipher = Aes256Gcm::new_from_slice(key)
+                    .map_err(|_| general("hpke: aes-256-gcm key length"))?;
+                cipher
+                    .decrypt(aes_gcm::Nonce::from_slice(nonce), payload)
+                    .map_err(|_| general("hpke: aes-256-gcm open"))
             }
             Self::ChaCha20Poly1305 => {
                 use chacha20poly1305::{ChaCha20Poly1305, KeyInit as _};
@@ -361,11 +380,14 @@ impl Hpke for X25519Hpke {
 pub(crate) static AES128_GCM: X25519Hpke = X25519Hpke {
     aead: Aead::Aes128Gcm,
 };
+pub(crate) static AES256_GCM: X25519Hpke = X25519Hpke {
+    aead: Aead::Aes256Gcm,
+};
 pub(crate) static CHACHA20_POLY1305: X25519Hpke = X25519Hpke {
     aead: Aead::ChaCha20Poly1305,
 };
 
-pub(crate) static SUITES: [&'static dyn Hpke; 2] = [&AES128_GCM, &CHACHA20_POLY1305];
+pub(crate) static SUITES: [&'static dyn Hpke; 3] = [&AES128_GCM, &AES256_GCM, &CHACHA20_POLY1305];
 
 #[cfg(test)]
 mod tests {
@@ -458,7 +480,7 @@ mod tests {
 
     #[cfg_attr(miri, ignore = "uses the OS random source")]
     #[test]
-    fn seal_and_open_round_trip_both_suites() {
+    fn seal_and_open_round_trip_every_suite() {
         for suite in SUITES {
             let (public, private) = suite.generate_key_pair().unwrap();
             let (enc, ciphertext) = suite.seal(b"info", b"aad", b"hello", &public).unwrap();
