@@ -3597,4 +3597,58 @@ mod tests {
             "the download survives the upload's marker and arrives after it"
         );
     }
+
+    fn socket_pair() -> (Connection, Connection) {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let dialled = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let (accepted, _) = listener.accept().expect("accepts");
+        (dialled, accepted)
+    }
+
+    #[test]
+    fn a_peer_that_ends_its_download_with_the_marker_still_takes_the_upload() {
+        let key = [0x55u8; 16];
+        let iv = [0x66u8; 16];
+        let options = OPT_STREAM | OPT_MASK | OPT_PAD;
+        let mut sender = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+        let mut pad = PadSource::fresh().expect("entropy");
+        let mut marker = Vec::new();
+        assert!(
+            stage_frame(&mut sender, &[], &mut marker, &mut pad),
+            "seals the download marker"
+        );
+        let send = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+        let recv = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("recvs");
+
+        let (plain, mut client) = socket_pair();
+        let (sealed, mut server) = socket_pair();
+        let relay = thread::spawn(move || pump_relay(&plain, &sealed, send, recv, None));
+
+        server.write_all(&marker).expect("writes the marker");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("arms");
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            client.read(&mut byte).expect("reads the half-close"),
+            0,
+            "the marker ends the download"
+        );
+
+        let _ = client.write_all(b"ping");
+        let _ = client.shutdown(Shutdown::Write);
+
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("arms");
+        let mut uploader = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("recvs");
+        let mut scratch = Vec::new();
+        let upload = read_frame(&mut server, &mut uploader, &mut scratch)
+            .expect("the upload survives");
+        assert_eq!(upload, b"ping");
+        let end = read_frame(&mut server, &mut uploader, &mut scratch).expect("the upload marker");
+        assert!(end.is_empty());
+        relay.join().expect("joins");
+    }
 }
