@@ -209,6 +209,13 @@ impl<R: Read> Read for ChainReader<R> {
     }
 }
 
+impl Reader<Connection> {
+    /// Arm or clear the poll quantum on the socket this reader reads through; a duplicated socket inherits no read timeout on Windows.
+    pub(crate) fn set_poll(&mut self, every: Option<std::time::Duration>) {
+        let _ = self.read.set_read_timeout(every);
+    }
+}
+
 impl<R: Read> Reader<R> {
     /// Every read that reaches the stream, counted where it happens; quiet sockets retry.
     fn take(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
