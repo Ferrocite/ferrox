@@ -729,8 +729,8 @@ fn split(
     Some(split_halves(read, write, early, have, at, masked))
 }
 
-// The same split over halves that cannot clone: `have` is the buffer the head read left, with `at` already past the head.
-fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
+/// The same split over halves that cannot clone: `have` is the buffer the head read left, with `at` already past the head.
+pub(crate) fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
     read: R,
     write: W,
     early: Vec<u8>,
