@@ -123,8 +123,9 @@
 
 append_pem 591
 
-# Re-blessed 60123580 by b6f9218: the decide probe's frame is 4096 walks of
-# one direct forward, one rule return, two hijacks and one malformed name. The
-# inline question and rule buffers moved it from the 55544745 c6099e2 blessed;
-# two ops runs after b6f9218, on separate branches, returned 60123580.
-ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 60123580 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+# Re-blessed 47810992 by the once-per-question fold: the decide probe's frame is
+# 4096 walks of one direct forward, one rule return, two hijacks and one
+# malformed name. The inline question and rule buffers moved it from 55544745
+# (c6099e2) to 60123580; folding the name once per question instead of once per
+# domain rule moved it to 47810992, the ops run on 86e28e9.
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 47810992 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
