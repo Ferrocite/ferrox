@@ -122,3 +122,10 @@
 # (pointer identity across two appends) witness it, green on linux, macos and windows.
 
 append_pem 591
+
+# Blessed 55544745 by c2beeab: the first row gated under its own filter, the
+# decide probe the DNS outbound's page points method-ops at. The number is the
+# probe test's whole frame under 4096 walks of one direct forward, one rule
+# return, two hijacks and one malformed name, and the diff that moved it is
+# the DNS codec and decode landing in c6099e2.
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 55544745 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
