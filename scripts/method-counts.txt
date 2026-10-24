@@ -492,6 +492,7 @@ tls-cipher-suites ops-retired-instructions UNBLESSED scripts/count-ops.sh
 tls-cipher-suites oracle-cases-replayed-byte-identical 10 ferrox-core-tls::cipher_suites::tests::oracle_replay_matches_go
 tls-cipher-suites cipher-suite-ids-reachable-by-the-backend 3 ferrox-core-tls::rustls_backend::tests::a_crafted_list_reorders_the_dialer_hello_to_the_reference
 tls-cipher-suites dialer-hello-cipher-field-equals-reference 1 ferrox-core-tls::rustls_backend::tests::a_crafted_list_reorders_the_dialer_hello_to_the_reference
+tls-cipher-suites config-key-heap-buffers-per-dial 0 ferrox-core-tls::rustls_backend::tests::a_repeat_dial_keys_the_config_without_copying_the_suite_order
 
 # --- uTLS-shaped ClientHello (matrix row 38) --------------------------------
 security-utls ops-retired-instructions UNBLESSED scripts/count-ops.sh

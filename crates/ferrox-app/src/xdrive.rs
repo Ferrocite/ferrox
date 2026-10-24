@@ -242,7 +242,7 @@ fn transport_tls(stream: &Json, security: &str) -> Option<Arc<TlsConfig>> {
                 .unwrap_or_default(),
             pins: ferrox_core::foxy::pin::Pins::default(),
             cert_pins: std::sync::Arc::from(Vec::new()),
-            cipher_suites: Vec::new(),
+            cipher_suites: std::sync::Arc::default(),
             insecure: tls.get("allowInsecure").and_then(Json::as_bool) == Some(true),
             fingerprint: None,
             ech_config_list: None,

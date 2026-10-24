@@ -226,7 +226,7 @@ fn doh(
             roots: crate::quic::system_roots(),
             cert_pins: std::sync::Arc::default(),
             pins: ferrox_core::foxy::pin::Pins::default(),
-            cipher_suites: Vec::new(),
+            cipher_suites: std::sync::Arc::default(),
             insecure: false,
             fingerprint: None,
             ech_config_list: None,
