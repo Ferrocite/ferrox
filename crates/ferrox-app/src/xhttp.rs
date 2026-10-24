@@ -338,10 +338,13 @@ fn drain_answer(stream: &mut dyn Read) -> bool {
     else {
         return false;
     };
-    if !ok_status(&head[..at]) {
+    let Ok(text) = std::str::from_utf8(&head[..at]) else {
+        return false;
+    };
+    if !ok_status_text(text) {
         return false;
     }
-    let mut left = content_length(&head[..at]).unwrap_or(0);
+    let mut left = content_length(text).unwrap_or(0);
     let mut sink = [0u8; 256];
     while left > 0 {
         let want = left.min(sink.len());
@@ -1099,8 +1102,7 @@ fn query_param<'a>(target: &'a str, key: &str) -> Option<&'a str> {
     None
 }
 
-fn header_cookie<'a>(head: &'a [u8], name: &str) -> Option<&'a str> {
-    let text = std::str::from_utf8(head).ok()?;
+fn header_cookie<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     for line in text.lines() {
         let Some((k, v)) = line.split_once(':') else {
             continue;
@@ -1186,8 +1188,7 @@ fn names_part(name: &str, key: &str, sep: u8, index: usize, fold: bool) -> bool 
 }
 
 /// The packet the data parts carry: one walk of the head answers every part name, and the parts decode as their join because the six-bit window crosses the cut.
-fn data_parts(head: &[u8], settings: &XhttpSettings) -> Option<Vec<u8>> {
-    let text = std::str::from_utf8(head).ok()?;
+fn data_parts(text: &str, settings: &XhttpSettings) -> Option<Vec<u8>> {
     let (key, sep, fields, fold) = match settings.uplink_data_placement {
         Placement::Header => (
             if settings.uplink_data_key.is_empty() {
@@ -1225,22 +1226,22 @@ fn data_parts(head: &[u8], settings: &XhttpSettings) -> Option<Vec<u8>> {
 }
 
 fn extract_padding<'a>(
-    head: &'a [u8],
+    text: &'a str,
     target: &'a str,
     settings: &XhttpSettings,
 ) -> Option<&'a str> {
     if !settings.x_padding_obfs {
-        if let Some(remark) = crate::proxy::header_value(head, "referer") {
+        if let Some(remark) = crate::proxy::header_value_in(text, "referer") {
             if let Some(v) = query_param(remark, "x_padding") {
                 return Some(v);
             }
         }
         return query_param(target, "x_padding");
     }
-    if let Some(cookie) = header_cookie(head, &settings.x_padding_key) {
+    if let Some(cookie) = header_cookie(text, &settings.x_padding_key) {
         return Some(cookie);
     }
-    if let Some(value) = crate::proxy::header_value(head, &settings.x_padding_header) {
+    if let Some(value) = crate::proxy::header_value_in(text, &settings.x_padding_header) {
         if settings.x_padding_placement == Placement::Header {
             return Some(value);
         }
@@ -1252,7 +1253,7 @@ fn extract_padding<'a>(
 }
 
 fn extract_meta<'a>(
-    head: &'a [u8],
+    text: &'a str,
     target: &'a str,
     settings: &XhttpSettings,
 ) -> (Option<&'a str>, Option<&'a str>) {
@@ -1277,19 +1278,19 @@ fn extract_meta<'a>(
         sid = query_param(target, &settings.session_key);
     }
     if settings.session_placement == Placement::Header {
-        sid = crate::proxy::header_value(head, &settings.session_key);
+        sid = crate::proxy::header_value_in(text, &settings.session_key);
     }
     if settings.session_placement == Placement::Cookie {
-        sid = header_cookie(head, &settings.session_key);
+        sid = header_cookie(text, &settings.session_key);
     }
     if settings.seq_placement == Placement::Query {
         seq = query_param(target, &settings.seq_key);
     }
     if settings.seq_placement == Placement::Header {
-        seq = crate::proxy::header_value(head, &settings.seq_key);
+        seq = crate::proxy::header_value_in(text, &settings.seq_key);
     }
     if settings.seq_placement == Placement::Cookie {
-        seq = header_cookie(head, &settings.seq_key);
+        seq = header_cookie(text, &settings.seq_key);
     }
     (sid, seq)
 }
@@ -1621,18 +1622,19 @@ fn plain_ok(stream: &mut impl Write, settings: &XhttpSettings, padded: &str) {
     );
 }
 
-fn ok_status(head: &[u8]) -> bool {
-    std::str::from_utf8(head)
-        .ok()
-        .and_then(|t| t.lines().next().map(|l| l.starts_with("HTTP/1.1 200 OK")))
-        .unwrap_or(false)
+/// Whether the head's status line is the `200 OK` this carrier writes and expects.
+fn ok_status_text(text: &str) -> bool {
+    text.lines()
+        .next()
+        .is_some_and(|l| l.starts_with("HTTP/1.1 200 OK"))
 }
 
 fn check_response(head: &[u8]) -> Option<()> {
-    if !ok_status(head) {
+    let text = std::str::from_utf8(head).ok()?;
+    if !ok_status_text(text) {
         return None;
     }
-    if !crate::proxy::header_value(head, "transfer-encoding").is_some_and(has_chunked) {
+    if !crate::proxy::header_value_in(text, "transfer-encoding").is_some_and(has_chunked) {
         return None;
     }
     Some(())
@@ -1663,8 +1665,8 @@ fn emit_500(stream: &mut impl Write) {
     );
 }
 
-fn content_length(head: &[u8]) -> Option<usize> {
-    crate::proxy::header_value(head, "content-length").and_then(|v| v.trim().parse().ok())
+fn content_length(text: &str) -> Option<usize> {
+    crate::proxy::header_value_in(text, "content-length").and_then(|v| v.trim().parse().ok())
 }
 
 // --- Server ------------------------------------------------------------------
@@ -1688,7 +1690,7 @@ fn check_request(head: &[u8], path: &str) -> Option<()> {
     if !path_covers(path, bare_path(target)) {
         return None;
     }
-    if !crate::proxy::header_value(head, "transfer-encoding").is_some_and(has_chunked) {
+    if !crate::proxy::header_value_in(text, "transfer-encoding").is_some_and(has_chunked) {
         return None;
     }
     Some(())
@@ -1741,10 +1743,7 @@ pub(crate) enum Served<R, W> {
 }
 
 /// Whether the client means to keep this connection: HTTP/1.1 keeps alive unless the request says otherwise, HTTP/1.0 only when it does.
-fn keeps_alive(head: &[u8]) -> bool {
-    let Ok(text) = std::str::from_utf8(head) else {
-        return false;
-    };
+fn keeps_alive(text: &str) -> bool {
     let mut lines = text.lines();
     let mut keep = !lines
         .next()
@@ -1852,7 +1851,7 @@ pub(crate) fn accept_core<
     let padded = pad_value(settings.x_padding_method, pad_target_len(settings));
 
     if method == "OPTIONS" {
-        let alive = keeps_alive(head);
+        let alive = keeps_alive(text);
         let mut resp = String::from("HTTP/1.1 200 OK\r\n");
         if !settings.x_padding_obfs {
             let _ = write!(resp, "X-Padding: {padded}\r\n");
@@ -1866,7 +1865,7 @@ pub(crate) fn accept_core<
         return Served::Closed;
     }
 
-    let pad_ok = match extract_padding(head, target, settings) {
+    let pad_ok = match extract_padding(text, target, settings) {
         Some(v) => padding_valid(
             v,
             settings.x_padding_bytes.0,
@@ -1879,7 +1878,7 @@ pub(crate) fn accept_core<
         emit_400(&mut write);
         return Served::Closed;
     }
-    let (sid, seq) = extract_meta(head, target, settings);
+    let (sid, seq) = extract_meta(text, target, settings);
 
     match (sid, seq) {
         (None, None) => {
@@ -1901,7 +1900,7 @@ pub(crate) fn accept_core<
             }
             if method == settings.uplink_method.as_str() {
                 if h2.is_none()
-                    && !crate::proxy::header_value(head, "transfer-encoding")
+                    && !crate::proxy::header_value_in(text, "transfer-encoding")
                         .is_some_and(has_chunked)
                 {
                     emit_400(&mut write);
@@ -1945,7 +1944,7 @@ pub(crate) fn accept_core<
                 emit_400(&mut write);
                 return Served::Closed;
             }
-            if !crate::proxy::header_value(head, "transfer-encoding").is_some_and(has_chunked)
+            if !crate::proxy::header_value_in(text, "transfer-encoding").is_some_and(has_chunked)
                 && h2.is_none()
             {
                 emit_400(&mut write);
@@ -1983,7 +1982,7 @@ pub(crate) fn accept_core<
             let mut body = Vec::new();
             let mut carry = Vec::new();
             let mut resumable = true;
-            if let Some(n) = content_length(head) {
+            if let Some(n) = content_length(text) {
                 if n > settings.sc_max_each_post {
                     emit_413(&mut write);
                     return Served::Closed;
@@ -1993,7 +1992,8 @@ pub(crate) fn accept_core<
                 };
                 carry = carry_tail(prefix, pre);
                 body = buf;
-            } else if crate::proxy::header_value(head, "transfer-encoding").is_some_and(has_chunked)
+            } else if crate::proxy::header_value_in(text, "transfer-encoding")
+                .is_some_and(has_chunked)
             {
                 // A chunked body leaves no length behind that the next request's head could be found after.
                 resumable = false;
@@ -2024,7 +2024,7 @@ pub(crate) fn accept_core<
                 carry = prefix;
             }
             let payload = match settings.uplink_data_placement {
-                Placement::Header | Placement::Cookie => data_parts(head, settings),
+                Placement::Header | Placement::Cookie => data_parts(text, settings),
                 _ => Some(body),
             };
             let Some(payload) = payload else {
@@ -2043,7 +2043,7 @@ pub(crate) fn accept_core<
                 return Served::Closed;
             }
             plain_ok(&mut write, settings, &padded);
-            if resumable && h2.is_none() && keeps_alive(head) {
+            if resumable && h2.is_none() && keeps_alive(text) {
                 return Served::Again(read, write, carry);
             }
             Served::Closed
@@ -3034,19 +3034,19 @@ mod tests {
             r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/up/"}}}"#,
         );
         let (meta, counts) =
-            ferrox_core::alloc_count::measure(|| extract_meta(b"", "/up/abc/7", &settings));
+            ferrox_core::alloc_count::measure(|| extract_meta("", "/up/abc/7", &settings));
         assert_eq!(counts.allocs, 0, "the segments are borrowed: {counts:?}");
         assert_eq!(meta, (Some("abc"), Some("7")));
         settings.session_placement = Placement::Query;
         settings.session_key = "x_session".to_owned();
         settings.seq_placement = Placement::Path;
         assert_eq!(
-            extract_meta(b"", "/up/abc/7?x_session=z", &settings),
+            extract_meta("", "/up/abc/7?x_session=z", &settings),
             (Some("z"), Some("abc")),
             "a seq-only path takes the first segment"
         );
         assert_eq!(
-            extract_meta(b"", "/up/", &settings),
+            extract_meta("", "/up/", &settings),
             (None, None),
             "a path with no segments names nothing"
         );
@@ -3242,19 +3242,19 @@ mod tests {
     /// per request that said whether the connection stays.
     #[test]
     fn a_connection_header_is_named_without_a_lowercase_copy() {
-        let head = b"POST /up HTTP/1.1\r\nHost: h\r\nConnection: Keep-Alive\r\n\r\n";
+        let head = "POST /up HTTP/1.1\r\nHost: h\r\nConnection: Keep-Alive\r\n\r\n";
         let (keep, counts) = ferrox_core::alloc_count::measure(|| keeps_alive(head));
         assert!(keep, "HTTP/1.1 keeps alive when told to");
         assert_eq!(counts.allocs, 0, "the field is read in place: {counts:?}");
         assert!(
-            !keeps_alive(b"POST /up HTTP/1.1\r\nConnection: keep-alive, CLOSE\r\n\r\n"),
+            !keeps_alive("POST /up HTTP/1.1\r\nConnection: keep-alive, CLOSE\r\n\r\n"),
             "a close in the list wins"
         );
         assert!(
-            keeps_alive(b"POST /up HTTP/1.0\r\nConnection: KEEP-ALIVE\r\n\r\n"),
+            keeps_alive("POST /up HTTP/1.0\r\nConnection: KEEP-ALIVE\r\n\r\n"),
             "HTTP/1.0 keeps alive only when told"
         );
-        assert!(!keeps_alive(b"POST /up HTTP/1.0\r\n\r\n"));
+        assert!(!keeps_alive("POST /up HTTP/1.0\r\n\r\n"));
     }
 
     /// A missing or `auto` mode is the dialer's default, not a promise about what may arrive: the reference hub gates a shape only when the mode was written down (`hub.go:154`, `:199`, `:241` all read `Mode != "" && Mode != "auto" && Mode != <shape>`). Our own `xhttp::connect` writes the `stream-one` POST, so a hub resolved from `{"path": "/share"}` refusing it is a hub that answers no dial its own client can make — which is what left `vless-xhttp-down-8` with no flow at any connection count.
@@ -3961,7 +3961,7 @@ mod tests {
                 "POST /up/one_walk/0 HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\n{parts}Content-Length: 0\r\nConnection: close\r\n\r\n"
             );
             let (decoded, counts) =
-                ferrox_core::alloc_count::measure(|| data_parts(head.as_bytes(), &settings));
+                ferrox_core::alloc_count::measure(|| data_parts(&head, &settings));
             assert_eq!(
                 decoded.as_deref(),
                 Some(&packet[..]),
@@ -3992,7 +3992,7 @@ mod tests {
                     let hit = if placement == "header" {
                         crate::proxy::header_value(head.as_bytes(), &name)
                     } else {
-                        header_cookie(head.as_bytes(), &name)
+                        header_cookie(&head, &name)
                     };
                     match hit {
                         Some(v) => joined.push_str(v),
