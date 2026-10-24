@@ -747,6 +747,12 @@ enum Role {
         carrier: Carrier,
         freedom: bool,
     },
+    VmessTls {
+        id: [u8; 16],
+        carrier: Carrier,
+        freedom: bool,
+        server: Arc<ferrox_core::tls::TlsServerConfig>,
+    },
     Shadowsocks {
         password: String,
         method: String,
@@ -784,6 +790,7 @@ impl Role {
             | Role::Trojan { carrier, .. }
             | Role::TrojanTls { carrier, .. }
             | Role::Vmess { carrier, .. }
+            | Role::VmessTls { carrier, .. }
             | Role::Shadowsocks { carrier, .. } => carrier.tcp_mask(),
             // A front with no tcp carrier has nowhere to arm a chain, so its inbound refuses one.
             Role::Socks { .. } | Role::Http { .. } | Role::Mixed { .. } | Role::Dokodemo { .. } => {
@@ -1314,6 +1321,12 @@ fn accept_loop(address: &str, role: &Role) {
                     }
                     refused_carriers!() => {}
                 },
+                Role::VmessTls {
+                    id,
+                    carrier,
+                    freedom,
+                    server,
+                } => serve_vmess_tls(stream, &id, &carrier, freedom, &server),
                 Role::Shadowsocks {
                     password,
                     method,
@@ -4445,12 +4458,21 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
 
 fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
     let id = inbound_id(inbound);
+    let sec = stream_security(inbound);
     match inbound_carrier(inbound) {
         Carrier::Kcp(config) => {
-            let serve: KcpServe = Arc::new(move |conn| {
-                let (reader, writer, close) = kcp_parts(conn);
-                crate::vmess::serve_kcp(reader, writer, &id, freedom, &close);
-            });
+            let serve: KcpServe = if sec == "tls" {
+                let Some(server) = inbound_tls_identity(inbound) else {
+                    eprintln!("unreadable vmess tls identity on {address}: refused, not served");
+                    return;
+                };
+                Arc::new(move |conn| serve_vmess_kcp_tls(conn, &id, freedom, &server))
+            } else {
+                Arc::new(move |conn| {
+                    let (reader, writer, close) = kcp_parts(conn);
+                    crate::vmess::serve_kcp(reader, writer, &id, freedom, &close);
+                })
+            };
             let owned = address.to_owned();
             let _ = serve_kcp_bound(&owned, config, &serve);
         }
@@ -4458,6 +4480,21 @@ fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
             let accept: crate::xdrive::Accept =
                 Arc::new(move |session| serve_vmess_xdrive(session, &id, freedom));
             serve_xdrive_loop(&settings, address, accept);
+        }
+        carrier if sec == "tls" => {
+            let Some(server) = inbound_tls_identity(inbound) else {
+                eprintln!("unreadable vmess tls identity on {address}: refused, not served");
+                return;
+            };
+            spawn_role(
+                address,
+                Role::VmessTls {
+                    id,
+                    carrier,
+                    freedom,
+                    server,
+                },
+            );
         }
         other => spawn_role(
             address,
@@ -7699,6 +7736,313 @@ fn serve_session_trojan_grpc<R: Read, W: FrameWrite + 'static>(
     };
     echo_trace("session grpc relaying");
     relay_sink(creader, &cwriter, &uplink, crate::grpc::mark_reader_dead);
+}
+
+/// A vmess listener that declares `security: tls` answers the handshake before its carrier, and
+/// an identity it cannot load is refused rather than served as plaintext.
+fn serve_vmess_tls(
+    stream: Connection,
+    id: &[u8; 16],
+    carrier: &Carrier,
+    freedom: bool,
+    server: &ferrox_core::tls::TlsServerConfig,
+) {
+    if stream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
+    match carrier {
+        Carrier::Raw(_) => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(mut tls) = ferrox_core::tls::accept(server, stream) else {
+                return;
+            };
+            if !shake_tls(&mut tls) {
+                return;
+            }
+            serve_session_vmess_raw(tls, raw, id, freedom);
+        }
+        Carrier::Ws { path, .. } => {
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            serve_session_vmess_ws(reader, writer, path.as_str(), id, freedom);
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            serve_session_vmess_xhttp(reader, writer, settings, id, freedom);
+        }
+        Carrier::HttpUpgrade { path, .. } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            serve_session_vmess_httpupgrade(reader, writer, raw, path.as_str(), id, freedom);
+        }
+        Carrier::HttpHeader { path } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            serve_session_vmess_httpheader(reader, writer, raw, path.as_str(), id, freedom);
+        }
+        Carrier::Grpc { path } => {
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            serve_session_vmess_grpc(reader, writer, path.as_str(), id, freedom);
+        }
+        refused_carriers!() => {}
+    }
+}
+
+fn serve_session_vmess_raw<S>(session: S, raw: Connection, id: &[u8; 16], freedom: bool)
+where
+    S: ferrox_core::tls::TlsProvider
+        + ferrox_core::tls::RecordAlignment
+        + Drivable
+        + Send
+        + 'static,
+{
+    let Ok(transport) = raw.try_clone() else {
+        return;
+    };
+    let (mut reader, mut writer) = session_halves(session, transport);
+    let request = {
+        let mut bounded = HandshakeDeadline {
+            inner: &mut reader,
+            until: Instant::now() + budgets::handshake(),
+        };
+        crate::vmess::accept_request(&mut bounded, id)
+    };
+    let Some((target, send, recv, prefix, cmd)) = request else {
+        return;
+    };
+    if !freedom || cmd != 1 {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    if writer.write_all(&prefix).is_err() {
+        return;
+    }
+    let closer = raw;
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = closer.shutdown(Shutdown::Both);
+    });
+    crate::vmess::pump_relay_carried(&uplink, reader, writer, &close, send, recv, None);
+}
+
+fn serve_session_vmess_ws<R: Read, W: FrameWrite + 'static>(
+    read: R,
+    write: W,
+    path: &str,
+    id: &[u8; 16],
+    freedom: bool,
+) {
+    let Some((mut reader, writer)) = crate::ws::accept_split(read, write, path) else {
+        return;
+    };
+    reader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
+    let request = crate::vmess::accept_request(&mut reader, id);
+    reader.set_handshake_budget(None);
+    let Some((target, send, recv, prefix, cmd)) = request else {
+        return;
+    };
+    if !freedom || cmd != 1 {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    if !writer.send(&prefix) {
+        return;
+    }
+    let closer = writer.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+    crate::vmess::pump_relay_carried(
+        &uplink,
+        reader,
+        crate::vmess::WsSink::carried(writer),
+        &close,
+        send,
+        recv,
+        None,
+    );
+}
+
+fn serve_session_vmess_grpc<R: Read, W: FrameWrite + 'static>(
+    read: R,
+    write: W,
+    path: &str,
+    id: &[u8; 16],
+    freedom: bool,
+) {
+    let Some((mut reader, writer)) = crate::grpc::accept_split(read, write, path) else {
+        return;
+    };
+    reader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
+    let request = crate::vmess::accept_request(&mut reader, id);
+    reader.set_handshake_budget(None);
+    let Some((target, send, recv, prefix, cmd)) = request else {
+        return;
+    };
+    if !freedom || cmd != 1 {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    if !writer.send(&prefix) {
+        return;
+    }
+    let closer = writer.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+    crate::vmess::pump_relay_carried(&uplink, reader, writer, &close, send, recv, None);
+}
+
+fn serve_session_vmess_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+    read: R,
+    write: W,
+    settings: &crate::xhttp::XhttpSettings,
+    id: &[u8; 16],
+    freedom: bool,
+) {
+    let Some((mut reader, writer)) =
+        crate::xhttp::accept_split_with_settings(read, write, settings)
+    else {
+        return;
+    };
+    let Some((target, send, recv, prefix, cmd)) = crate::vmess::accept_request(&mut reader, id)
+    else {
+        writer.finish();
+        return;
+    };
+    if !freedom || cmd != 1 {
+        writer.finish();
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        writer.finish();
+        return;
+    };
+    if !writer.send(&prefix) {
+        writer.finish();
+        return;
+    }
+    let closer = writer.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
+    crate::vmess::pump_relay_carried(&uplink, reader, writer, &close, send, recv, None);
+}
+
+fn serve_session_vmess_httpupgrade<R: Read, W: Write + Clone + Send + 'static>(
+    read: R,
+    write: W,
+    raw: Connection,
+    path: &str,
+    id: &[u8; 16],
+    freedom: bool,
+) {
+    let raw = Arc::new(raw);
+    let Some((mut reader, mut writer)) = crate::httpupgrade::accept_split(read, write, path) else {
+        crate::httpupgrade::quiet(&raw);
+        return;
+    };
+    let Some((target, send, recv, prefix, cmd)) = crate::vmess::accept_request(&mut reader, id)
+    else {
+        crate::httpupgrade::quiet(&raw);
+        return;
+    };
+    if !freedom || cmd != 1 {
+        crate::httpupgrade::quiet(&raw);
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        crate::httpupgrade::quiet(&raw);
+        return;
+    };
+    if writer.write_all(&prefix).is_err() {
+        crate::httpupgrade::quiet(&raw);
+        return;
+    }
+    let closer = Arc::clone(&raw);
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = closer.shutdown(Shutdown::Both);
+    });
+    crate::vmess::pump_relay_carried(&uplink, reader, writer, &close, send, recv, None);
+    crate::httpupgrade::quiet(&raw);
+}
+
+fn serve_session_vmess_httpheader<R: Read, W: Write + Clone + Send + 'static>(
+    read: R,
+    write: W,
+    raw: Connection,
+    path: &str,
+    id: &[u8; 16],
+    freedom: bool,
+) {
+    let raw = Arc::new(raw);
+    let Some((mut reader, mut writer)) = crate::httpheader::accept_split(read, write, path) else {
+        return;
+    };
+    let Some((target, send, recv, prefix, cmd)) = crate::vmess::accept_request(&mut reader, id)
+    else {
+        return;
+    };
+    if !freedom || cmd != 1 {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    if writer.write_all(&prefix).is_err() {
+        return;
+    }
+    let closer = raw;
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = closer.shutdown(Shutdown::Both);
+    });
+    crate::vmess::pump_relay_carried(&uplink, reader, writer, &close, send, recv, None);
+}
+
+fn serve_vmess_kcp_tls(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    id: &[u8; 16],
+    freedom: bool,
+    server: &ferrox_core::tls::TlsServerConfig,
+) {
+    let Ok(mut tls) = ferrox_core::tls::accept(
+        server,
+        KcpIo {
+            conn: Arc::clone(conn),
+        },
+    ) else {
+        return;
+    };
+    if tls.handshake().is_err() {
+        return;
+    }
+    let (reader, writer) = session_halves(
+        tls,
+        KcpIo {
+            conn: Arc::clone(conn),
+        },
+    );
+    let closer = Arc::clone(conn);
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+    crate::vmess::serve_kcp(reader, writer, id, freedom, &close);
 }
 
 fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) {
