@@ -72,6 +72,8 @@ impl std::error::Error for ConnError {}
 struct Notifier {
     generation: Mutex<u64>,
     condvar: Condvar,
+    #[cfg(test)]
+    wakes: AtomicU32,
 }
 
 impl Notifier {
@@ -84,6 +86,8 @@ impl Notifier {
     }
 
     fn signal(&self) {
+        #[cfg(test)]
+        self.wakes.fetch_add(1, Ordering::SeqCst);
         *self.generation.lock().unwrap() += 1;
         self.condvar.notify_all();
     }
@@ -392,7 +396,6 @@ impl Connection {
         if woke {
             self.data_input.signal();
         }
-        self.wake_update();
     }
 }
 
@@ -585,6 +588,11 @@ impl Connection {
     #[cfg(test)]
     pub(crate) fn flush_calls(&self) -> u32 {
         self.flush_calls.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn update_wakeups(&self) -> u32 {
+        self.update.wakes.load(Ordering::SeqCst)
     }
 
     #[must_use]
@@ -858,6 +866,31 @@ mod tests {
             conn.data_input.gen(),
             before,
             "a segment outside the receiving window is not a wakeup"
+        );
+    }
+
+    /// An inbound datagram is not an updater wake: the tick already runs while an ack is pending, so signalling the updater per datagram only pays a futex.
+    #[test]
+    fn an_inbound_datagram_does_not_wake_the_updater() {
+        let local = ([127, 0, 0, 1], 1).into();
+        let conn = Connection::new(
+            ConnMetadata {
+                local,
+                remote: local,
+                conversation: 4,
+            },
+            Box::new(|_| Ok(())),
+            Box::new(|| {}),
+            Config::default(),
+        );
+        let before = conn.update_wakeups();
+        for number in 0..8 {
+            conn.input(&mut vec![data(number, 0, b"payload")]);
+        }
+        assert_eq!(
+            conn.update_wakeups() - before,
+            0,
+            "eight datagrams woke the updater"
         );
     }
 
