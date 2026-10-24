@@ -1560,22 +1560,56 @@ fn serve_vless_raw_with<D>(
 {
     // Bound only the opening request read to a wall-clock budget, then restore the blocking relay reads behind it.
     let _ = stream.set_read_timeout(Some(budgets::handshake()));
-    // With a table on, the decode reads through the mirror and keeps what it pulled: a probe the header refuses is relayed from the head it has spent.
-    let (decoded, table) = match fallbacks {
-        Some(rows) => {
-            let mirror = mirror_decode(&mut stream);
-            (mirror.0, Some((rows, mirror.1)))
+    let (probe, carried) = match fallbacks {
+        // With a table on, the reference's first read and its verdict name the flow as a header or a probe.
+        Some(_) => {
+            let mut window = [0u8; PROBE_READ];
+            let (probe, first, carried) = probe_front(&mut stream, id, &mut window);
+            let _ = stream.set_read_timeout(None);
+            return vless_raw_reply(
+                stream,
+                id,
+                freedom,
+                fallbacks,
+                &window[..first],
+                (probe, carried),
+                dial,
+            );
         }
-        None => (decode_request_bounded(&mut stream), None),
+        None => (
+            match decode_request_bounded(&mut stream) {
+                Some(header) => Probe::Decoded(header),
+                None => Probe::Dropped,
+            },
+            Vec::new(),
+        ),
     };
     let _ = stream.set_read_timeout(None);
-    let Some((got, flow, cmd, target)) = decoded else {
-        let Some((rows, saved)) = table else { return };
-        return seize_fallback(stream, rows, &saved);
+    vless_raw_reply(stream, id, freedom, fallbacks, &[], (probe, carried), dial);
+}
+
+fn vless_raw_reply<D>(
+    mut stream: Connection,
+    id: &[u8; 16],
+    freedom: bool,
+    fallbacks: Option<&[Fallback]>,
+    window: &[u8],
+    (probe, carried): (Probe, Vec<u8>),
+    dial: D,
+) where
+    D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
+{
+    let (got, flow, cmd, target) = match probe {
+        Probe::Decoded(header) => header,
+        Probe::Refused => {
+            let Some(rows) = fallbacks else { return };
+            return seize_fallback(stream, rows, window, &carried);
+        }
+        Probe::Dropped => return,
     };
     if got != *id || !freedom {
-        let Some((rows, saved)) = table else { return };
-        return seize_fallback(stream, rows, &saved);
+        let Some(rows) = fallbacks else { return };
+        return seize_fallback(stream, rows, window, &carried);
     }
     if cmd == 2 {
         if flow != Flow::None {
@@ -1590,9 +1624,8 @@ fn serve_vless_raw_with<D>(
         return serve_vless_mux_with(stream, dial);
     }
     if cmd != 1 {
-        // The reference's decoder refuses any other command before its handler would look at it, which with a table on is the fallback route.
-        let Some((rows, saved)) = table else { return };
-        return seize_fallback(stream, rows, &saved);
+        // The reference's decoder refuses a command past the id without falling back.
+        return;
     }
     let Some(uplink) = dial(&target) else {
         return;
@@ -1603,37 +1636,75 @@ fn serve_vless_raw_with<D>(
     relay_handoff(&stream, &uplink);
 }
 
-/// The bytes a bounded header decode pulled from a front, kept on the side so a fallback relay
-/// can hand them forward: the decode has moved the stream past its head, and the head itself
-/// only survives here. A decode that succeeds frees them.
-struct Mirror<R> {
-    io: R,
-    saved: Vec<u8>,
+/// The reference's first read is one `Read` into an 8 KiB buffer; its route scans that buffer
+/// and its fallback relays it.
+const PROBE_READ: usize = 8192;
+
+/// What one probe of a table-bearing front lands on: a header the handler owns, a flow the
+/// rows cover, or the reference's own refusal to fall back.
+enum Probe {
+    Decoded(([u8; 16], Flow, u8, SocketAddr)),
+    Refused,
+    Dropped,
 }
 
-impl<R: Read> Read for Mirror<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = self.io.read(buf)?;
-        if n > 0 {
-            self.saved.extend_from_slice(&buf[..n]);
-        }
-        Ok(n)
+/// The probe: one bounded first read into the caller's window, then the header parse replayed
+/// through it. The window is the bytes the route scans; `carried` is only what the parse pulled
+/// past it, the head a fallback relays after the window. The reference falls back on a short
+/// read, an unknown version, or an unknown user, and drops a header that names this inbound but
+/// does not parse.
+fn probe_front(
+    session: &mut dyn Read,
+    id: &[u8; 16],
+    first: &mut [u8; PROBE_READ],
+) -> (Probe, usize, Vec<u8>) {
+    let mut bounded = HandshakeDeadline {
+        inner: session,
+        until: Instant::now() + budgets::handshake(),
+    };
+    let n = match bounded.read(&mut *first) {
+        Ok(0) | Err(_) => return (Probe::Dropped, 0, Vec::new()),
+        Ok(n) => n,
+    };
+    if n < 18 || first[0] != 0 || first[1..17] != id[..] {
+        return (Probe::Refused, n, Vec::new());
+    }
+    let mut carried = Vec::new();
+    let mut replay = Prefixed {
+        head: &first[..n],
+        at: 0,
+        tail: &mut bounded,
+        carried: &mut carried,
+    };
+    match decode_request(&mut replay) {
+        Some(header) => (Probe::Decoded(header), n, carried),
+        None => (Probe::Dropped, n, carried),
     }
 }
 
-/// One bounded decode's take: the verdict the header gives and the bytes it read past.
-type Probe = (Option<([u8; 16], Flow, u8, SocketAddr)>, Vec<u8>);
+/// The first read's bytes served ahead of the live stream, with what the parse pulls past them
+/// kept for a fallback head.
+struct Prefixed<'a> {
+    head: &'a [u8],
+    at: usize,
+    tail: &'a mut dyn Read,
+    carried: &'a mut Vec<u8>,
+}
 
-/// A bounded decode for a front that carries fallback rows: the same reads the plain decode
-/// takes, and the bytes they pulled, saved beside the verdict.
-fn mirror_decode(session: &mut dyn Read) -> Probe {
-    let mut mirror = Mirror {
-        io: session,
-        saved: Vec::new(),
-    };
-    let decoded = decode_request_bounded(&mut mirror);
-    let saved = std::mem::take(&mut mirror.saved);
-    (decoded, saved)
+impl Read for Prefixed<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.at < self.head.len() {
+            let n = (self.head.len() - self.at).min(buf.len());
+            buf[..n].copy_from_slice(&self.head[self.at..self.at + n]);
+            self.at += n;
+            return Ok(n);
+        }
+        let n = self.tail.read(buf)?;
+        if n > 0 {
+            self.carried.extend_from_slice(&buf[..n]);
+        }
+        Ok(n)
+    }
 }
 
 /// The peer a fallback row dials: a stream the relay holds, or a datagram socket.
@@ -1861,21 +1932,23 @@ fn route_head<'a>(
     rows: &'a [Fallback],
     name: &str,
     alpn: &str,
-    saved: &[u8],
+    window: &[u8],
+    carried: &[u8],
     front: &Connection,
 ) -> Option<(&'a Fallback, Vec<u8>)> {
-    let row = Fallback::route(rows, name, alpn, saved)?;
+    let row = Fallback::route(rows, name, alpn, window)?;
     let mut head = fallback_head(row.xver, front);
-    head.extend_from_slice(saved);
+    head.extend_from_slice(window);
+    head.extend_from_slice(carried);
     Some((row, head))
 }
 
 /// A refused probe a raw front holds: the route and the head over the front's own ends, the
 /// dial, and a socket-to-socket relay of everything the front carries from here on. No
 /// vless answer is written: the front is the substitute's own now.
-fn seize_fallback(front: Connection, rows: &[Fallback], saved: &[u8]) {
+fn seize_fallback(front: Connection, rows: &[Fallback], window: &[u8], carried: &[u8]) {
     let _ = front.set_read_timeout(None);
-    let Some((row, head)) = route_head(rows, "", "", saved, &front) else {
+    let Some((row, head)) = route_head(rows, "", "", window, carried, &front) else {
         return;
     };
     let Some(mut peer) = fallback_dial(&row.network) else {
@@ -1899,12 +1972,13 @@ fn seize_fallback_tls<S>(
     session: S,
     raw: &Connection,
     rows: &[Fallback],
-    saved: &[u8],
+    window: &[u8],
+    carried: &[u8],
     front: &FrontNames,
 ) where
     S: Read + Write + Drivable + CipherOpen + ferrox_core::tls::RecordAlignment + Send + 'static,
 {
-    let Some((row, head)) = route_head(rows, &front.sni, &front.alpn, saved, raw) else {
+    let Some((row, head)) = route_head(rows, &front.sni, &front.alpn, window, carried, raw) else {
         return;
     };
     let Some(mut peer) = fallback_dial(&row.network) else {
@@ -3426,19 +3500,81 @@ fn relay_vless<S>(
         + CipherOpen
         + 'static,
 {
-    // With a table on, the decode reads through the mirror and keeps what it pulled: a probe the header or the id's own gates refuse is relayed from its head.
-    let (decoded, table) = match fallbacks {
-        Some(rows) => {
-            let mirror = mirror_decode(&mut session);
-            (mirror.0, Some((rows, mirror.1)))
+    let (probe, carried) = match fallbacks {
+        // With a table on, the reference's first read and its verdict name the flow as a header or a probe.
+        Some(_) => {
+            let mut window = [0u8; PROBE_READ];
+            let (probe, first, carried) = probe_front(&mut session, id, &mut window);
+            return relay_vless_reply(
+                session,
+                raw,
+                id,
+                freedom,
+                fallbacks,
+                &window[..first],
+                (probe, carried),
+                front,
+            );
         }
-        None => (decode_request_bounded(&mut session), None),
+        None => (
+            match decode_request_bounded(&mut session) {
+                Some(header) => Probe::Decoded(header),
+                None => Probe::Dropped,
+            },
+            Vec::new(),
+        ),
+    };
+    relay_vless_reply(
+        session,
+        raw,
+        id,
+        freedom,
+        fallbacks,
+        &[],
+        (probe, carried),
+        front,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn relay_vless_reply<S>(
+    mut session: S,
+    raw: Option<Connection>,
+    id: &[u8; 16],
+    freedom: bool,
+    fallbacks: Option<&[Fallback]>,
+    window: &[u8],
+    (probe, carried): (Probe, Vec<u8>),
+    front: &FrontNames,
+) where
+    S: std::io::Read
+        + std::io::Write
+        + Send
+        + ferrox_core::tls::RecordAlignment
+        + Drivable
+        + CipherOpen
+        + 'static,
+{
+    let decoded = match probe {
+        Probe::Decoded(header) => {
+            if !matches!(header.2, 1..=3) {
+                // The reference's decoder refuses a command past the id without falling back.
+                return;
+            }
+            Some(header)
+        }
+        Probe::Refused => {
+            let Some(rows) = fallbacks else { return };
+            let Some(raw) = raw else { return };
+            return seize_fallback_tls(session, &raw, rows, window, &carried, front);
+        }
+        Probe::Dropped => return,
     };
     let Some((flow, uplink, close)) = open_vless(&mut session, raw.as_ref(), id, freedom, decoded)
     else {
-        let Some((rows, saved)) = table else { return };
+        let Some(rows) = fallbacks else { return };
         let Some(raw) = raw else { return };
-        return seize_fallback_tls(session, &raw, rows, &saved, front);
+        return seize_fallback_tls(session, &raw, rows, window, &carried, front);
     };
     if flow == Flow::Vision {
         // The Link reads its own transport, so the split is not its shape: the quiet grain stops at the tick instead, and a park never outlasts a writer.
@@ -34881,6 +35017,122 @@ mod dns_lane_tests {
             &fallback_unknown_head(2)[..],
             &b"\r\n\r\n\x00\r\nQUIT\n\x20\x00\x00\x00"[..]
         );
+    }
+
+    /// A first read that answers at most `limit` bytes, the way a header can straddle two
+    /// reads on a live socket.
+    struct Chunked {
+        bytes: Vec<u8>,
+        at: usize,
+        limit: usize,
+    }
+
+    impl Read for Chunked {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.at == self.bytes.len() {
+                return Ok(0);
+            }
+            let n = self.limit.min(buf.len()).min(self.bytes.len() - self.at);
+            buf[..n].copy_from_slice(&self.bytes[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    struct Failing;
+
+    impl Read for Failing {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset))
+        }
+    }
+
+    fn a_vless_probe(id: &[u8; 16], cmd: u8) -> Vec<u8> {
+        let mut out = vec![0u8];
+        out.extend_from_slice(id);
+        out.push(0);
+        out.push(cmd);
+        out.extend_from_slice(&8080u16.to_be_bytes());
+        out.push(ferrox_core::addr::IPV4);
+        out.extend_from_slice(&[127, 0, 0, 1]);
+        out
+    }
+
+    /// The reference's first read is the route's window and the fallback's head; its fallback
+    /// verdicts are a short read, an unknown version, or an unknown user, and nothing past them.
+    #[test]
+    fn a_probe_takes_the_reference_s_fallback_verdicts() {
+        let id = [7u8; 16];
+        let header = a_vless_probe(&id, 1);
+        let mut window = [0u8; PROBE_READ];
+
+        let mut whole = header.clone();
+        whole.extend_from_slice(b"hello");
+        let (verdict, first, carried) =
+            probe_front(&mut std::io::Cursor::new(whole.clone()), &id, &mut window);
+        assert!(
+            matches!(verdict, Probe::Decoded((got, _, 1, target)) if got == id && target.port() == 8080 && target.ip().is_loopback()),
+            "a header this inbound owns is not a probe"
+        );
+        assert_eq!(
+            &window[..first],
+            whole.as_slice(),
+            "the window is the first read"
+        );
+        assert_eq!(
+            carried,
+            Vec::<u8>::new(),
+            "the parse pulled nothing past it"
+        );
+
+        let (verdict, first, carried) = probe_front(
+            &mut Chunked {
+                bytes: header.clone(),
+                at: 0,
+                limit: 18,
+            },
+            &id,
+            &mut window,
+        );
+        assert!(matches!(verdict, Probe::Decoded(_)));
+        assert_eq!(
+            &window[..first],
+            &header[..18],
+            "the window stops at the read"
+        );
+        assert_eq!(
+            carried,
+            header[18..],
+            "the tail keeps what the parse pulled"
+        );
+
+        let mut foreign = vec![0u8];
+        foreign.extend_from_slice(&[9u8; 16]);
+        foreign.extend_from_slice(b"GET / HTTP/1.1\r\n\r\n");
+        for probe in [b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec(), foreign] {
+            let (verdict, first, carried) =
+                probe_front(&mut std::io::Cursor::new(probe.clone()), &id, &mut window);
+            assert!(matches!(verdict, Probe::Refused), "{probe:?}");
+            assert_eq!(&window[..first], probe);
+            assert_eq!(carried, Vec::<u8>::new());
+        }
+        let short = b"GET / HTTP/1.1".to_vec();
+        let (verdict, first, carried) =
+            probe_front(&mut std::io::Cursor::new(short.clone()), &id, &mut window);
+        assert!(matches!(verdict, Probe::Refused));
+        assert_eq!(&window[..first], short.as_slice());
+        assert_eq!(carried, Vec::<u8>::new());
+
+        let mut no_address = a_vless_probe(&id, 1);
+        no_address.truncate(19);
+        let (verdict, _, _) = probe_front(&mut std::io::Cursor::new(no_address), &id, &mut window);
+        assert!(
+            matches!(verdict, Probe::Dropped),
+            "the reference does not fall back past the id"
+        );
+
+        let (verdict, _, _) = probe_front(&mut Failing, &id, &mut window);
+        assert!(matches!(verdict, Probe::Dropped), "a failed read drops");
     }
 
     /// A probe the vless header refuses falls to the row it routes: the substitute echoes
