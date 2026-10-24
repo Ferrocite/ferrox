@@ -1042,10 +1042,10 @@ fn server_versions(
     }
     let mut versions = Vec::with_capacity(2);
     if floor == 0x0303 {
-        versions.push(rustls::version::TLS12);
+        versions.push(&rustls::version::TLS12);
     }
     if ceiling == 0x0304 {
-        versions.push(rustls::version::TLS13);
+        versions.push(&rustls::version::TLS13);
     }
     Ok(Some(versions))
 }
@@ -1130,7 +1130,7 @@ pub(crate) fn reality_server_config(
     key.keys_match()
         .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?;
     let mut config = rustls::ServerConfig::builder_with_provider(provider())
-        .with_protocol_versions(&[rustls::version::TLS13])
+        .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(key)));
@@ -2734,7 +2734,7 @@ mod tests {
                 let mut server = rustls::ServerConnection::new(server_config).expect("session");
                 let _ = server.complete_io(&mut stream);
             });
-            let mut client = stock_session(stock_client(&[rustls::version::TLS13]));
+            let mut client = stock_session(stock_client(&[&rustls::version::TLS13]));
             let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
             assert!(
                 client.complete_io(&mut stream).is_err(),
@@ -2762,7 +2762,7 @@ mod tests {
                 let mut server = rustls::ServerConnection::new(server_config).expect("session");
                 server.complete_io(&mut stream).expect("handshakes");
             });
-            let mut client = stock_session(stock_client(&[rustls::version::TLS12]));
+            let mut client = stock_session(stock_client(&[&rustls::version::TLS12]));
             let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
             client.complete_io(&mut stream).expect("handshakes");
             assert_eq!(
