@@ -42,7 +42,6 @@ than a quiet baseline. The numbers come from the
 | server | `vless-tls-grpc-down-8` | 0.79x (118 vs 149 MiB/s) | [#467](https://github.com/FerroxCo/ferrox/issues/467) |
 | server | `vless-reality-grpc-down-8` | 0.78x (121 vs 156 MiB/s) | [#468](https://github.com/FerroxCo/ferrox/issues/468) |
 | server | `vmess-raw-down-8` | xray-core reads 0 after a 64 KiB write (broken pipe); ferrox, xray-core-rust and zeronet pass | [#470](https://github.com/FerroxCo/ferrox/issues/470) |
-| server | `vmess-tls-ws-down-8` | every vmess client is dropped; zeronet's socks connect gets reply code 4 | [#471](https://github.com/FerroxCo/ferrox/issues/471) |
 | both | `vless-reality-xhttp-down-8` | all engines 0 B on the ferrox server; ferrox client 0 B on xray-core | [#472](https://github.com/FerroxCo/ferrox/issues/472) |
 
 The coverage holes with no number — a client that cannot use a ferrox server at all — are tracked in [#480](https://github.com/FerroxCo/ferrox/issues/480):
