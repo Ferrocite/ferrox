@@ -156,7 +156,7 @@ fn udp(
 ) -> Result<(Vec<u8>, u32), String> {
     let id = random_id()?;
     let packet = question(name, id, false)?;
-    let response = crate::dnsnet::udp(host, port, &packet, options, TIMEOUT, true)?;
+    let response = crate::dnsnet::udp(host, port, &packet, None, options, TIMEOUT, true)?;
     parse_response(&response, Some(id), name)
 }
 
@@ -168,7 +168,7 @@ fn tcp(
 ) -> Result<(Vec<u8>, u32), String> {
     let id = random_id()?;
     let packet = question(name, id, false)?;
-    let response = crate::dnsnet::tcp(host, port, &packet, options, TIMEOUT, true)?;
+    let response = crate::dnsnet::tcp(host, port, &packet, None, options, TIMEOUT, true)?;
     parse_response(&response, Some(id), name)
 }
 
@@ -181,7 +181,9 @@ fn doh(
     options: Option<&SocketOptions>,
 ) -> Result<(Vec<u8>, u32), String> {
     let packet = question(name, 0, true)?;
-    let body = crate::dnsnet::doh(host, port, path, cleartext, &packet, options, TIMEOUT, true)?;
+    let body = crate::dnsnet::doh(
+        host, port, path, cleartext, &packet, None, options, TIMEOUT, true,
+    )?;
     parse_response(&body, None, name)
 }
 

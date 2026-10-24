@@ -5,7 +5,7 @@
 - symbols: build_query, parse_answer, resolve_endpoint
 - go: ./app/dns/..., ./app/dns/fakedns/..., ./infra/conf/...
 <!-- scope:end -->
-Row 82: a `dns` block builds the resolver the relay's own name lookups use. A question rides one server's transport — UDP, a length-framed TCP stream, that stream under TLS, an HTTP/2 POST, or one QUIC bidirectional stream — and the answer is the small resolver's own bytes: the same core `build_query`/`parse_answer` the DNS outbound (row 26) already replays against the pinned Go. The app keeps A and AAAA apart per server, honours the reference's cache policy, serves the static `hosts` map with its ten-second TTL, and allocates fake addresses from the configured pools. Per-server `expectedIPs`/`unexpectedIPs` filter an answer before it can win, with `*` raising the filter to a priority that narrows rather than rejects; hosts `#rcode` answers as that rcode instead of falling through to a server. A protobuf `xray.app.dns.Config` decodes into the same block, including both filters and their `actPrior`/`actUnprior` flags. A server address is dispatched through the configured route and outbound, the way the reference's dispatcher carries it; the `+local` spellings and DoQ (always local in the reference) keep the direct dial, and a hostname in a UDP server address takes the system dial because the lane frames an address. `enableParallelQuery` and the Lua `script` are named on stderr and the server list is queried in order.
+Row 82: a `dns` block builds the resolver the relay's own name lookups use. A question rides one server's transport — UDP, a length-framed TCP stream, that stream under TLS, an HTTP/2 POST, or one QUIC bidirectional stream — and the answer is the small resolver's own bytes: the same core `build_query`/`parse_answer` the DNS outbound (row 26) already replays against the pinned Go. The app keeps A and AAAA apart per server, honours the reference's cache policy, serves the static `hosts` map with its ten-second TTL, and allocates fake addresses from the configured pools. Per-server `expectedIPs`/`unexpectedIPs` filter an answer before it can win, with `*` raising the filter to a priority that narrows rather than rejects; hosts `#rcode` answers as that rcode instead of falling through to a server. A protobuf `xray.app.dns.Config` decodes into the same block, including both filters and their `actPrior`/`actUnprior` flags. A server address is dispatched through the configured route and outbound, the way the reference's dispatcher carries it; the `+local` spellings and DoQ (always local in the reference) keep the direct dial, and a hostname in a UDP server address resolves locally before the SOCKS datagram frame is addressed. `enableParallelQuery` races every server of one `policyID` group and starts the next group only when the first answers nothing; the Lua `script` is named on stderr and the server list is queried in order. A routed query carries its server's `tag`, or the config's, as the inbound tag the route's rules see.
 
 Routing's `IpIfNonMatch` and `IpOnDemand` resolve through this resolver, so a static host can steer a route before the dial.
 
@@ -23,7 +23,8 @@ graph TD
     H -- no --> S{"queryStrategy"}
     S -- UseSys --> Y["system resolver"]
     S -- UseIP / UseIP4 / UseIP6 --> M["match servers by domains,<br/>then fall back"]
-    M --> F["expected / unexpected<br/>IP filter"]
+    M --> G["policyID groups:<br/>race, then the next"]
+    G --> F["expected / unexpected<br/>IP filter"]
     F --> R["route: the configured outbound"]
     R --> U["UDP datagram"]
     R --> T["TCP / TLS framed message"]
@@ -47,7 +48,7 @@ graph TD
 - **A second DoH client alongside the first.** `ech_dns` carried its own UDP, TCP and HTTP/2 exchange. It now calls the same `dnsnet` functions, so one place owns the framing, the HTTP/2 preface, and the response read.
 - **A DNS query for the proxy's own server name routed through that proxy.** Outbound addresses now resolve through the resolver's local dial, so opening the tunnel never asks the tunnel to resolve its own far end.
 
-What is **not** removed: the cache record owns its `Vec<IpAddr>` and the answer is a clone of it; the routing order and focus vectors are per-lookup allocations; the DoQ path ignores configured socket options; `enableParallelQuery` and the Lua `script` warn and fall back to ordered server queries; a hostname in a UDP server address takes the system dial; and the routed datagram pays a loopback relay and a thread per uncached query.
+What is **not** removed: the cache record owns its `Vec<IpAddr>` and the answer is a clone of it; the routing order and focus vectors are per-lookup allocations; the DoQ path ignores configured socket options; the Lua `script` warns and falls back to ordered server queries; a parallel group leaves its slower threads running after the first answer returns; a hostname in a UDP server address resolves through the system before the frame names it; and the routed datagram pays a loopback relay and a thread per uncached query.
 
 ## Time
 
