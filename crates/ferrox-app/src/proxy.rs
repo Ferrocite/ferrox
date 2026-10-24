@@ -34252,7 +34252,7 @@ mod dns_lane_tests {
         });
         let mut stream = stream;
         let mut body = Vec::new();
-        let (base, capacity, counts) = ferrox_core::alloc_count::measure(|| {
+        let ((base, capacity), counts) = ferrox_core::alloc_count::measure(|| {
             let mut base = 0usize;
             let mut capacity = 0usize;
             for (n, frame) in frames.iter().enumerate() {
