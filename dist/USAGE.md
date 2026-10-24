@@ -4,7 +4,7 @@ Two things were built here, from the same release binary — a release package f
 
 | what | where |
 | --- | --- |
-| the binary | `target/release/ferrox-app` (arm64, `ferrox-app 0.0.4`) |
+| the binary | `target/release/ferrox-app` (arm64, `ferrox-app 0.0.1`) |
 | the CLI | `dist/ferrox-cli.sh` — every lane, every front, ports, system proxy |
 | the app | `dist/Ferrox.app` — the same CLI behind a double-click |
 
