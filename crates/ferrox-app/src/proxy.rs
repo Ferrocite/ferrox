@@ -1168,6 +1168,7 @@ pub(crate) struct VlessOut {
     host: String,
     mux: bool,
     quic_roots: Option<ferrox_core::tls::Anchors>,
+    quic_ech: Option<Arc<[u8]>>,
     hysteria_roots: Option<ferrox_core::tls::Anchors>,
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
     flow: String,
@@ -2188,14 +2189,7 @@ fn quic_inbound_identity(inbound: &Json) -> Option<Arc<ferrox_core::tls::TlsServ
     if settings.get("security").and_then(Json::as_str) != Some("tls") {
         return None;
     }
-    let identity = inbound_tls_identity(inbound)?;
-    if identity.ech_server_keys.is_some() {
-        eprintln!(
-            "ech: quic server-side ECH (echServerKeys) has no backend here; the inbound is refused"
-        );
-        return None;
-    }
-    Some(identity)
+    inbound_tls_identity(inbound)
 }
 
 fn serve_vless_quic_inbound(
@@ -5635,7 +5629,7 @@ fn tls_failure(error: &ferrox_core::tls::TlsError) -> Failure {
     match error {
         Tls::BadCertificate(_) => Failure::new(Stage::SocketConnected, Kind::Rejected),
         Tls::Timeout => Failure::new(Stage::SocketConnected, Kind::Unreachable),
-        Tls::Closed | Tls::NoSharedCipher | Tls::Other(_) => {
+        Tls::Closed | Tls::NoSharedCipher | Tls::EchRetry(_) | Tls::Other(_) => {
             Failure::new(Stage::SocketConnected, Kind::Dropped)
         }
     }
@@ -5646,21 +5640,39 @@ fn dial_tls_session(
     cfg: &ferrox_core::tls::TlsConfig,
     mask: Option<&ferrox_core::finalmask::Chain>,
 ) -> Option<ferrox_core::tls::ClientSession<Connection>> {
-    let uplink = match dial(server) {
-        Ok(uplink) => uplink.with_mask(mask),
-        Err(failure) => {
-            note_dial_failure(server, failure);
-            return None;
+    let mut retry = None;
+    let mut ready = None;
+    for attempt in 0..2 {
+        let current = retry.as_ref().unwrap_or(cfg);
+        let uplink = match dial(server) {
+            Ok(uplink) => uplink,
+            Err(failure) => {
+                note_dial_failure(server, failure);
+                return None;
+            }
         }
-    };
-    let Ok(mut session) = ferrox_core::tls::connect(cfg, uplink) else {
-        note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
-        return None;
-    };
-    if let Err(error) = session.handshake() {
-        note_dial_failure(server, tls_failure(&error));
-        return None;
+        .with_mask(mask);
+        let Ok(mut session) = ferrox_core::tls::connect(current, uplink) else {
+            note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
+            return None;
+        };
+        match session.handshake() {
+            Ok(()) => {
+                ready = Some(session);
+                break;
+            }
+            Err(ferrox_core::tls::TlsError::EchRetry(list)) if attempt == 0 && !list.is_empty() => {
+                let mut next = current.clone();
+                next.ech_config_list = Some(list);
+                retry = Some(next);
+            }
+            Err(error) => {
+                note_dial_failure(server, tls_failure(&error));
+                return None;
+            }
+        }
     }
+    let session = ready?;
     // Session-shared behind a lock: reads wait one tick, and `TlsHalf::read` spends a grain unlocked.
     if session
         .get_ref()
@@ -8139,6 +8151,7 @@ fn serve_connect(
                         port: vless.port,
                         upstream: None,
                         roots: vless.quic_roots.clone(),
+                        ech_config_list: vless.quic_ech.clone(),
                     },
                     asked,
                 );
@@ -10658,6 +10671,7 @@ fn foxy_quic_dial(foxy: &FoxyOut, edge: &ferrox_core::foxy::Candidate) -> crate:
         port: edge.port,
         upstream: foxy.upstream.clone(),
         roots: Some(foxy.roots.clone()),
+        ech_config_list: None,
     }
 }
 
@@ -13755,6 +13769,7 @@ fn loopback_dial(
                 host,
                 mux: false,
                 quic_roots: None,
+                quic_ech: None,
                 hysteria_roots: None,
                 tls: None,
                 flow: String::new(),
@@ -14918,6 +14933,7 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
                 host,
                 mux,
                 quic_roots: None,
+                quic_ech: None,
                 hysteria_roots: None,
                 tls: None,
                 flow,
@@ -14928,10 +14944,23 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
             continue;
         }
         let (carrier, host) = stored.unwrap_or_else(|| outbound_carrier(outbound, &address));
-        let (quic_roots, hysteria_roots) = match &carrier {
-            Carrier::Quic => (tls_ca_roots(outbound), None),
-            Carrier::Hysteria(_) => (None, tls_ca_roots(outbound)),
-            _ => (None, None),
+        let (quic_roots, quic_ech, hysteria_roots) = match &carrier {
+            Carrier::Quic => {
+                let ech = if security == "tls" {
+                    match crate::config::quic_ech_config(outbound, &address) {
+                        Ok(ech) => ech,
+                        Err(why) => {
+                            eprintln!("vless: {why}; the quic dial will fail");
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
+                (tls_ca_roots(outbound), ech, None)
+            }
+            Carrier::Hysteria(_) => (None, None, tls_ca_roots(outbound)),
+            _ => (None, None, None),
         };
         return Some(VlessOut {
             address,
@@ -14941,6 +14970,7 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
             host,
             mux,
             quic_roots,
+            quic_ech,
             hysteria_roots,
             tls: None,
             flow: outbound_flow(server),
@@ -14971,6 +15001,7 @@ fn tls_carried_vless(
         host,
         mux: false,
         quic_roots: None,
+        quic_ech: None,
         hysteria_roots: None,
         tls: Some(tls),
         flow: outbound_flow(server),
@@ -19099,6 +19130,18 @@ mod tests {
         list
     }
 
+    /// A valid ECH config the fixture server does not hold.
+    fn stale_ech_config_list() -> Vec<u8> {
+        [
+            0x00, 0x3f, 0xfe, 0x0d, 0x00, 0x3b, 0x00, 0x00, 0x20, 0x00, 0x20, 0x6e, 0x80, 0x2c,
+            0x26, 0x2c, 0xf7, 0x22, 0x4d, 0xea, 0x31, 0xcb, 0xc3, 0x71, 0x13, 0x4a, 0xc6, 0x85,
+            0x23, 0x4f, 0xd0, 0x71, 0x40, 0xa3, 0x8f, 0x0a, 0xa4, 0x6f, 0x0d, 0xd0, 0xb0, 0xc9,
+            0x7a, 0x00, 0x04, 0x00, 0x01, 0x00, 0x01, 0x00, 0x0c, 0x63, 0x61, 0x72, 0x72, 0x69,
+            0x65, 0x72, 0x2e, 0x74, 0x65, 0x73, 0x74, 0x00, 0x00,
+        ]
+        .to_vec()
+    }
+
     fn ech_server_key_tlv() -> Vec<u8> {
         let mut keys = Vec::with_capacity(4 + ECH_PRIVATE_KEY.len() + ECH_CONFIG.len());
         keys.extend_from_slice(&(ECH_PRIVATE_KEY.len() as u16).to_be_bytes());
@@ -19827,6 +19870,7 @@ mod tests {
             host: String::new(),
             mux: false,
             quic_roots: None,
+            quic_ech: None,
             hysteria_roots: None,
             tls: None,
             flow: String::new(),
@@ -19897,6 +19941,7 @@ mod tests {
             host: String::new(),
             mux: false,
             quic_roots: None,
+            quic_ech: None,
             hysteria_roots: None,
             tls: None,
             flow: String::new(),
@@ -19965,6 +20010,7 @@ mod tests {
             host: String::new(),
             mux: false,
             quic_roots: None,
+            quic_ech: None,
             hysteria_roots: None,
             tls: None,
             flow: String::new(),
@@ -20070,6 +20116,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: false,
             quic_roots: None,
+            quic_ech: None,
             hysteria_roots: None,
             tls: None,
             flow: String::new(),
@@ -20464,6 +20511,7 @@ mod tests {
                 host: String::new(),
                 mux: false,
                 quic_roots: None,
+                quic_ech: None,
                 hysteria_roots: None,
                 tls: Some(Arc::new(client_config)),
                 flow: String::new(),
@@ -20597,6 +20645,7 @@ mod tests {
                 host: String::new(),
                 mux: false,
                 quic_roots: None,
+                quic_ech: None,
                 hysteria_roots: None,
                 tls: Some(Arc::new(client_config)),
                 flow: String::new(),
@@ -20670,6 +20719,7 @@ mod tests {
                 host: String::new(),
                 mux: false,
                 quic_roots: None,
+                quic_ech: None,
                 hysteria_roots: None,
                 tls: Some(Arc::new(client_config)),
                 flow: String::new(),
@@ -20756,6 +20806,43 @@ mod tests {
         filler.join().expect("joins");
     }
 
+    /// A rejected offer is dialled once more with the list the server returned.
+    #[test]
+    fn a_rejected_ech_offer_retries_once_with_the_servers_list() {
+        use ferrox_core::tls::TlsProvider as _;
+        use std::io::Read as _;
+        use std::io::Write as _;
+
+        let (server_config, mut client_config) = carried_tls_configs();
+        let mut server_config = (*server_config).clone();
+        server_config.ech_server_keys = Some(ech_server_key_tlv().into());
+        let server_config = std::sync::Arc::new(server_config);
+        client_config.ech_config_list = Some(stale_ech_config_list().into());
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts the stale offer");
+            let mut rejected = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            let _ = rejected.handshake();
+            let (stream, _) = listener.accept().expect("accepts the retry");
+            let mut accepted = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            accepted.handshake().expect("the retry is accepted");
+            let mut buf = [0u8; 4];
+            accepted.read_exact(&mut buf).expect("reads");
+            accepted.write_all(&buf).expect("echoes");
+            accepted.flush().expect("flushes");
+        });
+
+        let mut session = dial_tls_session(&addr, &client_config, None).expect("retries");
+        session.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        session.read_exact(&mut back).expect("reads");
+        assert_eq!(&back, b"ping");
+        drop(session);
+        server.join().expect("joins");
+    }
+
     #[test]
     fn vless_over_tls_vision_carries_an_echo() {
         let (server_config, client_config) = carried_tls_configs();
@@ -20803,6 +20890,7 @@ mod tests {
                 host: String::new(),
                 mux: false,
                 quic_roots: None,
+                quic_ech: None,
                 hysteria_roots: None,
                 tls: Some(Arc::new(client_config)),
                 flow: crate::vision::FLOW.to_owned(),
@@ -21594,6 +21682,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: false,
             quic_roots: None,
+            quic_ech: None,
             hysteria_roots: None,
             tls: Some(Arc::new(tls)),
             flow: String::new(),
@@ -22732,6 +22821,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: false,
             quic_roots: None,
+            quic_ech: None,
             hysteria_roots: None,
             tls: None,
             flow: String::new(),
@@ -23523,6 +23613,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: true,
             quic_roots: None,
+            quic_ech: None,
             hysteria_roots: None,
             tls: None,
             flow: String::new(),
@@ -24468,6 +24559,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: true,
             quic_roots: None,
+            quic_ech: None,
             hysteria_roots: None,
             tls: None,
             flow: String::new(),
@@ -25306,6 +25398,7 @@ mod tests {
             local,
             "localhost",
             roots,
+            None,
             QUIC_TEST_TIMEOUT,
         )
         .expect("handshakes");
@@ -25392,6 +25485,7 @@ mod tests {
             local,
             "localhost",
             &roots,
+            None,
             QUIC_TEST_TIMEOUT,
         )
         .expect("handshakes");
@@ -25449,6 +25543,7 @@ mod tests {
             local,
             "localhost",
             &roots,
+            None,
             QUIC_TEST_TIMEOUT,
         )
         .expect("handshakes");
@@ -25507,6 +25602,24 @@ mod tests {
     }
 
     #[test]
+    fn quic_outbound_reads_ech_config() {
+        let root = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vless",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": 443,
+                    "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]},
+                "streamSettings": {"network": "quic", "security": "tls",
+                    "tlsSettings": {"echConfigList": "not base64"}}}]}"#,
+        )
+        .expect("parses");
+        let out = find_vless_outbound(&root).expect("finds quic+tls");
+        assert!(matches!(out.carrier, Carrier::Quic));
+        assert!(
+            out.quic_ech.is_some(),
+            "the dial offers the configured list"
+        );
+    }
+
+    #[test]
     fn quic_tcp_front_closes_without_handshake() {
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -25534,6 +25647,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: false,
             quic_roots: None,
+            quic_ech: None,
             hysteria_roots: None,
             tls: None,
             flow: String::new(),
@@ -25714,6 +25828,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: false,
             quic_roots: None,
+            quic_ech: None,
             hysteria_roots: None,
             tls: None,
             flow: String::new(),
@@ -26562,6 +26677,7 @@ mod tests {
             host: "localhost".to_owned(),
             mux: false,
             quic_roots: Some(roots.into()),
+            quic_ech: None,
             hysteria_roots: None,
             tls: None,
             flow: String::new(),
@@ -26608,6 +26724,7 @@ mod tests {
             host: "localhost".to_owned(),
             mux: true,
             quic_roots: None,
+            quic_ech: None,
             hysteria_roots: None,
             tls: None,
             flow: String::new(),
@@ -26734,6 +26851,7 @@ mod tests {
             port: quic_port,
             upstream: None,
             roots: Some(roots.into()),
+            ech_config_list: None,
         };
         let relay = thread::spawn({
             let dial = dial.clone();
@@ -26827,6 +26945,7 @@ mod tests {
             port: quic_port,
             upstream: None,
             roots: Some(roots.into()),
+            ech_config_list: None,
         };
         let front = Arc::new(crate::conn::test_bind("127.0.0.1:0").expect("binds"));
         let front_port = front.local_addr().expect("addr").port();
@@ -26968,6 +27087,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: false,
             quic_roots: None,
+            quic_ech: None,
             hysteria_roots: None,
             tls: Some(Arc::clone(&client)),
             flow: String::new(),
@@ -27067,6 +27187,7 @@ mod tests {
                 host: "127.0.0.1".to_owned(),
                 mux: false,
                 quic_roots: None,
+                quic_ech: None,
                 hysteria_roots: None,
                 tls: Some(client),
                 flow: String::new(),
@@ -28306,6 +28427,7 @@ mod tests {
             host: "localhost".to_owned(),
             mux: false,
             quic_roots: None,
+            quic_ech: None,
             hysteria_roots: Some(roots.into()),
             tls: None,
             flow: String::new(),
@@ -29375,6 +29497,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: false,
             quic_roots: None,
+            quic_ech: None,
             hysteria_roots: None,
             tls: None,
             flow: String::new(),
@@ -29408,6 +29531,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: false,
             quic_roots: None,
+            quic_ech: None,
             hysteria_roots: None,
             tls: None,
             flow: String::new(),
@@ -30463,6 +30587,7 @@ mod tests {
             host: "127.0.0.1".to_owned(),
             mux: false,
             quic_roots: None,
+            quic_ech: None,
             hysteria_roots: None,
             tls: None,
             flow: String::new(),

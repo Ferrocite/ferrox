@@ -366,19 +366,44 @@ fn tls_cipher_suites(settings: Option<&Json>) -> Vec<u16> {
 
 const INVALID_ECH: &[u8] = &[1, 1, 4, 5, 1, 4];
 
-fn tls_ech_config(settings: Option<&Json>, server_name: &str) -> Option<std::sync::Arc<[u8]>> {
-    let text = settings
+fn tls_ech_config(
+    settings: Option<&Json>,
+    server_name: &str,
+) -> Result<Option<std::sync::Arc<[u8]>>, String> {
+    let sockopt = crate::sockopt::parse(
+        settings.and_then(|s| s.get("echSockopt").or_else(|| s.get("echSocketSettings"))),
+    )?;
+    let Some(text) = settings
         .and_then(|s| s.get("echConfigList"))
         .and_then(Json::as_str)
         .map(str::trim)
-        .filter(|text| !text.is_empty())?;
-    match crate::ech_dns::resolve(text, server_name) {
-        Ok(list) => Some(list.into()),
+        .filter(|text| !text.is_empty())
+    else {
+        return Ok(None);
+    };
+    match crate::ech_dns::resolve(text, server_name, sockopt.as_ref()) {
+        Ok(list) => Ok(Some(list.into())),
         Err(why) => {
             eprintln!("ech: {why}; the dial will fail");
-            Some(INVALID_ECH.into())
+            Ok(Some(INVALID_ECH.into()))
         }
     }
+}
+
+/// The ECH config a QUIC dial offers: xray has no QUIC transport, so this reads the TLS field it would have used and hands it to quiche's `BoringSSL` handshake.
+pub(crate) fn quic_ech_config(
+    outbound: &Json,
+    address: &str,
+) -> Result<Option<std::sync::Arc<[u8]>>, String> {
+    let tls = outbound
+        .get("streamSettings")
+        .and_then(|s| s.get("tlsSettings"));
+    let server_name = tls
+        .and_then(|s| s.get("serverName"))
+        .and_then(Json::as_str)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(address);
+    tls_ech_config(tls, server_name)
 }
 
 fn tls_version(settings: Option<&Json>, key: &str) -> Option<u16> {
@@ -482,7 +507,7 @@ pub(crate) fn outbound_tls(
             )
         }
     };
-    let ech_config_list = tls_ech_config(tls, &server_name);
+    let ech_config_list = tls_ech_config(tls, &server_name)?;
     // xray's empty name is Chrome and a name it does not know returns nil, which dials stock.
     let fingerprint = tls
         .and_then(|s| s.get("fingerprint"))
@@ -1853,12 +1878,62 @@ mod tests {
         let encoded = base64::engine::general_purpose::STANDARD.encode(&list);
         let settings =
             crate::json::parse(&format!(r#"{{"echConfigList":"{encoded}"}}"#)).expect("parses");
-        let got = tls_ech_config(Some(&settings), "hidden.test").expect("resolves");
+        let got = tls_ech_config(Some(&settings), "hidden.test")
+            .expect("resolves")
+            .expect("present");
         assert_eq!(got.as_ref(), list.as_slice());
 
         let malformed = crate::json::parse(r#"{"echConfigList":"not base64"}"#).expect("parses");
-        let got = tls_ech_config(Some(&malformed), "hidden.test").expect("fails closed");
+        let got = tls_ech_config(Some(&malformed), "hidden.test")
+            .expect("fails closed")
+            .expect("present");
         assert_eq!(got.as_ref(), [1, 1, 4, 5, 1, 4]);
+    }
+
+    #[test]
+    fn ech_sockopt_is_read_under_xray_key_and_bad_options_refuse() {
+        let settings = crate::json::parse(
+            r#"{"echConfigList":"not base64","echSockopt":{"domainStrategy":"useipv4"}}"#,
+        )
+        .expect("parses");
+        assert!(tls_ech_config(Some(&settings), "hidden.test")
+            .expect("options parse")
+            .is_some());
+
+        let alias = crate::json::parse(
+            r#"{"echConfigList":"not base64","echSocketSettings":{"tcpFastOpen":true}}"#,
+        )
+        .expect("parses");
+        assert!(tls_ech_config(Some(&alias), "hidden.test")
+            .expect("options parse")
+            .is_some());
+
+        let bad = crate::json::parse(
+            r#"{"echConfigList":"not base64","echSockopt":{"domainStrategy":"nearest"}}"#,
+        )
+        .expect("parses");
+        let error = tls_ech_config(Some(&bad), "hidden.test").expect_err("refuses");
+        assert!(error.contains("domainStrategy"), "{error}");
+    }
+
+    #[test]
+    fn a_quic_outbound_reads_the_ech_list_from_its_tls_settings() {
+        let outbound = crate::json::parse(
+            r#"{"streamSettings":{"network":"quic","security":"tls",
+                "tlsSettings":{"echConfigList":"not base64"}}}"#,
+        )
+        .expect("parses");
+        let got = quic_ech_config(&outbound, "hidden.test")
+            .expect("parses options")
+            .expect("names a list");
+        assert_eq!(got.as_ref(), [1, 1, 4, 5, 1, 4]);
+        let absent = crate::json::parse(
+            r#"{"streamSettings":{"network":"quic","security":"tls","tlsSettings":{}}}"#,
+        )
+        .expect("parses");
+        assert!(quic_ech_config(&absent, "hidden.test")
+            .expect("parses options")
+            .is_none());
     }
 
     #[test]

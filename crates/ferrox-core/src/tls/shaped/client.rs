@@ -201,12 +201,12 @@ impl<S: Stream> Session<S> {
         }
         if ech {
             if sh.version != 0x0304 {
-                return Err(ech_rejected(&hello));
+                return Err(ech_rejected(&hello, sh.ech.as_deref()));
             }
             let suite = Suite::from_id(sh.suite)
                 .filter(|suite| suite.is_tls13())
                 .ok_or(TlsError::NoSharedCipher)?;
-            self.ech_accepted(&hello, &msg, suite)?;
+            self.ech_accepted(&hello, &msg, suite, sh.ech.as_deref())?;
         }
         self.transcript.extend_from_slice(&msg);
         self.suite = Suite::from_id(sh.suite);
@@ -227,7 +227,7 @@ impl<S: Stream> Session<S> {
         msg: &[u8],
         suite: Suite,
     ) -> Result<(), TlsError> {
-        let confirmation = sh.ech.as_deref().ok_or_else(|| ech_rejected(hello))?;
+        let confirmation = sh.ech.as_deref().ok_or_else(|| ech_rejected(hello, None))?;
         if confirmation.len() != 8 {
             return Err(TlsError::Other(
                 "ech: the retry confirmation is not eight bytes".to_owned(),
@@ -243,7 +243,7 @@ impl<S: Stream> Session<S> {
             b"hrr ech accept confirmation",
         );
         if derived != confirmation {
-            return Err(ech_rejected(hello));
+            return Err(ech_rejected(hello, None));
         }
         let mut transcript = message_hash(suite.hash(), inner);
         transcript.extend_from_slice(msg);
@@ -251,7 +251,13 @@ impl<S: Stream> Session<S> {
         Ok(())
     }
 
-    fn ech_accepted(&self, hello: &Hello, msg: &[u8], suite: Suite) -> Result<(), TlsError> {
+    fn ech_accepted(
+        &self,
+        hello: &Hello,
+        msg: &[u8],
+        suite: Suite,
+        retry: Option<&[u8]>,
+    ) -> Result<(), TlsError> {
         let mut transcript = self.transcript.clone();
         let mut hello_conf = msg.to_vec();
         hello_conf[30..38].fill(0);
@@ -263,7 +269,7 @@ impl<S: Stream> Session<S> {
             b"ech accept confirmation",
         );
         if derived != msg[30..38] {
-            return Err(ech_rejected(hello));
+            return Err(ech_rejected(hello, retry));
         }
         Ok(())
     }
@@ -1312,11 +1318,14 @@ fn hrr_without_confirmation(msg: &[u8]) -> Result<Vec<u8>, TlsError> {
     ))
 }
 
-fn ech_rejected(hello: &Hello) -> TlsError {
-    TlsError::Other(format!(
-        "ech: the server did not accept the offer for {}",
-        hello.ech_public_name().unwrap_or("its public name")
-    ))
+fn ech_rejected(hello: &Hello, retry: Option<&[u8]>) -> TlsError {
+    match retry {
+        Some(list) if list.len() > 2 => TlsError::EchRetry(list.to_vec().into()),
+        _ => TlsError::Other(format!(
+            "ech: the server did not accept the offer for {}",
+            hello.ech_public_name().unwrap_or("its public name")
+        )),
+    }
 }
 
 fn certificate_empty() -> Vec<u8> {
