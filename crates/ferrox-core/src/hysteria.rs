@@ -299,12 +299,42 @@ pub fn decode_udp(packet: &[u8]) -> Result<UdpMessage<'_>, RequestError> {
     Ok(message)
 }
 
+/// One message's fragments, walked in order without a list: every payload chunk borrows
+/// the message's own bytes, so a relay pays no allocation for the common one-fragment
+/// datagram and none for a split one either.
+#[derive(Debug)]
+pub struct Fragments<'a> {
+    message: UdpMessage<'a>,
+    chunks: core::slice::Chunks<'a, u8>,
+    next: u8,
+    total: u8,
+}
+
+impl<'a> Iterator for Fragments<'a> {
+    type Item = UdpMessage<'a>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let payload = self.chunks.next()?;
+        let message = UdpMessage {
+            frag: self.next,
+            frags: self.total,
+            payload,
+            ..self.message
+        };
+        self.next += 1;
+        Some(message)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.chunks.size_hint()
+    }
+}
+
 /// Split a whole message across datagrams no larger than `max` — the peer's writable datagram size — without copying its payload; a head already at or over `max` is refused rather than truncated.
-pub fn fragment_udp<'a>(
+pub fn fragments_udp<'a>(
     message: &UdpMessage<'a>,
     max: usize,
-    out: &mut Vec<UdpMessage<'a>>,
-) -> Result<(), RequestError> {
+) -> Result<Fragments<'a>, RequestError> {
     message.validate()?;
     if message.frags != 1 {
         return Err(RequestError::Invalid);
@@ -313,17 +343,14 @@ pub fn fragment_udp<'a>(
         .checked_sub(message.header_len())
         .filter(|room| *room > 0)
         .ok_or(RequestError::Invalid)?;
-    let count = u8::try_from(message.payload.len().div_ceil(capacity))
+    let total = u8::try_from(message.payload.len().div_ceil(capacity))
         .map_err(|_| RequestError::Invalid)?;
-    for (index, chunk) in message.payload.chunks(capacity).enumerate() {
-        out.push(UdpMessage {
-            frag: index as u8,
-            frags: count,
-            payload: chunk,
-            ..*message
-        });
-    }
-    Ok(())
+    Ok(Fragments {
+        message: *message,
+        chunks: message.payload.chunks(capacity),
+        next: 0,
+        total,
+    })
 }
 
 /// The reassembly of one session's datagrams: at most one incomplete packet, a new packet id discarding the previous partial, fragments delivered in id order once every slot fills — the pinned `Defragger`'s contract, minus its byte budget and timer, which the relay's own idle reap replaces.
@@ -1073,8 +1100,7 @@ mod tests {
             payload: b"0123456789",
         };
         // header_len is 8 + 1 varint + 3 address = 12, so capacity is 16 - 12 = 4 -> three fragments.
-        let mut frags = Vec::new();
-        fragment_udp(&message, 16, &mut frags).expect("fragments");
+        let frags: Vec<_> = fragments_udp(&message, 16).expect("fragments").collect();
         assert_eq!(frags.len(), 3);
         assert!(frags.iter().all(|f| f.frags == 3));
         assert_eq!(frags[0].frag, 0);
@@ -1085,10 +1111,7 @@ mod tests {
             .collect();
         assert_eq!(joined, b"0123456789");
         // A capacity no larger than the head cannot carry even one byte.
-        assert_eq!(
-            fragment_udp(&message, 12, &mut Vec::new()),
-            Err(RequestError::Invalid)
-        );
+        assert!(fragments_udp(&message, 12).is_err());
         // Feeding fragments out of order still reassembles in id order.
         let mut defrag = Defrag::new();
         let mut assembled = Vec::new();
@@ -1100,6 +1123,42 @@ mod tests {
             .expect("complete");
         assert_eq!(packet.0, "a:1");
         assert_eq!(packet.1, b"0123456789");
+    }
+
+    /// The fragment walk is an iterator over the message's own bytes: a relay pays no
+    /// list for a one-fragment datagram and no list for a split one either.
+    #[test]
+    fn a_fragment_run_takes_no_heap() {
+        let payload: Vec<u8> = (0..3000).map(|i| (i % 251) as u8).collect();
+        let message = UdpMessage {
+            session: 7,
+            packet: 42,
+            frag: 0,
+            frags: 1,
+            address: "edge.example:443",
+            payload: &payload,
+        };
+        let mut wire = Vec::with_capacity(1200);
+        for frag in fragments_udp(&message, 1200).expect("fragments") {
+            wire.clear();
+            encode_udp(&frag, &mut wire).expect("encodes");
+        }
+        wire.clear();
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                for frag in fragments_udp(std::hint::black_box(&message), 1200).expect("fragments")
+                {
+                    wire.clear();
+                    encode_udp(&frag, &mut wire).expect("encodes");
+                    std::hint::black_box(&wire);
+                }
+            }
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "4096 fragment runs take no heap at all"
+        );
     }
 
     #[test]
@@ -1277,8 +1336,7 @@ mod tests {
             };
             // A datagram of the head plus seven bytes carries seven payload bytes per fragment.
             let max = message.header_len() + 7;
-            let mut frags = Vec::new();
-            fragment_udp(&message, max, &mut frags).expect("fragments");
+            let frags: Vec<_> = fragments_udp(&message, max).expect("fragments").collect();
             assert_eq!(frags.len(), len.div_ceil(7));
             let mut defrag = Defrag::new();
             let mut assembled = Vec::new();
