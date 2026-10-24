@@ -865,14 +865,6 @@ pub(crate) fn write_frame(
 
 fn stage_frame(send: &mut Flow, plain: &[u8], staging: &mut Vec<u8>, pad: &mut PadSource) -> bool {
     let at = staging.len();
-    let width = send.size_field();
-    let body = at + width;
-    staging.resize(at + width, 0);
-    if !send.seal_onto(plain, staging) {
-        staging.truncate(at);
-        return false;
-    }
-    let encrypted = staging.len() - body;
     let (padding, mask_raw, masked) = match send.shake.as_mut() {
         None => (0, 0, false),
         Some(s) => {
@@ -880,7 +872,12 @@ fn stage_frame(send: &mut Flow, plain: &[u8], staging: &mut Vec<u8>, pad: &mut P
             (usize::from(pad_raw % 64), mask_raw, true)
         }
     };
-    let total = encrypted + padding;
+    let tag = if send.cipher == Cipher::None {
+        0
+    } else {
+        TAG_LEN
+    };
+    let total = plain.len() + tag + padding;
     if total > u16::MAX as usize {
         staging.truncate(at);
         return false;
@@ -889,14 +886,18 @@ fn stage_frame(send: &mut Flow, plain: &[u8], staging: &mut Vec<u8>, pad: &mut P
         // The size field the sealed parser writes, in place of the two masked octets.
         let mut field = [0u8; SIZE_FIELD];
         seal.seal_len(total as u16, &mut field);
-        staging[at..body].copy_from_slice(&field);
+        staging.extend_from_slice(&field);
     } else {
         let wire = if masked {
             mask_raw ^ total as u16
         } else {
             total as u16
         };
-        staging[at..body].copy_from_slice(&wire.to_be_bytes());
+        staging.extend_from_slice(&wire.to_be_bytes());
+    }
+    if !send.seal_onto(plain, staging) {
+        staging.truncate(at);
+        return false;
     }
     if padding > 0 {
         let Some(bytes) = pad.take(padding) else {
