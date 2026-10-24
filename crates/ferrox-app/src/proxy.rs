@@ -15891,7 +15891,7 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
         {
             eprintln!("vmess outbound dials without the authenticated-length experiment: the framing below is the default one either way");
         }
-        if let Some((carrier, host, tls)) = tls_parts(outbound, &address) {
+        if let Some((carrier, host, tls)) = tls_carried_parts(outbound, &address) {
             return Some(VmessOut {
                 address,
                 port,
@@ -21274,10 +21274,15 @@ mod tests {
             let stream = format!(
                 r#""network": "{network}", "security": "tls", "tlsSettings": {{"caCertFile": "{ca_json}"}}"#
             );
-            assert!(
-                find_vmess_outbound(&vnext_tls_root("vmess", &stream)).is_none(),
-                "{network}"
-            );
+            let root = vnext_tls_root("vmess", &stream);
+            match network {
+                "kcp" => {
+                    let out = find_vmess_outbound(&root).expect("kcp wraps its transport");
+                    assert!(matches!(out.carrier, Carrier::Kcp(_)));
+                    assert!(out.tls.is_some(), "the kcp session carries tls");
+                }
+                _ => assert!(find_vmess_outbound(&root).is_none(), "{network}"),
+            }
         }
         let plain = crate::json::parse(
             r#"{"outbounds": [{"protocol": "vmess",
@@ -22846,6 +22851,32 @@ mod tests {
     fn vmess_tls_serves_udp_over_kcp() {
         let tls = carried_tls_configs();
         vmess_udp_over_kcp(Some(&tls));
+    }
+
+    #[test]
+    fn a_vmess_kcp_tls_outbound_parses_and_carries_udp() {
+        let (cert, key, _) = tls_cert_json();
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vmess", "settings": {{"clients": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}},
+                "streamSettings": {{"network": "kcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        serve_vmess_inbound(&format!("127.0.0.1:{port}"), &inbound, true);
+        let outbound = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vmess",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": {port},
+                    "users": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}}]}},
+                "streamSettings": {{"network": "kcp", "security": "tls",
+                    "tlsSettings": {{"allowInsecure": true}}}}}}]}}"#
+        ))
+        .expect("parses");
+        let out = find_vmess_outbound(&outbound).expect("the kcp tls outbound parses");
+        assert!(out.tls.is_some(), "the kcp session carries tls");
+        vmess_udp_association(&out, udp_echo_port());
     }
 
     #[test]
