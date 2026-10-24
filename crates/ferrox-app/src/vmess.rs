@@ -1720,7 +1720,7 @@ pub(crate) fn serve_raw_split<R, W>(
 
 pub(crate) fn serve_kcp<R, W>(
     mut reader: R,
-    mut writer: W,
+    writer: W,
     id: &[u8; 16],
     freedom: bool,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
@@ -1728,19 +1728,8 @@ pub(crate) fn serve_kcp<R, W>(
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    let Some((target, send, recv, prefix, cmd)) = accept_request(&mut reader, id) else {
-        return;
-    };
-    if !freedom || cmd != 1 {
-        return;
-    }
-    let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
-        return;
-    };
-    if writer.write_all(&prefix).is_err() {
-        return;
-    }
-    pump_relay_carried(&uplink, reader, writer, close, send, recv, None);
+    let decoded = accept_request(&mut reader, id);
+    serve_decoded(reader, writer, close, decoded, freedom);
 }
 
 pub(crate) fn serve(mut stream: Connection, id: &[u8; 16], freedom: bool) {
