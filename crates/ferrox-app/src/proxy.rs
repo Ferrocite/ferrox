@@ -10231,15 +10231,8 @@ fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan) {
         if matches!(out, Outbound::Block(_)) {
             continue;
         }
+        retire_finished_lane(&mut lanes, &mut replies, key.as_deref());
         if !lanes.contains_key(&key) {
-            lanes.retain(|_, lane| {
-                if lane.handle.is_finished() {
-                    replies.remove(&lane.address);
-                    false
-                } else {
-                    true
-                }
-            });
             if let Some(lane) = spawn_udp_lane(out, local) {
                 replies.insert(lane.address, key.clone());
                 lanes.insert(key.clone(), lane);
@@ -10247,6 +10240,24 @@ fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan) {
         }
         if let Some(lane) = lanes.get(&key) {
             let _ = relay.send_to(&buf[..n], lane.address);
+        }
+    }
+}
+
+/// A lane's loop ends on its own idle or a refused upstream; the key must not keep writing to the
+/// socket nobody reads, so a later datagram for that tag opens a fresh lane.
+fn retire_finished_lane(
+    lanes: &mut HashMap<Option<String>, UdpLane>,
+    replies: &mut HashMap<SocketAddr, Option<String>>,
+    key: Option<&str>,
+) {
+    let finished = lanes
+        .iter()
+        .find(|(tag, lane)| tag.as_deref() == key && lane.handle.is_finished())
+        .map(|(tag, _)| tag.clone());
+    if let Some(tag) = finished {
+        if let Some(lane) = lanes.remove(&tag) {
+            replies.remove(&lane.address);
         }
     }
 }
@@ -32597,6 +32608,80 @@ mod tests {
         let (source, payload) = parse_socks_udp(&back[..n]).expect("splits");
         assert_eq!(source.port(), allowed);
         assert_eq!(payload, b"ping");
+    }
+
+    /// A split association keeps the client's name: a domain rule drops the datagram before any
+    /// resolver sees it, and an address datagram still rides the same association.
+    #[test]
+    fn a_split_association_routes_a_datagram_by_its_name() {
+        let allowed = udp_echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[
+                {"type":"field","domain":["full:blocked.test"],"outboundTag":"block"},
+                {"type":"field","inboundTag":["in"],"outboundTag":"direct"}]}}"#;
+        let front = socks_front_with(route_outbound(config, Some("in"), true));
+        let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0, "the split association is served: {reply:?}");
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        let name_frame = |name: &str, port: u16| {
+            let mut datagram = vec![0u8, 0, 0, 3, name.len() as u8];
+            datagram.extend_from_slice(name.as_bytes());
+            datagram.extend_from_slice(&port.to_be_bytes());
+            datagram.extend_from_slice(b"drop");
+            datagram
+        };
+        udp.send_to(&name_frame("blocked.test", 443), relay)
+            .expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        assert!(
+            udp.recv_from(&mut back).is_err(),
+            "a name rule drops it before a resolver sees it"
+        );
+        udp.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let mut frame = vec![0u8, 0, 0];
+        push_socks_addr(
+            &mut frame,
+            &format!("127.0.0.1:{allowed}").parse().expect("addr"),
+        );
+        frame.extend_from_slice(b"ping");
+        udp.send_to(&frame, relay).expect("sends");
+        let (n, _) = udp.recv_from(&mut back).expect("echoes");
+        assert_eq!(parse_socks_udp(&back[..n]).expect("splits").1, b"ping");
+    }
+
+    /// A lane whose loop ended is retired, so the next datagram for its tag opens a fresh socket
+    /// rather than writing to one nobody reads.
+    #[test]
+    fn a_finished_udp_lane_is_retired_before_its_key_is_reused() {
+        let address: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let key = Some("lane".to_owned());
+        let handle = thread::spawn(|| {});
+        while !handle.is_finished() {
+            thread::yield_now();
+        }
+        let mut lanes = HashMap::from([(key.clone(), UdpLane { address, handle })]);
+        let mut replies = HashMap::from([(address, key.clone())]);
+        retire_finished_lane(&mut lanes, &mut replies, key.as_deref());
+        assert!(!lanes.contains_key(&key));
+        assert!(!replies.contains_key(&address));
     }
 
     /// A balancer picks a lane per flow: the round robin walks the selected tags in config order,
