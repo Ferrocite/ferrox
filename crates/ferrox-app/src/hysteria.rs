@@ -416,23 +416,22 @@ pub(crate) fn open_flow(session: &Session, stream: u64, header: &[u8]) -> Option
     })
 }
 
-/// Reads a Hysteria v2 TCP request body whose `0x401` frame type is already consumed, leaving any payload that followed it in the backlog.
+/// Reads a Hysteria v2 TCP request body whose `0x401` frame type is already in the backlog behind `at`, leaving every byte where it arrived.
 pub(crate) fn read_request(flow: &mut Flow, deadline: Instant) -> Option<String> {
-    flow.backlog.drain(..flow.at);
-    flow.at = 0;
+    let prefix = flow.at;
     let mut head = std::mem::take(&mut flow.backlog);
     let mut room = Unfilled::<4096>::new();
     loop {
-        match hysteria::decode_tcp_request_body(&head) {
+        match hysteria::decode_tcp_request_body(head.get(prefix..)?) {
             Ok((address, used)) => {
                 let address = address.to_owned();
                 flow.backlog = head;
-                flow.at = used;
+                flow.at = prefix + used;
                 return Some(address);
             }
             Err(hysteria::RequestError::Invalid) => return None,
             Err(hysteria::RequestError::Incomplete) => {
-                if head.len() >= HEAD_CAP || Instant::now() >= deadline {
+                if head.len().saturating_sub(prefix) >= HEAD_CAP || Instant::now() >= deadline {
                     return None;
                 }
                 let n = flow.read(room.as_mut()).ok()?;
@@ -1298,13 +1297,12 @@ fn udp_reader(
             address,
             payload: &buf[..n],
         };
-        let mut frags = Vec::new();
-        if hysteria::fragment_udp(&message, max, &mut frags).is_err() {
+        let Ok(fragments) = hysteria::fragments_udp(&message, max) else {
             break;
-        }
-        for frag in &frags {
+        };
+        for frag in fragments {
             wire.clear();
-            if hysteria::encode_udp(frag, &mut wire).is_ok() {
+            if hysteria::encode_udp(&frag, &mut wire).is_ok() {
                 let _ = conn.dgram_send(&wire);
             }
         }
@@ -1406,13 +1404,12 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
             address,
             payload,
         };
-        let mut frags = Vec::new();
-        if hysteria::fragment_udp(&message, max, &mut frags).is_err() {
+        let Ok(fragments) = hysteria::fragments_udp(&message, max) else {
             continue;
-        }
-        for frag in &frags {
+        };
+        for frag in fragments {
             wire.clear();
-            if hysteria::encode_udp(frag, &mut wire).is_ok() {
+            if hysteria::encode_udp(&frag, &mut wire).is_ok() {
                 let _ = conn.dgram_send(&wire);
             }
         }
@@ -1908,9 +1905,12 @@ mod tests {
     #[test]
     fn a_parsed_request_leaves_its_payload_where_it_landed() {
         let session = idle_session();
+        let payload = b"vless-bytes-behind-the-request";
         let mut head = Vec::new();
         hysteria::encode_tcp_request("127.0.0.1:8080", &[9, 9], &mut head);
-        head.extend_from_slice(b"vless-bytes-behind-the-request");
+        let payload_at = head.len();
+        head.extend_from_slice(payload);
+        let payload_base = head[payload_at..].as_ptr();
         let mut flow = Flow::from_parts(
             Arc::clone(&session.shared),
             Arc::clone(&session.sock),
@@ -1926,8 +1926,23 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(1);
         let address = read_request(&mut flow, deadline).expect("parses");
         assert_eq!(address, "127.0.0.1:8080");
-        assert_eq!(flow.backlog.as_ptr(), base, "the payload never moved");
+        assert_eq!(flow.backlog.as_ptr(), base, "the buffer never moved");
         assert_eq!(flow.backlog.capacity(), room, "no reallocation");
-        assert_eq!(&flow.backlog[flow.at..], b"vless-bytes-behind-the-request");
+        assert_eq!(
+            &flow.backlog[..2],
+            &[0x44, 0x01],
+            "the frame type stayed where it arrived"
+        );
+        assert_eq!(
+            &flow.backlog[3..17],
+            b"127.0.0.1:8080",
+            "the request body stayed where it arrived"
+        );
+        assert_eq!(
+            flow.backlog[flow.at..].as_ptr(),
+            payload_base,
+            "the payload stayed where it arrived"
+        );
+        assert_eq!(&flow.backlog[flow.at..], payload);
     }
 }
