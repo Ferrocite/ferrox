@@ -2174,7 +2174,7 @@ mod tests {
             "the slices are sealed into one record"
         );
 
-        let (_, counts) = ferrox_core::alloc_count::measure(|| {
+        let (_, counts) = crate::alloc_count::measure(|| {
             subject.write_all_slices(&[&b"head"[..], &payload[..], &b"tail"[..]])
         });
         assert_eq!(counts.allocs, 0, "a warm write opens no buffer");
@@ -2190,7 +2190,7 @@ mod tests {
         );
 
         let (_, counts) =
-            ferrox_core::alloc_count::measure(|| subject.write(&payload).expect("a single slice"));
+            crate::alloc_count::measure(|| subject.write(&payload).expect("a single slice"));
         assert_eq!(counts.allocs, 0, "the single-slice write shares it");
     }
 
