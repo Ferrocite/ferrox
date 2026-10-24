@@ -174,10 +174,10 @@ carrier-httpupgrade prefix-bytes-held-after-walk 0 ferrox-app-httpupgrade::tests
 carrier-httpupgrade sweep-head-cases 108 ferrox-app-httpupgrade::tests::sweep::the_head_sweep_agrees_with_the_reference_on_every_length_and_split
 carrier-httpupgrade sweep-head-lengths 93 ferrox-app-httpupgrade::tests::sweep::the_head_sweep_agrees_with_the_reference_on_every_length_and_split
 carrier-httpupgrade sweep-head-end-offsets-that-differ 0 ferrox-app-httpupgrade::tests::sweep::the_head_sweep_agrees_with_the_reference_on_every_length_and_split
-carrier-httpupgrade sweep-head-verdicts-that-differ 21 ferrox-app-httpupgrade::tests::sweep::the_head_sweep_agrees_with_the_reference_on_every_length_and_split
+carrier-httpupgrade sweep-head-verdicts-that-differ 0 ferrox-app-httpupgrade::tests::sweep::the_head_sweep_agrees_with_the_reference_on_every_length_and_split
 carrier-httpupgrade sweep-served-cases 13 ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head
-carrier-httpupgrade sweep-served-verdicts-that-differ 1 ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head
-carrier-httpupgrade sweep-served-answers-that-differ 1 ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head
+carrier-httpupgrade sweep-served-verdicts-that-differ 0 ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head
+carrier-httpupgrade sweep-served-answers-that-differ 0 ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head
 carrier-httpupgrade sweep-tails-the-reference-dropped 2 ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head
 carrier-httpupgrade sweep-dialled-cases 9 ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer
 carrier-httpupgrade sweep-dialled-verdicts-that-differ 2 ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer

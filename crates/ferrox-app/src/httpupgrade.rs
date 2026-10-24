@@ -3,7 +3,7 @@ use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::time::Instant;
 
-pub(crate) const HEAD_LIMIT: usize = 64 * 1024;
+pub(crate) const HEAD_LIMIT: usize = 12 * 1024;
 
 /// The answer this carrier writes when the request carries no key: a status line and the two upgrade headers.
 pub(crate) const SWITCH: &[u8] =
@@ -137,10 +137,10 @@ fn read_head(stream: &mut Connection) -> Option<(Vec<u8>, usize)> {
     got
 }
 
-pub(crate) fn accept(stream: Connection, path: &str) -> Option<(UpReader, Connection)> {
+pub(crate) fn accept(stream: Connection, path: &str, host: &str) -> Option<(UpReader, Connection)> {
     let mut read = stream;
     let (head, at) = read_head(&mut read)?;
-    let key = check_request(&head[..at], path)?;
+    let key = check_request(&head[..at], path, host)?;
     let Ok(write) = read.try_clone() else {
         return None;
     };
@@ -214,7 +214,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
 }
 
 /// The key the accepted request carried, or an empty slice when it carried none.
-fn check_request<'a>(head: &'a [u8], path: &str) -> Option<&'a str> {
+fn check_request<'a>(head: &'a [u8], path: &str, host: &str) -> Option<&'a str> {
     // One UTF-8 pass and one line scan answers the whole request; the fanout re-validated and rescanned for each field.
     let text = std::str::from_utf8(head).ok()?;
     let mut lines = text
@@ -230,6 +230,7 @@ fn check_request<'a>(head: &'a [u8], path: &str) -> Option<&'a str> {
     let mut upgrade = None;
     let mut connection = None;
     let mut key = None;
+    let mut request_host = None;
     for line in lines {
         // A colon-less line (the trailing empty one after the terminator, or a stray octet line) is skipped, as the references do.
         let Some((name, value)) = line.split_once(':') else {
@@ -242,7 +243,12 @@ fn check_request<'a>(head: &'a [u8], path: &str) -> Option<&'a str> {
             connection = Some(value.eq_ignore_ascii_case("upgrade"));
         } else if name.eq_ignore_ascii_case("sec-websocket-key") && key.is_none() {
             key = Some(value);
+        } else if name.eq_ignore_ascii_case("host") && request_host.is_none() {
+            request_host = Some(value);
         }
+    }
+    if !host.is_empty() && !valid_http_host(request_host?, host) {
+        return None;
     }
     if upgrade == Some(true) && connection == Some(true) {
         Some(key.unwrap_or_default())
@@ -251,14 +257,39 @@ fn check_request<'a>(head: &'a [u8], path: &str) -> Option<&'a str> {
     }
 }
 
+/// `internet.IsValidHTTPHost`: the request's host, without a port, compared case-insensitively to the configured host.
+fn valid_http_host(request: &str, config: &str) -> bool {
+    let request = request.to_ascii_lowercase();
+    let config = config.to_ascii_lowercase();
+    if request.contains(':') {
+        split_host_port(&request).is_some_and(|host| host == config)
+    } else {
+        request == config
+    }
+}
+
+/// `net.SplitHostPort`'s host half: a port is required, an optional port is digits, and brackets around an IPv6 host are stripped.
+fn split_host_port(value: &str) -> Option<&str> {
+    let (host, port) = value.rsplit_once(':')?;
+    if port.is_empty() || !port.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some(
+        host.strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host),
+    )
+}
+
 // The same accept over halves that cannot peek: the kept read consumes the head, so what rode in behind it is the reader's own prefix.
 pub(crate) fn accept_split<R: Read, W: Write>(
     mut read: R,
     mut write: W,
     path: &str,
+    host: &str,
 ) -> Option<(UpReader<R>, W)> {
     let (head, at) = read_upgrade_head(&mut read, HEAD_LIMIT)?;
-    let key = check_request(&head[..at], path)?;
+    let key = check_request(&head[..at], path, host)?;
     if key.is_empty() {
         write.write_all(SWITCH).ok()?;
     } else {
@@ -412,7 +443,7 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            let (mut reader, write) = accept(stream, "/tunnel").expect("upgrades");
+            let (mut reader, write) = accept(stream, "/tunnel", "").expect("upgrades");
             let mut buf = [0u8; 4];
             reader.read_exact(&mut buf).expect("reads");
             assert_eq!(&buf, b"ping");
@@ -534,7 +565,7 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            let (mut reader, _write) = accept(stream, "/tunnel").expect("upgrades");
+            let (mut reader, _write) = accept(stream, "/tunnel", "").expect("upgrades");
             let mut payload = [0u8; 8];
             reader.read_exact(&mut payload).expect("reads the payload");
             assert_eq!(&payload, b"01234567");
@@ -556,17 +587,17 @@ mod tests {
         let upgrade = "Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
         let post = format!("POST /tunnel HTTP/1.1\r\n{upgrade}");
         assert!(
-            check_request(post.as_bytes(), "/tunnel").is_some(),
+            check_request(post.as_bytes(), "/tunnel", "").is_some(),
             "the reference reads any method"
         );
         let decoded = format!("GET /tun%6Eel HTTP/1.1\r\n{upgrade}");
         assert!(
-            check_request(decoded.as_bytes(), "/tunnel").is_some(),
+            check_request(decoded.as_bytes(), "/tunnel", "").is_some(),
             "the reference compares the decoded path"
         );
         let bare_lf = "GET /tunnel HTTP/1.1\nConnection: Upgrade\nUpgrade: websocket\n\n";
         assert!(
-            check_request(bare_lf.as_bytes(), "/tunnel").is_some(),
+            check_request(bare_lf.as_bytes(), "/tunnel", "").is_some(),
             "the reference reads a bare line feed"
         );
     }
@@ -575,7 +606,13 @@ mod tests {
     fn a_bare_lf_head_reaches_the_reader() {
         let head = b"GET /tunnel HTTP/1.1\nHost: oracle.example\nConnection: Upgrade\nUpgrade: websocket\n\n";
         assert!(
-            accept_split(std::io::Cursor::new(head.to_vec()), Vec::new(), "/tunnel").is_some(),
+            accept_split(
+                std::io::Cursor::new(head.to_vec()),
+                Vec::new(),
+                "/tunnel",
+                ""
+            )
+            .is_some(),
             "the shared head read ends on \\n\\n as the reference does"
         );
     }
@@ -583,8 +620,13 @@ mod tests {
     #[test]
     fn a_keyed_request_is_answered_with_the_accept_the_reference_derives() {
         let head = b"GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
-        let (_, answer) = accept_split(std::io::Cursor::new(head.to_vec()), Vec::new(), "/tunnel")
-            .expect("upgrades");
+        let (_, answer) = accept_split(
+            std::io::Cursor::new(head.to_vec()),
+            Vec::new(),
+            "/tunnel",
+            "",
+        )
+        .expect("upgrades");
         let accept = b"Sec-Websocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n";
         assert!(
             answer.windows(accept.len()).any(|window| window == accept),
@@ -598,32 +640,77 @@ mod tests {
     fn check_request_accepts_and_refuses_the_vectors_it_did() {
         let ok = b"GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\n\
                   Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
-        assert!(check_request(ok, "/tunnel").is_some());
+        assert!(check_request(ok, "/tunnel", "").is_some());
+        // The configured host is checked against the request's own, without a port and case-insensitively.
+        assert!(check_request(ok, "/tunnel", "oracle.example").is_some());
+        assert!(
+            check_request(ok, "/tunnel", "other.example").is_none(),
+            "wrong host"
+        );
+        assert!(
+            check_request(
+                b"GET /tunnel HTTP/1.1\r\nHost: ORACLE.EXAMPLE:443\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                "/tunnel",
+                "oracle.example",
+            )
+            .is_some(),
+            "a request host with a port matches the configured host"
+        );
+        assert!(
+            check_request(
+                b"GET /tunnel HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                "/tunnel",
+                "oracle.example",
+            )
+            .is_none(),
+            "a configured host requires the request's"
+        );
+        assert!(
+            check_request(
+                b"GET /tunnel HTTP/1.1\r\nHost: [::1]:443\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                "/tunnel",
+                "::1",
+            )
+            .is_some(),
+            "an IPv6 request host drops its brackets and port"
+        );
+        assert!(
+            check_request(
+                b"GET /tunnel HTTP/1.1\r\nHost: [::1]\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+                "/tunnel",
+                "::1",
+            )
+            .is_none(),
+            "a bracketed host still needs a port"
+        );
         // Case- and whitespace-insensitive on both the key and the value, as `trim` plus `eq_ignore_ascii_case` gave.
         let messy = b"GET /tunnel HTTP/1.1\r\nupGRADE:   WebSocket \r\n\
                       Connection:  upgrade\r\n\r\n";
-        assert!(check_request(messy, "/tunnel").is_some());
+        assert!(check_request(messy, "/tunnel", "").is_some());
         // A query is stripped from the target before the compare.
         assert!(check_request(
             b"GET /tunnel?ed=4096 HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
-            "/tunnel"
+            "/tunnel",
+            ""
         )
         .is_some());
         // A method other than GET is not a rejection: the reference reads any method.
         assert!(
             check_request(
                 b"POST /tunnel HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
-                "/tunnel"
+                "/tunnel",
+                ""
             )
             .is_some(),
             "the reference reads any method"
         );
         // Each rejection the previous parse produced, the fused one still produces.
-        assert!(check_request(ok, "/other").is_none(), "wrong path");
+        assert!(check_request(ok, "/other", "").is_none(), "wrong path");
         assert!(
             check_request(
                 b"GET /tunnel HTTP/1.1\r\nConnection: Upgrade\r\nUpgrade: gzip\r\n\r\n",
-                "/tunnel"
+                "/tunnel",
+                ""
             )
             .is_none(),
             "wrong Upgrade"
@@ -631,7 +718,8 @@ mod tests {
         assert!(
             check_request(
                 b"GET /tunnel HTTP/1.1\r\nUpgrade: websocket\r\n\r\n",
-                "/tunnel"
+                "/tunnel",
+                ""
             )
             .is_none(),
             "missing Connection"
@@ -640,13 +728,14 @@ mod tests {
         assert!(
             check_request(
                 b"GET /tunnel HTTP/1.1\r\nUpgrade: websocket\r\nbogus\r\nConnection: Upgrade\r\n\r\n",
-                "/tunnel"
+                "/tunnel",
+                ""
             )
             .is_some(),
             "trailing colon-less line"
         );
         assert!(
-            check_request(b"\xff\xfe", "/tunnel").is_none(),
+            check_request(b"\xff\xfe", "/tunnel", "").is_none(),
             "invalid UTF-8"
         );
     }
@@ -820,7 +909,7 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            let (mut reader, mut write) = accept(stream, "/tunnel").expect("upgrades");
+            let (mut reader, mut write) = accept(stream, "/tunnel", "").expect("upgrades");
             let mut buf = [0u8; 4];
             reader.read_exact(&mut buf).expect("reads early data");
             assert_eq!(&buf, b"ping");
@@ -906,7 +995,7 @@ mod tests {
         let mut wire = Vec::from(HEAD);
         wire.extend_from_slice(TAIL);
         let (reader, _write) =
-            accept_split(std::io::Cursor::new(wire), Vec::new(), "/tunnel").expect("upgrades");
+            accept_split(std::io::Cursor::new(wire), Vec::new(), "/tunnel", "").expect("upgrades");
         assert_eq!(reader.at, HEAD.len(), "the cursor sits past the head");
         assert_eq!(
             reader.prefix.len(),
@@ -1060,7 +1149,7 @@ mod tests {
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             let configured = ferrox_core::transport::EarlyData::split("/interop-upgrade?ed=2048");
-            let (mut reader, write) = accept(stream, &configured.path).expect("upgrades");
+            let (mut reader, write) = accept(stream, &configured.path, "").expect("upgrades");
             // Drain the early data before closing: a Windows socket closed with received bytes still unread answers RST, which discards the `101` the client has not yet read.
             let mut early = [0u8; 5];
             reader.read_exact(&mut early).expect("reads the early data");
@@ -1087,7 +1176,7 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            let (_reader, write) = accept(stream, "/tunnel").expect("upgrades");
+            let (_reader, write) = accept(stream, "/tunnel", "").expect("upgrades");
             quiet(&write);
             drop(write);
         });
@@ -1115,7 +1204,7 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            assert!(accept(stream, "/tunnel").is_none());
+            assert!(accept(stream, "/tunnel", "").is_none());
         });
         let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
@@ -1507,7 +1596,7 @@ mod tests {
             };
             let mut wire = head.clone();
             wire.extend_from_slice(&tail);
-            let outcome = accept_split(std::io::Cursor::new(wire), Vec::new(), &case.path);
+            let outcome = accept_split(std::io::Cursor::new(wire), Vec::new(), &case.path, "");
             let answer = outcome
                 .as_ref()
                 .map(|(_, write)| write.clone())

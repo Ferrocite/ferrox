@@ -10,7 +10,7 @@ The one thing worth writing down is the head scan. It is not quadratic, and the 
 
 The other thing worth writing down is what happens when a served connection ends. `?ed` exists so the client can ride payload in ahead of the `101`, which means a served connection routinely holds received bytes nobody has read — every exit after the `101` (decode refused, id refused, no uplink) reads the head and never touches them. A socket whose last handle closes with received bytes unread is answered with an RST, and an RST makes the peer discard whatever it has not read yet, including the `101` written a moment earlier.
 
-That is the whole of the Windows failure this lane used to carry: `a_configured_budget_serves_the_bare_path` was red there and green here, because macOS delivers the already-buffered `101` and reports the reset on the *next* read, while Windows discards it. `quiet` drains the pending bytes before the close with one 4 KiB scratch: **one** read when nothing is pending (it ends on the `SESSION_POLL` timeout), at most `HEAD_LIMIT / 4096` = **16** reads when a peer keeps talking, so the close is a FIN and the answer stands. The bound is deliberate — an unbounded drain would let a chatty peer postpone the teardown forever.
+That is the whole of the Windows failure this lane used to carry: `a_configured_budget_serves_the_bare_path` was red there and green here, because macOS delivers the already-buffered `101` and reports the reset on the *next* read, while Windows discards it. `quiet` drains the pending bytes before the close with one 4 KiB scratch: **one** read when nothing is pending (it ends on the `SESSION_POLL` timeout), at most `HEAD_LIMIT / 4096` = **3** reads when a peer keeps talking, so the close is a FIN and the answer stands. The bound is deliberate — an unbounded drain would let a chatty peer postpone the teardown forever.
 
 The checker is `a_drained_teardown_ends_the_upgrade_with_a_fin`, witnessed on this machine: with the drain disabled it fails 3/3 with `Os { code: 54, kind: ConnectionReset }`; with it the read ends in EOF. The bare-path test cannot gate this — it passes on macOS either way — so it was retargeted to the teardown production actually has (`quiet`, then drop) rather than a shape only the test uses.
 
@@ -47,10 +47,10 @@ graph TD
 | sweep-head-cases | 108 | ferrox-app-httpupgrade::tests::sweep::the_head_sweep_agrees_with_the_reference_on_every_length_and_split |
 | sweep-head-lengths | 93 | ferrox-app-httpupgrade::tests::sweep::the_head_sweep_agrees_with_the_reference_on_every_length_and_split |
 | sweep-head-end-offsets-that-differ | 0 | ferrox-app-httpupgrade::tests::sweep::the_head_sweep_agrees_with_the_reference_on_every_length_and_split |
-| sweep-head-verdicts-that-differ | 21 | ferrox-app-httpupgrade::tests::sweep::the_head_sweep_agrees_with_the_reference_on_every_length_and_split |
+| sweep-head-verdicts-that-differ | 0 | ferrox-app-httpupgrade::tests::sweep::the_head_sweep_agrees_with_the_reference_on_every_length_and_split |
 | sweep-served-cases | 13 | ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head |
-| sweep-served-verdicts-that-differ | 1 | ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head |
-| sweep-served-answers-that-differ | 1 | ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head |
+| sweep-served-verdicts-that-differ | 0 | ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head |
+| sweep-served-answers-that-differ | 0 | ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head |
 | sweep-tails-the-reference-dropped | 2 | ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head |
 | sweep-dialled-cases | 9 | ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer |
 | sweep-dialled-verdicts-that-differ | 2 | ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer |
@@ -78,9 +78,9 @@ The head sweep runs every length the script names — 93 of them, from 55 octets
 | what | ferrox: `upgrade_head_end` (core's `foxy::head_end` plus a bare-LF fallback), a portable SWAR pass over 8-byte words — scalar on every build, no target feature and no intrinsic | xray-core at the pin: `bufio` over `net/http`'s `textproto` line reader — `bytes.IndexByte`, SIMD assembly on amd64 and arm64 | the difference the sweep measured |
 | --- | --- | --- | --- |
 | the head's end, over 93 lengths and every split offset | the octet the tree's scan returns | the octet the reference's parser consumed | 0 offsets differ (`sweep-head-end-offsets-that-differ 0`) |
-| the head a connection may send | 65 536 octets (`HEAD_LIMIT`) | 12 288 octets (`io.LimitReader`) | 21 of the 108 heads read differently (`sweep-head-verdicts-that-differ 21`) |
-| the served verdict, over 13 heads | `check_request`: any method, the decoded path, the first value of a repeated header, and both upgrade headers | `http.ReadRequest` plus `internet.IsValidHTTPHost`: any method, the decoded path, the host, the first value of a repeated header | 1 verdict differs (`sweep-served-verdicts-that-differ 1`) |
-| the answer the server writes | `SWITCH`: 101 and the two upgrade headers | the same, plus `Sec-Websocket-Accept` derived from the key it was given | 1 answer differs (`sweep-served-answers-that-differ 1`) |
+| the head a connection may send | 12 288 octets (`HEAD_LIMIT`) | 12 288 octets (`io.LimitReader`) | 0 of the 108 heads read differently (`sweep-head-verdicts-that-differ 0`) |
+| the served verdict, over 13 heads | `check_request`: any method, the decoded path, the configured host, the first value of a repeated header, and both upgrade headers | `http.ReadRequest` plus `internet.IsValidHTTPHost`: any method, the decoded path, the host, the first value of a repeated header | 0 verdicts differ (`sweep-served-verdicts-that-differ 0`) |
+| the answer the server writes | 101, the two upgrade headers, and `Sec-Websocket-Accept` derived from the key it was given | the same | 0 answers differ (`sweep-served-answers-that-differ 0`) |
 | the octets that arrived with the head | kept: they are the reader's own prefix | dropped: the `bufio` read-ahead is discarded | 2 tails the reference dropped (`sweep-tails-the-reference-dropped 2`) |
 | the dialled verdict, over 9 answers | `check_response`: a 12-octet status prefix and both upgrade headers | `http.ReadResponse`, which wants the whole `101 Switching Protocols` | 2 verdicts differ (`sweep-dialled-verdicts-that-differ 2`) |
 | the early payload's order and its bytes | rides in the request's write, or goes after the answer | the same two orders | 0 orders and 0 payload bytes differ |
@@ -90,7 +90,7 @@ The tree dispatches to scalar against the reference's vector path on every build
 
 The material that would let a permuted implementation pass is held to the octet: the golden keeps the octet at which the reference's parser ended each head, the caller's own key verbatim in the request it wrote, the accept header the reference derived from that key (the Rust side recomputes `base64(sha1(key + GUID))` and compares the bytes), the early payload as distinct octets (`a0`…`a7`) in the order they arrived, and the request's own line order. A scan that moved, a key that was permuted, a payload that was reordered or a request whose pieces were swapped all fail the sweep: moving the head end by one octet fails the head sweep, and permuting the request's pieces fails the dialled one.
 
-What the sweep does **not** claim: that the two sides are interchangeable. They are not, and the divergences above are the list. The remaining divergence is the host check: the reference refuses a served request whose `Host` does not match, and the tree does not. A peer that satisfies one need not satisfy the other. The reference's own limit is the one that bites in production: a head above 12 288 octets is read by this tree and refused by the reference, and the reference's `bufio` discards the octets that came in with the head, where this tree hands them to its reader as the prefix it already holds.
+What the sweep does **not** claim: that the two sides are interchangeable. They are not, and the divergences above are the list. The reference's `bufio` discards the octets that came in with the head, where this tree hands them to its reader as the prefix it already holds; that tail difference is the one left in the served sweep, and it is named rather than removed because dropping the prefix would break a dial that pipelines its first packet.
 
 ## Ops
 
