@@ -296,35 +296,25 @@ impl Session {
         let worker = Arc::clone(&self);
         std::thread::spawn(move || {
             let mut chunk = vec![0u8; READ_SLICE];
-            let mut buf: Vec<u8> = Vec::with_capacity(READ_SLICE);
-            let mut at = 0;
-            loop {
-                if at >= buf.len() {
-                    buf.clear();
-                    at = 0;
-                } else if at > 0 {
-                    buf.drain(..at);
-                    at = 0;
-                }
-                let mut progressed = false;
+            // Only a frame that straddles two reads is copied here: a whole frame is parsed where the read landed it.
+            let mut carry: Vec<u8> = Vec::new();
+            let drain_frames = |data: &[u8]| -> Option<usize> {
+                let mut at = 0;
                 loop {
-                    match ferrox_core::mux::decode(&buf[at..], ferrox_core::mux::NewTail::Forward) {
-                        Err(ferrox_core::mux::Error::Short { .. }) => break,
-                        Err(_) => {
-                            worker.finish();
-                            return;
-                        }
+                    match ferrox_core::mux::decode(&data[at..], ferrox_core::mux::NewTail::Forward)
+                    {
+                        Err(ferrox_core::mux::Error::Short { .. }) => return Some(at),
+                        Err(_) => return None,
                         Ok((frame, used)) => {
                             at += used;
-                            progressed = true;
                             match frame.status {
                                 ferrox_core::mux::Status::Keep => {
-                                    let Some(data) = frame.data else { continue };
+                                    let Some(payload) = frame.data else { continue };
                                     let Some(sender) = worker.sender(frame.id) else {
                                         continue;
                                     };
                                     let source = frame.target.and_then(source_addr);
-                                    if sender.try_send((data.to_vec(), source)).is_err() {
+                                    if sender.try_send((payload.to_vec(), source)).is_err() {
                                         worker.end(frame.id);
                                     }
                                 }
@@ -335,10 +325,31 @@ impl Session {
                         }
                     }
                 }
-                if !progressed {
-                    match reader.read(&mut chunk) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            };
+            loop {
+                let n = match reader.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => n,
+                };
+                if carry.is_empty() {
+                    let data = &chunk[..n];
+                    let Some(at) = drain_frames(data) else {
+                        worker.finish();
+                        return;
+                    };
+                    if at < n {
+                        carry.extend_from_slice(&data[at..]);
+                    }
+                } else {
+                    carry.extend_from_slice(&chunk[..n]);
+                    let Some(at) = drain_frames(&carry) else {
+                        worker.finish();
+                        return;
+                    };
+                    if at == carry.len() {
+                        carry.clear();
+                    } else {
+                        carry.drain(..at);
                     }
                 }
             }

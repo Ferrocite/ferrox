@@ -74,6 +74,6 @@ xhttp, QUIC, KCP, hysteria and xdrive carriers are not carried: xhttp frames its
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/reverse.rs
-- symbols: reverse_portals, reverse_carried, reverse_ask, ReverseAsk, attach_reverse, attach_reverse_session, serve_reverse_tcp, vless_reverse_header, BridgeLane, refuse_bridge_lane, serve_bridge_mux, start_bridges, find_bridges, reverse_tests, connection_closer, into_tunnel
+- symbols: reverse_portals, reverse_carried, reverse_ask, ReverseAsk, attach_reverse, attach_reverse_session, serve_reverse_tcp, vless_reverse_header, BridgeLane, refuse_bridge_lane, serve_bridge_mux, start_bridges, find_bridges, reverse_tests, portal_echo, a_portal_flow_reaches_the_bridge_and_comes_back, a_sixteen_kib_downlink_frame_is_echoed_whole, connection_closer, into_tunnel
 - go: ./proxy/vless/..., ./app/reverse/...
 <!-- scope:end -->
