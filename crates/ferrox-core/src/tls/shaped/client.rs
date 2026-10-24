@@ -649,7 +649,10 @@ impl<S: Stream> Session<S> {
             if self.eof {
                 return Ok(0);
             }
-            if self.inbuf.is_empty() && buf.len() >= RECORD_READ {
+            if self.inbuf.is_empty()
+                && self.version == Some(Version::Tls13)
+                && buf.len() >= RECORD_READ
+            {
                 let filled = self.read_direct(buf)?;
                 if filled > 0 {
                     return Ok(filled);
@@ -682,80 +685,116 @@ impl<S: Stream> Session<S> {
     /// where the transport wrote it, so the plaintext the caller gets costs no second buffer.
     fn read_direct(&mut self, buf: &mut [u8]) -> Result<usize, TlsError> {
         let mut header = [0u8; 5];
-        match exact(&mut self.io, &mut header) {
-            Ok(()) => {}
-            Err(TlsError::Closed) => {
+        let n = match self.io.read_vectored(&mut [
+            std::io::IoSliceMut::new(&mut header),
+            std::io::IoSliceMut::new(buf),
+        ]) {
+            Ok(0) => {
                 self.eof = true;
                 return Ok(0);
             }
-            Err(error) => return Err(error),
-        }
-        let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
-        if len > MAX_RECORD {
-            return Err(TlsError::Other(
-                "record exceeds the maximum length".to_owned(),
-            ));
-        }
-        self.plain_at = 0;
-        self.plain_end = 0;
-        let direct = header[0] == APPLICATION
-            && self.version == Some(Version::Tls13)
-            && self.read_key.is_some()
-            && len <= buf.len();
-        let (kind, start, bytes) = if direct {
-            exact(&mut self.io, &mut buf[..len])?;
-            let Self {
-                read_key,
-                server12,
-                version,
-                ..
-            } = self;
-            decrypt(read_key, server12, *version, header, &mut buf[..len])?
-        } else {
-            if self.plain.len() < len {
-                self.plain.resize(len, 0);
-            }
-            exact(&mut self.io, &mut self.plain[..len])?;
-            let Self {
-                read_key,
-                server12,
-                version,
-                plain,
-                ..
-            } = self;
-            decrypt(read_key, server12, *version, header, &mut plain[..len])?
+            Ok(n) => n,
+            Err(error) if TlsError::is_timeout(&error) => return Err(TlsError::Timeout),
+            Err(error) => return Err(TlsError::from(error)),
         };
-        let body = if direct {
-            &buf[start..start + bytes]
-        } else {
-            &self.plain[start..start + bytes]
-        };
-        match kind {
-            APPLICATION => {
-                if direct {
-                    return Ok(bytes);
-                }
-                self.plain_at = start;
-                self.plain_end = start + bytes;
-                Ok(0)
-            }
-            HANDSHAKE => {
-                self.hs.extend_from_slice(body);
-                self.post_handshake()?;
-                Ok(0)
-            }
-            ALERT => {
-                let error = alert(body);
-                if error == TlsError::Closed {
+        let mut got = n.saturating_sub(5);
+        if n < 5 {
+            match exact(&mut self.io, &mut header[n..]) {
+                Ok(()) => {}
+                Err(TlsError::Closed) => {
                     self.eof = true;
-                    Ok(0)
+                    return Ok(0);
+                }
+                Err(error) => return Err(error),
+            }
+            got = 0;
+        }
+        let mut body_at = 0usize;
+        let mut filled = 0usize;
+        let mut next = Some(header);
+        loop {
+            let header = match next.take() {
+                Some(header) => header,
+                None => {
+                    if got - body_at < 5 {
+                        break;
+                    }
+                    let header = buf[body_at..body_at + 5]
+                        .try_into()
+                        .expect("five-byte record header");
+                    body_at += 5;
+                    header
+                }
+            };
+            let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+            if len > MAX_RECORD {
+                return Err(TlsError::Other(
+                    "record exceeds the maximum length".to_owned(),
+                ));
+            }
+            if got - body_at < len {
+                // The first record's body is completed in the window the transport already wrote
+                // to; a later record's tail is staged so the plaintext ahead of it is not held back.
+                if filled == 0 && body_at == 0 && len <= buf.len() {
+                    match exact(&mut self.io, &mut buf[got..len]) {
+                        Ok(()) => {}
+                        Err(TlsError::Closed) => {
+                            self.eof = true;
+                            return Ok(filled);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    got = len;
                 } else {
-                    Err(error)
+                    self.inbuf.extend_from_slice(&header);
+                    self.inbuf.extend_from_slice(&buf[body_at..got]);
+                    return Ok(filled);
                 }
             }
-            CCS => Ok(0),
-            other => Err(unexpected(other)),
+            let (kind, start, bytes) = {
+                let Self {
+                    read_key,
+                    server12,
+                    version,
+                    ..
+                } = self;
+                decrypt(
+                    read_key,
+                    server12,
+                    *version,
+                    header,
+                    &mut buf[body_at..body_at + len],
+                )?
+            };
+            let plain = body_at + start;
+            match kind {
+                APPLICATION => {
+                    if filled != plain {
+                        buf.copy_within(plain..plain + bytes, filled);
+                    }
+                    filled += bytes;
+                }
+                HANDSHAKE => {
+                    self.hs.extend_from_slice(&buf[plain..plain + bytes]);
+                    self.post_handshake()?;
+                }
+                ALERT => {
+                    let error = alert(&buf[plain..plain + bytes]);
+                    if error == TlsError::Closed {
+                        self.eof = true;
+                        return Ok(filled);
+                    }
+                    return Err(error);
+                }
+                CCS => {}
+                other => return Err(unexpected(other)),
+            }
+            body_at += len;
         }
+        if body_at < got {
+            self.inbuf.extend_from_slice(&buf[body_at..got]);
+        }
+        Ok(filled)
     }
 
     fn post_handshake(&mut self) -> Result<(), TlsError> {
@@ -1776,6 +1815,76 @@ mod tests {
         assert_eq!(&window, b"in p");
         assert_eq!(session.read(&mut window).expect("reads"), 4);
         assert_eq!(&window, b"lace");
+    }
+
+    struct Vectored {
+        wire: Vec<u8>,
+        at: usize,
+        calls: std::cell::Cell<usize>,
+    }
+
+    impl Read for Vectored {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let n = (self.wire.len() - self.at).min(out.len());
+            out[..n].copy_from_slice(&self.wire[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+
+        fn read_vectored(
+            &mut self,
+            bufs: &mut [std::io::IoSliceMut<'_>],
+        ) -> std::io::Result<usize> {
+            self.calls.set(self.calls.get() + 1);
+            let mut moved = 0;
+            for buf in bufs {
+                let n = (self.wire.len() - self.at).min(buf.len());
+                buf[..n].copy_from_slice(&self.wire[self.at..self.at + n]);
+                self.at += n;
+                moved += n;
+                if self.at == self.wire.len() {
+                    break;
+                }
+            }
+            Ok(moved)
+        }
+    }
+
+    impl Write for Vectored {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A record the transport can hand over whole costs one vectored read, and its body is the
+    /// window the caller gets back rather than a copy of a second buffer.
+    #[test]
+    fn a_pulled_record_lands_in_one_vectored_read() {
+        let suite = Suite::Aes128GcmSha256;
+        let secret = [9u8; 32];
+        let mut sender = Direction::tls13(suite, &secret);
+        let mut wire = Vec::new();
+        record::seal13(&mut sender, APPLICATION, b"in place", &mut wire).expect("seals");
+        let mut session = session_on(
+            Vectored {
+                wire,
+                at: 0,
+                calls: std::cell::Cell::new(0),
+            },
+            Version::Tls13,
+            suite,
+            Direction::tls13(suite, &secret),
+            Direction::tls13(suite, &secret),
+        );
+        let mut window = vec![0u8; RECORD_READ];
+        assert_eq!(session.read(&mut window).expect("reads"), 8);
+        assert_eq!(&window[..8], b"in place");
+        assert_eq!(session.io.calls.get(), 1, "one vectored read per record");
+        assert_eq!(session.plain_buffer(), []);
     }
 
     #[test]
