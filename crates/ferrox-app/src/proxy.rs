@@ -21700,6 +21700,10 @@ mod tests {
         });
 
         let mut session = dial_tls_session(&addr, &client_config, None).expect("retries");
+        session
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
         session.write_all(b"ping").expect("writes");
         let mut back = [0u8; 4];
         session.read_exact(&mut back).expect("reads");
