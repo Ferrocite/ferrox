@@ -415,6 +415,48 @@ mod tests {
         server.join().expect("joins");
     }
 
+    #[test]
+    fn check_request_accepts_every_method_a_decoded_path_and_a_bare_lf_head() {
+        let upgrade = "Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+        let post = format!("POST /tunnel HTTP/1.1\r\n{upgrade}");
+        assert!(
+            check_request(post.as_bytes(), "/tunnel").is_some(),
+            "the reference reads any method"
+        );
+        let decoded = format!("GET /tun%6Eel HTTP/1.1\r\n{upgrade}");
+        assert!(
+            check_request(decoded.as_bytes(), "/tunnel").is_some(),
+            "the reference compares the decoded path"
+        );
+        let bare_lf = "GET /tunnel HTTP/1.1\nConnection: Upgrade\nUpgrade: websocket\n\n";
+        assert!(
+            check_request(bare_lf.as_bytes(), "/tunnel").is_some(),
+            "the reference reads a bare line feed"
+        );
+    }
+
+    #[test]
+    fn a_bare_lf_head_reaches_the_reader() {
+        let head = b"GET /tunnel HTTP/1.1\nHost: oracle.example\nConnection: Upgrade\nUpgrade: websocket\n\n";
+        assert!(
+            accept_split(std::io::Cursor::new(head.to_vec()), Vec::new(), "/tunnel").is_some(),
+            "the shared head read ends on \\n\\n as the reference does"
+        );
+    }
+
+    #[test]
+    fn a_keyed_request_is_answered_with_the_accept_the_reference_derives() {
+        let head = b"GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n";
+        let (_, answer) = accept_split(std::io::Cursor::new(head.to_vec()), Vec::new(), "/tunnel")
+            .expect("upgrades");
+        let accept = b"Sec-Websocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n";
+        assert!(
+            answer.windows(accept.len()).any(|window| window == accept),
+            "the answer carries the reference's accept header: {}",
+            String::from_utf8_lossy(&answer)
+        );
+    }
+
     /// One UTF-8 pass and one line scan answers the whole request; every byte-level decision matches the previous three-helper fanout.
     #[test]
     fn check_request_accepts_and_refuses_the_vectors_it_did() {
