@@ -24,8 +24,8 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| aes256-gcm-seal-retired-instructions | UNBLESSED | scripts/count-ops.sh |
-| aes256-gcm-open-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| aes256-gcm-seal-retired-instructions | 29612 | scripts/count-ops.sh |
+| aes256-gcm-open-retired-instructions | 29749 | scripts/count-ops.sh |
 | ech-offers-accepted-by-the-stock-lane | 1 | ferrox-app-proxy::tests::vless_over_ech_tls_carries_an_echo |
 | rejected-ech-offers-retried-once | 1 | ferrox-app-proxy::tests::a_rejected_ech_offer_retries_once_with_the_servers_list |
 | ech-offers-built-by-the-shaped-lane | 1 | ferrox-core-tls::shaped::hello::tests::a_real_ech_offer_hides_the_inner_name_under_the_public_one |
@@ -46,7 +46,7 @@ The stock test is the relay path: a VLESS flow over a TLS listener whose ECH key
   'ferrox_core::tls::hpke::Context::open'
 ```
 
-The probe is the existing AES-256-only ECH hello test: one `enable_ech` seals the cover and one inner open decrypts it, so each symbol is one frame under a fixed hello and fixed inner length. The counts are `UNBLESSED` until an `ops.yml` run on this head reports them; this host is macOS/aarch64, where valgrind has no build, so the exact-count gate in `./scripts/check.sh` is CI-only for the rows.
+The probe is the existing AES-256-only ECH hello test: one `enable_ech` seals the cover and one inner open decrypts it, so each symbol is one frame under a fixed hello and fixed inner length. `ops.yml` on this head reports `seal` 29612 and `open` 29749 retired instructions; this host is macOS/aarch64, where valgrind has no build, so the exact-count gate in `./scripts/check.sh` is CI-only for the rows.
 
 ## Time
 
