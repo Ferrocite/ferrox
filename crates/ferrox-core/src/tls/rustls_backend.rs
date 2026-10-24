@@ -17,7 +17,7 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 fn order_cipher_suites(provider: &mut rustls::crypto::CryptoProvider, order: &[u16]) {
     provider.cipher_suites.retain(|suite| {
         let id = u16::from(suite.suite());
-        id >= 0x1301 || order.contains(&id)
+        matches!(id, 0x1301..=0x1305) || order.contains(&id)
     });
     provider.cipher_suites.sort_by_key(|suite| {
         let id = u16::from(suite.suite());
