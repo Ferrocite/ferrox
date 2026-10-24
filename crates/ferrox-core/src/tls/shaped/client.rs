@@ -711,20 +711,16 @@ impl<S: Stream> Session<S> {
         }
         let mut body_at = 0usize;
         let mut filled = 0usize;
-        let mut next = Some(header);
+        let mut first = Some(header);
         loop {
-            let header = match next.take() {
-                Some(header) => header,
-                None => {
-                    if got - body_at < 5 {
-                        break;
-                    }
-                    let header = buf[body_at..body_at + 5]
-                        .try_into()
-                        .expect("five-byte record header");
-                    body_at += 5;
-                    header
-                }
+            let header = if let Some(header) = first.take() {
+                header
+            } else if got - body_at < 5 {
+                break;
+            } else {
+                let header = header_at(buf, body_at);
+                body_at += 5;
+                header
             };
             let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
             if len > MAX_RECORD {
@@ -735,37 +731,27 @@ impl<S: Stream> Session<S> {
             if got - body_at < len {
                 // The first record's body is completed in the window the transport already wrote
                 // to; a later record's tail is staged so the plaintext ahead of it is not held back.
-                if filled == 0 && body_at == 0 && len <= buf.len() {
-                    match exact(&mut self.io, &mut buf[got..len]) {
-                        Ok(()) => {}
-                        Err(TlsError::Closed) => {
-                            self.eof = true;
-                            return Ok(filled);
-                        }
-                        Err(error) => return Err(error),
-                    }
-                    got = len;
-                } else {
+                if filled != 0 || body_at != 0 || len > buf.len() {
                     self.inbuf.extend_from_slice(&header);
                     self.inbuf.extend_from_slice(&buf[body_at..got]);
                     return Ok(filled);
                 }
+                if let Err(error) = exact(&mut self.io, &mut buf[got..len]) {
+                    if error != TlsError::Closed {
+                        return Err(error);
+                    }
+                    self.eof = true;
+                    return Ok(filled);
+                }
+                got = len;
             }
-            let (kind, start, bytes) = {
-                let Self {
-                    read_key,
-                    server12,
-                    version,
-                    ..
-                } = self;
-                decrypt(
-                    read_key,
-                    server12,
-                    *version,
-                    header,
-                    &mut buf[body_at..body_at + len],
-                )?
-            };
+            let (kind, start, bytes) = decrypt(
+                &mut self.read_key,
+                &mut self.server12,
+                self.version,
+                header,
+                &mut buf[body_at..body_at + len],
+            )?;
             let plain = body_at + start;
             match kind {
                 APPLICATION => {
@@ -780,11 +766,11 @@ impl<S: Stream> Session<S> {
                 }
                 ALERT => {
                     let error = alert(&buf[plain..plain + bytes]);
-                    if error == TlsError::Closed {
-                        self.eof = true;
-                        return Ok(filled);
+                    if error != TlsError::Closed {
+                        return Err(error);
                     }
-                    return Err(error);
+                    self.eof = true;
+                    return Ok(filled);
                 }
                 CCS => {}
                 other => return Err(unexpected(other)),
@@ -851,9 +837,7 @@ impl<S: Stream> Session<S> {
             if ciphertext.len() - at < 5 {
                 break;
             }
-            let header: [u8; 5] = ciphertext[at..at + 5]
-                .try_into()
-                .expect("five-byte record header");
+            let header = header_at(ciphertext, at);
             let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
             if len > MAX_RECORD {
                 return Err(TlsError::Other(
@@ -927,9 +911,7 @@ impl<S: Stream> Session<S> {
             if self.inbuf.len() - at < 5 {
                 break;
             }
-            let header: [u8; 5] = self.inbuf[at..at + 5]
-                .try_into()
-                .expect("five-byte record header");
+            let header = header_at(&self.inbuf, at);
             let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
             if len > MAX_RECORD {
                 return Err(TlsError::Other(
@@ -1510,6 +1492,12 @@ fn message(kind: u8, body: &[u8]) -> Vec<u8> {
 
 fn unexpected(kind: u8) -> TlsError {
     TlsError::Other(format!("unexpected handshake message {kind}"))
+}
+
+fn header_at(bytes: &[u8], at: usize) -> [u8; 5] {
+    bytes[at..at + 5]
+        .try_into()
+        .expect("five-byte record header")
 }
 
 /// Opens one record in place and returns its content type with the plaintext range inside `body`.
