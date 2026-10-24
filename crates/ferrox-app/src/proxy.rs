@@ -5121,8 +5121,7 @@ fn dial_vmess_udp_uplink(
     relay: &UdpSocket,
     source: Arc<Mutex<Option<SocketAddr>>>,
 ) -> Option<VmessUdpUplink> {
-    let server = resolve_outbound(&vmess.address, vmess.port)?;
-    let carried = open_vmess_udp_stream(vmess, &server, dest)?;
+    let carried = open_vmess_udp_stream(vmess, dest)?;
     let udp_send = relay.try_clone().ok()?;
     let done = spawn_vmess_udp_reader(carried.reader, udp_send, source, *dest, carried.recv);
     let pad = crate::vmess::PadSource::fresh()?;
@@ -5136,18 +5135,103 @@ fn dial_vmess_udp_uplink(
     })
 }
 
-fn open_vmess_udp_stream(
-    vmess: &VmessOut,
-    server: &SocketAddr,
-    dest: &SocketAddr,
-) -> Option<CarriedVmess> {
-    if let Some(cfg) = vmess.tls.as_deref() {
-        let session = dial_tls_session(server, cfg, vmess.carrier.tcp_mask())?;
-        return open_vmess_udp_tls(vmess, server, cfg, session, dest);
+fn open_vmess_udp_stream(vmess: &VmessOut, dest: &SocketAddr) -> Option<CarriedVmess> {
+    if matches!(&vmess.carrier, Carrier::Xdrive { .. }) {
+        return open_vmess_udp_xdrive(vmess, dest);
     }
-    let uplink = dial_or_report(server)?.with_mask(vmess.carrier.tcp_mask());
+    let server = resolve_outbound(&vmess.address, vmess.port)?;
+    if matches!(&vmess.carrier, Carrier::Kcp(_)) {
+        return open_vmess_udp_kcp(vmess, server, dest);
+    }
+    if let Some(cfg) = vmess.tls.as_deref() {
+        let session = dial_tls_session(&server, cfg, vmess.carrier.tcp_mask())?;
+        return open_vmess_udp_tls(vmess, &server, cfg, session, dest);
+    }
+    let uplink = dial_or_report(&server)?.with_mask(vmess.carrier.tcp_mask());
     let shutdown = uplink.try_clone().ok()?;
     open_vmess_udp_plain(vmess, uplink, shutdown, dest)
+}
+
+fn open_vmess_udp_kcp(
+    vmess: &VmessOut,
+    server: SocketAddr,
+    dest: &SocketAddr,
+) -> Option<CarriedVmess> {
+    let Carrier::Kcp(config) = &vmess.carrier else {
+        return None;
+    };
+    let (request, send, recv, response_key, response_iv, auth) = vmess_udp_request(vmess, dest)?;
+    let conn = ferrox_core::kcp::dial(
+        server,
+        config.clone(),
+        ferrox_core::kcp::fresh_conversation(),
+    )
+    .ok()?;
+    if let Some(cfg) = vmess.tls.as_deref() {
+        let mut session = kcp_tls_connect(&conn, cfg)?;
+        if session.write_all(&request).is_err()
+            || !crate::vmess::read_response(&mut session, &response_key, &response_iv, auth)
+        {
+            return None;
+        }
+        let (reader, writer) = session_halves(
+            session,
+            KcpIo {
+                conn: Arc::clone(&conn),
+            },
+        );
+        return Some(CarriedVmess {
+            reader: Box::new(reader),
+            writer: Box::new(writer),
+            close: kcp_close(&conn),
+            send,
+            recv,
+        });
+    }
+    if conn.write(&request).is_err() {
+        return None;
+    }
+    let mut reader = KcpIo {
+        conn: Arc::clone(&conn),
+    };
+    if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
+        return None;
+    }
+    let writer = KcpIo {
+        conn: Arc::clone(&conn),
+    };
+    Some(CarriedVmess {
+        reader: Box::new(reader),
+        writer: Box::new(writer),
+        close: kcp_close(&conn),
+        send,
+        recv,
+    })
+}
+
+fn open_vmess_udp_xdrive(vmess: &VmessOut, dest: &SocketAddr) -> Option<CarriedVmess> {
+    let (request, send, recv, response_key, response_iv, auth) = vmess_udp_request(vmess, dest)?;
+    let session = xdrive_dial_session(&vmess.carrier, &vmess.address, vmess.port)?;
+    let mut reader = session.clone();
+    if reader.write_all(&request).is_err()
+        || !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth)
+    {
+        return None;
+    }
+    let close: VmessClose = {
+        let session = session.clone();
+        Arc::new(move || {
+            session.end_read();
+            let _ = session.end_write();
+        })
+    };
+    Some(CarriedVmess {
+        reader: Box::new(reader),
+        writer: Box::new(session),
+        close,
+        send,
+        recv,
+    })
 }
 
 #[allow(clippy::too_many_lines)]
@@ -22116,6 +22200,10 @@ mod tests {
             serve_vmess_carrier(stream, id, &carrier_for_server, server.as_ref());
         });
         let out = vmess_test_out(port, id, carrier, tls);
+        vmess_udp_association(&out, echo_port);
+    }
+
+    fn vmess_udp_association(out: &VmessOut, echo_port: u16) {
         let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
         relay
             .set_read_timeout(Some(Duration::from_secs(30)))
@@ -22123,7 +22211,7 @@ mod tests {
         let source = Arc::new(Mutex::new(Some(relay.local_addr().expect("addr"))));
         let dest: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let mut up =
-            dial_vmess_udp_uplink(&out, &dest, &relay, source).expect("opens the association");
+            dial_vmess_udp_uplink(out, &dest, &relay, source).expect("opens the association");
         let mut staging = Vec::new();
         let mut pad = crate::vmess::PadSource::fresh().expect("entropy");
         assert!(crate::vmess::write_frame(
@@ -22139,6 +22227,78 @@ mod tests {
         assert_eq!(payload, b"ping");
         (up.close)();
         join(&up.done);
+    }
+
+    fn vmess_udp_over_kcp(
+        tls: Option<&(
+            Arc<ferrox_core::tls::TlsServerConfig>,
+            ferrox_core::tls::TlsConfig,
+        )>,
+    ) {
+        let echo_port = udp_echo_port();
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let port = listener.local_addr().port();
+        let id = [0x62u8; 16];
+        let server = tls.map(|(server, _)| Arc::clone(server));
+        thread::spawn(move || {
+            let conn = listener.accept().expect("accepts");
+            if let Some(server) = server {
+                serve_vmess_kcp_tls(&conn, &id, true, &server);
+                return;
+            }
+            let (reader, writer, close) = kcp_parts(&conn);
+            crate::vmess::serve_kcp(reader, writer, &id, true, &close);
+        });
+        let out = vmess_test_out(
+            port,
+            id,
+            Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            tls,
+        );
+        vmess_udp_association(&out, echo_port);
+    }
+
+    fn vmess_udp_over_xdrive() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-vmess-xdrive-{}-{stamp}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let folder = dir.to_str().expect("utf-8 folder").replace('\\', "\\\\");
+        let settings = crate::json::parse(&format!(
+            r#"{{"network": "xdrive", "security": "tls",
+                "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
+                    "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 60}},
+                "tlsSettings": {{"allowInsecure": true}}}}"#
+        ))
+        .expect("parses");
+        let settings = crate::xdrive::Settings::from_json(Some(&settings)).expect("settings");
+        let echo_port = udp_echo_port();
+        let id = [0x62u8; 16];
+        let accept: crate::xdrive::Accept =
+            Arc::new(move |session| serve_vmess_xdrive(session, &id, true));
+        settings
+            .listen(Some(("127.0.0.1", 9)), accept)
+            .expect("listens");
+        let out = vmess_test_out(
+            9,
+            id,
+            Carrier::Xdrive {
+                settings: Box::new(settings.clone()),
+            },
+            None,
+        );
+        vmess_udp_association(&out, echo_port);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -22236,6 +22396,22 @@ mod tests {
         for carrier in vmess_carriers() {
             vmess_udp_over(carrier, Some(&tls));
         }
+    }
+
+    #[test]
+    fn vmess_serves_udp_over_kcp() {
+        vmess_udp_over_kcp(None);
+    }
+
+    #[test]
+    fn vmess_tls_serves_udp_over_kcp() {
+        let tls = carried_tls_configs();
+        vmess_udp_over_kcp(Some(&tls));
+    }
+
+    #[test]
+    fn vmess_serves_udp_over_xdrive() {
+        vmess_udp_over_xdrive();
     }
 
     #[test]

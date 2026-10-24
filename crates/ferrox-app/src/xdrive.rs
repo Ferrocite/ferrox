@@ -1325,6 +1325,11 @@ impl Conn {
     pub(crate) fn end_write(&self) -> io::Result<()> {
         self.writer.close()
     }
+
+    /// End the read mailbox too, for a caller that is done with both directions and must not leave its reader parked.
+    pub(crate) fn end_read(&self) {
+        self.reader.inbox.end(None);
+    }
 }
 
 impl Read for Conn {
