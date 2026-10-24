@@ -1668,12 +1668,12 @@ const RESOLVE_CACHE_CAP: usize = 256;
 
 struct Resolved {
     at: Instant,
-    addrs: Vec<SocketAddr>,
+    addrs: Arc<[SocketAddr]>,
 }
 
 static RESOLVED: Mutex<Option<HashMap<u16, HashMap<String, Resolved>>>> = Mutex::new(None);
 
-fn cached_lookup(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
+fn cached_lookup(host: &str, port: u16) -> Option<Arc<[SocketAddr]>> {
     let mut cache = RESOLVED.lock().ok()?;
     let entries = cache.as_mut()?;
     let per_port = entries.get_mut(&port)?;
@@ -1682,7 +1682,7 @@ fn cached_lookup(host: &str, port: u16) -> Option<Vec<SocketAddr>> {
         per_port.remove(host);
         return None;
     }
-    Some(entry.addrs.clone())
+    Some(Arc::clone(&entry.addrs))
 }
 
 #[cfg(test)]
@@ -1694,9 +1694,10 @@ pub(crate) fn lookup_is_remembered(host: &str, port: u16) -> bool {
         .is_some()
 }
 
-fn remember_lookup(host: &str, port: u16, addrs: &[SocketAddr]) {
+fn remember_lookup(host: &str, port: u16, addrs: &[SocketAddr]) -> Arc<[SocketAddr]> {
+    let stored: Arc<[SocketAddr]> = Arc::from(addrs);
     let Ok(mut cache) = RESOLVED.lock() else {
-        return;
+        return stored;
     };
     let entries = cache.get_or_insert_with(HashMap::new);
     if entries.len() >= RESOLVE_CACHE_CAP {
@@ -1710,9 +1711,10 @@ fn remember_lookup(host: &str, port: u16, addrs: &[SocketAddr]) {
         host.to_owned(),
         Resolved {
             at: Instant::now(),
-            addrs: addrs.to_vec(),
+            addrs: Arc::clone(&stored),
         },
     );
+    stored
 }
 
 /// A resolver has no deadline, so the flow waits its dial budget and a detached thread carries the lookup.
@@ -1748,10 +1750,9 @@ pub(crate) fn resolve_endpoint(host: &str, port: u16) -> Option<SocketAddr> {
                 .to_socket_addrs()
                 .map(std::iter::Iterator::collect)
         });
-        remember_lookup(host, port, &addrs);
-        addrs
+        remember_lookup(host, port, &addrs)
     });
-    addrs.into_iter().next()
+    addrs.first().copied()
 }
 
 fn mux_target_of(addr: SocketAddr) -> ferrox_core::mux::Target<'static> {
@@ -9778,8 +9779,7 @@ fn dns_lookup(name: &[u8]) -> ferrox_core::dns::Resolve {
                 .to_socket_addrs()
                 .map(std::iter::Iterator::collect)
         });
-        remember_lookup(host, 0, &addrs);
-        addrs
+        remember_lookup(host, 0, &addrs)
     });
     if addrs.is_empty() {
         return ferrox_core::dns::Resolve::AnsweredEmpty;
@@ -34030,6 +34030,20 @@ mod dns_lane_tests {
             panic!("a literal is a record list");
         };
         assert_eq!(rdata, vec![vec![192, 0, 2, 9]]);
+        assert_eq!(ttl, 300);
+        assert_eq!(counts.allocs, 2, "the record list and its one address");
+    }
+
+    /// A cached name answers from the refcounted entry: the record list and its one address, and no
+    /// copy of the cache's own vector.
+    #[test]
+    fn a_cached_lookup_answers_without_a_copy_of_the_cache() {
+        remember_lookup("cached.test", 0, &[SocketAddr::from(([192, 0, 2, 7], 0))]);
+        let (resolve, counts) = ferrox_core::alloc_count::measure(|| dns_lookup(b"cached.test."));
+        let ferrox_core::dns::Resolve::Records { rdata, ttl } = resolve else {
+            panic!("a cached name is a record list");
+        };
+        assert_eq!(rdata, vec![vec![192, 0, 2, 7]]);
         assert_eq!(ttl, 300);
         assert_eq!(counts.allocs, 2, "the record list and its one address");
     }
