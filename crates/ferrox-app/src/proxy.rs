@@ -9824,16 +9824,17 @@ enum DnsUpstream {
     Udp(UdpSocket),
 }
 
-/// One message the source network's own frame carries: a length-prefixed read on a stream, one recv on a socket.
-fn read_dns_source(stream: &mut Connection) -> Option<Vec<u8>> {
+/// One message the source network's own frame carries: a length-prefixed read into the caller's
+/// buffer — the lane reads every message into the one it already owns — and the message's span in it.
+fn read_dns_source<'a>(stream: &mut impl Read, body: &'a mut Vec<u8>) -> Option<&'a [u8]> {
     let mut head = [0u8; 2];
     stream.read_exact(&mut head).ok()?;
     let size = usize::from(u16::from_be_bytes(head));
     if size > ferrox_core::dns::MESSAGE_MAX {
         return None;
     }
-    let mut body = vec![0u8; size];
-    stream.read_exact(&mut body).ok()?;
+    body.resize(size, 0);
+    stream.read_exact(body).ok()?;
     Some(body)
 }
 
@@ -9966,10 +9967,11 @@ fn serve_dns_tcp(mut client: Connection, dns: &DnsOut, asked: &Destination) {
             };
             let mut sink = to_client;
             let mut back = udp_buffer();
+            let mut body = Vec::new();
             loop {
                 let wrote = match &mut reader {
-                    DnsUpstream::Tcp(stream) => match read_dns_source(stream) {
-                        Some(message) => write_dns_frame(&mut sink, &message),
+                    DnsUpstream::Tcp(stream) => match read_dns_source(stream, &mut body) {
+                        Some(message) => write_dns_frame(&mut sink, message),
                         None => return,
                     },
                     DnsUpstream::Udp(socket) => match socket.recv(&mut back) {
@@ -9986,8 +9988,9 @@ fn serve_dns_tcp(mut client: Connection, dns: &DnsOut, asked: &Destination) {
         return;
     };
     let mut lane: Option<DnsUpstream> = None;
-    while let Some(message) = read_dns_source(&mut client) {
-        match ferrox_core::dns::decide(&message, &dns.rules, &dns_lookup) {
+    let mut body = Vec::new();
+    while let Some(message) = read_dns_source(&mut client, &mut body) {
+        match ferrox_core::dns::decide(message, &dns.rules, &dns_lookup) {
             ferrox_core::dns::Step::Quiet => {}
             ferrox_core::dns::Step::Reply(answer) => {
                 if !write_dns_frame(&mut client, &answer) {
@@ -10013,7 +10016,7 @@ fn serve_dns_tcp(mut client: Connection, dns: &DnsOut, asked: &Destination) {
                 let Some(up) = lane.as_mut() else {
                     continue;
                 };
-                if !send_dns_query(up, &message) {
+                if !send_dns_query(up, message) {
                     return;
                 }
             }
@@ -10071,21 +10074,25 @@ fn serve_dns_udp(relay: &UdpSocket, dns: &DnsOut) {
                     .spawn(move || {
                         let mut to_up = reader;
                         let mut back = udp_buffer();
+                        let mut body = Vec::new();
                         let mut framed = Vec::with_capacity(HEAD + UDP_BUF);
                         loop {
                             let wrote = match &mut to_up {
-                                DnsUpstream::Tcp(stream) => match read_dns_source(stream) {
-                                    Some(message) => {
-                                        let out =
-                                            socks_udp_frame(&mut framed, None, &named, &message);
-                                        let Some(src) = peer.lock().ok().and_then(|slot| *slot)
-                                        else {
-                                            continue;
-                                        };
-                                        relay_write.send_to(out, src).is_ok()
+                                DnsUpstream::Tcp(stream) => {
+                                    match read_dns_source(stream, &mut body) {
+                                        Some(message) => {
+                                            let out = socks_udp_frame(
+                                                &mut framed, None, &named, message,
+                                            );
+                                            let Some(src) = peer.lock().ok().and_then(|slot| *slot)
+                                            else {
+                                                continue;
+                                            };
+                                            relay_write.send_to(out, src).is_ok()
+                                        }
+                                        None => false,
                                     }
-                                    None => false,
-                                },
+                                }
                                 DnsUpstream::Udp(socket) => match socket.recv(&mut back) {
                                     Ok(read) => {
                                         let out = socks_udp_frame(
@@ -34222,6 +34229,49 @@ mod dns_lane_tests {
         assert_eq!(rdata, vec![vec![192, 0, 2, 7]]);
         assert_eq!(ttl, 300);
         assert_eq!(counts.allocs, 2, "the record list and its one address");
+    }
+
+    /// The stream lane's framing read: eight framed messages cost one buffer, not one each, and the
+    /// buffer it reads them into neither moves nor grows for them.
+    #[test]
+    fn the_stream_lane_reads_every_message_into_one_buffer() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let stream = Connection::connect(("127.0.0.1", port)).expect("dials");
+        let (mut peer, _) = listener.accept().expect("accepts");
+        let frames: Vec<Vec<u8>> = (0..8)
+            .map(|n| dns_question(&format!("q{n}.test."), 1))
+            .collect();
+        let sent = frames.clone();
+        let writer = std::thread::spawn(move || {
+            for frame in &sent {
+                let head = (frame.len() as u16).to_be_bytes();
+                std::io::Write::write_all(&mut peer, &head).expect("the length leaves");
+                std::io::Write::write_all(&mut peer, frame).expect("the body leaves");
+            }
+        });
+        let mut stream = stream;
+        let mut body = Vec::new();
+        let (base, capacity, counts) = ferrox_core::alloc_count::measure(|| {
+            let mut base = 0usize;
+            let mut capacity = 0usize;
+            for (n, frame) in frames.iter().enumerate() {
+                let read = read_dns_source(&mut stream, &mut body).expect("a message");
+                assert_eq!(read, frame.as_slice());
+                if n == 0 {
+                    base = body.as_ptr() as usize;
+                    capacity = body.capacity();
+                }
+            }
+            (base, capacity)
+        });
+        writer.join().expect("the writer ends");
+        assert_eq!(
+            counts.allocs, 1,
+            "one buffer for the lane, not one per message"
+        );
+        assert_eq!(body.as_ptr() as usize, base, "the buffer never moves");
+        assert_eq!(body.capacity(), capacity, "nor grows for them");
     }
 
     #[test]
