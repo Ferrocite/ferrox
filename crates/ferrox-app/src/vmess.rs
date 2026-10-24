@@ -1454,136 +1454,268 @@ pub(crate) fn pump_relay_carried<R, W>(
     let _ = plain_write.shutdown(Shutdown::Both);
 }
 
+type Accepted = (SocketAddr, Flow, Flow, Vec<u8>, u8);
+type Close = std::sync::Arc<dyn Fn() + Send + Sync>;
+
+fn accept_request_bounded(reader: &mut dyn Read, id: &[u8; 16]) -> Option<Accepted> {
+    let mut bounded = crate::proxy::HandshakeDeadline {
+        inner: reader,
+        until: std::time::Instant::now() + crate::budgets::handshake(),
+    };
+    accept_request(&mut bounded, id)
+}
+
+fn serve_decoded<R, W>(
+    reader: R,
+    mut writer: W,
+    close: &Close,
+    decoded: Option<Accepted>,
+    freedom: bool,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    let Some((target, send, recv, prefix, cmd)) = decoded else {
+        close();
+        return;
+    };
+    if !freedom || !matches!(cmd, 1 | 2) {
+        close();
+        return;
+    }
+    match cmd {
+        1 => {
+            let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
+                close();
+                return;
+            };
+            if !write_prefix(&mut writer, &prefix) {
+                close();
+                return;
+            }
+            pump_relay_carried(&uplink, reader, writer, close, send, recv, None);
+        }
+        2 => serve_udp_carried(reader, writer, close, &target, &prefix, send, recv),
+        _ => {}
+    }
+}
+
+fn write_prefix<W: Write>(writer: &mut W, prefix: &[u8]) -> bool {
+    prefix.is_empty() || (writer.write_all(prefix).is_ok() && writer.flush().is_ok())
+}
+
+fn serve_udp_carried<R, W>(
+    reader: R,
+    mut writer: W,
+    close: &Close,
+    target: &SocketAddr,
+    prefix: &[u8],
+    send: Flow,
+    recv: Flow,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    let bind = if target.is_ipv6() {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    let Ok(udp) = UdpSocket::bind(bind) else {
+        close();
+        return;
+    };
+    if udp.connect(target).is_err() {
+        close();
+        return;
+    }
+    if !write_prefix(&mut writer, prefix) {
+        close();
+        return;
+    }
+    crate::proxy::pump_vmess_udp(reader, writer, close, &udp, send, recv);
+}
+
 pub(crate) fn serve_ws(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
     let Some((mut reader, writer)) = crate::ws::accept(stream, path) else {
         return;
     };
-    let Some((target, send, recv, prefix, cmd)) = accept_request(&mut reader, id) else {
-        return;
-    };
-    if !freedom || cmd != 1 {
-        return;
-    }
-    let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
-        return;
-    };
-    if !writer.send(&prefix) {
-        return;
-    }
+    let decoded = accept_request(&mut reader, id);
     let closer = writer.clone();
-    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
-    pump_relay_carried(
-        &uplink,
-        reader,
-        WsSink::carried(writer),
-        &close,
-        send,
-        recv,
-        None,
-    );
+    let close: Close = std::sync::Arc::new(move || closer.close());
+    serve_decoded(reader, WsSink::carried(writer), &close, decoded, freedom);
+}
+
+pub(crate) fn serve_ws_split<R, W>(
+    reader: R,
+    writer: W,
+    path: &str,
+    id: &[u8; 16],
+    freedom: bool,
+    close: &Close,
+) where
+    R: Read + Send + 'static,
+    W: crate::proxy::FrameWrite + Send + 'static,
+{
+    let Some((mut reader, writer)) = crate::ws::accept_split(reader, writer, path) else {
+        return;
+    };
+    let decoded = accept_request_bounded(&mut reader, id);
+    let closer = writer.clone();
+    let shutdown = std::sync::Arc::clone(close);
+    let close: Close = std::sync::Arc::new(move || {
+        closer.close();
+        shutdown();
+    });
+    serve_decoded(reader, WsSink::carried(writer), &close, decoded, freedom);
 }
 
 pub(crate) fn serve_grpc(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
     let Some((mut reader, writer)) = crate::grpc::accept(stream, path) else {
         return;
     };
-    let Some((target, send, recv, prefix, cmd)) =
-        under_handshake(&mut reader, |read| accept_request(read, id))
-    else {
-        return;
-    };
-    if !freedom || cmd != 1 {
-        return;
-    }
-    let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
-        return;
-    };
-    if !writer.send(&prefix) {
-        return;
-    }
+    let decoded = under_handshake(&mut reader, |read| accept_request(read, id));
     let closer = writer.clone();
-    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv, None);
+    let close: Close = std::sync::Arc::new(move || closer.close());
+    serve_decoded(reader, writer, &close, decoded, freedom);
+}
+
+pub(crate) fn serve_grpc_split<R, W>(
+    reader: R,
+    writer: W,
+    path: &str,
+    id: &[u8; 16],
+    freedom: bool,
+    close: &Close,
+) where
+    R: Read + Send + 'static,
+    W: crate::proxy::FrameWrite + Send + 'static,
+{
+    let Some((mut reader, writer)) = crate::grpc::accept_split(reader, writer, path) else {
+        return;
+    };
+    let decoded = accept_request_bounded(&mut reader, id);
+    let closer = writer.clone();
+    let shutdown = std::sync::Arc::clone(close);
+    let close: Close = std::sync::Arc::new(move || {
+        closer.close();
+        shutdown();
+    });
+    serve_decoded(reader, writer, &close, decoded, freedom);
 }
 
 pub(crate) fn serve_xhttp(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
     let Some((mut reader, writer)) = crate::xhttp::accept(stream, path) else {
         return;
     };
-    let Some((target, send, recv, prefix, cmd)) = accept_request(&mut reader, id) else {
-        return;
-    };
-    if !freedom || cmd != 1 {
-        return;
-    }
-    let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
-        return;
-    };
-    if !writer.send(&prefix) {
-        return;
-    }
+    let decoded = accept_request(&mut reader, id);
     let closer = writer.clone();
-    let close: std::sync::Arc<dyn Fn() + Send + Sync> =
-        std::sync::Arc::new(move || closer.finish());
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv, None);
+    let close: Close = std::sync::Arc::new(move || closer.finish());
+    serve_decoded(reader, writer, &close, decoded, freedom);
+}
+
+pub(crate) fn serve_xhttp_split<R, W>(
+    reader: R,
+    writer: W,
+    settings: &crate::xhttp::XhttpSettings,
+    id: &[u8; 16],
+    freedom: bool,
+    close: &Close,
+) where
+    R: Read + Send + 'static,
+    W: crate::proxy::FrameWrite + Send + 'static,
+{
+    let Some((mut reader, writer)) =
+        crate::xhttp::accept_split_with_settings(reader, writer, settings)
+    else {
+        return;
+    };
+    let decoded = accept_request_bounded(&mut reader, id);
+    let closer = writer.clone();
+    let shutdown = std::sync::Arc::clone(close);
+    let close: Close = std::sync::Arc::new(move || {
+        closer.finish();
+        shutdown();
+    });
+    serve_decoded(reader, writer, &close, decoded, freedom);
 }
 
 pub(crate) fn serve_httpheader(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
     let Some((mut reader, write)) = crate::httpheader::accept(stream, path) else {
         return;
     };
-    let Some((target, send, recv, prefix, cmd)) = accept_request(&mut reader, id) else {
-        return;
-    };
-    if !freedom || cmd != 1 {
-        return;
-    }
-    let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
-        return;
-    };
-    let Ok(down) = write.try_clone() else {
-        return;
-    };
-    let mut down = down;
-    if down.write_all(&prefix).is_err() {
-        return;
-    }
+    let decoded = accept_request(&mut reader, id);
     let Ok(closer) = write.try_clone() else {
         return;
     };
-    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+    let close: Close = std::sync::Arc::new(move || {
         let _ = closer.shutdown(Shutdown::Both);
     });
-    pump_relay_carried(&uplink, reader, write, &close, send, recv, None);
+    serve_decoded(reader, write, &close, decoded, freedom);
+}
+
+pub(crate) fn serve_httpheader_split<R, W>(
+    reader: R,
+    writer: W,
+    path: &str,
+    id: &[u8; 16],
+    freedom: bool,
+    close: &Close,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    let Some((mut reader, writer)) = crate::httpheader::accept_split(reader, writer, path) else {
+        return;
+    };
+    let decoded = accept_request_bounded(&mut reader, id);
+    serve_decoded(reader, writer, close, decoded, freedom);
 }
 
 pub(crate) fn serve_httpupgrade(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
     let Some((mut reader, write)) = crate::httpupgrade::accept(stream, path) else {
         return;
     };
-    let Some((target, send, recv, prefix, cmd)) = accept_request(&mut reader, id) else {
-        return;
-    };
-    if !freedom || cmd != 1 {
-        return;
-    }
-    let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
-        return;
-    };
-    let Ok(down) = write.try_clone() else {
-        return;
-    };
-    let mut down = down;
-    if down.write_all(&prefix).is_err() {
-        return;
-    }
+    let decoded = accept_request(&mut reader, id);
     let Ok(closer) = write.try_clone() else {
         return;
     };
-    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+    let close: Close = std::sync::Arc::new(move || {
         let _ = closer.shutdown(Shutdown::Both);
     });
-    pump_relay_carried(&uplink, reader, write, &close, send, recv, None);
+    serve_decoded(reader, write, &close, decoded, freedom);
+}
+
+pub(crate) fn serve_httpupgrade_split<R, W>(
+    reader: R,
+    writer: W,
+    path: &str,
+    id: &[u8; 16],
+    freedom: bool,
+    close: &Close,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    let Some((mut reader, writer)) = crate::httpupgrade::accept_split(reader, writer, path) else {
+        return;
+    };
+    let decoded = accept_request_bounded(&mut reader, id);
+    serve_decoded(reader, writer, close, decoded, freedom);
+}
+
+pub(crate) fn serve_raw_split<R, W>(
+    mut reader: R,
+    writer: W,
+    id: &[u8; 16],
+    freedom: bool,
+    close: &Close,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    let decoded = accept_request_bounded(&mut reader, id);
+    serve_decoded(reader, writer, close, decoded, freedom);
 }
 
 pub(crate) fn serve_kcp<R, W>(
@@ -1645,7 +1777,7 @@ pub(crate) fn serve(mut stream: Connection, id: &[u8; 16], freedom: bool) {
 }
 
 pub(crate) fn serve_vmess_udp(
-    stream: Connection,
+    mut stream: Connection,
     target: &SocketAddr,
     send: Flow,
     recv: Flow,
@@ -1662,11 +1794,19 @@ pub(crate) fn serve_vmess_udp(
     if udp.connect(target).is_err() {
         return;
     }
-    let mut stream = stream;
     if stream.write_all(prefix).is_err() {
         return;
     }
-    crate::proxy::pump_vmess_udp(&stream, &udp, send, recv);
+    let Ok(reader) = stream.try_clone() else {
+        return;
+    };
+    let Ok(closer) = stream.try_clone() else {
+        return;
+    };
+    let close: Close = std::sync::Arc::new(move || {
+        let _ = closer.shutdown(Shutdown::Both);
+    });
+    crate::proxy::pump_vmess_udp(reader, stream, &close, &udp, send, recv);
 }
 
 pub(crate) type PendingResponse = ([u8; 16], [u8; 16], u8);
