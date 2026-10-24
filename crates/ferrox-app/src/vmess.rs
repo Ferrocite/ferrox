@@ -2385,6 +2385,16 @@ mod tests {
         #[derive(Clone, Default)]
         struct Seen(std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>>);
 
+        impl std::io::Write for Seen {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                Ok(data.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
         impl crate::proxy::FrameWrite for Seen {
             fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
                 let payload = parts.get(1).copied().unwrap_or(&[]);
@@ -2444,6 +2454,16 @@ mod tests {
     #[test]
     fn a_web_socket_carrier_opens_no_batch_buffer() {
         struct NoWrite;
+
+        impl std::io::Write for NoWrite {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                Ok(data.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
 
         impl crate::proxy::FrameWrite for NoWrite {
             fn write_slices(&mut self, _parts: &[&[u8]]) -> bool {
