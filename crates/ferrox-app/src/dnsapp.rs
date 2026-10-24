@@ -248,6 +248,7 @@ impl Resolver {
             .map(str::to_owned);
         warn_unsupported(dns);
         let mut assets = Assets::new(asset_dirs());
+        let mut policies = PolicyIds::default();
         let mut servers = Vec::new();
         if let Some(list) = dns.get("servers").and_then(Json::as_arr) {
             for item in list {
@@ -260,6 +261,7 @@ impl Resolver {
                     serve_expired,
                     tag.as_deref(),
                     &mut assets,
+                    &mut policies,
                 )?);
             }
         }
@@ -453,8 +455,8 @@ impl Resolver {
             .unwrap_or(if empty { Lookup::Empty } else { Lookup::Failed })
     }
 
-    /// One group races its servers and the next group starts only when this one answered nothing.
-    /// The reference groups adjacent servers by `policyID`; a group's first non-empty answer wins.
+    /// Every group starts together; one group's answer wins and the next group is consulted
+    /// only when every server before it failed. The reference groups adjacent servers by `policyID`.
     #[allow(clippy::fn_params_excessive_bools)]
     fn ask_parallel(
         self: &Arc<Self>,
@@ -465,37 +467,51 @@ impl Resolver {
         fake_enabled: bool,
         force_local: bool,
     ) -> Lookup {
+        let (sender, receiver) = mpsc::channel();
+        for (slot, &index) in order.iter().enumerate() {
+            let resolver = Arc::clone(self);
+            let name = name.to_owned();
+            let sender = sender.clone();
+            thread::spawn(move || {
+                let result = resolver.query_server(index, &name, v4, v6, fake_enabled, force_local);
+                let _ = sender.send((slot, result));
+            });
+        }
+        drop(sender);
+        let mut results: Vec<Option<Lookup>> = (0..order.len()).map(|_| None).collect();
         let mut last_rcode = None;
         let mut empty = false;
         let mut start = 0;
         while start < order.len() {
-            let policy = self.servers[order[start]].policy_id;
             let mut end = start + 1;
-            while end < order.len() && self.servers[order[end]].policy_id == policy {
+            while end < order.len()
+                && self.servers[order[end]].policy_id == self.servers[order[start]].policy_id
+            {
                 end += 1;
             }
-            let (sender, receiver) = mpsc::channel();
-            for &index in &order[start..end] {
-                let resolver = Arc::clone(self);
-                let name = name.to_owned();
-                let sender = sender.clone();
-                thread::spawn(move || {
-                    let result =
-                        resolver.query_server(index, &name, v4, v6, fake_enabled, force_local);
-                    let _ = sender.send(result);
-                });
-            }
-            drop(sender);
-            for _ in start..end {
-                let Ok(result) = receiver.recv() else {
-                    break;
-                };
-                match result {
-                    Lookup::Records(ips, ttl) if !ips.is_empty() => {
+            loop {
+                if let Some(slot) = (start..end).find(|&slot| {
+                    matches!(
+                        results[slot].as_ref(),
+                        Some(Lookup::Records(ips, _)) if !ips.is_empty()
+                    )
+                }) {
+                    if let Some(Lookup::Records(ips, ttl)) = results[slot].take() {
                         return Lookup::Records(ips, ttl);
                     }
+                }
+                if results[start..end].iter().all(Option::is_some) {
+                    break;
+                }
+                let Ok((slot, result)) = receiver.recv() else {
+                    break;
+                };
+                results[slot] = Some(result);
+            }
+            for result in results[start..end].iter().flatten() {
+                match result {
                     Lookup::Records(_, _) | Lookup::Empty => empty = true,
-                    Lookup::Rcode(code) => last_rcode = Some(code),
+                    Lookup::Rcode(code) => last_rcode = Some(*code),
                     Lookup::Failed => {}
                 }
             }
@@ -980,6 +996,7 @@ fn parse_server(
     serve_expired: Duration,
     default_tag: Option<&str>,
     assets: &mut Assets,
+    policies: &mut PolicyIds,
 ) -> Result<Server, String> {
     let (
         address,
@@ -1001,7 +1018,7 @@ fn parse_server(
             None,
             false,
             false,
-            0,
+            policies.get(item),
             strategy,
             client_ip,
             DEFAULT_TIMEOUT,
@@ -1024,7 +1041,9 @@ fn parse_server(
                 item.get("finalQuery")
                     .and_then(Json::as_bool)
                     .unwrap_or(false),
-                item.get("policyID").and_then(Json::as_u32).unwrap_or(0),
+                item.get("policyID")
+                    .and_then(Json::as_u32)
+                    .unwrap_or_else(|| policies.get(item)),
                 parse_strategy(item.get("queryStrategy").and_then(Json::as_str)),
                 parse_ip(item.get("clientIp").and_then(Json::as_str))?.or(client_ip),
                 Duration::from_millis(
@@ -1089,6 +1108,83 @@ fn parse_server(
         v6: own_v6 && global_v6,
         req_id: AtomicU16::new(0),
     })
+}
+
+#[derive(Default)]
+struct PolicyIds {
+    ids: HashMap<String, u32>,
+    next: u32,
+}
+
+impl PolicyIds {
+    /// The reference groups servers whose policy fields agree, in first-seen order starting at 1.
+    fn get(&mut self, item: &Json) -> u32 {
+        let mut key = String::new();
+        key.push_str("client=");
+        key.push_str(
+            item.get("clientIp")
+                .and_then(Json::as_str)
+                .unwrap_or("none")
+                .trim(),
+        );
+        key.push_str(if flag(item, "skipFallback") {
+            "|skip=1|"
+        } else {
+            "|skip=0|"
+        });
+        key.push_str("qs=");
+        key.push_str(
+            &item
+                .get("queryStrategy")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase(),
+        );
+        key.push_str("|tag=");
+        key.push_str(
+            &item
+                .get("tag")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase(),
+        );
+        for (name, value) in [
+            ("domains", item.get("domains")),
+            ("expected", item.get("expectedIPs")),
+            ("expect", item.get("expectIPs")),
+            ("unexpected", item.get("unexpectedIPs")),
+        ] {
+            key.push('|');
+            key.push_str(name);
+            key.push('=');
+            let mut list: Vec<String> = match value {
+                Some(Json::Str(text)) => text
+                    .split(',')
+                    .map(|part| part.trim().to_ascii_lowercase())
+                    .collect(),
+                Some(Json::Arr(items)) => items
+                    .iter()
+                    .filter_map(Json::as_str)
+                    .map(|part| part.trim().to_ascii_lowercase())
+                    .collect(),
+                _ => Vec::new(),
+            };
+            list.sort();
+            if list.is_empty() {
+                key.push_str("[]");
+            } else {
+                key.push_str(&list.join(","));
+            }
+        }
+        if let Some(id) = self.ids.get(&key) {
+            return *id;
+        }
+        self.next += 1;
+        self.ids.insert(key, self.next);
+        self.next
+    }
 }
 
 type AddressParts = (Transport, Option<Endpoint>, String, bool, bool);
@@ -1872,6 +1968,28 @@ mod resolver_tests {
             resolver.lookup("example.com"),
             Some((vec!["192.0.2.1".parse().unwrap()], 60))
         );
+    }
+
+    #[test]
+    fn a_json_policy_is_the_reference_key() {
+        let resolver = Arc::new(
+            Resolver::from_root(&root(
+                r#"{"dns":{"servers":[
+                    {"address":"udp://192.0.2.1","tag":"same"},
+                    {"address":"udp://192.0.2.2","tag":"same"},
+                    {"address":"udp://192.0.2.3","tag":"other"},
+                    "udp://192.0.2.4"
+                ]}}"#,
+            ))
+            .expect("resolver")
+            .expect("configured"),
+        );
+        let ids: Vec<u32> = resolver
+            .servers
+            .iter()
+            .map(|server| server.policy_id)
+            .collect();
+        assert_eq!(ids, [1, 1, 2, 3]);
     }
 
     #[test]
