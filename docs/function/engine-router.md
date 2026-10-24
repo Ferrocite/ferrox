@@ -1,6 +1,6 @@
 # Routing rules and the geosite/geoip assets
 
-A rule is a set of selectors that must all hold, and one outbound tag the first match decides. The default is the first configured outbound — the reference's `defaultHandler`, tag or no tag — so a config that adds `routing` moves unmatched flows to that entry rather than to the protocol priority this tree used before. Every tag a rule names is built once, at startup; a tag no outbound carries, an outbound this tree cannot dial, and a missing asset file or code are startup refusals named by the thing that is missing, never inert rules.
+A rule is a set of selectors that must all hold, and one outbound tag the first match decides. A rule may instead name a `balancerTag`: the balancer draws a candidate from the outbound tags its selector prefixes match, ordered by tag as the reference handler manager sorts them, with `random` when no strategy is given and an atomic counter for `roundRobin`. `leastPing` and `leastLoad` need the health observatory this tree does not carry, so they pick nothing and the `fallbackTag`, then the default outbound, answers exactly as the reference does without observations. A duplicate balancer tag, an unknown strategy, a selector that is not a list, and a rule naming a balancer no entry defines are startup refusals named by the offending field. When a rule names both an outbound tag and a balancer, the outbound wins, as the reference's selector does. The default is the first configured outbound — the reference's `defaultHandler`, tag or no tag — so a config that adds `routing` moves unmatched flows to that entry rather than to the protocol priority this tree used before. Every tag a rule names is built once, at startup; a tag no outbound carries, an outbound this tree cannot dial, and a missing asset file or code are startup refusals named by the thing that is missing, never inert rules.
 
 The asset containers are xray's protobuf `GeoSiteList` and `GeoIPList`, decoded here with the same field walk the rest of the tree uses for xray's wire form. On Unix a container is read into an anonymous mapping rather than a heap buffer and unmapped when the parse ends, so a real `geoip.dat` is resident during startup, not for the life of the process; elsewhere it is a heap buffer. `geosite:CODE@attr@attr` keeps only the domains that carry **all** listed attributes; codes are compared case-insensitively and attributes are lowercased as the reference does. For addresses, a leading `!` on a rule toggles that rule's own reverse flag, twice toggles it back, and the positive and negative subsets OR together. A family that the negative set never names is not matched by its reverse — the reference's `max4`/`max6` sentinel — so a v4-only `!geoip:test` does not match a v6 address.
 
@@ -25,7 +25,8 @@ graph TD
     D --> O
     U["SOCKS UDP association"] --> Q{"every reachable rule before the first stable one agrees?"}
     Q -- yes --> O
-    Q -- no --> X["reply 0x07 before the relay binds"]
+    Q -- no --> W["split: one lane per datagram's tag"]
+    W --> O
     V["server inbound"] --> G["startup proof: every reachable rule and the fallback are freedom"]
 ```
 
@@ -41,7 +42,7 @@ A server inbound in this tree dials direct whatever the rules say. Rather than i
 
 A `tun` flow has no source or local address the rules could read. If any rule that could reach the tun tag names `source`, `sourcePort`, `localIP` or `localPort`, the config is refused naming that selector instead of letting the rule silently never match.
 
-A SOCKS UDP association carries one lane, but its datagrams each name their own destination. The association decision is made with `network=udp` and no target: a per-destination rule that could split it is a refusal (`0x07`, command not supported) written before the relay binds, with one log line. A rule that matches every datagram on the association may fix its lane; when all such rules agree with the fallback the association rides it. Per-destination datagram routing is not carried.
+A SOCKS UDP association whose reachable rules agree on one tag rides that tag's lane. When a per-destination selector (a domain, an address, a port) could send datagrams of the same association to different tags, the association is split: the outer relay asks the rules for each datagram's destination and forwards the frame to a lane, one per chosen tag, spawned on first use and reaped when its loop ends. A datagram whose destination picks a blackhole is dropped without opening a lane; a lane's replies travel back through the outer relay to the client. A rule that matches every datagram on the association still fixes a single lane, when all such rules agree with the fallback.
 
 ## Measured
 
@@ -81,6 +82,7 @@ No duration is claimed here. Benchmarks are CI-only in this tree, and the pinned
 | rule shape, first match, default handler, `IpOnDemand`/`IpIfNonMatch` | `upstream/xray-core/app/router/{config.proto,config.go,condition.go,router.go}`, `upstream/xray-core/infra/conf/router.go` |
 | geosite/geoip containers, attributes, reverse semantics, invalid-entry skipping | `upstream/xray-core/common/geodata/{geodat.proto,rule_parser.go,geodat_loader.go,ip_matcher.go,domain_matcher.go,ip_registry.go}` |
 | asset location and file checks | `upstream/xray-core/common/platform/{platform.go,others.go,filesystem/file.go}` |
+| balancers, selector prefixes, strategy shapes, fallback | `upstream/xray-core/app/router/{config.proto,config.go,balancing.go,strategy_random.go,strategy_leastping.go,strategy_leastload.go}`, `upstream/xray-core/infra/conf/router.go` |
 | same-language reference | `upstream/zeronet/crates/zero-router/src/{router.rs,matcher.rs,assets.rs}` |
 
 ## CI scope
