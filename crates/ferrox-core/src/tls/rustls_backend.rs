@@ -250,7 +250,7 @@ struct MaterialKey {
     roots: crate::tls::Anchors,
     pins: crate::foxy::pin::Pins,
     cert_pins: Arc<[[u8; 32]]>,
-    cipher_suites: Vec<u16>,
+    cipher_suites: std::sync::Arc<[u16]>,
 }
 
 /// Two anchor lists name the same trust when one allocation answers for both, which is what sharing them by reference makes the ordinary case; comparing their bytes is a walk of every certificate the platform trusts, and only a set read twice can reach it.
@@ -273,7 +273,7 @@ impl MaterialKey {
             roots: Arc::clone(&cfg.roots),
             pins: cfg.pins.clone(),
             cert_pins: Arc::clone(&cfg.cert_pins),
-            cipher_suites: cfg.cipher_suites.clone(),
+            cipher_suites: Arc::clone(&cfg.cipher_suites),
         }
     }
 }
@@ -1535,7 +1535,7 @@ mod tests {
             roots: vec![ANCHOR.to_vec()].into(),
             pins: crate::foxy::pin::Pins::default(),
             cert_pins: std::sync::Arc::default(),
-            cipher_suites: Vec::new(),
+            cipher_suites: std::sync::Arc::default(),
             insecure: false,
             fingerprint: None,
             ech_config_list: None,
@@ -1722,7 +1722,7 @@ mod tests {
             true,
         );
         let mut cfg = client("tls.test", &[]);
-        cfg.cipher_suites = crafted;
+        cfg.cipher_suites = crafted.into();
         let config = client_config(&cfg).expect("builds");
         let mut conn = rustls::ClientConnection::new(
             config,
@@ -2388,7 +2388,7 @@ mod tests {
         );
 
         let mut reordered = client("one.test", &[b"test-only"]);
-        reordered.cipher_suites = vec![0x1302];
+        reordered.cipher_suites = vec![0x1302].into();
         let other_order = material(&reordered).expect("builds");
         assert!(
             !Arc::ptr_eq(&built, &other_order),
@@ -2401,6 +2401,21 @@ mod tests {
         assert!(
             !Arc::ptr_eq(&built, &empty),
             "a dial that names no anchor stores a different store"
+        );
+    }
+
+    /// A repeat dial asks the config cache with the suite order it already named: the key must share that list rather than copy it, so a hit costs no heap buffer.
+    #[test]
+    fn a_repeat_dial_keys_the_config_without_copying_the_suite_order() {
+        let mut cfg = client("one.test", &[b"test-only"]);
+        cfg.cipher_suites = vec![0x1302, 0x1301, 0x1303].into();
+        let first = client_config(&cfg).expect("first config builds");
+        let (again, counts) =
+            crate::alloc_count::measure(|| client_config(&cfg).expect("repeat config builds"));
+        assert!(Arc::ptr_eq(&first, &again), "the repeat dial hit the cache");
+        assert_eq!(
+            counts.allocs, 0,
+            "the key shares the suite order: {counts:?}"
         );
     }
 

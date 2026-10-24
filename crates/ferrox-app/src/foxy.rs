@@ -326,7 +326,7 @@ fn tls_config(dial: &FoxyDial) -> ferrox_core::tls::TlsConfig {
         roots: Arc::clone(&dial.roots),
         pins: dial.pins.clone(),
         cert_pins: std::sync::Arc::from(Vec::new()),
-        cipher_suites: Vec::new(),
+        cipher_suites: std::sync::Arc::default(),
         insecure: false,
         fingerprint: None,
         ech_config_list: None,

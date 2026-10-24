@@ -905,7 +905,7 @@ pub(crate) fn outbound_tls(
         roots,
         pins: ferrox_core::foxy::pin::Pins::default(),
         cert_pins: std::sync::Arc::from(cert_pins),
-        cipher_suites: tls_cipher_suites(tls),
+        cipher_suites: tls_cipher_suites(tls).into(),
         insecure,
         fingerprint: Some(fingerprint),
         ech_config_list,
