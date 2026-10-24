@@ -454,6 +454,8 @@ fn valid_auth_id(key: &AuthKey, auth_id: &[u8; 16]) -> bool {
 struct Shake {
     reader: shake::Shake128Reader,
     padding: bool,
+    bytes: [u8; 64],
+    at: usize,
 }
 
 impl Shake {
@@ -464,12 +466,21 @@ impl Shake {
         Self {
             reader: shake.finalize_xof(),
             padding,
+            bytes: [0u8; 64],
+            at: 64,
         }
     }
+    fn refill(&mut self) {
+        sha3::digest::XofReader::read(&mut self.reader, &mut self.bytes);
+        self.at = 0;
+    }
     fn draw(&mut self) -> u16 {
-        let mut buf = [0u8; 2];
-        sha3::digest::XofReader::read(&mut self.reader, &mut buf);
-        u16::from_be_bytes(buf)
+        if self.at + 2 > self.bytes.len() {
+            self.refill();
+        }
+        let bytes = [self.bytes[self.at], self.bytes[self.at + 1]];
+        self.at += 2;
+        u16::from_be_bytes(bytes)
     }
     #[cfg(test)]
     fn pad_len(&mut self) -> u16 {
@@ -481,10 +492,13 @@ impl Shake {
     }
     fn pad_and_mask(&mut self, wire: u16) -> (usize, u16) {
         if self.padding {
-            let mut buf = [0u8; 4];
-            sha3::digest::XofReader::read(&mut self.reader, &mut buf);
-            let pad = usize::from(u16::from_be_bytes([buf[0], buf[1]]) % 64);
-            let mask = u16::from_be_bytes([buf[2], buf[3]]);
+            if self.at + 4 > self.bytes.len() {
+                self.refill();
+            }
+            let bytes = &self.bytes[self.at..self.at + 4];
+            let pad = usize::from(u16::from_be_bytes([bytes[0], bytes[1]]) % 64);
+            let mask = u16::from_be_bytes([bytes[2], bytes[3]]);
+            self.at += 4;
             (pad, mask ^ wire)
         } else {
             (0, self.draw() ^ wire)
@@ -492,12 +506,16 @@ impl Shake {
     }
     fn draws(&mut self) -> (u16, u16) {
         if self.padding {
-            let mut buf = [0u8; 4];
-            sha3::digest::XofReader::read(&mut self.reader, &mut buf);
-            (
-                u16::from_be_bytes([buf[0], buf[1]]),
-                u16::from_be_bytes([buf[2], buf[3]]),
-            )
+            if self.at + 4 > self.bytes.len() {
+                self.refill();
+            }
+            let bytes = &self.bytes[self.at..self.at + 4];
+            let draws = (
+                u16::from_be_bytes([bytes[0], bytes[1]]),
+                u16::from_be_bytes([bytes[2], bytes[3]]),
+            );
+            self.at += 4;
+            draws
         } else {
             (0, self.draw())
         }
@@ -2714,6 +2732,35 @@ mod tests {
                 0xcd, 0x45, 0x4e, 0x47, 0x98, 0x8d, 0x4a, 0xf9, 0x11, 0xd7,
             ]
         );
+    }
+
+    #[test]
+    fn batched_draws_keep_the_reference_stream() {
+        use sha3::digest::{ExtendableOutput as _, Update as _, XofReader as _};
+        let iv = [0x4du8; 16];
+        for padding in [false, true] {
+            let mut raw = shake::Shake128::default();
+            raw.update(&iv);
+            let mut raw = raw.finalize_xof();
+            let mut wrapped = Shake::fresh(&iv, padding);
+            for _ in 0..200 {
+                if padding {
+                    let mut want = [0u8; 4];
+                    raw.read(&mut want);
+                    assert_eq!(
+                        wrapped.draws(),
+                        (
+                            u16::from_be_bytes([want[0], want[1]]),
+                            u16::from_be_bytes([want[2], want[3]])
+                        )
+                    );
+                } else {
+                    let mut want = [0u8; 2];
+                    raw.read(&mut want);
+                    assert_eq!(wrapped.draws(), (0, u16::from_be_bytes(want)));
+                }
+            }
+        }
     }
 
     #[test]
