@@ -654,4 +654,38 @@ mod tests {
         // One label byte more: 255 bytes, refused.
         assert!(parse_query(&build(39)).is_none());
     }
+
+    /// The decide probe: a direct forward its domains rule names, a rule
+    /// return, two hijacks the lookup answers, and a malformed name, walked
+    /// 4096 times, so the frame the count harness reads is the method and
+    /// not the caller that inlined it.
+    #[test]
+    fn the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else() {
+        let messages = [
+            query(0x1234, "example.com.", 1),
+            query(0x1234, "mil.example.", 28),
+            query(0x1234, "blocked.example.", 1),
+            query(0x1234, "example.com.", 28),
+        ];
+        let rules = vec![
+            rule("*/blocked.example/return/1"),
+            rule("*/example.com/direct/-"),
+        ];
+        let resolve = canned("v4:192.0.2.9");
+        let broken = unhex("00010100000100000000000001610000010001");
+        let mut answer = 0usize;
+        for _ in 0..4096 {
+            let lookup = |_: &[u8]| resolve.clone();
+            for message in &messages {
+                if let Step::Reply(reply) = decide(message, &rules, &lookup) {
+                    answer += reply.len();
+                }
+            }
+            if let Step::Reply(reply) = decide(&broken, &rules, &lookup) {
+                answer += reply.len();
+            }
+        }
+        std::hint::black_box(answer);
+        assert!(answer > 0, "the probe decided nothing");
+    }
 }
