@@ -1733,7 +1733,7 @@ fn vless_raw_reply<D>(
         if stream.write_all(&[0, 0]).is_err() {
             return;
         }
-        return serve_vless_mux_with(stream, dial, carried);
+        return serve_vless_mux_with(stream, dial, &carried);
     }
     if cmd != 1 {
         // The reference's decoder refuses a command past the id without falling back.
@@ -1788,18 +1788,19 @@ fn probe_front(
         return (Probe::Refused, n, Vec::new());
     }
     let mut carried = Vec::new();
-    let mut replay = Prefixed {
-        head: &first[..n],
-        at: 0,
-        tail: &mut bounded,
-        carried: &mut carried,
+    let (probe, consumed) = {
+        let mut replay = Prefixed {
+            head: &first[..n],
+            at: 0,
+            tail: &mut bounded,
+            carried: &mut carried,
+        };
+        let probe = match decode_request(&mut replay) {
+            Some(header) => Probe::Decoded(header),
+            None => Probe::Dropped,
+        };
+        (probe, replay.at)
     };
-    let probe = match decode_request(&mut replay) {
-        Some(header) => Probe::Decoded(header),
-        None => Probe::Dropped,
-    };
-    let consumed = replay.at;
-    drop(replay);
     if consumed < n {
         let mut rest = Vec::with_capacity(n - consumed + carried.len());
         rest.extend_from_slice(&first[consumed..n]);
@@ -2401,7 +2402,7 @@ fn remove_mux_session(
     send_mux_end(shared, staging, id);
 }
 
-fn serve_vless_mux_with<D>(stream: Connection, dial: D, carried: Vec<u8>)
+fn serve_vless_mux_with<D>(stream: Connection, dial: D, carried: &[u8])
 where
     D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
 {
@@ -2422,7 +2423,7 @@ where
     let mut global: UdpGlobal = HashMap::new();
     let mut handles: Vec<RelayEnd> = Vec::new();
     let mut buf: Vec<u8> = Vec::with_capacity(READ_SLICE.max(carried.len()));
-    buf.extend_from_slice(&carried);
+    buf.extend_from_slice(carried);
     let mut at = 0;
     let mut staging = Vec::with_capacity(8192);
     loop {
