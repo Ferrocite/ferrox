@@ -665,6 +665,7 @@ dns-outbound maximum-name-bytes 254 ferrox-core-dns::tests::the_name_bound_match
 dns-outbound allocations-per-forwarded-question 0 ferrox-core-dns::tests::a_forwarded_question_is_decided_without_an_allocation
 dns-outbound allocations-per-hijacked-question 1 ferrox-core-dns::tests::a_hijacked_question_opens_only_its_answer
 dns-outbound allocations-per-literal-lookup 2 ferrox-app-proxy::dns_lane_tests::a_literal_lookup_answers_without_a_socket_addr_buffer
+dns-outbound allocations-per-cached-lookup 2 ferrox-app-proxy::dns_lane_tests::a_cached_lookup_answers_without_a_copy_of_the_cache
 dns-outbound stream-answer-bytes-per-query 38 ferrox-app-proxy::dns_lane_tests::the_dns_stream_lane_relays_a_direct_query_byte_for_byte
 dns-outbound datagram-query-bytes-per-datagram 43 ferrox-app-proxy::dns_lane_tests::the_dns_datagram_lane_relays_a_direct_datagram_byte_for_byte
 dns-outbound datagram-answer-bytes-per-datagram 58 ferrox-app-proxy::dns_lane_tests::the_dns_datagram_lane_relays_a_direct_datagram_byte_for_byte
