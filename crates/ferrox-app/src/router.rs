@@ -1875,6 +1875,11 @@ fn geoip_cidr(bytes: &[u8]) -> Result<Option<(IpAddr, u32)>, String> {
 
 fn resolve_ips(host: &str, port: u16) -> Vec<IpAddr> {
     use std::net::ToSocketAddrs;
+    if let Some(resolver) = crate::dnsapp::installed() {
+        if let Some((ips, _)) = resolver.lookup(host) {
+            return ips;
+        }
+    }
     (host, port)
         .to_socket_addrs()
         .map(|addrs| addrs.map(|addr| addr.ip()).collect())
