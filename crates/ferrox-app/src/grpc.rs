@@ -2048,6 +2048,40 @@ mod tests {
         while reader.read(&mut buf).unwrap_or(0) != 0 {}
     }
 
+    /// A hunk is one frame: the envelope and the payload its length announces fit the DATA frame
+    /// the peer advertised, so a peer parses the message where it landed instead of reassembling it
+    /// from a frame of its own. The reference's client reassembles every message that crosses one.
+    #[test]
+    fn a_hunk_fits_the_frame_that_carries_it() {
+        let data: Vec<u8> = (0..4 * HUNK).map(|i| (i % 251) as u8).collect();
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, u64::MAX);
+        assert!(writer.send(&data));
+        let wire = peer.lock().unwrap().writes.concat();
+        let mut at = 0;
+        let mut frames = 0;
+        let mut got = Vec::new();
+        while at < wire.len() {
+            assert!(wire.len() - at >= 9, "a frame head was cut short");
+            let len = usize::from(wire[at]) << 16
+                | usize::from(wire[at + 1]) << 8
+                | usize::from(wire[at + 2]);
+            assert_eq!(wire[at + 3], T_DATA, "only DATA frames carry a hunk");
+            assert!(wire.len() - at - 9 >= len, "a frame body was cut short");
+            let body = &wire[at + 9..at + 9 + len];
+            assert!(body.len() >= 5, "a DATA frame opens no message");
+            let announced = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
+            assert_eq!(announced + 5, body.len(), "a hunk crossed a frame boundary");
+            let (_, payload) = hunk_decode(&body[5..]).expect("the hunk decodes");
+            got.extend_from_slice(payload);
+            frames += 1;
+            at += 9 + len;
+        }
+        assert_eq!(at, wire.len(), "a frame was cut short");
+        assert_eq!(got, data, "the payload is unchanged");
+        assert_eq!(frames, 5, "64 KiB at 16 KiB frames is five hunks");
+    }
+
     #[test]
     fn tunnel_rejects_a_wrong_path() {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
