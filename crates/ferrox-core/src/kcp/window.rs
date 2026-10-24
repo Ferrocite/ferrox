@@ -26,8 +26,6 @@ struct Outgoing {
 pub struct SendingWindow {
     cache: VecDeque<Outgoing>,
     arena: Vec<u8>,
-    /// Bytes at the front of `arena` that no cached segment refers to any more.
-    base: usize,
     total_in_flight: u32,
 }
 
@@ -70,34 +68,25 @@ impl SendingWindow {
     /// Drops the arena prefix no cached segment points into, once it is at least
     /// half the arena, so trimming is amortised rather than per segment.
     fn trim(&mut self) {
-        // Nothing live means the whole arena is garbage, and that has to be checked before `base`: a window that is acknowledged down to empty between bursts has `base == 0` and would otherwise never reclaim.
-        if self.cache.is_empty() {
+        // The oldest live range ends the dead prefix, whether or not the cache reached empty between bursts.
+        let Some(front) = self.cache.front() else {
             self.arena.clear();
-            self.base = 0;
+            return;
+        };
+        let base = front.start;
+        if base == 0 || base * 2 < self.arena.len() {
             return;
         }
-        if self.base == 0 {
-            return;
-        }
-        if self.base * 2 < self.arena.len() {
-            return;
-        }
-        self.arena.drain(..self.base);
+        self.arena.drain(..base);
         for seg in &mut self.cache {
-            seg.start -= self.base;
-            seg.end -= self.base;
+            seg.start -= base;
+            seg.end -= base;
         }
-        self.base = 0;
     }
 
     #[must_use]
     pub fn arena_capacity(&self) -> usize {
         self.arena.capacity()
-    }
-
-    #[must_use]
-    pub fn arena_base(&self) -> usize {
-        self.base
     }
 
     #[must_use]
@@ -145,7 +134,6 @@ impl SendingWindow {
     pub fn release(&mut self) {
         self.cache.clear();
         self.arena.clear();
-        self.base = 0;
         self.total_in_flight = 0;
     }
 
