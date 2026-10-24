@@ -1261,6 +1261,7 @@ pub(crate) struct ShadowsocksOut {
     password: String,
     carrier: Carrier,
     host: String,
+    tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
 }
 
 fn accept_loop(address: &str, role: &Role) {
@@ -3909,6 +3910,21 @@ fn hysteria_dial_session(vless: &VlessOut) -> Option<crate::hysteria::Dial> {
     })
 }
 
+/// The session a KCP dial opens when the row's security is tls, shaken before any header is written.
+fn kcp_tls_connect(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    cfg: &ferrox_core::tls::TlsConfig,
+) -> Option<ferrox_core::tls::ClientSession<KcpIo>> {
+    let mut session = ferrox_core::tls::connect(
+        cfg,
+        KcpIo {
+            conn: Arc::clone(conn),
+        },
+    )
+    .ok()?;
+    shake_tls(&mut session).then_some(session)
+}
+
 /// KCP is the transport and the security rides it, as it does upstream: the session carries the header and both relay legs, not the connection.
 fn relay_kcp_under_tls(
     client: &Connection,
@@ -3917,15 +3933,10 @@ fn relay_kcp_under_tls(
     header: &[u8],
     ready: impl FnOnce(&mut ferrox_core::tls::ClientSession<KcpIo>) -> bool,
 ) {
-    let Ok(mut session) = ferrox_core::tls::connect(
-        cfg,
-        KcpIo {
-            conn: Arc::clone(conn),
-        },
-    ) else {
+    let Some(mut session) = kcp_tls_connect(conn, cfg) else {
         return;
     };
-    if !shake_tls(&mut session) || session.write_all(header).is_err() || !ready(&mut session) {
+    if session.write_all(header).is_err() || !ready(&mut session) {
         return;
     }
     let Ok(downstream) = client.try_clone() else {
@@ -4097,6 +4108,25 @@ fn dial_vmess_kcp(
     else {
         return;
     };
+    if let Some(cfg) = vmess.tls.as_deref() {
+        let Some(mut session) = kcp_tls_connect(conn, cfg) else {
+            return;
+        };
+        if session.write_all(&request).is_err()
+            || !crate::vmess::read_response(&mut session, &response_key, &response_iv, auth)
+        {
+            return;
+        }
+        let (reader, writer) = session_halves(
+            session,
+            KcpIo {
+                conn: Arc::clone(conn),
+            },
+        );
+        let close = kcp_close(conn);
+        crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv, None);
+        return;
+    }
     if conn.write(&request).is_err() {
         return;
     }
@@ -4110,12 +4140,58 @@ fn dial_vmess_kcp(
     crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv, None);
 }
 
+fn kcp_close(conn: &Arc<ferrox_core::kcp::Connection>) -> Arc<dyn Fn() + Send + Sync> {
+    let conn = Arc::clone(conn);
+    Arc::new(move || conn.close())
+}
+
 fn dial_ss_kcp(
     client: &Connection,
     conn: &Arc<ferrox_core::kcp::Connection>,
     ss: &ShadowsocksOut,
     target: &Destination,
 ) {
+    if let Some(cfg) = ss.tls.as_deref() {
+        let Some(mut session) = kcp_tls_connect(conn, cfg) else {
+            return;
+        };
+        if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
+            let Some((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+                &mut session,
+                &ss.password,
+                &ss.method,
+                target,
+            ) else {
+                return;
+            };
+            let (reader, writer) = session_halves(
+                session,
+                KcpIo {
+                    conn: Arc::clone(conn),
+                },
+            );
+            let close = kcp_close(conn);
+            crate::shadowsocks2022::pump_relay_carried(client, reader, writer, &close, send, recv);
+            return;
+        }
+        let Some((send, recv)) = crate::shadowsocks::client_send_handshake(
+            &mut session,
+            &ss.password,
+            &ss.method,
+            target,
+        ) else {
+            return;
+        };
+        let (reader, writer) = session_halves(
+            session,
+            KcpIo {
+                conn: Arc::clone(conn),
+            },
+        );
+        let close = kcp_close(conn);
+        crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
+        return;
+    }
     let mut writer = KcpIo {
         conn: Arc::clone(conn),
     };
@@ -4139,6 +4215,39 @@ fn dial_ss_kcp(
     };
     let (reader, _, close) = kcp_parts(conn);
     crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
+}
+
+fn serve_ss_kcp_tls(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    password: &str,
+    method: &str,
+    freedom: bool,
+    is_2022: bool,
+    server: &ferrox_core::tls::TlsServerConfig,
+) {
+    let Ok(mut tls) = ferrox_core::tls::accept(
+        server,
+        KcpIo {
+            conn: Arc::clone(conn),
+        },
+    ) else {
+        return;
+    };
+    if !shake_tls(&mut tls) {
+        return;
+    }
+    let (reader, writer) = session_halves(
+        tls,
+        KcpIo {
+            conn: Arc::clone(conn),
+        },
+    );
+    let close = kcp_close(conn);
+    if is_2022 {
+        crate::shadowsocks2022::serve_kcp(reader, writer, password, method, freedom, &close);
+    } else {
+        crate::shadowsocks::serve_kcp(reader, writer, password, method, freedom, &close);
+    }
 }
 
 /// The store this outbound's config names, opened as one session: an xdrive lane starts by announcing itself where the listener polls.
@@ -4736,18 +4845,30 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
     }
     match carrier {
         Carrier::Kcp(config) => {
-            let serve: KcpServe = Arc::new(move |conn| {
-                let (reader, writer, close) = kcp_parts(conn);
-                if is_2022 {
-                    crate::shadowsocks2022::serve_kcp(
-                        reader, writer, &password, &method, freedom, &close,
+            let serve: KcpServe = if stream_security(inbound) == "tls" {
+                let Some(server) = inbound_tls_identity(inbound) else {
+                    eprintln!(
+                        "unreadable shadowsocks tls identity on {address}: refused, not served"
                     );
-                } else {
-                    crate::shadowsocks::serve_kcp(
-                        reader, writer, &password, &method, freedom, &close,
-                    );
-                }
-            });
+                    return;
+                };
+                Arc::new(move |conn| {
+                    serve_ss_kcp_tls(conn, &password, &method, freedom, is_2022, &server)
+                })
+            } else {
+                Arc::new(move |conn| {
+                    let (reader, writer, close) = kcp_parts(conn);
+                    if is_2022 {
+                        crate::shadowsocks2022::serve_kcp(
+                            reader, writer, &password, &method, freedom, &close,
+                        );
+                    } else {
+                        crate::shadowsocks::serve_kcp(
+                            reader, writer, &password, &method, freedom, &close,
+                        );
+                    }
+                })
+            };
             let owned = address.to_owned();
             let _ = serve_kcp_bound(&owned, config, &serve);
         }
@@ -4758,6 +4879,11 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
                 serve_ss_xdrive(session, &password, &method, freedom, is_2022);
             });
             serve_xdrive_loop(&settings, address, accept);
+        }
+        // A carrier whose tls row this lane does not serve yet refuses it by name rather than answering plaintext.
+        _ if !matches!(stream_security(inbound), "" | "none") => {
+            let security = stream_security(inbound);
+            eprintln!("shadowsocks security `{security}` on {address}: refused, not served");
         }
         other => spawn_role(
             address,
@@ -13593,6 +13719,32 @@ fn outbound_refusal(outbound: &Json, protocol: &str) -> Option<String> {
                 if server.get("password").and_then(Json::as_str).is_none() {
                     return Some("no password in the server entry".to_owned());
                 }
+                let security = stream_security(outbound);
+                if !matches!(security, "" | "none") {
+                    let network = outbound
+                        .get("streamSettings")
+                        .and_then(|s| s.get("network"))
+                        .and_then(Json::as_str)
+                        .unwrap_or("tcp");
+                    // The store's lanes speak their own handshake, so a tls xdrive row builds here as find_shadowsocks_outbound builds it.
+                    match (security, network) {
+                        (_, "xdrive") => {}
+                        ("tls", "kcp") => {
+                            let address = server
+                                .get("address")
+                                .and_then(Json::as_str)
+                                .unwrap_or_default();
+                            if let Err(reason) = outbound_tls(outbound, address) {
+                                return Some(reason);
+                            }
+                        }
+                        (security, network) => {
+                            return Some(format!(
+                                "security `{security}` does not ride `{network}`"
+                            ));
+                        }
+                    }
+                }
             }
             if protocol == "socks" {
                 match settings
@@ -13910,6 +14062,7 @@ fn loopback_dial(
                 password: inbound_ss_password(inbound),
                 carrier,
                 host,
+                tls: None,
             }))
         }
         _ => Err(format!(
@@ -14561,7 +14714,30 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
         let port = server.get("port").and_then(Json::as_port)?;
         let method = server.get("method").and_then(Json::as_str)?.to_owned();
         let password = server.get("password").and_then(Json::as_str)?.to_owned();
+        // The store's own lanes speak the handshake, so a tls xdrive row adds no second one and keeps the row.
+        if let Some((carrier, host)) = xdrive_carried(outbound, &address) {
+            return Some(ShadowsocksOut {
+                address,
+                port,
+                method,
+                password,
+                carrier,
+                host,
+                tls: None,
+            });
+        }
         let (carrier, host) = outbound_carrier(outbound, &address);
+        let tls = match stream_security(outbound) {
+            "" | "none" => None,
+            // KCP carries the session above the connection, as the other protocols' rows do; every other carrier is refused until this lane dials it under tls.
+            "tls" if matches!(carrier, Carrier::Kcp(_)) => {
+                let Ok(tls) = outbound_tls(outbound, &address) else {
+                    continue;
+                };
+                Some(tls)
+            }
+            _ => continue,
+        };
         return Some(ShadowsocksOut {
             address,
             port,
@@ -14569,6 +14745,7 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
             password,
             carrier,
             host,
+            tls,
         });
     }
     None
@@ -21555,6 +21732,116 @@ mod tests {
         conn.close();
     }
 
+    /// The dial half of the same row: a shadowsocks outbound that declares tls writes its request inside the session, not ahead of it.
+    #[test]
+    fn a_shadowsocks_kcp_dial_under_tls_wraps_the_header_in_the_session() {
+        let _guard = budgets::lock();
+        let (cert, key, client) = tls_cert_json();
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "shadowsocks", "settings": {{"password": "an-example-shared-password", "method": "aes-256-gcm"}},
+                "streamSettings": {{"network": "kcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        serve_shadowsocks_inbound(&format!("127.0.0.1:{port}"), &inbound, true);
+        let ss = ShadowsocksOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            method: "aes-256-gcm".to_owned(),
+            password: "an-example-shared-password".to_owned(),
+            carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            host: "127.0.0.1".to_owned(),
+            tls: Some(client),
+        };
+        let conn = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        let echo_port = echo_loop();
+        let asked = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let pump = thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_ss_kcp(&socket, &conn, &ss, &asked);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(
+            &read_echo(&mut sock),
+            b"ping",
+            "the shadowsocks tls arm over kcp echoes"
+        );
+        drop(sock);
+        let _ = pump.join();
+    }
+
+    /// The vmess dial carries its request in the session too, so a tls kcp row speaks the same bytes both roles.
+    #[test]
+    fn a_vmess_kcp_dial_under_tls_wraps_the_header_in_the_session() {
+        let _guard = budgets::lock();
+        let (cert, key, client) = tls_cert_json();
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vmess", "settings": {{"clients": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}},
+                "streamSettings": {{"network": "kcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        serve_vmess_inbound(&format!("127.0.0.1:{port}"), &inbound, true);
+        let vmess = VmessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id: uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id"),
+            cipher: crate::vmess::Cipher::Auto,
+            carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
+            host: "127.0.0.1".to_owned(),
+            tls: Some(client),
+        };
+        let conn = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        let echo_port = echo_loop();
+        let asked = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let pump = thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_vmess_kcp(&socket, &conn, &vmess, &asked);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(
+            &read_echo(&mut sock),
+            b"ping",
+            "the vmess tls arm over kcp echoes"
+        );
+        drop(sock);
+        let _ = pump.join();
+    }
+
     /// The store is the transport, so an xdrive row that declares tls parses and dials: both roles read the folder the config names.
     #[test]
     fn a_trojan_xdrive_dial_under_tls_reaches_the_store() {
@@ -22745,6 +23032,7 @@ mod tests {
             password,
             carrier,
             host: "127.0.0.1".to_owned(),
+            tls: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -23757,6 +24045,7 @@ mod tests {
             password: "an-example-shared-password".to_owned(),
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
+            tls: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -31410,6 +31699,7 @@ mod tests {
             password,
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
+            tls: None,
         }));
         let mut client = socks_tcp_client(front_port, echo_port);
         client.write_all(b"ping").expect("writes");

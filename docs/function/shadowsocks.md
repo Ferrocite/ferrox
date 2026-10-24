@@ -12,6 +12,8 @@ That chunk shape is not ours to change: `MAX_CHUNK = 0x3FFF` is the largest payl
 
 The AEAD sits on [`ferrox-core`'s own ChaCha20-Poly1305](../../crates/ferrox-core/src/aead.rs) and, for `aes-128-gcm`/`aes-256-gcm`, on [our AES-GCM ladder](../../crates/ferrox-core/src/aesgcm/mod.rs). `xchacha20-ietf-poly1305` derives a per-chunk subkey with HChaCha from the first sixteen extended-nonce bytes and seals with the same IETF AEAD over an inner nonce of four zero bytes plus the last eight. Neither takes a pointer to a scratch buffer: `seal_into` writes the plaintext into the caller's buffer and encrypts it where it lies.
 
+The carrier carries TLS as the other protocols' rows do: over KCP the session sits above the connection in both roles, so the listener reads the header from the terminated stream and the dial writes it there (`a_shadowsocks_kcp_inbound_that_declares_tls_answers_the_session`, `a_shadowsocks_kcp_dial_under_tls_wraps_the_header_in_the_session`). A `tls` row on any other carrier — raw, ws, httpUpgrade, gRPC, xhttp, http header — is refused by name rather than answered plaintext, because this lane does not yet wire its session halves for those carriers.
+
 ## Data path
 
 ```mermaid
