@@ -23,7 +23,7 @@ The payload cipher follows the reference's `auto` negotiation rather than a fixe
 ```mermaid
 graph TD
     W["plaintext read, 128 KiB"] --> W1["16 frames of 8192 B"]
-    W1 --> W2["each: mask a 2-byte length with SHAKE,<br/>seal the payload in place, append the tag"]
+    W1 --> W2["one buffered SHAKE draw masks<br/>every length in the batch; seal the payload in place, append the tag"]
     W2 --> W3["one staging buffer<br/>1 copy per byte, 0 allocations"]
     W3 --> W4["write_all, 1 syscall"]
     W4 --> W(("wire"))
@@ -61,10 +61,12 @@ graph TD
 
 ```bash
 ./scripts/count-ops.sh report \
-  vmess::tests::frames_reuse_the_callers_buffers 'vmess::stage_frames'
+  vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time 'vmess::stage_frame'
+./scripts/count-ops.sh report \
+  vmess::tests::frames_reuse_the_callers_buffers 'vmess::read_frame'
 ```
 
-`UNBLESSED`, as above.
+`UNBLESSED` for the gate, as above; the artefact's pair is the claim. On the same twelve-frame test `vmess::stage_frame` read **9 646 837 Ir** before the buffered draw (`p2-vmess-gate`) and **9 637 793 Ir** after it (`p2-vmess-tcp-aead`), **−9 044 Ir / −0.094 %**, about 754 Ir a frame. `vmess::read_frame` stayed inside layout noise (69 533 → 69 284) because the read path did not change. The wire bytes are the unchanged side: `frames_seal_to_stable_bytes` and `a_batch_on_the_wire_is_the_frames_written_one_at_a_time` hold them.
 
 ## Time
 
@@ -95,6 +97,7 @@ The tag and the payload are both authenticated over the ciphertext, so this meth
 
 - **A `host:port` string per datagram.** The datagram lane's target was re-serialised into a `host:port` string for the resolver, so every datagram that named a host paid a string the resolver then had to take apart again. The resolver is asked for a host and a port now, the way this tree already asks on the flow's own dial, and the `host:port` spelling is gone from the tree.
 - **Three hundred and ninety-three kilobytes of zero fill per flow.** The wire's receive window, the relay leg's read window and the response header's buffer were each allocated with `vec![0u8; n]`, so a flow paid a zero pass over 393 KiB of memory that the first read overwrites in full. They are the same buffers without the pass now: the counting allocator's `zeroed` counter is the witness, and `the_flows_windows_are_not_zero_filled` fails if any of them is zeroed again. What did not move: the bytes on the wire, and the buffers' sizes — the same memory is still allocated, and the pages the fill used to fault in are now faulted in by the read that overwrites them.
+- **A SHAKE refill per frame.** `Shake::draw` asked `Shake128Reader` for two or four bytes for every frame's length mask and padding, so a sixteen-frame batch entered the XOF sixteen times. The reader now fills one sixty-four-byte buffer and the batch consumes it; `batched_draws_keep_the_reference_stream` compares the wrapped stream against a raw `Shake128Reader` for padding off and on over 200 draws, so the bytes and the draw order are the reference's. Measured on the same twelve-frame test: `vmess::stage_frame` **9 646 837 → 9 637 793 Ir** (−9 044, −0.094 %). What is **not** removed: every length is still xored with its mask and every pad still writes its zeros; only the number of XOF calls falls.
 - **A frame buffer per relay write.** `frames_reuse_the_callers_buffers` is the gate: one buffer, sized once per connection by `with_capacity`, refilled by `clear`. For comparison, Xray's `common/crypto/auth.go:287` does `mb2Write := make(buf.MultiBuffer, 0, len(mb)+10)` and takes a pooled `temp := buf.New()` scratch on every `WriteMultiBuffer` call, so the batch is the pipe's read granularity rather than a number chosen for syscalls.
 - **Sixteen write syscalls per relay read.** sing-box's VMess writes one `ChunkWriter` frame per write with `WriteChunkSize = 15000` (`sing-vmess/protocol.go:24-32`) and only coalesces when the upper layer is vectorised. Xray's stream path coalesces with `writev` but starts from a fresh scratch each call. This tree stages sixteen frames and writes once; `a_batch_on_the_wire_is_the_frames_written_one_at_a_time` is the gate that the batch is byte-identical to writing the frames one at a time.
 - **Four write syscalls — and four segments — per relayed batch.** The plain leg of a relay wrote one decoded frame per `write_all`: a syscall and a loopback segment for every 8 KiB. On `vmess-raw-down-8` (ubuntu-latest, 3 repeats each) ferrox reads **1 850 ms/GiB of system CPU against xray-core's 1 153**, while the same runs read **788 ms/GiB of user CPU against their 1 275**: the user-space half of this method already costs 1.6x less than the reference, and the row that is red is entirely the kernel. The reference batches for the same reason — `AuthenticationReader.ReadMultiBuffer` (`common/crypto/auth.go:207`) pulls one frame and then up to fifteen more **only from what its `BufferedReader` already holds**, so a batch never waits and an interactive byte is never held up to fill one. `Wire::batch` is that shape over one buffer instead of two, which also drops the `BufReader` hop into a scratch `Vec` and the `resize` that zeroed a frame right before `read_exact` overwrote it. `a_batch_of_frames_leaves_the_pump_in_one_write` gates the batch, and `a_dribbled_carrier_still_offers_one_frame_and_loses_nothing` that a carrier arriving three bytes at a time still loses nothing. The moved row: **1 850 → 1 291 ms/GiB of system CPU**, user CPU left where it was (788 → 790), which is what makes this a kernel-side removal rather than a relocation into user space.
