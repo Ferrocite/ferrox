@@ -107,7 +107,7 @@ The shared protocol in `crates/ferrox-prompt/prompts.md` states it as "a superse
 | engine-selector | engine | planned | upstream/sing-box/protocol/group | `selector` and `urltest` with history |
 | engine-api | engine | planned | upstream/xray-core/app/commander, upstream/sing-box/option/api.go, upstream/sing-box/option/experimental.go | gRPC services, HTTP management, v2ray api |
 | engine-stats | engine | planned | upstream/xray-core/app/stats, upstream/xray-core/transport/internet/stat | counters and channel |
-| engine-reverse | engine | planned | upstream/xray-core/app/reverse, upstream/zeronet/crates/zero-runtime/src/reverse.rs, upstream/xray-core-rust/crates/xray-app-reverse | bridge and portal; the ZeroNet shape rides Mux.cool carriers with a `Control{ACTIVE|DRAIN}` heartbeat, DRAIN after 256 sessions, ≤16 carriers per bridge |
+| reverse | engine | partial | upstream/xray-core/app/reverse, upstream/xray-core/proxy/vless/encoding, upstream/zeronet/crates/zero-runtime/src/reverse.rs, upstream/xray-core-rust/crates/xray-app-reverse, docs/function/reverse.md | bridge and portal on modern VLESS reverse: cmd 4 opens the mux session, `Control{ACTIVE\|DRAIN}` rides a mux UDP flow to `reverse`, DRAIN past 256 flows, ≤16 flows per bridge worker, 60s idle sweep; bridge lanes are freedom and blackhole only, and xhttp/QUIC/KCP/hysteria/xdrive carriers plus Vision-flow reverse users are refused by name |
 | engine-sniffing | engine | planned | upstream/xray-core/app/dispatcher | http, tls, quic, fakedns sniffers |
 | engine-tagged | engine | planned | upstream/xray-core/transport/internet/tagged | the tagged outbound |
 | engine-policy | engine | planned | upstream/xray-core/app/policy | per-level timeouts and buffer sizes |

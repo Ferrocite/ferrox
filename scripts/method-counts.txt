@@ -688,3 +688,7 @@ engine-dns ops-retired-instructions UNBLESSED scripts/count-ops.sh
 engine-dns syscalls-per-udp-exchange UNBLESSED scripts/count-ops.sh
 engine-dns allocations-per-cached-lookup 4 ferrox-app-dnsapp::resolver_tests::a_cache_hit_copies_only_the_answer_vector
 engine-dns seconds-per-lookup UNBLESSED CI bench.yml (no cell yet)
+
+# --- the reverse tunnel -----------------------------------------------------
+reverse ops-retired-instructions UNBLESSED scripts/count-ops.sh
+reverse tcp-echo-bytes-preserved 5 ferrox-app-proxy::reverse_tests::a_portal_flow_reaches_the_bridge_and_comes_back

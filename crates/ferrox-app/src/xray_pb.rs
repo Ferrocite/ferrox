@@ -1807,7 +1807,7 @@ fn vmess_client(id: String, security: Option<String>) -> Json {
 }
 
 /// A vless account: its uuid, and the two strings that shape the dial when the config names them.
-type VlessAccount = (String, Option<String>, Option<String>);
+type VlessAccount = (String, Option<String>, Option<String>, Option<String>);
 
 /// A proto3 string, read as the utf-8 the reference writes it.
 fn account_text(reader: &mut Reader<'_>) -> Result<String, String> {
@@ -1825,6 +1825,7 @@ fn vless_account(bytes: &[u8]) -> Result<VlessAccount, String> {
     let mut id = None;
     let mut flow = None;
     let mut encryption = None;
+    let mut reverse = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => id = Some(account_text(&mut reader)?),
@@ -1833,7 +1834,8 @@ fn vless_account(bytes: &[u8]) -> Result<VlessAccount, String> {
             (4 | 5 | 8 | 9, 0) => {
                 reader.varint()?;
             }
-            (6 | 7 | 9, 2) => {
+            (7, 2) => reverse = Some(vless_reverse(reader.bytes()?)?),
+            (6 | 9, 2) => {
                 reader.bytes()?;
             }
             _ => return Err(reader.refuse(field, wire)),
@@ -1843,7 +1845,25 @@ fn vless_account(bytes: &[u8]) -> Result<VlessAccount, String> {
         id.ok_or("xray.proxy.vless.Account: no id".to_owned())?,
         encryption,
         flow,
+        reverse,
     ))
+}
+
+/// The tag an account opens a reverse session under; its sniffing block names a sniffer this tree
+/// does not run on a reverse stream, and the reference does not accept one on an inbound either.
+fn vless_reverse(bytes: &[u8]) -> Result<String, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.vless.Reverse");
+    let mut tag = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => tag = Some(account_text(&mut reader)?),
+            (2, 2) => {
+                reader.bytes()?;
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    tag.ok_or("xray.proxy.vless.Reverse: no tag".to_owned())
 }
 
 /// A `common.protocol.User` whose account is a vless one; level and email feed the policy and
@@ -1879,8 +1899,8 @@ fn vless_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => {
-                let (id, _, flow) = vless_user(reader.bytes()?)?;
-                clients.push(vless_client(id, None, flow));
+                let (id, _, flow, reverse) = vless_user(reader.bytes()?)?;
+                clients.push(vless_client(id, None, flow, reverse));
             }
             (2, 2) => fallbacks.push(vless_fallback(reader.bytes()?)?),
             (3, 2) => decryption = Some(reader.bytes()?.to_owned()),
@@ -1962,26 +1982,41 @@ fn vless_outbound_settings(bytes: &[u8]) -> Result<Json, String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    let (address, port, (id, encryption, flow)) =
+    let (address, port, (id, encryption, flow, reverse)) =
         vnext.ok_or("xray.proxy.vless.outbound.Config: no vnext")?;
-    Ok(object(vec![(
+    let mut pairs = vec![(
         "vnext",
         Json::Arr(vec![object(vec![
             ("address", Json::Str(address)),
             ("port", Json::Num(f64::from(port))),
-            ("users", Json::Arr(vec![vless_client(id, encryption, flow)])),
+            (
+                "users",
+                Json::Arr(vec![vless_client(id, encryption, flow, None)]),
+            ),
         ])]),
-    )]))
+    )];
+    if let Some(tag) = reverse {
+        pairs.push(("reverse", object(vec![("tag", Json::Str(tag))])));
+    }
+    Ok(object(pairs))
 }
 
 /// The account as this tree's JSON dialect names it; an inbound client carries no encryption.
-fn vless_client(id: String, encryption: Option<String>, flow: Option<String>) -> Json {
+fn vless_client(
+    id: String,
+    encryption: Option<String>,
+    flow: Option<String>,
+    reverse: Option<String>,
+) -> Json {
     let mut pairs = vec![("id", Json::Str(id))];
     if let Some(encryption) = encryption {
         pairs.push(("encryption", Json::Str(encryption)));
     }
     if let Some(flow) = flow {
         pairs.push(("flow", Json::Str(flow)));
+    }
+    if let Some(tag) = reverse {
+        pairs.push(("reverse", object(vec![("tag", Json::Str(tag))])));
     }
     object(pairs)
 }
@@ -3057,12 +3092,24 @@ mod tests {
     }
 
     fn vless_account(id: &[u8], flow: Option<&[u8]>, encryption: Option<&[u8]>) -> Vec<u8> {
+        vless_account_with(id, flow, encryption, None)
+    }
+
+    fn vless_account_with(
+        id: &[u8],
+        flow: Option<&[u8]>,
+        encryption: Option<&[u8]>,
+        reverse: Option<&[u8]>,
+    ) -> Vec<u8> {
         let mut account = vec![bytes_field(1, id)];
         if let Some(flow) = flow {
             account.push(bytes_field(2, flow));
         }
         if let Some(encryption) = encryption {
             account.push(bytes_field(3, encryption));
+        }
+        if let Some(tag) = reverse {
+            account.push(bytes_field(7, &message(&[bytes_field(1, tag)])));
         }
         typed("xray.proxy.vless.Account", &message(&account))
     }
@@ -3278,6 +3325,73 @@ mod tests {
         let error =
             to_json(&config(&vless_inbound(5000, &[]), &freedom_outbound())).expect_err("refused");
         assert!(error.contains("no user"), "{error}");
+    }
+
+    #[test]
+    fn a_vless_reverse_tag_reaches_the_inbound_client_and_the_outbound_settings() {
+        let settings = message(&[
+            bytes_field(
+                1,
+                &vless_user(&vless_account_with(
+                    b"aaaa-aaaa",
+                    None,
+                    None,
+                    Some(b"portal"),
+                )),
+            ),
+            bytes_field(3, b"none"),
+        ]);
+        let endpoint = message(&[
+            bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
+            varint_field(2, 443),
+            bytes_field(
+                3,
+                &vless_user(&vless_account_with(
+                    b"aaaa-aaaa",
+                    None,
+                    Some(b"none"),
+                    Some(b"portal"),
+                )),
+            ),
+        ]);
+        let outbound = message(&[bytes_field(
+            3,
+            &typed(
+                "xray.proxy.vless.outbound.Config",
+                &bytes_field(1, &endpoint),
+            ),
+        )]);
+        let json =
+            to_json(&config(&vless_inbound(5000, &settings), &outbound)).expect("vless decodes");
+        let client = &json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("settings")
+            .expect("settings")
+            .get("clients")
+            .and_then(Json::as_arr)
+            .expect("clients")[0];
+        assert_eq!(
+            client
+                .get("reverse")
+                .and_then(|reverse| reverse.get("tag"))
+                .and_then(Json::as_str),
+            Some("portal")
+        );
+        let settings = json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0]
+            .get("settings")
+            .expect("settings");
+        assert_eq!(
+            settings
+                .get("reverse")
+                .and_then(|reverse| reverse.get("tag"))
+                .and_then(Json::as_str),
+            Some("portal")
+        );
     }
 
     /// A `StreamConfig` as the vless TLS/REALITY scenarios carry it: the tcp transport, the

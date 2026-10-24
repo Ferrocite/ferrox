@@ -429,7 +429,7 @@ pub fn decode_request<'a>(
     crate::tls::read_exact(stream, &mut scratch[18..19 + addons]).ok()?;
     let command = scratch[18 + addons];
     let flow = flow_of(&scratch[18..18 + addons]);
-    if command == Command::Mux.byte() {
+    if command == Command::Mux.byte() || command == Command::Reverse.byte() {
         return Some(Request {
             id,
             flow,
