@@ -3091,10 +3091,17 @@ fn handle_mux_frame(
             };
             if flow.pending.try_send(data.to_vec()).is_err() {
                 // A full queue is a stalled origin: end that flow and keep the session reading, so its next Keep is dropped here rather than parking every other flow.
-                if let Ok(mut table) = table.lock() {
-                    table.flows.remove(&frame.id);
-                }
+                let removed = match table.lock() {
+                    Ok(mut table) => table.flows.remove(&frame.id).is_some(),
+                    Err(_) => false,
+                };
                 flow.control.cancel();
+                if removed {
+                    if let Some(worker) = out.worker {
+                        worker.release_connection();
+                    }
+                    send_mux_end(out.wire, out.staging, frame.id);
+                }
             }
         }
         Status::End => {
