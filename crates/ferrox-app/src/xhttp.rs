@@ -3714,6 +3714,31 @@ mod tests {
         up.join().expect("joins the uplink service");
     }
 
+    /// A packet-up session whose downlink never arrives holds its packets forever; a later bind must start fresh rather than read a sequence from a flow that already stalled.
+    #[test]
+    fn a_packet_up_session_with_no_downlink_is_replaced_after_the_stall() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(std::time::Duration::from_millis(200)),
+            ..Default::default()
+        });
+        let stale = get_or_create_session("packet-up-no-downlink");
+        assert!(
+            stale.push_packet(1, b"stale".to_vec(), 16),
+            "the packet is buffered"
+        );
+        thread::sleep(std::time::Duration::from_millis(250));
+        let fresh = get_or_create_session("packet-up-no-downlink");
+        let packets = fresh.state.lock().expect("session lock").packets.len();
+        end_session("packet-up-no-downlink");
+        crate::budgets::clear();
+        assert!(
+            !Arc::ptr_eq(&stale, &fresh),
+            "a session with no downlink outlived the stall and kept its stale sequence"
+        );
+        assert_eq!(packets, 0, "the replacement starts with no packets");
+    }
+
     #[test]
     fn a_stream_up_session_with_no_downlink_ends_at_its_idle_budget() {
         let session = get_or_create_session("post-only-idle");
