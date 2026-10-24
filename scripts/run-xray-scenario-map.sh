@@ -2,9 +2,9 @@
 # xray-core writes its own config form and spawns its own binary: `testing/scenarios`
 # builds `main` at run time (BuildXray) and execs it with `-config=stdin: -format=pb`.
 # scripts/xray-scenarios.sh replaces that build with a launcher that execs ferrox-app, so
-# the suite's own tests run against Ferrox. The gate in upstream/pins.toml names four of
-# those tests. This script runs EVERY test in the package, family by family, and records
-# which ones Ferrox answers: a family is one source file, because a hang inside one
+# the suite's own tests run against Ferrox. The gate in upstream/pins.toml names the
+# tests Ferrox answers. This script runs EVERY test in the package, family by family, and
+# records which ones Ferrox answers: a family is one source file, because a hang inside one
 # family must cost that family's remaining verdicts and nothing else.
 #
 # Informational: a failing test never fails this job. What does fail it is a run that

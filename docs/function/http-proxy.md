@@ -67,7 +67,7 @@ The absolute-form rewrite still allocates: a `http://`-form head leaves as a fre
 
 ## CI scope
 
-What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md). The run's oracle is the `xray-core` pin's four http scenario tests (`TestHttpConformance`, `TestHttpError`, `TestHTTPConnectMethod`, `TestHttpPost`), which the pin's suite already names as its whole list — no `oracle:` pattern can narrow it further, because the suite has no `--` name list to filter.
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md). The run's oracle is the `xray-core` pin's four http scenario tests (`TestHttpConformance`, `TestHttpError`, `TestHTTPConnectMethod`, `TestHttpPost`), all named by the pin's suite — no `oracle:` pattern can narrow it further, because the suite has no `--` name list to filter.
 
 <!-- scope:begin -->
 - paths: -

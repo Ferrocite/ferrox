@@ -80,7 +80,7 @@ The peer's bytes are read, not skipped, when there is an answer to protect, and 
 
 ## CI scope
 
-What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md). The oracle is this tree's own: the pinned `xray-core` has a blackhole handler but no suite for it, and its scenario package's own blackhole test (`TestBlackhole`) is not in the pin's gated list, so no pin's suite names this row and the oracle is the byte comparison in `ferrox-core`; the scenario map runs that test anyway, and it is green. The bridge carries the blackhole's own config and the router app's tag and port list — the two selectors that scenario writes — so the rule that sends the flow to the sink reaches this tree's own router; every other router selector is refused by name, and the other apps are skipped as the bridge has always skipped them.
+What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md). The oracle is this tree's own byte comparison in `ferrox-core`, and the pinned `xray-core` scenario `TestBlackhole` is in the pin's gate now; the scenario map runs it as well, and it is green. The bridge carries the blackhole's own config and the router app's tag and port list — the two selectors that scenario writes — so the rule that sends the flow to the sink reaches this tree's own router; every other router selector is refused by name, and the other apps are skipped as the bridge has always skipped them.
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/blackhole.rs, crates/ferrox-core/src/blackhole.rs
