@@ -520,8 +520,8 @@ security-utls inbuf-reallocations-per-record-cycle 0 ferrox-core-tls::shaped::cl
 security-utls heap-buffers-for-a-warm-relay-write 0 ferrox-core-tls::shaped::client::tests::a_warm_write_seals_into_the_buffer_it_already_owns
 security-utls pulled-record-plaintext-copies-out-of-a-fitting-window 0 ferrox-core-tls::shaped::client::tests::a_tls13_record_is_read_where_it_lands
 security-utls pulled-record-reads-per-window 1 ferrox-core-tls::shaped::client::tests::a_pulled_record_lands_in_one_vectored_read
-security-utls heap-buffers-for-an-hpke-context 0 ferrox-core-tls::hpke::tests::a_context_costs_no_allocations
-security-utls heap-buffers-for-an-ech-config 1 ferrox-core-tls::ech::tests::an_encoded_config_is_one_buffer
+security-ech heap-buffers-for-an-hpke-context 0 ferrox-core-tls::hpke::tests::a_context_costs_no_allocations
+security-ech heap-buffers-for-an-ech-config 1 ferrox-core-tls::ech::tests::an_encoded_config_is_one_buffer
 
 # --- ECH -------------------------------------------------------------------
 security-ech aes256-gcm-seal-retired-instructions 29612 scripts/count-ops.sh

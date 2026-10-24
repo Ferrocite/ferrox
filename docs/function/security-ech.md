@@ -33,6 +33,8 @@ graph TD
 | quic-dials-that-offer-the-configured-list | 1 | ferrox-app-quic::tests::a_client_dial_offers_the_configured_ech_list |
 | quic-lanes-that-fall-back-without-an-offer | 1 | ferrox-app-quic::tests::an_ech_serving_lane_answers_a_client_without_an_offer |
 | heap-buffers-for-an-ech-cover | 1 | ferrox-core-tls::shaped::hello::tests::an_ech_cover_is_written_into_one_buffer |
+| heap-buffers-for-an-hpke-context | 0 | ferrox-core-tls::hpke::tests::a_context_costs_no_allocations |
+| heap-buffers-for-an-ech-config | 1 | ferrox-core-tls::ech::tests::an_encoded_config_is_one_buffer |
 <!-- counts:end -->
 
 The stock test is the relay path: a VLESS flow over a TLS listener whose ECH key is the fixture's. The retry test first offers a valid config the listener does not hold, takes the retry list it returns, then keeps the second session. The QUIC tests read `ech_accepted()` on both ends, and the fallback test proves a client without a list still reaches the lane. The shaped hello test gates the real offer's outer and inner names, not a GREASE cover.

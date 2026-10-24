@@ -52,8 +52,6 @@ graph TD
 | heap-buffers-for-a-warm-relay-write | 0 | ferrox-core-tls::shaped::client::tests::a_warm_write_seals_into_the_buffer_it_already_owns |
 | pulled-record-plaintext-copies-out-of-a-fitting-window | 0 | ferrox-core-tls::shaped::client::tests::a_tls13_record_is_read_where_it_lands |
 | pulled-record-reads-per-window | 1 | ferrox-core-tls::shaped::client::tests::a_pulled_record_lands_in_one_vectored_read |
-| heap-buffers-for-an-hpke-context | 0 | ferrox-core-tls::hpke::tests::a_context_costs_no_allocations |
-| heap-buffers-for-an-ech-config | 1 | ferrox-core-tls::ech::tests::an_encoded_config_is_one_buffer |
 <!-- counts:end -->
 
 The 50 cases are the 31 presets plus the 19 names that alias onto them, so the alias table is gated by the same bytes it resolves to rather than asserted. `scripts/utls-oracle` zeroes the hello-phase entropy (random, session id, both 32-byte reads and the 10 GREASE bytes), erases the key-share, ECH-payload and key material after the fact, and prints the remaining body; both seeds are fixed, so the golden is stable. The oracle dials with `utls.Config.OmitEmptyPsk`, the only way a psk preset holding no session reaches the wire, and every shuffled case prints the body ahead of its extensions as a fourth field, so a shuffled preset gates its cipher list and not only its extension multiset.
@@ -142,6 +140,6 @@ CI's `benchmark-matrix` vision reality cell carries a fingerprint and times the 
 What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
 
 <!-- scope:begin -->
-- paths: crates/ferrox-core/src/tls/shaped/*, crates/ferrox-core/src/tls/hpke.rs, crates/ferrox-core/src/tls/ech.rs, scripts/utls-oracle/*, scripts/tls12-oracle/*
+- paths: crates/ferrox-core/src/tls/shaped/*, scripts/utls-oracle/*, scripts/tls12-oracle/*
 - go: ./transport/internet/tls/...
 <!-- scope:end -->
