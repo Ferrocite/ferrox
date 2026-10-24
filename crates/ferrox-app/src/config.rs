@@ -1073,6 +1073,7 @@ pub(crate) enum Carrier {
     },
     HttpUpgrade {
         path: String,
+        host: String,
         ed: u32,
     },
     Grpc {
@@ -1172,8 +1173,15 @@ fn resolve_ws(settings: Option<&Json>, _: &str) -> Carrier {
 
 fn resolve_httpupgrade(settings: Option<&Json>, _: &str) -> Carrier {
     let early = EarlyData::split(&sub_path(settings, "httpupgradeSettings"));
+    let host = settings
+        .and_then(|s| s.get("httpupgradeSettings"))
+        .and_then(|s| s.get("host"))
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_owned();
     Carrier::HttpUpgrade {
         path: early.path,
+        host,
         ed: early.budget,
     }
 }

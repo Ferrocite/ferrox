@@ -1647,8 +1647,14 @@ pub(crate) fn serve_httpheader_split<R, W>(
     serve_decoded(reader, writer, close, decoded, freedom);
 }
 
-pub(crate) fn serve_httpupgrade(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
-    let Some((mut reader, write)) = crate::httpupgrade::accept(stream, path) else {
+pub(crate) fn serve_httpupgrade(
+    stream: Connection,
+    path: &str,
+    host: &str,
+    id: &[u8; 16],
+    freedom: bool,
+) {
+    let Some((mut reader, write)) = crate::httpupgrade::accept(stream, path, host) else {
         return;
     };
     let decoded = accept_request(&mut reader, id);
@@ -1665,6 +1671,7 @@ pub(crate) fn serve_httpupgrade_split<R, W>(
     reader: R,
     writer: W,
     path: &str,
+    host: &str,
     id: &[u8; 16],
     freedom: bool,
     close: &Close,
@@ -1672,7 +1679,8 @@ pub(crate) fn serve_httpupgrade_split<R, W>(
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    let Some((mut reader, writer)) = crate::httpupgrade::accept_split(reader, writer, path) else {
+    let Some((mut reader, writer)) = crate::httpupgrade::accept_split(reader, writer, path, host)
+    else {
         return;
     };
     let decoded = accept_request_bounded(&mut reader, id);
