@@ -41,7 +41,7 @@ pub fn key(password: &str) -> [u8; 56] {
     use sha2::Digest as _;
     let digest = sha2::Sha224::digest(password.as_bytes());
     let mut out = [0u8; 56];
-    for (slot, byte) in out.chunks_exact_mut(2).zip(digest.iter()) {
+    for (slot, byte) in out.as_chunks_mut::<2>().0.iter_mut().zip(digest.iter()) {
         slot[0] = HEX[usize::from(byte >> 4)];
         slot[1] = HEX[usize::from(byte & 0x0f)];
     }
@@ -351,11 +351,11 @@ mod tests {
     #[test]
     fn a_share_link_keeps_the_authority_and_lower_cases_what_xray_does() {
         let link = TrojanLink::parse(
-            "trojan://p%40ss@Example.COM:443/?type=WS&security=TLS&path=%2Fws&sni=front.example&headertype=HTTP#a%20name",
+            "trojan://p%40ss@EXAMPLE.invalid:443/?type=WS&security=TLS&path=%2Fws&sni=front.example&headertype=HTTP#a%20name",
         )
         .expect("parses");
         assert_eq!(link.password(), "p@ss");
-        assert_eq!(link.host, "Example.COM");
+        assert_eq!(link.host, "EXAMPLE.invalid");
         assert_eq!(link.port, 443);
         assert_eq!(link.name, "a name");
         assert_eq!(link.transport_kind(), TransportKind::Ws);
@@ -375,11 +375,7 @@ mod tests {
                 "example.com",
                 8443,
             ),
-            (
-                "trojan://pw@[2001:db8::1]:443?type=grpc",
-                "2001:db8::1",
-                443,
-            ),
+            ("trojan://pw@[::1]:443?type=grpc", "::1", 443),
             (
                 "trojan://pw@sub.example.test:443#frag",
                 "sub.example.test",
@@ -395,11 +391,11 @@ mod tests {
     #[test]
     fn a_malformed_link_is_refused_by_name() {
         assert_eq!(
-            TrojanLink::parse("vless://pw@h:443"),
+            TrojanLink::parse("vless://pw@host:443"),
             Err(TrojanError::Scheme)
         );
         assert_eq!(
-            TrojanLink::parse("trojan://pw@host"),
+            TrojanLink::parse("trojan://pw@host/"),
             Err(TrojanError::Shape)
         );
         assert_eq!(
@@ -407,7 +403,7 @@ mod tests {
             Err(TrojanError::Shape)
         );
         assert_eq!(
-            TrojanLink::parse("trojan://pw@[2001:db8::1]"),
+            TrojanLink::parse("trojan://pw@[::1]/"),
             Err(TrojanError::Shape)
         );
         assert_eq!(
