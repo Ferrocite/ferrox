@@ -2066,14 +2066,14 @@ mod tests {
     /// from a frame of its own. The reference's client reassembles every message that crosses one.
     #[test]
     fn a_hunk_fits_the_frame_that_carries_it() {
+        const _: () = assert!(4 * (HUNK - 1) <= 65_535);
+        const _: () = assert!(4 * HUNK > 65_535);
         let fit = message_payload(HUNK - 1);
         assert_eq!(
             fit, 16_375,
             "the envelope and the tag leave this much of a frame one byte under the width the window packs"
         );
         assert_eq!(fit + 8, HUNK - 1);
-        const _: () = assert!(4 * (HUNK - 1) <= 65_535);
-        const _: () = assert!(4 * HUNK > 65_535);
         let data: Vec<u8> = (0..4 * HUNK).map(|i| (i % 251) as u8).collect();
         let peer = Arc::new(Mutex::new(Peer::default()));
         let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, u64::MAX);
