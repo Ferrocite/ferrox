@@ -20967,6 +20967,30 @@ mod tests {
     }
 
     #[test]
+    fn reality_xhttp_dial_reaches_echo_through_the_relay() {
+        let pair = reality_pair_with(
+            "",
+            "xhttp",
+            Carrier::Xhttp {
+                settings: xhttp_settings("/"),
+            },
+        );
+        let (mut user, dialled) = dial_pair(&pair);
+        let payload: Vec<u8> = (0..200_000u32)
+            .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let back = echo_bulk(&mut user, &payload);
+        assert_eq!(
+            back, payload,
+            "payload came back altered through the carried REALITY xhttp session"
+        );
+        drop(user);
+        dialled.join().expect("joins");
+        pair.echo.join().expect("joins");
+        pair.front.join().expect("joins");
+    }
+
+    #[test]
     fn reality_vision_direct_switch_carries_inner_tls() {
         use ferrox_core::tls::TlsProvider as _;
 
