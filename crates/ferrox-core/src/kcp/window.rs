@@ -413,6 +413,26 @@ mod tests {
         assert_eq!(w.len(), 0, "every round acknowledged its eight");
         // one buffer, reused: not one per segment, and not one that grows forever
         assert!(high >= 8 * 1332);
+
+        // A live window never drains between reads: the next eight arrive while the last eight are still owed.
+        let mut w = SendingWindow::new();
+        let mut high = 0usize;
+        for round in 0..64u32 {
+            let base = round * 8;
+            for n in base..base + 8 {
+                w.push(n, &[n as u8; 1332]);
+            }
+            high = high.max(w.arena_capacity());
+            w.flush(100 + round, 200, 64, 0, 0, SegmentOption::NONE, &mut |_| {});
+            if round > 0 {
+                w.clear(base);
+            }
+        }
+        assert_eq!(w.len(), 8, "the live tail is the last round's eight");
+        assert!(
+            high <= 8 * 1332 * 3,
+            "the live window's arena reached {high} bytes for 8 live segments of 1332"
+        );
     }
 
     /// Trimming shifts every live range down by the trimmed prefix. If that
