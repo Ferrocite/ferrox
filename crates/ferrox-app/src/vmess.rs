@@ -1305,40 +1305,6 @@ pub(crate) fn accept_request(
     decode_header(&header)
 }
 
-pub(crate) struct WsSink {
-    writer: crate::ws::WsWriter,
-    staged: Vec<u8>,
-}
-
-impl WsSink {
-    pub(crate) fn carried(writer: crate::ws::WsWriter) -> Self {
-        Self {
-            writer,
-            staged: Vec::with_capacity(READ_PLAIN + FRAMES_PER_WRITE * (TAG_LEN + 2 + 64)),
-        }
-    }
-}
-
-impl std::io::Write for WsSink {
-    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
-        self.staged.extend_from_slice(data);
-        Ok(data.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        if self.staged.is_empty() {
-            return Ok(());
-        }
-        let sent = self.writer.send(&self.staged);
-        self.staged.clear();
-        if sent {
-            Ok(())
-        } else {
-            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
-        }
-    }
-}
-
 /// The relay leg's read window: a read fills every byte the leg reads, so the zero pass
 /// in front of it was work generated and thrown away.
 fn relay_window() -> Vec<u8> {
@@ -1543,7 +1509,7 @@ pub(crate) fn serve_ws(stream: Connection, path: &str, id: &[u8; 16], freedom: b
     let decoded = accept_request(&mut reader, id);
     let closer = writer.clone();
     let close: Close = std::sync::Arc::new(move || closer.close());
-    serve_decoded(reader, WsSink::carried(writer), &close, decoded, freedom);
+    serve_decoded(reader, writer, &close, decoded, freedom);
 }
 
 pub(crate) fn serve_ws_split<R, W>(
@@ -1567,7 +1533,7 @@ pub(crate) fn serve_ws_split<R, W>(
         closer.close();
         shutdown();
     });
-    serve_decoded(reader, WsSink::carried(writer), &close, decoded, freedom);
+    serve_decoded(reader, writer, &close, decoded, freedom);
 }
 
 pub(crate) fn serve_grpc(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
@@ -2073,10 +2039,7 @@ mod tests {
         )
         .expect("recvs");
 
-        let mut sink = WsSink {
-            writer: writer.clone(),
-            staged: Vec::new(),
-        };
+        let mut sink = writer;
         let mut staging = Vec::new();
         let mut pad = PadSource::fresh().expect("entropy");
         let mut scratch = Vec::new();
@@ -2413,6 +2376,89 @@ mod tests {
             );
             assert_eq!(b, whole.len(), "the batch is exactly the same frames");
         }
+    }
+
+    /// The sealed batch is the buffer the webSocket carrier writes: the frame's payload starts at
+    /// the staging buffer's own base, so no second buffer takes the bytes on their way out.
+    #[test]
+    fn a_sealed_batch_reaches_a_web_socket_carrier_where_it_lies() {
+        #[derive(Clone, Default)]
+        struct Seen(std::sync::Arc<std::sync::Mutex<Vec<(usize, usize)>>>);
+
+        impl crate::proxy::FrameWrite for Seen {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                let payload = parts.get(1).copied().unwrap_or(&[]);
+                self.0
+                    .lock()
+                    .expect("the record is not poisoned")
+                    .push((payload.as_ptr() as usize, payload.len()));
+                true
+            }
+        }
+
+        let seen = Seen::default();
+        let (_, mut writer) = crate::ws::split_halves(
+            std::io::empty(),
+            seen.clone(),
+            Vec::new(),
+            Vec::new(),
+            0,
+            false,
+        );
+        let options = OPT_STREAM | OPT_MASK | OPT_PAD;
+        let key = [0x3cu8; 16];
+        let iv: [u8; 16] = std::array::from_fn(|i| 0x10u8.wrapping_add(i as u8));
+        let mut send = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+        let body: Vec<u8> = (0..READ_PLAIN)
+            .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let mut staging = Vec::new();
+        let mut pad = PadSource::fresh().expect("entropy");
+        assert!(stage_frames(
+            &mut writer,
+            &mut send,
+            &body,
+            &mut staging,
+            &mut pad
+        ));
+        let base = staging.as_ptr() as usize;
+        let capacity = staging.capacity();
+        let recorded = seen.0.lock().expect("the record is not poisoned").clone();
+        assert_eq!(recorded.len(), 1, "one batch is one carrier write");
+        let (payload, len) = recorded[0];
+        assert_eq!(len, staging.len(), "the whole batch left");
+        assert_eq!(
+            payload, base,
+            "the payload is the staging buffer itself, not a copy of it"
+        );
+        assert_eq!(
+            staging.capacity(),
+            capacity,
+            "and it did not grow to send it"
+        );
+    }
+
+    /// A webSocket carrier opens its shared state and nothing sized by a batch: the staging
+    /// buffer the relay already keeps is the one that goes out, and the counting allocator is
+    /// the witness for the batch-sized one that is not opened.
+    #[test]
+    fn a_web_socket_carrier_opens_no_batch_buffer() {
+        struct NoWrite;
+
+        impl crate::proxy::FrameWrite for NoWrite {
+            fn write_slices(&mut self, _parts: &[&[u8]]) -> bool {
+                true
+            }
+        }
+
+        let (_, counts) = ferrox_core::alloc_count::measure(|| {
+            crate::ws::split_halves(std::io::empty(), NoWrite, Vec::new(), Vec::new(), 0, false)
+        });
+        assert!(
+            counts.bytes <= 1024,
+            "the carrier opened {} bytes, a batch buffer is 132416",
+            counts.bytes
+        );
     }
 
     /// `stage_frames` stages at most `FRAMES_PER_WRITE` frames: a wider read must refuse before any of the batch reaches the stream, because exiting the loop with bytes left and returning true would put a truncated frame sequence on the wire.
