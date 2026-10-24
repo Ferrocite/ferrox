@@ -49,7 +49,7 @@ impl ProjectState {
             Targets::None => Vec::new(),
         };
         if targets == Targets::Open {
-            rows.sort_by_key(|row| !row.real_page);
+            rows.sort_by_key(|row| (row.gap.rank(), !row.high_priority, !row.real_page));
         }
         rows
     }
@@ -91,7 +91,7 @@ pub fn next_target<'a>(
     let row = state
         .candidates(prompt.targets)
         .into_iter()
-        .find(|row| !served.contains(&row.key()))?;
+        .find(|row| row.gap.is_drawable() && !served.contains(&row.key()))?;
     Some((row, fill(prompt, row, &state.pins)))
 }
 
@@ -266,6 +266,8 @@ update the pins, nothing per-method here
                     method: "VLESS TCP none".to_owned(),
                     state: "implemented".to_owned(),
                     implemented: true,
+                    gap: crate::state::Gap::Shipped,
+                    high_priority: false,
                     page: "docs/function/vless.md".to_owned(),
                     real_page: true,
                     text: "| 3 | VLESS TCP none, private/loopback only | implemented |".to_owned(),
@@ -276,6 +278,8 @@ update the pins, nothing per-method here
                     method: "VLESS over QUIC".to_owned(),
                     state: "client only".to_owned(),
                     implemented: false,
+                    gap: crate::state::Gap::Partial,
+                    high_priority: false,
                     page: "docs/function/carrier-quic.md".to_owned(),
                     real_page: true,
                     text:
@@ -288,6 +292,8 @@ update the pins, nothing per-method here
                     method: "WireGuard".to_owned(),
                     state: "planned".to_owned(),
                     implemented: false,
+                    gap: crate::state::Gap::Planned,
+                    high_priority: false,
                     page: "docs/function/wireguard.md".to_owned(),
                     real_page: false,
                     text: "| 45 | WireGuard (UDP) | planned | amneziawg-go, sing-box |".to_owned(),
@@ -360,6 +366,8 @@ update the pins, nothing per-method here
             method: "A greenfield row".to_owned(),
             state: "planned".to_owned(),
             implemented: false,
+            gap: crate::state::Gap::Planned,
+            high_priority: false,
             page: "docs/function/a-greenfield-row.md".to_owned(),
             real_page: false,
             text: "| 2 | A greenfield row | planned |".to_owned(),
@@ -367,6 +375,48 @@ update the pins, nothing per-method here
         let open = made.candidates(Targets::Open);
         let keys: Vec<String> = open.iter().map(|row| row.key()).collect();
         assert_eq!(keys, ["A13", "C45", "A2"]);
+    }
+
+    #[test]
+    fn a_high_priority_partial_row_beats_a_plain_planned_row_and_not_scheduled_is_skipped() {
+        let library = library();
+        let prompt = library.prompt(1).unwrap();
+        let mut made = state();
+        made.methods.push(MethodRow {
+            section: 'D',
+            index: 1,
+            method: "A high-priority half-wired row".to_owned(),
+            state: "partial — high priority".to_owned(),
+            implemented: false,
+            gap: crate::state::Gap::Partial,
+            high_priority: true,
+            page: "docs/function/half.md".to_owned(),
+            real_page: true,
+            text: "| 1 | A high-priority half-wired row | partial — high priority |".to_owned(),
+        });
+        made.methods.push(MethodRow {
+            section: 'D',
+            index: 2,
+            method: "A parked row".to_owned(),
+            state: "not-scheduled".to_owned(),
+            implemented: false,
+            gap: crate::state::Gap::NotScheduled,
+            high_priority: false,
+            page: "docs/function/parked.md".to_owned(),
+            real_page: true,
+            text: "| 2 | A parked row | not-scheduled |".to_owned(),
+        });
+        let open = made.candidates(Targets::Open);
+        assert_eq!(open[0].key(), "D1");
+        let (row, _) = next_target(prompt, &made, &[]).expect("a drawable row exists");
+        assert_eq!(row.key(), "D1");
+        let served = ["D1".to_owned()];
+        let (row, _) = next_target(prompt, &made, &served).expect("a drawable row remains");
+        assert_ne!(
+            row.key(),
+            "D2",
+            "a not-scheduled row is not drawn by default"
+        );
     }
 
     #[test]
@@ -446,6 +496,8 @@ update the pins, nothing per-method here
             method: "VLESS over QUIC, second spelling".to_owned(),
             state: "planned".to_owned(),
             implemented: false,
+            gap: crate::state::Gap::Planned,
+            high_priority: false,
             page: "docs/function/vless-over-quic.md".to_owned(),
             real_page: false,
             text: "| 7 | VLESS over QUIC, second spelling | planned |".to_owned(),

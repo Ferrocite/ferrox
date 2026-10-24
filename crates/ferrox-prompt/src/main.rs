@@ -13,7 +13,7 @@ use ferrox_prompt::markdown::{
     Addon, Diagnostic, Effort, Library, Prompt, Severity, Status, Targets, Touch,
 };
 use ferrox_prompt::render::{self, Options, Rendered};
-use ferrox_prompt::state::MethodRow;
+use ferrox_prompt::state::{Gap, MethodRow};
 use ferrox_prompt::worktree::Worktree;
 use ferrox_prompt::{clipboard, load_library, workspace_root};
 
@@ -67,6 +67,10 @@ prints the command that would fill it instead. Every handout is recorded in
 Every handout also names the worktree the slice runs in and what to do about it:
 created with `scripts/new-worktree.sh` when there is none, used and brought onto
 `main` when that script has made one for this task already.
+
+`next` reads the matrix's state cells: a partially carried row outranks a
+greenfield plan, a high-priority row outranks its unmarked peers, and a
+`not-scheduled` row is never drawn unless `--row` names it.
 
 `--row` names the matrix row a slice is about, so a template and a row can be
 picked by hand: `render 1 --row A13` renders P1 for that row, and
@@ -504,9 +508,13 @@ fn run_list(args: &Args, library: &Library, root: &Path) -> ExitCode {
 
     let state = ProjectState::load(root);
     if state.has_matrix() {
+        let open = state.candidates(Targets::Open);
         println!(
-            "matrix: {} open · {} implemented · {} rows served here",
-            state.candidates(Targets::Open).len(),
+            "matrix: {} open ({} partial, {} unclassified, {} high priority) · {} implemented · {} rows served here",
+            open.len(),
+            open.iter().filter(|row| row.gap == Gap::Partial).count(),
+            open.iter().filter(|row| row.gap == Gap::Unclassified).count(),
+            open.iter().filter(|row| row.high_priority).count(),
             state.candidates(Targets::Implemented).len(),
             ledger
                 .entries
@@ -570,18 +578,31 @@ fn run_rows(args: &Args, library: &Library, root: &Path) -> ExitCode {
     }
     for row in &rows {
         println!(
-            "{} · {} · {} · {}",
+            "{} · {} · {} · gap: {} · {}{} · {}{}",
             row.key(),
             row.method,
             row.state,
-            if row.implemented { "shipped" } else { "open" }
+            row.gap.as_str(),
+            if row.implemented { "shipped" } else { "open" },
+            if row.high_priority {
+                " · high priority"
+            } else {
+                ""
+            },
+            row.page,
+            if row.real_page { "" } else { " (suggested)" }
         );
     }
     println!();
     println!(
-        "{} row(s) · {} open · {} shipped",
+        "{} row(s) · {} open · {} partial · {} unclassified · {} high priority · {} shipped",
         rows.len(),
         rows.iter().filter(|row| !row.implemented).count(),
+        rows.iter().filter(|row| row.gap == Gap::Partial).count(),
+        rows.iter()
+            .filter(|row| row.gap == Gap::Unclassified)
+            .count(),
+        rows.iter().filter(|row| row.high_priority).count(),
         rows.iter().filter(|row| row.implemented).count()
     );
     ExitCode::SUCCESS
@@ -727,7 +748,10 @@ fn row_json(row: Option<&MethodRow>) -> Value {
         ("key", Value::text(row.key())),
         ("method", Value::text(row.method.clone())),
         ("state", Value::text(row.state.clone())),
+        ("gap", Value::text(row.gap.as_str())),
+        ("high_priority", Value::Bool(row.high_priority)),
         ("page", Value::text(row.page.clone())),
+        ("real_page", Value::Bool(row.real_page)),
         ("implemented", Value::Bool(row.implemented)),
     ])
 }
@@ -893,10 +917,16 @@ fn report_target(target: Option<&(&MethodRow, Values)>, ledger: &Ledger, prompt:
         ""
     };
     println!(
-        "targeting row {} — {} (state: {}{})",
+        "targeting row {} — {} (state: {}; gap: {}{}{})",
         row.key(),
         row.method,
         row.state,
+        row.gap.as_str(),
+        if row.high_priority {
+            ", high priority"
+        } else {
+            ""
+        },
         again
     );
 }
@@ -2005,6 +2035,12 @@ do the fixed thing
             }
             .to_owned(),
             implemented,
+            gap: ferrox_prompt::state::gap_of(if implemented {
+                "implemented"
+            } else {
+                "planned"
+            }),
+            high_priority: false,
             page: "docs/function/method.md".to_owned(),
             real_page: false,
             text: format!("| {index} | {method} | planned |"),

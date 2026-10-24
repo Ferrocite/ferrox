@@ -75,9 +75,9 @@ The datagram row is the shape: a datagram the door receives reaches the target t
 - **The transparent redirect is refused, not served.** `followRedirect` and `portMap` need the original destination, which lives in a socket option (`SO_ORIGINAL_DST` on Linux, TPROXY's mark) this tree asks for nothing; the `tun` front is the tree's transparent path, and it reads the destination off the packet header instead. A config naming either setting is refused by name — in the protobuf form the bridge already refused it, and now in the JSON form too, so neither dialect can read as served.
 - **One leg per client, and a thread per leg.** The lane answers the address the request came from, so the answers can only be told apart by the source; a leg is that source. The cost is a socket and a thread per client address, reaped when the leg dies. A single socket with the client encoded in the frame would need the lane to carry a field the protocol does not have.
 - **The datagram lane has no per-destination routing.** A datagram names its own destination, so a rule that could split an association refuses it (the socks front's own rule); the door's target is fixed, so this costs the door nothing.
-- **The pb `streamSettings` on a receiver are still refused by name.** Every tls and reality scenario waits on that one, not on this row.
+- **The pb `streamSettings` on a receiver now decode** to the network and security this tree's JSON dialect spells, so the tls and reality scenarios reach the door instead of stopping at the receiver.
 - **The syscalls and the copies are not counted.** A socket's read count cannot be gated by a loopback test, and the datagram's copies are the relay's own; no local check counts either, so the page names no number for them.
-- **The router's protobuf app is still dropped**, so `TestSocksBridageUDPWithRouting` stays red: the rules never reach the tree from the pinned config.
+- **The router's protobuf app carries only its tag and port list.** That is enough for `TestSocksBridageUDPWithRouting`, which is green and gated; every other selector still refuses by name.
 
 ## Pins
 
