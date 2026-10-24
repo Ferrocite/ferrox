@@ -21168,6 +21168,38 @@ mod tests {
         }
     }
 
+    /// The link parser's encoder and the dial's encoder are two routes to one wire: same key, same family numbering, same bytes for every destination and both commands.
+    #[test]
+    fn the_link_encoder_and_the_dial_encoder_write_one_header() {
+        let password = "an-example-shared-password";
+        let link = ferrox_core::trojan::TrojanLink::parse(&format!(
+            "trojan://{password}@example.com:443?security=tls"
+        ))
+        .expect("parses");
+        assert_eq!(link.key(), &trojan_key(password), "one key derivation");
+        for target in [
+            Destination::from("192.0.2.53:8080".parse::<SocketAddr>().expect("IPv4")),
+            Destination::from("[2001:db8::1]:443".parse::<SocketAddr>().expect("IPv6")),
+            Destination::Name("www.example.com".to_owned(), 8443),
+            Destination::Name("a".repeat(255), 53),
+        ] {
+            let host = match &target {
+                Destination::Name(host, _) => host.clone(),
+                Destination::Address(address) => address.ip().to_string(),
+            };
+            for (command, byte) in [
+                (ferrox_core::trojan::Command::Connect, 1u8),
+                (ferrox_core::trojan::Command::Udp, 3),
+            ] {
+                assert_eq!(
+                    link.encode_header(command, &host, target.port()),
+                    &trojan_header(link.key(), byte, &target)[..],
+                    "{host} cmd {byte}"
+                );
+            }
+        }
+    }
+
     /// The pump belongs to the carrier, not to the socket: a WebSocket server that holds its `[0, 0]` until the first frame arrives must not deadlock either.
     #[test]
     fn vless_websocket_client_pumps_the_upload_before_reading_the_response() {
