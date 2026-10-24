@@ -19,9 +19,11 @@ pub struct TlsConfig {
     /// because a lane with no pins is the ordinary case.
     pub pins: crate::foxy::pin::Pins,
     /// The `cipher_suites` ids a client advertises, in `crypto/tls` order, from xray's
-    /// `tlsSettings.cipherSuites`. Empty means the config named none, so the backend keeps
-    /// its stock ordering; see `cipher_suites` for how a non-empty list is built.
-    pub cipher_suites: Vec<u16>,
+    /// `tlsSettings.cipherSuites`, behind one allocation: the config names the order once and
+    /// the cache keys on it per dial, so a copy would be a heap buffer on every handshake.
+    /// Empty means the config named none, so the backend keeps its stock ordering; see
+    /// `cipher_suites` for how a non-empty list is built.
+    pub cipher_suites: std::sync::Arc<[u16]>,
     /// Accept the peer chain as presented, keeping only the handshake signature that binds
     /// it to the key exchange: xray's `allowInsecure`, read by a masquerade cover's
     /// `masq_url_insecure` origin and by an outbound that names it. `false` is the default
