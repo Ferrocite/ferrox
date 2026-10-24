@@ -2128,7 +2128,7 @@ mod tests {
         let (got, early) = open_handshake(&mut std::io::Cursor::new(&seen[s.len()..]), &mut cipher)
             .expect("the one-write handshake parses");
         assert_eq!(got, target);
-        assert!(early.is_empty());
+        assert_eq!(early, Vec::<u8>::new());
     }
 
     #[test]
