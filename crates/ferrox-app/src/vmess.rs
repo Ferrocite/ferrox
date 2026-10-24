@@ -969,7 +969,7 @@ pub(crate) fn read_frame<'a>(
         return Some(&scratch[..0]);
     }
     if scratch.len() < total {
-        scratch.resize(total, 0);
+        crate::proxy::grow_scratch(scratch, total);
     }
     read_exact(stream, &mut scratch[..total]).ok()?;
     let len = open_body(recv, &mut scratch[..total], padding)?;
