@@ -132,3 +132,4 @@ append_pem 591
 # test join the same ferrox-core lib test binary, and the thin-LTO layout moves
 # the decide probe's frame by 98 Ir; dns.rs is untouched.
 ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 47810894 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+

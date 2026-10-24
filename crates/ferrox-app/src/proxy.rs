@@ -870,6 +870,8 @@ impl Outbound {
 struct RouteShared {
     routing: crate::router::Routing,
     tagged: HashMap<String, Outbound>,
+    /// Each balancer's candidate tags, ordered by tag. Built once so a flow picks from a slice.
+    balancers: HashMap<String, Vec<String>>,
     default: Outbound,
     default_tag: Option<String>,
 }
@@ -884,7 +886,7 @@ pub(crate) struct RoutePlan {
     udp: Association,
 }
 
-/// The one decision a SOCKS association can carry: a datagram has no per-destination route here.
+/// The one decision a SOCKS association can carry, or `Split` when each datagram names its own.
 #[derive(Debug, Clone)]
 pub(crate) enum Association {
     Default,
@@ -911,6 +913,9 @@ impl RoutePlan {
     }
 
     fn target(&self, tag: &str) -> &Outbound {
+        if Some(tag) == self.shared.default_tag.as_deref() {
+            return &self.shared.default;
+        }
         self.shared
             .tagged
             .get(tag)
@@ -923,6 +928,17 @@ impl RoutePlan {
         network: crate::router::Network,
         client: Option<&Connection>,
     ) -> &Outbound {
+        self.lane(asked, network, client).0
+    }
+
+    /// The outbound one flow takes and the tag that names its lane, or the default when no rule
+    /// matched. A balancer picks per flow; its fallback, then the default handler, covers no pick.
+    fn lane(
+        &self,
+        asked: &Destination,
+        network: crate::router::Network,
+        client: Option<&Connection>,
+    ) -> (&Outbound, Option<&str>) {
         let (domain, ip) = match asked {
             Destination::Name(host, _) => (Some(host.as_str()), None),
             Destination::Address(address) => (None, Some(address.ip())),
@@ -940,10 +956,34 @@ impl RoutePlan {
             local,
             inbound_tag: self.inbound_tag.as_deref(),
         };
-        match self.shared.routing.route(&flow) {
-            Some(tag) => self.target(tag),
-            None => &self.shared.default,
+        let Some(target) = self.shared.routing.route_target(&flow) else {
+            return (&self.shared.default, self.shared.default_tag.as_deref());
+        };
+        let tag = match target {
+            crate::router::RouteTarget::Outbound(tag) => {
+                return (self.target(tag), Some(tag));
+            }
+            crate::router::RouteTarget::Balancer(tag) => tag,
+        };
+        let Some(balancer) = self.shared.routing.balancer(tag) else {
+            return (&self.shared.default, self.shared.default_tag.as_deref());
+        };
+        let candidates = self
+            .shared
+            .balancers
+            .get(tag)
+            .expect("startup built every balancer's candidates");
+        if let Some(picked) = balancer.pick(candidates) {
+            return (self.target(picked), Some(picked));
         }
+        if let Some(fallback) = balancer.fallback() {
+            return (self.target(fallback), Some(fallback));
+        }
+        (&self.shared.default, self.shared.default_tag.as_deref())
+    }
+
+    fn split_udp(&self) -> bool {
+        matches!(self.udp, Association::Split)
     }
 
     fn udp_out(&self) -> Result<&Outbound, ()> {
@@ -1012,6 +1052,10 @@ fn route_shared(root: &Json, routing: crate::router::Routing) -> Result<Arc<Rout
     }
     let mut tagged = HashMap::new();
     for target in routing.targets() {
+        if matches!(target, crate::router::RouteTarget::Balancer(_)) {
+            continue;
+        }
+        let target = target.tag();
         if tagged.contains_key(target) {
             continue;
         }
@@ -1027,9 +1071,46 @@ fn route_shared(root: &Json, routing: crate::router::Routing) -> Result<Arc<Rout
         let out = build_outbound(config, target)?;
         tagged.insert(target.to_owned(), out);
     }
+    let mut balancers = HashMap::new();
+    for balancer in routing.balancers() {
+        let mut candidates: Vec<String> = list
+            .iter()
+            .filter_map(|outbound| {
+                let tag = outbound.get("tag").and_then(Json::as_str).unwrap_or("");
+                (!tag.is_empty() && balancer.selects(tag)).then(|| tag.to_owned())
+            })
+            .collect();
+        candidates.sort_unstable();
+        for candidate in &candidates {
+            if tagged.contains_key(candidate) || Some(candidate.as_str()) == default_tag.as_deref()
+            {
+                continue;
+            }
+            let Some(config) = configs.get(candidate.as_str()) else {
+                return Err(format!(
+                    "balancer `{}` selects `{candidate}`, which no outbound names",
+                    balancer.tag()
+                ));
+            };
+            tagged.insert(candidate.clone(), build_outbound(config, candidate)?);
+        }
+        if let Some(fallback) = balancer.fallback() {
+            if !tagged.contains_key(fallback) && Some(fallback) != default_tag.as_deref() {
+                let Some(config) = configs.get(fallback) else {
+                    return Err(format!(
+                        "balancer `{}` falls back to `{fallback}`, which no outbound names",
+                        balancer.tag()
+                    ));
+                };
+                tagged.insert(fallback.to_owned(), build_outbound(config, fallback)?);
+            }
+        }
+        balancers.insert(balancer.tag().to_owned(), candidates);
+    }
     Ok(Arc::new(RouteShared {
         routing,
         tagged,
+        balancers,
         default,
         default_tag,
     }))
@@ -1046,7 +1127,27 @@ fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
         return;
     }
     let tag = inbound_tag(inbound);
-    let direct = |named: &str| matches!(shared.tagged.get(named), Some(Outbound::Freedom));
+    let direct = |named: &str, balancer: bool| {
+        if balancer {
+            let Some(candidates) = shared.balancers.get(named) else {
+                return false;
+            };
+            let fallback = shared
+                .routing
+                .balancer(named)
+                .and_then(crate::router::Balancer::fallback);
+            return candidates
+                .iter()
+                .map(String::as_str)
+                .chain(fallback)
+                .all(|candidate| {
+                    Some(candidate) == shared.default_tag.as_deref()
+                        || matches!(shared.tagged.get(candidate), Some(Outbound::Freedom))
+                });
+        }
+        Some(named) == shared.default_tag.as_deref()
+            || matches!(shared.tagged.get(named), Some(Outbound::Freedom))
+    };
     if let Err(error) = shared.routing.server_routes(
         tag.as_deref(),
         matches!(&shared.default, Outbound::Freedom),
@@ -10028,20 +10129,21 @@ fn socks_udp_relay(client: &mut Connection) -> Option<UdpSocket> {
     Some(relay)
 }
 
-fn serve_socks_udp(mut client: Connection, out: &Outbound) {
-    // A datagram names its own destination, so rules that could split the association refuse it here.
-    let out = if let Outbound::Route(plan) = out {
-        if let Ok(target) = plan.udp_out() {
-            target
-        } else {
-            eprintln!("socks udp: routing rules could split this association; refused, not routed");
-            let _ = client.write_all(&foxy_socks_reply(0x07));
-            return;
+fn serve_socks_udp(client: Connection, out: &Outbound) {
+    if let Outbound::Route(plan) = out {
+        if plan.split_udp() {
+            return serve_socks_udp_split(client, plan);
         }
-    } else {
-        out
-    };
-    // A blackhole association is the same refusal: a relay that drops every datagram reads as working.
+        if let Ok(target) = plan.udp_out() {
+            return serve_socks_udp_lane(client, target);
+        }
+    }
+    serve_socks_udp_lane(client, out);
+}
+
+/// One lane for the whole association: every datagram reaches the same outbound.
+fn serve_socks_udp_lane(mut client: Connection, out: &Outbound) {
+    // A blackhole association is a refusal: a relay that drops every datagram reads as working.
     if matches!(out, Outbound::Block(_)) {
         let _ = client.write_all(&foxy_socks_reply(0x07));
         return;
@@ -10049,42 +10151,121 @@ fn serve_socks_udp(mut client: Connection, out: &Outbound) {
     let Some(relay) = socks_udp_relay(&mut client) else {
         return;
     };
-    // The handler holds the control socket open for its life, and the Foxy arms watch it for the client's goodbye.
+    serve_udp_lane(&relay, out, Some(&client));
+}
+
+/// One outbound's datagram lane over a relay socket. The association is `None` when the lane is
+/// itself an inner relay of a split association, whose control socket the splitter owns.
+fn serve_udp_lane(relay: &UdpSocket, out: &Outbound, associate: Option<&Connection>) {
     match out {
         Outbound::Vless(vless)
             if matches!(vless.carrier, Carrier::Raw(_)) && vless.tls.is_none() =>
         {
-            serve_socks_udp_vless(&relay, vless);
+            serve_socks_udp_vless(relay, vless);
         }
         Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Hysteria(_)) && !vless.mux => {
             // The datagram lane carries UDP flows the same way it carries TCP ones: one association per destination, ids never reused on the connection.
             if let Some(dial) = hysteria_dial_session(vless) {
-                crate::hysteria::serve_udp(&relay, &dial);
+                crate::hysteria::serve_udp(relay, &dial);
             }
         }
         Outbound::Trojan(trojan)
             if matches!(trojan.carrier, Carrier::Raw(_)) && trojan.tls.is_none() =>
         {
-            serve_socks_udp_trojan(&relay, trojan);
+            serve_socks_udp_trojan(relay, trojan);
         }
         Outbound::Vmess(vmess)
             if matches!(vmess.carrier, Carrier::Raw(_)) && vmess.tls.is_none() =>
         {
-            serve_socks_udp_vmess(&relay, vmess);
+            serve_socks_udp_vmess(relay, vmess);
         }
         Outbound::Shadowsocks(ss) if matches!(ss.carrier, Carrier::Raw(_)) => {
-            serve_socks_udp_shadowsocks(&relay, ss);
+            serve_socks_udp_shadowsocks(relay, ss);
         }
         Outbound::Foxy(foxy) => match foxy.carrier {
             // One tunnel for all destinations: later ones ride the first one opened.
-            crate::foxy::Carrier::H3 => serve_socks_udp_foxy_ip(&relay, foxy, &client),
-            _ => serve_socks_udp_foxy(&relay, foxy, &client),
+            crate::foxy::Carrier::H3 => serve_socks_udp_foxy_ip(relay, foxy, associate),
+            _ => serve_socks_udp_foxy(relay, foxy, associate),
         },
-        Outbound::Freedom => serve_socks_udp_freedom(&relay),
-        Outbound::Socks(socks) => serve_socks_udp_socks(&relay, socks),
-        Outbound::Dns(dns) => serve_dns_udp(&relay, dns),
+        Outbound::Freedom => serve_socks_udp_freedom(relay),
+        Outbound::Socks(socks) => serve_socks_udp_socks(relay, socks),
+        Outbound::Dns(dns) => serve_dns_udp(relay, dns),
         _ => {}
     }
+}
+
+/// A datagram names its own destination, so a ruleset that can name different outbounds gets one
+/// lane per chosen tag and the datagram goes to the lane its destination picked. Each lane is the
+/// same relay the unsplit association runs, fed by the outer relay and answering through it.
+struct UdpLane {
+    address: SocketAddr,
+    handle: thread::JoinHandle<()>,
+}
+
+fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan) {
+    let Some(relay) = socks_udp_relay(&mut client) else {
+        return;
+    };
+    let local = relay
+        .local_addr()
+        .map_or(std::net::IpAddr::V4([127, 0, 0, 1].into()), |addr| {
+            addr.ip()
+        });
+    let mut lanes: HashMap<Option<String>, UdpLane> = HashMap::new();
+    let mut replies: HashMap<SocketAddr, Option<String>> = HashMap::new();
+    let mut client_addr: Option<SocketAddr> = None;
+    let mut buf = udp_buffer();
+    while let Ok((n, src)) = relay.recv_from(&mut buf) {
+        if replies.contains_key(&src) {
+            if let Some(client) = client_addr {
+                let _ = relay.send_to(&buf[..n], client);
+            }
+            continue;
+        }
+        let Some((dest, _)) = parse_socks_udp_dest(&buf[..n]) else {
+            continue;
+        };
+        client_addr = Some(src);
+        let (out, key) = plan.lane(&dest, crate::router::Network::Udp, Some(&client));
+        let key = key.map(str::to_owned);
+        if matches!(out, Outbound::Block(_)) {
+            continue;
+        }
+        retire_finished_lane(&mut lanes, &mut replies, &key);
+        if !lanes.contains_key(&key) {
+            if let Some(lane) = spawn_udp_lane(out, local) {
+                replies.insert(lane.address, key.clone());
+                lanes.insert(key.clone(), lane);
+            }
+        }
+        if let Some(lane) = lanes.get(&key) {
+            let _ = relay.send_to(&buf[..n], lane.address);
+        }
+    }
+}
+
+/// A lane's loop ends on its own idle or a refused upstream; the key must not keep writing to the
+/// socket nobody reads, so a later datagram for that tag opens a fresh lane.
+#[allow(clippy::ref_option)] // the map is keyed by the optional tag itself
+fn retire_finished_lane(
+    lanes: &mut HashMap<Option<String>, UdpLane>,
+    replies: &mut HashMap<SocketAddr, Option<String>>,
+    key: &Option<String>,
+) {
+    if lanes.get(key).is_some_and(|lane| lane.handle.is_finished()) {
+        if let Some(lane) = lanes.remove(key) {
+            replies.remove(&lane.address);
+        }
+    }
+}
+
+fn spawn_udp_lane(out: &Outbound, local: std::net::IpAddr) -> Option<UdpLane> {
+    let socket = UdpSocket::bind(SocketAddr::new(local, 0)).ok()?;
+    let address = socket.local_addr().ok()?;
+    let _ = socket.set_read_timeout(Some(budgets::udp_idle()));
+    let out = out.clone();
+    let handle = thread::spawn(move || serve_udp_lane(&socket, &out, None));
+    Some(UdpLane { address, handle })
 }
 
 /// The SOCKS5 client lane for datagrams: one association to the upstream server, and
@@ -10559,9 +10740,11 @@ fn serve_dns_udp(relay: &UdpSocket, dns: &DnsOut) {
 }
 
 /// Foxy UDP: one CONNECT-UDP stream per destination, HTTP/2 then HTTP/3; the configured carrier does not apply.
-fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connection) {
+fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut, associate: Option<&Connection>) {
     let _ = relay.set_read_timeout(Some(UDP_POLL));
-    let _ = associate.set_read_timeout(Some(budgets::SESSION_POLL));
+    if let Some(associate) = associate {
+        let _ = associate.set_read_timeout(Some(budgets::SESSION_POLL));
+    }
     let mut streams: HashMap<SocketAddr, crate::foxy::Datagram> = HashMap::new();
     let mut buf = udp_buffer();
     let mut datagram = udp_buffer();
@@ -10599,7 +10782,8 @@ fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connectio
                     }
                 }
                 Err(error) if is_timeout(&error) => {
-                    ended = peer_left(associate) || quiet.elapsed() >= budgets::udp_idle();
+                    ended =
+                        associate.is_some_and(peer_left) || quiet.elapsed() >= budgets::udp_idle();
                     break;
                 }
                 Err(_) => {
@@ -10642,9 +10826,11 @@ fn serve_socks_udp_foxy(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connectio
 }
 
 /// CONNECT-IP UDP: one tunnel shared by every destination, so later targets cost a map row, not a dial.
-fn serve_socks_udp_foxy_ip(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connection) {
+fn serve_socks_udp_foxy_ip(relay: &UdpSocket, foxy: &FoxyOut, associate: Option<&Connection>) {
     let _ = relay.set_read_timeout(Some(UDP_POLL));
-    let _ = associate.set_read_timeout(Some(budgets::SESSION_POLL));
+    if let Some(associate) = associate {
+        let _ = associate.set_read_timeout(Some(budgets::SESSION_POLL));
+    }
     // The tunnel and its owned source address are opened once and shared: that is this row's whole point.
     let mut tunnel: Option<crate::foxy::Ip> = None;
     let mut source = [0u8; 16];
@@ -10714,7 +10900,8 @@ fn serve_socks_udp_foxy_ip(relay: &UdpSocket, foxy: &FoxyOut, associate: &Connec
                     }
                 }
                 Err(error) if is_timeout(&error) => {
-                    ended = peer_left(associate) || quiet.elapsed() >= budgets::udp_idle();
+                    ended =
+                        associate.is_some_and(peer_left) || quiet.elapsed() >= budgets::udp_idle();
                     break;
                 }
                 Err(_) => {
@@ -13695,6 +13882,53 @@ pub(crate) fn parse_socks_udp(packet: &[u8]) -> Option<(SocketAddr, &[u8])> {
     }
     let (addr, used) = parse_socks_addr_rest(&packet[4..], packet[3])?;
     Some((addr, &packet[4 + used..]))
+}
+
+/// The same frame with the name kept: a routing rule may name a domain, and resolving here would
+/// hand the decision an address the client never asked for.
+pub(crate) fn parse_socks_udp_dest(packet: &[u8]) -> Option<(Destination, &[u8])> {
+    if packet.len() < 4 || packet[2] != 0 {
+        return None;
+    }
+    let body = &packet[4..];
+    let (dest, used) = match packet[3] {
+        1 => {
+            let ip: [u8; 4] = body.get(..4)?.try_into().ok()?;
+            let port: [u8; 2] = body.get(4..6)?.try_into().ok()?;
+            (
+                Destination::Address(SocketAddr::new(
+                    std::net::IpAddr::V4(ip.into()),
+                    u16::from_be_bytes(port),
+                )),
+                6,
+            )
+        }
+        3 => {
+            let len = usize::from(*body.first()?);
+            let name = body.get(1..1 + len)?;
+            let port: [u8; 2] = body.get(1 + len..3 + len)?.try_into().ok()?;
+            (
+                Destination::Name(
+                    std::str::from_utf8(name).ok()?.to_owned(),
+                    u16::from_be_bytes(port),
+                ),
+                3 + len,
+            )
+        }
+        4 => {
+            let ip: [u8; 16] = body.get(..16)?.try_into().ok()?;
+            let port: [u8; 2] = body.get(16..18)?.try_into().ok()?;
+            (
+                Destination::Address(SocketAddr::new(
+                    std::net::IpAddr::V6(ip.into()),
+                    u16::from_be_bytes(port),
+                )),
+                18,
+            )
+        }
+        _ => return None,
+    };
+    Some((dest, &body[used..]))
 }
 
 /// The handshake a front's client made: the command, the destination, and the version
@@ -21700,6 +21934,10 @@ mod tests {
         });
 
         let mut session = dial_tls_session(&addr, &client_config, None).expect("retries");
+        session
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
         session.write_all(b"ping").expect("writes");
         let mut back = [0u8; 4];
         session.read_exact(&mut back).expect("reads");
@@ -24120,7 +24358,7 @@ mod tests {
         let (associate, _peer) = association_pair();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
-            serve_socks_udp_foxy(&relay, &foxy_without_edges(), &associate);
+            serve_socks_udp_foxy(&relay, &foxy_without_edges(), Some(&associate));
             let _ = done_tx.send(());
         });
         let returned = done_rx.recv_timeout(Duration::from_millis(250) + Duration::from_secs(5));
@@ -24141,7 +24379,7 @@ mod tests {
         let (associate, peer) = association_pair();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
-            serve_socks_udp_foxy(&relay, &foxy_without_edges(), &associate);
+            serve_socks_udp_foxy(&relay, &foxy_without_edges(), Some(&associate));
             let _ = done_tx.send(());
         });
         drop(peer);
@@ -24163,7 +24401,7 @@ mod tests {
         let (associate, _peer) = association_pair();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
-            serve_socks_udp_foxy_ip(&relay, &foxy_without_edges(), &associate);
+            serve_socks_udp_foxy_ip(&relay, &foxy_without_edges(), Some(&associate));
             let _ = done_tx.send(());
         });
         let returned = done_rx.recv_timeout(Duration::from_millis(250) + Duration::from_secs(5));
@@ -24184,7 +24422,7 @@ mod tests {
         let (associate, peer) = association_pair();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
-            serve_socks_udp_foxy_ip(&relay, &foxy_without_edges(), &associate);
+            serve_socks_udp_foxy_ip(&relay, &foxy_without_edges(), Some(&associate));
             let _ = done_tx.send(());
         });
         drop(peer);
@@ -32316,10 +32554,68 @@ mod tests {
         assert_eq!(&back, b"ping");
     }
 
-    /// A datagram names its own destination, so rules that could split one association refuse it
-    /// with a reply the client can read, rather than bind a relay that would route half of it.
+    /// A datagram names its own destination, so an association the rules could split runs one lane
+    /// per chosen tag: the blocked destination is dropped, and the allowed one still reaches its echo.
     #[test]
-    fn an_association_the_rules_could_split_is_refused_before_the_relay_binds() {
+    fn an_association_the_rules_could_split_runs_one_lane_per_tag() {
+        let blocked = udp_echo_loop();
+        let allowed = udp_echo_loop();
+        let config = format!(
+            r#"{{"outbounds":[{{"tag":"direct","protocol":"freedom"}},{{"tag":"block","protocol":"blackhole"}}],
+            "routing":{{"rules":[
+                {{"type":"field","port":{blocked},"outboundTag":"block"}},
+                {{"type":"field","inboundTag":["in"],"outboundTag":"direct"}}]}}}}"#
+        );
+        let front = socks_front_with(route_outbound(&config, Some("in"), true));
+        let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0, "the split association is served: {reply:?}");
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        let frame = |port: u16, payload: &[u8]| {
+            let mut datagram = vec![0u8, 0, 0];
+            push_socks_addr(
+                &mut datagram,
+                &format!("127.0.0.1:{port}").parse().expect("addr"),
+            );
+            datagram.extend_from_slice(payload);
+            datagram
+        };
+        udp.send_to(&frame(blocked, b"drop"), relay).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        assert!(
+            udp.recv_from(&mut back).is_err(),
+            "the blocked lane never answers"
+        );
+        udp.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        udp.send_to(&frame(allowed, b"ping"), relay).expect("sends");
+        let (n, _) = udp.recv_from(&mut back).expect("echoes");
+        let (source, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(source.port(), allowed);
+        assert_eq!(payload, b"ping");
+    }
+
+    /// A split association keeps the client's name: a domain rule drops the datagram before any
+    /// resolver sees it, and an address datagram still rides the same association.
+    #[test]
+    fn a_split_association_routes_a_datagram_by_its_name() {
+        let allowed = udp_echo_loop();
         let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
             "routing":{"rules":[
                 {"type":"field","domain":["full:blocked.test"],"outboundTag":"block"},
@@ -32337,7 +32633,122 @@ mod tests {
             .expect("associates");
         let mut reply = [0u8; 10];
         client.read_exact(&mut reply).expect("replies");
-        assert_eq!(reply[1], 0x07, "command not supported: {reply:?}");
+        assert_eq!(reply[1], 0, "the split association is served: {reply:?}");
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        let name_frame = |name: &str, port: u16| {
+            let mut datagram = vec![0u8, 0, 0, 3, name.len() as u8];
+            datagram.extend_from_slice(name.as_bytes());
+            datagram.extend_from_slice(&port.to_be_bytes());
+            datagram.extend_from_slice(b"drop");
+            datagram
+        };
+        udp.send_to(&name_frame("blocked.test", 443), relay)
+            .expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        assert!(
+            udp.recv_from(&mut back).is_err(),
+            "a name rule drops it before a resolver sees it"
+        );
+        udp.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let mut frame = vec![0u8, 0, 0];
+        push_socks_addr(
+            &mut frame,
+            &format!("127.0.0.1:{allowed}").parse().expect("addr"),
+        );
+        frame.extend_from_slice(b"ping");
+        udp.send_to(&frame, relay).expect("sends");
+        let (n, _) = udp.recv_from(&mut back).expect("echoes");
+        assert_eq!(parse_socks_udp(&back[..n]).expect("splits").1, b"ping");
+    }
+
+    /// A lane whose loop ended is retired, so the next datagram for its tag opens a fresh socket
+    /// rather than writing to one nobody reads.
+    #[test]
+    fn a_finished_udp_lane_is_retired_before_its_key_is_reused() {
+        let address: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let key = Some("lane".to_owned());
+        let handle = thread::spawn(|| {});
+        while !handle.is_finished() {
+            thread::yield_now();
+        }
+        let mut lanes = HashMap::from([(key.clone(), UdpLane { address, handle })]);
+        let mut replies = HashMap::from([(address, key.clone())]);
+        retire_finished_lane(&mut lanes, &mut replies, &key);
+        assert!(!lanes.contains_key(&key));
+        assert!(!replies.contains_key(&address));
+    }
+
+    /// A balancer picks a lane per flow: the round robin walks the selected tags in config order,
+    /// and a strategy with no observatory falls back where the reference does.
+    #[test]
+    fn a_balancer_rule_picks_its_lane_per_flow() {
+        let out = route_outbound(
+            r#"{"outbounds":[{"tag":"lane-b","protocol":"blackhole"},{"tag":"lane-a","protocol":"freedom"}],
+                "routing":{"balancers":[{"tag":"pool","selector":["lane-"],"strategy":"roundRobin"}],
+                "rules":[{"type":"field","network":"tcp","balancerTag":"pool"}]}}"#,
+            Some("in"),
+            true,
+        );
+        let Outbound::Route(plan) = &out else {
+            panic!("a route plan");
+        };
+        let asked = Destination::Name("echo.test".to_owned(), 443);
+        assert!(
+            matches!(
+                plan.pick(&asked, crate::router::Network::Tcp, None),
+                Outbound::Freedom
+            ),
+            "candidates are ordered by tag, not by config order"
+        );
+        assert!(matches!(
+            plan.pick(&asked, crate::router::Network::Tcp, None),
+            Outbound::Block(_)
+        ));
+        assert!(matches!(
+            plan.pick(&asked, crate::router::Network::Tcp, None),
+            Outbound::Freedom
+        ));
+
+        let out = route_outbound(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"spare","protocol":"freedom"}],
+                "routing":{"balancers":[{"tag":"pool","selector":["spare"],"strategy":"leastPing","fallbackTag":"direct"}],
+                "rules":[{"type":"field","network":"tcp","balancerTag":"pool"}]}}"#,
+            Some("in"),
+            true,
+        );
+        let Outbound::Route(plan) = &out else {
+            panic!("a route plan");
+        };
+        let (picked, tag) = plan.lane(&asked, crate::router::Network::Tcp, None);
+        assert!(matches!(picked, Outbound::Freedom));
+        assert_eq!(tag, Some("direct"), "an observatory-less pick falls back");
+    }
+
+    /// A balancer tag and an outbound tag may be the same name; an `outboundTag` rule still takes
+    /// that outbound, where a `balancerTag` rule takes the drawing.
+    #[test]
+    fn an_outbound_tag_that_shares_a_balancer_tag_is_still_an_outbound() {
+        let out = route_outbound(
+            r#"{"outbounds":[{"tag":"pool","protocol":"freedom"},{"tag":"lane-a","protocol":"blackhole"}],
+                "routing":{"balancers":[{"tag":"pool","selector":["lane-"],"strategy":"roundRobin"}],
+                "rules":[{"type":"field","network":"tcp","outboundTag":"pool"}]}}"#,
+            Some("in"),
+            true,
+        );
+        let Outbound::Route(plan) = &out else {
+            panic!("a route plan");
+        };
+        let asked = Destination::Name("echo.test".to_owned(), 443);
+        let (picked, tag) = plan.lane(&asked, crate::router::Network::Tcp, None);
+        assert!(matches!(picked, Outbound::Freedom));
+        assert_eq!(tag, Some("pool"));
     }
 
     /// A tag a rule names but no outbound carries, a tag named twice, and a blackhole mode this tree

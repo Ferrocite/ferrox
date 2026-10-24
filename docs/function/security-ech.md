@@ -24,7 +24,8 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| aes256-gcm-seal-retired-instructions | 29612 | scripts/count-ops.sh |
+| aes256-gcm-open-retired-instructions | 29749 | scripts/count-ops.sh |
 | ech-offers-accepted-by-the-stock-lane | 1 | ferrox-app-proxy::tests::vless_over_ech_tls_carries_an_echo |
 | rejected-ech-offers-retried-once | 1 | ferrox-app-proxy::tests::a_rejected_ech_offer_retries_once_with_the_servers_list |
 | ech-offers-built-by-the-shaped-lane | 1 | ferrox-core-tls::shaped::hello::tests::a_real_ech_offer_hides_the_inner_name_under_the_public_one |
@@ -32,6 +33,8 @@ graph TD
 | quic-dials-that-offer-the-configured-list | 1 | ferrox-app-quic::tests::a_client_dial_offers_the_configured_ech_list |
 | quic-lanes-that-fall-back-without-an-offer | 1 | ferrox-app-quic::tests::an_ech_serving_lane_answers_a_client_without_an_offer |
 | heap-buffers-for-an-ech-cover | 1 | ferrox-core-tls::shaped::hello::tests::an_ech_cover_is_written_into_one_buffer |
+| heap-buffers-for-an-hpke-context | 0 | ferrox-core-tls::hpke::tests::a_context_costs_no_allocations |
+| heap-buffers-for-an-ech-config | 1 | ferrox-core-tls::ech::tests::an_encoded_config_is_one_buffer |
 <!-- counts:end -->
 
 The stock test is the relay path: a VLESS flow over a TLS listener whose ECH key is the fixture's. The retry test first offers a valid config the listener does not hold, takes the retry list it returns, then keeps the second session. The QUIC tests read `ech_accepted()` on both ends, and the fallback test proves a client without a list still reaches the lane. The shaped hello test gates the real offer's outer and inner names, not a GREASE cover.
@@ -40,10 +43,12 @@ The stock test is the relay path: a VLESS flow over a TLS listener whose ECH key
 
 ```bash
 ./scripts/count-ops.sh report \
-  vless_over_ech_tls_carries_an_echo 'proxy'
+  tls::shaped::hello::tests::an_aes_256_only_config_seals_the_inner_hello \
+  'ferrox_core::tls::hpke::Context::seal' \
+  'ferrox_core::tls::hpke::Context::open'
 ```
 
-`UNBLESSED`. This host is macOS/aarch64, where valgrind has no build, so `scripts/count-ops.sh` cannot run locally; `ops.yml` is the only checker and its artefact has not been read for this path. The exact-count gate in `./scripts/check.sh` is therefore CI-only for this row.
+The probe is the existing AES-256-only ECH hello test: one `enable_ech` seals the cover and one inner open decrypts it, so each symbol is one frame under a fixed hello and fixed inner length. `ops.yml` on this head reports `seal` 29612 and `open` 29749 retired instructions; this host is macOS/aarch64, where valgrind has no build, so the exact-count gate in `./scripts/check.sh` is CI-only for the rows.
 
 ## Time
 
@@ -71,6 +76,6 @@ What was **not** removed: the retry costs one extra connection when a server rej
 What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
 
 <!-- scope:begin -->
-- paths: crates/ferrox-app/src/ech_dns.rs, crates/ferrox-core/src/tls/ech.rs, crates/ferrox-core/src/tls/hpke.rs
+- paths: crates/ferrox-app/src/ech_dns.rs
 - go: ./transport/internet/tls/...
 <!-- scope:end -->

@@ -12,7 +12,9 @@ use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Network {
@@ -50,11 +52,178 @@ enum DomainStrategy {
     IpOnDemand,
 }
 
+/// What a matching rule names: an outbound, or a balancer that picks one per flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RouteTarget<'a> {
+    Outbound(&'a str),
+    Balancer(&'a str),
+}
+
+impl<'a> RouteTarget<'a> {
+    pub(crate) fn tag(self) -> &'a str {
+        match self {
+            Self::Outbound(tag) | Self::Balancer(tag) => tag,
+        }
+    }
+}
+
+fn rule_target(rule: &Rule) -> RouteTarget<'_> {
+    if rule.balancer {
+        RouteTarget::Balancer(&rule.target)
+    } else {
+        RouteTarget::Outbound(&rule.target)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct Routing {
     strategy: DomainStrategy,
     rules: Vec<Rule>,
+    balancers: Vec<Balancer>,
     has_domains: bool,
+}
+
+/// One `balancers` entry: a tag a rule may name, the outbound-tag prefixes it draws from, and the
+/// strategy that picks one per flow. Xray selects candidates with `strings.HasPrefix`, not a regex.
+#[derive(Debug)]
+pub(crate) struct Balancer {
+    tag: String,
+    selectors: Vec<String>,
+    strategy: Strategy,
+    fallback: Option<String>,
+    index: AtomicUsize,
+    seed: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Strategy {
+    Random,
+    RoundRobin,
+    LeastPing,
+    LeastLoad,
+}
+
+impl Balancer {
+    pub(crate) fn tag(&self) -> &str {
+        &self.tag
+    }
+
+    pub(crate) fn selects(&self, tag: &str) -> bool {
+        self.selectors
+            .iter()
+            .any(|selector| tag.starts_with(selector))
+    }
+
+    pub(crate) fn fallback(&self) -> Option<&str> {
+        self.fallback.as_deref()
+    }
+
+    /// The candidate for one flow. Without the observatory the two health strategies have no
+    /// reading to choose from, so they name nothing and the caller falls back as the reference does.
+    pub(crate) fn pick<'a>(&self, candidates: &'a [String]) -> Option<&'a str> {
+        let count = candidates.len();
+        if count == 0 {
+            return None;
+        }
+        let at = match self.strategy {
+            Strategy::RoundRobin => self.index.fetch_add(1, Ordering::Relaxed) % count,
+            Strategy::Random => {
+                let mut state = self.seed.load(Ordering::Relaxed);
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                self.seed.store(state, Ordering::Relaxed);
+                (state % count as u64) as usize
+            }
+            Strategy::LeastPing | Strategy::LeastLoad => return None,
+        };
+        Some(candidates[at].as_str())
+    }
+
+    fn parse(value: &Json, at: usize) -> Result<Self, String> {
+        let pairs = object(value, "routing balancer")?;
+        let mut tag = None;
+        let mut selectors = None;
+        let mut strategy = Strategy::Random;
+        let mut fallback = None;
+        for (key, field) in pairs {
+            match key.as_str() {
+                "tag" => {
+                    tag = Some(
+                        field
+                            .as_str()
+                            .filter(|tag| !tag.is_empty())
+                            .ok_or_else(|| "balancer tag is empty".to_owned())?
+                            .to_owned(),
+                    );
+                }
+                "selector" => selectors = string_list(field, "selector")?,
+                "strategy" => strategy = parse_strategy(field)?,
+                "fallbackTag" => {
+                    fallback = field
+                        .as_str()
+                        .filter(|tag| !tag.is_empty())
+                        .map(str::to_owned);
+                }
+                other => return Err(format!("routing balancer field `{other}` is not carried")),
+            }
+        }
+        let tag = tag.ok_or_else(|| "routing balancer has no tag".to_owned())?;
+        let selectors = selectors.ok_or_else(|| format!("balancer `{tag}` has no selector"))?;
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos() as u64)
+            .wrapping_add(at as u64)
+            | 1;
+        Ok(Self {
+            tag,
+            selectors,
+            strategy,
+            fallback,
+            index: AtomicUsize::new(0),
+            seed: AtomicU64::new(seed),
+        })
+    }
+}
+
+fn parse_strategy(value: &Json) -> Result<Strategy, String> {
+    let named = match value {
+        Json::Null => return Ok(Strategy::Random),
+        Json::Str(named) => named.as_str(),
+        Json::Obj(pairs) => {
+            let mut named = "";
+            for (key, field) in pairs {
+                match key.as_str() {
+                    "type" => {
+                        named = field
+                            .as_str()
+                            .ok_or_else(|| "balancer strategy type is not a string".to_owned())?;
+                    }
+                    "settings" => {
+                        if !matches!(field, Json::Null | Json::Obj(_)) {
+                            return Err("balancer strategy settings is not an object".into());
+                        }
+                    }
+                    other => {
+                        return Err(format!(
+                            "routing balancer strategy field `{other}` is not carried"
+                        ))
+                    }
+                }
+            }
+            named
+        }
+        _ => return Err("routing balancer strategy is not a string or object".into()),
+    };
+    match named.to_ascii_lowercase().as_str() {
+        "" | "random" => Ok(Strategy::Random),
+        "roundrobin" => Ok(Strategy::RoundRobin),
+        "leastping" => Ok(Strategy::LeastPing),
+        "leastload" => Ok(Strategy::LeastLoad),
+        _ => Err(format!(
+            "routing balancer strategy `{named}` is not random, roundRobin, leastPing or leastLoad"
+        )),
+    }
 }
 
 /// The name a flow carries, in the form the tables store and the form a regex must see. Lowering
@@ -78,6 +247,7 @@ impl Names<'_> {
 #[derive(Debug)]
 struct Rule {
     target: String,
+    balancer: bool,
     tag: Option<String>,
     inbound_tags: Option<Vec<String>>,
     networks: Option<Vec<Network>>,
@@ -108,6 +278,7 @@ impl Routing {
         let pairs = object(block, "routing")?;
         let mut strategy = DomainStrategy::AsIs;
         let mut raw_rules = None;
+        let mut raw_balancers = None;
         let mut assets = Assets::new(dirs);
         for (key, value) in pairs {
             match key.as_str() {
@@ -133,11 +304,7 @@ impl Routing {
                     raw_rules = Some(value);
                 }
                 "balancers" => {
-                    if value.as_arr().is_some_and(|items| !items.is_empty()) {
-                        return Err(
-                            "routing balancers is row 81, which this tree does not carry".into(),
-                        );
-                    }
+                    raw_balancers = Some(value);
                 }
                 "script" => {
                     if value.as_str().is_some_and(|script| !script.is_empty()) {
@@ -145,6 +312,22 @@ impl Routing {
                     }
                 }
                 other => return Err(format!("routing field `{other}` is not carried")),
+            }
+        }
+        let mut balancers = Vec::new();
+        if let Some(value) = raw_balancers {
+            if !matches!(value, Json::Null) {
+                let items = value
+                    .as_arr()
+                    .ok_or_else(|| "routing balancers is not an array".to_owned())?;
+                let mut tags = HashSet::new();
+                for (at, item) in items.iter().enumerate() {
+                    let balancer = Balancer::parse(item, at)?;
+                    if !tags.insert(balancer.tag.clone()) {
+                        return Err(format!("duplicate balancer tag `{}`", balancer.tag));
+                    }
+                    balancers.push(balancer);
+                }
             }
         }
         let mut rules = Vec::new();
@@ -165,25 +348,60 @@ impl Routing {
                 }
             }
         }
+        for rule in &rules {
+            if rule.balancer && !balancers.iter().any(|balancer| balancer.tag == rule.target) {
+                return Err(format!("balancer `{}` not found", rule.target));
+            }
+        }
         let has_domains = rules.iter().any(|rule| rule.domains.is_some());
         Ok(Some(Self {
             strategy,
             rules,
+            balancers,
             has_domains,
         }))
     }
 
-    /// The tags rules name, for the registry that has to build every one of them.
-    pub(crate) fn targets(&self) -> impl Iterator<Item = &str> {
-        self.rules.iter().map(|rule| rule.target.as_str())
+    /// The targets rules name and whether each names a balancer, for the registry that has to
+    /// build every outbound and every balancer's candidates.
+    pub(crate) fn targets(&self) -> impl Iterator<Item = RouteTarget<'_>> {
+        self.rules.iter().map(|rule| {
+            if rule.balancer {
+                RouteTarget::Balancer(rule.target.as_str())
+            } else {
+                RouteTarget::Outbound(rule.target.as_str())
+            }
+        })
     }
 
-    /// The first matching rule's tag; `None` leaves the caller's default in place.
+    pub(crate) fn balancers(&self) -> impl Iterator<Item = &Balancer> {
+        self.balancers.iter()
+    }
+
+    pub(crate) fn balancer(&self, tag: &str) -> Option<&Balancer> {
+        self.balancers.iter().find(|balancer| balancer.tag == tag)
+    }
+
+    /// The first matching rule's target; `None` leaves the caller's default in place.
+    #[cfg(test)]
     pub(crate) fn route(&self, flow: &Flow) -> Option<&str> {
-        self.route_with(flow, &resolve_ips)
+        self.route_target(flow).map(RouteTarget::tag)
     }
 
+    pub(crate) fn route_target(&self, flow: &Flow) -> Option<RouteTarget<'_>> {
+        self.route_target_with(flow, &resolve_ips)
+    }
+
+    #[cfg(test)]
     fn route_with(&self, flow: &Flow, resolve: &dyn Fn(&str, u16) -> Vec<IpAddr>) -> Option<&str> {
+        self.route_target_with(flow, resolve).map(RouteTarget::tag)
+    }
+
+    fn route_target_with(
+        &self,
+        flow: &Flow,
+        resolve: &dyn Fn(&str, u16) -> Vec<IpAddr>,
+    ) -> Option<RouteTarget<'_>> {
         let lower = OnceCell::new();
         let names = flow.domain.map(|raw| Names {
             raw,
@@ -193,13 +411,15 @@ impl Routing {
         match self.strategy {
             DomainStrategy::AsIs => {
                 let mut ips = Ips::never();
-                self.first_match(flow, names, &mut ips)
+                self.first_match(flow, names, &mut ips).map(rule_target)
             }
             DomainStrategy::IpOnDemand => {
                 let mut ips = Ips::lazy(resolve);
-                self.first_match(flow, names, &mut ips)
+                self.first_match(flow, names, &mut ips).map(rule_target)
             }
-            DomainStrategy::IpIfNonMatch => self.first_match_if_non_match(flow, names, resolve),
+            DomainStrategy::IpIfNonMatch => self
+                .first_match_if_non_match(flow, names, resolve)
+                .map(rule_target),
         }
     }
 
@@ -208,11 +428,10 @@ impl Routing {
         flow: &Flow,
         names: Option<Names<'_>>,
         ips: &mut Ips<'_>,
-    ) -> Option<&'a str> {
+    ) -> Option<&'a Rule> {
         self.rules
             .iter()
             .find(|rule| rule.matches(flow, names, ips))
-            .map(|rule| rule.target.as_str())
     }
 
     /// `IpIfNonMatch` only resolves when a rule whose other selectors already hold still has an
@@ -223,7 +442,7 @@ impl Routing {
         flow: &Flow,
         names: Option<Names<'_>>,
         resolve: &dyn Fn(&str, u16) -> Vec<IpAddr>,
-    ) -> Option<&'a str> {
+    ) -> Option<&'a Rule> {
         let mut pending = [0u64; 4];
         let mut spilled = false;
         for (at, rule) in self.rules.iter().enumerate() {
@@ -232,10 +451,10 @@ impl Routing {
             }
             if let Some(ip) = flow.ip {
                 if rule.ip_matches_addr(ip) {
-                    return Some(rule.target.as_str());
+                    return Some(rule);
                 }
             } else if rule.ips.is_none() {
-                return Some(rule.target.as_str());
+                return Some(rule);
             } else if at < pending.len() * 64 {
                 pending[at / 64] |= 1 << (at % 64);
             } else {
@@ -251,24 +470,22 @@ impl Routing {
         }
         for at in 0..self.rules.len().min(pending.len() * 64) {
             if pending[at / 64] & (1 << (at % 64)) != 0 && self.rules[at].ip_matches_any(&addrs) {
-                return Some(self.rules[at].target.as_str());
+                return Some(&self.rules[at]);
             }
         }
         if spilled {
-            return self.rules[pending.len() * 64..]
-                .iter()
-                .find(|rule| {
-                    rule.ips.is_some()
-                        && rule.matches_without_ip(flow, names)
-                        && rule.ip_matches_any(&addrs)
-                })
-                .map(|rule| rule.target.as_str());
+            return self.rules[pending.len() * 64..].iter().find(|rule| {
+                rule.ips.is_some()
+                    && rule.matches_without_ip(flow, names)
+                    && rule.ip_matches_any(&addrs)
+            });
         }
         None
     }
 
     /// The one tag a SOCKS association may use when every datagram reaches it; `None` when a
-    /// per-destination rule could split the association, which the caller refuses rather than guesses.
+    /// per-destination rule could split the association, which the caller serves one lane per
+    /// datagram's chosen tag rather than guessing.
     pub(crate) fn udp_tag<'a>(
         &'a self,
         inbound: Option<&str>,
@@ -278,6 +495,9 @@ impl Routing {
         for rule in &self.rules {
             if !rule.reachable(inbound, Network::Udp) || !rule.local_os_matches() {
                 continue;
+            }
+            if rule.balancer {
+                return Err(());
             }
             if !agree(&mut decided, &rule.target) {
                 return Err(());
@@ -299,13 +519,13 @@ impl Routing {
         &self,
         inbound: Option<&str>,
         default_direct: bool,
-        direct: impl Fn(&str) -> bool,
+        direct: impl Fn(&str, bool) -> bool,
     ) -> Result<(), String> {
         for rule in &self.rules {
             if !rule.reachable(inbound, Network::Tcp) || !rule.local_os_matches() {
                 continue;
             }
-            if !direct(&rule.target) {
+            if !direct(&rule.target, rule.balancer) {
                 return Err(format!(
                     "a rule for inbound {} targets `{}`, which the server inbound serves direct",
                     inbound.unwrap_or("<untagged>"),
@@ -398,10 +618,18 @@ impl<'a> Ips<'a> {
     }
 }
 
+fn rule_field_target(field: &Json, name: &str) -> Result<Option<String>, String> {
+    field
+        .as_str()
+        .map(|tag| (!tag.is_empty()).then(|| tag.to_owned()))
+        .ok_or_else(|| format!("routing rule {name} is not a string"))
+}
+
 impl Rule {
     fn parse(value: &Json, assets: &mut Assets) -> Result<Self, String> {
         let pairs = object(value, "routing rule")?;
         let mut target = None;
+        let mut balancing_target = None;
         let mut tag = None;
         let mut inbound_tags = None;
         let mut networks = None;
@@ -419,20 +647,8 @@ impl Rule {
         let mut local_ips = None;
         for (key, field) in pairs {
             match key.as_str() {
-                "outboundTag" => {
-                    target = Some(
-                        field
-                            .as_str()
-                            .filter(|tag| !tag.is_empty())
-                            .ok_or_else(|| "routing rule outboundTag is empty".to_owned())?
-                            .to_owned(),
-                    );
-                }
-                "balancerTag" => {
-                    if field.as_str().is_some_and(|tag| !tag.is_empty()) {
-                        return Err("routing rule balancerTag is row 81, which this tree does not carry".into());
-                    }
-                }
+                "outboundTag" => target = rule_field_target(field, "outboundTag")?,
+                "balancerTag" => balancing_target = rule_field_target(field, "balancerTag")?,
                 "type" => {
                     let named = field
                         .as_str()
@@ -464,7 +680,9 @@ impl Rule {
                 other => return Err(format!("routing rule field `{other}` is not carried")),
             }
         }
+        let balancing = target.is_none() && balancing_target.is_some();
         let target = target
+            .or(balancing_target)
             .ok_or_else(|| "routing rule names neither outboundTag nor balancerTag".to_owned())?;
         let domain_json = domains_list.or(domain_value);
         if let Some(field) = domain_json {
@@ -476,6 +694,7 @@ impl Rule {
         }
         let rule = Self {
             target,
+            balancer: balancing,
             tag,
             inbound_tags,
             networks,
@@ -508,7 +727,8 @@ impl Rule {
     }
 
     fn association_stable(&self) -> bool {
-        self.ports.is_none()
+        !self.balancer
+            && self.ports.is_none()
             && self.source_ports.is_none()
             && self.local_ports.is_none()
             && self.domains.is_none()
@@ -518,7 +738,8 @@ impl Rule {
     }
 
     fn server_always(&self) -> bool {
-        self.inbound_tags.is_some()
+        !self.balancer
+            && self.inbound_tags.is_some()
             && self.networks.is_none()
             && self.local_os.is_none()
             && self.association_stable()
@@ -2379,7 +2600,7 @@ mod tests {
     }
 
     #[test]
-    fn a_socks_association_is_refused_when_rules_could_split_it() {
+    fn a_socks_association_that_could_split_is_not_pinned_to_one_tag() {
         let root = |rules| object(vec![("routing", routing(rules))]);
         let split = root(vec![
             rule("block", vec![("domain", array(vec![text("blocked.test")]))]),
@@ -2423,7 +2644,7 @@ mod tests {
 
     #[test]
     fn a_server_inbound_is_refused_when_routing_could_change_its_direct_dial() {
-        let direct = |tag: &str| tag == "direct";
+        let direct = |tag: &str, _balancer: bool| tag == "direct";
         let root = |rules| object(vec![("routing", routing(rules))]);
         let pinned = root(vec![rule(
             "direct",
@@ -2689,6 +2910,125 @@ mod tests {
         });
         assert_eq!(tag, Some("address"));
         assert_eq!(lookups.get(), 1);
+    }
+
+    #[test]
+    fn a_balancer_rule_draws_from_the_outbound_tags_it_selects() {
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                (
+                    "balancers",
+                    array(vec![object(vec![
+                        ("tag", text("pool")),
+                        ("selector", array(vec![text("lane-")])),
+                        ("strategy", object(vec![("type", text("roundRobin"))])),
+                    ])]),
+                ),
+                (
+                    "rules",
+                    array(vec![object(vec![
+                        ("balancerTag", text("pool")),
+                        ("network", text("tcp")),
+                    ])]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let balancer = routing.balancer("pool").expect("the balancer");
+        assert!(balancer.selects("lane-a") && balancer.selects("lane-b"));
+        assert!(!balancer.selects("direct"));
+        let candidates = vec!["lane-a".to_owned(), "lane-b".to_owned()];
+        assert_eq!(balancer.pick(&candidates), Some("lane-a"));
+        assert_eq!(balancer.pick(&candidates), Some("lane-b"));
+        assert_eq!(balancer.pick(&candidates), Some("lane-a"));
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("echo.test"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: None,
+        };
+        assert_eq!(routing.route(&flow), Some("pool"));
+    }
+
+    #[test]
+    fn a_balancer_parse_refuses_the_names_it_cannot_honour() {
+        let balancer = |pairs: Vec<(&str, Json)>| {
+            object(vec![(
+                "routing",
+                object(vec![("balancers", array(vec![object(pairs)]))]),
+            )])
+        };
+        let error = Routing::parse_in(
+            &balancer(vec![
+                ("tag", text("pool")),
+                ("selector", array(vec![text("lane")])),
+                ("strategy", object(vec![("type", text("fancy"))])),
+            ]),
+            vec![dir()],
+        )
+        .expect_err("refused");
+        assert!(error.contains("fancy"), "{error}");
+        let error = Routing::parse_in(
+            &balancer(vec![("tag", text("pool")), ("selector", array(Vec::new()))]),
+            vec![dir()],
+        )
+        .expect_err("refused");
+        assert!(error.contains("selector"), "{error}");
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                (
+                    "balancers",
+                    array(vec![object(vec![
+                        ("tag", text("pool")),
+                        ("selector", array(vec![text("lane")])),
+                    ])]),
+                ),
+                (
+                    "rules",
+                    array(vec![object(vec![
+                        ("outboundTag", text("direct")),
+                        ("balancerTag", text("pool")),
+                        ("network", text("tcp")),
+                    ])]),
+                ),
+            ]),
+        )]);
+        let parsed = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("echo.test"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: None,
+        };
+        assert_eq!(
+            parsed.route_target(&flow),
+            Some(RouteTarget::Outbound("direct")),
+            "outboundTag wins over balancerTag, as the reference's switch does"
+        );
+        let root = object(vec![(
+            "routing",
+            object(vec![(
+                "rules",
+                array(vec![object(vec![
+                    ("balancerTag", text("missing")),
+                    ("network", text("tcp")),
+                ])]),
+            )]),
+        )]);
+        let error = Routing::parse_in(&root, vec![dir()]).expect_err("refused");
+        assert!(error.contains("missing"), "{error}");
     }
 
     #[test]
