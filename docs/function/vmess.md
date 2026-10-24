@@ -61,7 +61,9 @@ graph TD
 
 ```bash
 ./scripts/count-ops.sh report \
-  vmess::tests::frames_reuse_the_callers_buffers 'vmess::stage_frames'
+  vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time 'vmess::stage_frames'
+./scripts/count-ops.sh report \
+  vmess::tests::frames_reuse_the_callers_buffers 'vmess::read_frame'
 ```
 
 `UNBLESSED`, as above.
