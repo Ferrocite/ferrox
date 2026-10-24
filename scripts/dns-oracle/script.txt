@@ -1,0 +1,30 @@
+// One query per line, driven by the pinned `proxy/dns` handler; see main.go
+// for the grammar. Names and IPs are documentation ranges only.
+//
+// Default actions, no rule: A/AAAA hijack, everything else returned with
+// RCODE 0.
+hijack  udp 6a01 www.formulate.dev.        0001 ips=v4:203.0.113.8 ttl=3600
+hijack  tcp 6a02 www.formulate.dev.        0001 ips=v4:203.0.113.8 ttl=3600
+hijack  udp 6a03 www.formulate.dev.        001c ips=v6:2001:db8::8 ttl=3600
+hijack  udp 6a04 www.formulate.dev.        0001 ips=v4:203.0.113.8,v4:192.0.2.18 ttl=3600
+hijack  udp 6a05 www.formulate.dev.        0001 ips=empty ttl=900
+hijack  udp 6a06 www.formulate.dev.        0001 ips=nxdomain ttl=900
+reject  tcp 6a07 txt.formulate.dev.        001c
+reject  udp 6a08 www.formulate.dev.        000f
+hijack  udp 6a09 longer-formulated-name-for-a-case-well-past-the-shortest-names.example. 0001 ips=v4:203.0.113.8 ttl=3600
+// Root name: the question and both answer names pack as the root shortcut.
+hijack  udp 6a0b . 0001 ips=v4:203.0.113.8 ttl=3600
+// Rules: qtype-scoped, substring and full domains, drop, tunnel rewrite.
+hijack  udp 6b01 www.formulate.dev.        0001 ips=v4:203.0.113.8 ttl=3600 rule=0001/full:www.formulate.dev/Hijack/-
+drop    udp 6b02 www.formulate.dev.        0001 rule=0001/formulate.dev/Drop/-
+reject  udp 6b03 www.formulate.dev.        0001 rule=*/formulate.dev/Return/0005
+drop    udp 6b04 www.formulate.dev.        001c rule=001c/formulate.dev/Drop/-
+reject  udp 6b05 www.formulate.dev.        000f rule=000f/formulate.dev/Return/0005
+reject  tcp 6b06 www.formulate.dev.        000f rule=000f/formulate.dev/Return/0005
+direct  udp 6b07 www.formulate.dev.        0001 rule=0001/formulate.dev/Direct/- feed=6b07818000010000000000000377777709666f726d756c617465036465760000010001
+direct  tcp 6b08 www.formulate.dev.        0001 rule=0001/formulate.dev/Direct/- dest=tcp feed=6b08818000010000000000000377777709666f726d756c617465036465760000010001
+// A query the reference's parse refuses: a short header, then a bad name.
+broken  udp 00000000000000000000
+broken  udp 6d02000100000000000102612e620000010001
+// A TCP lane whose declared size is past the bound: the connection ends.
+oversize tcp 6e01 www.formulate.dev. 0001 ips=v4:203.0.113.8 ttl=3600

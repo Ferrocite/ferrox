@@ -632,7 +632,7 @@ impl Rule {
 }
 
 #[derive(Debug)]
-struct DomainMatcher {
+pub(crate) struct DomainMatcher {
     full: DomainSet,
     suffix: DomainSet,
     substr: Vec<Arc<str>>,
@@ -727,7 +727,7 @@ std::thread_local! {
 }
 
 impl DomainMatcher {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             full: DomainSet::default(),
             suffix: DomainSet::default(),
@@ -737,7 +737,7 @@ impl DomainMatcher {
         }
     }
 
-    fn finish(&mut self) -> Result<(), String> {
+    pub(crate) fn finish(&mut self) -> Result<(), String> {
         self.full.finish();
         self.suffix.finish();
         if !self.substr.is_empty() {
@@ -764,7 +764,7 @@ impl DomainMatcher {
         }
     }
 
-    fn matches(&self, host: &str, lower: &str) -> bool {
+    pub(crate) fn matches(&self, host: &str, lower: &str) -> bool {
         #[cfg(test)]
         DOMAIN_TABLE_READS.with(|reads| reads.set(reads.get() + 1));
         let bytes = lower.as_bytes();
@@ -1033,7 +1033,11 @@ fn lower_arc(text: &str) -> Arc<str> {
     }
 }
 
-fn add_domain(matcher: &mut DomainMatcher, value: &str, assets: &mut Assets) -> Result<(), String> {
+pub(crate) fn add_domain(
+    matcher: &mut DomainMatcher,
+    value: &str,
+    assets: &mut Assets,
+) -> Result<(), String> {
     if value.starts_with('!') {
         return Err(format!(
             "domain rule `{value}`: domains have no reverse form"
@@ -1344,7 +1348,7 @@ impl std::ops::Deref for AssetBytes {
     }
 }
 
-struct Assets {
+pub(crate) struct Assets {
     dirs: Vec<PathBuf>,
     files: HashMap<PathBuf, Rc<AssetBytes>>,
     sites: SiteCache,
@@ -1352,7 +1356,7 @@ struct Assets {
 }
 
 impl Assets {
-    fn new(dirs: Vec<PathBuf>) -> Self {
+    pub(crate) fn new(dirs: Vec<PathBuf>) -> Self {
         Self {
             dirs,
             files: HashMap::new(),
@@ -1452,7 +1456,7 @@ fn is_local_asset(file: &str) -> bool {
         .all(|part| matches!(part, Component::Normal(_) | Component::CurDir))
 }
 
-fn asset_dirs() -> Vec<PathBuf> {
+pub(crate) fn asset_dirs() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     match std::env::var_os("xray.location.asset")
         .or_else(|| std::env::var_os("XRAY_LOCATION_ASSET"))
