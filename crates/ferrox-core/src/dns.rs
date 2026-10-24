@@ -246,27 +246,69 @@ impl std::fmt::Debug for Matcher {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static NAME_FOLDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The name a rule matches: borrowed when the parse's spelling is already lowercase, else folded
+/// once into one stack buffer — one fold per question, never one per rule.
+enum Fold<'q> {
+    Borrowed(&'q str),
+    Folded([u8; NAME_MAX], usize),
+    Unmatchable,
+}
+
+impl<'q> Fold<'q> {
+    fn of(question: &'q Question) -> Self {
+        let name = question.name();
+        let Some(matchable) = name.get(..name.len().saturating_sub(1)) else {
+            return Self::Unmatchable;
+        };
+        let Ok(text) = std::str::from_utf8(matchable) else {
+            return Self::Unmatchable;
+        };
+        if !text.bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return Self::Borrowed(text);
+        }
+        #[cfg(test)]
+        NAME_FOLDS.with(|folds| folds.set(folds.get() + 1));
+        let mut bytes = [0u8; NAME_MAX];
+        let folded = &mut bytes[..text.len()];
+        folded.copy_from_slice(text.as_bytes());
+        folded.make_ascii_lowercase();
+        Self::Folded(bytes, text.len())
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            Self::Borrowed(text) => Some(text),
+            Self::Folded(bytes, len) => std::str::from_utf8(&bytes[..*len]).ok(),
+            Self::Unmatchable => None,
+        }
+    }
+}
+
 impl Rule {
     /// The reference's `DNSRule.apply`: any type the rule carries and, where
     /// it carries domains, the name the parse spelled — lowercased, trimmed
     /// of its trailing dot.
     pub fn applies(&self, question: &Question) -> bool {
+        let mut fold = None;
+        self.applies_with(question, &mut fold)
+    }
+
+    fn applies_with<'q>(&self, question: &'q Question, fold: &mut Option<Fold<'q>>) -> bool {
         if !self.qtypes.is_empty() && !self.qtypes.contains(&question.qtype) {
             return false;
         }
         let Some(domains) = &self.domains else {
             return true;
         };
-        let name = question.name();
-        let Ok(matchable) = std::str::from_utf8(&name[..name.len().saturating_sub(1)]) else {
+        let Some(name) = fold.get_or_insert_with(|| Fold::of(question)).as_str() else {
             return false;
         };
-        let mut lower = [0u8; NAME_MAX];
-        let folded = &mut lower[..matchable.len()];
-        folded.copy_from_slice(matchable.as_bytes());
-        folded.make_ascii_lowercase();
-        let folded = std::str::from_utf8(folded).expect("folding ascii bytes keeps utf-8");
-        domains.matches(folded)
+        domains.matches(name)
     }
 }
 
@@ -305,8 +347,9 @@ pub fn decide(message: &[u8], rules: &[Rule], lookup: &dyn Fn(&[u8]) -> Resolve)
         }
         Action::Direct => Step::Forward,
     };
+    let mut fold = None;
     for rule in rules {
-        if rule.applies(&question) {
+        if rule.applies_with(&question, &mut fold) {
             return decision(rule.action, rule.rcode);
         }
     }
@@ -753,5 +796,59 @@ mod tests {
         }
         std::hint::black_box(answer);
         assert!(answer > 0, "the probe decided nothing");
+    }
+
+    /// Three domain rules, the last one naming the question: the borrow is the whole match.
+    #[test]
+    fn a_lowercase_name_matches_the_rule_list_without_a_fold() {
+        let rules: Vec<Rule> = ["first.example", "second.example", "www.example.com"]
+            .iter()
+            .copied()
+            .map(|needle| Rule {
+                qtypes: Vec::new(),
+                domains: Some(Matcher::new(move |name: &str| name.ends_with(needle))),
+                action: Action::Direct,
+                rcode: 0,
+            })
+            .collect();
+        let lookup = |_: &[u8]| canned("empty");
+        NAME_FOLDS.with(|folds| folds.set(0));
+        let step = decide(&query(0x1234, "www.example.com.", 1), &rules, &lookup);
+        assert!(
+            matches!(step, Step::Forward),
+            "the last rule names the question"
+        );
+        assert_eq!(
+            NAME_FOLDS.with(std::cell::Cell::get),
+            0,
+            "a lowercase name reaches the matcher as it arrived"
+        );
+    }
+
+    /// The same three rules over a mixed-case name: one fold, not one per rule, and the same match.
+    #[test]
+    fn a_mixed_case_name_is_folded_once_for_the_rule_list() {
+        let rules: Vec<Rule> = ["first.example", "second.example", "www.example.com"]
+            .iter()
+            .copied()
+            .map(|needle| Rule {
+                qtypes: Vec::new(),
+                domains: Some(Matcher::new(move |name: &str| name.ends_with(needle))),
+                action: Action::Direct,
+                rcode: 0,
+            })
+            .collect();
+        let lookup = |_: &[u8]| canned("empty");
+        NAME_FOLDS.with(|folds| folds.set(0));
+        let step = decide(&query(0x1234, "WWW.Example.COM.", 1), &rules, &lookup);
+        assert!(
+            matches!(step, Step::Forward),
+            "the folded name still matches"
+        );
+        assert_eq!(
+            NAME_FOLDS.with(std::cell::Cell::get),
+            1,
+            "one fold for three domain rules"
+        );
     }
 }

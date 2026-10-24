@@ -664,6 +664,8 @@ dns-outbound pointer-hop-cap 10 ferrox-core-dns::tests::the_pointer_loop_refuses
 dns-outbound maximum-name-bytes 254 ferrox-core-dns::tests::the_name_bound_matches_the_reference
 dns-outbound allocations-per-forwarded-question 0 ferrox-core-dns::tests::a_forwarded_question_is_decided_without_an_allocation
 dns-outbound allocations-per-hijacked-question 1 ferrox-core-dns::tests::a_hijacked_question_opens_only_its_answer
+dns-outbound name-folds-per-rule-list 1 ferrox-core-dns::tests::a_mixed_case_name_is_folded_once_for_the_rule_list
+dns-outbound name-folds-per-lowercase-rule-list 0 ferrox-core-dns::tests::a_lowercase_name_matches_the_rule_list_without_a_fold
 dns-outbound allocations-per-literal-lookup 2 ferrox-app-proxy::dns_lane_tests::a_literal_lookup_answers_without_a_socket_addr_buffer
 dns-outbound allocations-per-cached-lookup 2 ferrox-app-proxy::dns_lane_tests::a_cached_lookup_answers_without_a_copy_of_the_cache
 dns-outbound allocations-per-eight-stream-messages 1 ferrox-app-proxy::dns_lane_tests::the_stream_lane_reads_every_message_into_one_buffer
