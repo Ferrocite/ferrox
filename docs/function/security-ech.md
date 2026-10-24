@@ -71,6 +71,6 @@ What was **not** removed: the retry costs one extra connection when a server rej
 What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
 
 <!-- scope:begin -->
-- paths: crates/ferrox-app/src/ech_dns.rs, crates/ferrox-core/src/tls/ech.rs, crates/ferrox-core/src/tls/hpke.rs
+- paths: crates/ferrox-app/src/ech_dns.rs
 - go: ./transport/internet/tls/...
 <!-- scope:end -->
