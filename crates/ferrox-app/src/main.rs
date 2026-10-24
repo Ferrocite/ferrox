@@ -55,8 +55,9 @@ use std::time::Duration;
 
 fn usage() -> ! {
     eprintln!("usage:");
-    eprintln!("  ferrox-app check <vless://...> [--allow-unsafe-fp] [--allow-plaintext-public]   parse + support + header len (no network)");
-    eprintln!("  ferrox-app run <vless://...> [--allow-unsafe-fp] [--allow-plaintext-public]     check + TCP reachability (sends nothing)");
+    eprintln!("  ferrox-app check <vless://...|trojan://...> [--allow-unsafe-fp] [--allow-plaintext-public]");
+    eprintln!("                                parse + support + header len (no network)");
+    eprintln!("  ferrox-app run <vless://...|trojan://...> [same flags]   check + TCP reachability (sends nothing)");
     eprintln!("  ferrox-app version                print the serving binary's version");
     eprintln!("  ferrox-app x25519                 print a fresh X25519 keypair");
     eprintln!("  ferrox-app run -c <config.json>   serve inbounds until killed");
@@ -87,25 +88,86 @@ fn link_and_opt_in<I: Iterator<Item = String>>(args: &mut I) -> (String, UnsafeO
     }
 }
 
-fn describe(link: &ferrox_core::vless::VlessLink, opt_in: UnsafeOptIn) -> String {
-    format!(
-        "host={} port={} type={} security={} flow={} support=[{}]",
-        link.host,
-        link.port,
-        link.param("type"),
-        link.param("security"),
-        link.flow(),
-        link.support_opted(opt_in),
-    )
+enum Link {
+    Vless(ferrox_core::vless::VlessLink),
+    Trojan(ferrox_core::trojan::TrojanLink),
+}
+
+impl Link {
+    fn parse(text: &str) -> Self {
+        if text.starts_with(ferrox_core::trojan::SCHEME) {
+            return ferrox_core::trojan::TrojanLink::parse(text).map_or_else(
+                |e| {
+                    eprintln!("bad link: {e}");
+                    std::process::exit(1);
+                },
+                Self::Trojan,
+            );
+        }
+        ferrox_core::vless::VlessLink::parse(text).map_or_else(
+            |e| {
+                eprintln!("bad link: {e}");
+                std::process::exit(1);
+            },
+            Self::Vless,
+        )
+    }
+
+    fn describe(&self, opt_in: UnsafeOptIn) -> String {
+        match self {
+            Self::Vless(link) => format!(
+                "host={} port={} type={} security={} flow={} support=[{}]",
+                link.host,
+                link.port,
+                link.param("type"),
+                link.param("security"),
+                link.flow(),
+                link.support_opted(opt_in),
+            ),
+            Self::Trojan(link) => format!(
+                "host={} port={} type={} security={} header={} support=[{}]",
+                link.host,
+                link.port,
+                link.param("type"),
+                link.param("security"),
+                match link.header_type() {
+                    "" => "none",
+                    header => header,
+                },
+                link.support_opted(opt_in),
+            ),
+        }
+    }
+
+    fn support_opted(&self, opt_in: UnsafeOptIn) -> Support {
+        match self {
+            Self::Vless(link) => link.support_opted(opt_in),
+            Self::Trojan(link) => link.support_opted(opt_in),
+        }
+    }
+
+    fn authority(&self) -> (&str, u16) {
+        match self {
+            Self::Vless(link) => (&link.host, link.port),
+            Self::Trojan(link) => (&link.host, link.port),
+        }
+    }
+
+    /// A header for the same probe destination either way, so `check` prints one number for both schemes.
+    fn header(&self) -> Vec<u8> {
+        match self {
+            Self::Vless(link) => link.encode_request_header("example.com", 443),
+            Self::Trojan(link) => {
+                link.encode_header(ferrox_core::trojan::Command::Connect, "example.com", 443)
+            }
+        }
+    }
 }
 
 fn cmd_check(link_str: &str, opt_in: UnsafeOptIn) {
-    let link = ferrox_core::vless::VlessLink::parse(link_str).unwrap_or_else(|e| {
-        eprintln!("bad link: {e}");
-        std::process::exit(1);
-    });
-    println!("{}", describe(&link, opt_in));
-    let hdr = link.encode_request_header("example.com", 443);
+    let link = Link::parse(link_str);
+    println!("{}", link.describe(opt_in));
+    let hdr = link.header();
     println!(
         "header_len={} header_prefix={:02x?}",
         hdr.len(),
@@ -123,11 +185,8 @@ fn cmd_check(link_str: &str, opt_in: UnsafeOptIn) {
 }
 
 fn cmd_run(link_str: &str, opt_in: UnsafeOptIn) {
-    let link = ferrox_core::vless::VlessLink::parse(link_str).unwrap_or_else(|e| {
-        eprintln!("bad link: {e}");
-        std::process::exit(1);
-    });
-    println!("{}", describe(&link, opt_in));
+    let link = Link::parse(link_str);
+    println!("{}", link.describe(opt_in));
     match link.support_opted(opt_in) {
         Support::Implemented { .. } => {}
         other => {
@@ -136,7 +195,8 @@ fn cmd_run(link_str: &str, opt_in: UnsafeOptIn) {
             std::process::exit(3);
         }
     }
-    let addr = format!("{}:{}", link.host, link.port);
+    let (host, port) = link.authority();
+    let addr = format!("{host}:{port}");
     let sock: std::net::SocketAddr = if let Ok(sock) = addr.parse() {
         sock
     } else {
@@ -161,7 +221,7 @@ fn cmd_run(link_str: &str, opt_in: UnsafeOptIn) {
             std::process::exit(4);
         }
     }
-    let hdr = link.encode_request_header("example.com", 443);
+    let hdr = link.header();
     println!("header_len={} (encoded locally, not sent)", hdr.len());
     let _ = std::io::stdout().flush();
 }

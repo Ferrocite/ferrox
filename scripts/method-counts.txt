@@ -83,6 +83,8 @@ vmess frame-buffer-allocations-per-relay-write 0 ferrox-app-vmess::tests::frames
 vmess frames-per-plain-write 16 ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write
 vmess plain-write-syscalls-per-16-frame-batch 1 ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write
 vmess pump-buffer-allocations-per-batch 0 ferrox-app-vmess::tests::the_pump_gathers_into_its_own_buffer_and_never_moves_it
+vmess web-socket-staging-copies-per-batch 0 ferrox-app-vmess::tests::a_sealed_batch_reaches_a_web_socket_carrier_where_it_lies
+vmess web-socket-carrier-bytes-opened-at-most 1024 ferrox-app-vmess::tests::a_web_socket_carrier_opens_no_batch_buffer
 vmess counters-per-frame 1 ferrox-app-vmess::tests::counters_advance_one_per_frame_at_any_offset
 vmess replay-keys-held-at-most 131072 ferrox-app-vmess::tests::the_window_holds_two_rotations_at_most
 vmess zero-filled-bytes-per-flow 0 ferrox-app-vmess::tests::the_flows_windows_are_not_zero_filled
@@ -108,6 +110,7 @@ trojan ops-retired-instructions UNBLESSED scripts/count-ops.sh
 trojan password-bytes-on-the-wire 56 ferrox-app-proxy::tests::trojan_key_is_sha224_hex
 trojan framing-bytes-added-after-the-header 0 ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers
 trojan udp-framing-bytes-per-datagram 2 ferrox-app-proxy::tests::trojan_udp_frames_carry
+trojan udp-carriers-holding-an-association 7 ferrox-app-proxy::tests::a_trojan_udp_association_crosses_every_carrier
 
 # --- XTLS Vision ------------------------------------------------------------
 xtls-vision ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -520,11 +523,12 @@ security-utls inbuf-reallocations-per-record-cycle 0 ferrox-core-tls::shaped::cl
 security-utls heap-buffers-for-a-warm-relay-write 0 ferrox-core-tls::shaped::client::tests::a_warm_write_seals_into_the_buffer_it_already_owns
 security-utls pulled-record-plaintext-copies-out-of-a-fitting-window 0 ferrox-core-tls::shaped::client::tests::a_tls13_record_is_read_where_it_lands
 security-utls pulled-record-reads-per-window 1 ferrox-core-tls::shaped::client::tests::a_pulled_record_lands_in_one_vectored_read
-security-utls heap-buffers-for-an-hpke-context 0 ferrox-core-tls::hpke::tests::a_context_costs_no_allocations
-security-utls heap-buffers-for-an-ech-config 1 ferrox-core-tls::ech::tests::an_encoded_config_is_one_buffer
+security-ech heap-buffers-for-an-hpke-context 0 ferrox-core-tls::hpke::tests::a_context_costs_no_allocations
+security-ech heap-buffers-for-an-ech-config 1 ferrox-core-tls::ech::tests::an_encoded_config_is_one_buffer
 
 # --- ECH -------------------------------------------------------------------
-security-ech ops-retired-instructions UNBLESSED scripts/count-ops.sh
+security-ech aes256-gcm-seal-retired-instructions 29612 scripts/count-ops.sh
+security-ech aes256-gcm-open-retired-instructions 29749 scripts/count-ops.sh
 security-ech ech-offers-accepted-by-the-stock-lane 1 ferrox-app-proxy::tests::vless_over_ech_tls_carries_an_echo
 security-ech rejected-ech-offers-retried-once 1 ferrox-app-proxy::tests::a_rejected_ech_offer_retries_once_with_the_servers_list
 security-ech ech-offers-built-by-the-shaped-lane 1 ferrox-core-tls::shaped::hello::tests::a_real_ech_offer_hides_the_inner_name_under_the_public_one

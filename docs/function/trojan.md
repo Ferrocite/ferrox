@@ -6,9 +6,11 @@ The header is `sha224_hex(password) | CRLF | command(1) | address | port | CRLF`
 
 A dial that was handed a name writes it as ATYP 3 with its own length, the form this method's reader already accepts, so the edge answers the lookup rather than the client's resolver.
 
-A listener that declares `security: tls` terminates the session its config names and reads the header off it, on each carrier the dial uses — the six TCP carriers, and KCP, where the session wraps the connection itself, and an `xdrive` row, where `security` names the store's own lane handshake rather than a session above it; `a_trojan_inbound_that_declares_tls_answers_every_carrier` dials all six and holds the echo, and `a_trojan_kcp_inbound_that_declares_tls_answers_the_session` / `a_trojan_kcp_dial_under_tls_wraps_the_header_in_the_session` hold the KCP pair from both ends. A UDP association rides the same session in both directions — `a_trojan_udp_association_crosses_the_tls_arm` sends one through the listener and holds the reply.
+A listener that declares `security: tls` terminates the session its config names and reads the header off it, on each carrier the dial uses — the six TCP carriers, and KCP, where the session wraps the connection itself, and an `xdrive` row, where `security` names the store's own lane handshake rather than a session above it; `a_trojan_inbound_that_declares_tls_answers_every_carrier` dials all six and holds the echo, and `a_trojan_kcp_inbound_that_declares_tls_answers_the_session` / `a_trojan_kcp_dial_under_tls_wraps_the_header_in_the_session` hold the KCP pair from both ends.
 
-Three things are deliberately not implemented and are named rather than rounded off: there is no `trojan://` share-link parser (the link column in the README is empty for this row); `security: tls` is neither dialled nor served under mux; and a UDP association is refused on both ends by every carried carrier — ws, grpc, httpupgrade, xhttp, httpheader, kcp — with or without tls, a gap that predates the TLS arm. The raw arm carries one, plaintext or under a terminated session. These are capability statements, not performance ones.
+A UDP association rides every carrier the outbound dials — raw, ws, httpUpgrade, gRPC, xhttp (stream-one), http header and KCP — plain or under a terminated session, on both the client and the listener. The listener parses the association off whatever carrier the dial wrote; the client splits the session into the reader and writer its pump needs and wakes a parked reader by closing the carrier it came from. `a_trojan_udp_association_crosses_every_carrier` runs all fourteen pairs and holds two datagrams through each, 250 ms apart so a pump that polls instead of parking is caught.
+
+Two things are deliberately not implemented and are named rather than rounded off: mux is VLESS-only on both ends, so a trojan row that asks for it is not carried; and an inbound that declares `security: reality` is refused by name rather than served as plaintext — a silent downgrade of a session the config asked for is the failure mode, and `a_trojan_reality_inbound_is_refused_not_downgraded` is the gate. The `trojan://` share link is parsed by `ferrox_core::trojan::TrojanLink`, which `check`/`run` accept beside `vless://`, and its header probe goes through the same `encode_header` the dial uses. These are capability statements, not performance ones.
 
 ## Data path
 
@@ -23,7 +25,7 @@ graph TD
     W --> S["server: read 56 bytes,<br/>compare in constant time"]
     S --> S2["skip CRLF, read command, address, port, CRLF"]
     S2 --> S3["connect, then relay:<br/>0 framing bytes added"]
-    S3 --> U["UDP variant prefixes each<br/>datagram with a 2-byte length"]
+    S3 --> U["UDP association: SOCKS address,<br/>2-byte length, CRLF, payload"]
 ```
 
 ## Measured
@@ -35,6 +37,7 @@ graph TD
 | password-bytes-on-the-wire | 56 | ferrox-app-proxy::tests::trojan_key_is_sha224_hex |
 | framing-bytes-added-after-the-header | 0 | ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers |
 | udp-framing-bytes-per-datagram | 2 | ferrox-app-proxy::tests::trojan_udp_frames_carry |
+| udp-carriers-holding-an-association | 7 | ferrox-app-proxy::tests::a_trojan_udp_association_crosses_every_carrier |
 | header-reads-numeric-address | 2 | ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven |
 | header-reads-domain-address | 3 | ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven |
 | header-bytes-copied-out-of-the-buffer | 0 | ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven |

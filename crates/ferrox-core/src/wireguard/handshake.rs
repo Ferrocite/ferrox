@@ -152,7 +152,9 @@ pub fn set_mac1(msg: &mut [u8], receiver_static: &[u8; 32]) {
 /// Check the `mac1` of a handshake message against the receiver's own static.
 #[must_use]
 pub fn check_mac1(msg: &[u8], receiver_static: &[u8; 32]) -> bool {
-    let end = msg.len() - 2 * MAC_SIZE;
+    let Some(end) = msg.len().checked_sub(2 * MAC_SIZE) else {
+        return false;
+    };
     ct_eq(
         &mac1_of(msg, &mac1_key(receiver_static)),
         &msg[end..end + MAC_SIZE],
@@ -508,6 +510,15 @@ mod tests {
         let mut initiation = alice.create_initiation(&alice_pub, [0x33; 32], 1, STAMP);
         initiation[50] ^= 1;
         assert!(Handshake::consume_initiation(&bob_priv, &bob_pub, &initiation).is_none());
+    }
+
+    #[test]
+    fn a_message_shorter_than_two_macs_is_refused_not_indexed() {
+        let (_, bob_pub) = identity(0x22);
+        let bytes = [0u8; 2 * MAC_SIZE];
+        for len in 0..bytes.len() {
+            assert!(!check_mac1(&bytes[..len], &bob_pub), "length {len}");
+        }
     }
 
     #[test]
