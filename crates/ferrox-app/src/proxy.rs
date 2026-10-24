@@ -404,12 +404,12 @@ fn spawn_role(address: &str, role: Role) {
 }
 
 fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str) -> bool {
-    let id = inbound_id(inbound);
+    let users = inbound_users(inbound);
     let carrier = inbound_carrier(inbound);
     let sec = stream_security(inbound);
     // QUIC arrives on UDP with its own handshake, so it never reaches the TCP accept loop.
     if matches!(carrier, Carrier::Quic) {
-        return serve_vless_quic_inbound(address, inbound, &id, freedom, path);
+        return serve_vless_quic_inbound(address, inbound, &users, freedom, path);
     }
     if let Carrier::Unknown { network } = &carrier {
         eprintln!("unsupported network `{network}` in {path}: refused, not served");
@@ -417,8 +417,9 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
     }
     // An xdrive inbound has no socket: its `security` belongs to the store's lanes, so the stream is served as it arrives from the log.
     if let Carrier::Xdrive { settings } = &carrier {
+        let users = Arc::clone(&users);
         let accept: crate::xdrive::Accept =
-            Arc::new(move |session| serve_vless_xdrive(session, &id, freedom));
+            Arc::new(move |session| serve_vless_xdrive(session, &users, freedom));
         serve_xdrive_loop(settings, address, accept);
         return true;
     }
@@ -439,8 +440,9 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
             };
             let (cert_path, key_path) = (cert_path.to_owned(), key_path.to_owned());
             let masq = crate::config::masquerade_from_stream(Some(settings));
+            let users = Arc::clone(&users);
             let serve: crate::hysteria::Serve = Arc::new(move |flow| {
-                serve_vless_hysteria(flow, &id, freedom);
+                serve_vless_hysteria(flow, &users, freedom);
             });
             thread::spawn(move || {
                 crate::hysteria::serve_loop(
@@ -456,8 +458,8 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
             });
             true
         }
-        "tls" => serve_vless_tls_inbound(address, inbound, &id, &carrier, freedom, path),
-        "reality" => serve_vless_reality_inbound(address, inbound, &id, &carrier, freedom, path),
+        "tls" => serve_vless_tls_inbound(address, inbound, &users, &carrier, freedom, path),
+        "reality" => serve_vless_reality_inbound(address, inbound, &users, &carrier, freedom, path),
         _ if !vless_security_supported(sec) => {
             eprintln!("unsupported vless security `{sec}` in {path}: serves raw TCP only");
             false
@@ -465,8 +467,9 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
         _ => {
             let owned = address.to_owned();
             if let Carrier::Kcp(config) = carrier {
+                let users = Arc::clone(&users);
                 let serve: KcpServe = Arc::new(move |conn: &Arc<ferrox_core::kcp::Connection>| {
-                    serve_vless_kcp(conn, &id, freedom);
+                    serve_vless_kcp(conn, &users, freedom);
                 });
                 return serve_kcp_bound(&owned, config, &serve);
             }
@@ -478,7 +481,7 @@ fn serve_vless_inbound(address: &str, inbound: &Json, freedom: bool, path: &str)
                 }
             };
             let role = Role::Vless {
-                id,
+                users,
                 carrier,
                 freedom,
                 fallbacks,
@@ -724,20 +727,20 @@ fn http_accounts(inbound: &Json) -> SocksAccounts {
 #[derive(Debug, Clone)]
 enum Role {
     Vless {
-        id: [u8; 16],
+        users: VlessUsers,
         carrier: Carrier,
         freedom: bool,
         fallbacks: Option<Arc<[Fallback]>>,
     },
     VlessTls {
-        id: [u8; 16],
+        users: VlessUsers,
         freedom: bool,
         carrier: Carrier,
         server: Arc<ferrox_core::tls::TlsServerConfig>,
         fallbacks: Option<Arc<[Fallback]>>,
     },
     VlessReality {
-        id: [u8; 16],
+        users: VlessUsers,
         freedom: bool,
         carrier: Carrier,
         server: Arc<ferrox_core::tls::RealityServerConfig>,
@@ -1475,23 +1478,23 @@ fn serve_shadowsocks(
 
 fn serve_vless(
     stream: Connection,
-    id: &[u8; 16],
+    users: &[VlessUser],
     carrier: &Carrier,
     freedom: bool,
     fallbacks: Option<&[Fallback]>,
 ) {
     match carrier {
-        Carrier::Raw(_) => serve_vless_raw(stream, id, freedom, fallbacks),
+        Carrier::Raw(_) => serve_vless_raw(stream, users, freedom, fallbacks),
         Carrier::Ws { path, .. } => {
             let Some((mut reader, writer)) = crate::ws::accept(stream, path) else {
                 return;
             };
             // Past the upgrade the frame layer retries timeouts itself, so bound it by wall clock and poll the socket.
             let decoded = under_handshake(&mut reader, decode_request);
-            let Some((got, _flow, cmd, target)) = decoded else {
+            let Some((got, flow, cmd, target)) = decoded else {
                 return;
             };
-            if got != *id || cmd != 1 || !freedom {
+            if !vless_user_allows(users, &got, flow, cmd, freedom) {
                 return;
             }
             let Some(uplink) = dial_or_report(&target) else {
@@ -1509,10 +1512,10 @@ fn serve_vless(
             reader.set_poll(Some(RELAY_POLL));
             let decoded = decode_request_bounded(&mut reader);
             reader.set_poll(None);
-            let Some((got, _flow, cmd, target)) = decoded else {
+            let Some((got, flow, cmd, target)) = decoded else {
                 return;
             };
-            if got != *id || cmd != 1 || !freedom {
+            if !vless_user_allows(users, &got, flow, cmd, freedom) {
                 return;
             }
             let Some(uplink) = dial_or_report(&target) else {
@@ -1529,10 +1532,10 @@ fn serve_vless(
             };
             // Past the preface the reader retries timeouts itself, so the opening request is polled at the relay's grain and bounded by the handshake budget, the way the websocket arm bounds its frames.
             let decoded = under_handshake(&mut reader, decode_request);
-            let Some((got, _flow, cmd, target)) = decoded else {
+            let Some((got, flow, cmd, target)) = decoded else {
                 return;
             };
-            if got != *id || cmd != 1 || !freedom {
+            if !vless_user_allows(users, &got, flow, cmd, freedom) {
                 return;
             }
             let Some(uplink) = dial_or_report(&target) else {
@@ -1547,7 +1550,7 @@ fn serve_vless(
             let Ok(read) = stream.try_clone() else {
                 return;
             };
-            serve_xhttp_stream(read, stream, settings, id, freedom, |read, timeout| {
+            serve_xhttp_stream(read, stream, settings, users, freedom, |read, timeout| {
                 read.set_read_timeout(timeout).is_ok()
             });
         }
@@ -1558,10 +1561,10 @@ fn serve_vless(
             reader.set_poll(Some(RELAY_POLL));
             let decoded = decode_request_bounded(&mut reader);
             reader.set_poll(None);
-            let Some((got, _flow, cmd, target)) = decoded else {
+            let Some((got, flow, cmd, target)) = decoded else {
                 return;
             };
-            if got != *id || cmd != 1 || !freedom {
+            if !vless_user_allows(users, &got, flow, cmd, freedom) {
                 return;
             }
             let Some(uplink) = dial_or_report(&target) else {
@@ -1643,16 +1646,16 @@ pub(crate) fn under_handshake<T, R: Read + Carried>(
 
 fn serve_vless_raw(
     stream: Connection,
-    id: &[u8; 16],
+    users: &[VlessUser],
     freedom: bool,
     fallbacks: Option<&[Fallback]>,
 ) {
-    serve_vless_raw_with(stream, id, freedom, fallbacks, dial_or_report);
+    serve_vless_raw_with(stream, users, freedom, fallbacks, dial_or_report);
 }
 
 fn serve_vless_raw_with<D>(
     mut stream: Connection,
-    id: &[u8; 16],
+    users: &[VlessUser],
     freedom: bool,
     fallbacks: Option<&[Fallback]>,
     dial: D,
@@ -1665,11 +1668,11 @@ fn serve_vless_raw_with<D>(
         // With a table on, the reference's first read and its verdict name the flow as a header or a probe.
         Some(_) => {
             let mut window = [0u8; PROBE_READ];
-            let (probe, first, carried) = probe_front(&mut stream, id, &mut window);
+            let (probe, first, carried) = probe_front(&mut stream, users, &mut window);
             let _ = stream.set_read_timeout(None);
             return vless_raw_reply(
                 stream,
-                id,
+                users,
                 freedom,
                 fallbacks,
                 &window[..first],
@@ -1686,12 +1689,20 @@ fn serve_vless_raw_with<D>(
         ),
     };
     let _ = stream.set_read_timeout(None);
-    vless_raw_reply(stream, id, freedom, fallbacks, &[], (probe, carried), dial);
+    vless_raw_reply(
+        stream,
+        users,
+        freedom,
+        fallbacks,
+        &[],
+        (probe, carried),
+        dial,
+    );
 }
 
 fn vless_raw_reply<D>(
     mut stream: Connection,
-    id: &[u8; 16],
+    users: &[VlessUser],
     freedom: bool,
     fallbacks: Option<&[Fallback]>,
     window: &[u8],
@@ -1708,14 +1719,14 @@ fn vless_raw_reply<D>(
         }
         Probe::Dropped => return,
     };
-    if got != *id || !freedom {
+    let Some(user) = users.iter().find(|user| same_vless_user(&user.id, &got)) else {
         let Some(rows) = fallbacks else { return };
         return seize_fallback(stream, rows, window, &carried);
+    };
+    if !freedom || !vless_flow_ok(user, flow, cmd, false) {
+        return;
     }
     if cmd == 2 {
-        if flow != Flow::None {
-            return;
-        }
         return serve_vless_udp(stream, &target);
     }
     if cmd == 3 {
@@ -1756,7 +1767,7 @@ enum Probe {
 /// does not parse.
 fn probe_front(
     session: &mut dyn Read,
-    id: &[u8; 16],
+    users: &[VlessUser],
     first: &mut [u8; PROBE_READ],
 ) -> (Probe, usize, Vec<u8>) {
     let mut bounded = HandshakeDeadline {
@@ -1767,7 +1778,9 @@ fn probe_front(
         Ok(0) | Err(_) => return (Probe::Dropped, 0, Vec::new()),
         Ok(n) => n,
     };
-    if n < 18 || first[0] != 0 || first[1..17] != id[..] {
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&first[1..17]);
+    if n < 18 || first[0] != 0 || !users.iter().any(|user| same_vless_user(&user.id, &key)) {
         return (Probe::Refused, n, Vec::new());
     }
     let mut carried = Vec::new();
@@ -2720,7 +2733,7 @@ fn quic_inbound_identity(inbound: &Json) -> Option<Arc<ferrox_core::tls::TlsServ
 fn serve_vless_quic_inbound(
     address: &str,
     inbound: &Json,
-    id: &[u8; 16],
+    users: &VlessUsers,
     freedom: bool,
     path: &str,
 ) -> bool {
@@ -2736,9 +2749,9 @@ fn serve_vless_quic_inbound(
         eprintln!("cannot listen on {address}: serves nothing");
         return false;
     };
-    let id = *id;
+    let users = Arc::clone(users);
     let serve: crate::quic::Serve = Arc::new(move |stream| {
-        serve_vless_quic(stream, &id, freedom);
+        serve_vless_quic(stream, &users, freedom);
     });
     thread::spawn(move || {
         crate::quic::serve_loop(
@@ -2752,7 +2765,7 @@ fn serve_vless_quic_inbound(
 }
 
 /// One QUIC stream, one VLESS session: the header, the accept, then the relay with a FIN at its end.
-fn serve_vless_quic(mut stream: crate::quic::QuicStream, id: &[u8; 16], freedom: bool) {
+fn serve_vless_quic(mut stream: crate::quic::QuicStream, users: &[VlessUser], freedom: bool) {
     let fin = stream.clone();
     let decoded = decode_request_bounded(&mut stream);
     let Some((got, flow, cmd, target)) = decoded else {
@@ -2760,7 +2773,7 @@ fn serve_vless_quic(mut stream: crate::quic::QuicStream, id: &[u8; 16], freedom:
         return;
     };
     // Streams carry TCP sessions only, never Vision framing, UDP or mux: a foreign shape closes here.
-    if got != *id || cmd != 1 || flow != Flow::None || !freedom {
+    if !vless_user_allows(users, &got, flow, cmd, freedom) {
         stream.close();
         return;
     }
@@ -2793,7 +2806,7 @@ fn serve_vless_quic(mut stream: crate::quic::QuicStream, id: &[u8; 16], freedom:
 fn serve_vless_tls_inbound(
     address: &str,
     inbound: &Json,
-    id: &[u8; 16],
+    users: &VlessUsers,
     carrier: &Carrier,
     freedom: bool,
     path: &str,
@@ -2812,14 +2825,14 @@ fn serve_vless_tls_inbound(
     let owned = address.to_owned();
     if let Carrier::Kcp(config) = carrier {
         let config = config.clone();
-        let id = *id;
+        let users = Arc::clone(users);
         let serve: KcpServe = Arc::new(move |conn: &Arc<ferrox_core::kcp::Connection>| {
-            serve_vless_kcp_tls(conn, &id, freedom, &server);
+            serve_vless_kcp_tls(conn, &users, freedom, &server);
         });
         return serve_kcp_bound(&owned, config, &serve);
     }
     let role = Role::VlessTls {
-        id: *id,
+        users: Arc::clone(users),
         freedom,
         carrier: carrier.clone(),
         server,
@@ -2832,7 +2845,7 @@ fn serve_vless_tls_inbound(
 fn serve_vless_reality_inbound(
     address: &str,
     inbound: &Json,
-    id: &[u8; 16],
+    users: &VlessUsers,
     carrier: &Carrier,
     freedom: bool,
     path: &str,
@@ -2851,15 +2864,15 @@ fn serve_vless_reality_inbound(
     let owned = address.to_owned();
     if let Carrier::Kcp(config) = carrier {
         let config = config.clone();
-        let id = *id;
+        let users = Arc::clone(users);
         let server = Arc::new(server);
         let serve: KcpServe = Arc::new(move |conn: &Arc<ferrox_core::kcp::Connection>| {
-            serve_vless_kcp_reality(conn, &id, freedom, &server);
+            serve_vless_kcp_reality(conn, &users, freedom, &server);
         });
         return serve_kcp_bound(&owned, config, &serve);
     }
     let role = Role::VlessReality {
-        id: *id,
+        users: Arc::clone(users),
         freedom,
         carrier: carrier.clone(),
         server: Arc::new(server),
@@ -2873,7 +2886,7 @@ fn serve_session_ws<R: Read, W: FrameWrite + 'static>(
     read: R,
     write: W,
     path: &str,
-    id: &[u8; 16],
+    users: &[VlessUser],
     freedom: bool,
 ) {
     let Some((mut creader, cwriter)) = crate::ws::accept_split(read, write, path) else {
@@ -2883,11 +2896,11 @@ fn serve_session_ws<R: Read, W: FrameWrite + 'static>(
     creader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
     let decoded = decode_request(&mut creader);
     creader.set_handshake_budget(None);
-    let Some((got, _flow, cmd, target)) = decoded else {
+    let Some((got, flow, cmd, target)) = decoded else {
         echo_trace("session ws vless decode refused");
         return;
     };
-    if got != *id || cmd != 1 || !freedom {
+    if !vless_user_allows(users, &got, flow, cmd, freedom) {
         echo_trace("session ws vless id or cmd refused");
         return;
     }
@@ -2908,7 +2921,7 @@ fn serve_session_xhttp<R: Read + Send + 'static, W: FrameWrite + 'static>(
     read: R,
     write: W,
     settings: &crate::xhttp::XhttpSettings,
-    id: &[u8; 16],
+    users: &[VlessUser],
     freedom: bool,
 ) {
     let Some((creader, cwriter)) = crate::xhttp::accept_split_with_settings(read, write, settings)
@@ -2916,14 +2929,14 @@ fn serve_session_xhttp<R: Read + Send + 'static, W: FrameWrite + 'static>(
         echo_trace("session xhttp accept refused");
         return;
     };
-    serve_session_xhttp_with(creader, &cwriter, id, freedom);
+    serve_session_xhttp_with(creader, &cwriter, users, freedom);
 }
 
 fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
     mut read: R,
     write: W,
     settings: &crate::xhttp::XhttpSettings,
-    id: &[u8; 16],
+    users: &[VlessUser],
     freedom: bool,
     mut arm: impl FnMut(&R, Option<Duration>) -> bool,
 ) {
@@ -2951,24 +2964,24 @@ fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
     }
     let chained = crate::xhttp::ChainReader::new(magic[..at].to_vec(), read);
     if at == magic.len() && magic == *crate::h2::MAGIC {
-        return crate::xhttp_h2::serve_h2(chained, write, settings, *id, freedom);
+        return crate::xhttp_h2::serve_h2(chained, write, settings, users, freedom);
     }
-    serve_session_xhttp(chained, write, settings, id, freedom);
+    serve_session_xhttp(chained, write, settings, users, freedom);
 }
 
 pub(crate) fn serve_session_xhttp_with(
     mut creader: Box<dyn Read + Send>,
     cwriter: &crate::xhttp::XhttpWriter,
-    id: &[u8; 16],
+    users: &[VlessUser],
     freedom: bool,
 ) {
     // Every refusal ends the carrier's stream: a session that answers nothing leaves its reader parked on a reply that will never come.
-    let Some((got, _flow, cmd, target)) = decode_request(&mut creader) else {
+    let Some((got, flow, cmd, target)) = decode_request(&mut creader) else {
         echo_trace("session xhttp vless decode refused");
         cwriter.finish();
         return;
     };
-    if got != *id || cmd != 1 || !freedom {
+    if !vless_user_allows(users, &got, flow, cmd, freedom) {
         echo_trace("session xhttp vless id or cmd refused");
         cwriter.finish();
         return;
@@ -2992,7 +3005,7 @@ fn serve_session_httpupgrade<R: Read, W: Write + Clone + Send + 'static>(
     write: W,
     raw: Connection,
     path: &str,
-    id: &[u8; 16],
+    users: &[VlessUser],
     freedom: bool,
 ) {
     // Every exit of a served connection drains before it closes, so the peer keeps what it had already been sent.
@@ -3003,12 +3016,12 @@ fn serve_session_httpupgrade<R: Read, W: Write + Clone + Send + 'static>(
         return;
     };
     let decoded = decode_request_bounded(&mut creader);
-    let Some((got, _flow, cmd, target)) = decoded else {
+    let Some((got, flow, cmd, target)) = decoded else {
         echo_trace("session httpupgrade vless decode refused");
         crate::httpupgrade::quiet(&raw);
         return;
     };
-    if got != *id || cmd != 1 || !freedom {
+    if !vless_user_allows(users, &got, flow, cmd, freedom) {
         echo_trace("session httpupgrade vless id or cmd refused");
         crate::httpupgrade::quiet(&raw);
         return;
@@ -3037,7 +3050,7 @@ fn serve_session_httpheader<R: Read, W: Write + Clone + Send + 'static>(
     write: W,
     raw: Connection,
     path: &str,
-    id: &[u8; 16],
+    users: &[VlessUser],
     freedom: bool,
 ) {
     let Some((mut creader, cwriter)) = crate::httpheader::accept_split(read, write, path) else {
@@ -3045,11 +3058,11 @@ fn serve_session_httpheader<R: Read, W: Write + Clone + Send + 'static>(
         return;
     };
     let decoded = decode_request_bounded(&mut creader);
-    let Some((got, _flow, cmd, target)) = decoded else {
+    let Some((got, flow, cmd, target)) = decoded else {
         echo_trace("session httpheader vless decode refused");
         return;
     };
-    if got != *id || cmd != 1 || !freedom {
+    if !vless_user_allows(users, &got, flow, cmd, freedom) {
         echo_trace("session httpheader vless id or cmd refused");
         return;
     }
@@ -3073,7 +3086,7 @@ fn serve_session_grpc<R: Read, W: FrameWrite + 'static>(
     read: R,
     write: W,
     path: &str,
-    id: &[u8; 16],
+    users: &[VlessUser],
     freedom: bool,
 ) {
     let Some((mut creader, cwriter)) = crate::grpc::accept_split(read, write, path) else {
@@ -3084,11 +3097,11 @@ fn serve_session_grpc<R: Read, W: FrameWrite + 'static>(
     creader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
     let decoded = decode_request(&mut creader);
     creader.set_handshake_budget(None);
-    let Some((got, _flow, cmd, target)) = decoded else {
+    let Some((got, flow, cmd, target)) = decoded else {
         echo_trace("session grpc vless decode refused");
         return;
     };
-    if got != *id || cmd != 1 || !freedom {
+    if !vless_user_allows(users, &got, flow, cmd, freedom) {
         echo_trace("session grpc vless id or cmd refused");
         return;
     }
@@ -3124,7 +3137,7 @@ fn accept_tls_session(
 
 fn serve_vless_tls(
     stream: Connection,
-    id: &[u8; 16],
+    users: &[VlessUser],
     freedom: bool,
     carrier: &Carrier,
     server: &ferrox_core::tls::TlsServerConfig,
@@ -3143,7 +3156,7 @@ fn serve_vless_tls(
                 return;
             }
             let front = FrontNames::of(&tls);
-            relay_vless(tls, Some(raw), id, freedom, fallbacks, &front);
+            relay_vless(tls, Some(raw), users, freedom, true, fallbacks, &front);
         }
         Carrier::Ws { path, .. } => {
             let Ok(out) = stream.try_clone() else { return };
@@ -3151,7 +3164,7 @@ fn serve_vless_tls(
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            serve_session_ws(reader, writer, path, id, freedom);
+            serve_session_ws(reader, writer, path, users, freedom);
         }
         Carrier::Xhttp { settings, .. } => {
             let Ok(out) = stream.try_clone() else { return };
@@ -3159,7 +3172,7 @@ fn serve_vless_tls(
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            serve_xhttp_stream(reader, writer, settings, id, freedom, |_, _| true);
+            serve_xhttp_stream(reader, writer, settings, users, freedom, |_, _| true);
         }
         Carrier::HttpUpgrade { path, .. } => {
             let Ok(raw) = stream.try_clone() else { return };
@@ -3168,7 +3181,7 @@ fn serve_vless_tls(
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            serve_session_httpupgrade(reader, writer, raw, path, id, freedom);
+            serve_session_httpupgrade(reader, writer, raw, path, users, freedom);
         }
         Carrier::HttpHeader { path } => {
             let Ok(raw) = stream.try_clone() else { return };
@@ -3177,7 +3190,7 @@ fn serve_vless_tls(
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            serve_session_httpheader(reader, writer, raw, path, id, freedom);
+            serve_session_httpheader(reader, writer, raw, path, users, freedom);
         }
         Carrier::Grpc { path } => {
             let Ok(out) = stream.try_clone() else { return };
@@ -3185,7 +3198,7 @@ fn serve_vless_tls(
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            serve_session_grpc(reader, writer, path, id, freedom);
+            serve_session_grpc(reader, writer, path, users, freedom);
         }
         refused_carriers!() => {}
     }
@@ -3193,7 +3206,7 @@ fn serve_vless_tls(
 
 fn serve_vless_kcp_tls(
     conn: &Arc<ferrox_core::kcp::Connection>,
-    id: &[u8; 16],
+    users: &[VlessUser],
     freedom: bool,
     server: &ferrox_core::tls::TlsServerConfig,
 ) {
@@ -3208,7 +3221,15 @@ fn serve_vless_kcp_tls(
     if tls.handshake().is_err() {
         return;
     }
-    relay_vless(tls, None, id, freedom, None, &FrontNames::default());
+    relay_vless(
+        tls,
+        None,
+        users,
+        freedom,
+        false,
+        None,
+        &FrontNames::default(),
+    );
 }
 
 /// An idle handshake is retried until the deadline; anything but silence refuses at once.
@@ -3225,7 +3246,7 @@ fn shake_tls<S: ferrox_core::tls::TlsProvider>(session: &mut S) -> bool {
 
 fn serve_vless_reality(
     stream: Connection,
-    id: &[u8; 16],
+    users: &[VlessUser],
     freedom: bool,
     carrier: &Carrier,
     server: &ferrox_core::tls::RealityServerConfig,
@@ -3240,7 +3261,7 @@ fn serve_vless_reality(
             let edges = reality_edges(server, &stream);
             let accepted =
                 ferrox_core::tls::RealityServer::accept(server, unix_millis(), stream, edges);
-            answer_reality(accepted, Some(raw), id, freedom, server, fallbacks);
+            answer_reality(accepted, Some(raw), users, freedom, server, fallbacks);
         }
         Carrier::Ws { path, .. } => {
             let Ok(out) = stream.try_clone() else { return };
@@ -3249,7 +3270,7 @@ fn serve_vless_reality(
                     return;
                 }
                 let (reader, writer) = session_halves(session, out);
-                serve_session_ws(reader, writer, path, id, freedom);
+                serve_session_ws(reader, writer, path, users, freedom);
             });
         }
         Carrier::Xhttp { settings, .. } => {
@@ -3259,7 +3280,7 @@ fn serve_vless_reality(
                     return;
                 }
                 let (reader, writer) = session_halves(session, out);
-                serve_xhttp_stream(reader, writer, settings, id, freedom, |_, _| true);
+                serve_xhttp_stream(reader, writer, settings, users, freedom, |_, _| true);
             });
         }
         Carrier::HttpUpgrade { path, .. } => {
@@ -3270,7 +3291,7 @@ fn serve_vless_reality(
                     return;
                 }
                 let (reader, writer) = session_halves(session, out);
-                serve_session_httpupgrade(reader, writer, raw, path, id, freedom);
+                serve_session_httpupgrade(reader, writer, raw, path, users, freedom);
             });
         }
         Carrier::HttpHeader { path } => {
@@ -3281,7 +3302,7 @@ fn serve_vless_reality(
                     return;
                 }
                 let (reader, writer) = session_halves(session, out);
-                serve_session_httpheader(reader, writer, raw, path, id, freedom);
+                serve_session_httpheader(reader, writer, raw, path, users, freedom);
             });
         }
         Carrier::Grpc { path } => {
@@ -3291,7 +3312,7 @@ fn serve_vless_reality(
                     return;
                 }
                 let (reader, writer) = session_halves(session, out);
-                serve_session_grpc(reader, writer, path, id, freedom);
+                serve_session_grpc(reader, writer, path, users, freedom);
             });
         }
         refused_carriers!() => {}
@@ -3379,7 +3400,7 @@ impl Gauge {
 fn answer_reality(
     accepted: Result<ferrox_core::tls::RealityAccept<Connection>, ferrox_core::tls::TlsError>,
     raw: Option<Connection>,
-    id: &[u8; 16],
+    users: &[VlessUser],
     freedom: bool,
     server: &ferrox_core::tls::RealityServerConfig,
     fallbacks: Option<&[Fallback]>,
@@ -3395,7 +3416,7 @@ fn answer_reality(
     };
     match accepted {
         ferrox_core::tls::RealityAccept::Session(session) => {
-            finish_reality(session, raw, id, freedom, fallbacks);
+            finish_reality(session, raw, users, freedom, fallbacks);
         }
         ferrox_core::tls::RealityAccept::Proxied(proxied) => relay_fallback(proxied),
     }
@@ -3477,7 +3498,7 @@ fn shutdown_pair(
 fn finish_reality<S>(
     mut session: S,
     raw: Option<Connection>,
-    id: &[u8; 16],
+    users: &[VlessUser],
     freedom: bool,
     fallbacks: Option<&[Fallback]>,
 ) where
@@ -3493,7 +3514,7 @@ fn finish_reality<S>(
         return;
     }
     let front = FrontNames::of(&session);
-    relay_vless(session, raw, id, freedom, fallbacks, &front);
+    relay_vless(session, raw, users, freedom, true, fallbacks, &front);
 }
 
 #[cfg(test)]
@@ -3529,12 +3550,10 @@ type Opened = (Flow, Connection, Arc<dyn Fn() + Send + Sync>);
 fn open_vless<S: Read + Write>(
     session: &mut S,
     raw: Option<&Connection>,
-    id: &[u8; 16],
     freedom: bool,
-    decoded: Option<([u8; 16], Flow, u8, SocketAddr)>,
+    (_, flow, cmd, target): ([u8; 16], Flow, u8, SocketAddr),
 ) -> Option<Opened> {
-    let (got, flow, cmd, target) = decoded?;
-    if got != *id || cmd != 1 || !freedom {
+    if cmd != 1 || !freedom {
         return None;
     }
     let uplink = dial_or_report(&target)?;
@@ -3591,8 +3610,9 @@ impl FrontNames {
 fn relay_vless<S>(
     mut session: S,
     raw: Option<Connection>,
-    id: &[u8; 16],
+    users: &[VlessUser],
     freedom: bool,
+    vision: bool,
     fallbacks: Option<&[Fallback]>,
     front: &FrontNames,
 ) where
@@ -3608,12 +3628,13 @@ fn relay_vless<S>(
         // With a table on, the reference's first read and its verdict name the flow as a header or a probe.
         Some(_) => {
             let mut window = [0u8; PROBE_READ];
-            let (probe, first, carried) = probe_front(&mut session, id, &mut window);
+            let (probe, first, carried) = probe_front(&mut session, users, &mut window);
             return relay_vless_reply(
                 session,
                 raw,
-                id,
+                users,
                 freedom,
+                vision,
                 fallbacks,
                 &window[..first],
                 (probe, carried),
@@ -3631,8 +3652,9 @@ fn relay_vless<S>(
     relay_vless_reply(
         session,
         raw,
-        id,
+        users,
         freedom,
+        vision,
         fallbacks,
         &[],
         (probe, carried),
@@ -3644,8 +3666,9 @@ fn relay_vless<S>(
 fn relay_vless_reply<S>(
     mut session: S,
     raw: Option<Connection>,
-    id: &[u8; 16],
+    users: &[VlessUser],
     freedom: bool,
+    vision: bool,
     fallbacks: Option<&[Fallback]>,
     window: &[u8],
     (probe, carried): (Probe, Vec<u8>),
@@ -3659,13 +3682,13 @@ fn relay_vless_reply<S>(
         + CipherOpen
         + 'static,
 {
-    let decoded = match probe {
+    let header = match probe {
         Probe::Decoded(header) => {
             if !matches!(header.2, 1..=3) {
                 // The reference's decoder refuses a command past the id without falling back.
                 return;
             }
-            Some(header)
+            header
         }
         Probe::Refused => {
             let Some(rows) = fallbacks else { return };
@@ -3674,7 +3697,20 @@ fn relay_vless_reply<S>(
         }
         Probe::Dropped => return,
     };
-    let Some((flow, uplink, close)) = open_vless(&mut session, raw.as_ref(), id, freedom, decoded)
+    let Some(user) = users
+        .iter()
+        .find(|user| same_vless_user(&user.id, &header.0))
+    else {
+        // The reference's decoder does not know this user: a table front falls back, a bare one drops.
+        let Some(rows) = fallbacks else { return };
+        let Some(raw) = raw else { return };
+        return seize_fallback_tls(session, &raw, rows, window, &carried, front);
+    };
+    if !vless_flow_ok(user, header.1, header.2, vision) {
+        return;
+    }
+    let wire_id = header.0;
+    let Some((flow, uplink, close)) = open_vless(&mut session, raw.as_ref(), freedom, header)
     else {
         let Some(rows) = fallbacks else { return };
         let Some(raw) = raw else { return };
@@ -3684,7 +3720,7 @@ fn relay_vless_reply<S>(
         // The Link reads its own transport, so the split is not its shape: the quiet grain stops at the tick instead, and a park never outlasts a writer.
         relay_stream(
             Half::shared_armed_capped(
-                crate::vision::Link::new(session, raw, id),
+                crate::vision::Link::new(session, raw, &wire_id),
                 super::vision::Link::arm_read_timeout,
                 SESSION_POLL,
             ),
@@ -4501,14 +4537,19 @@ fn kcp_relay(tcp: &Connection, conn: &Arc<ferrox_core::kcp::Connection>) {
     join(&done);
 }
 
-fn serve_vless_kcp(conn: &Arc<ferrox_core::kcp::Connection>, id: &[u8; 16], freedom: bool) {
+fn serve_vless_kcp(conn: &Arc<ferrox_core::kcp::Connection>, users: &[VlessUser], freedom: bool) {
     let mut io = KcpIo {
         conn: Arc::clone(conn),
     };
-    let Some((got, _flow, cmd, target)) = decode_request_bounded(&mut io) else {
+    let Some((got, flow, cmd, target)) = decode_request_bounded(&mut io) else {
         return;
     };
-    if got != *id || !freedom || cmd != 1 {
+    if !users
+        .iter()
+        .any(|user| same_vless_user(&user.id, &got) && vless_flow_ok(user, flow, cmd, false))
+        || !freedom
+        || cmd != 1
+    {
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
@@ -4614,20 +4655,25 @@ fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &s
     true
 }
 
-fn serve_vless_hysteria(mut flow: crate::hysteria::Flow, id: &[u8; 16], freedom: bool) {
-    let Some((got, _flow, cmd, target)) = decode_request_bounded(&mut flow) else {
+fn serve_vless_hysteria(mut io: crate::hysteria::Flow, users: &[VlessUser], freedom: bool) {
+    let Some((got, flow, cmd, target)) = decode_request_bounded(&mut io) else {
         return;
     };
-    if got != *id || !freedom || cmd != 1 {
+    if !users
+        .iter()
+        .any(|user| same_vless_user(&user.id, &got) && vless_flow_ok(user, flow, cmd, false))
+        || !freedom
+        || cmd != 1
+    {
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
-    if flow.write_all(&[0, 0]).is_err() {
+    if io.write_all(&[0, 0]).is_err() {
         return;
     }
-    crate::hysteria::relay(&uplink, &flow);
+    crate::hysteria::relay(&uplink, &io);
 }
 
 fn hysteria_dial_session(vless: &VlessOut) -> Option<crate::hysteria::Dial> {
@@ -4734,7 +4780,7 @@ fn dial_vless_kcp(
 
 fn serve_vless_kcp_reality(
     conn: &Arc<ferrox_core::kcp::Connection>,
-    id: &[u8; 16],
+    users: &[VlessUser],
     freedom: bool,
     server: &ferrox_core::tls::RealityServerConfig,
 ) {
@@ -4754,7 +4800,7 @@ fn serve_vless_kcp_reality(
     };
     match accepted {
         ferrox_core::tls::RealityAccept::Session(session) => {
-            finish_reality(session, None, id, freedom, None);
+            finish_reality(session, None, users, freedom, None);
         }
         ferrox_core::tls::RealityAccept::Proxied(proxied) => relay_fallback(proxied),
     }
@@ -5155,11 +5201,11 @@ fn serve_xdrive_loop(
     });
 }
 
-fn serve_vless_xdrive(mut session: crate::xdrive::Conn, id: &[u8; 16], freedom: bool) {
-    let Some((got, _flow, cmd, target)) = decode_request_bounded(&mut session) else {
+fn serve_vless_xdrive(mut session: crate::xdrive::Conn, users: &[VlessUser], freedom: bool) {
+    let Some((got, flow, cmd, target)) = decode_request_bounded(&mut session) else {
         return;
     };
-    if got != *id || cmd != 1 || !freedom {
+    if !vless_user_allows(users, &got, flow, cmd, freedom) {
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
@@ -14861,6 +14907,93 @@ fn inbound_id(inbound: &Json) -> [u8; 16] {
         .unwrap_or([0u8; 16])
 }
 
+/// One client a vless inbound serves: the id the wire names and the flow its account is bound to.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct VlessUser {
+    pub(crate) id: [u8; 16],
+    pub(crate) flow: Flow,
+}
+
+/// The clients one vless inbound serves; lookup keys the id the way the reference's validator
+/// does, where bytes 6 and 7 are the mux route rather than identity.
+pub(crate) type VlessUsers = Arc<[VlessUser]>;
+
+/// A single-user set, the shape a test front hands a handler.
+#[cfg(test)]
+pub(crate) fn one_user(id: [u8; 16]) -> VlessUsers {
+    Arc::from([VlessUser {
+        id,
+        flow: Flow::None,
+    }])
+}
+
+#[cfg(test)]
+fn one_vless_user(id: &[u8; 16]) -> [VlessUser; 1] {
+    [VlessUser {
+        id: *id,
+        flow: Flow::None,
+    }]
+}
+
+fn same_vless_user(a: &[u8; 16], b: &[u8; 16]) -> bool {
+    a[..6] == b[..6] && a[8..] == b[8..]
+}
+
+fn inbound_users(inbound: &Json) -> VlessUsers {
+    let mut users: Vec<VlessUser> = Vec::new();
+    let clients = inbound
+        .get("settings")
+        .and_then(|settings| settings.get("clients"))
+        .and_then(Json::as_arr);
+    for client in clients.into_iter().flatten() {
+        let Some(id) = client.get("id").and_then(Json::as_str).and_then(uuid_bytes) else {
+            continue;
+        };
+        let flow = match client.get("flow").and_then(Json::as_str).unwrap_or("") {
+            ferrox_core::vless::VISION_FLOW => Flow::Vision,
+            "" => Flow::None,
+            _ => Flow::Other,
+        };
+        let user = VlessUser { id, flow };
+        match users.iter_mut().find(|seen| same_vless_user(&seen.id, &id)) {
+            Some(seen) => *seen = user,
+            None => users.push(user),
+        }
+    }
+    if users.is_empty() {
+        users.push(VlessUser {
+            id: inbound_id(inbound),
+            flow: Flow::None,
+        });
+    }
+    Arc::from(users)
+}
+
+/// The reference's account-flow gate: the wire's flow must be the account's own, and only a
+/// front that runs Vision framing speaks it.
+fn vless_flow_ok(user: &VlessUser, wire: Flow, cmd: u8, vision: bool) -> bool {
+    match wire {
+        Flow::Vision => vision && cmd == 1 && user.flow == Flow::Vision,
+        Flow::None => !(user.flow == Flow::Vision && cmd == 1),
+        Flow::Other => false,
+    }
+}
+
+/// A front that does not frame Vision still speaks the account's flow: the id must be served and the wire flow the account's own.
+fn vless_user_allows(
+    users: &[VlessUser],
+    got: &[u8; 16],
+    flow: Flow,
+    cmd: u8,
+    freedom: bool,
+) -> bool {
+    freedom
+        && cmd == 1
+        && users
+            .iter()
+            .any(|user| same_vless_user(&user.id, got) && vless_flow_ok(user, flow, cmd, false))
+}
+
 /// xray registers each handler under more than one name; the alias resolves to the one protocol this tree builds.
 fn canonical_protocol(protocol: &str) -> &str {
     match protocol {
@@ -17610,7 +17743,15 @@ mod tests {
         edge.write_all(&vless_header(&id, 1, &Destination::from(site_addr)))
             .expect("greets");
         let relay = thread::spawn(move || {
-            relay_vless(session, Some(raw), &id, true, None, &FrontNames::default());
+            relay_vless(
+                session,
+                Some(raw),
+                &one_vless_user(&id),
+                true,
+                true,
+                None,
+                &FrontNames::default(),
+            );
         });
 
         edge.set_read_timeout(Some(Duration::from_secs(5)))
@@ -17656,7 +17797,7 @@ mod tests {
             let (stream, _) = listener.accept().expect("accepts");
             serve_vless_tls(
                 stream,
-                &[0x9Du8; 16],
+                &one_vless_user(&[0x9Du8; 16]),
                 true,
                 &Carrier::Raw(Chain::default()),
                 &server_config,
@@ -19462,12 +19603,24 @@ mod tests {
             }
         });
         let id = uuid_bytes(REALITY_TEST_ID).expect("id");
+        let account = if flow == crate::vision::FLOW {
+            Flow::Vision
+        } else {
+            Flow::None
+        };
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let server_addr = front.local_addr().expect("addr");
         let server_config = reality_server_config();
         let front_handle = thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_vless_reality(stream, &id, true, &carrier, &server_config, None);
+            serve_vless_reality(
+                stream,
+                &[VlessUser { id, flow: account }],
+                true,
+                &carrier,
+                &server_config,
+                None,
+            );
         });
         let public =
             x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
@@ -19948,7 +20101,7 @@ mod tests {
         let serving: Carrier = carrier.clone();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_vless(stream, &id, &serving, true, None);
+            serve_vless(stream, &one_vless_user(&id), &serving, true, None);
         });
         let link = ferrox_core::vless::VlessLink::parse(
             "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@192.0.2.1:443?security=none&encryption=none&type=tcp#x",
@@ -20104,7 +20257,7 @@ mod tests {
         for stream in listener.incoming().take(takes) {
             let Ok(stream) = stream else { continue };
             let carrier = carrier.clone();
-            thread::spawn(move || serve_vless(stream, &id, &carrier, true, None));
+            thread::spawn(move || serve_vless(stream, &one_vless_user(&id), &carrier, true, None));
         }
     }
 
@@ -20124,7 +20277,7 @@ mod tests {
         let (done, waited) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_vless(stream, &[0xaau8; 16], &carrier, true, None);
+            serve_vless(stream, &one_vless_user(&[0xaau8; 16]), &carrier, true, None);
             let _ = done.send(());
         });
         let peer = Connection::connect(addr).expect("connects");
@@ -20148,7 +20301,7 @@ mod tests {
         };
         let serving = thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_vless(stream, &[0xaau8; 16], &carrier, true, None);
+            serve_vless(stream, &one_vless_user(&[0xaau8; 16]), &carrier, true, None);
         });
         let mut peer = Connection::connect(addr).expect("connects");
         peer.set_read_timeout(Some(Duration::from_secs(2)))
@@ -21023,7 +21176,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_vless_raw(stream, &id, true, None);
+            serve_vless_raw(stream, &one_vless_user(&id), true, None);
             let _ = done_tx.send(());
         });
         let _peer = Connection::connect(addr).expect("connects");
@@ -21123,7 +21276,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_vless(stream, &id, &carrier, true, None);
+            serve_vless(stream, &one_vless_user(&id), &carrier, true, None);
             let _ = done_tx.send(());
         });
         let mut peer = Connection::connect(addr).expect("connects");
@@ -21155,7 +21308,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_vless(stream, &id, &carrier, true, None);
+            serve_vless(stream, &one_vless_user(&id), &carrier, true, None);
             let _ = done_tx.send(());
         });
         let mut peer = Connection::connect(addr).expect("connects");
@@ -21185,7 +21338,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_vless(stream, &id, &carrier, true, None);
+            serve_vless(stream, &one_vless_user(&id), &carrier, true, None);
             let _ = done_tx.send(());
         });
         let mut peer = Connection::connect(addr).expect("connects");
@@ -21213,7 +21366,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_vless(stream, &id, &carrier, true, None);
+            serve_vless(stream, &one_vless_user(&id), &carrier, true, None);
             let _ = done_tx.send(());
         });
         let _peer = Connection::connect(addr).expect("connects");
@@ -21238,7 +21391,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_vless(stream, &id, &carrier, true, None);
+            serve_vless(stream, &one_vless_user(&id), &carrier, true, None);
             let _ = done_tx.send(());
         });
         let mut peer = Connection::connect(addr).expect("connects");
@@ -21265,7 +21418,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_vless(stream, &id, &carrier, true, None);
+            serve_vless(stream, &one_vless_user(&id), &carrier, true, None);
             let _ = done_tx.send(());
         });
         let stream = Connection::connect(addr).expect("connects");
@@ -21293,7 +21446,14 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_vless_tls(stream, &id, true, &carrier, &server_config, None);
+            serve_vless_tls(
+                stream,
+                &one_vless_user(&id),
+                true,
+                &carrier,
+                &server_config,
+                None,
+            );
             let _ = done_tx.send(());
         });
         let session = dial_tls_session(&addr, &client_config, None).expect("dialled");
@@ -21349,7 +21509,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let conn = listener.accept().expect("accepts");
-            serve_vless_kcp(&conn, &id, true);
+            serve_vless_kcp(&conn, &one_vless_user(&id), true);
             let _ = done_tx.send(());
         });
         let server_addr: SocketAddr = format!("127.0.0.1:{kcp_port}").parse().expect("addr");
@@ -22164,7 +22324,7 @@ mod tests {
             let (stream, _) = inbound.accept().expect("accepts");
             serve_vless_tls(
                 stream,
-                &id,
+                &one_vless_user(&id),
                 true,
                 &Carrier::Raw(Chain::default()),
                 &server_config,
@@ -22376,7 +22536,7 @@ mod tests {
             let (stream, _) = inbound.accept().expect("accepts");
             serve_vless_tls(
                 stream,
-                &id,
+                &one_vless_user(&id),
                 true,
                 &Carrier::Raw(Chain::default()),
                 &server_config,
@@ -22471,7 +22631,10 @@ mod tests {
             let (stream, _) = listener.accept().expect("accepts");
             serve_vless_tls(
                 stream,
-                &id,
+                &[VlessUser {
+                    id,
+                    flow: Flow::Vision,
+                }],
                 true,
                 &Carrier::Raw(Chain::default()),
                 &server_config,
@@ -24026,7 +24189,7 @@ mod tests {
             let (stream, _) = listener.accept().expect("accepts");
             serve_vless_tls(
                 stream,
-                &id,
+                &one_vless_user(&id),
                 true,
                 &Carrier::Ws {
                     path: "/w".to_owned(),
@@ -24768,6 +24931,123 @@ mod tests {
     }
 
     #[test]
+    fn a_second_client_serves_on_the_same_front() {
+        let first = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let mut second = first;
+        second[15] ^= 0xff;
+        let users = [
+            VlessUser {
+                id: first,
+                flow: Flow::None,
+            },
+            VlessUser {
+                id: second,
+                flow: Flow::None,
+            },
+        ];
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).expect("reads");
+            stream.write_all(&buf).expect("echoes");
+        });
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = tunnel.accept().expect("accepts");
+            serve_vless_raw(stream, &users, true, None);
+        });
+        let mut stream = Connection::connect(("127.0.0.1", tunnel_port)).expect("connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        stream
+            .write_all(&vless_header(&second, 1, &Destination::from(echo_addr)))
+            .expect("requests");
+        assert!(read_vless_response(&mut stream).is_some());
+        stream.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        stream.read_exact(&mut back).expect("reads");
+        assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn the_mux_route_bytes_are_not_identity() {
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let mut routed = id;
+        routed[6] ^= 0x5a;
+        routed[7] ^= 0xa5;
+        let users = [VlessUser {
+            id,
+            flow: Flow::None,
+        }];
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            stream.write_all(b"ok").expect("echoes");
+        });
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = tunnel.accept().expect("accepts");
+            serve_vless_raw(stream, &users, true, None);
+        });
+        let mut stream = Connection::connect(("127.0.0.1", tunnel_port)).expect("connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        stream
+            .write_all(&vless_header(&routed, 1, &Destination::from(echo_addr)))
+            .expect("requests");
+        assert!(read_vless_response(&mut stream).is_some());
+        let mut back = [0u8; 2];
+        stream.read_exact(&mut back).expect("reads");
+        assert_eq!(&back, b"ok");
+    }
+
+    #[test]
+    fn every_client_entry_is_served_and_keyed_like_the_validator() {
+        let inbound = crate::json::parse(
+            r#"{"settings":{"clients":[
+                {"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},
+                {"id":"11111111-2222-3333-4444-555555555555","flow":"xtls-rprx-vision"},
+                {"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","flow":"xtls-rprx-vision"}
+            ]}}"#,
+        )
+        .expect("parses");
+        let users = inbound_users(&inbound);
+        assert_eq!(users.len(), 2, "a masked duplicate replaces its row");
+        assert_eq!(users[0].flow, Flow::Vision, "the last entry wins");
+        assert_eq!(users[1].flow, Flow::Vision);
+        assert_eq!(
+            users[1].id,
+            uuid_bytes("11111111-2222-3333-4444-555555555555").expect("id")
+        );
+    }
+
+    #[test]
+    fn the_account_flow_gates_the_wire_flow_like_the_reference() {
+        let vision = VlessUser {
+            id: [0x33u8; 16],
+            flow: Flow::Vision,
+        };
+        let plain = VlessUser {
+            id: [0x44u8; 16],
+            flow: Flow::None,
+        };
+        assert!(vless_flow_ok(&vision, Flow::Vision, 1, true));
+        assert!(!vless_flow_ok(&vision, Flow::None, 1, true));
+        assert!(vless_flow_ok(&vision, Flow::None, 2, true));
+        assert!(vless_flow_ok(&vision, Flow::None, 3, true));
+        assert!(!vless_flow_ok(&plain, Flow::Vision, 1, true));
+        assert!(!vless_flow_ok(&plain, Flow::Other, 1, true));
+        assert!(!vless_flow_ok(&vision, Flow::Vision, 1, false));
+    }
+
+    #[test]
     fn vless_udp_reaches_echo_over_raw_tcp() {
         let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
@@ -24787,7 +25067,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
-            serve_vless_raw(stream, &id, true, None);
+            serve_vless_raw(stream, &one_vless_user(&id), true, None);
         });
         let mut stream = Connection::connect(("127.0.0.1", tunnel_port)).expect("connects");
         stream
@@ -24811,7 +25091,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
-            serve_vless_raw(stream, &id, true, None);
+            serve_vless_raw(stream, &one_vless_user(&id), true, None);
         });
         let mut stream = Connection::connect(("127.0.0.1", tunnel_port)).expect("connects");
         stream
@@ -25034,7 +25314,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
-            serve_vless_raw(stream, &id, true, None);
+            serve_vless_raw(stream, &one_vless_user(&id), true, None);
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -25731,7 +26011,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
-            serve_vless_raw(stream, &id, true, None);
+            serve_vless_raw(stream, &one_vless_user(&id), true, None);
         });
         let mut client = mux_test_connect(&id, tunnel_port);
         let identity = [9u8; ferrox_core::mux::GLOBAL_ID];
@@ -25872,7 +26152,7 @@ mod tests {
                     continue;
                 };
                 opened.fetch_add(1, Ordering::Relaxed);
-                thread::spawn(move || serve_vless_raw(stream, &id, true, None));
+                thread::spawn(move || serve_vless_raw(stream, &one_vless_user(&id), true, None));
             }
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -25945,7 +26225,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
-            serve_vless_raw(stream, &id, true, None);
+            serve_vless_raw(stream, &one_vless_user(&id), true, None);
         });
         let mut stream = mux_test_connect(&id, tunnel_port);
         let new7 = ferrox_core::mux::Outgoing {
@@ -26005,7 +26285,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
-            serve_vless_raw(stream, &id, true, None);
+            serve_vless_raw(stream, &one_vless_user(&id), true, None);
         });
         let mut stream = mux_test_connect(&id, tunnel_port);
         let flows = ferrox_core::mux::DEFAULT_CAP + 8;
@@ -26080,7 +26360,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
-            serve_vless_raw_with(stream, &id, true, None, dial);
+            serve_vless_raw_with(stream, &one_vless_user(&id), true, None, dial);
         });
         let mut stream = mux_test_connect(&id, tunnel_port);
         mux_test_send(
@@ -26134,7 +26414,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
-            serve_vless_raw(stream, &id, true, None);
+            serve_vless_raw(stream, &one_vless_user(&id), true, None);
         });
         let mut stream = mux_test_connect(&id, tunnel_port);
         let stray = ferrox_core::mux::Outgoing::bare(77, ferrox_core::mux::Status::Keep, 0);
@@ -26202,7 +26482,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
-            serve_vless_raw(stream, &id, true, None);
+            serve_vless_raw(stream, &one_vless_user(&id), true, None);
         });
         let mut client = mux_test_connect(&id, tunnel_port);
         client
@@ -26279,7 +26559,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_vless_raw(stream, &id, true, None);
+            serve_vless_raw(stream, &one_vless_user(&id), true, None);
             let _ = done_tx.send(());
         });
         let mut client = mux_test_connect(&id, addr.port());
@@ -26882,7 +27162,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
-            serve_vless_raw(stream, &id, true, None);
+            serve_vless_raw(stream, &one_vless_user(&id), true, None);
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -27609,7 +27889,7 @@ mod tests {
         };
         assert!(role.tcp_mask().is_some(), "a raw carrier arms its chain");
         let bare = Role::Vless {
-            id: [0u8; 16],
+            users: one_user([0u8; 16]),
             carrier: stream_carrier(None),
             freedom: false,
             fallbacks: None,
@@ -27709,7 +27989,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let task_stop = Arc::clone(&stop);
         let serve: crate::quic::Serve = Arc::new(move |stream| {
-            serve_vless_quic(stream, &id, true);
+            serve_vless_quic(stream, &one_vless_user(&id), true);
         });
         let driver = thread::spawn(move || {
             let config = Arc::new(Mutex::new(config));
@@ -27962,7 +28242,7 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_vless(stream, &id, &Carrier::Quic, true, None);
+            serve_vless(stream, &one_vless_user(&id), &Carrier::Quic, true, None);
         });
         let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
         client
@@ -29344,7 +29624,7 @@ mod tests {
         let kcp_port = listener.local_addr().port();
         let server = thread::spawn(move || {
             let conn = listener.accept().expect("accepts");
-            serve_vless_kcp(&conn, &id, true);
+            serve_vless_kcp(&conn, &one_vless_user(&id), true);
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let header = vless_header(&id, 1, &Destination::from(target));
@@ -29413,7 +29693,7 @@ mod tests {
         let kcp_port = listener.local_addr().port();
         let server = thread::spawn(move || {
             let conn = listener.accept().expect("accepts");
-            serve_vless_kcp_tls(&conn, &id, true, &server_cfg);
+            serve_vless_kcp_tls(&conn, &one_vless_user(&id), true, &server_cfg);
         });
         let vless = VlessOut {
             address: "127.0.0.1".to_owned(),
@@ -29762,7 +30042,7 @@ mod tests {
         let auths = vec![auth.to_owned()];
         let obfs = obfs.to_owned();
         let serve: crate::hysteria::Serve = Arc::new(move |flow| {
-            serve_vless_hysteria(flow, &id, true);
+            serve_vless_hysteria(flow, &one_vless_user(&id), true);
         });
         let (cert_path, key_path) = (
             cert_path.to_str().expect("ascii").to_owned(),
@@ -29967,7 +30247,7 @@ mod tests {
                 rest,
                 true,
             );
-            serve_vless_hysteria(flow, &id, true);
+            serve_vless_hysteria(flow, &one_vless_user(&id), true);
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let dial = crate::hysteria::Dial {
@@ -31857,7 +32137,7 @@ mod tests {
         let server_port = server.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = server.accept().expect("accepts");
-            serve_vless_raw(stream, &id, true, None);
+            serve_vless_raw(stream, &one_vless_user(&id), true, None);
         });
         let front = http_front_with(Outbound::Vless(VlessOut {
             address: "127.0.0.1".to_owned(),
@@ -32588,7 +32868,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
-            serve_vless_raw(stream, &id_bytes, true, None);
+            serve_vless_raw(stream, &one_vless_user(&id_bytes), true, None);
         });
         let root = loopback_root(&format!(
             r#"{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":{tunnel_port},"settings":{{"clients":[{{"id":"{id}"}}]}}}}"#,
@@ -32644,7 +32924,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
-            serve_vless_raw(stream, &id_bytes, true, None);
+            serve_vless_raw(stream, &one_vless_user(&id_bytes), true, None);
         });
         let root = loopback_root(&format!(
             r#"{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":{tunnel_port},"settings":{{"clients":[{{"id":"{id}"}}]}}}}"#,
@@ -32913,7 +33193,8 @@ mod tests {
     fn socks_dials_vless_over_kcp_to_echo() {
         let echo_port = echo_loop();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let serve: KcpServe = Arc::new(move |conn| serve_vless_kcp(conn, &id, true));
+        let serve: KcpServe =
+            Arc::new(move |conn| serve_vless_kcp(conn, &one_vless_user(&id), true));
         let kcp_port = kcp_loop_with(serve);
         let front_port = socks_front_with(Outbound::Vless(VlessOut {
             address: "127.0.0.1".to_owned(),
@@ -35967,8 +36248,11 @@ mod dns_lane_tests {
 
         let mut whole = header.clone();
         whole.extend_from_slice(b"hello");
-        let (verdict, first, carried) =
-            probe_front(&mut std::io::Cursor::new(whole.clone()), &id, &mut window);
+        let (verdict, first, carried) = probe_front(
+            &mut std::io::Cursor::new(whole.clone()),
+            &one_vless_user(&id),
+            &mut window,
+        );
         assert!(
             matches!(verdict, Probe::Decoded((got, _, 1, target)) if got == id && target.port() == 8080 && target.ip().is_loopback()),
             "a header this inbound owns is not a probe"
@@ -35990,7 +36274,7 @@ mod dns_lane_tests {
                 at: 0,
                 limit: 18,
             },
-            &id,
+            &one_vless_user(&id),
             &mut window,
         );
         assert!(matches!(verdict, Probe::Decoded(_)));
@@ -36009,28 +36293,38 @@ mod dns_lane_tests {
         foreign.extend_from_slice(&[9u8; 16]);
         foreign.extend_from_slice(b"GET / HTTP/1.1\r\n\r\n");
         for probe in [b"GET / HTTP/1.1\r\nHost: x\r\n\r\n".to_vec(), foreign] {
-            let (verdict, first, carried) =
-                probe_front(&mut std::io::Cursor::new(probe.clone()), &id, &mut window);
+            let (verdict, first, carried) = probe_front(
+                &mut std::io::Cursor::new(probe.clone()),
+                &one_vless_user(&id),
+                &mut window,
+            );
             assert!(matches!(verdict, Probe::Refused), "{probe:?}");
             assert_eq!(&window[..first], probe);
             assert_eq!(carried, Vec::<u8>::new());
         }
         let short = b"GET / HTTP/1.1".to_vec();
-        let (verdict, first, carried) =
-            probe_front(&mut std::io::Cursor::new(short.clone()), &id, &mut window);
+        let (verdict, first, carried) = probe_front(
+            &mut std::io::Cursor::new(short.clone()),
+            &one_vless_user(&id),
+            &mut window,
+        );
         assert!(matches!(verdict, Probe::Refused));
         assert_eq!(&window[..first], short.as_slice());
         assert_eq!(carried, Vec::<u8>::new());
 
         let mut no_address = a_vless_probe(&id, 1);
         no_address.truncate(19);
-        let (verdict, _, _) = probe_front(&mut std::io::Cursor::new(no_address), &id, &mut window);
+        let (verdict, _, _) = probe_front(
+            &mut std::io::Cursor::new(no_address),
+            &one_vless_user(&id),
+            &mut window,
+        );
         assert!(
             matches!(verdict, Probe::Dropped),
             "the reference does not fall back past the id"
         );
 
-        let (verdict, _, _) = probe_front(&mut Failing, &id, &mut window);
+        let (verdict, _, _) = probe_front(&mut Failing, &one_vless_user(&id), &mut window);
         assert!(matches!(verdict, Probe::Dropped), "a failed read drops");
     }
 
@@ -36074,7 +36368,12 @@ mod dns_lane_tests {
                 return;
             };
             drop(listener);
-            serve_vless_raw(Connection::from(front), &[0u8; 16], true, Some(&rows));
+            serve_vless_raw(
+                Connection::from(front),
+                &one_vless_user(&[0u8; 16]),
+                true,
+                Some(&rows),
+            );
         });
         let mut client = Connection::connect(front_addr).expect("connect");
         client.write_all(b"not a vless probe").expect("write");
@@ -36103,34 +36402,34 @@ mod dns_lane_tests {
 fn front_dispatch(stream: Connection, role: Role) {
     match role {
         Role::Vless {
-            id,
+            users,
             carrier,
             freedom,
             fallbacks,
-        } => serve_vless(stream, &id, &carrier, freedom, fallbacks.as_deref()),
+        } => serve_vless(stream, &users, &carrier, freedom, fallbacks.as_deref()),
         Role::VlessTls {
-            id,
+            users,
             freedom,
             carrier,
             server,
             fallbacks,
         } => serve_vless_tls(
             stream,
-            &id,
+            &users,
             freedom,
             &carrier,
             &server,
             fallbacks.as_deref(),
         ),
         Role::VlessReality {
-            id,
+            users,
             freedom,
             carrier,
             server,
             fallbacks,
         } => serve_vless_reality(
             stream,
-            &id,
+            &users,
             freedom,
             &carrier,
             &server,
