@@ -31,7 +31,11 @@ The stream lane rides `serve_connect` after the refuse gate: one connection, fra
 
 The datagram lane is `serve_socks_udp`'s shape: one association, one lane per client address keyed by the rewritten destination, the first datagram the payload that opens the lane, and the answers written back from the client-named destination. An upstream that has not dialled when the first datagram arrives dials it there, and the handoff parks the answer thread on the dial instead of polling.
 
-The direct rule resolves inline: the name minus its root, the literal-IP fast path, then the engine's cached lookup, and an empty answer writes the reference's empty-answer reply. Name what is left: each message lands in its own heap buffer, the per-message allocation the sharing rules do not remove, and the syscalls a loopback lane spends are only gated over real sockets as bytes — the counts a dial spends belong to CI's profile, not to a loopback test.
+The direct rule resolves inline: the name minus its root, the literal-IP fast path, then the engine's cached lookup, and an empty answer writes the reference's empty-answer reply. Name what is left: the stream lane reads each message into its own heap buffer, and the syscalls a loopback lane spends are only gated over real sockets as bytes — the counts a dial spends belong to CI's profile, not to a loopback test.
+
+## What we removed
+
+- **A heap buffer for every question, and one for every domain rule it matched.** `parse_query` built the name in a `Vec::with_capacity(NAME_MAX)` — a 254-byte allocation per message — and `Rule::applies` lowercased that name into a `String` per domain rule the question reached, a second allocation on the common forwarded path. The name now rides the `Question` (the `NAME_MAX` bytes the widest parse accepts, inline) and the fold lands in a stack buffer, so `decide` opens nothing for a question it forwards: `allocations-per-forwarded-question 0` is gated by `a_forwarded_question_is_decided_without_an_allocation`, which drives a mixed-case name through a full-match domain rule under the counting allocator, and `allocations-per-hijacked-question 1` by `a_hijacked_question_opens_only_its_answer`, which holds the returned answer as the only buffer a type-A hijack opens. The resolver's record list is handed to `ip_answer` as it stands instead of being collected into a `Vec<&[u8]>`, one allocation the answered path no longer pays. The bytes are unchanged: the replay against the pinned handler (`answer-cases-replayed`) still matches octet for octet, because the parse stores the same name bytes and `pack_name` writes them the same way. What is **not** removed: the stream lane's message buffer, one allocation per query it reads, and the resolver's own `rdata` vectors, one per address, which the decision receives rather than opens.
 
 ## Time
 
@@ -47,6 +51,8 @@ Nothing here is timed by a local run — every dial through this outbound is a c
 | parse-refusals-replayed | 8 | ferrox-core-dns::tests::the_parse_refuses_what_the_reference_refuses |
 | pointer-hop-cap | 10 | ferrox-core-dns::tests::the_pointer_loop_refuses_at_the_cap |
 | maximum-name-bytes | 254 | ferrox-core-dns::tests::the_name_bound_matches_the_reference |
+| allocations-per-forwarded-question | 0 | ferrox-core-dns::tests::a_forwarded_question_is_decided_without_an_allocation |
+| allocations-per-hijacked-question | 1 | ferrox-core-dns::tests::a_hijacked_question_opens_only_its_answer |
 | stream-answer-bytes-per-query | 38 | ferrox-app-proxy::dns_lane_tests::the_dns_stream_lane_relays_a_direct_query_byte_for_byte |
 | datagram-query-bytes-per-datagram | 43 | ferrox-app-proxy::dns_lane_tests::the_dns_datagram_lane_relays_a_direct_datagram_byte_for_byte |
 | datagram-answer-bytes-per-datagram | 58 | ferrox-app-proxy::dns_lane_tests::the_dns_datagram_lane_relays_a_direct_datagram_byte_for_byte |
