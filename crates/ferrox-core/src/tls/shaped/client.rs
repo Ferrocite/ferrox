@@ -914,6 +914,18 @@ impl<S: Stream> Session<S> {
         Ok(())
     }
 
+    /// Seals `parts` into the session's own write buffer and sends it, so a relay write after the first costs no allocation.
+    fn seal_out(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        let mut out = std::mem::take(&mut self.out);
+        out.clear();
+        let sent = self
+            .seal_parts(parts, &mut out)
+            .map_err(std::io::Error::other)
+            .and_then(|()| self.io.write_all(&out));
+        self.out = out;
+        sent
+    }
+
     fn seal_chunk(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> Result<(), TlsError> {
         let keys = self
             .write_key
@@ -1011,10 +1023,7 @@ impl<S: Stream + RecordAlignment> RecordAlignment for Session<S> {
             self.run().map_err(std::io::Error::other)?;
         }
         self.flush_reply()?;
-        let mut out = Vec::new();
-        self.seal_parts(parts, &mut out)
-            .map_err(std::io::Error::other)?;
-        self.io.write_all(&out)
+        self.seal_out(parts)
     }
 }
 
@@ -1039,14 +1048,7 @@ impl<S: Stream> Write for Session<S> {
         if !self.done {
             self.run().map_err(std::io::Error::other)?;
         }
-        let mut out = std::mem::take(&mut self.out);
-        out.clear();
-        let sent = self
-            .seal_parts(&[buf], &mut out)
-            .map_err(std::io::Error::other)
-            .and_then(|()| self.io.write_all(&out));
-        self.out = out;
-        sent?;
+        self.seal_out(&[buf])?;
         Ok(buf.len())
     }
 
@@ -2145,4 +2147,73 @@ mod tests {
             Ok(())
         }
     }
+
+    /// A relay write hands its record out of the session's own buffer, kept across writes: a fresh
+    /// `Vec` per call is one allocation on every write and a different base each time.
+    #[test]
+    fn a_warm_write_seals_into_the_buffer_it_already_owns() {
+        let suite = Suite::Aes128GcmSha256;
+        let secret = [17u8; 32];
+        let mut subject = session_on(
+            Tap {
+                base: std::cell::Cell::new(std::ptr::null()),
+            },
+            Version::Tls13,
+            suite,
+            Direction::tls13(suite, &secret),
+            Direction::tls13(suite, &secret),
+        );
+        let payload = [0x5Au8; 8192];
+        subject
+            .write_all_slices(&[&b"head"[..], &payload[..], &b"tail"[..]])
+            .expect("the first write opens the buffer");
+        let capacity = subject.out.capacity();
+        assert_eq!(
+            subject.out.len(),
+            5 + b"head".len() + payload.len() + b"tail".len() + 1 + 16,
+            "the slices are sealed into one record"
+        );
+
+        let (_, counts) = ferrox_core::alloc_count::measure(|| {
+            subject.write_all_slices(&[&b"head"[..], &payload[..], &b"tail"[..]])
+        });
+        assert_eq!(counts.allocs, 0, "a warm write opens no buffer");
+        assert_eq!(
+            subject.out.capacity(),
+            capacity,
+            "and does not grow the one it has"
+        );
+        assert_eq!(
+            subject.io.base.get(),
+            subject.out.as_ptr(),
+            "the record went out from that buffer"
+        );
+
+        let (_, counts) =
+            ferrox_core::alloc_count::measure(|| subject.write(&payload).expect("a single slice"));
+        assert_eq!(counts.allocs, 0, "the single-slice write shares it");
+    }
+
+    struct Tap {
+        base: std::cell::Cell<*const u8>,
+    }
+
+    impl Read for Tap {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for Tap {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.base.set(buf.as_ptr());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl RecordAlignment for Tap {}
 }

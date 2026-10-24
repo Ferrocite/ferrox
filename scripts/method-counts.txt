@@ -517,6 +517,7 @@ security-utls heap-buffers-for-a-post-handshake-flight 0 ferrox-core-tls::shaped
 security-utls certificate-entries-copied-out-of-the-record 0 ferrox-core-tls::shaped::client::tests::a_certificate_chain_is_read_where_the_record_lies
 security-utls pulled-record-reads-outside-the-inbuf 0 ferrox-core-tls::shaped::client::tests::a_record_read_fills_the_inbuf_it_decrypts_from
 security-utls inbuf-reallocations-per-record-cycle 0 ferrox-core-tls::shaped::client::tests::a_record_read_fills_the_inbuf_it_decrypts_from
+security-utls heap-buffers-for-a-warm-relay-write 0 ferrox-core-tls::shaped::client::tests::a_warm_write_seals_into_the_buffer_it_already_owns
 
 # --- loopback re-inject outbound --------------------------------------------
 loopback ops-retired-instructions UNBLESSED scripts/count-ops.sh
