@@ -1317,11 +1317,12 @@ fn sessions() -> &'static Sessions {
 }
 
 fn sweep_stalled_sessions(map: &mut HashMap<String, Arc<Session>>) {
-    let stall = crate::budgets::relay_stall();
+    let budget = crate::budgets::relay_stall();
     let stale: Vec<String> = map
         .iter()
         .filter(|(_, session)| {
-            session.born.elapsed() >= stall && !session.state.lock().expect("session lock").downlink
+            session.born.elapsed() >= budget
+                && !session.state.lock().expect("session lock").downlink
         })
         .map(|(id, _)| id.clone())
         .collect();
