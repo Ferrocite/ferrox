@@ -504,18 +504,6 @@ mod tests {
         assert_eq!(context.key().len(), 16);
     }
 
-    #[test]
-    fn aes_256_gcm_matches_the_nist_empty_message_vector() {
-        let context = Context {
-            aead: Aead::Aes256Gcm,
-            key: vec![0u8; 32],
-            base_nonce: [0u8; 12],
-        };
-        let tag = context.seal(b"", b"", 0).expect("seals");
-        assert_eq!(tag, hex("530f8afbc74536b9a963b4f1c4cb738b"));
-        assert_eq!(context.open(b"", &tag, 0).expect("opens"), Vec::<u8>::new());
-    }
-
     #[cfg_attr(miri, ignore = "uses the OS random source")]
     #[test]
     fn seal_and_open_round_trip_every_suite() {

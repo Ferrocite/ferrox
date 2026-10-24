@@ -524,8 +524,8 @@ security-utls heap-buffers-for-an-hpke-context 0 ferrox-core-tls::hpke::tests::a
 security-utls heap-buffers-for-an-ech-config 1 ferrox-core-tls::ech::tests::an_encoded_config_is_one_buffer
 
 # --- ECH -------------------------------------------------------------------
-security-ech aes256-gcm-seal-retired-instructions 1517 scripts/count-ops.sh
-security-ech aes256-gcm-open-retired-instructions 1587 scripts/count-ops.sh
+security-ech aes256-gcm-seal-retired-instructions UNBLESSED scripts/count-ops.sh
+security-ech aes256-gcm-open-retired-instructions UNBLESSED scripts/count-ops.sh
 security-ech ech-offers-accepted-by-the-stock-lane 1 ferrox-app-proxy::tests::vless_over_ech_tls_carries_an_echo
 security-ech rejected-ech-offers-retried-once 1 ferrox-app-proxy::tests::a_rejected_ech_offer_retries_once_with_the_servers_list
 security-ech ech-offers-built-by-the-shaped-lane 1 ferrox-core-tls::shaped::hello::tests::a_real_ech_offer_hides_the_inner_name_under_the_public_one

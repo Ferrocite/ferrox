@@ -130,9 +130,3 @@ append_pem 591
 # domain rule moved it to 47810992, the ops run on 86e28e9.
 ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 47810992 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 
-# Blessed 1517 (seal) and 1587 (open) by 48bbcf8: the AES-256-GCM ECH suite
-# and its fixed NIST empty-message probe. Both frames are deterministic: the
-# probe's fixed key, zero nonce and empty plaintext leave no random key share
-# in the count, and four ops runs returned the same pair.
-ferrox_core::tls::hpke::Context::seal 1517 tls::hpke::tests::aes_256_gcm_matches_the_nist_empty_message_vector
-ferrox_core::tls::hpke::Context::open 1587 tls::hpke::tests::aes_256_gcm_matches_the_nist_empty_message_vector

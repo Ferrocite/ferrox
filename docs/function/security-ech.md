@@ -24,8 +24,8 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| aes256-gcm-seal-retired-instructions | 1517 | scripts/count-ops.sh |
-| aes256-gcm-open-retired-instructions | 1587 | scripts/count-ops.sh |
+| aes256-gcm-seal-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| aes256-gcm-open-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 | ech-offers-accepted-by-the-stock-lane | 1 | ferrox-app-proxy::tests::vless_over_ech_tls_carries_an_echo |
 | rejected-ech-offers-retried-once | 1 | ferrox-app-proxy::tests::a_rejected_ech_offer_retries_once_with_the_servers_list |
 | ech-offers-built-by-the-shaped-lane | 1 | ferrox-core-tls::shaped::hello::tests::a_real_ech_offer_hides_the_inner_name_under_the_public_one |
@@ -41,12 +41,12 @@ The stock test is the relay path: a VLESS flow over a TLS listener whose ECH key
 
 ```bash
 ./scripts/count-ops.sh report \
-  tls::hpke::tests::aes_256_gcm_matches_the_nist_empty_message_vector \
+  tls::shaped::hello::tests::an_aes_256_only_config_seals_the_inner_hello \
   'ferrox_core::tls::hpke::Context::seal' \
   'ferrox_core::tls::hpke::Context::open'
 ```
 
-The seal costs 1,517 retired instructions and the open 1,587. The NIST vector test is the deterministic probe: its fixed key, zero nonce and fixed plaintext mean the frame's count does not move with the offer's random key shares, and two `ops.yml` runs on the same tree returned the same pair. This host is macOS/aarch64, where valgrind has no build, so the exact-count gate in `./scripts/check.sh` is CI-only for the rows.
+The probe is the existing AES-256-only ECH hello test: one `enable_ech` seals the cover and one inner open decrypts it, so each symbol is one frame under a fixed hello and fixed inner length. The counts are `UNBLESSED` until an `ops.yml` run on this head reports them; this host is macOS/aarch64, where valgrind has no build, so the exact-count gate in `./scripts/check.sh` is CI-only for the rows.
 
 ## Time
 
