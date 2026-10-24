@@ -18119,6 +18119,30 @@ mod tests {
         pair.front.join().expect("joins");
     }
 
+    /// A read timeout is the socket's poll, not the flow's end: the echo retries it and still answers every round.
+    struct IdleOnce {
+        io: Connection,
+        idle: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Read for IdleOnce {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.idle.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+            }
+            self.io.read(buf)
+        }
+    }
+
+    impl Write for IdleOnce {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.io.write(buf)
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.io.flush()
+        }
+    }
+
     #[test]
     fn reality_vision_inner_tls_survives_rounds_through_the_window() {
         use ferrox_core::tls::TlsProvider as _;
@@ -18127,14 +18151,20 @@ mod tests {
         let (server_config, client_config) = carried_tls_configs();
         let inner = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let inner_addr = inner.local_addr().expect("addr");
+        let idle = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let echo_idle = Arc::clone(&idle);
         let echo = thread::spawn(move || {
             let (stream, _) = inner.accept().expect("accepts");
-            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            let mut tls = ferrox_core::tls::accept(
+                &server_config,
+                IdleOnce {
+                    io: stream,
+                    idle: echo_idle,
+                },
+            )
+            .expect("accepts");
             tls.handshake().expect("handshakes");
-            tls.get_ref()
-                .get_ref()
-                .set_read_timeout(Some(Duration::from_millis(20)))
-                .expect("times out");
+            idle.store(true, std::sync::atomic::Ordering::SeqCst);
             let mut buf = [0u8; 4096];
             loop {
                 match tls.read(&mut buf) {
@@ -18144,7 +18174,6 @@ mod tests {
                             break;
                         }
                     }
-                    Err(error) if is_timeout(&error) => {}
                     Err(_) => break,
                 }
             }
@@ -18184,9 +18213,6 @@ mod tests {
             let mut echoed = vec![0u8; width];
             inner.read_exact(&mut echoed).expect("echoes");
             assert_eq!(echoed, payload);
-            if round == 0 {
-                thread::sleep(Duration::from_millis(60));
-            }
         }
         drop(inner);
         dialled.join().expect("joins");
