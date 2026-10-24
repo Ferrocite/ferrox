@@ -177,9 +177,10 @@ pub(crate) fn serve_httpupgrade(
     password: &str,
     method: &str,
     path: &str,
+    host: &str,
     freedom: bool,
 ) {
-    let Some((mut reader, mut writer)) = crate::httpupgrade::accept(stream, path) else {
+    let Some((mut reader, mut writer)) = crate::httpupgrade::accept(stream, path, host) else {
         return;
     };
     let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, password, method, freedom)
@@ -1541,6 +1542,15 @@ mod tests {
             });
             Connection::connect(("127.0.0.1", port)).expect("connects")
         }
+        fn serve_httpupgrade_without_host(
+            stream: Connection,
+            password: &str,
+            method: &str,
+            path: &str,
+            freedom: bool,
+        ) {
+            serve_httpupgrade(stream, password, method, path, "", freedom);
+        }
         fn sealed(target: &Destination) -> (Vec<u8>, Uplink, Recv) {
             let mut packet = Vec::new();
             let Some((send, recv)) = client_send_handshake(&mut packet, PASSWORD, METHOD, target)
@@ -1559,7 +1569,7 @@ mod tests {
         // What the dial does on this carrier: the request packet is sealed before the connect, so `ed=0` leaves it whole after the answer and a budget puts it on the wire with the `GET`.
         let (packet, send, recv) = sealed(&target);
         let (mut reader, mut writer) = crate::httpupgrade::connect(
-            tunnel(serve_httpupgrade, "/ss-upgrade"),
+            tunnel(serve_httpupgrade_without_host, "/ss-upgrade"),
             "127.0.0.1",
             "/ss-upgrade",
             0,
@@ -1569,7 +1579,7 @@ mod tests {
         answers(&mut reader, &mut writer, send, recv);
         let (packet, send, recv) = sealed(&target);
         let (mut reader, mut writer) = crate::httpupgrade::connect(
-            tunnel(serve_httpupgrade, "/ss-upgrade"),
+            tunnel(serve_httpupgrade_without_host, "/ss-upgrade"),
             "127.0.0.1",
             "/ss-upgrade",
             64,

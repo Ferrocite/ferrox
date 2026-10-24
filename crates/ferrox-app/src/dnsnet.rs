@@ -13,16 +13,18 @@ use ferrox_core::tls::TlsProvider as _;
 use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn udp(
     host: &str,
     port: u16,
     query: &[u8],
+    tag: Option<&str>,
     options: Option<&SocketOptions>,
     timeout: Duration,
     local: bool,
 ) -> Result<Vec<u8>, String> {
     if !local {
-        if let Some(response) = crate::proxy::dns_udp(host, port, query, timeout) {
+        if let Some(response) = crate::proxy::dns_udp(host, port, tag, query, timeout) {
             return Ok(response);
         }
     }
@@ -42,11 +44,12 @@ pub(crate) fn tcp(
     host: &str,
     port: u16,
     query: &[u8],
+    tag: Option<&str>,
     options: Option<&SocketOptions>,
     timeout: Duration,
     local: bool,
 ) -> Result<Vec<u8>, String> {
-    let mut stream = connect(host, port, options, timeout, local)?;
+    let mut stream = connect(host, port, tag, options, timeout, local)?;
     write_frame(&mut stream, query)?;
     read_frame(&mut stream)
 }
@@ -55,11 +58,12 @@ pub(crate) fn tls(
     host: &str,
     port: u16,
     query: &[u8],
+    tag: Option<&str>,
     options: Option<&SocketOptions>,
     timeout: Duration,
     local: bool,
 ) -> Result<Vec<u8>, String> {
-    let stream = connect(host, port, options, timeout, local)?;
+    let stream = connect(host, port, tag, options, timeout, local)?;
     let config = std::sync::Arc::new(ferrox_core::tls::TlsConfig {
         server_name: host.to_owned(),
         alpn: Vec::new().into(),
@@ -88,6 +92,7 @@ pub(crate) fn doh(
     path: &str,
     cleartext: bool,
     query: &[u8],
+    tag: Option<&str>,
     options: Option<&SocketOptions>,
     timeout: Duration,
     local: bool,
@@ -99,7 +104,7 @@ pub(crate) fn doh(
         format!("{host}:{port}")
     };
     let scheme = if cleartext { "http" } else { "https" };
-    let stream = connect(host, port, options, timeout, local)?;
+    let stream = connect(host, port, tag, options, timeout, local)?;
     if cleartext {
         return exchange(stream, &authority, scheme, path, query);
     }
@@ -161,12 +166,13 @@ pub(crate) fn doq(
 fn connect(
     host: &str,
     port: u16,
+    tag: Option<&str>,
     options: Option<&SocketOptions>,
     timeout: Duration,
     local: bool,
 ) -> Result<Connection, String> {
     if !local {
-        if let Some(stream) = crate::proxy::dns_stream(host, port, timeout) {
+        if let Some(stream) = crate::proxy::dns_stream(host, port, tag, timeout) {
             return Ok(stream);
         }
     }

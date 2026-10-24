@@ -423,9 +423,10 @@ pub(crate) fn serve_httpupgrade(
     password: &str,
     method: &str,
     path: &str,
+    host: &str,
     freedom: bool,
 ) {
-    let Some((mut reader, writer)) = crate::httpupgrade::accept(stream, path) else {
+    let Some((mut reader, writer)) = crate::httpupgrade::accept(stream, path, host) else {
         return;
     };
     let Some((uplink, response, recv)) = accept_on(&mut reader, password, method, freedom) else {

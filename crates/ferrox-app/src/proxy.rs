@@ -561,7 +561,7 @@ fn rung_of(carrier: &Carrier) -> Option<Rung> {
 // The (path, early-data budget) a non-raw rung reuses from the configured carrier.
 fn stream_params(carrier: &Carrier) -> Option<(&str, u32)> {
     match carrier {
-        Carrier::Ws { path, ed } | Carrier::HttpUpgrade { path, ed } => Some((path, *ed)),
+        Carrier::Ws { path, ed } | Carrier::HttpUpgrade { path, ed, .. } => Some((path, *ed)),
         Carrier::Grpc { path } | Carrier::HttpHeader { path } => Some((path, 0)),
         Carrier::Xhttp { settings, .. } => Some((settings.path.as_str(), 0)),
         _ => None,
@@ -1482,12 +1482,13 @@ fn serve_shadowsocks(
             Carrier::Ws { path, .. } => {
                 crate::shadowsocks2022::serve_ws(stream, password, method, path.as_str(), freedom);
             }
-            Carrier::HttpUpgrade { path, .. } => {
+            Carrier::HttpUpgrade { path, host, .. } => {
                 crate::shadowsocks2022::serve_httpupgrade(
                     stream,
                     password,
                     method,
                     path.as_str(),
+                    host,
                     freedom,
                 );
             }
@@ -1527,8 +1528,15 @@ fn serve_shadowsocks(
         Carrier::Ws { path, .. } => {
             crate::shadowsocks::serve_ws(stream, password, method, path.as_str(), freedom);
         }
-        Carrier::HttpUpgrade { path, .. } => {
-            crate::shadowsocks::serve_httpupgrade(stream, password, method, path.as_str(), freedom);
+        Carrier::HttpUpgrade { path, host, .. } => {
+            crate::shadowsocks::serve_httpupgrade(
+                stream,
+                password,
+                method,
+                path.as_str(),
+                host,
+                freedom,
+            );
         }
         Carrier::Grpc { path } => {
             crate::shadowsocks::serve_grpc(stream, password, method, path.as_str(), freedom);
@@ -1559,7 +1567,9 @@ fn serve_vless(
     match carrier {
         Carrier::Raw(_) => serve_vless_raw(stream, users, freedom, fallbacks),
         Carrier::Ws { path, .. } => serve_vless_ws(stream, users, path, freedom),
-        Carrier::HttpUpgrade { path, .. } => serve_vless_httpupgrade(stream, users, path, freedom),
+        Carrier::HttpUpgrade { path, host, .. } => {
+            serve_vless_httpupgrade(stream, users, path, host, freedom);
+        }
         Carrier::Grpc { path } => serve_vless_grpc(stream, users, path, freedom),
         Carrier::Xhttp { settings, .. } => {
             let Ok(read) = stream.try_clone() else {
@@ -1614,8 +1624,14 @@ fn serve_vless_ws(stream: Connection, users: &[VlessUser], path: &str, freedom: 
     crate::proxy::relay_sink(reader, &writer, &uplink, |_| {});
 }
 
-fn serve_vless_httpupgrade(stream: Connection, users: &[VlessUser], path: &str, freedom: bool) {
-    let Some((mut reader, mut write)) = crate::httpupgrade::accept(stream, path) else {
+fn serve_vless_httpupgrade(
+    stream: Connection,
+    users: &[VlessUser],
+    path: &str,
+    host: &str,
+    freedom: bool,
+) {
+    let Some((mut reader, mut write)) = crate::httpupgrade::accept(stream, path, host) else {
         return;
     };
     reader.set_poll(Some(RELAY_POLL));
@@ -2380,7 +2396,11 @@ fn install_dns_route(route: Option<Arc<RouteShared>>, outbound: Option<&Outbound
 
 /// The outbound a DNS server address takes, resolved once through the same rules every other
 /// flow uses. A missing route means the resolver's own dial.
-fn dns_outbound(dest: &Destination, network: crate::router::Network) -> Option<Outbound> {
+fn dns_outbound(
+    dest: &Destination,
+    network: crate::router::Network,
+    tag: Option<&str>,
+) -> Option<Outbound> {
     let (route, outbound) = {
         let held = DNS_ROUTE.lock().ok()?;
         let stored = held.as_ref()?;
@@ -2388,7 +2408,7 @@ fn dns_outbound(dest: &Destination, network: crate::router::Network) -> Option<O
     };
     match route {
         Some(shared) => {
-            let plan = RoutePlan::new(shared, None, false);
+            let plan = RoutePlan::new(shared, tag.map(str::to_owned), false);
             Some(plan.pick(dest, network, None).clone())
         }
         None => outbound,
@@ -2396,9 +2416,11 @@ fn dns_outbound(dest: &Destination, network: crate::router::Network) -> Option<O
 }
 
 fn dns_socket(host: &str, port: u16) -> Option<SocketAddr> {
-    host.parse::<std::net::IpAddr>()
-        .ok()
-        .map(|ip| SocketAddr::new(ip, port))
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Some(SocketAddr::new(ip, port));
+    }
+    // The SOCKS datagram frame carries an address, so a name resolves before the route sees it.
+    (host, port).to_socket_addrs().ok()?.next()
 }
 
 fn dns_destination(host: &str, port: u16) -> Destination {
@@ -2411,9 +2433,14 @@ fn dns_destination(host: &str, port: u16) -> Destination {
 /// A stream to a DNS server, carried by the route's chosen outbound over a loopback pair.
 /// The outbound sees the literal or the name the config gave, the same destination the
 /// reference hands its dispatcher.
-pub(crate) fn dns_stream(host: &str, port: u16, timeout: Duration) -> Option<Connection> {
+pub(crate) fn dns_stream(
+    host: &str,
+    port: u16,
+    tag: Option<&str>,
+    timeout: Duration,
+) -> Option<Connection> {
     let dest = dns_destination(host, port);
-    let out = dns_outbound(&dest, crate::router::Network::Tcp)?;
+    let out = dns_outbound(&dest, crate::router::Network::Tcp, tag)?;
     // Freedom is the system dial under another name, so the direct path is shorter and the same.
     if matches!(out, Outbound::Freedom) {
         return None;
@@ -2444,11 +2471,17 @@ fn dns_stream_with(out: &Outbound, dest: Destination, timeout: Duration) -> Opti
 }
 
 /// One DNS datagram through the route's chosen outbound. The SOCKS UDP frame needs the
-/// resolved address, so a hostname takes the system dial; a literal rides the chosen lane.
-pub(crate) fn dns_udp(host: &str, port: u16, query: &[u8], timeout: Duration) -> Option<Vec<u8>> {
+/// resolved address, so a hostname resolves through the system before the chosen lane sees it.
+pub(crate) fn dns_udp(
+    host: &str,
+    port: u16,
+    tag: Option<&str>,
+    query: &[u8],
+    timeout: Duration,
+) -> Option<Vec<u8>> {
     let target = dns_socket(host, port)?;
     let dest = Destination::Address(target);
-    let out = dns_outbound(&dest, crate::router::Network::Udp)?;
+    let out = dns_outbound(&dest, crate::router::Network::Udp, tag)?;
     if matches!(out, Outbound::Freedom) {
         return None;
     }
@@ -3626,12 +3659,14 @@ fn serve_session_httpupgrade<R: Read, W: Write + Clone + Send + 'static>(
     write: W,
     raw: Connection,
     path: &str,
+    host: &str,
     users: &[VlessUser],
     freedom: bool,
 ) {
     // Every exit of a served connection drains before it closes, so the peer keeps what it had already been sent.
     let raw = Arc::new(raw);
-    let Some((mut creader, cwriter)) = crate::httpupgrade::accept_split(read, write, path) else {
+    let Some((mut creader, cwriter)) = crate::httpupgrade::accept_split(read, write, path, host)
+    else {
         echo_trace("session httpupgrade accept refused");
         crate::httpupgrade::quiet(&raw);
         return;
@@ -3795,14 +3830,14 @@ fn serve_vless_tls(
             let (reader, writer) = session_halves(session, out);
             serve_xhttp_stream(reader, writer, settings, users, freedom, |_, _| true);
         }
-        Carrier::HttpUpgrade { path, .. } => {
+        Carrier::HttpUpgrade { path, host, .. } => {
             let Ok(raw) = stream.try_clone() else { return };
             let Ok(out) = stream.try_clone() else { return };
             let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            serve_session_httpupgrade(reader, writer, raw, path, users, freedom);
+            serve_session_httpupgrade(reader, writer, raw, path, host, users, freedom);
         }
         Carrier::HttpHeader { path } => {
             let Ok(raw) = stream.try_clone() else { return };
@@ -3904,7 +3939,7 @@ fn serve_vless_reality(
                 serve_xhttp_stream(reader, writer, settings, users, freedom, |_, _| true);
             });
         }
-        Carrier::HttpUpgrade { path, .. } => {
+        Carrier::HttpUpgrade { path, host, .. } => {
             let Ok(raw) = stream.try_clone() else { return };
             let Ok(out) = stream.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
@@ -3912,7 +3947,7 @@ fn serve_vless_reality(
                     return;
                 }
                 let (reader, writer) = session_halves(session, out);
-                serve_session_httpupgrade(reader, writer, raw, path, users, freedom);
+                serve_session_httpupgrade(reader, writer, raw, path, host, users, freedom);
             });
         }
         Carrier::HttpHeader { path } => {
@@ -6130,8 +6165,8 @@ fn serve_vmess_tls(
         Carrier::HttpHeader { path } => {
             crate::vmess::serve_httpheader_split(reader, writer, path, id, freedom, &close);
         }
-        Carrier::HttpUpgrade { path, .. } => {
-            crate::vmess::serve_httpupgrade_split(reader, writer, path, id, freedom, &close);
+        Carrier::HttpUpgrade { path, host, .. } => {
+            crate::vmess::serve_httpupgrade_split(reader, writer, path, host, id, freedom, &close);
         }
         Carrier::Grpc { path } => {
             crate::vmess::serve_grpc_split(reader, writer, path, id, freedom, &close);
@@ -6768,7 +6803,7 @@ fn open_vmess_udp_plain(
                 recv,
             })
         }
-        Carrier::HttpUpgrade { path, ed } => {
+        Carrier::HttpUpgrade { path, ed, .. } => {
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
             let (mut reader, writer) =
@@ -6918,7 +6953,7 @@ fn open_vmess_udp_tls(
                 recv,
             })
         }
-        Carrier::HttpUpgrade { path, ed } => {
+        Carrier::HttpUpgrade { path, ed, .. } => {
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
             let (mut reader, writer) =
@@ -7095,7 +7130,7 @@ fn trojan_udp_plain(
             };
             Some((Box::new(reader), Box::new(writer), Box::new(close)))
         }
-        Carrier::HttpUpgrade { path, ed } => {
+        Carrier::HttpUpgrade { path, ed, .. } => {
             let (reader, writer) = crate::httpupgrade::connect(uplink, host, path, *ed, header)?;
             let socket = writer.try_clone().ok()?;
             let close = move || {
@@ -7161,7 +7196,7 @@ fn trojan_udp_tls<S: Dialed>(
             };
             Some((Box::new(reader), Box::new(writer), Box::new(close)))
         }
-        Carrier::HttpUpgrade { path, ed } => {
+        Carrier::HttpUpgrade { path, ed, .. } => {
             let (reader, writer, raw) = session.into_halves()?;
             let (reader, writer) =
                 crate::httpupgrade::connect_split(reader, writer, host, path, *ed, header)?;
@@ -8581,7 +8616,7 @@ fn ride_carrier<S: Dialed>(
             }
             relay_sink(reader, &writer, client, |_| {});
         }
-        Carrier::HttpUpgrade { path, ed } => {
+        Carrier::HttpUpgrade { path, ed, .. } => {
             let Some((mut reader, sink)) =
                 tls_httpupgrade(server, session, &vless.host, path, *ed, header)
             else {
@@ -8930,7 +8965,7 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
             };
             relay_sink(reader, &writer, client, |_| {});
         }
-        Carrier::HttpUpgrade { path, ed } => {
+        Carrier::HttpUpgrade { path, ed, .. } => {
             let Some((reader, sink)) =
                 tls_httpupgrade(server, session, &trojan.host, path, *ed, header)
             else {
@@ -9064,7 +9099,7 @@ fn vmess_tls_carried(
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
             crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv, None);
         }
-        Carrier::HttpUpgrade { path, ed } => {
+        Carrier::HttpUpgrade { path, ed, .. } => {
             let Some((mut reader, sink)) =
                 tls_httpupgrade(server, session, &vmess.host, path, *ed, &request)
             else {
@@ -9481,8 +9516,8 @@ fn serve_trojan(stream: Connection, key: &[u8; 56], carrier: &Carrier, freedom: 
     match carrier {
         Carrier::Raw(_) => serve_trojan_raw(stream, key, freedom),
         Carrier::Ws { path, .. } => serve_trojan_ws(stream, key, path.as_str(), freedom),
-        Carrier::HttpUpgrade { path, .. } => {
-            serve_trojan_httpupgrade(stream, key, path.as_str(), freedom);
+        Carrier::HttpUpgrade { path, host, .. } => {
+            serve_trojan_httpupgrade(stream, key, path.as_str(), host, freedom);
         }
         Carrier::Grpc { path } => serve_trojan_grpc(stream, key, path.as_str(), freedom),
         Carrier::Xhttp { settings, .. } => {
@@ -9645,8 +9680,14 @@ fn serve_trojan_ws(stream: Connection, key: &[u8; 56], path: &str, freedom: bool
     crate::proxy::relay_sink(reader, &writer, &uplink, |_| {});
 }
 
-fn serve_trojan_httpupgrade(stream: Connection, key: &[u8; 56], path: &str, freedom: bool) {
-    let Some((mut reader, write)) = crate::httpupgrade::accept(stream, path) else {
+fn serve_trojan_httpupgrade(
+    stream: Connection,
+    key: &[u8; 56],
+    path: &str,
+    host: &str,
+    freedom: bool,
+) {
+    let Some((mut reader, write)) = crate::httpupgrade::accept(stream, path, host) else {
         return;
     };
     let Some((cmd, target)) = decode_trojan_request(&mut reader, key) else {
@@ -9784,14 +9825,14 @@ fn serve_trojan_tls(
             let (reader, writer) = session_halves(session, out);
             serve_session_trojan_xhttp(reader, writer, settings, key, freedom);
         }
-        Carrier::HttpUpgrade { path, .. } => {
+        Carrier::HttpUpgrade { path, host, .. } => {
             let Ok(raw) = stream.try_clone() else { return };
             let Ok(out) = stream.try_clone() else { return };
             let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            serve_session_trojan_httpupgrade(reader, writer, raw, path, key, freedom);
+            serve_session_trojan_httpupgrade(reader, writer, raw, path, host, key, freedom);
         }
         Carrier::HttpHeader { path } => {
             let Ok(raw) = stream.try_clone() else { return };
@@ -9990,11 +10031,13 @@ fn serve_session_trojan_httpupgrade<R: Read + Send + 'static, W: Write + Clone +
     write: W,
     raw: Connection,
     path: &str,
+    host: &str,
     key: &[u8; 56],
     freedom: bool,
 ) {
     let raw = Arc::new(raw);
-    let Some((mut creader, cwriter)) = crate::httpupgrade::accept_split(read, write, path) else {
+    let Some((mut creader, cwriter)) = crate::httpupgrade::accept_split(read, write, path, host)
+    else {
         echo_trace("session httpupgrade trojan accept refused");
         crate::httpupgrade::quiet(&raw);
         return;
@@ -21906,7 +21949,7 @@ mod tests {
         carried_round_trip(
             "httpupgrade",
             |stream| {
-                let (reader, write) = crate::httpupgrade::accept(stream, "/tunnel")?;
+                let (reader, write) = crate::httpupgrade::accept(stream, "/tunnel", "")?;
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(write) as Box<dyn Write + Send>,
@@ -22425,6 +22468,7 @@ mod tests {
         let id = [0x23u8; 16];
         let carrier = Carrier::HttpUpgrade {
             path: "/p".into(),
+            host: String::new(),
             ed: 0,
         };
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -24606,6 +24650,7 @@ mod tests {
             },
             Carrier::HttpUpgrade {
                 path: "/vmess-upgrade".to_owned(),
+                host: String::new(),
                 ed: 0,
             },
             Carrier::HttpHeader {
@@ -24631,8 +24676,8 @@ mod tests {
             Carrier::Xhttp { settings, .. } => {
                 crate::vmess::serve_xhttp(stream, settings.path.as_str(), &id, true);
             }
-            Carrier::HttpUpgrade { path, .. } => {
-                crate::vmess::serve_httpupgrade(stream, path, &id, true);
+            Carrier::HttpUpgrade { path, host, .. } => {
+                crate::vmess::serve_httpupgrade(stream, path, host, &id, true);
             }
             Carrier::HttpHeader { path } => {
                 crate::vmess::serve_httpheader(stream, path, &id, true);
@@ -25265,7 +25310,7 @@ mod tests {
         read: ServerHalf,
         write: ServerHalf,
     ) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
-        let (reader, writer) = crate::httpupgrade::accept_split(read, write, "/u")?;
+        let (reader, writer) = crate::httpupgrade::accept_split(read, write, "/u", "")?;
         Some((Box::new(reader), Box::new(writer)))
     }
 
@@ -25367,6 +25412,7 @@ mod tests {
                     id,
                     Carrier::HttpUpgrade {
                         path: "/u".to_owned(),
+                        host: String::new(),
                         ed: 0,
                     },
                     client_config,
@@ -25489,6 +25535,7 @@ mod tests {
                     id,
                     Carrier::HttpUpgrade {
                         path: "/u".to_owned(),
+                        host: String::new(),
                         ed: 0,
                     },
                     client_config,
@@ -25591,6 +25638,7 @@ mod tests {
                     key,
                     Carrier::HttpUpgrade {
                         path: "/u".to_owned(),
+                        host: String::new(),
                         ed: 0,
                     },
                     client_config,
@@ -25811,6 +25859,26 @@ mod tests {
         assert_eq!(&back, b"ping");
     }
 
+    fn serve_ss_httpupgrade(
+        stream: Connection,
+        password: &str,
+        method: &str,
+        path: &str,
+        freedom: bool,
+    ) {
+        crate::shadowsocks::serve_httpupgrade(stream, password, method, path, "", freedom);
+    }
+
+    fn serve_ss2022_httpupgrade(
+        stream: Connection,
+        password: &str,
+        method: &str,
+        path: &str,
+        freedom: bool,
+    ) {
+        crate::shadowsocks2022::serve_httpupgrade(stream, password, method, path, "", freedom);
+    }
+
     fn socks_dials_ss_via(
         carrier: Carrier,
         serve: fn(Connection, &str, &str, &str, bool),
@@ -25895,9 +25963,10 @@ mod tests {
         socks_dials_ss_via(
             Carrier::HttpUpgrade {
                 path: "/ss-upgrade".to_owned(),
+                host: String::new(),
                 ed: 0,
             },
-            crate::shadowsocks::serve_httpupgrade,
+            serve_ss_httpupgrade,
             "/ss-upgrade",
             ("aes-256-gcm", "an-example-shared-password"),
         );
@@ -25909,6 +25978,7 @@ mod tests {
         socks_dials_ss_via(
             Carrier::HttpUpgrade {
                 path: "/ss-upgrade".to_owned(),
+                host: String::new(),
                 ed: 64,
             },
             crate::shadowsocks::serve_httpupgrade_answering_after_the_request,
@@ -25923,9 +25993,10 @@ mod tests {
         socks_dials_ss_via(
             Carrier::HttpUpgrade {
                 path: "/ss-upgrade".to_owned(),
+                host: String::new(),
                 ed: 64,
             },
-            crate::shadowsocks2022::serve_httpupgrade,
+            serve_ss2022_httpupgrade,
             "/ss-upgrade",
             (
                 "2022-blake3-aes-256-gcm",
@@ -28553,7 +28624,7 @@ mod tests {
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
                 let Ok(stream) = stream else { continue };
-                crate::vmess::serve_httpupgrade(stream, "/tunnel", &id, true);
+                crate::vmess::serve_httpupgrade(stream, "/tunnel", "", &id, true);
             }
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -28565,6 +28636,7 @@ mod tests {
             cipher: crate::vmess::Cipher::Chacha,
             carrier: Carrier::HttpUpgrade {
                 path: "/tunnel".to_owned(),
+                host: String::new(),
                 ed: 0,
             },
             host: "127.0.0.1".to_owned(),
@@ -28747,7 +28819,7 @@ mod tests {
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
                 let Ok(stream) = stream else { continue };
-                serve_trojan_httpupgrade(stream, &trojan_key("secret"), "/tunnel", true);
+                serve_trojan_httpupgrade(stream, &trojan_key("secret"), "/tunnel", "", true);
             }
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -28758,6 +28830,7 @@ mod tests {
             key: trojan_key("secret"),
             carrier: Carrier::HttpUpgrade {
                 path: "/tunnel".to_owned(),
+                host: String::new(),
                 ed: 0,
             },
             host: "127.0.0.1".to_owned(),
@@ -29599,6 +29672,7 @@ mod tests {
             (
                 Carrier::HttpUpgrade {
                     path: "/t".to_owned(),
+                    host: String::new(),
                     ed: 0,
                 },
                 Rung::HttpUpgrade,
@@ -37853,8 +37927,8 @@ fn front_dispatch(stream: Connection, role: Role) {
             Carrier::HttpHeader { path } => {
                 crate::vmess::serve_httpheader(stream, path.as_str(), &id, freedom);
             }
-            Carrier::HttpUpgrade { path, .. } => {
-                crate::vmess::serve_httpupgrade(stream, path.as_str(), &id, freedom);
+            Carrier::HttpUpgrade { path, host, .. } => {
+                crate::vmess::serve_httpupgrade(stream, path.as_str(), &host, &id, freedom);
             }
             Carrier::Grpc { path } => {
                 crate::vmess::serve_grpc(stream, path.as_str(), &id, freedom);
