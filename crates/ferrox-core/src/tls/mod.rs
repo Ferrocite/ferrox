@@ -28,6 +28,11 @@ pub struct TlsConfig {
     /// because verifying is the ordinary case, and an unchecked chain is a deliberate,
     /// bounded exception rather than a mode.
     pub insecure: bool,
+    /// SHA-256 digests over whole certificates (`pinnedPeerCertSha256`): a digest matching
+    /// the leaf's DER accepts the handshake on the pin alone, one matching an intermediate's
+    /// verifies the chain with that certificate as the only root and the server name alongside.
+    /// Empty pins nothing, so the ordinary chain verifier stands.
+    pub cert_pins: std::sync::Arc<[[u8; 32]]>,
     /// The browser hello to shape, or `None` to keep the stock rustls hello.
     pub fingerprint: Option<shaped::Fingerprint>,
     /// The ECH config list a client encrypts its inner hello with, fetched or decoded
@@ -232,18 +237,14 @@ pub fn parse_pem_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsServerCo
             "tls certificate file holds no CERTIFICATE block".to_owned(),
         ));
     }
-    let kinds = [
-        ("PRIVATE KEY", ServerKeyKind::Pkcs8),
-        ("EC PRIVATE KEY", ServerKeyKind::Sec1),
-        ("RSA PRIVATE KEY", ServerKeyKind::Pkcs1),
-    ];
-    for (label, key_kind) in kinds {
+    // The label a key block carries is the writer's, not the key's: xray writes every minted key under `RSA PRIVATE KEY` whichever algorithm fed it, so the DER itself names the kind the parser takes.
+    for label in ["PRIVATE KEY", "EC PRIVATE KEY", "RSA PRIVATE KEY"] {
         if let Some(key_der) = pem_blocks(key_pem, label).into_iter().next() {
             return Ok(TlsServerConfig {
                 alpn: Vec::new(),
                 cert_chain,
+                key_kind: key_kind(&key_der).unwrap_or(ServerKeyKind::Pkcs1),
                 key_der,
-                key_kind,
                 send_tickets: true,
                 server_config_cache: std::sync::Arc::default(),
                 ech_server_keys: None,
@@ -253,6 +254,37 @@ pub fn parse_pem_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsServerCo
     Err(TlsError::Other(
         "tls key file holds no recognized private-key block".to_owned(),
     ))
+}
+
+/// The DER shape a key names: PKCS#8 is version `0` before an algorithm `SEQUENCE`, PKCS#1 is an
+/// `INTEGER` modulus there, SEC 1 an `OCTET STRING` — the shapes these bytes carry whatever label
+/// the writer chose.
+fn key_kind(der: &[u8]) -> Option<ServerKeyKind> {
+    /// One DER element past `at`, as its tag and the offset where it ends.
+    fn element(der: &[u8], at: usize) -> Option<(u8, usize)> {
+        let body = at + 2;
+        let header = usize::from(*der.get(at + 1)?);
+        let end = match header.checked_sub(0x80) {
+            Some(count) if (1..8).contains(&count) => {
+                let mut length = 0usize;
+                for &byte in der.get(body..body + count)? {
+                    length = length.checked_mul(256)?.checked_add(usize::from(byte))?;
+                }
+                body.checked_add(count)?.checked_add(length)?
+            }
+            _ => body.checked_add(header)?,
+        };
+        (end <= der.len()).then_some((*der.get(at)?, end))
+    }
+    if element(der, 0)?.0 != 0x30 {
+        // A shape the probes do not name is rustls's to refuse, and the plain PKCS#1 slot is where that refusal reads.
+        return Some(ServerKeyKind::Pkcs1);
+    }
+    Some(match element(der, element(der, 2)?.1)?.0 {
+        0x04 => ServerKeyKind::Sec1,
+        0x30 => ServerKeyKind::Pkcs8,
+        _ => ServerKeyKind::Pkcs1,
+    })
 }
 
 fn pem_blocks(pem: &[u8], label: &str) -> Vec<Vec<u8>> {

@@ -392,6 +392,43 @@ fn tls_version(settings: Option<&Json>, key: &str) -> Option<u16> {
     }
 }
 
+/// The certificate digests a `pinnedPeerCertSha256` names: comma-separated hex, colons
+/// stripped for the OpenSSL spelling, every entry exactly the thirty-two bytes a SHA-256 is.
+fn cert_pinned_peer_cert_sha256(text: &str) -> Result<Vec<[u8; 32]>, String> {
+    let mut pins = Vec::new();
+    for entry in text.split(',') {
+        let entry = entry.trim().replace(':', "");
+        if entry.is_empty() {
+            continue;
+        }
+        let mut pin = [0u8; 32];
+        hex_slice(&entry, &mut pin)
+            .map_err(|_| format!("pinnedPeerCertSha256 `{text}` is not hex"))?;
+        pins.push(pin);
+    }
+    Ok(pins)
+}
+
+/// The big-endian hex of an entry into the caller's slice, the whole text or nothing.
+fn hex_slice(text: &str, out: &mut [u8]) -> Result<(), u8> {
+    fn nibble(byte: u8) -> Result<u8, u8> {
+        match byte {
+            b'0'..=b'9' => Ok(byte - b'0'),
+            b'a'..=b'f' => Ok(byte - b'a' + 10),
+            b'A'..=b'F' => Ok(byte - b'A' + 10),
+            _ => Err(byte),
+        }
+    }
+    let bytes = text.as_bytes();
+    if bytes.len() != out.len() * 2 {
+        return Err(0);
+    }
+    for (at, slot) in out.iter_mut().enumerate() {
+        *slot = nibble(bytes[at * 2])? << 4 | nibble(bytes[at * 2 + 1])?;
+    }
+    Ok(())
+}
+
 pub(crate) fn outbound_tls(
     outbound: &Json,
     address: &str,
@@ -418,19 +455,26 @@ pub(crate) fn outbound_tls(
         return Err("no serverName".to_owned());
     }
     let alpn = tls_alpn(tls);
+    // The reference pins comma-separated hex, colons stripped, one SHA-256 over a whole certificate; a pin is the whole contract, so no root and no name check follows a leaf pin.
+    let cert_pins = tls
+        .and_then(|s| s.get("pinnedPeerCertSha256"))
+        .and_then(Json::as_str)
+        .map(cert_pinned_peer_cert_sha256)
+        .transpose()?
+        .unwrap_or_default();
     let system_only = !matches!(
         tls.and_then(|s| s.get("disableSystemRoot")),
         Some(Json::Bool(true))
     );
     let roots = tls_ca_roots(outbound).or_else(|| {
-        (!insecure && system_only)
+        (!insecure && system_only && cert_pins.is_empty())
             .then(crate::quic::system_roots)
             .filter(|r| !r.is_empty())
     });
     let roots = match roots {
         Some(roots) if !roots.is_empty() => roots,
-        // The skip verifier reads no anchor, so an insecure dial needs none and loads none.
-        _ if insecure => std::sync::Arc::from(Vec::new()),
+        // The skip verifier reads no anchor, so an insecure dial needs none and loads none; a pin verifier answers from its own pins before any chain question, so it needs none either.
+        _ if insecure || !cert_pins.is_empty() => std::sync::Arc::from(Vec::new()),
         _ => {
             return Err(
                 "no certificate authorities: no caCertFile and the system roots are empty"
@@ -453,6 +497,7 @@ pub(crate) fn outbound_tls(
         alpn: alpn.into(),
         roots,
         pins: ferrox_core::foxy::pin::Pins::default(),
+        cert_pins: std::sync::Arc::from(cert_pins),
         cipher_suites: tls_cipher_suites(tls),
         insecure,
         fingerprint: Some(fingerprint),
@@ -1391,7 +1436,7 @@ mod tests {
     fn a_short_id_hex_fills_from_the_front() {
         assert_eq!(short_id("a8"), Some([0xa8, 0, 0, 0, 0, 0, 0, 0]));
         assert_eq!(short_id("01020304"), Some([1, 2, 3, 4, 0, 0, 0, 0]));
-        assert_eq!(short_id(""), Some([0; 8]));
+        assert_eq!(short_id(""), Some([0, 0, 0, 0, 0, 0, 0, 0]));
         assert_eq!(short_id("abc"), None);
     }
 
