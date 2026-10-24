@@ -866,7 +866,10 @@ mod tests {
     #[test]
     fn a_burst_of_inbound_segments_does_not_flush_once_per_segment() {
         let local = ([127, 0, 0, 1], 1).into();
-        let config = Config::default();
+        let config = Config {
+            tti: 5000,
+            ..Config::default()
+        };
         let conn = Connection::new(
             ConnMetadata {
                 local,
@@ -883,8 +886,8 @@ mod tests {
         }
         let flushes = conn.flush_calls();
         assert!(
-            flushes <= 10,
-            "40 segments over 400 ms flushed {flushes} times; a 50 ms tick allows nine"
+            flushes <= 2,
+            "40 segments over 400 ms flushed {flushes} times; a five-second tick allows one"
         );
     }
 
