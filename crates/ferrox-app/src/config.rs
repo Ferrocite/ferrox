@@ -156,21 +156,18 @@ pub(crate) fn server_fallbacks(inbound: &Json) -> Result<Option<Vec<Fallback>>, 
 
 impl Fallback {
     /// The row that owns a flow the front named with `front` and `alpn` and whose first read
-    /// `first` holds: the walk over the table's names, the fall from the front's alpn to `""`,
-    /// and the scan for a request path, each in the order the reference takes them. Every miss
-    /// refuses the flow, and the caller of a refused flow relays nothing.
+    /// `first` holds: the reference's three-map walk, its two inheritance passes, and the scan
+    /// for a request path, each in the order it takes them. Every miss refuses the flow, and
+    /// the caller of a refused flow relays nothing.
     pub(crate) fn route<'a>(
         table: &'a [Fallback],
         front: &str,
         alpn: &str,
         first: &[u8],
     ) -> Option<&'a Fallback> {
-        let mut names: Vec<&str> = Vec::new();
-        for row in table {
-            if !names.contains(&row.name.as_str()) {
-                names.push(row.name.as_str());
-            }
-        }
+        let mut groups = FallbackGroups::build(table);
+        groups.inherit();
+        let names = groups.names();
         let front = front.to_ascii_lowercase();
         let alpn = alpn.to_ascii_lowercase();
         let mut picked = front.as_str();
@@ -186,35 +183,18 @@ impl Fallback {
                 .copied()
                 .unwrap_or("");
         }
+        // A front no group spells shares the unnamed group, and one without that group is unserved.
         if !names.contains(&picked) {
-            return None;
+            picked = "";
         }
-        // The alpn reads one map: the front's when the name group spells it, `""` when it doesn't; a group that spells neither leaves the flow unserved.
-        let spell = |alpn: &str| {
-            table
-                .iter()
-                .any(|row| row.name == picked && row.alpn == alpn)
+        let group = groups.find(picked)?;
+        // The alpn reads one map: the front's when the group grew it, `""` when it didn't.
+        let ap = if group.alpns.iter().any(|map| map.alpn == alpn) {
+            alpn.as_str()
+        } else {
+            ""
         };
-        let ap = if spell(&alpn) { alpn.as_str() } else { "" };
-        if !spell(ap) {
-            return None;
-        }
-        // The paths the group's two alpn maps spell together: the front's own rows keep their paths, duplicates collapse to the row spelled last, and the `""` ones fill where a path has no own cell.
-        let mut cells: Vec<(&str, &Fallback)> = Vec::new();
-        for row in table
-            .iter()
-            .filter(|row| row.name == picked && row.alpn == ap)
-        {
-            put_cell(&mut cells, row);
-        }
-        for row in table
-            .iter()
-            .filter(|row| row.name == picked && row.alpn.is_empty())
-        {
-            if !cells.iter().any(|(path, _)| *path == row.path.as_str()) {
-                cells.push((row.path.as_str(), row));
-            }
-        }
+        let cells = &group.alpns.iter().find(|map| map.alpn == ap)?.cells;
         // The scan runs when the group spells more paths than one or no `""` row fills the default; otherwise the `""` cell answers and the probe's bytes stay unread.
         let mut wanted: &[u8] = b"";
         if cells.len() > 1 || !cells.iter().any(|(path, _)| path.is_empty()) {
@@ -224,10 +204,130 @@ impl Fallback {
             }
         }
         cells
-            .into_iter()
+            .iter()
             .rev()
             .find(|(path, _)| path.as_bytes() == wanted)
-            .map(|(_, row)| row)
+            .map(|(_, row)| *row)
+    }
+}
+
+/// One name's alpn maps, the shape the reference's `fallbacks[name][alpn]` walks.
+struct NamedFallbacks<'a> {
+    name: &'a str,
+    alpns: Vec<AlpnFallbacks<'a>>,
+}
+
+struct AlpnFallbacks<'a> {
+    alpn: &'a str,
+    cells: Vec<(&'a str, &'a Fallback)>,
+}
+
+/// The three maps one config's rows spell before the reference's inheritance passes.
+struct FallbackGroups<'a> {
+    groups: Vec<NamedFallbacks<'a>>,
+}
+
+impl<'a> FallbackGroups<'a> {
+    fn build(table: &'a [Fallback]) -> Self {
+        let mut groups: Vec<NamedFallbacks<'a>> = Vec::new();
+        for row in table {
+            let at = if let Some(at) = groups.iter().position(|g| g.name == row.name) {
+                at
+            } else {
+                groups.push(NamedFallbacks {
+                    name: row.name.as_str(),
+                    alpns: Vec::new(),
+                });
+                groups.len() - 1
+            };
+            put_cell(alpn_map(&mut groups[at], row.alpn.as_str()), row);
+        }
+        Self { groups }
+    }
+
+    /// The two passes `New` runs after the insert: the unnamed group's alpn maps reach every
+    /// named one, then a group's `""` rows fill its other maps, then the unnamed group's rows
+    /// fill the same-alpn map of every named group where a path is missing.
+    fn inherit(&mut self) {
+        let Some(default) = self.groups.iter().position(|g| g.name.is_empty()) else {
+            return;
+        };
+        let alpns: Vec<&'a str> = self.groups[default]
+            .alpns
+            .iter()
+            .map(|map| map.alpn)
+            .collect();
+        for (at, group) in self.groups.iter_mut().enumerate() {
+            if at == default {
+                continue;
+            }
+            for alpn in &alpns {
+                alpn_map(group, alpn);
+            }
+        }
+        for group in &mut self.groups {
+            let Some(shared) = group
+                .alpns
+                .iter()
+                .find(|map| map.alpn.is_empty())
+                .map(|map| map.cells.clone())
+            else {
+                continue;
+            };
+            for map in &mut group.alpns {
+                if map.alpn.is_empty() {
+                    continue;
+                }
+                fill(&mut map.cells, &shared);
+            }
+        }
+        let shared: Vec<(&'a str, Vec<(&'a str, &'a Fallback)>)> = self.groups[default]
+            .alpns
+            .iter()
+            .map(|map| (map.alpn, map.cells.clone()))
+            .collect();
+        for (at, group) in self.groups.iter_mut().enumerate() {
+            if at == default {
+                continue;
+            }
+            for (alpn, cells) in &shared {
+                fill(alpn_map(group, alpn), cells);
+            }
+        }
+    }
+
+    fn names(&self) -> Vec<&'a str> {
+        self.groups.iter().map(|group| group.name).collect()
+    }
+
+    fn find(&self, name: &str) -> Option<&NamedFallbacks<'a>> {
+        self.groups.iter().find(|group| group.name == name)
+    }
+}
+
+/// One alpn map in a name group, made on first use the way the reference's nested map insert does.
+fn alpn_map<'g, 'a>(
+    group: &'g mut NamedFallbacks<'a>,
+    alpn: &'a str,
+) -> &'g mut Vec<(&'a str, &'a Fallback)> {
+    let at = if let Some(at) = group.alpns.iter().position(|map| map.alpn == alpn) {
+        at
+    } else {
+        group.alpns.push(AlpnFallbacks {
+            alpn,
+            cells: Vec::new(),
+        });
+        group.alpns.len() - 1
+    };
+    &mut group.alpns[at].cells
+}
+
+/// Every path `shared` spells that `cells` does not, in the reference's map-fill shape.
+fn fill<'a>(cells: &mut Vec<(&'a str, &'a Fallback)>, shared: &[(&'a str, &'a Fallback)]) {
+    for (path, row) in shared {
+        if !cells.iter().any(|(have, _)| have == path) {
+            cells.push((path, row));
+        }
     }
 }
 
@@ -270,14 +370,15 @@ fn scanned_path(first: &[u8]) -> &[u8] {
 }
 
 /// A `dest` spells itself either as a string or as a bare port number; the number is the lonely
-/// host the reference's dialer lands on `localhost`.
+/// host the reference's dialer lands on `localhost`. A number that is not a port reads empty,
+/// the way the reference's two unmarshals leave a `dest` that fits neither.
 fn fallback_dest_text(node: Option<&Json>) -> String {
     match node {
         Some(Json::Str(text)) => text.clone(),
         Some(Json::Num(_)) => node
             .and_then(Json::as_port)
             .map(|port| port.to_string())
-            .expect("a number node has a port"),
+            .unwrap_or_default(),
         _ => String::new(),
     }
 }
@@ -2322,6 +2423,18 @@ mod tests {
             .expect_err("dest"),
             r#"VLESS fallbacks: please fill in a valid value for every "dest""#
         );
+
+        // A number that is no port fits neither unmarshal the reference tries, so the row refuses.
+        for number in ["99999", "-1", "1.5"] {
+            assert_eq!(
+                server_fallbacks(&vless_settings(&format!(
+                    r#"{{"fallbacks":[{{"dest":{number}}}]}}"#
+                )))
+                .expect_err("dest"),
+                r#"VLESS fallbacks: please fill in a valid value for every "dest""#,
+                "the row whose dest is {number}"
+            );
+        }
     }
 
     #[test]
@@ -2465,6 +2578,76 @@ mod tests {
                 b"GET / HTTP/1.1"
             )),
             None
+        );
+
+        // One unnamed row is every front's cover site, named or not.
+        let only_default = fallback_rows(r#"{"dest":"127.0.0.1:8"}"#);
+        assert_eq!(
+            dial(Fallback::route(
+                &only_default,
+                "cover.example",
+                "h2",
+                b"GET / HTTP/1.1"
+            )),
+            Some(8),
+            "a lone unnamed row answers a front the table never spells"
+        );
+    }
+
+    #[test]
+    fn the_unnamed_group_reaches_every_named_group_the_reference_way() {
+        // The unnamed group's h2 map reaches a named group that spelled no h2 row, its own `""` row filling the default path.
+        let rows = fallback_rows(
+            r#"
+            {"name":"","alpn":"h2","path":"/api","dest":"127.0.0.1:1"},
+            {"name":"web","alpn":"","dest":"127.0.0.1:2"}"#,
+        );
+        let dial = |picked: Option<&Fallback>| {
+            picked.and_then(|row| match &row.network {
+                FallbackNetwork::Tcp { port, .. } => Some(*port),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            dial(Fallback::route(
+                &rows,
+                "web",
+                "h2",
+                b"GET /api?q=1 HTTP/1.1"
+            )),
+            Some(1),
+            "the unnamed group's h2 path reaches the named group"
+        );
+        assert_eq!(
+            dial(Fallback::route(&rows, "web", "h2", b"GET / HTTP/1.1")),
+            Some(2),
+            "the named group's own empty-alpn row fills the default path"
+        );
+
+        // An unnamed path reaches an unnamed front; the named group's path is not shared into it.
+        let named_only = fallback_rows(
+            r#"
+            {"name":"web","alpn":"","path":"/api","dest":"127.0.0.1:3"},
+            {"name":"","alpn":"","dest":"127.0.0.1:4"}"#,
+        );
+        assert_eq!(
+            dial(Fallback::route(
+                &named_only,
+                "web",
+                "",
+                b"GET /api?q=1 HTTP/1.1"
+            )),
+            Some(3)
+        );
+        assert_eq!(
+            dial(Fallback::route(
+                &named_only,
+                "cover.example",
+                "",
+                b"GET /api?q=1 HTTP/1.1"
+            )),
+            Some(4),
+            "the named group's path does not leak into the unnamed one"
         );
     }
 }
