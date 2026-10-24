@@ -247,6 +247,25 @@ fn sender_config(bytes: &[u8]) -> Result<Option<Json>, String> {
     Ok(stream)
 }
 
+/// xray's `SocketConfig` as far as a stream's dial reads it: the system dial this tree puts
+/// under `freedom` already resolves a name to an address, which is `USE_IP`; every other
+/// socket option shapes a dial this tree does not carry and is refused by number.
+fn socket_settings(bytes: &[u8]) -> Result<(), String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.SocketConfig");
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (8, 0) => {
+                let strategy = reader.varint()?;
+                if strategy > 1 {
+                    return Err(reader.uncarried(&format!("socket domain strategy {strategy}")));
+                }
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(())
+}
+
 /// One stream policy as this tree's JSON dialect spells it: the network, and the security the
 /// `security_type` name selects from the carried settings. An absent protocol name is xray's
 /// own default (`tcp`), and a named security whose settings bytes are absent is that type's
@@ -277,9 +296,8 @@ fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
                 }
             }
             (5, 2) => network = account_text(&mut reader)?,
-            (6 | 8 | 9 | 10 | 11 | 12, _) => {
-                return Err(reader.uncarried("socket, address, mask or quic policy on a stream"))
-            }
+            (6, 2) => socket_settings(reader.bytes()?)?,
+            (8..=12, _) => return Err(reader.uncarried("address, mask or quic policy on a stream")),
             _ => return Err(reader.refuse(field, wire)),
         }
     }
@@ -2790,6 +2808,21 @@ mod tests {
             .expect("stream");
         assert_eq!(stream.get("network").and_then(Json::as_str), Some("tcp"));
         assert!(stream.get("security").is_none());
+    }
+
+    #[test]
+    fn a_stream_socket_use_ip_policy_decodes_and_another_option_is_refused() {
+        let policy = receiver_stream(5000, &bytes_field(6, &varint_field(8, 1)));
+        to_json(&config(&http_inbound(&policy, &[]), &freedom_outbound()))
+            .expect("the system dial is USE_IP");
+
+        let marked = receiver_stream(5000, &bytes_field(6, &varint_field(1, 1)));
+        let error = to_json(&config(&http_inbound(&marked, &[]), &freedom_outbound()))
+            .expect_err("a mark is refused");
+        assert!(
+            error.contains("xray.transport.internet.SocketConfig"),
+            "{error}"
+        );
     }
 
     #[test]
