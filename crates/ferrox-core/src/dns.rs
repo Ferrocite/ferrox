@@ -251,41 +251,45 @@ std::thread_local! {
     static NAME_FOLDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The name a rule matches: borrowed when the parse's spelling is already lowercase, else folded
-/// once into one stack buffer — one fold per question, never one per rule.
-enum Fold<'q> {
-    Borrowed(&'q str),
-    Folded([u8; NAME_MAX], usize),
-    Unmatchable,
+/// The name a rule matches: borrowed when already lowercase, else folded once into the one stack buffer this owns — never once per rule.
+struct Fold<'q> {
+    borrowed: Option<&'q str>,
+    folded: Option<([u8; NAME_MAX], usize)>,
 }
 
 impl<'q> Fold<'q> {
     fn of(question: &'q Question) -> Self {
+        let mut fold = Self {
+            borrowed: None,
+            folded: None,
+        };
         let name = question.name();
         let Some(matchable) = name.get(..name.len().saturating_sub(1)) else {
-            return Self::Unmatchable;
+            return fold;
         };
         let Ok(text) = std::str::from_utf8(matchable) else {
-            return Self::Unmatchable;
+            return fold;
         };
         if !text.bytes().any(|byte| byte.is_ascii_uppercase()) {
-            return Self::Borrowed(text);
+            fold.borrowed = Some(text);
+            return fold;
         }
         #[cfg(test)]
         NAME_FOLDS.with(|folds| folds.set(folds.get() + 1));
         let mut bytes = [0u8; NAME_MAX];
-        let folded = &mut bytes[..text.len()];
-        folded.copy_from_slice(text.as_bytes());
-        folded.make_ascii_lowercase();
-        Self::Folded(bytes, text.len())
+        let lower = &mut bytes[..text.len()];
+        lower.copy_from_slice(text.as_bytes());
+        lower.make_ascii_lowercase();
+        fold.folded = Some((bytes, text.len()));
+        fold
     }
 
     fn as_str(&self) -> Option<&str> {
-        match self {
-            Self::Borrowed(text) => Some(text),
-            Self::Folded(bytes, len) => std::str::from_utf8(&bytes[..*len]).ok(),
-            Self::Unmatchable => None,
+        if let Some(text) = self.borrowed {
+            return Some(text);
         }
+        let (bytes, len) = self.folded.as_ref()?;
+        std::str::from_utf8(&bytes[..*len]).ok()
     }
 }
 
