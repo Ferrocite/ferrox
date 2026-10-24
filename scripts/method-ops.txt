@@ -139,3 +139,5 @@ socks  socks::tests::the_client_writes_the_bytes_the_pinned_go_writes  ferrox_co
 socks  socks::tests::the_socks4_request_is_the_bytes_the_pinned_writer_writes  ferrox_core::socks::request4
 socks  socks::tests::the_socks4_reply_is_the_bytes_the_pinned_server_writes  ferrox_core::socks::grant4
 dns-outbound  dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else  ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+security-ech  tls::shaped::hello::tests::a_real_ech_offer_hides_the_inner_name_under_the_public_one  ferrox_core::tls::shaped::hello::Hello::enable_ech
+security-ech  tls::shaped::hello::tests::a_real_ech_offer_hides_the_inner_name_under_the_public_one  ferrox_core::tls::shaped::hello::Hello::retry
