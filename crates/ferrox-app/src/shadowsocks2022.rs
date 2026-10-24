@@ -1919,6 +1919,69 @@ mod tests {
     }
 
     #[test]
+    fn the_response_head_folds_the_first_downlink_chunk() {
+        let method = Method::Aes256Gcm;
+        let name = "2022-blake3-aes-256-gcm";
+        let psk = psk_b64(method.key_len());
+        let target = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let target_port = target.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = target.accept().expect("accepts");
+            stream.write_all(b"first").expect("writes");
+        });
+        let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = server.local_addr().expect("addr").port();
+        let announced = psk.clone();
+        let named = name.to_owned();
+        thread::spawn(move || {
+            for stream in server.incoming().take(1) {
+                let Ok(stream) = stream else { continue };
+                let announced = announced.clone();
+                let named = named.clone();
+                thread::spawn(move || {
+                    serve(stream, &announced, &named, true);
+                });
+            }
+        });
+        let target_addr: SocketAddr = format!("127.0.0.1:{target_port}").parse().expect("addr");
+        let mut uplink = Connection::connect(("127.0.0.1", port)).expect("connects");
+        uplink
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let Some((_send, recv)) = client_send_handshake(
+            &mut uplink,
+            &psk,
+            name,
+            &crate::proxy::Destination::from(target_addr),
+        ) else {
+            panic!("handshake refused");
+        };
+        let Recv::Waiting(m, p, s) = recv else {
+            panic!("the client waits for a server salt");
+        };
+        let mut peer = vec![0u8; m.key_len()];
+        read_exact(&mut uplink, &mut peer).expect("salt");
+        let mut cipher = Cipher::from_psk(m, &p, &peer).expect("derives");
+        let fixed_len = 1 + 8 + m.key_len() + 2 + TAG_LEN;
+        let mut fixed = vec![0u8; fixed_len];
+        read_exact(&mut uplink, &mut fixed).expect("fixed");
+        cipher.open_in_place(&mut fixed).expect("opens");
+        let first = usize::from(u16::from_be_bytes([
+            fixed[9 + m.key_len()],
+            fixed[10 + m.key_len()],
+        ]));
+        assert!(
+            first > 0,
+            "the server head carries the first downlink chunk"
+        );
+        let mut chunk = vec![0u8; first + TAG_LEN];
+        read_exact(&mut uplink, &mut chunk).expect("first");
+        let got = cipher.open_in_place(&mut chunk).expect("opens first");
+        assert_eq!(&chunk[..got], b"first");
+        let _ = s;
+    }
+
+    #[test]
     fn every_named_method_relays_an_echo() {
         for (name, method) in [
             ("2022-blake3-aes-128-gcm", Method::Aes128Gcm),
