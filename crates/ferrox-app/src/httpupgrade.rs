@@ -177,8 +177,12 @@ fn path_matches(target: &str, path: &str) -> bool {
     let mut at = 0;
     while at < bytes.len() {
         let byte = if bytes[at] == b'%' {
-            let hi = hex_digit(*bytes.get(at + 1)?)?;
-            let lo = hex_digit(*bytes.get(at + 2)?)?;
+            let Some(hi) = bytes.get(at + 1).copied().and_then(hex_digit) else {
+                return false;
+            };
+            let Some(lo) = bytes.get(at + 2).copied().and_then(hex_digit) else {
+                return false;
+            };
             at += 3;
             hi << 4 | lo
         } else {
