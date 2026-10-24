@@ -118,6 +118,7 @@ Both H1 handshakes — the `POST` a server reads and the `200` a dialer reads �
 | path-segment-allocations | 0 | ferrox-app-xhttp::tests::the_path_placements_are_read_without_a_list |
 | connection-header-allocations | 0 | ferrox-app-xhttp::tests::a_connection_header_is_named_without_a_lowercase_copy |
 | data-part-decode-allocations | 3 | ferrox-app-xhttp::tests::the_data_parts_decode_off_one_walk_of_the_head |
+| carry-tail-allocations | 0 | ferrox-app-xhttp::tests::the_tail_a_body_read_leaves_stays_in_the_head_buffer |
 | received-data-frames-copied | 0 | ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into |
 | received-header-blocks-copied | 0 | ferrox-app-xhttp_h2::tests::a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into |
 | partly-read-frame-tail-copies | 0 | ferrox-app-xhttp_h2::tests::a_partly_read_frame_is_not_moved |
@@ -192,6 +193,7 @@ What did not move: the two scans of the value, and the default a request with no
 - **A zero pass over every request body.** `read_body` allocated a `Content-Length` body with `vec![0u8; n]`, so every uplink POST paid a zero pass over its whole body before the read that fills it in full — the same bytes written twice.
 The body is the read's own uninitialised room now, and the counting allocator's `zeroed` counter is the witness: `a_body_read_lands_in_room_it_never_zeroes` reads a 32-byte body in full off an in-memory stream, holds the bytes and the head-tail prefix, and fails if the buffer is zeroed again.
 What did not move: the body is still one allocation of exactly `n`, the head-tail bytes still land at its front, and the leftover tail is still copied into the next request's carry.
+- **A copy of the tail behind every pipelined body.** A body read takes its first bytes from the head's own over-read, and the bytes after it are the next request's head; the arm copied those into a fresh `Vec` before handing them back as the next prefix. They now move down inside the head's buffer with one `copy_within` and a truncate, so a pipelined request pays one allocation and one copy less and keeps the room the head already had. `the_tail_a_body_read_leaves_stays_in_the_head_buffer` measures **zero allocations** and holds the returned tail's base to the head buffer's base and its capacity to the head's — a bytes-only check cannot see the difference — beside the old `.to_vec()` measured at one. What did not move: the tail's bytes and order, and the carry a request with no body already passes through untouched.
 
 ## Open rows
 
