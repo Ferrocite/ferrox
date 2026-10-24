@@ -955,18 +955,6 @@ pub(crate) fn outbound_reality(
     }))
 }
 
-/// The user flow: empty or Vision dials, anything else is refused rather than sent plain.
-pub(crate) fn outbound_flow(server: &Json) -> String {
-    server
-        .get("users")
-        .and_then(Json::as_arr)
-        .and_then(|users| users.first())
-        .and_then(|user| user.get("flow"))
-        .and_then(Json::as_str)
-        .unwrap_or("")
-        .to_owned()
-}
-
 pub(crate) fn kcp_config(settings: Option<&Json>) -> ferrox_core::kcp::Config {
     let base = ferrox_core::kcp::Config::default();
     let Some(kcp) = settings.and_then(|s| s.get("kcpSettings")) else {
