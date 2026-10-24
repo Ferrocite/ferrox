@@ -637,6 +637,10 @@ impl<S: Stream> Session<S> {
         verify_signature(leaf, scheme, &content, signature)
     }
 
+    #[allow(
+        clippy::uninit_vec,
+        reason = "the read reports the bytes it wrote, and only those join the length"
+    )]
     fn pump(&mut self, buf: &mut [u8]) -> Result<usize, TlsError> {
         loop {
             if self.plain_at < self.plain_end {
@@ -649,13 +653,18 @@ impl<S: Stream> Session<S> {
             if filled > 0 {
                 return Ok(filled);
             }
-            let mut chunk = [0u8; RECORD_READ];
-            match self.io.read(&mut chunk) {
+            let at = self.inbuf.len();
+            self.inbuf.reserve(RECORD_READ);
+            // SAFETY: the room is spare capacity, and the length below covers only the bytes `read` reports writing.
+            let room = unsafe {
+                std::slice::from_raw_parts_mut(self.inbuf.as_mut_ptr().add(at), RECORD_READ)
+            };
+            match self.io.read(room) {
                 Ok(0) => {
                     self.eof = true;
                     return Ok(0);
                 }
-                Ok(n) => self.inbuf.extend_from_slice(&chunk[..n]),
+                Ok(n) => unsafe { self.inbuf.set_len(at + n) },
                 Err(error) if TlsError::is_timeout(&error) => return Err(TlsError::Timeout),
                 Err(error) => return Err(TlsError::from(error)),
             }
@@ -2046,6 +2055,88 @@ mod tests {
     }
 
     impl Write for SplitRead {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The record read lands where the record is decrypted from: a stack chunk would have been a second
+    /// buffer, zeroed for the full window and then copied into `inbuf`, which only a pointer can see.
+    #[test]
+    fn a_record_read_fills_the_inbuf_it_decrypts_from() {
+        let suite = Suite::Aes128GcmSha256;
+        let secret = [13u8; 32];
+        let mut sender = Direction::tls13(suite, &secret);
+        let mut wire = Vec::new();
+        record::seal13(&mut sender, APPLICATION, b"seven", &mut wire).expect("seals");
+        let per_read = wire.len();
+        record::seal13(&mut sender, APPLICATION, b"eight", &mut wire).expect("seals");
+        let mut subject = session_on(
+            Recorder {
+                wire,
+                per_read,
+                base: std::cell::Cell::new(std::ptr::null()),
+                len: std::cell::Cell::new(0),
+            },
+            Version::Tls13,
+            suite,
+            Direction::tls13(suite, &secret),
+            Direction::tls13(suite, &secret),
+        );
+
+        let mut buf = [0u8; 16];
+        let n = subject.read(&mut buf).expect("the first record lands");
+        assert_eq!(&buf[..n], b"seven");
+        let base = subject.inbuf.as_ptr();
+        let capacity = subject.inbuf.capacity();
+        assert_eq!(
+            subject.io.len.get(),
+            RECORD_READ,
+            "the room is one record window"
+        );
+        assert_eq!(
+            subject.io.base.get(),
+            base,
+            "the read wrote at the vector's own base"
+        );
+
+        let n = subject.read(&mut buf).expect("the second record lands");
+        assert_eq!(&buf[..n], b"eight");
+        assert_eq!(
+            subject.io.base.get(),
+            base,
+            "the next record reuses the same room"
+        );
+        assert_eq!(
+            subject.inbuf.capacity(),
+            capacity,
+            "the staging vector did not grow between records"
+        );
+    }
+
+    struct Recorder {
+        wire: Vec<u8>,
+        per_read: usize,
+        base: std::cell::Cell<*const u8>,
+        len: std::cell::Cell<usize>,
+    }
+
+    impl Read for Recorder {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.base.set(buf.as_ptr());
+            self.len.set(buf.len());
+            let n = self.per_read.min(buf.len()).min(self.wire.len());
+            buf[..n].copy_from_slice(&self.wire[..n]);
+            self.wire.drain(..n);
+            Ok(n)
+        }
+    }
+
+    impl Write for Recorder {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
             Ok(buf.len())
         }
