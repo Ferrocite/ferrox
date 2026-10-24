@@ -53,6 +53,8 @@ Copies: a whole downlink frame is parsed where the read landed it and copied onc
 
 ## What we removed
 
+**The downlink's second copy of a whole frame.** `read_loop` read into a 32 KiB `chunk`, extended a `buf` with the whole chunk, parsed it, then `drain`ed the consumed prefix — so a whole frame crossed user space twice before the flow queue copied its payload. The loop now parses the read where it landed; only a frame that straddles two reads is copied into a carry. A 16 KiB frame costs **80,066 Ir**, down from **109,108** (**-29,042, -26.6%**), in CI `ops` runs 40131705581 and 40130833832; the 16 KiB echo test holds the bytes, and the 5-byte flow still passes.
+
 The reference's separate dispatcher and its own mux client. Xray used to serve reverse through `app/reverse`'s inbound/outbound pair and, in ZeroNet, through a `reverse.rs` that implemented Mux.cool framing again. Here the portal registers one `Outbound::ReversePortal` inside the route registry the config already built, the session is a mux client used by nothing else, and the bridge serves the portal's flows through the same `serve_mux_wire` a VLESS mux inbound uses. The three command-4 checks (header, user, flow) live in one `reverse_ask`, so no carrier can grow its own.
 
 ## What was not removed
