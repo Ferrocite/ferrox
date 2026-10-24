@@ -3339,25 +3339,17 @@ fn copy_stream<R: Read, W: Write>(
     let mut buffer = RelayBuf::new();
     loop {
         let n = match from.read_once(buffer.as_mut()) {
-            Ok(0) => {
-                echo_trace("copy stream eof");
-                break;
-            }
+            Ok(0) => break,
             Ok(n) => n,
             Err(error) if is_timeout(&error) => {
                 if ended.load(Ordering::Relaxed) {
-                    echo_trace("copy stream ended sibling");
                     break;
                 }
                 continue;
             }
-            Err(error) => {
-                echo_trace(&format!("copy stream err {error:?}"));
-                break;
-            }
+            Err(_) => break,
         };
         if to.write_once(buffer.filled(n)).is_err() {
-            echo_trace("copy stream write err");
             break;
         }
     }
@@ -6978,9 +6970,7 @@ fn dial_vless_reality(
                     crate::vision::Link::arm_read_timeout,
                     SESSION_POLL,
                 );
-                echo_trace("vision relay start");
                 relay_stream(Half::socket(downstream), half, &close);
-                echo_trace("vision relay end");
             } else {
                 // The limiter stops bounding, the transport's wait leaves the lock, and only the decryption stays under it.
                 match driven_halves(session, RELAY_POLL) {
