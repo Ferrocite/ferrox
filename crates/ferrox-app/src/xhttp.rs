@@ -3825,8 +3825,14 @@ mod tests {
         thread::spawn(move || {
             let mut reader = SessionReader::new(down, "parked-downlink".to_owned());
             let mut buf = [0u8; 8];
-            // Nothing is ever posted to this session, so this read is the park itself.
-            let _ = down_done.send(reader.read(&mut buf).expect("reads"));
+            // Nothing is ever posted to this session, so this read is the park itself; the poll grain is not the end.
+            let got = loop {
+                match reader.read(&mut buf) {
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                    outcome => break outcome,
+                }
+            };
+            let _ = down_done.send(got.expect("reads"));
         });
         let (up_done, up_waiting) = std::sync::mpsc::channel();
         let up = get_or_create_session("parked-uplink");
