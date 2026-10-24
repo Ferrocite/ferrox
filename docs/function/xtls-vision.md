@@ -28,11 +28,12 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 16896 | scripts/count-ops.sh |
+| ops-retired-instructions | 17152 | scripts/count-ops.sh |
 | padding-command-bytes | 5 | ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid |
 | first-frame-uuid-bytes | 16 | ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid |
 | largest-framed-block-bytes | 8171 | ferrox-app-vision::tests::a_bulk_write_frames_every_block_inside_the_bound |
 | tls-buffers-inspected-before-the-switch | 8 | ferrox-app-vision::tests::both_directions_spend_the_same_filter_budget |
+| feed-bytes-zeroed-per-steady-read | 0 | ferrox-app-vision::tests::a_steady_read_builds_no_feed |
     | user-space-copies-per-byte-while-framed | 1 | ferrox-app-vision::tests::the_framing_switch_ends_the_staging |
 | user-space-copies-per-byte-after-the-switch | 0 | ferrox-app-vision::tests::the_framing_switch_ends_the_staging |
 | user-space-copies-per-byte-written-while-framed | 0 | ferrox-app-vision::tests::the_writer_hands_the_callers_payload_by_pointer |
@@ -53,7 +54,7 @@ graph TD
   'vision::Linkferrox_app::vision::tests::Fake::pump'
 ```
 
-`16896` retired instructions, the frame the probe walks through 512 empty frames. The row names the monomorphized frame the probe builds because `count-ops.sh` drops the angle brackets from a generic frame; the row it replaced named `unpad`, which the walk no longer has, so it read as an inlined frame rather than a measurement. The probe's own row is in `scripts/expected-ops.txt`.
+`17152` retired instructions, the frame the probe walks through 512 empty frames. The row names the monomorphized frame the probe builds because `count-ops.sh` drops the angle brackets from a generic frame; the row it replaced named `unpad`, which the walk no longer has, so it read as an inlined frame rather than a measurement. The probe's own row is in `scripts/expected-ops.txt`. The count rose from 16,896 with the steady-read feed: the probe pays 256 more instructions (0.5 per empty frame) for the `Option` that lets a post-budget read skip the feed, while that read no longer builds its 320 bytes of scan state.
 
 ## Time
 
@@ -71,7 +72,9 @@ The two rows beside the renamed one are properly gated: all three `user-space-co
 
 ## What we removed
 
-- **The walk's per-frame state traffic.** `pump` reloaded and stored `want_header`, `want_content`, `want_padding` and `command` through `self.walk` on every turn of the frame loop, and the five-byte header was five indexed loads into a temporary array. The loop now keeps the cursor and a copy of `Walk` in registers, writes both back once when it parks or returns, and reads the header as one five-byte slice with two big-endian pairs. The probe moves from 25,536 to 16,896 retired instructions — 8,640 fewer, 33.8% — gated by `ops-retired-instructions`. The 512 frames, the one validated command per frame and the replayed split-frame bytes do not move. What was not removed: while the framing is live, a content extent still takes one copy into the caller's buffer, and a header split across reads still takes the byte-by-byte arm.
+- **A 320-byte scan feed built after the scan is over.** `Link::read` built `Feeding` — a 310-byte head, a 10-byte boundary span and their scalars — on every read for the life of the connection, but the filter spends only eight buffers; once `budget` reaches zero nothing reads the feed. The feed is now built only while the budget is live, so a steady read zeroes no scan state. `a_steady_read_builds_no_feed` holds a post-budget read at zero feeds, and `both_directions_spend_the_same_filter_budget` still holds the eight buffers. The frame walk's own count is unchanged in kind: it still takes the feed when the filter is live.
+
+- **The walk's per-frame state traffic.** `pump` reloaded and stored `want_header`, `want_content`, `want_padding` and `command` through `self.walk` on every turn of the frame loop, and the five-byte header was five indexed loads into a temporary array. The loop now keeps the cursor and a copy of `Walk` in registers, writes both back once when it parks or returns, and reads the header as one five-byte slice with two big-endian pairs. The probe moved from 25,536 to 16,896 retired instructions — 8,640 fewer, 33.8% — gated by `ops-retired-instructions`; the steady-read feed later moved it to 17,152, with both numbers named below. The 512 frames, the one validated command per frame and the replayed split-frame bytes do not move. What was not removed: while the framing is live, a content extent still takes one copy into the caller's buffer, and a header split across reads still takes the byte-by-byte arm.
 
 - **A command byte that nothing checked.** The reader took the frame's command byte as a number and compared it twice — once against zero to ask "is another frame coming", once against two to ask "does the socket go raw". The byte is now validated by `VisionCommand::from_byte`, the same validator the core's `VisionSeal`/`VisionOpen` pair uses, so the check is one named match and the reader holds a command rather than a number. It runs on every frame, so it is counted like the parser is: `a_frame_validates_its_command_once` holds the reader at one validated command byte per frame — the frames it walks, and no more — and the acceptance set is fixed by `the_command_validator_accepts_three_commands`, which holds the validator at the three commands the reference knows (`0` continue, `1` end, `2` direct) and refuses the other 253 byte values. A command the reference does not know ends the framing the way `end` does, exactly as Xray does with one it only logs.
 
