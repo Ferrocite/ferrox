@@ -2476,7 +2476,7 @@ mod tests {
         });
         assert!(
             counts.bytes <= 1024,
-            "the carrier opened {} bytes, a batch buffer is 132416",
+            "the carrier opened {} bytes, a batch buffer is 132384",
             counts.bytes
         );
     }
