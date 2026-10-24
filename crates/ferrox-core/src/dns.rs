@@ -287,6 +287,7 @@ pub enum Step {
 /// A Hijack reply's rcode is the ride the lookup gave, never the rule's own:
 /// the rule's rcode reaches only the reject a Hijack rule writes for a type
 /// its resolver does not take.
+#[cfg_attr(test, inline(never))]
 pub fn decide(message: &[u8], rules: &[Rule], lookup: &dyn Fn(&[u8]) -> Resolve) -> Step {
     let Some(question) = parse_query(message) else {
         return Step::Quiet;
