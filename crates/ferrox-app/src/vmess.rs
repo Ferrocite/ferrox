@@ -1829,9 +1829,10 @@ pub(crate) fn pump_relay(
         let Some(mut pad) = PadSource::fresh() else {
             return;
         };
+        let mut ended = false;
         while let Ok(read) = plain_read.read(&mut buf) {
             if read == 0 {
-                let _ = write_frame(&mut sealed_write, &mut send, &[], &mut staging, &mut pad);
+                ended = write_frame(&mut sealed_write, &mut send, &[], &mut staging, &mut pad);
                 break;
             }
             let mut at = 0;
@@ -1854,8 +1855,12 @@ pub(crate) fn pump_relay(
                 break;
             }
         }
-        let _ = plain_read.shutdown(Shutdown::Both);
-        let _ = sealed_write.shutdown(Shutdown::Both);
+        // A clean end tells the peer this direction is done; the other direction keeps relaying.
+        if ended {
+            let _ = sealed_write.shutdown(Shutdown::Write);
+        } else {
+            let _ = sealed_write.shutdown(Shutdown::Both);
+        }
     });
     let mut recv = recv;
     let mut sealed_reader = Wire::new(sealed_read);
@@ -1872,9 +1877,18 @@ pub(crate) fn pump_relay(
             break;
         }
     }
+    if sealed_reader.ended_by_marker() {
+        // The marker ends this direction only: half-close its peer and keep the other direction.
+        let _ = plain_write.shutdown(Shutdown::Write);
+        let _ = done.join();
+    } else {
+        let _ = sealed.shutdown(Shutdown::Both);
+        let _ = plain_write.shutdown(Shutdown::Both);
+        let _ = done.join();
+        return;
+    }
     let _ = sealed.shutdown(Shutdown::Both);
     let _ = plain_write.shutdown(Shutdown::Both);
-    let _ = done.join();
 }
 
 #[cfg(test)]
@@ -3644,8 +3658,8 @@ mod tests {
             .expect("arms");
         let mut uploader = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("recvs");
         let mut scratch = Vec::new();
-        let upload = read_frame(&mut server, &mut uploader, &mut scratch)
-            .expect("the upload survives");
+        let upload =
+            read_frame(&mut server, &mut uploader, &mut scratch).expect("the upload survives");
         assert_eq!(upload, b"ping");
         let end = read_frame(&mut server, &mut uploader, &mut scratch).expect("the upload marker");
         assert!(end.is_empty());
