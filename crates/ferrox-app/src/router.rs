@@ -2511,7 +2511,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fields_and_empty_rules_are_refused_by_name() {
+    fn unknown_routing_fields_are_refused_by_name() {
         let root = object(vec![(
             "routing",
             object(vec![("script", text("x")), ("rules", array(Vec::new()))]),
@@ -2520,19 +2520,50 @@ mod tests {
         assert!(error.contains("script"), "{error}");
         let root = object(vec![(
             "routing",
-            routing(vec![rule(
-                "direct",
-                vec![("protocol", array(vec![text("http")]))],
-            )]),
+            routing(vec![rule("direct", vec![("notAField", text("x"))])]),
         )]);
         let error = Routing::parse_in(&root, vec![dir()]).expect_err("refused");
-        assert!(error.contains("protocol"), "{error}");
+        assert!(error.contains("notAField"), "{error}");
+    }
+
+    #[test]
+    fn a_catch_all_rule_matches_every_flow_and_a_sniffer_rule_is_skipped() {
         let root = object(vec![(
             "routing",
-            routing(vec![object(vec![("outboundTag", text("direct"))])]),
+            routing(vec![
+                rule(
+                    "block",
+                    vec![
+                        ("domain", array(vec![text("x.com")])),
+                        ("protocol", array(vec![text("http")])),
+                    ],
+                ),
+                rule("direct", Vec::new()),
+            ]),
         )]);
-        let error = Routing::parse_in(&root, vec![dir()]).expect_err("refused");
-        assert!(error.contains("no effective fields"), "{error}");
+        let parsed = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let named = Flow {
+            network: Network::Tcp,
+            domain: Some("x.com"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: None,
+        };
+        assert_eq!(parsed.route(&named), Some("direct"));
+        let bare = Flow {
+            network: Network::Udp,
+            domain: None,
+            ip: None,
+            port: None,
+            source: None,
+            local: None,
+            inbound_tag: None,
+        };
+        assert_eq!(parsed.route(&bare), Some("direct"));
     }
 
     #[test]
