@@ -3393,7 +3393,10 @@ mod tests {
         )]);
         let cidr = message(&[bytes_field(
             2,
-            &message(&[bytes_field(1, &[192, 0, 2, 0]), varint_field(2, 24)]),
+            &message(&[bytes_field(
+                1,
+                &message(&[bytes_field(1, &[192, 0, 2, 0]), varint_field(2, 24)]),
+            )]),
         )]);
         let source_cidr = message(&[bytes_field(
             2,
