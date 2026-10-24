@@ -705,6 +705,56 @@ mod tests {
         assert!(check_response(b"\xff").is_none(), "invalid UTF-8");
     }
 
+    /// The reference's `http.ReadResponse` reads lines through the same `textproto`
+    /// reader as the request head, so a bare line feed is an answer it accepts.
+    #[test]
+    fn check_response_accepts_a_bare_lf_answer() {
+        let ok = b"HTTP/1.1 101 Switching Protocols\nConnection: Upgrade\nUpgrade: websocket\n\n";
+        assert!(
+            check_response(ok).is_some(),
+            "the reference accepts a bare-LF answer"
+        );
+    }
+
+    /// A peer that answers with bare line feeds must reach the reader, not stall
+    /// until it closes; the server closes right after the answer so the old
+    /// CRLF-only scan fails at once instead of waiting out the head budget.
+    #[test]
+    fn a_bare_lf_answer_reaches_the_dial() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut head = vec![0u8; expected_request("oracle.example", "/tunnel").len()];
+            stream.read_exact(&mut head).expect("reads the request");
+            stream
+                .write_all(
+                    b"HTTP/1.1 101 Switching Protocols\nConnection: Upgrade\nUpgrade: websocket\n\n",
+                )
+                .expect("answers with a bare line feed");
+        });
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
+        connect(stream, "oracle.example", "/tunnel", 0, &[]).expect("reads the bare-LF answer");
+        server.join().expect("joins");
+    }
+
+    /// The split arm takes the same head read: a bare-LF answer is proved from the
+    /// stream itself, without a socket close to end the scan.
+    #[test]
+    fn a_bare_lf_answer_reaches_the_split_dial() {
+        let answer =
+            b"HTTP/1.1 101 Switching Protocols\nConnection: Upgrade\nUpgrade: websocket\n\n";
+        connect_split(
+            std::io::Cursor::new(answer.to_vec()),
+            Recorder::default(),
+            "oracle.example",
+            "/tunnel",
+            0,
+            &[],
+        )
+        .expect("reads the bare-LF answer");
+    }
+
     /// A payload that fits the budget rides with the GET, so the server has it before the reader is even built and the caller sends nothing after.
     #[test]
     fn early_data_rides_ahead_of_the_switch() {
