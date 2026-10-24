@@ -1604,7 +1604,14 @@ pub(crate) fn under_handshake<T, R: Read + Carried>(
     out
 }
 
-fn serve_vless_raw(mut stream: Connection, id: &[u8; 16], freedom: bool) {
+fn serve_vless_raw(stream: Connection, id: &[u8; 16], freedom: bool) {
+    serve_vless_raw_with(stream, id, freedom, dial_or_report);
+}
+
+fn serve_vless_raw_with<D>(mut stream: Connection, id: &[u8; 16], freedom: bool, dial: D)
+where
+    D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
+{
     // Bound only the opening request read to a wall-clock budget, then restore the blocking relay reads behind it.
     let _ = stream.set_read_timeout(Some(budgets::handshake()));
     let decoded = decode_request_bounded(&mut stream);
@@ -1625,12 +1632,12 @@ fn serve_vless_raw(mut stream: Connection, id: &[u8; 16], freedom: bool) {
         if stream.write_all(&[0, 0]).is_err() {
             return;
         }
-        return serve_vless_mux(stream);
+        return serve_vless_mux_with(stream, dial);
     }
     if cmd != 1 {
         return;
     }
-    let Some(uplink) = dial_or_report(&target) else {
+    let Some(uplink) = dial(&target) else {
         return;
     };
     if stream.write_all(&[0, 0]).is_err() {
@@ -1915,10 +1922,6 @@ fn remove_mux_session(
         table.flows.remove(&id);
     }
     send_mux_end(shared, staging, id);
-}
-
-fn serve_vless_mux(stream: Connection) {
-    serve_vless_mux_with(stream, dial_or_report);
 }
 
 fn serve_vless_mux_with<D>(stream: Connection, dial: D)
@@ -24605,7 +24608,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
-            serve_vless_mux_with(stream, dial);
+            serve_vless_raw_with(stream, &id, true, dial);
         });
         let mut stream = mux_test_connect(&id, tunnel_port);
         mux_test_send(
