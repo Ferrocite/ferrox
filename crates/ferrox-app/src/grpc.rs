@@ -2072,11 +2072,8 @@ mod tests {
             "the envelope and the tag leave this much of a frame one byte under the width the window packs"
         );
         assert_eq!(fit + 8, HUNK - 1);
-        assert!(
-            4 * (HUNK - 1) <= 65_535,
-            "four hunks fill the default stream window"
-        );
-        assert!(4 * HUNK > 65_535, "four full frames do not fit it");
+        const _: () = assert!(4 * (HUNK - 1) <= 65_535);
+        const _: () = assert!(4 * HUNK > 65_535);
         let data: Vec<u8> = (0..4 * HUNK).map(|i| (i % 251) as u8).collect();
         let peer = Arc::new(Mutex::new(Peer::default()));
         let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, u64::MAX);
@@ -2094,10 +2091,7 @@ mod tests {
             assert!(wire.len() - at - 9 >= len, "a frame body was cut short");
             let body = &wire[at + 9..at + 9 + len];
             assert!(body.len() >= 5, "a DATA frame opens no message");
-            assert!(
-                body.len() <= HUNK - 1,
-                "a hunk is wider than the window packs"
-            );
+            assert!(body.len() < HUNK, "a hunk is wider than the window packs");
             let announced = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
             assert_eq!(announced + 5, body.len(), "a hunk crossed a frame boundary");
             let (_, payload) = hunk_decode(&body[5..]).expect("the hunk decodes");
