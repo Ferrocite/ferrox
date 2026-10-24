@@ -522,12 +522,10 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 }
                 Err(error) => {
                     self.have.truncate(base);
-                    crate::proxy::echo_trace(&format!("vision fill err {error:?}"));
                     return Err(error);
                 }
             };
             if n == 0 {
-                crate::proxy::echo_trace("vision fill eof");
                 return Ok(false);
             }
             self.stage(n);
