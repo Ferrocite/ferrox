@@ -19362,6 +19362,10 @@ mod tests {
         assert!(outbound_refusal(outbound, "vless").is_none());
         let out = find_vless_outbound(&root).expect("hysteria over tls dials");
         assert!(matches!(out.carrier, Carrier::Hysteria(_)));
+        assert_eq!(
+            out.host, "carrier.test",
+            "the carrier's SNI is tlsSettings.serverName"
+        );
         assert!(out.tls.is_none(), "the carrier's TLS is not a second layer");
     }
 
