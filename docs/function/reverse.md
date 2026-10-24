@@ -30,22 +30,22 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| ops-retired-instructions | 80066 | scripts/count-ops.sh |
 | tcp-echo-bytes-preserved | 5 | ferrox-app-proxy::reverse_tests::a_portal_flow_reaches_the_bridge_and_comes_back |
 <!-- counts:end -->
 
 Syscalls: one loopback `connect` plus one `accept` per bridge worker at startup, one mux frame write per uplink chunk, one outbound `connect` per flow the bridge dials, and the relay's own reads and writes — no checker counts this yet.
 
-Copies: the portal's downlink copies each byte once, into the flow's queue (`data.to_vec()`), because the queue is what lets a slow consumer cost only its own flow. The uplink copies nothing: the header is built in the session's scratch and the caller's payload is written with one `writev`, the same two-part write a direct mux session makes. A pointer-identity test does not exist for either arm yet, so both stay prose rather than manifest rows.
+Copies: a whole downlink frame is parsed where the read landed it and copied once, into the flow's queue (`data.to_vec()`), because the queue is what lets a slow consumer cost only its own flow. Only a frame that straddles two reads is copied into a carry first. The uplink copies nothing: the header is built in the session's scratch and the caller's payload is written with one `writev`, the same two-part write a direct mux session makes. A pointer-identity test does not exist for either arm yet, so both stay prose rather than manifest rows.
 
 ## Ops
 
 ```bash
 ./scripts/count-ops.sh report \
-  proxy::reverse_tests::a_portal_flow_reaches_the_bridge_and_comes_back 'reverse::'
+  proxy::reverse_tests::a_sixteen_kib_downlink_frame_is_echoed_whole 'reverse::Session::read_loop'
 ```
 
-`UNBLESSED`, as above.
+**80,066 retired instructions** for a 16 KiB downlink frame, from CI `ops` run 40131705581; the same frame cost **109,108** before the read loop parsed it in place (run 40130833832), so the copy and the common drain removal is **-29,042 instructions (-26.6%)**. The 5-byte echo is correctness, not a priced frame.
 
 ## Time
 
