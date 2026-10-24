@@ -37,12 +37,16 @@ The direct rule resolves inline: the name minus its root, the literal-IP fast pa
 
 Nothing here is timed by a local run — every dial through this outbound is a connection a contributor's tunnel would measure, so the duration numbers are CI's `bench.yml` and `parity.yml` cells alone. The lane's own waits are the reference's: the upstream read that ends a lane is its idle timeout, and nothing in the decision path spins between a question and its answer.
 
+## Gated counts
+
+The decision's retired instructions are the decide probe's frame — `ferrox-core-dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else`, walked 4096 times so the frame is the method and not the caller that inlined it — read by `scripts/count-ops.sh` under the probe's own filter, the row the count gate now accepts per test.
+
 ## Measured
 
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| ops-retired-instructions | 55544745 | scripts/count-ops.sh |
 | answer-cases-replayed | 21 | ferrox-core-dns::tests::the_answer_is_the_bytes_the_pinned_go_writes |
 | parse-refusals-replayed | 8 | ferrox-core-dns::tests::the_parse_refuses_what_the_reference_refuses |
 | pointer-hop-cap | 10 | ferrox-core-dns::tests::the_pointer_loop_refuses_at_the_cap |
