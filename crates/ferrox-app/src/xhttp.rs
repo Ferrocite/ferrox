@@ -1298,6 +1298,7 @@ struct Session {
     state: Mutex<SessionState>,
     cv: Condvar,
     id: String,
+    born: std::time::Instant,
 }
 
 struct SessionState {
@@ -1315,8 +1316,25 @@ fn sessions() -> &'static Sessions {
     &CELL
 }
 
+fn sweep_stalled_sessions(map: &mut HashMap<String, Arc<Session>>) {
+    let stall = crate::budgets::relay_stall();
+    let stale: Vec<String> = map
+        .iter()
+        .filter(|(_, session)| {
+            session.born.elapsed() >= stall && !session.state.lock().expect("session lock").downlink
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in stale {
+        if let Some(session) = map.remove(&id) {
+            close_session(&session);
+        }
+    }
+}
+
 fn get_or_create_session(id: &str) -> Arc<Session> {
     let mut map = sessions().lock().expect("sessions lock");
+    sweep_stalled_sessions(&mut map);
     map.entry(id.to_owned())
         .or_insert_with(|| {
             Arc::new(Session {
@@ -1329,6 +1347,7 @@ fn get_or_create_session(id: &str) -> Arc<Session> {
                 }),
                 cv: Condvar::new(),
                 id: id.to_owned(),
+                born: std::time::Instant::now(),
             })
         })
         .clone()
@@ -4131,6 +4150,7 @@ mod tests {
             }),
             cv: Condvar::new(),
             id: String::new(),
+            born: std::time::Instant::now(),
         });
         let mut reader = SessionReader::new(session, String::new());
         let mut byte = [0u8; 1];
@@ -4154,6 +4174,7 @@ mod tests {
             }),
             cv: Condvar::new(),
             id: String::new(),
+            born: std::time::Instant::now(),
         });
         let mut reader = SessionReader::new(session, String::new());
         let (sender, receiver) = std::sync::mpsc::channel();
