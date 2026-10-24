@@ -63,6 +63,296 @@ pub(crate) fn inbound_reality_config(
     })
 }
 
+/// One fallback row: the dial a front's first bytes route to when they fail the vless header.
+#[derive(Debug, Clone)]
+pub(crate) struct Fallback {
+    pub(crate) name: String,
+    pub(crate) alpn: String,
+    pub(crate) path: String,
+    pub(crate) network: FallbackNetwork,
+    pub(crate) xver: u8,
+}
+
+/// The dial a fallback row names, spelled the way the reference hands it to its dialer: the
+/// strings stay as the config wrote them and resolve when the dial fires, so an address a
+/// dying resolver cannot answer now still dials when one can.
+#[derive(Debug, Clone)]
+pub(crate) enum FallbackNetwork {
+    Tcp {
+        family: u8,
+        host: String,
+        port: u16,
+    },
+    Udp {
+        family: u8,
+        host: String,
+        port: u16,
+    },
+    Unix {
+        path: String,
+    },
+    /// `serve-ws-none` leaves `type` as `serve`, which the reference's dialer refuses on
+    /// every attempt; the row is carried and the flow falls after its retry budget.
+    NotDialable,
+}
+
+/// The vless decryption a server names and the fallbacks it routes. The reading carries the
+/// dialect's verdicts: an empty `decryption` refuses, a decryption engine this tree does not
+/// carry refuses, and fallback rows refuse beside one.
+pub(crate) fn server_fallbacks(inbound: &Json) -> Result<Option<Vec<Fallback>>, String> {
+    let decryption = inbound
+        .get("settings")
+        .and_then(|settings| settings.get("decryption").and_then(Json::as_str));
+    if let Some(decryption) = decryption {
+        if decryption.is_empty() {
+            return Err(
+                r#"VLESS settings: please add/set "decryption":"none" to every settings"#.into(),
+            );
+        }
+        if decryption != "none" {
+            return Err(format!(
+                r#"VLESS settings: unsupported "decryption": {decryption}"#
+            ));
+        }
+    }
+    let rows = inbound
+        .get("settings")
+        .and_then(|settings| settings.get("fallbacks"))
+        .and_then(Json::as_arr);
+    let Some(rows) = rows else {
+        return Ok(None);
+    };
+    if rows.is_empty() {
+        return Ok(None);
+    }
+    let mut table = Vec::with_capacity(rows.len());
+    for row in rows {
+        let dest_text = fallback_dest_text(row.get("dest"));
+        let kind = row.get("type").and_then(Json::as_str).unwrap_or("");
+        let path = row.get("path").and_then(Json::as_str).unwrap_or("");
+        if !path.is_empty() && !path.starts_with('/') {
+            return Err(r#"VLESS fallbacks: "path" must be empty or start with "/""#.into());
+        }
+        let xver = row.get("xver").and_then(Json::as_u32).unwrap_or(0);
+        if xver > 2 {
+            return Err(
+                r#"VLESS fallbacks: invalid PROXY protocol version, "xver" only accepts 0, 1, 2"#
+                    .into(),
+            );
+        }
+        let Some(network) = fallback_network(kind, &dest_text) else {
+            return Err(r#"VLESS fallbacks: please fill in a valid value for every "dest""#.into());
+        };
+        table.push(Fallback {
+            name: row.get("name").and_then(Json::as_str).unwrap_or("").into(),
+            alpn: row.get("alpn").and_then(Json::as_str).unwrap_or("").into(),
+            path: path.into(),
+            network,
+            xver: u8::try_from(xver).expect("the version is two at most"),
+        });
+    }
+    Ok(Some(table))
+}
+
+impl Fallback {
+    /// The row that owns a flow the front named with `front` and `alpn` and whose first read
+    /// `first` holds: the walk over the table's names, the fall from the front's alpn to `""`,
+    /// and the scan for a request path, each in the order the reference takes them. Every miss
+    /// refuses the flow, and the caller of a refused flow relays nothing.
+    pub(crate) fn route<'a>(
+        table: &'a [Fallback],
+        front: &str,
+        alpn: &str,
+        first: &[u8],
+    ) -> Option<&'a Fallback> {
+        let mut names: Vec<&str> = Vec::new();
+        for row in table {
+            if !names.contains(&row.name.as_str()) {
+                names.push(row.name.as_str());
+            }
+        }
+        let front = front.to_ascii_lowercase();
+        let alpn = alpn.to_ascii_lowercase();
+        let mut picked = front.as_str();
+        // More table names than one, or none spelled as `""`: an unmatched front walks the longest name spelled inside it, and any miss walks as `""`.
+        if (names.len() > 1 || !names.contains(&""))
+            && !front.is_empty()
+            && !names.contains(&front.as_str())
+        {
+            picked = names
+                .iter()
+                .filter(|name| !name.is_empty() && front.contains(*name))
+                .max_by_key(|name| name.len())
+                .copied()
+                .unwrap_or("");
+        }
+        if !names.contains(&picked) {
+            return None;
+        }
+        // The alpn reads one map: the front's when the name group spells it, `""` when it doesn't; a group that spells neither leaves the flow unserved.
+        let spell = |alpn: &str| {
+            table
+                .iter()
+                .any(|row| row.name == picked && row.alpn == alpn)
+        };
+        let ap = if spell(&alpn) { alpn.as_str() } else { "" };
+        if !spell(ap) {
+            return None;
+        }
+        // The paths the group's two alpn maps spell together: the front's own rows keep their paths, duplicates collapse to the row spelled last, and the `""` ones fill where a path has no own cell.
+        let mut cells: Vec<(&str, &Fallback)> = Vec::new();
+        for row in table
+            .iter()
+            .filter(|row| row.name == picked && row.alpn == ap)
+        {
+            put_cell(&mut cells, row);
+        }
+        for row in table
+            .iter()
+            .filter(|row| row.name == picked && row.alpn.is_empty())
+        {
+            if !cells.iter().any(|(path, _)| *path == row.path.as_str()) {
+                cells.push((row.path.as_str(), row));
+            }
+        }
+        // The scan runs when the group spells more paths than one or no `""` row fills the default; otherwise the `""` cell answers and the probe's bytes stay unread.
+        let mut wanted: &[u8] = b"";
+        if cells.len() > 1 || !cells.iter().any(|(path, _)| path.is_empty()) {
+            let scanned = scanned_path(first);
+            if cells.iter().any(|(path, _)| path.as_bytes() == scanned) {
+                wanted = scanned;
+            }
+        }
+        cells
+            .into_iter()
+            .rev()
+            .find(|(path, _)| path.as_bytes() == wanted)
+            .map(|(_, row)| row)
+    }
+}
+
+/// One path cell in a name group, spelled last wins, the way the reference's map insert
+/// collapses duplicate rows.
+fn put_cell<'a>(cells: &mut Vec<(&'a str, &'a Fallback)>, row: &'a Fallback) {
+    match cells
+        .iter_mut()
+        .find(|(path, _)| *path == row.path.as_str())
+    {
+        Some(cell) => *cell = (row.path.as_str(), row),
+        None => cells.push((row.path.as_str(), row)),
+    }
+}
+
+/// The request path the probe's first bytes spell, over the window the reference looks in:
+/// a `/` opened behind byte four and closed by a `?` or a space wins, the CR/LF or the
+/// window's edge leaves the path unfound, and an unserved shape reads nothing at all.
+fn scanned_path(first: &[u8]) -> &[u8] {
+    if first.len() < 18 || first[4] == b'*' {
+        return b"";
+    }
+    for i in 4..=8 {
+        if first[i] == b'/' && first[i - 1] == b' ' {
+            let mut found: &[u8] = b"";
+            for j in i + 1..first.len().min(64) {
+                match first[j] {
+                    b'\r' | b'\n' => break,
+                    b'?' | b' ' => {
+                        found = &first[i..j];
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            return found;
+        }
+    }
+    b""
+}
+
+/// A `dest` spells itself either as a string or as a bare port number; the number is the lonely
+/// host the reference's dialer lands on `localhost`.
+fn fallback_dest_text(node: Option<&Json>) -> String {
+    match node {
+        Some(Json::Str(text)) => text.clone(),
+        Some(Json::Num(_)) => node
+            .and_then(Json::as_port)
+            .map(|port| port.to_string())
+            .expect("a number node has a port"),
+        _ => String::new(),
+    }
+}
+
+/// The network kind a row resolves to, with the reference's own inference for an unnamed one.
+fn fallback_network(kind: &str, dest: &str) -> Option<FallbackNetwork> {
+    if !kind.is_empty() {
+        return fallback_named_network(kind, dest);
+    }
+    if dest == "serve-ws-none" {
+        return Some(FallbackNetwork::NotDialable);
+    }
+    if dest.starts_with('@') || dest.starts_with('/') {
+        return fallback_named_network("unix", &pad_abstract(dest));
+    }
+    if let Ok(port) = dest.parse::<u16>() {
+        return fallback_named_network("tcp", &format!("localhost:{port}"));
+    }
+    // A `host:port` name; anything the parser leaves behind is a dial the reference also fails.
+    fallback_named_network("tcp", dest)
+}
+
+/// One spelled network kind with its address, in either the unix or the `host:port` family.
+fn fallback_named_network(kind: &str, dest: &str) -> Option<FallbackNetwork> {
+    if kind == "unix" {
+        return Some(FallbackNetwork::Unix { path: dest.into() });
+    }
+    let (head, family) = match kind.as_bytes() {
+        b"tcp" => (b't', 0),
+        b"tcp4" => (b't', 4),
+        b"tcp6" => (b't', 6),
+        b"udp" => (b'u', 0),
+        b"udp4" => (b'u', 4),
+        b"udp6" => (b'u', 6),
+        _ => return Some(FallbackNetwork::NotDialable),
+    };
+    let (host, port) = fallback_split_host_port(dest)?;
+    Some(match head {
+        b'u' => FallbackNetwork::Udp { family, host, port },
+        _ => FallbackNetwork::Tcp { family, host, port },
+    })
+}
+
+/// The `host` and `port` of a fallback address; a bracketed IPv6 literal keeps only its
+/// interior, the way the reference's splitter hands its dialer an unbracketed host. A shape
+/// the reference's dialer cannot split leaves nothing, which refuses at load time.
+fn fallback_split_host_port(dest: &str) -> Option<(String, u16)> {
+    let (host, port) = if let Some(close) = dest.rfind(']') {
+        let open = dest[..close].find('[')?;
+        let port = dest.get(close + 1..)?.strip_prefix(':')?;
+        (dest[open + 1..close].to_owned(), port.to_owned())
+    } else {
+        let (host, port) = dest.rsplit_once(':')?;
+        (host.to_owned(), port.to_owned())
+    };
+    Some((host, port.parse().ok()?))
+}
+
+/// The spell the reference reserves for an abstract unix name on its linuxish builds: an
+/// `@@`dest is spelled as the kernel's full `sun_path`, zeros and all, one hundred and eight
+/// bytes long, so the name the dialer takes behind the `@` matches the listener's own.
+fn pad_abstract(dest: &str) -> String {
+    if !dest.starts_with("@@") {
+        return dest.into();
+    }
+    if !cfg!(any(target_os = "linux", target_os = "android")) {
+        return dest.into();
+    }
+    let mut full = vec![0u8; 108];
+    let body = &dest.as_bytes()[1..];
+    let end = body.len().min(full.len());
+    full[..end].copy_from_slice(&body[..end]);
+    String::from_utf8_lossy(&full).into_owned()
+}
+
 fn client_ver(text: &str) -> Option<[u8; 3]> {
     let mut out = [0u8; 3];
     let mut at = 0;
@@ -1971,6 +2261,219 @@ mod tests {
         assert!(
             ech_server_keys(malformed.get("streamSettings").expect("settings")).is_err(),
             "a string that is not a server-key TLV refuses the inbound"
+        );
+    }
+
+    /// One inbound as the dialect names it, with the `settings` object spelled the loader reads.
+    fn vless_settings(text: &str) -> Json {
+        crate::json::parse(&format!(r#"{{"protocol":"vless","settings":{text}}}"#)).expect("parses")
+    }
+
+    /// The rows a settings object carries, spelled `{"decryption":"none","fallbacks":[…]}`.
+    fn fallback_rows(text: &str) -> Vec<Fallback> {
+        server_fallbacks(&vless_settings(&format!(
+            r#"{{"decryption":"none","fallbacks":[{text}]}}"#
+        )))
+        .expect("serves")
+        .expect("the rows the dialect carries")
+    }
+
+    #[test]
+    fn the_fallback_verdicts_are_the_reference_s_own() {
+        assert_eq!(
+            fallback_rows(r#"{"dest":"127.0.0.1:8080"}"#).len(),
+            1,
+            "an unnamed decryption carries the rows it spells"
+        );
+
+        assert_eq!(
+            server_fallbacks(&vless_settings(r#"{"decryption":""}"#)).expect_err("empty"),
+            r#"VLESS settings: please add/set "decryption":"none" to every settings"#
+        );
+        assert_eq!(
+            server_fallbacks(&vless_settings(r#"{"decryption":"always"}"#)).expect_err("engine"),
+            r#"VLESS settings: unsupported "decryption": always"#
+        );
+
+        // Rows beside `none` serve; beside an engine they refuse on the first line.
+        assert_eq!(
+            fallback_rows(r#"{"dest":"127.0.0.1:8080"}"#).len(),
+            1,
+            "none carries the rows it names"
+        );
+        assert_eq!(
+            server_fallbacks(&vless_settings(
+                r#"{"decryption":"always","fallbacks":[{"dest":"192.0.2.1:80"}]}"#
+            ))
+            .expect_err("engine"),
+            r#"VLESS settings: unsupported "decryption": always"#
+        );
+
+        let path = r#"{"dest":"127.0.0.1:8080","path":"no"}"#;
+        assert_eq!(
+            server_fallbacks(&vless_settings(&format!(r#"{{"fallbacks":[{path}]}}"#)))
+                .expect_err("path"),
+            r#"VLESS fallbacks: "path" must be empty or start with "/""#
+        );
+
+        let tiny = r#"{"dest":"8080","xver":3}"#;
+        assert_eq!(
+            server_fallbacks(&vless_settings(&format!(r#"{{"fallbacks":[{tiny}]}}"#)))
+                .expect_err("xver"),
+            r#"VLESS fallbacks: invalid PROXY protocol version, "xver" only accepts 0, 1, 2"#
+        );
+
+        let unspelled = r#"{"dest":"not a dest"}"#;
+        assert_eq!(
+            server_fallbacks(&vless_settings(&format!(
+                r#"{{"fallbacks":[{unspelled}]}}"#
+            )))
+            .expect_err("dest"),
+            r#"VLESS fallbacks: please fill in a valid value for every "dest""#
+        );
+    }
+
+    #[test]
+    fn the_fallback_dials_are_inferred_the_reference_s_way() {
+        let unnamed = fallback_rows(r#"{"dest":"8080"}"#);
+        assert!(
+            matches!(
+                &unnamed[0].network,
+                FallbackNetwork::Tcp { family: 0, host, port } if host == "localhost" && *port == 8080
+            ),
+            "a bare port dials localhost"
+        );
+        assert!(
+            matches!(
+                fallback_rows(r#"{"dest":"[::1]:80","xver":1}"#)[0].network,
+                FallbackNetwork::Tcp { family: 0, .. }
+            ),
+            "a bracketed literal keeps the same unbracketed dialer"
+        );
+        assert!(matches!(
+            fallback_rows(r#"{"dest":"/tmp/app.sock"}"#)[0].network,
+            FallbackNetwork::Unix { .. }
+        ));
+        assert!(matches!(
+            fallback_rows(r#"{"dest":"@abs"}"#)[0].network,
+            FallbackNetwork::Unix { .. }
+        ));
+        assert_eq!(
+            server_fallbacks(&vless_settings(
+                r#"{"fallbacks":[{"dest":"@abs","type":"tcp"}]}"#
+            ))
+            .expect_err("named tcp with an abstract name"),
+            r#"VLESS fallbacks: please fill in a valid value for every "dest""#
+        );
+        assert!(matches!(
+            fallback_rows(r#"{"dest":"serve-ws-none"}"#)[0].network,
+            FallbackNetwork::NotDialable
+        ));
+
+        // The named kinds keep the family the spelling selects, `serve` included.
+        for (kind, family, head) in [
+            ("tcp6", 6u8, "2001:db8::1"),
+            ("udp", 0u8, "127.0.0.1"),
+            ("udp4", 4u8, "127.0.0.1"),
+        ] {
+            let rows = fallback_rows(&format!(r#"{{"dest":"{head}:8080","type":"{kind}"}}"#));
+            let network = rows[0].network.clone();
+            match &network {
+                FallbackNetwork::Udp {
+                    family: got, host, ..
+                }
+                | FallbackNetwork::Tcp {
+                    family: got, host, ..
+                } => {
+                    assert_eq!(*got, family);
+                    assert_eq!(host, head);
+                }
+                other => panic!("{other:?} is not the dial `{kind}` spells"),
+            }
+        }
+        assert!(
+            matches!(
+                fallback_rows(r#"{"type":"serve","dest":"x"}"#)[0].network,
+                FallbackNetwork::NotDialable
+            ),
+            "an unknown kind keeps the row, the dialer refusing every round"
+        );
+    }
+
+    #[test]
+    fn the_fallback_route_walks_the_reference_s_table() {
+        let rows = fallback_rows(
+            r#"
+            {"dest":"127.0.0.1:1"},
+            {"name":"apple","dest":"127.0.0.1:2"},
+            {"name":"www.apple.com","dest":"127.0.0.1:3"},
+            {"name":"web","alpn":"h2","dest":"127.0.0.1:4"},
+            {"name":"web","alpn":"","path":"/api","dest":"127.0.0.1:5"},
+            {"name":"web","alpn":"","dest":"127.0.0.1:6"}"#,
+        );
+        let dial = |picked: Option<&Fallback>| {
+            picked.and_then(|row| match &row.network {
+                FallbackNetwork::Tcp { port, .. } => Some(*port),
+                _ => None,
+            })
+        };
+        // The front without a name dials the unnamed row.
+        assert_eq!(
+            dial(Fallback::route(&rows, "", "", b"GET / HTTP/1.1")),
+            Some(1)
+        );
+
+        // A name the table contains routes to the tightest spelling of it.
+        assert_eq!(
+            dial(Fallback::route(
+                &rows,
+                "www.apple.com",
+                "",
+                b"GET / HTTP/1.1"
+            )),
+            Some(3)
+        );
+        assert_eq!(
+            dial(Fallback::route(&rows, "apple", "", b"GET / HTTP/1.1")),
+            Some(2)
+        );
+        assert_eq!(
+            dial(Fallback::route(&rows, "front.dev", "", b"GET / HTTP/1.1")),
+            Some(1),
+            "a name nothing in the table contains shares the unnamed cell"
+        );
+
+        // An alpn the exact cell spells beats the empty one.
+        assert_eq!(
+            dial(Fallback::route(&rows, "web", "h2", b"GET / HTTP/1.1")),
+            Some(4)
+        );
+
+        // The first request line's path picks inside the empty-alpn cell, and the front's alpn falls to the group's `""` map the way the reference reads one.
+        assert_eq!(
+            dial(Fallback::route(
+                &rows,
+                "web",
+                "http/1.1",
+                b"GET /api?q=1 HTTP/1.1"
+            )),
+            Some(5)
+        );
+        assert_eq!(
+            dial(Fallback::route(&rows, "web", "http/1.1", b"GET / HTTP/1.1")),
+            Some(6)
+        );
+
+        // A group that spells neither the front's alpn nor `""` leaves the flow unserved.
+        let only_h2 = fallback_rows(r#"{"name":"web","alpn":"h2","dest":"127.0.0.1:7"}"#);
+        assert_eq!(
+            dial(Fallback::route(
+                &only_h2,
+                "web",
+                "http/1.1",
+                b"GET / HTTP/1.1"
+            )),
+            None
         );
     }
 }

@@ -183,6 +183,12 @@ impl<S: Stream> TlsProvider for RealityServer<S> {
         self.inner.alpn()
     }
 
+    /// The name the client's hello replayed into the session, so the inner
+    /// handshake's own answer is the matched one.
+    fn sni(&self) -> Option<&[u8]> {
+        self.inner.sni()
+    }
+
     fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
         self.inner.seal_into(plaintext, out)
     }

@@ -1268,7 +1268,9 @@ fn account_text(reader: &mut Reader<'_>) -> Result<String, String> {
 }
 
 /// The uuid a vless session is keyed by, with the flow and encryption the account names.
-/// `padding` and `reverse` change the bytes on the wire or name a tunnel this tree does not carry.
+/// `padding`, the reverse tunnel's message and the decryption test's fields are read and
+/// dropped: the plain account carries none of what they shape, and an engine that turns them
+/// on never reaches the settings' own gate.
 fn vless_account(bytes: &[u8]) -> Result<VlessAccount, String> {
     let mut reader = Reader::new(bytes, "xray.proxy.vless.Account");
     let mut id = None;
@@ -1279,8 +1281,12 @@ fn vless_account(bytes: &[u8]) -> Result<VlessAccount, String> {
             (1, 2) => id = Some(account_text(&mut reader)?),
             (2, 2) => flow = Some(account_text(&mut reader)?),
             (3, 2) => encryption = Some(account_text(&mut reader)?),
-            (6, 2) => return Err(reader.uncarried("the account's padding")),
-            (7, 2) => return Err(reader.uncarried("the account's reverse tunnel")),
+            (4 | 5 | 8 | 9, 0) => {
+                reader.varint()?;
+            }
+            (6 | 7 | 9, 2) => {
+                reader.bytes()?;
+            }
             _ => return Err(reader.refuse(field, wire)),
         }
     }
@@ -1313,32 +1319,88 @@ fn vless_user(bytes: &[u8]) -> Result<VlessAccount, String> {
     account.ok_or("xray.common.protocol.User: no account".to_owned())
 }
 
-/// The clients a vless inbound serves. `decryption` is read and dropped: the uuid is what
-/// authenticates here and nothing in this tree gates on that string. `fallbacks`, `xorMode`,
-/// the `seconds_*` window and a `padding` name bytes this tree does not write.
+/// The clients a vless inbound serves, with the fallback rows it names. A `decryption` past
+/// `none` refuses with its verdict the way the reference's own build does — an empty spelling
+/// too — while `xorMode`, the seconds window and `padding` ride along unheard.
 fn vless_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.proxy.vless.inbound.Config");
     let mut clients = Vec::new();
+    let mut fallbacks = Vec::new();
+    let mut decryption = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => {
                 let (id, _, flow) = vless_user(reader.bytes()?)?;
                 clients.push(vless_client(id, None, flow));
             }
-            (2, 2) => return Err(reader.uncarried("a fallback destination")),
-            (3, 2) => {
-                account_text(&mut reader)?;
+            (2, 2) => fallbacks.push(vless_fallback(reader.bytes()?)?),
+            (3, 2) => decryption = Some(reader.bytes()?.to_owned()),
+            (4..=6, 0) => {
+                reader.varint()?;
             }
-            (4, 0) => return Err(reader.uncarried("xorMode")),
-            (5 | 6, 0) => return Err(reader.uncarried("the padding seconds window")),
-            (7, 2) => return Err(reader.uncarried("the inbound's padding")),
+            (7, 2) => {
+                reader.bytes()?;
+            }
             _ => return Err(reader.refuse(field, wire)),
         }
+    }
+    match decryption.as_deref() {
+        Some(b"") => {
+            return Err(
+                r#"VLESS settings: please add/set "decryption":"none" to every settings"#.into(),
+            )
+        }
+        Some(shape) if shape != b"none" => {
+            return Err(format!(
+                r#"VLESS settings: unsupported "decryption": {}"#,
+                String::from_utf8_lossy(shape)
+            ))
+        }
+        _ => {}
     }
     if clients.is_empty() {
         return Err("xray.proxy.vless.inbound.Config: no user".to_owned());
     }
-    Ok(object(vec![("clients", Json::Arr(clients))]))
+    let mut pairs = vec![("clients", Json::Arr(clients))];
+    if !fallbacks.is_empty() {
+        pairs.push(("fallbacks", Json::Arr(fallbacks)));
+    }
+    Ok(object(pairs))
+}
+
+/// One fallback row spelled into the dialect's JSON, its fields as they arrived: an omitted
+/// field takes the row's own default, and the dest stays the string the message carried, the
+/// way the loader infers its dial behind.
+fn vless_fallback(bytes: &[u8]) -> Result<Json, String> {
+    const NAMES: [&str; 5] = ["name", "alpn", "path", "type", "dest"];
+    let mut reader = Reader::new(bytes, "xray.proxy.vless.Fallback");
+    let mut text: [Option<String>; 5] = Default::default();
+    let mut xver = 0u64;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1..=5, 2) => {
+                text[usize::try_from(field - 1).map_err(|_| "field".to_owned())?] =
+                    Some(account_text(&mut reader)?);
+            }
+            (6, 0) => xver = reader.varint()?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = Vec::new();
+    for (at, name) in NAMES.iter().enumerate() {
+        if let Some(value) = text[at].as_ref().filter(|value| !value.is_empty()) {
+            pairs.push((*name, Json::Str(value.clone())));
+        }
+    }
+    if xver != 0 {
+        pairs.push((
+            "xver",
+            Json::Num(f64::from(
+                u32::try_from(xver).map_err(|_| "xver".to_owned())?,
+            )),
+        ));
+    }
+    Ok(object(pairs))
 }
 
 /// A vless outbound dials the one endpoint its config names.
@@ -2275,7 +2337,7 @@ mod tests {
     fn a_vless_scenario_decodes_both_sides() {
         let settings = message(&[
             bytes_field(1, &vless_user(&vless_account(b"aaaa-aaaa", None, None))),
-            bytes_field(3, b"always"),
+            bytes_field(3, b"none"),
         ]);
         let endpoint = message(&[
             bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
@@ -2340,61 +2402,131 @@ mod tests {
         );
     }
 
+    /// A fallback row the message carries reaches the dialect's settings, its fields as they
+    /// came and a dest the loader infers its dial behind.
     #[test]
-    fn a_vless_fallback_is_refused() {
+    fn a_fallback_row_arrives_from_the_bridge() {
         let settings = message(&[
             bytes_field(1, &vless_user(&vless_account(b"a", None, None))),
-            bytes_field(2, &message(&[bytes_field(5, b"127.0.0.1:80")])),
-            bytes_field(3, b"always"),
+            bytes_field(
+                2,
+                &message(&[
+                    bytes_field(1, b"web"),
+                    bytes_field(2, b"h2"),
+                    bytes_field(3, b"/api"),
+                    bytes_field(5, b"127.0.0.1:8080"),
+                    varint_field(6, 2),
+                ]),
+            ),
         ]);
-        let error = to_json(&config(
+        let json = to_json(&config(
             &vless_inbound(5000, &settings),
             &freedom_outbound(),
         ))
-        .expect_err("refused");
-        assert!(error.contains("fallback"), "{error}");
+        .expect("vless decodes");
+        let row = &json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("settings")
+            .expect("settings")
+            .get("fallbacks")
+            .and_then(Json::as_arr)
+            .expect("fallbacks")[0];
+        assert_eq!(row.get("name").and_then(Json::as_str), Some("web"));
+        assert_eq!(row.get("alpn").and_then(Json::as_str), Some("h2"));
+        assert_eq!(row.get("path").and_then(Json::as_str), Some("/api"));
+        assert_eq!(
+            row.get("dest").and_then(Json::as_str),
+            Some("127.0.0.1:8080")
+        );
+        assert_eq!(row.get("xver").and_then(Json::as_u32), Some(2));
     }
 
     #[test]
-    fn a_vless_xor_mode_is_refused() {
+    fn a_vless_xor_mode_is_dropped_without_an_engine() {
         let settings = message(&[
             bytes_field(1, &vless_user(&vless_account(b"a", None, None))),
-            bytes_field(3, b"always"),
             varint_field(4, 1),
         ]);
+        to_json(&config(
+            &vless_inbound(5000, &settings),
+            &freedom_outbound(),
+        ))
+        .expect("vless decodes");
+    }
+
+    #[test]
+    fn an_engaged_decryption_is_refused() {
+        let settings = message(&[
+            bytes_field(1, &vless_user(&vless_account(b"a", None, None))),
+            bytes_field(3, b"always"),
+        ]);
         let error = to_json(&config(
             &vless_inbound(5000, &settings),
             &freedom_outbound(),
         ))
         .expect_err("refused");
-        assert!(error.contains("xorMode"), "{error}");
+        assert!(
+            error.contains(r#"unsupported "decryption": always"#),
+            "{error}"
+        );
     }
 
     #[test]
-    fn a_vless_account_padding_is_refused() {
+    fn an_empty_decryption_spelling_is_refused() {
+        let settings = message(&[
+            bytes_field(1, &vless_user(&vless_account(b"a", None, None))),
+            bytes_field(3, b""),
+        ]);
+        let error = to_json(&config(
+            &vless_inbound(5000, &settings),
+            &freedom_outbound(),
+        ))
+        .expect_err("refused");
+        assert!(
+            error.contains(r#"please add/set "decryption":"none""#),
+            "{error}"
+        );
+    }
+
+    /// The account's padding, reverse message and test seeds ride along unheard rather than
+    /// refusing: a plain account serves both spellings.
+    #[test]
+    fn the_account_decryption_test_fields_ride_along_unheard() {
         let account = typed(
             "xray.proxy.vless.Account",
             &message(&[
                 bytes_field(1, b"a"),
-                bytes_field(6, b"1234567890abcdef1234567890abcdef"),
+                bytes_field(6, b"padpad"),
+                bytes_field(7, &bytes_field(1, b"tag")),
+                varint_field(8, 1),
+                varint_field(9, 7),
+                bytes_field(9, &message(&[varint(7), varint(9)])),
             ]),
         );
         let settings = bytes_field(1, &vless_user(&account));
-        let error = to_json(&config(
+        let json = to_json(&config(
             &vless_inbound(5000, &settings),
             &freedom_outbound(),
         ))
-        .expect_err("refused");
-        assert!(error.contains("padding"), "{error}");
+        .expect("vless decodes");
+        let client = &json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("settings")
+            .expect("settings")
+            .get("clients")
+            .and_then(Json::as_arr)
+            .expect("clients")[0];
+        assert_eq!(client.get("id").and_then(Json::as_str), Some("a"));
     }
 
     #[test]
     fn a_vless_inbound_without_a_user_is_refused() {
-        let error = to_json(&config(
-            &vless_inbound(5000, &bytes_field(3, b"always")),
-            &freedom_outbound(),
-        ))
-        .expect_err("refused");
+        let error =
+            to_json(&config(&vless_inbound(5000, &[]), &freedom_outbound())).expect_err("refused");
         assert!(error.contains("no user"), "{error}");
     }
 
