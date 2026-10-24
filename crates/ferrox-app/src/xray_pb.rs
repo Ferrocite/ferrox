@@ -1215,7 +1215,7 @@ fn geosite_rule(bytes: &[u8]) -> Result<String, String> {
         return Err("xray.common.geodata.GeoSiteRule: an empty code".to_owned());
     }
     let mut value = match file.as_deref() {
-        None | Some("") | Some("geosite.dat") => format!("geosite:{code}"),
+        None | Some("" | "geosite.dat") => format!("geosite:{code}"),
         Some(file) => format!("ext-site:{file}:{code}"),
     };
     if let Some(attrs) = attrs.filter(|attrs| !attrs.is_empty()) {
@@ -1284,7 +1284,7 @@ fn geoip_rule(bytes: &[u8]) -> Result<String, String> {
         return Err("xray.common.geodata.GeoIPRule: an empty code".to_owned());
     }
     let value = match file.as_deref() {
-        None | Some("") | Some("geoip.dat") => format!("geoip:{code}"),
+        None | Some("" | "geoip.dat") => format!("geoip:{code}"),
         Some(file) => format!("ext-ip:{file}:{code}"),
     };
     Ok(if reverse { format!("!{value}") } else { value })
@@ -1292,20 +1292,20 @@ fn geoip_rule(bytes: &[u8]) -> Result<String, String> {
 
 fn cidr_rule(bytes: &[u8]) -> Result<String, String> {
     let mut reader = Reader::new(bytes, "xray.common.geodata.CIDRRule");
-    let mut cidr = None;
+    let mut value = None;
     let mut reverse = false;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
-            (1, 2) => cidr = Some(cidr(reader.bytes()?)?),
+            (1, 2) => value = Some(cidr_value(reader.bytes()?)?),
             (2, 0) => reverse = reader.varint()? != 0,
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    let cidr = cidr.ok_or("xray.common.geodata.CIDRRule: no cidr")?;
-    Ok(if reverse { format!("!{cidr}") } else { cidr })
+    let value = value.ok_or("xray.common.geodata.CIDRRule: no cidr")?;
+    Ok(if reverse { format!("!{value}") } else { value })
 }
 
-fn cidr(bytes: &[u8]) -> Result<String, String> {
+fn cidr_value(bytes: &[u8]) -> Result<String, String> {
     let mut reader = Reader::new(bytes, "xray.common.geodata.CIDR");
     let mut ip = None;
     let mut prefix = 0u32;
