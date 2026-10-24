@@ -18174,6 +18174,7 @@ mod tests {
                             break;
                         }
                     }
+                    Err(error) if is_timeout(&error) => {}
                     Err(_) => break,
                 }
             }
