@@ -8777,7 +8777,7 @@ fn dial_vless_tls(
         _ => ride_carrier(
             server,
             session,
-            || second_tls_session(server, vless),
+            || tls_lane(server, vless),
             vless,
             &header,
             client,
@@ -8819,7 +8819,7 @@ fn pump_tls_answer(
         .and_then(Result::ok)
 }
 
-fn second_tls_session(
+fn tls_lane(
     server: &SocketAddr,
     vless: &VlessOut,
 ) -> Option<ferrox_core::tls::ClientSession<Connection>> {
@@ -8829,7 +8829,7 @@ fn second_tls_session(
         .and_then(|cfg| dial_tls_session(server, cfg, vless.carrier.tcp_mask()))
 }
 
-fn second_reality_session(
+fn reality_lane(
     server: &SocketAddr,
     vless: &VlessOut,
 ) -> Option<
@@ -8882,6 +8882,10 @@ fn dial_reality_session(
 }
 
 /// One REALITY dial: TCP, the sealed handshake, the VLESS header, then the relay.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the REALITY dial owns the raw, vision and carried lanes in one match"
+)]
 fn dial_vless_reality(
     client: &Connection,
     server: &SocketAddr,
@@ -8988,7 +8992,7 @@ fn dial_vless_reality(
         _ => ride_carrier(
             server,
             session,
-            || second_reality_session(server, vless),
+            || reality_lane(server, vless),
             vless,
             &header,
             client,
