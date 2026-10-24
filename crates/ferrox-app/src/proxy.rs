@@ -7845,7 +7845,7 @@ where
     crate::vmess::pump_relay_carried(&uplink, reader, writer, &close, send, recv, None);
 }
 
-fn serve_session_vmess_ws<R: Read, W: FrameWrite + 'static>(
+fn serve_session_vmess_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
     read: R,
     write: W,
     path: &str,
@@ -7883,7 +7883,7 @@ fn serve_session_vmess_ws<R: Read, W: FrameWrite + 'static>(
     );
 }
 
-fn serve_session_vmess_grpc<R: Read, W: FrameWrite + 'static>(
+fn serve_session_vmess_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
     read: R,
     write: W,
     path: &str,
@@ -7947,7 +7947,7 @@ fn serve_session_vmess_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + 's
     crate::vmess::pump_relay_carried(&uplink, reader, writer, &close, send, recv, None);
 }
 
-fn serve_session_vmess_httpupgrade<R: Read, W: Write + Clone + Send + 'static>(
+fn serve_session_vmess_httpupgrade<R: Read + Send + 'static, W: Write + Clone + Send + 'static>(
     read: R,
     write: W,
     raw: Connection,
@@ -7985,7 +7985,7 @@ fn serve_session_vmess_httpupgrade<R: Read, W: Write + Clone + Send + 'static>(
     crate::httpupgrade::quiet(&raw);
 }
 
-fn serve_session_vmess_httpheader<R: Read, W: Write + Clone + Send + 'static>(
+fn serve_session_vmess_httpheader<R: Read + Send + 'static, W: Write + Clone + Send + 'static>(
     read: R,
     write: W,
     raw: Connection,
