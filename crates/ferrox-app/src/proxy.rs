@@ -1658,7 +1658,7 @@ fn serve_vless_raw(
         users,
         freedom,
         fallbacks,
-        MuxIo {
+        &MuxIo {
             dial: dial_or_report,
             resolve: resolve_endpoint,
         },
@@ -1670,7 +1670,7 @@ fn serve_vless_raw_with<D, R>(
     users: &[VlessUser],
     freedom: bool,
     fallbacks: Option<&[Fallback]>,
-    io: MuxIo<D, R>,
+    io: &MuxIo<D, R>,
 ) where
     D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
     R: Fn(&str, u16) -> Option<SocketAddr> + Send + Sync + Clone + 'static,
@@ -1712,7 +1712,7 @@ fn vless_raw_reply<D, R>(
     fallbacks: Option<&[Fallback]>,
     window: &[u8],
     (probe, carried): (Probe, Vec<u8>),
-    io: MuxIo<D, R>,
+    io: &MuxIo<D, R>,
 ) where
     D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
     R: Fn(&str, u16) -> Option<SocketAddr> + Send + Sync + Clone + 'static,
@@ -1739,7 +1739,7 @@ fn vless_raw_reply<D, R>(
         if stream.write_all(&[0, 0]).is_err() {
             return;
         }
-        return serve_vless_mux_with(stream, &io, &carried);
+        return serve_vless_mux_with(stream, io, &carried);
     }
     if cmd != 1 {
         // The reference's decoder refuses a command past the id without falling back.
@@ -26600,7 +26600,7 @@ mod tests {
                 &one_vless_user(&id),
                 true,
                 None,
-                MuxIo {
+                &MuxIo {
                     dial,
                     resolve: resolve_endpoint,
                 },
@@ -26671,7 +26671,7 @@ mod tests {
                 &one_vless_user(&id),
                 true,
                 None,
-                MuxIo { dial, resolve },
+                &MuxIo { dial, resolve },
             );
         });
         let mut stream = mux_test_connect(&id, tunnel_port);
@@ -36744,7 +36744,7 @@ mod dns_lane_tests {
                 Probe::Decoded((id, Flow::None, 1, echo_addr)),
                 payload.to_vec(),
             ),
-            MuxIo {
+            &MuxIo {
                 dial,
                 resolve: resolve_endpoint,
             },
