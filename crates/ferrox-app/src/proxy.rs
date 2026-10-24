@@ -3719,6 +3719,7 @@ impl Write for KcpIo {
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        self.conn.flush();
         Ok(())
     }
 }
