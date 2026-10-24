@@ -8777,12 +8777,7 @@ fn dial_vless_tls(
         _ => ride_carrier(
             server,
             session,
-            || {
-                vless
-                    .tls
-                    .as_deref()
-                    .and_then(|cfg| dial_tls_session(server, cfg, vless.carrier.tcp_mask()))
-            },
+            || second_tls_session(server, vless),
             vless,
             &header,
             client,
@@ -8824,6 +8819,28 @@ fn pump_tls_answer(
         .and_then(Result::ok)
 }
 
+fn second_tls_session(
+    server: &SocketAddr,
+    vless: &VlessOut,
+) -> Option<ferrox_core::tls::ClientSession<Connection>> {
+    vless
+        .tls
+        .as_deref()
+        .and_then(|cfg| dial_tls_session(server, cfg, vless.carrier.tcp_mask()))
+}
+
+fn second_reality_session(
+    server: &SocketAddr,
+    vless: &VlessOut,
+) -> Option<
+    ferrox_core::tls::RealityClientSession<ferrox_core::tls::reality::RecordLimiter<Connection>>,
+> {
+    vless
+        .reality
+        .as_deref()
+        .and_then(|cfg| dial_reality_session(server, cfg, vless.carrier.tcp_mask()))
+}
+
 /// A second REALITY session for a carrier whose modes split their request and answer.
 fn dial_reality_session(
     server: &SocketAddr,
@@ -8841,7 +8858,7 @@ fn dial_reality_session(
     };
     let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
     let limiter = ferrox_core::tls::reality::RecordLimiter::new(uplink);
-    let mut session = match ferrox_core::tls::RealityClientSession::connect(cfg, now, limiter) {
+    let session = match ferrox_core::tls::RealityClientSession::connect(cfg, now, limiter) {
         Ok(session) => session,
         Err(error) => {
             let failure = Failure::new(
@@ -8971,12 +8988,7 @@ fn dial_vless_reality(
         _ => ride_carrier(
             server,
             session,
-            || {
-                vless
-                    .reality
-                    .as_deref()
-                    .and_then(|cfg| dial_reality_session(server, cfg, vless.carrier.tcp_mask()))
-            },
+            || second_reality_session(server, vless),
             vless,
             &header,
             client,
