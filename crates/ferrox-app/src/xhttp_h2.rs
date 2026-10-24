@@ -10,6 +10,7 @@ use crate::h2::{
     F_END, F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_MAX_FRAME, S_WINDOW, T_CONT,
     T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW,
 };
+use crate::proxy::{VlessUser, VlessUsers};
 use crate::xhttp::XhttpSettings;
 
 const CONN_WINDOW_TOP_UP: u32 = 16 * 1024 * 1024 - 65_535;
@@ -552,7 +553,7 @@ fn synth_head(method: &[u8], target: &[u8], lines: &[u8], end_stream: bool) -> V
 fn open_stream(
     conn: &Arc<H2Conn>,
     settings: &XhttpSettings,
-    id: [u8; 16],
+    users: &VlessUsers,
     freedom: bool,
     sid: u32,
     block: &[u8],
@@ -632,6 +633,7 @@ fn open_stream(
         headed: false,
     };
     let settings = settings.clone();
+    let users = Arc::clone(users);
     std::thread::spawn(move || {
         match crate::xhttp::accept_core(
             &head,
@@ -642,7 +644,7 @@ fn open_stream(
             Some(h2out.clone()),
         ) {
             crate::xhttp::Served::Session(ureader, xwriter) => {
-                crate::proxy::serve_session_xhttp_with(ureader, &xwriter, &id, freedom);
+                crate::proxy::serve_session_xhttp_with(ureader, &xwriter, &users, freedom);
             }
             _ => h2out.end(),
         }
@@ -653,9 +655,10 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
     mut read: R,
     write: W,
     settings: &XhttpSettings,
-    id: [u8; 16],
+    users: &[VlessUser],
     freedom: bool,
 ) {
+    let users: VlessUsers = Arc::from(users);
     let mut magic = [0u8; 24];
     if crate::proxy::read_exact(&mut read, &mut magic).is_err() || magic != *MAGIC {
         return;
@@ -694,7 +697,7 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
             break;
         }
         if !pump_frame(
-            &conn, settings, id, freedom, kind, flags, sid, body, &mut frag,
+            &conn, settings, &users, freedom, kind, flags, sid, body, &mut frag,
         ) {
             break;
         }
@@ -724,7 +727,7 @@ fn cut_padded_data(body: &mut Vec<u8>, pad: usize) -> usize {
 fn pump_frame(
     conn: &Arc<H2Conn>,
     settings: &XhttpSettings,
-    id: [u8; 16],
+    users: &VlessUsers,
     freedom: bool,
     kind: u8,
     flags: u8,
@@ -813,7 +816,7 @@ fn pump_frame(
                 {
                     return true;
                 }
-                open_stream(conn, settings, id, freedom, sid, &block, end_stream);
+                open_stream(conn, settings, users, freedom, sid, &block, end_stream);
             } else {
                 *frag = Some((sid, block));
             }
@@ -832,7 +835,7 @@ fn pump_frame(
                 }
                 gathered.extend_from_slice(&body);
                 if flags & F_END_HEADERS != 0 {
-                    open_stream(conn, settings, id, freedom, sid, &gathered, false);
+                    open_stream(conn, settings, users, freedom, sid, &gathered, false);
                 } else {
                     *frag = Some((sid, gathered));
                 }
@@ -1170,7 +1173,9 @@ mod tests {
                     continue;
                 };
                 let settings = settings.clone();
-                thread::spawn(move || serve_h2(read, stream, &settings, id, true));
+                thread::spawn(move || {
+                    serve_h2(read, stream, &settings, &crate::proxy::one_user(id), true);
+                });
             }
         });
         (addr, handle)
@@ -1219,7 +1224,7 @@ mod tests {
                 reader,
                 writer,
                 &XhttpSettings::stream_one(),
-                [0u8; 16],
+                &crate::proxy::one_user([0u8; 16]),
                 true,
             );
         });
@@ -1249,7 +1254,15 @@ mod tests {
         let body = vec![9u8; 5];
         let base = body.as_ptr();
         assert!(pump_frame(
-            &conn, &settings, [0u8; 16], true, T_DATA, 0, 1, body, &mut frag
+            &conn,
+            &settings,
+            &crate::proxy::one_user([0u8; 16]),
+            true,
+            T_DATA,
+            0,
+            1,
+            body,
+            &mut frag
         ));
         {
             let st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1266,7 +1279,15 @@ mod tests {
         let frame = vec![2u8, b'a', b'b', b'c', b'd', b'e', b'f', 2, 2];
         let base = frame.as_ptr();
         assert!(pump_frame(
-            &conn, &settings, [0u8; 16], true, T_DATA, F_PADDED, 1, frame, &mut frag
+            &conn,
+            &settings,
+            &crate::proxy::one_user([0u8; 16]),
+            true,
+            T_DATA,
+            F_PADDED,
+            1,
+            frame,
+            &mut frag
         ));
         {
             let st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -1288,7 +1309,15 @@ mod tests {
         let block = vec![0x88u8, 0x86, 0x40, 0x01, 0x02];
         let base = block.as_ptr();
         assert!(pump_frame(
-            &conn, &settings, [0u8; 16], true, T_HEADERS, 0, 3, block, &mut frag
+            &conn,
+            &settings,
+            &crate::proxy::one_user([0u8; 16]),
+            true,
+            T_HEADERS,
+            0,
+            3,
+            block,
+            &mut frag
         ));
         let stored = frag.as_ref().expect("stored").1.as_ptr();
         assert_eq!(stored, base, "the header block is the assembly's buffer");
@@ -2043,7 +2072,7 @@ mod tests {
         assert!(pump_frame(
             &conn,
             &settings,
-            [0u8; 16],
+            &crate::proxy::one_user([0u8; 16]),
             true,
             T_DATA,
             F_PADDED,
@@ -2070,7 +2099,7 @@ mod tests {
         assert!(pump_frame(
             &conn,
             &settings,
-            [0u8; 16],
+            &crate::proxy::one_user([0u8; 16]),
             true,
             T_DATA,
             F_PADDED,
@@ -2089,7 +2118,7 @@ mod tests {
         assert!(pump_frame(
             &conn,
             &settings,
-            [0u8; 16],
+            &crate::proxy::one_user([0u8; 16]),
             true,
             T_DATA,
             F_PADDED,
@@ -2108,7 +2137,7 @@ mod tests {
         assert!(pump_frame(
             &conn,
             &settings,
-            [0u8; 16],
+            &crate::proxy::one_user([0u8; 16]),
             true,
             T_DATA,
             0,
