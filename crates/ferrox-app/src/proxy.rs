@@ -1739,7 +1739,7 @@ fn vless_raw_reply<D, R>(
         if stream.write_all(&[0, 0]).is_err() {
             return;
         }
-        return serve_vless_mux_with(stream, io, &carried);
+        return serve_vless_mux_with(stream, &io, &carried);
     }
     if cmd != 1 {
         // The reference's decoder refuses a command past the id without falling back.
@@ -2593,7 +2593,7 @@ fn remove_mux_session(
     send_mux_end(shared, staging, id);
 }
 
-fn serve_vless_mux_with<D, R>(stream: Connection, io: MuxIo<D, R>, carried: &[u8])
+fn serve_vless_mux_with<D, R>(stream: Connection, io: &MuxIo<D, R>, carried: &[u8])
 where
     D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
     R: Fn(&str, u16) -> Option<SocketAddr> + Send + Sync + Clone + 'static,
@@ -2642,7 +2642,7 @@ where
                         staging: &mut staging,
                         handles: &mut handles,
                     };
-                    handle_mux_frame(frame, &table, &mut udp, &mut global, &mut out, io.clone());
+                    handle_mux_frame(frame, &table, &mut udp, &mut global, &mut out, io);
                 }
             }
         }
@@ -2683,7 +2683,7 @@ fn handle_mux_frame<D, R>(
     udp: &mut UdpTable,
     global: &mut UdpGlobal,
     out: &mut MuxOut<'_>,
-    io: MuxIo<D, R>,
+    io: &MuxIo<D, R>,
 ) where
     D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
     R: Fn(&str, u16) -> Option<SocketAddr> + Send + Sync + Clone + 'static,
@@ -2694,7 +2694,7 @@ fn handle_mux_frame<D, R>(
             if frame.target.is_some_and(|t| t.network == Network::Udp) {
                 handle_mux_udp_new(frame, udp, global, out);
             } else {
-                handle_mux_tcp_new(frame, table, out, io);
+                handle_mux_tcp_new(frame, table, out, io.clone());
             }
         }
         Status::Keep => {
