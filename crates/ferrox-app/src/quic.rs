@@ -670,9 +670,9 @@ const RECV_SLOTS: usize = 8;
 #[cfg(target_os = "linux")]
 pub(crate) struct Batch {
     slots: [Unfilled<MAX_DATAGRAM>; RECV_SLOTS],
-    peers: [libc::sockaddr_storage; RECV_SLOTS],
-    names: [libc::socklen_t; RECV_SLOTS],
-    lens: [libc::c_uint; RECV_SLOTS],
+    peers: [std::mem::MaybeUninit<libc::sockaddr_storage>; RECV_SLOTS],
+    names: [std::mem::MaybeUninit<libc::socklen_t>; RECV_SLOTS],
+    lens: [std::mem::MaybeUninit<libc::c_uint>; RECV_SLOTS],
     len: usize,
 }
 
@@ -681,9 +681,9 @@ impl Batch {
     pub(crate) fn new() -> Self {
         Self {
             slots: std::array::from_fn(|_| Unfilled::<MAX_DATAGRAM>::new()),
-            peers: [unsafe { std::mem::zeroed() }; RECV_SLOTS],
-            names: [0; RECV_SLOTS],
-            lens: [0; RECV_SLOTS],
+            peers: [std::mem::MaybeUninit::uninit(); RECV_SLOTS],
+            names: [std::mem::MaybeUninit::uninit(); RECV_SLOTS],
+            lens: [std::mem::MaybeUninit::uninit(); RECV_SLOTS],
             len: 0,
         }
     }
@@ -695,8 +695,12 @@ impl Batch {
 
     /// One datagram of the batch, with the peer it came from: the bytes are read out of the slot the kernel wrote, and the address out of the storage it filled.
     fn at(&mut self, at: usize) -> Option<(&mut [u8], SocketAddr)> {
-        let len = usize::try_from(self.lens[at]).ok()?;
-        let from = crate::proxy::socket_addr_of(&self.peers[at], self.names[at])?;
+        // SAFETY: `recv_batch` writes this slot's length, name and peer before it publishes the slot in `len`, and `at` only visits `0..len`.
+        let len = usize::try_from(unsafe { *self.lens[at].assume_init_ref() }).ok()?;
+        let from =
+            crate::proxy::socket_addr_of(unsafe { self.peers[at].assume_init_ref() }, unsafe {
+                *self.names[at].assume_init_ref()
+            })?;
         let bytes = self.slots[at].as_mut().get_mut(..len)?;
         Some((bytes, from))
     }
@@ -756,7 +760,7 @@ pub(crate) fn recv_batch(sock: &Datagram, batch: &mut Batch) -> Drain {
     let room = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     for at in 0..RECV_SLOTS {
         parts[at].iov_base = batch.slots[at].as_mut().as_mut_ptr().cast();
-        headers[at].msg_hdr.msg_name = (&raw mut batch.peers[at]).cast();
+        headers[at].msg_hdr.msg_name = batch.peers[at].as_mut_ptr().cast();
         headers[at].msg_hdr.msg_namelen = room;
         headers[at].msg_hdr.msg_iov = (&raw mut parts[at]).cast();
         headers[at].msg_hdr.msg_iovlen = 1;
@@ -792,8 +796,8 @@ pub(crate) fn recv_batch(sock: &Datagram, batch: &mut Batch) -> Drain {
     // A read that ran dry after some datagrams is the count, not the error: the kernel answers with what it took.
     let got = usize::try_from(got).unwrap_or(0).min(RECV_SLOTS);
     for (at, header) in headers.iter().enumerate().take(got) {
-        batch.lens[at] = header.msg_len;
-        batch.names[at] = header.msg_hdr.msg_namelen;
+        batch.lens[at].write(header.msg_len);
+        batch.names[at].write(header.msg_hdr.msg_namelen);
     }
     batch.len = got;
     Drain::Read
