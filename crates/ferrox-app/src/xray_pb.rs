@@ -3233,22 +3233,22 @@ mod tests {
         let list = |key: &str| rule.get(key).and_then(Json::as_arr);
         assert_eq!(
             list("domain"),
-            Some(&vec![Json::Str("full:x.com".to_owned())])
+            Some(&[Json::Str("full:x.com".to_owned())][..])
         );
         assert_eq!(
             list("ip"),
-            Some(&vec![Json::Str("192.0.2.0/24".to_owned())])
+            Some(&[Json::Str("192.0.2.0/24".to_owned())][..])
         );
         assert_eq!(
             list("sourceIP"),
-            Some(&vec![Json::Str("198.51.100.0/24".to_owned())])
+            Some(&[Json::Str("198.51.100.0/24".to_owned())][..])
         );
         assert_eq!(
             list("localIP"),
-            Some(&vec![Json::Str("127.0.0.1/32".to_owned())])
+            Some(&[Json::Str("127.0.0.1/32".to_owned())][..])
         );
-        assert_eq!(list("inboundTag"), Some(&vec![Json::Str("in".to_owned())]));
-        assert_eq!(list("localOS"), Some(&vec![Json::Str("linux".to_owned())]));
+        assert_eq!(list("inboundTag"), Some(&[Json::Str("in".to_owned())][..]));
+        assert_eq!(list("localOS"), Some(&[Json::Str("linux".to_owned())][..]));
         assert_eq!(rule.get("network").and_then(Json::as_str), Some("tcp,udp"));
         assert_eq!(rule.get("port").and_then(Json::as_str), Some("80"));
         assert_eq!(
