@@ -10231,7 +10231,7 @@ fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan) {
         if matches!(out, Outbound::Block(_)) {
             continue;
         }
-        retire_finished_lane(&mut lanes, &mut replies, key.as_deref());
+        retire_finished_lane(&mut lanes, &mut replies, &key);
         if !lanes.contains_key(&key) {
             if let Some(lane) = spawn_udp_lane(out, local) {
                 replies.insert(lane.address, key.clone());
@@ -10246,17 +10246,14 @@ fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan) {
 
 /// A lane's loop ends on its own idle or a refused upstream; the key must not keep writing to the
 /// socket nobody reads, so a later datagram for that tag opens a fresh lane.
+#[allow(clippy::ref_option)] // the map is keyed by the optional tag itself
 fn retire_finished_lane(
     lanes: &mut HashMap<Option<String>, UdpLane>,
     replies: &mut HashMap<SocketAddr, Option<String>>,
-    key: Option<&str>,
+    key: &Option<String>,
 ) {
-    let finished = lanes
-        .iter()
-        .find(|(tag, lane)| tag.as_deref() == key && lane.handle.is_finished())
-        .map(|(tag, _)| tag.clone());
-    if let Some(tag) = finished {
-        if let Some(lane) = lanes.remove(&tag) {
+    if lanes.get(key).is_some_and(|lane| lane.handle.is_finished()) {
+        if let Some(lane) = lanes.remove(key) {
             replies.remove(&lane.address);
         }
     }
@@ -32679,7 +32676,7 @@ mod tests {
         }
         let mut lanes = HashMap::from([(key.clone(), UdpLane { address, handle })]);
         let mut replies = HashMap::from([(address, key.clone())]);
-        retire_finished_lane(&mut lanes, &mut replies, key.as_deref());
+        retire_finished_lane(&mut lanes, &mut replies, &key);
         assert!(!lanes.contains_key(&key));
         assert!(!replies.contains_key(&address));
     }
