@@ -528,8 +528,7 @@ impl Shake {
 struct SizeAead {
     aes: Option<ferrox_core::aesgcm::Aes128Gcm>,
     chacha: Option<[u8; 32]>,
-    /// The body IV's own tail: the size nonce is the body's shape with a counter of its own.
-    iv: [u8; 10],
+    nonce: [u8; 12],
     counter: u16,
 }
 
@@ -542,38 +541,28 @@ impl SizeAead {
             // No cipher the reference seals a length with, so no authenticated length.
             _ => return None,
         };
-        let mut tail = [0u8; 10];
-        tail.copy_from_slice(&iv[2..12]);
+        let mut nonce = [0u8; 12];
+        nonce[2..].copy_from_slice(&iv[2..12]);
         Some(Self {
             aes,
             chacha,
-            iv: tail,
+            nonce,
             counter: 0,
         })
-    }
-    fn nonce(&self) -> [u8; 12] {
-        let mut nonce = [0u8; 12];
-        nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
-        nonce[2..].copy_from_slice(&self.iv);
-        nonce
     }
     /// The wire's 18 bytes open to the frame's total: the two plain octets are sealed here (`AEADChunkSizeParser::Decode`) and the overhead is added back.
     fn unseal_len(&mut self, sealed: &mut [u8; SIZE_FIELD]) -> Option<u16> {
         let (size, tag) = sealed.split_at_mut(HEADER_LEN);
         let tag: [u8; TAG_LEN] = <[u8; TAG_LEN]>::try_from(tag).ok()?;
+        self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
+        let nonce = &self.nonce;
         let plain = match (&self.aes, &self.chacha) {
             (Some(aes), None) => {
-                aes.open_in_place(&self.nonce(), b"", size, &tag)?;
+                aes.open_in_place(nonce, b"", size, &tag)?;
                 size
             }
             (None, Some(key)) => {
-                ferrox_core::aead::chacha20_poly1305_decrypt_in_place(
-                    key,
-                    &self.nonce(),
-                    b"",
-                    size,
-                    &tag,
-                )?;
+                ferrox_core::aead::chacha20_poly1305_decrypt_in_place(key, nonce, b"", size, &tag)?;
                 size
             }
             _ => return None,
@@ -584,14 +573,13 @@ impl SizeAead {
     /// The wire's 18 bytes seal the frame's body total less the tag, the shape the reference's encoder writes (`AEADChunkSizeParser::Encode`) and its nonce steps beside the body's.
     fn seal_len(&mut self, total: u16, sealed: &mut [u8; SIZE_FIELD]) {
         let mut plain = total.wrapping_sub(TAG_LEN as u16).to_be_bytes();
+        self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
+        let nonce = &self.nonce;
         let tag = match (&self.aes, &self.chacha) {
-            (Some(aes), None) => aes.seal_in_place(&self.nonce(), b"", &mut plain),
-            (None, Some(key)) => ferrox_core::aead::chacha20_poly1305_seal_in_place(
-                key,
-                &self.nonce(),
-                b"",
-                &mut plain,
-            ),
+            (Some(aes), None) => aes.seal_in_place(nonce, b"", &mut plain),
+            (None, Some(key)) => {
+                ferrox_core::aead::chacha20_poly1305_seal_in_place(key, nonce, b"", &mut plain)
+            }
             _ => return,
         };
         sealed[..HEADER_LEN].copy_from_slice(&plain);
@@ -604,7 +592,7 @@ pub(crate) struct Flow {
     cipher: Cipher,
     aes: Option<ferrox_core::aesgcm::Aes128Gcm>,
     chacha: Option<[u8; 32]>,
-    iv: [u8; 16],
+    nonce: [u8; 12],
     counter: u16,
     shake: Option<Shake>,
     /// The sealed size field when the request asks for an authenticated length: the
@@ -635,11 +623,13 @@ impl Flow {
             Cipher::Auto => return None,
         };
         let shake = masking.then(|| Shake::fresh(mask_seed, padding));
+        let mut nonce = [0u8; 12];
+        nonce[2..].copy_from_slice(&iv[2..12]);
         Some(Self {
             cipher: actual,
             aes,
             chacha,
-            iv: *iv,
+            nonce,
             counter: 0,
             shake,
             len_seal: None,
@@ -653,27 +643,26 @@ impl Flow {
             HEADER_LEN
         }
     }
-    fn nonce(&self) -> [u8; 12] {
-        let mut nonce = [0u8; 12];
-        nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
-        nonce[2..].copy_from_slice(&self.iv[2..12]);
-        nonce
+    #[cfg(test)]
+    fn nonce(&mut self) -> &[u8; 12] {
+        self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
+        &self.nonce
     }
     fn seal_onto(&mut self, plain: &[u8], out: &mut Vec<u8>) -> bool {
         let at = out.len();
         out.extend_from_slice(plain);
+        self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
+        let nonce = &self.nonce;
         let sealed = match (&self.aes, &self.chacha) {
             (Some(aes), None) => {
-                let nonce = self.nonce();
-                let tag = aes.seal_in_place(&nonce, b"", &mut out[at..]);
+                let tag = aes.seal_in_place(nonce, b"", &mut out[at..]);
                 out.extend_from_slice(&tag);
                 true
             }
             (None, Some(key)) => {
-                let nonce = self.nonce();
                 let tag = ferrox_core::aead::chacha20_poly1305_seal_in_place(
                     key,
-                    &nonce,
+                    nonce,
                     b"",
                     &mut out[at..],
                 );
@@ -697,22 +686,24 @@ impl Flow {
                 if chunk.len() < TAG_LEN {
                     return None;
                 }
-                let nonce = self.nonce();
+                self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
+                let nonce = &self.nonce;
                 let split = chunk.len() - TAG_LEN;
                 let (body, tag) = chunk.split_at_mut(split);
                 let tag: &[u8; TAG_LEN] = <&[u8; TAG_LEN]>::try_from(&*tag).ok()?;
-                aes.open_in_place(&nonce, b"", body, tag)?;
+                aes.open_in_place(nonce, b"", body, tag)?;
                 split
             }
             (None, Some(key)) => {
                 if chunk.len() < TAG_LEN {
                     return None;
                 }
-                let nonce = self.nonce();
+                self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
+                let nonce = &self.nonce;
                 let split = chunk.len() - TAG_LEN;
                 let (body, tag) = chunk.split_at_mut(split);
                 let tag: &[u8; TAG_LEN] = <&[u8; TAG_LEN]>::try_from(&*tag).ok()?;
-                ferrox_core::aead::chacha20_poly1305_decrypt_in_place(key, &nonce, b"", body, tag)?;
+                ferrox_core::aead::chacha20_poly1305_decrypt_in_place(key, nonce, b"", body, tag)?;
                 split
             }
             (None, None) => chunk.len(),
@@ -2910,14 +2901,14 @@ mod tests {
                 send.counter = at;
                 recv.counter = at;
                 let mut first = [0u8; 12];
-                first.copy_from_slice(&send.nonce());
+                first.copy_from_slice(send.nonce());
                 let mut sealed = Vec::new();
                 assert!(send.seal_onto(b"ping", &mut sealed));
                 let back = recv.open_chunk(&mut sealed).expect("opens");
                 assert_eq!(&sealed[..back], b"ping");
                 assert_eq!(send.counter, at.wrapping_add(1));
                 assert_eq!(recv.counter, at.wrapping_add(1));
-                assert_ne!(send.nonce(), first);
+                assert_ne!(send.nonce(), &first);
             }
         }
     }
@@ -3390,7 +3381,10 @@ mod tests {
                 let mut want_nonce = [0u8; 12];
                 want_nonce[..2].copy_from_slice(&(frame as u16).to_be_bytes());
                 want_nonce[2..].copy_from_slice(&data_iv[2..12]);
-                assert_eq!(nonce, want_nonce, "frame {frame}: counter then the iv tail");
+                assert_eq!(
+                    *nonce, want_nonce,
+                    "frame {frame}: counter then the iv tail"
+                );
                 let mut ours = Vec::new();
                 assert!(flow.seal_onto(&plain, &mut ours), "seals frame {len}");
 
@@ -3411,7 +3405,11 @@ mod tests {
                 }
                 let n = recv.open_chunk(&mut ours).expect("opens");
                 assert_eq!(n, len, "length {len} frame {frame} opens to its own length");
-                assert_eq!(recv.iv, data_iv, "opening does not disturb the iv");
+                assert_eq!(
+                    &recv.nonce[2..],
+                    &data_iv[2..12],
+                    "opening does not disturb the iv"
+                );
             }
         }
     }
