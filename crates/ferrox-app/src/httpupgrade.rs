@@ -1835,7 +1835,7 @@ mod tests {
             assert_eq!(lengths, 93, "the head lengths the script names");
             assert_eq!(cases, 108, "the head cases the script names");
             assert_eq!(
-                verdicts_differing, 21,
+                verdicts_differing, 0,
                 "the heads the two sides read differently"
             );
             assert_eq!(offsets_differing, 0, "the head ends that differ");

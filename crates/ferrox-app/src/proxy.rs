@@ -1568,7 +1568,7 @@ fn serve_vless(
         Carrier::Raw(_) => serve_vless_raw(stream, users, freedom, fallbacks),
         Carrier::Ws { path, .. } => serve_vless_ws(stream, users, path, freedom),
         Carrier::HttpUpgrade { path, host, .. } => {
-            serve_vless_httpupgrade(stream, users, path, host, freedom)
+            serve_vless_httpupgrade(stream, users, path, host, freedom);
         }
         Carrier::Grpc { path } => serve_vless_grpc(stream, users, path, freedom),
         Carrier::Xhttp { settings, .. } => {
