@@ -2668,6 +2668,51 @@ mod tests {
         ignore = "needs a loopback socket, and ring's assembly behind it"
     )]
     #[test]
+    fn ech_server_accepts_an_aes_256_only_offer() {
+        let (list, keys) = crate::tls::ech::generate_with_suites(
+            "public.test",
+            4,
+            &[(
+                crate::tls::ech::KDF_SHA256,
+                crate::tls::ech::AEAD_AES_256_GCM,
+            )],
+        )
+        .expect("generates");
+        let cert_pem = anchor_pem("CERTIFICATE", ANCHOR);
+        let key_pem = anchor_pem("PRIVATE KEY", ANCHOR_KEY);
+        let mut identity = crate::tls::parse_pem_identity(&cert_pem, &key_pem).expect("parses");
+        identity.ech_server_keys = Some(keys.into());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let (stream, _) = listener.accept().expect("accepts");
+                let mut server = crate::tls::accept(&identity, stream).expect("accepts");
+                server.handshake().expect("handshakes");
+                assert!(server.ech_accepted(), "the aes-256 offer was accepted");
+                let mut buf = [0u8; 4];
+                server.read_exact(&mut buf).expect("reads");
+                server.write_all(&buf).expect("writes");
+                server.flush().expect("flushes");
+            });
+            let mut cfg = client("tls.test", &[]);
+            cfg.ech_config_list = Some(list.into());
+            let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut client = crate::tls::connect(&cfg, stream).expect("configures");
+            client.handshake().expect("handshakes");
+            client.write_all(b"ping").expect("writes");
+            client.flush().expect("flushes");
+            let mut buf = [0u8; 4];
+            client.read_exact(&mut buf).expect("reads");
+            assert_eq!(&buf, b"ping");
+        });
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
     fn ech_server_still_answers_a_client_that_does_not_offer_it() {
         let (_, keys) = crate::tls::ech::generate("public.test", 3).expect("generates");
         let cert_pem = anchor_pem("CERTIFICATE", ANCHOR);

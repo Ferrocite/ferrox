@@ -6,6 +6,7 @@ pub(crate) const VERSION: u16 = 0xfe0d;
 pub(crate) const KEM_X25519: u16 = 0x0020;
 pub(crate) const KDF_SHA256: u16 = 0x0001;
 pub(crate) const AEAD_AES_128_GCM: u16 = 0x0001;
+pub(crate) const AEAD_AES_256_GCM: u16 = 0x0002;
 pub(crate) const AEAD_CHACHA20_POLY1305: u16 = 0x0003;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -221,6 +222,23 @@ pub(crate) fn encode_server_keys(keys: &[ServerKey]) -> Vec<u8> {
 
 #[cfg(test)]
 pub(crate) fn generate(public_name: &str, config_id: u8) -> Result<(Vec<u8>, Vec<u8>), String> {
+    generate_with_suites(
+        public_name,
+        config_id,
+        &[
+            (KDF_SHA256, AEAD_AES_128_GCM),
+            (KDF_SHA256, AEAD_AES_256_GCM),
+            (KDF_SHA256, AEAD_CHACHA20_POLY1305),
+        ],
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn generate_with_suites(
+    public_name: &str,
+    config_id: u8,
+    cipher_suites: &[(u16, u16)],
+) -> Result<(Vec<u8>, Vec<u8>), String> {
     if public_name.is_empty() || public_name.len() > 255 {
         return Err("ech: public name must be 1..=255 bytes".to_owned());
     }
@@ -231,10 +249,7 @@ pub(crate) fn generate(public_name: &str, config_id: u8) -> Result<(Vec<u8>, Vec
         id: config_id,
         kem_id: KEM_X25519,
         public_key: public.to_vec(),
-        cipher_suites: vec![
-            (KDF_SHA256, AEAD_AES_128_GCM),
-            (KDF_SHA256, AEAD_CHACHA20_POLY1305),
-        ],
+        cipher_suites: cipher_suites.to_vec(),
         maximum_name_length: 0,
         public_name: public_name.as_bytes().to_vec(),
         extensions: Vec::new(),

@@ -2,7 +2,7 @@
 
 `tlsSettings.echConfigList` carries an ECH config list as raw base64 or as `name+udp://…` / `name+https://…/dns-query`, and one list feeds both client lanes: the stock rustls dial in `crates/ferrox-core/src/tls/rustls_backend.rs` and the shaped dial in `crates/ferrox-core/src/tls/shaped/client.rs`. `tlsSettings.echServerKeys` is the base64 `u16 key || u16 config` TLV a TLS listener answers through BoringSSL. A QUIC listener hands the same keys to quiche's BoringSSL context, and a QUIC dial offers the same list before its first packet, so this method carries both roles on both transports. `echSockopt` (also read as `echSocketSettings`) marks the socket that carries the ECH DNS query.
 
-A bad config list fails the dial closed; a bad server key set refuses the inbound. A server that rejects an offer names its retry list, and the stock dial repeats the TCP and TLS handshake once with that list. The shaped lane reports the same list to the same one-retry caller. This is a setup path, not a per-record one.
+The HPKE lane accepts X25519 with HKDF-SHA256 and AES-128-GCM, AES-256-GCM, or ChaCha20-Poly1305, so every suite an xray or sing-box key names is one this tree can answer. A bad config list fails the dial closed; a bad server key set refuses the inbound. A server that rejects an offer names its retry list, and the stock dial repeats the TCP and TLS handshake once with that list. The shaped lane reports the same list to the same one-retry caller. This is a setup path, not a per-record one.
 
 ## Data path
 
@@ -63,7 +63,7 @@ What was **not** removed: the retry costs one extra connection when a server rej
 | ECH config list, DNS query, cache and `echServerKeys` TLV | `upstream/xray-core/transport/internet/tls/ech.go` |
 | retry-on-rejection client | `upstream/sing-box/common/tls/client.go` |
 | quiche's ECH setter | `upstream/quiche/quiche/src/lib.rs` |
-| BoringSSL retry-config rule | `~/.cargo/registry/src/*/boring-sys-5.2.0/deps/boringssl/ssl/encrypted_client_hello.cc` |
+| BoringSSL retry-config rule | `~/.cargo/registry/src/*/boring-sys-5.3.0/deps/boringssl/ssl/encrypted_client_hello.cc` |
 | rustls rejection payload | `~/.cargo/registry/src/*/rustls-0.23.46/src/error.rs` |
 
 ## CI scope
