@@ -6,6 +6,8 @@ A TCP session is `salt || AEAD(fixed) || AEAD(variable) || data*` where `fixed` 
 
 The AEAD sits on the same ladder as the AEAD rung: AES-GCM through `aesgcm`, ChaCha through `aead`, XChaCha through `hchacha` plus the IETF AEAD. The KDF is `blake3::derive_key` (`shadowsocks 2022 session subkey`, `shadowsocks 2022 identity subkey`) and `blake3::hash` truncated for the user hash. Timestamps and the salt filter live in `ferrox-app`, so `ferrox-core` stays deterministic.
 
+The carrier carries TLS as the other protocols' rows do: over KCP the session sits above the connection in both roles, so the listener reads the header from the terminated stream and the dial writes it there (`a_shadowsocks_kcp_inbound_that_declares_tls_answers_the_session`, `a_shadowsocks_kcp_dial_under_tls_wraps_the_header_in_the_session`). A `tls` row on any other carrier — raw, ws, httpUpgrade, gRPC, xhttp, http header — is refused by name rather than answered plaintext, because this lane does not yet wire its session halves for those carriers.
+
 ## Data path
 
 ```mermaid
