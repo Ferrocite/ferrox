@@ -1121,8 +1121,20 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
         }
     }
 
+    fn sni(&self) -> Option<&[u8]> {
+        match &self.inner {
+            ServerInner::Rustls { conn, .. } => conn.server_name().map(str::as_bytes),
+            ServerInner::Ech {
+                stream: Some(stream),
+                ..
+            } => stream
+                .ssl()
+                .servername_raw(boring::ssl::NameType::HOST_NAME),
+            ServerInner::Ech { .. } => None,
+        }
+    }
+
     fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
-        self.handshake()?;
         match &mut self.inner {
             ServerInner::Rustls { conn, .. } => {
                 let len = conn.writer().write(plaintext)?;
