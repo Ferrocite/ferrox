@@ -407,7 +407,7 @@ pub(crate) fn serve_ws(
     path: &str,
     freedom: bool,
 ) {
-    let Some((mut reader, mut writer)) = crate::ws::accept(stream, path) else {
+    let Some((mut reader, writer)) = crate::ws::accept(stream, path) else {
         return;
     };
     let Some((uplink, response, recv)) = accept_on(&mut reader, password, method, freedom) else {
@@ -425,7 +425,7 @@ pub(crate) fn serve_httpupgrade(
     path: &str,
     freedom: bool,
 ) {
-    let Some((mut reader, mut writer)) = crate::httpupgrade::accept(stream, path) else {
+    let Some((mut reader, writer)) = crate::httpupgrade::accept(stream, path) else {
         return;
     };
     let Some((uplink, response, recv)) = accept_on(&mut reader, password, method, freedom) else {
@@ -447,7 +447,7 @@ pub(crate) fn serve_grpc(
     path: &str,
     freedom: bool,
 ) {
-    let Some((mut reader, mut writer)) = crate::grpc::accept(stream, path) else {
+    let Some((mut reader, writer)) = crate::grpc::accept(stream, path) else {
         return;
     };
     let Some((uplink, response, recv)) = under_handshake(&mut reader, |read| {
@@ -467,7 +467,7 @@ pub(crate) fn serve_xhttp(
     path: &str,
     freedom: bool,
 ) {
-    let Some((mut reader, mut writer)) = crate::xhttp::accept(stream, path) else {
+    let Some((mut reader, writer)) = crate::xhttp::accept(stream, path) else {
         return;
     };
     let Some((uplink, response, recv)) = accept_on(&mut reader, password, method, freedom) else {
@@ -486,7 +486,7 @@ pub(crate) fn serve_httpheader(
     path: &str,
     freedom: bool,
 ) {
-    let Some((mut reader, mut writer)) = crate::httpheader::accept(stream, path) else {
+    let Some((mut reader, writer)) = crate::httpheader::accept(stream, path) else {
         return;
     };
     let Some((uplink, response, recv)) = accept_on(&mut reader, password, method, freedom) else {
@@ -503,7 +503,7 @@ pub(crate) fn serve_httpheader(
 
 pub(crate) fn serve_kcp<R, W>(
     mut reader: R,
-    mut writer: W,
+    writer: W,
     password: &str,
     method: &str,
     freedom: bool,
