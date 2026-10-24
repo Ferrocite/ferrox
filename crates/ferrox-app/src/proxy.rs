@@ -19993,6 +19993,108 @@ mod tests {
         }
     }
 
+    /// The vmess listener reads its stream settings: a tls inbound answers the handshake before any carrier.
+    #[test]
+    fn a_vmess_inbound_that_declares_tls_answers_every_carrier() {
+        let (cert, key, client) = tls_cert_json();
+        let cases = [
+            ("raw", r#""network": "tcp""#),
+            ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
+            (
+                "httpupgrade",
+                r#""network": "httpupgrade", "httpupgradeSettings": {"path": "/u"}"#,
+            ),
+            (
+                "grpc",
+                r#""network": "grpc", "grpcSettings": {"serviceName": "/TunnelService/Tun"}"#,
+            ),
+            (
+                "xhttp",
+                r#""network": "xhttp", "xhttpSettings": {"path": "/x"}"#,
+            ),
+            (
+                "httpheader",
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/c"]}}}"#,
+            ),
+        ];
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        for (tag, stream) in cases {
+            let inbound = crate::json::parse(&format!(
+                r#"{{"protocol": "vmess", "settings": {{"clients": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}},
+                    "streamSettings": {{{stream}, "security": "tls",
+                        "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+            ))
+            .expect("parses");
+            let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let port = probe.local_addr().expect("addr").port();
+            drop(probe);
+            let address = format!("127.0.0.1:{port}");
+            serve_vmess_inbound(&address, &inbound, true);
+            let waited = Instant::now();
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                assert!(
+                    waited.elapsed() < Duration::from_secs(10),
+                    "{tag} listener never bound"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let echo_port = echo.local_addr().expect("addr").port();
+            thread::spawn(move || {
+                let (mut socket, _) = echo.accept().expect("accepts");
+                let mut buf = [0u8; 1024];
+                loop {
+                    let Ok(read) = socket.read(&mut buf) else {
+                        return;
+                    };
+                    if read == 0 || socket.write_all(&buf[..read]).is_err() {
+                        return;
+                    }
+                }
+            });
+            let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let dport = downstream.local_addr().expect("addr").port();
+            let asked: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+            let vmess = VmessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                cipher: crate::vmess::Cipher::Auto,
+                carrier: inbound_carrier(&inbound),
+                host: "127.0.0.1".to_owned(),
+                tls: Some(Arc::clone(&client)),
+            };
+            let listener: SocketAddr = address.parse().expect("addr");
+            thread::spawn(move || {
+                let (socket, _) = downstream.accept().expect("accepts");
+                dial_vmess(
+                    &socket,
+                    &listener,
+                    &vmess,
+                    &Destination::from(asked),
+                    Ladder::global(),
+                );
+            });
+            let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+            sock.set_read_timeout(Some(Duration::from_millis(200)))
+                .expect("timeout");
+            sock.write_all(b"ping").expect("writes");
+            let start = Instant::now();
+            let mut back = [0u8; 4];
+            let mut at = 0;
+            while at < back.len() {
+                match sock.read(&mut back[at..]) {
+                    Ok(0) => panic!("{tag} over tls closed before echoing"),
+                    Ok(n) => at += n,
+                    Err(error)
+                        if is_timeout(&error) && start.elapsed() < Duration::from_secs(10) => {}
+                    Err(error) => panic!("{tag} over tls did not echo: {error:?}"),
+                }
+            }
+            assert_eq!(&back, b"ping", "{tag} over tls echoes");
+        }
+    }
+
     #[test]
     fn a_trojan_udp_association_crosses_the_tls_arm() {
         let (cert, key, client) = tls_cert_json();
