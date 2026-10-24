@@ -30,12 +30,20 @@ const POINTER_HIGH: u8 = 0xC0;
 
 /// A question in the reference's `parseQuery` form: the name as the parse
 /// spelled it — trailing dot, case and every byte kept — so the builder packs
-/// what its `dnsmessage.Name` packs.
-#[derive(Debug)]
+/// what its `dnsmessage.Name` packs. The name rides the question: the longest a
+/// parse accepts is `NAME_MAX`, so every message decides without a heap buffer.
 pub struct Question {
     pub id: u16,
     pub qtype: u16,
-    pub name: Vec<u8>,
+    name: [u8; NAME_MAX],
+    len: usize,
+}
+
+impl Question {
+    /// The name the parse spelled, trailing dot included.
+    pub fn name(&self) -> &[u8] {
+        &self.name[..self.len]
+    }
 }
 
 /// The rule actions the reference's config carries, named as its own config
@@ -83,10 +91,10 @@ pub fn parse_query(msg: &[u8]) -> Option<Question> {
     if u16::from_be_bytes([msg[4], msg[5]]) == 0 {
         return None;
     }
-    let mut name = Vec::with_capacity(NAME_MAX);
+    let mut name = [0u8; NAME_MAX];
+    let mut len = 0usize;
     let mut at = HEADER;
     let mut pointers = 0u32;
-    let mut sum = 0usize;
     loop {
         let start = *msg.get(at)?;
         if start & POINTER_HIGH == POINTER_HIGH {
@@ -117,20 +125,27 @@ pub fn parse_query(msg: &[u8]) -> Option<Question> {
         if msg[at + 1..end].contains(&b'.') {
             return None;
         }
-        if sum + span >= NAME_MAX {
+        if len + span >= NAME_MAX {
             return None;
         }
-        name.extend_from_slice(&msg[at + 1..end]);
-        name.push(b'.');
-        sum += span + 1;
+        name[len..len + span].copy_from_slice(&msg[at + 1..end]);
+        len += span;
+        name[len] = b'.';
+        len += 1;
         at = end;
     }
-    if name.is_empty() {
-        name.push(b'.');
+    if len == 0 {
+        name[0] = b'.';
+        len = 1;
     }
     let qtype = read_u16(msg, at)?;
     read_u16(msg, at + 2)?;
-    Some(Question { id, qtype, name })
+    Some(Question {
+        id,
+        qtype,
+        name,
+        len,
+    })
 }
 
 fn read_u16(msg: &[u8], at: usize) -> Option<u16> {
@@ -241,8 +256,16 @@ impl Rule {
         let Some(domains) = &self.domains else {
             return true;
         };
-        let matchable = &question.name[..question.name.len().saturating_sub(1)];
-        std::str::from_utf8(matchable).is_ok_and(|name| domains.matches(&name.to_ascii_lowercase()))
+        let name = question.name();
+        let Ok(matchable) = std::str::from_utf8(&name[..name.len().saturating_sub(1)]) else {
+            return false;
+        };
+        let mut lower = [0u8; NAME_MAX];
+        let folded = &mut lower[..matchable.len()];
+        folded.copy_from_slice(matchable.as_bytes());
+        folded.make_ascii_lowercase();
+        let folded = std::str::from_utf8(folded).expect("folding ascii bytes keeps utf-8");
+        domains.matches(folded, folded)
     }
 }
 
@@ -269,13 +292,13 @@ pub fn decide(message: &[u8], rules: &[Rule], lookup: &dyn Fn(&[u8]) -> Resolve)
     };
     let decision = |action, rcode: u16| match action {
         Action::Drop => Step::Quiet,
-        Action::Return => reject(question.id, question.qtype, &question.name, rcode)
+        Action::Return => reject(question.id, question.qtype, question.name(), rcode)
             .map_or(Step::Quiet, Step::Reply),
         Action::Hijack => {
             if Action::applies_by_type(question.qtype) {
                 resolve_step(&question, lookup)
             } else {
-                reject(question.id, question.qtype, &question.name, rcode)
+                reject(question.id, question.qtype, question.name(), rcode)
                     .map_or(Step::Quiet, Step::Reply)
             }
         }
@@ -298,10 +321,9 @@ pub fn decide(message: &[u8], rules: &[Rule], lookup: &dyn Fn(&[u8]) -> Resolve)
 /// nothing for the error whose rcode is zero and which is not the empty
 /// response.
 fn resolve_step(question: &Question, lookup: &dyn Fn(&[u8]) -> Resolve) -> Step {
-    match lookup(&question.name) {
+    match lookup(question.name()) {
         Resolve::Records { rdata, ttl } => {
-            let records: Vec<&[u8]> = rdata.iter().map(Vec::as_slice).collect();
-            ip_answer(question, 0, ttl, &records).map_or(Step::Quiet, Step::Reply)
+            ip_answer(question, 0, ttl, &rdata).map_or(Step::Quiet, Step::Reply)
         }
         Resolve::AnsweredEmpty => ip_answer(question, 0, 0, &[]).map_or(Step::Quiet, Step::Reply),
         Resolve::Refused(rcode) => {
@@ -322,20 +344,28 @@ fn resolve_step(question: &Question, lookup: &dyn Fn(&[u8]) -> Resolve) -> Step 
 ///
 /// Every record carries the builder's one compressed name: four bytes for A,
 /// sixteen for AAAA.
-pub fn ip_answer(question: &Question, rcode: u16, ttl: u32, records: &[&[u8]]) -> Option<Vec<u8>> {
+pub fn ip_answer(
+    question: &Question,
+    rcode: u16,
+    ttl: u32,
+    records: &[Vec<u8>],
+) -> Option<Vec<u8>> {
     let width = match question.qtype {
         28 => 16,
         _ => 4,
     };
-    let matching = records.iter().filter(|ip| ip.len() == width).count() as u16;
+    let matching = records
+        .iter()
+        .filter(|record| record.len() == width)
+        .count() as u16;
 
     let mut out =
-        Vec::with_capacity(HEADER + question.name.len() + 6 + records.len() * (16 + width));
+        Vec::with_capacity(HEADER + question.name().len() + 6 + records.len() * (16 + width));
     write_header(&mut out, question.id, rcode, 1, matching);
-    pack_name(&mut out, &question.name)?;
+    pack_name(&mut out, question.name())?;
     out.extend_from_slice(&question.qtype.to_be_bytes());
     out.extend_from_slice(&1u16.to_be_bytes());
-    let pointer = packed_answer_name(&question.name);
+    let pointer = packed_answer_name(question.name());
     for ip in records {
         if ip.len() != width {
             continue;
@@ -653,6 +683,41 @@ mod tests {
         );
         // One label byte more: 255 bytes, refused.
         assert!(parse_query(&build(39)).is_none());
+    }
+
+    /// A forwarded question is the lane's common decision and its answer is a constant: the name
+    /// rides the question, the rule match folds it where it lies, and nothing is opened.
+    #[test]
+    fn a_forwarded_question_is_decided_without_an_allocation() {
+        let message = query(0x1234, "WWW.Example.COM.", 1);
+        let rules = vec![Rule {
+            qtypes: Vec::new(),
+            domains: Some(Matcher::new(|name: &str| name == "www.example.com")),
+            action: Action::Direct,
+            rcode: 0,
+        }];
+        let (step, counts) =
+            crate::alloc_count::measure(|| decide(&message, &rules, &|_| Resolve::AnsweredEmpty));
+        assert!(matches!(step, Step::Forward), "the rule forwards it");
+        assert_eq!(counts.allocs, 0, "a forwarded question opens no buffer");
+    }
+
+    /// A hijacked question's only buffer is the answer it returns: the name, the match and the
+    /// answer's own shape open nothing.
+    #[test]
+    fn a_hijacked_question_opens_only_its_answer() {
+        let message = query(0x4321, "Example.COM.", 1);
+        let (step, counts) =
+            crate::alloc_count::measure(|| decide(&message, &[], &|_| Resolve::AnsweredEmpty));
+        let Step::Reply(answer) = step else {
+            panic!("a type-A question is hijacked");
+        };
+        assert_eq!(counts.allocs, 1, "the answer is the one buffer");
+        assert_eq!(
+            answer.len(),
+            message.len(),
+            "a header and the echoed question"
+        );
     }
 
     /// The decide probe: a direct forward its domains rule names, a rule
