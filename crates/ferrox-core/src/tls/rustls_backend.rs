@@ -12,6 +12,22 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::clone(PROVIDER.get_or_init(|| Arc::new(rustls::crypto::ring::default_provider())))
 }
 
+/// A config that names TLS 1.2 suites admits only those, in its order: TLS 1.3
+/// suites are fixed by the protocol and stay whatever the config says.
+fn order_cipher_suites(provider: &mut rustls::crypto::CryptoProvider, order: &[u16]) {
+    provider.cipher_suites.retain(|suite| {
+        let id = u16::from(suite.suite());
+        id >= 0x1301 || order.contains(&id)
+    });
+    provider.cipher_suites.sort_by_key(|suite| {
+        let id = u16::from(suite.suite());
+        order
+            .iter()
+            .position(|&want| want == id)
+            .unwrap_or(usize::MAX)
+    });
+}
+
 pub struct RustlsProvider<S: Stream> {
     conn: rustls::ClientConnection,
     io: S,
@@ -298,15 +314,8 @@ fn build_material(cfg: &TlsConfig) -> Result<Material, TlsError> {
 
     let mut provider = (*provider()).clone();
     if !cfg.cipher_suites.is_empty() {
-        // The ring backend's set is a subset of `crypto/tls`'s, so the sort only re-orders what is reachable.
-        let order = &cfg.cipher_suites;
-        provider.cipher_suites.sort_by_key(|cs| {
-            let id = u16::from(cs.suite());
-            order
-                .iter()
-                .position(|&want| want == id)
-                .unwrap_or(usize::MAX)
-        });
+        // The ring backend's set is a subset of `crypto/tls`'s, so a named suite it cannot reach is absent rather than replaced by a stock one.
+        order_cipher_suites(&mut provider, &cfg.cipher_suites);
     }
     let provider = Arc::new(provider);
 
@@ -992,18 +1001,7 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
     };
     let mut provider = (*provider()).clone();
     if !cfg.cipher_suites.is_empty() {
-        let order = &cfg.cipher_suites;
-        provider.cipher_suites.retain(|suite| {
-            let id = u16::from(suite.suite());
-            id >= 0x1301 || order.contains(&id)
-        });
-        provider.cipher_suites.sort_by_key(|suite| {
-            let id = u16::from(suite.suite());
-            order
-                .iter()
-                .position(|&want| want == id)
-                .unwrap_or(usize::MAX)
-        });
+        order_cipher_suites(&mut provider, &cfg.cipher_suites);
     }
     let versions = server_versions(cfg.min_version, cfg.max_version)?;
     let builder = rustls::ServerConfig::builder_with_provider(Arc::new(provider));
@@ -2693,20 +2691,25 @@ mod tests {
         crate::tls::parse_pem_identity(&cert_pem, &key_pem).expect("parses")
     }
 
-    fn stock_client(
+    fn stock_client_with(
         versions: &[&'static rustls::SupportedProtocolVersion],
+        provider: rustls::crypto::CryptoProvider,
     ) -> rustls::ClientConfig {
         let mut roots = RootStore::empty();
         roots
             .add(rustls::pki_types::CertificateDer::from(ANCHOR.to_vec()))
             .expect("anchor");
-        rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_protocol_versions(versions)
-        .expect("client versions")
-        .with_root_certificates(roots)
-        .with_no_client_auth()
+        rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(versions)
+            .expect("client versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    }
+
+    fn stock_client(
+        versions: &[&'static rustls::SupportedProtocolVersion],
+    ) -> rustls::ClientConfig {
+        stock_client_with(versions, rustls::crypto::ring::default_provider())
     }
 
     fn stock_session(config: rustls::ClientConfig) -> rustls::ClientConnection {
@@ -2762,7 +2765,11 @@ mod tests {
                 let mut server = rustls::ServerConnection::new(server_config).expect("session");
                 server.complete_io(&mut stream).expect("handshakes");
             });
-            let mut client = stock_session(stock_client(&[&rustls::version::TLS12]));
+            let mut provider = rustls::crypto::ring::default_provider();
+            provider
+                .cipher_suites
+                .retain(|suite| u16::from(suite.suite()) == 0xc02b);
+            let mut client = stock_session(stock_client_with(&[&rustls::version::TLS12], provider));
             let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
             client.complete_io(&mut stream).expect("handshakes");
             assert_eq!(
