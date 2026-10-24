@@ -1668,14 +1668,14 @@ fn serve_vless_raw_with<D>(
         // With a table on, the reference's first read and its verdict name the flow as a header or a probe.
         Some(_) => {
             let mut window = [0u8; PROBE_READ];
-            let (probe, first, carried) = probe_front(&mut stream, users, &mut window);
+            let (probe, consumed, carried) = probe_front(&mut stream, users, &mut window);
             let _ = stream.set_read_timeout(None);
             return vless_raw_reply(
                 stream,
                 users,
                 freedom,
                 fallbacks,
-                &window[..first],
+                &window[..consumed],
                 (probe, carried),
                 dial,
             );
@@ -1727,22 +1727,25 @@ fn vless_raw_reply<D>(
         return;
     }
     if cmd == 2 {
-        return serve_vless_udp(stream, &target);
+        return serve_vless_udp(stream, &target, carried);
     }
     if cmd == 3 {
         if stream.write_all(&[0, 0]).is_err() {
             return;
         }
-        return serve_vless_mux_with(stream, dial);
+        return serve_vless_mux_with(stream, dial, &carried);
     }
     if cmd != 1 {
         // The reference's decoder refuses a command past the id without falling back.
         return;
     }
-    let Some(uplink) = dial(&target) else {
+    let Some(mut uplink) = dial(&target) else {
         return;
     };
     if stream.write_all(&[0, 0]).is_err() {
+        return;
+    }
+    if !carried.is_empty() && uplink.write_all(&carried).is_err() {
         return;
     }
     relay_handoff(&stream, &uplink);
@@ -1761,10 +1764,11 @@ enum Probe {
 }
 
 /// The probe: one bounded first read into the caller's window, then the header parse replayed
-/// through it. The window is the bytes the route scans; `carried` is only what the parse pulled
-/// past it, the head a fallback relays after the window. The reference falls back on a short
-/// read, an unknown version, or an unknown user, and drops a header that names this inbound but
-/// does not parse.
+/// through it. The window is the bytes the route scans; the returned length is the part of it
+/// the parse consumed, and `carried` is the rest of the first read followed by what the parse
+/// pulled past it. A fallback relays the consumed window plus `carried`; a handler forwards
+/// `carried` to its own peer. The reference falls back on a short read, an unknown version, or
+/// an unknown user, and drops a header that names this inbound but does not parse.
 fn probe_front(
     session: &mut dyn Read,
     users: &[VlessUser],
@@ -1784,16 +1788,26 @@ fn probe_front(
         return (Probe::Refused, n, Vec::new());
     }
     let mut carried = Vec::new();
-    let mut replay = Prefixed {
-        head: &first[..n],
-        at: 0,
-        tail: &mut bounded,
-        carried: &mut carried,
+    let (probe, consumed) = {
+        let mut replay = Prefixed {
+            head: &first[..n],
+            at: 0,
+            tail: &mut bounded,
+            carried: &mut carried,
+        };
+        let probe = match decode_request(&mut replay) {
+            Some(header) => Probe::Decoded(header),
+            None => Probe::Dropped,
+        };
+        (probe, replay.at)
     };
-    match decode_request(&mut replay) {
-        Some(header) => (Probe::Decoded(header), n, carried),
-        None => (Probe::Dropped, n, carried),
+    if consumed < n {
+        let mut rest = Vec::with_capacity(n - consumed + carried.len());
+        rest.extend_from_slice(&first[consumed..n]);
+        rest.extend_from_slice(&carried);
+        carried = rest;
     }
+    (probe, consumed, carried)
 }
 
 /// The first read's bytes served ahead of the live stream, with what the parse pulls past them
@@ -2388,7 +2402,7 @@ fn remove_mux_session(
     send_mux_end(shared, staging, id);
 }
 
-fn serve_vless_mux_with<D>(stream: Connection, dial: D)
+fn serve_vless_mux_with<D>(stream: Connection, dial: D, carried: &[u8])
 where
     D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
 {
@@ -2408,7 +2422,8 @@ where
     let mut udp: UdpTable = HashMap::new();
     let mut global: UdpGlobal = HashMap::new();
     let mut handles: Vec<RelayEnd> = Vec::new();
-    let mut buf: Vec<u8> = Vec::with_capacity(READ_SLICE);
+    let mut buf: Vec<u8> = Vec::with_capacity(READ_SLICE.max(carried.len()));
+    buf.extend_from_slice(carried);
     let mut at = 0;
     let mut staging = Vec::with_capacity(8192);
     loop {
@@ -3628,7 +3643,7 @@ fn relay_vless<S>(
         // With a table on, the reference's first read and its verdict name the flow as a header or a probe.
         Some(_) => {
             let mut window = [0u8; PROBE_READ];
-            let (probe, first, carried) = probe_front(&mut session, users, &mut window);
+            let (probe, consumed, carried) = probe_front(&mut session, users, &mut window);
             return relay_vless_reply(
                 session,
                 raw,
@@ -3636,7 +3651,7 @@ fn relay_vless<S>(
                 freedom,
                 vision,
                 fallbacks,
-                &window[..first],
+                &window[..consumed],
                 (probe, carried),
                 front,
             );
@@ -3710,12 +3725,16 @@ fn relay_vless_reply<S>(
         return;
     }
     let wire_id = header.0;
-    let Some((flow, uplink, close)) = open_vless(&mut session, raw.as_ref(), freedom, header)
+    let Some((flow, mut uplink, close)) = open_vless(&mut session, raw.as_ref(), freedom, header)
     else {
         let Some(rows) = fallbacks else { return };
         let Some(raw) = raw else { return };
         return seize_fallback_tls(session, &raw, rows, window, &carried, front);
     };
+    if !carried.is_empty() && uplink.write_all(&carried).is_err() {
+        close();
+        return;
+    }
     if flow == Flow::Vision {
         // The Link reads its own transport, so the split is not its shape: the quiet grain stops at the tick instead, and a park never outlasts a writer.
         relay_stream(
@@ -12610,7 +12629,7 @@ pub(crate) fn udp_buffer() -> Vec<u8> {
 /// The largest SOCKS5 UDP request header: the three-byte opening plus the longest address this tree frames.
 const HEAD: usize = 22;
 
-fn read_udp_datagram(stream: &mut Connection, buf: &mut [u8]) -> Option<usize> {
+fn read_udp_datagram(stream: &mut dyn Read, buf: &mut [u8]) -> Option<usize> {
     let mut len = [0u8; 2];
     read_exact(stream, &mut len).ok()?;
     let len = usize::from(u16::from_be_bytes(len));
@@ -12659,7 +12678,7 @@ fn read_trojan_datagram(stream: &mut dyn Read, buf: &mut [u8]) -> Option<(Socket
     Some((dest, len))
 }
 
-fn serve_vless_udp(mut stream: Connection, target: &SocketAddr) {
+fn serve_vless_udp(mut stream: Connection, target: &SocketAddr, carried: Vec<u8>) {
     let bind = if target.is_ipv6() {
         "[::]:0"
     } else {
@@ -12683,7 +12702,7 @@ fn serve_vless_udp(mut stream: Connection, target: &SocketAddr) {
     let done = Arc::new(AtomicBool::new(false));
     let done_in = Arc::clone(&done);
     let forward = move || {
-        let mut tcp_read = tcp_read;
+        let mut tcp_read = std::io::Cursor::new(carried).chain(tcp_read);
         let mut buf = udp_buffer();
         while let Some(n) = read_udp_datagram(&mut tcp_read, &mut buf) {
             if udp_send.send(&buf[..n]).is_err() {
@@ -36248,7 +36267,7 @@ mod dns_lane_tests {
 
         let mut whole = header.clone();
         whole.extend_from_slice(b"hello");
-        let (verdict, first, carried) = probe_front(
+        let (verdict, consumed, carried) = probe_front(
             &mut std::io::Cursor::new(whole.clone()),
             &one_vless_user(&id),
             &mut window,
@@ -36258,15 +36277,11 @@ mod dns_lane_tests {
             "a header this inbound owns is not a probe"
         );
         assert_eq!(
-            &window[..first],
-            whole.as_slice(),
-            "the window is the first read"
+            &window[..consumed],
+            header.as_slice(),
+            "the window stops at the header"
         );
-        assert_eq!(
-            carried,
-            Vec::<u8>::new(),
-            "the parse pulled nothing past it"
-        );
+        assert_eq!(carried, b"hello", "the payload after the header is carried");
 
         let (verdict, first, carried) = probe_front(
             &mut Chunked {
@@ -36326,6 +36341,61 @@ mod dns_lane_tests {
 
         let (verdict, _, _) = probe_front(&mut Failing, &one_vless_user(&id), &mut window);
         assert!(matches!(verdict, Probe::Dropped), "a failed read drops");
+    }
+
+    /// A header and its first payload arriving in one read: the handler forwards the payload the
+    /// parse left in the window, not just the bytes a later read pulled past it.
+    #[test]
+    fn a_decoded_header_forwards_the_first_read_s_payload() {
+        let echo = std::net::TcpListener::bind("127.0.0.1:0").expect("bind echo");
+        let echo_addr = echo.local_addr().expect("echo addr");
+        let payload = b"GET / HTTP/1.1\r\nHost: x\r\n\r\n";
+        let (sent, got) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let Ok((mut peer, _)) = echo.accept() else {
+                return;
+            };
+            let _ = peer.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut buf = vec![0u8; payload.len()];
+            let read = peer.read_exact(&mut buf);
+            let _ = sent.send((read, buf));
+        });
+
+        let front = std::net::TcpListener::bind("127.0.0.1:0").expect("bind front");
+        let front_addr = front.local_addr().expect("front addr");
+        let client = thread::spawn(move || {
+            let mut client = std::net::TcpStream::connect(front_addr).expect("connect front");
+            let mut reply = [0u8; 2];
+            client.read_exact(&mut reply).expect("the vless reply");
+            assert_eq!(reply, [0, 0]);
+        });
+
+        let (server, _) = front.accept().expect("accept front");
+        let id = [7u8; 16];
+        let dial = move |target: &SocketAddr| Connection::connect(*target).ok();
+        vless_raw_reply(
+            Connection::from(server),
+            &one_vless_user(&id),
+            true,
+            None,
+            &[],
+            (
+                Probe::Decoded((id, Flow::None, 1, echo_addr)),
+                payload.to_vec(),
+            ),
+            dial,
+        );
+
+        let (read, buf) = got
+            .recv_timeout(Duration::from_secs(3))
+            .expect("echo answered");
+        read.expect("the upstream reads the carried payload");
+        assert_eq!(
+            buf.as_slice(),
+            &payload[..],
+            "the first read's payload reaches the uplink"
+        );
+        client.join().expect("client");
     }
 
     /// A probe the vless header refuses falls to the row it routes: the substitute echoes
