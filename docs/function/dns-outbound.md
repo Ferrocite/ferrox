@@ -43,7 +43,7 @@ The direct rule resolves inline: the name minus its root, the literal-IP fast pa
 
 ## Time
 
-Nothing here is timed by a local run — every dial through this outbound is a connection a contributor's tunnel would measure, so the duration numbers are CI's `bench.yml` and `parity.yml` cells alone. The lane's own waits are the reference's: the upstream read that ends a lane is its idle timeout, and nothing in the decision path spins between a question and its answer.
+Nothing here is timed by a local run — every dial through this outbound is a connection a contributor's tunnel would measure. Neither `bench.yml` nor `parity.yml` has a DNS cell, so this page carries no duration number and does not quote one; the measured cost is the ops probe below. The lane's own waits are the reference's: the upstream read that ends a lane is its idle timeout, and nothing in the decision path spins between a question and its answer.
 
 ## Gated counts
 
