@@ -2203,6 +2203,56 @@ mod tests {
         );
     }
 
+    fn inbound_tls_identity_with(
+        settings: &str,
+    ) -> (Arc<ferrox_core::tls::TlsServerConfig>, Vec<u8>) {
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["tls.test".to_owned()]).expect("mints");
+        let string_json = |pem: &str| -> String {
+            format!(
+                "\"{}\"",
+                pem.trim_end().replace('\r', "").replace('\n', "\\n")
+            )
+        };
+        let config = crate::json::parse(&format!(
+            r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{{settings}, "certificates": [{{"certificate": {}, "key": {}}}]}}}}}}"#,
+            string_json(&minted.cert.pem()),
+            string_json(&minted.signing_key.serialize_pem())
+        ))
+        .expect("parses");
+        let identity = inbound_tls_identity(&config).expect("the inline identity loads");
+        (identity, minted.cert.der().as_ref().to_vec())
+    }
+
+    #[test]
+    fn the_tls_listener_selects_the_configured_alpn() {
+        use ferrox_core::tls::{TlsConfig, TlsProvider as _};
+        let (identity, cert) = inbound_tls_identity_with(r#""alpn": ["h2"]"#);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let (stream, _) = listener.accept().expect("accepts");
+                let mut server = ferrox_core::tls::accept(&identity, stream).expect("accepts");
+                server.handshake().expect("handshakes");
+            });
+            let stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let config = TlsConfig {
+                server_name: "tls.test".to_owned(),
+                alpn: vec![b"h2".to_vec()].into(),
+                roots: vec![cert].into(),
+                ..TlsConfig::default()
+            };
+            let mut client = ferrox_core::tls::connect(&config, stream).expect("configures");
+            client.handshake().expect("handshakes");
+            assert_eq!(
+                client.alpn(),
+                Some(b"h2".as_slice()),
+                "the listener advertises the configured ALPN"
+            );
+        });
+    }
+
     #[test]
     fn an_absent_budgets_section_moves_no_wait() {
         let root = crate::json::parse(r#"{"inbounds": []}"#).expect("parses");
