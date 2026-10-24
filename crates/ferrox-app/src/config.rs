@@ -568,6 +568,11 @@ pub(crate) fn inbound_tls_identity(
     };
     let (cert_pem, key_pem) = tls_cert_pem(settings)?;
     let mut identity = ferrox_core::tls::parse_pem_identity(&cert_pem, &key_pem).ok()?;
+    let tls = settings.get("tlsSettings");
+    identity.alpn = tls_alpn(tls);
+    identity.min_version = tls_version(tls, "minVersion");
+    identity.max_version = tls_version(tls, "maxVersion");
+    identity.cipher_suites = tls_cipher_suites(tls);
     identity.ech_server_keys = ech;
     Some(Arc::new(identity))
 }
@@ -2251,6 +2256,19 @@ mod tests {
                 "the listener advertises the configured ALPN"
             );
         });
+    }
+
+    #[test]
+    fn inbound_tls_identity_reads_the_version_bounds_and_suites() {
+        let (identity, _) = inbound_tls_identity_with(
+            r#""minVersion": "1.2", "maxVersion": "1.2", "cipherSuites": "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256""#,
+        );
+        assert_eq!(identity.min_version, Some(0x0303));
+        assert_eq!(identity.max_version, Some(0x0303));
+        assert!(
+            identity.cipher_suites.contains(&0xc02b),
+            "the configured TLS 1.2 suite reaches the identity"
+        );
     }
 
     #[test]
