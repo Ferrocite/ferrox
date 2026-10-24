@@ -156,12 +156,21 @@ impl TlsError {
     #[must_use]
     pub fn is_timeout(error: &std::io::Error) -> bool {
         use std::io::ErrorKind::{TimedOut, WouldBlock};
+        // A timed-out overlapped socket read surfaces as `ERROR_IO_PENDING` on Windows, not as `TimedOut`; a relay that read it as an end drops a live flow.
+        let pending = cfg!(windows) && error.raw_os_error() == Some(997);
         matches!(error.kind(), TimedOut | WouldBlock)
+            || pending
             || error
                 .get_ref()
                 .and_then(|source| source.downcast_ref::<TlsError>())
                 .is_some_and(|mapped| matches!(mapped, TlsError::Timeout))
     }
+}
+
+#[test]
+fn a_pending_overlapped_read_is_an_idle_wait_on_windows() {
+    let pending = std::io::Error::from_raw_os_error(997);
+    assert_eq!(TlsError::is_timeout(&pending), cfg!(windows));
 }
 
 /// Fills `buf` from `stream`: a `dyn Read` may answer short, and a poll quantum the
