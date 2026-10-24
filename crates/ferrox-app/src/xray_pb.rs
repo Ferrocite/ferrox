@@ -3122,6 +3122,146 @@ mod tests {
         assert_eq!(routing.route(&flow), Some("blocked"));
     }
 
+    /// A pb domain rule reaches the same router the JSON spelling does: the
+    /// selector is decoded, not refused, and the flow lands on its outbound.
+    #[test]
+    fn a_pb_domain_rule_reaches_the_router() {
+        let domain = message(&[varint_field(1, 3), bytes_field(2, b"x.com")]);
+        let domain_rule = message(&[bytes_field(2, &domain)]);
+        let rule = message(&[bytes_field(1, b"blocked"), bytes_field(2, &domain_rule)]);
+        let router = message(&[bytes_field(2, &rule)]);
+        let outbound = message(&[
+            bytes_field(1, b"blocked"),
+            bytes_field(3, &typed("xray.proxy.blackhole.Config", &[])),
+        ]);
+        let config = message(&[
+            bytes_field(1, &socks_inbound(5000, 0, &[])),
+            bytes_field(2, &outbound),
+            bytes_field(4, &typed("xray.app.router.Config", &router)),
+        ]);
+        let json = to_json(&config).expect("decodes");
+        let rules = json
+            .get("routing")
+            .expect("routing")
+            .get("rules")
+            .and_then(Json::as_arr)
+            .expect("rules");
+        assert_eq!(
+            rules[0].get("domain"),
+            Some(&Json::Arr(vec![Json::Str("full:x.com".to_owned())]))
+        );
+        let routing = crate::router::Routing::parse(&json)
+            .expect("parses")
+            .expect("routing");
+        let flow = crate::router::Flow {
+            network: crate::router::Network::Tcp,
+            domain: Some("x.com"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: None,
+        };
+        assert_eq!(routing.route(&flow), Some("blocked"));
+    }
+
+    /// Every selector the JSON router reads survives the protobuf walk with the
+    /// key and spelling that router expects.
+    #[test]
+    fn a_pb_rule_carries_every_selector_the_router_reads() {
+        let custom_domain = message(&[bytes_field(
+            2,
+            &message(&[varint_field(1, 3), bytes_field(2, b"x.com")]),
+        )]);
+        let cidr = message(&[bytes_field(
+            1,
+            &message(&[bytes_field(1, &[192, 0, 2, 0]), varint_field(2, 24)]),
+        )]);
+        let source_cidr = message(&[bytes_field(
+            2,
+            &message(&[bytes_field(
+                1,
+                &message(&[bytes_field(1, &[198, 51, 100, 0]), varint_field(2, 24)]),
+            )]),
+        )]);
+        let local_cidr = message(&[bytes_field(
+            2,
+            &message(&[bytes_field(
+                1,
+                &message(&[bytes_field(1, &[127, 0, 0, 1]), varint_field(2, 32)]),
+            )]),
+        )]);
+        let port = |from: u64, to: u64| {
+            message(&[bytes_field(
+                1,
+                &message(&[varint_field(1, from), varint_field(2, to)]),
+            )])
+        };
+        let mut packed = varint(2);
+        packed.extend(varint(3));
+        let rule = message(&[
+            bytes_field(1, b"blocked"),
+            bytes_field(2, &custom_domain),
+            bytes_field(8, b"in"),
+            bytes_field(10, &cidr),
+            bytes_field(11, &source_cidr),
+            bytes_field(13, &packed),
+            bytes_field(14, &port(80, 80)),
+            bytes_field(16, &port(1000, 1001)),
+            bytes_field(17, &local_cidr),
+            bytes_field(18, &port(443, 443)),
+            bytes_field(19, b"r"),
+            bytes_field(23, b"linux"),
+        ]);
+        let router = message(&[bytes_field(2, &rule)]);
+        let outbound = message(&[
+            bytes_field(1, b"blocked"),
+            bytes_field(3, &typed("xray.proxy.blackhole.Config", &[])),
+        ]);
+        let config = message(&[
+            bytes_field(1, &socks_inbound(5000, 0, &[])),
+            bytes_field(2, &outbound),
+            bytes_field(4, &typed("xray.app.router.Config", &router)),
+        ]);
+        let json = to_json(&config).expect("decodes");
+        let rule = &json
+            .get("routing")
+            .expect("routing")
+            .get("rules")
+            .and_then(Json::as_arr)
+            .expect("rules")[0];
+        let list = |key: &str| rule.get(key).and_then(Json::as_arr);
+        assert_eq!(
+            list("domain"),
+            Some(&vec![Json::Str("full:x.com".to_owned())])
+        );
+        assert_eq!(
+            list("ip"),
+            Some(&vec![Json::Str("192.0.2.0/24".to_owned())])
+        );
+        assert_eq!(
+            list("sourceIP"),
+            Some(&vec![Json::Str("198.51.100.0/24".to_owned())])
+        );
+        assert_eq!(
+            list("localIP"),
+            Some(&vec![Json::Str("127.0.0.1/32".to_owned())])
+        );
+        assert_eq!(list("inboundTag"), Some(&vec![Json::Str("in".to_owned())]));
+        assert_eq!(list("localOS"), Some(&vec![Json::Str("linux".to_owned())]));
+        assert_eq!(rule.get("network").and_then(Json::as_str), Some("tcp,udp"));
+        assert_eq!(rule.get("port").and_then(Json::as_str), Some("80"));
+        assert_eq!(
+            rule.get("sourcePort").and_then(Json::as_str),
+            Some("1000-1001")
+        );
+        assert_eq!(rule.get("localPort").and_then(Json::as_str), Some("443"));
+        assert_eq!(rule.get("ruleTag").and_then(Json::as_str), Some("r"));
+        crate::router::Routing::parse(&json)
+            .expect("parses")
+            .expect("routing");
+    }
+
     /// An app this tree does not read is xray's own object graph and is
     /// skipped, the way the bridge has always skipped it; the router is the one
     /// app that decides where a flow goes, so it is read.
