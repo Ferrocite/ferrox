@@ -62,11 +62,6 @@ pub(crate) fn quiet(stream: &Connection) {
     let _ = stream.set_read_timeout(previous);
 }
 
-/// The head, the octets that arrived with it, and where the head ends: this read consumes what it proves, so a payload pipelined behind the request is already in hand.
-fn read_head(stream: &mut Connection) -> Option<(Vec<u8>, usize)> {
-    crate::proxy::read_http_head_kept(stream, HEAD_LIMIT, crate::budgets::head_arrival())
-}
-
 /// Where an HTTP/1.1 head ends: the first empty line, whether it is closed with CRLF or a bare LF.
 fn upgrade_head_end(head: &[u8]) -> Option<usize> {
     if let Some(at) = ferrox_core::foxy::head_end(head) {
@@ -74,15 +69,24 @@ fn upgrade_head_end(head: &[u8]) -> Option<usize> {
     }
     let mut at = 0;
     while at + 1 < head.len() {
-        if head[at] == b'\n' && head[at + 1] == b'\n' {
-            return Some(at + 2);
+        if head[at] == b'\n' {
+            if head[at + 1] == b'\n' {
+                return Some(at + 2);
+            }
+            if head[at + 1] == b'\r' && head.get(at + 2) == Some(&b'\n') {
+                return Some(at + 3);
+            }
         }
         at += 1;
     }
     None
 }
 
-/// The request head the reference's parser reads: any method, any line ending, and the decoded path.
+/// The head either role reads: any method, any line ending, and the octets that arrived with it.
+#[allow(
+    clippy::uninit_vec,
+    reason = "the reader fills the grown bytes, and every path that does not truncates them back"
+)]
 fn read_upgrade_head<R: Read>(read: &mut R, limit: usize) -> Option<(Vec<u8>, usize)> {
     const ROUND: usize = 512;
     let mut head = Vec::with_capacity(ROUND);
@@ -93,7 +97,9 @@ fn read_upgrade_head<R: Read>(read: &mut R, limit: usize) -> Option<(Vec<u8>, us
         }
         let base = head.len();
         let want = ROUND.min(limit - base);
-        head.resize(base + want, 0);
+        head.reserve(want);
+        // SAFETY: `read` initialises the bytes it reports, and `set_len` is rolled back on every path that does not.
+        unsafe { head.set_len(base + want) };
         let n = match read.read(&mut head[base..]) {
             Ok(n) => n,
             Err(error) if crate::proxy::is_timeout(&error) => {
@@ -119,7 +125,8 @@ fn read_upgrade_head<R: Read>(read: &mut R, limit: usize) -> Option<(Vec<u8>, us
     }
 }
 
-fn read_request_head(stream: &mut Connection) -> Option<(Vec<u8>, usize)> {
+/// The head, the octets that arrived with it, and where the head ends: this read consumes what it proves, so a payload pipelined behind the request is already in hand.
+fn read_head(stream: &mut Connection) -> Option<(Vec<u8>, usize)> {
     let previous = stream.read_timeout().ok().flatten();
     let poll = previous.map_or(crate::budgets::RELAY_POLL, |armed| {
         armed.min(crate::budgets::RELAY_POLL)
@@ -132,7 +139,7 @@ fn read_request_head(stream: &mut Connection) -> Option<(Vec<u8>, usize)> {
 
 pub(crate) fn accept(stream: Connection, path: &str) -> Option<(UpReader, Connection)> {
     let mut read = stream;
-    let (head, at) = read_request_head(&mut read)?;
+    let (head, at) = read_head(&mut read)?;
     let key = check_request(&head[..at], path)?;
     let Ok(write) = read.try_clone() else {
         return None;
@@ -337,7 +344,9 @@ pub(crate) fn connect(
 fn check_response(head: &[u8]) -> Option<()> {
     // One UTF-8 pass and one line scan for status plus both upgrade headers; the fanout cost three of each.
     let text = std::str::from_utf8(head).ok()?;
-    let mut lines = text.split("\r\n");
+    let mut lines = text
+        .split('\n')
+        .map(|line| line.strip_suffix('\r').unwrap_or(line));
     let status = lines.next()?;
     // xray and sing-box read only the version token and the three digits; a reason phrase is free text and may be absent.
     if !status.starts_with("HTTP/1.1 101")
@@ -376,8 +385,7 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite>(
 ) -> Option<(UpReader<R>, W)> {
     let early = rides(budget, first);
     send_request(&mut write, host, path, early, first)?;
-    let (head, at) =
-        crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
+    let (head, at) = read_upgrade_head(&mut read, HEAD_LIMIT)?;
     check_response(&head[..at])?;
     if !early && !first.is_empty() {
         write.write_all(first).ok()?;
@@ -753,6 +761,56 @@ mod tests {
             &[],
         )
         .expect("reads the bare-LF answer");
+    }
+
+    /// A head whose lines use LF but whose blank line is CRLF is still a head to
+    /// the reference's line reader, which strips the `\r` from each line.
+    #[test]
+    fn a_mixed_lf_crlf_answer_reaches_the_split_dial() {
+        let answer =
+            b"HTTP/1.1 101 Switching Protocols\nConnection: Upgrade\nUpgrade: websocket\n\r\n";
+        connect_split(
+            std::io::Cursor::new(answer.to_vec()),
+            Recorder::default(),
+            "oracle.example",
+            "/tunnel",
+            0,
+            &[],
+        )
+        .expect("reads the mixed-ending answer");
+    }
+
+    /// One `read` per 512-octet window, so a dribbled head costs the windows it
+    /// spans and no more; the count is on the reader, not on a socket.
+    #[test]
+    fn a_head_costs_one_read_per_window() {
+        struct Counted {
+            data: Vec<u8>,
+            at: usize,
+            reads: usize,
+        }
+
+        impl Read for Counted {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                let n = (self.data.len() - self.at).min(buf.len());
+                buf[..n].copy_from_slice(&self.data[self.at..self.at + n]);
+                self.at += n;
+                Ok(n)
+            }
+        }
+
+        let mut wire = vec![b'A'; 1025];
+        wire.extend_from_slice(b"\r\n\r\n");
+        let mut reader = Counted {
+            data: wire,
+            at: 0,
+            reads: 0,
+        };
+        let (head, at) = read_upgrade_head(&mut reader, HEAD_LIMIT).expect("reads the head");
+        assert_eq!(at, 1029, "the head ends after the terminator");
+        assert_eq!(head.len(), 1029, "the head keeps every octet it read");
+        assert_eq!(reader.reads, 3, "one read per 512-octet window");
     }
 
     /// A payload that fits the budget rides with the GET, so the server has it before the reader is even built and the caller sends nothing after.
