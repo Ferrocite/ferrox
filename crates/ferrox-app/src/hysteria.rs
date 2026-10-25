@@ -117,6 +117,8 @@ pub(crate) struct Session {
 pub(crate) struct StreamWake {
     gen: Mutex<u64>,
     cv: Condvar,
+    /// Whether the stream already has a wake the reader has not taken, so a datagram that leaves it readable does not bump the latch again.
+    pending: AtomicBool,
 }
 
 impl StreamWake {
@@ -125,10 +127,17 @@ impl StreamWake {
     }
 
     fn bump(&self) {
+        if self.pending.swap(true, Ordering::Relaxed) {
+            return;
+        }
         if let Ok(mut gen) = self.gen.lock() {
             *gen = gen.wrapping_add(1);
         }
         self.cv.notify_all();
+    }
+
+    fn clear(&self) {
+        self.pending.store(false, Ordering::Relaxed);
     }
 
     fn wait(&self, seen: u64, timeout: Duration) {
@@ -169,6 +178,7 @@ impl Driver {
         let wake = Arc::new(StreamWake {
             gen: Mutex::new(0),
             cv: Condvar::new(),
+            pending: AtomicBool::new(false),
         });
         if let Ok(mut streams) = self.streams.lock() {
             streams.insert(stream, Arc::clone(&wake));
@@ -355,7 +365,10 @@ fn recv_reply(
             .as_ref()
             .is_some_and(|driver| driver.running());
         match wake {
-            Some(wake) if pumped => wake.wait(before, STREAM_POLL),
+            Some(wake) if pumped => {
+                wake.clear();
+                wake.wait(before, STREAM_POLL);
+            }
             _ => {
                 let _ = drive_once(session, STREAM_POLL);
             }
@@ -603,6 +616,7 @@ impl Read for Flow {
                 .as_ref()
                 .is_some_and(|driver| driver.running());
             if let Some(wake) = self.wake.as_ref().filter(|_| pumped) {
+                wake.clear();
                 wake.wait(before, STREAM_POLL);
                 continue;
             }
