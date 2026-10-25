@@ -1232,8 +1232,7 @@ fn start_keepalive(shared: Arc<Shared>, settings: &GrpcSettings) {
             let sent = shared
                 .stream
                 .lock()
-                .map(|mut socket| socket.write_slices(&[&head, &body]))
-                .unwrap_or(false);
+                .is_ok_and(|mut socket| socket.write_slices(&[&head, &body]));
             if !sent {
                 shared.dead.store(true, Ordering::SeqCst);
                 return;
