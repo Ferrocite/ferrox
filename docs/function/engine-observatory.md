@@ -2,12 +2,12 @@
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/observatory.rs
-- symbols: probe_stream, tunnel_stream
+- symbols: probe_stream, tunnel_stream, observatory_settings, burst_observatory_settings, healthping_settings
 - scenarios: vless-raw, vmess-raw, trojan-raw, shadowsocks-raw
 <!-- scope:end -->
 Row 149's engine half: xray's `observatory` and `burstObservatory` apps probe the outbounds a balancer selects, and the balancer's strategy reads that history. This page is the probe loop and the status it publishes; [`engine-router`](engine-router.md) is the rule scan that hands a flow to a balancer.
 
-A config may name either app at the top level. `observatory` is the legacy loop: `subjectSelector` prefixes pick outbounds, `probeURL` defaults to `https://www.google.com/generate_204`, `probeInterval` defaults to 10 seconds, and `enableConcurrency` probes every selected tag at once instead of in sorted order. A probe is one HTTP `GET`; any response means alive and the time to its headers is the delay in milliseconds; a failure publishes `99999999`, the reference's sentinel. `burstObservatory.pingConfig` is required, `destination` defaults to the Chromium connectivity URL, `interval` to one minute (never below ten seconds), `sampling` to ten, `timeout` to five seconds and `httpMethod` to `HEAD`. A failed sample is stored unless `connectivity` is configured and that direct URL fails too, in which case the network is down and the sample is not put.
+A config may name either app at the top level, in the JSON dialect or as the protobuf `xray.app.observatory.Config`/`xray.app.observatory.burst.Config` messages, which the bridge decodes to the same keys. `observatory` is the legacy loop: `subjectSelector` prefixes pick outbounds, `probeURL` defaults to `https://www.google.com/generate_204`, `probeInterval` defaults to 10 seconds, and `enableConcurrency` probes every selected tag at once instead of in sorted order. A probe is one HTTP `GET`; any response means alive and the time to its headers is the delay in milliseconds; a failure publishes `99999999`, the reference's sentinel. `burstObservatory.pingConfig` is required, `destination` defaults to the Chromium connectivity URL, `interval` to one minute (never below ten seconds), `sampling` to ten, `timeout` to five seconds and `httpMethod` to `HEAD`. A failed sample is stored unless `connectivity` is configured and that direct URL fails too, in which case the network is down and the sample is not put.
 
 When both blocks are present the legacy app runs, as the reference's first-of-type observatory lookup does; both are parsed first, so a malformed burst block is still a startup refusal. The burst history is a ring of `sampling` samples with a validity of twice the sampling window; a sample expires on read, a failure counts in `fail`, and the published `average`/`deviation` are the reference's integer nanoseconds. An outbound with no reading is unknown to the balancer, not dead.
 
