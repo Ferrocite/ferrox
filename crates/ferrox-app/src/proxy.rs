@@ -25378,9 +25378,7 @@ mod tests {
                     "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
         ))
         .expect("parses");
-        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let port = probe.local_addr().expect("addr").port();
-        drop(probe);
+        let port = 22015;
         let address = format!("127.0.0.1:{port}");
         assert!(serve_trojan_inbound(&address, &inbound, true));
         let waited = Instant::now();
@@ -25416,6 +25414,72 @@ mod tests {
         assert_eq!(
             got, b"early",
             "the pipelined payload reaches the target and returns"
+        );
+    }
+
+    /// A trojan UDP client that pipelines its first datagram with the request header keeps it.
+    #[test]
+    fn a_trojan_tls_udp_probe_keeps_the_datagram_that_rides_with_the_header() {
+        let (cert, key, client) = tls_cert_json();
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            while let Ok((n, src)) = echo.recv_from(&mut buf) {
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan",
+                "settings": {{"clients": [{{"password": "secret"}}],
+                    "fallbacks": [{{"dest": "127.0.0.1:9"}}]}},
+                "streamSettings": {{"network": "tcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let port = 22016;
+        let address = format!("127.0.0.1:{port}");
+        assert!(serve_trojan_inbound(&address, &inbound, true));
+        let waited = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(10),
+                "trojan listener never bound"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let addr: SocketAddr = address.parse().expect("addr");
+        let mut session = dial_tls_session(&addr, &client, None).expect("dialled");
+        let mut request = Vec::new();
+        request.extend_from_slice(&trojan_key("secret"));
+        request.extend_from_slice(b"\r\n\x03\x01\x7f\x00\x00\x01");
+        request.extend_from_slice(&echo_port.to_be_bytes());
+        request.extend_from_slice(b"\r\n");
+        request.push(1);
+        request.extend_from_slice(&[127, 0, 0, 1]);
+        request.extend_from_slice(&echo_port.to_be_bytes());
+        request.extend_from_slice(&5u16.to_be_bytes());
+        request.extend_from_slice(b"\r\nearly");
+        session.write_all(&request).expect("writes");
+        let mut got = Vec::new();
+        let mut buf = [0u8; 64];
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            match session.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(error) if is_timeout(&error) => {}
+                Err(_) => break,
+            }
+            if got.ends_with(b"early") {
+                break;
+            }
+        }
+        assert!(
+            got.ends_with(b"early"),
+            "the pipelined datagram reaches the target and returns: {got:?}"
         );
     }
 
