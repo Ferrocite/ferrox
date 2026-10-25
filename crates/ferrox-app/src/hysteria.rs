@@ -1,7 +1,7 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,68 +32,6 @@ const UDP_POLL: Duration = Duration::from_secs(1);
 /// A target reply is a whole UDP datagram, so one buffer of the wire's UDP ceiling holds any single response the association reads.
 const UDP_TARGET_BUF: usize = hysteria::MAX_UDP_PAYLOAD;
 
-/// Temporary: where the server's send path spends its time, printed every two seconds of `Router::idle` and read from the cell's `server.log`.
-struct Stats {
-    ticks: AtomicU64,
-    drive: AtomicU64,
-    drive_lock_ns: AtomicU64,
-    send_all: AtomicU64,
-    stream_send: AtomicU64,
-    short: AtomicU64,
-    send_lock_ns: AtomicU64,
-    sleeps: AtomicU64,
-    sleep_ns: AtomicU64,
-    sent: AtomicU64,
-    flush: AtomicU64,
-    drain_bytes: AtomicU64,
-}
-
-static STATS: Stats = Stats {
-    ticks: AtomicU64::new(0),
-    drive: AtomicU64::new(0),
-    drive_lock_ns: AtomicU64::new(0),
-    send_all: AtomicU64::new(0),
-    stream_send: AtomicU64::new(0),
-    short: AtomicU64::new(0),
-    send_lock_ns: AtomicU64::new(0),
-    sleeps: AtomicU64::new(0),
-    sleep_ns: AtomicU64::new(0),
-    sent: AtomicU64::new(0),
-    flush: AtomicU64::new(0),
-    drain_bytes: AtomicU64::new(0),
-};
-
-impl Stats {
-    fn add(counter: &AtomicU64, since: Instant) {
-        counter.fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
-    }
-
-    fn report(&self) {
-        if !self
-            .ticks
-            .fetch_add(1, Ordering::Relaxed)
-            .is_multiple_of(20)
-        {
-            return;
-        }
-        let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
-        eprintln!(
-            "hy-stats: drive={} drive_lock_ms={} send_all={} stream_send={} short={} send_lock_ms={} sleeps={} sleep_ms={} sent_mib={} flush={}",
-            get(&self.drive),
-            get(&self.drive_lock_ns) / 1_000_000,
-            get(&self.send_all),
-            get(&self.stream_send),
-            get(&self.short),
-            get(&self.send_lock_ns) / 1_000_000,
-            get(&self.sleeps),
-            get(&self.sleep_ns) / 1_000_000,
-            get(&self.sent) / (1024 * 1024),
-            get(&self.flush),
-        );
-        eprintln!("hy-drain: bytes={}", get(&self.drain_bytes));
-    }
-}
-
 pub(crate) struct Dial {
     pub(crate) host: String,
     pub(crate) address: String,
@@ -114,11 +52,9 @@ pub(crate) struct Session {
 }
 
 /// One stream's latch: the pump bumps it when a datagram filled the stream, and the flow reading it parks until then instead of waiting on the shared socket with the others.
-pub(crate) struct StreamWake {
+struct StreamWake {
     gen: Mutex<u64>,
     cv: Condvar,
-    /// Whether the stream already has a wake the reader has not taken, so a datagram that leaves it readable does not bump the latch again.
-    pending: AtomicBool,
 }
 
 impl StreamWake {
@@ -127,17 +63,10 @@ impl StreamWake {
     }
 
     fn bump(&self) {
-        if self.pending.swap(true, Ordering::Relaxed) {
-            return;
-        }
         if let Ok(mut gen) = self.gen.lock() {
             *gen = gen.wrapping_add(1);
         }
         self.cv.notify_all();
-    }
-
-    fn clear(&self) {
-        self.pending.store(false, Ordering::Relaxed);
     }
 
     fn wait(&self, seen: u64, timeout: Duration) {
@@ -178,7 +107,6 @@ impl Driver {
         let wake = Arc::new(StreamWake {
             gen: Mutex::new(0),
             cv: Condvar::new(),
-            pending: AtomicBool::new(false),
         });
         if let Ok(mut streams) = self.streams.lock() {
             streams.insert(stream, Arc::clone(&wake));
@@ -202,7 +130,7 @@ impl Driver {
             };
             let mut ready = Vec::with_capacity(16);
             while !pump.stop.load(Ordering::Relaxed) {
-                if !drive_once(&session, STREAM_POLL, Some(&mut ready)) {
+                if !drive_once(&session, STREAM_POLL) {
                     let closed = match session.shared.lock() {
                         Ok(conn) => conn.is_closed(),
                         Err(_) => true,
@@ -212,6 +140,10 @@ impl Driver {
                     }
                     std::thread::sleep(STREAM_POLL);
                     continue;
+                }
+                ready.clear();
+                if let Ok(conn) = session.shared.lock() {
+                    ready.extend(conn.readable());
                 }
                 if ready.is_empty() {
                     continue;
@@ -232,26 +164,16 @@ impl Driver {
 
 fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
     let deadline = Instant::now() + crate::quic::SEND_WAIT;
-    STATS.send_all.fetch_add(1, Ordering::Relaxed);
     loop {
         let last = buf.is_empty();
         if last && !fin {
             return true;
         }
-        let want = buf.len();
-        let locked = Instant::now();
         let Ok(mut conn) = session.shared.lock() else {
             return false;
         };
-        Stats::add(&STATS.send_lock_ns, locked);
-        STATS.stream_send.fetch_add(1, Ordering::Relaxed);
         match conn.stream_send(stream, buf, fin && last) {
             Ok(written) => {
-                if written < want {
-                    STATS.short.fetch_add(1, Ordering::Relaxed);
-                }
-                STATS.sent.fetch_add(written as u64, Ordering::Relaxed);
-                STATS.flush.fetch_add(1, Ordering::Relaxed);
                 buf = &buf[written..];
                 crate::quic::flush_egress(&mut conn, &session.sock);
                 if buf.is_empty() && (!fin || last) {
@@ -269,15 +191,12 @@ fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
             Err(_) => return false,
         }
         drop(conn);
-        STATS.sleeps.fetch_add(1, Ordering::Relaxed);
-        let slept = Instant::now();
         std::thread::sleep(STREAM_POLL);
-        Stats::add(&STATS.sleep_ns, slept);
     }
 }
 
 /// One turn of the quiche wheel with the lock held for quiche calls only, never for the socket wait between them — the shape the pool's pump takes, so a writer's one `send_all` is never starved by a reader's polling.
-fn drive_once(session: &Session, wait: Duration, ready: Option<&mut Vec<u64>>) -> bool {
+fn drive_once(session: &Session, wait: Duration) -> bool {
     let timeout = {
         let Ok(conn) = session.shared.lock() else {
             return false;
@@ -325,10 +244,6 @@ fn drive_once(session: &Session, wait: Duration, ready: Option<&mut Vec<u64>>) -
         None => conn.on_timeout(),
     }
     crate::quic::flush_egress(&mut conn, &session.sock);
-    if let Some(ready) = ready {
-        ready.clear();
-        ready.extend(conn.readable());
-    }
     true
 }
 
@@ -365,12 +280,9 @@ fn recv_reply(
             .as_ref()
             .is_some_and(|driver| driver.running());
         match wake {
-            Some(wake) if pumped => {
-                wake.clear();
-                wake.wait(before, STREAM_POLL);
-            }
+            Some(wake) if pumped => wake.wait(before, STREAM_POLL),
             _ => {
-                let _ = drive_once(session, STREAM_POLL, None);
+                let _ = drive_once(session, STREAM_POLL);
             }
         }
     }
@@ -410,7 +322,7 @@ fn read_headers_block(session: &Session, stream: u64, deadline: Instant) -> Opti
         if let Some(n) = read {
             head.extend_from_slice(&room.as_mut()[..n]);
         } else {
-            let _ = drive_once(session, STREAM_POLL, None);
+            let _ = drive_once(session, STREAM_POLL);
         }
     }
 }
@@ -516,12 +428,9 @@ pub(crate) struct Flow {
     drive: bool,
     /// The latch the session's pump bumps when this stream has data; `None` when this flow drives.
     wake: Option<Arc<StreamWake>>,
-    /// The server downlink queue the router drains; `None` on a client flow, which writes its own bytes.
-    sender: Option<Arc<Sender>>,
 }
 
 impl Flow {
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_parts(
         shared: Arc<Mutex<quiche::Connection>>,
         sock: Arc<crate::quic::Datagram>,
@@ -529,8 +438,6 @@ impl Flow {
         stream: u64,
         backlog: Vec<u8>,
         drive: bool,
-        wake: Option<Arc<StreamWake>>,
-        sender: Option<Arc<Sender>>,
     ) -> Self {
         Self {
             session: Session {
@@ -544,31 +451,14 @@ impl Flow {
             backlog,
             at: 0,
             drive,
-            wake,
-            sender,
+            wake: None,
         }
     }
 
     pub(crate) fn close(&self) {
-        if let Some(sender) = &self.sender {
-            sender.close();
-            if let Ok(mut conn) = self.session.shared.lock() {
-                drain(&mut conn, self.stream, sender);
-                crate::quic::flush_egress(&mut conn, &self.session.sock);
-            }
-            return;
-        }
         if let Ok(mut conn) = self.session.shared.lock() {
             let _ = conn.stream_send(self.stream, &[], true);
             crate::quic::flush_egress(&mut conn, &self.session.sock);
-        }
-    }
-}
-
-impl Drop for Flow {
-    fn drop(&mut self) {
-        if let Some(sender) = &self.sender {
-            sender.close();
         }
     }
 }
@@ -607,7 +497,7 @@ impl Read for Flow {
                 return Ok(n);
             }
             if self.drive {
-                let _ = drive_once(&self.session, STREAM_POLL, None);
+                let _ = drive_once(&self.session, STREAM_POLL);
                 continue;
             }
             let pumped = self
@@ -616,7 +506,6 @@ impl Read for Flow {
                 .as_ref()
                 .is_some_and(|driver| driver.running());
             if let Some(wake) = self.wake.as_ref().filter(|_| pumped) {
-                wake.clear();
                 wake.wait(before, STREAM_POLL);
                 continue;
             }
@@ -638,14 +527,7 @@ impl Write for Flow {
         if buf.is_empty() {
             return Ok(0);
         }
-        let Some(sender) = &self.sender else {
-            return if send_all(&self.session, self.stream, buf, false) {
-                Ok(buf.len())
-            } else {
-                Err(broken())
-            };
-        };
-        if sender.push(buf, self.stream, &self.session) {
+        if send_all(&self.session, self.stream, buf, false) {
             Ok(buf.len())
         } else {
             Err(broken())
@@ -679,7 +561,6 @@ pub(crate) fn open_flow(session: &Session, stream: u64, header: &[u8]) -> Option
         at: 0,
         drive,
         wake,
-        sender: None,
     })
 }
 
@@ -937,172 +818,6 @@ pub(crate) fn server_config(
 
 pub(crate) type Serve = Arc<dyn Fn(Flow) + Send + Sync>;
 
-/// The most one stream's downlink may buffer before its relay waits for the router to drain it, so a connection whose window stays shut never grows memory without bound.
-const QUEUE_CAP: usize = 128 * 1024;
-
-/// One stream's downlink queue: the relay appends, and whichever of the router or the relay itself finds the connection lock free sends from it. One queue and one drainer at a time, so a window credit is never split across threads that would each write a slice and then block.
-pub(crate) struct Sender {
-    queue: Mutex<SenderQueue>,
-    room: Condvar,
-    queued: AtomicUsize,
-}
-
-struct SenderQueue {
-    chunks: VecDeque<Vec<u8>>,
-    front: usize,
-    closed: bool,
-    fin: bool,
-}
-
-impl Sender {
-    fn new() -> Self {
-        Self {
-            queue: Mutex::new(SenderQueue {
-                chunks: VecDeque::new(),
-                front: 0,
-                closed: false,
-                fin: false,
-            }),
-            room: Condvar::new(),
-            queued: AtomicUsize::new(0),
-        }
-    }
-
-    /// Queues `buf` and returns once the connection has taken it, sending it here when the router does not hold the lock and waiting for the drain it will do otherwise.
-    fn push(&self, buf: &[u8], stream: u64, session: &Session) -> bool {
-        {
-            let Ok(mut queue) = self.queue.lock() else {
-                return false;
-            };
-            while !queue.closed && self.queued.load(Ordering::Relaxed) + buf.len() > QUEUE_CAP {
-                queue = match self.room.wait(queue) {
-                    Ok(queue) => queue,
-                    Err(_) => return false,
-                };
-            }
-            if queue.closed {
-                return false;
-            }
-            queue.chunks.push_back(buf.to_vec());
-            self.queued.fetch_add(buf.len(), Ordering::Relaxed);
-        }
-        loop {
-            if let Ok(mut conn) = session.shared.try_lock() {
-                if drain(&mut conn, stream, self) {
-                    crate::quic::flush_egress(&mut conn, &session.sock);
-                }
-                if self.queued.load(Ordering::Relaxed) == 0 {
-                    return true;
-                }
-            }
-            let Ok(queue) = self.queue.lock() else {
-                return false;
-            };
-            if self.queued.load(Ordering::Relaxed) == 0 {
-                return true;
-            }
-            if queue.closed {
-                return false;
-            }
-            let _ = self.room.wait_timeout(queue, STREAM_POLL);
-        }
-    }
-
-    fn close(&self) {
-        if let Ok(mut queue) = self.queue.lock() {
-            queue.closed = true;
-        }
-        self.room.notify_all();
-    }
-
-    fn done(&self) -> bool {
-        self.queue
-            .lock()
-            .map_or(true, |queue| queue.closed && queue.chunks.is_empty())
-    }
-}
-
-/// Sends as much of a stream's queue as the connection takes in one lock, and wakes the relay if that made room.
-fn drain(conn: &mut quiche::Connection, stream: u64, sender: &Sender) -> bool {
-    let Ok(mut queue) = sender.queue.lock() else {
-        return false;
-    };
-    let mut wrote = false;
-    loop {
-        let Some(chunk_len) = queue.chunks.front().map(Vec::len) else {
-            if queue.closed && !queue.fin && conn.stream_send(stream, &[], true).is_ok() {
-                queue.fin = true;
-                wrote = true;
-            }
-            break;
-        };
-        let rest = chunk_len - queue.front;
-        let fin = queue.closed && queue.chunks.len() == 1;
-        let sent = match conn.stream_send(stream, &queue.chunks[0][queue.front..], fin) {
-            Ok(0) | Err(quiche::Error::Done) => break,
-            Ok(sent) => sent,
-            Err(_) => {
-                queue.closed = true;
-                queue.chunks.clear();
-                queue.front = 0;
-                sender.queued.store(0, Ordering::Relaxed);
-                break;
-            }
-        };
-        wrote = true;
-        STATS.drain_bytes.fetch_add(sent as u64, Ordering::Relaxed);
-        queue.front += sent;
-        sender.queued.fetch_sub(sent, Ordering::Relaxed);
-        if queue.front == chunk_len {
-            queue.chunks.pop_front();
-            queue.front = 0;
-            if fin {
-                queue.fin = true;
-            }
-        }
-        if sent < rest {
-            break;
-        }
-    }
-    drop(queue);
-    if wrote {
-        sender.room.notify_all();
-    }
-    wrote
-}
-
-/// Drains every served stream's queue in one pass, so the flush that follows carries whatever the datagram opened room for.
-fn drain_all(conn: &mut quiche::Connection, inbound: &Inbound) {
-    for (stream, sender) in &inbound.out {
-        drain(conn, *stream, sender);
-    }
-}
-
-/// Starts the relay for a newly readable flow stream, which appends to the sender the router drains.
-#[allow(clippy::too_many_arguments)]
-fn spawn_stream(
-    shared: &Arc<Mutex<quiche::Connection>>,
-    sock: &Arc<crate::quic::Datagram>,
-    local: SocketAddr,
-    id: u64,
-    serve: &Serve,
-    masq: &Arc<Masquerade>,
-    sender: &Arc<Sender>,
-    peer: SocketAddr,
-) {
-    let (shared, sock, serve, masq, sender) = (
-        Arc::clone(shared),
-        Arc::clone(sock),
-        Arc::clone(serve),
-        Arc::clone(masq),
-        Arc::clone(sender),
-    );
-    std::thread::spawn(move || {
-        serve_stream(&shared, &sock, local, id, &serve, peer, &masq, &sender);
-        sender.close();
-    });
-}
-
 struct Inbound {
     conn: Arc<Mutex<quiche::Connection>>,
     client_cid: Vec<u8>,
@@ -1111,7 +826,6 @@ struct Inbound {
     settings_done: bool,
     auth_buf: Vec<u8>,
     served: HashSet<u64>,
-    out: HashMap<u64, Arc<Sender>>,
     udp: HashMap<u32, UdpFlow>,
 }
 
@@ -1149,7 +863,6 @@ fn drain_settings(conn: &mut quiche::Connection) -> bool {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn serve_stream(
     shared: &Arc<Mutex<quiche::Connection>>,
     sock: &Arc<crate::quic::Datagram>,
@@ -1158,7 +871,6 @@ fn serve_stream(
     serve: &Serve,
     peer: SocketAddr,
     masq: &Masquerade,
-    sender: &Arc<Sender>,
 ) {
     let mut head = Vec::with_capacity(8);
     let mut room = Unfilled::<64>::new();
@@ -1215,8 +927,6 @@ fn serve_stream(
         stream,
         head,
         false,
-        None,
-        Some(Arc::clone(sender)),
     );
     // The prefix stays in the buffer and the cursor steps over it, so no payload byte is moved.
     flow.at = prefix;
@@ -1879,7 +1589,7 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
 fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpSocket) {
     let mut reply = Vec::with_capacity(3 + 25 + UDP_TARGET_BUF);
     loop {
-        if stop.load(Ordering::Relaxed) || !drive_once(session, UDP_POLL, None) {
+        if stop.load(Ordering::Relaxed) || !drive_once(session, UDP_POLL) {
             break;
         }
         let Ok(mut conn) = session.shared.lock() else {
@@ -2066,7 +1776,6 @@ impl Router<'_> {
                 settings_done: false,
                 auth_buf: Vec::new(),
                 served: HashSet::new(),
-                out: HashMap::new(),
                 udp: HashMap::new(),
             },
         );
@@ -2082,22 +1791,17 @@ impl Router<'_> {
             masq,
             local,
         } = self;
-        let Some(inbound) = routes.get(dcid) else {
+        let Some(shared) = routes.get(dcid).map(|i| Arc::clone(&i.conn)) else {
             return;
         };
-        let shared = Arc::clone(&inbound.conn);
         let info = quiche::RecvInfo { from, to: *local };
         {
-            let locked = Instant::now();
             let Ok(mut conn) = shared.lock() else {
                 return;
             };
-            Stats::add(&STATS.drive_lock_ns, locked);
-            STATS.drive.fetch_add(1, Ordering::Relaxed);
             if conn.recv(packet, info).is_err() {
                 return;
             }
-            drain_all(&mut conn, inbound);
             flush(sock, &mut conn, out.as_mut());
             if !conn.is_established() || conn.is_closed() {
                 return;
@@ -2153,9 +1857,23 @@ impl Router<'_> {
                     continue;
                 }
                 inbound.served.insert(id);
-                let sender = Arc::new(Sender::new());
-                inbound.out.insert(id, Arc::clone(&sender));
-                spawn_stream(&shared, sock, *local, id, serve, masq, &sender, from);
+                let thread_shared = Arc::clone(&shared);
+                let thread_sock = Arc::clone(sock);
+                let thread_serve = Arc::clone(serve);
+                let thread_masq = Arc::clone(masq);
+                let local = *local;
+                let peer = from;
+                std::thread::spawn(move || {
+                    serve_stream(
+                        &thread_shared,
+                        &thread_sock,
+                        local,
+                        id,
+                        &thread_serve,
+                        peer,
+                        &thread_masq,
+                    );
+                });
             }
             relay_datagrams(routes, sock, &shared, dcid, &mut conn);
             flush(sock, &mut conn, out.as_mut());
@@ -2163,7 +1881,6 @@ impl Router<'_> {
     }
 
     fn idle(&mut self) {
-        STATS.report();
         let Self {
             routes, sock, out, ..
         } = self;
@@ -2181,9 +1898,7 @@ impl Router<'_> {
                 return false;
             }
             conn.on_timeout();
-            drain_all(&mut conn, inbound);
             flush(sock, &mut conn, out.as_mut());
-            inbound.out.retain(|_, sender| !sender.done());
             inbound.udp.retain(|_, flow| {
                 if now.duration_since(flow.last) > UDP_IDLE {
                     flow.stop.store(true, Ordering::Relaxed);
@@ -2370,8 +2085,6 @@ mod tests {
             FIRST_FLOW_STREAM,
             head,
             true,
-            None,
-            None,
         );
         // The state serve_stream hands over: the frame type stepped over, nothing moved.
         flow.at = hysteria::read_tcp_prefix(&flow.backlog).expect("prefix");
