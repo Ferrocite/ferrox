@@ -15,6 +15,12 @@ cd "$(dirname "$0")/.."
 source scripts/lib-shared-target.sh
 shared="$(ferrox_shared_target)"
 
+# Keep a free-space floor before a build: a full disk fails every agent at once,
+# and the idlest clones are cheap to recreate from the seed.
+if [[ -z "${CI:-}" ]]; then
+  ./scripts/gc-target.sh --ensure-free "${FERROX_MIN_FREE_GIB:-25}" --keep "$PWD" >/dev/null || true
+fi
+
 if [[ "$(git rev-parse --git-dir)" == "$(git rev-parse --git-common-dir)" ]]; then
   exit 0
 fi
