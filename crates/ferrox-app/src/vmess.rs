@@ -650,16 +650,15 @@ impl Flow {
         self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
         &self.nonce
     }
-    fn seal_onto(&mut self, plain: &[u8], out: &mut Vec<u8>) -> bool {
+    fn seal_onto(&mut self, plain: &[u8], out: &mut Vec<u8>) {
         let at = out.len();
         out.extend_from_slice(plain);
         self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
         let nonce = &self.nonce;
-        let sealed = match &self.aead {
+        match &self.aead {
             Aead::Aes(aes) => {
                 let tag = aes.seal_in_place(nonce, b"", &mut out[at..]);
                 out.extend_from_slice(&tag);
-                true
             }
             Aead::Chacha(key) => {
                 let tag = ferrox_core::aead::chacha20_poly1305_seal_in_place(
@@ -669,17 +668,11 @@ impl Flow {
                     &mut out[at..],
                 );
                 out.extend_from_slice(&tag);
-                true
             }
-            Aead::Plain => true,
-        };
-        if !sealed {
-            out.truncate(at);
-            return false;
+            Aead::Plain => {}
         }
         // Wraps past 65535 like the reference's `GenerateChunkNonce`; see the method page.
         self.counter = self.counter.wrapping_add(1);
-        true
     }
     fn open_chunk(&mut self, chunk: &mut [u8]) -> Option<usize> {
         let plain_len = match &self.aead {
@@ -895,10 +888,7 @@ fn stage_frame(send: &mut Flow, plain: &[u8], staging: &mut Vec<u8>, pad: &mut P
         };
         staging.extend_from_slice(&wire.to_be_bytes());
     }
-    if !send.seal_onto(plain, staging) {
-        staging.truncate(at);
-        return false;
-    }
+    send.seal_onto(plain, staging);
     if padding > 0 {
         let Some(bytes) = pad.take(padding) else {
             staging.truncate(at);
@@ -937,9 +927,6 @@ fn stage_frames(
         if !rest.is_empty() {
             return false;
         }
-    }
-    if staging.is_empty() {
-        return true;
     }
     write_frames(stream, staging)
 }
@@ -2806,7 +2793,7 @@ mod tests {
             )
             .expect("fresh");
             let mut sealed = Vec::new();
-            assert!(flow.seal_onto(b"hello", &mut sealed));
+            flow.seal_onto(b"hello", &mut sealed);
             assert_eq!(sealed, golden);
             let mut recv = Flow::fresh(
                 cipher,
@@ -2848,7 +2835,7 @@ mod tests {
                 )
                 .expect("recvs");
                 let mut sealed = Vec::new();
-                assert!(send.seal_onto(&plain, &mut sealed));
+                send.seal_onto(&plain, &mut sealed);
                 assert_eq!(sealed.len(), plain.len() + tag);
                 let back = recv.open_chunk(&mut sealed).expect("opens");
                 assert_eq!(back, plain.len());
@@ -2927,7 +2914,7 @@ mod tests {
                 let mut first = [0u8; 12];
                 first.copy_from_slice(send.nonce());
                 let mut sealed = Vec::new();
-                assert!(send.seal_onto(b"ping", &mut sealed));
+                send.seal_onto(b"ping", &mut sealed);
                 let back = recv.open_chunk(&mut sealed).expect("opens");
                 assert_eq!(&sealed[..back], b"ping");
                 assert_eq!(send.counter, at.wrapping_add(1));
@@ -2959,13 +2946,13 @@ mod tests {
             send.counter = u16::MAX;
             recv.counter = u16::MAX;
             let mut sealed = Vec::new();
-            assert!(send.seal_onto(b"ping", &mut sealed));
+            send.seal_onto(b"ping", &mut sealed);
             assert_eq!(send.counter, 0);
             let back = recv.open_chunk(&mut sealed).expect("opens across the wrap");
             assert_eq!(&sealed[..back], b"ping");
             assert_eq!(recv.counter, 0);
             let mut sealed = Vec::new();
-            assert!(send.seal_onto(b"pong", &mut sealed));
+            send.seal_onto(b"pong", &mut sealed);
             let back = recv.open_chunk(&mut sealed).expect("opens after the wrap");
             assert_eq!(&sealed[..back], b"pong");
         }
@@ -3034,7 +3021,7 @@ mod tests {
             )
             .expect("sends");
             let mut frame = Vec::new();
-            assert!(send.seal_onto(b"ping", &mut frame));
+            send.seal_onto(b"ping", &mut frame);
             let mut recv = Flow::fresh(
                 cipher,
                 &[0x55u8; 16],
@@ -3410,7 +3397,7 @@ mod tests {
                     "frame {frame}: counter then the iv tail"
                 );
                 let mut ours = Vec::new();
-                assert!(flow.seal_onto(&plain, &mut ours), "seals frame {len}");
+                flow.seal_onto(&plain, &mut ours);
 
                 let mut want = plain.clone();
                 let want_tag = cipher
