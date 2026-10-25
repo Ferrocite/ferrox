@@ -178,6 +178,15 @@ fn serve_root(label: &str, root: &Json) -> ! {
     );
     crate::dnsapp::install(root)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    crate::policy::install(root)
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    crate::stats::install(root)
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    crate::metrics::install(root)
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    crate::accesslog::install(root)
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    install_default_outbound_tag(root);
     let freedom =
         has_protocol(root, "outbounds", "freedom") || find_unbuilt_outbound(root).is_some();
     let outbound =
@@ -327,11 +336,7 @@ fn serve_inbounds(
                             "socks" => Role::Socks { out, accounts },
                             _ => Role::Mixed { out, accounts },
                         };
-                        spawn_role(
-                            address,
-                            role,
-                            crate::config::accept_proxy_protocol(inbound.get("streamSettings")),
-                        );
+                        spawn_role(address, inbound_role(inbound, role), inbound_tag(inbound));
                         inbounds += 1;
                     }
                     "dokodemo-door" => {
@@ -423,14 +428,9 @@ fn inbound_served(protocol: &str) -> bool {
     SERVED_INBOUNDS.contains(&protocol)
 }
 
-fn spawn_role(address: &str, role: Role, accept_proxy_protocol: bool) {
+fn spawn_role(address: &str, role: Role, tag: Option<String>) {
     let address = address.to_owned();
-    let role = if accept_proxy_protocol {
-        Role::Proxied(Box::new(role))
-    } else {
-        role
-    };
-    thread::spawn(move || accept_loop(&address, &role));
+    thread::spawn(move || accept_loop(&address, &role, tag.as_deref()));
 }
 
 /// The role a listener serves, wrapped when its config says the first bytes are a PROXY header.
@@ -534,9 +534,54 @@ fn serve_vless_inbound(
                     fallbacks,
                 },
             );
-            thread::spawn(move || accept_loop(&owned, &role));
+            let tag = inbound_tag(inbound);
+            thread::spawn(move || accept_loop(&owned, &role, tag.as_deref()));
             true
         }
+    }
+}
+
+thread_local! {
+    /// The lane the flow on this thread resolved to; a dial under it carries that lane's counters.
+    static OUTBOUND_TAG: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The tag of the one outbound a config without routing uses, which is what its counters key on.
+static DEFAULT_OUTBOUND_TAG: Mutex<Option<String>> = Mutex::new(None);
+
+fn install_default_outbound_tag(root: &Json) {
+    let tag = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .and_then(|rows| rows.first())
+        .and_then(|row| row.get("tag"))
+        .and_then(Json::as_str)
+        .filter(|tag| !tag.is_empty())
+        .map(str::to_owned);
+    *DEFAULT_OUTBOUND_TAG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = tag;
+}
+
+fn default_outbound_tag() -> Option<String> {
+    DEFAULT_OUTBOUND_TAG
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
+}
+
+struct OutboundTag;
+
+impl OutboundTag {
+    fn enter(tag: Option<&str>) -> Self {
+        OUTBOUND_TAG.with(|cell| *cell.borrow_mut() = tag.map(str::to_owned));
+        Self
+    }
+}
+
+impl Drop for OutboundTag {
+    fn drop(&mut self) {
+        OUTBOUND_TAG.with(|cell| *cell.borrow_mut() = None);
     }
 }
 
@@ -545,7 +590,15 @@ fn dial(target: &SocketAddr) -> Result<Connection, Failure> {
     let stream = crate::conn::connect(&crate::conn::Target::Ip(*target), budgets::dial())
         .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?;
     no_delay(&stream);
-    Ok(stream)
+    let meter = OUTBOUND_TAG.with(|cell| {
+        cell.borrow()
+            .as_deref()
+            .map(|tag| crate::stats::outbound(Some(tag)))
+    });
+    Ok(match meter {
+        Some(meter) => stream.with_meter(meter),
+        None => stream,
+    })
 }
 
 pub(crate) fn dial_or_report(target: &SocketAddr) -> Option<Connection> {
@@ -886,6 +939,10 @@ pub(crate) enum Outbound {
     /// A reverse portal, named by an inbound user's tag: its flows ride a mux session the bridge
     /// opened, and the portal answers them from its own side.
     ReversePortal(Arc<crate::reverse::Portal>),
+    /// The metrics app's tag: a flow routed here reaches its own HTTP handler on a loopback lane.
+    Metrics {
+        address: SocketAddr,
+    },
 }
 
 impl Outbound {
@@ -898,6 +955,7 @@ impl Outbound {
             Self::Shadowsocks(ss) => resolve_outbound(&ss.address, ss.port),
             Self::Socks(socks) => resolve_outbound(&socks.address, socks.port),
             Self::Http(http) => resolve_outbound(&http.address, http.port),
+            Self::Metrics { address } => Some(*address),
             Self::Foxy(_)
             | Self::Veepn(_)
             | Self::Freedom
@@ -908,16 +966,16 @@ impl Outbound {
         }
     }
 
-    /// The outbound a flow resolves to; every outbound but a route is its own answer.
-    fn resolved(
+    /// The outbound and the tag that names its lane, which is what the outbound's counters key on.
+    fn resolved_lane(
         &self,
         asked: &Destination,
         network: crate::router::Network,
         client: Option<&Connection>,
-    ) -> &Self {
+    ) -> (&Self, Option<&str>) {
         match self {
-            Self::Route(plan) => plan.pick(asked, network, client),
-            other => other,
+            Self::Route(plan) => plan.lane(asked, network, client),
+            other => (other, None),
         }
     }
 }
@@ -1178,6 +1236,12 @@ fn route_shared(
         if let Some(portal) = portals.get(target) {
             tagged.insert(target.to_owned(), Outbound::ReversePortal(portal));
             continue;
+        }
+        if crate::metrics::tag().as_deref() == Some(target) {
+            if let Some(address) = crate::metrics::tagged_address() {
+                tagged.insert(target.to_owned(), Outbound::Metrics { address });
+                continue;
+            }
         }
         let Some(config) = configs.get(target) else {
             return Err(format!(
@@ -1494,7 +1558,7 @@ pub(crate) struct ShadowsocksOut {
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
 }
 
-fn accept_loop(address: &str, role: &Role) {
+fn accept_loop(address: &str, role: &Role, tag: Option<&str>) {
     let target = parse_target(address)
         .unwrap_or_else(|error| exit(&format!("cannot resolve {address}: {error}")));
     let listener = Listener::bind(&target)
@@ -1503,6 +1567,7 @@ fn accept_loop(address: &str, role: &Role) {
         let Ok(mut stream) = stream else { continue };
         no_delay(&stream);
         let role = role.clone();
+        let tag = tag.map(str::to_owned);
         thread::spawn(move || {
             let (stream, role) = match role {
                 Role::Proxied(inner) => {
@@ -1519,7 +1584,9 @@ fn accept_loop(address: &str, role: &Role) {
                 role => (stream, role),
             };
             // Armed once per accepted stream, as the reference wraps its listener's conn.
-            let stream = stream.with_mask(role.tcp_mask());
+            let stream = stream
+                .with_mask(role.tcp_mask())
+                .with_meter(crate::stats::inbound(tag.as_deref(), 0));
             front_dispatch(stream, role);
         });
     }
@@ -1861,7 +1928,11 @@ fn serve_vless_raw_with<D, R>(
     R: Fn(&str, u16) -> Option<SocketAddr> + Send + Sync + Clone + 'static,
 {
     // Bound only the opening request read to a wall-clock budget, then restore the blocking relay reads behind it.
-    let _ = stream.set_read_timeout(Some(budgets::handshake()));
+    let handshake = stream
+        .policy()
+        .and_then(|flow| flow.handshake())
+        .unwrap_or_else(budgets::handshake);
+    let _ = stream.set_read_timeout(Some(handshake));
     let (probe, carried) = match fallbacks {
         // With a table on, the reference's first read and its verdict name the flow as a header or a probe.
         Some(_) => {
@@ -1891,7 +1962,7 @@ fn serve_vless_raw_with<D, R>(
 }
 
 fn vless_raw_reply<D, R>(
-    mut stream: Connection,
+    stream: Connection,
     users: &[VlessUser],
     freedom: bool,
     fallbacks: Option<&[Fallback]>,
@@ -1911,9 +1982,28 @@ fn vless_raw_reply<D, R>(
         Probe::Dropped => return,
     };
     let Some(user) = users.iter().find(|user| same_vless_user(&user.id, &got)) else {
-        let Some(rows) = fallbacks else { return };
+        let Some(rows) = fallbacks else {
+            crate::accesslog::record(
+                stream.peer_addr().ok(),
+                false,
+                &target,
+                None,
+                "invalid user",
+                "",
+            );
+            return;
+        };
         return seize_fallback(stream, rows, window, &carried);
     };
+    crate::accesslog::record(
+        stream.peer_addr().ok(),
+        true,
+        &target,
+        None,
+        "",
+        &user.email,
+    );
+    let mut stream = stream.with_meter(crate::stats::user(&user.email, user.level));
     match reverse_ask(users, &got, flow, cmd) {
         ReverseAsk::Allowed(portal) => {
             if stream.write_all(&[0, 0]).is_err() {
@@ -2532,7 +2622,7 @@ fn tunnel_stream(
         .name(name.to_owned())
         .spawn({
             let out = out.clone();
-            move || serve_connect(Connection::Tcp(server), &out, &dest, front, &[])
+            move || serve_connect(Connection::Tcp(server), &out, &dest, front, &[], None)
         })
         .ok()?;
     Some(Connection::Tcp(client))
@@ -3584,7 +3674,8 @@ fn serve_vless_tls_inbound(
             fallbacks,
         },
     );
-    thread::spawn(move || accept_loop(&owned, &role));
+    let tag = inbound_tag(inbound);
+    thread::spawn(move || accept_loop(&owned, &role, tag.as_deref()));
     true
 }
 
@@ -3627,7 +3718,8 @@ fn serve_vless_reality_inbound(
             fallbacks,
         },
     );
-    thread::spawn(move || accept_loop(&owned, &role));
+    let tag = inbound_tag(inbound);
+    thread::spawn(move || accept_loop(&owned, &role, tag.as_deref()));
     true
 }
 
@@ -6255,7 +6347,6 @@ fn hc_content_length(head: &str) -> Option<usize> {
 fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
     let key = trojan_key(&inbound_password(inbound));
     let sec = stream_security(inbound);
-    let accept = crate::config::accept_proxy_protocol(inbound.get("streamSettings"));
     // A REALITY inbound has no Trojan arm yet, and reading only `tls` here would serve it as plaintext.
     if sec == "reality" {
         eprintln!("trojan reality inbound on {address}: refused, not served as plaintext");
@@ -6288,25 +6379,31 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
             };
             spawn_role(
                 address,
-                Role::TrojanTls {
-                    key,
-                    carrier,
-                    freedom,
-                    server,
-                },
-                accept,
+                inbound_role(
+                    inbound,
+                    Role::TrojanTls {
+                        key,
+                        carrier,
+                        freedom,
+                        server,
+                    },
+                ),
+                inbound_tag(inbound),
             );
             true
         }
         carrier => {
             spawn_role(
                 address,
-                Role::Trojan {
-                    key,
-                    carrier,
-                    freedom,
-                },
-                accept,
+                inbound_role(
+                    inbound,
+                    Role::Trojan {
+                        key,
+                        carrier,
+                        freedom,
+                    },
+                ),
+                inbound_tag(inbound),
             );
             true
         }
@@ -6316,7 +6413,6 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
 fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
     let id = inbound_id(inbound);
     let sec = stream_security(inbound);
-    let accept = crate::config::accept_proxy_protocol(inbound.get("streamSettings"));
     match inbound_carrier(inbound) {
         Carrier::Kcp(config) => {
             let serve: KcpServe = if sec == "tls" {
@@ -6346,23 +6442,29 @@ fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
             };
             spawn_role(
                 address,
-                Role::VmessTls {
-                    id,
-                    carrier,
-                    freedom,
-                    server,
-                },
-                accept,
+                inbound_role(
+                    inbound,
+                    Role::VmessTls {
+                        id,
+                        carrier,
+                        freedom,
+                        server,
+                    },
+                ),
+                inbound_tag(inbound),
             );
         }
         other => spawn_role(
             address,
-            Role::Vmess {
-                id,
-                carrier: other,
-                freedom,
-            },
-            accept,
+            inbound_role(
+                inbound,
+                Role::Vmess {
+                    id,
+                    carrier: other,
+                    freedom,
+                },
+            ),
+            inbound_tag(inbound),
         ),
     }
 }
@@ -6450,12 +6552,15 @@ fn serve_dokodemo(address: &str, inbound: &Json, out: &Outbound, label: &str) ->
     if networks.contains(&"tcp") {
         spawn_role(
             address,
-            Role::Dokodemo {
-                out: out.clone(),
-                dest: dest.clone(),
-                port_map: port_map.clone(),
-            },
-            crate::config::accept_proxy_protocol(inbound.get("streamSettings")),
+            inbound_role(
+                inbound,
+                Role::Dokodemo {
+                    out: out.clone(),
+                    dest: dest.clone(),
+                    port_map: port_map.clone(),
+                },
+            ),
+            inbound_tag(inbound),
         );
         armed += 1;
     }
@@ -6588,7 +6693,6 @@ fn serve_ss_kcp_listener(
 fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
     let password = inbound_ss_password(inbound);
     let method = inbound_method(inbound);
-    let accept = crate::config::accept_proxy_protocol(inbound.get("streamSettings"));
     let carrier = inbound_carrier(inbound);
     let udp_raw = matches!(carrier, Carrier::Raw(_));
     let udp_address = address.to_owned();
@@ -6653,13 +6757,16 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
         }
         other => spawn_role(
             address,
-            Role::Shadowsocks {
-                password,
-                method,
-                carrier: other,
-                freedom,
-            },
-            accept,
+            inbound_role(
+                inbound,
+                Role::Shadowsocks {
+                    password,
+                    method,
+                    carrier: other,
+                    freedom,
+                },
+            ),
+            inbound_tag(inbound),
         ),
     }
     if udp_raw {
@@ -10512,13 +10619,24 @@ fn serve_vmess_kcp_tls(
 
 fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) {
     let Some(handshake) = socks_target(&mut client, false, accounts) else {
+        crate::accesslog::record(
+            client.peer_addr().ok(),
+            false,
+            &"unknown",
+            None,
+            "rejected",
+            "",
+        );
         return;
     };
     if handshake.cmd == 3 {
         return serve_socks_udp(client, out);
     }
     // The rules decide the lane first; a blocked flow is granted before it closes, so the front's reply is read.
-    let out = out.resolved(&handshake.asked, crate::router::Network::Tcp, Some(&client));
+    let destination = handshake.asked.authority();
+    crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", "");
+    let (out, tag) =
+        out.resolved_lane(&handshake.asked, crate::router::Network::Tcp, Some(&client));
     if !matches!(out, Outbound::Foxy(_) | Outbound::Veepn(_)) {
         let grant = match handshake.version {
             crate::socks::Version::V5 => Front::Socks.grant_line(),
@@ -10528,7 +10646,7 @@ fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts)
             return;
         }
     }
-    serve_connect(client, out, &handshake.asked, Front::Socks, &[]);
+    serve_connect(client, out, &handshake.asked, Front::Socks, &[], tag);
 }
 
 /// The device front's relay: the front layer's own dial, with the destination the
@@ -10538,8 +10656,8 @@ fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts)
 /// front reaches — the same `serve_connect` the socks and http fronts call, with the
 /// same rules and the same grant.
 pub(crate) fn serve_device_flow(client: Connection, out: &Outbound, dest: &Destination) {
-    let lane = out.resolved(dest, crate::router::Network::Tcp, Some(&client));
-    serve_connect(client, lane, dest, Front::Socks, &[]);
+    let (lane, tag) = out.resolved_lane(dest, crate::router::Network::Tcp, Some(&client));
+    serve_connect(client, lane, dest, Front::Socks, &[], tag);
 }
 
 /// One mux `New` target for a flow the portal carries.
@@ -10621,13 +10739,17 @@ fn serve_connect_freedom(client: &Connection, asked: &Destination, prefix: &[u8]
 }
 
 /// One tunnel request from either front, already resolved to its lane: the Foxy lane grants after its tunnel opens.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn serve_connect(
     mut client: Connection,
     out: &Outbound,
     asked: &Destination,
     front: Front,
     prefix: &[u8],
+    tag: Option<&str>,
 ) {
+    let tag = tag.map(str::to_owned).or_else(default_outbound_tag);
+    let _outbound = OutboundTag::enter(tag.as_deref());
     // The rules dropped this flow: the front has granted it, so the sink answers and ends it.
     if let Outbound::Block(answer) = out {
         crate::blackhole::serve(client, answer);
@@ -10653,6 +10775,16 @@ pub(crate) fn serve_connect(
     }
     if let Outbound::ReversePortal(portal) = out {
         return serve_reverse_tcp(&client, portal, asked);
+    }
+    if let Outbound::Metrics { address } = out {
+        let Some(mut upstream) = dial_or_report(address) else {
+            return;
+        };
+        if !prefix.is_empty() && upstream.write_all(prefix).is_err() {
+            return;
+        }
+        relay_handoff(&client, &upstream);
+        return;
     }
     if let Outbound::Vless(vless) = out {
         if matches!(vless.carrier, Carrier::Quic) {
@@ -10767,7 +10899,8 @@ fn dial_socks_outbound(
         | Outbound::Route(_)
         | Outbound::Block(_)
         | Outbound::Dns(_)
-        | Outbound::ReversePortal(_) => {}
+        | Outbound::ReversePortal(_)
+        | Outbound::Metrics { .. } => {}
     }
 }
 
@@ -11546,6 +11679,14 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
         return;
     };
     if accounts.names_accounts() && !http_credential_accepted(&head, accounts) {
+        crate::accesslog::record(
+            client.peer_addr().ok(),
+            false,
+            &"unknown",
+            None,
+            "rejected",
+            "",
+        );
         let _ = client.write_all(HTTP_AUTH_REQUIRED);
         return;
     }
@@ -11555,17 +11696,21 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
     };
     match request {
         ProxyRequest::Connect(asked) => {
-            let out = out.resolved(&asked, crate::router::Network::Tcp, Some(&client));
+            let destination = asked.authority();
+            crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", "");
+            let (out, tag) = out.resolved_lane(&asked, crate::router::Network::Tcp, Some(&client));
             if !matches!(out, Outbound::Foxy(_) | Outbound::Veepn(_))
                 && client.write_all(Front::Http.grant_line()).is_err()
             {
                 return;
             }
-            serve_connect(client, out, &asked, Front::Http, &[]);
+            serve_connect(client, out, &asked, Front::Http, &[], tag);
         }
         ProxyRequest::Forward(asked, origin) => {
-            let out = out.resolved(&asked, crate::router::Network::Tcp, Some(&client));
-            serve_connect(client, out, &asked, Front::Http, &origin);
+            let destination = asked.authority();
+            crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", "");
+            let (out, tag) = out.resolved_lane(&asked, crate::router::Network::Tcp, Some(&client));
+            serve_connect(client, out, &asked, Front::Http, &origin, tag);
         }
     }
 }
@@ -13601,7 +13746,12 @@ fn relay_handoff(client: &Connection, target: &Connection) {
     let Ok(client_write) = client.try_clone() else {
         return;
     };
-    if !target_write.masked() && !client_write.masked() && poll_available() {
+    if !target_write.masked()
+        && !client_write.masked()
+        && !client_read.metered()
+        && !target_read.metered()
+        && poll_available()
+    {
         let _ends = poll_handoff(client_read, target_write, target_read, client_write);
         return;
     }
@@ -14212,14 +14362,21 @@ fn copy_all(from: &mut Connection, to: &mut Connection) {
 #[inline]
 fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
     // Once per leg, outside the byte loop: a budget read per buffer would price the copy.
-    let stall = crate::budgets::relay_stall();
+    let policy = from.policy().or_else(|| to.policy());
+    let stall = policy
+        .and_then(|flow| flow.conn_idle())
+        .unwrap_or_else(crate::budgets::relay_stall);
     let _ = to.set_write_timeout(Some(stall));
     // A read a caller already armed is that caller's to end: a poll quantum it set is how the leg stops, so this shape arms only a read nobody bounded.
     let armed = from.read_timeout().ok().flatten();
     let patient = armed.is_none();
     let read_arm = armed.or(Some(stall));
     let _ = from.set_read_timeout(read_arm);
-    let mut buffer = RelayBuf::new();
+    let window = policy
+        .and_then(|flow| flow.buffer())
+        .filter(|window| *window > 0)
+        .map_or(RELAY_SMALL_BUFFER, |window| window.min(RELAY_BUFFER));
+    let mut buffer = RelayBuf::with_len(window);
     loop {
         let read = {
             census!("relay-leg-read", crate::census::handle(from), read_arm);
@@ -14246,8 +14403,8 @@ fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
 
 #[cfg(target_os = "linux")]
 fn copy_all(from: &mut Connection, to: &mut Connection) {
-    // A masked destination cannot be fed by splice: the pipe would write the socket directly.
-    if to.masked() {
+    // A masked or metered leg cannot be fed by splice: the pipe would write the socket directly.
+    if to.masked() || to.metered() || from.metered() {
         return copy_all_memcpy(from, to);
     }
     let Some(pipe) = SplicePipe::new() else {
@@ -16111,6 +16268,9 @@ fn inbound_id(inbound: &Json) -> [u8; 16] {
 pub(crate) struct VlessUser {
     pub(crate) id: [u8; 16],
     pub(crate) flow: Flow,
+    /// The reference's account name and policy level; an account without an email counts nothing.
+    pub(crate) email: String,
+    pub(crate) level: u32,
     /// The portal a user's reverse tag names: a reverse account forwards nothing itself, it only
     /// lends the portal's sessions to the flows routed to that tag.
     pub(crate) reverse: Option<Arc<crate::reverse::Portal>>,
@@ -16126,6 +16286,8 @@ pub(crate) fn one_user(id: [u8; 16]) -> VlessUsers {
     Arc::from([VlessUser {
         id,
         flow: Flow::None,
+        email: String::new(),
+        level: 0,
         reverse: None,
     }])
 }
@@ -16135,6 +16297,8 @@ fn one_vless_user(id: &[u8; 16]) -> [VlessUser; 1] {
     [VlessUser {
         id: *id,
         flow: Flow::None,
+        email: String::new(),
+        level: 0,
         reverse: None,
     }]
 }
@@ -16164,7 +16328,19 @@ fn inbound_users(inbound: &Json, portals: &crate::reverse::Portals) -> VlessUser
             .and_then(Json::as_str)
             .filter(|tag| !tag.is_empty())
             .and_then(|tag| portals.get(tag));
-        let user = VlessUser { id, flow, reverse };
+        let email = client
+            .get("email")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_owned();
+        let level = client.get("level").and_then(Json::as_u32).unwrap_or(0);
+        let user = VlessUser {
+            id,
+            flow,
+            email,
+            level,
+            reverse,
+        };
         match users.iter_mut().find(|seen| same_vless_user(&seen.id, &id)) {
             Some(seen) => *seen = user,
             None => users.push(user),
@@ -16174,6 +16350,8 @@ fn inbound_users(inbound: &Json, portals: &crate::reverse::Portals) -> VlessUser
         users.push(VlessUser {
             id: inbound_id(inbound),
             flow: Flow::None,
+            email: String::new(),
+            level: 0,
             reverse: None,
         });
     }
@@ -21097,6 +21275,8 @@ mod tests {
                 &[VlessUser {
                     id,
                     flow: account,
+                    email: String::new(),
+                    level: 0,
                     reverse: None,
                 }],
                 true,
@@ -24151,6 +24331,8 @@ mod tests {
                 &[VlessUser {
                     id,
                     flow: Flow::Vision,
+                    email: String::new(),
+                    level: 0,
                     reverse: None,
                 }],
                 true,
@@ -26497,11 +26679,15 @@ mod tests {
             VlessUser {
                 id: first,
                 flow: Flow::None,
+                email: String::new(),
+                level: 0,
                 reverse: None,
             },
             VlessUser {
                 id: second,
                 flow: Flow::None,
+                email: String::new(),
+                level: 0,
                 reverse: None,
             },
         ];
@@ -26542,6 +26728,8 @@ mod tests {
         let users = [VlessUser {
             id,
             flow: Flow::None,
+            email: String::new(),
+            level: 0,
             reverse: None,
         }];
         let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -26594,11 +26782,15 @@ mod tests {
         let vision = VlessUser {
             id: [0x33u8; 16],
             flow: Flow::Vision,
+            email: String::new(),
+            level: 0,
             reverse: None,
         };
         let plain = VlessUser {
             id: [0x44u8; 16],
             flow: Flow::None,
+            email: String::new(),
+            level: 0,
             reverse: None,
         };
         assert!(vless_flow_ok(&vision, Flow::Vision, 1, true));
@@ -38445,8 +38637,8 @@ fn front_dispatch(stream: Connection, role: Role) {
                 .map(|bound| bound.port())
                 .unwrap_or_default();
             let dest = port_map.get(&port).unwrap_or(&dest);
-            let target = out.resolved(dest, crate::router::Network::Tcp, Some(&stream));
-            serve_connect(stream, target, dest, Front::Socks, &[]);
+            let (target, tag) = out.resolved_lane(dest, crate::router::Network::Tcp, Some(&stream));
+            serve_connect(stream, target, dest, Front::Socks, &[], tag);
         }
         Role::Proxied(inner) => front_dispatch(stream, *inner),
     }
@@ -38467,6 +38659,8 @@ mod reverse_tests {
         let reverse = [VlessUser {
             id,
             flow: Flow::None,
+            email: String::new(),
+            level: 0,
             reverse: Some(Arc::clone(&portal)),
         }];
         let forward = one_vless_user(&id);
