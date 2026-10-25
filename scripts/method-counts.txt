@@ -54,6 +54,7 @@ shadowsocks-2022 ops-retired-instructions UNBLESSED scripts/count-ops.sh
 shadowsocks-2022 aead-calls-per-chunk 2 ferrox-core-shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
 shadowsocks-2022 maximum-payload-per-chunk 65535 ferrox-core-shadowsocks2022::tests::every_method_round_trips_a_chunk_and_refuses_a_forged_tag
 shadowsocks-2022 write-syscalls-per-16KiB-relay-read 1 ferrox-app-shadowsocks2022::tests::one_relay_read_becomes_one_write_and_reads_back_whole
+shadowsocks-2022 client-handshake-write-syscalls 1 ferrox-app-shadowsocks2022::tests::a_client_handshake_leaves_in_one_write
 shadowsocks-2022 payload-chunks-per-16KiB-relay-read 1 ferrox-app-shadowsocks2022::tests::one_relay_read_becomes_one_write_and_reads_back_whole
 shadowsocks-2022 user-space-copies-per-byte-written 0 ferrox-app-shadowsocks2022::tests::one_relay_read_becomes_one_write_and_reads_back_whole
 shadowsocks-2022 user-space-copies-per-byte-read 0 ferrox-app-shadowsocks2022::tests::chunks_open_that_seal_sealed_and_reject_damage
@@ -706,7 +707,7 @@ engine-dns allocations-per-cached-lookup 4 ferrox-app-dnsapp::resolver_tests::a_
 engine-dns seconds-per-lookup UNBLESSED CI bench.yml (no cell yet)
 
 # --- the reverse tunnel -----------------------------------------------------
-reverse ops-retired-instructions UNBLESSED scripts/count-ops.sh
+reverse ops-retired-instructions 80066 scripts/count-ops.sh
 reverse tcp-echo-bytes-preserved 5 ferrox-app-proxy::reverse_tests::a_portal_flow_reaches_the_bridge_and_comes_back
 
 # --- health observatory and healthcheck inbound -----------------------------

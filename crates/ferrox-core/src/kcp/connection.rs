@@ -368,7 +368,13 @@ impl Connection {
         if draining {
             now + Duration::from_secs(1)
         } else {
-            last_flush + tick
+            // A pass that flushed nothing must still park for a tick: adding the tick to a stale `last_flush` returns an instant already past and spins the one scheduler thread every millisecond.
+            let next = last_flush + tick;
+            if next > now {
+                next
+            } else {
+                now + tick
+            }
         }
     }
 
@@ -702,7 +708,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::{
         ping_due, CmdOnlySegment, Command, Config, ConnMetadata, Connection, Segment,
@@ -769,6 +775,20 @@ mod tests {
         let (recorder, conn) = recording_connection(u32::MAX);
         conn.ping(1, Command::Ping);
         assert_eq!(recorder.attempts.load(Ordering::SeqCst), WRITE_ATTEMPTS);
+    }
+
+    /// An idle connection must park the scheduler for a tick rather than return an instant that already passed.
+    #[test]
+    fn an_idle_connection_parks_for_a_tick() {
+        let (_, conn) = recording_connection(0);
+        let now = Instant::now();
+        let tick = Duration::from_millis(u64::from(Config::default().tti));
+        let next = conn.poll(now);
+        assert!(
+            next.saturating_duration_since(now) >= tick,
+            "idle poll returned {:?}, not a tick",
+            next.saturating_duration_since(now)
+        );
     }
 
     fn data(number: u32, sending_next: u32, payload: &[u8]) -> Segment {

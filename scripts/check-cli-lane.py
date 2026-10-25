@@ -16,7 +16,9 @@ flow must be stopped by `up` itself, with its pid file, config and proxy marker
 removed and its port free again. An attempt cut short by an interrupt must leave
 nothing either: the lane child, its pid file, its config and the proxy marker
 are all gone. The proxy is never armed or cleared on the machine running the
-gate: a fake `networksetup` records the calls instead.
+gate: a fake `networksetup` and `scutil` record and answer the calls instead, so
+`--vpn` must turn PAC and auto discovery off, restore them on `down`, and fail
+when the read-back still shows PAC enabled.
 """
 
 from __future__ import annotations
@@ -50,13 +52,142 @@ def fake_networksetup(state: pathlib.Path) -> pathlib.Path:
     bin_dir.mkdir(exist_ok=True)
     tool = bin_dir / "networksetup"
     tool.write_text(
+        '''#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+
+state = pathlib.Path(os.environ["FERROX_CONF_DIR"])
+with open(state / "networksetup.calls", "a", encoding="utf-8") as log:
+    log.write(" ".join(sys.argv[1:]) + "\\n")
+
+args = sys.argv[1:]
+command = args[0] if args else ""
+root = state / "fake-net"
+root.mkdir(exist_ok=True)
+
+
+def service(name):
+    directory = root / name.replace(" ", "_").replace("/", "_")
+    directory.mkdir(exist_ok=True)
+    return directory
+
+
+def read(directory, field, default=""):
+    path = directory / field
+    return path.read_text(encoding="utf-8") if path.exists() else default
+
+
+def write(directory, field, value):
+    (directory / field).write_text(value, encoding="utf-8")
+
+
+if command == "-listallnetworkservices":
+    listing = state / "fake-services"
+    names = (
+        listing.read_text(encoding="utf-8").splitlines()
+        if listing.exists()
+        else ["Wi-Fi"]
+    )
+    print("An asterisk (*) denotes that a network service is disabled.")
+    for name in names:
+        print(name)
+elif command == "-getautoproxyurl":
+    directory = service(args[1])
+    url = read(directory, "pac-url")
+    enabled = read(directory, "pac-enabled", "no") == "yes"
+    print(f"URL: {url}")
+    print(f"Enabled: {'Yes' if enabled else 'No'}")
+elif command == "-setautoproxyurl":
+    directory = service(args[1])
+    write(directory, "pac-url", args[2] if len(args) > 2 else "")
+    write(directory, "pac-enabled", "yes")
+elif command == "-setautoproxystate":
+    directory = service(args[1])
+    write(directory, "pac-enabled", "yes" if args[2] == "on" else "no")
+elif command == "-getproxyautodiscovery":
+    directory = service(args[1])
+    enabled = read(directory, "autodiscovery", "off") == "on"
+    print(f"Auto Proxy Discovery: {'On' if enabled else 'Off'}")
+elif command == "-setproxyautodiscovery":
+    directory = service(args[1])
+    write(directory, "autodiscovery", args[2])
+elif command in ("-setsocksfirewallproxy", "-setwebproxy", "-setsecurewebproxy"):
+    directory = service(args[1])
+    field = {
+        "-setsocksfirewallproxy": "socks",
+        "-setwebproxy": "http",
+        "-setsecurewebproxy": "https",
+    }[command]
+    write(directory, f"{field}-proxy", f"{args[2]}:{args[3]}")
+elif command in (
+    "-setsocksfirewallproxystate",
+    "-setwebproxystate",
+    "-setsecurewebproxystate",
+):
+    directory = service(args[1])
+    field = {
+        "-setsocksfirewallproxystate": "socks",
+        "-setwebproxystate": "http",
+        "-setsecurewebproxystate": "https",
+    }[command]
+    write(directory, f"{field}-enabled", args[2])
+sys.exit(0)
+''',
+        encoding="utf-8",
+    )
+    tool.chmod(0o755)
+
+    scutil = bin_dir / "scutil"
+    scutil.write_text(
+        '''#!/usr/bin/env python3
+import os
+import pathlib
+import sys
+
+state = pathlib.Path(os.environ["FERROX_CONF_DIR"])
+override = state / "scutil.override"
+if override.exists():
+    sys.stdout.write(override.read_text(encoding="utf-8"))
+    sys.exit(0)
+
+directory = state / "fake-net" / "Wi-Fi"
+
+
+def read(field, default=""):
+    path = directory / field
+    return path.read_text(encoding="utf-8") if path.exists() else default
+
+
+def enabled(field):
+    return 1 if read(field, "off") in ("on", "yes") else 0
+
+
+print("<dictionary> {")
+print(f"  ProxyAutoConfigEnable : {enabled('pac-enabled')}")
+print(f"  ProxyAutoDiscoveryEnable : {enabled('autodiscovery')}")
+print(f"  HTTPEnable : {enabled('http-enabled')}")
+print(f"  HTTPSEnable : {enabled('https-enabled')}")
+print(f"  SOCKSEnable : {enabled('socks-enabled')}")
+print("}")
+''',
+        encoding="utf-8",
+    )
+    scutil.chmod(0o755)
+    return bin_dir
+
+
+def fake_curl(state: pathlib.Path) -> pathlib.Path:
+    bin_dir = state / "fake-curl-bin"
+    bin_dir.mkdir(exist_ok=True)
+    tool = bin_dir / "curl"
+    tool.write_text(
         """#!/bin/sh
-printf '%s\\n' "$*" >> "$FERROX_CONF_DIR/networksetup.calls"
-case "$1" in
-  -listallnetworkservices)
-    printf 'An asterisk (*) denotes that a network service is disabled.\\nWi-Fi\\n' ;;
-esac
-exit 0
+if [ "${FERROX_FAKE_TRACE:-}" = 1 ]; then
+  printf 'ip=203.0.113.9\\nloc=US\\n'
+  exit 0
+fi
+exit 7
 """,
         encoding="utf-8",
     )
@@ -64,11 +195,38 @@ exit 0
     return bin_dir
 
 
-def env_for(state: pathlib.Path) -> dict[str, str]:
+def seed_proxy_state(
+    state: pathlib.Path,
+    *,
+    pac_url: str = "",
+    pac_enabled: bool = False,
+    autodiscovery: bool = False,
+) -> pathlib.Path:
+    directory = state / "fake-net" / "Wi-Fi"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "pac-url").write_text(pac_url, encoding="utf-8")
+    (directory / "pac-enabled").write_text(
+        "yes" if pac_enabled else "no", encoding="utf-8"
+    )
+    (directory / "autodiscovery").write_text(
+        "on" if autodiscovery else "off", encoding="utf-8"
+    )
+    return directory
+
+
+def proxy_field(state: pathlib.Path, field: str, default: str = "") -> str:
+    path = state / "fake-net" / "Wi-Fi" / field
+    return path.read_text(encoding="utf-8") if path.exists() else default
+
+
+def env_for(state: pathlib.Path, curl: bool = False) -> dict[str, str]:
     env = dict(os.environ)
     env["FERROX_CONF_DIR"] = str(state)
     env["FERROX_BIN"] = shutil.which("true") or "/bin/true"
-    env["PATH"] = f"{fake_networksetup(state)}:{env.get('PATH', '')}"
+    path = f"{fake_networksetup(state)}:{env.get('PATH', '')}"
+    if curl:
+        path = f"{fake_curl(state)}:{path}"
+    env["PATH"] = path
     return env
 
 
@@ -690,6 +848,549 @@ def check_config_survives(state: pathlib.Path) -> int:
     return 0
 
 
+def vpn_lane_binary(state: pathlib.Path) -> pathlib.Path:
+    binary = state / "fake-vpn-lane"
+    binary.write_text(
+        """#!/usr/bin/env python3
+import json, os, socket, sys, time
+config = sys.argv[sys.argv.index("-c") + 1]
+with open(config, encoding="utf-8") as handle:
+    document = json.load(handle)
+state = os.environ["FERROX_CONF_DIR"]
+with open(os.path.join(state, "fake-vpn-lane.pids"), "a", encoding="utf-8") as handle:
+    handle.write(f"{os.getpid()}\\n")
+bound = []
+for inbound in document.get("inbounds", []):
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", inbound["port"]))
+    server.listen(16)
+    bound.append(server)
+while True:
+    time.sleep(1)
+""",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    return binary
+
+
+def check_vpn_fronts(state: pathlib.Path) -> int:
+    ports = []
+    while len(ports) < 3:
+        port = free_port()
+        if port not in ports:
+            ports.append(port)
+    socks_port, http_port, mixed_port = ports
+    config = state / "vpn-fronts.json"
+    config.write_text(
+        json.dumps(
+            {
+                "inbounds": [
+                    {"protocol": "socks", "listen": "127.0.0.1", "port": socks_port},
+                    {"protocol": "http", "listen": "127.0.0.1", "port": http_port},
+                    {"protocol": "mixed", "listen": "127.0.0.1", "port": mixed_port},
+                ],
+                "outbounds": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    env = env_for(state, curl=True)
+    env["FERROX_BIN"] = str(vpn_lane_binary(state))
+    env["FERROX_FAKE_TRACE"] = "1"
+    cases = [
+        ("socks", socks_port, None),
+        ("http", None, http_port),
+        ("mixed", mixed_port, mixed_port),
+        ("socks,http", socks_port, http_port),
+        ("socks,mixed", socks_port, mixed_port),
+        ("http,mixed", mixed_port, http_port),
+        ("socks,http,mixed", socks_port, http_port),
+    ]
+    calls = state / "networksetup.calls"
+    for fronts, want_socks, want_http in cases:
+        calls.unlink(missing_ok=True)
+        (state / "system-proxy.ports").unlink(missing_ok=True)
+        run = subprocess.run(
+            [
+                str(CLI),
+                "up",
+                "--config",
+                str(config),
+                "--fronts",
+                fronts,
+                "--socks",
+                str(socks_port),
+                "--http",
+                str(http_port),
+                "--mixed",
+                str(mixed_port),
+                "--vpn",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env,
+        )
+        output = run.stdout + run.stderr
+        if run.returncode != 0:
+            print(
+                f"check-cli-lane: --fronts {fronts} exited {run.returncode}:\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+        recorded = calls.read_text(encoding="utf-8") if calls.exists() else ""
+        wanted = []
+        if want_socks is not None:
+            wanted.append(f"-setsocksfirewallproxy Wi-Fi 127.0.0.1 {want_socks}")
+        if want_http is not None:
+            wanted.extend(
+                [
+                    f"-setwebproxy Wi-Fi 127.0.0.1 {want_http}",
+                    f"-setsecurewebproxy Wi-Fi 127.0.0.1 {want_http}",
+                ]
+            )
+        missing = [call for call in wanted if call not in recorded]
+        wrong_socks = want_socks is None and "-setsocksfirewallproxy" in recorded
+        wrong_http = want_http is None and (
+            "-setwebproxy" in recorded or "-setsecurewebproxy" in recorded
+        )
+        if missing or wrong_socks or wrong_http:
+            print(
+                f"check-cli-lane: --fronts {fronts} armed the wrong system proxy:"
+                f"\n{recorded}\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+        down = subprocess.run(
+            [str(CLI), "down"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env,
+        )
+        if down.returncode != 0:
+            print(
+                f"check-cli-lane: down after --fronts {fronts} exited {down.returncode}:"
+                f"\n{down.stdout + down.stderr}",
+                file=sys.stderr,
+            )
+            return 1
+    print("check-cli-lane: every front list arms the system proxy at the port it serves")
+    return 0
+
+
+def config_lane(
+    state: pathlib.Path, config: pathlib.Path, trace: bool = True
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    calls = state / "networksetup.calls"
+    calls.unlink(missing_ok=True)
+    (state / "system-proxy.ports").unlink(missing_ok=True)
+    env = env_for(state, curl=True)
+    env["FERROX_BIN"] = str(vpn_lane_binary(state))
+    env["FERROX_FAKE_TRACE"] = "1" if trace else ""
+    run = subprocess.run(
+        [str(CLI), "up", "--config", str(config), "--vpn"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH,
+        env=env,
+    )
+    recorded = calls.read_text(encoding="utf-8") if calls.exists() else ""
+    return run, recorded
+
+
+def check_config_fronts(state: pathlib.Path) -> int:
+    http_port = free_port()
+    http = state / "config-http.json"
+    http.write_text(
+        json.dumps(
+            {
+                "inbounds": [
+                    {"protocol": "http", "listen": "127.0.0.1", "port": http_port}
+                ],
+                "outbounds": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run, recorded = config_lane(state, http)
+    output = run.stdout + run.stderr
+    if run.returncode != 0:
+        print(
+            f"check-cli-lane: an HTTP config lane exited {run.returncode}:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    wanted = [
+        f"-setwebproxy Wi-Fi 127.0.0.1 {http_port}",
+        f"-setsecurewebproxy Wi-Fi 127.0.0.1 {http_port}",
+    ]
+    marker = state / "system-proxy.ports"
+    if (
+        any(call not in recorded for call in wanted)
+        or "-setsocksfirewallproxy" in recorded
+        or not marker.exists()
+        or marker.read_text(encoding="utf-8").strip() != f"- {http_port}"
+    ):
+        print(
+            f"check-cli-lane: an HTTP config lane armed the wrong system proxy:"
+            f"\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    subprocess.run(
+        [str(CLI), "down"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH,
+        env=env_for(state),
+    )
+
+    mixed_port = free_port()
+    mixed = state / "config-mixed.json"
+    mixed.write_text(
+        json.dumps(
+            {
+                "inbounds": [
+                    {"protocol": "mixed", "listen": "127.0.0.1", "port": mixed_port}
+                ],
+                "outbounds": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run, recorded = config_lane(state, mixed)
+    output = run.stdout + run.stderr
+    wanted = [
+        f"-setsocksfirewallproxy Wi-Fi 127.0.0.1 {mixed_port}",
+        f"-setwebproxy Wi-Fi 127.0.0.1 {mixed_port}",
+        f"-setsecurewebproxy Wi-Fi 127.0.0.1 {mixed_port}",
+    ]
+    if (
+        run.returncode != 0
+        or any(call not in recorded for call in wanted)
+        or not marker.exists()
+        or marker.read_text(encoding="utf-8").strip()
+        != f"{mixed_port} {mixed_port}"
+    ):
+        print(
+            f"check-cli-lane: a mixed config lane armed the wrong system proxy:"
+            f"\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    subprocess.run(
+        [str(CLI), "down"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH,
+        env=env_for(state),
+    )
+
+    exposed = state / "config-exposed.json"
+    exposed.write_text(
+        json.dumps(
+            {
+                "inbounds": [
+                    {
+                        "protocol": "http",
+                        "listen": "0.0.0.0",
+                        "port": free_port(),
+                    }
+                ],
+                "outbounds": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run, recorded = config_lane(state, exposed, trace=False)
+    output = run.stdout + run.stderr
+    if (
+        run.returncode == 0
+        or recorded
+        or (state / "lane.pid").exists()
+        or "loopback" not in output
+    ):
+        print(
+            f"check-cli-lane: a config on 0.0.0.0 was armed instead of refused:"
+            f"\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+
+    no_front = state / "config-no-front.json"
+    no_front.write_text(
+        json.dumps(
+            {
+                "inbounds": [
+                    {
+                        "protocol": "dokodemo-door",
+                        "listen": "127.0.0.1",
+                        "port": free_port(),
+                    }
+                ],
+                "outbounds": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run, recorded = config_lane(state, no_front, trace=False)
+    output = run.stdout + run.stderr
+    if (
+        run.returncode == 0
+        or recorded
+        or (state / "lane.pid").exists()
+        or "no socks, http or mixed inbound" not in output
+    ):
+        print(
+            f"check-cli-lane: a config with no proxy front was armed:"
+            f"\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+
+    silent = state / "config-silent.json"
+    silent.write_text(
+        json.dumps(
+            {
+                "inbounds": [
+                    {
+                        "protocol": "http",
+                        "listen": "127.0.0.1",
+                        "port": free_port(),
+                    }
+                ],
+                "outbounds": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run, recorded = config_lane(state, silent, trace=False)
+    output = run.stdout + run.stderr
+    if (
+        run.returncode == 0
+        or recorded
+        or (state / "lane.pid").exists()
+        or marker.exists()
+    ):
+        print(
+            f"check-cli-lane: a config lane that answered no flow was armed:"
+            f"\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        "check-cli-lane: a config lane arms the fronts and ports it serves, and"
+        " refuses an exposed, frontless or silent one"
+    )
+    return 0
+
+
+def check_vpn_pac(state: pathlib.Path) -> int:
+    port = free_port()
+    config = state / "vpn-pac.json"
+    config.write_text(
+        json.dumps(
+            {
+                "inbounds": [
+                    {"protocol": "socks", "listen": "127.0.0.1", "port": port}
+                ],
+                "outbounds": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    env = env_for(state, curl=True)
+    env["FERROX_BIN"] = str(vpn_lane_binary(state))
+    env["FERROX_FAKE_TRACE"] = "1"
+    calls = state / "networksetup.calls"
+    override = state / "scutil.override"
+    pac_url = "http://pac.corp.example/proxy.pac"
+
+    def clear() -> None:
+        for stale in (
+            "lane.pid",
+            "lane.json",
+            "system-proxy.ports",
+            "system-proxy.state",
+            "networksetup.calls",
+            "scutil.override",
+            "fake-vpn-lane.pids",
+        ):
+            (state / stale).unlink(missing_ok=True)
+
+    def arm(readback: str | None = None) -> subprocess.CompletedProcess[str]:
+        clear()
+        if readback is not None:
+            override.write_text(readback, encoding="utf-8")
+        return subprocess.run(
+            [
+                str(CLI),
+                "up",
+                "--config",
+                str(config),
+                "--fronts",
+                "socks",
+                "--socks",
+                str(port),
+                "--vpn",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env,
+        )
+
+    def down() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(CLI), "down"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env,
+        )
+
+    seed_proxy_state(state, pac_url=pac_url, pac_enabled=True, autodiscovery=True)
+    run = arm()
+    output = run.stdout + run.stderr
+    if run.returncode != 0:
+        print(
+            f"check-cli-lane: --vpn over a PAC exited {run.returncode}:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    recorded = calls.read_text(encoding="utf-8") if calls.exists() else ""
+    if "-setproxyautodiscovery Wi-Fi off" not in recorded:
+        print(
+            f"check-cli-lane: --vpn left auto discovery on:\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if "-setautoproxystate Wi-Fi off" not in recorded:
+        print(
+            f"check-cli-lane: --vpn left the PAC enabled:\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if proxy_field(state, "pac-enabled") != "no":
+        print("check-cli-lane: --vpn left the PAC enabled", file=sys.stderr)
+        return 1
+    if proxy_field(state, "autodiscovery") != "off":
+        print("check-cli-lane: --vpn left auto discovery on", file=sys.stderr)
+        return 1
+    if proxy_field(state, "socks-enabled") != "on":
+        print("check-cli-lane: --vpn did not enable the SOCKS proxy", file=sys.stderr)
+        return 1
+    down_run = down()
+    output = down_run.stdout + down_run.stderr
+    if down_run.returncode != 0:
+        print(
+            f"check-cli-lane: down after a PAC arm exited {down_run.returncode}:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if proxy_field(state, "pac-url") != pac_url:
+        print(
+            f"check-cli-lane: down restored the PAC URL as "
+            f"{proxy_field(state, 'pac-url')!r}",
+            file=sys.stderr,
+        )
+        return 1
+    if proxy_field(state, "pac-enabled") != "yes":
+        print("check-cli-lane: down left the PAC disabled", file=sys.stderr)
+        return 1
+    if proxy_field(state, "autodiscovery") != "on":
+        print("check-cli-lane: down left auto discovery off", file=sys.stderr)
+        return 1
+    print(
+        "check-cli-lane: --vpn disables PAC and auto discovery, and down restores both"
+    )
+
+    seed_proxy_state(state)
+    run = arm()
+    output = run.stdout + run.stderr
+    if run.returncode != 0:
+        print(
+            f"check-cli-lane: --vpn with no PAC exited {run.returncode}:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    down_run = down()
+    output = down_run.stdout + down_run.stderr
+    if down_run.returncode != 0:
+        print(
+            f"check-cli-lane: down after a PAC-free arm exited {down_run.returncode}:"
+            f"\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if (
+        proxy_field(state, "pac-url") != ""
+        or proxy_field(state, "pac-enabled") != "no"
+        or proxy_field(state, "autodiscovery") != "off"
+    ):
+        print(
+            "check-cli-lane: down changed a service that had no PAC",
+            file=sys.stderr,
+        )
+        return 1
+    print("check-cli-lane: a service with PAC off is unchanged by down")
+
+    seed_proxy_state(state, pac_url=pac_url, pac_enabled=True)
+    run = arm("ProxyAutoConfigEnable : 1\nSOCKSEnable : 1\n")
+    output = run.stdout + run.stderr
+    if run.returncode == 0:
+        print(
+            f"check-cli-lane: a read-back that still shows PAC enabled passed:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if (state / "system-proxy.ports").exists() or (state / "system-proxy.state").exists():
+        print(
+            f"check-cli-lane: a failed PAC read-back left the marker behind:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if (state / "lane.pid").exists():
+        print(
+            f"check-cli-lane: a failed PAC read-back left the lane behind:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if proxy_field(state, "socks-enabled") == "on":
+        print(
+            f"check-cli-lane: a failed PAC read-back left the proxy armed:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    pids = state / "fake-vpn-lane.pids"
+    for pid in pids.read_text(encoding="utf-8").split() if pids.exists() else []:
+        try:
+            os.kill(int(pid), 0)
+        except ProcessLookupError:
+            continue
+        print(
+            f"check-cli-lane: a failed PAC read-back left process {pid} running:\n"
+            f"{output}",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "check-cli-lane: a read-back that still shows PAC enabled fails the arm and clears it"
+    )
+    return 0
+
+
 def check_instance_ports(state: pathlib.Path) -> int:
     held = socket.socket()
     held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -840,6 +1541,12 @@ def main() -> int:
     if check_config_survives(state) != 0:
         return 1
     if check_instance_ports(state) != 0:
+        return 1
+    if check_vpn_fronts(state) != 0:
+        return 1
+    if check_config_fronts(state) != 0:
+        return 1
+    if check_vpn_pac(state) != 0:
         return 1
     return check_instance_lifecycle(state)
 

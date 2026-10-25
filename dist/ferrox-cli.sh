@@ -46,6 +46,7 @@ LOCATIONS_FILE="$CONF_DIR/foxy-locations.jsonl"
 PID_FILE="$CONF_DIR/lane.pid"
 LOG="$CONF_DIR/lane.log"
 PROXY_PORTS="$CONF_DIR/system-proxy.ports"
+PROXY_STATE="$CONF_DIR/system-proxy.state"
 
 ACTION="up"
 OUTBOUND=""
@@ -83,6 +84,7 @@ VEEPN_DOMAINS=""
 VEEPN_UDID=""
 PROBE_TIMEOUT=20
 FRONTS="socks,http,mixed"
+FRONTS_SET=0
 SOCKS_PORT="${FOXY_SOCKS_PORT:-10808}"
 HTTP_PORT="${FOXY_HTTP_PORT:-8080}"
 MIXED_PORT="${FOXY_MIXED_PORT:-10809}"
@@ -486,12 +488,14 @@ if config:
             document = json.load(handle)
     except (OSError, ValueError):
         document = {}
+    adopted = set()
     for inbound in document.get("inbounds", []):
         name = inbound.get("protocol")
         port = inbound.get("port")
-        if name in names and name in fronts and not explicit[names.index(name)] and isinstance(port, int):
+        if name in names and name in fronts and not explicit[names.index(name)] and name not in adopted and isinstance(port, int):
             values[names.index(name)] = port
             fixed[names.index(name)] = True
+            adopted.add(name)
 taken = {values[i] for i, name in enumerate(names) if name in fronts and fixed[i]}
 if scan:
     for i, name in enumerate(names):
@@ -512,6 +516,62 @@ if scan:
         values[i] = port
         taken.add(port)
 print(" ".join(str(v) for v in values))
+PY
+}
+
+# A config lane serves the proxy inbounds its file names, so the fronts and the
+# ports a system proxy may point at come from that file, not from the defaults.
+# A selected front must be loopback before it is armed, and a file with none is
+# refused by name.
+config_fronts() {
+  python3 - "$CONFIG_FILE" "$WANT_VPN" "$FRONTS_SET" "$FRONTS" <<'PY'
+import json, sys
+
+path, vpn, explicit, asked = sys.argv[1:5]
+try:
+    with open(path, encoding="utf-8") as handle:
+        document = json.load(handle)
+except (OSError, ValueError) as error:
+    sys.exit(f"cannot read config {path}: {error}")
+order = []
+for inbound in document.get("inbounds", []):
+    if not isinstance(inbound, dict):
+        continue
+    name = inbound.get("protocol")
+    if name not in ("socks", "http", "mixed"):
+        continue
+    port = inbound.get("port")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        sys.exit(f"inbound `{name}` has no port in 1-65535")
+    if name not in order:
+        order.append(name)
+if explicit == "1":
+    wanted = [front.strip() for front in asked.split(",") if front.strip()]
+    missing = [front for front in wanted if front not in order]
+    if missing:
+        sys.exit(f"the config serves no {missing[0]} inbound; --fronts names it")
+    order = [front for front in order if front in wanted]
+if vpn == "1":
+    if not order:
+        sys.exit("the config serves no socks, http or mixed inbound; --vpn needs one")
+    checked = set()
+    for inbound in document.get("inbounds", []):
+        if not isinstance(inbound, dict):
+            continue
+        name = inbound.get("protocol")
+        if name not in order or name in checked:
+            continue
+        checked.add(name)
+        listen = inbound.get("listen")
+        loopback = isinstance(listen, str) and (
+            listen == "::1" or listen == "localhost" or listen.startswith("127.")
+        )
+        if not loopback:
+            sys.exit(
+                f"inbound `{name}` listens on {listen or 'all interfaces'}, not loopback;"
+                " --vpn needs 127.0.0.1 or ::1"
+            )
+print(",".join(order))
 PY
 }
 
@@ -816,49 +876,136 @@ PY
 
 # ------------------------------------------------------------------- system proxy
 
+proxy_pac_line() { networksetup -getautoproxyurl "$1" 2>/dev/null; }
+proxy_auto_line() { networksetup -getproxyautodiscovery "$1" 2>/dev/null; }
+
+proxy_readback_has() {
+  printf '%s\n' "$1" | grep -Eq "^[[:space:]]*$2[[:space:]]*:[[:space:]]*$3[[:space:]]*$"
+}
+
 system_proxy_on() {
   command -v networksetup >/dev/null 2>&1 || { say "no networksetup: point your apps at the ports by hand."; return 0; }
-  local any=0 svc want_socks=0 want_http=0 front
+  command -v scutil >/dev/null 2>&1 || { say "system proxy: no scutil to read the proxy back; nothing was armed." >&2; return 1; }
+  local any=0 svc want_socks="" want_http="" front pac auto pac_url pac_on auto_on readback bad
   for front in ${FRONTS//,/ }; do
-    case "$front" in socks) want_socks=1 ;; http|mixed) want_http=1 ;; esac
+    case "$front" in
+      socks) want_socks="$SOCKS_PORT" ;;
+      http) want_http="$HTTP_PORT" ;;
+      mixed)
+        [ -n "$want_socks" ] || want_socks="$MIXED_PORT"
+        [ -n "$want_http" ] || want_http="$MIXED_PORT"
+        ;;
+    esac
   done
+  [ -n "$want_socks$want_http" ] || { say "system proxy: --fronts names no socks, http or mixed front; nothing was armed." >&2; return 1; }
+  # Keep the first snapshot: a re-arm must still restore what the user had before any lane touched it.
+  if [ ! -f "$PROXY_STATE" ]; then
+    [ -f "$PROXY_PORTS" ] && system_proxy_off
+    : > "$PROXY_STATE"
+    while IFS= read -r svc; do
+      [ -z "$svc" ] && continue
+      case "$svc" in *\**) continue ;; esac
+      pac="$(proxy_pac_line "$svc")" || {
+        say "system proxy: cannot read the PAC setting for '$svc'; nothing was armed." >&2
+        system_proxy_off
+        return 1
+      }
+      auto="$(proxy_auto_line "$svc")" || {
+        say "system proxy: cannot read auto discovery for '$svc'; nothing was armed." >&2
+        system_proxy_off
+        return 1
+      }
+      pac_url="$(printf '%s\n' "$pac" | sed -n 's/^URL: //p' | head -n 1)"
+      case "$pac_url" in "(null)"|"(empty)") pac_url="" ;; esac
+      pac_on=off
+      case "$(printf '%s\n' "$pac" | sed -n 's/^Enabled: //p' | head -n 1 | tr '[:upper:]' '[:lower:]')" in yes|on) pac_on=on ;; esac
+      auto_on=off
+      case "$(printf '%s\n' "$auto" | sed -n 's/^Auto Proxy Discovery: //p' | head -n 1 | tr '[:upper:]' '[:lower:]')" in on|yes) auto_on=on ;; esac
+      printf '%s\t%s\t%s\t%s\n' "$svc" "$pac_on" "${pac_url:--}" "$auto_on" >> "$PROXY_STATE"
+    done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
+  fi
   while IFS= read -r svc; do
     [ -z "$svc" ] && continue
     case "$svc" in *\**) continue ;; esac
-    if [ "$want_socks" = 1 ]; then
-      networksetup -setsocksfirewallproxy "$svc" 127.0.0.1 "$SOCKS_PORT" 2>/dev/null || continue
+    networksetup -setproxyautodiscovery "$svc" off 2>/dev/null || true
+    networksetup -setautoproxyurl "$svc" "" 2>/dev/null || true
+    networksetup -setautoproxystate "$svc" off 2>/dev/null || true
+    if [ -n "$want_socks" ]; then
+      networksetup -setsocksfirewallproxy "$svc" 127.0.0.1 "$want_socks" 2>/dev/null || continue
       networksetup -setsocksfirewallproxystate "$svc" on 2>/dev/null || true
     fi
-    if [ "$want_http" = 1 ]; then
-      networksetup -setwebproxy "$svc" 127.0.0.1 "$HTTP_PORT" 2>/dev/null || true
+    if [ -n "$want_http" ]; then
+      networksetup -setwebproxy "$svc" 127.0.0.1 "$want_http" 2>/dev/null || true
       networksetup -setwebproxystate "$svc" on 2>/dev/null || true
-      networksetup -setsecurewebproxy "$svc" 127.0.0.1 "$HTTP_PORT" 2>/dev/null || true
+      networksetup -setsecurewebproxy "$svc" 127.0.0.1 "$want_http" 2>/dev/null || true
       networksetup -setsecurewebproxystate "$svc" on 2>/dev/null || true
     fi
     any=1
   done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
-  [ "$any" = 1 ] || die "no network service took the proxy"
-  printf '%s %s\n' "$SOCKS_PORT" "$HTTP_PORT" > "$PROXY_PORTS"
-  [ "$want_socks" = 1 ] && say "system proxy on: SOCKS 127.0.0.1:$SOCKS_PORT"
-  [ "$want_http" = 1 ] && say "system proxy on: HTTP and HTTPS 127.0.0.1:$HTTP_PORT"
+  [ "$any" = 1 ] || { system_proxy_off; say "no network service took the proxy" >&2; return 1; }
+  printf '%s %s\n' "${want_socks:--}" "${want_http:--}" > "$PROXY_PORTS"
+  readback="$(scutil --proxy 2>/dev/null)" || readback=""
+  bad=""
+  proxy_readback_has "$readback" ProxyAutoConfigEnable 0 || bad="PAC"
+  proxy_readback_has "$readback" ProxyAutoDiscoveryEnable 0 || bad="$bad auto discovery"
+  if [ -n "$want_socks" ]; then
+    proxy_readback_has "$readback" SOCKSEnable 1 || bad="$bad SOCKS"
+  fi
+  if [ -n "$want_http" ]; then
+    proxy_readback_has "$readback" HTTPEnable 1 || bad="$bad HTTP"
+    proxy_readback_has "$readback" HTTPSEnable 1 || bad="$bad HTTPS"
+  fi
+  if [ -n "$bad" ]; then
+    say "system proxy: the read-back did not show the armed state ($bad); clearing it." >&2
+    system_proxy_off
+    return 1
+  fi
+  [ -n "$want_socks" ] && say "system proxy on: SOCKS 127.0.0.1:$want_socks"
+  [ -n "$want_http" ] && say "system proxy on: HTTP and HTTPS 127.0.0.1:$want_http"
   say "scope: apps that honour the system proxy. There is no utun device, so"
   say "apps that ignore it (and UDP) are not captured: ferrox-cli tun says why."
 }
 
 system_proxy_off() {
-  [ -f "$PROXY_PORTS" ] || return 0
-  local svc
+  [ -f "$PROXY_PORTS" ] || [ -f "$PROXY_STATE" ] || return 0
+  local svc pac_on pac_url auto_on
   if command -v networksetup >/dev/null 2>&1; then
-    while IFS= read -r svc; do
-      [ -z "$svc" ] && continue
-      case "$svc" in *\**) continue ;; esac
-      networksetup -setsocksfirewallproxystate "$svc" off 2>/dev/null || true
-      networksetup -setwebproxystate "$svc" off 2>/dev/null || true
-      networksetup -setsecurewebproxystate "$svc" off 2>/dev/null || true
-    done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
+    if [ -f "$PROXY_STATE" ]; then
+      while IFS=$'\t' read -r svc pac_on pac_url auto_on; do
+        [ -z "$svc" ] && continue
+        case "$svc" in *\**) continue ;; esac
+        [ "$pac_url" = - ] && pac_url=""
+        if [ -n "$pac_url" ]; then
+          networksetup -setautoproxyurl "$svc" "$pac_url" 2>/dev/null || true
+        else
+          networksetup -setautoproxyurl "$svc" "" 2>/dev/null || true
+        fi
+        if [ "$pac_on" = on ]; then
+          networksetup -setautoproxystate "$svc" on 2>/dev/null || true
+        else
+          networksetup -setautoproxystate "$svc" off 2>/dev/null || true
+        fi
+        if [ "$auto_on" = on ]; then
+          networksetup -setproxyautodiscovery "$svc" on 2>/dev/null || true
+        else
+          networksetup -setproxyautodiscovery "$svc" off 2>/dev/null || true
+        fi
+        networksetup -setsocksfirewallproxystate "$svc" off 2>/dev/null || true
+        networksetup -setwebproxystate "$svc" off 2>/dev/null || true
+        networksetup -setsecurewebproxystate "$svc" off 2>/dev/null || true
+      done < "$PROXY_STATE"
+    else
+      while IFS= read -r svc; do
+        [ -z "$svc" ] && continue
+        case "$svc" in *\**) continue ;; esac
+        networksetup -setsocksfirewallproxystate "$svc" off 2>/dev/null || true
+        networksetup -setwebproxystate "$svc" off 2>/dev/null || true
+        networksetup -setsecurewebproxystate "$svc" off 2>/dev/null || true
+      done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
+    fi
     say "system proxy cleared."
   fi
-  rm -f "$PROXY_PORTS"
+  rm -f "$PROXY_PORTS" "$PROXY_STATE"
 }
 
 # ---------------------------------------------------------------------- lane
@@ -872,6 +1019,7 @@ apply_instance() {
   PID_FILE="$CONF_DIR/lane$suffix.pid"
   LOG="$CONF_DIR/lane$suffix.log"
   PROXY_PORTS="$CONF_DIR/system-proxy$suffix.ports"
+  PROXY_STATE="$CONF_DIR/system-proxy$suffix.state"
   LOCATION_FILE="$CONF_DIR/foxy-location$suffix"
 }
 
@@ -1221,7 +1369,7 @@ action_up() {
   start_lane
   # An attempt cut short is not a lane: Ctrl-C before it proves a flow removes what it started.
   trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
-  if [ "$OUTBOUND" != config ] && ! wait_fronts; then
+  if [ -n "$FRONTS" ] && ! wait_fronts; then
     say "the lane did not open its fronts; last lines of $LOG:"
     tail -n 20 "$LOG" 2>/dev/null || true
     stop_and_forget
@@ -1231,12 +1379,11 @@ action_up() {
   say "lane${INSTANCE:+ '$INSTANCE'} up (pid $(lane_pid)), fronts:"
   if [ "$OUTBOUND" = config ]; then
     say "  the ones $CONFIG_FILE names (served verbatim)"
-  else
-    port_map
   fi
+  port_map
   [ "$OUTBOUND" = foxy ] && say "carrier: $CARRIER"
   local ok=0
-  if [ "$OUTBOUND" != config ]; then verify_flow || ok=1; fi
+  if [ -n "$FRONTS" ]; then verify_flow || ok=1; fi
   if [ "$ok" = 1 ]; then
     # A lane that carries no flow is a leftover, not a result: end it here.
     stop_and_forget
@@ -1246,7 +1393,11 @@ action_up() {
   fi
   # Route the machine only at a lane that proved it carries a flow: an armed
   # system proxy over a dead lane takes the network down with it.
-  if [ "$WANT_VPN" = 1 ]; then system_proxy_on; fi
+  if [ "$WANT_VPN" = 1 ] && ! system_proxy_on; then
+    stop_and_forget
+    say "the system proxy was not armed; the lane was stopped and its config removed."
+    exit 1
+  fi
   say "log:  $LOG"
   say "stop: ferrox-cli down"
 }
@@ -1256,7 +1407,7 @@ action_serve() {
   start_lane
   # A serve that never proved a flow is an attempt too: the same interruption cleanup applies.
   trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
-  if [ "$OUTBOUND" != config ] && ! wait_fronts; then
+  if [ -n "$FRONTS" ] && ! wait_fronts; then
     say "the lane did not open its fronts; last lines of $LOG:"
     tail -n 20 "$LOG" 2>/dev/null || true
     stop_and_forget
@@ -1266,19 +1417,22 @@ action_serve() {
   say "lane${INSTANCE:+ '$INSTANCE'} up, fronts:"
   if [ "$OUTBOUND" = config ]; then
     say "  the ones $CONFIG_FILE names (served verbatim)"
-  else
-    port_map
   fi
+  port_map
   [ "$OUTBOUND" = foxy ] && say "carrier: $CARRIER"
   local ok=0
-  if [ "$OUTBOUND" != config ]; then verify_flow || ok=1; fi
+  if [ -n "$FRONTS" ]; then verify_flow || ok=1; fi
   if [ "$ok" = 1 ]; then
     stop_and_forget
     say "the lane was stopped and its config removed; nothing is routed, and the"
     say "log stays at $LOG."
     exit 3
   fi
-  if [ "$WANT_VPN" = 1 ]; then system_proxy_on; fi
+  if [ "$WANT_VPN" = 1 ] && ! system_proxy_on; then
+    stop_and_forget
+    say "the system proxy was not armed; the lane was stopped and its config removed."
+    exit 1
+  fi
   say "Ctrl-C stops it."
   trap 'stop_and_forget; exit 0' INT TERM
   local pid; pid="$(lane_pid)"
@@ -1444,7 +1598,7 @@ while [ $# -gt 0 ]; do
     --upstream) need_value --upstream "an http:// or socks5:// URL" "$#" "${2:-}"; UPSTREAM="$2"; shift 2 ;;
     --exclude-domains) need_value --exclude-domains "comma-separated domain suffixes" "$#" "${2:-}"; EXCLUDE_DOMAINS="$2"; shift 2 ;;
     --exclude-ports) need_value --exclude-ports "comma-separated ports" "$#" "${2:-}"; EXCLUDE_PORTS="$2"; shift 2 ;;
-    --fronts) need_value --fronts "a comma-separated front list" "$#" "${2:-}"; FRONTS="$2"; shift 2 ;;
+    --fronts) need_value --fronts "a comma-separated front list" "$#" "${2:-}"; FRONTS="$2"; FRONTS_SET=1; shift 2 ;;
     --socks) need_port --socks "$#" "${2:-}"; SOCKS_PORT="$2"; SOCKS_SET=1; shift 2 ;;
     --http) need_port --http "$#" "${2:-}"; HTTP_PORT="$2"; HTTP_SET=1; shift 2 ;;
     --mixed) need_port --mixed "$#" "${2:-}"; MIXED_PORT="$2"; MIXED_SET=1; shift 2 ;;
@@ -1489,22 +1643,28 @@ fi
 apply_instance
 case "$ACTION" in
   up|serve)
-    if [ "$OUTBOUND" != config ]; then
-      scan=0; [ -n "$INSTANCE" ] && scan=1
-      planned="$(plan_ports "$scan")" || die "the lane's ports could not be chosen; nothing was started."
-      read -r SOCKS_PORT HTTP_PORT MIXED_PORT <<<"$planned"
-      seen=""
-      for front in ${FRONTS//,/ }; do
-        case "$front" in
-          socks) port="$SOCKS_PORT" ;;
-          http) port="$HTTP_PORT" ;;
-          mixed) port="$MIXED_PORT" ;;
-          *) continue ;;
-        esac
-        case " $seen " in *" $port "*) die "two fronts cannot share port $port; nothing was started." ;; esac
-        seen="$seen $port"
-      done
-    fi ;;
+    scan=0
+    if [ "$OUTBOUND" = config ]; then
+      CFG="$CONFIG_FILE"
+      FRONTS="$(config_fronts 2>&1)" || die "$FRONTS"
+      # The file is served verbatim, so its ports win over the flags.
+      SOCKS_SET=0; HTTP_SET=0; MIXED_SET=0
+    else
+      [ -n "$INSTANCE" ] && scan=1
+    fi
+    planned="$(plan_ports "$scan")" || die "the lane's ports could not be chosen; nothing was started."
+    read -r SOCKS_PORT HTTP_PORT MIXED_PORT <<<"$planned"
+    seen=""
+    for front in ${FRONTS//,/ }; do
+      case "$front" in
+        socks) port="$SOCKS_PORT" ;;
+        http) port="$HTTP_PORT" ;;
+        mixed) port="$MIXED_PORT" ;;
+        *) continue ;;
+      esac
+      case " $seen " in *" $port "*) die "two fronts cannot share port $port; nothing was started." ;; esac
+      seen="$seen $port"
+    done ;;
   status|ports) adopt_lane_ports || true ;;
 esac
 
