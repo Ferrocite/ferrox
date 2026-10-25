@@ -3769,6 +3769,34 @@ mod tests {
         assert_eq!(packets, 0, "the replacement starts with no packets");
     }
 
+    /// The stall sweep is about silence, not age: a packet-up session that keeps receiving packets
+    /// past the budget is still alive and must keep the same sequence.
+    #[test]
+    fn an_active_packet_up_session_is_not_swept_by_its_age() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(std::time::Duration::from_millis(200)),
+            ..Default::default()
+        });
+        let id = "packet-up-active";
+        let session = get_or_create_session(id);
+        for seq in 0..3u64 {
+            thread::sleep(std::time::Duration::from_millis(120));
+            assert!(
+                session.push_packet(seq, vec![seq as u8], 16),
+                "the active packet is accepted"
+            );
+            let current = get_or_create_session(id);
+            assert!(
+                Arc::ptr_eq(&session, &current),
+                "an active packet-up session was swept after {}ms",
+                (seq + 1) * 120
+            );
+        }
+        end_session(id);
+        crate::budgets::clear();
+    }
+
     /// A reader left over from an ended session must not remove the fresh session that reused its id:
     /// the map's owner is the session the entry points at, not whoever drops last with the same key.
     #[test]
