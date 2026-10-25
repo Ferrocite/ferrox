@@ -12310,7 +12310,7 @@ fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts)
         reject_socks(&client);
         return;
     };
-    serve_socks_connected(client, out, handshake);
+    serve_socks_connected(client, out, &handshake);
 }
 
 fn reject_socks(client: &Connection) {
@@ -12324,7 +12324,7 @@ fn reject_socks(client: &Connection) {
     );
 }
 
-fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: Handshake) {
+fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: &Handshake) {
     let email = handshake
         .account
         .as_ref()
@@ -17746,6 +17746,7 @@ struct Handshake {
 }
 
 /// The handshake that keeps the client's name: resolving here hands the edge an address it cannot route.
+#[cfg(test)]
 fn socks_target(
     client: &mut Connection,
     grant: bool,
