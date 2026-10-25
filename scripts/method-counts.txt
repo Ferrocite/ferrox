@@ -712,3 +712,6 @@ engine-observatory default-burst-samples 10 ferrox-app-observatory::tests::burst
 front-healthcheck ops-retired-instructions UNBLESSED scripts/count-ops.sh
 front-healthcheck answer-allocations 1 ferrox-app-proxy::hc_tests::an_hc_answer_is_one_allocation
 front-healthcheck answer-bytes 85 ferrox-app-proxy::hc_tests::an_hc_answer_is_one_allocation
+
+# --- Commander gRPC management API ----------------------------------------
+engine-api ops-retired-instructions UNBLESSED scripts/count-ops.sh

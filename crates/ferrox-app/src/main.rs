@@ -15,6 +15,7 @@ mod budgets;
 #[macro_use]
 mod census;
 mod blackhole;
+mod commander;
 mod config;
 mod conn;
 mod dnsapp;

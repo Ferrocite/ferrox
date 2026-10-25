@@ -16,6 +16,10 @@ impl Counter {
     pub(crate) fn value(&self) -> i64 {
         self.0.load(Ordering::Relaxed)
     }
+
+    fn swap(&self, value: i64) -> i64 {
+        self.0.swap(value, Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -97,6 +101,16 @@ impl Meter {
     pub(crate) fn write(&self, bytes: usize) {
         for counter in &self.write {
             counter.add(bytes as u64);
+        }
+    }
+
+    /// The same counters seen from the far side of a relay: reads there are downlink and writes
+    /// are uplink.
+    pub(crate) fn reversed(self) -> Self {
+        Self {
+            read: self.write,
+            write: self.read,
+            online: self.online,
         }
     }
 
@@ -367,6 +381,37 @@ impl Snapshot {
     }
 }
 
+/// One counter by the name the reference registered, optionally reset by the read.
+pub(crate) fn get(name: &str, reset: bool) -> Option<i64> {
+    let registry = registry();
+    let counter = registry.counters.get(name)?;
+    Some(if reset {
+        counter.swap(0)
+    } else {
+        counter.value()
+    })
+}
+
+/// Every counter whose name contains the pattern, optionally reset by the read.
+pub(crate) fn query(pattern: &str, reset: bool) -> Vec<(String, i64)> {
+    let registry = registry();
+    let mut found: Vec<(String, i64)> = registry
+        .counters
+        .iter()
+        .filter(|(name, _)| name.contains(pattern))
+        .map(|(name, counter)| {
+            let value = if reset {
+                counter.swap(0)
+            } else {
+                counter.value()
+            };
+            (name.clone(), value)
+        })
+        .collect();
+    found.sort_by(|left, right| left.0.cmp(&right.0));
+    found
+}
+
 /// A consistent read of every counter and online map the manager holds.
 pub(crate) fn snapshot() -> Snapshot {
     let registry = registry();
@@ -462,6 +507,26 @@ mod tests {
         let snapshot = snapshot();
         assert_eq!(snapshot.inbound["in"].uplink, 9);
         assert_eq!(snapshot.user["alice@example"].uplink, 9);
+        clear();
+    }
+
+    #[test]
+    fn a_reversed_user_meter_counts_the_far_side_directions() {
+        let _guard = test_lock();
+        clear();
+        let root = crate::json::parse(
+            r#"{"stats":{},"policy":{"levels":{"1":{"statsUserUplink":true,
+                "statsUserDownlink":true}}}}"#,
+        )
+        .expect("parses");
+        crate::policy::install(&root).expect("policy installs");
+        install(&root).expect("stats installs");
+        let meter = user("alice@example", 1).reversed();
+        meter.write(11);
+        meter.read(7);
+        let snapshot = snapshot();
+        assert_eq!(snapshot.user["alice@example"].uplink, 11);
+        assert_eq!(snapshot.user["alice@example"].downlink, 7);
         clear();
     }
 
