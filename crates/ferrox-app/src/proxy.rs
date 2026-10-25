@@ -2345,6 +2345,31 @@ impl Read for Prefixed<'_> {
     }
 }
 
+/// Bytes a probe read past the request header, served ahead of the live stream.
+struct CarriedReader<R> {
+    head: Vec<u8>,
+    at: usize,
+    inner: R,
+}
+
+impl<R> CarriedReader<R> {
+    fn new(head: Vec<u8>, inner: R) -> Self {
+        Self { head, at: 0, inner }
+    }
+}
+
+impl<R: Read> Read for CarriedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if self.at < self.head.len() {
+            let n = (self.head.len() - self.at).min(buf.len());
+            buf[..n].copy_from_slice(&self.head[self.at..self.at + n]);
+            self.at += n;
+            return Ok(n);
+        }
+        self.inner.read(buf)
+    }
+}
+
 /// The peer a fallback row dials: a stream the relay holds, or a datagram socket.
 enum FallbackPeer {
     Socket(Connection),
@@ -10755,7 +10780,7 @@ fn relay_trojan<S>(
     let Some(header) = bounded else {
         return;
     };
-    relay_trojan_request(session, raw, kcp, header, freedom);
+    relay_trojan_request(session, raw, kcp, header, freedom, &[]);
 }
 
 /// A trojan front with fallbacks: the first read names the inbound or routes to the cover site.
@@ -10797,20 +10822,21 @@ fn relay_trojan_with_fallbacks<S>(
         };
         return seize_fallback_tls(session, raw, rows, &window[..n], &[], front);
     }
-    let mut carried = Vec::new();
-    let header = {
+    let mut tail = Vec::new();
+    let (header, consumed) = {
         let mut replay = Prefixed {
             head: &window[..n],
             at: 0,
             tail: &mut session,
-            carried: &mut carried,
+            carried: &mut tail,
         };
-        decode_trojan_request(&mut replay, key)
+        let header = decode_trojan_request(&mut replay, key);
+        (header, replay.at)
     };
     let Some(header) = header else {
         return;
     };
-    relay_trojan_request(session, raw, kcp, header, freedom);
+    relay_trojan_request(session, raw, kcp, header, freedom, &window[consumed..n]);
 }
 
 fn relay_trojan_request<S>(
@@ -10819,6 +10845,7 @@ fn relay_trojan_request<S>(
     kcp: Option<Arc<ferrox_core::kcp::Connection>>,
     (cmd, target): (u8, SocketAddr),
     freedom: bool,
+    carried: &[u8],
 ) where
     S: std::io::Read
         + std::io::Write
@@ -10839,9 +10866,13 @@ fn relay_trojan_request<S>(
             };
             // A driven reader hands over one record's plaintext and withholds the rest until the next lands, and a datagram is read a field at a time: the pump reads through the shared session.
             let (_driven, half) = session_halves(session, raw);
-            serve_trojan_udp_halves(half.clone(), half, move || {
-                let _ = close.shutdown(Shutdown::Both);
-            });
+            serve_trojan_udp_halves(
+                CarriedReader::new(carried.to_vec(), half.clone()),
+                half,
+                move || {
+                    let _ = close.shutdown(Shutdown::Both);
+                },
+            );
             return;
         }
         if let Some(kcp) = kcp {
@@ -10851,17 +10882,24 @@ fn relay_trojan_request<S>(
                     conn: Arc::clone(&kcp),
                 },
             );
-            serve_trojan_udp_halves(reader, writer, move || kcp.close());
+            serve_trojan_udp_halves(
+                CarriedReader::new(carried.to_vec(), reader),
+                writer,
+                move || kcp.close(),
+            );
         }
         return;
     }
     if cmd != 1 {
         return;
     }
-    let Some(uplink) = dial_or_report(&target) else {
+    let Some(mut uplink) = dial_or_report(&target) else {
         return;
     };
     if uplink.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
+    if !carried.is_empty() && uplink.write_all(carried).is_err() {
         return;
     }
     let close: Arc<dyn Fn() + Send + Sync> = match &kcp {
