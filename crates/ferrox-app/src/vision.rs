@@ -247,8 +247,7 @@ impl<S: Read + Write + RecordAlignment> Link<ferrox_core::vless_encryption::Encr
         uuid: &[u8; 16],
     ) -> Self {
         let mut link = Self::new(session, None, uuid);
-        link.direct =
-            Some(ferrox_core::vless_encryption::EncryptedStream::<S>::enter_direct_mode);
+        link.direct = Some(ferrox_core::vless_encryption::EncryptedStream::<S>::enter_direct_mode);
         link
     }
 }

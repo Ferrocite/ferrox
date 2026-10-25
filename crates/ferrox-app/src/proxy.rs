@@ -21770,7 +21770,13 @@ mod tests {
         peer.set_read_timeout(Some(Duration::from_secs(10)))
             .expect("timeout");
         thread::spawn(move || {
-            dial_vless_encrypted_raw(&Connection::from(app), &server_addr, &vless, &client, &header);
+            dial_vless_encrypted_raw(
+                &Connection::from(app),
+                &server_addr,
+                &vless,
+                &client,
+                &header,
+            );
         });
         let payload = b"hello through the sealed raw session";
         peer.write_all(payload).expect("writes");
