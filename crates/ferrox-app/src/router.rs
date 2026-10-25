@@ -43,6 +43,7 @@ pub(crate) struct Flow<'a> {
     pub(crate) source: Option<SocketAddr>,
     pub(crate) local: Option<SocketAddr>,
     pub(crate) inbound_tag: Option<&'a str>,
+    pub(crate) protocol: Option<&'a str>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -614,6 +615,7 @@ struct Rule {
     ips: Option<IpMatcher>,
     source_ips: Option<IpMatcher>,
     local_ips: Option<IpMatcher>,
+    protocols: Option<Vec<String>>,
 }
 
 impl Routing {
@@ -1002,6 +1004,7 @@ impl Rule {
         let mut source_value = None;
         let mut source_ip_value = None;
         let mut local_ips = None;
+        let mut protocols = None;
         let mut unread = None;
         for (key, field) in pairs {
             match key.as_str() {
@@ -1033,7 +1036,8 @@ impl Rule {
                 "localPort" => local_ports = port_set(field, "localPort")?,
                 "inboundTag" => inbound_tags = string_list(field, "inboundTag")?,
                 "localOS" => local_os = string_list(field, "localOS")?,
-                "protocol" | "attrs" | "user" | "vlessRoute" | "process" | "webhook" => {
+                "protocol" => protocols = string_list(field, "protocol")?,
+                "attrs" | "user" | "vlessRoute" | "process" | "webhook" => {
                     unread = Some(key);
                 }
                 other => return Err(format!("routing rule field `{other}` is not carried")),
@@ -1069,6 +1073,7 @@ impl Rule {
             ips,
             source_ips,
             local_ips,
+            protocols,
         }))
     }
 
@@ -1081,6 +1086,7 @@ impl Rule {
             && self.ips.is_none()
             && self.source_ips.is_none()
             && self.local_ips.is_none()
+            && self.protocols.is_none()
     }
 
     fn server_always(&self) -> bool {
@@ -1134,6 +1140,14 @@ impl Rule {
         }
         if !self.local_os_matches() {
             return false;
+        }
+        if let Some(protocols) = &self.protocols {
+            let Some(protocol) = flow.protocol else {
+                return false;
+            };
+            if !protocols.iter().any(|listed| protocol.starts_with(listed)) {
+                return false;
+            }
         }
         if let Some(ports) = &self.ports {
             if !flow.port.is_some_and(|port| ports.contains(port)) {
@@ -2397,6 +2411,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         assert_eq!(routing.route(&flow("example.test")), Some("direct"));
         assert_eq!(routing.route(&flow("www.example.test")), Some("direct"));
@@ -2428,6 +2443,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         assert_eq!(routing.route(&matching), Some("direct"));
         for changed in [
@@ -2469,6 +2485,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         assert_eq!(routing.route(&flow), Some("first"));
     }
@@ -2503,6 +2520,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         assert_eq!(routing.route(&flow("x.both.test")), Some("direct"));
         assert_eq!(routing.route(&flow("one.test")), None);
@@ -2687,6 +2705,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         assert_eq!(
             routing.route(&flow("192.0.2.9".parse().expect("ip"))),
@@ -2753,6 +2772,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         let lookups = std::cell::Cell::new(0);
         let tag = routing.route_with(&flow, &|_, _| {
@@ -2803,6 +2823,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         let before = DOMAIN_TABLE_READS.with(std::cell::Cell::get);
         let tag = routing.route_with(&flow, &|_, _| vec!["192.0.2.1".parse().expect("ip")]);
@@ -2840,6 +2861,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         let lookups = std::cell::Cell::new(0);
         let tag = routing.route_with(&flow, &|_, _| {
@@ -2878,7 +2900,7 @@ mod tests {
     }
 
     #[test]
-    fn a_catch_all_rule_matches_every_flow_and_a_sniffer_rule_is_skipped() {
+    fn a_protocol_rule_reads_the_sniffed_protocol() {
         let root = object(vec![(
             "routing",
             routing(vec![
@@ -2903,8 +2925,9 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: Some("http1"),
         };
-        assert_eq!(parsed.route(&named), Some("direct"));
+        assert_eq!(parsed.route(&named), Some("block"));
         let bare = Flow {
             network: Network::Udp,
             domain: None,
@@ -2913,6 +2936,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         assert_eq!(parsed.route(&bare), Some("direct"));
     }
@@ -2940,6 +2964,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         assert_eq!(parsed.route(&flow), Some("direct"));
         flow.port = Some(102);
@@ -2972,6 +2997,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         assert_eq!(parsed.route(&flow), Some("direct"));
         flow.port = Some(100);
@@ -3096,6 +3122,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, None);
@@ -3122,6 +3149,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, Some("direct"));
@@ -3148,6 +3176,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, Some("direct"));
@@ -3180,6 +3209,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, Some("second"));
@@ -3209,6 +3239,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, Some("first"));
@@ -3238,6 +3269,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         let lookups = std::cell::Cell::new(0);
         let tag = routing.route_with(&flow, &|_, _| {
@@ -3277,6 +3309,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         let lookups = std::cell::Cell::new(0);
         let tag = routing.route_with(&flow, &|_, _| {
@@ -3338,6 +3371,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         assert_eq!(routing.route(&flow), Some("pool"));
     }
@@ -3523,6 +3557,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         assert_eq!(
             parsed.route_target(&flow),

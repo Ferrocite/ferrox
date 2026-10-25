@@ -260,6 +260,15 @@ fn routed_out(
 
 /// Opens every inbound the config names, proving each server inbound's rules at startup, and reports
 /// how many opened and whether a hysteria inbound wants the readiness token.
+fn inbound_sniffing(inbound: &Json, label: &str) -> Option<Arc<crate::sniff::Sniffing>> {
+    crate::sniff::parse(inbound.get("sniffing")).unwrap_or_else(|error| {
+        exit(&format!(
+            "bad config {label}: inbound {} sniffing {error}",
+            inbound_tag(inbound).as_deref().unwrap_or("<untagged>")
+        ))
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 fn serve_inbounds(
     label: &str,
@@ -271,8 +280,7 @@ fn serve_inbounds(
 ) -> (usize, bool) {
     let routed =
         |inbound: &Json, source_known: bool| routed_out(outbound, route, inbound, source_known);
-    let mut inbounds = 0;
-    let mut hysteria_served = false;
+    let (mut inbounds, mut hysteria_served) = (0, false);
     if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
         for inbound in list {
             let protocol =
@@ -288,6 +296,7 @@ fn serve_inbounds(
             if let Some(shared) = route {
                 prove_server_route(shared, inbound, label);
             }
+            register_inbound_sniffing(inbound, label, &addresses);
             for address in &addresses {
                 match protocol {
                     "vless" => {
@@ -373,6 +382,13 @@ fn serve_inbounds(
         }
     }
     (inbounds, hysteria_served)
+}
+
+fn register_inbound_sniffing(inbound: &Json, label: &str, addresses: &[String]) {
+    let sniffing = inbound_sniffing(inbound, label);
+    for address in addresses {
+        crate::sniff::register(address, sniffing.clone());
+    }
 }
 
 /// The listener lanes an inbound opens: the device's own (a tun names no socket), else one
@@ -973,8 +989,18 @@ impl Outbound {
         network: crate::router::Network,
         client: Option<&Connection>,
     ) -> (&Self, Option<&str>) {
+        self.resolved_lane_with_protocol(asked, network, client, None)
+    }
+
+    fn resolved_lane_with_protocol(
+        &self,
+        asked: &Destination,
+        network: crate::router::Network,
+        client: Option<&Connection>,
+        protocol: Option<&str>,
+    ) -> (&Self, Option<&str>) {
         match self {
-            Self::Route(plan) => plan.lane(asked, network, client),
+            Self::Route(plan) => plan.lane_with_protocol(asked, network, client, protocol),
             other => (other, None),
         }
     }
@@ -1045,16 +1071,37 @@ impl RoutePlan {
         network: crate::router::Network,
         client: Option<&Connection>,
     ) -> &Outbound {
-        self.lane(asked, network, client).0
+        self.pick_with_protocol(asked, network, client, None)
+    }
+
+    fn pick_with_protocol(
+        &self,
+        asked: &Destination,
+        network: crate::router::Network,
+        client: Option<&Connection>,
+        protocol: Option<&str>,
+    ) -> &Outbound {
+        self.lane_with_protocol(asked, network, client, protocol).0
     }
 
     /// The outbound one flow takes and the tag that names its lane, or the default when no rule
     /// matched. A balancer picks per flow; its fallback, then the default handler, covers no pick.
+    #[cfg(test)]
     fn lane(
         &self,
         asked: &Destination,
         network: crate::router::Network,
         client: Option<&Connection>,
+    ) -> (&Outbound, Option<&str>) {
+        self.lane_with_protocol(asked, network, client, None)
+    }
+
+    fn lane_with_protocol(
+        &self,
+        asked: &Destination,
+        network: crate::router::Network,
+        client: Option<&Connection>,
+        protocol: Option<&str>,
     ) -> (&Outbound, Option<&str>) {
         let (domain, ip) = match asked {
             Destination::Name(host, _) => (Some(host.as_str()), None),
@@ -1072,6 +1119,7 @@ impl RoutePlan {
             source,
             local,
             inbound_tag: self.inbound_tag.as_deref(),
+            protocol,
         };
         let Some(target) = self.shared.routing.route_target(&flow) else {
             return (&self.shared.default, self.shared.default_tag.as_deref());
@@ -1563,12 +1611,15 @@ fn accept_loop(address: &str, role: &Role, tag: Option<&str>) {
         .unwrap_or_else(|error| exit(&format!("cannot resolve {address}: {error}")));
     let listener = Listener::bind(&target)
         .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
+    let sniffing = crate::sniff::for_listener(listener.local_addr().ok(), address);
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
         no_delay(&stream);
         let role = role.clone();
         let tag = tag.map(str::to_owned);
+        let sniffing = sniffing.clone();
         thread::spawn(move || {
+            crate::sniff::install_current(sniffing);
             let (stream, role) = match role {
                 Role::Proxied(inner) => {
                     let _ = stream.set_read_timeout(Some(budgets::handshake()));
@@ -10635,9 +10686,14 @@ fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts)
     // The rules decide the lane first; a blocked flow is granted before it closes, so the front's reply is read.
     let destination = handshake.asked.authority();
     crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", "");
-    let (out, tag) =
-        out.resolved_lane(&handshake.asked, crate::router::Network::Tcp, Some(&client));
-    if !matches!(out, Outbound::Foxy(_) | Outbound::Veepn(_)) {
+    let first = match crate::sniff::current() {
+        Some(sniffing) if sniffing.enabled() => None,
+        _ => Some(
+            out.resolved_lane(&handshake.asked, crate::router::Network::Tcp, Some(&client))
+                .0,
+        ),
+    };
+    if !matches!(first.unwrap_or(out), Outbound::Foxy(_) | Outbound::Veepn(_)) {
         let grant = match handshake.version {
             crate::socks::Version::V5 => Front::Socks.grant_line(),
             crate::socks::Version::V4 => ferrox_core::socks::grant4(),
@@ -10646,7 +10702,9 @@ fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts)
             return;
         }
     }
-    serve_connect(client, out, &handshake.asked, Front::Socks, &[], tag);
+    let (dial, out, tag) = sniff_lane(out, &handshake.asked, &client);
+    let asked = dial.as_ref().unwrap_or(&handshake.asked);
+    serve_connect(client, out, asked, Front::Socks, &[], tag);
 }
 
 /// The device front's relay: the front layer's own dial, with the destination the
@@ -10656,7 +10714,8 @@ fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts)
 /// front reaches — the same `serve_connect` the socks and http fronts call, with the
 /// same rules and the same grant.
 pub(crate) fn serve_device_flow(client: Connection, out: &Outbound, dest: &Destination) {
-    let (lane, tag) = out.resolved_lane(dest, crate::router::Network::Tcp, Some(&client));
+    let (dial, lane, tag) = sniff_lane(out, dest, &client);
+    let dest = dial.as_ref().unwrap_or(dest);
     serve_connect(client, lane, dest, Front::Socks, &[], tag);
 }
 
@@ -10736,6 +10795,38 @@ fn serve_connect_freedom(client: &Connection, asked: &Destination, prefix: &[u8]
         return;
     }
     relay_handoff(client, &upstream);
+}
+
+/// Sniff the client's first bytes, then pick the lane the reference would: the sniffed name is the
+/// route target, and the original address stays the dial target under `routeOnly`.
+fn sniff_lane<'a>(
+    out: &'a Outbound,
+    asked: &Destination,
+    client: &Connection,
+) -> (Option<Destination>, &'a Outbound, Option<&'a str>) {
+    let Some(sniffing) = crate::sniff::current() else {
+        let (lane, tag) = out.resolved_lane(asked, crate::router::Network::Tcp, Some(client));
+        return (None, lane, tag);
+    };
+    let Some(found) = sniffing.inspect(asked, crate::router::Network::Tcp, client) else {
+        let (lane, tag) = out.resolved_lane(asked, crate::router::Network::Tcp, Some(client));
+        return (None, lane, tag);
+    };
+    let route = found
+        .override_destination
+        .then(|| Destination::Name(found.domain.clone(), asked.port()));
+    let dial = if sniffing.should_dial_override(&found) {
+        route.clone()
+    } else {
+        None
+    };
+    let (resolved, tag) = out.resolved_lane_with_protocol(
+        route.as_ref().unwrap_or(asked),
+        crate::router::Network::Tcp,
+        Some(client),
+        Some(found.protocol),
+    );
+    (dial, resolved, tag)
 }
 
 /// One tunnel request from either front, already resolved to its lane: the Foxy lane grants after its tunnel opens.
@@ -11698,18 +11789,31 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
         ProxyRequest::Connect(asked) => {
             let destination = asked.authority();
             crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", "");
-            let (out, tag) = out.resolved_lane(&asked, crate::router::Network::Tcp, Some(&client));
-            if !matches!(out, Outbound::Foxy(_) | Outbound::Veepn(_))
+            let first = match crate::sniff::current() {
+                Some(sniffing) if sniffing.enabled() => None,
+                _ => Some(
+                    out.resolved_lane(&asked, crate::router::Network::Tcp, Some(&client))
+                        .0,
+                ),
+            };
+            if !matches!(first.unwrap_or(out), Outbound::Foxy(_) | Outbound::Veepn(_))
                 && client.write_all(Front::Http.grant_line()).is_err()
             {
                 return;
             }
-            serve_connect(client, out, &asked, Front::Http, &[], tag);
+            let (dial, out, tag) = sniff_lane(out, &asked, &client);
+            let asked = dial.as_ref().unwrap_or(&asked);
+            serve_connect(client, out, asked, Front::Http, &[], tag);
         }
         ProxyRequest::Forward(asked, origin) => {
             let destination = asked.authority();
             crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", "");
-            let (out, tag) = out.resolved_lane(&asked, crate::router::Network::Tcp, Some(&client));
+            let (out, tag) = out.resolved_lane_with_protocol(
+                &asked,
+                crate::router::Network::Tcp,
+                Some(&client),
+                Some("http/1.1"),
+            );
             serve_connect(client, out, &asked, Front::Http, &origin, tag);
         }
     }
@@ -11892,14 +11996,63 @@ fn socks_udp_relay(client: &mut Connection) -> Option<UdpSocket> {
 
 fn serve_socks_udp(client: Connection, out: &Outbound) {
     if let Outbound::Route(plan) = out {
-        if plan.split_udp() {
+        if plan.split_udp() || crate::sniff::current().is_some_and(|sniffing| sniffing.enabled()) {
             return serve_socks_udp_split(client, plan);
         }
         if let Ok(target) = plan.udp_out() {
             return serve_socks_udp_lane(client, target);
         }
     }
+    if !matches!(out, Outbound::Block(_))
+        && crate::sniff::current().is_some_and(|sniffing| sniffing.enabled())
+    {
+        return serve_socks_udp_sniffed(client, out);
+    }
     serve_socks_udp_lane(client, out);
+}
+
+/// One outbound that is not the routing plan still needs the sniffer's override: the lane reads
+/// the datagram's own header, and this relay rewrites it before the outbound does.
+fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
+    let Some(relay) = socks_udp_relay(&mut client) else {
+        return;
+    };
+    let local = relay
+        .local_addr()
+        .map_or(std::net::IpAddr::V4([127, 0, 0, 1].into()), |addr| {
+            addr.ip()
+        });
+    let Some(lane) = spawn_udp_lane(out, local) else {
+        return;
+    };
+    let mut client_addr: Option<SocketAddr> = None;
+    let mut buf = udp_buffer();
+    let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
+    while let Ok((n, src)) = relay.recv_from(&mut buf) {
+        if src == lane.address {
+            if let Some(client) = client_addr {
+                let _ = relay.send_to(&buf[..n], client);
+            }
+            continue;
+        }
+        let Some((dest, payload)) = parse_socks_udp_dest(&buf[..n]) else {
+            continue;
+        };
+        client_addr = Some(src);
+        let mut dial = None;
+        if let Some(sniffing) = crate::sniff::current().filter(|sniffing| sniffing.enabled()) {
+            if let Some(found) = sniffing.inspect_udp(&dest, payload) {
+                if sniffing.should_dial_override(&found) {
+                    dial = Destination::Name(found.domain, dest.port()).socket();
+                }
+            }
+        }
+        let frame = match dial {
+            Some(address) => socks_udp_frame(&mut frame, None, &address, payload),
+            None => &buf[..n],
+        };
+        let _ = relay.send_to(frame, lane.address);
+    }
 }
 
 /// One lane for the whole association: every datagram reaches the same outbound.
@@ -12046,6 +12199,7 @@ fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan) {
     let mut replies: HashMap<SocketAddr, Option<String>> = HashMap::new();
     let mut client_addr: Option<SocketAddr> = None;
     let mut buf = udp_buffer();
+    let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         if replies.contains_key(&src) {
             if let Some(client) = client_addr {
@@ -12053,11 +12207,26 @@ fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan) {
             }
             continue;
         }
-        let Some((dest, _)) = parse_socks_udp_dest(&buf[..n]) else {
+        let Some((dest, payload)) = parse_socks_udp_dest(&buf[..n]) else {
             continue;
         };
+        let mut route = dest.clone();
+        let mut dial = None;
+        let mut protocol = None;
+        if let Some(sniffing) = crate::sniff::current().filter(|sniffing| sniffing.enabled()) {
+            if let Some(found) = sniffing.inspect_udp(&dest, payload) {
+                protocol = Some(found.protocol);
+                if found.override_destination {
+                    route = Destination::Name(found.domain.clone(), dest.port());
+                    if sniffing.should_dial_override(&found) {
+                        dial = route.socket();
+                    }
+                }
+            }
+        }
         client_addr = Some(src);
-        let (out, key) = plan.lane(&dest, crate::router::Network::Udp, Some(&client));
+        let (out, key) =
+            plan.lane_with_protocol(&route, crate::router::Network::Udp, Some(&client), protocol);
         let key = key.map(str::to_owned);
         if matches!(out, Outbound::Block(_)) {
             continue;
@@ -12070,7 +12239,11 @@ fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan) {
             }
         }
         if let Some(lane) = lanes.get(&key) {
-            let _ = relay.send_to(&buf[..n], lane.address);
+            let frame = match dial {
+                Some(address) => socks_udp_frame(&mut frame, None, &address, payload),
+                None => &buf[..n],
+            };
+            let _ = relay.send_to(frame, lane.address);
         }
     }
 }
@@ -16870,10 +17043,8 @@ fn is_freedom(root: &Json) -> bool {
 }
 
 /// The tag a `loopback` outbound re-injects through, or nothing when no such
-/// outbound is configured to carry. An empty tag and an enabled sniffer skip
-/// the outbound the way other uncarriable settings skip theirs: the tag is
-/// the whole route, and sniffing belongs to the engine sniffer this tree has
-/// not built.
+/// outbound is configured to carry. An empty tag skips it; loopback sniffing has
+/// no second routing pass here, so the dial keeps the named inbound's own sniffer.
 fn find_loopback_outbound(root: &Json) -> Option<String> {
     let outbounds = root.get("outbounds").and_then(Json::as_arr)?;
     for outbound in outbounds {
@@ -16891,7 +17062,9 @@ fn find_loopback_outbound(root: &Json) -> Option<String> {
             .and_then(Json::as_bool)
             .unwrap_or(false);
         if sniffing {
-            continue;
+            eprintln!(
+                "loopback outbound `{tag}` asks for sniffing, which this tree does not re-dispatch; its inbound sniffer decides"
+            );
         }
         return Some(tag.to_owned());
     }
@@ -27179,6 +27352,66 @@ mod tests {
         assert_eq!(payload, b"ping");
     }
 
+    /// A non-route UDP outbound still takes the sniffed lane: bittorrent has no domain to override,
+    /// so the original destination and the echo reply must come back untouched.
+    #[test]
+    fn a_sniffed_udp_association_keeps_an_empty_domain_destination() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            loop {
+                let Ok((n, src)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let value =
+            crate::json::parse(r#"{"enabled":true,"destOverride":["bittorrent"]}"#).expect("json");
+        let sniffing = crate::sniff::parse(Some(&value)).expect("sniffing");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            crate::sniff::install_current(sniffing);
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &Outbound::Freedom, &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let mut datagram = vec![0u8, 0, 0];
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"\x13BitTorrent protocol");
+        udp.send_to(&datagram, relay).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = udp.recv_from(&mut back).expect("echoes");
+        let (source, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(source, target);
+        assert_eq!(payload, b"\x13BitTorrent protocol");
+    }
+
     #[test]
     fn trojan_udp_frames_carry() {
         let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -34112,6 +34345,33 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_http_forward_matches_the_http_protocol_selector() {
+        let echo = echo_loop();
+        let route = route_outbound(
+            r#"{"outbounds":[{"protocol":"freedom","tag":"direct"},{"protocol":"blackhole","tag":"blocked"}],"routing":{"rules":[{"type":"field","protocol":["http"],"outboundTag":"direct"}]}}"#,
+            None,
+            true,
+        );
+        let front = http_front_with(route);
+        let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client
+            .write_all(
+                format!("GET http://127.0.0.1:{echo}/ HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n")
+                    .as_bytes(),
+            )
+            .expect("gets");
+        let head =
+            read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("echoes the head");
+        assert_eq!(
+            head,
+            format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n").into_bytes()
+        );
+    }
+
+    #[test]
     fn http_get_to_a_protocol_outbound_is_405() {
         let front = http_front_with(Outbound::Vless(VlessOut {
             address: "127.0.0.1".to_owned(),
@@ -34687,16 +34947,15 @@ mod tests {
         }
     }
 
-    /// Sniffing on re-dispatch belongs to the engine sniffer this tree has not
-    /// built, so an enabled sniffer skips the outbound rather than re-injecting
-    /// unsniffed in silence.
+    /// Sniffing on re-dispatch has no second routing pass here; the outbound
+    /// still names its inbound, and that inbound's own sniffer decides.
     #[test]
-    fn a_loopback_outbound_with_sniffing_enabled_is_skipped() {
+    fn a_loopback_outbound_keeps_its_tag_when_sniffing_is_enabled() {
         let root = crate::json::parse(
             r#"{"outbounds":[{"protocol":"loopback","settings":{"inboundTag":"t","sniffing":{"enabled":true}}}]}"#,
         )
         .expect("parses");
-        assert!(find_loopback_outbound(&root).is_none());
+        assert_eq!(find_loopback_outbound(&root).as_deref(), Some("t"));
         let root = crate::json::parse(
             r#"{"outbounds":[{"protocol":"loopback","settings":{"inboundTag":"t","sniffing":{"enabled":false}}}]}"#,
         )
@@ -38637,7 +38896,8 @@ fn front_dispatch(stream: Connection, role: Role) {
                 .map(|bound| bound.port())
                 .unwrap_or_default();
             let dest = port_map.get(&port).unwrap_or(&dest);
-            let (target, tag) = out.resolved_lane(dest, crate::router::Network::Tcp, Some(&stream));
+            let (dial, target, tag) = sniff_lane(&out, dest, &stream);
+            let dest = dial.as_ref().unwrap_or(dest);
             serve_connect(stream, target, dest, Front::Socks, &[], tag);
         }
         Role::Proxied(inner) => front_dispatch(stream, *inner),
