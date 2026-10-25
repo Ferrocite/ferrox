@@ -246,7 +246,8 @@ fn splice<S: Stream>(
     let refused = |why: &str| TlsError::Other(format!("reality: cover origin, {why}"));
     let mut target = TcpStream::connect(dest).map_err(|_| refused("unreachable"))?;
     if cfg.xver > 0 {
-        proxy_protocol(&mut target, cfg.xver, edges).map_err(|_| refused("proxy protocol"))?;
+        write_proxy_protocol(&mut target, cfg.xver, edges)
+            .map_err(|_| refused("proxy protocol"))?;
     }
     target.write_all(hello).map_err(|_| refused("hello"))?;
     target.flush().map_err(|_| refused("hello"))?;
@@ -277,7 +278,11 @@ fn wide(edge: &SocketAddr) -> [u8; 16] {
 
 /// The PROXY-protocol header, either the text form or the binary one, written
 /// before the hello so the cover origin sees who really connected.
-fn proxy_protocol(target: &mut TcpStream, version: u8, edges: Edges) -> Result<(), std::io::Error> {
+pub fn write_proxy_protocol<W: Write>(
+    target: &mut W,
+    version: u8,
+    edges: Edges,
+) -> Result<(), std::io::Error> {
     match version {
         1 => {
             match (edges.local, edges.peer) {
@@ -1748,7 +1753,7 @@ mod tests {
         assert!(edges.peer.is_some() && edges.local.is_some());
         assert_ne!(edges.peer, edges.local);
         let (mut site, _) = listener.accept().expect("accepts");
-        proxy_protocol(&mut site, 1, edges).expect("writes a header");
+        write_proxy_protocol(&mut site, 1, edges).expect("writes a header");
         drop(site);
         let mut sink = stream;
         sink.set_read_timeout(Some(COVER_WAIT)).expect("timeout");
@@ -1779,7 +1784,7 @@ mod tests {
         let stream = TcpStream::connect(("127.0.0.1", listening)).expect("connects");
         let client = stream.local_addr().expect("addr").port();
         let (mut site, _) = listener.accept().expect("accepts");
-        proxy_protocol(&mut site, 2, Edges::of(&stream)).expect("writes a header");
+        write_proxy_protocol(&mut site, 2, Edges::of(&stream)).expect("writes a header");
         drop(site);
         let mut sink = stream;
         sink.set_read_timeout(Some(COVER_WAIT)).expect("timeout");

@@ -197,7 +197,7 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>) -> 
     // A loopback outbound names its inbound by tag, so it resolves only when no concrete dial won.
     let loopback = find_loopback_outbound(root);
     let outbound = match outbound {
-        Some(Outbound::Freedom) | None if loopback.is_some() => {
+        Some(Outbound::Freedom(_)) | None if loopback.is_some() => {
             let tag = loopback.expect("guarded by is_some");
             Some(
                 resolve_loopback(root, &tag, freedom).unwrap_or_else(|reason| {
@@ -1212,7 +1212,7 @@ pub(crate) enum Outbound {
     Socks(SocksOut),
     Foxy(Box<FoxyOut>),
     Veepn(crate::veepn::VeepnOut),
-    Freedom,
+    Freedom(Arc<FreedomOut>),
     Http(HttpOut),
     /// The rules choose the outbound per flow; the plan holds the registry and the fallback.
     Route(Arc<RoutePlan>),
@@ -1247,7 +1247,7 @@ impl Outbound {
             Self::Metrics { address } => Some(*address),
             Self::Foxy(_)
             | Self::Veepn(_)
-            | Self::Freedom
+            | Self::Freedom(_)
             | Self::Route(_)
             | Self::Loopback(_)
             | Self::Block(_)
@@ -1856,15 +1856,15 @@ fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
                 .chain(fallback)
                 .all(|candidate| {
                     Some(candidate) == shared.default_tag.as_deref()
-                        || matches!(shared.tagged.get(candidate), Some(Outbound::Freedom))
+                        || matches!(shared.tagged.get(candidate), Some(Outbound::Freedom(_)))
                 });
         }
         Some(named) == shared.default_tag.as_deref()
-            || matches!(shared.tagged.get(named), Some(Outbound::Freedom))
+            || matches!(shared.tagged.get(named), Some(Outbound::Freedom(_)))
     };
     if let Err(error) = shared.routing.server_routes(
         tag.as_deref(),
-        matches!(&shared.default, Outbound::Freedom),
+        matches!(&shared.default, Outbound::Freedom(_)),
         direct,
     ) {
         exit(&format!("bad config {label}: {error}"));
@@ -2002,6 +2002,110 @@ pub(crate) struct VlessOut {
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
     flow: String,
     reality: Option<Arc<ferrox_core::tls::RealityClientConfig>>,
+}
+
+/// The freedom lane's own settings: where it redirects, how it resolves a name, whether it
+/// prefixes the dial with a PROXY header, and the fragment stage its carrier writes through.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct FreedomOut {
+    redirect: Option<FreedomRedirect>,
+    domain: FreedomDomain,
+    proxy_protocol: u8,
+    fragment: Option<Arc<ferrox_core::finalmask::Chain>>,
+}
+
+impl FreedomOut {
+    fn is_plain(&self) -> bool {
+        self.redirect.is_none()
+            && self.domain == FreedomDomain::AsIs
+            && self.proxy_protocol == 0
+            && self.fragment.is_none()
+    }
+}
+
+/// `redirect` replaces the requested address, or only its port when the host is empty.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FreedomRedirect {
+    Address(String, u16),
+    Port(u16),
+}
+
+impl FreedomRedirect {
+    fn apply(&self, asked: &Destination) -> Destination {
+        match (self, asked) {
+            (Self::Address(host, port), _) => {
+                let port = if *port == 0 { asked.port() } else { *port };
+                match host.parse() {
+                    Ok(ip) => Destination::Address(SocketAddr::new(ip, port)),
+                    Err(_) => Destination::Name(host.clone(), port),
+                }
+            }
+            (Self::Port(0), _) => asked.clone(),
+            (Self::Port(port), Destination::Address(address)) => {
+                Destination::Address(SocketAddr::new(address.ip(), *port))
+            }
+            (Self::Port(port), Destination::Name(host, _)) => {
+                Destination::Name(host.clone(), *port)
+            }
+        }
+    }
+}
+
+/// The family preference the reference's `domainStrategy` names. `AsIs` leaves a name to the
+/// system dial; every other value resolves it here first.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum FreedomDomain {
+    #[default]
+    AsIs,
+    UseIp,
+    UseIp4,
+    UseIp6,
+    UseIp46,
+    UseIp64,
+    ForceIp,
+    ForceIp4,
+    ForceIp6,
+    ForceIp46,
+    ForceIp64,
+}
+
+impl FreedomDomain {
+    fn parse(text: &str) -> Option<Self> {
+        match text.to_ascii_lowercase().as_str() {
+            "" | "asis" => Some(Self::AsIs),
+            "useip" => Some(Self::UseIp),
+            "useipv4" => Some(Self::UseIp4),
+            "useipv6" => Some(Self::UseIp6),
+            "useipv4v6" => Some(Self::UseIp46),
+            "useipv6v4" => Some(Self::UseIp64),
+            "forceip" => Some(Self::ForceIp),
+            "forceipv4" => Some(Self::ForceIp4),
+            "forceipv6" => Some(Self::ForceIp6),
+            "forceipv4v6" => Some(Self::ForceIp46),
+            "forceipv6v4" => Some(Self::ForceIp64),
+            _ => None,
+        }
+    }
+
+    fn forces(self) -> bool {
+        matches!(
+            self,
+            Self::ForceIp | Self::ForceIp4 | Self::ForceIp6 | Self::ForceIp46 | Self::ForceIp64
+        )
+    }
+
+    /// The first address in the order this strategy asks for, from the resolver's whole answer.
+    fn pick(self, ips: &[std::net::IpAddr]) -> Option<std::net::IpAddr> {
+        let v4 = || ips.iter().copied().find(std::net::IpAddr::is_ipv4);
+        let v6 = || ips.iter().copied().find(std::net::IpAddr::is_ipv6);
+        match self {
+            Self::AsIs | Self::UseIp | Self::ForceIp => ips.first().copied(),
+            Self::UseIp4 | Self::ForceIp4 => v4(),
+            Self::UseIp6 | Self::ForceIp6 => v6(),
+            Self::UseIp46 | Self::ForceIp46 => v4().or_else(v6),
+            Self::UseIp64 | Self::ForceIp64 => v6().or_else(v4),
+        }
+    }
 }
 
 /// A direct Hysteria v1 outbound: the QUIC edge, the credential and the trust bundle it dials with.
@@ -3339,8 +3443,10 @@ pub(crate) fn dns_stream(
     let dest = dns_destination(host, port);
     let out = dns_outbound(&dest, crate::router::Network::Tcp, tag)?;
     // Freedom is the system dial under another name, so the direct path is shorter and the same.
-    if matches!(out, Outbound::Freedom) {
-        return None;
+    if let Outbound::Freedom(freedom) = &out {
+        if freedom.is_plain() {
+            return None;
+        }
     }
     dns_stream_with(&out, dest, timeout)
 }
@@ -3400,8 +3506,10 @@ pub(crate) fn dns_udp(
     let target = dns_socket(host, port)?;
     let dest = Destination::Address(target);
     let out = dns_outbound(&dest, crate::router::Network::Udp, tag)?;
-    if matches!(out, Outbound::Freedom) {
-        return None;
+    if let Outbound::Freedom(freedom) = &out {
+        if freedom.is_plain() {
+            return None;
+        }
     }
     dns_udp_with(&out, target, query, timeout)
 }
@@ -3735,7 +3843,9 @@ impl BridgeLane {
     fn tcp(&self, target: &MuxTarget) -> Option<Connection> {
         let asked = target.destination();
         match self.pick(&asked, crate::router::Network::Tcp).as_deref() {
-            Some(Outbound::Freedom) => asked.socket().and_then(|address| dial_or_report(&address)),
+            Some(Outbound::Freedom(freedom)) => freedom_socket(freedom, &asked)
+                .and_then(|address| dial_or_report(&address))
+                .map(|stream| stream.with_mask(freedom.fragment.as_deref())),
             Some(Outbound::Block(_)) => None,
             _ => {
                 refuse_bridge_lane(&self.tag);
@@ -3747,7 +3857,7 @@ impl BridgeLane {
     fn udp(&self, target: &MuxTarget) -> bool {
         let asked = target.destination();
         match self.pick(&asked, crate::router::Network::Udp).as_deref() {
-            Some(Outbound::Freedom) => true,
+            Some(Outbound::Freedom(_)) => true,
             Some(Outbound::Block(_)) => false,
             _ => {
                 refuse_bridge_lane(&self.tag);
@@ -12301,18 +12411,95 @@ fn serve_reverse_tcp(client: &Connection, portal: &crate::reverse::Portal, asked
     let _ = reader.join();
 }
 
-/// Nothing carries the destination onward, so this lane is the one that has to look it up.
-fn serve_connect_freedom(client: &Connection, asked: &Destination, prefix: &[u8]) {
-    let Some(target) = asked.socket() else {
+/// Nothing carries the destination onward, so this lane is the one that has to redirect it,
+/// resolve it by the configured strategy, and add the header or fragment the config asks for.
+fn serve_connect_freedom(
+    client: &Connection,
+    freedom: &FreedomOut,
+    asked: &Destination,
+    prefix: &[u8],
+) {
+    let Some(target) = freedom_socket(freedom, asked) else {
         return;
     };
     let Some(mut upstream) = dial_or_report(&target) else {
         return;
     };
+    if freedom.proxy_protocol > 0 {
+        let edges = Edges {
+            local: client.peer_addr().ok(),
+            peer: upstream.peer_addr().ok().or(Some(target)),
+        };
+        if ferrox_core::tls::write_proxy_protocol(&mut upstream, freedom.proxy_protocol, edges)
+            .is_err()
+        {
+            return;
+        }
+    }
+    let mut upstream = upstream.with_mask(freedom.fragment.as_deref());
     if !prefix.is_empty() && upstream.write_all(prefix).is_err() {
         return;
     }
     relay_handoff(client, &upstream);
+}
+
+/// The socket a freedom flow dials: its redirect first, then the family the strategy names.
+fn freedom_socket(freedom: &FreedomOut, asked: &Destination) -> Option<SocketAddr> {
+    let asked = freedom
+        .redirect
+        .as_ref()
+        .map_or_else(|| asked.clone(), |redirect| redirect.apply(asked));
+    match asked {
+        Destination::Address(address) => Some(address),
+        Destination::Name(host, port) => {
+            if freedom.domain == FreedomDomain::AsIs {
+                return resolve_endpoint(&host, port);
+            }
+            let ips = freedom_lookup(&host, port);
+            if let Some(ip) = freedom.domain.pick(&ips) {
+                return Some(SocketAddr::new(ip, port));
+            }
+            if freedom.domain.forces() {
+                eprintln!(
+                    "freedom: {host} did not resolve, and {} forces an address",
+                    strategy_name(freedom.domain)
+                );
+                return None;
+            }
+            resolve_endpoint(&host, port)
+        }
+    }
+}
+
+fn freedom_lookup(host: &str, port: u16) -> Vec<std::net::IpAddr> {
+    if let Some(resolver) = crate::dnsapp::installed() {
+        return resolver.lookup(host).map_or_else(Vec::new, |(ips, _)| ips);
+    }
+    let addrs = cached_lookup(host, port).unwrap_or_else(|| {
+        let addrs = resolve_bounded(host, port, budgets::dial(), |host, port| {
+            (host, port)
+                .to_socket_addrs()
+                .map(std::iter::Iterator::collect)
+        });
+        remember_lookup(host, port, &addrs)
+    });
+    addrs.iter().map(std::net::SocketAddr::ip).collect()
+}
+
+fn strategy_name(domain: FreedomDomain) -> &'static str {
+    match domain {
+        FreedomDomain::AsIs => "AsIs",
+        FreedomDomain::UseIp => "UseIP",
+        FreedomDomain::UseIp4 => "UseIP4",
+        FreedomDomain::UseIp6 => "UseIP6",
+        FreedomDomain::UseIp46 => "UseIP46",
+        FreedomDomain::UseIp64 => "UseIP64",
+        FreedomDomain::ForceIp => "ForceIP",
+        FreedomDomain::ForceIp4 => "ForceIP4",
+        FreedomDomain::ForceIp6 => "ForceIP6",
+        FreedomDomain::ForceIp46 => "ForceIP46",
+        FreedomDomain::ForceIp64 => "ForceIP64",
+    }
 }
 
 /// Sniff the client's first bytes, then pick the lane the reference would: the sniffed name is the
@@ -12393,8 +12580,8 @@ pub(crate) fn serve_connect(
     if let Outbound::Veepn(lane) = out {
         return serve_veepn_front(client, lane, asked, front, prefix);
     }
-    if matches!(out, Outbound::Freedom) {
-        serve_connect_freedom(&client, asked, prefix);
+    if let Outbound::Freedom(freedom) = out {
+        serve_connect_freedom(&client, freedom, asked, prefix);
         return;
     }
     if !prefix.is_empty() {
@@ -12528,7 +12715,7 @@ fn dial_socks_outbound(
         }
         Outbound::Foxy(_)
         | Outbound::Veepn(_)
-        | Outbound::Freedom
+        | Outbound::Freedom(_)
         | Outbound::Route(_)
         | Outbound::Loopback(_)
         | Outbound::Block(_)
@@ -13658,7 +13845,7 @@ fn serve_udp_lane(relay: &UdpSocket, out: &Outbound, associate: Option<&Connecti
             crate::foxy::Carrier::H3 => serve_socks_udp_foxy_ip(relay, foxy, associate),
             _ => serve_socks_udp_foxy(relay, foxy, associate),
         },
-        Outbound::Freedom => serve_socks_udp_freedom(relay),
+        Outbound::Freedom(out) => serve_socks_udp_freedom(relay, out),
         Outbound::Socks(socks) => serve_socks_udp_socks(relay, socks),
         Outbound::Dns(dns) => serve_dns_udp(relay, dns),
         Outbound::ReversePortal(portal) => serve_socks_udp_portal(relay, portal),
@@ -13912,7 +14099,7 @@ fn serve_socks_udp_socks(relay: &UdpSocket, socks: &SocksOut) {
 }
 
 /// Freedom UDP: the machine's own socket per destination, since a datagram here has no carrier to ride.
-fn serve_socks_udp_freedom(relay: &UdpSocket) {
+fn serve_socks_udp_freedom(relay: &UdpSocket, freedom: &FreedomOut) {
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let mut uplinks: HashMap<SocketAddr, (UdpSocket, thread::JoinHandle<()>)> = HashMap::new();
     let mut buf = udp_buffer();
@@ -13923,6 +14110,9 @@ fn serve_socks_udp_freedom(relay: &UdpSocket) {
         if payload.is_empty() {
             continue;
         }
+        let Some(dest) = freedom_socket(freedom, &Destination::Address(dest)) else {
+            continue;
+        };
         if let Ok(mut slot) = source.lock() {
             *slot = Some(src);
         }
@@ -18650,8 +18840,8 @@ fn find_outbound(root: &Json) -> Result<Option<Outbound>, String> {
     if let Some(hysteria) = find_hysteria_outbound(root) {
         return Ok(Some(Outbound::Hysteria(Box::new(hysteria))));
     }
-    if is_freedom(root) {
-        return Ok(Some(Outbound::Freedom));
+    if let Some(freedom) = find_freedom_outbound(root)? {
+        return Ok(Some(Outbound::Freedom(Arc::new(freedom))));
     }
     // The sink is the last resort: a config that names a dial takes the dial.
     if let Some(answer) = find_blackhole_outbound(root)? {
@@ -18662,9 +18852,93 @@ fn find_outbound(root: &Json) -> Result<Option<Outbound>, String> {
     }
     if let Some((tag, protocol)) = find_unbuilt_outbound(root) {
         eprintln!("outbound `{tag}` protocol `{protocol}` is not carried; dialing direct");
-        return Ok(Some(Outbound::Freedom));
+        return Ok(Some(Outbound::Freedom(Arc::default())));
     }
     Ok(None)
+}
+
+/// The freedom outbound's settings, read the way the reference reads them. A value the
+/// reference refuses is a startup refusal here too; a field this tree has no lane for is
+/// named once and left out rather than silently changing the dial.
+fn find_freedom_outbound(root: &Json) -> Result<Option<FreedomOut>, String> {
+    let empty = Vec::new();
+    let outbounds = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty);
+    for outbound in outbounds {
+        if canonical_protocol(
+            outbound
+                .get("protocol")
+                .and_then(Json::as_str)
+                .unwrap_or(""),
+        ) != "freedom"
+        {
+            continue;
+        }
+        let settings = outbound.get("settings");
+        let mut freedom = FreedomOut::default();
+        if let Some(redirect) = settings
+            .and_then(|s| s.get("redirect"))
+            .and_then(Json::as_str)
+        {
+            if !redirect.is_empty() {
+                freedom.redirect = Some(parse_freedom_redirect(redirect)?);
+            }
+        }
+        let strategy = settings
+            .and_then(|s| s.get("targetStrategy").or_else(|| s.get("domainStrategy")))
+            .and_then(Json::as_str)
+            .unwrap_or("");
+        freedom.domain = FreedomDomain::parse(strategy)
+            .ok_or_else(|| format!("unsupported domain strategy: {strategy}"))?;
+        if let Some(version) = settings
+            .and_then(|s| s.get("proxyProtocol"))
+            .and_then(Json::as_u32)
+        {
+            if version <= 2 {
+                freedom.proxy_protocol = version as u8;
+            } else {
+                eprintln!(
+                    "freedom: proxyProtocol {version} is outside 1..=2, so it is not written"
+                );
+            }
+        }
+        if let Some(conf) = settings.and_then(|s| s.get("fragment")) {
+            let stage = crate::config::fragment(Some(conf)).ok_or_else(|| {
+                "freedom fragment cannot be driven: check packets, length, interval and maxSplit"
+                    .to_owned()
+            })?;
+            let mut chain = ferrox_core::finalmask::Chain::default();
+            chain.push(stage);
+            freedom.fragment = Some(Arc::new(chain));
+        }
+        for field in ["noise", "noises", "ipsBlocked", "finalRules", "userLevel"] {
+            if settings
+                .and_then(|s| s.get(field))
+                .is_some_and(|value| !matches!(value, Json::Null))
+            {
+                eprintln!("freedom: {field} is not carried; the dial keeps its own behaviour");
+            }
+        }
+        return Ok(Some(freedom));
+    }
+    Ok(None)
+}
+
+fn parse_freedom_redirect(text: &str) -> Result<FreedomRedirect, String> {
+    let (host, port) = text
+        .rsplit_once(':')
+        .ok_or_else(|| format!("invalid redirect address: {text}: missing port"))?;
+    let port = port
+        .parse::<u16>()
+        .map_err(|_| format!("invalid redirect port: {text}"))?;
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    if host.is_empty() {
+        Ok(FreedomRedirect::Port(port))
+    } else {
+        Ok(FreedomRedirect::Address(host.to_owned(), port))
+    }
 }
 
 /// The blackhole outbound's answer, read the way the reference's own config
@@ -18691,10 +18965,6 @@ fn find_blackhole_outbound(
         return Ok(Some(crate::blackhole::answer(outbound.get("settings"))?));
     }
     Ok(None)
-}
-
-fn is_freedom(root: &Json) -> bool {
-    has_protocol(root, "outbounds", "freedom")
 }
 
 /// The tag a `loopback` outbound re-injects through, or nothing when no such
@@ -20453,6 +20723,10 @@ mod tests {
     use crate::config::{grpc_path, stream_carrier};
     use ferrox_core::finalmask::Chain;
 
+    fn freedom() -> Outbound {
+        Outbound::Freedom(Arc::default())
+    }
+
     /// A relay half that is read by one thread and written by another: the reader parks
     /// where the kernel would park, and the writer must not wait for it.
     struct Parked {
@@ -20530,27 +20804,27 @@ mod tests {
         let lane = |plan: &RoutePlan| {
             matches!(
                 &*plan.pick(&asked, crate::router::Network::Tcp, None),
-                Outbound::Freedom
+                Outbound::Freedom(_)
             )
         };
         assert!(lane(&plan));
-        assert!(shared.add_outbound("alt", Outbound::Freedom).is_err());
+        assert!(shared.add_outbound("alt", freedom()).is_err());
         shared.remove_outbound("alt");
         assert!(matches!(
             &*plan.pick(&asked, crate::router::Network::Tcp, None),
             Outbound::Block(_)
         ));
-        assert!(shared.add_outbound("alt", Outbound::Freedom).is_ok());
+        assert!(shared.add_outbound("alt", freedom()).is_ok());
         assert!(lane(&plan));
         shared.remove_outbound("alt");
         assert!(matches!(
             &*plan.pick(&asked, crate::router::Network::Tcp, None),
             Outbound::Block(_)
         ));
-        assert!(shared.add_outbound("alt", Outbound::Freedom).is_ok());
+        assert!(shared.add_outbound("alt", freedom()).is_ok());
         assert!(lane(&plan));
-        assert!(shared.add_outbound("new", Outbound::Freedom).is_ok());
-        assert!(matches!(&*plan.target("new"), Outbound::Freedom));
+        assert!(shared.add_outbound("new", freedom()).is_ok());
+        assert!(matches!(&*plan.target("new"), Outbound::Freedom(_)));
         shared.remove_outbound("new");
         assert!(matches!(&*plan.target("new"), Outbound::Block(_)));
         shared.remove_outbound("nobody");
@@ -20570,7 +20844,7 @@ mod tests {
         let portals = Arc::new(crate::reverse::Portals::default());
         let shared = route_shared(&root, routing, &portals, None).expect("shared");
         let runtime = Runtime::new(
-            Some(Outbound::Freedom),
+            Some(freedom()),
             Some(Arc::clone(&shared)),
             false,
             Arc::clone(&portals),
@@ -20583,7 +20857,7 @@ mod tests {
         raw.extend_from_slice(&[0x0a, name.len() as u8]);
         raw.extend_from_slice(name);
         runtime.add_outbound("new", &raw).expect("adds");
-        assert!(matches!(&*plan.target("new"), Outbound::Freedom));
+        assert!(matches!(&*plan.target("new"), Outbound::Freedom(_)));
         assert!(runtime.add_outbound("new", &raw).is_err());
         runtime.remove_outbound("new");
         assert!(matches!(&*plan.target("new"), Outbound::Block(_)));
@@ -25001,7 +25275,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_socks(stream, &Outbound::Freedom, &no_accounts());
+            serve_socks(stream, &freedom(), &no_accounts());
             let _ = done_tx.send(());
         });
         let _peer = Connection::connect(addr).expect("connects");
@@ -25024,7 +25298,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_socks(stream, &Outbound::Freedom, &no_accounts());
+            serve_socks(stream, &freedom(), &no_accounts());
             let _ = done_tx.send(());
         });
         // The peer stays open and says nothing more, so the request read expires rather than seeing a close.
@@ -27852,7 +28126,7 @@ mod tests {
         let (opened, _) = serve_inbounds(
             "test",
             &root,
-            Some(&Outbound::Freedom),
+            Some(&freedom()),
             None,
             true,
             &crate::reverse::Portals::default(),
@@ -29578,7 +29852,7 @@ mod tests {
         let front_port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &Outbound::Freedom, &no_accounts());
+            serve_socks(stream, &freedom(), &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -29638,7 +29912,7 @@ mod tests {
         thread::spawn(move || {
             crate::sniff::install_current(sniffing);
             let (stream, _) = front.accept().expect("accepts");
-            serve_socks(stream, &Outbound::Freedom, &no_accounts());
+            serve_socks(stream, &freedom(), &no_accounts());
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
@@ -32488,7 +32762,7 @@ mod tests {
         );
         assert!(
             Role::Socks {
-                out: Outbound::Freedom,
+                out: freedom(),
                 accounts: Arc::new(SocksAccounts::default()),
             }
             .tcp_mask()
@@ -36339,7 +36613,7 @@ mod tests {
     #[test]
     fn a_socks4_request_reaches_the_destination_it_names() {
         let echo = echo_loop();
-        let front = socks_front_with(Outbound::Freedom);
+        let front = socks_front_with(freedom());
         let mut client = socks4_ask(
             front,
             format!("127.0.0.1:{echo}").parse().expect("an address"),
@@ -36362,7 +36636,7 @@ mod tests {
     #[test]
     fn a_socks4a_request_carries_its_name_to_the_front() {
         let echo = echo_loop();
-        let front = socks_front_with(Outbound::Freedom);
+        let front = socks_front_with(freedom());
         let mut client = socks4_ask(
             front,
             format!("127.0.0.1:{echo}").parse().expect("an address"),
@@ -36375,6 +36649,126 @@ mod tests {
         let mut back = [0u8; 4];
         client.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"ping");
+    }
+
+    fn freedom_out(root: &str) -> Outbound {
+        let root = crate::json::parse(root).expect("parses");
+        find_outbound(&root)
+            .expect("builds")
+            .expect("the config names a freedom outbound")
+    }
+
+    fn unbound_port() -> u16 {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        listener.local_addr().expect("addr").port()
+    }
+
+    /// The redirect wins over the requested destination: the requested port has no
+    /// listener, so only a dial that took the redirect can answer.
+    #[test]
+    fn a_freedom_redirect_reaches_the_redirected_service() {
+        let echo = echo_loop();
+        let dead = unbound_port();
+        let out = freedom_out(&format!(
+            r#"{{"outbounds":[{{"protocol":"freedom","settings":{{"redirect":"127.0.0.1:{echo}"}}}}]}}"#
+        ));
+        let front = socks_front_with(out);
+        let mut client = socks_ask(
+            front,
+            format!("127.0.0.1:{dead}").parse().expect("an address"),
+        );
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client
+            .read_exact(&mut back)
+            .expect("the redirected echo answers");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// A `proxyProtocol: 2` dial puts the binary header in front of the payload, with
+    /// the client as the source and the dialled service as the destination.
+    #[test]
+    fn a_freedom_proxy_protocol_writes_the_v2_header() {
+        let sink = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let sink_port = sink.local_addr().expect("addr").port();
+        let (header, got_header) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = sink.accept().expect("accepts");
+            let mut head = [0u8; 16];
+            stream.read_exact(&mut head).expect("the header");
+            let _ = header.send(head);
+            let _ = stream.write_all(b"OK");
+        });
+        let dead = unbound_port();
+        let out = freedom_out(&format!(
+            r#"{{"outbounds":[{{"protocol":"freedom","settings":{{"redirect":"127.0.0.1:{sink_port}","proxyProtocol":2}}}}]}}"#
+        ));
+        let front = socks_front_with(out);
+        let mut client = socks_ask(
+            front,
+            format!("127.0.0.1:{dead}").parse().expect("an address"),
+        );
+        client.write_all(b"ping").expect("writes");
+        let head = got_header
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the proxy header reached the redirected service");
+        assert_eq!(
+            &head[..12],
+            &[0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a],
+            "the v2 magic"
+        );
+        assert_eq!(head[12], 0x21, "PROXY command");
+    }
+
+    /// The family order is the strategy's own: `useipv4v6` takes v4 first, `useipv6v4`
+    /// takes v6 first, and the single-family values drop the other family.
+    #[test]
+    fn a_freedom_domain_strategy_picks_the_named_family() {
+        let v4: std::net::IpAddr = "192.0.2.1".parse().expect("v4");
+        let v6: std::net::IpAddr = "2001:db8::1".parse().expect("v6");
+        assert_eq!(FreedomDomain::UseIp46.pick(&[v6, v4]), Some(v4));
+        assert_eq!(FreedomDomain::UseIp64.pick(&[v4, v6]), Some(v6));
+        assert_eq!(FreedomDomain::UseIp4.pick(&[v6, v4]), Some(v4));
+        assert_eq!(FreedomDomain::UseIp6.pick(&[v4, v6]), Some(v6));
+        assert_eq!(FreedomDomain::UseIp4.pick(&[v6]), None);
+    }
+
+    /// An empty redirect host keeps the requested name and changes only its port; a zero
+    /// port is the reference's "leave the port alone".
+    #[test]
+    fn a_freedom_redirect_with_no_host_keeps_the_requested_host() {
+        let asked = Destination::Name("example.com".to_owned(), 443);
+        assert_eq!(
+            FreedomRedirect::Port(8443).apply(&asked),
+            Destination::Name("example.com".to_owned(), 8443)
+        );
+        assert_eq!(FreedomRedirect::Port(0).apply(&asked), asked);
+        assert_eq!(
+            FreedomRedirect::Address("127.0.0.2".to_owned(), 0).apply(&asked),
+            Destination::Address(SocketAddr::from(([127, 0, 0, 2], 443)))
+        );
+    }
+
+    /// The freedom fragment reads `interval` as its delay and keeps the finalmask stage.
+    #[test]
+    fn a_freedom_fragment_is_a_finalmask_stage() {
+        let out = freedom_out(
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"fragment":{"packets":"tlshello","length":"10-20","interval":"1-2","maxSplit":4}}}]}"#,
+        );
+        let Outbound::Freedom(freedom) = out else {
+            panic!("a freedom outbound");
+        };
+        assert!(freedom.fragment.is_some(), "the fragment stage is kept");
+    }
+
+    /// An unknown strategy is refused by name rather than dialled as `AsIs`.
+    #[test]
+    fn a_freedom_domain_strategy_must_be_one_the_reference_knows() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"domainStrategy":"useip9"}}]}"#,
+        )
+        .expect("parses");
+        assert!(find_outbound(&root).is_err());
     }
 
     /// A front that asks for a credential refuses a SOCKS4 request: the protocol
@@ -36391,7 +36785,7 @@ mod tests {
                 level: 0,
             }],
         };
-        let front = socks_front_with_accounts(Outbound::Freedom, accounts);
+        let front = socks_front_with_accounts(freedom(), accounts);
         let mut client = socks4_ask(front, "127.0.0.1:80".parse().expect("an address"), None);
         let mut reply = [0u8; 8];
         client.read_exact(&mut reply).expect("the refusal");
@@ -36450,9 +36844,8 @@ mod tests {
                 let _ = target.send_to(&buf[..n], src);
             }
         });
-        let association =
-            udp_association(|conn| serve_socks(conn, &Outbound::Freedom, &no_accounts()))
-                .expect("the association answers with the relay");
+        let association = udp_association(|conn| serve_socks(conn, &freedom(), &no_accounts()))
+            .expect("the association answers with the relay");
         let relay = association.relay;
         let mut frame = vec![0, 0, 0];
         push_socks_addr(&mut frame, &target_addr);
@@ -36484,7 +36877,7 @@ mod tests {
         let port = door.local_addr().expect("addr").port();
         let dest = Destination::Address(target_addr);
         let port_map: HashMap<u16, Destination> = HashMap::new();
-        thread::spawn(move || dokodemo_udp_door(&door, &dest, &port_map, &Outbound::Freedom));
+        thread::spawn(move || dokodemo_udp_door(&door, &dest, &port_map, &freedom()));
         let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
         client
             .connect(SocketAddr::from(([127, 0, 0, 1], port)))
@@ -36508,7 +36901,7 @@ mod tests {
             .and_then(Json::as_arr)
             .expect("inbounds")[0];
         assert_eq!(
-            serve_dokodemo("127.0.0.1:0", inbound, &Outbound::Freedom, "test", None).0,
+            serve_dokodemo("127.0.0.1:0", inbound, &freedom(), "test", None).0,
             0,
             "`followRedirect` is refused, not served as if the rewrite had been asked for"
         );
@@ -36531,7 +36924,7 @@ mod tests {
         let (opened, _) = serve_inbounds(
             "test",
             &root,
-            Some(&Outbound::Freedom),
+            Some(&freedom()),
             None,
             false,
             &crate::reverse::Portals::default(),
@@ -36558,7 +36951,7 @@ mod tests {
             .and_then(Json::as_arr)
             .expect("inbounds")[0];
         assert_eq!(
-            serve_dokodemo("127.0.0.1:0", inbound, &Outbound::Freedom, "test", None).0,
+            serve_dokodemo("127.0.0.1:0", inbound, &freedom(), "test", None).0,
             0,
             "a bad entry is the Build's refusal"
         );
@@ -36574,7 +36967,7 @@ mod tests {
         let (opened, _) = serve_inbounds(
             "test",
             &root,
-            Some(&Outbound::Freedom),
+            Some(&freedom()),
             None,
             false,
             &crate::reverse::Portals::default(),
@@ -36605,7 +36998,7 @@ mod tests {
         let (opened, _) = serve_inbounds(
             "test",
             &root,
-            Some(&Outbound::Freedom),
+            Some(&freedom()),
             None,
             false,
             &crate::reverse::Portals::default(),
@@ -36624,7 +37017,7 @@ mod tests {
     #[test]
     fn a_socks_client_dials_the_front_and_carries_an_echo() {
         let echo = echo_loop();
-        let upstream = socks_front_with(Outbound::Freedom);
+        let upstream = socks_front_with(freedom());
         let lane = Outbound::Socks(SocksOut::new(
             "127.0.0.1",
             upstream,
@@ -36657,7 +37050,7 @@ mod tests {
                 level: 0,
             }],
         };
-        let upstream = socks_front_with_accounts(Outbound::Freedom, accounts.clone());
+        let upstream = socks_front_with_accounts(freedom(), accounts.clone());
         let lane = Outbound::Socks(SocksOut::new(
             "127.0.0.1",
             upstream,
@@ -36692,7 +37085,7 @@ mod tests {
             }
         });
         // The upstream: the socks front, whose own datagram lane carries the echo.
-        let upstream = socks_front_with(Outbound::Freedom);
+        let upstream = socks_front_with(freedom());
         let lane = Outbound::Socks(SocksOut::new(
             "127.0.0.1",
             upstream,
@@ -36838,7 +37231,7 @@ mod tests {
                 level: 0,
             }],
         };
-        let front = socks_front_with_accounts(Outbound::Freedom, accounts);
+        let front = socks_front_with_accounts(freedom(), accounts);
         let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
@@ -36898,7 +37291,7 @@ mod tests {
         let (opened, _) = serve_inbounds(
             "test",
             &root,
-            Some(&Outbound::Freedom),
+            Some(&freedom()),
             None,
             false,
             &crate::reverse::Portals::default(),
@@ -36921,7 +37314,7 @@ mod tests {
         let (opened, _) = serve_inbounds(
             "test",
             &root,
-            Some(&Outbound::Freedom),
+            Some(&freedom()),
             None,
             false,
             &crate::reverse::Portals::default(),
@@ -37026,7 +37419,7 @@ mod tests {
         let port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_mixed(stream, &Outbound::Freedom, &accounts);
+            serve_mixed(stream, &freedom(), &accounts);
         });
         let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
         client
@@ -37158,7 +37551,7 @@ mod tests {
     #[test]
     fn http_connect_reaches_echo_direct() {
         let echo = echo_loop();
-        let front = http_front_with(Outbound::Freedom);
+        let front = http_front_with(freedom());
         let mut client = http_connect(front, &format!("127.0.0.1:{echo}"));
         assert!(http_status(&mut client).starts_with("HTTP/1.1 200"));
         client.write_all(b"ping").expect("writes");
@@ -37170,7 +37563,7 @@ mod tests {
     #[test]
     fn http_get_forwards_origin_form_to_direct() {
         let echo = echo_loop();
-        let front = http_front_with(Outbound::Freedom);
+        let front = http_front_with(freedom());
         let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
@@ -37335,7 +37728,7 @@ mod tests {
         thread::spawn(move || {
             for stream in front.incoming().take(2) {
                 let Ok(stream) = stream else { continue };
-                thread::spawn(|| serve_mixed(stream, &Outbound::Freedom, &no_accounts()));
+                thread::spawn(|| serve_mixed(stream, &freedom(), &no_accounts()));
             }
         });
         let mut socks = socks_tcp_client(port, echo_socks);
@@ -37361,7 +37754,7 @@ mod tests {
         let quiet = Connection::connect(addr).expect("connects");
         let (stream, _) = front.accept().expect("accepts");
         let at = Instant::now();
-        serve_mixed(stream, &Outbound::Freedom, &no_accounts());
+        serve_mixed(stream, &freedom(), &no_accounts());
         budgets::clear();
         drop(quiet);
         assert!(
@@ -37373,7 +37766,7 @@ mod tests {
 
     #[test]
     fn garbage_closes_the_http_front() {
-        let front = http_front_with(Outbound::Freedom);
+        let front = http_front_with(freedom());
         let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
         client
             .set_read_timeout(Some(Duration::from_secs(30)))
@@ -38607,11 +39000,7 @@ mod tests {
         let root = crate::json::parse(r#"{"outbounds":[{"protocol":"direct","settings":{}}]}"#)
             .expect("parses");
         assert!(
-            is_freedom(&root),
-            "`direct` is xray's other name for freedom"
-        );
-        assert!(
-            matches!(find_outbound(&root), Ok(Some(Outbound::Freedom))),
+            matches!(find_outbound(&root), Ok(Some(Outbound::Freedom(_)))),
             "the alias resolves to the direct dial"
         );
     }
@@ -38647,7 +39036,7 @@ mod tests {
             );
             let root = crate::json::parse(&text).expect("parses");
             assert!(
-                matches!(find_outbound(&root), Ok(Some(Outbound::Freedom))),
+                matches!(find_outbound(&root), Ok(Some(Outbound::Freedom(_)))),
                 "`{protocol}` is named at its outbound and dials direct"
             );
         }
@@ -38860,7 +39249,7 @@ mod tests {
         assert!(
             matches!(
                 &*plan.pick(&asked, crate::router::Network::Tcp, None),
-                Outbound::Freedom
+                Outbound::Freedom(_)
             ),
             "candidates are ordered by tag, not by config order"
         );
@@ -38870,7 +39259,7 @@ mod tests {
         ));
         assert!(matches!(
             &*plan.pick(&asked, crate::router::Network::Tcp, None),
-            Outbound::Freedom
+            Outbound::Freedom(_)
         ));
 
         let out = route_outbound(
@@ -38884,7 +39273,7 @@ mod tests {
             panic!("a route plan");
         };
         let (picked, tag) = plan.lane(&asked, crate::router::Network::Tcp, None);
-        assert!(matches!(&*picked, Outbound::Freedom));
+        assert!(matches!(&*picked, Outbound::Freedom(_)));
         assert_eq!(tag, Some("direct"), "an observatory-less pick falls back");
     }
 
@@ -38904,7 +39293,7 @@ mod tests {
         };
         let asked = Destination::Name("echo.test".to_owned(), 443);
         let (picked, tag) = plan.lane(&asked, crate::router::Network::Tcp, None);
-        assert!(matches!(&*picked, Outbound::Freedom));
+        assert!(matches!(&*picked, Outbound::Freedom(_)));
         assert_eq!(tag, Some("pool"));
     }
 

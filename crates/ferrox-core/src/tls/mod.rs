@@ -520,8 +520,8 @@ impl<S: Stream> std::io::Write for ClientSession<S> {
 
 pub mod reality;
 pub use reality::{
-    Edges, Proxied, RateLimit, RealityAccept, RealityClientConfig, RealityClientSession,
-    RealityServer, RealityServerConfig,
+    write_proxy_protocol, Edges, Proxied, RateLimit, RealityAccept, RealityClientConfig,
+    RealityClientSession, RealityServer, RealityServerConfig,
 };
 
 pub fn connect<S: Stream + RecordAlignment>(
