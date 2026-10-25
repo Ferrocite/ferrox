@@ -200,8 +200,10 @@ fn serve_root(label: &str, root: &Json) -> ! {
     let portals = reverse_portals(root);
     let routing = crate::router::Routing::parse(root)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    let observatory = crate::observatory::start(root)
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     let route = routing.map(|routing| {
-        route_shared(root, routing, &portals)
+        route_shared(root, routing, &portals, observatory)
             .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")))
     });
     install_dns_route(route.clone(), outbound.as_ref());
@@ -249,6 +251,7 @@ fn routed_out(
 
 /// Opens every inbound the config names, proving each server inbound's rules at startup, and reports
 /// how many opened and whether a hysteria inbound wants the readiness token.
+#[allow(clippy::too_many_lines)]
 fn serve_inbounds(
     label: &str,
     root: &Json,
@@ -336,6 +339,11 @@ fn serve_inbounds(
                             inbounds += serve_dokodemo(address, inbound, &out, label);
                         }
                     }
+                    "hc" => {
+                        if serve_hc_inbound(address, inbound) {
+                            inbounds += 1;
+                        }
+                    }
                     "tun" => {
                         // A tun flow has no source or local address, so a reaching rule that names one is refused here.
                         if let Some(shared) = route {
@@ -396,7 +404,7 @@ fn refuse_inbound(protocol: &str, label: &str, inbound: &Json) {
 }
 
 /// Served inbounds; the `tun` device inbound opens a native interface and relays TCP flows.
-const SERVED_INBOUNDS: [&str; 10] = [
+const SERVED_INBOUNDS: [&str; 11] = [
     "vless",
     "trojan",
     "vmess",
@@ -407,6 +415,7 @@ const SERVED_INBOUNDS: [&str; 10] = [
     "mixed",
     "tun",
     "dokodemo-door",
+    "hc",
 ];
 
 /// Whether this protocol is an inbound this binary serves.
@@ -921,6 +930,7 @@ struct RouteShared {
     tagged: HashMap<String, Outbound>,
     /// Each balancer's candidate tags, ordered by tag. Built once so a flow picks from a slice.
     balancers: HashMap<String, Vec<String>>,
+    observatory: Option<Arc<crate::observatory::Observatory>>,
     default: Outbound,
     default_tag: Option<String>,
 }
@@ -1022,7 +1032,12 @@ impl RoutePlan {
             .balancers
             .get(tag)
             .expect("startup built every balancer's candidates");
-        if let Some(picked) = balancer.pick(candidates) {
+        let observed = self
+            .shared
+            .observatory
+            .as_deref()
+            .map(crate::observatory::Observatory::snapshot);
+        if let Some(picked) = balancer.pick(candidates, observed.as_deref()) {
             return (self.target(picked), Some(picked));
         }
         if let Some(fallback) = balancer.fallback() {
@@ -1055,7 +1070,7 @@ fn inbound_tag(inbound: &Json) -> Option<String> {
 
 /// The outbound one configured entry names, with the reason when this tree cannot dial it: a tag a
 /// rule can reach is built at startup, so a missing or unbuildable one stops the process, not a flow.
-fn build_outbound(config: &Json, tag: &str) -> Result<Outbound, String> {
+pub(crate) fn build_outbound(config: &Json, tag: &str) -> Result<Outbound, String> {
     let protocol = canonical_protocol(config.get("protocol").and_then(Json::as_str).unwrap_or(""));
     if protocol == "loopback" {
         return Err(format!(
@@ -1124,6 +1139,7 @@ fn route_shared(
     root: &Json,
     routing: crate::router::Routing,
     portals: &crate::reverse::Portals,
+    observatory: Option<Arc<crate::observatory::Observatory>>,
 ) -> Result<Arc<RouteShared>, String> {
     let list = root.get("outbounds").and_then(Json::as_arr).unwrap_or(&[]);
     let Some(first) = list.first() else {
@@ -1211,6 +1227,7 @@ fn route_shared(
         routing,
         tagged,
         balancers,
+        observatory,
         default,
         default_tag,
     }))
@@ -2487,6 +2504,19 @@ pub(crate) fn dns_stream(
 }
 
 fn dns_stream_with(out: &Outbound, dest: Destination, timeout: Duration) -> Option<Connection> {
+    tunnel_stream(out, dest, timeout, Front::Socks, "ferrox-dns")
+}
+
+/// A stream that speaks through one outbound without a front in front of it: the health probe's
+/// own request, or the DNS lane's frames. The client end is returned once the server half has
+/// accepted it, so a dial that never arrives cannot leave a serving thread behind.
+fn tunnel_stream(
+    out: &Outbound,
+    dest: Destination,
+    timeout: Duration,
+    front: Front,
+    name: &str,
+) -> Option<Connection> {
     let listener = std::net::TcpListener::bind(SocketAddr::new(
         std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
         0,
@@ -2499,13 +2529,21 @@ fn dns_stream_with(out: &Outbound, dest: Destination, timeout: Duration) -> Opti
     let _ = client.set_read_timeout(Some(timeout));
     let _ = client.set_write_timeout(Some(timeout));
     thread::Builder::new()
-        .name("ferrox-dns".to_owned())
+        .name(name.to_owned())
         .spawn({
             let out = out.clone();
-            move || serve_connect(Connection::Tcp(server), &out, &dest, Front::Socks, &[])
+            move || serve_connect(Connection::Tcp(server), &out, &dest, front, &[])
         })
         .ok()?;
     Some(Connection::Tcp(client))
+}
+
+pub(crate) fn probe_stream(
+    out: &Outbound,
+    dest: &Destination,
+    timeout: Duration,
+) -> Option<Connection> {
+    tunnel_stream(out, dest.clone(), timeout, Front::Probe, "ferrox-probe")
 }
 
 /// One DNS datagram through the route's chosen outbound. The SOCKS UDP frame needs the
@@ -6078,6 +6116,140 @@ fn kcp_parts(conn: &Arc<ferrox_core::kcp::Connection>) -> (KcpIo, KcpIo, KcpClos
     };
     let close: KcpClose = Arc::new(move || closer.close());
     (reader, writer, close)
+}
+
+/// Leaf's healthcheck door: one exact request line and, for `POST`, one exact body answer a
+/// fixed `200` body. A mismatch closes without an answer.
+fn serve_hc_inbound(address: &str, inbound: &Json) -> bool {
+    let Some(settings) = inbound.get("settings") else {
+        eprintln!("inbound `hc` names no settings");
+        return false;
+    };
+    let Some(path) = settings.get("path").and_then(Json::as_str) else {
+        eprintln!("inbound `hc` names no path");
+        return false;
+    };
+    let Some(response) = settings.get("response").and_then(Json::as_str) else {
+        eprintln!("inbound `hc` names no response");
+        return false;
+    };
+    let request = match settings.get("request") {
+        None | Some(Json::Null) => String::new(),
+        Some(Json::Str(request)) => request.clone(),
+        Some(_) => {
+            eprintln!("inbound `hc` request is not a string");
+            return false;
+        }
+    };
+    let handler = std::sync::Arc::new(HcHandler {
+        path: path.to_owned(),
+        request,
+        response: response.to_owned(),
+    });
+    let address = address.to_owned();
+    thread::spawn(move || {
+        let target = parse_target(&address)
+            .unwrap_or_else(|error| exit(&format!("cannot resolve {address}: {error}")));
+        let listener = Listener::bind(&target)
+            .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
+        for stream in listener.incoming() {
+            let Ok(stream) = stream else { continue };
+            no_delay(&stream);
+            let handler = std::sync::Arc::clone(&handler);
+            thread::spawn(move || handler.serve(stream));
+        }
+    });
+    true
+}
+
+struct HcHandler {
+    path: String,
+    request: String,
+    response: String,
+}
+
+impl HcHandler {
+    fn serve(&self, mut stream: Connection) {
+        let mut data = Vec::with_capacity(1024);
+        let mut buf = [0u8; 8192];
+        loop {
+            let read = match stream.read(&mut buf) {
+                Ok(0) | Err(_) => return,
+                Ok(read) => read,
+            };
+            data.extend_from_slice(&buf[..read]);
+            if let Some(end) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+                let (head, body) = data.split_at(end + 4);
+                if self.answer(&mut stream, head, body).is_ok() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+                return;
+            }
+            if data.len() > 65_536 {
+                return;
+            }
+        }
+    }
+
+    fn answer(
+        &self,
+        stream: &mut Connection,
+        head: &[u8],
+        remaining: &[u8],
+    ) -> std::io::Result<()> {
+        let head = std::str::from_utf8(head)
+            .map_err(|_| std::io::Error::other("request head is not UTF-8"))?;
+        let line = head.lines().next().unwrap_or("");
+        let mut parts = line.split_whitespace();
+        let method = parts.next().unwrap_or("");
+        let path = parts.next().unwrap_or("");
+        if path != self.path {
+            return Err(std::io::Error::other("not found"));
+        }
+        let get = self.request.is_empty();
+        if method != if get { "GET" } else { "POST" } {
+            return Err(std::io::Error::other("bad method"));
+        }
+        if !get {
+            let length = hc_content_length(head)
+                .filter(|length| *length > 0 && *length <= 8192)
+                .ok_or_else(|| std::io::Error::other("no usable content-length"))?;
+            let mut body = remaining.to_vec();
+            let mut left = length.saturating_sub(body.len());
+            while left > 0 {
+                let mut buf = [0u8; 8192];
+                let read = stream.read(&mut buf[..left.min(8192)])?;
+                if read == 0 {
+                    break;
+                }
+                body.extend_from_slice(&buf[..read]);
+                left = left.saturating_sub(read);
+            }
+            body.truncate(length);
+            if String::from_utf8_lossy(&body) != self.request {
+                return Err(std::io::Error::other("bad body"));
+            }
+        }
+        stream.write_all(self.payload().as_bytes())?;
+        stream.flush()
+    }
+
+    fn payload(&self) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+            self.response.len(),
+            self.response
+        )
+    }
+}
+
+fn hc_content_length(head: &str) -> Option<usize> {
+    head.lines().find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.eq_ignore_ascii_case("content-length")
+            .then(|| value.trim().parse().ok())
+            .flatten()
+    })
 }
 
 fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
@@ -10449,7 +10621,7 @@ fn serve_connect_freedom(client: &Connection, asked: &Destination, prefix: &[u8]
 }
 
 /// One tunnel request from either front, already resolved to its lane: the Foxy lane grants after its tunnel opens.
-fn serve_connect(
+pub(crate) fn serve_connect(
     mut client: Connection,
     out: &Outbound,
     asked: &Destination,
@@ -10750,9 +10922,10 @@ fn debug_relay(direction: &str, moved: u64, sleeps: u32, error: Option<std::io::
 
 /// Which byte front a tunnel answers: the grant and refusal render per front, the tunnel loop does not.
 #[derive(Debug, Clone, Copy)]
-enum Front {
+pub(crate) enum Front {
     Socks,
     Http,
+    Probe,
 }
 
 impl Front {
@@ -10761,11 +10934,12 @@ impl Front {
         match self {
             Self::Socks => &SOCKS_GRANTED,
             Self::Http => b"HTTP/1.1 200 Connection established\r\n\r\n",
+            Self::Probe => &[],
         }
     }
     fn direct_grant(self) -> Option<&'static [u8]> {
         match self {
-            Self::Socks => None,
+            Self::Socks | Self::Probe => None,
             Self::Http => Some(self.grant_line()),
         }
     }
@@ -10773,6 +10947,7 @@ impl Front {
         match self {
             Self::Socks => foxy_socks_reply(code).to_vec(),
             Self::Http => b"HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n".to_vec(),
+            Self::Probe => Vec::new(),
         }
     }
 }
@@ -34951,8 +35126,8 @@ mod tests {
         let routing = crate::router::Routing::parse_in(&root, Vec::new())
             .expect("parses")
             .expect("routing");
-        let shared =
-            route_shared(&root, routing, &crate::reverse::Portals::default()).expect("builds");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
         Outbound::Route(Arc::new(RoutePlan::new(
             shared,
             tag.map(str::to_owned),
@@ -35314,7 +35489,7 @@ mod tests {
         let routing = crate::router::Routing::parse_in(&missing, Vec::new())
             .expect("parses")
             .expect("routing");
-        let error = route_shared(&missing, routing, &crate::reverse::Portals::default())
+        let error = route_shared(&missing, routing, &crate::reverse::Portals::default(), None)
             .expect_err("refused");
         assert!(error.contains("nope"), "{error}");
 
@@ -35325,7 +35500,7 @@ mod tests {
         let routing = crate::router::Routing::parse_in(&twice, Vec::new())
             .expect("parses")
             .expect("routing");
-        let error = route_shared(&twice, routing, &crate::reverse::Portals::default())
+        let error = route_shared(&twice, routing, &crate::reverse::Portals::default(), None)
             .expect_err("refused");
         assert!(
             error.contains("twice") || error.contains("named twice"),
@@ -35339,8 +35514,13 @@ mod tests {
         let routing = crate::router::Routing::parse_in(&response, Vec::new())
             .expect("parses")
             .expect("routing");
-        let error = route_shared(&response, routing, &crate::reverse::Portals::default())
-            .expect_err("refused");
+        let error = route_shared(
+            &response,
+            routing,
+            &crate::reverse::Portals::default(),
+            None,
+        )
+        .expect_err("refused");
         assert!(error.contains("teapot"), "{error}");
 
         let response = crate::json::parse(
@@ -35350,8 +35530,13 @@ mod tests {
         let routing = crate::router::Routing::parse_in(&response, Vec::new())
             .expect("parses")
             .expect("routing");
-        let error = route_shared(&response, routing, &crate::reverse::Portals::default())
-            .expect_err("refused");
+        let error = route_shared(
+            &response,
+            routing,
+            &crate::reverse::Portals::default(),
+            None,
+        )
+        .expect_err("refused");
         assert!(error.contains("object"), "{error}");
     }
 
@@ -38517,7 +38702,7 @@ mod accept_proxy_protocol_tests {
         let routing = crate::router::Routing::parse_in(&root, Vec::new())
             .expect("parses")
             .expect("routing");
-        let shared = route_shared(&root, routing, &crate::reverse::Portals::default())
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
             .expect("builds the route");
         let plan = RoutePlan::new(shared, None, true);
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -38545,6 +38730,97 @@ mod accept_proxy_protocol_tests {
         assert!(
             got.starts_with(b"HTTP/1.1 101"),
             "the upgrade after a PROXY v2 header was not answered: {got:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod hc_tests {
+    use super::*;
+
+    fn serve(handler: HcHandler) -> u16 {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            handler.serve(Connection::from(stream));
+        });
+        port
+    }
+
+    fn exchange(port: u16, request: &[u8]) -> Vec<u8> {
+        let mut client = crate::conn::Connection::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        client.write_all(request).expect("writes");
+        let mut answer = Vec::new();
+        client.read_to_end(&mut answer).expect("reads");
+        answer
+    }
+
+    #[test]
+    fn an_hc_get_answers_the_configured_body_after_the_exact_path() {
+        let port = serve(HcHandler {
+            path: "/health".to_owned(),
+            request: String::new(),
+            response: "ok".to_owned(),
+        });
+        assert_eq!(
+            exchange(port, b"GET /health HTTP/1.1\r\nHost: probe\r\n\r\n"),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nok"
+        );
+    }
+
+    #[test]
+    fn an_hc_answer_is_one_allocation() {
+        let handler = HcHandler {
+            path: "/health".to_owned(),
+            request: String::new(),
+            response: "ok".to_owned(),
+        };
+        let (payload, counts) = ferrox_core::alloc_count::measure(|| handler.payload());
+        assert_eq!(payload.len(), 85);
+        assert_eq!(counts.allocs, 1);
+    }
+
+    #[test]
+    fn an_hc_post_checks_the_body_and_a_mismatch_answers_nothing() {
+        let handler = || HcHandler {
+            path: "/health".to_owned(),
+            request: "ping".to_owned(),
+            response: "pong".to_owned(),
+        };
+        let port = serve(handler());
+        assert_eq!(
+            exchange(
+                port,
+                b"POST /health HTTP/1.1\r\nContent-Length: 4\r\n\r\nping"
+            ),
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\npong"
+        );
+        let port = serve(handler());
+        assert_eq!(
+            exchange(port, b"GET /health HTTP/1.1\r\n\r\n"),
+            Vec::<u8>::new()
+        );
+        let port = serve(handler());
+        assert_eq!(
+            exchange(port, b"POST /health HTTP/1.1\r\n\r\nping"),
+            Vec::<u8>::new()
+        );
+        let port = serve(handler());
+        assert_eq!(
+            exchange(
+                port,
+                b"POST /health HTTP/1.1\r\nContent-Length: 4\r\n\r\nnope"
+            ),
+            Vec::<u8>::new()
+        );
+        let port = serve(handler());
+        assert_eq!(
+            exchange(port, b"GET /other HTTP/1.1\r\n\r\n"),
+            Vec::<u8>::new()
         );
     }
 }
