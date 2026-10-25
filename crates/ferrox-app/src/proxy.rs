@@ -10533,11 +10533,7 @@ fn pump_trojan_replies(
             }
             Some(write_trojan_datagram(stream, &src, &buf[..n], head))
         }
-        Err(error)
-            if is_timeout(&error) || error.kind() == std::io::ErrorKind::WouldBlock =>
-        {
-            None
-        }
+        Err(error) if is_timeout(&error) || error.kind() == std::io::ErrorKind::WouldBlock => None,
         Err(_) => Some(false),
     }
 }
