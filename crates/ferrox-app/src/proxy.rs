@@ -3273,7 +3273,7 @@ struct MuxOut<'a> {
 
 struct UdpMux {
     socket: Arc<UdpSocket>,
-    dest: SocketAddr,
+    dest: Mutex<SocketAddr>,
     id: Arc<AtomicU16>,
     done: Arc<AtomicBool>,
     wire: MuxWire,
@@ -3456,7 +3456,12 @@ fn handle_mux_frame(
                 let dest = frame
                     .target
                     .and_then(|t| mux_target_addr(&t))
-                    .unwrap_or(session.dest);
+                    .unwrap_or_else(|| {
+                        *session
+                            .dest
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    });
                 let _ = session.socket.send_to(data, dest);
                 return;
             }
@@ -3691,6 +3696,10 @@ fn handle_mux_udp_new(
             send_mux_end(out.wire, out.staging, old);
         }
         session.id.store(frame.id, Ordering::Relaxed);
+        *session
+            .dest
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = dest;
         session
     } else {
         let bound = if dest.is_ipv6() {
@@ -3703,7 +3712,7 @@ fn handle_mux_udp_new(
         };
         let session = Arc::new(UdpMux {
             socket: Arc::new(socket),
-            dest,
+            dest: Mutex::new(dest),
             id: Arc::new(AtomicU16::new(frame.id)),
             done: Arc::new(AtomicBool::new(false)),
             wire: out.wire.clone(),
@@ -28536,6 +28545,92 @@ mod tests {
         assert_eq!(got, 8);
         assert_eq!(status, ferrox_core::mux::Status::Keep);
         assert_eq!(data, b"ping");
+    }
+
+    #[test]
+    fn a_reused_udp_global_id_follows_the_target_it_was_renewed_for() {
+        let first = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let second = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        first
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        second
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        let first_port = first.local_addr().expect("addr").port();
+        let second_port = second.local_addr().expect("addr").port();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let client = Connection::connect(listener.local_addr().expect("addr")).expect("connects");
+        let (_server, _) = listener.accept().expect("accepts");
+        let wire = MuxWire::Conn(Arc::new(Mutex::new(client)));
+        let table: MuxTable = Arc::new(Mutex::new(MuxState {
+            flows: HashMap::new(),
+            done: false,
+        }));
+        let mut udp: UdpTable = HashMap::new();
+        let mut global: UdpGlobal = HashMap::new();
+        let mut staging = Vec::new();
+        let mut handles = Vec::new();
+        let identity = [0x42u8; ferrox_core::mux::GLOBAL_ID];
+        let new = |port| ferrox_core::mux::Incoming {
+            id: 7,
+            status: ferrox_core::mux::Status::New,
+            options: ferrox_core::mux::DATA,
+            target: Some(mux_test_udp_target(port)),
+            global_id: Some(identity),
+            reflection: None,
+            data: None,
+        };
+        let keep = |data: &'static [u8]| ferrox_core::mux::Incoming {
+            id: 7,
+            status: ferrox_core::mux::Status::Keep,
+            options: ferrox_core::mux::DATA,
+            target: None,
+            global_id: None,
+            reflection: None,
+            data: Some(data),
+        };
+        let dial: MuxDial = Arc::new(|_| None);
+        let udp_ok: MuxUdpOk = Arc::new(|_| true);
+        let mut feed = |frame| {
+            let mut out = MuxOut {
+                wire: &wire,
+                staging: &mut staging,
+                handles: &mut handles,
+                worker: None,
+            };
+            handle_mux_frame(
+                frame,
+                &table,
+                &mut udp,
+                &mut global,
+                &mut out,
+                &dial,
+                &udp_ok,
+            );
+        };
+        feed(new(first_port));
+        feed(keep(b"one"));
+        let mut got = [0u8; 16];
+        let (n, _) = first.recv_from(&mut got).expect("first target answers");
+        assert_eq!(&got[..n], b"one");
+        feed(new(second_port));
+        feed(keep(b"two"));
+        let (n, _) = second
+            .recv_from(&mut got)
+            .expect("the renewed target answers");
+        assert_eq!(&got[..n], b"two");
+        first
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("timeout");
+        assert!(
+            matches!(first.recv_from(&mut got), Err(ref error) if is_timeout(error)),
+            "the old target got the renewed session's datagram"
+        );
+        drop(feed);
+        for session in udp.values() {
+            session.done.store(true, Ordering::Relaxed);
+        }
     }
 
     #[test]
