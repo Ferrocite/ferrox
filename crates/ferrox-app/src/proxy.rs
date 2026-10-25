@@ -25049,6 +25049,92 @@ mod tests {
         let _ = pump.join();
     }
 
+    /// A shadowsocks listener and dial that declare tls answer the handshake before any non-KCP carrier.
+    #[test]
+    fn a_shadowsocks_inbound_that_declares_tls_answers_every_carrier() {
+        let _guard = budgets::lock();
+        let (cert, key, client) = tls_cert_json();
+        let cases = [
+            ("raw", r#""network": "tcp""#),
+            ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
+            (
+                "httpupgrade",
+                r#""network": "httpupgrade", "httpupgradeSettings": {"path": "/u"}"#,
+            ),
+            (
+                "grpc",
+                r#""network": "grpc", "grpcSettings": {"serviceName": "/TunnelService/Tun"}"#,
+            ),
+            (
+                "xhttp",
+                r#""network": "xhttp", "xhttpSettings": {"path": "/x"}"#,
+            ),
+            (
+                "httpheader",
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/c"]}}}"#,
+            ),
+        ];
+        for (tag, stream) in cases {
+            let inbound = crate::json::parse(&format!(
+                r#"{{"protocol": "shadowsocks", "settings": {{"password": "an-example-shared-password", "method": "aes-256-gcm"}},
+                    "streamSettings": {{{stream}, "security": "tls",
+                        "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+            ))
+            .expect("parses");
+            let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let port = probe.local_addr().expect("addr").port();
+            drop(probe);
+            let address = format!("127.0.0.1:{port}");
+            serve_shadowsocks_inbound(&address, &inbound, true);
+            let waited = Instant::now();
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                assert!(
+                    waited.elapsed() < Duration::from_secs(10),
+                    "{tag} listener never bound"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            let echo_port = echo_loop();
+            let ss = ShadowsocksOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                method: "aes-256-gcm".to_owned(),
+                password: "an-example-shared-password".to_owned(),
+                carrier: inbound_carrier(&inbound),
+                host: "127.0.0.1".to_owned(),
+                tls: Some(Arc::clone(&client)),
+            };
+            let listener: SocketAddr = address.parse().expect("addr");
+            let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let dport = downstream.local_addr().expect("addr").port();
+            let asked = Destination::from(
+                format!("127.0.0.1:{echo_port}")
+                    .parse::<SocketAddr>()
+                    .expect("addr"),
+            );
+            thread::spawn(move || {
+                let (socket, _) = downstream.accept().expect("accepts");
+                dial_shadowsocks(&socket, &listener, &ss, &asked, Ladder::global());
+            });
+            let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+            sock.set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("timeout");
+            sock.write_all(b"ping").expect("writes");
+            assert_eq!(&read_echo(&mut sock), b"ping", "{tag} over tls echoes");
+        }
+    }
+
+    #[test]
+    fn a_shadowsocks_outbound_keeps_tls_on_a_non_kcp_carrier() {
+        let root = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "streamSettings": {"network": "ws", "security": "tls", "wsSettings": {"path": "/t"}, "tlsSettings": {"allowInsecure": true}}}]}"#,
+        )
+        .expect("parses");
+        let out = find_shadowsocks_outbound(&root).expect("finds");
+        assert!(matches!(out.carrier, Carrier::Ws { .. }));
+        assert!(out.tls.is_some(), "the tls row is kept");
+    }
+
     /// The vmess dial carries its request in the session too, so a tls kcp row speaks the same bytes both roles.
     #[test]
     fn a_vmess_kcp_dial_under_tls_wraps_the_header_in_the_session() {
