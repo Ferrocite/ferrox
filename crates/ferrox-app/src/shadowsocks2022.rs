@@ -2247,11 +2247,13 @@ mod tests {
                 .seal(&psk, method, &target, b"a payload worth keeping")
                 .expect("seals")
                 .to_vec();
+            let start = packet.as_ptr() as usize;
+            let end = start + packet.len();
             let (got, payload, _) = datagrams.open(&psk, method, &mut packet).expect("opens");
             let _ = got;
             assert_eq!(payload, b"a payload worth keeping", "round {round}");
             assert!(
-                packet.as_ptr_range().contains(&payload.as_ptr()),
+                (start..end).contains(&(payload.as_ptr() as usize)),
                 "round {round}: payload is a separate buffer"
             );
         }
@@ -2343,13 +2345,15 @@ mod tests {
             let mut client = Datagrams::new();
             client.session = client_session;
             let mut opened = packet.clone();
+            let start = opened.as_ptr() as usize;
+            let end = start + opened.len();
             let (got, payload) = client
                 .open_server(&psk, method, &mut opened)
                 .expect("opens");
             assert_eq!(got, target, "{method}");
             assert_eq!(payload, b"reply-payload", "{method}");
             assert!(
-                opened.as_ptr_range().contains(&payload.as_ptr()),
+                (start..end).contains(&(payload.as_ptr() as usize)),
                 "{method}: the reply is opened in the datagram"
             );
             let mut stranger = Datagrams::new();
