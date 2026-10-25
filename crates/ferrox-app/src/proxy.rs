@@ -25141,6 +25141,74 @@ mod tests {
         }
     }
 
+    /// A non-trojan TLS client on a listener with fallbacks reaches the cover site, with the PROXY head its xver asks for.
+    #[test]
+    fn a_trojan_tls_fallback_reaches_the_cover_site() {
+        let (cert, key, client) = tls_cert_json();
+        let cover = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let cover_port = cover.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut socket, _) = cover.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                match socket.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if socket.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan",
+                "settings": {{"clients": [{{"password": "secret"}}],
+                    "fallbacks": [{{"dest": "127.0.0.1:{cover_port}", "xver": 1}}]}},
+                "streamSettings": {{"network": "tcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        assert!(serve_trojan_inbound(&address, &inbound, true));
+        let waited = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(10),
+                "trojan listener never bound"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let addr: SocketAddr = address.parse().expect("addr");
+        let mut session = dial_tls_session(&addr, &client, None).expect("dialled");
+        session.write_all(b"hello\n").expect("writes");
+        let mut got = Vec::new();
+        let mut buf = [0u8; 1024];
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            match session.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(error) if is_timeout(&error) => {}
+                Err(_) => break,
+            }
+            if got.ends_with(b"hello\n") {
+                break;
+            }
+        }
+        assert!(
+            got.starts_with(b"PROXY TCP4 "),
+            "the fallback head rides the cover-site stream: {got:?}"
+        );
+        assert!(
+            got.ends_with(b"hello\n"),
+            "the cover site echoes the probe: {got:?}"
+        );
+    }
+
     /// The vmess listener reads its stream settings: a tls inbound answers the handshake before any carrier.
     #[test]
     fn a_vmess_inbound_that_declares_tls_answers_every_carrier() {
