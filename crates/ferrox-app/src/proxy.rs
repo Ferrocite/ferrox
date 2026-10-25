@@ -21533,6 +21533,18 @@ mod tests {
         let plain =
             crate::json::parse(r#"{"grpcSettings": {"serviceName": "svc"}}"#).expect("parses");
         assert_eq!(grpc_path(Some(&plain)), "/svc/Tun");
+        let custom =
+            crate::json::parse(r#"{"grpcSettings": {"serviceName": "/svc/tun"}}"#)
+                .expect("parses");
+        assert_eq!(grpc_path(Some(&custom)), "/svc/tun");
+        let multi =
+            crate::json::parse(r#"{"grpcSettings": {"serviceName": "/svc/tun|tunmulti"}}"#)
+                .expect("parses");
+        assert_eq!(
+            grpc_path(Some(&multi)),
+            "/svc/tun",
+            "a custom service name names the call, not the multi stream"
+        );
         assert_eq!(grpc_path(None), "/Tun");
     }
 
