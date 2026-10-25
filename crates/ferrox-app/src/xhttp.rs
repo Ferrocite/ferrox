@@ -1368,6 +1368,16 @@ fn close_session(s: &Arc<Session>) {
     s.cv.notify_all();
 }
 
+fn remove_session_if_owned(id: &str, session: &Session) {
+    let mut map = sessions().lock().expect("sessions lock");
+    if map
+        .get(id)
+        .is_some_and(|carried| std::ptr::eq(Arc::as_ptr(carried), session))
+    {
+        map.remove(id);
+    }
+}
+
 // Drop is the only other way a session ends, and a waiter parked before a reader exists has no Drop to run.
 pub(crate) fn end_session(id: &str) {
     let carried = sessions().lock().expect("sessions lock").remove(id);
@@ -1453,13 +1463,7 @@ impl Session {
         }
         drop(st);
         if expired {
-            let mut map = sessions().lock().expect("sessions lock");
-            if map
-                .get(&self.id)
-                .is_some_and(|carried| std::ptr::eq(Arc::as_ptr(carried), self))
-            {
-                map.remove(&self.id);
-            }
+            remove_session_if_owned(&self.id, self);
         }
     }
 }
@@ -1559,8 +1563,7 @@ impl Read for SessionReader {
 impl Drop for SessionReader {
     fn drop(&mut self) {
         if !self.id.is_empty() {
-            let mut map = sessions().lock().expect("sessions lock");
-            map.remove(&self.id);
+            remove_session_if_owned(&self.id, self.session.as_ref());
         }
         close_session(&self.session);
     }
@@ -3764,6 +3767,25 @@ mod tests {
             "a session with no downlink outlived the stall and kept its stale sequence"
         );
         assert_eq!(packets, 0, "the replacement starts with no packets");
+    }
+
+    /// A reader left over from an ended session must not remove the fresh session that reused its id:
+    /// the map's owner is the session the entry points at, not whoever drops last with the same key.
+    #[test]
+    fn a_stale_reader_drop_keeps_the_session_that_reused_its_id() {
+        let id = "reused-xhttp-session";
+        let stale = get_or_create_session(id);
+        let reader = SessionReader::new(Arc::clone(&stale), id.to_owned());
+        end_session(id);
+        let fresh = get_or_create_session(id);
+        assert!(!Arc::ptr_eq(&stale, &fresh), "the id was reused");
+        drop(reader);
+        let carried = session_is_carried(id);
+        end_session(id);
+        assert!(
+            carried,
+            "the stale reader's drop removed the replacement session"
+        );
     }
 
     #[test]
