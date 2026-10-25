@@ -83,6 +83,7 @@ VEEPN_DOMAINS=""
 VEEPN_UDID=""
 PROBE_TIMEOUT=20
 FRONTS="socks,http,mixed"
+FRONTS_SET=0
 SOCKS_PORT="${FOXY_SOCKS_PORT:-10808}"
 HTTP_PORT="${FOXY_HTTP_PORT:-8080}"
 MIXED_PORT="${FOXY_MIXED_PORT:-10809}"
@@ -486,12 +487,14 @@ if config:
             document = json.load(handle)
     except (OSError, ValueError):
         document = {}
+    adopted = set()
     for inbound in document.get("inbounds", []):
         name = inbound.get("protocol")
         port = inbound.get("port")
-        if name in names and name in fronts and not explicit[names.index(name)] and isinstance(port, int):
+        if name in names and name in fronts and not explicit[names.index(name)] and name not in adopted and isinstance(port, int):
             values[names.index(name)] = port
             fixed[names.index(name)] = True
+            adopted.add(name)
 taken = {values[i] for i, name in enumerate(names) if name in fronts and fixed[i]}
 if scan:
     for i, name in enumerate(names):
@@ -512,6 +515,62 @@ if scan:
         values[i] = port
         taken.add(port)
 print(" ".join(str(v) for v in values))
+PY
+}
+
+# A config lane serves the proxy inbounds its file names, so the fronts and the
+# ports a system proxy may point at come from that file, not from the defaults.
+# A selected front must be loopback before it is armed, and a file with none is
+# refused by name.
+config_fronts() {
+  python3 - "$CONFIG_FILE" "$WANT_VPN" "$FRONTS_SET" "$FRONTS" <<'PY'
+import json, sys
+
+path, vpn, explicit, asked = sys.argv[1:5]
+try:
+    with open(path, encoding="utf-8") as handle:
+        document = json.load(handle)
+except (OSError, ValueError) as error:
+    sys.exit(f"cannot read config {path}: {error}")
+order = []
+for inbound in document.get("inbounds", []):
+    if not isinstance(inbound, dict):
+        continue
+    name = inbound.get("protocol")
+    if name not in ("socks", "http", "mixed"):
+        continue
+    port = inbound.get("port")
+    if not isinstance(port, int) or isinstance(port, bool) or not 1 <= port <= 65535:
+        sys.exit(f"inbound `{name}` has no port in 1-65535")
+    if name not in order:
+        order.append(name)
+if explicit == "1":
+    wanted = [front.strip() for front in asked.split(",") if front.strip()]
+    missing = [front for front in wanted if front not in order]
+    if missing:
+        sys.exit(f"the config serves no {missing[0]} inbound; --fronts names it")
+    order = [front for front in order if front in wanted]
+if vpn == "1":
+    if not order:
+        sys.exit("the config serves no socks, http or mixed inbound; --vpn needs one")
+    checked = set()
+    for inbound in document.get("inbounds", []):
+        if not isinstance(inbound, dict):
+            continue
+        name = inbound.get("protocol")
+        if name not in order or name in checked:
+            continue
+        checked.add(name)
+        listen = inbound.get("listen")
+        loopback = isinstance(listen, str) and (
+            listen == "::1" or listen == "localhost" or listen.startswith("127.")
+        )
+        if not loopback:
+            sys.exit(
+                f"inbound `{name}` listens on {listen or 'all interfaces'}, not loopback;"
+                " --vpn needs 127.0.0.1 or ::1"
+            )
+print(",".join(order))
 PY
 }
 
@@ -1229,7 +1288,7 @@ action_up() {
   start_lane
   # An attempt cut short is not a lane: Ctrl-C before it proves a flow removes what it started.
   trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
-  if [ "$OUTBOUND" != config ] && ! wait_fronts; then
+  if [ -n "$FRONTS" ] && ! wait_fronts; then
     say "the lane did not open its fronts; last lines of $LOG:"
     tail -n 20 "$LOG" 2>/dev/null || true
     stop_and_forget
@@ -1239,12 +1298,11 @@ action_up() {
   say "lane${INSTANCE:+ '$INSTANCE'} up (pid $(lane_pid)), fronts:"
   if [ "$OUTBOUND" = config ]; then
     say "  the ones $CONFIG_FILE names (served verbatim)"
-  else
-    port_map
   fi
+  port_map
   [ "$OUTBOUND" = foxy ] && say "carrier: $CARRIER"
   local ok=0
-  if [ "$OUTBOUND" != config ]; then verify_flow || ok=1; fi
+  if [ -n "$FRONTS" ]; then verify_flow || ok=1; fi
   if [ "$ok" = 1 ]; then
     # A lane that carries no flow is a leftover, not a result: end it here.
     stop_and_forget
@@ -1264,7 +1322,7 @@ action_serve() {
   start_lane
   # A serve that never proved a flow is an attempt too: the same interruption cleanup applies.
   trap 'stop_and_forget; say "interrupted: the lane was stopped and its config removed; the log stays at $LOG."; exit 130' INT TERM
-  if [ "$OUTBOUND" != config ] && ! wait_fronts; then
+  if [ -n "$FRONTS" ] && ! wait_fronts; then
     say "the lane did not open its fronts; last lines of $LOG:"
     tail -n 20 "$LOG" 2>/dev/null || true
     stop_and_forget
@@ -1274,12 +1332,11 @@ action_serve() {
   say "lane${INSTANCE:+ '$INSTANCE'} up, fronts:"
   if [ "$OUTBOUND" = config ]; then
     say "  the ones $CONFIG_FILE names (served verbatim)"
-  else
-    port_map
   fi
+  port_map
   [ "$OUTBOUND" = foxy ] && say "carrier: $CARRIER"
   local ok=0
-  if [ "$OUTBOUND" != config ]; then verify_flow || ok=1; fi
+  if [ -n "$FRONTS" ]; then verify_flow || ok=1; fi
   if [ "$ok" = 1 ]; then
     stop_and_forget
     say "the lane was stopped and its config removed; nothing is routed, and the"
@@ -1452,7 +1509,7 @@ while [ $# -gt 0 ]; do
     --upstream) need_value --upstream "an http:// or socks5:// URL" "$#" "${2:-}"; UPSTREAM="$2"; shift 2 ;;
     --exclude-domains) need_value --exclude-domains "comma-separated domain suffixes" "$#" "${2:-}"; EXCLUDE_DOMAINS="$2"; shift 2 ;;
     --exclude-ports) need_value --exclude-ports "comma-separated ports" "$#" "${2:-}"; EXCLUDE_PORTS="$2"; shift 2 ;;
-    --fronts) need_value --fronts "a comma-separated front list" "$#" "${2:-}"; FRONTS="$2"; shift 2 ;;
+    --fronts) need_value --fronts "a comma-separated front list" "$#" "${2:-}"; FRONTS="$2"; FRONTS_SET=1; shift 2 ;;
     --socks) need_port --socks "$#" "${2:-}"; SOCKS_PORT="$2"; SOCKS_SET=1; shift 2 ;;
     --http) need_port --http "$#" "${2:-}"; HTTP_PORT="$2"; HTTP_SET=1; shift 2 ;;
     --mixed) need_port --mixed "$#" "${2:-}"; MIXED_PORT="$2"; MIXED_SET=1; shift 2 ;;
@@ -1497,22 +1554,28 @@ fi
 apply_instance
 case "$ACTION" in
   up|serve)
-    if [ "$OUTBOUND" != config ]; then
-      scan=0; [ -n "$INSTANCE" ] && scan=1
-      planned="$(plan_ports "$scan")" || die "the lane's ports could not be chosen; nothing was started."
-      read -r SOCKS_PORT HTTP_PORT MIXED_PORT <<<"$planned"
-      seen=""
-      for front in ${FRONTS//,/ }; do
-        case "$front" in
-          socks) port="$SOCKS_PORT" ;;
-          http) port="$HTTP_PORT" ;;
-          mixed) port="$MIXED_PORT" ;;
-          *) continue ;;
-        esac
-        case " $seen " in *" $port "*) die "two fronts cannot share port $port; nothing was started." ;; esac
-        seen="$seen $port"
-      done
-    fi ;;
+    scan=0
+    if [ "$OUTBOUND" = config ]; then
+      CFG="$CONFIG_FILE"
+      FRONTS="$(config_fronts 2>&1)" || die "$FRONTS"
+      # The file is served verbatim, so its ports win over the flags.
+      SOCKS_SET=0; HTTP_SET=0; MIXED_SET=0
+    else
+      [ -n "$INSTANCE" ] && scan=1
+    fi
+    planned="$(plan_ports "$scan")" || die "the lane's ports could not be chosen; nothing was started."
+    read -r SOCKS_PORT HTTP_PORT MIXED_PORT <<<"$planned"
+    seen=""
+    for front in ${FRONTS//,/ }; do
+      case "$front" in
+        socks) port="$SOCKS_PORT" ;;
+        http) port="$HTTP_PORT" ;;
+        mixed) port="$MIXED_PORT" ;;
+        *) continue ;;
+      esac
+      case " $seen " in *" $port "*) die "two fronts cannot share port $port; nothing was started." ;; esac
+      seen="$seen $port"
+    done ;;
   status|ports) adopt_lane_ports || true ;;
 esac
 
