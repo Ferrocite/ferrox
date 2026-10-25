@@ -522,12 +522,17 @@ impl Shake {
     }
 }
 
+enum Aead {
+    Aes(ferrox_core::aesgcm::Aes128Gcm),
+    Chacha([u8; 32]),
+    Plain,
+}
+
 /// The sealed size field's parser, where the mask draw would be: its key is
 /// `KDF16(body_key, "auth_len")` (the same second AEAD per cipher the reference builds,
 /// `proxy/vmess/encoding/server.go`), its nonce the body's shape with a counter of its own.
 struct SizeAead {
-    aes: Option<ferrox_core::aesgcm::Aes128Gcm>,
-    chacha: Option<[u8; 32]>,
+    aead: Aead,
     nonce: [u8; 12],
     counter: u16,
 }
@@ -535,17 +540,16 @@ struct SizeAead {
 impl SizeAead {
     fn fresh(key: &[u8; 16], cipher: Cipher, iv: &[u8; 16]) -> Option<Self> {
         let len_key = kdf16(key, &[b"auth_len"]);
-        let (aes, chacha) = match cipher {
-            Cipher::Aes => (Some(ferrox_core::aesgcm::Aes128Gcm::new(&len_key)), None),
-            Cipher::Chacha => (None, Some(chacha_key(&len_key))),
+        let aead = match cipher {
+            Cipher::Aes => Aead::Aes(ferrox_core::aesgcm::Aes128Gcm::new(&len_key)),
+            Cipher::Chacha => Aead::Chacha(chacha_key(&len_key)),
             // No cipher the reference seals a length with, so no authenticated length.
             _ => return None,
         };
         let mut nonce = [0u8; 12];
         nonce[2..].copy_from_slice(&iv[2..12]);
         Some(Self {
-            aes,
-            chacha,
+            aead,
             nonce,
             counter: 0,
         })
@@ -556,16 +560,16 @@ impl SizeAead {
         let tag: [u8; TAG_LEN] = <[u8; TAG_LEN]>::try_from(tag).ok()?;
         self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
         let nonce = &self.nonce;
-        let plain = match (&self.aes, &self.chacha) {
-            (Some(aes), None) => {
+        let plain = match &self.aead {
+            Aead::Aes(aes) => {
                 aes.open_in_place(nonce, b"", size, &tag)?;
                 size
             }
-            (None, Some(key)) => {
+            Aead::Chacha(key) => {
                 ferrox_core::aead::chacha20_poly1305_decrypt_in_place(key, nonce, b"", size, &tag)?;
                 size
             }
-            _ => return None,
+            Aead::Plain => return None,
         };
         self.counter = self.counter.wrapping_add(1);
         Some(u16::from_be_bytes([plain[0], plain[1]]).wrapping_add(TAG_LEN as u16))
@@ -575,12 +579,12 @@ impl SizeAead {
         let mut plain = total.wrapping_sub(TAG_LEN as u16).to_be_bytes();
         self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
         let nonce = &self.nonce;
-        let tag = match (&self.aes, &self.chacha) {
-            (Some(aes), None) => aes.seal_in_place(nonce, b"", &mut plain),
-            (None, Some(key)) => {
+        let tag = match &self.aead {
+            Aead::Aes(aes) => aes.seal_in_place(nonce, b"", &mut plain),
+            Aead::Chacha(key) => {
                 ferrox_core::aead::chacha20_poly1305_seal_in_place(key, nonce, b"", &mut plain)
             }
-            _ => return,
+            Aead::Plain => return,
         };
         sealed[..HEADER_LEN].copy_from_slice(&plain);
         sealed[HEADER_LEN..].copy_from_slice(&tag);
@@ -590,8 +594,7 @@ impl SizeAead {
 
 pub(crate) struct Flow {
     cipher: Cipher,
-    aes: Option<ferrox_core::aesgcm::Aes128Gcm>,
-    chacha: Option<[u8; 32]>,
+    aead: Aead,
     nonce: [u8; 12],
     counter: u16,
     shake: Option<Shake>,
@@ -616,10 +619,10 @@ impl Flow {
         let masking = options & OPT_MASK != 0 && options & OPT_AUTH_LEN == 0;
         let padding = options & OPT_PAD != 0 && options & OPT_AUTH_LEN == 0;
         let actual = cipher.resolve();
-        let (aes, chacha) = match actual {
-            Cipher::Aes => (Some(ferrox_core::aesgcm::Aes128Gcm::new(key)), None),
-            Cipher::Chacha => (None, Some(chacha_key(key))),
-            Cipher::None => (None, None),
+        let aead = match actual {
+            Cipher::Aes => Aead::Aes(ferrox_core::aesgcm::Aes128Gcm::new(key)),
+            Cipher::Chacha => Aead::Chacha(chacha_key(key)),
+            Cipher::None => Aead::Plain,
             Cipher::Auto => return None,
         };
         let shake = masking.then(|| Shake::fresh(mask_seed, padding));
@@ -627,8 +630,7 @@ impl Flow {
         nonce[2..].copy_from_slice(&iv[2..12]);
         Some(Self {
             cipher: actual,
-            aes,
-            chacha,
+            aead,
             nonce,
             counter: 0,
             shake,
@@ -653,13 +655,13 @@ impl Flow {
         out.extend_from_slice(plain);
         self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
         let nonce = &self.nonce;
-        let sealed = match (&self.aes, &self.chacha) {
-            (Some(aes), None) => {
+        let sealed = match &self.aead {
+            Aead::Aes(aes) => {
                 let tag = aes.seal_in_place(nonce, b"", &mut out[at..]);
                 out.extend_from_slice(&tag);
                 true
             }
-            (None, Some(key)) => {
+            Aead::Chacha(key) => {
                 let tag = ferrox_core::aead::chacha20_poly1305_seal_in_place(
                     key,
                     nonce,
@@ -669,8 +671,7 @@ impl Flow {
                 out.extend_from_slice(&tag);
                 true
             }
-            (None, None) => true,
-            _ => false,
+            Aead::Plain => true,
         };
         if !sealed {
             out.truncate(at);
@@ -681,8 +682,8 @@ impl Flow {
         true
     }
     fn open_chunk(&mut self, chunk: &mut [u8]) -> Option<usize> {
-        let plain_len = match (&self.aes, &self.chacha) {
-            (Some(aes), None) => {
+        let plain_len = match &self.aead {
+            Aead::Aes(aes) => {
                 if chunk.len() < TAG_LEN {
                     return None;
                 }
@@ -694,7 +695,7 @@ impl Flow {
                 aes.open_in_place(nonce, b"", body, tag)?;
                 split
             }
-            (None, Some(key)) => {
+            Aead::Chacha(key) => {
                 if chunk.len() < TAG_LEN {
                     return None;
                 }
@@ -706,8 +707,7 @@ impl Flow {
                 ferrox_core::aead::chacha20_poly1305_decrypt_in_place(key, nonce, b"", body, tag)?;
                 split
             }
-            (None, None) => chunk.len(),
-            _ => return None,
+            Aead::Plain => chunk.len(),
         };
         self.counter = self.counter.wrapping_add(1);
         Some(plain_len)
